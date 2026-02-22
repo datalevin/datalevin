@@ -590,9 +590,7 @@
         [:closed lk hk] (index->ktype index)
         [:closed lv hv] (index->vtype index))))
 
-  (size [store index low-datom high-datom]
-    (.size store index low-datom high-datom nil))
-  (size [_ index low-datom high-datom cap]
+  (size [_ index low-datom high-datom]
     (list-range-count
       lmdb (index->dbi index)
       [:closed
@@ -600,8 +598,7 @@
        (index->k index schema high-datom true)] (index->ktype index)
       [:closed
        (index->v index schema low-datom false)
-       (index->v index schema high-datom true)] (index->vtype index)
-      cap))
+       (index->v index schema high-datom true)] (index->vtype index)))
 
   (e-size [_ e] (list-count lmdb c/eav e :id))
 
@@ -672,14 +669,13 @@
     (list-count
       lmdb c/ave (datom->indexable schema (d/datom c/e0 a v) false) :avg))
 
-  (av-range-size ^long [this a lv hv] (.av-range-size this a lv hv nil))
-  (av-range-size ^long [_ a lv hv cap]
+  (av-range-size ^long [_ a lv hv]
     (key-range-list-count
       lmdb c/ave
       [:closed
        (datom->indexable schema (d/datom c/e0 a lv) false)
        (datom->indexable schema (d/datom c/emax a hv) true)]
-      :avg cap))
+      :avg))
 
   (cardinality [_ a]
     (if (:db/aid (schema a))
@@ -784,9 +780,7 @@
               (map #(d/datom % attr v) es)))))
       schema))
 
-  (size-filter [store index pred low-datom high-datom]
-    (.size-filter store index pred low-datom high-datom nil))
-  (size-filter [_ index pred low-datom high-datom cap]
+  (size-filter [_ index pred low-datom high-datom]
     (list-range-filter-count
       lmdb (index->dbi index)
       (datom-pred->kv-pred lmdb attrs index pred)
@@ -794,7 +788,7 @@
        (index->k index schema high-datom true)] (index->ktype index)
       [:closed (index->v index schema low-datom false)
        (index->v index schema high-datom true)] (index->vtype index)
-      true cap))
+      true))
 
   (head-filter [_ index pred low-datom high-datom]
     (list-range-some

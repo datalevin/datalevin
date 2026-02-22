@@ -649,7 +649,7 @@
                               (let [id      (.readLong in)
                                     to-skip ^long (- ^long body-len 8)]
                                 (when (pos? to-skip)
-                                  (let [remaining
+                                  (let [^long remaining
                                         (loop [rem to-skip]
                                           (if (pos? rem)
                                             (let [n (.skip in rem)]
@@ -1343,19 +1343,29 @@
              (string? (second k)))
     (second k)))
 
+(def ^:private byte-array-class (class (byte-array 0)))
+
+(defn- decode-wal-field
+  [raw? x t]
+  (if (and raw? (instance? byte-array-class x))
+    (b/read-buffer (ByteBuffer/wrap ^bytes x) (normalize-type t))
+    x))
+
 (defn- wal-recorded-dbi-opts
   [records]
   (reduce
     (fn [m {:wal/keys [ops]}]
       (reduce
-        (fn [acc {:keys [op dbi k v]}]
+        (fn [acc {:keys [op dbi k v kt vt raw?]}]
           (if (= dbi c/kv-info)
-            (if-let [dbi-name (dbi-name-from-kv-info-key k)]
-              (case op
-                :put (if (map? v) (assoc acc dbi-name v) acc)
-                :del (dissoc acc dbi-name)
-                acc)
-              acc)
+            (let [k* (decode-wal-field raw? k kt)]
+              (if-let [dbi-name (dbi-name-from-kv-info-key k*)]
+                (case op
+                  :put (let [v* (decode-wal-field raw? v vt)]
+                         (if (map? v*) (assoc acc dbi-name v*) acc))
+                  :del (dissoc acc dbi-name)
+                  acc)
+                acc))
             acc))
         m
         ops))
@@ -1533,14 +1543,17 @@
        (read-wal-records (i/env-dir lmdb) from-wal-id upto)))))
 
 (defn- overlay-entry-count
-  [overlay-map]
-  (reduce
-    (fn [^long acc ^java.util.concurrent.ConcurrentSkipListMap m]
-      (if m
-        (+ acc (.size m))
-        acc))
-    0
-    (vals (or overlay-map {}))))
+  [info]
+  (if-let [overlay-env (:kv-overlay-env info)]
+    (try
+      (reduce
+       (fn [^long acc dbi-name]
+         (+ acc (long (i/entries overlay-env dbi-name))))
+       0
+       (i/list-dbis overlay-env))
+      (catch Exception _
+        0))
+    0))
 
 (defn kv-wal-metrics
   "Report WAL overlay/indexer/segment diagnostics."
@@ -1549,7 +1562,7 @@
         committed       (long (or (:last-committed-wal-tx-id info) 0))
         indexed         (long (or (:last-indexed-wal-tx-id info) 0))
         lag             (max 0 (- committed indexed))
-        committed-count (overlay-entry-count (:kv-overlay-by-dbi info))
+        committed-count (overlay-entry-count info)
         private-count   (long (or (:kv-overlay-private-entries info) 0))
         dir             (i/env-dir lmdb)
         segments        (or (segment-files dir) [])

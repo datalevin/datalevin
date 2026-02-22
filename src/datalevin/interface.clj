@@ -46,7 +46,6 @@
      specified key range")
   (list-range-count
     [db list-name k-range k-type v-range v-type]
-    [db list-name k-range k-type v-range v-type cap]
     "Return the number of key-values in the specified value range of the
      specified key range")
   (list-range-filter
@@ -67,7 +66,6 @@
   (list-range-filter-count
     [db list-name pred k-range k-type v-range v-type]
     [db list-name pred k-range k-type v-range v-type raw-pred?]
-    [db list-name pred k-range k-type v-range v-type raw-pred? cap]
     "Return the count of key-values in the specified value range of the
      specified key range for those pred call is true")
   (visit-list-range
@@ -219,13 +217,10 @@ values;")
   (key-range-count
     [db dbi-name k-range]
     [db dbi-name k-range k-type]
-    [db dbi-name k-range k-type cap]
     "Return the number of keys in the specified key range, does not read
 values;")
   (key-range-list-count
     [db dbi-name k-range k-type]
-    [db dbi-name k-range k-type cap]
-    [db dbi-name k-range k-type cap budget]
     "Return the total number of list items in the specified key range, does not read values;")
   (range-count
     [db dbi-name k-range]
@@ -356,7 +351,7 @@ values;")
   (fetch [this datom] "Return [datom] if it exists in store, otherwise '()")
   (populated? [this index low-datom high-datom]
     "Return true if there exists at least one datom in the given boundary (inclusive)")
-  (size [this index low-datom high-datom] [this index low-datom high-datom cap]
+  (size [this index low-datom high-datom]
     "Return the number of datoms within the given range (inclusive)")
   (e-size [this e]
     "Return the numbers of datoms with the given e value")
@@ -372,7 +367,7 @@ values;")
     "Return the numbers of ref datoms with the given v value")
   (av-size [this a v]
     "Return the numbers of datoms with the given a and v value")
-  (av-range-size [this a lv hv] [this a lv hv cap]
+  (av-range-size [this a lv hv]
     "Return the numbers of datoms with given a and v range")
   (cardinality [this a]
     "Return the number of distinct values of an attribute")
@@ -398,7 +393,6 @@ values;")
   (v-datoms [this v] "Return datoms with given v, for ref attribute only")
   (size-filter
     [this index pred low-datom high-datom]
-    [this index pred low-datom high-datom cap]
     "Return the number of datoms within the given range (inclusive) that
     return true for (pred x), where x is the datom")
   (head-filter [this index pred low-datom high-datom]

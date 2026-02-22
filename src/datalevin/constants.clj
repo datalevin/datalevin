@@ -507,8 +507,8 @@
 
 (def ^{:dynamic true :no-doc true
        :doc     "When true, append KV transactions to the on-disk WAL
-                 (`<db-dir>/wal`). Enabled by default."}
-  *enable-kv-wal* true)
+                 (`<db-dir>/wal`). Disabled by default."}
+  *enable-kv-wal* false)
 
 (def ^{:dynamic true :no-doc true
        :doc     "When KV WAL is enabled, flush durable `wal/meta` after this
@@ -518,7 +518,7 @@
 (def ^{:dynamic true :no-doc true
        :doc     "When KV WAL is enabled, max delay in ms before durable
                  `wal/meta` flush even when tx-count threshold is not reached."}
-  *wal-meta-flush-max-ms* 100)
+  *wal-meta-flush-max-ms* 1000)
 
 (def ^{:dynamic true :no-doc true
        :doc     "Max WAL segment size in bytes before rotation."}
@@ -543,7 +543,7 @@
        :doc     "Max milliseconds since the last WAL sync before forcing an
                  fdatasync on the next write.  Bounds the durability window when
                  writes are infrequent.  0 disables the time-based trigger."}
-  *wal-group-commit-ms* 10)
+  *wal-group-commit-ms* 100)
 
 (def ^{:dynamic true :no-doc true
        :doc     "Max buffer size in bytes for in-memory vector index
@@ -581,6 +581,14 @@
                  Reserved in Phase 1; actual hook call-sites land in Phase 2
                  when WAL writer/indexer paths are implemented."}
   *failpoint* nil)
+
+(def ^{:dynamic true :no-doc true
+       :doc     "When true, print per-stage datalog transaction timing.
+                 Can also be enabled via:
+                   - env var DTLV_TX_STAGE_TIMING=1|true
+                   - JVM prop -Ddatalevin.tx.stage.timing=true
+                   - DB opts {:tx-stage-timing? true}."}
+  *tx-stage-timing* false)
 
 (def ^{:dynamic true
        :doc     "Batch size (# of datoms) when filling Datalog DB"}
@@ -699,14 +707,6 @@ values means trust sampled high ratio more."}
 (def ^{:dynamic true
        :doc     "The time measure is taken every this step of iterations when sampling."}
   sample-iteration-step 20000)
-
-(def ^{:dynamic true
-       :doc     "The time budget allocated for counting av ranges of an attribute, in milliseconds. The counting will stop if it takes longer than this."}
-  range-count-time-budget 10)
-
-(def ^{:dynamic true
-       :doc     "The time measure is taken every this step of iterations when counting."}
-  range-count-iteration-step 1000)
 
 (def ^{:dynamic true
        :doc     "Max milliseconds to wait for a tuple before failing. nil to wait forever."}

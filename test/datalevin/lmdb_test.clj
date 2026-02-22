@@ -469,20 +469,18 @@
     (is (= (if/entries lmdb "list") 10))
 
     (is (= (if/key-range-count lmdb "list" [:all]) 3))
-    (is (= (if/key-range-count lmdb "list" [:all] :string 2) 2))
+    (is (= (if/key-range-count lmdb "list" [:all] :string) 3))
 
     (if/visit-key-range lmdb "list" kvisit [:all] :string)
     (is (= "a b c" (s/trim @joins)))
 
     (is (= (if/key-range-list-count lmdb "list" [:all] :string) 10))
-    (is (= (if/key-range-list-count lmdb "list" [:all] :string 5) 5))
     (is (= (if/key-range-list-count lmdb "list" [:greater-than "a"] :string)
            6))
     (is (= (if/key-range-list-count lmdb "list" [:closed "A" "d"] :string) 10))
     (is (= (if/key-range-list-count lmdb "list" [:closed "a" "e"] :string) 10))
     (is (= (if/key-range-list-count lmdb "list" [:less-than "c"] :string)
            7))
-    (is (= (if/key-range-list-count lmdb "list" [:less-than "c"] :string 5) 5))
 
     (is (= (if/key-range lmdb "list" [:all] :string) ["a" "b" "c"]))
     (is (= (if/key-range-count lmdb "list" [:greater-than "b"] :string) 1))

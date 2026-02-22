@@ -452,36 +452,20 @@
            {:dbi dbi-name :key-range k-range})))
 
 (defn- filter-count*
-  ([iterable pred raw-pred? k-type v-type]
-   (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-     (loop [c 0]
-       (if (.hasNext ^Iterator iter)
-         (let [kv (.next ^Iterator iter)]
-           (if raw-pred?
-             (if (pred kv)
-               (recur (unchecked-inc c))
-               (recur c))
-             (if (pred (b/read-buffer (l/k kv) k-type)
-                       (when v-type (b/read-buffer (l/v kv) v-type)))
-               (recur (unchecked-inc c))
-               (recur c))))
-         c))))
-  ([iterable pred raw-pred? k-type v-type cap]
-   (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-     (loop [c 0]
-       (if (= c cap)
-         c
-         (if (.hasNext ^Iterator iter)
-           (let [kv (.next ^Iterator iter)]
-             (if raw-pred?
-               (if (pred kv)
-                 (recur (unchecked-inc c))
-                 (recur c))
-               (if (pred (b/read-buffer (l/k kv) k-type)
-                         (when v-type (b/read-buffer (l/v kv) v-type)))
-                 (recur (unchecked-inc c))
-                 (recur c))))
-           c))))))
+  [iterable pred raw-pred? k-type v-type]
+  (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
+    (loop [c 0]
+      (if (.hasNext ^Iterator iter)
+        (let [kv (.next ^Iterator iter)]
+          (if raw-pred?
+            (if (pred kv)
+              (recur (unchecked-inc c))
+              (recur c))
+            (if (pred (b/read-buffer (l/k kv) k-type)
+                      (when v-type (b/read-buffer (l/v kv) v-type)))
+              (recur (unchecked-inc c))
+              (recur c))))
+        c))))
 
 (defn range-filter-count
   [lmdb dbi-name pred k-range k-type v-type raw-pred?]
@@ -645,13 +629,11 @@
            {:dbi dbi-name :key-range k-range :val-range v-range})))
 
 (defn list-range-filter-count
-  [lmdb dbi-name pred k-range k-type v-range v-type raw-pred? cap]
+  [lmdb dbi-name pred k-range k-type v-range v-type raw-pred?]
   (scan
     (let [iterable (*iterate-list* lmdb dbi rtx cur k-range k-type
                                    v-range v-type)]
-      (if cap
-        (filter-count* iterable pred raw-pred? k-type v-type cap)
-        (filter-count* iterable pred raw-pred? k-type v-type)))
+      (filter-count* iterable pred raw-pred? k-type v-type))
     (raise "Fail to count filtered list range: " e
            {:dbi dbi-name :key-range k-range :val-range v-range})))
 
@@ -737,9 +719,13 @@
   (when k
     (scan
       (with-open [^AutoCloseable iter
-                  (l/val-iterator (*iterate-list-val-full* lmdb dbi rtx cur))]
-        (when (l/seek-key iter k kt)
-          (let [v (b/read-buffer (l/next-val iter) vt)]
+                  (.iterator
+                    ^Iterable (*iterate-list* lmdb dbi rtx cur
+                                              [:closed k k] kt
+                                              [:all] vt))]
+        (when (.hasNext ^Iterator iter)
+          (let [kv (.next ^Iterator iter)
+                v  (b/read-buffer (l/v kv) vt)]
             (if ignore-key?
               (if v v true)
               [(b/expected-return k kt) v]))))

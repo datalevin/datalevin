@@ -1198,22 +1198,14 @@
 (defn range->start-end [[[_ lv] [_ hv]]] [(nillify lv) (nillify hv)])
 
 (defn range-count
-  [db attr ranges ^long cap]
+  [db attr ranges]
   (if (identical? ranges :empty-range)
     0
-    (let [start (System/currentTimeMillis)]
-      (unreduced
-        (reduce
-          (fn [^long sum range]
-            (let [s (+ sum (let [[lv hv] (range->start-end range)]
-                             ^long (db/-index-range-size db attr lv hv)))
-                  t (- (System/currentTimeMillis) start)]
-              (if (< s cap)
-                (if (< t ^long c/range-count-time-budget)
-                  s
-                  (reduced (inc s)))
-                (reduced cap))))
-          0 ranges)))))
+    (reduce
+      (fn ^long [^long sum range]
+        (let [[lv hv] (range->start-end range)]
+          (unchecked-add sum ^long (db/-index-range-size db attr lv hv))))
+      0 ranges)))
 
 (defn count-node-datoms
   [^DB db {:keys [free bound] :as node}]
@@ -1222,8 +1214,8 @@
       (fn [{:keys [mcount] :as node} [k i {:keys [attr val range]}]]
         (let [^long c (cond
                         (some? val) (av-size store attr val)
-                        range       (range-count db attr range mcount)
-                        :else       (db/-count db [nil attr nil] mcount))]
+                        range       (range-count db attr range)
+                        :else       (db/-count db [nil attr nil]))]
           (cond
             (zero? c)          (reduced (assoc node :mcount 0))
             (< c ^long mcount) (-> node
@@ -1238,7 +1230,7 @@
   [db e {:keys [free] :as node}]
   (u/reduce-indexed
     (fn [{:keys [mcount] :as node} {:keys [attr]} i]
-      (let [^long c (db/-count db [e attr nil] mcount)]
+      (let [^long c (db/-count db [e attr nil])]
         (cond
           (zero? c)          (reduced (assoc node :mcount 0))
           (< c ^long mcount) (-> node

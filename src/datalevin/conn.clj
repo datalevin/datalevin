@@ -89,16 +89,22 @@
              res#)
            (let [kv#     (.-lmdb ^Store s#)
                  s1#     (volatile! nil)
+                 db1#    (volatile! db#)
                  res1#   (l/with-transaction-kv [kv1# kv#]
                            (let [conn1# (atom (db/transfer
                                                 db# (s/transfer s# kv1#))
                                               :meta (meta ~orig-conn))
                                  res#   (let [~conn conn1#]
-                                          ~@body)]
-                             (vreset! s1# (.-store ^DB (deref conn1#)))
+                                          ~@body)
+                                 db2#   (if (and (map? res#)
+                                                 (instance? DB (:db-after res#)))
+                                          ^DB (:db-after res#)
+                                          ^DB (deref conn1#))]
+                             (vreset! db1# db2#)
+                             (vreset! s1# (.-store db2#))
                              res#))
                  new-s#  (s/transfer (deref s1#) kv#)
-                 new-db# (db/new-db new-s#)]
+                 new-db# (db/transfer ^DB (deref db1#) new-s#)]
              (reset! ~orig-conn new-db#)
              (when-not old# (db/enable-cache new-s#))
              res1#))))))

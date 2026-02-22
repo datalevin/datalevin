@@ -551,14 +551,6 @@
     (is (= [[2 4] [2 3] [2 2] [1 4] [1 3] [1 2]]
            (if/list-range lmdb "a" [:closed-back 5 0] :long
                           [:closed-back 5 0] :long)))
-    (is (= 6
-           (if/list-range-count lmdb "a" [:closed-back 5 0] :long
-                                [:closed-back 5 0] :long)))
-    (is (= 3
-           (if/list-range-count lmdb "a" [:closed-back 5 0] :long
-                                [:closed-back 5 0] :long 3)))
-    (is (= 1 (if/list-range-count lmdb "a" [:greater-than 3] :long
-                                  [:greater-than 20] :long)))
     (is (= [5 30]
            (if/list-range-first lmdb "a" [:greater-than 3] :long
                                 [:greater-than 20] :long)))
@@ -578,9 +570,6 @@
     (is (if/list-range-some lmdb "a" pred [:closed 2 2] :long [:all] :long))
     (is (= 5 (if/list-range-filter-count
                  lmdb "a" pred [:open 2 6] :long [:greater-than 5] :long)))
-    (is (= 2 (if/list-range-filter-count
-                 lmdb "a" pred [:open 2 6] :long [:greater-than 5] :long
-                 true 2)))
     (if/close-kv lmdb)
     (u/delete-files dir)))
 

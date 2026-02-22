@@ -1174,7 +1174,10 @@ See also: [[open-kv]], [[sync]]"}
 
          * `:nordahead`, don't do readahead (no effect on Windows), set in Datalevin by default
 
-         * `:nomeminit`, don't initialize malloc'd memory before writing to datafile "}
+         * `:nomeminit`, don't initialize malloc'd memory before writing to datafile
+
+         * `:inmemory`, ignore the path parameter (may be nil), create a
+           process-local, non-durable environment; all data is lost on close "}
   set-env-flags i/set-env-flags)
 
 (def ^{:arglists '([db])
@@ -1423,15 +1426,12 @@ This function is eager and attempts to load all data in range into memory. When 
   key-range i/key-range)
 
 (def ^{:arglists '([db dbi-name k-range]
-                   [db dbi-name k-range k-type]
-                   [db dbi-name k-range k-type cap])
+                   [db dbi-name k-range k-type])
        :doc      "Returns the number of keys in the specified key range in the key-value store.
 
 `k-range` is a vector `[range-type k1 k2]`, `range-type` can be one of `:all`, `:at-least`, `:at-most`, `:closed`, `:closed-open`, `:greater-than`, `:less-than`, `:open`, `:open-closed`, plus backward variants that put a `-back` suffix to each of the above, e.g. `:all-back`.
 
 `k-type` is data type of key. The allowed data types are described in [[read-buffer]].
-
-`cap` is a number, over which the count will stop.
 
      Examples:
 
@@ -1439,15 +1439,12 @@ This function is eager and attempts to load all data in range into memory. When 
               ;;==> 1002"}
   key-range-count i/key-range-count)
 
-(def ^{:arglists '([db dbi-name k-range k-type]
-                   [db dbi-name k-range k-type cap])
+(def ^{:arglists '([db dbi-name k-range k-type])
        :doc      "Returns the number of list items for the specified key range in the key-value store. This function is only applicable for dbi opened with `open-list-dbi`.
 
 `k-range` is a vector `[range-type k1 k2]`, `range-type` can be one of `:all`, `:at-least`, `:at-most`, `:closed`, `:closed-open`, `:greater-than`, `:less-than`, `:open`, `:open-closed`, plus backward variants that put a `-back` suffix to each of the above, e.g. `:all-back`.
 
-`k-type` is data type of key. The allowed data types are described in [[read-buffer]].
-
-`cap` is a number, over which the count will stop."}
+`k-type` is data type of key. The allowed data types are described in [[read-buffer]]."}
   key-range-list-count i/key-range-list-count)
 
 (def ^{:arglists '([db dbi-name visitor k-range]

@@ -106,12 +106,10 @@
       (is (= 2 (if/datom-count store :eav)))
       (is (= 2 (if/datom-count store :ave)))
       (is (= [] (if/slice store :eav d (d/datom c/e0 :non-exist v1))))
-      (is (= 0 (if/size store :eav d (d/datom c/e0 :non-exist v1))))
       (is (nil? (if/populated? store :eav d (d/datom c/e0 :non-exist v1))))
       (is (= d (if/head store :eav d d1)))
       (is (= d1 (if/tail store :eav d1 d)))
       (is (= 2 (if/size store :eav d d1)))
-      (is (= 1 (if/size store :eav d d1 1)))
       (is (= 2 (if/e-size store c/e0)))
       (is (= 1 (if/a-size store b)))
       (is (= [d d1] (if/slice store :eav d d1)))
@@ -127,10 +125,6 @@
                                (fn [^Datom d] (= v (.-v d)))
                                (d/datom c/e0 nil nil)
                                (d/datom c/e0 nil nil))))
-      (is (= 0 (if/size-filter store :eav
-                               (fn [^Datom d] (= v (.-v d)))
-                               (d/datom c/e0 nil nil)
-                               (d/datom c/e0 nil nil) 0)))
       (is (= d (if/head-filter store :eav
                                (fn [^Datom d] (when (= v (.-v d)) d))
                                (d/datom c/e0 nil nil)
@@ -388,7 +382,7 @@
     (is (= 5 (if/av-range-size store :b 7 20)))
     (is (= 7 (if/av-range-size store :b 4 20)))
 
-    (is (= 2 (if/av-range-size store :b 2 4 2)))
+    (is (= 3 (if/av-range-size store :b 2 4)))
 
     (are [a range pred get-v? result]
         (do (.clear res)

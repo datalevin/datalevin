@@ -288,7 +288,7 @@
             "type": "datalevin.dtlvnative.DTLV$dtlv_list_iter"
         },
         {
-            "type": "datalevin.dtlvnative.DTLV$dtlv_list_sample_iter"
+            "type": "datalevin.dtlvnative.DTLV$dtlv_list_rank_sample_iter"
         },
         {
             "type": "datalevin.dtlvnative.DTLV$dtlv_list_val_full_iter"

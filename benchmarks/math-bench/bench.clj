@@ -85,10 +85,10 @@
                   me.lemire.integercompression/JavaFastPFOR {:mvn/version \"0.3.8\"}
                   org.roaringbitmap/RoaringBitmap {:mvn/version \"1.3.0\"}
                   org.eclipse.collections/eclipse-collections {:mvn/version \"13.0.0\"}
-                  org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version \"0.15.12\"}
-                  org.clojars.huahaiy/dtlvnative-linux-x86_64 {:mvn/version \"0.15.12\"}
-                  org.clojars.huahaiy/dtlvnative-linux-arm64 {:mvn/version \"0.15.12\"}
-                  org.clojars.huahaiy/dtlvnative-macosx-arm64 {:mvn/version \"0.15.12\"}
+                  org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version \"0.16.0\"}
+                  org.clojars.huahaiy/dtlvnative-linux-x86_64 {:mvn/version \"0.16.0\"}
+                  org.clojars.huahaiy/dtlvnative-linux-arm64 {:mvn/version \"0.16.0\"}
+                  org.clojars.huahaiy/dtlvnative-macosx-arm64 {:mvn/version \"0.16.0\"}
                   }}"
                   )
 

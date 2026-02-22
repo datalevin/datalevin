@@ -552,18 +552,12 @@
   ([db dbi-name k-range]
    (when-let [d (get-kv db)] (d/key-range-count d dbi-name k-range)))
   ([db dbi-name k-range k-type]
-   (when-let [d (get-kv db)] (d/key-range-count d dbi-name k-range k-type)))
-  ([db dbi-name k-range k-type cap]
-   (when-let [d (get-kv db)]
-     (d/key-range-count d dbi-name k-range k-type cap))))
+   (when-let [d (get-kv db)] (d/key-range-count d dbi-name k-range k-type))))
 
 (defn key-range-list-count
   ([db dbi-name k-range k-type]
    (when-let [d (get-kv db)]
-     (d/key-range-list-count d dbi-name k-range k-type)))
-  ([db dbi-name k-range k-type cap]
-   (when-let [d (get-kv db)]
-     (d/key-range-list-count d dbi-name k-range k-type cap))))
+     (d/key-range-list-count d dbi-name k-range k-type))))
 
 (defn visit-key-range
   ([db dbi-name visitor k-range]

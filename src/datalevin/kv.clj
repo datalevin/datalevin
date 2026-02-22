@@ -13,10 +13,11 @@
   (:require
    [clojure.stacktrace :as stt]
    [datalevin.binding.cpp :as cpp]
+   [datalevin.bits :as b]
+   [datalevin.buffer :as bf]
    [datalevin.constants :as c]
    [datalevin.interface :as i :refer [ILMDB IList IAdmin]]
    [datalevin.lmdb :as l]
-   [datalevin.overlay :as ol]
    [datalevin.scan :as scan]
    [datalevin.util :as u]
    [datalevin.validate :as vld]
@@ -26,6 +27,7 @@
    [datalevin.binding.cpp Rtx]
    [datalevin.cpp Txn]
    [datalevin.lmdb KVTxData]
+   [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels FileChannel]
    [java.nio.charset StandardCharsets]))
 
@@ -33,10 +35,28 @@
   [db]
   (boolean (:kv-wal? @(l/kv-info db))))
 
+(defn- normalize-kv-type
+  [t]
+  (or t :data))
+
+(defn- encode-kv-bytes
+  [x t]
+  (let [t (normalize-kv-type t)]
+    (loop [^ByteBuffer buf (bf/get-tl-buffer)]
+      (let [result (try
+                     (b/put-bf buf x t)
+                     (b/get-bytes buf)
+                     (catch BufferOverflowException _
+                       ::overflow))]
+        (if (identical? result ::overflow)
+          (let [new-buf (ByteBuffer/allocate (* 2 (.capacity buf)))]
+            (bf/set-tl-buffer new-buf)
+            (recur new-buf))
+          result)))))
+
 (defn- overlay-active?
-  [db dbi-name]
-  (ol/kv-overlay-active? @(l/kv-info db) (l/write-txn db) dbi-name
-                         (l/writing? db)))
+  [_db _dbi-name]
+  false)
 
 (defn- dbi-opts!
   [db dbi-name]
@@ -53,15 +73,15 @@
 (defn- validate-kv-txs!
   [db txs dbi-name kt vt]
   (if dbi-name
-    (let [opts      (dbi-opts! db dbi-name)
+    (let [opts (dbi-opts! db dbi-name)
           validate? (boolean (:validate-data? opts))
-          tx-data   (mapv #(l/->kv-tx-data % kt vt) txs)]
+          tx-data (mapv #(l/->kv-tx-data % kt vt) txs)]
       (doseq [tx tx-data]
         (vld/validate-kv-tx-data tx validate?))
       tx-data)
     (let [tx-data (mapv l/->kv-tx-data txs)]
       (doseq [^KVTxData tx tx-data]
-        (let [opts      (dbi-opts! db (.-dbi-name tx))
+        (let [opts (dbi-opts! db (.-dbi-name tx))
               validate? (boolean (:validate-data? opts))]
           (vld/validate-kv-tx-data tx validate?)))
       tx-data)))
@@ -71,16 +91,16 @@
    (canonical-kv-op db tx fallback-dbi nil))
   ([db ^KVTxData tx fallback-dbi cached-dbi-bytes]
    (let [dbi-name (or (.-dbi-name tx) fallback-dbi)
-         kt       (ol/normalize-kv-type (.-kt tx))]
-     {:op        (.-op tx)
-      :dbi       dbi-name
-      :k         (.-k tx)
-      :v         (.-v tx)
-      :kt        kt
-      :vt        (.-vt tx)
-      :flags     (.-flags tx)
-      :dupsort?  (dbi-dupsort? db dbi-name)
-      :k-bytes   (ol/encode-kv-bytes (.-k tx) kt)
+         kt (normalize-kv-type (.-kt tx))]
+     {:op (.-op tx)
+      :dbi dbi-name
+      :k (.-k tx)
+      :v (.-v tx)
+      :kt kt
+      :vt (.-vt tx)
+      :flags (.-flags tx)
+      :dupsort? (dbi-dupsort? db dbi-name)
+      :k-bytes (encode-kv-bytes (.-k tx) kt)
       :dbi-bytes (or cached-dbi-bytes
                      (.getBytes ^String dbi-name StandardCharsets/UTF_8))})))
 
@@ -94,41 +114,36 @@
 
 (defn- wal-transact-one-shot!
   [db dbi-name txs k-type v-type]
-  (let [info      (l/kv-info db)
+  (let [info (l/kv-info db)
         write-txn (l/write-txn db)]
     (try
-      (let [tx-data    (validate-kv-txs! db txs dbi-name k-type v-type)
-            dbi-bs     (when dbi-name
-                         (.getBytes ^String dbi-name StandardCharsets/UTF_8))
-            ops        (mapv #(canonical-kv-op db % dbi-name dbi-bs) tx-data)
+      (let [tx-data (validate-kv-txs! db txs dbi-name k-type v-type)
+            dbi-bs (when dbi-name
+                     (.getBytes ^String dbi-name StandardCharsets/UTF_8))
+            ops (mapv #(canonical-kv-op db % dbi-name dbi-bs) tx-data)
             max-val-op (when (:max-val-size-changed? @info)
                          (let [tx (l/->kv-tx-data
-                                    [:put :max-val-size
-                                     (:max-val-size @info)]
-                                    nil nil)]
+                                   [:put :max-val-size
+                                    (:max-val-size @info)]
+                                   nil nil)]
                            (vswap! info assoc :max-val-size-changed? false)
                            (canonical-kv-op db tx c/kv-info)))
-            ops        (if max-val-op (conj ops max-val-op) ops)
-            wal-entry  (when (seq ops)
-                         (run-writer-step!
-                           :step-3
-                           #(wal/append-kv-wal-record!
-                              db ops (System/currentTimeMillis))))
-            wal-id     (:wal-id wal-entry)]
+            ops (if max-val-op (conj ops max-val-op) ops)
+            wal-entry (when (seq ops)
+                        (run-writer-step!
+                         :step-3
+                         #(wal/append-kv-wal-record!
+                           db ops (System/currentTimeMillis))))
+            wal-id (:wal-id wal-entry)]
         (when wal-id
           (run-writer-step! :step-4 (fn [] nil))
-          (run-writer-step! :step-5
-                            #(ol/publish-kv-committed-overlay!
-                               info write-txn wal-id
-                               (:ops wal-entry)))
+          (run-writer-step! :step-5 (fn [] nil))
           (run-writer-step! :step-6 (fn [] nil))
-          (run-writer-step! :step-7
-                            #(ol/publish-kv-overlay-watermark!
-                               info wal-id))
+          (run-writer-step! :step-7 (fn [] nil))
           (try
             (run-writer-step!
-              :step-8
-              #(wal/maybe-publish-kv-wal-meta! db wal-id))
+             :step-8
+             #(wal/maybe-publish-kv-wal-meta! db wal-id))
             (catch Exception _ nil))
           ;; Keep default commit path decoupled from replay/resize; only
           ;; pressure-triggered catch-up may flush synchronously.
@@ -142,35 +157,35 @@
       (catch Exception e
         (wal/refresh-kv-wal-info! db)
         (wal/refresh-kv-wal-meta-info! db)
-        (ol/recover-kv-overlay! info write-txn (i/env-dir db))
         (if-let [edata (ex-data e)]
           (u/raise "Fail to transact to LMDB: " e edata)
           (u/raise "Fail to transact to LMDB: " e {}))))))
 
 (defn- wal-transact-open-txn!
   [db dbi-name txs k-type v-type]
-  (let [info      (l/kv-info db)
+  (let [info (l/kv-info db)
         write-txn (l/write-txn db)
-        ^Rtx rtx  @write-txn]
+        ^Rtx rtx @write-txn]
     (if (nil? rtx)
       (u/raise "Calling `transact-kv` in WAL mode without opening transaction"
                {})
       (try
-        (let [tx-data    (validate-kv-txs! db txs dbi-name k-type v-type)
-              dbi-bs     (when dbi-name
-                           (.getBytes ^String dbi-name StandardCharsets/UTF_8))
-              ops        (mapv #(canonical-kv-op db % dbi-name dbi-bs) tx-data)
+        (let [tx-data (validate-kv-txs! db txs dbi-name k-type v-type)
+              dbi-bs (when dbi-name
+                       (.getBytes ^String dbi-name StandardCharsets/UTF_8))
+              ops (mapv #(canonical-kv-op db % dbi-name dbi-bs) tx-data)
               max-val-op (when (:max-val-size-changed? @info)
                            (let [tx (l/->kv-tx-data
-                                      [:put :max-val-size
-                                       (:max-val-size @info)]
-                                      nil nil)]
+                                     [:put :max-val-size
+                                      (:max-val-size @info)]
+                                     nil nil)]
                              (vswap! info assoc :max-val-size-changed? false)
                              (canonical-kv-op db tx c/kv-info)))
-              ops        (if max-val-op (conj ops max-val-op) ops)]
+              ops (if max-val-op (conj ops max-val-op) ops)]
           (when (seq ops)
-            (vswap! (.-wal-ops rtx) into ops)
-            (ol/publish-kv-private-overlay! rtx info ops))
+            ;; Defer private overlay materialization until a read needs it.
+            ;; Write-only txns then avoid temp private overlay env setup.
+            (vswap! (.-wal-ops rtx) into ops))
           :transacted)
         (catch Exception e
           (if-let [edata (ex-data e)]
@@ -179,40 +194,36 @@
 
 (defn- wal-close-transact!
   [db]
-  (let [info      (l/kv-info db)
+  (let [info (l/kv-info db)
         write-txn (l/write-txn db)]
     (if-let [^Rtx wtxn @write-txn]
       (if-let [^Txn txn (.-txn wtxn)]
         (let [aborted? @(.-aborted? wtxn)
-              ops      (when-not aborted?
-                         (seq @(.-wal-ops wtxn)))]
+              ops (when-not aborted?
+                    (seq @(.-wal-ops wtxn)))
+              _overlay-private (some-> (l/private-overlay wtxn) deref)]
           (try
             (let [wal-entry (when (seq ops)
                               (run-writer-step!
-                                :step-3
-                                #(wal/append-kv-wal-record!
-                                   db (vec ops)
-                                   (System/currentTimeMillis))))
-                  wal-id    (:wal-id wal-entry)]
+                               :step-3
+                               #(wal/append-kv-wal-record!
+                                 db (vec ops)
+                                 (System/currentTimeMillis))))
+                  wal-id (:wal-id wal-entry)]
               (when wal-id
                 (locking write-txn
                   (run-writer-step! :step-4 (fn [] nil))
-                  (run-writer-step! :step-5
-                                    #(ol/publish-kv-committed-overlay!
-                                       info write-txn wal-id
-                                       (:ops wal-entry)))
+                  (run-writer-step! :step-5 (fn [] nil))
                   (run-writer-step! :step-6 (fn [] nil))
-                  (run-writer-step! :step-7
-                                    #(ol/publish-kv-overlay-watermark!
-                                       info wal-id))))
+                  (run-writer-step! :step-7 (fn [] nil))))
               (.abort txn)
               (vreset! write-txn nil)
               (.close txn)
               (when wal-id
                 (try
                   (run-writer-step!
-                    :step-8
-                    #(wal/maybe-publish-kv-wal-meta! db wal-id))
+                   :step-8
+                   #(wal/maybe-publish-kv-wal-meta! db wal-id))
                   (catch Exception _ nil))
                 ;; Keep default commit path decoupled from replay/resize; only
                 ;; pressure-triggered catch-up may flush synchronously.
@@ -224,12 +235,10 @@
                 nil)
               (when (.-wal-ops wtxn)
                 (vreset! (.-wal-ops wtxn) []))
-              (ol/reset-private-overlay! wtxn info)
               (if aborted? :aborted :committed))
             (catch Exception e
               (wal/refresh-kv-wal-info! db)
               (wal/refresh-kv-wal-meta-info! db)
-              (ol/recover-kv-overlay! info write-txn (i/env-dir db))
               (when-let [^Txn t (.-txn wtxn)]
                 (try
                   (.close t)
@@ -245,13 +254,12 @@
 
 (defn- wal-abort-transact!
   [db]
-  (let [info      (l/kv-info db)
+  (let [info (l/kv-info db)
         write-txn (l/write-txn db)]
     (when-let [^Rtx wtxn @write-txn]
       (vreset! (.-aborted? wtxn) true)
       (when (.-wal-ops wtxn)
         (vreset! (.-wal-ops wtxn) []))
-      (ol/reset-private-overlay! wtxn info)
       (vreset! write-txn wtxn)
       nil)))
 
@@ -266,7 +274,7 @@
       (let [sync-ok?
             (when-let [^FileChannel ch (:wal-channel @info)]
               (when (.isOpen ch)
-                (let [sync-mode  (or (:wal-sync-mode @info) c/*wal-sync-mode*)
+                (let [sync-mode (or (:wal-sync-mode @info) c/*wal-sync-mode*)
                       close-mode (if (= sync-mode :none) :fdatasync sync-mode)]
                   (try
                     (wal/sync-channel! ch close-mode)
@@ -299,7 +307,6 @@
         (when (and (:kv-wal? @info) (not (:wal-runtime-ready? @info)))
           (wal/refresh-kv-wal-info! db)
           (wal/refresh-kv-wal-meta-info! db)
-          (ol/recover-kv-overlay! info (l/write-txn db) (i/env-dir db))
           (wal/start-scheduled-wal-checkpoint info db l/vector-indices)
           (vswap! info assoc :wal-runtime-ready? true))))))
 
@@ -313,10 +320,7 @@
   (when (and (kv-wal-enabled? db)
              (not c/*bypass-wal*)
              (nil? @(l/write-txn db)))
-    (try
-      (ol/sync-kv-overlay! (l/kv-info db) (l/write-txn db) (i/env-dir db))
-      true
-      (catch Exception _ nil))))
+    false))
 
 (declare wal-iterate-key
          wal-iterate-list
@@ -391,61 +395,40 @@
     (instance? KVDBI dbi) dbi
     :else (KVDBI. db dbi)))
 
-(defn- overlay-map-for-dbi
-  [db dbi]
-  (ol/overlay-for-dbi @(l/kv-info db) (l/write-txn db) (l/dbi-name dbi)
-                      (l/writing? db)))
-
 (defn- native-dbi
   [dbi]
   (if (instance? KVDBI dbi)
     (.-native ^KVDBI dbi)
     dbi))
 
+(defn- info-snapshot
+  [info-src]
+  (if (instance? clojure.lang.IDeref info-src) @info-src info-src))
+
 (defn- wal-iterate-key
-  [db _lmdb dbi rtx cur [range-type k1 k2 :as k-range] k-type]
-  (let [dbi* (native-dbi dbi)
-        base (l/iterate-key dbi* rtx cur k-range k-type)]
-    (if-let [ov (overlay-map-for-dbi db dbi*)]
-      (let [ctx (l/range-info rtx range-type k1 k2 k-type)]
-        (ol/overlay-iterate-key base ctx ov range-type))
-      base)))
+  [_db _lmdb dbi rtx cur k-range k-type]
+  (let [dbi* (native-dbi dbi)]
+    (l/iterate-key dbi* rtx cur k-range k-type)))
 
 (defn- wal-iterate-list
-  [db _lmdb dbi rtx cur
-   [k-range-type k1 k2 :as k-range] k-type
-   [v-range-type v1 v2 :as v-range] v-type]
-  (let [dbi* (native-dbi dbi)
-        base (l/iterate-list dbi* rtx cur k-range k-type v-range v-type)]
-    (if-let [ov (overlay-map-for-dbi db dbi*)]
-      (let [ctx (l/list-range-info rtx k-range-type k1 k2 k-type
-                                   v-range-type v1 v2 v-type)]
-        (ol/overlay-iterate-list base ctx ov k-range-type v-range-type))
-      base)))
+  [_db _lmdb dbi rtx cur k-range k-type v-range v-type]
+  (let [dbi* (native-dbi dbi)]
+    (l/iterate-list dbi* rtx cur k-range k-type v-range v-type)))
 
 (defn- wal-iterate-list-key-range-val-full
-  [db _lmdb dbi rtx cur [range-type k1 k2 :as k-range] k-type]
-  (let [dbi* (native-dbi dbi)
-        base (l/iterate-list-key-range-val-full dbi* rtx cur k-range k-type)]
-    (if-let [ov (overlay-map-for-dbi db dbi*)]
-      (let [ctx (l/range-info rtx range-type k1 k2 k-type)]
-        (ol/overlay-iterate-list-key-range-val-full base ctx ov range-type))
-      base)))
+  [_db _lmdb dbi rtx cur k-range k-type]
+  (let [dbi* (native-dbi dbi)]
+    (l/iterate-list-key-range-val-full dbi* rtx cur k-range k-type)))
 
 (defn- wal-iterate-list-val-full
-  [db _lmdb dbi rtx cur]
-  (let [dbi* (native-dbi dbi)
-        base (l/iterate-list-val-full dbi* rtx cur)]
-    (if-let [ov (overlay-map-for-dbi db dbi*)]
-      (ol/wrap-list-full-val-iterable base ov)
-      base)))
+  [_db _lmdb dbi rtx cur]
+  (let [dbi* (native-dbi dbi)]
+    (l/iterate-list-val-full dbi* rtx cur)))
 
 (defn- wal-iterate-kv
-  [db lmdb dbi rtx cur k-range k-type v-type]
+  [_db _lmdb dbi rtx cur k-range k-type v-type]
   (let [dbi* (native-dbi dbi)]
-    (if (dbi-dupsort? db (l/dbi-name dbi*))
-      (wal-iterate-list db lmdb dbi* rtx cur k-range k-type [:all] v-type)
-      (wal-iterate-key db lmdb dbi* rtx cur k-range k-type))))
+    (l/iterate-kv dbi* rtx cur k-range k-type v-type)))
 
 (defmacro with-wal-overlay-scan
   [db & body]
@@ -484,35 +467,12 @@
   (get-value [this dbi-name k k-type v-type]
     (.get-value this dbi-name k k-type v-type true))
   (get-value [this dbi-name k k-type v-type ignore-key?]
-    (if (kv-wal-enabled? this)
-      (let [ret (ol/overlay-get-value this dbi-name k k-type v-type
-                                      ignore-key?)]
-        (case ret
-          ::ol/overlay-tombstone nil
-
-          ::ol/overlay-miss
-          (let [base (scan/get-value this dbi-name k k-type v-type ignore-key?)]
-            (if (some? base)
-              base
-              (do
-                (sync-kv-overlay-on-miss! this)
-                (let [ret' (ol/overlay-get-value this dbi-name k k-type v-type
-                                                 ignore-key?)]
-                  (case ret'
-                    ::ol/overlay-miss
-                    (scan/get-value this dbi-name k k-type v-type ignore-key?)
-                    ::ol/overlay-tombstone nil
-                    ret')))))
-
-          ret))
-      (scan/get-value this dbi-name k k-type v-type ignore-key?)))
+    (scan/get-value this dbi-name k k-type v-type ignore-key?))
 
   (get-rank [this dbi-name k]
     (.get-rank this dbi-name k :data))
   (get-rank [this dbi-name k k-type]
-    (if (overlay-active? this dbi-name)
-      (ol/overlay-rank this dbi-name k k-type)
-      (scan/get-rank this dbi-name k k-type)))
+    (scan/get-rank this dbi-name k k-type))
 
   (get-by-rank [this dbi-name rank]
     (.get-by-rank this dbi-name rank :data :data true))
@@ -521,9 +481,7 @@
   (get-by-rank [this dbi-name rank k-type v-type]
     (.get-by-rank this dbi-name rank k-type v-type true))
   (get-by-rank [this dbi-name rank k-type v-type ignore-key?]
-    (if (overlay-active? this dbi-name)
-      (ol/overlay-get-by-rank this dbi-name rank k-type v-type ignore-key?)
-      (scan/get-by-rank this dbi-name rank k-type v-type ignore-key?)))
+    (scan/get-by-rank this dbi-name rank k-type v-type ignore-key?))
 
   (sample-kv [this dbi-name n]
     (.sample-kv this dbi-name n :data :data true))
@@ -532,49 +490,28 @@
   (sample-kv [this dbi-name n k-type v-type]
     (.sample-kv this dbi-name n k-type v-type true))
   (sample-kv [this dbi-name n k-type v-type ignore-key?]
-    (if (overlay-active? this dbi-name)
-      (ol/overlay-sample-kv this dbi-name n k-type v-type ignore-key?)
-      (scan/sample-kv this dbi-name n k-type v-type ignore-key?)))
+    (scan/sample-kv this dbi-name n k-type v-type ignore-key?))
 
   (key-range-count [this dbi-name k-range]
     (.key-range-count this dbi-name k-range :data))
   (key-range-count [this dbi-name k-range k-type]
-    (.key-range-count this dbi-name k-range k-type nil))
-  (key-range-count [this dbi-name k-range k-type cap]
-    (if (kv-wal-enabled? this)
-      (ol/wal-key-range-count this dbi-name k-range k-type cap)
-      (i/key-range-count native dbi-name k-range k-type cap)))
+    (i/key-range-count native dbi-name k-range k-type))
 
   (key-range-list-count [this dbi-name k-range k-type]
-    (.key-range-list-count this dbi-name k-range k-type nil nil))
-  (key-range-list-count [this dbi-name k-range k-type cap]
-    (.key-range-list-count this dbi-name k-range k-type cap nil))
-  (key-range-list-count [this dbi-name k-range k-type cap budget]
-    (if (kv-wal-enabled? this)
-      (if (i/list-dbi? native dbi-name)
-        (ol/wal-list-range-count this dbi-name k-range k-type [:all] nil cap)
-        (ol/wal-key-range-count this dbi-name k-range k-type cap))
-      (i/key-range-list-count native dbi-name k-range k-type cap budget)))
+    (i/key-range-list-count native dbi-name k-range k-type))
 
   (visit-key-sample [this dbi-name indices budget step visitor k-range k-type]
     (.visit-key-sample this dbi-name indices budget step visitor k-range k-type
                        true))
   (visit-key-sample
     [this dbi-name indices budget step visitor k-range k-type raw-pred?]
-    (if (overlay-active? this dbi-name)
-      (ol/overlay-visit-key-sample this dbi-name indices visitor k-range
-                                   k-type raw-pred?)
-      (i/visit-key-sample native dbi-name indices budget step visitor
-                          k-range k-type raw-pred?)))
+    (i/visit-key-sample native dbi-name indices budget step visitor
+                        k-range k-type raw-pred?))
 
   (range-count [this dbi-name k-range]
     (.range-count this dbi-name k-range :data))
   (range-count [this dbi-name k-range k-type]
-    (if (kv-wal-enabled? this)
-      (if (i/list-dbi? native dbi-name)
-        (ol/wal-list-range-count this dbi-name k-range k-type [:all] nil nil)
-        (ol/wal-key-range-count this dbi-name k-range k-type nil))
-      (i/range-count native dbi-name k-range k-type)))
+    (i/range-count native dbi-name k-range k-type))
 
   (transact-kv [this txs]
     (.transact-kv this nil txs))
@@ -618,9 +555,7 @@
                                      (or (i/get-value this c/kv-info
                                                       c/applied-wal-tx-id
                                                       :data :data)
-                                         0)))
-        (ol/prune-kv-committed-overlay! (l/kv-info this)
-                                        (:indexed-wal-tx-id res)))
+                                         0))))
       res))
 
   (open-tx-log [this from-wal-id]
@@ -633,337 +568,321 @@
   (gc-wal-segments! [this retain-wal-id]
     (wal/gc-wal-segments! this retain-wal-id))
 
-(abort-transact-kv [db]
- (if (and (kv-wal-enabled? db) (not c/*bypass-wal*))
-   (wal-abort-transact! db)
-   (datalevin.interface/abort-transact-kv native)))
-(check-ready [db] (datalevin.interface/check-ready native))
-(clear-dbi
- [db dbi-name]
- ;; In WAL mode, clear-dbi can be used to clear base LMDB state while
- ;; preserving committed overlay visibility (e.g. replay/recovery tests).
- ;; Do not force synchronous WAL catch-up here.
- (datalevin.interface/clear-dbi native dbi-name))
-(close-kv [db]
- (if (kv-wal-enabled? db)
-   (do
-     (wal-close-kv! db)
-     (datalevin.interface/close-kv native))
-   (datalevin.interface/close-kv native)))
-(close-transact-kv [db]
- (if (and (kv-wal-enabled? db) (not c/*bypass-wal*))
-   (wal-close-transact! db)
-   (datalevin.interface/close-transact-kv native)))
-(closed-kv? [db] (datalevin.interface/closed-kv? native))
-(copy
- [db dest]
- (flush-kv-indexer-if-wal! db)
- (datalevin.interface/copy native dest))
-(copy
- [db dest compact?]
- (flush-kv-indexer-if-wal! db)
- (datalevin.interface/copy native dest compact?))
-(dbi-opts [db dbi-name] (datalevin.interface/dbi-opts native dbi-name))
-(drop-dbi
- [db dbi-name]
- (flush-kv-indexer-if-wal! db)
- (let [existing (datalevin.interface/dbi-opts native dbi-name)
-       ret      (datalevin.interface/drop-dbi native dbi-name)]
-   (when (and existing (not= dbi-name c/kv-info))
-     (.transact-kv db c/kv-info
-                   [[:del [:dbis dbi-name]]]
-                   [:keyword :string]))
-   ret))
-(entries
- [db dbi-name]
- (if (kv-wal-enabled? db)
-   (try
-     (long
-      (or (if (dbi-dupsort? db dbi-name)
-            (ol/wal-list-range-count db dbi-name [:all] :raw [:all] :raw nil)
-            (ol/wal-key-range-count db dbi-name [:all] :raw nil))
-          0))
-     (catch Exception _
-       (datalevin.interface/entries native dbi-name)))
-   (datalevin.interface/entries native dbi-name)))
-(env-dir [db] (datalevin.interface/env-dir native))
-(env-opts [db] (datalevin.interface/env-opts native))
-(get-dbi
- [db dbi-name]
- (wrap-dbi db (datalevin.interface/get-dbi native dbi-name)))
-(get-dbi
- [db dbi-name create?]
- (wrap-dbi db
-           (datalevin.interface/get-dbi native dbi-name create?)))
-(get-env-flags [db] (datalevin.interface/get-env-flags native))
-(get-first
- [db dbi-name k-range]
- (.get-first db dbi-name k-range :data :data false))
-(get-first
- [db dbi-name k-range k-type]
- (.get-first db dbi-name k-range k-type :data false))
-(get-first
- [db dbi-name k-range k-type v-type]
- (.get-first db dbi-name k-range k-type v-type false))
-(get-first
- [db dbi-name k-range k-type v-type ignore-key?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/get-first db dbi-name k-range k-type v-type ignore-key?))
-   (datalevin.interface/get-first native dbi-name k-range k-type
-                                  v-type ignore-key?)))
-(get-first-n
- [db dbi-name n k-range]
- (.get-first-n db dbi-name n k-range :data :data false))
-(get-first-n
- [db dbi-name n k-range k-type]
- (.get-first-n db dbi-name n k-range k-type :data false))
-(get-first-n
- [db dbi-name n k-range k-type v-type]
- (.get-first-n db dbi-name n k-range k-type v-type false))
-(get-first-n
- [db dbi-name n k-range k-type v-type ignore-key?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/get-first-n db dbi-name n k-range k-type v-type ignore-key?))
-   (datalevin.interface/get-first-n native dbi-name n k-range
-                                    k-type v-type ignore-key?)))
-(get-range
- [db dbi-name k-range]
- (.get-range db dbi-name k-range :data :data false))
-(get-range
- [db dbi-name k-range k-type]
- (.get-range db dbi-name k-range k-type :data false))
-(get-range
- [db dbi-name k-range k-type v-type]
- (.get-range db dbi-name k-range k-type v-type false))
-(get-range
- [db dbi-name k-range k-type v-type ignore-key?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/get-range db dbi-name k-range k-type v-type ignore-key?))
-   (datalevin.interface/get-range native dbi-name k-range
-                                  k-type v-type ignore-key?)))
-(get-rtx [db] (datalevin.interface/get-rtx native))
-(get-some
- [db dbi-name pred k-range]
- (.get-some db dbi-name pred k-range :data :data false true))
-(get-some
- [db dbi-name pred k-range k-type]
- (.get-some db dbi-name pred k-range k-type :data false true))
-(get-some
- [db dbi-name pred k-range k-type v-type]
- (.get-some db dbi-name pred k-range k-type v-type false true))
-(get-some
- [db dbi-name pred k-range k-type v-type ignore-key?]
- (.get-some db dbi-name pred k-range k-type v-type ignore-key? true))
-(get-some
- [db dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/get-some db dbi-name pred k-range k-type v-type
-                    ignore-key? raw-pred?))
-   (datalevin.interface/get-some native dbi-name pred k-range k-type
-                                 v-type ignore-key? raw-pred?)))
-(key-compressor [db] (datalevin.interface/key-compressor native))
-(key-range
- [db dbi-name k-range]
- (.key-range db dbi-name k-range :data))
-(key-range
- [db dbi-name k-range k-type]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/key-range db dbi-name k-range k-type))
-   (datalevin.interface/key-range native dbi-name k-range k-type)))
-(list-dbis [db] (datalevin.interface/list-dbis native))
-(max-val-size [db] (datalevin.interface/max-val-size native))
-(open-dbi [db dbi-name] (.open-dbi db dbi-name nil))
-(open-dbi
- [db dbi-name opts]
- (let [existing (datalevin.interface/dbi-opts native dbi-name)
-       ret      (wrap-dbi db
-                          (datalevin.interface/open-dbi native dbi-name
-                                                        opts))]
-   (when (and (nil? existing) (not= dbi-name c/kv-info))
-     (let [dbi-opts (datalevin.interface/dbi-opts native dbi-name)]
-       (.transact-kv db
-                     [(l/kv-tx :put c/kv-info [:dbis dbi-name] dbi-opts
-                               [:keyword :string])])))
-   ret))
-(open-list-dbi
- [db list-name]
- (.open-list-dbi db list-name nil))
-(open-list-dbi
- [db list-name opts]
- (let [existing (datalevin.interface/dbi-opts native list-name)
-       ret      (wrap-dbi db
-                          (datalevin.interface/open-list-dbi native list-name
-                                                             opts))]
-   (when (and (nil? existing) (not= list-name c/kv-info))
-     (let [dbi-opts (datalevin.interface/dbi-opts native list-name)]
-       (.transact-kv db
-                     [(l/kv-tx :put c/kv-info [:dbis list-name] dbi-opts
-                               [:keyword :string])])))
-   ret))
-(range-filter
- [db dbi-name pred k-range]
- (.range-filter db dbi-name pred k-range :data :data false true))
-(range-filter
- [db dbi-name pred k-range k-type]
- (.range-filter db dbi-name pred k-range k-type :data false true))
-(range-filter
- [db dbi-name pred k-range k-type v-type]
- (.range-filter db dbi-name pred k-range k-type v-type false true))
-(range-filter
- [db dbi-name pred k-range k-type v-type ignore-key?]
- (.range-filter db dbi-name pred k-range k-type v-type ignore-key? true))
-(range-filter
- [db dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/range-filter db dbi-name pred k-range k-type v-type
-                        ignore-key? raw-pred?))
-   (datalevin.interface/range-filter native dbi-name pred k-range
-                                     k-type v-type ignore-key?
-                                     raw-pred?)))
-(range-filter-count
- [db dbi-name pred k-range]
- (.range-filter-count db dbi-name pred k-range :data :data true))
-(range-filter-count
- [db dbi-name pred k-range k-type]
- (.range-filter-count db dbi-name pred k-range k-type :data true))
-(range-filter-count
- [db dbi-name pred k-range k-type v-type]
- (.range-filter-count db dbi-name pred k-range k-type v-type true))
-(range-filter-count
- [db dbi-name pred k-range k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/range-filter-count db dbi-name pred k-range k-type v-type
-                              raw-pred?))
-   (datalevin.interface/range-filter-count native dbi-name pred k-range
-                                           k-type v-type raw-pred?)))
-(range-keep
- [db dbi-name pred k-range]
- (.range-keep db dbi-name pred k-range :data :data true))
-(range-keep
- [db dbi-name pred k-range k-type]
- (.range-keep db dbi-name pred k-range k-type :data true))
-(range-keep
- [db dbi-name pred k-range k-type v-type]
- (.range-keep db dbi-name pred k-range k-type v-type true))
-(range-keep
- [db dbi-name pred k-range k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/range-keep db dbi-name pred k-range k-type v-type raw-pred?))
-   (datalevin.interface/range-keep native dbi-name pred k-range
-                                   k-type v-type raw-pred?)))
-(range-seq
- [db dbi-name k-range]
- (.range-seq db dbi-name k-range :data :data false nil))
-(range-seq
- [db dbi-name k-range k-type]
- (.range-seq db dbi-name k-range k-type :data false nil))
-(range-seq
- [db dbi-name k-range k-type v-type]
- (.range-seq db dbi-name k-range k-type v-type false nil))
-(range-seq
- [db dbi-name k-range k-type v-type ignore-key?]
- (.range-seq db dbi-name k-range k-type v-type ignore-key? nil))
-(range-seq
- [db dbi-name k-range k-type v-type ignore-key? opts]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/range-seq db dbi-name k-range k-type v-type ignore-key? opts))
-   (datalevin.interface/range-seq native dbi-name k-range
-                                  k-type v-type ignore-key? opts)))
-(range-some
- [db dbi-name pred k-range]
- (.range-some db dbi-name pred k-range :data :data true))
-(range-some
- [db dbi-name pred k-range k-type]
- (.range-some db dbi-name pred k-range k-type :data true))
-(range-some
- [db dbi-name pred k-range k-type v-type]
- (.range-some db dbi-name pred k-range k-type v-type true))
-(range-some
- [db dbi-name pred k-range k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/range-some db dbi-name pred k-range k-type v-type raw-pred?))
-   (datalevin.interface/range-some native dbi-name pred k-range
-                                   k-type v-type raw-pred?)))
-(return-rtx [db rtx] (datalevin.interface/return-rtx native rtx))
-(set-env-flags
- [db ks on-off]
- (datalevin.interface/set-env-flags native ks on-off))
-(set-key-compressor
- [db c]
- (datalevin.interface/set-key-compressor native c))
-(set-max-val-size
- [db size]
- (datalevin.interface/set-max-val-size native size))
-(set-val-compressor
- [db c]
- (datalevin.interface/set-val-compressor native c))
-(stat [db] (datalevin.interface/stat native))
-(stat
- [db dbi-name]
- (if (and dbi-name (kv-wal-enabled? db))
-   (do
-     (flush-kv-indexer-if-wal! db)
-     (datalevin.interface/stat native dbi-name))
-   (datalevin.interface/stat native dbi-name)))
-(sync
- [db]
- (flush-kv-indexer-if-wal! db)
- (datalevin.interface/sync native))
-(sync
- [db force]
- (flush-kv-indexer-if-wal! db)
- (datalevin.interface/sync native force))
-(val-compressor [db] (datalevin.interface/val-compressor native))
-(visit
- [db dbi-name visitor k-range]
- (.visit db dbi-name visitor k-range :data :data true))
-(visit
- [db dbi-name visitor k-range k-type]
- (.visit db dbi-name visitor k-range k-type :data true))
-(visit
- [db dbi-name visitor k-range k-type v-type]
- (.visit db dbi-name visitor k-range k-type v-type true))
-(visit
- [db dbi-name visitor k-range k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/visit db dbi-name visitor k-range k-type v-type raw-pred?))
-   (datalevin.interface/visit native dbi-name visitor k-range
-                              k-type v-type raw-pred?)))
-(visit-key-range
- [db dbi-name visitor k-range]
- (.visit-key-range db dbi-name visitor k-range :data true))
-(visit-key-range
- [db dbi-name visitor k-range k-type]
- (.visit-key-range db dbi-name visitor k-range k-type true))
-(visit-key-range
- [db dbi-name visitor k-range k-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/visit-key-range db dbi-name visitor k-range k-type raw-pred?))
-   (datalevin.interface/visit-key-range native dbi-name visitor k-range
-                                        k-type raw-pred?)))
+  (abort-transact-kv [db]
+    (if (and (kv-wal-enabled? db) (not c/*bypass-wal*))
+      (wal-abort-transact! db)
+      (datalevin.interface/abort-transact-kv native)))
+  (check-ready [db] (datalevin.interface/check-ready native))
+  (clear-dbi
+    [db dbi-name]
+    ;; In WAL mode, clear-dbi can be used to clear base LMDB state while
+    ;; preserving committed overlay visibility (e.g. replay/recovery tests).
+    ;; Do not force synchronous WAL catch-up here.
+    (datalevin.interface/clear-dbi native dbi-name))
+  (close-kv [db]
+    (if (kv-wal-enabled? db)
+      (do
+        (wal-close-kv! db)
+        (datalevin.interface/close-kv native))
+      (datalevin.interface/close-kv native)))
+  (close-transact-kv [db]
+    (if (and (kv-wal-enabled? db) (not c/*bypass-wal*))
+      (wal-close-transact! db)
+      (datalevin.interface/close-transact-kv native)))
+  (closed-kv? [db] (datalevin.interface/closed-kv? native))
+  (copy
+    [db dest]
+    (flush-kv-indexer-if-wal! db)
+    (datalevin.interface/copy native dest))
+  (copy
+    [db dest compact?]
+    (flush-kv-indexer-if-wal! db)
+    (datalevin.interface/copy native dest compact?))
+  (dbi-opts [db dbi-name] (datalevin.interface/dbi-opts native dbi-name))
+  (drop-dbi
+    [db dbi-name]
+    (flush-kv-indexer-if-wal! db)
+    (let [existing (datalevin.interface/dbi-opts native dbi-name)
+          ret      (datalevin.interface/drop-dbi native dbi-name)]
+      (when (and existing (not= dbi-name c/kv-info))
+        (.transact-kv db c/kv-info
+                      [[:del [:dbis dbi-name]]]
+                      [:keyword :string]))
+      ret))
+  (entries
+    [db dbi-name]
+    (datalevin.interface/entries native dbi-name))
+  (env-dir [db] (datalevin.interface/env-dir native))
+  (env-opts [db] (datalevin.interface/env-opts native))
+  (get-dbi
+    [db dbi-name]
+    (wrap-dbi db (datalevin.interface/get-dbi native dbi-name)))
+  (get-dbi
+    [db dbi-name create?]
+    (wrap-dbi db
+              (datalevin.interface/get-dbi native dbi-name create?)))
+  (get-env-flags [db] (datalevin.interface/get-env-flags native))
+  (get-first
+    [db dbi-name k-range]
+    (.get-first db dbi-name k-range :data :data false))
+  (get-first
+    [db dbi-name k-range k-type]
+    (.get-first db dbi-name k-range k-type :data false))
+  (get-first
+    [db dbi-name k-range k-type v-type]
+    (.get-first db dbi-name k-range k-type v-type false))
+  (get-first
+    [db dbi-name k-range k-type v-type ignore-key?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/get-first db dbi-name k-range k-type v-type ignore-key?))
+      (datalevin.interface/get-first native dbi-name k-range k-type
+                                     v-type ignore-key?)))
+  (get-first-n
+    [db dbi-name n k-range]
+    (.get-first-n db dbi-name n k-range :data :data false))
+  (get-first-n
+    [db dbi-name n k-range k-type]
+    (.get-first-n db dbi-name n k-range k-type :data false))
+  (get-first-n
+    [db dbi-name n k-range k-type v-type]
+    (.get-first-n db dbi-name n k-range k-type v-type false))
+  (get-first-n
+    [db dbi-name n k-range k-type v-type ignore-key?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/get-first-n db dbi-name n k-range k-type v-type ignore-key?))
+      (datalevin.interface/get-first-n native dbi-name n k-range
+                                       k-type v-type ignore-key?)))
+  (get-range
+    [db dbi-name k-range]
+    (.get-range db dbi-name k-range :data :data false))
+  (get-range
+    [db dbi-name k-range k-type]
+    (.get-range db dbi-name k-range k-type :data false))
+  (get-range
+    [db dbi-name k-range k-type v-type]
+    (.get-range db dbi-name k-range k-type v-type false))
+  (get-range
+    [db dbi-name k-range k-type v-type ignore-key?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/get-range db dbi-name k-range k-type v-type ignore-key?))
+      (datalevin.interface/get-range native dbi-name k-range
+                                     k-type v-type ignore-key?)))
+  (get-rtx [db] (datalevin.interface/get-rtx native))
+  (get-some
+    [db dbi-name pred k-range]
+    (.get-some db dbi-name pred k-range :data :data false true))
+  (get-some
+    [db dbi-name pred k-range k-type]
+    (.get-some db dbi-name pred k-range k-type :data false true))
+  (get-some
+    [db dbi-name pred k-range k-type v-type]
+    (.get-some db dbi-name pred k-range k-type v-type false true))
+  (get-some
+    [db dbi-name pred k-range k-type v-type ignore-key?]
+    (.get-some db dbi-name pred k-range k-type v-type ignore-key? true))
+  (get-some
+    [db dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/get-some db dbi-name pred k-range k-type v-type
+                       ignore-key? raw-pred?))
+      (datalevin.interface/get-some native dbi-name pred k-range k-type
+                                    v-type ignore-key? raw-pred?)))
+  (key-compressor [db] (datalevin.interface/key-compressor native))
+  (key-range
+    [db dbi-name k-range]
+    (.key-range db dbi-name k-range :data))
+  (key-range
+    [db dbi-name k-range k-type]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/key-range db dbi-name k-range k-type))
+      (datalevin.interface/key-range native dbi-name k-range k-type)))
+  (list-dbis [db] (datalevin.interface/list-dbis native))
+  (max-val-size [db] (datalevin.interface/max-val-size native))
+  (open-dbi [db dbi-name] (.open-dbi db dbi-name nil))
+  (open-dbi
+    [db dbi-name opts]
+    (let [existing (datalevin.interface/dbi-opts native dbi-name)
+          ret      (wrap-dbi db
+                             (datalevin.interface/open-dbi native dbi-name
+                                                           opts))]
+      (when (and (nil? existing) (not= dbi-name c/kv-info))
+        (let [dbi-opts (datalevin.interface/dbi-opts native dbi-name)]
+          (.transact-kv db
+                        [(l/kv-tx :put c/kv-info [:dbis dbi-name] dbi-opts
+                                  [:keyword :string])])))
+      ret))
+  (open-list-dbi
+    [db list-name]
+    (.open-list-dbi db list-name nil))
+  (open-list-dbi
+    [db list-name opts]
+    (let [existing (datalevin.interface/dbi-opts native list-name)
+          ret      (wrap-dbi db
+                             (datalevin.interface/open-list-dbi native list-name
+                                                                opts))]
+      (when (and (nil? existing) (not= list-name c/kv-info))
+        (let [dbi-opts (datalevin.interface/dbi-opts native list-name)]
+          (.transact-kv db
+                        [(l/kv-tx :put c/kv-info [:dbis list-name] dbi-opts
+                                  [:keyword :string])])))
+      ret))
+  (range-filter
+    [db dbi-name pred k-range]
+    (.range-filter db dbi-name pred k-range :data :data false true))
+  (range-filter
+    [db dbi-name pred k-range k-type]
+    (.range-filter db dbi-name pred k-range k-type :data false true))
+  (range-filter
+    [db dbi-name pred k-range k-type v-type]
+    (.range-filter db dbi-name pred k-range k-type v-type false true))
+  (range-filter
+    [db dbi-name pred k-range k-type v-type ignore-key?]
+    (.range-filter db dbi-name pred k-range k-type v-type ignore-key? true))
+  (range-filter
+    [db dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/range-filter db dbi-name pred k-range k-type v-type
+                           ignore-key? raw-pred?))
+      (datalevin.interface/range-filter native dbi-name pred k-range
+                                        k-type v-type ignore-key?
+                                        raw-pred?)))
+  (range-filter-count
+    [db dbi-name pred k-range]
+    (.range-filter-count db dbi-name pred k-range :data :data true))
+  (range-filter-count
+    [db dbi-name pred k-range k-type]
+    (.range-filter-count db dbi-name pred k-range k-type :data true))
+  (range-filter-count
+    [db dbi-name pred k-range k-type v-type]
+    (.range-filter-count db dbi-name pred k-range k-type v-type true))
+  (range-filter-count
+    [db dbi-name pred k-range k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/range-filter-count db dbi-name pred k-range k-type v-type
+                                 raw-pred?))
+      (datalevin.interface/range-filter-count native dbi-name pred k-range
+                                              k-type v-type raw-pred?)))
+  (range-keep
+    [db dbi-name pred k-range]
+    (.range-keep db dbi-name pred k-range :data :data true))
+  (range-keep
+    [db dbi-name pred k-range k-type]
+    (.range-keep db dbi-name pred k-range k-type :data true))
+  (range-keep
+    [db dbi-name pred k-range k-type v-type]
+    (.range-keep db dbi-name pred k-range k-type v-type true))
+  (range-keep
+    [db dbi-name pred k-range k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/range-keep db dbi-name pred k-range k-type v-type raw-pred?))
+      (datalevin.interface/range-keep native dbi-name pred k-range
+                                      k-type v-type raw-pred?)))
+  (range-seq
+    [db dbi-name k-range]
+    (.range-seq db dbi-name k-range :data :data false nil))
+  (range-seq
+    [db dbi-name k-range k-type]
+    (.range-seq db dbi-name k-range k-type :data false nil))
+  (range-seq
+    [db dbi-name k-range k-type v-type]
+    (.range-seq db dbi-name k-range k-type v-type false nil))
+  (range-seq
+    [db dbi-name k-range k-type v-type ignore-key?]
+    (.range-seq db dbi-name k-range k-type v-type ignore-key? nil))
+  (range-seq
+    [db dbi-name k-range k-type v-type ignore-key? opts]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/range-seq db dbi-name k-range k-type v-type ignore-key? opts))
+      (datalevin.interface/range-seq native dbi-name k-range
+                                     k-type v-type ignore-key? opts)))
+  (range-some
+    [db dbi-name pred k-range]
+    (.range-some db dbi-name pred k-range :data :data true))
+  (range-some
+    [db dbi-name pred k-range k-type]
+    (.range-some db dbi-name pred k-range k-type :data true))
+  (range-some
+    [db dbi-name pred k-range k-type v-type]
+    (.range-some db dbi-name pred k-range k-type v-type true))
+  (range-some
+    [db dbi-name pred k-range k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/range-some db dbi-name pred k-range k-type v-type raw-pred?))
+      (datalevin.interface/range-some native dbi-name pred k-range
+                                      k-type v-type raw-pred?)))
+  (return-rtx [db rtx] (datalevin.interface/return-rtx native rtx))
+  (set-env-flags
+    [db ks on-off]
+    (datalevin.interface/set-env-flags native ks on-off))
+  (set-key-compressor
+    [db c]
+    (datalevin.interface/set-key-compressor native c))
+  (set-max-val-size
+    [db size]
+    (datalevin.interface/set-max-val-size native size))
+  (set-val-compressor
+    [db c]
+    (datalevin.interface/set-val-compressor native c))
+  (stat [db] (datalevin.interface/stat native))
+  (stat
+    [db dbi-name]
+    (if (and dbi-name (kv-wal-enabled? db))
+      (do
+        (flush-kv-indexer-if-wal! db)
+        (datalevin.interface/stat native dbi-name))
+      (datalevin.interface/stat native dbi-name)))
+  (sync
+    [db]
+    (flush-kv-indexer-if-wal! db)
+    (datalevin.interface/sync native))
+  (sync
+    [db force]
+    (flush-kv-indexer-if-wal! db)
+    (datalevin.interface/sync native force))
+  (val-compressor [db] (datalevin.interface/val-compressor native))
+  (visit
+    [db dbi-name visitor k-range]
+    (.visit db dbi-name visitor k-range :data :data true))
+  (visit
+    [db dbi-name visitor k-range k-type]
+    (.visit db dbi-name visitor k-range k-type :data true))
+  (visit
+    [db dbi-name visitor k-range k-type v-type]
+    (.visit db dbi-name visitor k-range k-type v-type true))
+  (visit
+    [db dbi-name visitor k-range k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/visit db dbi-name visitor k-range k-type v-type raw-pred?))
+      (datalevin.interface/visit native dbi-name visitor k-range
+                                 k-type v-type raw-pred?)))
+  (visit-key-range
+    [db dbi-name visitor k-range]
+    (.visit-key-range db dbi-name visitor k-range :data true))
+  (visit-key-range
+    [db dbi-name visitor k-range k-type]
+    (.visit-key-range db dbi-name visitor k-range k-type true))
+  (visit-key-range
+    [db dbi-name visitor k-range k-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/visit-key-range db dbi-name visitor k-range k-type raw-pred?))
+      (datalevin.interface/visit-key-range native dbi-name visitor k-range
+                                           k-type raw-pred?)))
 
   IList
   (list-count [this dbi-name k kt]
-    (if (kv-wal-enabled? this)
-      (if k
-        (long (or (ol/wal-list-range-count this dbi-name
-                                           [:closed k k] kt
-                                           [:all] :raw nil)
-                  0))
-        0)
-      (i/list-count native dbi-name k kt)))
+    (i/list-count native dbi-name k kt))
 
   (near-list [this dbi-name k v kt vt]
     (if (kv-wal-enabled? this)
@@ -983,11 +902,7 @@
       (i/in-list? native dbi-name k v kt vt)))
 
   (list-range-count [this dbi-name k-range k-type v-range v-type]
-    (.list-range-count this dbi-name k-range k-type v-range v-type nil))
-  (list-range-count [this dbi-name k-range k-type v-range v-type cap]
-    (if (kv-wal-enabled? this)
-      (ol/wal-list-range-count this dbi-name k-range k-type v-range v-type cap)
-      (i/list-range-count native dbi-name k-range k-type v-range v-type cap)))
+    (i/list-range-count native dbi-name k-range k-type v-range v-type))
 
   (visit-list-sample
     [this dbi-name indices budget step visitor k-range k-type v-type]
@@ -996,144 +911,135 @@
   (visit-list-sample
     [this dbi-name indices budget step visitor k-range k-type v-type
      raw-pred?]
-    (if (overlay-active? this dbi-name)
-      (ol/overlay-visit-list-sample this dbi-name indices visitor k-range
-                                    k-type v-type raw-pred?)
-      (i/visit-list-sample native dbi-name indices budget step visitor
-                           k-range k-type v-type raw-pred?)))
-(del-list-items
- [db list-name k k-type]
- (.transact-kv db [(l/kv-tx :del list-name k k-type)]))
-(del-list-items
- [db list-name k vs k-type v-type]
- (.transact-kv db [(l/kv-tx :del-list list-name k vs k-type v-type)]))
-(get-list
- [db list-name k k-type v-type]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/get-list db list-name k k-type v-type))
-   (datalevin.interface/get-list native list-name k k-type v-type)))
-(list-dbi?
- [db dbi-name]
- (datalevin.interface/list-dbi? native dbi-name))
-(list-range
- [db list-name k-range k-type v-range v-type]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range db list-name k-range k-type v-range v-type))
-   (datalevin.interface/list-range native list-name k-range
-                                   k-type v-range v-type)))
-(list-range-filter
- [db list-name pred k-range k-type v-range v-type]
- (.list-range-filter db list-name pred k-range k-type v-range v-type true))
-(list-range-filter
- [db list-name pred k-range k-type v-range v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-filter db list-name pred k-range
-                             k-type v-range v-type raw-pred?))
-   (datalevin.interface/list-range-filter native list-name pred k-range
-                                          k-type v-range v-type raw-pred?)))
-(list-range-filter-count
- [db list-name pred k-range k-type v-range v-type]
- (.list-range-filter-count db list-name pred k-range k-type
-                           v-range v-type true nil))
-(list-range-filter-count
- [db list-name pred k-range k-type v-range v-type raw-pred?]
- (.list-range-filter-count db list-name pred k-range k-type
-                           v-range v-type raw-pred? nil))
-(list-range-filter-count
- [db list-name pred k-range k-type v-range v-type raw-pred? cap]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-filter-count db list-name pred k-range k-type
-                                   v-range v-type raw-pred? cap))
-   (datalevin.interface/list-range-filter-count native list-name pred k-range
-                                                k-type v-range v-type raw-pred?
-                                                cap)))
-(list-range-first
- [db list-name k-range k-type v-range v-type]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-first db list-name k-range k-type v-range v-type))
-   (datalevin.interface/list-range-first native list-name k-range
-                                         k-type v-range v-type)))
-(list-range-first-n
- [db list-name n k-range k-type v-range v-type]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-first-n db list-name n k-range k-type v-range v-type))
-   (datalevin.interface/list-range-first-n native list-name n k-range
-                                           k-type v-range v-type)))
-(list-range-keep
- [db list-name pred k-range k-type v-range v-type]
- (.list-range-keep db list-name pred k-range k-type v-range v-type true))
-(list-range-keep
- [db list-name pred k-range k-type v-range v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-keep db list-name pred k-range
-                           k-type v-range v-type raw-pred?))
-   (datalevin.interface/list-range-keep native list-name pred k-range
-                                        k-type v-range v-type raw-pred?)))
-(list-range-some
- [db list-name pred k-range k-type v-range v-type]
- (.list-range-some db list-name pred k-range k-type v-range v-type true))
-(list-range-some
- [db list-name pred k-range k-type v-range v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/list-range-some db list-name pred k-range
-                           k-type v-range v-type raw-pred?))
-   (datalevin.interface/list-range-some native list-name pred k-range
-                                        k-type v-range v-type raw-pred?)))
-(put-list-items
- [db list-name k vs k-type v-type]
- (.transact-kv db [(l/kv-tx :put-list list-name k vs k-type v-type)]))
-(visit-list
- [db list-name visitor k k-type]
- (.visit-list db list-name visitor k k-type :data true))
-(visit-list
- [db list-name visitor k k-type v-type]
- (.visit-list db list-name visitor k k-type v-type true))
-(visit-list
- [db list-name visitor k k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/visit-list db list-name visitor k k-type v-type raw-pred?))
-   (datalevin.interface/visit-list native list-name visitor k k-type
-                                   v-type raw-pred?)))
-(visit-list-key-range
- [db list-name visitor k-range k-type v-type]
- (.visit-list-key-range db list-name visitor k-range k-type v-type true))
-(visit-list-key-range
- [db list-name visitor k-range k-type v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/visit-list-key-range db list-name visitor k-range k-type
-                                v-type raw-pred?))
-   (datalevin.interface/visit-list-key-range native list-name visitor
-                                             k-range k-type v-type
-                                             raw-pred?)))
-(visit-list-range
- [db list-name visitor k-range k-type v-range v-type]
- (.visit-list-range db list-name visitor k-range k-type v-range v-type true))
-(visit-list-range
- [db list-name visitor k-range k-type v-range v-type raw-pred?]
- (if (kv-wal-enabled? db)
-   (with-wal-overlay-scan db
-     (scan/visit-list-range db list-name visitor k-range k-type
-                            v-range v-type raw-pred?))
-   (datalevin.interface/visit-list-range native list-name visitor
-                                         k-range k-type v-range v-type
-                                         raw-pred?)))
+    (i/visit-list-sample native dbi-name indices budget step visitor
+                         k-range k-type v-type raw-pred?))
+  (del-list-items
+    [db list-name k k-type]
+    (.transact-kv db [(l/kv-tx :del list-name k k-type)]))
+  (del-list-items
+    [db list-name k vs k-type v-type]
+    (.transact-kv db [(l/kv-tx :del-list list-name k vs k-type v-type)]))
+  (get-list
+    [db list-name k k-type v-type]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/get-list db list-name k k-type v-type))
+      (datalevin.interface/get-list native list-name k k-type v-type)))
+  (list-dbi?
+    [db dbi-name]
+    (datalevin.interface/list-dbi? native dbi-name))
+  (list-range
+    [db list-name k-range k-type v-range v-type]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range db list-name k-range k-type v-range v-type))
+      (datalevin.interface/list-range native list-name k-range
+                                      k-type v-range v-type)))
+  (list-range-filter
+    [db list-name pred k-range k-type v-range v-type]
+    (.list-range-filter db list-name pred k-range k-type v-range v-type true))
+  (list-range-filter
+    [db list-name pred k-range k-type v-range v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-filter db list-name pred k-range
+                                k-type v-range v-type raw-pred?))
+      (datalevin.interface/list-range-filter native list-name pred k-range
+                                             k-type v-range v-type raw-pred?)))
+  (list-range-filter-count
+    [db list-name pred k-range k-type v-range v-type]
+    (.list-range-filter-count db list-name pred k-range k-type
+                              v-range v-type true))
+  (list-range-filter-count
+    [db list-name pred k-range k-type v-range v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-filter-count db list-name pred k-range k-type
+                                      v-range v-type raw-pred?))
+      (datalevin.interface/list-range-filter-count native list-name pred k-range
+                                                   k-type v-range v-type raw-pred?)))
+  (list-range-first
+    [db list-name k-range k-type v-range v-type]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-first db list-name k-range k-type v-range v-type))
+      (datalevin.interface/list-range-first native list-name k-range
+                                            k-type v-range v-type)))
+  (list-range-first-n
+    [db list-name n k-range k-type v-range v-type]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-first-n db list-name n k-range k-type v-range v-type))
+      (datalevin.interface/list-range-first-n native list-name n k-range
+                                              k-type v-range v-type)))
+  (list-range-keep
+    [db list-name pred k-range k-type v-range v-type]
+    (.list-range-keep db list-name pred k-range k-type v-range v-type true))
+  (list-range-keep
+    [db list-name pred k-range k-type v-range v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-keep db list-name pred k-range
+                              k-type v-range v-type raw-pred?))
+      (datalevin.interface/list-range-keep native list-name pred k-range
+                                           k-type v-range v-type raw-pred?)))
+  (list-range-some
+    [db list-name pred k-range k-type v-range v-type]
+    (.list-range-some db list-name pred k-range k-type v-range v-type true))
+  (list-range-some
+    [db list-name pred k-range k-type v-range v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/list-range-some db list-name pred k-range
+                              k-type v-range v-type raw-pred?))
+      (datalevin.interface/list-range-some native list-name pred k-range
+                                           k-type v-range v-type raw-pred?)))
+  (put-list-items
+    [db list-name k vs k-type v-type]
+    (.transact-kv db [(l/kv-tx :put-list list-name k vs k-type v-type)]))
+  (visit-list
+    [db list-name visitor k k-type]
+    (.visit-list db list-name visitor k k-type :data true))
+  (visit-list
+    [db list-name visitor k k-type v-type]
+    (.visit-list db list-name visitor k k-type v-type true))
+  (visit-list
+    [db list-name visitor k k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/visit-list db list-name visitor k k-type v-type raw-pred?))
+      (datalevin.interface/visit-list native list-name visitor k k-type
+                                      v-type raw-pred?)))
+  (visit-list-key-range
+    [db list-name visitor k-range k-type v-type]
+    (.visit-list-key-range db list-name visitor k-range k-type v-type true))
+  (visit-list-key-range
+    [db list-name visitor k-range k-type v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/visit-list-key-range db list-name visitor k-range k-type
+                                   v-type raw-pred?))
+      (datalevin.interface/visit-list-key-range native list-name visitor
+                                                k-range k-type v-type
+                                                raw-pred?)))
+  (visit-list-range
+    [db list-name visitor k-range k-type v-range v-type]
+    (.visit-list-range db list-name visitor k-range k-type v-range v-type true))
+  (visit-list-range
+    [db list-name visitor k-range k-type v-range v-type raw-pred?]
+    (if (kv-wal-enabled? db)
+      (with-wal-overlay-scan db
+        (scan/visit-list-range db list-name visitor k-range k-type
+                               v-range v-type raw-pred?))
+      (datalevin.interface/visit-list-range native list-name visitor
+                                            k-range k-type v-range v-type
+                                            raw-pred?)))
 
   IAdmin
-(re-index [db opts] (datalevin.interface/re-index native opts))
-(re-index
- [db schema opts]
- (datalevin.interface/re-index native schema opts))
-)
+  (re-index [db opts] (datalevin.interface/re-index native opts))
+  (re-index
+    [db schema opts]
+    (datalevin.interface/re-index native schema opts)))
 
 (defn wrap-kv
   [db]

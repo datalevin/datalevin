@@ -53,7 +53,7 @@
 (defprotocol ISearch
   (-search [db pattern])
   (-search-tuples [db pattern])
-  (-count [db pattern] [data pattern cap])
+  (-count [db pattern])
   (-first [db pattern]))
 
 (defprotocol IIndexAccess
@@ -67,7 +67,7 @@
   (-rseek-datoms [db index c1 c2 c3] [db index c1 c2 c3 n])
   (-cardinality [db attr])
   (-index-range [db attr start end])
-  (-index-range-size [db attr start end] [db attr start end cap]))
+  (-index-range-size [db attr start end]))
 
 (defprotocol IDB
   (-schema [db])
@@ -484,19 +484,16 @@
 
   (-count
     [db pattern]
-    (.-count db pattern nil))
-  (-count
-    [db pattern cap]
     (let [[e a v] pattern]
       (wrap-cache
-          store [:count e a v cap]
+          store [:count e a v]
         (case-tree
           [e a (some? v)]
-          [(size store :eav (datom e a v) (datom e a v) cap) ; e a v
-           (size store :eav (datom e a c/v0) (datom e a c/vmax) cap) ; e a _
+          [(size store :eav (datom e a v) (datom e a v)) ; e a v
+           (size store :eav (datom e a c/v0) (datom e a c/vmax)) ; e a _
            (size-filter store :eav
                         (fn [^Datom d] ((s/vpred v) (.-v d)))
-                        (datom e nil nil) (datom e nil nil) cap)  ; e _ v
+                        (datom e nil nil) (datom e nil nil))  ; e _ v
            (e-size store e) ; e _ _
            (av-size store a v) ; _ a v
            (a-size store a) ; _ a _
@@ -596,12 +593,9 @@
 
   (-index-range-size
     [db attr start end]
-    (.-index-range-size db attr start end nil))
-  (-index-range-size
-    [db attr start end cap]
     (wrap-cache
         store [:index-range-size attr start end]
-      (av-range-size store attr start end cap))))
+      (av-range-size store attr start end))))
 
 ;; (defmethod print-method DB [^DB db, ^java.io.Writer w]
 ;;   (binding [*out* w]
@@ -627,7 +621,7 @@
 
 (defn search-datoms [db e a v] (-search db [e a v]))
 
-(defn count-datoms [db e a v] (-count db [e a v] nil))
+(defn count-datoms [db e a v] (-count db [e a v]))
 
 (defn seek-datoms
   ([db index]
@@ -1717,21 +1711,74 @@
         :else
         (vld/validate-tx-entity-type entity)))))
 
+(defn- truthy-flag?
+  [v]
+  (contains? #{true "1" "true" "TRUE" "yes" "YES" "on" "ON"} v))
+
+(defonce ^:private tx-stage-timing-env?
+  (delay (truthy-flag? (System/getenv "DTLV_TX_STAGE_TIMING"))))
+
+(defonce ^:private tx-stage-timing-prop?
+  (delay (truthy-flag? (System/getProperty "datalevin.tx.stage.timing"))))
+
+(defn- tx-stage-timing-enabled?
+  [store]
+  (or c/*tx-stage-timing*
+      (true? (:tx-stage-timing? (opts store)))
+      @tx-stage-timing-env?
+      @tx-stage-timing-prop?))
+
+(defn- make-tx-stage-logger
+  [store tx-time simulated?]
+  (when (tx-stage-timing-enabled? store)
+    (let [start-ns (System/nanoTime)
+          last-ns  (volatile! start-ns)
+          wal?     (when (instance? Store store)
+                     (boolean (:kv-wal? (i/env-opts (.-lmdb ^Store store)))))
+          dbn      (or (db-name store) "?")
+          thread   (.getName (Thread/currentThread))]
+      (fn [stage extra]
+        (let [now      (System/nanoTime)
+              stage-ms (/ (double (- now ^long @last-ns)) 1000000.0)
+              total-ms (/ (double (- now ^long start-ns)) 1000000.0)
+              payload  (merge
+                         {:tx-time    tx-time
+                          :db         dbn
+                          :thread     thread
+                          :wal?       wal?
+                          :simulated? simulated?
+                          :stage      stage
+                          :stage-ms   stage-ms
+                          :total-ms   total-ms}
+                         (or extra {}))]
+          (vreset! last-ns now)
+          (binding [*out* *err*]
+            (println "TX-STAGE" (pr-str payload))))))))
+
 (defn- local-transact-tx-data
   ([initial-report initial-es tx-time]
-   (local-transact-tx-data initial-report initial-es tx-time false))
+   (local-transact-tx-data initial-report initial-es tx-time false nil))
   ([initial-report initial-es tx-time simulated?]
-   (let [rp     (execute-tx-loop initial-report initial-es tx-time)
-         pstore (.-store ^DB (:db-after rp))]
+   (local-transact-tx-data initial-report initial-es tx-time simulated? nil))
+  ([initial-report initial-es tx-time simulated? stage-log!]
+   (let [rp          (execute-tx-loop initial-report initial-es tx-time)
+         datoms      (:tx-data rp)
+         datom-count (count datoms)
+         pstore      (.-store ^DB (:db-after rp))]
+     (when stage-log!
+       (stage-log! :tx-datoms-formed {:datom-count datom-count}))
      (when-not simulated?
-       (vld/validate-prepared-datoms (schema pstore) (opts pstore)
-                                    (:tx-data rp))
+       (vld/validate-prepared-datoms (schema pstore) (opts pstore) datoms)
+       (when stage-log!
+         (stage-log! :validate-prepared-datoms {:datom-count datom-count}))
        (when (instance? Store pstore)
          (vld/validate-side-index-domains
-           (schema pstore) (:tx-data rp)
+           (schema pstore) datoms
            {:fulltext (set (keys (.-search-engines ^Store pstore)))
             :vector   (set (keys (.-vector-indices ^Store pstore)))
             :idoc     (set (keys (.-idoc-indices ^Store pstore)))}))
+       (when stage-log!
+         (stage-log! :validate-side-index-domains {:datom-count datom-count}))
        ;; Writer step 3: commit point (apply prepared datoms to storage).
        ;; In Phase 2+ this becomes WAL append + sync; trusted apply is the
        ;; current synchronous equivalent.  Failpoint hooks for steps 4-8
@@ -1743,10 +1790,16 @@
          (let [wal? (:kv-wal? (i/env-opts (.-lmdb ^Store pstore)))]
            (binding [c/*trusted-apply* true
                      c/*bypass-wal*   (not wal?)]
-             (apply-prepared-datoms pstore (:tx-data rp))))
-         (load-datoms pstore (:tx-data rp)))
+             (apply-prepared-datoms pstore datoms)))
+         (load-datoms pstore datoms))
+       (when stage-log!
+         (stage-log! :apply-prepared-datoms {:datom-count datom-count}))
        (vld/check-failpoint :step-3 :after)
-       (invalidate-cache pstore (:tx-data rp) (last-modified pstore)))
+       (invalidate-cache pstore datoms (last-modified pstore))
+       (when stage-log!
+         (stage-log! :invalidate-cache {:datom-count datom-count})))
+     (when stage-log!
+       (stage-log! :done {:datom-count datom-count}))
      rp)))
 
 (defn- remote-tx-result
@@ -1810,7 +1863,8 @@
   [initial-report initial-es simulated?]
   (let [^DB db  (:db-before initial-report)
         store   (.-store db)
-        tx-time (System/currentTimeMillis)]
+        tx-time (System/currentTimeMillis)
+        stage-log! (make-tx-stage-logger store tx-time simulated?)]
     (if (instance? datalevin.remote.DatalogStore store)
       (try
         (let [res     (r/tx-data store initial-es simulated?)
@@ -1818,30 +1872,44 @@
               res     (if db-info (dissoc res :db-info) res)
               [tx-data tempids max-eid new-attributes]
               (remote-tx-result res)]
+          (when stage-log!
+            (stage-log! :remote-tx-data {:datom-count (count tx-data)}))
           (when-not simulated?
             (invalidate-cache store tx-data
                               (if db-info
                                 (:last-modified db-info)
-                                (last-modified store))))
+                                (last-modified store)))
+            (when stage-log!
+              (stage-log! :invalidate-cache
+                          {:datom-count (count tx-data)})))
           (let [info (when db-info
-                       (assoc db-info :max-eid max-eid))]
-            (cond-> (assoc initial-report
-                           :db-after (-> (new-db store info)
-                                         (assoc :max-eid max-eid)
-                                         (#(if simulated?
-                                             (update % :max-tx u/long-inc)
-                                             %)))
-                           :tx-data tx-data
-                           :tempids tempids)
-              (seq new-attributes) (assoc :new-attributes new-attributes))))
+                       (assoc db-info :max-eid max-eid))
+                report (cond-> (assoc initial-report
+                                      :db-after (-> (new-db store info)
+                                                    (assoc :max-eid max-eid)
+                                                    (#(if simulated?
+                                                        (update % :max-tx u/long-inc)
+                                                        %)))
+                                      :tx-data tx-data
+                                      :tempids tempids)
+                         (seq new-attributes)
+                         (assoc :new-attributes new-attributes))]
+            (when stage-log!
+              (stage-log! :done {:datom-count (count tx-data)}))
+            report))
         (catch Exception e
           (if (:resized (ex-data e))
             (throw e)
             (let [entities (prepare-entities db initial-es tx-time)]
+              (when stage-log!
+                (stage-log! :prepare-entities {}))
               (local-transact-tx-data initial-report entities tx-time
-                                      simulated?)))))
+                                      simulated? stage-log!)))))
       (let [entities (prepare-entities db initial-es tx-time)]
-        (local-transact-tx-data initial-report entities tx-time simulated?)))))
+        (when stage-log!
+          (stage-log! :prepare-entities {}))
+        (local-transact-tx-data initial-report entities tx-time
+                                simulated? stage-log!)))))
 
 (defn tx-data->simulated-report
   [db tx-data]

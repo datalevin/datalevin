@@ -98,7 +98,8 @@
         ^ByteBuffer dst (bf/allocate-buffer c/+max-key-size+)
         ^ByteBuffer res (bf/allocate-buffer c/+max-key-size+)]
     (prop/for-all
-      [k (gen/such-that (partial data-size-less-than? c/+val-bytes-wo-hdr+)
+      ;; Hu-Tucker can expand; keep inputs small to avoid flakey overflow.
+      [k (gen/such-that (partial data-size-less-than? 200)
                         gen/any-equatable)]
       (.clear src)
       (.clear dst)

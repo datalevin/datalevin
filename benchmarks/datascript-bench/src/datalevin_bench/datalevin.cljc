@@ -17,6 +17,10 @@
    :age       {:db/valueType :db.type/long}
    :salary    {:db/valueType :db.type/long}})
 
+(def bench-kv-opts
+  {:flags         #{:nordahead :writemap :nosync}
+   :wal-sync-mode :none})
+
 
 (defn- wide-db
   "depth = 3 width = 2
@@ -130,20 +134,17 @@
               (d/db-with [[:db/add (:db/id p) :age       (:age p)]])
               (d/db-with [[:db/add (:db/id p) :salary    (:salary p)]])))
         (d/empty-db (u/tmp-dir (str "datalevin-bench-add-1" (UUID/randomUUID)))
-                    schema {:kv-opts
-                            {:flags #{:nordahead :writemap :nosync}}})
+                    schema {:kv-opts bench-kv-opts})
         core/people20k))))
 
 
 (defn ^:export add-5 []
   (core/bench-10
     (d/close-db
-      (reduce (fn [db p] (d/db-with db [p]))
+              (reduce (fn [db p] (d/db-with db [p]))
               (d/empty-db (u/tmp-dir (str "datalevin-bench-add-5"
                                           (UUID/randomUUID)))
-                          schema
-                          {:kv-opts
-                           {:flags #{:nordahead :writemap :nosync}}})
+                          schema {:kv-opts bench-kv-opts})
               core/people20k))))
 
 
@@ -153,9 +154,7 @@
       (d/db-with
         (d/empty-db (u/tmp-dir (str "datalevin-bench-add-all"
                                     (UUID/randomUUID)))
-                    schema
-                    {:kv-opts
-                     {:flags #{:nordahead :writemap :nosync}}})
+                    schema {:kv-opts bench-kv-opts})
         core/people20k))))
 
 
@@ -171,17 +170,14 @@
       (d/close-db
         (d/init-db datoms (u/tmp-dir (str "datalevin-bench-init"
                                           (UUID/randomUUID)))
-                   schema {:kv-opts
-                           {:flags #{:nordahead :writemap :nosync}}})))))
+                   schema {:kv-opts bench-kv-opts})))))
 
 
 (defn ^:export retract-5 []
   (let [db   (d/db-with
                (d/empty-db (u/tmp-dir (str "datalevin-bench-retract"
                                            (UUID/randomUUID)))
-                           schema
-                           {:kv-opts
-                            {:flags #{:nordahead :writemap :nosync}}})
+                           schema {:kv-opts bench-kv-opts})
                core/people20k)
         eids (->> (d/datoms db :ave :name) (map :e) (shuffle))
         res  (core/bench-10

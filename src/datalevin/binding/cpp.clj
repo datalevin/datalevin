@@ -32,16 +32,16 @@
             IListRandKeyValIterable IListRandKeyValIterator]])
   (:import
    [datalevin.dtlvnative DTLV DTLV$MDB_envinfo DTLV$MDB_stat DTLV$dtlv_key_iter
-    DTLV$dtlv_list_iter DTLV$dtlv_list_sample_iter
-    DTLV$dtlv_list_rank_sample_iter DTLV$dtlv_list_val_full_iter DTLV$MDB_val
-    DTLV$dtlv_list_key_range_full_val_iter DTLV$dtlv_key_sample_iter
+    DTLV$dtlv_list_iter DTLV$dtlv_list_rank_sample_iter
+    DTLV$dtlv_list_val_full_iter DTLV$MDB_val
+    DTLV$dtlv_list_key_range_full_val_iter
     DTLV$dtlv_key_rank_sample_iter]
    [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException]
    [datalevin.lmdb RangeContext KVTxData]
    [datalevin.async IAsyncWork]
    [datalevin.utl BitOps]
    [java.util.concurrent TimeUnit ScheduledExecutorService
-    ScheduledFuture ConcurrentSkipListMap]
+    ScheduledFuture]
    [java.lang AutoCloseable]
    [java.io File]
    [java.util Iterator HashMap ArrayDeque]
@@ -102,6 +102,7 @@
     :nolock     DTLV/MDB_NOLOCK
     :nordahead  DTLV/MDB_NORDAHEAD
     :nomeminit  DTLV/MDB_NOMEMINIT
+    :inmemory   DTLV/MDB_INMEMORY
 
     :cp-compact DTLV/MDB_CP_COMPACT
 
@@ -143,7 +144,8 @@
    0x200000  :notls
    0x400000  :nolock
    0x800000  :nordahead
-   0x1000000 :nomeminit})
+   0x1000000 :nomeminit
+   DTLV/MDB_INMEMORY :inmemory})
 
 (defn- env-flag-keys
   [v]
@@ -428,43 +430,27 @@
                             ^RangeContext ctx]
   Iterable
   (iterator [_]
-    (let [sk             (dtlv-val (.-start-bf ctx))
-          ek             (dtlv-val (.-stop-bf ctx))
-          forward?       (dtlv-bool (.-forward? ctx))
-          include-start? (dtlv-bool (.-include-start? ctx))
-          include-stop?  (dtlv-bool (.-include-stop? ctx))
-          k              (.key cur)
-          v              (.val cur)
-          dlmdb?         (l/dlmdb?)
-          iter           (if dlmdb?
-                           (DTLV$dtlv_key_rank_sample_iter.)
-                           (DTLV$dtlv_key_sample_iter.))
-          samples        (alength indices)
-          sizets         (SizeTPointer. samples)]
+    (let [sk      (dtlv-val (.-start-bf ctx))
+          ek      (dtlv-val (.-stop-bf ctx))
+          k       (.key cur)
+          v       (.val cur)
+          iter    (DTLV$dtlv_key_rank_sample_iter.)
+          samples (alength indices)
+          sizets  (SizeTPointer. samples)]
       (dotimes [i samples] (.put sizets i (aget indices i)))
       (Util/checkRc
-        (if dlmdb?
-          (DTLV/dtlv_key_rank_sample_iter_create
-            ^DTLV$dtlv_key_rank_sample_iter iter
-            sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek)
-          (DTLV/dtlv_key_sample_iter_create
-            ^DTLV$dtlv_key_sample_iter iter
-            sizets samples budget step (.ptr cur) (.ptr k) (.ptr v)
-            ^int forward? ^int include-start? ^int include-stop? sk ek)))
+        (DTLV/dtlv_key_rank_sample_iter_create
+          ^DTLV$dtlv_key_rank_sample_iter iter
+          sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek))
       (reify
         Iterator
         (hasNext [_]
-          (dtlv-rc
-            (if dlmdb?
-              (DTLV/dtlv_key_rank_sample_iter_has_next iter)
-              (DTLV/dtlv_key_sample_iter_has_next iter))))
+          (dtlv-rc (DTLV/dtlv_key_rank_sample_iter_has_next iter)))
         (next [_] (KV. k v lmdb rtx))
 
         AutoCloseable
         (close [_]
-          (if dlmdb?
-            (DTLV/dtlv_key_rank_sample_iter_destroy iter)
-            (DTLV/dtlv_key_sample_iter_destroy iter)))))))
+          (DTLV/dtlv_key_rank_sample_iter_destroy iter))))))
 
 (deftype ListIterable [lmdb
                        ^DBI db
@@ -516,35 +502,23 @@
           ek      (dtlv-val (.-stop-bf ctx))
           k       (.key cur)
           v       (.val cur)
-          dlmdb?  (l/dlmdb?)
-          iter    (if dlmdb?
-                    (DTLV$dtlv_list_rank_sample_iter.)
-                    (DTLV$dtlv_list_sample_iter.))
+          iter    (DTLV$dtlv_list_rank_sample_iter.)
           samples (alength indices)
           sizets  (SizeTPointer. samples)]
       (dotimes [i samples] (.put sizets i (aget indices i)))
       (Util/checkRc
-        (if dlmdb?
-          (DTLV/dtlv_list_rank_sample_iter_create
-            ^DTLV$dtlv_list_rank_sample_iter iter
-            sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek)
-          (DTLV/dtlv_list_sample_iter_create
-            ^DTLV$dtlv_list_sample_iter iter
-            sizets samples budget step (.ptr cur) (.ptr k) (.ptr v) sk ek)))
+        (DTLV/dtlv_list_rank_sample_iter_create
+          ^DTLV$dtlv_list_rank_sample_iter iter
+          sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek))
       (reify
         Iterator
         (hasNext [_]
-          (dtlv-rc
-            (if dlmdb?
-              (DTLV/dtlv_list_rank_sample_iter_has_next iter)
-              (DTLV/dtlv_list_sample_iter_has_next iter))))
+          (dtlv-rc (DTLV/dtlv_list_rank_sample_iter_has_next iter)))
         (next [_] (KV. k v lmdb rtx))
 
         AutoCloseable
         (close [_]
-          (if l/dlmdb?
-            (DTLV/dtlv_list_rank_sample_iter_destroy iter)
-            (DTLV/dtlv_list_sample_iter_destroy iter)))))))
+          (DTLV/dtlv_list_rank_sample_iter_destroy iter))))))
 
 (deftype ListKeyRangeFullValIterable [lmdb
                                       ^DBI db
@@ -707,7 +681,9 @@
     (when (.exists (io/file src))
       (u/copy-file src dst))))
 
-(declare key-range-list-count-fast key-range-list-count-slow)
+(declare key-range-list-count-fast)
+
+
 
 (deftype CppLMDB [^Env env
                   info
@@ -765,7 +741,7 @@
                              v-comp-bf-w
                              (volatile! false)
                              (volatile! [])
-                             (volatile! {}))))
+                             (volatile! nil))))
 
   IObj
   (withMeta [this m] (set! meta m) this)
@@ -786,7 +762,10 @@
         (a/shutdown-executor)
         (u/shutdown-worker-thread-pool)
         (u/shutdown-scheduler))
-      (.sync env 1)
+      ;; Temp envs are ephemeral scratch spaces (e.g. WAL overlays). Forcing a
+      ;; durability sync on close only adds latency with no correctness benefit.
+      (when-not (@info :temp?)
+        (.sync env 1))
       (.close env)
       (doseq [idx (keep @l/vector-indices (u/list-files (.env-dir this)))]
         (close-vecs idx))
@@ -1151,37 +1130,25 @@
 
   (key-range-count [lmdb dbi-name k-range]
     (.key-range-count lmdb dbi-name k-range :data))
-  (key-range-count [lmdb dbi-name k-range k-type]
-    (.key-range-count lmdb dbi-name k-range k-type nil))
-  (key-range-count [lmdb dbi-name [range-type k1 k2] k-type cap]
+  (key-range-count [lmdb dbi-name [range-type k1 k2] k-type]
     (scan/scan
       (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
-            forward           (dtlv-bool (.-forward? ctx))
-            start             (dtlv-bool (.-include-start? ctx))
-            end               (dtlv-bool (.-include-stop? ctx))
             sk                (dtlv-val (.-start-bf ctx))
-            ek                (dtlv-val (.-stop-bf ctx))]
+            ek                (dtlv-val (.-stop-bf ctx))
+            _                 (when-not (l/dlmdb?)
+                                (raise "Only dlmdb counted env is supported."
+                                       {:dbi dbi-name}))
+            flag              (BitOps/intOr
+                                (if (.-include-start? ctx)
+                                  (int DTLV/MDB_COUNT_LOWER_INCL) 0)
+                                (if (.-include-stop? ctx)
+                                  (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
         (dtlv-c
-          (if cap
-            (DTLV/dtlv_key_range_count_cap
-              (.ptr ^Cursor cur) cap
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              forward start end sk ek)
-            (if (l/dlmdb?)
-              (let [flag (BitOps/intOr
-                           (if (.-include-start? ctx)
-                             (int DTLV/MDB_COUNT_LOWER_INCL) 0)
-                           (if (.-include-stop? ctx)
-                             (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
-                (with-open [total (LongPointer. 1)]
-                  (DTLV/mdb_range_count_keys
-                    (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
-                    sk ek flag total)
-                  (.get ^LongPointer total)))
-              (DTLV/dtlv_key_range_count
-                (.ptr ^Cursor cur)
-                (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-                forward start end sk ek)))))
+          (with-open [total (LongPointer. 1)]
+            (DTLV/mdb_range_count_keys
+              (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
+              sk ek flag total)
+            (.get ^LongPointer total))))
       (raise "Fail to count key range: " e {:dbi dbi-name})))
 
   (range-seq [this dbi-name k-range]
@@ -1336,46 +1303,20 @@
         false)))
 
   (key-range-list-count [lmdb dbi-name k-range k-type]
-    (.key-range-list-count lmdb dbi-name k-range k-type nil nil))
-  (key-range-list-count [lmdb dbi-name k-range k-type cap]
-    (.key-range-list-count lmdb dbi-name k-range k-type cap nil))
-  (key-range-list-count [lmdb dbi-name k-range k-type cap budget]
-    (if (l/dlmdb?)
-      (key-range-list-count-fast lmdb dbi-name k-range k-type cap)
-      (key-range-list-count-slow lmdb dbi-name k-range k-type cap budget)))
+    (when-not (l/dlmdb?)
+      (raise "Only dlmdb counted env is supported." {:dbi dbi-name}))
+    (key-range-list-count-fast lmdb dbi-name k-range k-type))
 
   (list-range [this dbi-name k-range kt v-range vt]
     (scan/list-range this dbi-name k-range kt v-range vt))
 
-  (list-range-count [lmdb dbi-name k-range kt v-range vt]
-    (.list-range-count lmdb dbi-name k-range kt v-range vt nil))
-  (list-range-count [lmdb dbi-name [k-range-type k1 k2] k-type
-                     [v-range-type v1 v2] v-type cap]
-    (scan/scan
-      (let [[^RangeContext kctx ^RangeContext vctx]
-            (l/list-range-info rtx k-range-type k1 k2 k-type
-                               v-range-type v1 v2 v-type)
-            kforward (dtlv-bool (.-forward? kctx))
-            kstart   (dtlv-bool (.-include-start? kctx))
-            kend     (dtlv-bool (.-include-stop? kctx))
-            sk       (dtlv-val (.-start-bf kctx))
-            ek       (dtlv-val (.-stop-bf kctx))
-            vforward (dtlv-bool (.-forward? vctx))
-            vstart   (dtlv-bool (.-include-start? vctx))
-            vend     (dtlv-bool (.-include-stop? vctx))
-            sv       (dtlv-val (.-start-bf vctx))
-            ev       (dtlv-val (.-stop-bf vctx))]
-        (dtlv-c
-          (if cap
-            (DTLV/dtlv_list_range_count_cap
-              (.ptr ^Cursor cur) cap
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              kforward kstart kend sk ek vforward vstart vend sv ev)
-            (DTLV/dtlv_list_range_count
-              (.ptr ^Cursor cur)
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              kforward kstart kend sk ek vforward vstart vend sv ev))))
-      (raise "Fail to count list range: " e {:dbi dbi-name})))
+  (list-range-count [lmdb dbi-name k-range k-type _v-range _v-type]
+    ;; Fast approximate count: ignore value range and open/backwards boundaries.
+    ;; This intentionally trades accuracy for speed and removed native support.
+    (when-not (l/dlmdb?)
+      (raise "Only dlmdb counted env is supported." {:dbi dbi-name}))
+    (let [[_ k1 k2] k-range]
+      (key-range-list-count-fast lmdb dbi-name [:closed k1 k2] k-type)))
 
   (list-range-first [this dbi-name k-range kt v-range vt]
     (scan/list-range-first this dbi-name k-range kt v-range vt))
@@ -1402,15 +1343,11 @@
   (list-range-filter-count
     [this list-name pred k-range k-type v-range v-type]
     (.list-range-filter-count this list-name pred k-range k-type v-range
-                              v-type true nil))
+                              v-type true))
   (list-range-filter-count
     [this dbi-name pred k-range kt v-range vt raw-pred?]
-    (.list-range-filter-count this dbi-name pred k-range kt v-range
-                              vt raw-pred? nil))
-  (list-range-filter-count
-    [this dbi-name pred k-range kt v-range vt raw-pred? cap]
     (scan/list-range-filter-count this dbi-name pred k-range kt v-range
-                                  vt raw-pred? cap))
+                                  vt raw-pred?))
 
   (visit-list-range
     [this list-name visitor k-range k-type v-range v-type]
@@ -1443,7 +1380,7 @@
   (re-index [this opts] (l/re-index* this opts)))
 
 (defn- key-range-list-count-fast
-  [lmdb dbi-name [range-type k1 k2] k-type cap]
+  [lmdb dbi-name [range-type k1 k2] k-type]
   (scan/scan
     (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
           flag              (BitOps/intOr
@@ -1456,38 +1393,8 @@
           (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
           (dtlv-val (.-start-bf ctx)) (dtlv-val (.-stop-bf ctx))
           flag ptr)
-        (let [res (.get ^LongPointer ptr)]
-          (if (and cap (> ^long res ^long cap)) cap res))))
+        (.get ^LongPointer ptr)))
     (raise "Fail to count (fast) list in key range: " e {:dbi dbi-name})))
-
-(defn- key-range-list-count-slow
-  [lmdb dbi-name [range-type k1 k2] k-type cap budget]
-  (scan/scan
-    (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
-          forward           (dtlv-bool (.-forward? ctx))
-          start             (dtlv-bool (.-include-start? ctx))
-          end               (dtlv-bool (.-include-stop? ctx))
-          sk                (dtlv-val (.-start-bf ctx))
-          ek                (dtlv-val (.-stop-bf ctx))]
-      (dtlv-c
-        (cond
-          budget
-          (DTLV/dtlv_key_range_list_count_cap_budget
-            (.ptr ^Cursor cur) cap budget c/range-count-iteration-step
-            (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-            forward start end sk ek)
-          cap
-          (let [res (DTLV/dtlv_key_range_list_count_cap
-                      (.ptr ^Cursor cur) cap
-                      (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-                      forward start end sk ek)]
-            (if (> ^long res ^long cap) cap res))
-          :else
-          (DTLV/dtlv_key_range_list_count
-            (.ptr ^Cursor cur)
-            (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-            forward start end sk ek))))
-    (raise "Fail to count (slow) list in key range: " e {:dbi dbi-name})))
 
 (defn- init-info
   ([^CppLMDB lmdb new-info]
@@ -1574,9 +1481,9 @@
                                         :wal-last-sync-ms now-ms
                                         :wal-indexer-last-flush-ms now-ms
                                         :wal-indexer-last-flush-duration-ms 0
-                                        :kv-overlay-committed-by-tx
-                                        (ConcurrentSkipListMap.)
-                                        :kv-overlay-by-dbi {}
+                                        :kv-overlay-active-dbis #{}
+                                        :kv-overlay-active-keys {}
+                                        :kv-overlay-env nil
                                         :kv-overlay-private-entries 0
                                         :overlay-published-wal-tx-id 0})
                           key-compress (assoc :key-compress key-compress)
@@ -1616,13 +1523,15 @@
                          (str dir u/+separator+ c/valcode-file-name)))]
           (init-info lmdb (dissoc info
                                   :kv-wal?
-                                  :kv-overlay-committed-by-tx
-                                  :kv-overlay-by-dbi
+                                  :kv-overlay-active-dbis
+                                  :kv-overlay-active-keys
+                                  :kv-overlay-env
                                   :overlay-published-wal-tx-id))
           (vswap! (l/kv-info lmdb) assoc
                   :kv-wal? kv-wal-enabled
-                  :kv-overlay-committed-by-tx (ConcurrentSkipListMap.)
-                  :kv-overlay-by-dbi {}
+                  :kv-overlay-active-dbis #{}
+                  :kv-overlay-active-keys {}
+                  :kv-overlay-env nil
                   :overlay-published-wal-tx-id 0)
           (set-max-val-size lmdb (max-val-size lmdb))
           (set-key-compressor lmdb k-comp)
