@@ -46,8 +46,8 @@
      specified key range")
   (list-range-count
     [db list-name k-range k-type v-range v-type]
-    "Return the number of key-values in the specified value range of the
-     specified key range")
+    "Return an approximate number of key-values in the specified key range.
+     Value-range bounds are ignored.")
   (list-range-filter
     [db list-name pred k-range k-type v-range v-type]
     [db list-name pred k-range k-type v-range v-type raw-pred?]

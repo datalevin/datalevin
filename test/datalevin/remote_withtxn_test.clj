@@ -87,7 +87,8 @@
         conn   (d/create-conn
                  dir nil
                  {:kv-opts              {:mapsize 1
-                                         :flags   (conj c/default-env-flags :nosync)}
+                                         :flags   (conj c/default-env-flags :nosync)
+                                         :kv-wal? false}
                   :background-sampling? false})
         query1 '[:find ?d .
                  :in $ ?e

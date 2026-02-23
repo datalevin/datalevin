@@ -882,7 +882,7 @@
         (scan/scan
           (with-open [^AutoCloseable iter
                       (lmdb/val-iterator
-                        (lmdb/iterate-list-val-full dbi rtx cur))]
+                        (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
             (if (single-attrs? schema attrs-v)
               (loop [tuple (p/produce in)]
                 (when tuple
@@ -924,7 +924,7 @@
         (scan/scan
           (with-open [^AutoCloseable iter
                       (lmdb/val-iterator
-                        (lmdb/iterate-list-val-full dbi rtx cur))]
+                        (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
             (if (single-attrs? schema attrs-v)
               (dotimes [i nt]
                 (eav-scan-v-single*
@@ -951,7 +951,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (loop [^objects tuple (p/produce in)]
                 (when tuple
                   (let [v (aget tuple v-idx)]
@@ -975,7 +975,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (dotimes [i nt]
                 (let [^objects tuple (.get ^List in i)
                       v              (aget tuple v-idx)]
@@ -992,7 +992,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (loop [^objects tuple (p/produce in)]
                 (when tuple
                   (let [v (aget tuple v-idx)]
@@ -1016,7 +1016,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (dotimes [i nt]
                 (let [^objects tuple (.get ^List in i)
                       v              (aget tuple v-idx)]
@@ -1034,7 +1034,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (loop [^objects tuple (p/produce in)]
                 (when tuple
                   (let [old-e (aget tuple f-idx)
@@ -1059,7 +1059,7 @@
           (scan/scan
             (with-open [^AutoCloseable iter
                         (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
+                          (scan/*iterate-list-val-full* lmdb dbi rtx cur))]
               (dotimes [i nt]
                 (let [^objects tuple (.get ^List in i)
                       old-e          (aget tuple f-idx)

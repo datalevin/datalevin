@@ -26,9 +26,11 @@
   [lmdb dbi-name k k-type v-type ignore-key?]
   (i/check-ready lmdb)
   (let [dbi (i/get-dbi lmdb dbi-name false)
-        rtx (if (l/writing? lmdb)
-              @(l/write-txn lmdb)
-              (i/get-rtx lmdb))]
+        wal? (boolean (:kv-wal? (i/env-opts lmdb)))
+        wtxn (when-not wal?
+               (when-let [wref (l/write-txn lmdb)]
+                 @wref))
+        rtx (or wtxn (i/get-rtx lmdb))]
     (try
       (l/put-key rtx k k-type)
       (when-let [^ByteBuffer bb (l/get-kv dbi rtx)]
@@ -39,16 +41,18 @@
         (raise "Fail to get-value: " e
                {:dbi dbi-name :k k :k-type k-type :v-type v-type}))
       (finally
-        (when-not (l/writing? lmdb)
+        (when-not wtxn
           (i/return-rtx lmdb rtx))))))
 
 (defn get-rank
   [lmdb dbi-name k k-type]
   (i/check-ready lmdb)
   (let [dbi (i/get-dbi lmdb dbi-name false)
-        rtx (if (l/writing? lmdb)
-              @(l/write-txn lmdb)
-              (i/get-rtx lmdb))]
+        wal? (boolean (:kv-wal? (i/env-opts lmdb)))
+        wtxn (when-not wal?
+               (when-let [wref (l/write-txn lmdb)]
+                 @wref))
+        rtx (or wtxn (i/get-rtx lmdb))]
     (try
       (l/put-key rtx k k-type)
       (l/get-key-rank dbi rtx)
@@ -56,16 +60,18 @@
         (raise "Fail to get-rank: " e
                {:dbi dbi-name :k k :k-type k-type}))
       (finally
-        (when-not (l/writing? lmdb)
+        (when-not wtxn
           (i/return-rtx lmdb rtx))))))
 
 (defn get-by-rank
   [lmdb dbi-name rank k-type v-type ignore-key?]
   (i/check-ready lmdb)
   (let [dbi (i/get-dbi lmdb dbi-name false)
-        rtx (if (l/writing? lmdb)
-              @(l/write-txn lmdb)
-              (i/get-rtx lmdb))]
+        wal? (boolean (:kv-wal? (i/env-opts lmdb)))
+        wtxn (when-not wal?
+               (when-let [wref (l/write-txn lmdb)]
+                 @wref))
+        rtx (or wtxn (i/get-rtx lmdb))]
     (try
       (when-let [[kb vb] (l/get-key-by-rank dbi rtx rank)]
         (if ignore-key?
@@ -75,7 +81,7 @@
         (raise "Fail to get-by-rank: " e
                {:dbi dbi-name :rank rank :k-type k-type :v-type v-type}))
       (finally
-        (when-not (l/writing? lmdb)
+        (when-not wtxn
           (i/return-rtx lmdb rtx))))))
 
 (defmacro scan
@@ -84,21 +90,34 @@
   ([call error keep-rtx?]
    `(do
       (i/check-ready ~'lmdb)
-      (let [~'dbi (i/get-dbi ~'lmdb ~'dbi-name false)
-            ~'rtx (if (l/writing? ~'lmdb)
-                    @(l/write-txn ~'lmdb)
-                    (i/get-rtx ~'lmdb))
-            ~'cur (l/get-cursor ~'dbi ~'rtx)]
-        (try
-          ~call
-          (catch Throwable ~'e
-            ~error)
-          (finally
-            (if (l/read-only? ~'rtx)
-              (l/return-cursor ~'dbi ~'cur)
-              (l/close-cursor ~'dbi ~'cur))
-            (when-not (or (l/writing? ~'lmdb) ~keep-rtx?)
-              (i/return-rtx ~'lmdb ~'rtx))))))))
+      (let [~'wal? (boolean (:kv-wal? (i/env-opts ~'lmdb)))
+            ~'dbi (if ~'wal?
+                    (try
+                      (i/get-dbi ~'lmdb ~'dbi-name false)
+                      (catch Throwable ~'e
+                        (if (re-find #"not open" (ex-message ~'e))
+                          nil
+                          (throw ~'e))))
+                    (i/get-dbi ~'lmdb ~'dbi-name false))
+            ~'wtxn (when-not ~'wal?
+                     (when-let [wref# (l/write-txn ~'lmdb)]
+                       @wref#))
+            ~'rtx (or ~'wtxn (i/get-rtx ~'lmdb))
+            ~'cur (when ~'dbi (l/get-cursor ~'dbi ~'rtx))]
+        (binding [*dbi-name* ~'dbi-name]
+          (try
+            ~call
+            (catch Throwable ~'e
+              ~error)
+            (finally
+              (when ~'cur
+                (if (l/read-only? ~'rtx)
+                  (l/return-cursor ~'dbi ~'cur)
+                  (l/close-cursor ~'dbi ~'cur)))
+              (when-not (or ~'wtxn ~keep-rtx?)
+                (i/return-rtx ~'lmdb ~'rtx)))))))))
+
+(def ^:dynamic *dbi-name* nil)
 
 (def ^:dynamic *iterate-key*
   (fn [_lmdb dbi rtx cur k-range k-type]
@@ -239,6 +258,12 @@
   (let [iter  (.iterator
                 ^Iterable (*iterate-kv* lmdb dbi rtx cur
                                         k-range k-type v-type))
+        closed? (volatile! false)
+        close! (fn []
+                 (when-not @closed?
+                   (vreset! closed? true)
+                   (.close ^AutoCloseable iter)
+                   (i/return-rtx lmdb rtx)))
         item  (fn [kv]
                 (let [v (when (not= v-type :ignore)
                           (b/read-buffer (l/v kv) v-type))]
@@ -256,35 +281,43 @@
                           {:batch  (persistent! holder)
                            :next-k k}))
                       {:batch  (persistent! holder)
-                       :next-k nil}))))]
+                       :next-k nil}))))
+        next-seq (fn next-seq [ret]
+                   (if (clojure.core/seq (:batch ret))
+                     (if-some [k (:next-k ret)]
+                       (cons (:batch ret)
+                             (lazy-seq (next-seq (fetch k))))
+                       (do
+                         (close!)
+                         (list (:batch ret))))
+                     (do
+                       (close!)
+                       nil)))]
     (reify
       Seqable
       (seq [_]
         (u/lazy-concat
-          ((fn next [ret]
-             (when (clojure.core/seq (:batch ret))
-               (cons (:batch ret)
-                     (when-some [k (:next-k ret)]
-                       (lazy-seq (next (fetch k)))))))
-           (fetch batch-size))))
+          (next-seq (fetch batch-size))))
 
       IReduceInit
       (reduce [_ rf init]
-        (loop [acc init
-               ret (fetch batch-size)]
-          (if (clojure.core/seq (:batch ret))
-            (let [acc (rf acc (:batch ret))]
-              (if (reduced? acc)
-                @acc
-                (if-some [k (:next-k ret)]
-                  (recur acc (fetch k))
-                  acc)))
-            acc)))
+        (try
+          (loop [acc init
+                 ret (fetch batch-size)]
+            (if (clojure.core/seq (:batch ret))
+              (let [acc (rf acc (:batch ret))]
+                (if (reduced? acc)
+                  @acc
+                  (if-some [k (:next-k ret)]
+                    (recur acc (fetch k))
+                    acc)))
+              acc))
+          (finally
+            (close!))))
 
       AutoCloseable
       (close [_]
-        (.close ^AutoCloseable iter)
-        (i/return-rtx lmdb rtx))
+        (close!))
 
       Object
       (toString [this] (str (apply list this))))))
@@ -668,9 +701,19 @@
 (defn visit-key-sample
   [lmdb dbi-name indices budget step visitor k-range k-type raw-pred?]
   (scan
-    (let [iterable (*iterate-key-sample* lmdb dbi rtx cur
-                                         indices budget step k-range k-type)]
-      (visit* iterable visitor raw-pred? k-type nil))
+    (with-open [^AutoCloseable iter
+                (.iterator ^Iterable
+                           (*iterate-key-sample* lmdb dbi rtx cur
+                                                 indices budget step
+                                                 k-range k-type))]
+      (loop []
+        (when (.hasNext ^Iterator iter)
+          (let [kv  (.next ^Iterator iter)
+                res (if raw-pred?
+                      (visitor kv)
+                      (visitor (b/read-buffer (l/k kv) k-type)))]
+            (when-not (identical? res :datalevin/terminate-visit)
+              (recur))))))
     (raise "Fail to visit key sample: " e
            {:dbi dbi-name :key-range k-range})))
 

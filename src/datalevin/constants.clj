@@ -464,6 +464,10 @@
   *init-db-size* 1000)
 
 (def ^{:dynamic true
+       :doc     "Initial in-memory overlay size in MiB for WAL overlays."}
+  *overlay-init-db-size* 256)
+
+(def ^{:dynamic true
        :doc     "Initial maximal value size is 16384 bytes, automatically grown"}
   *init-val-size* 16384)
 
@@ -507,8 +511,8 @@
 
 (def ^{:dynamic true :no-doc true
        :doc     "When true, append KV transactions to the on-disk WAL
-                 (`<db-dir>/wal`). Disabled by default."}
-  *enable-kv-wal* false)
+                 (`<db-dir>/wal`). Enabled by default."}
+  *enable-kv-wal* true)
 
 (def ^{:dynamic true :no-doc true
        :doc     "When KV WAL is enabled, flush durable `wal/meta` after this
@@ -577,9 +581,7 @@
                              (:step-3 through :step-8, :repair)
                    :phase  - :before, :during, or :after
                    :fn     - zero-arg function to invoke at the injection point
-                             (typically throws or calls System/exit)
-                 Reserved in Phase 1; actual hook call-sites land in Phase 2
-                 when WAL writer/indexer paths are implemented."}
+                             (typically throws or calls System/exit)."}
   *failpoint* nil)
 
 (def ^{:dynamic true :no-doc true

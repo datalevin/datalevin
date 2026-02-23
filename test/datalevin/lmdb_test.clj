@@ -192,6 +192,40 @@
           (if/close-kv lmdb))))
     (u/delete-files dir)))
 
+(deftest inmemory-ops-test
+  (let [flags (conj c/default-env-flags :inmemory)
+        lmdb  (l/open-kv nil {:flags flags})]
+    (try
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" 1 "one"]
+                            [:put "a" 2 "two"]])
+      (is (= "one" (if/get-value lmdb "a" 1)))
+      (is (contains? (if/get-env-flags lmdb) :inmemory))
+      (is (contains? (if/get-env-flags lmdb) :nosync))
+      (is (false? (:kv-wal? (if/env-opts lmdb))))
+      (is (nil? (if/env-dir lmdb)))
+      (is (nil? (if/sync lmdb)))
+      (let [lmdb-other (l/open-kv nil {:flags flags})]
+        (try
+          (if/open-dbi lmdb-other "a")
+          (is (nil? (if/get-value lmdb-other "a" 1)))
+          (finally
+            (if/close-kv lmdb-other))))
+      (let [readers (doall (repeatedly 4 #(future (if/get-value lmdb "a" 2))))]
+        (is (every? #(= "two" @%) readers)))
+      (let [reader (future (dotimes [_ 100] (if/get-value lmdb "a" 1)) true)]
+        (if/transact-kv lmdb [[:put "a" 1 "one-updated"]])
+        (is @reader)
+        (is (= "one-updated" (if/get-value lmdb "a" 1))))
+      (if/close-kv lmdb)
+      (let [lmdb2 (l/open-kv nil {:flags flags})]
+        (if/open-dbi lmdb2 "a")
+        (is (nil? (if/get-value lmdb2 "a" 1)))
+        (if/close-kv lmdb2))
+      (finally
+        (when-not (if/closed-kv? lmdb)
+          (if/close-kv lmdb))))))
+
 (deftest async-basic-ops-test
   (let [dir  (u/tmp-dir (str "async-lmdb-test-" (UUID/randomUUID)))
         lmdb (l/open-kv dir {:spill-opts {:spill-threshold 50}})]
@@ -527,6 +561,14 @@
            (if/list-range lmdb "list" [:open "a" "c"] :string
                           [:less-than 6] :long)))
 
+    ;; list-range-count is approximate: value-range bounds are ignored.
+    (is (= 10 (if/list-range-count lmdb "list" [:all] :string
+                                   [:closed 2 4] :long)))
+    (is (= 7 (if/list-range-count lmdb "list" [:less-than "c"] :string
+                                  [:closed 2 4] :long)))
+    (is (= 6 (if/list-range-count lmdb "list" [:greater-than "a"] :string
+                                  [:closed 2 4] :long)))
+
     (is (= (if/list-count lmdb "list" "a" :string) 4))
     (is (= (if/list-count lmdb "list" "b" :string) 3))
 
@@ -711,6 +753,7 @@
 (deftest with-txn-map-resize-test
   (let [dir  (u/tmp-dir (str "map-size-" (UUID/randomUUID)))
         lmdb (l/open-kv dir {:mapsize 1
+                             :kv-wal? false
                              :flags   (conj c/default-env-flags :nosync)})
         data {:description "this is going to be bigger than 1 MB"
               :numbers     (range 500000)}]
@@ -731,6 +774,7 @@
 (deftest open-again-resized-test
   (let [dir  (u/tmp-dir (str "again-resize-" (UUID/randomUUID)))
         lmdb (l/open-kv dir {:mapsize 1
+                             :kv-wal? false
                              :flags   (conj c/default-env-flags :nosync)})
         data {:description "this is normal data"}]
 
@@ -739,7 +783,7 @@
     (is (= data (if/get-value lmdb "a" 0)))
     (if/close-kv lmdb)
 
-    (let [lmdb1 (l/open-kv dir {:mapsize 10})]
+    (let [lmdb1 (l/open-kv dir {:mapsize 10 :kv-wal? false})]
       (if/open-dbi lmdb1 "a")
       (is (= data (if/get-value lmdb1 "a" 0)))
       (if/transact-kv lmdb1 [[:put "a" 1000 "good"]])

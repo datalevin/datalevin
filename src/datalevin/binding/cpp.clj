@@ -36,7 +36,8 @@
     DTLV$dtlv_list_val_full_iter DTLV$MDB_val
     DTLV$dtlv_list_key_range_full_val_iter
     DTLV$dtlv_key_rank_sample_iter]
-   [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException]
+   [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException
+    Util$DTLVException]
    [datalevin.lmdb RangeContext KVTxData]
    [datalevin.async IAsyncWork]
    [datalevin.utl BitOps]
@@ -44,7 +45,7 @@
     ScheduledFuture]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util Iterator HashMap ArrayDeque]
+   [java.util Iterator HashMap ArrayDeque UUID]
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
@@ -373,7 +374,12 @@
             (when-let [^Cursor cur (pool-take curs)]
               (.renew cur txn)
               cur))
-          (Cursor/create txn db (.-kp rtx) (.-vp rtx)))))
+          ;; Cursor key/value buffers must stay isolated from the transaction
+          ;; point-read buffers (kp/vp). Nested point-reads during scans
+          ;; otherwise overwrite iterator state.
+          (Cursor/create txn db
+                         (new-bufval c/+max-key-size+)
+                         (new-bufval (i/max-val-size lmdb))))))
   (cursor-count [_ cur] (.count ^Cursor cur))
   (close-cursor [_ cur] (.close ^Cursor cur))
   (return-cursor [_ cur] (pool-add curs cur)))
@@ -757,19 +763,22 @@
   (close-kv [this]
     (when-not (.isClosed env)
       (stop-scheduled-sync scheduled-sync)
-      (swap! l/lmdb-dirs disj (env-dir this))
+      (let [dir-id (or (@info :dir-id) (env-dir this))]
+        (swap! l/lmdb-dirs disj dir-id))
       (when (zero? (count @l/lmdb-dirs))
         (a/shutdown-executor)
         (u/shutdown-worker-thread-pool)
         (u/shutdown-scheduler))
       ;; Temp envs are ephemeral scratch spaces (e.g. WAL overlays). Forcing a
       ;; durability sync on close only adds latency with no correctness benefit.
-      (when-not (@info :temp?)
+      (when-not (or (@info :temp?) (@info :inmemory?))
         (.sync env 1))
       (.close env)
-      (doseq [idx (keep @l/vector-indices (u/list-files (.env-dir this)))]
-        (close-vecs idx))
-      (when (@info :temp?) (u/delete-files (@info :dir)))
+      (when-not (@info :inmemory?)
+        (doseq [idx (keep @l/vector-indices (u/list-files (.env-dir this)))]
+          (close-vecs idx)))
+      (when (and (@info :temp?) (@info :dir))
+        (u/delete-files (@info :dir)))
       nil))
 
   (closed-kv? [_] (.isClosed env))
@@ -821,6 +830,7 @@
               dbi      (Dbi/create env dbi-name (kv-flags flags))
               db       (DBI. this dbi (new-pools) kp vp kc vc
                              dupsort? counted? validate-data?)]
+
           (when (not= dbi-name c/kv-info)
             (vswap! info assoc-in [:dbis dbi-name] opts))
           (.put dbis dbi-name db)
@@ -1050,7 +1060,10 @@
                 (raise "Fail to transact to LMDB: " e edata)
                 (raise "Fail to transact to LMDB: " e {}))))))))
 
-  (set-env-flags [_ ks on-off] (.setFlags env (kv-flags ks) (if on-off 1 0)))
+  (set-env-flags [_ ks on-off]
+    (when (contains? ks :inmemory)
+      (raise "inmemory flag cannot be set or cleared after open" {}))
+    (.setFlags env (kv-flags ks) (if on-off 1 0)))
 
   (get-env-flags [_] (env-flag-keys (.getFlags env)))
 
@@ -1311,12 +1324,10 @@
     (scan/list-range this dbi-name k-range kt v-range vt))
 
   (list-range-count [lmdb dbi-name k-range k-type _v-range _v-type]
-    ;; Fast approximate count: ignore value range and open/backwards boundaries.
-    ;; This intentionally trades accuracy for speed and removed native support.
+    ;; Fast approximate count: value-range bounds are ignored.
     (when-not (l/dlmdb?)
       (raise "Only dlmdb counted env is supported." {:dbi dbi-name}))
-    (let [[_ k1 k2] k-range]
-      (key-range-list-count-fast lmdb dbi-name [:closed k1 k2] k-type)))
+    (key-range-list-count-fast lmdb dbi-name k-range k-type))
 
   (list-range-first [this dbi-name k-range kt v-range vt]
     (scan/list-range-first this dbi-name k-range kt v-range vt))
@@ -1448,23 +1459,42 @@
                                 kv-wal?          c/*enable-kv-wal*}
                          :as   opts}]
   (try
-    (let [mapsize       (* (long (if (.exists ^File db-file)
+    (let [inmemory?     (contains? flags :inmemory)
+          dir-id        (when inmemory? (str "inmemory:" (UUID/randomUUID)))
+          open-dir      (or dir dir-id)
+          mapsize       (* (long (if (and db-file (.exists ^File db-file))
                                    (c/pick-mapsize db-file)
                                    mapsize))
                            1024 1024)
           flags         (if temp?
                           (conj flags :nosync)
                           flags)
-          kv-wal-enabled (if temp? false (boolean kv-wal?))
-          ^Env env      (Env/create dir mapsize max-readers max-dbs
-                                    (kv-flags flags))
+          flags         (if inmemory?
+                          (conj flags :nosync)
+                          flags)
+          kv-wal-enabled (if (or temp? inmemory?) false (boolean kv-wal?))
+          ^Env env      (loop [attempt 0]
+                          (let [result (try
+                                         (Env/create open-dir mapsize max-readers
+                                                     max-dbs (kv-flags flags))
+                                         (catch Util$DTLVException e
+                                           (if (and (< attempt 5)
+                                                    (s/includes? (.getMessage e)
+                                                                 "Resource temporarily unavailable"))
+                                             ::retry
+                                             (throw e))))]
+                            (if (identical? result ::retry)
+                              (do
+                                (Thread/sleep (* 50 (inc attempt)))
+                                (recur (inc attempt)))
+                              result)))
           now-ms        (System/currentTimeMillis)
           info          (cond-> (merge opts
-                                       {:dir          dir
-                                        :flags        flags
+                                       {:flags        flags
                                         :max-readers  max-readers
                                         :max-dbs      max-dbs
                                         :temp?        temp?
+                                        :inmemory?    inmemory?
                                         :kv-wal?      kv-wal-enabled
                                         :wal-meta-flush-max-txs
                                         wal-meta-flush-max-txs
@@ -1481,13 +1511,14 @@
                                         :wal-last-sync-ms now-ms
                                         :wal-indexer-last-flush-ms now-ms
                                         :wal-indexer-last-flush-duration-ms 0
-                                        :kv-overlay-active-dbis #{}
-                                        :kv-overlay-active-keys {}
                                         :kv-overlay-env nil
-                                        :kv-overlay-private-entries 0
-                                        :overlay-published-wal-tx-id 0})
+                                        :kv-overlay-private-env nil
+                                        :kv-overlay-private-state nil
+                                        :kv-overlay-private-entries 0})
+                          (not inmemory?) (assoc :dir dir)
                           key-compress (assoc :key-compress key-compress)
-                          val-compress (assoc :val-compress val-compress))
+                          val-compress (assoc :val-compress val-compress)
+                          inmemory? (assoc :dir-id dir-id))
           ^CppLMDB lmdb (->CppLMDB env
                                    (volatile! info)
                                    (ThreadLocal.)
@@ -1507,38 +1538,39 @@
                                    nil
                                    kv-wal-enabled
                                    nil)]
-      (swap! l/lmdb-dirs conj dir)
+      (swap! l/lmdb-dirs conj (or dir-id dir))
       (open-dbi lmdb c/kv-info) ;; never compressed
-      (when kv-wal-enabled
+      (when (and kv-wal-enabled dir)
         (u/file (str dir u/+separator+ c/wal-dir)))
       (if temp?
-        (u/delete-on-exit dir-file)
-          (let [k-comp (when (and key-compress
+        (when dir-file
+          (u/delete-on-exit dir-file))
+        (let [k-comp (when (and (not inmemory?) key-compress dir
                                 (.exists (io/file dir c/keycode-file-name)))
                        (cp/load-key-compressor
                          (str dir u/+separator+ c/keycode-file-name)))
-              v-comp (when (and val-compress
+              v-comp (when (and (not inmemory?) val-compress dir
                                 (.exists (io/file dir c/valcode-file-name)))
                        (cp/load-val-compressor
                          (str dir u/+separator+ c/valcode-file-name)))]
           (init-info lmdb (dissoc info
                                   :kv-wal?
-                                  :kv-overlay-active-dbis
-                                  :kv-overlay-active-keys
                                   :kv-overlay-env
-                                  :overlay-published-wal-tx-id))
+                                  :kv-overlay-private-env
+                                  :kv-overlay-private-state))
           (vswap! (l/kv-info lmdb) assoc
                   :kv-wal? kv-wal-enabled
-                  :kv-overlay-active-dbis #{}
-                  :kv-overlay-active-keys {}
                   :kv-overlay-env nil
-                  :overlay-published-wal-tx-id 0)
+                  :kv-overlay-private-env nil
+                  :kv-overlay-private-state nil)
           (set-max-val-size lmdb (max-val-size lmdb))
           (set-key-compressor lmdb k-comp)
           (set-val-compressor lmdb v-comp)
-          (.addShutdownHook (Runtime/getRuntime)
-                            (Thread. #(close-kv lmdb)))
-          (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+          (when-not inmemory?
+            (.addShutdownHook (Runtime/getRuntime)
+                              (Thread. #(close-kv lmdb))))
+          (when (and (not inmemory?) dir)
+            (start-scheduled-sync (.-scheduled-sync lmdb) dir env))))
       lmdb)
     (catch Exception e
       (raise "Fail to open database: " e {:dir dir}))))
@@ -1546,28 +1578,36 @@
 (defn open-cpp-kv
   ([dir] (open-cpp-kv dir {}))
   ([dir opts]
-   (assert (string? dir) "directory should be a string.")
-   (let [dir-file  (u/file dir)
-         db-file   (io/file dir c/data-file-name)
-         exist-db? (.exists db-file)
-         version   (read-version-file dir-file)]
-     (cond
-       (not exist-db?)
-       (let [lmdb (open-kv* dir dir-file db-file opts)]
-         (write-version-file dir-file c/version)
-         lmdb)
-       version
+   (let [flags     (or (:flags opts) c/default-env-flags)
+         flags     (if (set? flags) flags (set flags))
+         inmemory? (contains? flags :inmemory)
+         opts      (assoc opts :flags flags)]
+     (if inmemory?
+       (open-kv* nil nil nil opts)
        (do
-         (when (not= version c/version)
-           (if-let [{:keys [major minor patch]} (c/parse-version version)]
-             (let [{cmajor :major cminor :minor} (c/parse-version c/version)]
-               (when (and c/require-migration?
-                          (or (< ^long major ^long cmajor)
-                              (< ^long minor ^long cminor)))
-                 (m/perform-migration dir major minor patch))
-               (write-version-file dir-file c/version))
-             (raise "Corrupt VERSION file" {:input version})))
-         (open-kv* dir dir-file db-file opts))
-       :else
-       (raise "Database requires migration. Please follow instruction at https://github.com/datalevin/datalevin/blob/master/doc/upgrade.md"
-              {:dir dir})))))
+         (assert (string? dir) "directory should be a string.")
+         (let [dir-file  (u/file dir)
+               db-file   (io/file dir c/data-file-name)
+               exist-db? (.exists db-file)
+               version   (read-version-file dir-file)]
+           (cond
+             (not exist-db?)
+             (let [lmdb (open-kv* dir dir-file db-file opts)]
+               (write-version-file dir-file c/version)
+               lmdb)
+             version
+             (do
+               (when (not= version c/version)
+                 (if-let [{:keys [major minor patch]} (c/parse-version version)]
+                   (let [{cmajor :major cminor :minor}
+                         (c/parse-version c/version)]
+                     (when (and c/require-migration?
+                                (or (< ^long major ^long cmajor)
+                                    (< ^long minor ^long cminor)))
+                       (m/perform-migration dir major minor patch))
+                     (write-version-file dir-file c/version))
+                   (raise "Corrupt VERSION file" {:input version})))
+               (open-kv* dir dir-file db-file opts))
+             :else
+             (raise "Database requires migration. Please follow instruction at https://github.com/datalevin/datalevin/blob/master/doc/upgrade.md"
+                    {:dir dir}))))))))

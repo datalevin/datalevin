@@ -52,7 +52,8 @@
         conn  (d/create-conn
                 dir nil
                 {:kv-opts {:mapsize 1
-                           :flags   (conj c/default-env-flags :nosync)}})
+                           :flags   (conj c/default-env-flags :nosync)
+                           :kv-wal? false}})
         query '[:find ?e .
                 :in $ ?d
                 :where [?e :content ?d]]

@@ -1177,7 +1177,8 @@ See also: [[open-kv]], [[sync]]"}
          * `:nomeminit`, don't initialize malloc'd memory before writing to datafile
 
          * `:inmemory`, ignore the path parameter (may be nil), create a
-           process-local, non-durable environment; all data is lost on close "}
+           process-local, non-durable environment; all data is lost on close.
+           This flag must be set at open time and cannot be toggled later. "}
   set-env-flags i/set-env-flags)
 
 (def ^{:arglists '([db])
@@ -1760,12 +1761,12 @@ To access store on a server, [[interpret.inter-fn]] should be used to define the
   list-range i/list-range)
 
 (def ^{:arglists '([db list-name k-range k-type v-range v-type])
-       :doc      "Return the number of key-values in the specified value
-     range and the specified key range of a sub-database opened by
-     [[open-list-dbi]].
+       :doc      "Return an approximate number of key-values in the
+     specified key range of a sub-database opened by [[open-list-dbi]].
+     Value-range bounds are ignored.
 
      The same range specification as `k-range` in [[get-range]] is
-     supported for both `k-range` and `v-range`."}
+     supported for `k-range`."}
   list-range-count i/list-range-count)
 
 (def ^{:arglists '([db list-name k-range k-type v-range v-type])

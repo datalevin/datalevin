@@ -15,7 +15,8 @@
         conn (d/create-conn
                dir {}
                {:kv-opts {:flags   (conj c/default-env-flags :nosync)
-                          :mapsize 1}})]
+                          :mapsize 1
+                          :kv-wal? false}})]
 
     (dotimes [i 10000] (d/transact! conn [{:foo i}]))
     (is (= 10000 (count (d/datoms @conn :eav))))
@@ -34,7 +35,8 @@
                    dir {:buggy/key {:db/valueType :db.type/string
                                     :db/unique    :db.unique/identity}}
                    {:kv-opts {:mapsize 1
-                              :flags   (conj c/default-env-flags :nosync)}})]
+                              :flags   (conj c/default-env-flags :nosync)
+                              :kv-wal? false}})]
         (d/transact! conn (for [i (range 100000)]
                             {:buggy/key  (format "%20d" i)
                              :buggy/val  (format "bubba-%d" i)
@@ -43,11 +45,11 @@
         (d/close conn)
         (is (d/closed? conn))
 
-        (let [conn1 (d/create-conn dir)]
+        (let [conn1 (d/create-conn dir nil {:kv-opts {:kv-wal? false}})]
           (d/clear conn1)
           (is (d/closed? conn1)))
 
-        (let [conn2 (d/create-conn dir)]
+        (let [conn2 (d/create-conn dir nil {:kv-opts {:kv-wal? false}})]
           (is (= 0 (count (d/datoms (d/db conn2) :eav))))
           (d/transact! conn2 [{:buggy/key  (format "%20d" 100001)
                                :buggy/val  (format "bubba-%d" 100)
@@ -56,7 +58,7 @@
           (is (= 3 (count (d/datoms (d/db conn2) :eav))))
           (d/close conn2))
 
-        (let [conn1 (d/create-conn dir)]
+        (let [conn1 (d/create-conn dir nil {:kv-opts {:kv-wal? false}})]
           (d/clear conn1)
           (is (d/closed? conn1)))))
     (u/delete-files dir)))

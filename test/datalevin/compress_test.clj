@@ -100,7 +100,8 @@
     (prop/for-all
       ;; Hu-Tucker can expand; keep inputs small to avoid flakey overflow.
       [k (gen/such-that (partial data-size-less-than? 200)
-                        gen/any-equatable)]
+                        gen/any-equatable
+                        1000)]
       (.clear src)
       (.clear dst)
       (.clear res)
@@ -158,6 +159,8 @@
                                     comp-opt))]
               (if/open-dbi comp-kv "a")
               (if/transact-kv comp-kv txs)
+              (if/flush-kv-indexer! orig-kv)
+              (if/flush-kv-indexer! comp-kv)
 
               (is (= (if/get-range orig-kv "a" [:all] :string :string)
                      (if/get-range comp-kv "a" [:all] :string :string)))

@@ -65,7 +65,7 @@
 
 (deftest with-txn-map-resize-test
   (let [dir  "dtlv://datalevin:datalevin@localhost/remote-with-tx"
-        lmdb (d/open-kv dir {:mapsize 1})
+        lmdb (d/open-kv dir {:mapsize 1 :kv-wal? false})
         data {:description "this is going to be bigger than 1MB"
               :numbers     (range 1000000)}]
     (d/open-dbi lmdb "a")

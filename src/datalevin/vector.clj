@@ -135,14 +135,26 @@
   (assert (not (i/closed-kv? lmdb)) "LMDB env is closed.")
 
   ;; vec-ref -> vec-ids
-  (i/open-list-dbi lmdb vecs-dbi {:key-size c/+max-key-size+
-                                  :val-size c/+id-bytes+}))
+  (let [opts {:key-size c/+max-key-size+
+              :val-size c/+id-bytes+}]
+    ;; Open in WAL overlays.
+    (i/open-list-dbi lmdb vecs-dbi opts)
+    ;; Also ensure base DBI is opened for internal bypass-wal writes used by
+    ;; vector direct/shadow commit paths.
+    (binding [c/*bypass-wal* true]
+      (i/open-list-dbi lmdb vecs-dbi opts))))
 
 (defn- open-vec-blob-dbis
   "Open the vec-index-dbi and vec-meta-dbi for LMDB blob storage."
   [lmdb]
+  ;; Open in WAL overlays.
   (i/open-dbi lmdb c/vec-index-dbi)
-  (i/open-dbi lmdb c/vec-meta-dbi))
+  (i/open-dbi lmdb c/vec-meta-dbi)
+  ;; Also ensure base DBIs are opened for checkpoint/clear paths that bypass
+  ;; WAL and write blob chunks directly to base LMDB.
+  (binding [c/*bypass-wal* true]
+    (i/open-dbi lmdb c/vec-index-dbi)
+    (i/open-dbi lmdb c/vec-meta-dbi)))
 
 (defn- init-vecs
   [lmdb vecs-dbi]

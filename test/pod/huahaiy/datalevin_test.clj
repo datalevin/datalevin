@@ -41,7 +41,7 @@
 
 (deftest with-txn-kv-map-resize-test
   (let [dir  (u/tmp-dir (str "pod-with-tx-kv-test-" (UUID/randomUUID)))
-        lmdb (pd/open-kv dir {:mapsize 1})
+        lmdb (pd/open-kv dir {:mapsize 1 :kv-wal? false})
         data {:description "this is going to be bigger than 1MB"
               :numbers     (range 1000000)}]
     (pd/open-dbi lmdb "a")
@@ -85,7 +85,8 @@
 
 (deftest with-txn-map-resize-test
   (let [dir    (u/tmp-dir (str "pod-with-tx-test-" (UUID/randomUUID)))
-        conn   (pd/create-conn dir nil {:kv-opts {:mapsize 1}})
+        conn   (pd/create-conn dir nil {:kv-opts {:mapsize 1
+                                                  :kv-wal? false}})
         query1 '[:find ?d .
                  :in $ ?e
                  :where [?e :content ?d]]

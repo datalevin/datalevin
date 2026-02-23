@@ -15,6 +15,7 @@
    [clojure.string :as str]
    [clojure.walk :as w]
    [datalevin.db :as db]
+   [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.query-util :as qu
     :refer [IStep -execute -execute-pipe -explain]]
@@ -1361,13 +1362,14 @@
             (finally (finish i)))))
       (let [tasks (mapv (fn [step i]
                           ^Callable
-                          #(try
-                             (work step i)
-                             (catch Throwable e
-                               (raise "Error in executing step" i e
-                                      {:step step}))
-                             (finally
-                               (finish i))))
+                          (bound-fn []
+                            (try
+                              (work step i)
+                              (catch Throwable e
+                                (raise "Error in executing step" i e
+                                       {:step step}))
+                              (finally
+                                (finish i)))))
                         steps (range))]
         (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool tasks)]
           (.get f))))
@@ -1380,16 +1382,25 @@
   [context db steps]
   (let [steps (vec steps)
         n     (count steps)
-        attrs (cols->attrs (:cols (peek steps)))]
-    (condp = n
-      1 (let [tuples (-execute (first steps) db nil)]
-          (save-intermediates context steps nil tuples)
-          (r/relation! attrs tuples))
-      2 (let [src    (-execute (first steps) db nil)
-              tuples (-execute (peek steps) db src)]
-          (save-intermediates context steps (object-array [src]) tuples)
-          (r/relation! attrs tuples))
-      (pipelining context db attrs steps n))))
+        attrs (cols->attrs (:cols (peek steps)))
+        run*  (fn []
+                (condp = n
+                  1 (let [tuples (-execute (first steps) db nil)]
+                      (save-intermediates context steps nil tuples)
+                      (r/relation! attrs tuples))
+                  2 (let [src    (-execute (first steps) db nil)
+                          tuples (-execute (peek steps) db src)]
+                      (save-intermediates context steps (object-array [src])
+                                          tuples)
+                      (r/relation! attrs tuples))
+                  (pipelining context db attrs steps n)))]
+    (if (instance? DB db)
+      (let [^Store store (.-store ^DB db)
+            lmdb         (.-lmdb store)]
+        (if (and lmdb (boolean (:kv-wal? @(l/kv-info lmdb))))
+          (kv/with-wal-overlay-scan-bindings lmdb run*)
+          (run*)))
+      (run*))))
 
 (defn- execute-plan
   [{:keys [plan sources] :as context}]
@@ -1414,14 +1425,16 @@
 
 (defn -q
   [context run?]
-  (binding [qu/*implicit-source* (get (:sources context) '$)]
-    (let [{:keys [result-set] :as context} (planning context)]
-      (if (= result-set #{})
-        (do (pl/plan-explain) context)
-        (as-> context c
-          (do (pl/plan-explain) c)
-          (if run? (execute-plan c) c)
-          (if run? (reduce resolve-clause c (:late-clauses c)) c))))))
+  (kv/with-wal-overlay-scan-bindings
+    (fn []
+      (binding [qu/*implicit-source* (get (:sources context) '$)]
+        (let [{:keys [result-set] :as context} (planning context)]
+          (if (= result-set #{})
+            (do (pl/plan-explain) context)
+            (as-> context c
+              (do (pl/plan-explain) c)
+              (if run? (execute-plan c) c)
+              (if run? (reduce resolve-clause c (:late-clauses c)) c))))))))
 
 (defn -collect-tuples
   [acc rel ^long len copy-map]
