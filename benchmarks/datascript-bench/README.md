@@ -22,14 +22,11 @@ For more comparisons with other alternatives, you may also consult [this fork](h
 
 ## Results
 
-We ran this benchmark on a 2016 Intel Core i7-6850K CPU @ 3.60GHz with 6 cores, 64GB
-RAM, 1TB SSD, running Debian 6.1.128-1 (2025-02-07) x86_64 GNU/Linux and OpenJDK
-17, with Clojure 1.12.0.
+We ran this benchmark on an Apple M3 Pro with 36GB RAM, running macOS 26.2 and
+OpenJDK 21.0.9, with Clojure 1.12.4.
 
-Datomic peer binary (licensed under Apache 2.0) 1.0.7277 and Datascript 1.7.4
-ran in memory only mode, as they require another database for persistence.
-Datalevin 0.9.20 does not have a in memory only mode, so it writes to database
-files on a RAM disk in `:nosync` mode.
+Datomic peer binary (licensed under Apache 2.0) 1.0.7277, Datascript 1.7.4, and
+Datalevin 0.10.5 all ran in in-memory mode.
 
 Clojure code for benchmarked tasks are given below in Datalevin syntax.
 
@@ -44,19 +41,19 @@ without going through the transaction process. Datomic does not have this
 option.
 
 ```Clojure
-      (d/init-db datoms (u/tmp-dir (str "bench-init" (UUID/randomUUID)))
-                 schema {:kv-opts
-                 {:flags #{:nordahead :writemap :nosync}}})
+      (d/init-db datoms nil schema {:kv-opts {:inmemory? true}})
 ```
 
 |DB|Init Latency (ms)|
 |---|---|
 |Datomic|N/A|
-|Datascript|45.8|
-|Datalevin|152.7|
+|Datascript|13.1|
+|Datalevin|164.7|
 
-Unsurprisingly, Datalevin loads datoms into a DB file slower than Datascript
-loads the same data into memory. The difference ratio is over 3X.
+Datalevin loads datoms into an in-memory DB slower than Datascript. The
+difference ratio is over 12X, because Datalevin still uses its LMDB-backed
+index structures even in memory mode, while Datascript uses a simple in-memory
+sorted set.
 
 #### Add-1
 
@@ -71,27 +68,22 @@ This transacts one datom at a time.
             (d/db-with [[:db/add (:db/id p) :sex       (:sex p)]])
             (d/db-with [[:db/add (:db/id p) :age       (:age p)]])
             (d/db-with [[:db/add (:db/id p) :salary    (:salary p)]])))
-      (d/empty-db (u/tmp-dir (str "bench-add-1" (UUID/randomUUID)))
-                  schema
-                  {:kv-opts {:flags #{:nordahead :writemap :nosync}}})
+      (d/empty-db nil schema {:kv-opts {:inmemory? true}})
       core/people20k)
 ```
 
 |DB|Add-1 Latency (ms)|
 |---|---|
-|Datomic|3601.8|
-|Datascript|1353.1|
-|Datalevin|2263.6|
+|Datomic|1187.2|
+|Datascript|500.4|
+|Datalevin|878.3|
 
 Compared with Init, transacting data is an order of magnitude more expensive,
 since the transaction logic involves a great many number of reads and checks.
 
-Datascript is the fasted and Datomic is the slowest.
+Datascript is the fastest and Datomic is the slowest.
 
-Notice that the difference ratio between Datalevin and Datascript reduces from
-3X to less than 2X, which suggests that Datalevin's transaction process is more efficient.
-This is likely due to faster reads, as Datalevin and Datascript use the same
-high level transaction code, only differ in data access layer.
+Datalevin is between the two, about 1.75X slower than Datascript.
 
 #### Add-5
 
@@ -99,24 +91,20 @@ This transacts one entity (5 datoms) at a time.
 
 ```Clojure
           (reduce (fn [db p] (d/db-with db [p]))
-            (d/empty-db (u/tmp-dir (str "bench-add-5" (UUID/randomUUID)))
-                        schema
-                        {:kv-opts {:flags #{:nordahead :writemap :nosync}}})
+            (d/empty-db nil schema {:kv-opts {:inmemory? true}})
             core/people20k)
 ```
 
 |DB|Add-5 Latency (ms)|
 |---|---|
-|Datomic|1084.0|
-|Datascript|1306.1|
-|Datalevin|1520.6|
+|Datomic|388.5|
+|Datascript|479.9|
+|Datalevin|531.1|
 
-Datomic does better in this condition, more than halves its transaction
-time compared with Add-1 condition, now actually becomes the fastest.
+Datomic does better in this condition, more than halves its transaction time
+compared with Add-1, now actually becomes the fastest.
 
-Datascript's improvement over Add-1 is relatively unremarkable.
-
-Datalevin improved over Add-1 a little more.
+Datascript improves modestly over Add-1. Datalevin is close to Datascript.
 
 #### Add-all
 
@@ -124,22 +112,20 @@ This transacts all 100K datoms in one go.
 
 ```Clojure
     (d/db-with
-      (d/empty-db (u/tmp-dir (str "bench-add-all" (UUID/randomUUID)))
-                  schema
-                  {:kv-opts {:flags #{:nordahead :writemap :nosync}}})
+      (d/empty-db nil schema {:kv-opts {:inmemory? true}})
       core/people20k)
 ```
 
 |DB|Add-all Latency (ms)|
 |---|---|
-|Datomic|411.7|
-|Datascript|1238.8|
-|Datalevin|1298.8|
+|Datomic|168.2|
+|Datascript|469.1|
+|Datalevin|448.5|
 
 Datomic again improves greatly.
 
-Datalevin steadily improves its write speed compared with Add-5, now only a
-little slower than Datascript.
+Datalevin is now slightly faster than Datascript, both within a few percent of
+each other.
 
 #### Retract-5
 
@@ -151,13 +137,12 @@ This retracts one entity at a time.
 
 |DB|Retract-5 Latency (ms)|
 |---|---|
-|Datomic|1729.6|
-|Datascript|545.6|
-|Datalevin|429.5|
+|Datomic|698.1|
+|Datascript|230.4|
+|Datalevin|146.4|
 
-Datalevin is the fastest in retracting data, more than 4X faster than Datomic.
-
-Datascript is close to 3X faster than Datomic.
+Datalevin is the fastest in retracting data, about 1.6X faster than Datascript
+and almost 5X faster than Datomic.
 
 ### Read
 
@@ -177,11 +162,11 @@ returning about 4K IDs.
 ```
 |DB|Q1 Latency (ms)|
 |---|---|
-|Datomic|8.1|
-|Datascript|0.61|
-|Datalevin|0.67|
+|Datomic|1.0|
+|Datascript|0.25|
+|Datalevin|0.22|
 
-Datascript is the fastest for this query, with Datalevin slightly slower. Datomic is an order of magnitude slower.
+Datalevin edges out Datascript for this query. Datomic is several times slower.
 
 #### q2
 
@@ -195,13 +180,13 @@ This adds an unbound attribute to the results.
 ```
 |DB|Q2 Latency (ms)|
 |---|---|
-|Datomic|14.7|
-|Datascript|2.6|
-|Datalevin|0.69|
+|Datomic|2.0|
+|Datascript|1.1|
+|Datalevin|0.25|
 
-Datalevin is now over 3X faster than Datascript. The reason is that Datalevin
+Datalevin is over 4X faster than Datascript. The reason is that Datalevin
 performs a merge scan on the index instead of a hash join to get the values of
-`:age`, so it processed a lot less intermediate results.
+`:age`, so it processes far fewer intermediate results.
 
 Datomic lags further behind Datalevin for this query.
 
@@ -217,19 +202,17 @@ This is the same query as q2, just switched the order of the two where clauses.
 ```
 |DB|Q2-switch Latency (ms)|
 |---|---|
-|Datomic|43.4|
-|Datascript|5.8|
-|Datalevin|0.66|
+|Datomic|9.6|
+|Datascript|2.2|
+|Datalevin|0.24|
 
-In this query, Datalevin has the same speed as q2, and is actually a little
-faster. The query optimizer generates identical plans for q2 and q2-switch, so
-the performance difference is perhaps due to better JVM warmness as this
-benchmark runs latter. Switching the running order confirmed this suspicion.
+Datalevin performs identically to q2 at 0.24ms. The query optimizer generates
+the same plan regardless of clause order.
 
-Now Datascript slows down more than 2X compared with q2. Datomic is even worse,
-slows down close to 3X. The reason is that these databases do not have a query
-optimizer, so they blindly join one clause at a time. If the first clause
-happens to have a huge size, the query slows down significantly.
+Datascript slows down 2X compared with q2. Datomic is even worse, slowing down
+close to 5X. These databases do not have a query optimizer, so they blindly join
+one clause at a time. If the first clause has a large result set, the query
+slows down significantly.
 
 #### q3
 
@@ -247,12 +230,12 @@ the number of tuples in half.
 
 |DB|Q3 Latency (ms)|
 |---|---|
-|Datomic|20.2|
-|Datascript|3.9|
-|Datalevin|1.9|
+|Datomic|2.7|
+|Datascript|1.7|
+|Datalevin|0.13|
 
-Datalevin manages to be 2X faster than Datascript and over 10X faster than
-Datomic for this query.
+Datalevin is over 13X faster than Datascript and over 20X faster than Datomic
+for this query.
 
 #### q4
 
@@ -269,14 +252,15 @@ This adds one more unbound attribute.
 ```
 |DB|Q4 Latency (ms)|
 |---|---|
-|Datomic|25.1|
-|Datascript|5.8|
-|Datalevin|2.3|
+|Datomic|3.7|
+|Datascript|2.5|
+|Datalevin|0.14|
 
-Datalevin's s now 2.5X faster than Datascript and over 10X faster than Datomic.
+Datalevin is now nearly 18X faster than Datascript and over 26X faster than
+Datomic.
 
-An additional unbound attribute adds relatively small overhead in Datalevin,
-while it costs a little more for Datomic and Datascript.
+An additional unbound attribute adds negligible overhead in Datalevin, while it
+costs more for Datomic and Datascript.
 
 #### qpred1
 
@@ -291,11 +275,11 @@ half of the value range, returning about 10K tuples.
 ```
 |DB|QPred1 Latency (ms)|
 |---|---|
-|Datomic|24.7|
-|Datascript|7.1|
-|Datalevin|2.6|
+|Datomic|5.4|
+|Datascript|3.7|
+|Datalevin|1.0|
 
-Datalevin is over 3X faster than Datascript, and about 10X faster than Datomic
+Datalevin is over 3.7X faster than Datascript, and about 5.4X faster than Datomic
 for this query. The reason is that the Datalevin optimizer rewrites the
 predicate into a range boundary for range scan on `:salary`. This query is
 essentially turned into a single range scan in the `:ave` index, so even though
@@ -315,19 +299,18 @@ is passed in as a parameter.
 ```
 |DB|QPred2 Latency (ms)|
 |---|---|
-|Datomic|26.8|
-|Datascript|15.9|
-|Datalevin|2.7|
+|Datomic|6.6|
+|Datascript|6.1|
+|Datalevin|0.99|
 
 Datalevin performs the same as qpred1 for this one. The reason is because the
 optimizer plugs the input parameter into the query directly, so it becomes
 identical to qpred1.
 
-Datascript performs over 2X worse in this one than in qpred1, the reason is that
-Datascript treats each input parameter as an additional relations to be joined,
-often performing Cartesian product due to a lack of shared attributes. Datomic
-performs this one a little worse than qpred1, for unknown reasons, as the code
-is not available.
+Datascript performs over 1.6X worse in this one than in qpred1, because
+Datascript treats each input parameter as an additional relation to be joined,
+often performing a Cartesian product due to a lack of shared attributes. Datomic
+also slows slightly.
 
 ## Conclusion
 

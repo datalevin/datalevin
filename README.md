@@ -302,6 +302,14 @@ Datalevin's default transaction function is over 5X faster than SQLite's
 default; while Datlevin's asynchronous transaction mode is over 20X faster than
 SQLite's WAL mode.
 
+For performance comparison with [Datomic](https://www.datomic.com) and
+[Datascript](https://github.com/tonsky/datascript), see the [DataScript
+benchmark](benchmarks/datascript-bench). Run on an Apple M3 Pro with all three
+databases in in-memory mode, Datalevin is competitive on write operations, and
+significantly outperforms both on complex read queries due to its query
+optimizer. For example, Datalevin is over 13X faster than Datascript on a
+3-way join query and nearly 18X faster on a 4-way join.
+
 Datalevin also has an advanced [rule engine](doc/rules.md), which is much faster
 than Datomic and Datascript that implement the same rule language. [This
 benchmark](benchmarks/math-bench) shows the running time in milliseconds of

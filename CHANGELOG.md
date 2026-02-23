@@ -4,11 +4,12 @@
 
 ### Added
 - [WAL] Write Ahead Log (WAL) mode for both KV and Datalog transactions. When
-  enabled, transaction returns success after WAL is sync'ed to disk. Persistence
-  to DLMDB is done later at checkpoint. This increases write speed while keeping
-  durability guarantees. In memory overlay serves queries for non-checkpointed
-  data. WAL will be the bases for replication, crash recovery and high
-  availability.
+  enabled, transaction returns success after WAL is sync'ed to disk. Disk sync
+  in DLMDB is done later at checkpoint. This increases write speed while keeping
+  durability guarantees.  WAL will be the bases for replication, crash recovery
+  and high availability.
+- [KV] `:inmemory` mode, where the env is entirely in memory and all data is
+  lost on close. It has faster write than `:nosync`.
 
 ## 0.10.5 (2026-02-08)
 

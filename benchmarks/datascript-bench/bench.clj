@@ -138,22 +138,21 @@
    "q4"
    "qpred1"
    "qpred2"
-   "q5"
-   "rules-wide-3x3"
-   "rules-wide-5x3"
-   "rules-wide-7x3"
-   "rules-wide-4x6"
-   "rules-long-10x3"
-   "rules-long-30x3"
-   "rules-long-30x5"
+   ;; "q5"
+   ;; "rules-wide-3x3"
+   ;; "rules-wide-5x3"
+   ;; "rules-wide-7x3"
+   ;; "rules-wide-4x6"
+   ;; "rules-long-10x3"
+   ;; "rules-long-30x3"
+   ;; "rules-long-30x5"
    ])
 
 
 (def default-versions
   [
-   ;; ["latest" "datomic"]
-   ;; ["latest" "datascript"]
-                                        ;["0.9.22" "datalevin"]
+   ["latest" "datomic"]
+   ["latest" "datascript"]
    ["latest" "datalevin"]
    ])
 
