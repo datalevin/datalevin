@@ -27,10 +27,12 @@
    [datalevin.async IAsyncWork]
    [datalevin.remote KVStore]
    [datalevin.interface IAdmin IVectorIndex]
-   [java.io FileOutputStream FileInputStream DataOutputStream DataInputStream]
-   [java.util Map]
+   [java.io File FileOutputStream FileInputStream DataOutputStream
+    DataInputStream]
+   [java.util Arrays Map]
    [java.util.concurrent.atomic AtomicLong]
-   [java.util.concurrent.locks ReentrantReadWriteLock]))
+   [java.util.concurrent.locks ReentrantReadWriteLock]
+   [org.bytedeco.javacpp BytePointer]))
 
 (defn- metric-key->type
   [k]
@@ -61,18 +63,16 @@
   [lmdb domain]
   (str (i/env-dir lmdb) u/+separator+ domain c/vector-index-suffix))
 
-(defn- init-index
-  [^String fname dimensions metric-key quantization connectivity expansion-add
+(defn- create-index
+  [dimensions metric-key quantization connectivity expansion-add
    expansion-search]
-  (let [^DTLV$usearch_index_t index (VecIdx/create
-                                      ^long dimensions
-                                      ^int (metric-key->type metric-key)
-                                      ^int (scalar-kind quantization)
-                                      ^long connectivity
-                                      ^long expansion-add
-                                      ^long expansion-search)]
-    (when (u/file-exists fname) (VecIdx/load index fname))
-    index))
+  (VecIdx/create
+    ^long dimensions
+    ^int (metric-key->type metric-key)
+    ^int (scalar-kind quantization)
+    ^long connectivity
+    ^long expansion-add
+    ^long expansion-search))
 
 (defn- ->array
   [quantization vec-data]
@@ -151,6 +151,122 @@
     (i/visit-list-range lmdb vecs-dbi load [:all] :data [:all] :id)
     [@max-id vecs]))
 
+(defn- open-vec-blob-dbis
+  [lmdb]
+  (assert (not (i/closed-kv? lmdb)) "LMDB env is closed.")
+  (i/open-dbi lmdb c/vec-index-dbi)
+  (i/open-dbi lmdb c/vec-meta-dbi))
+
+(defn- vec-temp-dir
+  [lmdb]
+  (let [dir (File. (str (i/env-dir lmdb) u/+separator+ "tmp"))]
+    (.mkdirs dir)
+    dir))
+
+(defn- checkpoint-to-lmdb
+  [lmdb ^DTLV$usearch_index_t index ^String domain]
+  (let [total-bytes  (VecIdx/serializedLength index)
+        chunk-size   (long c/*vec-chunk-bytes*)
+        safe-buffer  (long (min (long c/*vec-max-buffer-bytes*)
+                                (long Integer/MAX_VALUE)))
+        old-meta     (i/get-value lmdb c/vec-meta-dbi domain :string :data)
+        old-chunks   (long (or (:chunk-count old-meta) 0))
+        chunk-count  (long (Math/ceil (/ (double total-bytes)
+                                         (double chunk-size))))
+        txs          (java.util.ArrayList.)]
+    ;; Remove prior chunks in the same LMDB write txn so stale chunks are not kept.
+    (dotimes [i old-chunks]
+      (.add txs (l/kv-tx :del c/vec-index-dbi [domain i] :data)))
+    (if (<= total-bytes safe-buffer)
+      ;; Buffer mode: serialize to native memory, copy to JVM byte[] and chunk.
+      (let [buf (BytePointer. (long total-bytes))]
+        (try
+          (VecIdx/saveBuffer index buf total-bytes)
+          (let [all-bytes (byte-array (int total-bytes))]
+            (.get buf all-bytes)
+            (dotimes [i chunk-count]
+              (let [offset (int (* i chunk-size))
+                    end    (int (min (+ offset chunk-size) total-bytes))
+                    chunk  (Arrays/copyOfRange all-bytes offset end)]
+                (.add txs (l/kv-tx :put c/vec-index-dbi
+                                   [domain i] chunk :data :bytes)))))
+          (finally
+            (.close buf))))
+      ;; File-spool mode: avoid very large contiguous buffers.
+      (let [tmp-file (File/createTempFile "vec-checkpoint-" ".tmp"
+                                          (vec-temp-dir lmdb))]
+        (try
+          (VecIdx/save index (.getAbsolutePath tmp-file))
+          (with-open [fis (FileInputStream. tmp-file)]
+            (let [read-buf (byte-array (int (min chunk-size
+                                             (long Integer/MAX_VALUE))))]
+              (loop [chunk-id 0]
+                (let [n (.read fis read-buf)]
+                  (when (pos? n)
+                    (let [chunk (Arrays/copyOf read-buf n)]
+                      (.add txs (l/kv-tx :put c/vec-index-dbi
+                                         [domain chunk-id] chunk :data :bytes))
+                      (recur (inc chunk-id))))))))
+          (finally
+            (.delete tmp-file)))))
+    (.add txs (l/kv-tx :put c/vec-meta-dbi domain
+                       {:chunk-count chunk-count
+                        :total-bytes total-bytes}
+                       :string :data))
+    (i/transact-kv lmdb txs)))
+
+(defn- load-from-lmdb
+  [lmdb ^DTLV$usearch_index_t index ^String domain]
+  (when-let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)]
+    (let [total-bytes (long (:total-bytes meta-val))
+          chunk-count (long (:chunk-count meta-val))
+          safe-buffer (long (min (long c/*vec-max-buffer-bytes*)
+                                 (long Integer/MAX_VALUE)))]
+      (if (<= total-bytes safe-buffer)
+        ;; Buffer mode: load chunks into one byte[] then call native load.
+        (let [all-bytes (byte-array (int total-bytes))]
+          (loop [i 0, offset 0]
+            (when (< i chunk-count)
+              (let [chunk0 (or (i/get-value lmdb c/vec-index-dbi
+                                            [domain i] :data :bytes)
+                               (raise "Missing vector blob chunk in LMDB"
+                                      {:domain domain :chunk-id i}))
+                    ^bytes chunk chunk0
+                    len          (alength chunk)]
+                (System/arraycopy ^bytes chunk 0 ^bytes all-bytes
+                                  (int offset) len)
+                (recur (inc i) (+ offset (long len))))))
+          (let [buf (BytePointer. all-bytes)]
+            (try
+              (VecIdx/loadBuffer index buf total-bytes)
+              (finally
+                (.close buf)))))
+        ;; File-spool mode: materialize chunks to a temp file then load.
+        (let [tmp-file (File/createTempFile "vec-load-" ".tmp" (vec-temp-dir lmdb))]
+          (try
+            (with-open [fos (FileOutputStream. tmp-file)]
+              (dotimes [i chunk-count]
+                (let [chunk0 (or (i/get-value lmdb c/vec-index-dbi
+                                              [domain i] :data :bytes)
+                                 (raise "Missing vector blob chunk in LMDB"
+                                        {:domain domain :chunk-id i}))
+                      ^bytes chunk chunk0]
+                  (.write ^FileOutputStream fos chunk))))
+            (VecIdx/load index (.getAbsolutePath tmp-file))
+            (finally
+              (.delete tmp-file)))))
+      true)))
+
+(defn- clear-vec-blobs
+  [lmdb ^String domain]
+  (when-let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)]
+    (let [chunk-count (long (:chunk-count meta-val))
+          txs         (java.util.ArrayList.)]
+      (dotimes [i chunk-count]
+        (.add txs (l/kv-tx :del c/vec-index-dbi [domain i] :data)))
+      (.add txs (l/kv-tx :del c/vec-meta-dbi domain :string))
+      (i/transact-kv lmdb txs))))
+
 (def default-search-opts {:display    :refs
                           :top        10
                           :vec-filter (constantly true)})
@@ -180,6 +296,7 @@
                       closed?
                       ^DTLV$usearch_index_t index
                       ^String fname
+                      ^String domain
                       ^long dimensions
                       ^clojure.lang.Keyword metric-type
                       ^clojure.lang.Keyword quantization
@@ -215,7 +332,9 @@
       (a/exec (a/get-executor) (AsyncVecSave. this fname vec-lock))
       (i/transact-kv lmdb [(l/kv-tx :del vecs-dbi vec-ref)])))
 
-  (persist-vecs [_] (when-not @closed? (VecIdx/save index fname)))
+  (persist-vecs [_]
+    (when-not @closed?
+      (checkpoint-to-lmdb lmdb index domain)))
 
   (close-vecs [this]
     (let [wlock (.writeLock vec-lock)]
@@ -235,7 +354,9 @@
     (.close-vecs this)
     (.empty vecs)
     (i/clear-dbi lmdb vecs-dbi)
-    (u/delete-files fname))
+    (clear-vec-blobs lmdb domain)
+    (when (u/file-exists fname)
+      (u/delete-files fname)))
 
   (vecs-info [_]
     (let [^VecIdx$IndexInfo info (VecIdx/info index)]
@@ -322,18 +443,27 @@
                 search-opts      (default-opts :search-opts)
                 domain           c/default-domain}}]
   (assert dimensions ":dimensions is required")
-  (let [vecs-dbi (str domain "/" c/vec-refs)]
+  (let [vecs-dbi (str domain "/" c/vec-refs)
+        domain   (str domain)]
     (open-dbi lmdb vecs-dbi)
+    (open-vec-blob-dbis lmdb)
     (let [[max-vec-id vecs] (init-vecs lmdb vecs-dbi)
           fname             (index-fname lmdb domain)
-          index             (init-index fname dimensions metric-type
-                                        quantization connectivity
-                                        expansion-add expansion-search)]
+          index             (create-index dimensions metric-type
+                                          quantization connectivity
+                                          expansion-add expansion-search)]
+      ;; Prefer LMDB blob. If absent, migrate from legacy .vid file.
+      (when-not (load-from-lmdb lmdb index domain)
+        (when (u/file-exists fname)
+          (VecIdx/load index fname)
+          (checkpoint-to-lmdb lmdb index domain)
+          (u/delete-files fname)))
       (swap! l/vector-indices assoc fname index)
       (->VectorIndex lmdb
                      (volatile! false)
                      index
                      fname
+                     domain
                      dimensions
                      metric-type
                      quantization
@@ -358,6 +488,7 @@
                  (.-closed? old)
                  (.-index old)
                  (.-fname old)
+                 (.-domain old)
                  (.-dimensions old)
                  (.-metric-type old)
                  (.-quantization old)

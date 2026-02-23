@@ -1984,8 +1984,9 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
   for vectors.
 
   The mapping of semantic references to vectors is stored in the
-  passed-in key-value DB opened by [[open-kv]], while the HNSW index
-  is stored in a file (suffix is `.vid`) under the KV DB directory.
+  passed-in key-value DB opened by [[open-kv]], and the HNSW index blob is
+  also stored in LMDB (DBIs `datalevin/vec-index` and `datalevin/vec-meta`).
+  Legacy `.vid` files are migrated automatically when present.
 
   `opts` is a map that may contain these keys:
 

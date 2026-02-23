@@ -303,6 +303,14 @@
   "dbi name suffix for vec-ref -> vec-id map is `vec-refs`"
   "vec-refs")
 
+(def ^:const vec-index-dbi
+  "dbi name for vector index blob chunks is `datalevin/vec-index`"
+  "datalevin/vec-index")
+
+(def ^:const vec-meta-dbi
+  "dbi name for vector index metadata is `datalevin/vec-meta`"
+  "datalevin/vec-meta")
+
 ;; idoc
 
 (def ^:const idoc-doc-ref
@@ -378,7 +386,7 @@
 (def ^:no-doc ^:const message-format-nippy (unchecked-byte 0x02))
 
 (def ^:const vector-index-suffix
-  "File name suffix for vector index is `.vid`"
+  "Legacy file name suffix for vector index is `.vid`"
   ".vid")
 
 (def ^:const default-metric-type
@@ -404,6 +412,14 @@
 (def ^:const default-multi?
   "Default vector index multi? flag is false"
   false)
+
+(def ^{:dynamic true
+       :doc     "Maximum serialized vector blob bytes to use in-memory buffer mode before file-spool mode"}
+  *vec-max-buffer-bytes* (* 128 1024 1024))
+
+(def ^{:dynamic true
+       :doc     "Chunk size in bytes for vector blobs stored in LMDB"}
+  *vec-chunk-bytes* (* 512 1024 1024))
 
 ;;-------------------------------------------------------------
 ;; user configurable

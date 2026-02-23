@@ -79,6 +79,30 @@ public class VecIdx {
         expectNoError(error, "Fail to load index");
     }
 
+    public static long serializedLength(DTLV.usearch_index_t index) {
+        PointerPointer<BytePointer> error = new PointerPointer<>(1);
+        error.put(0, (BytePointer) null);
+        long length = DTLV.usearch_serialized_length(index, error);
+        expectNoError(error, "Fail to get serialized length");
+        return length;
+    }
+
+    public static void saveBuffer(DTLV.usearch_index_t index,
+                                  Pointer buffer, long length) {
+        PointerPointer<BytePointer> error = new PointerPointer<>(1);
+        error.put(0, (BytePointer) null);
+        DTLV.usearch_save_buffer(index, buffer, length, error);
+        expectNoError(error, "Fail to save index to buffer");
+    }
+
+    public static void loadBuffer(DTLV.usearch_index_t index,
+                                  Pointer buffer, long length) {
+        PointerPointer<BytePointer> error = new PointerPointer<>(1);
+        error.put(0, (BytePointer) null);
+        DTLV.usearch_load_buffer(index, buffer, length, error);
+        expectNoError(error, "Fail to load index from buffer");
+    }
+
     public static void addDouble(DTLV.usearch_index_t index, long key, double[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);

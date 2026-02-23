@@ -8,8 +8,11 @@
   in DLMDB is done later at checkpoint. This increases write speed while keeping
   durability guarantees.  WAL will be the bases for replication, crash recovery
   and high availability.
-- [KV] `:inmemory` mode, where the env is entirely in memory and all data is
-  lost on close. It has faster write than `:nosync`.
+- [KV] `:inmemory` mode, where the env resides entirely in memory and all data is
+  lost on close. It has faster write speed than even `:nosync`.
+
+### Improved
+- [Vector] Vector index persists inside LMDB, keeping atomic guarantees.
 
 ## 0.10.5 (2026-02-08)
 

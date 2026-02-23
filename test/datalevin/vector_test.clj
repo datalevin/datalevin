@@ -54,6 +54,7 @@
 
       (if/close-vecs index)
       (if/close-vecs index) ;; close should be idempotent
+      (is (not (u/file-exists (sut/index-fname lmdb c/default-domain))))
 
       (let [index1 ^VectorIndex (sut/new-vector-index lmdb {:dimensions n})
             info1  (if/vecs-info index1)]
@@ -90,6 +91,7 @@
         (is (= [:nice] (if/search-vec index2 v2)))
         (is (= [[:nice 0.0]] (if/search-vec index2 v2 {:display :refs+dists})))
         (if/clear-vecs index2))
+      (is (not (u/file-exists (sut/index-fname lmdb c/default-domain))))
 
       (let [index3 ^VectorIndex (sut/new-vector-index lmdb {:dimensions n})]
         (is (= 0 (:size (if/vecs-info index3))))
