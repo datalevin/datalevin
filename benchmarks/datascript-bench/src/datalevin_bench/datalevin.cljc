@@ -2,10 +2,7 @@
   (:require
    [datalevin.core :as d]
    [datalevin.query :as q]
-   [datalevin.util :as u]
-   [datalevin-bench.core :as core])
-  (:import
-   [java.util UUID]))
+   [datalevin-bench.core :as core]))
 
 
 (def schema
@@ -71,52 +68,14 @@
                         :name  "Ivan"}]))))
 
 
-(def db100k-1
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query1"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-2
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query2"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-2s
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query2s"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-3
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query3"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-4
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query4"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-5
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-query5"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-
-(def db100k-p1
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-queryp1"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
-(def db100k-p2
-  (d/db-with (d/empty-db (u/tmp-dir (str "datalevin-bench-queryp2"
-                                         (UUID/randomUUID)))
-                         schema)
-             core/people20k))
+(def db100k-1  (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-2  (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-2s (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-3  (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-4  (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-5  (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-p1 (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-p2 (d/db-with (d/empty-db nil schema) core/people20k))
 
 (defn ^:export add-1 []
   (core/bench-10
@@ -129,9 +88,7 @@
               (d/db-with [[:db/add (:db/id p) :sex       (:sex p)]])
               (d/db-with [[:db/add (:db/id p) :age       (:age p)]])
               (d/db-with [[:db/add (:db/id p) :salary    (:salary p)]])))
-        (d/empty-db (u/tmp-dir (str "datalevin-bench-add-1" (UUID/randomUUID)))
-                    schema {:kv-opts
-                            {:flags #{:nordahead :writemap :nosync}}})
+        (d/empty-db nil schema {:kv-opts {:inmemory? true}})
         core/people20k))))
 
 
@@ -139,11 +96,7 @@
   (core/bench-10
     (d/close-db
       (reduce (fn [db p] (d/db-with db [p]))
-              (d/empty-db (u/tmp-dir (str "datalevin-bench-add-5"
-                                          (UUID/randomUUID)))
-                          schema
-                          {:kv-opts
-                           {:flags #{:nordahead :writemap :nosync}}})
+              (d/empty-db nil schema {:kv-opts {:inmemory? true}})
               core/people20k))))
 
 
@@ -151,11 +104,7 @@
   (core/bench-10
     (d/close-db
       (d/db-with
-        (d/empty-db (u/tmp-dir (str "datalevin-bench-add-all"
-                                    (UUID/randomUUID)))
-                    schema
-                    {:kv-opts
-                     {:flags #{:nordahead :writemap :nosync}}})
+        (d/empty-db nil schema {:kv-opts {:inmemory? true}})
         core/people20k))))
 
 
@@ -169,19 +118,12 @@
                        (d/datom id k v)))]
     (core/bench-10
       (d/close-db
-        (d/init-db datoms (u/tmp-dir (str "datalevin-bench-init"
-                                          (UUID/randomUUID)))
-                   schema {:kv-opts
-                           {:flags #{:nordahead :writemap :nosync}}})))))
+        (d/init-db datoms nil schema {:kv-opts {:inmemory? true}})))))
 
 
 (defn ^:export retract-5 []
   (let [db   (d/db-with
-               (d/empty-db (u/tmp-dir (str "datalevin-bench-retract"
-                                           (UUID/randomUUID)))
-                           schema
-                           {:kv-opts
-                            {:flags #{:nordahead :writemap :nosync}}})
+               (d/empty-db nil schema {:kv-opts {:inmemory? true}})
                core/people20k)
         eids (->> (d/datoms db :ave :name) (map :e) (shuffle))
         res  (core/bench-10

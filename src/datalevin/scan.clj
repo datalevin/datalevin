@@ -124,7 +124,7 @@
           (with-open [^AutoCloseable iter
                       (.iterator ^Iterable
                                  (l/iterate-list-sample
-                                   dbi rtx cur indices 0 0 [:all] k-type))]
+                                   dbi rtx cur indices [:all] k-type))]
             (sample iter))
           (raise "Fail to sample-kv: " e
                  {:dbi dbi-name :n n :k-type k-type :v-type v-type}))
@@ -132,7 +132,7 @@
           (with-open [^AutoCloseable iter
                       (.iterator ^Iterable
                                  (l/iterate-key-sample
-                                   dbi rtx cur indices 0 0 [:all] k-type))]
+                                   dbi rtx cur indices [:all] k-type))]
             (sample iter))
           (raise "Fail to sample-kv: " e
                  {:dbi dbi-name :n n :k-type k-type :v-type v-type}))))))
@@ -417,36 +417,20 @@
            {:dbi dbi-name :key-range k-range})))
 
 (defn- filter-count*
-  ([iterable pred raw-pred? k-type v-type]
-   (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-     (loop [c 0]
-       (if (.hasNext ^Iterator iter)
-         (let [kv (.next ^Iterator iter)]
-           (if raw-pred?
-             (if (pred kv)
-               (recur (unchecked-inc c))
-               (recur c))
-             (if (pred (b/read-buffer (l/k kv) k-type)
-                       (when v-type (b/read-buffer (l/v kv) v-type)))
-               (recur (unchecked-inc c))
-               (recur c))))
-         c))))
-  ([iterable pred raw-pred? k-type v-type cap]
-   (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
-     (loop [c 0]
-       (if (= c cap)
-         c
-         (if (.hasNext ^Iterator iter)
-           (let [kv (.next ^Iterator iter)]
-             (if raw-pred?
-               (if (pred kv)
-                 (recur (unchecked-inc c))
-                 (recur c))
-               (if (pred (b/read-buffer (l/k kv) k-type)
-                         (when v-type (b/read-buffer (l/v kv) v-type)))
-                 (recur (unchecked-inc c))
-                 (recur c))))
-           c))))))
+  [iterable pred raw-pred? k-type v-type]
+  (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
+    (loop [c 0]
+      (if (.hasNext ^Iterator iter)
+        (let [kv (.next ^Iterator iter)]
+          (if raw-pred?
+            (if (pred kv)
+              (recur (unchecked-inc c))
+              (recur c))
+            (if (pred (b/read-buffer (l/k kv) k-type)
+                      (when v-type (b/read-buffer (l/v kv) v-type)))
+              (recur (unchecked-inc c))
+              (recur c))))
+        c))))
 
 (defn range-filter-count
   [lmdb dbi-name pred k-range k-type v-type raw-pred?]
@@ -591,13 +575,10 @@
            {:dbi dbi-name :key-range k-range :val-range v-range})))
 
 (defn list-range-filter-count
-  [lmdb dbi-name pred k-range k-type v-range v-type raw-pred? cap]
+  [lmdb dbi-name pred k-range k-type v-range v-type raw-pred?]
   (scan
-    (let [iterable (l/iterate-list dbi rtx cur k-range k-type
-                                   v-range v-type)]
-      (if cap
-        (filter-count* iterable pred raw-pred? k-type v-type cap)
-        (filter-count* iterable pred raw-pred? k-type v-type)))
+    (let [iterable (l/iterate-list dbi rtx cur k-range k-type v-range v-type)]
+      (filter-count* iterable pred raw-pred? k-type v-type))
     (raise "Fail to count filtered list range: " e
            {:dbi dbi-name :key-range k-range :val-range v-range})))
 
@@ -620,20 +601,17 @@
            {:dbi dbi-name :key-range k-range})))
 
 (defn visit-list-sample
-  [lmdb dbi-name indices budget step visitor k-range k-type v-type
-   raw-pred?]
+  [lmdb dbi-name indices visitor k-range k-type v-type raw-pred?]
   (scan
-    (let [iterable (l/iterate-list-sample dbi rtx cur indices budget step
-                                          k-range k-type)]
+    (let [iterable (l/iterate-list-sample dbi rtx cur indices k-range k-type)]
       (visit* iterable visitor raw-pred? k-type v-type))
     (raise "Fail to visit list sample: " e
            {:dbi dbi-name :key-range k-range})))
 
 (defn visit-key-sample
-  [lmdb dbi-name indices budget step visitor k-range k-type raw-pred?]
+  [lmdb dbi-name indices visitor k-range k-type raw-pred?]
   (scan
-    (let [iterable (l/iterate-key-sample dbi rtx cur indices budget step
-                                         k-range k-type)]
+    (let [iterable (l/iterate-key-sample dbi rtx cur indices k-range k-type)]
       (visit* iterable visitor raw-pred? k-type nil))
     (raise "Fail to visit key sample: " e
            {:dbi dbi-name :key-range k-range})))

@@ -480,20 +480,17 @@
     (is (= (if/entries lmdb "list") 10))
 
     (is (= (if/key-range-count lmdb "list" [:all]) 3))
-    (is (= (if/key-range-count lmdb "list" [:all] :string 2) 2))
 
     (if/visit-key-range lmdb "list" kvisit [:all] :string)
     (is (= "a b c" (s/trim @joins)))
 
     (is (= (if/key-range-list-count lmdb "list" [:all] :string) 10))
-    (is (= (if/key-range-list-count lmdb "list" [:all] :string 5) 5))
     (is (= (if/key-range-list-count lmdb "list" [:greater-than "a"] :string)
            6))
     (is (= (if/key-range-list-count lmdb "list" [:closed "A" "d"] :string) 10))
     (is (= (if/key-range-list-count lmdb "list" [:closed "a" "e"] :string) 10))
     (is (= (if/key-range-list-count lmdb "list" [:less-than "c"] :string)
            7))
-    (is (= (if/key-range-list-count lmdb "list" [:less-than "c"] :string 5) 5))
 
     (is (= (if/key-range lmdb "list" [:all] :string) ["a" "b" "c"]))
     (is (= (if/key-range-count lmdb "list" [:greater-than "b"] :string) 1))
@@ -884,3 +881,39 @@
                             [:closed [13 0] [14 0]] :int-int :id)))
     (if/close-kv lmdb)
     (u/delete-files dir)))
+
+(deftest inmemory-test
+  (testing "nil dir implies in-memory"
+    (let [lmdb (l/open-kv nil)]
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" 1 "hello" :long :string]
+                             [:put "a" 2 "world" :long :string]])
+      (is (= "hello" (if/get-value lmdb "a" 1 :long :string)))
+      (is (= "world" (if/get-value lmdb "a" 2 :long :string)))
+      (is (= [[1 "hello"] [2 "world"]]
+             (if/get-range lmdb "a" [:all] :long :string)))
+      (is (not (.exists (clojure.java.io/file (if/env-dir lmdb) c/data-file-name))))
+      (if/close-kv lmdb)))
+
+  (testing "explicit :inmemory? opt"
+    (let [dir  (u/tmp-dir (str "inmemory-" (UUID/randomUUID)))
+          lmdb (l/open-kv dir {:inmemory? true})]
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" :x 42]])
+      (is (= 42 (if/get-value lmdb "a" :x)))
+      (is (not (.exists (clojure.java.io/file dir c/data-file-name))))
+      (if/close-kv lmdb)
+      (u/delete-files dir)))
+
+  (testing "data does not persist across opens"
+    (let [dir  (u/tmp-dir (str "inmemory-persist-" (UUID/randomUUID)))
+          lmdb (l/open-kv dir {:inmemory? true})]
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" :k :v]])
+      (is (= :v (if/get-value lmdb "a" :k)))
+      (if/close-kv lmdb)
+      (let [lmdb2 (l/open-kv dir {:inmemory? true})]
+        (if/open-dbi lmdb2 "a")
+        (is (nil? (if/get-value lmdb2 "a" :k)))
+        (if/close-kv lmdb2))
+      (u/delete-files dir))))

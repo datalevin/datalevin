@@ -68,14 +68,14 @@
     "Return an Iterable of key-values, given the key range")
   (iterate-key [this rtx cur k-range k-type]
     "Return an Iterable based on key range only")
-  (iterate-key-sample [this rtx cur indices budget step k-range k-type]
+  (iterate-key-sample [this rtx cur indices k-range k-type]
     "Return an Iterable of a sample of keys given key range, and an array
     of indices.")
   (iterate-list [this rtx cur k-range k-type v-range v-type]
     "Return an Iterable of key-values given key range and value range,
      applicable only to list dbi")
   (iterate-list-sample
-    [this rtx cur indices budget step k-range k-type]
+    [this rtx cur indices k-range k-type]
     "Return an Iterable of a sample of key-values given key range,
      and an array of indices, applicable only to list dbi")
   (iterate-list-key-range-val-full [this crt cur k-range k-type]

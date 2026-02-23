@@ -2280,19 +2280,13 @@
   [db attr ranges ^long cap]
   (if (identical? ranges :empty-range)
     0
-    (let [start (System/currentTimeMillis)]
-      (unreduced
-        (reduce
-          (fn [^long sum range]
-            (let [s (+ sum (let [[lv hv] (range->start-end range)]
-                             ^long (db/-index-range-size db attr lv hv)))
-                  t (- (System/currentTimeMillis) start)]
-              (if (< s cap)
-                (if (< t ^long c/range-count-time-budget)
-                  s
-                  (reduced (inc s)))
-                (reduced cap))))
-          0 ranges)))))
+    (unreduced
+      (reduce
+        (fn [^long sum range]
+          (let [s (+ sum (let [[lv hv] (range->start-end range)]
+                           ^long (db/-index-range-size db attr lv hv)))]
+            (if (< s cap) s (reduced cap))))
+        0 ranges))))
 
 (defn- count-node-datoms
   [^DB db {:keys [free bound] :as node}]

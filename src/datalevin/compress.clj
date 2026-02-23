@@ -107,15 +107,13 @@
   [db dbi-name size ratio freqs]
   (let [in      (u/reservoir-sampling size (pick ratio size))
         visitor (fn [kv] (collect-keys freqs (l/k kv)))]
-    (visit-key-sample db dbi-name in c/sample-time-budget
-                      c/sample-iteration-step visitor [:all] :raw)))
+    (visit-key-sample db dbi-name in visitor [:all] :raw)))
 
 (defn- sample-values
   [db dbi-name size ratio ^FastList valbytes]
   (let [in      (u/reservoir-sampling size (pick ratio size))
         visitor (fn [kv] (.add valbytes (b/get-bytes (l/v kv))))]
-    (visit-key-sample db dbi-name in c/sample-time-budget
-                      c/sample-iteration-step visitor [:all] :raw)))
+    (visit-key-sample db dbi-name in visitor [:all] :raw)))
 
 (defn- sample-list
   [db dbi-name size ratio freqs]
@@ -128,8 +126,7 @@
                     (when-not (.contains key-set bs)
                       (.add key-set bs)
                       (collect-keys freqs (.rewind kb)))))]
-    (visit-list-sample db dbi-name in c/sample-time-budget
-                       c/sample-iteration-step visitor [:all] :raw :raw)))
+    (visit-list-sample db dbi-name in visitor [:all] :raw :raw)))
 
 (defn sample-key-freqs
   "return a long array of frequencies of 2 bytes symbols for keys,

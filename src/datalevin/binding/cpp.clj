@@ -33,9 +33,9 @@
             IListRandKeyValIterable IListRandKeyValIterator]])
   (:import
    [datalevin.dtlvnative DTLV DTLV$MDB_envinfo DTLV$MDB_stat DTLV$dtlv_key_iter
-    DTLV$dtlv_list_iter DTLV$dtlv_list_sample_iter DTLV$dtlv_list_val_iter
+    DTLV$dtlv_list_iter DTLV$dtlv_list_val_iter
     DTLV$dtlv_list_rank_sample_iter DTLV$dtlv_list_val_full_iter DTLV$MDB_val
-    DTLV$dtlv_list_key_range_full_val_iter DTLV$dtlv_key_sample_iter
+    DTLV$dtlv_list_key_range_full_val_iter
     DTLV$dtlv_key_rank_sample_iter]
    [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException]
    [datalevin.lmdb RangeContext KVTxData]
@@ -82,8 +82,8 @@
 (defn- new-pools
   []
   (Pool. (ThreadLocal/withInitial
-           (reify Supplier
-             (get [_] (ArrayDeque.))))))
+          (reify Supplier
+            (get [_] (ArrayDeque.))))))
 
 (defn- new-bufval [size] (BufVal. size))
 
@@ -91,37 +91,38 @@
   "flag key to int value, cover all flags"
   [k]
   (case k
-    :fixedmap   DTLV/MDB_FIXEDMAP
-    :nosubdir   DTLV/MDB_NOSUBDIR
+    :fixedmap DTLV/MDB_FIXEDMAP
+    :nosubdir DTLV/MDB_NOSUBDIR
     :rdonly-env DTLV/MDB_RDONLY
-    :writemap   DTLV/MDB_WRITEMAP
+    :writemap DTLV/MDB_WRITEMAP
     :nometasync DTLV/MDB_NOMETASYNC
-    :nosync     DTLV/MDB_NOSYNC
-    :mapasync   DTLV/MDB_MAPASYNC
-    :notls      DTLV/MDB_NOTLS
-    :nolock     DTLV/MDB_NOLOCK
-    :nordahead  DTLV/MDB_NORDAHEAD
-    :nomeminit  DTLV/MDB_NOMEMINIT
+    :nosync DTLV/MDB_NOSYNC
+    :mapasync DTLV/MDB_MAPASYNC
+    :notls DTLV/MDB_NOTLS
+    :nolock DTLV/MDB_NOLOCK
+    :nordahead DTLV/MDB_NORDAHEAD
+    :nomeminit DTLV/MDB_NOMEMINIT
+    :inmemory DTLV/MDB_INMEMORY
 
     :cp-compact DTLV/MDB_CP_COMPACT
 
-    :reversekey         DTLV/MDB_REVERSEKEY
-    :dupsort            DTLV/MDB_DUPSORT
-    :integerkey         DTLV/MDB_INTEGERKEY
-    :dupfixed           DTLV/MDB_DUPFIXED
-    :integerdup         DTLV/MDB_INTEGERDUP
-    :reversedup         DTLV/MDB_REVERSEDUP
-    :create             DTLV/MDB_CREATE
+    :reversekey DTLV/MDB_REVERSEKEY
+    :dupsort DTLV/MDB_DUPSORT
+    :integerkey DTLV/MDB_INTEGERKEY
+    :dupfixed DTLV/MDB_DUPFIXED
+    :integerdup DTLV/MDB_INTEGERDUP
+    :reversedup DTLV/MDB_REVERSEDUP
+    :create DTLV/MDB_CREATE
     :prefix-compression DTLV/MDB_PREFIX_COMPRESSION
-    :counted            DTLV/MDB_COUNTED
+    :counted DTLV/MDB_COUNTED
 
     :nooverwrite DTLV/MDB_NOOVERWRITE
-    :nodupdata   DTLV/MDB_NODUPDATA
-    :current     DTLV/MDB_CURRENT
-    :reserve     DTLV/MDB_RESERVE
-    :append      DTLV/MDB_APPEND
-    :appenddup   DTLV/MDB_APPENDDUP
-    :multiple    DTLV/MDB_MULTIPLE
+    :nodupdata DTLV/MDB_NODUPDATA
+    :current DTLV/MDB_CURRENT
+    :reserve DTLV/MDB_RESERVE
+    :append DTLV/MDB_APPEND
+    :appenddup DTLV/MDB_APPENDDUP
+    :multiple DTLV/MDB_MULTIPLE
 
     :rdonly-txn DTLV/MDB_RDONLY))
 
@@ -133,26 +134,26 @@
     (int 0)))
 
 (defonce env-flag-map
-  {0x01      :fixedmap
-   0x4000    :nosubdir
-   0x10000   :nosync
-   0x20000   :rdonly-env
-   0x40000   :nometasync
-   0x80000   :writemap
-   0x100000  :mapasync
-   0x200000  :notls
-   0x400000  :nolock
-   0x800000  :nordahead
+  {0x01 :fixedmap
+   0x4000 :nosubdir
+   0x10000 :nosync
+   0x20000 :rdonly-env
+   0x40000 :nometasync
+   0x80000 :writemap
+   0x100000 :mapasync
+   0x200000 :notls
+   0x400000 :nolock
+   0x800000 :nordahead
    0x1000000 :nomeminit})
 
 (defn- env-flag-keys
   [v]
   (reduce-kv
-    (fn [s i k]
-      (if (not= 0 (bit-and ^int i ^int v))
-        (conj s k)
-        s))
-    #{} env-flag-map))
+   (fn [s i k]
+     (if (not= 0 (bit-and ^int i ^int v))
+       (conj s k)
+       s))
+   #{} env-flag-map))
 
 (defn- put-bufval
   [^BufVal vp k kt compressor ^ByteBuffer cbf]
@@ -246,12 +247,12 @@
 
 (defn- stat-map [^Stat stat]
   (let [^DTLV$MDB_stat s (.get stat)]
-    {:psize          (.ms_psize s)
-     :depth          (.ms_depth s)
-     :branch-pages   (.ms_branch_pages s)
-     :leaf-pages     (.ms_leaf_pages s)
+    {:psize (.ms_psize s)
+     :depth (.ms_depth s)
+     :branch-pages (.ms_branch_pages s)
+     :leaf-pages (.ms_leaf_pages s)
      :overflow-pages (.ms_overflow_pages s)
-     :entries        (.ms_entries s)}))
+     :entries (.ms_entries s)}))
 
 (declare ->KeyIterable ->KeySampleIterable ->ListIterable
          ->ListRandKeyValIterable ->ListFullValIterable ->ListSampleIterable
@@ -285,7 +286,7 @@
         (raise "Key cannot be larger than 511 bytes." {:input x}))
       (catch Exception e
         (raise "Error putting r/w key buffer of "
-               (.dbi-name this)": " e {:value x :type t}))))
+               (.dbi-name this) ": " e {:value x :type t}))))
   (put-val [this x t]
     (try
       (put-bufval vp x t (val-compressor lmdb) v-comp-bf)
@@ -297,7 +298,7 @@
           (put-bufval vp x t (val-compressor lmdb) v-comp-bf)))
       (catch Exception e
         (raise "Error putting r/w value buffer of "
-               (.dbi-name this)": " e {:value x :type t}))))
+               (.dbi-name this) ": " e {:value x :type t}))))
 
   IDB
   (dbi [_] db)
@@ -309,41 +310,41 @@
   (get-kv [_ rtx]
     (let [^BufVal kp (.-kp ^Rtx rtx)
           ^BufVal vp (.-vp ^Rtx rtx)
-          rc         (DTLV/mdb_get (.get ^Txn (.-txn ^Rtx rtx))
-                                   (.get db) (.ptr kp) (.ptr vp))]
+          rc (DTLV/mdb_get (.get ^Txn (.-txn ^Rtx rtx))
+                           (.get db) (.ptr kp) (.ptr vp))]
       (Util/checkRc ^int rc)
       (when-not (= rc DTLV/MDB_NOTFOUND)
         (.outBuf vp))))
   (get-key-rank [_ rtx]
-    (let [^BufVal kp   (.-kp ^Rtx rtx)
+    (let [^BufVal kp (.-kp ^Rtx rtx)
           ^LongPointer rp (LongPointer. 1)
-          rc           (DTLV/mdb_get_key_rank (.get ^Txn (.-txn ^Rtx rtx))
-                                              (.get db) (.ptr kp) nil rp)]
+          rc (DTLV/mdb_get_key_rank (.get ^Txn (.-txn ^Rtx rtx))
+                                    (.get db) (.ptr kp) nil rp)]
       (Util/checkRc ^int rc)
       (when-not (= rc DTLV/MDB_NOTFOUND)
         (.get rp))))
   (get-key-by-rank [_ rtx rank]
     (let [^BufVal kp (.-kp ^Rtx rtx)
           ^BufVal vp (.-vp ^Rtx rtx)
-          rc         (DTLV/mdb_get_rank (.get ^Txn (.-txn ^Rtx rtx))
-                                        (.get db) (long rank) (.ptr kp) (.ptr vp))]
+          rc (DTLV/mdb_get_rank (.get ^Txn (.-txn ^Rtx rtx))
+                                (.get db) (long rank) (.ptr kp) (.ptr vp))]
       (Util/checkRc ^int rc)
       (when-not (= rc DTLV/MDB_NOTFOUND)
         [(.outBuf kp) (.outBuf vp)])))
   (iterate-key [this rtx cur [range-type k1 k2] k-type]
     (let [ctx (l/range-info rtx range-type k1 k2 k-type)]
       (->KeyIterable lmdb this cur rtx ctx)))
-  (iterate-key-sample [this rtx cur indices budget step [range-type k1 k2] k-type]
+  (iterate-key-sample [this rtx cur indices [range-type k1 k2] k-type]
     (let [ctx (l/range-info rtx range-type k1 k2 k-type)]
-      (->KeySampleIterable lmdb this indices budget step cur rtx ctx)))
+      (->KeySampleIterable lmdb this indices cur rtx ctx)))
   (iterate-list [this rtx cur [k-range-type k1 k2] k-type
                  [v-range-type v1 v2] v-type]
     (let [ctx (l/list-range-info rtx k-range-type k1 k2 k-type
                                  v-range-type v1 v2 v-type)]
       (->ListIterable lmdb this cur rtx ctx)))
-  (iterate-list-sample [this rtx cur indices budget step [k-range-type k1 k2] k-type]
+  (iterate-list-sample [this rtx cur indices [k-range-type k1 k2] k-type]
     (let [ctx (l/range-info rtx k-range-type k1 k2 k-type)]
-      (->ListSampleIterable lmdb this indices budget step cur rtx ctx)))
+      (->ListSampleIterable lmdb this indices cur rtx ctx)))
   (iterate-list-val [this rtx cur [v-range-type v1 v2] v-type]
     (let [ctx (l/range-info rtx v-range-type v1 v2 v-type)]
       (->ListRandKeyValIterable lmdb this cur rtx ctx)))
@@ -374,7 +375,7 @@
 
 (defn- dtlv-rc [x]
   (condp = x
-    DTLV/DTLV_TRUE  true
+    DTLV/DTLV_TRUE true
     DTLV/DTLV_FALSE false
     (u/raise "Native iterator returns error code" x {})))
 
@@ -390,18 +391,18 @@
                       ^RangeContext ctx]
   Iterable
   (iterator [_]
-    (let [forward?       (dtlv-bool (.-forward? ctx))
+    (let [forward? (dtlv-bool (.-forward? ctx))
           include-start? (dtlv-bool (.-include-start? ctx))
-          include-stop?  (dtlv-bool (.-include-stop? ctx))
-          sk             (dtlv-val (.-start-bf ctx))
-          ek             (dtlv-val (.-stop-bf ctx))
-          k              (.key cur)
-          v              (.val cur)
-          iter           (DTLV$dtlv_key_iter.)]
+          include-stop? (dtlv-bool (.-include-stop? ctx))
+          sk (dtlv-val (.-start-bf ctx))
+          ek (dtlv-val (.-stop-bf ctx))
+          k (.key cur)
+          v (.val cur)
+          iter (DTLV$dtlv_key_iter.)]
       (Util/checkRc
-        (DTLV/dtlv_key_iter_create
-          iter (.ptr cur) (.ptr k) (.ptr v)
-          ^int forward? ^int include-start? ^int include-stop? sk ek))
+       (DTLV/dtlv_key_iter_create
+        iter (.ptr cur) (.ptr k) (.ptr v)
+        ^int forward? ^int include-start? ^int include-stop? sk ek))
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_key_iter_has_next iter)))
@@ -413,50 +414,30 @@
 (deftype KeySampleIterable [lmdb
                             ^DBI db
                             ^longs indices
-                            ^long budget
-                            ^long step
                             ^Cursor cur
                             ^Rtx rtx
                             ^RangeContext ctx]
   Iterable
   (iterator [_]
-    (let [sk             (dtlv-val (.-start-bf ctx))
-          ek             (dtlv-val (.-stop-bf ctx))
-          forward?       (dtlv-bool (.-forward? ctx))
-          include-start? (dtlv-bool (.-include-start? ctx))
-          include-stop?  (dtlv-bool (.-include-stop? ctx))
-          k              (.key cur)
-          v              (.val cur)
-          dlmdb?         (l/dlmdb?)
-          iter           (if dlmdb?
-                           (DTLV$dtlv_key_rank_sample_iter.)
-                           (DTLV$dtlv_key_sample_iter.))
-          samples        (alength indices)
-          sizets         (SizeTPointer. samples)]
+    (let [sk (dtlv-val (.-start-bf ctx))
+          ek (dtlv-val (.-stop-bf ctx))
+          k (.key cur)
+          v (.val cur)
+          iter (DTLV$dtlv_key_rank_sample_iter.)
+          samples (alength indices)
+          sizets (SizeTPointer. samples)]
       (dotimes [i samples] (.put sizets i (aget indices i)))
       (Util/checkRc
-        (if dlmdb?
-          (DTLV/dtlv_key_rank_sample_iter_create
-            ^DTLV$dtlv_key_rank_sample_iter iter
-            sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek)
-          (DTLV/dtlv_key_sample_iter_create
-            ^DTLV$dtlv_key_sample_iter iter
-            sizets samples budget step (.ptr cur) (.ptr k) (.ptr v)
-            ^int forward? ^int include-start? ^int include-stop? sk ek)))
+       (DTLV/dtlv_key_rank_sample_iter_create
+        ^DTLV$dtlv_key_rank_sample_iter iter
+        sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek))
       (reify
         Iterator
-        (hasNext [_]
-          (dtlv-rc
-            (if dlmdb?
-              (DTLV/dtlv_key_rank_sample_iter_has_next iter)
-              (DTLV/dtlv_key_sample_iter_has_next iter))))
+        (hasNext [_] (dtlv-rc (DTLV/dtlv_key_rank_sample_iter_has_next iter)))
         (next [_] (KV. k v lmdb rtx))
 
         AutoCloseable
-        (close [_]
-          (if dlmdb?
-            (DTLV/dtlv_key_rank_sample_iter_destroy iter)
-            (DTLV/dtlv_key_sample_iter_destroy iter)))))))
+        (close [_] (DTLV/dtlv_key_rank_sample_iter_destroy iter))))))
 
 (deftype ListIterable [lmdb
                        ^DBI db
@@ -467,25 +448,25 @@
   (iterator [_]
     (let [[^RangeContext kctx ^RangeContext vctx] ctx
 
-          forward-key?       (dtlv-bool (.-forward? kctx))
+          forward-key? (dtlv-bool (.-forward? kctx))
           include-start-key? (dtlv-bool (.-include-start? kctx))
-          include-stop-key?  (dtlv-bool (.-include-stop? kctx))
-          sk                 (dtlv-val (.-start-bf kctx))
-          ek                 (dtlv-val (.-stop-bf kctx))
-          forward-val?       (dtlv-bool (.-forward? vctx))
+          include-stop-key? (dtlv-bool (.-include-stop? kctx))
+          sk (dtlv-val (.-start-bf kctx))
+          ek (dtlv-val (.-stop-bf kctx))
+          forward-val? (dtlv-bool (.-forward? vctx))
           include-start-val? (dtlv-bool (.-include-start? vctx))
-          include-stop-val?  (dtlv-bool (.-include-stop? vctx))
-          sv                 (dtlv-val (.-start-bf vctx))
-          ev                 (dtlv-val (.-stop-bf vctx))
-          k                  (.key cur)
-          v                  (.val cur)
-          iter               (DTLV$dtlv_list_iter.)]
+          include-stop-val? (dtlv-bool (.-include-stop? vctx))
+          sv (dtlv-val (.-start-bf vctx))
+          ev (dtlv-val (.-stop-bf vctx))
+          k (.key cur)
+          v (.val cur)
+          iter (DTLV$dtlv_list_iter.)]
       (Util/checkRc
-        (DTLV/dtlv_list_iter_create
-          iter (.ptr cur) (.ptr k) (.ptr v)
-          ^int forward-key? ^int include-start-key? ^int include-stop-key? sk ek
-          ^int forward-val? ^int include-start-val? ^int include-stop-val?
-          sv ev))
+       (DTLV/dtlv_list_iter_create
+        iter (.ptr cur) (.ptr k) (.ptr v)
+        ^int forward-key? ^int include-start-key? ^int include-stop-key? sk ek
+        ^int forward-val? ^int include-start-val? ^int include-stop-val?
+        sv ev))
       (reify
         Iterator
         (hasNext [_] (dtlv-rc (DTLV/dtlv_list_iter_has_next iter)))
@@ -497,46 +478,30 @@
 (deftype ListSampleIterable [lmdb
                              ^DBI db
                              ^longs indices
-                             ^long budget
-                             ^long step
                              ^Cursor cur
                              ^Rtx rtx
                              ^RangeContext ctx]
   Iterable
   (iterator [_]
-    (let [sk      (dtlv-val (.-start-bf ctx))
-          ek      (dtlv-val (.-stop-bf ctx))
-          k       (.key cur)
-          v       (.val cur)
-          dlmdb?  (l/dlmdb?)
-          iter    (if dlmdb?
-                    (DTLV$dtlv_list_rank_sample_iter.)
-                    (DTLV$dtlv_list_sample_iter.))
+    (let [sk (dtlv-val (.-start-bf ctx))
+          ek (dtlv-val (.-stop-bf ctx))
+          k (.key cur)
+          v (.val cur)
+          iter (DTLV$dtlv_list_rank_sample_iter.)
           samples (alength indices)
-          sizets  (SizeTPointer. samples)]
+          sizets (SizeTPointer. samples)]
       (dotimes [i samples] (.put sizets i (aget indices i)))
       (Util/checkRc
-        (if dlmdb?
-          (DTLV/dtlv_list_rank_sample_iter_create
-            ^DTLV$dtlv_list_rank_sample_iter iter
-            sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek)
-          (DTLV/dtlv_list_sample_iter_create
-            ^DTLV$dtlv_list_sample_iter iter
-            sizets samples budget step (.ptr cur) (.ptr k) (.ptr v) sk ek)))
+       (DTLV/dtlv_list_rank_sample_iter_create
+        ^DTLV$dtlv_list_rank_sample_iter iter
+        sizets samples (.ptr cur) (.ptr k) (.ptr v) sk ek))
       (reify
         Iterator
-        (hasNext [_]
-          (dtlv-rc
-            (if dlmdb?
-              (DTLV/dtlv_list_rank_sample_iter_has_next iter)
-              (DTLV/dtlv_list_sample_iter_has_next iter))))
+        (hasNext [_] (dtlv-rc (DTLV/dtlv_list_rank_sample_iter_has_next iter)))
         (next [_] (KV. k v lmdb rtx))
 
         AutoCloseable
-        (close [_]
-          (if l/dlmdb?
-            (DTLV/dtlv_list_rank_sample_iter_destroy iter)
-            (DTLV/dtlv_list_sample_iter_destroy iter)))))))
+        (close [_] (DTLV/dtlv_list_rank_sample_iter_destroy iter))))))
 
 (deftype ListRandKeyValIterable [lmdb
                                  ^DBI db
@@ -545,13 +510,13 @@
                                  ^RangeContext ctx]
   IListRandKeyValIterable
   (val-iterator [_]
-    (let [sv        (dtlv-val (.-start-bf ctx))
-          ev        (dtlv-val (.-stop-bf ctx))
+    (let [sv (dtlv-val (.-start-bf ctx))
+          ev (dtlv-val (.-stop-bf ctx))
           ^BufVal k (.key cur)
           ^BufVal v (.val cur)
-          iter      (DTLV$dtlv_list_val_iter.)]
+          iter (DTLV$dtlv_list_val_iter.)]
       (Util/checkRc
-        (DTLV/dtlv_list_val_iter_create iter (.ptr cur) (.ptr k) (.ptr v) sv ev))
+       (DTLV/dtlv_list_val_iter_create iter (.ptr cur) (.ptr k) (.ptr v) sv ev))
       (reify
         IListRandKeyValIterator
         (seek-key [_ x t]
@@ -571,16 +536,16 @@
   Iterable
   (iterator [_]
     (let [include-start? (dtlv-bool (.-include-start? ctx))
-          include-stop?  (dtlv-bool (.-include-stop? ctx))
-          sk             (dtlv-val (.-start-bf ctx))
-          ek             (dtlv-val (.-stop-bf ctx))
-          k              (.key cur)
-          v              (.val cur)
-          iter           (DTLV$dtlv_list_key_range_full_val_iter.)]
+          include-stop? (dtlv-bool (.-include-stop? ctx))
+          sk (dtlv-val (.-start-bf ctx))
+          ek (dtlv-val (.-stop-bf ctx))
+          k (.key cur)
+          v (.val cur)
+          iter (DTLV$dtlv_list_key_range_full_val_iter.)]
       (Util/checkRc
-        (DTLV/dtlv_list_key_range_full_val_iter_create
-          iter (.ptr cur) (.ptr k) (.ptr v)
-          ^int include-start? ^int include-stop? sk ek))
+       (DTLV/dtlv_list_key_range_full_val_iter_create
+        iter (.ptr cur) (.ptr k) (.ptr v)
+        ^int include-start? ^int include-stop? sk ek))
       (reify
         Iterator
         (hasNext [_]
@@ -598,15 +563,15 @@
   (val-iterator [_]
     (let [^BufVal k (.key cur)
           ^BufVal v (.val cur)
-          iter      (DTLV$dtlv_list_val_full_iter.)]
+          iter (DTLV$dtlv_list_val_full_iter.)]
       (Util/checkRc
-        (DTLV/dtlv_list_val_full_iter_create iter (.ptr cur) (.ptr k) (.ptr v)))
+       (DTLV/dtlv_list_val_full_iter_create iter (.ptr cur) (.ptr k) (.ptr v)))
       (reify
         IListRandKeyValIterator
         (seek-key [_ x t]
           (l/put-key rtx x t)
           (dtlv-rc
-            (DTLV/dtlv_list_val_full_iter_seek iter (.ptr ^BufVal (.-kp rtx)))))
+           (DTLV/dtlv_list_val_full_iter_seek iter (.ptr ^BufVal (.-kp rtx)))))
         (has-next-val [_]
           (dtlv-rc (DTLV/dtlv_list_val_full_iter_has_next iter)))
         (next-val [_] (v-bf v lmdb rtx))
@@ -617,13 +582,13 @@
 (defn- put-tx
   [^DBI dbi txn ^KVTxData tx]
   (case (.-op tx)
-    :put      (do (.put-key dbi (.-k tx) (.-kt tx))
-                  (.put-val dbi (.-v tx) (.-vt tx))
-                  (if-let [f (.-flags tx)]
-                    (.put dbi txn f)
-                    (.put dbi txn)))
-    :del      (do (.put-key dbi (.-k tx) (.-kt tx))
-                  (.del dbi txn))
+    :put (do (.put-key dbi (.-k tx) (.-kt tx))
+             (.put-val dbi (.-v tx) (.-vt tx))
+             (if-let [f (.-flags tx)]
+               (.put dbi txn f)
+               (.put dbi txn)))
+    :del (do (.put-key dbi (.-k tx) (.-kt tx))
+             (.del dbi txn))
     :put-list (let [vs (.-v tx)]
                 (.put-key dbi (.-k tx) (.-kt tx))
                 (doseq [v vs]
@@ -647,10 +612,10 @@
   [txs ^HashMap dbis txn]
   (doseq [t txs]
     (let [^KVTxData tx (l/->kv-tx-data t)
-          dbi-name     (.-dbi-name tx)
-          ^DBI dbi     (or (.get dbis dbi-name)
-                           (raise dbi-name " is not open" {}))
-          validate?    (.-validate-data? dbi)]
+          dbi-name (.-dbi-name tx)
+          ^DBI dbi (or (.get dbis dbi-name)
+                       (raise dbi-name " is not open" {}))
+          validate? (.-validate-data? dbi)]
       (vld/validate-kv-tx-data tx validate?)
       (put-tx dbi txn tx))))
 
@@ -658,7 +623,7 @@
   [^Rtx rtx ^Cursor cur k kt]
   (.put-key rtx k kt)
   (dtlv-c (DTLV/dtlv_list_val_count
-            (.ptr cur) (.ptr ^BufVal (.-kp rtx)) (.ptr ^BufVal (.-vp rtx)))))
+           (.ptr cur) (.ptr ^BufVal (.-kp rtx)) (.ptr ^BufVal (.-vp rtx)))))
 
 (defn- in-list?*
   [^Rtx rtx ^Cursor cur k kt v vt]
@@ -695,14 +660,14 @@
 (defn- start-scheduled-sync
   [scheduled-sync dir ^Env env]
   (let [scheduler ^ScheduledExecutorService (u/get-scheduler)
-        fut       (.scheduleWithFixedDelay
-                    scheduler
-                    ^Runnable #(let [exe (a/get-executor)]
-                                 (when (a/running? exe)
-                                   (a/exec exe (AsyncSync. dir env))))
-                    ^long (rand-int c/lmdb-sync-interval)
-                    ^long c/lmdb-sync-interval
-                    TimeUnit/SECONDS)]
+        fut (.scheduleWithFixedDelay
+             scheduler
+             ^Runnable #(let [exe (a/get-executor)]
+                          (when (a/running? exe)
+                            (a/exec exe (AsyncSync. dir env))))
+             ^long (rand-int c/lmdb-sync-interval)
+             ^long c/lmdb-sync-interval
+             TimeUnit/SECONDS)]
     (vreset! scheduled-sync fut)))
 
 (defn- stop-scheduled-sync
@@ -752,9 +717,9 @@
 
   (mark-write [_]
     (->CppLMDB
-      env info tl-reader dbis scheduled-sync kp-w vp-w start-kp-w
-      stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
-      write-txn true k-comp v-comp meta))
+     env info tl-reader dbis scheduled-sync kp-w vp-w start-kp-w
+     stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
+     write-txn true k-comp v-comp meta))
 
   (reset-write
     [this]
@@ -827,33 +792,33 @@
     (.open-dbi this dbi-name nil))
   (open-dbi [this dbi-name
              {:keys [key-size val-size flags validate-data?]
-              :or   {key-size       (or (get-in @info [:dbis dbi-name :key-size])
-                                        c/+max-key-size+)
-                     val-size       (or (get-in @info [:dbis dbi-name :val-size])
-                                        c/*init-val-size*)
-                     flags          (or (get-in @info [:dbis dbi-name :flags])
-                                        c/default-dbi-flags)
-                     validate-data? (or (get-in @info
-                                                [:dbis dbi-name :validate-data?])
-                                        false)}}]
+              :or {key-size (or (get-in @info [:dbis dbi-name :key-size])
+                                c/+max-key-size+)
+                   val-size (or (get-in @info [:dbis dbi-name :val-size])
+                                c/*init-val-size*)
+                   flags (or (get-in @info [:dbis dbi-name :flags])
+                             c/default-dbi-flags)
+                   validate-data? (or (get-in @info
+                                              [:dbis dbi-name :validate-data?])
+                                      false)}}]
     (.check-ready this)
     (assert (< ^long key-size 512) "Key size cannot be greater than 511 bytes")
     (let [{info-dbis :dbis max-dbis :max-dbs} @info]
       (if (< (count info-dbis) ^long max-dbis)
-        (let [opts     {:key-size       key-size
-                        :val-size       val-size
-                        :flags          flags
-                        :validate-data? validate-data?}
-              flags    (set flags)
+        (let [opts {:key-size key-size
+                    :val-size val-size
+                    :flags flags
+                    :validate-data? validate-data?}
+              flags (set flags)
               dupsort? (if (:dupsort flags) true false)
               counted? (if (:counted flags) true false)
-              kp       (new-bufval key-size)
-              vp       (new-bufval val-size)
-              kc       (bf/allocate-buffer key-size)
-              vc       (bf/allocate-buffer val-size)
-              dbi      (Dbi/create env dbi-name (kv-flags flags))
-              db       (DBI. this dbi (new-pools) kp vp kc vc
-                             dupsort? counted? validate-data?)]
+              kp (new-bufval key-size)
+              vp (new-bufval val-size)
+              kc (bf/allocate-buffer key-size)
+              vc (bf/allocate-buffer val-size)
+              dbi (Dbi/create env dbi-name (kv-flags flags))
+              db (DBI. this dbi (new-pools) kp vp kc vc
+                       dupsort? counted? validate-data?)]
           (when (not= dbi-name c/kv-info)
             (vswap! info assoc-in [:dbis dbi-name] opts)
             (transact-kv this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
@@ -941,7 +906,7 @@
                  {:cause (.getMessage e)})))))
 
   (return-rtx [this rtx]
-    (when-not  (.closed-kv? this)
+    (when-not (.closed-kv? this)
       (if (.isVirtual (Thread/currentThread))
         (do (.abort ^Txn (.-txn ^Rtx rtx))
             (.remove tl-reader))
@@ -950,7 +915,7 @@
   (stat [_]
     (try
       (let [stat ^Stat (Stat/create env)
-            m    (stat-map stat)]
+            m (stat-map stat)]
         (.close stat)
         m)
       (catch Exception e
@@ -959,11 +924,11 @@
     (if dbi-name
       (let [^Rtx rtx (.get-rtx this)]
         (try
-          (let [^DBI dbi   (.get-dbi this dbi-name false)
-                ^Dbi db    (.-db dbi)
-                ^Txn txn   (.-txn rtx)
+          (let [^DBI dbi (.get-dbi this dbi-name false)
+                ^Dbi db (.-db dbi)
+                ^Txn txn (.-txn rtx)
                 ^Stat stat (Stat/create txn db)
-                m          (stat-map stat)]
+                m (stat-map stat)]
             (.close stat)
             m)
           (catch Exception e
@@ -974,16 +939,15 @@
   (entries [this dbi-name]
     (let [^DBI dbi (.get-dbi this dbi-name)
           ^Rtx rtx (.get-rtx this)
-          ^Dbi db  (.-db dbi)
+          ^Dbi db (.-db dbi)
           ^Txn txn (.-txn rtx)]
       (try
         (if (.-counted? dbi)
           (with-open [^LongPointer ptr (LongPointer. 1)]
             (DTLV/mdb_count_all (.get txn) (.get db) (int 0) ptr)
             (.get ptr))
-          (let [
-                ^Stat stat (Stat/create txn db)
-                entries    (.ms_entries ^DTLV$MDB_stat (.get stat))]
+          (let [^Stat stat (Stat/create txn db)
+                entries (.ms_entries ^DTLV$MDB_stat (.get stat))]
             (.close stat)
             entries))
         (catch Exception e
@@ -1035,14 +999,14 @@
   (transact-kv [this dbi-name txs k-type v-type]
     (locking write-txn
       (.check-ready this)
-      (let [^Rtx rtx  @write-txn
+      (let [^Rtx rtx @write-txn
             one-shot? (nil? rtx)
-            ^DBI dbi  (when dbi-name
-                        (or (.get dbis dbi-name)
-                            (raise dbi-name " is not open" {})))
-            ^Txn txn  (if one-shot?
-                        (Txn/create env)
-                        (.-txn rtx))]
+            ^DBI dbi (when dbi-name
+                       (or (.get dbis dbi-name)
+                           (raise dbi-name " is not open" {})))
+            ^Txn txn (if one-shot?
+                       (Txn/create env)
+                       (.-txn rtx))]
         (try
           (if dbi
             (transact1* txs dbi txn k-type v-type)
@@ -1144,38 +1108,23 @@
 
   (key-range-count [lmdb dbi-name k-range]
     (.key-range-count lmdb dbi-name k-range :data))
-  (key-range-count [lmdb dbi-name k-range k-type]
-    (.key-range-count lmdb dbi-name k-range k-type nil))
-  (key-range-count [lmdb dbi-name [range-type k1 k2] k-type cap]
+  (key-range-count [lmdb dbi-name [range-type k1 k2] k-type]
     (scan/scan
-      (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
-            forward           (dtlv-bool (.-forward? ctx))
-            start             (dtlv-bool (.-include-start? ctx))
-            end               (dtlv-bool (.-include-stop? ctx))
-            sk                (dtlv-val (.-start-bf ctx))
-            ek                (dtlv-val (.-stop-bf ctx))]
-        (dtlv-c
-          (if cap
-            (DTLV/dtlv_key_range_count_cap
-              (.ptr ^Cursor cur) cap
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              forward start end sk ek)
-            (if (l/dlmdb?)
-              (let [flag (BitOps/intOr
-                           (if (.-include-start? ctx)
-                             (int DTLV/MDB_COUNT_LOWER_INCL) 0)
-                           (if (.-include-stop? ctx)
-                             (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
-                (with-open [total (LongPointer. 1)]
-                  (DTLV/mdb_range_count_keys
-                    (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
-                    sk ek flag total)
-                  (.get ^LongPointer total)))
-              (DTLV/dtlv_key_range_count
-                (.ptr ^Cursor cur)
-                (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-                forward start end sk ek)))))
-      (raise "Fail to count key range: " e {:dbi dbi-name})))
+     (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
+           forward? (.-forward? ctx)
+           lower (if forward? (.-start-bf ctx) (.-stop-bf ctx))
+           upper (if forward? (.-stop-bf ctx) (.-start-bf ctx))
+           include-lower? (if forward? (.-include-start? ctx) (.-include-stop? ctx))
+           include-upper? (if forward? (.-include-stop? ctx) (.-include-start? ctx))
+           flag (BitOps/intOr
+                 (if include-lower? (int DTLV/MDB_COUNT_LOWER_INCL) 0)
+                 (if include-upper? (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
+       (with-open [total (LongPointer. 1)]
+         (DTLV/mdb_range_count_keys
+          (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
+          (dtlv-val lower) (dtlv-val upper) flag total)
+         (.get ^LongPointer total)))
+     (raise "Fail to count key range: " e {:dbi dbi-name})))
 
   (range-seq [this dbi-name k-range]
     (.range-seq this dbi-name k-range :data :data false nil))
@@ -1203,7 +1152,7 @@
   (get-some [this dbi-name pred k-range k-type v-type]
     (.get-some this dbi-name pred k-range k-type v-type false true))
   (get-some [this dbi-name pred k-range k-type v-type ignore-key?]
-    (.get-some this dbi-name pred k-range k-type v-type  ignore-key? true))
+    (.get-some this dbi-name pred k-range k-type v-type ignore-key? true))
   (get-some [this dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
     (scan/get-some this dbi-name pred k-range k-type v-type ignore-key?
                    raw-pred?))
@@ -1215,7 +1164,7 @@
   (range-filter [this dbi-name pred k-range k-type v-type]
     (.range-filter this dbi-name pred k-range k-type v-type false true))
   (range-filter [this dbi-name pred k-range k-type v-type ignore-key?]
-    (.range-filter this dbi-name pred k-range k-type v-type  ignore-key? true))
+    (.range-filter this dbi-name pred k-range k-type v-type ignore-key? true))
   (range-filter [this dbi-name pred k-range k-type v-type ignore-key? raw-pred?]
     (scan/range-filter this dbi-name pred k-range k-type v-type ignore-key?
                        raw-pred?))
@@ -1257,25 +1206,23 @@
     (scan/visit this dbi-name visitor k-range k-type v-type raw-pred?))
 
   (visit-key-sample
-    [db dbi-name indices budget step visitor k-range k-type]
-    (.visit-key-sample
-      db dbi-name indices budget step visitor k-range k-type true))
+    [db dbi-name indices visitor k-range k-type]
+    (.visit-key-sample db dbi-name indices visitor k-range k-type true))
   (visit-key-sample
-    [db dbi-name indices budget step visitor k-range k-type raw-pred?]
-    (scan/visit-key-sample
-      db dbi-name indices budget step visitor k-range k-type raw-pred?))
+    [db dbi-name indices visitor k-range k-type raw-pred?]
+    (scan/visit-key-sample db dbi-name indices visitor k-range k-type raw-pred?))
 
   (open-list-dbi [this dbi-name {:keys [key-size val-size flags]
-                                 :or   {key-size c/+max-key-size+
-                                        val-size c/+max-key-size+
-                                        flags    c/default-dbi-flags}}]
+                                 :or {key-size c/+max-key-size+
+                                      val-size c/+max-key-size+
+                                      flags c/default-dbi-flags}}]
     (.check-ready this)
     (assert (and (>= c/+max-key-size+ ^long key-size)
                  (>= c/+max-key-size+ ^long val-size))
             "Data size cannot be larger than 511 bytes")
     (.open-dbi this dbi-name
                {:key-size key-size :val-size val-size
-                :flags    (conj flags :dupsort)}))
+                :flags (conj flags :dupsort)}))
   (open-list-dbi [lmdb dbi-name]
     (.open-list-dbi lmdb dbi-name nil))
 
@@ -1304,67 +1251,34 @@
     (.check-ready lmdb)
     (if k
       (scan/scan
-        (list-count* rtx cur k kt)
-        (raise "Fail to count list: " e {:dbi dbi-name :k k}))
+       (list-count* rtx cur k kt)
+       (raise "Fail to count list: " e {:dbi dbi-name :k k}))
       0))
 
   (near-list [lmdb dbi-name k v kt vt]
     (.check-ready lmdb)
     (scan/scan
-      (near-list* rtx cur k kt v vt)
-      (raise "Fail to get an item that is near in a list: "
-             e {:dbi dbi-name :k k :v v})))
+     (near-list* rtx cur k kt v vt)
+     (raise "Fail to get an item that is near in a list: "
+            e {:dbi dbi-name :k k :v v})))
 
   (in-list? [lmdb dbi-name k v kt vt]
     (.check-ready lmdb)
     (if (and k v)
       (scan/scan
-        (in-list?* rtx cur k kt v vt)
-        (raise "Fail to test if an item is in list: "
-               e {:dbi dbi-name :k k :v v}))
+       (in-list?* rtx cur k kt v vt)
+       (raise "Fail to test if an item is in list: "
+              e {:dbi dbi-name :k k :v v}))
       false))
 
   (key-range-list-count [lmdb dbi-name k-range k-type]
-    (.key-range-list-count lmdb dbi-name k-range k-type nil nil))
-  (key-range-list-count [lmdb dbi-name k-range k-type cap]
-    (.key-range-list-count lmdb dbi-name k-range k-type cap nil))
-  (key-range-list-count [lmdb dbi-name k-range k-type cap budget]
-    (if (l/dlmdb?)
-      (key-range-list-count-fast lmdb dbi-name k-range k-type cap)
-      (key-range-list-count-slow lmdb dbi-name k-range k-type cap budget)))
+    (key-range-list-count-fast lmdb dbi-name k-range k-type))
 
   (list-range [this dbi-name k-range kt v-range vt]
     (scan/list-range this dbi-name k-range kt v-range vt))
 
-  (list-range-count [lmdb dbi-name k-range kt v-range vt]
-    (.list-range-count lmdb dbi-name k-range kt v-range vt nil))
-  (list-range-count [lmdb dbi-name [k-range-type k1 k2] k-type
-                     [v-range-type v1 v2] v-type cap]
-    (scan/scan
-      (let [[^RangeContext kctx ^RangeContext vctx]
-            (l/list-range-info rtx k-range-type k1 k2 k-type
-                               v-range-type v1 v2 v-type)
-            kforward (dtlv-bool (.-forward? kctx))
-            kstart   (dtlv-bool (.-include-start? kctx))
-            kend     (dtlv-bool (.-include-stop? kctx))
-            sk       (dtlv-val (.-start-bf kctx))
-            ek       (dtlv-val (.-stop-bf kctx))
-            vforward (dtlv-bool (.-forward? vctx))
-            vstart   (dtlv-bool (.-include-start? vctx))
-            vend     (dtlv-bool (.-include-stop? vctx))
-            sv       (dtlv-val (.-start-bf vctx))
-            ev       (dtlv-val (.-stop-bf vctx))]
-        (dtlv-c
-          (if cap
-            (DTLV/dtlv_list_range_count_cap
-              (.ptr ^Cursor cur) cap
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              kforward kstart kend sk ek vforward vstart vend sv ev)
-            (DTLV/dtlv_list_range_count
-              (.ptr ^Cursor cur)
-              (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-              kforward kstart kend sk ek vforward vstart vend sv ev))))
-      (raise "Fail to count list range: " e {:dbi dbi-name})))
+  (list-range-count [lmdb dbi-name k-range k-type v-range v-type]
+    (key-range-list-count-fast lmdb dbi-name k-range k-type))
 
   (list-range-first [this dbi-name k-range kt v-range vt]
     (scan/list-range-first this dbi-name k-range kt v-range vt))
@@ -1391,15 +1305,11 @@
   (list-range-filter-count
     [this list-name pred k-range k-type v-range v-type]
     (.list-range-filter-count this list-name pred k-range k-type v-range
-                              v-type true nil))
+                              v-type true))
   (list-range-filter-count
     [this dbi-name pred k-range kt v-range vt raw-pred?]
-    (.list-range-filter-count this dbi-name pred k-range kt v-range
-                              vt raw-pred? nil))
-  (list-range-filter-count
-    [this dbi-name pred k-range kt v-range vt raw-pred? cap]
     (scan/list-range-filter-count this dbi-name pred k-range kt v-range
-                                  vt raw-pred? cap))
+                                  vt raw-pred?))
 
   (visit-list-range
     [this list-name visitor k-range k-type v-range v-type]
@@ -1420,13 +1330,11 @@
                                v-type raw-pred?))
 
   (visit-list-sample
-    [this list-name indices budget step visitor k-range k-type v-type]
-    (.visit-list-sample this list-name indices budget step visitor k-range
-                        k-type v-type true))
+    [this list-name indices visitor k-range k-type v-type]
+    (.visit-list-sample this list-name indices visitor k-range k-type v-type true))
   (visit-list-sample
-    [this dbi-name indices budget step visitor k-range kt vt raw-pred?]
-    (scan/visit-list-sample this dbi-name indices budget step visitor k-range
-                            kt vt raw-pred?))
+    [this dbi-name indices visitor k-range kt vt raw-pred?]
+    (scan/visit-list-sample this dbi-name indices visitor k-range kt vt raw-pred?))
 
   (operate-list-val-range
     [this dbi-name operator v-range vt]
@@ -1436,51 +1344,27 @@
   (re-index [this opts] (l/re-index* this opts)))
 
 (defn- key-range-list-count-fast
-  [lmdb dbi-name [range-type k1 k2] k-type cap]
+  [lmdb dbi-name [range-type k1 k2] k-type]
   (scan/scan
-    (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
-          flag              (BitOps/intOr
-                              (if (.-include-start? ctx)
-                                (int DTLV/MDB_COUNT_LOWER_INCL) 0)
-                              (if (.-include-stop? ctx)
-                                (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
-      (with-open [ptr (LongPointer. 1)]
-        (DTLV/mdb_range_count_values
-          (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
-          (dtlv-val (.-start-bf ctx)) (dtlv-val (.-stop-bf ctx))
-          flag ptr)
-        (let [res (.get ^LongPointer ptr)]
-          (if (and cap (> ^long res ^long cap)) cap res))))
-    (raise "Fail to count (fast) list in key range: " e {:dbi dbi-name})))
-
-(defn- key-range-list-count-slow
-  [lmdb dbi-name [range-type k1 k2] k-type cap budget]
-  (scan/scan
-    (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
-          forward           (dtlv-bool (.-forward? ctx))
-          start             (dtlv-bool (.-include-start? ctx))
-          end               (dtlv-bool (.-include-stop? ctx))
-          sk                (dtlv-val (.-start-bf ctx))
-          ek                (dtlv-val (.-stop-bf ctx))]
-      (dtlv-c
-        (cond
-          budget
-          (DTLV/dtlv_key_range_list_count_cap_budget
-            (.ptr ^Cursor cur) cap budget c/range-count-iteration-step
-            (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-            forward start end sk ek)
-          cap
-          (let [res (DTLV/dtlv_key_range_list_count_cap
-                      (.ptr ^Cursor cur) cap
-                      (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-                      forward start end sk ek)]
-            (if (> ^long res ^long cap) cap res))
-          :else
-          (DTLV/dtlv_key_range_list_count
-            (.ptr ^Cursor cur)
-            (.ptr ^BufVal (.-kp ^Rtx rtx)) (.ptr ^BufVal (.-vp ^Rtx rtx))
-            forward start end sk ek))))
-    (raise "Fail to count (slow) list in key range: " e {:dbi dbi-name})))
+   (let [^RangeContext ctx (l/range-info rtx range-type k1 k2 k-type)
+         forward? (.-forward? ctx)
+          ;; mdb_range_count_values expects (lower, upper) in ascending order.
+          ;; For forward ranges: start-bf=lower, stop-bf=upper.
+          ;; For backward ranges: start-bf=upper, stop-bf=lower, so swap.
+         lower (if forward? (.-start-bf ctx) (.-stop-bf ctx))
+         upper (if forward? (.-stop-bf ctx) (.-start-bf ctx))
+         include-lower? (if forward? (.-include-start? ctx) (.-include-stop? ctx))
+         include-upper? (if forward? (.-include-stop? ctx) (.-include-start? ctx))
+         flag (BitOps/intOr
+               (if include-lower? (int DTLV/MDB_COUNT_LOWER_INCL) 0)
+               (if include-upper? (int DTLV/MDB_COUNT_UPPER_INCL) 0))]
+     (with-open [ptr (LongPointer. 1)]
+       (DTLV/mdb_range_count_values
+        (.get ^Txn (.-txn ^Rtx rtx)) (.get ^Dbi (.-db ^DBI dbi))
+        (dtlv-val lower) (dtlv-val upper)
+        flag ptr)
+       (.get ^LongPointer ptr)))
+   (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
 (defn- init-info
   [^CppLMDB lmdb new-info]
@@ -1503,29 +1387,30 @@
 (defn- open-kv*
   [dir dir-file db-file {:keys [mapsize max-readers flags max-dbs temp?
                                 key-compress val-compress]
-                         :or   {max-readers c/*max-readers*
-                                max-dbs     c/*max-dbs*
-                                mapsize     c/*init-db-size*
-                                flags       c/default-env-flags
-                                temp?       false}
-                         :as   opts}]
+                         :or {max-readers c/*max-readers*
+                              max-dbs c/*max-dbs*
+                              mapsize c/*init-db-size*
+                              flags c/default-env-flags
+                              temp? false}
+                         :as opts}]
   (try
-    (let [mapsize       (* (long (if (.exists ^File db-file)
-                                   (c/pick-mapsize db-file)
-                                   mapsize))
-                           1024 1024)
-          flags         (if temp?
-                          (conj flags :nosync)
-                          flags)
-          ^Env env      (Env/create dir mapsize max-readers max-dbs
-                                    (kv-flags flags))
-          info          (cond-> (merge opts {:dir          dir
-                                             :flags        flags
-                                             :max-readers  max-readers
-                                             :max-dbs      max-dbs
-                                             :temp?        temp?})
-                          key-compress (assoc :key-compress key-compress)
-                          val-compress (assoc :val-compress val-compress))
+    (let [inmemory? (some #{:inmemory} flags)
+          mapsize (* (long (if (or inmemory? (not (.exists ^File db-file)))
+                             mapsize
+                             (c/pick-mapsize db-file)))
+                     1024 1024)
+          flags (cond
+                  (or inmemory? temp?) (conj flags :nosync)
+                  :else flags)
+          ^Env env (Env/create dir mapsize max-readers max-dbs
+                               (kv-flags flags))
+          info (cond-> (merge opts {:dir dir
+                                    :flags flags
+                                    :max-readers max-readers
+                                    :max-dbs max-dbs
+                                    :temp? temp?})
+                 key-compress (assoc :key-compress key-compress)
+                 val-compress (assoc :val-compress val-compress))
           ^CppLMDB lmdb (->CppLMDB env
                                    (volatile! info)
                                    (ThreadLocal.)
@@ -1546,16 +1431,18 @@
                                    nil)]
       (swap! l/lmdb-dirs conj dir)
       (open-dbi lmdb c/kv-info) ;; never compressed
-      (if temp?
-        (u/delete-on-exit dir-file)
+      (cond
+        inmemory? nil
+        temp? (u/delete-on-exit dir-file)
+        :else
         (let [k-comp (when (and key-compress
                                 (.exists (io/file dir c/keycode-file-name)))
                        (cp/load-key-compressor
-                         (str dir u/+separator+ c/keycode-file-name)))
+                        (str dir u/+separator+ c/keycode-file-name)))
               v-comp (when (and val-compress
                                 (.exists (io/file dir c/valcode-file-name)))
                        (cp/load-val-compressor
-                         (str dir u/+separator+ c/valcode-file-name)))]
+                        (str dir u/+separator+ c/valcode-file-name)))]
           (init-info lmdb info)
           (set-max-val-size lmdb (max-val-size lmdb))
           (set-key-compressor lmdb k-comp)
@@ -1571,28 +1458,37 @@
 (defmethod open-kv :cpp
   ([dir] (open-kv dir {}))
   ([dir opts]
-   (assert (string? dir) "directory should be a string.")
-   (let [dir-file  (u/file dir)
-         db-file   (io/file dir c/data-file-name)
-         exist-db? (.exists db-file)
-         version   (read-version-file dir-file)]
-     (cond
-       (not exist-db?)
-       (let [lmdb (open-kv* dir dir-file db-file opts)]
-         (write-version-file dir-file c/version)
-         lmdb)
-       version
-       (do
-         (when (not= version c/version)
-           (if-let [{:keys [major minor patch]} (c/parse-version version)]
-             (let [{cmajor :major cminor :minor} (c/parse-version c/version)]
-               (when (and c/require-migration?
-                          (or (< ^long major ^long cmajor)
-                              (< ^long minor ^long cminor)))
-                 (m/perform-migration dir major minor patch))
-               (write-version-file dir-file c/version))
-             (raise "Corrupt VERSION file" {:input version})))
-         (open-kv* dir dir-file db-file opts))
-       :else
-       (raise "Database requires migration. Please follow instruction at https://github.com/datalevin/datalevin/blob/master/doc/upgrade.md"
-              {:dir dir})))))
+   (let [inmemory? (or (nil? dir)
+                       (:inmemory? opts)
+                       (some #{:inmemory} (:flags opts)))
+         dir (or dir (str (u/tmp-dir) (java.util.UUID/randomUUID)))
+         _ (assert (string? dir) "directory should be a string.")
+         dir-file (u/file dir)
+         db-file (io/file dir c/data-file-name)
+         opts (if inmemory?
+                (update opts :flags (fnil conj c/default-env-flags) :inmemory)
+                opts)]
+     (if inmemory?
+       (open-kv* dir dir-file db-file opts)
+       (let [exist-db? (.exists db-file)
+             version (read-version-file dir-file)]
+         (cond
+           (not exist-db?)
+           (let [lmdb (open-kv* dir dir-file db-file opts)]
+             (write-version-file dir-file c/version)
+             lmdb)
+           version
+           (do
+             (when (not= version c/version)
+               (if-let [{:keys [major minor patch]} (c/parse-version version)]
+                 (let [{cmajor :major cminor :minor} (c/parse-version c/version)]
+                   (when (and c/require-migration?
+                              (or (< ^long major ^long cmajor)
+                                  (< ^long minor ^long cminor)))
+                     (m/perform-migration dir major minor patch))
+                   (write-version-file dir-file c/version))
+                 (raise "Corrupt VERSION file" {:input version})))
+             (open-kv* dir dir-file db-file opts))
+           :else
+           (raise "Database requires migration. Please follow instruction at https://github.com/datalevin/datalevin/blob/master/doc/upgrade.md"
+                  {:dir dir})))))))

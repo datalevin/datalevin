@@ -67,7 +67,7 @@
   (-rseek-datoms [db index c1 c2 c3] [db index c1 c2 c3 n])
   (-cardinality [db attr])
   (-index-range [db attr start end])
-  (-index-range-size [db attr start end] [db attr start end cap]))
+  (-index-range-size [db attr start end]))
 
 (defprotocol IDB
   (-schema [db])
@@ -492,11 +492,11 @@
           store [:count e a v cap]
         (case-tree
           [e a (some? v)]
-          [(size store :eav (datom e a v) (datom e a v) cap) ; e a v
-           (size store :eav (datom e a c/v0) (datom e a c/vmax) cap) ; e a _
+          [(size store :eav (datom e a v) (datom e a v)) ; e a v
+           (size store :eav (datom e a c/v0) (datom e a c/vmax)) ; e a _
            (size-filter store :eav
                         (fn [^Datom d] ((s/vpred v) (.-v d)))
-                        (datom e nil nil) (datom e nil nil) cap)  ; e _ v
+                        (datom e nil nil) (datom e nil nil))  ; e _ v
            (e-size store e) ; e _ _
            (av-size store a v) ; _ a v
            (a-size store a) ; _ a _
@@ -596,12 +596,9 @@
 
   (-index-range-size
     [db attr start end]
-    (.-index-range-size db attr start end nil))
-  (-index-range-size
-    [db attr start end cap]
     (wrap-cache
         store [:index-range-size attr start end]
-      (av-range-size store attr start end cap))))
+      (av-range-size store attr start end))))
 
 ;; (defmethod print-method DB [^DB db, ^java.io.Writer w]
 ;;   (binding [*out* w]

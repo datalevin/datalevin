@@ -936,6 +936,11 @@ Only usable for debug output.
    e.g. `:rdonly-env`, `:nosubdir`, and so on. See [[set-env-flags]].
   * `:temp?` a boolean, indicating if this db is temporary, if so, the file
    will be deleted on JVM exit.
+  * `:inmemory?` a boolean, indicating if this db is in-memory only, with no
+   data persisted to disk. `dir` may be `nil`, in which case a unique temporary
+   path is generated automatically. If `dir` is provided, it is used as the
+   environment path and will be created if it does not exist. Passing `nil` as
+   `dir` also implies in-memory mode without needing to set this option.
   * `:client-opts` is the option map passed to the client if `dir` is a
    remote server URI string.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior

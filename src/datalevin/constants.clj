@@ -567,21 +567,6 @@ values means trust sampled high ratio more."}
        :doc     "Change ratio of an attribute's values, beyond which re-sampling will be done"}
   sample-change-ratio 0.05)
 
-(def ^{:dynamic true
-       :doc     "The time budget allocated for sampling an attribute, in milliseconds. The sampling will stop if it takes longer than this."}
-  sample-time-budget 2)
-
-(def ^{:dynamic true
-       :doc     "The time measure is taken every this step of iterations when sampling."}
-  sample-iteration-step 20000)
-
-(def ^{:dynamic true
-       :doc     "The time budget allocated for counting av ranges of an attribute, in milliseconds. The counting will stop if it takes longer than this."}
-  range-count-time-budget 10)
-
-(def ^{:dynamic true
-       :doc     "The time measure is taken every this step of iterations when counting."}
-  range-count-iteration-step 1000)
 
 (def ^{:dynamic true
        :doc     "Max milliseconds to wait for a tuple before failing. nil to wait forever."}

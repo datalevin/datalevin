@@ -487,17 +487,13 @@
 
   (key-range-count [db dbi-name k-range]
     (.key-range-count db dbi-name k-range :data))
-  (key-range-count [db dbi-name k-range k-type]
-    (.key-range-count db dbi-name k-range k-type nil))
-  (key-range-count [_ dbi-name k-range k-type cap]
+  (key-range-count [_ dbi-name k-range k-type]
     (cl/normal-request client :key-range-count
-                       [db-name dbi-name k-range k-type cap] writing?))
+                       [db-name dbi-name k-range k-type] writing?))
 
-  (key-range-list-count [db dbi-name k-range k-type]
-    (.key-range-list-count db dbi-name k-range k-type nil))
-  (key-range-list-count [_ dbi-name k-range k-type cap]
+  (key-range-list-count [_ dbi-name k-range k-type]
     (cl/normal-request client :key-range-list-count
-                       [db-name dbi-name k-range k-type cap] writing?))
+                       [db-name dbi-name k-range k-type] writing?))
 
   (visit-key-range [db dbi-name visitor k-range]
     (.visit-key-range db dbi-name visitor k-range :data true))
