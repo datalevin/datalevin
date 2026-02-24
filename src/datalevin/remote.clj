@@ -39,21 +39,23 @@
   ([client db-name datoms datom-type simulated?]
    (load-datoms* client db-name datoms datom-type simulated? false))
   ([client db-name datoms datom-type simulated? writing?]
-   (let [t (if (= datom-type :txs)
-                  :tx-data
-                  :load-datoms)
+   (let [tx? (#{:txs :txs+info} datom-type)
+         t   (case datom-type
+               :txs      :tx-data
+               :txs+info :tx-data+db-info
+               :load-datoms)
          {:keys [type message result err-data]}
          (if (< (count datoms) ^long c/+wire-datom-batch-size+)
            (cl/request client {:type     t
                                :mode     :request
                                :writing? writing?
-                               :args     (if (= datom-type :txs)
+                               :args     (if tx?
                                            [db-name datoms simulated?]
                                            [db-name datoms])})
            (cl/copy-in client {:type     t
                                :mode     :copy-in
                                :writing? writing?
-                               :args     (if (= datom-type :txs)
+                               :args     (if tx?
                                            [db-name simulated?]
                                            [db-name])}
                        datoms c/+wire-datom-batch-size+))]
@@ -73,6 +75,8 @@
   (pull-many [store pattern id opts])
   (explain [store opts query inputs])
   (fulltext-datoms [store query opts])
+  (db-info [store]
+    "Fetch all DB initialization info in a single round trip")
   (tx-data [store data simulated?]
     "Send to remote server the data from call to `db/transact-tx-data`")
   (open-transact [store])
@@ -256,8 +260,11 @@
   (fulltext-datoms [_ query opts]
     (cl/normal-request client :fulltext-datoms [db-name query opts] writing?))
 
+  (db-info [_]
+    (cl/normal-request client :db-info [db-name] writing?))
+
   (tx-data [_ data simulated?]
-    (load-datoms* client db-name data :txs simulated? writing?))
+    (load-datoms* client db-name data :txs+info simulated? writing?))
 
   (open-transact [this]
     (cl/normal-request client :open-transact [db-name])

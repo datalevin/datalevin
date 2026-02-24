@@ -463,6 +463,15 @@
        :doc     "The number of samples considered when build the key compression dictionary is 65536"}
   *compress-sample-size* 65536)
 
+(def ^{:dynamic true :no-doc true
+       :doc     "Minimum serialized giant-datom bytes before trying zstd
+                 compression for `datalevin/giants` values."}
+  *giants-zstd-threshold* 1024)
+
+(def ^{:dynamic true :no-doc true
+       :doc     "Zstd compression level for `datalevin/giants` values."}
+  *giants-zstd-level* 3)
+
 (def ^{:dynamic true
        :doc     "Time interval between automatic LMDB sync to disk, in seconds, default is 300"}
   lmdb-sync-interval 300)

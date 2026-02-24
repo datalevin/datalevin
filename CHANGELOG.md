@@ -10,9 +10,15 @@
   and high availability.
 - [KV] `:inmemory` mode, where the env resides entirely in memory and all data is
   lost on close. It has faster write speed than even `:nosync`.
+- [Datalog] Support atomic migration from default EDN blob to a specific data
+  type when `update-schema`.
+- [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf]
 
 ### Improved
 - [Vector] Vector index persists inside LMDB, keeping atomic guarantees.
+- [Datalog] Giants DBI is compressed when the value is greater than
+  `datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
+- [Server] Reduce the number of network round trips needed for a transaction.
 
 ## 0.10.5 (2026-02-08)
 

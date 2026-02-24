@@ -1157,6 +1157,8 @@
    'datom-count
    'load-datoms
    'tx-data
+   'db-info
+   'tx-data+db-info
    'open-transact
    'close-transact
    'abort-transact
@@ -1769,6 +1771,52 @@
       (if (< (count datoms) ^long c/+wire-datom-batch-size+)
         (write-message skey {:type :command-complete :result datoms})
         (copy-out skey datoms c/+wire-datom-batch-size+)))))
+
+(defn- db-info
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          dt-store (store server skey db-name writing?)]
+      (write-message skey {:type   :command-complete
+                           :result {:max-eid       (i/init-max-eid dt-store)
+                                    :max-tx        (i/max-tx dt-store)
+                                    :last-modified (i/last-modified dt-store)
+                                    :opts          (i/opts dt-store)}}))))
+
+(defn- tx-data+db-info
+  [^Server server ^SelectionKey skey {:keys [mode args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+        ::alter ::database (db-eid sys-conn db-name)
+        "Don't have permission to alter the database"
+        (let [txs (case mode
+                    :copy-in (copy-in server skey)
+                    :request (nth args 1)
+                    (u/raise "Missing :mode when transact data" {}))
+              db  (get-db server db-name writing?)
+              s?  (last args)
+              rp  (transact* db txs s? server db-name writing?)
+              db  (:db-after rp)
+              _   (update-db server db-name
+                             #(assoc % (if writing? :wdt-db :dt-db) db))
+              rp  (assoc-in rp [:tempids :max-eid] (:max-eid db))
+              dt-store (store server skey db-name writing?)
+              db-info  {:max-eid       (:max-eid db)
+                        :max-tx        (i/max-tx dt-store)
+                        :last-modified (i/last-modified dt-store)}
+              ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
+              res (cond-> (select-keys rp [:tx-data :tempids])
+                    (:new-attributes rp)
+                    (assoc :new-attributes (:new-attributes rp))
+                    true
+                    (assoc :db-info db-info))]
+          (if (< ct ^long c/+wire-datom-batch-size+)
+            (write-message skey {:type :command-complete :result res})
+            (let [{:keys [tx-data tempids]} res]
+              (copy-out skey (into tx-data tempids)
+                        c/+wire-datom-batch-size+))))))))
 
 (defn- start-sampling
   [^Server server ^SelectionKey skey {:keys [args writing?]}]

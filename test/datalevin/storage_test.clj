@@ -200,6 +200,44 @@
       (if/close store))
     (u/delete-files dir)))
 
+(deftest update-schema-migrate-untyped-values-test
+  (let [dir   (u/tmp-dir (str "datalevin-schema-migrate-test-" (UUID/randomUUID)))
+        store (sut/open
+                dir nil
+                {:validate-data? true
+                 :kv-opts        {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (if/load-datoms store [(d/datom 1 :age (int 42))
+                             (d/datom 2 :age (int 7))])
+      (is (nil? (get-in (if/schema store) [:age :db/valueType])))
+      (if/set-schema store {:age {:db/valueType :db.type/long}})
+      (is (= :db.type/long (get-in (if/schema store) [:age :db/valueType])))
+      (is (= 42 (if/ea-first-v store 1 :age)))
+      (is (= 7 (if/ea-first-v store 2 :age)))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
+
+(deftest update-schema-migrate-untyped-values-failure-test
+  (let [dir   (u/tmp-dir (str "datalevin-schema-migrate-fail-test-" (UUID/randomUUID)))
+        store (sut/open
+                dir nil
+                {:validate-data? true
+                 :kv-opts        {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (if/load-datoms store [(d/datom 1 :age (int 1))
+                             (d/datom 2 :age "not-a-number")])
+      (is (thrown-with-msg?
+            Exception
+            #"Cannot migrate attribute values to new type"
+            (if/set-schema store {:age {:db/valueType :db.type/long}})))
+      (is (nil? (get-in (if/schema store) [:age :db/valueType])))
+      (is (= 1 (if/ea-first-v store 1 :age)))
+      (is (= "not-a-number" (if/ea-first-v store 2 :age)))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
+
 (deftest giants-string-test
   (let [schema {:a {:db/valueType :db.type/string}}
         dir    (u/tmp-dir (str "datalevin-giants-str-test-" (UUID/randomUUID)))
@@ -244,6 +282,25 @@
       (is (= [d1] (if/fetch store' d1)))
       (if/close store'))
     (u/delete-files dir)))
+
+(deftest giants-zstd-compression-test
+  (let [dir   (u/tmp-dir (str "datalevin-giants-zstd-test-" (UUID/randomUUID)))
+        store (sut/open
+                dir nil
+                {:kv-opts {:flags (conj c/default-env-flags :nosync)}})
+        v     (apply str (repeat 12000 "giant-value-"))
+        d     (d/datom c/e0 :a v)]
+    (try
+      (if/load-datoms store [d])
+      (is (= [d] (if/fetch store d)))
+      (let [[gt raw] (if/get-first (.-lmdb ^Store store)
+                                   c/giants [:all] :id :raw)
+            sig      (mapv #(bit-and (int %) 0xFF) (take 4 raw))]
+        (is (= c/g0 gt))
+        (is (= [0x44 0x4C 0x47 0x5A] sig)))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
 
 (deftest normal-data-test
   (let [dir   (u/tmp-dir (str "datalevin-normal-data-test-" (UUID/randomUUID)))

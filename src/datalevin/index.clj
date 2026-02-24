@@ -16,6 +16,8 @@
    [datalevin.constants :as c]
    [datalevin.util :as u])
   (:import
+   [com.github.luben.zstd Zstd]
+   [java.nio ByteBuffer]
    [datalevin.bits Retrieved]
    [datalevin.datom Datom]))
 
@@ -59,6 +61,62 @@
 
 (defonce index->vtype {:eav :avg :ave :id})
 
+(def ^:private ^"[B" giant-zstd-magic
+  (byte-array [(byte 0x44) (byte 0x4C) (byte 0x47) (byte 0x5A)]))
+
+(def ^:private giant-zstd-version (byte 1))
+
+(def ^:private ^:const giant-zstd-header-size 9)
+
+(defn- giant-zstd-envelope?
+  [^bytes bs]
+  (and (<= giant-zstd-header-size (long (alength bs)))
+       (= (aget bs 0) (aget giant-zstd-magic 0))
+       (= (aget bs 1) (aget giant-zstd-magic 1))
+       (= (aget bs 2) (aget giant-zstd-magic 2))
+       (= (aget bs 3) (aget giant-zstd-magic 3))
+       (= (aget bs 4) giant-zstd-version)))
+
+(defn- maybe-compress-giant-datom-bytes
+  ^bytes [^bytes raw]
+  (let [threshold (long c/*giants-zstd-threshold*)]
+    (when (<= threshold (long (alength raw)))
+      (let [compressed (Zstd/compress raw (int c/*giants-zstd-level*))]
+        (when (< (alength compressed) (alength raw))
+          (let [compressed-len (alength compressed)
+                out            (byte-array
+                                 (unchecked-add-int
+                                   (int giant-zstd-header-size)
+                                   compressed-len))
+                bb             (ByteBuffer/wrap out)]
+            (.put bb ^bytes giant-zstd-magic)
+            (.put bb ^byte giant-zstd-version)
+            (.putInt bb (alength raw))
+            (.put bb ^bytes compressed)
+            out))))))
+
+(defn encode-giant-datom
+  "Encode a datom for `datalevin/giants`.
+  Returns {:value x :vtype t} where t is :data or :raw."
+  [^Datom datom]
+  (let [raw (b/serialize datom)]
+    (if-let [packed (maybe-compress-giant-datom-bytes raw)]
+      {:value packed :vtype :raw}
+      {:value datom :vtype :data})))
+
+(defn decode-giant-datom
+  "Decode `datalevin/giants` value bytes (supports both legacy :data encoding
+  and zstd-compressed raw envelope)."
+  [^bytes bs]
+  (if (giant-zstd-envelope? bs)
+    (let [bb         (ByteBuffer/wrap bs)
+          _          (.position bb 5)
+          raw-len    (.getInt bb)
+          compressed (byte-array (.remaining bb))]
+      (.get bb compressed)
+      (b/deserialize (Zstd/decompress compressed (long raw-len))))
+    (b/read-buffer (ByteBuffer/wrap bs) :data)))
+
 (defn index->k
   [index schema ^Datom datom high?]
   (case index
@@ -71,7 +129,10 @@
     :eav (datom->indexable schema datom high?)
     :ave (or (.-e datom) (if high? c/emax c/e0))))
 
-(defn gt->datom [lmdb gt] (get-value lmdb c/giants gt :id :data))
+(defn gt->datom
+  [lmdb gt]
+  (when-let [bs (get-value lmdb c/giants gt :id :raw)]
+    (decode-giant-datom bs)))
 
 (defn retrieved->v
   [lmdb ^Retrieved r]

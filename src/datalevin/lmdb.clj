@@ -394,8 +394,8 @@
 ;; for shutting down various executors when the last LMDB exits
 (defonce lmdb-dirs (atom #{}))
 
-;; for freeing in memory vector index when a LMDB exits
-(defonce vector-indices (atom {}))  ; fname -> index
+;; for freeing in-memory vector index objects when an LMDB exits
+(defonce vector-indices (atom {}))  ; fname -> VectorIndex
 
 ;; check if db is backed by DLMDB (rather than stock LMDB)
 (defonce dlmdb? (memoize (fn [] (s/starts-with? (Util/version) "D"))))

@@ -15,6 +15,7 @@
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.datom :as d]
+   [datalevin.index :as idx]
    [datalevin.interface :as i
     :refer [open-dbi open-list-dbi get-value visit transact-kv]]
    [datalevin.lmdb :as l]
@@ -1350,7 +1351,7 @@
 (defn doc-ref->doc
   [lmdb doc-ref]
   (if (and (vector? doc-ref) (identical? :g (first doc-ref)))
-    (let [datom (get-value lmdb c/giants (second doc-ref) :id :data)]
+    (let [datom (idx/gt->datom lmdb (second doc-ref))]
       (when datom (d/datom-v datom)))
     (peek doc-ref)))
 

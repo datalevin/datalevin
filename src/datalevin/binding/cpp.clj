@@ -758,6 +758,16 @@
   (close-kv [this]
     (when-not (.isClosed env)
       (stop-scheduled-sync scheduled-sync)
+      (let [dir-prefix (str (.env-dir this) u/+separator+)
+            indices    (->> @l/vector-indices
+                            (keep (fn [[fname idx]]
+                                    (when (and (string? fname)
+                                               (s/starts-with? fname dir-prefix))
+                                      idx)))
+                            vec)]
+        ;; Close vector indices while LMDB env is still valid.
+        (doseq [idx indices]
+          (close-vecs idx)))
       (swap! l/lmdb-dirs disj (env-dir this))
       (when (zero? (count @l/lmdb-dirs))
         (a/shutdown-executor)
@@ -765,8 +775,6 @@
         (u/shutdown-scheduler))
       (.sync env 1)
       (.close env)
-      (doseq [idx (keep @l/vector-indices (u/list-files (.env-dir this)))]
-        (close-vecs idx))
       (when (@info :temp?) (u/delete-files (@info :dir)))
       nil))
 

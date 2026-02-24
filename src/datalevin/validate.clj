@@ -45,15 +45,18 @@
                  {:attribute attr})))))
 
 (defn validate-value-type-change
-  "Validate value type change when data exist."
+  "Validate value type change when data exist.
+   Allows migration from untyped (:data) to a specific type."
   [store attr old new]
   (when (not= old new)
-    (when ((schema store) attr)
-      (let [low-datom  (d/datom c/e0 attr c/v0)
-            high-datom (d/datom c/emax attr c/vmax)]
-        (when (populated? store :ave low-datom high-datom)
-          (u/raise "Value type change is not allowed when data exist"
-                   {:attribute attr}))))))
+    (when-let [props ((schema store) attr)]
+      (let [old-vt (idx/value-type props)]
+        (when-not (identical? old-vt :data)
+          (let [low-datom  (d/datom c/e0 attr c/v0)
+                high-datom (d/datom c/emax attr c/vmax)]
+            (when (populated? store :ave low-datom high-datom)
+              (u/raise "Value type change is not allowed when data exist"
+                       {:attribute attr}))))))))
 
 (defn violate-unique?
   "Check if adding uniqueness to an attribute would violate existing data."

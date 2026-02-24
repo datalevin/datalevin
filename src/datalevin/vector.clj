@@ -275,18 +275,21 @@
 
 (def vec-save-key (memoize vec-save-key*))
 
-(deftype AsyncVecSave [vec-index fname ^ReentrantReadWriteLock vec-lock]
+(deftype AsyncVecSave [lmdb-lock vec-index fname ^ReentrantReadWriteLock vec-lock]
   IAsyncWork
   (work-key [_] (vec-save-key fname))
   (do-work [_]
-    (let [rlock (.readLock vec-lock)]
-      (when (.tryLock rlock)
-        (try
-          (when-not (i/vec-closed? vec-index)
-            (i/persist-vecs vec-index))
-          (catch Throwable _)
-          (finally
-            (.unlock rlock))))))
+    ;; Keep lock order as LMDB -> vector-lock to avoid deadlocks with
+    ;; datalog tx path that already holds LMDB write lock while adding vectors.
+    (locking lmdb-lock
+      (let [rlock (.readLock vec-lock)]
+        (when (.tryLock rlock)
+          (try
+            (when-not (i/vec-closed? vec-index)
+              (i/persist-vecs vec-index))
+            (catch Throwable _)
+            (finally
+              (.unlock rlock)))))))
   (combine [_] first)
   (callback [_] nil))
 
@@ -310,27 +313,80 @@
                       ^ReentrantReadWriteLock vec-lock]
   IVectorIndex
   (add-vec [this vec-ref vec-data]
-    (let [vec-id  (.incrementAndGet max-vec)
-          vec-arr (vec->arr dimensions quantization vec-data)]
-      (add index quantization vec-id vec-arr)
-      (a/exec (a/get-executor) (AsyncVecSave. this fname vec-lock))
-      (.put vecs vec-id vec-ref)
-      (i/transact-kv
-        lmdb [(l/kv-tx :put vecs-dbi vec-ref vec-id :data :id)])
-      vec-id))
+    (let [vec-arr (vec->arr dimensions quantization vec-data)
+          wlock   (.writeLock vec-lock)
+          tx-lock (l/write-txn lmdb)
+          vec-id  (volatile! nil)]
+      (.lock wlock)
+      (try
+        (when @closed?
+          (raise "Vector index is closed." {:domain domain}))
+        (let [id (.incrementAndGet max-vec)]
+          (vreset! vec-id id)
+          ;; Apply LMDB mapping first; mutate in-memory index only after success.
+          (i/transact-kv lmdb [(l/kv-tx :put vecs-dbi vec-ref id :data :id)])
+          (try
+            (add index quantization id vec-arr)
+            (.put vecs id vec-ref)
+            (catch Throwable e
+              (try
+                (i/transact-kv
+                  lmdb [(l/kv-tx :del-list vecs-dbi vec-ref [id] :data :id)])
+                (catch Throwable rollback-e
+                  (throw (ex-info "Fail to rollback vector ref mapping"
+                                  {:vec-ref vec-ref :vec-id id}
+                                  rollback-e))))
+              (throw (ex-info "Fail to add vector after LMDB apply"
+                              {:vec-ref vec-ref :vec-id id}
+                              e)))))
+        (finally
+          (.unlock wlock)))
+      (a/exec (a/get-executor) (AsyncVecSave. tx-lock this fname vec-lock))
+      @vec-id))
 
   (get-vec [_ vec-ref]
-    (let [ids (i/get-list lmdb vecs-dbi vec-ref :data :id)]
-      (for [^long id ids]
-        (get-vec* index id quantization dimensions))))
+    (let [rlock (.readLock vec-lock)]
+      (.lock rlock)
+      (try
+        (let [ids (i/get-list lmdb vecs-dbi vec-ref :data :id)]
+          (for [^long id ids]
+            (get-vec* index id quantization dimensions)))
+        (finally
+          (.unlock rlock)))))
 
   (remove-vec [this vec-ref]
-    (let [ids (i/get-list lmdb vecs-dbi vec-ref :data :id)]
-      (doseq [^long id ids]
-        (VecIdx/remove index id)
-        (.remove vecs id))
-      (a/exec (a/get-executor) (AsyncVecSave. this fname vec-lock))
-      (i/transact-kv lmdb [(l/kv-tx :del vecs-dbi vec-ref)])))
+    (let [wlock    (.writeLock vec-lock)
+          tx-lock  (l/write-txn lmdb)
+          removed? (volatile! false)]
+      (.lock wlock)
+      (try
+        (when @closed?
+          (raise "Vector index is closed." {:domain domain}))
+        (let [ids (vec (i/get-list lmdb vecs-dbi vec-ref :data :id))]
+          ;; Apply LMDB deletion first; mutate in-memory index only after success.
+          (i/transact-kv lmdb [(l/kv-tx :del vecs-dbi vec-ref)])
+          (try
+            (doseq [^long id ids]
+              (VecIdx/remove index id))
+            (doseq [^long id ids]
+              (.remove vecs id))
+            (vreset! removed? (boolean (seq ids)))
+            (catch Throwable e
+              (when (seq ids)
+                (try
+                  (i/transact-kv
+                    lmdb [(l/kv-tx :put-list vecs-dbi vec-ref ids :data :id)])
+                  (catch Throwable rollback-e
+                    (throw (ex-info "Fail to rollback vector ref mapping"
+                                    {:vec-ref vec-ref :ids ids}
+                                    rollback-e)))))
+              (throw (ex-info "Fail to remove vector after LMDB apply"
+                              {:vec-ref vec-ref :ids ids}
+                              e)))))
+        (finally
+          (.unlock wlock)))
+      (when @removed?
+        (a/exec (a/get-executor) (AsyncVecSave. tx-lock this fname vec-lock)))))
 
   (persist-vecs [_]
     (when-not @closed?
@@ -359,18 +415,23 @@
       (u/delete-files fname)))
 
   (vecs-info [_]
-    (let [^VecIdx$IndexInfo info (VecIdx/info index)]
-      {:size             (.getSize info)
-       :memory           (.getMemory info)
-       :capacity         (.getCapacity info)
-       :hardware         (.getHardware info)
-       :filename         fname
-       :dimensions       dimensions
-       :metric-type      metric-type
-       :quantization     quantization
-       :connectivity     connectivity
-       :expansion-add    expansion-add
-       :expansion-search expansion-search}))
+    (let [rlock (.readLock vec-lock)]
+      (.lock rlock)
+      (try
+        (let [^VecIdx$IndexInfo info (VecIdx/info index)]
+          {:size             (.getSize info)
+           :memory           (.getMemory info)
+           :capacity         (.getCapacity info)
+           :hardware         (.getHardware info)
+           :filename         fname
+           :dimensions       dimensions
+           :metric-type      metric-type
+           :quantization     quantization
+           :connectivity     connectivity
+           :expansion-add    expansion-add
+           :expansion-search expansion-search})
+        (finally
+          (.unlock rlock)))))
 
   (vec-indexed? [_ vec-ref] (i/get-value lmdb vecs-dbi vec-ref))
 
@@ -380,11 +441,16 @@
                                :or   {display    (:display search-opts)
                                       top        (:top search-opts)
                                       vec-filter (:vec-filter search-opts)}}]
-    (let [query                    (vec->arr dimensions quantization query-vec)
-          ^VecIdx$SearchResult res (search index query quantization (int top))]
-      (doall (sequence
-               (display-xf this vec-filter display)
-               (.getKeys res) (.getDists res)))))
+    (let [rlock (.readLock vec-lock)]
+      (.lock rlock)
+      (try
+        (let [query                    (vec->arr dimensions quantization query-vec)
+              ^VecIdx$SearchResult res (search index query quantization (int top))]
+          (doall (sequence
+                   (display-xf this vec-filter display)
+                   (.getKeys res) (.getDists res))))
+        (finally
+          (.unlock rlock)))))
 
   IAdmin
   (re-index [this opts]
@@ -458,23 +524,24 @@
           (VecIdx/load index fname)
           (checkpoint-to-lmdb lmdb index domain)
           (u/delete-files fname)))
-      (swap! l/vector-indices assoc fname index)
-      (->VectorIndex lmdb
-                     (volatile! false)
-                     index
-                     fname
-                     domain
-                     dimensions
-                     metric-type
-                     quantization
-                     connectivity
-                     expansion-add
-                     expansion-search
-                     vecs-dbi
-                     vecs
-                     (AtomicLong. max-vec-id)
-                     search-opts
-                     (ReentrantReadWriteLock.)))))
+      (let [vi (->VectorIndex lmdb
+                              (volatile! false)
+                              index
+                              fname
+                              domain
+                              dimensions
+                              metric-type
+                              quantization
+                              connectivity
+                              expansion-add
+                              expansion-search
+                              vecs-dbi
+                              vecs
+                              (AtomicLong. max-vec-id)
+                              search-opts
+                              (ReentrantReadWriteLock.))]
+        (swap! l/vector-indices assoc fname vi)
+        vi))))
 
 (defn new-vector-index
   [lmdb opts]

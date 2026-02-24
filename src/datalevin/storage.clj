@@ -22,12 +22,13 @@
    [datalevin.search :as s]
    [datalevin.idoc :as idoc]
    [datalevin.vector :as v]
+   [datalevin.prepare :as prep]
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.async :as a]
    [datalevin.index :as idx
     :refer [value-type datom->indexable index->dbi index->ktype index->vtype
-            index->k index->v gt->datom retrieved->v]]
+            index->k index->v gt->datom retrieved->v encode-giant-datom]]
    [datalevin.validate :as vld]
    [datalevin.interface
     :refer [transact-kv get-range get-first get-value visit-list-sample
@@ -414,7 +415,8 @@
         (b/read-buffer (.rewind bf) :avg)))))
 
 (declare insert-datom delete-datom fulltext-index vector-index idoc-index check
-         transact-opts ->SamplingWork e-sample* default-ratio* analyze*)
+         migrate-attr-values transact-opts ->SamplingWork e-sample*
+         default-ratio* analyze*)
 
 (deftype Store [lmdb
                 search-engines
@@ -483,6 +485,15 @@
             :let       [old (schema attr)]
             :when      old]
       (check this attr old new))
+    (doseq [[attr new] new-schema
+            :let       [old (schema attr)]
+            :when      old
+            :let       [old-vt (value-type old)
+                        new-vt (value-type new)]
+            :when      (and (identical? old-vt :data)
+                            (not (identical? new-vt :data)))]
+      ;; Re-encode stored values before persisting schema change.
+      (migrate-attr-values this attr new-vt))
     (set! schema (init-schema lmdb new-schema))
     (set! rschema (schema->rschema schema))
     (set! attrs (init-attrs schema))
@@ -1217,6 +1228,80 @@
 (defn- check [store attr old new]
   (vld/validate-schema-mutation store (.-lmdb ^Store store) attr old new))
 
+(defn migrate-attr-values
+  "Re-encode all datoms for `attr` from :data (untyped) to `new-vt`.
+   Validates every value can be coerced first. Deletes old datoms with
+   the old :data encoding, then inserts new datoms with the new typed
+   encoding, all in a single atomic `transact-kv` call."
+  [^Store store attr new-vt]
+  (let [lmdb   (.-lmdb store)
+        s      (schema store)
+        props  (s attr)
+        old-vt (value-type props)
+        aid    (props :db/aid)
+        datoms (.slice store :ave
+                       (d/datom c/e0 attr c/v0)
+                       (d/datom c/emax attr c/vmax))]
+    (when (seq datoms)
+      (let [errors  (volatile! [])
+            coerced (mapv
+                      (fn [^Datom datom]
+                        (try
+                          (let [v     (.-v datom)
+                                new-v (prep/type-coercion new-vt v)]
+                            [datom new-v])
+                          (catch Exception ex
+                            (vswap! errors conj
+                                    {:entity (.-e datom)
+                                     :value  (.-v datom)
+                                     :error  (.getMessage ex)})
+                            nil)))
+                      datoms)]
+        (when (seq @errors)
+          (u/raise "Cannot migrate attribute values to new type"
+                   {:attribute   attr
+                    :target-type new-vt
+                    :errors      @errors}))
+        (let [txs (FastList.)]
+          ;; 1) delete old datoms using old :data encoding
+          (doseq [[^Datom datom _] coerced]
+            (let [e  (.-e datom)
+                  v  (.-v datom)
+                  i  ^Indexable (b/indexable e aid v old-vt c/g0)
+                  gt (when (b/giant? i)
+                       (let [[_ ^Retrieved r]
+                             (nth
+                               (list-range
+                                 lmdb c/eav [:closed e e] :id
+                                 [:closed
+                                  i
+                                  (Indexable. e aid v (.-f i) (.-b i) c/gmax)]
+                                 :avg)
+                               0)]
+                         (.-g r)))
+                  ii (Indexable. e aid v (.-f i) (.-b i) (or gt c/normal))]
+              (.add txs (lmdb/kv-tx :del-list c/ave ii [e] :avg :id))
+              (.add txs (lmdb/kv-tx :del-list c/eav e [ii] :id :avg))
+              (when gt
+                (.add txs (lmdb/kv-tx :del c/giants gt :id)))))
+          ;; 2) insert new datoms using new typed encoding
+          (doseq [[^Datom datom new-v] coerced]
+            (let [e      (.-e datom)
+                  cur-gt (max-gt store)
+                  i      (b/indexable e aid new-v new-vt cur-gt)
+                  giant? (b/giant? i)]
+              (.add txs (lmdb/kv-tx :put c/ave i e :avg :id))
+              (.add txs (lmdb/kv-tx :put c/eav e i :id :avg))
+              (when giant?
+                (.advance-max-gt store)
+                (let [{:keys [value vtype]} (encode-giant-datom
+                                              (d/datom e attr new-v))]
+                  (.add txs (lmdb/kv-tx :put c/giants cur-gt value
+                                        :id vtype [:append]))))))
+          ;; 3) single atomic write
+          (locking (lmdb/write-txn lmdb)
+            (transact-kv lmdb txs)))))))
+
 (defn- collect-fulltext
   [^FastList ft-ds attr props v op]
   (when-not (str/blank? v)
@@ -1245,10 +1330,11 @@
     (.add txs (lmdb/kv-tx :put c/eav e i :id :avg))
     (when giant?
       (.advance-max-gt store)
-      (let [gd [e attr v]]
+      (let [gd [e attr v]
+            {:keys [value vtype]} (encode-giant-datom (apply d/datom gd))]
         (.put giants gd max-gt)
-        (.add txs (lmdb/kv-tx :put c/giants max-gt (apply d/datom gd)
-                              :id :data [:append]))))
+        (.add txs (lmdb/kv-tx :put c/giants max-gt value
+                              :id vtype [:append]))))
     (when (identical? vt :db.type/vec)
       (.add vi-ds [(conjv (props :db.vec/domains) (v/attr-domain attr))
                    (if giant? [:g [max-gt v]] [:a [e aid v]])]))
