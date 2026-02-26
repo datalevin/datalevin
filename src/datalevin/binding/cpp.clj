@@ -593,11 +593,16 @@
                 (doseq [v vs]
                   (.put-val dbi v (.-vt tx))
                   (.put dbi txn)))
-    :del-list (let [vs (.-v tx)]
+    :del-list (let [vs (.-v tx)
+                    vt (.-vt tx)
+                    ^BufVal kp (.-kp dbi)]
                 (.put-key dbi (.-k tx) (.-kt tx))
                 (doseq [v vs]
-                  (.put-val dbi v (.-vt tx))
-                  (.del dbi txn false)))))
+                  (.put-val dbi v vt)
+                  (.del dbi txn false)
+                  ;; mdb_del may mutate the native key view; restore once per item
+                  ;; without re-encoding the same key.
+                  (.reset kp)))))
 
 (defn- transact1*
   [txs ^DBI dbi txn kt vt]

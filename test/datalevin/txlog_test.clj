@@ -2,6 +2,7 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [clojure.java.io :as io]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
@@ -14,7 +15,7 @@
    [java.nio ByteBuffer]
    [java.nio.file Files StandardOpenOption]
    [java.nio.charset StandardCharsets]
-   [java.util UUID]))
+   [java.util UUID Random]))
 
 (defmacro with-temp-dir
   [[sym] & body]
@@ -28,6 +29,955 @@
 (defn- ->bytes
   [^String s]
   (.getBytes s StandardCharsets/UTF_8))
+
+(defn- open-fuzz-lmdb
+  [dir opts]
+  (let [lmdb (l/open-kv dir opts)]
+    (i/open-dbi lmdb "fuzz")
+    lmdb))
+
+(defn- long-kv-range->sorted-map
+  [lmdb dbi]
+  (into (sorted-map) (i/get-range lmdb dbi [:all] :long :long)))
+
+(defn- txlog-lsns
+  [dir]
+  (let [txlog-dir (str dir u/+separator+ "txlog")]
+    (->> (sut/segment-files txlog-dir)
+         (mapcat (fn [{:keys [file]}]
+                   (let [{:keys [records]}
+                         (sut/scan-segment (.getPath file)
+                                           {:allow-preallocated-tail? true})]
+                     (mapv (fn [{:keys [body]}]
+                             (-> body
+                                 sut/decode-commit-row-payload
+                                 :lsn
+                                 long))
+                           records))))
+         vec)))
+
+(defn- contiguous-lsns?
+  [lsns]
+  (every? (fn [[a b]] (= (inc ^long a) ^long b))
+          (partition 2 1 lsns)))
+
+(defn- apply-fuzz-row
+  [model row]
+  (let [[op dbi k v] row]
+    (if (= "fuzz" dbi)
+      (case op
+        :put (assoc model (long k) (long v))
+        :del (dissoc model (long k))
+        model)
+      model)))
+
+(defn- apply-fuzz-rows
+  [model rows]
+  (reduce apply-fuzz-row model rows))
+
+(defn- replay-fuzz-model
+  [records]
+  (reduce (fn [model {:keys [ops]}]
+            (apply-fuzz-rows model ops))
+          (sorted-map)
+          records))
+
+(defn- expected-open-range
+  [records from-lsn upto-lsn]
+  (->> records
+       (filter #(>= (long (:lsn %)) (long from-lsn)))
+       (filter #(if (some? upto-lsn)
+                  (<= (long (:lsn %)) (long upto-lsn))
+                  true))
+       vec))
+
+(defn- assert-open-txlog-range-and-replay!
+  [lmdb model ^Random rng]
+  (let [records (vec (i/open-tx-log lmdb 0))
+        lsns    (mapv (comp long :lsn) records)
+        max-lsn (long (or (last lsns) 0))]
+    (is (= model (long-kv-range->sorted-map lmdb "fuzz")))
+    (is (= model (replay-fuzz-model records)))
+    (is (:ok? (i/verify-commit-marker! lmdb)))
+    (when (seq lsns)
+      (is (contiguous-lsns? lsns))
+      (is (= 1 (first lsns)))
+      (is (= (long (count lsns)) max-lsn)))
+    (dotimes [_ 6]
+      (let [from      (long (.nextInt rng (int (+ 3 max-lsn))))
+            choose?   (.nextBoolean rng)
+            upto-lsn  (when choose?
+                        (long (+ from (.nextInt rng 8))))
+            expected  (expected-open-range records from upto-lsn)
+            actual    (if (some? upto-lsn)
+                        (vec (i/open-tx-log lmdb from upto-lsn))
+                        (vec (i/open-tx-log lmdb from)))]
+        (is (= expected actual))))
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (i/open-tx-log lmdb 10 9)))))
+
+(defn- assert-open-vs-segment-lsns!
+  [dir lmdb model]
+  (let [records      (vec (i/open-tx-log lmdb 0))
+        api-lsns     (mapv (comp long :lsn) records)
+        segment-lsns (txlog-lsns dir)]
+    (is (= model (long-kv-range->sorted-map lmdb "fuzz")))
+    (is (:ok? (i/verify-commit-marker! lmdb)))
+    (is (= segment-lsns api-lsns))
+    (when (seq api-lsns)
+      (is (contiguous-lsns? api-lsns))
+      (is (apply < api-lsns)))))
+
+(deftest txn-log-fuzz-open-range-and-replay-test
+  (doseq [seed [11 29 47]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      2
+                    :txn-log-segment-max-bytes 96
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 360)
+                (assert-open-txlog-range-and-replay! @lmdb-v model rng)
+                (let [op   (.nextInt rng 100)
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 66)
+                    (let [rows (vec (for [_ (range (inc (.nextInt rng 4)))]
+                                      (let [k (long (.nextInt rng 128))]
+                                        (if (< (.nextInt rng 100) 72)
+                                          [:put "fuzz"
+                                           k
+                                           (long (.nextInt rng 1000000))
+                                           :long
+                                           :long]
+                                          [:del "fuzz" k :long]))))]
+                      (i/transact-kv lmdb rows)
+                      (recur (inc step) (apply-fuzz-rows model rows)))
+
+                    (< op 82)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))
+
+                    (< op 92)
+                    (do
+                      (assert-open-txlog-range-and-replay! lmdb model rng)
+                      (recur (inc step) model))
+
+                    :else
+                    (do
+                      (is (= model (long-kv-range->sorted-map lmdb "fuzz")))
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+                      (assert-open-txlog-range-and-replay! @lmdb-v model rng)
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-segment-scan-gc-reopen-parity-test
+  (doseq [seed [2 9 27]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 88
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 420)
+                (assert-open-vs-segment-lsns! dir @lmdb-v model)
+                (let [op   (.nextInt rng 100)
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 58)
+                    (let [k (long (.nextInt rng 128))
+                          v (long (.nextInt rng 1000000))]
+                      (i/transact-kv lmdb [[:put "fuzz" k v :long :long]])
+                      (recur (inc step) (assoc model k v)))
+
+                    (< op 80)
+                    (let [k (long (.nextInt rng 128))]
+                      (i/transact-kv lmdb [[:del "fuzz" k :long]])
+                      (recur (inc step) (dissoc model k)))
+
+                    (< op 88)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))
+
+                    (< op 96)
+                    (let [watermarks (i/txlog-watermarks lmdb)
+                          applied-lsn (long (or (:applied-lsn watermarks) 0))
+                          floor       (when (and (pos? applied-lsn)
+                                                 (.nextBoolean rng))
+                                        (let [delta (inc (.nextInt
+                                                          rng
+                                                          (inc (min 32
+                                                                    (int applied-lsn)))))]
+                                          (long (max 0 (- applied-lsn delta)))))
+                          gc-res      (if (some? floor)
+                                        (i/gc-txlog-segments! lmdb floor)
+                                        (i/gc-txlog-segments! lmdb))
+                          retention   (i/txlog-retention-state lmdb)]
+                      (is (<= 0 (long (or (:deleted-count gc-res) 0))))
+                      (is (<= 0 (long (or (:safety-deletable-segment-count
+                                           retention)
+                                          0))))
+                      (let [records (vec (i/open-tx-log lmdb 0))]
+                        (when (seq records)
+                          (is (<= (long (or (:min-retained-lsn retention) 0))
+                                  (long (:lsn (first records)))))))
+                      (assert-open-vs-segment-lsns! dir lmdb model)
+                      (recur (inc step) model))
+
+                    :else
+                    (do
+                      (is (= model (long-kv-range->sorted-map lmdb "fuzz")))
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+                      (assert-open-vs-segment-lsns! dir @lmdb-v model)
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-relaxed-recovery-and-gc-test
+  (doseq [seed [7 19 41]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 128
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 400)
+                (do
+                  (is (= model (long-kv-range->sorted-map @lmdb-v "fuzz")))
+                  (is (:ok? (i/verify-commit-marker! @lmdb-v)))
+                  (let [ret    (i/txlog-retention-state @lmdb-v)
+                        gc-res (i/gc-txlog-segments! @lmdb-v)]
+                    (is (<= 0 (or (:safety-deletable-segment-count ret) -1)))
+                    (is (<= 0 (or (:deleted-count gc-res) -1))))
+                  (let [segments (sut/segment-files
+                                  (str dir u/+separator+ "txlog"))]
+                    (is (<= 1 (count segments)))))
+                (let [op   (.nextInt rng 100)
+                      k    (long (.nextInt rng 96))
+                      v    (long (.nextInt rng 1000000))
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 58)
+                    (do
+                      (i/transact-kv lmdb [[:put "fuzz" k v :long :long]])
+                      (recur (inc step) (assoc model k v)))
+
+                    (< op 82)
+                    (do
+                      (i/transact-kv lmdb [[:del "fuzz" k :long]])
+                      (recur (inc step) (dissoc model k)))
+
+                    (< op 90)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))
+
+                    (< op 96)
+                    (do
+                      (if (.nextBoolean rng)
+                        (i/gc-txlog-segments! lmdb)
+                        (let [watermarks (i/txlog-watermarks lmdb)
+                              floor      (max 0
+                                              (- (long (or (:applied-lsn
+                                                            watermarks)
+                                                           0))
+                                                 (.nextInt rng 16)))]
+                          (i/gc-txlog-segments! lmdb floor)))
+                      (recur (inc step) model))
+
+                    :else
+                    (do
+                      (is (= model (long-kv-range->sorted-map lmdb "fuzz")))
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+                      (is (= model (long-kv-range->sorted-map @lmdb-v "fuzz")))
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-strict-lsn-contiguity-test
+  (doseq [seed [5 13 23]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-durability-profile :strict
+                    :txn-log-sync-mode         :none
+                    :txn-log-segment-max-bytes 96
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 280)
+                (do
+                  (is (= model (long-kv-range->sorted-map @lmdb-v "fuzz")))
+                  (is (:ok? (i/verify-commit-marker! @lmdb-v)))
+                  (i/close-kv @lmdb-v)
+                  (vreset! lmdb-v nil)
+                  (let [lsns (txlog-lsns dir)]
+                    (is (seq lsns))
+                    (is (apply < lsns))
+                    (is (contiguous-lsns? lsns))
+                    (is (= (long (count lsns)) (long (last lsns)))))
+                  (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+                  (is (= model (long-kv-range->sorted-map @lmdb-v "fuzz"))))
+                (let [op   (.nextInt rng 100)
+                      k    (long (.nextInt rng 128))
+                      v    (long (.nextInt rng 1000000))
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 70)
+                    (do
+                      (i/transact-kv lmdb [[:put "fuzz" k v :long :long]])
+                      (recur (inc step) (assoc model k v)))
+
+                    (< op 95)
+                    (do
+                      (i/transact-kv lmdb [[:del "fuzz" k :long]])
+                      (recur (inc step) (dissoc model k)))
+
+                    :else
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(defn- apply-key-iter-op
+  [model {:keys [op k v]}]
+  (case op
+    :put (assoc model (long k) (long v))
+    :del (dissoc model (long k))
+    model))
+
+(defn- apply-key-iter-ops
+  [model ops]
+  (reduce apply-key-iter-op model ops))
+
+(defn- key-iter-ops->rows
+  [ops]
+  (mapv (fn [{:keys [op k v]}]
+          (case op
+            :put [:put "fuzz" (long k) (long v) :long :long]
+            :del [:del "fuzz" (long k) :long]))
+        ops))
+
+(defn- verify-key-iter-model!
+  [lmdb dbi ref-map]
+  (is (= (vec ref-map)
+         (vec (i/get-range lmdb dbi [:all] :long :long))))
+  (is (= (if (empty? ref-map) [] (vec (rseq ref-map)))
+         (vec (i/get-range lmdb dbi [:all-back] :long :long))))
+  (is (= (vec (keys ref-map))
+         (vec (i/key-range lmdb dbi [:all] :long))))
+  (is (= (count ref-map)
+         (i/range-count lmdb dbi [:all] :long)))
+  (is (= (count ref-map)
+         (i/key-range-count lmdb dbi [:all] :long)))
+  (let [visited (volatile! [])]
+    (i/visit-key-range lmdb dbi (fn [k] (vswap! visited conj k))
+                       [:all] :long false)
+    (is (= (vec (keys ref-map)) @visited)))
+  (let [visited (volatile! [])]
+    (i/visit lmdb dbi (fn [k v] (vswap! visited conj [k v]))
+             [:all] :long :long false)
+    (is (= (vec ref-map) @visited)))
+  (when (>= (count ref-map) 2)
+    (let [ks (vec (keys ref-map))
+          lo (first ks)
+          hi (last ks)]
+      (is (= (vec (subseq ref-map >= lo <= hi))
+             (vec (i/get-range lmdb dbi [:closed lo hi] :long :long))))
+      (when (> (count ks) 2)
+        (let [mid (nth ks (quot (count ks) 2))]
+          (is (= (vec (subseq ref-map >= mid))
+                 (vec (i/get-range lmdb dbi [:at-least mid] :long :long))))
+          (is (= (vec (subseq ref-map <= mid))
+                 (vec (i/get-range lmdb dbi [:at-most mid] :long :long))))
+          (is (= (vec (subseq ref-map > mid))
+                 (vec (i/get-range lmdb dbi [:greater-than mid] :long :long)))))))))
+
+(defn- random-key-iter-op
+  [^Random rng key-bound val-bound]
+  (let [k (long (.nextInt rng (int key-bound)))]
+    (if (< (.nextInt rng 100) 68)
+      {:op :put :k k :v (long (.nextInt rng (int val-bound)))}
+      {:op :del :k k})))
+
+(defn- random-key-iter-ops
+  [^Random rng]
+  (vec (repeatedly (inc (.nextInt rng 6))
+                   #(random-key-iter-op rng 192 1000000))))
+
+(defn- open-fuzz-list-lmdb
+  [dir opts]
+  (let [lmdb (l/open-kv dir opts)]
+    (i/open-list-dbi lmdb "fuzzl")
+    lmdb))
+
+(defn- random-distinct-longs
+  [^Random rng n bound]
+  (loop [acc (sorted-set)]
+    (if (>= (count acc) n)
+      (vec acc)
+      (recur (conj acc (long (.nextInt rng (int bound))))))))
+
+(defn- random-list-iter-op
+  [^Random rng key-bound val-bound]
+  (let [k (long (.nextInt rng (int key-bound)))
+        roll (.nextInt rng 100)]
+    (cond
+      (< roll 55)
+      {:op :put-list
+       :k  k
+       :vs (random-distinct-longs rng (inc (.nextInt rng 5)) val-bound)}
+
+      (< roll 85)
+      {:op :del-list
+       :k  k
+       :vs (random-distinct-longs rng (inc (.nextInt rng 4)) val-bound)}
+
+      :else
+      {:op :wipe :k k})))
+
+(defn- random-list-iter-ops
+  [^Random rng]
+  (vec (repeatedly (inc (.nextInt rng 5))
+                   #(random-list-iter-op rng 128 256))))
+
+(defn- random-key-from-model
+  [^Random rng model]
+  (let [ks (vec (keys model))]
+    (when (seq ks)
+      (nth ks (.nextInt rng (int (count ks)))))))
+
+(defn- first-missing-at-or-above
+  [s start]
+  (loop [candidate (long start)]
+    (if (contains? s candidate)
+      (recur (inc candidate))
+      candidate)))
+
+(defn- miss-heavy-del-list-values
+  [^Random rng s]
+  (if (seq s)
+    (let [lo       (long (first s))
+          hi       (long (last s))
+          mid      (long (quot (+ lo hi) 2))
+          miss-mid (first-missing-at-or-above s mid)
+          miss-hi  (first-missing-at-or-above s
+                                              (+ hi 1 (.nextInt rng 16)))]
+      (->> [-2 -1 lo miss-mid hi miss-hi]
+           (map long)
+           distinct
+           sort
+           vec))
+    (->> [-2 -1
+          (long (.nextInt rng 320))
+          (long (+ 512 (.nextInt rng 320)))]
+         distinct
+         sort
+         vec)))
+
+(defn- apply-list-iter-op
+  [model {:keys [op k vs]}]
+  (let [k (long k)]
+    (case op
+      :put-list
+      (update model k (fn [s] (into (or s (sorted-set)) (map long vs))))
+
+      :del-list
+      (if-let [s (get model k)]
+        (let [new-s (reduce disj s (map long vs))]
+          (if (empty? new-s) (dissoc model k)
+              (assoc model k new-s)))
+        model)
+
+      :wipe
+      (dissoc model k)
+
+      model)))
+
+(defn- apply-list-iter-ops
+  [model ops]
+  (reduce apply-list-iter-op model ops))
+
+(defn- mixed-hit-miss-del?
+  [s vs]
+  (and (seq s)
+       (some #(contains? s (long %)) vs)
+       (some #(not (contains? s (long %))) vs)))
+
+(defn- apply-list-iter-ops+mixed-del-count
+  [model ops]
+  (reduce (fn [[m mixed-del-count] {:keys [op k vs] :as tx-op}]
+            (let [s             (get m (long k))
+                  mixed?        (and (= op :del-list)
+                                     (mixed-hit-miss-del? s vs))
+                  next-model    (apply-list-iter-op m tx-op)
+                  mixed-next    (if mixed?
+                                  (inc mixed-del-count)
+                                  mixed-del-count)]
+              [next-model mixed-next]))
+          [model 0]
+          ops))
+
+(defn- list-iter-ops->rows
+  [ops]
+  (mapv (fn [{:keys [op k vs]}]
+          (case op
+            :put-list [:put-list "fuzzl" (long k) (mapv long vs) :long :long]
+            :del-list [:del-list "fuzzl" (long k) (mapv long vs) :long :long]
+            :wipe [:del "fuzzl" (long k) :long]))
+        ops))
+
+(defn- random-miss-heavy-list-op
+  [^Random rng model]
+  (let [roll       (.nextInt rng 100)
+        existing-k (when (seq model)
+                     (random-key-from-model rng model))
+        pick-k     (fn [prefer-existing?]
+                     (if (and prefer-existing?
+                              existing-k
+                              (< (.nextInt rng 100) 85))
+                       existing-k
+                       (long (.nextInt rng 40))))]
+    (cond
+      (< roll 40)
+      {:op :put-list
+       :k  (pick-k false)
+       :vs (random-distinct-longs rng (inc (.nextInt rng 5)) 320)}
+
+      (< roll 92)
+      (let [k (pick-k true)]
+        {:op :del-list
+         :k  k
+         :vs (miss-heavy-del-list-values rng (get model k))})
+
+      :else
+      {:op :wipe
+       :k  (pick-k true)})))
+
+(defn- random-list-churn-ops
+  [^Random rng model]
+  (let [existing-k (when (seq model)
+                     (random-key-from-model rng model))
+        k-main     (if (and existing-k
+                            (< (.nextInt rng 100) 82))
+                     existing-k
+                     (long (.nextInt rng 40)))
+        put-main   {:op :put-list
+                    :k  k-main
+                    :vs (random-distinct-longs rng (+ 2 (.nextInt rng 4)) 320)}
+        model1     (apply-list-iter-op model put-main)
+        del-main   {:op :del-list
+                    :k  k-main
+                    :vs (miss-heavy-del-list-values rng (get model1 k-main))}
+        k-side     (long (.nextInt rng 40))
+        side-op    (if (< (.nextInt rng 100) 57)
+                     {:op :put-list
+                      :k  k-side
+                      :vs (random-distinct-longs rng
+                                                 (inc (.nextInt rng 4))
+                                                 320)}
+                     {:op :del-list
+                      :k  k-side
+                      :vs (miss-heavy-del-list-values rng
+                                                      (get model1 k-side))})
+        model2     (apply-list-iter-ops model [put-main del-main side-op])
+        extra-del  (when (< (.nextInt rng 100) 35)
+                     {:op :del-list
+                      :k  k-main
+                      :vs (miss-heavy-del-list-values rng (get model2 k-main))})
+        maybe-wipe (when (< (.nextInt rng 100) 16)
+                     {:op :wipe
+                      :k  (if (< (.nextInt rng 100) 75)
+                            k-main
+                            (long (.nextInt rng 40)))})]
+    (->> [put-main del-main side-op extra-del maybe-wipe]
+         (remove nil?)
+         vec)))
+
+(defn- flatten-list-ref
+  ([m]
+   (flatten-list-ref m false false))
+  ([m key-back? val-back?]
+   (vec (let [key-seq (if key-back?
+                        (when (seq m) (rseq m))
+                        (seq m))]
+          (for [[k vs] key-seq
+                v      (if val-back? (rseq vs) (seq vs))]
+            [k v])))))
+
+(defn- verify-list-iter-model!
+  [lmdb dbi ref-map]
+  (is (= (flatten-list-ref ref-map)
+         (vec (i/list-range lmdb dbi [:all] :long [:all] :long))))
+  (is (= (flatten-list-ref ref-map true false)
+         (vec (i/list-range lmdb dbi [:all-back] :long [:all] :long))))
+  (is (= (flatten-list-ref ref-map false true)
+         (vec (i/list-range lmdb dbi [:all] :long [:all-back] :long))))
+  (is (= (reduce + 0 (map count (vals ref-map)))
+         (i/list-range-count lmdb dbi [:all] :long [:all] :long)))
+  (let [visited (volatile! [])]
+    (i/visit-list-range lmdb dbi (fn [k v] (vswap! visited conj [k v]))
+                        [:all] :long [:all] :long false)
+    (is (= (flatten-list-ref ref-map) @visited)))
+  (when (seq ref-map)
+    (let [[k vs] (first ref-map)
+          v-lo   (first vs)
+          v-hi   (last vs)]
+      (is (= (vec (for [v (subseq vs >= v-lo <= v-hi)] [k v]))
+             (vec (i/list-range lmdb dbi [:closed k k] :long
+                                [:closed v-lo v-hi] :long)))))
+    (when-let [[k vs] (first (filter (fn [[_ s]] (>= (count s) 3)) ref-map))]
+      (let [mid (nth (vec vs) (quot (count vs) 2))]
+        (is (= (vec (for [v (subseq vs >= mid)] [k v]))
+               (vec (i/list-range lmdb dbi [:closed k k] :long
+                                  [:at-least mid] :long))))
+        (is (= (vec (for [v (subseq vs <= mid)] [k v]))
+               (vec (i/list-range lmdb dbi [:closed k k] :long
+                                  [:at-most mid] :long))))
+        (is (= (vec (for [v (subseq vs > mid)] [k v]))
+               (vec (i/list-range lmdb dbi [:closed k k] :long
+                                  [:greater-than mid] :long))))
+        (is (= (vec (for [v (subseq vs < mid)] [k v]))
+               (vec (i/list-range lmdb dbi [:closed k k] :long
+                                  [:less-than mid] :long))))))))
+
+(defn- verify-list-key-range-model!
+  [lmdb dbi ref-map]
+  (let [visited (volatile! [])]
+    (i/visit-list-key-range lmdb dbi (fn [k v] (vswap! visited conj [k v]))
+                            [:all] :long :long false)
+    (is (= (flatten-list-ref ref-map) @visited)))
+  (let [visited (volatile! [])]
+    (i/visit-list-key-range lmdb dbi (fn [k v] (vswap! visited conj [k v]))
+                            [:all-back] :long :long false)
+    (is (= (flatten-list-ref ref-map true false) @visited)))
+  (when (>= (count ref-map) 2)
+    (let [lo      (first (keys ref-map))
+          hi      (last (keys ref-map))
+          sub     (into (sorted-map) (subseq ref-map >= lo <= hi))
+          visited (volatile! [])]
+      (i/visit-list-key-range lmdb dbi (fn [k v] (vswap! visited conj [k v]))
+                              [:closed lo hi] :long :long false)
+      (is (= (flatten-list-ref sub) @visited)))))
+
+(defn- apply-fuzz-list-row
+  [model row]
+  (let [[op dbi k v] row
+        k (long (or k 0))]
+    (if (= "fuzzl" dbi)
+      (case op
+        :put-list
+        (update model k (fn [s] (into (or s (sorted-set)) (map long (or v [])))))
+
+        :del-list
+        (if-let [s (get model k)]
+          (let [new-s (reduce disj s (map long (or v [])))]
+            (if (empty? new-s) (dissoc model k)
+                (assoc model k new-s)))
+          model)
+
+        :del
+        (dissoc model k)
+
+        model)
+      model)))
+
+(defn- apply-fuzz-list-rows
+  [model rows]
+  (reduce apply-fuzz-list-row model rows))
+
+(defn- replay-fuzz-list-model
+  [records]
+  (reduce (fn [model {:keys [ops]}]
+            (apply-fuzz-list-rows model ops))
+          (sorted-map)
+          records))
+
+(defn- assert-list-txlog-replay!
+  [lmdb model]
+  (let [records (vec (i/open-tx-log lmdb 0))
+        lsns    (mapv (comp long :lsn) records)]
+    (is (= model (replay-fuzz-list-model records)))
+    (is (:ok? (i/verify-commit-marker! lmdb)))
+    (when (seq lsns)
+      (is (contiguous-lsns? lsns))
+      (is (apply < lsns)))))
+
+(deftest txn-log-fuzz-key-iter-consistency-test
+  (doseq [seed [37 73]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 112
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 320)
+                (do
+                  (verify-key-iter-model! @lmdb-v "fuzz" model)
+                  (assert-open-txlog-range-and-replay! @lmdb-v model rng))
+                (let [op   (.nextInt rng 100)
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 68)
+                    (let [ops  (random-key-iter-ops rng)
+                          rows (key-iter-ops->rows ops)]
+                      (i/transact-kv lmdb rows)
+                      (recur (inc step) (apply-key-iter-ops model ops)))
+
+                    (< op 78)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))
+
+                    (< op 92)
+                    (do
+                      (verify-key-iter-model! lmdb "fuzz" model)
+                      (assert-open-txlog-range-and-replay! lmdb model rng)
+                      (recur (inc step) model))
+
+                    :else
+                    (do
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-lmdb dir opts))
+                      (verify-key-iter-model! @lmdb-v "fuzz" model)
+                      (assert-open-txlog-range-and-replay! @lmdb-v model rng)
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-list-iter-consistency-test
+  (doseq [seed [43 89]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 112
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+            (loop [step  (long 0)
+                   model (sorted-map)]
+              (if (= step 280)
+                (do
+                  (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                  (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                  (assert-list-txlog-replay! @lmdb-v model))
+                (let [op   (.nextInt rng 100)
+                      lmdb @lmdb-v]
+                  (cond
+                    (< op 66)
+                    (let [ops  (random-list-iter-ops rng)
+                          rows (list-iter-ops->rows ops)]
+                      (i/transact-kv lmdb rows)
+                      (recur (inc step) (apply-list-iter-ops model ops)))
+
+                    (< op 76)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model))
+
+                    (< op 92)
+                    (do
+                      (verify-list-iter-model! lmdb "fuzzl" model)
+                      (verify-list-key-range-model! lmdb "fuzzl" model)
+                      (assert-list-txlog-replay! lmdb model)
+                      (recur (inc step) model))
+
+                    :else
+                    (do
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+                      (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                      (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                      (assert-list-txlog-replay! @lmdb-v model)
+                      (recur (inc step) model))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-list-miss-heavy-del-batch-test
+  (doseq [seed [131 197 281]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 104
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+            (loop [step              (long 0)
+                   model             (sorted-map)
+                   mixed-del-batches (long 0)]
+              (if (= step 240)
+                (do
+                  (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                  (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                  (assert-list-txlog-replay! @lmdb-v model)
+                  (is (> mixed-del-batches 20)))
+                (let [op-roll (.nextInt rng 100)
+                      lmdb    @lmdb-v]
+                  (cond
+                    (< op-roll 72)
+                    (let [ops                 [(random-miss-heavy-list-op rng
+                                                                          model)]
+                          rows                (list-iter-ops->rows ops)
+                          [next-model mixed]  (apply-list-iter-ops+mixed-del-count
+                                               model
+                                               ops)]
+                      (i/transact-kv lmdb rows)
+                      (recur (inc step)
+                             next-model
+                             (long (+ mixed-del-batches mixed))))
+
+                    (< op-roll 80)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model mixed-del-batches))
+
+                    (< op-roll 94)
+                    (do
+                      (verify-list-iter-model! lmdb "fuzzl" model)
+                      (verify-list-key-range-model! lmdb "fuzzl" model)
+                      (assert-list-txlog-replay! lmdb model)
+                      (recur (inc step) model mixed-del-batches))
+
+                    :else
+                    (do
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+                      (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                      (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                      (assert-list-txlog-replay! @lmdb-v model)
+                      (recur (inc step) model mixed-del-batches))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
+
+(deftest txn-log-fuzz-list-churn-mixed-transaction-test
+  (doseq [seed [151 239]]
+    (testing (str "seed=" seed)
+      (with-temp-dir [dir]
+        (let [opts {:flags                     (conj c/default-env-flags
+                                                    :nosync)
+                    :txn-log?                  true
+                    :txn-log-group-commit      1
+                    :txn-log-segment-max-bytes 104
+                    :txn-log-segment-max-ms    600000}
+              ^Random rng (Random. (long seed))
+              lmdb-v      (volatile! nil)]
+          (try
+            (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+            (loop [step              (long 0)
+                   model             (sorted-map)
+                   mixed-del-batches (long 0)]
+              (if (= step 210)
+                (do
+                  (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                  (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                  (assert-list-txlog-replay! @lmdb-v model)
+                  (is (> mixed-del-batches 45)))
+                (let [op-roll (.nextInt rng 100)
+                      lmdb    @lmdb-v]
+                  (cond
+                    (< op-roll 70)
+                    (let [ops                 (random-list-churn-ops rng model)
+                          rows                (list-iter-ops->rows ops)
+                          [next-model mixed]  (apply-list-iter-ops+mixed-del-count
+                                               model
+                                               ops)]
+                      (i/transact-kv lmdb rows)
+                      (recur (inc step)
+                             next-model
+                             (long (+ mixed-del-batches mixed))))
+
+                    (< op-roll 79)
+                    (do
+                      (i/force-txlog-sync! lmdb)
+                      (recur (inc step) model mixed-del-batches))
+
+                    (< op-roll 94)
+                    (do
+                      (verify-list-iter-model! lmdb "fuzzl" model)
+                      (verify-list-key-range-model! lmdb "fuzzl" model)
+                      (assert-list-txlog-replay! lmdb model)
+                      (recur (inc step) model mixed-del-batches))
+
+                    :else
+                    (do
+                      (i/close-kv lmdb)
+                      (vreset! lmdb-v nil)
+                      (vreset! lmdb-v (open-fuzz-list-lmdb dir opts))
+                      (verify-list-iter-model! @lmdb-v "fuzzl" model)
+                      (verify-list-key-range-model! @lmdb-v "fuzzl" model)
+                      (assert-list-txlog-replay! @lmdb-v model)
+                      (recur (inc step) model mixed-del-batches))))))
+            (finally
+              (when-let [lmdb @lmdb-v]
+                (i/close-kv lmdb)))))))))
 
 (deftest classify-record-kind-test
   (testing "vector checkpoint records classify via vec-index/vec-meta DBIs"

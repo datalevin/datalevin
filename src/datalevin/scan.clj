@@ -594,8 +594,8 @@
 (defn visit-list-key-range
   [lmdb dbi-name visitor k-range k-type v-type raw-pred?]
   (scan
-    (let [iterable (l/iterate-list-key-range-val-full
-                     dbi rtx cur k-range k-type)]
+    (let [iterable (l/iterate-list dbi rtx cur k-range k-type
+                                   [:all] v-type)]
       (visit* iterable visitor raw-pred? k-type v-type))
     (raise "Fail to visit list key range: " e
            {:dbi dbi-name :key-range k-range})))

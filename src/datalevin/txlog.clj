@@ -66,7 +66,8 @@
          begin-sync!
          complete-sync-success!
          complete-sync-failure!
-         await-durable-lsn!)
+         await-durable-lsn!
+         decode-commit-row-payload)
 
 (defn enabled?
   [info]
@@ -174,14 +175,25 @@
                 (str (:dir info) u/+separator+ "txlog"))
         _ (u/create-dirs dir)
         segments (segment-files dir)
+        closed-last-lsn-v (volatile! nil)
         _ (doseq [{:keys [file]} (butlast segments)]
-            (let [{:keys [partial-tail?]}
+            (let [last-record-v (volatile! nil)
+                  {:keys [partial-tail?]}
                   (scan-segment (.getPath ^File file)
-                                {:collect-records? false})]
+                                {:collect-records? false
+                                 :on-record
+                                 (fn [record]
+                                   (vreset! last-record-v record))})]
               (when partial-tail?
                 (raise "Partial tail found on closed txn-log segment"
                        {:type :txlog/corrupt
-                        :path (.getPath ^File file)}))))
+                        :path (.getPath ^File file)}))
+              (when-let [last-record @last-record-v]
+                (vreset! closed-last-lsn-v
+                         (long (-> last-record
+                                   :body
+                                   decode-commit-row-payload
+                                   :lsn))))))
         active-id (long (if (seq segments) (:id (last segments)) 1))
         active-path (segment-path dir active-id)
         _ (when-not (.exists (io/file active-path))
@@ -205,11 +217,15 @@
         meta (read-meta-file meta-path)
         meta-cur (:current meta)
         marker-cur (:current marker-state)
-        last-from-seg (long (or (some-> active-scan
-                                        :records
-                                        peek
-                                        :lsn)
-                                0))
+        last-from-active (long (or (some-> active-scan
+                                           :records
+                                           peek
+                                           :body
+                                           decode-commit-row-payload
+                                           :lsn)
+                                   0))
+        last-from-closed (long (or @closed-last-lsn-v 0))
+        last-from-seg (long (max last-from-active last-from-closed))
         last-committed (max (long (or (:last-committed-lsn meta-cur) 0))
                             last-from-seg)
         last-durable (max (long (or (:last-durable-lsn meta-cur) 0))
