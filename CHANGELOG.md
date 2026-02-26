@@ -3,13 +3,14 @@
 ## WIP
 
 ### Added
-- [WAL] Write Ahead Log (WAL) mode for both KV and Datalog transactions. When
-  enabled, transaction returns success after WAL is sync'ed to disk. Disk sync
-  in DLMDB is done later at checkpoint. This increases write speed while keeping
-  durability guarantees.  WAL will be the bases for replication, crash recovery
-  and high availability.
+- [WAL] Write Ahead Log (WAL) mode for both KV and Datalog transactions. In
+  `:strict` durability profile, transaction returns success after WAL is flushed
+  to disk; while in `:relaxed` profile, transaction returns success after WAL is
+  written. Disk sync in DLMDB is done later at checkpoint. This increases write
+  speed while keeping durability guarantees. Moreover, WAL mode provides
+  tangible speedup for concurrent writers.
 - [KV] `:inmemory` mode, where the env resides entirely in memory and all data is
-  lost on close. It has faster write speed than even `:nosync`.
+  lost on close. It has even faster write speed than `:nosync`.
 - [Datalog] Support atomic migration from default EDN blob to a specific data
   type when `update-schema`.
 - [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf]

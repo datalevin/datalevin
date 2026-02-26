@@ -492,7 +492,7 @@
 
 (def ^{:dynamic true
        :doc     "Txn-log durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn."}
-  *txn-log-durability-profile* :strict #_:relaxed)
+  *txn-log-durability-profile* :relaxed)
 
 (def ^{:dynamic true
        :doc     "Enable LMDB dual-slot commit marker in txn-log mode."}

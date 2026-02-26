@@ -75,7 +75,8 @@
             cb             (.-cb item)]
         (when (and cb (identical? status :ok))
           (cb payload))
-        (deliver (.-promise item) res))
+        (when-let [p (.-promise item)]
+          (deliver p res)))
       (recur))))
 
 (defn- combined-work
@@ -93,7 +94,8 @@
             cb             (.-cb item)]
         (when (and cb (identical? status :ok))
           (cb payload))
-        (deliver (.-promise item) res)))))
+        (when-let [p (.-promise item)]
+          (deliver p res))))))
 
 (defn- event-handler
   [^ConcurrentHashMap work-queues k]
@@ -110,6 +112,22 @@
   (let [cmb (combine work)]
     (assert (or (nil? cmb) (ifn? cmb)) "combine should be nil or a function")
     (->WorkQueue (ConcurrentLinkedQueue.) work (when cmb (FastList.)))))
+
+(defn- enqueue-work!
+  [^ConcurrentHashMap work-queues
+   ^LinkedBlockingQueue event-queue
+   work
+   p
+   cb]
+  (let [k  (work-key work)]
+    (assert (keyword? k) "work-key should return a keyword")
+    (assert (or (nil? cb) (ifn? cb)) "callback should be nil or a function")
+    (.putIfAbsent work-queues k (new-workqueue work))
+    (let [item                     (->WorkItem work p cb)
+          ^WorkQueue wq            (.get work-queues k)
+          ^ConcurrentLinkedQueue q (.-items wq)]
+      (.offer q item)
+      (.offer event-queue k))))
 
 (defprotocol IAsyncExecutor
   (start [_] "Start the async event loop")
@@ -148,18 +166,10 @@
     (.shutdownNow workers)
     (.awaitTermination workers 100 TimeUnit/MILLISECONDS))
   (exec [_ work]
-    (let [k  (work-key work)
+    (let [p  (promise)
           cb (callback work)]
-      (assert (keyword? k) "work-key should return a keyword")
-      (assert (or (nil? cb) (ifn? cb)) "callback should be nil or a function")
-      (.putIfAbsent work-queues k (new-workqueue work))
-      (let [p                        (promise)
-            item                     (->WorkItem work p cb)
-            ^WorkQueue wq            (.get work-queues k)
-            ^ConcurrentLinkedQueue q (.-items wq)]
-        (.offer q item)
-        (.offer event-queue k)
-        (->AsyncResult p)))))
+      (enqueue-work! work-queues event-queue work p cb)
+      (->AsyncResult p))))
 
 (defn- async-worker-pool
   []
@@ -193,5 +203,18 @@
     (if (and e (running? e))
       e
       (new-executor))))
+
+(defn exec-noresult
+  "Submit work without creating/returning a future. Useful when completion is
+  tracked out-of-band."
+  [executor work]
+  (if (instance? AsyncExecutor executor)
+    (let [^AsyncExecutor e executor
+          cb             (callback work)]
+      (enqueue-work! (.-work-queues e) (.-event-queue e) work nil cb)
+      nil)
+    (do
+      (exec executor work)
+      nil)))
 
 (defn shutdown-executor [] (when-let [e @executor-atom] (stop e)))

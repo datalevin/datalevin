@@ -219,6 +219,7 @@
                                (System/currentTimeMillis)))
         now (System/currentTimeMillis)
         ch (open-segment-channel active-path)
+        profile (durability-profile info)
         prealloc-mode (segment-prealloc-mode info)
         prealloc? (and (segment-prealloc? info)
                        (not= prealloc-mode :none))
@@ -236,7 +237,7 @@
                :segment-prealloc? prealloc?
                :segment-prealloc-mode prealloc-mode
                :segment-prealloc-bytes (long (segment-prealloc-bytes info))
-               :durability-profile (durability-profile info)
+               :durability-profile profile
                :sync-mode (sync-mode info)
                :commit-marker? (commit-marker? info)
                :commit-marker-version
@@ -257,7 +258,8 @@
                  :last-sync-ms last-sync-ms
                  :group-commit (long (group-commit info))
                  :group-commit-ms (long (group-commit-ms info))
-                 :sync-adaptive? (sync-adaptive? info)})
+                 :sync-adaptive? (sync-adaptive? info)
+                 :track-trailing? (= :strict profile)})
                :segment-roll-count (volatile! 0)
                :segment-roll-duration-ms (volatile! 0)
                :segment-prealloc-success-count (volatile! 0)
@@ -3185,13 +3187,15 @@
            last-sync-ms
            group-commit
            group-commit-ms
-           sync-adaptive?]
+           sync-adaptive?
+           track-trailing?]
     :or {last-durable-lsn 0
          last-appended-lsn 0
          last-sync-ms 0
          group-commit 100
          group-commit-ms 100
-         sync-adaptive? true}}]
+         sync-adaptive? true
+         track-trailing? true}}]
   (let [last-durable-lsn* (long last-durable-lsn)
         last-appended-lsn* (long last-appended-lsn)
         pending0 (max 0 (- last-appended-lsn* last-durable-lsn*))]
@@ -3206,6 +3210,7 @@
    :group-commit (volatile! (long group-commit))
    :group-commit-ms (volatile! (long group-commit-ms))
    :sync-adaptive? (boolean sync-adaptive?)
+   :track-trailing? (boolean track-trailing?)
    :sync-count-by-reason (zero-sync-reason-array)
    :batched-sync-count (volatile! 0)
    :forced-sync-count (volatile! 0)
@@ -3362,6 +3367,7 @@
        (let [last-appended-lsn (long @(:last-appended-lsn manager))
              unsynced-count (long @(:unsynced-count manager))
              sync-requested? (boolean @(:sync-requested? manager))
+             track-trailing? (boolean (:track-trailing? manager))
              group-commit (long @(:group-commit manager))
              group-commit-ms (long @(:group-commit-ms manager))
              last-sync-ms (long @(:last-sync-ms manager))
@@ -3380,14 +3386,12 @@
                       time? :batch-time
                       :else nil)]
          (vreset! (:last-appended-lsn manager) new-appended)
-         (when appended?
+         (when (and track-trailing? appended?)
            (enqueue-pending-lsn! manager lsn*))
          (vreset! (:unsynced-count manager) unsynced-after)
-         (.notifyAll monitor)
          (when (and reason (not sync-requested?))
            (vreset! (:sync-requested? manager) true)
            (vreset! (:sync-request-reason manager) reason)
-           (.notifyAll monitor)
            {:request? true
             :reason reason}))))))
 
@@ -3431,7 +3435,6 @@
         (when (and (pos? pending) (not sync-requested?))
           (vreset! (:sync-requested? manager) true)
           (vreset! (:sync-request-reason manager) :forced)
-          (.notifyAll monitor)
           {:request? true :reason :forced})))))
 
 (defn begin-sync!
@@ -3444,7 +3447,8 @@
            last-appended-lsn (long @(:last-appended-lsn manager))
            last-durable-lsn (long @(:last-durable-lsn manager))
            sync-requested? (boolean @(:sync-requested? manager))
-           sync-request-reason @(:sync-request-reason manager)]
+           sync-request-reason @(:sync-request-reason manager)
+           track-trailing? (boolean (:track-trailing? manager))]
        (when-not healthy?
          (raise "Txn-log sync manager is unhealthy"
                 {:type :txlog/unhealthy
@@ -3452,8 +3456,10 @@
        (if sync-in-progress?
          nil
          (if (> ^long last-appended-lsn ^long last-durable-lsn)
-           (let [target-lsn (long (or (pending-trailing-lsn manager)
-                                      last-appended-lsn))
+           (let [target-lsn (long (if track-trailing?
+                                    (or (pending-trailing-lsn manager)
+                                        last-appended-lsn)
+                                    last-appended-lsn))
                  lsn* (when (some? lsn) (long lsn))]
              (if (and lsn* (not= lsn* target-lsn))
                nil
@@ -3495,7 +3501,8 @@
        (vreset! (:last-sync-reason manager) reason*)
        (vreset! (:last-durable-lsn manager) durable)
        (vreset! (:last-sync-ms manager) (long now))
-       (drop-pending-through! manager durable)
+       (when (boolean (:track-trailing? manager))
+         (drop-pending-through! manager durable))
        (vreset! (:unsynced-count manager) pending-after)
        (vreset! (:sync-in-progress? manager) false)
        (vreset! (:sync-requested? manager) keep-request?)

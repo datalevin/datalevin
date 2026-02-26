@@ -36,6 +36,22 @@
     (fn [c]
       (is (false? (#'conn/strict-txlog-sync-queue? c))))))
 
+(deftest relaxed-profile-uses-sync-queue-test
+  (with-temp-dl-conn
+    {:txn-log? true
+     :txn-log-durability-profile :relaxed}
+    (fn [c]
+      (let [queued? (atom false)]
+        (with-redefs [conn/queued-transact!
+                      (fn [conn' tx-data tx-meta]
+                        (reset! queued? true)
+                        (#'conn/run-transact-now! conn' tx-data tx-meta))]
+          (d/transact! c [{:k 2}]))
+        (is (true? @queued?))
+        (is (= 1 (d/q '[:find (count ?e) .
+                        :where [?e :k]]
+                      (d/db c))))))))
+
 (deftest strict-profile-report-db-after-is-usable-test
   (with-temp-dl-conn
     {:txn-log? true

@@ -1584,6 +1584,7 @@
       (let [lmdb (l/open-kv dir {:flags                     (conj c/default-env-flags
                                                                   :nosync)
                                  :txn-log?                  true
+                                 :txn-log-group-commit      1
                                  :txn-log-segment-max-bytes 64
                                  :txn-log-segment-max-ms    600000})]
         (if/open-list-dbi lmdb "list")

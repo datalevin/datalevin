@@ -20,7 +20,7 @@
    [datalevin.interface :as i]
    [datalevin.validate :as vld])
   (:import
-   [datalevin.db DB]
+   [datalevin.db DB TxReport]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork]
@@ -33,7 +33,7 @@
 (defn conn-from-db
   [db]
   {:pre [(db/db? db)]}
-  (atom db :meta { :listeners (atom {}) }))
+  (atom db :meta {:listeners (atom {})}))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -150,26 +150,30 @@
 
 (def ^:dynamic *sync-queue-worker?* false)
 
-(defn- strict-txlog-sync-queue?
+(defn- txlog-sync-queue-profile
   [conn]
   (and (not *sync-queue-worker?*)
        (conn? conn)
        (let [store (.-store ^DB @conn)]
          (and (instance? Store store)
               (let [lmdb (.-lmdb ^Store store)
-                    opts (i/opts ^Store store)
-                    profile (or (:txn-log-durability-profile info)
+                    env-opts (i/env-opts lmdb)
+                    profile (or (:txn-log-durability-profile env-opts)
                                 c/*txn-log-durability-profile*)]
                 (and (not (l/writing? lmdb))
-                     (true? (:txn-log? opts))
-                     (= :strict profile)))))))
+                     (true? (:txn-log? env-opts))
+                     profile))))))
+
+(defn- strict-txlog-sync-queue?
+  [conn]
+  (= :strict (txlog-sync-queue-profile conn)))
 
 (declare queued-transact!)
 
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
-   (if (strict-txlog-sync-queue? conn)
+   (if (txlog-sync-queue-profile conn)
      (queued-transact! conn tx-data tx-meta)
      (run-transact-now! conn tx-data tx-meta))))
 
@@ -291,9 +295,9 @@
 (def ^:no-doc dl-work-key (memoize dl-work-key*))
 (defn- sync-queued-dl-work-key* [db-name] (->> db-name hash (str "tx-sync") keyword))
 (def ^:private sync-queued-dl-work-key (memoize sync-queued-dl-work-key*))
-(defonce ^:private ^AtomicLong sync-queued-id-gen (AtomicLong. 0))
 
-(deftype ^:no-doc SyncQueuedReq [^long id tx-data tx-meta])
+(deftype ^:no-doc SyncQueuedReq [tx-data tx-meta result-promise])
+(deftype ^:no-doc SyncQueuedResult [report error])
 
 (deftype ^:no-doc AsyncDLTx [conn store tx-data tx-meta cb]
   IAsyncWork
@@ -312,73 +316,94 @@
 (defn- dl-tx-combine
   [coll]
   (let [^AsyncDLTx fw (first coll)]
-    (->AsyncDLTx (.-conn fw)
-                 (.-store fw)
-                 (into [] (comp (map #(.-tx-data ^AsyncDLTx %)) cat) coll)
-                 (.-tx-meta fw)
-                 (.-cb fw))))
+    (if (nil? (next coll))
+      fw
+      (->AsyncDLTx (.-conn fw)
+                   (.-store fw)
+                   (into [] (comp (map #(.-tx-data ^AsyncDLTx %)) cat) coll)
+                   (.-tx-meta fw)
+                   (.-cb fw)))))
 
 (defn- sync-queued-dl-tx-combine
   [coll]
-  (let [^SyncQueuedDLTx fw (first coll)
-        ^FastList out (FastList.)]
-    (doseq [^SyncQueuedDLTx work coll]
-      (.addAll out ^java.util.Collection (.-requests work)))
-    (->SyncQueuedDLTx (.-conn fw) out)))
+  (let [^SyncQueuedDLTx fw (first coll)]
+    (if (nil? (next coll))
+      fw
+      (let [^FastList out (FastList.)]
+        (doseq [^SyncQueuedDLTx work coll]
+          (.addAll out ^java.util.Collection (.-requests work)))
+        (->SyncQueuedDLTx (.-conn fw) out)))))
+
+(defn- deliver-sync-queued-error!
+  [^SyncQueuedReq req ^Throwable e]
+  (deliver (.-result-promise req) (->SyncQueuedResult nil e)))
+
+(defn- deliver-sync-queued-success!
+  [^SyncQueuedReq req report]
+  (deliver (.-result-promise req) (->SyncQueuedResult report nil)))
+
+(defn- finalize-sync-queued-report
+  [^TxReport report db-after]
+  (db/->TxReport (.-db_before report)
+                 db-after
+                 (.-tx_data report)
+                 (.-tempids report)
+                 (.-tx_meta report)))
 
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]
-  (let [all-err (fn [e]
-                  (let [acc (transient {})
-                        n   (.size requests)]
-                    (dotimes [i n]
-                      (let [^SyncQueuedReq req (.get requests i)]
-                        (assoc! acc (.-id req) {:status :err :error e})))
-                    (persistent! acc)))]
-    (try
-      (let [results-v (volatile! (transient {}))]
-        (binding [*sync-queue-worker?* true]
-          (with-transaction [c conn]
-            (assert (conn? c))
-            (dotimes [i (.size requests)]
-              (let [^SyncQueuedReq req (.get requests i)
-                    id (.-id req)
-                    report (with @c (.-tx-data req) (.-tx-meta req))]
-                (reset! c (:db-after report))
-                (vswap! results-v assoc! id {:status :ok :report report})))))
-        (let [db-after @conn
-              results  (persistent! @results-v)]
-          (persistent!
-           (reduce-kv
-             (fn [acc id {:keys [status report error]}]
-               (if (= :ok status)
-                 (assoc! acc id {:status :ok
-                                 :report (assoc report :db-after db-after)})
-                 (assoc! acc id {:status :err :error error})))
-             (transient {})
-             results))))
-      (catch Exception e
-        (all-err e)))))
+  (let [n (int (.size requests))]
+    (if (= n 1)
+      (let [^SyncQueuedReq req (.get requests 0)]
+        (try
+          (let [report-v (volatile! nil)]
+            (binding [*sync-queue-worker?* true]
+              (with-transaction [c conn]
+                (assert (conn? c))
+                (let [^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
+                  (reset! c (:db-after report))
+                  (vreset! report-v report))))
+            (deliver-sync-queued-success!
+              req
+              (finalize-sync-queued-report ^TxReport @report-v @conn)))
+          (catch Throwable e
+            (deliver-sync-queued-error! req e)))
+        nil)
+      (let [reports (object-array n)]
+        (try
+          (binding [*sync-queue-worker?* true]
+            (with-transaction [c conn]
+              (assert (conn? c))
+              (dotimes [i n]
+                (let [^SyncQueuedReq req (.get requests i)
+                      ^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
+                  (reset! c (:db-after report))
+                  (aset reports i report)))))
+          (let [db-after @conn]
+            (dotimes [i n]
+              (deliver-sync-queued-success!
+                (.get requests i)
+                (finalize-sync-queued-report
+                  ^TxReport (aget reports i)
+                  db-after))))
+          (catch Throwable e
+            (dotimes [i n]
+              (deliver-sync-queued-error! (.get requests i) e))))
+        nil))))
 
 (defn- queued-transact!
   [conn tx-data tx-meta]
-  (let [id (long (.incrementAndGet ^AtomicLong sync-queued-id-gen))
-        requests (doto (FastList. 1)
-                   (.add (->SyncQueuedReq id tx-data tx-meta)))
-        fut (a/exec (a/get-executor)
-                    (->SyncQueuedDLTx
-                     conn
-                     requests))
-        res @fut
-        entry (get res id)]
-    (when-not entry
-      (throw (ex-info "Missing sync queued transact result"
-                      {:id id :result-keys (keys res)})))
-    (if (= :ok (:status entry))
-      (let [report (:report entry)]
-        (notify-listeners! conn report)
-        report)
-      (throw ^Throwable (:error entry)))))
+  (let [result-promise (promise)
+        requests       (doto (FastList. 1)
+                         (.add (->SyncQueuedReq tx-data tx-meta result-promise)))]
+    (a/exec-noresult (a/get-executor)
+                     (->SyncQueuedDLTx conn requests))
+    (let [^SyncQueuedResult result @result-promise]
+      (if-let [e (.-error result)]
+        (throw ^Throwable e)
+        (let [report (.-report result)]
+          (notify-listeners! conn report)
+          report)))))
 
 (defn transact-async
   ([conn tx-data] (transact-async conn tx-data nil))
