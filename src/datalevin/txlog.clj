@@ -71,79 +71,79 @@
 
 (defn enabled?
   [info]
-  (true? (:txn-log? info)))
+  (true? (:wal? info)))
 
 (defn sync-mode
   [info]
-  (or (:txn-log-sync-mode info) c/*txn-log-sync-mode*))
+  (or (:wal-sync-mode info) c/*wal-sync-mode*))
 
 (defn durability-profile
   [info]
-  (or (:txn-log-durability-profile info)
-      c/*txn-log-durability-profile*))
+  (or (:wal-durability-profile info)
+      c/*wal-durability-profile*))
 
 (defn commit-marker?
   [info]
-  (if (contains? info :txn-log-commit-marker?)
-    (boolean (:txn-log-commit-marker? info))
-    c/*txn-log-commit-marker?*))
+  (if (contains? info :wal-commit-marker?)
+    (boolean (:wal-commit-marker? info))
+    c/*wal-commit-marker?*))
 
 (defn commit-marker-version
   [info]
-  (or (:txn-log-commit-marker-version info)
-      c/*txn-log-commit-marker-version*))
+  (or (:wal-commit-marker-version info)
+      c/*wal-commit-marker-version*))
 
 (defn group-commit
   [info]
-  (or (:txn-log-group-commit info) c/*txn-log-group-commit*))
+  (or (:wal-group-commit info) c/*wal-group-commit*))
 
 (defn group-commit-ms
   [info]
-  (or (:txn-log-group-commit-ms info) c/*txn-log-group-commit-ms*))
+  (or (:wal-group-commit-ms info) c/*wal-group-commit-ms*))
 
 (defn meta-flush-max-txs
   [info]
-  (or (:txn-log-meta-flush-max-txs info) c/*txn-log-meta-flush-max-txs*))
+  (or (:wal-meta-flush-max-txs info) c/*wal-meta-flush-max-txs*))
 
 (defn meta-flush-max-ms
   [info]
-  (or (:txn-log-meta-flush-max-ms info) c/*txn-log-meta-flush-max-ms*))
+  (or (:wal-meta-flush-max-ms info) c/*wal-meta-flush-max-ms*))
 
 (defn commit-wait-ms
   [info]
-  (or (:txn-log-commit-wait-ms info) c/*txn-log-commit-wait-ms*))
+  (or (:wal-commit-wait-ms info) c/*wal-commit-wait-ms*))
 
 (defn sync-adaptive?
   [info]
-  (if (contains? info :txn-log-sync-adaptive?)
-    (boolean (:txn-log-sync-adaptive? info))
-    c/*txn-log-sync-adaptive?*))
+  (if (contains? info :wal-sync-adaptive?)
+    (boolean (:wal-sync-adaptive? info))
+    c/*wal-sync-adaptive?*))
 
 (defn segment-max-bytes
   [info]
-  (or (:txn-log-segment-max-bytes info) c/*txn-log-segment-max-bytes*))
+  (or (:wal-segment-max-bytes info) c/*wal-segment-max-bytes*))
 
 (defn segment-max-ms
   [info]
-  (or (:txn-log-segment-max-ms info) c/*txn-log-segment-max-ms*))
+  (or (:wal-segment-max-ms info) c/*wal-segment-max-ms*))
 
 (defn segment-prealloc?
   [info]
-  (if (contains? info :txn-log-segment-prealloc?)
-    (boolean (:txn-log-segment-prealloc? info))
-    c/*txn-log-segment-prealloc?*))
+  (if (contains? info :wal-segment-prealloc?)
+    (boolean (:wal-segment-prealloc? info))
+    c/*wal-segment-prealloc?*))
 
 (defn segment-prealloc-mode
   [info]
-  (or (:txn-log-segment-prealloc-mode info)
-      c/*txn-log-segment-prealloc-mode*))
+  (or (:wal-segment-prealloc-mode info)
+      c/*wal-segment-prealloc-mode*))
 
 (defn segment-prealloc-bytes
   [info]
-  (or (:txn-log-segment-prealloc-bytes info)
-      (:txn-log-segment-max-bytes info)
-      c/*txn-log-segment-prealloc-bytes*
-      c/*txn-log-segment-max-bytes*))
+  (or (:wal-segment-prealloc-bytes info)
+      (:wal-segment-max-bytes info)
+      c/*wal-segment-prealloc-bytes*
+      c/*wal-segment-max-bytes*))
 
 (defn validate-runtime-config!
   [info]
@@ -151,27 +151,27 @@
         allowed #{:strict :relaxed}]
     (when-not (allowed profile)
       (raise "Unsupported txn-log durability profile"
-             {:txn-log-durability-profile profile
+             {:wal-durability-profile profile
               :allowed allowed})))
   (let [version (long (commit-marker-version info))]
     (when-not (= version commit-marker-format-major)
       (raise "Unsupported txn-log commit marker version"
-             {:txn-log-commit-marker-version version
+             {:wal-commit-marker-version version
               :supported commit-marker-format-major})))
   (let [mode (segment-prealloc-mode info)]
     (when-not (segment-prealloc-mode-values mode)
       (raise "Unsupported txn-log segment preallocation mode"
-             {:txn-log-segment-prealloc-mode mode
+             {:wal-segment-prealloc-mode mode
               :allowed segment-prealloc-mode-values})))
   (let [bytes (long (segment-prealloc-bytes info))]
     (when (neg? bytes)
       (raise "Txn-log segment preallocation bytes must be non-negative"
-             {:txn-log-segment-prealloc-bytes bytes}))))
+             {:wal-segment-prealloc-bytes bytes}))))
 
 (defn init-runtime-state
   [info marker-state]
   (validate-runtime-config! info)
-  (let [dir (or (:txn-log-dir info)
+  (let [dir (or (:wal-dir info)
                 (str (:dir info) u/+separator+ "txlog"))
         _ (u/create-dirs dir)
         segments (segment-files dir)
@@ -780,7 +780,7 @@
           (when (> map-bytes Integer/MAX_VALUE)
             (raise "Txn-log mmap mode requires segment size <= 2GB"
                    {:type :txlog/mmap-size-too-large
-                    :txn-log-segment-prealloc-bytes map-bytes
+                    :wal-segment-prealloc-bytes map-bytes
                     :max Integer/MAX_VALUE}))
           (when (or (nil? existing) (< existing-cap map-bytes))
             (ensure-channel-size-at-least! ch map-bytes)
@@ -1277,8 +1277,8 @@
 (defn snapshot-floor-state
   ([current-raw previous-raw applied-lsn]
    (snapshot-floor-state current-raw previous-raw applied-lsn
-                         :txn-log-snapshot-current-lsn
-                         :txn-log-snapshot-previous-lsn))
+                         :wal-snapshot-current-lsn
+                         :wal-snapshot-previous-lsn))
   ([current-raw previous-raw applied-lsn current-floor-k previous-floor-k]
    (let [current-lsn (parse-optional-floor-lsn current-raw current-floor-k)
          previous-lsn (parse-optional-floor-lsn previous-raw previous-floor-k)
@@ -1707,8 +1707,8 @@
 (defn commit-marker-key-for-revision
   [revision]
   (if (zero? (bit-and (long revision) 0x1))
-    c/txn-log-marker-a
-    c/txn-log-marker-b))
+    c/wal-marker-a
+    c/wal-marker-b))
 
 (defn newer-commit-marker
   [slot-a slot-b]
@@ -1845,7 +1845,7 @@
                      :newest-segment-id newest-segment-id
                      :floors floors
                      :explicit-gc? explicit-gc?})]
-    {:txn-log? true
+    {:wal? true
      :dir dir
      :retention-bytes retention-bytes
      :retention-ms retention-ms
@@ -2034,9 +2034,9 @@
           last-flush-v (:meta-last-flush-ms state)
           now-ms (System/currentTimeMillis)
           flush-txs (max 1 (long (or (:meta-flush-max-txs state)
-                                     c/*txn-log-meta-flush-max-txs*)))
+                                     c/*wal-meta-flush-max-txs*)))
           flush-ms (max 0 (long (or (:meta-flush-max-ms state)
-                                    c/*txn-log-meta-flush-max-ms*)))
+                                    c/*wal-meta-flush-max-ms*)))
           pending (if pending-v
                     (let [v (inc (long @pending-v))]
                       (vreset! pending-v v)

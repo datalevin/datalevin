@@ -444,8 +444,11 @@
   (opts [_] opts)
 
   (assoc-opt [_ k v]
-    (vld/validate-option-mutation k v)
-    (let [new-opts (assoc opts k v)]
+    (let [k' (c/canonical-wal-option-key k)
+          _  (vld/validate-option-mutation k' v)
+          new-opts (-> opts
+                       (dissoc k)
+                       (assoc k' v))]
       (set! opts new-opts)
       (transact-opts lmdb new-opts)))
 
@@ -1519,20 +1522,22 @@
 
 (defn- transact-opts
   [lmdb opts]
-  (when (true? (:txn-log? opts))
-    (let [flags (or (get-env-flags lmdb) #{})]
-      (when (and (not (contains? flags :nosync))
-                 (not (contains? flags :rdonly)))
-        (set-env-flags lmdb #{:nosync} true))))
-  (transact-kv
-    lmdb (conj (for [[k v] opts]
-                 (lmdb/kv-tx :put c/opts k v :attr :data))
-               (lmdb/kv-tx :put c/meta :last-modified
-                           (System/currentTimeMillis) :attr :long))))
+  (let [opts (c/canonicalize-wal-opts opts)]
+    (when (true? (:wal? opts))
+      (let [flags (or (get-env-flags lmdb) #{})]
+        (when (and (not (contains? flags :nosync))
+                   (not (contains? flags :rdonly)))
+          (set-env-flags lmdb #{:nosync} true))))
+    (transact-kv
+      lmdb (conj (for [[k v] opts]
+                   (lmdb/kv-tx :put c/opts k v :attr :data))
+                 (lmdb/kv-tx :put c/meta :last-modified
+                             (System/currentTimeMillis) :attr :long)))))
 
 (defn- load-opts
   [lmdb]
-  (into {} (get-range lmdb c/opts [:all] :attr :data)))
+  (c/canonicalize-wal-opts
+   (into {} (get-range lmdb c/opts [:all] :attr :data))))
 
 (defn- open-dbis
   [lmdb]
@@ -1644,24 +1649,21 @@
       (assoc m domain (idoc/new-idoc-index lmdb opts)))
     {} domains))
 
-(defn- txlog-opt-key?
-  [k]
-  (and (keyword? k)
-       (str/starts-with? (name k) "txn-log")))
-
 (defn- propagate-top-level-txlog-opts-to-kv-opts
   [opts]
   (let [opts      (or opts {})
-        kv-opts   (or (:kv-opts opts) {})
+        kv-opts   (c/canonicalize-wal-opts (or (:kv-opts opts) {}))
         txlog-opts (into {}
                          (keep (fn [[k v]]
-                                 (when (and (txlog-opt-key? k)
-                                            (not (contains? kv-opts k)))
-                                   [k v])))
+                                 (let [k' (c/canonical-wal-option-key k)]
+                                   (when (and (c/wal-option-key? k)
+                                              (not (contains? kv-opts k')))
+                                     [k' v]))))
                          opts)]
-    (if (seq txlog-opts)
-      (assoc opts :kv-opts (merge kv-opts txlog-opts))
-      opts)))
+    (-> (c/canonicalize-wal-opts opts)
+        (assoc :kv-opts (if (seq txlog-opts)
+                          (merge kv-opts txlog-opts)
+                          kv-opts)))))
 
 (defn open
   "Open and return the storage."
@@ -1676,6 +1678,15 @@
          {:keys [kv-opts search-opts search-domains vector-opts vector-domains]}
          opts
          dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
+         data-file (java.io.File. (str dir u/+separator+ c/data-file-name))
+         new-db? (not (.exists ^java.io.File data-file))
+         wal-default-kv-opts (when new-db?
+                               {:wal? c/*datalog-wal?*
+                                :wal-durability-profile
+                                c/*datalog-wal-durability-profile*})
+         kv-opts (if wal-default-kv-opts
+                   (merge wal-default-kv-opts kv-opts)
+                   kv-opts)
          lmdb (lmdb/open-kv dir kv-opts)]
      (open-dbis lmdb)
      (let [opts0     (load-opts lmdb)
@@ -1684,47 +1695,48 @@
                         :auto-entity-time?    false
                         :closed-schema?       false
                         :background-sampling? c/*db-background-sampling?*
-                        :txn-log?             c/*txn-log?*
-                        :txn-log-rollout-mode c/*txn-log-rollout-mode*
-                        :txn-log-rollback?    c/*txn-log-rollback?*
-                        :txn-log-durability-profile
-                        c/*txn-log-durability-profile*
-                        :txn-log-commit-marker? c/*txn-log-commit-marker?*
-                        :txn-log-commit-marker-version
-                        c/*txn-log-commit-marker-version*
-                        :txn-log-sync-mode            c/*txn-log-sync-mode*
-                        :txn-log-group-commit         c/*txn-log-group-commit*
-                        :txn-log-group-commit-ms      c/*txn-log-group-commit-ms*
-                        :txn-log-meta-flush-max-txs
-                        c/*txn-log-meta-flush-max-txs*
-                        :txn-log-meta-flush-max-ms
-                        c/*txn-log-meta-flush-max-ms*
-                        :txn-log-commit-wait-ms       c/*txn-log-commit-wait-ms*
-                        :txn-log-sync-adaptive?       c/*txn-log-sync-adaptive?*
-                        :txn-log-segment-max-bytes c/*txn-log-segment-max-bytes*
-                        :txn-log-segment-max-ms    c/*txn-log-segment-max-ms*
-                        :txn-log-segment-prealloc?
-                        c/*txn-log-segment-prealloc?*
-                        :txn-log-segment-prealloc-mode
-                        c/*txn-log-segment-prealloc-mode*
-                        :txn-log-segment-prealloc-bytes
-                        c/*txn-log-segment-prealloc-bytes*
-                        :txn-log-retention-bytes c/*txn-log-retention-bytes*
-                        :txn-log-retention-ms    c/*txn-log-retention-ms*
-                        :txn-log-retention-pin-backpressure-threshold-ms
-                        c/*txn-log-retention-pin-backpressure-threshold-ms*
-                        :txn-log-vec-checkpoint-interval-ms
-                        c/*txn-log-vec-checkpoint-interval-ms*
-                        :txn-log-vec-max-lsn-delta
-                        c/*txn-log-vec-max-lsn-delta*
-                        :txn-log-vec-max-buffer-bytes
-                        c/*txn-log-vec-max-buffer-bytes*
-                        :txn-log-vec-chunk-bytes
-                        c/*txn-log-vec-chunk-bytes*
+                        :wal?             c/*datalog-wal?*
+                        :wal-rollout-mode c/*wal-rollout-mode*
+                        :wal-rollback?    c/*wal-rollback?*
+                        :wal-durability-profile
+                        c/*datalog-wal-durability-profile*
+                        :wal-commit-marker? c/*wal-commit-marker?*
+                        :wal-commit-marker-version
+                        c/*wal-commit-marker-version*
+                        :wal-sync-mode            c/*wal-sync-mode*
+                        :wal-group-commit         c/*wal-group-commit*
+                        :wal-group-commit-ms      c/*wal-group-commit-ms*
+                        :wal-meta-flush-max-txs
+                        c/*wal-meta-flush-max-txs*
+                        :wal-meta-flush-max-ms
+                        c/*wal-meta-flush-max-ms*
+                        :wal-commit-wait-ms       c/*wal-commit-wait-ms*
+                        :wal-sync-adaptive?       c/*wal-sync-adaptive?*
+                        :wal-segment-max-bytes c/*wal-segment-max-bytes*
+                        :wal-segment-max-ms    c/*wal-segment-max-ms*
+                        :wal-segment-prealloc?
+                        c/*wal-segment-prealloc?*
+                        :wal-segment-prealloc-mode
+                        c/*wal-segment-prealloc-mode*
+                        :wal-segment-prealloc-bytes
+                        c/*wal-segment-prealloc-bytes*
+                        :wal-retention-bytes c/*wal-retention-bytes*
+                        :wal-retention-ms    c/*wal-retention-ms*
+                        :wal-retention-pin-backpressure-threshold-ms
+                        c/*wal-retention-pin-backpressure-threshold-ms*
+                        :wal-vec-checkpoint-interval-ms
+                        c/*wal-vec-checkpoint-interval-ms*
+                        :wal-vec-max-lsn-delta
+                        c/*wal-vec-max-lsn-delta*
+                        :wal-vec-max-buffer-bytes
+                        c/*wal-vec-max-buffer-bytes*
+                        :wal-vec-chunk-bytes
+                        c/*wal-vec-chunk-bytes*
                         :db-name              (str (UUID/randomUUID))
                         :cache-limit          512}
                        opts0)
-           opts2     (merge opts1 opts)
+           opts2     (c/canonicalize-wal-opts
+                      (merge opts1 opts))
            schema    (init-schema lmdb schema)
            s-domains (init-search-domains (:search-domains opts2)
                                           schema search-opts search-domains)

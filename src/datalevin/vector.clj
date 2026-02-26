@@ -170,41 +170,41 @@
 
 (defn- txn-log-enabled?
   [lmdb]
-  (true? (:txn-log? (i/env-opts lmdb))))
+  (true? (:wal? (i/env-opts lmdb))))
 
 (defn- vec-checkpoint-max-buffer-bytes
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        requested (or (:txn-log-vec-max-buffer-bytes opts)
+        requested (or (:wal-vec-max-buffer-bytes opts)
                       (:vec-max-buffer-bytes opts)
-                      c/*txn-log-vec-max-buffer-bytes*
+                      c/*wal-vec-max-buffer-bytes*
                       c/*vec-max-buffer-bytes*)]
     (long (max 1 requested))))
 
 (defn- vec-checkpoint-chunk-bytes
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        requested (or (:txn-log-vec-chunk-bytes opts)
+        requested (or (:wal-vec-chunk-bytes opts)
                       (:vec-chunk-bytes opts)
-                      c/*txn-log-vec-chunk-bytes*
+                      c/*wal-vec-chunk-bytes*
                       c/*vec-chunk-bytes*)]
     (long (max 1 requested))))
 
 (defn- vec-checkpoint-interval-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        requested (or (:txn-log-vec-checkpoint-interval-ms opts)
-                      c/*txn-log-vec-checkpoint-interval-ms*)]
+        requested (or (:wal-vec-checkpoint-interval-ms opts)
+                      c/*wal-vec-checkpoint-interval-ms*)]
     (long (max 1 requested))))
 
 (defn- vec-checkpoint-max-lsn-delta
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        requested (or (:txn-log-vec-max-lsn-delta opts)
-                      c/*txn-log-vec-max-lsn-delta*)]
+        requested (or (:wal-vec-max-lsn-delta opts)
+                      c/*wal-vec-max-lsn-delta*)]
     (long (max 1 requested))))
 
-(def ^:dynamic *txn-log-vector-apply-failpoint*
+(def ^:dynamic *wal-vector-apply-failpoint*
   nil)
 
 (defn- mark-txlog-fatal!
@@ -227,8 +227,8 @@
 (defn- maybe-run-txn-log-vector-apply-failpoint!
   [lmdb operation context]
   (when (and (txn-log-enabled? lmdb)
-             (fn? *txn-log-vector-apply-failpoint*))
-    (*txn-log-vector-apply-failpoint* operation context)))
+             (fn? *wal-vector-apply-failpoint*))
+    (*wal-vector-apply-failpoint* operation context)))
 
 (defn- decode-marker-slot-safe
   [slot]
@@ -241,10 +241,10 @@
 (defn- marker-applied-lsn
   [lmdb]
   (let [slot-a (decode-marker-slot-safe
-                (i/get-value lmdb c/kv-info c/txn-log-marker-a
+                (i/get-value lmdb c/kv-info c/wal-marker-a
                              :keyword :bytes))
         slot-b (decode-marker-slot-safe
-                (i/get-value lmdb c/kv-info c/txn-log-marker-b
+                (i/get-value lmdb c/kv-info c/wal-marker-b
                              :keyword :bytes))
         curr   (cond
                  (and slot-a slot-b)

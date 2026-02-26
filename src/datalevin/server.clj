@@ -2010,7 +2010,7 @@
           path               (Paths/get (str tf u/+separator+ c/data-file-name)
                                         (into-array String []))]
       (try
-        (binding [kv/*txn-log-copy-backup-pin-observer*
+        (binding [kv/*wal-copy-backup-pin-observer*
                   (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
                     (reset! copy-backup-pin
                             {:pin-id pin-id

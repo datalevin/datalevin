@@ -195,8 +195,17 @@ Only usable for debug output.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
+   * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
+
+   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` waits for durable WAL acknowledgement
+ per transaction; `:relaxed` improves throughput by batching durability and may
+ lose a small tail of recent transactions on a crash.
+
    * `:client-opts` is the option map passed to the client if `dir` is a
  remote URI string.
+
+  For Datalog stores opened through this API, the default for a new local
+  store is `:wal? true` with `:wal-durability-profile :strict`.
 
 
   Usage:
@@ -261,6 +270,10 @@ Only usable for debug output.
    * `:search-opts` is the default options passed to [[fulltext]] function for the default search domains in case `:search-domains` above is not specified.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
+
+   * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
+
+   * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
 
  See also [[datom]], [[new-search-engine]]."}
   init-db db/init-db)
@@ -637,6 +650,10 @@ Only usable for debug output.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
+   * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
+
+   * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
+
   "}
   conn-from-datoms conn/conn-from-datoms)
 
@@ -664,7 +681,16 @@ Only usable for debug output.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
+   * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
+
+   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` maximizes durability; `:relaxed`
+ improves write throughput with a small risk of losing the latest transactions
+ on a crash.
+
    * `:client-opts` is the option map passed to the client if `dir` is a remote URI string.
+
+  For Datalog stores opened through this API, the default for a new local
+  store is `:wal? true` with `:wal-durability-profile :strict`.
 
   Please note that the connection should be managed like a stateful resource.
   Application should hold on to the same connection rather than opening
@@ -844,6 +870,9 @@ Only usable for debug output.
 (def ^{:arglists '([dir] [dir schema] [dir schema opts])
        :doc      "Obtain an open connection to a Datalog database. `dir` could be a local directory path or a dtlv connection URI string. Create the database if it does not exist. Reuse the same connection if a connection to the same database already exists. Open the database if it is closed. Return the connection.
 
+  `opts` accepts the same WAL settings as [[create-conn]], including `:wal?`
+  and `:wal-durability-profile`.
+
   See also [[create-conn]] and [[with-conn]]"}
   get-conn conn/get-conn)
 
@@ -942,6 +971,11 @@ Only usable for debug output.
    path is generated automatically. If `dir` is provided, it is used as the
    environment path and will be created if it does not exist. Passing `nil` as
    `dir` also implies in-memory mode without needing to set this option.
+  * `:wal?` is a boolean, enabling WAL mode for direct KV writes. Default is
+   `false` for `open-kv`.
+  * `:wal-durability-profile` is one of `:strict` or `:relaxed`. `:strict` waits for durable WAL
+   acknowledgement per write transaction; `:relaxed` batches durability for
+   higher throughput with a small crash window.
   * `:client-opts` is the option map passed to the client if `dir` is a
    remote server URI string.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior
@@ -1144,24 +1178,24 @@ set of keywords. See [[set-env-flags]] for their meanings."}
   sync i/sync)
 
 (def ^{:arglists '([db])
-       :doc      "Return txn-log watermarks and runtime sync state for a KV store opened with `:txn-log? true`."}
+       :doc      "Return WAL watermarks and runtime sync state for a KV store opened with `:wal? true`."}
   txlog-watermarks kv/txlog-watermarks)
 
 (def ^{:arglists '([db from-lsn]
                    [db from-lsn upto-lsn])
-       :doc      "Read committed txn-log records from `from-lsn` (inclusive), optionally capped at `upto-lsn` (inclusive)."}
+       :doc      "Read committed WAL records from `from-lsn` (inclusive), optionally capped at `upto-lsn` (inclusive)."}
   open-tx-log kv/open-tx-log)
 
 (def ^{:arglists '([db])
-       :doc      "Force txn-log sync on the active segment and wait until current appended LSN is durable."}
+       :doc      "Force WAL sync on the active segment and wait until current appended LSN is durable."}
   force-txlog-sync! kv/force-txlog-sync!)
 
 (def ^{:arglists '([db])
-       :doc      "Force LMDB environment sync (`mdb_env_sync(force=1)`) for a txn-log KV store."}
+       :doc      "Force LMDB environment sync (`mdb_env_sync(force=1)`) for a WAL-enabled KV store."}
   force-lmdb-sync! kv/force-lmdb-sync!)
 
 (def ^{:arglists '([db])
-       :doc      "Create/rotate LMDB snapshots (`current`/`previous`) and update txn-log snapshot floor bookkeeping."}
+       :doc      "Create/rotate LMDB snapshots (`current`/`previous`) and update WAL snapshot floor bookkeeping."}
   create-snapshot! kv/create-snapshot!)
 
 (def ^{:arglists '([db])
@@ -1173,46 +1207,46 @@ set of keywords. See [[set-env-flags]] for their meanings."}
   snapshot-scheduler-state kv/snapshot-scheduler-state)
 
 (def ^{:arglists '([db])
-       :doc      "Read LMDB dual-slot txn-log commit marker state."}
+       :doc      "Read LMDB dual-slot WAL commit marker state."}
   read-commit-marker kv/read-commit-marker)
 
 (def ^{:arglists '([db])
-       :doc      "Verify commit marker integrity and marker->txlog record reference."}
+       :doc      "Verify commit marker integrity and marker->WAL record reference."}
   verify-commit-marker! kv/verify-commit-marker!)
 
 (def ^{:arglists '([db])
-       :doc      "Return txn-log retention floors, safety watermark, pressure state, and GC candidates."}
+       :doc      "Return WAL retention floors, safety watermark, pressure state, and GC candidates."}
   txlog-retention-state kv/txlog-retention-state)
 
 (def ^{:arglists '([db]
                    [db retain-floor-lsn])
-       :doc      "Run txn-log segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer."}
+       :doc      "Run WAL segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer."}
   gc-txlog-segments! kv/gc-txlog-segments!)
 
 (def ^{:arglists '([db snapshot-lsn]
                    [db snapshot-lsn previous-snapshot-lsn])
-       :doc      "Update txn-log snapshot floor bookkeeping used by retention safety. 2-arity rotates previous <- old current; 3-arity sets both explicitly."}
+       :doc      "Update WAL snapshot floor bookkeeping used by retention safety. 2-arity rotates previous <- old current; 3-arity sets both explicitly."}
   txlog-update-snapshot-floor! kv/txlog-update-snapshot-floor!)
 
 (def ^{:arglists '([db])
-       :doc      "Clear txn-log snapshot floor bookkeeping used by retention safety."}
+       :doc      "Clear WAL snapshot floor bookkeeping used by retention safety."}
   txlog-clear-snapshot-floor! kv/txlog-clear-snapshot-floor!)
 
 (def ^{:arglists '([db replica-id applied-lsn])
-       :doc      "Upsert replica heartbeat floor (`applied-lsn`) used by txn-log retention safety."}
+       :doc      "Upsert replica heartbeat floor (`applied-lsn`) used by WAL retention safety."}
   txlog-update-replica-floor! kv/txlog-update-replica-floor!)
 
 (def ^{:arglists '([db replica-id])
-       :doc      "Remove a replica heartbeat floor used by txn-log retention safety."}
+       :doc      "Remove a replica heartbeat floor used by WAL retention safety."}
   txlog-clear-replica-floor! kv/txlog-clear-replica-floor!)
 
 (def ^{:arglists '([db pin-id floor-lsn]
                    [db pin-id floor-lsn expires-ms])
-       :doc      "Upsert backup/snapshot pin floor used by txn-log retention safety. Optional `expires-ms` auto-expires the pin."}
+       :doc      "Upsert backup/snapshot pin floor used by WAL retention safety. Optional `expires-ms` auto-expires the pin."}
   txlog-pin-backup-floor! kv/txlog-pin-backup-floor!)
 
 (def ^{:arglists '([db pin-id])
-       :doc      "Remove a backup/snapshot pin floor used by txn-log retention safety."}
+       :doc      "Remove a backup/snapshot pin floor used by WAL retention safety."}
   txlog-unpin-backup-floor! kv/txlog-unpin-backup-floor!)
 
 (def ^{:arglists '([db dbi-name k]

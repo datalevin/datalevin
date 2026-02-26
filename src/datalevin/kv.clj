@@ -50,7 +50,7 @@
         (txlog-watermarks-map db state)
         (if (txlog-config-enabled? db)
           (txlog-rollout-watermarks db (txlog-rollout-mode db))
-          {:txn-log? false})))))
+          {:wal? false})))))
 
 (defn open-tx-log
   ([db from-lsn]
@@ -122,11 +122,11 @@
     (dissoc state :gc-target-segments)
     (if (txlog-config-enabled? db)
       (let [rollout-mode (txlog-rollout-mode db)]
-        {:txn-log? true
+        {:wal? true
          :skipped? true
          :reason :rollback
          :watermarks (txlog-rollout-watermarks db rollout-mode)})
-      {:txn-log? false})))
+      {:wal? false})))
 
 (defn- gc-txlog-segments-local!
   [db retain-floor-lsn]
@@ -157,9 +157,9 @@
          :watermarks (txlog-rollout-watermarks db rollout-mode)})
       {:ok? false
        :skipped? true
-       :reason :txn-log-disabled
+       :reason :wal-disabled
        :retain-floor-lsn retain-floor-lsn
-       :watermarks {:txn-log? false}})))
+       :watermarks {:wal? false}})))
 
 (defn txlog-update-snapshot-floor!
   ([db snapshot-lsn]
@@ -205,32 +205,32 @@
 (def ^:private snapshot-default-defer-backoff-min-ms 1000)
 (def ^:private snapshot-default-defer-backoff-max-ms 60000)
 
-(def ^:dynamic *txn-log-snapshot-copy-failpoint*
+(def ^:dynamic *wal-snapshot-copy-failpoint*
   nil)
 
 (defn- maybe-run-txn-log-snapshot-copy-failpoint!
   [context]
-  (when (fn? *txn-log-snapshot-copy-failpoint*)
-    (*txn-log-snapshot-copy-failpoint* context)))
+  (when (fn? *wal-snapshot-copy-failpoint*)
+    (*wal-snapshot-copy-failpoint* context)))
 
-(def ^:dynamic *txn-log-copy-backup-pin-failpoint*
+(def ^:dynamic *wal-copy-backup-pin-failpoint*
   nil)
 
-(def ^:dynamic *txn-log-copy-backup-pin-observer*
+(def ^:dynamic *wal-copy-backup-pin-observer*
   nil)
 
-(def ^:dynamic *txn-log-copy-backup-pin-enabled?*
+(def ^:dynamic *wal-copy-backup-pin-enabled?*
   true)
 
 (defn- maybe-notify-txn-log-copy-backup-pin-observer!
   [context]
-  (when (fn? *txn-log-copy-backup-pin-observer*)
-    (*txn-log-copy-backup-pin-observer* context)))
+  (when (fn? *wal-copy-backup-pin-observer*)
+    (*wal-copy-backup-pin-observer* context)))
 
 (defn- maybe-run-txn-log-copy-backup-pin-failpoint!
   [context]
-  (when (fn? *txn-log-copy-backup-pin-failpoint*)
-    (*txn-log-copy-backup-pin-failpoint* context)))
+  (when (fn? *wal-copy-backup-pin-failpoint*)
+    (*wal-copy-backup-pin-failpoint* context)))
 
 (defn- lmdb-sync-interval-ms
   [lmdb]
@@ -247,7 +247,7 @@
 (defn- checkpoint-stale-threshold-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        configured (:txn-log-checkpoint-stale-threshold-ms opts)
+        configured (:wal-checkpoint-stale-threshold-ms opts)
         fallback (* 2 (lmdb-sync-interval-ms lmdb))]
     (long (max 1
                (if (number? configured)
@@ -257,9 +257,9 @@
 (defn- txlog-lag-alert-threshold-lsn
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        configured (:txn-log-lag-alert-threshold-lsn opts)
-        fallback (* 2 (long (or (:txn-log-group-commit opts)
-                                c/*txn-log-group-commit*)))]
+        configured (:wal-lag-alert-threshold-lsn opts)
+        fallback (* 2 (long (or (:wal-group-commit opts)
+                                c/*wal-group-commit*)))]
     (long (max 1
                (if (number? configured)
                  (long configured)
@@ -810,7 +810,7 @@
         :pin-floor-lsn pin-floor-lsn
         :pin-expires-ms pin-expires-ms
         :applied-lsn applied-lsn})
-      (binding [*txn-log-copy-backup-pin-enabled?* false]
+      (binding [*wal-copy-backup-pin-enabled?* false]
         (i/copy lmdb tmp-path compact?))
       (let [completed-ms (System/currentTimeMillis)
             meta {:snapshot-id snapshot-id
@@ -1249,8 +1249,8 @@
 
 (defn read-commit-marker-state
   [lmdb]
-  (let [slot-a (txlog-read-marker-slot lmdb c/txn-log-marker-a)
-        slot-b (txlog-read-marker-slot lmdb c/txn-log-marker-b)
+  (let [slot-a (txlog-read-marker-slot lmdb c/wal-marker-a)
+        slot-b (txlog-read-marker-slot lmdb c/wal-marker-b)
         current (txlog/newer-commit-marker slot-a slot-b)]
     {:slot-a slot-a
      :slot-b slot-b
@@ -1258,7 +1258,7 @@
 
 (defn- sanitize-kv-info!
   [info-v]
-  (vswap! info-v dissoc c/txn-log-marker-a c/txn-log-marker-b)
+  (vswap! info-v dissoc c/wal-marker-a c/wal-marker-b)
   info-v)
 
 (defn- ensure-fast-list
@@ -1307,8 +1307,14 @@
 
 (defn txlog-mark-fatal!
   [state ex]
-  (when-let [fatal (:fatal-error state)]
-    (vreset! fatal ex)))
+  (let [retryable?
+        (loop [e ex]
+          (when e
+            (if (l/resized? e)
+              true
+              (recur (.getCause ^Throwable e)))))]
+    (when (and (not retryable?) (:fatal-error state))
+      (vreset! (:fatal-error state) ex))))
 
 (defn txlog-throw-if-fatal!
   [state]
@@ -1378,7 +1384,7 @@
   [lmdb rollout-mode]
   (let [write-path-enabled? (= :active rollout-mode)]
     (merge
-     {:txn-log? true
+     {:wal? true
       :rollout-mode rollout-mode
       :write-path-enabled? write-path-enabled?
       :rollback? (not write-path-enabled?)}
@@ -1410,10 +1416,11 @@
         checkpoint-stale? (and (some? checkpoint-staleness-ms)
                                (>= ^long checkpoint-staleness-ms
                                    ^long checkpoint-stale-threshold-ms))]
-    {:txn-log? true
+    {:wal? true
      :rollout-mode rollout-mode
      :write-path-enabled? write-path-enabled?
      :rollback? (not write-path-enabled?)
+     :durability-profile (:durability-profile state)
      :dir (:dir state)
      :segment-id (long @(:segment-id state))
      :next-lsn next-lsn
@@ -1529,7 +1536,7 @@
              {:keys [dir state]}
              (txlog/init-runtime-state info marker)]
          (vswap! info-v assoc
-                 :txn-log-dir dir
+                 :wal-dir dir
                  :txlog-state state
                  :txlog-pending-ops (FastList.))
          state)))))
@@ -1598,35 +1605,35 @@
 
 (def ^:private txlog-recovery-reopen-opt-keys
   [:mapsize :max-readers :flags :max-dbs :temp? :key-compress :val-compress
-   :txn-log?
-   :txn-log-dir
-   :txn-log-rollout-mode
-   :txn-log-rollback?
-   :txn-log-durability-profile
-   :txn-log-commit-marker?
-   :txn-log-commit-marker-version
-   :txn-log-sync-mode
-   :txn-log-group-commit
-   :txn-log-group-commit-ms
-   :txn-log-meta-flush-max-txs
-   :txn-log-meta-flush-max-ms
-   :txn-log-commit-wait-ms
-   :txn-log-sync-adaptive?
-   :txn-log-segment-max-bytes
-   :txn-log-segment-max-ms
-   :txn-log-segment-prealloc?
-   :txn-log-segment-prealloc-mode
-   :txn-log-segment-prealloc-bytes
-   :txn-log-retention-bytes
-   :txn-log-retention-ms
-   :txn-log-retention-pin-backpressure-threshold-ms
-   :txn-log-replica-floor-ttl-ms
-   :txn-log-lag-alert-threshold-lsn
-   :txn-log-checkpoint-stale-threshold-ms
-   :txn-log-vec-checkpoint-interval-ms
-   :txn-log-vec-max-lsn-delta
-   :txn-log-vec-max-buffer-bytes
-   :txn-log-vec-chunk-bytes
+   :wal?
+   :wal-dir
+   :wal-rollout-mode
+   :wal-rollback?
+   :wal-durability-profile
+   :wal-commit-marker?
+   :wal-commit-marker-version
+   :wal-sync-mode
+   :wal-group-commit
+   :wal-group-commit-ms
+   :wal-meta-flush-max-txs
+   :wal-meta-flush-max-ms
+   :wal-commit-wait-ms
+   :wal-sync-adaptive?
+   :wal-segment-max-bytes
+   :wal-segment-max-ms
+   :wal-segment-prealloc?
+   :wal-segment-prealloc-mode
+   :wal-segment-prealloc-bytes
+   :wal-retention-bytes
+   :wal-retention-ms
+   :wal-retention-pin-backpressure-threshold-ms
+   :wal-replica-floor-ttl-ms
+   :wal-lag-alert-threshold-lsn
+   :wal-checkpoint-stale-threshold-ms
+   :wal-vec-checkpoint-interval-ms
+   :wal-vec-max-lsn-delta
+   :wal-vec-max-buffer-bytes
+   :wal-vec-chunk-bytes
    :lmdb-sync-interval
    :lmdb-sync-interval-ms
    :snapshot-dir
@@ -1950,26 +1957,26 @@
 (defn- txlog-rollout-mode
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        rollout-specified? (contains? opts :txn-log-rollout-mode)
-        rollback-specified? (contains? opts :txn-log-rollback?)
-        rollback? (if (contains? opts :txn-log-rollback?)
-                    (boolean (:txn-log-rollback? opts))
-                    (boolean c/*txn-log-rollback?*))
-        requested (or (:txn-log-rollout-mode opts)
+        rollout-specified? (contains? opts :wal-rollout-mode)
+        rollback-specified? (contains? opts :wal-rollback?)
+        rollback? (if (contains? opts :wal-rollback?)
+                    (boolean (:wal-rollback? opts))
+                    (boolean c/*wal-rollback?*))
+        requested (or (:wal-rollout-mode opts)
                       (when rollback? :rollback)
-                      c/*txn-log-rollout-mode*)
+                      c/*wal-rollout-mode*)
         mode (normalize-txlog-rollout-mode requested)]
     (when-not (contains? txlog-rollout-mode-values mode)
       (raise "Unsupported txn-log rollout mode"
-             {:txn-log-rollout-mode requested
+             {:wal-rollout-mode requested
               :allowed txlog-rollout-mode-values}))
     (when (and rollout-specified?
                rollback-specified?
                rollback?
                (not= :rollback mode))
       (raise "Conflicting txn-log rollout options"
-             {:txn-log-rollout-mode (:txn-log-rollout-mode opts)
-              :txn-log-rollback? (:txn-log-rollback? opts)
+             {:wal-rollout-mode (:wal-rollout-mode opts)
+              :wal-rollback? (:wal-rollback? opts)
               :expected-mode :rollback}))
     mode))
 
@@ -1996,9 +2003,9 @@
 (defn- txlog-retention-pin-backpressure-threshold-ms
   [lmdb]
   (let [info (or (i/env-opts lmdb) {})
-        configured (:txn-log-retention-pin-backpressure-threshold-ms info)]
+        configured (:wal-retention-pin-backpressure-threshold-ms info)]
     (long (or configured
-              c/*txn-log-retention-pin-backpressure-threshold-ms*))))
+              c/*wal-retention-pin-backpressure-threshold-ms*))))
 
 (defn- txlog-retention-backpressure-state
   [lmdb state]
@@ -2008,8 +2015,8 @@
         total-bytes-v (:retention-total-bytes state)
         now-ms   (System/currentTimeMillis)
         info     (or (i/env-opts lmdb) {})
-        retention-bytes (long (or (:txn-log-retention-bytes info)
-                                  c/*txn-log-retention-bytes*))
+        retention-bytes (long (or (:wal-retention-bytes info)
+                                  c/*wal-retention-bytes*))
         total-bytes (when (some? total-bytes-v) (long @total-bytes-v))
         cached-report (when (some? cached-v) @cached-v)
         bytes-pressure?
@@ -2180,13 +2187,13 @@
 (defn txlog-snapshot-floor-state
   [lmdb info applied-lsn]
   (txlog/snapshot-floor-state
-   (or (kv-info-value lmdb c/txn-log-snapshot-current-lsn)
-       (get info :txn-log-snapshot-current-lsn))
-   (or (kv-info-value lmdb c/txn-log-snapshot-previous-lsn)
-       (get info :txn-log-snapshot-previous-lsn))
+   (or (kv-info-value lmdb c/wal-snapshot-current-lsn)
+       (get info :wal-snapshot-current-lsn))
+   (or (kv-info-value lmdb c/wal-snapshot-previous-lsn)
+       (get info :wal-snapshot-previous-lsn))
    applied-lsn
-   c/txn-log-snapshot-current-lsn
-   c/txn-log-snapshot-previous-lsn))
+   c/wal-snapshot-current-lsn
+   c/wal-snapshot-previous-lsn))
 
 (defn- configured-vector-domains
   [lmdb]
@@ -2228,31 +2235,31 @@
   (txlog/vector-floor-state
    (vector-meta-state lmdb)
    (configured-vector-domains lmdb)
-   (or (kv-info-value lmdb :txn-log-vector-floor-lsn)
-       (get info :txn-log-vector-floor-lsn))
-   :txn-log-vector-floor-lsn))
+   (or (kv-info-value lmdb :wal-vector-floor-lsn)
+       (get info :wal-vector-floor-lsn))
+   :wal-vector-floor-lsn))
 
 (defn txlog-replica-floor-state
   [lmdb info]
   (txlog/replica-floor-state
-   (or (kv-info-value lmdb c/txn-log-replica-floors)
-       (get info :txn-log-replica-floors))
-   (long (or (:txn-log-replica-floor-ttl-ms info)
-             c/*txn-log-replica-floor-ttl-ms*))
+   (or (kv-info-value lmdb c/wal-replica-floors)
+       (get info :wal-replica-floors))
+   (long (or (:wal-replica-floor-ttl-ms info)
+             c/*wal-replica-floor-ttl-ms*))
    (System/currentTimeMillis)
-   (or (kv-info-value lmdb :txn-log-replica-floor-lsn)
-       (get info :txn-log-replica-floor-lsn))
-   :txn-log-replica-floor-lsn))
+   (or (kv-info-value lmdb :wal-replica-floor-lsn)
+       (get info :wal-replica-floor-lsn))
+   :wal-replica-floor-lsn))
 
 (defn txlog-backup-pin-floor-state
   [lmdb info]
   (txlog/backup-pin-floor-state
-   (or (kv-info-value lmdb c/txn-log-backup-pins)
-       (get info :txn-log-backup-pins))
+   (or (kv-info-value lmdb c/wal-backup-pins)
+       (get info :wal-backup-pins))
    (System/currentTimeMillis)
-   (or (kv-info-value lmdb :txn-log-backup-pin-floor-lsn)
-       (get info :txn-log-backup-pin-floor-lsn))
-   :txn-log-backup-pin-floor-lsn))
+   (or (kv-info-value lmdb :wal-backup-pin-floor-lsn)
+       (get info :wal-backup-pin-floor-lsn))
+   :wal-backup-pin-floor-lsn))
 
 (defn- kv-info-map-value
   [lmdb k]
@@ -2270,20 +2277,20 @@
   (let [res (txlog/snapshot-floor-update-plan
              snapshot-lsn
              previous-snapshot-lsn
-             (kv-info-value lmdb c/txn-log-snapshot-current-lsn)
-             (kv-info-value lmdb c/txn-log-snapshot-previous-lsn)
-             c/txn-log-snapshot-current-lsn
-             c/txn-log-snapshot-previous-lsn)]
+             (kv-info-value lmdb c/wal-snapshot-current-lsn)
+             (kv-info-value lmdb c/wal-snapshot-previous-lsn)
+             c/wal-snapshot-current-lsn
+             c/wal-snapshot-previous-lsn)]
     (i/transact-kv lmdb c/kv-info (:txs res) :keyword :data)
     (dissoc res :txs)))
 
 (defn txlog-clear-snapshot-floor-state!
   [lmdb]
   (let [res (txlog/snapshot-floor-clear-plan
-             (kv-info-value lmdb c/txn-log-snapshot-current-lsn)
-             (kv-info-value lmdb c/txn-log-snapshot-previous-lsn)
-             c/txn-log-snapshot-current-lsn
-             c/txn-log-snapshot-previous-lsn)]
+             (kv-info-value lmdb c/wal-snapshot-current-lsn)
+             (kv-info-value lmdb c/wal-snapshot-previous-lsn)
+             c/wal-snapshot-current-lsn
+             c/wal-snapshot-previous-lsn)]
     (i/transact-kv lmdb c/kv-info (:txs res) :keyword :data)
     (dissoc res :txs)))
 
@@ -2293,18 +2300,18 @@
              replica-id
              applied-lsn
              (System/currentTimeMillis)
-             (kv-info-map-value lmdb c/txn-log-replica-floors)
-             c/txn-log-replica-floors)]
-    (write-kv-info-map! lmdb c/txn-log-replica-floors (:entries res))
+             (kv-info-map-value lmdb c/wal-replica-floors)
+             c/wal-replica-floors)]
+    (write-kv-info-map! lmdb c/wal-replica-floors (:entries res))
     (dissoc res :entries)))
 
 (defn txlog-clear-replica-floor-state!
   [lmdb replica-id]
   (let [res (txlog/replica-floor-clear-plan
              replica-id
-             (kv-info-map-value lmdb c/txn-log-replica-floors)
-             c/txn-log-replica-floors)]
-    (write-kv-info-map! lmdb c/txn-log-replica-floors (:entries res))
+             (kv-info-map-value lmdb c/wal-replica-floors)
+             c/wal-replica-floors)]
+    (write-kv-info-map! lmdb c/wal-replica-floors (:entries res))
     (dissoc res :entries)))
 
 (defn txlog-pin-backup-floor-state!
@@ -2314,18 +2321,18 @@
              floor-lsn
              expires-ms
              (System/currentTimeMillis)
-             (kv-info-map-value lmdb c/txn-log-backup-pins)
-             c/txn-log-backup-pins)]
-    (write-kv-info-map! lmdb c/txn-log-backup-pins (:entries res))
+             (kv-info-map-value lmdb c/wal-backup-pins)
+             c/wal-backup-pins)]
+    (write-kv-info-map! lmdb c/wal-backup-pins (:entries res))
     (dissoc res :entries)))
 
 (defn txlog-unpin-backup-floor-state!
   [lmdb pin-id]
   (let [res (txlog/backup-pin-floor-clear-plan
              pin-id
-             (kv-info-map-value lmdb c/txn-log-backup-pins)
-             c/txn-log-backup-pins)]
-    (write-kv-info-map! lmdb c/txn-log-backup-pins (:entries res))
+             (kv-info-map-value lmdb c/wal-backup-pins)
+             c/wal-backup-pins)]
+    (write-kv-info-map! lmdb c/wal-backup-pins (:entries res))
     (dissoc res :entries)))
 
 (defn- txlog-record-payload
@@ -2499,14 +2506,14 @@
   [db operator-retain-floor-lsn explicit-gc?]
   (let [runtime-state (txlog/state db)
         watermarks (txlog-watermarks db)
-        txlog? (:txn-log? watermarks)
+        txlog? (:wal? watermarks)
         dir (:dir watermarks)]
     (when (and txlog? (local-dir? dir))
       (let [info (or (i/env-opts db) {})
-            retention-bytes (long (or (:txn-log-retention-bytes info)
-                                      c/*txn-log-retention-bytes*))
-            retention-ms (long (or (:txn-log-retention-ms info)
-                                   c/*txn-log-retention-ms*))
+            retention-bytes (long (or (:wal-retention-bytes info)
+                                      c/*wal-retention-bytes*))
+            retention-ms (long (or (:wal-retention-ms info)
+                                   c/*wal-retention-ms*))
             marker-state (or (:commit-marker watermarks)
                              (read-commit-marker-state db))
             marker (:current marker-state)
@@ -2567,7 +2574,7 @@
 
 (defn- txlog-copy-with-backup-pin!
   [lmdb raw-lmdb dest compact?]
-  (if (and *txn-log-copy-backup-pin-enabled?*
+  (if (and *wal-copy-backup-pin-enabled?*
            (txlog-write-path-enabled? raw-lmdb))
     (let [state (txlog/enabled-state raw-lmdb)
           watermarks (txlog-watermarks-map raw-lmdb state)
@@ -2666,7 +2673,7 @@
       (txlog-watermarks-map db state)
       (if (txlog-config-enabled? db)
         (txlog-rollout-watermarks db (txlog-rollout-mode db))
-        {:txn-log? false})))
+        {:wal? false})))
 
   (open-tx-log [this from-lsn]
     (.open-tx-log this from-lsn nil))

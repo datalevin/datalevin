@@ -156,8 +156,10 @@
                      (when (.get running)
                        (.submit dispatcher ^Callable init)))))]
       (when-not (.get running)
-        (.submit dispatcher ^Callable init)
-        (.set running true))))
+        ;; Set running before scheduling init to avoid a startup race where
+        ;; init checks running=false and exits before the loop starts.
+        (.set running true)
+        (.submit dispatcher ^Callable init))))
   (running? [_] (.get running))
   (stop [_]
     (.set running false)

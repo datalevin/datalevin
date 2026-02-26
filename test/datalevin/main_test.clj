@@ -124,7 +124,7 @@
   (let [src (u/tmp-dir (str "datalevin-copy-meta-test-" (UUID/randomUUID)))
         dst (u/tmp-dir (str "datalevin-copy-meta-test-" (UUID/randomUUID)))
         db  (d/open-kv src {:flags    (conj c/default-env-flags :nosync)
-                            :txn-log? true})
+                            :wal? true})
         dbi "a"]
     (try
       (d/open-dbi db dbi)
@@ -154,7 +154,7 @@
   (let [src (u/tmp-dir (str "datalevin-dtlv-copy-meta-test-" (UUID/randomUUID)))
         dst (u/tmp-dir (str "datalevin-dtlv-copy-meta-test-" (UUID/randomUUID)))
         db  (d/open-kv src {:flags    (conj c/default-env-flags :nosync)
-                            :txn-log? true})
+                            :wal? true})
         dbi "a"]
     (try
       (d/open-dbi db dbi)

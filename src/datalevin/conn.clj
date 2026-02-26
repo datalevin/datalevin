@@ -158,10 +158,10 @@
          (and (instance? Store store)
               (let [lmdb (.-lmdb ^Store store)
                     env-opts (i/env-opts lmdb)
-                    profile (or (:txn-log-durability-profile env-opts)
-                                c/*txn-log-durability-profile*)]
+                    profile (or (:wal-durability-profile env-opts)
+                                c/*wal-durability-profile*)]
                 (and (not (l/writing? lmdb))
-                     (true? (:txn-log? env-opts))
+                     (true? (:wal? env-opts))
                      profile))))))
 
 (defn- strict-txlog-sync-queue?
@@ -344,11 +344,9 @@
 
 (defn- finalize-sync-queued-report
   [^TxReport report db-after]
-  (db/->TxReport (.-db_before report)
-                 db-after
-                 (.-tx_data report)
-                 (.-tempids report)
-                 (.-tx_meta report)))
+  ;; Preserve any extra tx report keys (e.g. :new-attributes) while updating
+  ;; db-after to the final shared connection snapshot.
+  (assoc report :db-after db-after))
 
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]

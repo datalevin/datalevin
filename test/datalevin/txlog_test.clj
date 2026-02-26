@@ -134,10 +134,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      2
-                    :txn-log-segment-max-bytes 96
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      2
+                    :wal-segment-max-bytes 96
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -190,10 +190,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 88
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 88
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -264,10 +264,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 128
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 128
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -336,11 +336,11 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-durability-profile :strict
-                    :txn-log-sync-mode         :none
-                    :txn-log-segment-max-bytes 96
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-durability-profile :strict
+                    :wal-sync-mode         :none
+                    :wal-segment-max-bytes 96
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -753,10 +753,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 112
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 112
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -805,10 +805,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 112
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 112
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -860,10 +860,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 104
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 104
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -923,10 +923,10 @@
       (with-temp-dir [dir]
         (let [opts {:flags                     (conj c/default-env-flags
                                                     :nosync)
-                    :txn-log?                  true
-                    :txn-log-group-commit      1
-                    :txn-log-segment-max-bytes 104
-                    :txn-log-segment-max-ms    600000}
+                    :wal?                  true
+                    :wal-group-commit      1
+                    :wal-segment-max-bytes 104
+                    :wal-segment-max-ms    600000}
               ^Random rng (Random. (long seed))
               lmdb-v      (volatile! nil)]
           (try
@@ -1093,6 +1093,16 @@
       (is (instance? Exception @(:fatal-error state)))
       (is (= "apply failed"
              (.getMessage ^Exception @(:fatal-error state)))))))
+
+(deftest txlog-mark-fatal-skips-resized-test
+  (let [state {:fatal-error (volatile! nil)}]
+    (#'kv/txlog-mark-fatal! state (ex-info "DB resized" {:resized true}))
+    (is (nil? @(:fatal-error state)))
+    (#'kv/txlog-mark-fatal! state
+                            (ex-info "wrapped"
+                                     {}
+                                     (ex-info "DB resized" {:resized true})))
+    (is (nil? @(:fatal-error state)))))
 
 (deftest retention-state-empty-floors-test
   (let [state (sut/retention-state
@@ -1395,10 +1405,10 @@
             {:keys [state]}
             (sut/init-runtime-state
              {:dir root
-              :txn-log? true
-              :txn-log-segment-prealloc? true
-              :txn-log-segment-prealloc-mode mode
-              :txn-log-segment-prealloc-bytes 512}
+              :wal? true
+              :wal-segment-prealloc? true
+              :wal-segment-prealloc-mode mode
+              :wal-segment-prealloc-bytes 512}
              {})]
         (try
           (is (= 1 @(:segment-id state)))

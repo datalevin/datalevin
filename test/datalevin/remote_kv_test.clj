@@ -21,7 +21,7 @@
   (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
                    (UUID/randomUUID))
         store (sut/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                :txn-log? true})]
+                                :wal? true})]
     (if/open-dbi store "a")
     (if/transact-kv store [[:put "a" :k :v]])
     (let [watermarks  (if/txlog-watermarks store)
@@ -35,7 +35,7 @@
           snapshot2   (if/create-snapshot! store)
           snapshots   (if/list-snapshots store)
           sched-state (if/snapshot-scheduler-state store)]
-      (is (:txn-log? watermarks))
+      (is (:wal? watermarks))
       (is (pos? committed))
       (is (every? #(contains? % :tx-kind) tx-records))
       (is (every? #{:user :vector-checkpoint :unknown}
@@ -85,7 +85,7 @@
   (let [db-name (str "copy-meta-" (UUID/randomUUID))
         uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
         store   (sut/open-kv uri {:flags    (conj c/default-env-flags :nosync)
-                                  :txn-log? true})
+                                  :wal? true})
         client  (cl/new-client uri)]
     (try
       (cl/open-database client db-name c/db-store-kv)
@@ -117,7 +117,7 @@
   (let [db-name (str "copy-meta-high-level-" (UUID/randomUUID))
         uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
         store   (sut/open-kv uri {:flags    (conj c/default-env-flags :nosync)
-                                  :txn-log? true})
+                                  :wal? true})
         dst     (u/tmp-dir (str "copy-meta-high-level-dst-" (UUID/randomUUID)))]
     (try
       (if/open-dbi store "z")
@@ -149,8 +149,8 @@
         store (sut/open-kv dir {:flags                (conj
                                                         c/default-env-flags
                                                         :nosync)
-                                :txn-log?            true
-                                :txn-log-rollout-mode :rollback})]
+                                :wal?            true
+                                :wal-rollout-mode :rollback})]
     (if/open-dbi store "a")
     (if/transact-kv store [[:put "a" :k :v]])
     (is (= :v (if/get-value store "a" :k)))
@@ -161,7 +161,7 @@
           verified (if/verify-commit-marker! store)
           retention (if/txlog-retention-state store)
           gc-res (if/gc-txlog-segments! store)]
-      (is (:txn-log? watermarks))
+      (is (:wal? watermarks))
       (is (= :rollback (:rollout-mode watermarks)))
       (is (false? (:write-path-enabled? watermarks)))
       (is (true? (:rollback? watermarks)))
@@ -178,7 +178,7 @@
       (is (:skipped? verified))
       (is (= :rollback (:reason verified)))
       (is (= :rollback (get-in verified [:watermarks :rollout-mode])))
-      (is (:txn-log? retention))
+      (is (:wal? retention))
       (is (:skipped? retention))
       (is (= :rollback (:reason retention)))
       (is (= :rollback (get-in retention [:watermarks :rollout-mode])))

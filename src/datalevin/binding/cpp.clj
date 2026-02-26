@@ -1490,7 +1490,8 @@
         info (into {}
                    (i/range-keep lmdb c/kv-info decode-kv-info-entry
                                  [:all] :raw :raw true))]
-    (assoc info :dbis dbis)))
+    (c/canonicalize-wal-opts
+     (assoc info :dbis dbis))))
 
 (defn- init-info
   [^CppLMDB lmdb new-info]
@@ -1575,7 +1576,8 @@
 (defmethod open-kv :cpp
   ([dir] (open-kv dir {}))
   ([dir opts]
-   (let [inmemory? (or (nil? dir)
+   (let [opts (c/canonicalize-wal-opts opts)
+         inmemory? (or (nil? dir)
                        (:inmemory? opts)
                        (some #{:inmemory} (:flags opts)))
          dir (or dir (str (u/tmp-dir) (java.util.UUID/randomUUID)))

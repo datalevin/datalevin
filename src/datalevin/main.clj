@@ -314,7 +314,7 @@
   [src-dir dest-dir compact?]
   (let [txlog-dir (str src-dir u/+separator+ "txlog")
         opts      (when (u/file-exists txlog-dir)
-                    {:txn-log? true})
+                    {:wal? true})
         lmdb      (l/open-kv src-dir opts)]
     (try
       (if/copy lmdb dest-dir compact?)

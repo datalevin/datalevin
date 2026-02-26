@@ -819,8 +819,19 @@
 (deftest txn-log-enables-nosync-flag-test
   (let [dir (u/tmp-dir (str "txlog-nosync-" (UUID/randomUUID)))]
     (try
-      (let [lmdb (l/open-kv dir {:txn-log? true})]
+      (let [lmdb (l/open-kv dir {:wal? true})]
         (is (contains? (if/get-env-flags lmdb) :nosync))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest wal-alias-enables-nosync-flag-test
+  (let [dir (u/tmp-dir (str "wal-nosync-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb       (l/open-kv dir {:wal? true})
+            watermarks (if/txlog-watermarks lmdb)]
+        (is (contains? (if/get-env-flags lmdb) :nosync))
+        (is (:wal? watermarks))
         (if/close-kv lmdb))
       (finally
         (u/delete-files dir)))))
@@ -831,23 +842,72 @@
                 :v {:db/valueType :db.type/string}}]
     (try
       (let [conn       (dc/get-conn dir schema
-                                    {:txn-log? true
+                                    {:wal? true
                                      :kv-opts  {:mapsize 64}})
             ^DB db     @conn
             ^Store s   (.-store db)
             lmdb       (.-lmdb s)
             watermarks (if/txlog-watermarks lmdb)]
-        (is (:txn-log? watermarks))
+        (is (:wal? watermarks))
         (is (contains? (if/get-env-flags lmdb) :nosync))
         (dc/close conn))
       (finally
         (u/delete-files dir)))))
 
+(deftest top-level-wal-propagates-to-kv-test
+  (let [dir (u/tmp-dir (str "wal-top-level-propagation-" (UUID/randomUUID)))
+        schema {:k {:db/valueType :db.type/long}
+                :v {:db/valueType :db.type/string}}]
+    (try
+      (let [conn (dc/create-conn dir schema
+                                 {:wal? true
+                                  :wal-durability-profile :strict
+                                  :kv-opts {:mapsize 64}})]
+        (try
+          (let [^DB db     @conn
+                ^Store s   (.-store db)
+                lmdb       (.-lmdb s)
+                env-opts   (if/env-opts lmdb)
+                watermarks (if/txlog-watermarks lmdb)]
+            (is (:wal? watermarks))
+            (is (contains? (if/get-env-flags lmdb) :nosync))
+            (is (true? (:wal? env-opts)))
+            (is (= :strict (:wal-durability-profile env-opts))))
+          (finally
+            (dc/close conn))))
+      (finally
+        (try
+          (u/delete-files dir)
+          (catch Exception _))))))
+
+(deftest datalog-defaults-to-strict-wal-test
+  (let [dir (u/tmp-dir (str "datalog-default-wal-" (UUID/randomUUID)))
+        schema {:k {:db/valueType :db.type/long}
+                :v {:db/valueType :db.type/string}}]
+    (try
+      (let [conn (dc/create-conn dir schema {:kv-opts {:mapsize 64}})]
+        (try
+          (let [^DB db     @conn
+                ^Store s   (.-store db)
+                lmdb       (.-lmdb s)
+                env-opts   (if/env-opts lmdb)
+                watermarks (if/txlog-watermarks lmdb)]
+            (is (true? (:wal? env-opts)))
+            (is (= :strict (:wal-durability-profile env-opts)))
+            (is (:wal? watermarks))
+            (is (= :strict (:durability-profile watermarks))))
+          (finally
+            (dc/close conn))))
+      (finally
+        (try
+          (u/delete-files dir)
+          (catch Exception _))))))
+
 (deftest txn-log-replay-from-commit-marker-test
   (let [dir (u/tmp-dir (str "txlog-replay-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-list-dbi lmdb "list")
         (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
         (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
@@ -875,12 +935,12 @@
         (if/transact-kv lmdb [[:del-list "list" :k [2] :data :long]])
         (is (= [1] (if/get-list lmdb "list" :k :data :long)))
         (if/transact-kv lmdb
-                        [[:put c/kv-info c/txn-log-marker-a slot-a :keyword :bytes]
-                         [:put c/kv-info c/txn-log-marker-b slot-b :keyword :bytes]])
+                        [[:put c/kv-info c/wal-marker-a slot-a :keyword :bytes]
+                         [:put c/kv-info c/wal-marker-b slot-b :keyword :bytes]])
         (if/close-kv lmdb))
 
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-list-dbi lmdb "list")
         (is (= [1 2] (if/get-list lmdb "list" :k :data :long)))
         (if/close-kv lmdb))
@@ -891,7 +951,7 @@
   (let [dir (u/tmp-dir (str "txlog-bootstrap-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         ;; Fresh LMDB may not have all copy prerequisites until first write.
         (is (empty? (if/list-snapshots lmdb)))
         (if/open-list-dbi lmdb "list")
@@ -899,7 +959,7 @@
         (if/close-kv lmdb))
       ;; Re-open should complete bootstrap to steady-state (current + previous).
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (let [snapshots (if/list-snapshots lmdb)]
           (is (= 2 (count snapshots)))
           (is (= :current (:slot (first snapshots))))
@@ -913,7 +973,7 @@
     (try
       (let [lmdb (l/open-kv dir {:flags                    (conj c/default-env-flags
                                                                  :nosync)
-                                 :txn-log?                true
+                                 :wal?                true
                                  :snapshot-bootstrap-force? false})]
         (is (empty? (if/list-snapshots lmdb)))
         (is (:ok? (if/create-snapshot! lmdb)))
@@ -926,18 +986,18 @@
   (let [dir (u/tmp-dir (str "txlog-snapshot-pin-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-list-dbi lmdb "list")
         (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
         (let [seen-pin-id (atom nil)
               seen-floor (atom nil)
-              res (binding [kv/*txn-log-snapshot-copy-failpoint*
+              res (binding [kv/*wal-snapshot-copy-failpoint*
                             (fn [{:keys [lmdb pin-id pin-floor-lsn
                                          pin-expires-ms]}]
                               (reset! seen-pin-id pin-id)
                               (reset! seen-floor pin-floor-lsn)
                               (let [pins (if/get-value lmdb c/kv-info
-                                                       c/txn-log-backup-pins
+                                                       c/wal-backup-pins
                                                        :keyword :data)]
                                 (is (map? pins))
                                 (is (= pin-floor-lsn
@@ -945,7 +1005,7 @@
                                 (is (= pin-expires-ms
                                        (get-in pins [pin-id :expires-ms])))))]
                     (if/create-snapshot! lmdb))
-              pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+              pins-after (if/get-value lmdb c/kv-info c/wal-backup-pins
                                        :keyword :data)]
           (is (:ok? res))
           (is (string? @seen-pin-id))
@@ -961,22 +1021,22 @@
   (let [dir (u/tmp-dir (str "txlog-snapshot-pin-fail-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-list-dbi lmdb "list")
         (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
         (let [seen-pin-id (atom nil)]
           (is (thrown-with-msg?
                clojure.lang.ExceptionInfo #"snapshot-copy-failpoint"
-               (binding [kv/*txn-log-snapshot-copy-failpoint*
+               (binding [kv/*wal-snapshot-copy-failpoint*
                          (fn [{:keys [lmdb pin-id]}]
                            (reset! seen-pin-id pin-id)
                            (let [pins (if/get-value lmdb c/kv-info
-                                                    c/txn-log-backup-pins
+                                                    c/wal-backup-pins
                                                     :keyword :data)]
                              (is (contains? pins pin-id)))
                            (throw (ex-info "snapshot-copy-failpoint" {})))]
                  (if/create-snapshot! lmdb))))
-          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+          (let [pins-after (if/get-value lmdb c/kv-info c/wal-backup-pins
                                          :keyword :data)]
             (is (string? @seen-pin-id))
             (is (or (nil? pins-after)
@@ -991,20 +1051,20 @@
         dest (str dest-root u/+separator+ "copy")]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-dbi lmdb "a")
         (if/transact-kv lmdb [[:put "a" :k :v]])
         (let [seen-pin-id (atom nil)
               seen-floor (atom nil)]
           (let [copy-res
-                (binding [kv/*txn-log-copy-backup-pin-failpoint*
+                (binding [kv/*wal-copy-backup-pin-failpoint*
                           (fn [{:keys [lmdb pin-id pin-floor-lsn
                                        pin-expires-ms compact?]}]
                             (reset! seen-pin-id pin-id)
                             (reset! seen-floor pin-floor-lsn)
                             (is (true? compact?))
                             (let [pins (if/get-value lmdb c/kv-info
-                                                     c/txn-log-backup-pins
+                                                     c/wal-backup-pins
                                                      :keyword :data)]
                               (is (map? pins))
                               (is (= pin-floor-lsn
@@ -1021,7 +1081,7 @@
             (is (= @seen-pin-id (get-in copy-res [:backup-pin :pin-id])))
             (is (= @seen-floor (get-in copy-res [:backup-pin :floor-lsn])))
             (is (number? (get-in copy-res [:backup-pin :expires-ms]))))
-          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+          (let [pins-after (if/get-value lmdb c/kv-info c/wal-backup-pins
                                          :keyword :data)]
             (is (string? @seen-pin-id))
             (is (number? @seen-floor))
@@ -1045,22 +1105,22 @@
         dest (str dest-root u/+separator+ "copy")]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-dbi lmdb "a")
         (if/transact-kv lmdb [[:put "a" :k :v]])
         (let [seen-pin-id (atom nil)]
           (is (thrown-with-msg?
                clojure.lang.ExceptionInfo #"copy-backup-pin-failpoint"
-               (binding [kv/*txn-log-copy-backup-pin-failpoint*
+               (binding [kv/*wal-copy-backup-pin-failpoint*
                          (fn [{:keys [lmdb pin-id]}]
                            (reset! seen-pin-id pin-id)
                            (let [pins (if/get-value lmdb c/kv-info
-                                                    c/txn-log-backup-pins
+                                                    c/wal-backup-pins
                                                     :keyword :data)]
                              (is (contains? pins pin-id)))
                            (throw (ex-info "copy-backup-pin-failpoint" {})))]
                  (if/copy lmdb dest false))))
-          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+          (let [pins-after (if/get-value lmdb c/kv-info c/wal-backup-pins
                                          :keyword :data)]
             (is (string? @seen-pin-id))
             (is (or (nil? pins-after)
@@ -1077,7 +1137,7 @@
     (try
       (let [lmdb (l/open-kv dir {:flags               (conj c/default-env-flags
                                                              :nosync)
-                                 :txn-log?            true
+                                 :wal?            true
                                  :snapshot-scheduler? true
                                  :snapshot-interval-ms 100
                                  :snapshot-max-lsn-delta 1})]
@@ -1109,7 +1169,7 @@
       (let [lmdb (l/open-kv dir {:flags                       (conj
                                                                 c/default-env-flags
                                                                 :nosync)
-                                 :txn-log?                    true
+                                 :wal?                    true
                                  :snapshot-scheduler?         true
                                  :snapshot-interval-ms        600000
                                  :snapshot-max-lsn-delta      1000000
@@ -1141,7 +1201,7 @@
       (let [lmdb (l/open-kv dir {:flags                       (conj
                                                                 c/default-env-flags
                                                                 :nosync)
-                                 :txn-log?                    true
+                                 :wal?                    true
                                  :snapshot-scheduler?         true
                                  :snapshot-interval-ms        600000
                                  :snapshot-max-lsn-delta      1000000
@@ -1172,8 +1232,8 @@
       (let [lmdb (l/open-kv dir {:flags                       (conj
                                                                 c/default-env-flags
                                                                 :nosync)
-                                 :txn-log?                    true
-                                 :txn-log-retention-bytes     1
+                                 :wal?                    true
+                                 :wal-retention-bytes     1
                                  :snapshot-scheduler?         true
                                  :snapshot-interval-ms        600000
                                  :snapshot-max-lsn-delta      1000000
@@ -1207,7 +1267,7 @@
       (let [lmdb (l/open-kv dir {:flags                        (conj
                                                                  c/default-env-flags
                                                                  :nosync)
-                                 :txn-log?                     true
+                                 :wal?                     true
                                  :snapshot-scheduler?          true
                                  :snapshot-interval-ms         600000
                                  :snapshot-max-lsn-delta       1000000
@@ -1252,7 +1312,7 @@
       (let [lmdb (l/open-kv dir {:flags                        (conj
                                                                  c/default-env-flags
                                                                  :nosync)
-                                 :txn-log?                     true
+                                 :wal?                     true
                                  :snapshot-scheduler?          true
                                  :snapshot-interval-ms         600000
                                  :snapshot-max-lsn-delta       1000000
@@ -1314,7 +1374,7 @@
       (let [lmdb (l/open-kv dir {:flags                        (conj
                                                                  c/default-env-flags
                                                                  :nosync)
-                                 :txn-log?                     true
+                                 :wal?                     true
                                  :snapshot-scheduler?          true
                                  :snapshot-interval-ms         600000
                                  :snapshot-max-lsn-delta       1000000
@@ -1361,7 +1421,7 @@
   (let [dir (u/tmp-dir (str "txlog-api-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-list-dbi lmdb "list")
         (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
         (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
@@ -1380,7 +1440,7 @@
               snapshot2   (if/create-snapshot! lmdb)
               snapshots   (if/list-snapshots lmdb)
               sched-state (if/snapshot-scheduler-state lmdb)]
-          (is (:txn-log? watermarks))
+          (is (:wal? watermarks))
           (is (<= 2 committed))
           (is (= committed applied))
           (is (= applied (get-in marker [:current :applied-lsn])))
@@ -1445,8 +1505,8 @@
       (let [lmdb (l/open-kv dir {:flags                (conj
                                                          c/default-env-flags
                                                          :nosync)
-                                 :txn-log?            true
-                                 :txn-log-rollout-mode :rollback})]
+                                 :wal?            true
+                                 :wal-rollout-mode :rollback})]
         (if/open-dbi lmdb "a")
         (if/transact-kv lmdb [[:put "a" :k :v]])
         (is (= :v (if/get-value lmdb "a" :k)))
@@ -1458,7 +1518,7 @@
               verified (if/verify-commit-marker! lmdb)
               retention (if/txlog-retention-state lmdb)
               gc-res (if/gc-txlog-segments! lmdb)]
-          (is (:txn-log? watermarks))
+          (is (:wal? watermarks))
           (is (= :rollback (:rollout-mode watermarks)))
           (is (false? (:write-path-enabled? watermarks)))
           (is (true? (:rollback? watermarks)))
@@ -1475,7 +1535,7 @@
           (is (:skipped? verified))
           (is (= :rollback (:reason verified)))
           (is (= :rollback (get-in verified [:watermarks :rollout-mode])))
-          (is (:txn-log? retention))
+          (is (:wal? retention))
           (is (:skipped? retention))
           (is (= :rollback (:reason retention)))
           (is (= :rollback (get-in retention [:watermarks :rollout-mode])))
@@ -1494,9 +1554,9 @@
             (l/open-kv dir {:flags                (conj
                                                    c/default-env-flags
                                                    :nosync)
-                            :txn-log?            true
-                            :txn-log-rollout-mode :active
-                            :txn-log-rollback?   true})))
+                            :wal?            true
+                            :wal-rollout-mode :active
+                            :wal-rollback?   true})))
       (finally
         (u/delete-files dir)))))
 
@@ -1505,7 +1565,7 @@
    (setup-txlog-snapshot-recovery-fixture! dir false))
   ([dir corrupt-marker?]
   (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                             :txn-log? true})]
+                             :wal? true})]
     (try
       (if/open-list-dbi lmdb "list")
       (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
@@ -1530,8 +1590,8 @@
                          :txlog-record-offset 0
                          :txlog-record-crc    0})]
             (if/transact-kv lmdb c/kv-info
-                            [[:put c/txn-log-marker-a slot-a]
-                             [:put c/txn-log-marker-b slot-b]]
+                            [[:put c/wal-marker-a slot-a]
+                             [:put c/wal-marker-b slot-b]]
                             :keyword :bytes)))
         {:current-path current-path
          :previous-path previous-path})
@@ -1543,7 +1603,7 @@
     (try
       (setup-txlog-snapshot-recovery-fixture! dir true)
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (try
           (if/open-list-dbi lmdb "list")
           (is (= [1 2 3 4] (if/get-list lmdb "list" :k :data :long)))
@@ -1564,7 +1624,7 @@
         (is (u/file-exists (str previous-path u/+separator+ c/data-file-name)))
         (u/delete-files (str current-path u/+separator+ c/data-file-name))
         (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                   :txn-log? true})]
+                                   :wal? true})]
           (try
             (if/open-list-dbi lmdb "list")
             (is (= [1 2 3 4] (if/get-list lmdb "list" :k :data :long)))
@@ -1583,10 +1643,10 @@
     (try
       (let [lmdb (l/open-kv dir {:flags                     (conj c/default-env-flags
                                                                   :nosync)
-                                 :txn-log?                  true
-                                 :txn-log-group-commit      1
-                                 :txn-log-segment-max-bytes 64
-                                 :txn-log-segment-max-ms    600000})]
+                                 :wal?                  true
+                                 :wal-group-commit      1
+                                 :wal-segment-max-bytes 64
+                                 :wal-segment-max-ms    600000})]
         (if/open-list-dbi lmdb "list")
         (doseq [v (range 1 13)]
           (if/transact-kv lmdb [[:put-list "list" :k [v] :data :long]]))
@@ -1617,8 +1677,8 @@
         now-ms    (System/currentTimeMillis)]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true
-                                 :txn-log-replica-floor-ttl-ms 30000})]
+                                 :wal? true
+                                 :wal-replica-floor-ttl-ms 30000})]
         (if/open-dbi lmdb "a")
         (if/open-dbi lmdb c/vec-meta-dbi)
         (if/transact-kv lmdb [[:put "a" :k :v]])
@@ -1628,12 +1688,12 @@
                          [:put "d-replay" {:vec-replay-floor-lsn 5}]]
                         :string :data)
         (if/transact-kv lmdb c/kv-info
-                        [[:put c/txn-log-snapshot-current-lsn 12]
-                         [:put c/txn-log-snapshot-previous-lsn 8]
-                         [:put c/txn-log-replica-floors
+                        [[:put c/wal-snapshot-current-lsn 12]
+                         [:put c/wal-snapshot-previous-lsn 8]
+                         [:put c/wal-replica-floors
                           {:replica-a {:applied-lsn 6 :updated-ms now-ms}
                            :replica-b {:applied-lsn 2 :updated-ms stale-ms}}]
-                         [:put c/txn-log-backup-pins
+                         [:put c/wal-backup-pins
                           {:backup-a {:floor-lsn 7}
                            :backup-b {:floor-lsn 1 :expires-ms stale-ms}}]]
                         :keyword :data)
@@ -1661,11 +1721,11 @@
       (let [lmdb (l/open-kv dir {:flags                    (conj
                                                             c/default-env-flags
                                                             :nosync)
-                                 :txn-log?                 true
-                                 :txn-log-retention-bytes  1
-                                 :txn-log-retention-ms     600000
-                                 :txn-log-segment-max-ms   600000
-                                 :txn-log-segment-max-bytes 1024})]
+                                 :wal?                 true
+                                 :wal-retention-bytes  1
+                                 :wal-retention-ms     600000
+                                 :wal-segment-max-ms   600000
+                                 :wal-segment-max-bytes 1024})]
         (if/open-dbi lmdb "a")
         (if/txlog-update-snapshot-floor! lmdb 0)
         (if/transact-kv lmdb [[:put "a" :k1 :v1]])
@@ -1689,13 +1749,13 @@
                             (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true
-                                 :txn-log-retention-bytes 1
-                                 :txn-log-retention-ms 600000
-                                 :txn-log-retention-pin-backpressure-threshold-ms
+                                 :wal? true
+                                 :wal-retention-bytes 1
+                                 :wal-retention-ms 600000
+                                 :wal-retention-pin-backpressure-threshold-ms
                                  100
-                                 :txn-log-segment-max-ms 600000
-                                 :txn-log-segment-max-bytes 1024})]
+                                 :wal-segment-max-ms 600000
+                                 :wal-segment-max-bytes 1024})]
         (if/open-dbi lmdb "a")
         (if/txlog-update-snapshot-floor! lmdb 1000)
         (if/txlog-update-replica-floor! lmdb :replica-a 0)
@@ -1728,7 +1788,7 @@
   (let [dir (u/tmp-dir (str "txlog-floor-api-" (UUID/randomUUID)))]
     (try
       (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})]
+                                 :wal? true})]
         (if/open-dbi lmdb "a")
         (if/transact-kv lmdb [[:put "a" :k :v]])
         (let [s1 (if/txlog-update-snapshot-floor! lmdb 5)
@@ -1749,14 +1809,14 @@
                                              (+ (System/currentTimeMillis) 60000))
               b3 (if/txlog-unpin-backup-floor! lmdb :b1)
               snapshot-current
-              (if/get-value lmdb c/kv-info c/txn-log-snapshot-current-lsn
+              (if/get-value lmdb c/kv-info c/wal-snapshot-current-lsn
                             :keyword :data)
               snapshot-previous
-              (if/get-value lmdb c/kv-info c/txn-log-snapshot-previous-lsn
+              (if/get-value lmdb c/kv-info c/wal-snapshot-previous-lsn
                             :keyword :data)
-              floors-map (if/get-value lmdb c/kv-info c/txn-log-replica-floors
+              floors-map (if/get-value lmdb c/kv-info c/wal-replica-floors
                                        :keyword :data)
-              pins-map   (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+              pins-map   (if/get-value lmdb c/kv-info c/wal-backup-pins
                                        :keyword :data)]
           (is (= 5 (:snapshot-current-lsn s1)))
           (is (nil? (:snapshot-previous-lsn s1)))

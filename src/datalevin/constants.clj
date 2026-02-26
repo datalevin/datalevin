@@ -476,137 +476,174 @@
        :doc     "Time interval between automatic LMDB sync to disk, in seconds, default is 300"}
   lmdb-sync-interval 300)
 
-;; txn-log
+;; wal
 
 (def ^{:dynamic true
-       :doc     "Enable txn-log mode. Experimental."}
-  *txn-log?* false)
+       :doc     "Enable WAL mode. Experimental."}
+  *wal?* false)
 
 (def ^{:dynamic true
-       :doc     "Txn-log rollout mode. `:active` uses txn-log write path; `:rollback` bypasses txn-log writes and falls back to legacy LMDB write path while keeping txn-log APIs available in degraded mode."}
-  *txn-log-rollout-mode* :active)
+       :doc     "WAL rollout mode. `:active` uses WAL write path; `:rollback` bypasses WAL writes and falls back to legacy LMDB write path while keeping WAL APIs available in degraded mode."}
+  *wal-rollout-mode* :active)
 
 (def ^{:dynamic true
-       :doc     "Boolean alias for rollback switch. When true and `:txn-log?` is enabled, write path bypasses txn-log and uses legacy LMDB writes."}
-  *txn-log-rollback?* false)
+       :doc     "Rollback switch. When true and `:wal?` is enabled, write path bypasses WAL and uses legacy LMDB writes."}
+  *wal-rollback?* false)
 
 (def ^{:dynamic true
-       :doc     "Txn-log durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn."}
-  *txn-log-durability-profile* :relaxed)
+       :doc     "WAL durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn."}
+  *wal-durability-profile* :relaxed)
 
 (def ^{:dynamic true
-       :doc     "Enable LMDB dual-slot commit marker in txn-log mode."}
-  *txn-log-commit-marker?* true)
+       :doc     "Enable LMDB dual-slot commit marker in WAL mode."}
+  *wal-commit-marker?* true)
 
 (def ^{:dynamic true
        :doc     "Commit marker binary format major version."}
-  *txn-log-commit-marker-version* 1)
+  *wal-commit-marker-version* 1)
 
 (def ^{:dynamic true
-       :doc     "Txn-log force mode for segment fsync operations."}
-  *txn-log-sync-mode* :fdatasync)
+       :doc     "WAL force mode for segment fsync operations."}
+  *wal-sync-mode* :fdatasync)
 
 (def ^{:dynamic true
-       :doc     "Txn-log group-commit threshold by number of records."}
-  *txn-log-group-commit* 100)
+       :doc     "WAL group-commit threshold by number of records."}
+  *wal-group-commit* 100)
 
 (def ^{:dynamic true
-       :doc     "Txn-log group-commit threshold by milliseconds."}
-  *txn-log-group-commit-ms* 100)
+       :doc     "WAL group-commit threshold by milliseconds."}
+  *wal-group-commit-ms* 100)
 
 (def ^{:dynamic true
-       :doc     "Txn-log metadata publish threshold by number of durable commits."}
-  *txn-log-meta-flush-max-txs* 1024)
+       :doc     "WAL metadata publish threshold by number of durable commits."}
+  *wal-meta-flush-max-txs* 1024)
 
 (def ^{:dynamic true
-       :doc     "Txn-log metadata publish threshold by milliseconds."}
-  *txn-log-meta-flush-max-ms* 1000)
+       :doc     "WAL metadata publish threshold by milliseconds."}
+  *wal-meta-flush-max-ms* 1000)
 
 (def ^{:dynamic true
        :doc     "Maximum commit wait for durable LSN in milliseconds."}
-  *txn-log-commit-wait-ms* 5000)
+  *wal-commit-wait-ms* 5000)
 
 (def ^{:dynamic true
        :doc     "Enable adaptive sync scheduling for batched sync cadence."}
-  *txn-log-sync-adaptive?* true)
+  *wal-sync-adaptive?* true)
 
 (def ^{:dynamic true
-       :doc     "Txn-log segment size cap in bytes before roll."}
-  *txn-log-segment-max-bytes* (* 256 1024 1024))
+       :doc     "WAL segment size cap in bytes before roll."}
+  *wal-segment-max-bytes* (* 256 1024 1024))
 
 (def ^{:dynamic true
-       :doc     "Txn-log segment age cap in milliseconds before roll."}
-  *txn-log-segment-max-ms* 300000)
+       :doc     "WAL segment age cap in milliseconds before roll."}
+  *wal-segment-max-ms* 300000)
 
 (def ^{:dynamic true
-       :doc     "Enable background preallocation for next txn-log segment."}
-  *txn-log-segment-prealloc?* true)
+       :doc     "Enable background preallocation for next WAL segment."}
+  *wal-segment-prealloc?* true)
 
 (def ^{:dynamic true
-       :doc     "Txn-log segment preallocation mode. :native uses file preallocation, :mmap uses memory-mapped preallocated segments, :none disables preallocation."}
-  *txn-log-segment-prealloc-mode* :native)
+       :doc     "WAL segment preallocation mode. :native uses file preallocation, :mmap uses memory-mapped preallocated segments, :none disables preallocation."}
+  *wal-segment-prealloc-mode* :native)
 
 (def ^{:dynamic true
-       :doc     "Txn-log preallocated segment size in bytes."}
-  *txn-log-segment-prealloc-bytes* *txn-log-segment-max-bytes*)
+       :doc     "WAL preallocated segment size in bytes."}
+  *wal-segment-prealloc-bytes* *wal-segment-max-bytes*)
 
 (def ^{:dynamic true
-       :doc     "Txn-log retention cap in bytes."}
-  *txn-log-retention-bytes* (* 8 1024 1024 1024))
+       :doc     "WAL retention cap in bytes."}
+  *wal-retention-bytes* (* 8 1024 1024 1024))
 
 (def ^{:dynamic true
-       :doc     "Txn-log retention cap in milliseconds."}
-  *txn-log-retention-ms* (* 7 24 60 60 1000))
+       :doc     "WAL retention cap in milliseconds."}
+  *wal-retention-ms* (* 7 24 60 60 1000))
 
 (def ^{:dynamic true
-       :doc     "Replica heartbeat TTL in milliseconds for txn-log retention floor computation."}
-  *txn-log-replica-floor-ttl-ms* 30000)
+       :doc     "Replica heartbeat TTL in milliseconds for WAL retention floor computation."}
+  *wal-replica-floor-ttl-ms* 30000)
 
 (def ^{:dynamic true
        :doc     "Grace window before retention-pressure pin backpressure starts rejecting writes."}
-  *txn-log-retention-pin-backpressure-threshold-ms* 300000)
+  *wal-retention-pin-backpressure-threshold-ms* 300000)
 
 (def ^{:dynamic true
-       :doc     "Vector checkpoint cadence target in milliseconds for txn-log mode."}
-  *txn-log-vec-checkpoint-interval-ms* 300000)
+       :doc     "Vector checkpoint cadence target in milliseconds for WAL mode."}
+  *wal-vec-checkpoint-interval-ms* 300000)
 
 (def ^{:dynamic true
        :doc     "Vector replay lag threshold in LSNs before checkpointing is recommended."}
-  *txn-log-vec-max-lsn-delta* 100000)
+  *wal-vec-max-lsn-delta* 100000)
 
 (def ^{:dynamic true
-       :doc     "Maximum serialized vector blob bytes to use in-memory buffer mode in txn-log workflows."}
-  *txn-log-vec-max-buffer-bytes* *vec-max-buffer-bytes*)
+       :doc     "Maximum serialized vector blob bytes to use in-memory buffer mode in WAL workflows."}
+  *wal-vec-max-buffer-bytes* *vec-max-buffer-bytes*)
 
 (def ^{:dynamic true
-       :doc     "Chunk size in bytes for vector blobs persisted to LMDB in txn-log workflows."}
-  *txn-log-vec-chunk-bytes* *vec-chunk-bytes*)
+       :doc     "Chunk size in bytes for vector blobs persisted to LMDB in WAL workflows."}
+  *wal-vec-chunk-bytes* *vec-chunk-bytes*)
 
-(def ^:const txn-log-marker-a
-  "kv-info key for txn-log commit marker slot A."
-  :txn-log/marker-a)
+(def ^:const wal-marker-a
+  "kv-info key for WAL commit marker slot A."
+  :wal/marker-a)
 
-(def ^:const txn-log-marker-b
-  "kv-info key for txn-log commit marker slot B."
-  :txn-log/marker-b)
+(def ^:const wal-marker-b
+  "kv-info key for WAL commit marker slot B."
+  :wal/marker-b)
 
-(def ^:const txn-log-snapshot-current-lsn
-  "kv-info key for snapshot current LSN used by txn-log retention floor computation."
-  :txn-log/snapshot-current-lsn)
+(def ^:const wal-snapshot-current-lsn
+  "kv-info key for snapshot current LSN used by WAL retention floor computation."
+  :wal/snapshot-current-lsn)
 
-(def ^:const txn-log-snapshot-previous-lsn
-  "kv-info key for snapshot previous LSN used by txn-log retention floor computation."
-  :txn-log/snapshot-previous-lsn)
+(def ^:const wal-snapshot-previous-lsn
+  "kv-info key for snapshot previous LSN used by WAL retention floor computation."
+  :wal/snapshot-previous-lsn)
 
-(def ^:const txn-log-replica-floors
-  "kv-info key for replica floor heartbeat map used by txn-log retention floor computation."
-  :txn-log/replica-floors)
+(def ^:const wal-replica-floors
+  "kv-info key for replica floor heartbeat map used by WAL retention floor computation."
+  :wal/replica-floors)
 
-(def ^:const txn-log-backup-pins
-  "kv-info key for backup/snapshot pin map used by txn-log retention floor computation."
-  :txn-log/backup-pins)
+(def ^:const wal-backup-pins
+  "kv-info key for backup/snapshot pin map used by WAL retention floor computation."
+  :wal/backup-pins)
+
+(defn ^:no-doc wal-option-key?
+  [k]
+  (and (keyword? k)
+       (let [n (name k)]
+         (or (= n "wal?")
+             (s/starts-with? n "wal-")))))
+
+(defn ^:no-doc legacy-txn-log-option-key?
+  [k]
+  (and (keyword? k)
+       (let [n (name k)]
+         (or (= n "txn-log?")
+             (s/starts-with? n "txn-log-")))))
+
+(defn ^:no-doc canonical-wal-option-key
+  [k]
+  (if (legacy-txn-log-option-key? k)
+    (u/raise "Legacy txn-log option key is no longer supported. Use WAL option keys (for example :wal? and :wal-durability-profile)."
+             {:option k})
+    k))
+
+(defn ^:no-doc canonicalize-wal-opts
+  [opts]
+  (reduce-kv
+   (fn [m k v]
+     (assoc m (canonical-wal-option-key k) v))
+   {}
+   (or opts {})))
 
 ;; datalog db
+
+(def ^{:dynamic true
+       :doc     "Default WAL mode for Datalog stores. This does not affect direct KV-only `open-kv` usage."}
+  *datalog-wal?* true)
+
+(def ^{:dynamic true
+       :doc     "Default WAL durability profile for Datalog stores."}
+  *datalog-wal-durability-profile* :strict)
 
 (def ^{:dynamic true :no-doc true
        :doc     "When true, use the prepare/apply transaction path"}

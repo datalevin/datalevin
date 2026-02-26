@@ -127,8 +127,8 @@
     (let [dir    (u/tmp-dir (str "vec-txlog-chunk-bytes-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags                   (conj c/default-env-flags
                                                                :nosync)
-                                 :txn-log?                true
-                                 :txn-log-vec-chunk-bytes 1})
+                                 :wal?                true
+                                 :wal-vec-chunk-bytes 1})
           n      8
           v1     (rand-float-vec n)
           domain "vec_txlog_chunk_bytes"]
@@ -152,9 +152,9 @@
     (let [dir    (u/tmp-dir (str "vec-txlog-auto-lsn-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags                           (conj c/default-env-flags
                                                                              :nosync)
-                                 :txn-log?                        true
-                                 :txn-log-vec-max-lsn-delta       1
-                                 :txn-log-vec-checkpoint-interval-ms 600000})
+                                 :wal?                        true
+                                 :wal-vec-max-lsn-delta       1
+                                 :wal-vec-checkpoint-interval-ms 600000})
           n      16
           v1     (rand-float-vec n)
           v2     (rand-float-vec n)
@@ -190,9 +190,9 @@
     (let [dir    (u/tmp-dir (str "vec-txlog-auto-interval-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags                           (conj c/default-env-flags
                                                                              :nosync)
-                                 :txn-log?                        true
-                                 :txn-log-vec-max-lsn-delta       1000000
-                                 :txn-log-vec-checkpoint-interval-ms 1})
+                                 :wal?                        true
+                                 :wal-vec-max-lsn-delta       1000000
+                                 :wal-vec-checkpoint-interval-ms 1})
           n      16
           v1     (rand-float-vec n)
           v2     (rand-float-vec n)
@@ -223,7 +223,7 @@
   (when-not (u/windows?)
     (let [dir    (u/tmp-dir (str "vec-txlog-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})
+                                 :wal? true})
           n      32
           v1     (rand-float-vec n)
           v2     (rand-float-vec n)
@@ -280,13 +280,13 @@
   (when-not (u/windows?)
     (let [dir    (u/tmp-dir (str "vec-txlog-fatal-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags    (conj c/default-env-flags :nosync)
-                                 :txn-log? true})
+                                 :wal? true})
           n      8
           v1     (rand-float-vec n)
           domain "vec_txlog_fatal"]
       (try
         (binding [sut/*submit-async-vec-save* dispatch-noop]
-          (binding [sut/*txn-log-vector-apply-failpoint*
+          (binding [sut/*wal-vector-apply-failpoint*
                     (fn [_ _]
                       (throw (ex-info "simulated vector add failure"
                                       {:type :test/vector-apply-failure})))]
@@ -320,7 +320,7 @@
   (when-not (u/windows?)
     (let [dir    (u/tmp-dir (str "vec-txlog-kind-" (UUID/randomUUID)))
           lmdb   (d/open-kv dir {:flags (conj c/default-env-flags :nosync)
-                                 :txn-log? true})
+                                 :wal? true})
           domain "vec_txlog_kind"
           dim    8
           index  ^VectorIndex (sut/new-vector-index lmdb {:domain domain
