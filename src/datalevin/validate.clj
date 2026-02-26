@@ -100,7 +100,38 @@
       :pass-through)))
 
 (def ^:private boolean-opts
-  #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?})
+  #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?
+    :txn-log? :txn-log-sync-adaptive?
+    :txn-log-segment-prealloc? :txn-log-commit-marker?
+    :txn-log-rollback?})
+
+(def ^:private non-negative-int-opts
+  #{:cache-limit
+    :txn-log-group-commit
+    :txn-log-group-commit-ms
+    :txn-log-meta-flush-max-txs
+    :txn-log-meta-flush-max-ms})
+
+(def ^:private positive-int-opts
+  #{:txn-log-commit-wait-ms
+    :txn-log-replica-floor-ttl-ms
+    :txn-log-retention-pin-backpressure-threshold-ms
+    :txn-log-commit-marker-version
+    :txn-log-segment-max-bytes
+    :txn-log-segment-max-ms
+    :txn-log-segment-prealloc-bytes
+    :txn-log-retention-bytes
+    :txn-log-retention-ms
+    :txn-log-vec-checkpoint-interval-ms
+    :txn-log-vec-max-lsn-delta
+    :txn-log-vec-max-buffer-bytes
+    :txn-log-vec-chunk-bytes})
+
+(def ^:private keyword-enum-opts
+  {:txn-log-durability-profile #{:strict :relaxed}
+   :txn-log-sync-mode          #{:fsync :fdatasync :none}
+   :txn-log-segment-prealloc-mode #{:native :mmap :none}
+   :txn-log-rollout-mode       #{:active :rollback}})
 
 (defn validate-option-mutation
   "Validate option key/value before commit."
@@ -111,15 +142,26 @@
       (u/raise "Option " k " expects a boolean, got " v
                {:option k :value v}))
 
-    (= k :cache-limit)
+    (non-negative-int-opts k)
     (when-not (and (integer? v) (not (neg? ^long v)))
-      (u/raise "Option :cache-limit expects a non-negative integer, got " v
+      (u/raise "Option " k " expects a non-negative integer, got " v
+               {:option k :value v}))
+
+    (positive-int-opts k)
+    (when-not (and (integer? v) (pos? ^long v))
+      (u/raise "Option " k " expects a positive integer, got " v
                {:option k :value v}))
 
     (= k :db-name)
     (when-not (string? v)
       (u/raise "Option :db-name expects a string, got " v
-               {:option k :value v}))))
+               {:option k :value v}))
+
+    :else
+    (when-let [allowed (keyword-enum-opts k)]
+      (when-not (allowed v)
+        (u/raise "Option " k " expects one of " allowed ", got " v
+                 {:option k :value v :allowed allowed})))))
 
 ;; ---- Key size validation ----
 

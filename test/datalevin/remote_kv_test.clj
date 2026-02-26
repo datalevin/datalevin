@@ -1,5 +1,6 @@
 (ns datalevin.remote-kv-test
   (:require
+   [datalevin.client :as cl]
    [datalevin.remote :as sut]
    [datalevin.interface :as if]
    [datalevin.lmdb :as l]
@@ -15,6 +16,177 @@
    [java.util UUID Arrays]))
 
 (use-fixtures :each server-fixture)
+
+(deftest txn-log-operational-apis-test
+  (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
+                   (UUID/randomUUID))
+        store (sut/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                :txn-log? true})]
+    (if/open-dbi store "a")
+    (if/transact-kv store [[:put "a" :k :v]])
+    (let [watermarks  (if/txlog-watermarks store)
+          committed   (:last-committed-lsn watermarks)
+          tx-records  (if/open-tx-log store 1 committed)
+          force-res   (if/force-txlog-sync! store)
+          lmdb-force  (if/force-lmdb-sync! store)
+          forced-watermarks (:watermarks lmdb-force)
+          snapshot1   (if/create-snapshot! store)
+          _           (if/transact-kv store [[:put "a" :k2 :v2]])
+          snapshot2   (if/create-snapshot! store)
+          snapshots   (if/list-snapshots store)
+          sched-state (if/snapshot-scheduler-state store)]
+      (is (:txn-log? watermarks))
+      (is (pos? committed))
+      (is (every? #(contains? % :tx-kind) tx-records))
+      (is (every? #{:user :vector-checkpoint :unknown}
+                  (map :tx-kind tx-records)))
+      (is (some #(= :user (:tx-kind %)) tx-records))
+      (is (<= 0 (or (:batched-sync-count watermarks) -1)))
+      (is (contains? watermarks :avg-commit-wait-ms))
+      (is (map? (:avg-commit-wait-ms-by-mode watermarks)))
+      (is (<= 0 (or (:segment-roll-count watermarks) -1)))
+      (is (<= 0 (or (:segment-roll-duration-ms watermarks) -1)))
+      (is (<= 0 (or (:segment-prealloc-success-count watermarks) -1)))
+      (is (<= 0 (or (:segment-prealloc-failure-count watermarks) -1)))
+      (is (contains? watermarks :append-p99-near-roll-ms))
+      (is (<= 0 (or (:vec-checkpoint-count watermarks) -1)))
+      (is (<= 0 (or (:vec-checkpoint-duration-ms watermarks) -1)))
+      (is (<= 0 (or (:vec-checkpoint-bytes watermarks) -1)))
+      (is (<= 0 (or (:vec-checkpoint-failure-count watermarks) -1)))
+      (is (<= 0 (or (:vec-replay-lag-lsn watermarks) -1)))
+      (is (map? (:vec-checkpoint-domains watermarks)))
+      (is (:synced? force-res))
+      (is (:synced? lmdb-force))
+      (is (= committed
+             (get-in lmdb-force [:watermarks :last-applied-lsn])))
+      (is (number? (:last-checkpoint-ms forced-watermarks)))
+      (is (<= 0 (or (:checkpoint-staleness-ms forced-watermarks) -1)))
+      (is (number? (:checkpoint-stale-threshold-ms forced-watermarks)))
+      (is (boolean? (:checkpoint-stale? forced-watermarks)))
+      (is (<= 0 (or (:durable-applied-lag-lsn forced-watermarks) -1)))
+      (is (number? (:durable-applied-lag-threshold-lsn forced-watermarks)))
+      (is (boolean? (:durable-applied-lag-alert? forced-watermarks)))
+      (is (<= 1 (or (:lmdb-sync-count forced-watermarks) 0)))
+      (is (:ok? snapshot1))
+      (is (:ok? snapshot2))
+      (is (= 2 (count snapshots)))
+      (is (= :current (:slot (first snapshots))))
+      (is (= :previous (:slot (second snapshots))))
+      (is (string? (get-in snapshot2 [:snapshot :path])))
+      (is (= 2 (:snapshot-count sched-state)))
+      (is (false? (:enabled? sched-state)))
+      (is (boolean? (:snapshot-age-alert? sched-state)))
+      (is (<= 0 (or (:snapshot-failure-count sched-state) -1)))
+      (is (<= 0 (or (:snapshot-consecutive-failure-count sched-state) -1)))
+      (is (boolean? (:snapshot-build-failure-alert? sched-state))))
+    (if/close-kv store)))
+
+(deftest txn-log-copy-response-metadata-test
+  (let [db-name (str "copy-meta-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri {:flags    (conj c/default-env-flags :nosync)
+                                  :txn-log? true})
+        client  (cl/new-client uri)]
+    (try
+      (cl/open-database client db-name c/db-store-kv)
+      (if/open-dbi store "z")
+      (if/transact-kv store [[:put "z" :k :v]])
+      (let [{:keys [type result copy-meta]}
+            (cl/request client {:type :copy :mode :request
+                                :args [db-name true]})
+            bs (->> result (apply str) b/decode-base64)]
+        (is (= :command-complete type))
+        (is (seq result))
+        (is (pos? (alength ^bytes bs)))
+        (is (map? copy-meta))
+        (is (number? (:started-ms copy-meta)))
+        (is (number? (:completed-ms copy-meta)))
+        (is (number? (:duration-ms copy-meta)))
+        (is (<= (:started-ms copy-meta) (:completed-ms copy-meta)))
+        (is (true? (:compact? copy-meta)))
+        (is (map? (:backup-pin copy-meta)))
+        (is (string? (get-in copy-meta [:backup-pin :pin-id])))
+        (is (number? (get-in copy-meta [:backup-pin :floor-lsn])))
+        (is (number? (get-in copy-meta [:backup-pin :expires-ms]))))
+      (finally
+        (when-not (cl/disconnected? client)
+          (cl/disconnect client))
+        (if/close-kv store)))))
+
+(deftest txn-log-copy-high-level-metadata-test
+  (let [db-name (str "copy-meta-high-level-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri {:flags    (conj c/default-env-flags :nosync)
+                                  :txn-log? true})
+        dst     (u/tmp-dir (str "copy-meta-high-level-dst-" (UUID/randomUUID)))]
+    (try
+      (if/open-dbi store "z")
+      (if/transact-kv store [[:put "z" :k :v]])
+      (let [copy-meta (if/copy store dst true)]
+        (is (map? copy-meta))
+        (is (number? (:started-ms copy-meta)))
+        (is (number? (:completed-ms copy-meta)))
+        (is (number? (:duration-ms copy-meta)))
+        (is (<= (:started-ms copy-meta) (:completed-ms copy-meta)))
+        (is (true? (:compact? copy-meta)))
+        (is (map? (:backup-pin copy-meta)))
+        (is (string? (get-in copy-meta [:backup-pin :pin-id])))
+        (is (number? (get-in copy-meta [:backup-pin :floor-lsn])))
+        (is (number? (get-in copy-meta [:backup-pin :expires-ms]))))
+      (let [copy-store (l/open-kv dst)]
+        (try
+          (if/open-dbi copy-store "z")
+          (is (= :v (if/get-value copy-store "z" :k)))
+          (finally
+            (if/close-kv copy-store))))
+      (finally
+        (if/close-kv store)
+        (u/delete-files dst)))))
+
+(deftest txn-log-rollback-switch-test
+  (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
+                   (UUID/randomUUID))
+        store (sut/open-kv dir {:flags                (conj
+                                                        c/default-env-flags
+                                                        :nosync)
+                                :txn-log?            true
+                                :txn-log-rollout-mode :rollback})]
+    (if/open-dbi store "a")
+    (if/transact-kv store [[:put "a" :k :v]])
+    (is (= :v (if/get-value store "a" :k)))
+    (let [watermarks (if/txlog-watermarks store)
+          txlog-force (if/force-txlog-sync! store)
+          lmdb-force (if/force-lmdb-sync! store)
+          snapshot (if/create-snapshot! store)
+          verified (if/verify-commit-marker! store)
+          retention (if/txlog-retention-state store)
+          gc-res (if/gc-txlog-segments! store)]
+      (is (:txn-log? watermarks))
+      (is (= :rollback (:rollout-mode watermarks)))
+      (is (false? (:write-path-enabled? watermarks)))
+      (is (true? (:rollback? watermarks)))
+      (is (false? (:synced? txlog-force)))
+      (is (:skipped? txlog-force))
+      (is (= :rollback (:reason txlog-force)))
+      (is (:synced? lmdb-force))
+      (is (= :rollback
+             (get-in lmdb-force [:watermarks :rollout-mode])))
+      (is (false? (:ok? snapshot)))
+      (is (:skipped? snapshot))
+      (is (= :rollback (:reason snapshot)))
+      (is (false? (:ok? verified)))
+      (is (:skipped? verified))
+      (is (= :rollback (:reason verified)))
+      (is (= :rollback (get-in verified [:watermarks :rollout-mode])))
+      (is (:txn-log? retention))
+      (is (:skipped? retention))
+      (is (= :rollback (:reason retention)))
+      (is (= :rollback (get-in retention [:watermarks :rollout-mode])))
+      (is (false? (:ok? gc-res)))
+      (is (:skipped? gc-res))
+      (is (= :rollback (:reason gc-res)))
+      (is (= :rollback (get-in gc-res [:watermarks :rollout-mode]))))
+    (if/close-kv store)))
 
 (deftest kv-store-ops-test
   (let [dir   "dtlv://datalevin:datalevin@localhost/testkv"

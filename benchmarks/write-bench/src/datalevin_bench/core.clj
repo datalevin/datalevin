@@ -8,7 +8,8 @@
    [next.jdbc.sql :as sql])
   (:import
    [java.util Random]
-   [java.util.concurrent Semaphore]
+   [java.util.concurrent Semaphore Executors TimeUnit]
+   [java.util.concurrent.atomic AtomicLong]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 ;; for kv
@@ -45,6 +46,14 @@
         ","
         (format "%.2f" (double (/ (- @sync-time @prev-time) @sync-count)))))))
 
+(defn- build-batch-txs
+  ^FastList [^long batch-size add-fn]
+  (when add-fn
+    (let [^FastList txs (FastList. (int batch-size))]
+      (dotimes [_ (int batch-size)]
+        (add-fn txs))
+      txs)))
+
 (defn max-write-bench
   [batch-size tx-fn add-fn async?]
   (print-header)
@@ -75,13 +84,7 @@
               (vreset! write-time 0)
               (vreset! prev-time @sync-time)
               (vreset! sync-count 0))
-            (let [txs    (when add-fn
-                           (reduce
-                             (fn [^FastList txs _]
-                               (add-fn txs)
-                               txs)
-                             (FastList. batch-size)
-                             (range 0 batch-size)))
+            (let [txs    (build-batch-txs batch-size add-fn)
                   before (System/currentTimeMillis)
                   fut    (tx-fn txs measure)]
               (vswap! write-time + (- (System/currentTimeMillis) before))
@@ -91,25 +94,110 @@
             (print-row written inserted write-time sync-count
                        sync-time prev-time start-time)))))))
 
-(def id (volatile! 0))
+(defn max-write-bench-sync-mt
+  [batch-size tx-fn add-fn threads]
+  (print-header)
+  (let [batch-size   (long batch-size)
+        threads      (long threads)
+        write-time   (volatile! 0)
+        sync-count   (volatile! 0)
+        inserted     (volatile! 0)
+        start-time   (System/currentTimeMillis)
+        prev-time    (volatile! start-time)
+        sync-time    (volatile! start-time)
+        next-report  (volatile! report)
+        metrics-lock (Object.)
+        counter      (AtomicLong. 0)
+        measure      (fn [_]
+                       (locking metrics-lock
+                         (vreset! sync-time (System/currentTimeMillis))
+                         (vswap! sync-count inc)
+                         (vswap! inserted + batch-size)
+                         (when (and (>= @inserted @next-report)
+                                    (pos? @sync-count))
+                           (print-row @inserted inserted write-time sync-count
+                                      sync-time prev-time start-time)
+                           (vreset! write-time 0)
+                           (vreset! prev-time @sync-time)
+                           (vreset! sync-count 0)
+                           (vreset! next-report (+ @next-report report)))))
+        worker       (fn []
+                       (loop []
+                         (let [idx (.getAndIncrement counter)
+                               written (* idx batch-size)]
+                           (when (< written total)
+                             (let [txs    (build-batch-txs batch-size add-fn)
+                                   before (System/currentTimeMillis)]
+                               (tx-fn txs measure)
+                               (locking metrics-lock
+                                 (vswap! write-time + (- (System/currentTimeMillis)
+                                                         before))))
+                             (recur)))))]
+    (if (= threads 1)
+      (worker)
+      (let [pool (Executors/newFixedThreadPool (int threads))]
+        (try
+          (let [workers (doall
+                          (repeatedly (int threads)
+                                      #(.submit pool ^Runnable worker)))]
+            (doseq [w workers] (.get w)))
+          (finally
+            (.shutdown pool)
+            (.awaitTermination pool 1 TimeUnit/MINUTES)))))
+    (when (pos? @sync-count)
+      (print-row @inserted inserted write-time sync-count
+                 sync-time prev-time start-time))))
+
+(def id (AtomicLong. 0))
+
+(defn- run-dir
+  ([base-dir f batch]
+   (run-dir base-dir f batch 1))
+  ([base-dir f batch threads]
+   (let [suffix (if (> (long threads) 1)
+                  (str "-t" threads)
+                  "")
+         name   (str f "-" batch suffix)]
+    (if (and (string? base-dir) (not (s/blank? base-dir)))
+      (str (if (s/ends-with? base-dir "/")
+             base-dir
+             (str base-dir "/"))
+           name)
+      name))))
 
 (defn write
-  [{:keys [batch f]}]
+  [{:keys [base-dir batch f threads durability-profile]
+    :or   {threads 1}}]
   (let [nf       (name f)
+        threads  (long threads)
+        _        (when (not (pos? threads))
+                   (throw (ex-info ":threads must be a positive integer"
+                                   {:threads threads})))
+        _        (when (and durability-profile
+                            (not (#{:strict :relaxed} durability-profile)))
+                   (throw (ex-info ":durability-profile must be :strict or :relaxed"
+                                   {:durability-profile durability-profile})))
+        dir      (run-dir base-dir f batch threads)
         kv?      (s/starts-with? nf "kv")
         dl?      (s/starts-with? nf "dl")
         sql?     (s/starts-with? nf "sql")
         async?   (s/ends-with? nf "async")
+        txlog?   (or (= "dl-txlog" nf) (= "kv-txlog" nf))
+        _        (when (and (string? base-dir) (not (s/blank? base-dir)))
+                   (.mkdirs (java.io.File. base-dir)))
         kvdb     (when kv?
-                   (doto (d/open-kv (str f "-" batch)
-                                    {:mapsize 60000
-                                     :flags   (-> c/default-env-flags
-                                                  ;; (conj :writemap)
-                                                  ;; (conj :mapasync)
-                                                  (conj :nosync)
-                                                  ;; (conj :nometasync)
-                                                  )
-                                     })
+                   (doto (d/open-kv dir
+                                    (cond-> {:mapsize 60000
+                                             :flags   (-> c/default-env-flags
+                                                          ;; (conj :writemap)
+                                                          ;; (conj :mapasync)
+                                                          ;; (conj :nosync)
+                                                          ;; (conj :nometasync)
+                                                          )}
+                                      txlog? (assoc :txn-log? true)
+                                      (and txlog? durability-profile)
+                                      (assoc :txn-log-durability-profile
+                                             durability-profile)))
                      (d/open-dbi max-write-dbi)))
         kv-async (fn [txs measure]
                    (d/transact-kv-async kvdb max-write-dbi txs
@@ -118,27 +206,31 @@
                    (measure (d/transact-kv kvdb max-write-dbi txs
                                            :id :string)))
         kv-add   (fn [^FastList txs]
-                   (.add txs [:put (vswap! id + 2) (str (random-uuid))]))
+                   (.add txs [:put (.addAndGet id 2) (str (random-uuid))]))
         conn     (when dl?
-                   (d/get-conn (str f "-" batch)
-                               {:k {:db/valueType :db.type/long}
-                                :v {:db/valueType :db.type/string}}
-                               {:kv-opts {:mapsize 60000
-                                          :flags   (-> c/default-env-flags
-                                                       ;; (conj :writemap)
-                                                       ;; (conj :mapasync)
-                                                       ;; (conj :nosync)
-                                                       ;; (conj :nometasync)
-                                                       )
-                                          }}))
+                   (d/get-conn
+                     dir
+                     {:k {:db/valueType :db.type/long}
+                      :v {:db/valueType :db.type/string}}
+                     (cond-> {:kv-opts {:mapsize 60000
+                                        :flags   (-> c/default-env-flags
+                                                     ;; (conj :writemap)
+                                                     ;; (conj :mapasync)
+                                                     ;; (conj :nosync)
+                                                     ;; (conj :nometasync)
+                                                     )}}
+                       txlog? (assoc :txn-log? true)
+                       (and txlog? durability-profile)
+                       (assoc :txn-log-durability-profile
+                              durability-profile))))
         dl-async (fn [txs measure] (d/transact-async conn txs nil measure))
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
         dl-add   (fn [^FastList txs]
-                   (.add txs {:k (vswap! id + 2) :v (str (random-uuid))}))
+                   (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
         sql-conn (when sql?
                    (let [conn (jdbc/get-connection
                                 {:dbtype "sqlite"
-                                 :dbname (str "sqlite-" batch)})]
+                                 :dbname (run-dir base-dir "sqlite" batch)})]
                      (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
                      (jdbc/execute! conn ["PRAGMA synchronous=FULL;"])
                      (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
@@ -148,18 +240,37 @@
         sql-tx   (fn [txs measure]
                    (measure (sql/insert-multi! sql-conn :my_table txs)))
         sql-add  (fn [^FastList txs]
-                   (.add txs {:k (vswap! id + 2) :v (str (random-uuid))}))
+                   (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
         tx-fn    (case f
                    kv-async kv-async
                    kv-sync  kv-sync
+                   kv-txlog kv-sync
                    dl-async dl-async
                    dl-sync  dl-sync
+                   dl-txlog dl-sync
                    sql-tx   sql-tx)
         add-fn   (cond
                    kv?  kv-add
                    dl?  dl-add
                    sql? sql-add)]
-    (max-write-bench batch tx-fn add-fn async?)
+    (cond
+      (= threads 1)
+      (max-write-bench batch tx-fn add-fn async?)
+
+      (and dl? (not txlog?))
+      (throw (ex-info "Multi-thread write benchmark for Datalog transact! requires txlog mode (use dl-txlog)."
+                      {:threads threads :f f}))
+
+      async?
+      (throw (ex-info "Multi-thread write benchmark supports synchronous writers only"
+                      {:threads threads :f f}))
+
+      sql?
+      (throw (ex-info "Multi-thread write benchmark for SQLite is not supported"
+                      {:threads threads :f f}))
+
+      :else
+      (max-write-bench-sync-mt batch tx-fn add-fn threads))
     (when kvdb
       (let [written (d/entries kvdb max-write-dbi)]
         (when-not (= written total) (println "Write only" written)))

@@ -5,6 +5,7 @@
    [datalevin.core :as d]
    [datalevin.interpret :as i]
    [datalevin.interface :as if]
+   [datalevin.constants :as c]
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [taoensso.nippy :as nippy]
    [clojure.test :refer [deftest is use-fixtures]]
@@ -118,6 +119,60 @@
     (d/close-kv db)
     (u/delete-files src)
     (u/delete-files dst)))
+
+(deftest txn-log-copy-meta-test
+  (let [src (u/tmp-dir (str "datalevin-copy-meta-test-" (UUID/randomUUID)))
+        dst (u/tmp-dir (str "datalevin-copy-meta-test-" (UUID/randomUUID)))
+        db  (d/open-kv src {:flags    (conj c/default-env-flags :nosync)
+                            :txn-log? true})
+        dbi "a"]
+    (try
+      (d/open-dbi db dbi)
+      (d/transact-kv db [[:put dbi "Hello" "Datalevin"]])
+      (let [copy-meta (sut/copy src dst true)]
+        (is (map? copy-meta))
+        (is (number? (:started-ms copy-meta)))
+        (is (number? (:completed-ms copy-meta)))
+        (is (number? (:duration-ms copy-meta)))
+        (is (<= (:started-ms copy-meta) (:completed-ms copy-meta)))
+        (is (true? (:compact? copy-meta)))
+        (is (string? (get-in copy-meta [:backup-pin :pin-id])))
+        (is (number? (get-in copy-meta [:backup-pin :floor-lsn])))
+        (is (number? (get-in copy-meta [:backup-pin :expires-ms]))))
+      (let [db-copied (d/open-kv dst)]
+        (try
+          (d/open-dbi db-copied dbi)
+          (is (= (d/get-value db-copied dbi "Hello") "Datalevin"))
+          (finally
+            (d/close-kv db-copied))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files src)
+        (u/delete-files dst)))))
+
+(deftest dtlv-copy-prints-copy-meta-test
+  (let [src (u/tmp-dir (str "datalevin-dtlv-copy-meta-test-" (UUID/randomUUID)))
+        dst (u/tmp-dir (str "datalevin-dtlv-copy-meta-test-" (UUID/randomUUID)))
+        db  (d/open-kv src {:flags    (conj c/default-env-flags :nosync)
+                            :txn-log? true})
+        dbi "a"]
+    (try
+      (d/open-dbi db dbi)
+      (d/transact-kv db [[:put dbi "Hello" "Datalevin"]])
+      (let [output (with-out-str
+                     (#'sut/run-copy {:dir src :compact true} [dst]))]
+        (is (s/includes? output "Copy metadata:"))
+        (is (s/includes? output ":backup-pin")))
+      (let [db-copied (d/open-kv dst)]
+        (try
+          (d/open-dbi db-copied dbi)
+          (is (= (d/get-value db-copied dbi "Hello") "Datalevin"))
+          (finally
+            (d/close-kv db-copied))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files src)
+        (u/delete-files dst)))))
 
 (deftest drop-test
   (let [dir (u/tmp-dir (str "datalevin-drop-test-" (UUID/randomUUID)))

@@ -208,20 +208,27 @@
          (map #(s/split % #"="))
          (into {}))))
 
-(defn- copy-out [conn req]
-  (try
-    (let [data (transient [])]
-      (loop []
-        (let [msg (receive conn)]
-          (if (map? msg)
-            (let [{:keys [type]} msg]
-              (if (= type :copy-done)
-                {:type :command-complete :result (persistent! data)}
-                (u/raise "Server error while copying out data" {:msg msg})))
-            (do (doseq [d msg] (conj! data d))
-                (recur))))))
-    (catch Exception e
-      (u/raise "Unable to receive copy:" e {:req req}))))
+(defn- copy-out
+  ([conn req]
+   (copy-out conn req nil))
+  ([conn req copy-out-response]
+   (try
+     (let [data (transient [])]
+       (loop []
+         (let [msg (receive conn)]
+           (if (map? msg)
+             (let [{:keys [type]} msg]
+               (if (= type :copy-done)
+                 (cond-> {:type :command-complete
+                          :result (persistent! data)}
+                   (and (map? copy-out-response)
+                        (contains? copy-out-response :copy-meta))
+                   (assoc :copy-meta (:copy-meta copy-out-response)))
+                 (u/raise "Server error while copying out data" {:msg msg})))
+             (do (doseq [d msg] (conj! data d))
+                 (recur))))))
+     (catch Exception e
+       (u/raise "Unable to receive copy:" e {:req req})))))
 
 (defn- copy-in*
   [conn req data batch-size ]
@@ -230,7 +237,7 @@
       (send-only conn batch))
     (let [{:keys [type] :as result} (send-n-receive conn {:type :copy-done})]
       (if (= type :copy-out-response)
-        (copy-out conn req)
+        (copy-out conn req result)
         result))
     (catch Exception e
       (send-n-receive conn {:type :copy-fail})
@@ -257,7 +264,7 @@
                                 (finally (release-connection pool conn)))]
                      (vreset! success? true)
                      (case type
-                       :copy-out-response (copy-out conn req)
+                       :copy-out-response (copy-out conn req result)
                        :command-complete  result
                        :error-response    result
                        :reopen

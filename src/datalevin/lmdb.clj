@@ -226,6 +226,17 @@
 
 (defmulti open-kv (constantly (pick-binding)))
 
+(defonce ^:private open-kv-wrapper (volatile! identity))
+
+(defn set-open-kv-wrapper!
+  [f]
+  (vreset! open-kv-wrapper (or f identity))
+  nil)
+
+(defn wrap-open-kv
+  [db]
+  (@open-kv-wrapper db))
+
 (defn- nippy-dbi [lmdb dbi]
   [{:dbi dbi :entries (entries lmdb dbi)}
    (for [[k v] (get-range lmdb dbi [:all] :raw :raw)]

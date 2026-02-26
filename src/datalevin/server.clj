@@ -23,6 +23,7 @@
    [datalevin.storage :as st]
    [datalevin.search :as sc]
    [datalevin.vector :as v]
+   [datalevin.kv :as kv]
    [datalevin.built-ins :as dbq]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
@@ -738,16 +739,21 @@
 
 (defn- copy-out
   "Continiously write data out to client in batches"
-  [^SelectionKey skey data batch-size]
-  (let [state                             (.attachment skey)
-        {:keys [^ByteBuffer write-bf]}    @state
-        ^SocketChannel                 ch (.channel skey)]
-    (locking write-bf
-      (p/write-message-blocking ch write-bf {:type :copy-out-response})
-      (doseq [batch (partition batch-size batch-size nil data)]
-        (write-message skey batch))
-      (p/write-message-blocking ch write-bf {:type :copy-done}))
-    (log/debug "Copied out" (count data) "data items")))
+  ([^SelectionKey skey data batch-size]
+   (copy-out skey data batch-size nil))
+  ([^SelectionKey skey data batch-size copy-meta]
+   (let [state                             (.attachment skey)
+         {:keys [^ByteBuffer write-bf]}    @state
+         ^SocketChannel                 ch (.channel skey)
+         response                          (cond-> {:type :copy-out-response}
+                                             copy-meta
+                                             (assoc :copy-meta copy-meta))]
+     (locking write-bf
+       (p/write-message-blocking ch write-bf response)
+       (doseq [batch (partition batch-size batch-size nil data)]
+         (write-message skey batch))
+       (p/write-message-blocking ch write-bf {:type :copy-done}))
+     (log/debug "Copied out" (count data) "data items"))))
 
 (defn- open-port
   [port]
@@ -1165,6 +1171,23 @@
    'set-env-flags
    'get-env-flags
    'sync
+   'txlog-watermarks
+   'open-tx-log
+   'read-commit-marker
+   'verify-commit-marker!
+   'force-txlog-sync!
+   'force-lmdb-sync!
+   'create-snapshot!
+   'list-snapshots
+   'snapshot-scheduler-state
+   'txlog-retention-state
+   'gc-txlog-segments!
+   'txlog-update-snapshot-floor!
+   'txlog-clear-snapshot-floor!
+   'txlog-update-replica-floor!
+   'txlog-clear-replica-floor!
+   'txlog-pin-backup-floor!
+   'txlog-unpin-backup-floor!
    'fetch
    'populated?
    'size
@@ -1981,14 +2004,30 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
     (let [[db-name compact?] args
+          started-ms          (System/currentTimeMillis)
+          copy-backup-pin     (atom nil)
           tf                 (u/tmp-dir (str "copy-" (UUID/randomUUID)))
           path               (Paths/get (str tf u/+separator+ c/data-file-name)
                                         (into-array String []))]
       (try
-        (i/copy (lmdb server skey db-name writing?) tf compact?)
-        (copy-out skey
-                  (b/encode-base64 (Files/readAllBytes path))
-                  8192)
+        (binding [kv/*txn-log-copy-backup-pin-observer*
+                  (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
+                    (reset! copy-backup-pin
+                            {:pin-id pin-id
+                             :floor-lsn pin-floor-lsn
+                             :expires-ms pin-expires-ms}))]
+          (i/copy (lmdb server skey db-name writing?) tf compact?))
+        (let [completed-ms (System/currentTimeMillis)
+              copy-meta (cond-> {:started-ms started-ms
+                                 :completed-ms completed-ms
+                                 :duration-ms (- completed-ms started-ms)
+                                 :compact? (boolean compact?)}
+                          (map? @copy-backup-pin)
+                          (assoc :backup-pin @copy-backup-pin))]
+          (copy-out skey
+                    (b/encode-base64 (Files/readAllBytes path))
+                    8192
+                    copy-meta))
         (finally (u/delete-files tf))))))
 
 (defn- stat
@@ -2134,6 +2173,218 @@
           "Don't have permission to alter the database"
         (i/sync kv-store force)
         (write-message skey {:type :command-complete})))))
+
+(defn- txlog-watermarks
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/txlog-watermarks kv-store)}))))
+
+(defn- open-tx-log
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          from-lsn (nth args 1)
+          upto-lsn (nth args 2 nil)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/open-tx-log kv-store from-lsn upto-lsn)}))))
+
+(defn- read-commit-marker
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/read-commit-marker kv-store)}))))
+
+(defn- verify-commit-marker!
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/verify-commit-marker! kv-store)}))))
+
+(defn- force-txlog-sync!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/force-txlog-sync! kv-store)})))))
+
+(defn- force-lmdb-sync!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/force-lmdb-sync! kv-store)})))))
+
+(defn- create-snapshot!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/create-snapshot! kv-store)})))))
+
+(defn- list-snapshots
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/list-snapshots kv-store)}))))
+
+(defn- snapshot-scheduler-state
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/snapshot-scheduler-state kv-store)}))))
+
+(defn- txlog-retention-state
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/txlog-retention-state kv-store)}))))
+
+(defn- gc-txlog-segments!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name          (nth args 0)
+          retain-floor-lsn (nth args 1 nil)
+          kv-store         (get-kv-store server db-name)
+          sys-conn         (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/gc-txlog-segments!
+                                 kv-store retain-floor-lsn)})))))
+
+(defn- txlog-update-snapshot-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name               (nth args 0)
+          snapshot-lsn          (nth args 1)
+          previous-snapshot-lsn (nth args 2 nil)
+          kv-store              (get-kv-store server db-name)
+          sys-conn              (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-update-snapshot-floor!
+                                 kv-store snapshot-lsn
+                                 previous-snapshot-lsn)})))))
+
+(defn- txlog-clear-snapshot-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-clear-snapshot-floor! kv-store)})))))
+
+(defn- txlog-update-replica-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name     (nth args 0)
+          replica-id  (nth args 1)
+          applied-lsn (nth args 2)
+          kv-store    (get-kv-store server db-name)
+          sys-conn    (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-update-replica-floor!
+                                 kv-store replica-id applied-lsn)})))))
+
+(defn- txlog-clear-replica-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name    (nth args 0)
+          replica-id (nth args 1)
+          kv-store   (get-kv-store server db-name)
+          sys-conn   (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-clear-replica-floor!
+                                 kv-store replica-id)})))))
+
+(defn- txlog-pin-backup-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name    (nth args 0)
+          pin-id     (nth args 1)
+          floor-lsn  (nth args 2)
+          expires-ms (nth args 3 nil)
+          kv-store   (get-kv-store server db-name)
+          sys-conn   (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-pin-backup-floor!
+                                 kv-store pin-id floor-lsn expires-ms)})))))
+
+(defn- txlog-unpin-backup-floor!
+  [^Server server ^SelectionKey skey {:keys [args]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          pin-id   (nth args 1)
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)]
+      (wrap-permission
+          ::alter ::database (db-eid sys-conn db-name)
+          "Don't have permission to alter the database"
+        (write-message skey
+                       {:type :command-complete
+                        :result (kv/txlog-unpin-backup-floor!
+                                 kv-store pin-id)})))))
 
 (defn- transact-kv
   [^Server server ^SelectionKey skey {:keys [mode args writing?]}]

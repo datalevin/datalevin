@@ -4,7 +4,9 @@
    [datalevin.binding.cpp :as cpp]
    [datalevin.bits :as b]
    [datalevin.interpret :as i]
+   [datalevin.kv :as kv]
    [datalevin.interface :as if]
+   [datalevin.txlog :as txlog]
    [datalevin.util :as u]
    [datalevin.core :as dc]
    [datalevin.constants :as c]
@@ -18,6 +20,8 @@
   (:import
    [java.util UUID Arrays]
    [java.lang Long]
+   [datalevin.db DB]
+   [datalevin.storage Store]
    [datalevin.lmdb IListRandKeyValIterable IListRandKeyValIterator]))
 
 (use-fixtures :each db-fixture)
@@ -757,6 +761,1022 @@
 
     (if/close-kv lmdb)
     (u/delete-files dir)))
+
+(defn- read-txlog-records
+  [dir]
+  (let [txlog-dir (str dir u/+separator+ "txlog")]
+    (->> (txlog/segment-files txlog-dir)
+         (mapcat (fn [{:keys [id file]}]
+                   (let [{:keys [records]}
+                         (txlog/scan-segment (.getPath file))]
+                     (mapv (fn [record]
+                             (let [{:keys [lsn ops]}
+                                   (txlog/decode-commit-row-payload
+                                    ^bytes (:body record))]
+                               {:lsn lsn
+                                :ops ops
+                                :segment-id id
+                                :offset (:offset record)
+                                :checksum (:checksum record)}))
+                           records))))
+         vec)))
+
+(defn- list-put-record
+  [records vec-val]
+  (first
+   (filter
+    (fn [{:keys [ops]}]
+      (some (fn [row]
+              (and (vector? row)
+                   (= :put-list (nth row 0 nil))
+                   (= "list" (nth row 1 nil))
+                   (= :k (nth row 2 nil))
+                   (= [vec-val] (nth row 3 nil))))
+            ops))
+    records)))
+
+(defn- wait-until
+  [pred timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (if (pred)
+        true
+        (if (< (System/currentTimeMillis) deadline)
+          (do (Thread/sleep 25)
+              (recur))
+          false)))))
+
+(defn- offpeak-window-away-from-now
+  []
+  (let [now      (java.time.LocalTime/now)
+        minute   (+ (* 60 (.getHour ^java.time.LocalTime now))
+                    (.getMinute ^java.time.LocalTime now))
+        day-mins (* 24 60)
+        start    (mod (+ minute 720) day-mins)
+        end      (mod (+ start 60) day-mins)]
+    [{:start start :end end}]))
+
+(deftest txn-log-enables-nosync-flag-test
+  (let [dir (u/tmp-dir (str "txlog-nosync-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:txn-log? true})]
+        (is (contains? (if/get-env-flags lmdb) :nosync))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest top-level-txn-log-propagates-to-kv-test
+  (let [dir (u/tmp-dir (str "txlog-top-level-propagation-" (UUID/randomUUID)))
+        schema {:k {:db/valueType :db.type/long}
+                :v {:db/valueType :db.type/string}}]
+    (try
+      (let [conn       (dc/get-conn dir schema
+                                    {:txn-log? true
+                                     :kv-opts  {:mapsize 64}})
+            ^DB db     @conn
+            ^Store s   (.-store db)
+            lmdb       (.-lmdb s)
+            watermarks (if/txlog-watermarks lmdb)]
+        (is (:txn-log? watermarks))
+        (is (contains? (if/get-env-flags lmdb) :nosync))
+        (dc/close conn))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-replay-from-commit-marker-test
+  (let [dir (u/tmp-dir (str "txlog-replay-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        (is (= [1 2] (if/get-list lmdb "list" :k :data :long)))
+        (if/close-kv lmdb))
+
+      (let [records (read-txlog-records dir)
+            r1      (or (list-put-record records 1)
+                        (throw (ex-info "Missing txn-log record for value 1" {})))
+            lmdb    (l/open-kv dir {:flags (conj c/default-env-flags :nosync)})
+            slot-a  (txlog/encode-commit-marker-slot
+                     {:revision            100
+                      :applied-lsn         (:lsn r1)
+                      :txlog-segment-id    (:segment-id r1)
+                      :txlog-record-offset (:offset r1)
+                      :txlog-record-crc    (:checksum r1)})
+            slot-b  (txlog/encode-commit-marker-slot
+                     {:revision            101
+                      :applied-lsn         (:lsn r1)
+                      :txlog-segment-id    (:segment-id r1)
+                      :txlog-record-offset (:offset r1)
+                      :txlog-record-crc    (:checksum r1)})]
+        ;; Simulate pre-replay LMDB state at marker LSN.
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:del-list "list" :k [2] :data :long]])
+        (is (= [1] (if/get-list lmdb "list" :k :data :long)))
+        (if/transact-kv lmdb
+                        [[:put c/kv-info c/txn-log-marker-a slot-a :keyword :bytes]
+                         [:put c/kv-info c/txn-log-marker-b slot-b :keyword :bytes]])
+        (if/close-kv lmdb))
+
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-list-dbi lmdb "list")
+        (is (= [1 2] (if/get-list lmdb "list" :k :data :long)))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-bootstrap-test
+  (let [dir (u/tmp-dir (str "txlog-bootstrap-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        ;; Fresh LMDB may not have all copy prerequisites until first write.
+        (is (empty? (if/list-snapshots lmdb)))
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (if/close-kv lmdb))
+      ;; Re-open should complete bootstrap to steady-state (current + previous).
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (let [snapshots (if/list-snapshots lmdb)]
+          (is (= 2 (count snapshots)))
+          (is (= :current (:slot (first snapshots))))
+          (is (= :previous (:slot (second snapshots)))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-bootstrap-disabled-test
+  (let [dir (u/tmp-dir (str "txlog-bootstrap-off-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                    (conj c/default-env-flags
+                                                                 :nosync)
+                                 :txn-log?                true
+                                 :snapshot-bootstrap-force? false})]
+        (is (empty? (if/list-snapshots lmdb)))
+        (is (:ok? (if/create-snapshot! lmdb)))
+        (is (= 1 (count (if/list-snapshots lmdb))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-backup-pin-lifecycle-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-pin-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (let [seen-pin-id (atom nil)
+              seen-floor (atom nil)
+              res (binding [kv/*txn-log-snapshot-copy-failpoint*
+                            (fn [{:keys [lmdb pin-id pin-floor-lsn
+                                         pin-expires-ms]}]
+                              (reset! seen-pin-id pin-id)
+                              (reset! seen-floor pin-floor-lsn)
+                              (let [pins (if/get-value lmdb c/kv-info
+                                                       c/txn-log-backup-pins
+                                                       :keyword :data)]
+                                (is (map? pins))
+                                (is (= pin-floor-lsn
+                                       (get-in pins [pin-id :floor-lsn])))
+                                (is (= pin-expires-ms
+                                       (get-in pins [pin-id :expires-ms])))))]
+                    (if/create-snapshot! lmdb))
+              pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+                                       :keyword :data)]
+          (is (:ok? res))
+          (is (string? @seen-pin-id))
+          (is (= @seen-pin-id (get-in res [:backup-pin :pin-id])))
+          (is (= @seen-floor (get-in res [:backup-pin :floor-lsn])))
+          (is (or (nil? pins-after)
+                  (not (contains? pins-after @seen-pin-id)))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-backup-pin-unpinned-on-failure-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-pin-fail-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (let [seen-pin-id (atom nil)]
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"snapshot-copy-failpoint"
+               (binding [kv/*txn-log-snapshot-copy-failpoint*
+                         (fn [{:keys [lmdb pin-id]}]
+                           (reset! seen-pin-id pin-id)
+                           (let [pins (if/get-value lmdb c/kv-info
+                                                    c/txn-log-backup-pins
+                                                    :keyword :data)]
+                             (is (contains? pins pin-id)))
+                           (throw (ex-info "snapshot-copy-failpoint" {})))]
+                 (if/create-snapshot! lmdb))))
+          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+                                         :keyword :data)]
+            (is (string? @seen-pin-id))
+            (is (or (nil? pins-after)
+                    (not (contains? pins-after @seen-pin-id))))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-copy-backup-pin-lifecycle-test
+  (let [dir (u/tmp-dir (str "txlog-copy-pin-" (UUID/randomUUID)))
+        dest-root (u/tmp-dir (str "txlog-copy-pin-dest-" (UUID/randomUUID)))
+        dest (str dest-root u/+separator+ "copy")]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-dbi lmdb "a")
+        (if/transact-kv lmdb [[:put "a" :k :v]])
+        (let [seen-pin-id (atom nil)
+              seen-floor (atom nil)]
+          (let [copy-res
+                (binding [kv/*txn-log-copy-backup-pin-failpoint*
+                          (fn [{:keys [lmdb pin-id pin-floor-lsn
+                                       pin-expires-ms compact?]}]
+                            (reset! seen-pin-id pin-id)
+                            (reset! seen-floor pin-floor-lsn)
+                            (is (true? compact?))
+                            (let [pins (if/get-value lmdb c/kv-info
+                                                     c/txn-log-backup-pins
+                                                     :keyword :data)]
+                              (is (map? pins))
+                              (is (= pin-floor-lsn
+                                     (get-in pins [pin-id :floor-lsn])))
+                              (is (= pin-expires-ms
+                                     (get-in pins [pin-id :expires-ms])))))]
+                  (if/copy lmdb dest true))]
+            (is (map? copy-res))
+            (is (number? (:started-ms copy-res)))
+            (is (number? (:completed-ms copy-res)))
+            (is (number? (:duration-ms copy-res)))
+            (is (<= (:started-ms copy-res) (:completed-ms copy-res)))
+            (is (true? (:compact? copy-res)))
+            (is (= @seen-pin-id (get-in copy-res [:backup-pin :pin-id])))
+            (is (= @seen-floor (get-in copy-res [:backup-pin :floor-lsn])))
+            (is (number? (get-in copy-res [:backup-pin :expires-ms]))))
+          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+                                         :keyword :data)]
+            (is (string? @seen-pin-id))
+            (is (number? @seen-floor))
+            (is (u/file-exists (str dest u/+separator+ c/data-file-name)))
+            (is (or (nil? pins-after)
+                    (not (contains? pins-after @seen-pin-id))))))
+        (if/close-kv lmdb))
+      (let [copy-lmdb (l/open-kv dest)]
+        (if/open-dbi copy-lmdb "a")
+        (is (= :v (if/get-value copy-lmdb "a" :k)))
+        (if/close-kv copy-lmdb))
+      (finally
+        (u/delete-files dir)
+        (try
+          (u/delete-files dest-root)
+          (catch Exception _))))))
+
+(deftest txn-log-copy-backup-pin-unpinned-on-failure-test
+  (let [dir (u/tmp-dir (str "txlog-copy-pin-fail-" (UUID/randomUUID)))
+        dest-root (u/tmp-dir (str "txlog-copy-pin-fail-dest-" (UUID/randomUUID)))
+        dest (str dest-root u/+separator+ "copy")]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-dbi lmdb "a")
+        (if/transact-kv lmdb [[:put "a" :k :v]])
+        (let [seen-pin-id (atom nil)]
+          (is (thrown-with-msg?
+               clojure.lang.ExceptionInfo #"copy-backup-pin-failpoint"
+               (binding [kv/*txn-log-copy-backup-pin-failpoint*
+                         (fn [{:keys [lmdb pin-id]}]
+                           (reset! seen-pin-id pin-id)
+                           (let [pins (if/get-value lmdb c/kv-info
+                                                    c/txn-log-backup-pins
+                                                    :keyword :data)]
+                             (is (contains? pins pin-id)))
+                           (throw (ex-info "copy-backup-pin-failpoint" {})))]
+                 (if/copy lmdb dest false))))
+          (let [pins-after (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+                                         :keyword :data)]
+            (is (string? @seen-pin-id))
+            (is (or (nil? pins-after)
+                    (not (contains? pins-after @seen-pin-id))))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)
+        (try
+          (u/delete-files dest-root)
+          (catch Exception _))))))
+
+(deftest txn-log-snapshot-scheduler-auto-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-scheduler-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags               (conj c/default-env-flags
+                                                             :nosync)
+                                 :txn-log?            true
+                                 :snapshot-scheduler? true
+                                 :snapshot-interval-ms 100
+                                 :snapshot-max-lsn-delta 1})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        (is (wait-until #(u/file-exists (str dir u/+separator+ c/version-file-name))
+                        2000))
+        ;; Force two scheduler steps to cover bootstrap (current, then previous).
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (is (= 2 (count (if/list-snapshots lmdb))))
+        (let [state (if/snapshot-scheduler-state lmdb)]
+          (is (:enabled? state))
+          (is (= :auto (:mode state)))
+          (is (boolean? (:running? state)))
+          (is (number? (:last-success-ms state)))
+          (is (contains? #{:bootstrap :interval :lsn-delta
+                           :gc-safety
+                           :max-age :log-bytes-delta}
+                         (:last-trigger state))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-log-bytes-trigger-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-log-bytes-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                       (conj
+                                                                c/default-env-flags
+                                                                :nosync)
+                                 :txn-log?                    true
+                                 :snapshot-scheduler?         true
+                                 :snapshot-interval-ms        600000
+                                 :snapshot-max-lsn-delta      1000000
+                                 :snapshot-max-log-bytes-delta 1
+                                 :snapshot-max-age-ms         600000})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Bootstrap to steady-state snapshots.
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        ;; Add more txlog bytes without tripping other triggers.
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (:ok? res))
+          (is (= :log-bytes-delta (:trigger res)))
+          (is (= :log-bytes-delta (:last-trigger state)))
+          (is (<= 1 (or (get-in state
+                                 [:last-trigger-details
+                                  :txlog-bytes-since-snapshot])
+                        0))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-max-age-trigger-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-max-age-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                       (conj
+                                                                c/default-env-flags
+                                                                :nosync)
+                                 :txn-log?                    true
+                                 :snapshot-scheduler?         true
+                                 :snapshot-interval-ms        600000
+                                 :snapshot-max-lsn-delta      1000000
+                                 :snapshot-max-log-bytes-delta 9223372036854775807
+                                 :snapshot-max-age-ms         1})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Bootstrap to steady-state snapshots.
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (Thread/sleep 5)
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (:ok? res))
+          (is (= :max-age (:trigger res)))
+          (is (= :max-age (:last-trigger state)))
+          (is (<= 1 (or (get-in state
+                                 [:last-trigger-details
+                                  :snapshot-age-ms])
+                        0))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-gc-safety-trigger-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-gc-safety-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                       (conj
+                                                                c/default-env-flags
+                                                                :nosync)
+                                 :txn-log?                    true
+                                 :txn-log-retention-bytes     1
+                                 :snapshot-scheduler?         true
+                                 :snapshot-interval-ms        600000
+                                 :snapshot-max-lsn-delta      1000000
+                                 :snapshot-max-log-bytes-delta 9223372036854775807
+                                 :snapshot-max-age-ms         600000})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Bootstrap to steady-state snapshots.
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (is (some? (#'kv/maybe-run-snapshot-scheduler! lmdb)))
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (:ok? res))
+          (is (= :gc-safety (:trigger res)))
+          (is (= :gc-safety (:last-trigger state)))
+          (is (true? (get-in state [:last-trigger-details
+                                    :pressure
+                                    :degraded?])))
+          (is (some #{:snapshot-floor-lsn}
+                    (get-in state [:last-trigger-details
+                                   :floor-limiters]))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-offpeak-deferral-test
+  (let [dir             (u/tmp-dir (str "txlog-snapshot-offpeak-deferral-"
+                                        (UUID/randomUUID)))
+        offpeak-windows (offpeak-window-away-from-now)]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                        (conj
+                                                                 c/default-env-flags
+                                                                 :nosync)
+                                 :txn-log?                     true
+                                 :snapshot-scheduler?          true
+                                 :snapshot-interval-ms         600000
+                                 :snapshot-max-lsn-delta       1000000
+                                 :snapshot-max-log-bytes-delta 1
+                                 :snapshot-max-age-ms          600000
+                                 :snapshot-defer-on-contention? false
+                                 :snapshot-defer-backoff-min-ms 5
+                                 :snapshot-defer-backoff-max-ms 5
+                                 :snapshot-offpeak-windows     offpeak-windows})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Prepare steady-state snapshot slots so non-bootstrap triggers apply.
+        (is (:ok? (if/create-snapshot! lmdb)))
+        (is (:ok? (if/create-snapshot! lmdb)))
+        ;; Add txlog bytes without tripping max-age/interval/lsn-delta.
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (true? (:deferred? res)))
+          (is (= :log-bytes-delta (:trigger res)))
+          (is (= :offpeak-window (get-in res [:defer :reason])))
+          (is (= :offpeak-window (:last-defer-reason state)))
+          (is (= :log-bytes-delta (:last-defer-trigger state)))
+          (is (false? (:in-offpeak-window? state)))
+          (is (= 5 (:defer-backoff-ms state)))
+          (is (number? (:next-eligible-ms state)))
+          (is (number? (:defer-since-ms state)))
+          (is (<= 0 (or (:current-defer-duration-ms state) -1)))
+          (is (<= 1 (or (get-in state [:defer-count :offpeak-window]) 0)))
+          (is (<= 1 (or (get-in state [:snapshot-defer-count
+                                       :offpeak-window])
+                        0)))
+          (is (<= -1 (or (:snapshot-defer-duration-ms state) -1))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-contention-deferral-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-contention-deferral-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                        (conj
+                                                                 c/default-env-flags
+                                                                 :nosync)
+                                 :txn-log?                     true
+                                 :snapshot-scheduler?          true
+                                 :snapshot-interval-ms         600000
+                                 :snapshot-max-lsn-delta       1000000
+                                 :snapshot-max-log-bytes-delta 1
+                                 :snapshot-max-age-ms          600000
+                                 :snapshot-contention-thresholds
+                                 {:commit-wait-p99-ms 1
+                                  :queue-depth 1000000
+                                  :fsync-p99-ms 1}
+                                 :snapshot-contention-sample-max-age-ms
+                                 1
+                                 :snapshot-defer-backoff-min-ms 1
+                                 :snapshot-defer-backoff-max-ms 1})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Prepare steady-state snapshot slots so non-bootstrap triggers apply.
+        (is (:ok? (if/create-snapshot! lmdb)))
+        (is (:ok? (if/create-snapshot! lmdb)))
+        ;; Add txlog bytes without tripping max-age/interval/lsn-delta.
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        ;; Inject recent contention samples to trigger load-shed deferral.
+        (let [sync-manager (:sync-manager (txlog/state lmdb))]
+          (txlog/record-commit-wait-ms! sync-manager 10)
+          (txlog/record-fsync-ms! sync-manager 10))
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (true? (:deferred? res)))
+          (is (= :log-bytes-delta (:trigger res)))
+          (is (= :contention (get-in res [:defer :reason])))
+          (is (true? (get-in res [:defer :hits :commit-wait-p99-ms])))
+          (is (true? (get-in res [:defer :hits :fsync-p99-ms])))
+          (is (= :contention (:last-defer-reason state)))
+          (is (= :log-bytes-delta (:last-defer-trigger state)))
+          (is (= 1 (:defer-backoff-ms state)))
+          (is (number? (:next-eligible-ms state)))
+          (is (<= 1 (or (get-in state [:defer-count :contention]) 0)))
+          (is (<= 1 (or (get-in state [:snapshot-defer-count :contention])
+                        0))))
+        ;; Allow contention samples to expire and confirm scheduler proceeds.
+        (Thread/sleep 5)
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (:ok? res))
+          (is (= :log-bytes-delta (:trigger res)))
+          (is (<= 1 (or (:run-count state) 0)))
+          (is (nil? (:defer-since-ms state)))
+          (is (number? (:last-run-duration-ms state)))
+          (is (<= 0 (or (:defer-duration-ms state) -1)))
+          (is (<= 0 (or (:last-defer-duration-ms state) -1))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-scheduler-max-age-override-deferral-test
+  (let [dir             (u/tmp-dir (str "txlog-snapshot-max-age-override-"
+                                        (UUID/randomUUID)))
+        offpeak-windows (offpeak-window-away-from-now)]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                        (conj
+                                                                 c/default-env-flags
+                                                                 :nosync)
+                                 :txn-log?                     true
+                                 :snapshot-scheduler?          true
+                                 :snapshot-interval-ms         600000
+                                 :snapshot-max-lsn-delta       1000000
+                                 :snapshot-max-log-bytes-delta 9223372036854775807
+                                 :snapshot-max-age-ms          1
+                                 :snapshot-offpeak-windows     offpeak-windows
+                                 :snapshot-defer-on-contention? true
+                                 :snapshot-contention-thresholds
+                                 {:commit-wait-p99-ms 1
+                                  :queue-depth 1000000
+                                  :fsync-p99-ms 1}
+                                 :snapshot-contention-sample-max-age-ms
+                                 60000})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        ;; Prepare steady-state snapshot slots.
+        (is (:ok? (if/create-snapshot! lmdb)))
+        (is (:ok? (if/create-snapshot! lmdb)))
+        ;; Inject contention and offpeak mismatch; max-age must still force run.
+        (let [sync-manager (:sync-manager (txlog/state lmdb))]
+          (txlog/record-commit-wait-ms! sync-manager 10)
+          (txlog/record-fsync-ms! sync-manager 10))
+        (Thread/sleep 5)
+        (let [res   (#'kv/maybe-run-snapshot-scheduler! lmdb)
+              state (if/snapshot-scheduler-state lmdb)]
+          (is (:ok? res))
+          (is (= :max-age (:trigger res)))
+          (is (not (:deferred? res)))
+          (is (= :max-age (:last-trigger state)))
+          (is (<= 1 (or (:max-age-breach-count state) 0)))
+          (is (<= 1 (or (:snapshot-max-age-breach-count state) 0)))
+          (is (number? (:last-max-age-breach-ms state)))
+          (is (<= 1 (or (:run-count state) 0)))
+          (is (number? (:last-run-duration-ms state)))
+          (is (<= (or (:last-run-duration-ms state) 0)
+                  (or (:run-duration-ms state) 0)))
+          (is (<= (or (:last-run-duration-ms state) 0)
+                  (or (:snapshot-run-duration-ms state) 0))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-operational-apis-test
+  (let [dir (u/tmp-dir (str "txlog-api-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-list-dbi lmdb "list")
+        (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+        (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+        (let [watermarks  (if/txlog-watermarks lmdb)
+              committed   (:last-committed-lsn watermarks)
+              applied     (:last-applied-lsn watermarks)
+              marker      (if/read-commit-marker lmdb)
+              verified    (if/verify-commit-marker! lmdb)
+              tx-records  (if/open-tx-log lmdb 1 committed)
+              force-res   (if/force-txlog-sync! lmdb)
+              lmdb-force  (if/force-lmdb-sync! lmdb)
+              forced-watermarks (:watermarks lmdb-force)
+              snapshot1   (if/create-snapshot! lmdb)
+              _           (if/transact-kv lmdb [[:put-list "list" :k [3]
+                                                 :data :long]])
+              snapshot2   (if/create-snapshot! lmdb)
+              snapshots   (if/list-snapshots lmdb)
+              sched-state (if/snapshot-scheduler-state lmdb)]
+          (is (:txn-log? watermarks))
+          (is (<= 2 committed))
+          (is (= committed applied))
+          (is (= applied (get-in marker [:current :applied-lsn])))
+          (is (:ok? verified))
+          (is (some? (:valid-marker verified)))
+          (is (some? (list-put-record tx-records 1)))
+          (is (some? (list-put-record tx-records 2)))
+          (is (every? #(contains? % :tx-kind) tx-records))
+          (is (every? #{:user :vector-checkpoint :unknown}
+                      (map :tx-kind tx-records)))
+          (is (some #(= :user (:tx-kind %)) tx-records))
+          (is (<= 0 (or (:batched-sync-count watermarks) -1)))
+          (is (contains? watermarks :avg-commit-wait-ms))
+          (is (map? (:avg-commit-wait-ms-by-mode watermarks)))
+          (is (<= 0 (or (:segment-roll-count watermarks) -1)))
+          (is (<= 0 (or (:segment-roll-duration-ms watermarks) -1)))
+          (is (<= 0 (or (:segment-prealloc-success-count watermarks) -1)))
+          (is (<= 0 (or (:segment-prealloc-failure-count watermarks) -1)))
+          (is (contains? watermarks :append-p99-near-roll-ms))
+          (is (<= 0 (or (:vec-checkpoint-count watermarks) -1)))
+          (is (<= 0 (or (:vec-checkpoint-duration-ms watermarks) -1)))
+          (is (<= 0 (or (:vec-checkpoint-bytes watermarks) -1)))
+          (is (<= 0 (or (:vec-checkpoint-failure-count watermarks) -1)))
+          (is (<= 0 (or (:vec-replay-lag-lsn watermarks) -1)))
+          (is (map? (:vec-checkpoint-domains watermarks)))
+          (is (:synced? force-res))
+          (is (<= (:target-lsn force-res)
+                  (:last-durable-lsn force-res)))
+          (is (:synced? lmdb-force))
+          (is (= committed
+                 (get-in lmdb-force [:watermarks :last-applied-lsn])))
+          (is (number? (:last-checkpoint-ms forced-watermarks)))
+          (is (<= 0 (or (:checkpoint-staleness-ms forced-watermarks) -1)))
+          (is (number? (:checkpoint-stale-threshold-ms forced-watermarks)))
+          (is (boolean? (:checkpoint-stale? forced-watermarks)))
+          (is (<= 0 (or (:durable-applied-lag-lsn forced-watermarks) -1)))
+          (is (number? (:durable-applied-lag-threshold-lsn forced-watermarks)))
+          (is (boolean? (:durable-applied-lag-alert? forced-watermarks)))
+          (is (<= 1 (or (:lmdb-sync-count forced-watermarks) 0)))
+          (is (:ok? snapshot1))
+          (is (:ok? snapshot2))
+          (is (= 2 (count snapshots)))
+          (is (= :current (:slot (first snapshots))))
+          (is (= :previous (:slot (second snapshots))))
+          (is (u/file-exists (get-in snapshot2 [:snapshot :path])))
+          (is (<= (get-in snapshot1 [:snapshot :applied-lsn])
+                  (get-in snapshot2 [:snapshot :applied-lsn])))
+          (is (= 2 (:snapshot-count sched-state)))
+          (is (false? (:enabled? sched-state)))
+          (is (some? (:latest-snapshot sched-state)))
+          (is (boolean? (:snapshot-age-alert? sched-state)))
+          (is (<= 0 (or (:snapshot-failure-count sched-state) -1)))
+          (is (<= 0 (or (:snapshot-consecutive-failure-count sched-state) -1)))
+          (is (boolean? (:snapshot-build-failure-alert? sched-state))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-rollback-switch-test
+  (let [dir (u/tmp-dir (str "txlog-rollback-switch-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                (conj
+                                                         c/default-env-flags
+                                                         :nosync)
+                                 :txn-log?            true
+                                 :txn-log-rollout-mode :rollback})]
+        (if/open-dbi lmdb "a")
+        (if/transact-kv lmdb [[:put "a" :k :v]])
+        (is (= :v (if/get-value lmdb "a" :k)))
+        (is (false? (u/file-exists (str dir u/+separator+ "txlog"))))
+        (let [watermarks (if/txlog-watermarks lmdb)
+              txlog-force (if/force-txlog-sync! lmdb)
+              lmdb-force (if/force-lmdb-sync! lmdb)
+              snapshot (if/create-snapshot! lmdb)
+              verified (if/verify-commit-marker! lmdb)
+              retention (if/txlog-retention-state lmdb)
+              gc-res (if/gc-txlog-segments! lmdb)]
+          (is (:txn-log? watermarks))
+          (is (= :rollback (:rollout-mode watermarks)))
+          (is (false? (:write-path-enabled? watermarks)))
+          (is (true? (:rollback? watermarks)))
+          (is (false? (:synced? txlog-force)))
+          (is (:skipped? txlog-force))
+          (is (= :rollback (:reason txlog-force)))
+          (is (:synced? lmdb-force))
+          (is (= :rollback
+                 (get-in lmdb-force [:watermarks :rollout-mode])))
+          (is (false? (:ok? snapshot)))
+          (is (:skipped? snapshot))
+          (is (= :rollback (:reason snapshot)))
+          (is (false? (:ok? verified)))
+          (is (:skipped? verified))
+          (is (= :rollback (:reason verified)))
+          (is (= :rollback (get-in verified [:watermarks :rollout-mode])))
+          (is (:txn-log? retention))
+          (is (:skipped? retention))
+          (is (= :rollback (:reason retention)))
+          (is (= :rollback (get-in retention [:watermarks :rollout-mode])))
+          (is (false? (:ok? gc-res)))
+          (is (:skipped? gc-res))
+          (is (= :rollback (:reason gc-res)))
+          (is (= :rollback (get-in gc-res [:watermarks :rollout-mode]))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-rollout-option-conflict-test
+  (let [dir (u/tmp-dir (str "txlog-rollout-conflict-" (UUID/randomUUID)))]
+    (try
+      (is (thrown-with-msg? Exception #"Conflicting txn-log rollout options"
+            (l/open-kv dir {:flags                (conj
+                                                   c/default-env-flags
+                                                   :nosync)
+                            :txn-log?            true
+                            :txn-log-rollout-mode :active
+                            :txn-log-rollback?   true})))
+      (finally
+        (u/delete-files dir)))))
+
+(defn- setup-txlog-snapshot-recovery-fixture!
+  ([dir]
+   (setup-txlog-snapshot-recovery-fixture! dir false))
+  ([dir corrupt-marker?]
+  (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                             :txn-log? true})]
+    (try
+      (if/open-list-dbi lmdb "list")
+      (if/transact-kv lmdb [[:put-list "list" :k [1] :data :long]])
+      (if/transact-kv lmdb [[:put-list "list" :k [2] :data :long]])
+      (if/create-snapshot! lmdb)
+      (if/transact-kv lmdb [[:put-list "list" :k [3] :data :long]])
+      (let [snapshot2 (if/create-snapshot! lmdb)
+            current-path (get-in snapshot2 [:snapshot :path])
+            previous-path (get-in snapshot2 [:snapshots 1 :path])]
+        (if/transact-kv lmdb [[:put-list "list" :k [4] :data :long]])
+        (when corrupt-marker?
+          (let [slot-a (txlog/encode-commit-marker-slot
+                        {:revision            1000
+                         :applied-lsn         999999
+                         :txlog-segment-id    9999
+                         :txlog-record-offset 0
+                         :txlog-record-crc    0})
+                slot-b (txlog/encode-commit-marker-slot
+                        {:revision            1001
+                         :applied-lsn         999999
+                         :txlog-segment-id    9999
+                         :txlog-record-offset 0
+                         :txlog-record-crc    0})]
+            (if/transact-kv lmdb c/kv-info
+                            [[:put c/txn-log-marker-a slot-a]
+                             [:put c/txn-log-marker-b slot-b]]
+                            :keyword :bytes)))
+        {:current-path current-path
+         :previous-path previous-path})
+      (finally
+        (if/close-kv lmdb))))))
+
+(deftest txn-log-snapshot-recovery-current-fallback-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-current-" (UUID/randomUUID)))]
+    (try
+      (setup-txlog-snapshot-recovery-fixture! dir true)
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (try
+          (if/open-list-dbi lmdb "list")
+          (is (= [1 2 3 4] (if/get-list lmdb "list" :k :data :long)))
+          (is (= :snapshot-current
+                 (get (if/env-opts lmdb) :txlog-recovery-source)))
+          (is (= :current
+                 (get (if/env-opts lmdb) :txlog-recovery-snapshot-slot)))
+          (finally
+            (if/close-kv lmdb))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-snapshot-recovery-previous-fallback-test
+  (let [dir (u/tmp-dir (str "txlog-snapshot-previous-" (UUID/randomUUID)))]
+    (try
+      (let [{:keys [current-path previous-path]}
+            (setup-txlog-snapshot-recovery-fixture! dir true)]
+        (is (u/file-exists (str previous-path u/+separator+ c/data-file-name)))
+        (u/delete-files (str current-path u/+separator+ c/data-file-name))
+        (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                   :txn-log? true})]
+          (try
+            (if/open-list-dbi lmdb "list")
+            (is (= [1 2 3 4] (if/get-list lmdb "list" :k :data :long)))
+            (is (= :snapshot-previous
+                   (get (if/env-opts lmdb) :txlog-recovery-source)))
+            (is (= :previous
+                   (get (if/env-opts lmdb) :txlog-recovery-snapshot-slot)))
+            (finally
+              (if/close-kv lmdb)))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-retention-gc-test
+  (let [dir       (u/tmp-dir (str "txlog-retention-" (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                     (conj c/default-env-flags
+                                                                  :nosync)
+                                 :txn-log?                  true
+                                 :txn-log-segment-max-bytes 64
+                                 :txn-log-segment-max-ms    600000})]
+        (if/open-list-dbi lmdb "list")
+        (doseq [v (range 1 13)]
+          (if/transact-kv lmdb [[:put-list "list" :k [v] :data :long]]))
+        (let [before-files   (txlog/segment-files txlog-dir)
+              before-count   (count before-files)
+              retention0     (if/txlog-retention-state lmdb)
+              pinned-gc      (if/gc-txlog-segments! lmdb 1)
+              unpinned-gc    (if/gc-txlog-segments! lmdb)
+              after-files    (txlog/segment-files txlog-dir)
+              after-count    (count after-files)
+              retention1     (if/txlog-retention-state lmdb)
+              marker-verified (if/verify-commit-marker! lmdb)]
+          (is (> before-count 1))
+          (is (pos? (:safety-deletable-segment-count retention0)))
+          (is (zero? (:deleted-count pinned-gc)))
+          (is (pos? (:deleted-count unpinned-gc)))
+          (is (= 1 after-count))
+          (is (:ok? marker-verified))
+          (is (<= (:min-retained-lsn retention1)
+                  (inc (:applied-lsn retention1)))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-retention-floor-providers-test
+  (let [dir       (u/tmp-dir (str "txlog-floor-providers-" (UUID/randomUUID)))
+        stale-ms  (- (System/currentTimeMillis) 60000)
+        now-ms    (System/currentTimeMillis)]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true
+                                 :txn-log-replica-floor-ttl-ms 30000})]
+        (if/open-dbi lmdb "a")
+        (if/open-dbi lmdb c/vec-meta-dbi)
+        (if/transact-kv lmdb [[:put "a" :k :v]])
+        (if/transact-kv lmdb c/vec-meta-dbi
+                        [[:put "d-prev" {:previous-snapshot-lsn 3}]
+                         [:put "d-cur" {:current-snapshot-lsn 10}]
+                         [:put "d-replay" {:vec-replay-floor-lsn 5}]]
+                        :string :data)
+        (if/transact-kv lmdb c/kv-info
+                        [[:put c/txn-log-snapshot-current-lsn 12]
+                         [:put c/txn-log-snapshot-previous-lsn 8]
+                         [:put c/txn-log-replica-floors
+                          {:replica-a {:applied-lsn 6 :updated-ms now-ms}
+                           :replica-b {:applied-lsn 2 :updated-ms stale-ms}}]
+                         [:put c/txn-log-backup-pins
+                          {:backup-a {:floor-lsn 7}
+                           :backup-b {:floor-lsn 1 :expires-ms stale-ms}}]]
+                        :keyword :data)
+        (let [state      (if/txlog-retention-state lmdb)
+              floors     (:floors state)
+              providers  (:floor-providers state)]
+          (is (= 9 (:snapshot-floor-lsn floors)))
+          (is (= 4 (:vector-global-floor-lsn floors)))
+          (is (= 6 (:replica-floor-lsn floors)))
+          (is (= 7 (:backup-pin-floor-lsn floors)))
+          (is (= 4 (:required-retained-floor-lsn state)))
+          (is (= [:vector-global-floor-lsn] (:floor-limiters state)))
+          (is (= 1 (get-in providers [:replica :active-count])))
+          (is (= 1 (get-in providers [:replica :stale-count])))
+          (is (= 1 (get-in providers [:backup :active-count])))
+          (is (= 1 (get-in providers [:backup :expired-count]))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-retention-degraded-write-backpressure-test
+  (let [dir (u/tmp-dir (str "txlog-retention-backpressure-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags                    (conj
+                                                            c/default-env-flags
+                                                            :nosync)
+                                 :txn-log?                 true
+                                 :txn-log-retention-bytes  1
+                                 :txn-log-retention-ms     600000
+                                 :txn-log-segment-max-ms   600000
+                                 :txn-log-segment-max-bytes 1024})]
+        (if/open-dbi lmdb "a")
+        (if/txlog-update-snapshot-floor! lmdb 0)
+        (if/transact-kv lmdb [[:put "a" :k1 :v1]])
+        (Thread/sleep 1100)
+        (let [ex (try
+                   (if/transact-kv lmdb [[:put "a" :k2 :v2]])
+                   nil
+                   (catch clojure.lang.ExceptionInfo e
+                     e))
+              retention (if/txlog-retention-state lmdb)]
+          (is (nil? ex))
+          (is (true? (get-in retention [:pressure :degraded?])))
+          (is (= :v1 (if/get-value lmdb "a" :k1)))
+          (is (= :v2 (if/get-value lmdb "a" :k2))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-retention-pin-backpressure-grace-test
+  (let [dir (u/tmp-dir (str "txlog-retention-pin-backpressure-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true
+                                 :txn-log-retention-bytes 1
+                                 :txn-log-retention-ms 600000
+                                 :txn-log-retention-pin-backpressure-threshold-ms
+                                 100
+                                 :txn-log-segment-max-ms 600000
+                                 :txn-log-segment-max-bytes 1024})]
+        (if/open-dbi lmdb "a")
+        (if/txlog-update-snapshot-floor! lmdb 1000)
+        (if/txlog-update-replica-floor! lmdb :replica-a 0)
+        (if/transact-kv lmdb [[:put "a" :k1 :v1]])
+        (Thread/sleep 1100)
+        (if/transact-kv lmdb [[:put "a" :k2 :v2]])
+        (if/transact-kv lmdb [[:put "a" :k3 :v3]])
+        (let [retention (if/txlog-retention-state lmdb)]
+          (is (true? (get-in retention [:pressure :degraded?])))
+          (is (some #{:replica-floor-lsn} (:floor-limiters retention))))
+        (Thread/sleep 1100)
+        (let [ex (try
+                   (if/transact-kv lmdb [[:put "a" :k4 :v4]])
+                   nil
+                   (catch clojure.lang.ExceptionInfo e
+                     e))
+              retention (if/txlog-retention-state lmdb)]
+          (is (nil? ex))
+          (is (true? (get-in retention [:pressure :degraded?])))
+          (is (some #{:replica-floor-lsn} (:floor-limiters retention)))
+          (is (= :v1 (if/get-value lmdb "a" :k1)))
+          (is (= :v2 (if/get-value lmdb "a" :k2)))
+          (is (= :v3 (if/get-value lmdb "a" :k3)))
+          (is (= :v4 (if/get-value lmdb "a" :k4))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest txn-log-floor-provider-api-test
+  (let [dir (u/tmp-dir (str "txlog-floor-api-" (UUID/randomUUID)))]
+    (try
+      (let [lmdb (l/open-kv dir {:flags    (conj c/default-env-flags :nosync)
+                                 :txn-log? true})]
+        (if/open-dbi lmdb "a")
+        (if/transact-kv lmdb [[:put "a" :k :v]])
+        (let [s1 (if/txlog-update-snapshot-floor! lmdb 5)
+              s2 (if/txlog-update-snapshot-floor! lmdb 9)
+              _  (is (thrown? clojure.lang.ExceptionInfo
+                              (if/txlog-update-snapshot-floor! lmdb 8)))
+              s3 (if/txlog-update-snapshot-floor! lmdb 12 10)
+              _  (is (thrown? clojure.lang.ExceptionInfo
+                              (if/txlog-update-snapshot-floor! lmdb 11 13)))
+              s4 (if/txlog-clear-snapshot-floor! lmdb)
+              r1 (if/txlog-update-replica-floor! lmdb :r1 5)
+              r2 (if/txlog-update-replica-floor! lmdb :r1 8)
+              _  (is (thrown? clojure.lang.ExceptionInfo
+                              (if/txlog-update-replica-floor! lmdb :r1 7)))
+              r3 (if/txlog-clear-replica-floor! lmdb :r1)
+              b1 (if/txlog-pin-backup-floor! lmdb :b1 9)
+              b2 (if/txlog-pin-backup-floor! lmdb :b2 4
+                                             (+ (System/currentTimeMillis) 60000))
+              b3 (if/txlog-unpin-backup-floor! lmdb :b1)
+              snapshot-current
+              (if/get-value lmdb c/kv-info c/txn-log-snapshot-current-lsn
+                            :keyword :data)
+              snapshot-previous
+              (if/get-value lmdb c/kv-info c/txn-log-snapshot-previous-lsn
+                            :keyword :data)
+              floors-map (if/get-value lmdb c/kv-info c/txn-log-replica-floors
+                                       :keyword :data)
+              pins-map   (if/get-value lmdb c/kv-info c/txn-log-backup-pins
+                                       :keyword :data)]
+          (is (= 5 (:snapshot-current-lsn s1)))
+          (is (nil? (:snapshot-previous-lsn s1)))
+          (is (= 9 (:snapshot-current-lsn s2)))
+          (is (= 5 (:snapshot-previous-lsn s2)))
+          (is (= 12 (:snapshot-current-lsn s3)))
+          (is (= 10 (:snapshot-previous-lsn s3)))
+          (is (:cleared? s4))
+          (is (= 5 (:applied-lsn r1)))
+          (is (= 8 (:applied-lsn r2)))
+          (is (:removed? r3))
+          (is (= 9 (:floor-lsn b1)))
+          (is (= 4 (:floor-lsn b2)))
+          (is (:removed? b3))
+          (is (nil? snapshot-current))
+          (is (nil? snapshot-previous))
+          (is (nil? floors-map))
+          (is (= #{:b2} (set (keys pins-map)))))
+        (if/close-kv lmdb))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest open-again-resized-test
   (let [dir  (u/tmp-dir (str "again-resize-" (UUID/randomUUID)))

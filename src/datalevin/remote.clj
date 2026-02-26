@@ -20,7 +20,7 @@
    [clojure.string :as str])
   (:import
    [datalevin.client Client]
-   [datalevin.interface ILMDB IList IAdmin IStore ISearchEngine IVectorIndex]
+   [datalevin.interface ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
    [java.net URI]))
 
@@ -277,9 +277,61 @@
     (cl/normal-request client :close-transact [db-name] true))
 
   ILMDB
+  (kv-info [_] nil)
   (sync [this] (.sync this 1))
   (sync [_ force]
     (cl/normal-request client :sync [db-name force] writing?))
+
+  ITxLog
+  (txlog-watermarks [_]
+    (cl/normal-request client :txlog-watermarks [db-name] writing?))
+  (open-tx-log [this from-lsn]
+    (.open-tx-log this from-lsn nil))
+  (open-tx-log [_ from-lsn upto-lsn]
+    (cl/normal-request client :open-tx-log [db-name from-lsn upto-lsn] writing?))
+  (force-txlog-sync! [_]
+    (cl/normal-request client :force-txlog-sync! [db-name] writing?))
+  (force-lmdb-sync! [_]
+    (cl/normal-request client :force-lmdb-sync! [db-name] writing?))
+  (create-snapshot! [_]
+    (cl/normal-request client :create-snapshot! [db-name] writing?))
+  (list-snapshots [_]
+    (cl/normal-request client :list-snapshots [db-name] writing?))
+  (snapshot-scheduler-state [_]
+    (cl/normal-request client :snapshot-scheduler-state [db-name] writing?))
+  (read-commit-marker [_]
+    (cl/normal-request client :read-commit-marker [db-name] writing?))
+  (verify-commit-marker! [_]
+    (cl/normal-request client :verify-commit-marker! [db-name] writing?))
+  (txlog-retention-state [_]
+    (cl/normal-request client :txlog-retention-state [db-name] writing?))
+  (gc-txlog-segments! [this]
+    (.gc-txlog-segments! this nil))
+  (gc-txlog-segments! [_ retain-floor-lsn]
+    (cl/normal-request client :gc-txlog-segments!
+                       [db-name retain-floor-lsn] writing?))
+  (txlog-update-snapshot-floor! [this snapshot-lsn]
+    (.txlog-update-snapshot-floor! this snapshot-lsn nil))
+  (txlog-update-snapshot-floor! [_ snapshot-lsn previous-snapshot-lsn]
+    (cl/normal-request client :txlog-update-snapshot-floor!
+                       [db-name snapshot-lsn previous-snapshot-lsn] writing?))
+  (txlog-clear-snapshot-floor! [_]
+    (cl/normal-request client :txlog-clear-snapshot-floor!
+                       [db-name] writing?))
+  (txlog-update-replica-floor! [_ replica-id applied-lsn]
+    (cl/normal-request client :txlog-update-replica-floor!
+                       [db-name replica-id applied-lsn] writing?))
+  (txlog-clear-replica-floor! [_ replica-id]
+    (cl/normal-request client :txlog-clear-replica-floor!
+                       [db-name replica-id] writing?))
+  (txlog-pin-backup-floor! [this pin-id floor-lsn]
+    (.txlog-pin-backup-floor! this pin-id floor-lsn nil))
+  (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms]
+    (cl/normal-request client :txlog-pin-backup-floor!
+                       [db-name pin-id floor-lsn expires-ms] writing?))
+  (txlog-unpin-backup-floor! [_ pin-id]
+    (cl/normal-request client :txlog-unpin-backup-floor!
+                       [db-name pin-id] writing?))
 
   IAdmin
   (re-index [_ schema opts]
@@ -332,6 +384,7 @@
       (cl/normal-request client :closed-kv? [db-name])))
 
   (env-dir [_] uri)
+  (kv-info [_] nil)
 
   (open-dbi [db dbi-name]
     (.open-dbi db dbi-name nil))
@@ -349,7 +402,18 @@
   ;; TODO need to zip the dir and checksum
   (copy [db dest] (.copy db dest false))
   (copy [_ dest compact?]
-    (let [bs   (->> (cl/normal-request client :copy [db-name compact?] writing?)
+    (let [{:keys [type message result copy-meta]}
+          (cl/request client {:type     :copy
+                              :mode     :request
+                              :writing? writing?
+                              :args     [db-name compact?]})
+          _    (when (= type :error-response)
+                 (u/raise "Request to Datalevin server failed: "
+                          message
+                          {:type :copy
+                           :args [db-name compact?]
+                           :writing? writing?}))
+          bs   (->> result
                     (apply str)
                     b/decode-base64)
           dir  (Paths/get dest (into-array String []))
@@ -360,7 +424,8 @@
       (Files/write file ^bytes bs
                    ^"[Ljava.nio.file.StandardOpenOption;"
                    (into-array StandardOpenOption []))
-      (spit (str dest u/+separator+ c/version-file-name) c/version)))
+      (spit (str dest u/+separator+ c/version-file-name) c/version)
+      copy-meta))
 
   (stat [db] (.stat db nil))
   (stat [_ dbi-name]
@@ -378,6 +443,67 @@
   (sync [this] (.sync this 1))
   (sync [_ force]
     (cl/normal-request client :sync [db-name force] writing?))
+
+  ITxLog
+  (txlog-watermarks [_]
+    (cl/normal-request client :txlog-watermarks [db-name] writing?))
+
+  (open-tx-log [this from-lsn]
+    (.open-tx-log this from-lsn nil))
+  (open-tx-log [_ from-lsn upto-lsn]
+    (cl/normal-request client :open-tx-log [db-name from-lsn upto-lsn] writing?))
+
+  (force-txlog-sync! [_]
+    (cl/normal-request client :force-txlog-sync! [db-name] writing?))
+
+  (force-lmdb-sync! [_]
+    (cl/normal-request client :force-lmdb-sync! [db-name] writing?))
+
+  (create-snapshot! [_]
+    (cl/normal-request client :create-snapshot! [db-name] writing?))
+
+  (list-snapshots [_]
+    (cl/normal-request client :list-snapshots [db-name] writing?))
+
+  (snapshot-scheduler-state [_]
+    (cl/normal-request client :snapshot-scheduler-state [db-name] writing?))
+
+  (read-commit-marker [_]
+    (cl/normal-request client :read-commit-marker [db-name] writing?))
+
+  (verify-commit-marker! [_]
+    (cl/normal-request client :verify-commit-marker! [db-name] writing?))
+
+  (txlog-retention-state [_]
+    (cl/normal-request client :txlog-retention-state [db-name] writing?))
+
+  (gc-txlog-segments! [this]
+    (.gc-txlog-segments! this nil))
+  (gc-txlog-segments! [_ retain-floor-lsn]
+    (cl/normal-request client :gc-txlog-segments!
+                       [db-name retain-floor-lsn] writing?))
+  (txlog-update-snapshot-floor! [this snapshot-lsn]
+    (.txlog-update-snapshot-floor! this snapshot-lsn nil))
+  (txlog-update-snapshot-floor! [_ snapshot-lsn previous-snapshot-lsn]
+    (cl/normal-request client :txlog-update-snapshot-floor!
+                       [db-name snapshot-lsn previous-snapshot-lsn] writing?))
+  (txlog-clear-snapshot-floor! [_]
+    (cl/normal-request client :txlog-clear-snapshot-floor!
+                       [db-name] writing?))
+  (txlog-update-replica-floor! [_ replica-id applied-lsn]
+    (cl/normal-request client :txlog-update-replica-floor!
+                       [db-name replica-id applied-lsn] writing?))
+  (txlog-clear-replica-floor! [_ replica-id]
+    (cl/normal-request client :txlog-clear-replica-floor!
+                       [db-name replica-id] writing?))
+  (txlog-pin-backup-floor! [this pin-id floor-lsn]
+    (.txlog-pin-backup-floor! this pin-id floor-lsn nil))
+  (txlog-pin-backup-floor! [_ pin-id floor-lsn expires-ms]
+    (cl/normal-request client :txlog-pin-backup-floor!
+                       [db-name pin-id floor-lsn expires-ms] writing?))
+  (txlog-unpin-backup-floor! [_ pin-id]
+    (cl/normal-request client :txlog-unpin-backup-floor!
+                       [db-name pin-id] writing?))
 
   (open-transact-kv [db]
     (cl/normal-request client :open-transact-kv [db-name])

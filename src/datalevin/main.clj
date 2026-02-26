@@ -312,18 +312,28 @@
   the destination data directory path. Will compact while copying if
   `compact?` is true."
   [src-dir dest-dir compact?]
-  (let [lmdb (l/open-kv src-dir)]
-    (if/copy lmdb dest-dir compact?)
-    (if/close-kv lmdb)))
+  (let [txlog-dir (str src-dir u/+separator+ "txlog")
+        opts      (when (u/file-exists txlog-dir)
+                    {:txn-log? true})
+        lmdb      (l/open-kv src-dir opts)]
+    (try
+      (if/copy lmdb dest-dir compact?)
+      (finally
+        (if/close-kv lmdb)))))
 
-(defn- dtlv-copy [{:keys [dir compact]} arguments]
+(defn- run-copy [{:keys [dir compact]} arguments]
   (assert dir (s/join \newline
                       ["Missing source data directory path." copy-help]))
   (assert (seq arguments)
           (s/join \newline
                   ["Missing destination data directory path." copy-help]))
+  (let [copy-meta (copy dir (first arguments) compact)]
+    (when (map? copy-meta)
+      (println "Copy metadata:" (pr-str copy-meta)))))
+
+(defn- dtlv-copy [options arguments]
   (try
-    (copy dir (first arguments) compact)
+    (run-copy options arguments)
     (catch Throwable e
       (st/print-cause-trace e)
       (exit 1 (str "Copy error: " (.getMessage e)))))

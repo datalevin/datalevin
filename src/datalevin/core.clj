@@ -27,6 +27,7 @@
    [datalevin.built-ins :as dbq]
    [datalevin.entity :as de]
    [datalevin.bits :as b]
+   [datalevin.kv :as kv]
    [datalevin.binding.cpp]
    [datalevin.datafy]))
 
@@ -1142,6 +1143,78 @@ set of keywords. See [[set-env-flags]] for their meanings."}
        :doc      "Force a synchronous flush to disk. Useful when non-default flags for write are included in the `:flags` option when opening the KV store, such as `:nosync`, `:mapasync`, etc. See [[open-kv]]"}
   sync i/sync)
 
+(def ^{:arglists '([db])
+       :doc      "Return txn-log watermarks and runtime sync state for a KV store opened with `:txn-log? true`."}
+  txlog-watermarks kv/txlog-watermarks)
+
+(def ^{:arglists '([db from-lsn]
+                   [db from-lsn upto-lsn])
+       :doc      "Read committed txn-log records from `from-lsn` (inclusive), optionally capped at `upto-lsn` (inclusive)."}
+  open-tx-log kv/open-tx-log)
+
+(def ^{:arglists '([db])
+       :doc      "Force txn-log sync on the active segment and wait until current appended LSN is durable."}
+  force-txlog-sync! kv/force-txlog-sync!)
+
+(def ^{:arglists '([db])
+       :doc      "Force LMDB environment sync (`mdb_env_sync(force=1)`) for a txn-log KV store."}
+  force-lmdb-sync! kv/force-lmdb-sync!)
+
+(def ^{:arglists '([db])
+       :doc      "Create/rotate LMDB snapshots (`current`/`previous`) and update txn-log snapshot floor bookkeeping."}
+  create-snapshot! kv/create-snapshot!)
+
+(def ^{:arglists '([db])
+       :doc      "List available LMDB snapshots and metadata."}
+  list-snapshots kv/list-snapshots)
+
+(def ^{:arglists '([db])
+       :doc      "Return snapshot scheduler runtime state. Current implementation is manual-only (no background scheduler)."}
+  snapshot-scheduler-state kv/snapshot-scheduler-state)
+
+(def ^{:arglists '([db])
+       :doc      "Read LMDB dual-slot txn-log commit marker state."}
+  read-commit-marker kv/read-commit-marker)
+
+(def ^{:arglists '([db])
+       :doc      "Verify commit marker integrity and marker->txlog record reference."}
+  verify-commit-marker! kv/verify-commit-marker!)
+
+(def ^{:arglists '([db])
+       :doc      "Return txn-log retention floors, safety watermark, pressure state, and GC candidates."}
+  txlog-retention-state kv/txlog-retention-state)
+
+(def ^{:arglists '([db]
+                   [db retain-floor-lsn])
+       :doc      "Run txn-log segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer."}
+  gc-txlog-segments! kv/gc-txlog-segments!)
+
+(def ^{:arglists '([db snapshot-lsn]
+                   [db snapshot-lsn previous-snapshot-lsn])
+       :doc      "Update txn-log snapshot floor bookkeeping used by retention safety. 2-arity rotates previous <- old current; 3-arity sets both explicitly."}
+  txlog-update-snapshot-floor! kv/txlog-update-snapshot-floor!)
+
+(def ^{:arglists '([db])
+       :doc      "Clear txn-log snapshot floor bookkeeping used by retention safety."}
+  txlog-clear-snapshot-floor! kv/txlog-clear-snapshot-floor!)
+
+(def ^{:arglists '([db replica-id applied-lsn])
+       :doc      "Upsert replica heartbeat floor (`applied-lsn`) used by txn-log retention safety."}
+  txlog-update-replica-floor! kv/txlog-update-replica-floor!)
+
+(def ^{:arglists '([db replica-id])
+       :doc      "Remove a replica heartbeat floor used by txn-log retention safety."}
+  txlog-clear-replica-floor! kv/txlog-clear-replica-floor!)
+
+(def ^{:arglists '([db pin-id floor-lsn]
+                   [db pin-id floor-lsn expires-ms])
+       :doc      "Upsert backup/snapshot pin floor used by txn-log retention safety. Optional `expires-ms` auto-expires the pin."}
+  txlog-pin-backup-floor! kv/txlog-pin-backup-floor!)
+
+(def ^{:arglists '([db pin-id])
+       :doc      "Remove a backup/snapshot pin floor used by txn-log retention safety."}
+  txlog-unpin-backup-floor! kv/txlog-unpin-backup-floor!)
+
 (def ^{:arglists '([db dbi-name k]
                    [db dbi-name k k-type]
                    [db dbi-name k k-type v-type]
@@ -2040,6 +2113,16 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
   clear-vector-index i/clear-vecs)
 
 (def ^{:arglists '([index])
+       :doc      "Force vector checkpoint persistence to LMDB (`datalevin/vec-index` and `datalevin/vec-meta`)."}
+  force-vec-checkpoint! i/persist-vecs)
+
+(defn ^{:arglists '([index])
+        :doc      "Return vector checkpoint metadata from LMDB, including snapshot/replay LSN coverage and chunk statistics."}
+  vector-checkpoint-state
+  [index]
+  (:checkpoint (i/vecs-info index)))
+
+(def ^{:arglists '([index])
        :doc      "Return a map of information about the vector index:
 
      * `:size` the number of vectors indexed
@@ -2047,12 +2130,14 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
      * `:capacity` the capacity of the vector index at the moment
      * `:hardware` the vector Instruction Set Architecture (ISA) name
      * `:filename` the full path file name of the vector index
+     * `:domain` the vector index domain name
      * `:dimensions` see [[new-vector-index]]
      * `:metric-type` see [[new-vector-index]]
      * `:quantization` see [[new-vector-index]]
      * `:connectivity`  see [[new-vector-index]]
      * `:expansion-add` see [[new-vector-index]]
-     * `:expansion-search`see [[new-vector-index]]"}
+     * `:expansion-search`see [[new-vector-index]]
+     * `:checkpoint` checkpoint metadata map from LMDB"}
   vector-index-info i/vecs-info)
 
 (def ^{:arglists '([index vec-ref vec-data])

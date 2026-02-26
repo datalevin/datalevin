@@ -10,7 +10,6 @@
   "Native binding using JavaCPP"
   (:refer-clojure :exclude [sync])
   (:require
-   [clojure.stacktrace :as stt]
    [clojure.java.io :as io]
    [clojure.string :as s]
    [datalevin.bits :as b]
@@ -619,6 +618,55 @@
       (vld/validate-kv-tx-data tx validate?)
       (put-tx dbi txn tx))))
 
+(defn- kv-tx->row
+  [^KVTxData tx]
+  (let [op   (.-op tx)
+        base (if (= op :del)
+               [op (.-dbi-name tx) (.-k tx) (.-kt tx)]
+               [op (.-dbi-name tx) (.-k tx) (.-v tx)
+                (.-kt tx) (.-vt tx) (.-flags tx)])
+        minc (if (= op :del) 3 4)]
+    (loop [row base]
+      (if (and (> (count row) minc) (nil? (peek row)))
+        (recur (pop row))
+        row))))
+
+(defn- ensure-row-dbi
+  [dbi-name row]
+  (assoc row 1 dbi-name))
+
+(defn- canonicalize-input-txs
+  [dbi-name txs kt vt]
+  (mapv
+   (fn [t]
+     (let [^KVTxData tx
+           (if (instance? KVTxData t)
+             ^KVTxData t
+             (if dbi-name
+               (l/->kv-tx-data t kt vt)
+               (l/->kv-tx-data t)))
+           row (kv-tx->row tx)]
+       (if dbi-name
+         (ensure-row-dbi dbi-name row)
+         row)))
+   txs))
+
+(def ^:private max-val-size-row-prefix
+  [:put c/kv-info :max-val-size])
+
+(defn- max-val-size-row
+  [size]
+  (conj max-val-size-row-prefix size :data :data))
+
+(defn- maybe-apply-max-val-size-op!
+  [info ^HashMap dbis txn rows]
+  (if (:max-val-size-changed? @info)
+    (let [row (max-val-size-row (:max-val-size @info))]
+      (transact* [row] dbis txn)
+      (vswap! info assoc :max-val-size-changed? false)
+      (conj rows row))
+    rows))
+
 (defn- list-count*
   [^Rtx rtx ^Cursor cur k kt]
   (.put-key rtx k kt)
@@ -645,6 +693,13 @@
     (.setMapSize env (* ^long c/+buffer-grow-factor+
                         (.me_mapsize ^DTLV$MDB_envinfo (.get info))))
     (.close info)))
+
+(defn- close-txn-quiet!
+  [^Txn txn]
+  (when txn
+    (try
+      (.close txn)
+      (catch Exception _))))
 
 (defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
 
@@ -783,6 +838,7 @@
   (check-ready [this] (assert (not (.closed-kv? this)) "LMDB env is closed."))
 
   (env-dir [_] (@info :dir))
+  (kv-info [_] info)
 
   (env-opts [_] (dissoc @info :dbis))
 
@@ -1374,9 +1430,51 @@
        (.get ^LongPointer ptr)))
    (raise "Fail to count list in key range: " e {:dbi dbi-name})))
 
-(defn- init-info
-  [^CppLMDB lmdb new-info]
-  (transact-kv lmdb c/kv-info (map (fn [[k v]] [:put k v]) new-info))
+(defn- raw-header-type
+  [header]
+  (case (short header)
+    (-64 -63 -8) :long
+    -15          :bigint
+    -14          :bigdec
+    -11          :float
+    -10          :double
+    -9           :instant
+    -7           :uuid
+    -6           :string
+    -5           :keyword
+    -4           :symbol
+    -3           :boolean
+    -2           :bytes
+    nil))
+
+(defn- decode-kv-info-buffer
+  [^ByteBuffer bf fallback-type]
+  (try
+    (b/read-buffer (.rewind bf) :data)
+    (catch Exception data-e
+      (if fallback-type
+        (b/read-buffer (.rewind bf) fallback-type)
+        (throw data-e)))))
+
+(defn- decode-kv-info-entry
+  [kv]
+  (let [^ByteBuffer kb (l/k kv)
+        ^ByteBuffer vb (l/v kv)
+        key-type       (b/read-buffer (.rewind kb) :byte)
+        val-type       (b/read-buffer (.rewind vb) :byte)]
+    (when (and (not= key-type c/type-hete-tuple)
+               (not= val-type c/type-bytes))
+      (let [k (decode-kv-info-buffer kb
+                                     (when (= key-type c/type-keyword)
+                                       :keyword))
+            v (decode-kv-info-buffer vb (raw-header-type val-type))]
+        (when-not (and (vector? k)
+                       (= 2 (count k))
+                       (= :dbis (nth k 0)))
+          [k v])))))
+
+(defn- load-info-from-kv
+  [^CppLMDB lmdb]
   (let [dbis (into {}
                    (map (fn [[[_ dbi-name] opts]] [dbi-name opts]))
                    (get-range lmdb c/kv-info
@@ -1385,12 +1483,14 @@
                                [:dbis :db.value/sysMax]]
                               [:keyword :string]))
         info (into {}
-                   (range-filter lmdb c/kv-info
-                                 (fn [kv]
-                                   (let [b (b/read-buffer (l/k kv) :byte)]
-                                     (not= b c/type-hete-tuple)))
-                                 [:all]))]
-    (vreset! (.-info lmdb) (assoc info :dbis dbis))))
+                   (i/range-keep lmdb c/kv-info decode-kv-info-entry
+                                 [:all] :raw :raw true))]
+    (assoc info :dbis dbis)))
+
+(defn- init-info
+  [^CppLMDB lmdb new-info]
+  (transact-kv lmdb c/kv-info (map (fn [[k v]] [:put k v]) new-info))
+  (vreset! (.-info lmdb) (merge new-info (load-info-from-kv lmdb))))
 
 (defn- open-kv*
   [dir dir-file db-file {:keys [mapsize max-readers flags max-dbs temp?
@@ -1450,17 +1550,21 @@
               v-comp (when (and val-compress
                                 (.exists (io/file dir c/valcode-file-name)))
                        (cp/load-val-compressor
-                        (str dir u/+separator+ c/valcode-file-name)))]
-          (init-info lmdb info)
+                        (str dir u/+separator+ c/valcode-file-name)))
+              loaded-info (load-info-from-kv lmdb)]
+          (if (empty? loaded-info)
+            (init-info lmdb info)
+            (vreset! (.-info lmdb)
+                     (assoc (merge loaded-info info)
+                            :dbis (:dbis loaded-info))))
           (set-max-val-size lmdb (max-val-size lmdb))
           (set-key-compressor lmdb k-comp)
           (set-val-compressor lmdb v-comp)
           (.addShutdownHook (Runtime/getRuntime)
                             (Thread. #(close-kv lmdb)))
           (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
-      lmdb)
+      (l/wrap-open-kv lmdb))
     (catch Exception e
-      (stt/print-stack-trace e)
       (raise "Fail to open database: " e {:dir dir}))))
 
 (defmethod open-kv :cpp

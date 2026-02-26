@@ -18,6 +18,7 @@
    [datalevin.remote :as r]
    [datalevin.bits :as b]
    [datalevin.interface :as i]
+   [datalevin.txlog :as txlog]
    [clojure.string :as s]
    [taoensso.nippy :as nippy])
   (:import
@@ -113,6 +114,10 @@
     :int8    (VecIdx/addInt8 index k ^bytes arr)
     :byte    (VecIdx/addByte index k ^bytes arr)))
 
+(defn- remove-id
+  [index ^long k]
+  (VecIdx/remove index k))
+
 (defn- search
   [index query quantization top]
   (case quantization
@@ -163,11 +168,247 @@
     (.mkdirs dir)
     dir))
 
+(defn- txn-log-enabled?
+  [lmdb]
+  (true? (:txn-log? (i/env-opts lmdb))))
+
+(defn- vec-checkpoint-max-buffer-bytes
+  [lmdb]
+  (let [opts (or (i/env-opts lmdb) {})
+        requested (or (:txn-log-vec-max-buffer-bytes opts)
+                      (:vec-max-buffer-bytes opts)
+                      c/*txn-log-vec-max-buffer-bytes*
+                      c/*vec-max-buffer-bytes*)]
+    (long (max 1 requested))))
+
+(defn- vec-checkpoint-chunk-bytes
+  [lmdb]
+  (let [opts (or (i/env-opts lmdb) {})
+        requested (or (:txn-log-vec-chunk-bytes opts)
+                      (:vec-chunk-bytes opts)
+                      c/*txn-log-vec-chunk-bytes*
+                      c/*vec-chunk-bytes*)]
+    (long (max 1 requested))))
+
+(defn- vec-checkpoint-interval-ms
+  [lmdb]
+  (let [opts (or (i/env-opts lmdb) {})
+        requested (or (:txn-log-vec-checkpoint-interval-ms opts)
+                      c/*txn-log-vec-checkpoint-interval-ms*)]
+    (long (max 1 requested))))
+
+(defn- vec-checkpoint-max-lsn-delta
+  [lmdb]
+  (let [opts (or (i/env-opts lmdb) {})
+        requested (or (:txn-log-vec-max-lsn-delta opts)
+                      c/*txn-log-vec-max-lsn-delta*)]
+    (long (max 1 requested))))
+
+(def ^:dynamic *txn-log-vector-apply-failpoint*
+  nil)
+
+(defn- mark-txlog-fatal!
+  [lmdb ex]
+  (when-let [state (txlog/state lmdb)]
+    (when-let [fatal (:fatal-error state)]
+      (vreset! fatal ex))
+    true))
+
+(defn- vector-commit-unknown!
+  [lmdb operation ex-data cause]
+  (let [ex (ex-info "Txn-log vector apply failed after LMDB commit"
+                    (merge {:type :txn/commit-unknown
+                            :operation operation}
+                           ex-data)
+                    cause)]
+    (mark-txlog-fatal! lmdb ex)
+    (throw ex)))
+
+(defn- maybe-run-txn-log-vector-apply-failpoint!
+  [lmdb operation context]
+  (when (and (txn-log-enabled? lmdb)
+             (fn? *txn-log-vector-apply-failpoint*))
+    (*txn-log-vector-apply-failpoint* operation context)))
+
+(defn- decode-marker-slot-safe
+  [slot]
+  (when (bytes? slot)
+    (try
+      (txlog/decode-commit-marker-slot-bytes slot)
+      (catch Exception _
+        nil))))
+
+(defn- marker-applied-lsn
+  [lmdb]
+  (let [slot-a (decode-marker-slot-safe
+                (i/get-value lmdb c/kv-info c/txn-log-marker-a
+                             :keyword :bytes))
+        slot-b (decode-marker-slot-safe
+                (i/get-value lmdb c/kv-info c/txn-log-marker-b
+                             :keyword :bytes))
+        curr   (cond
+                 (and slot-a slot-b)
+                 (if (>= ^long (:revision slot-a)
+                         ^long (:revision slot-b))
+                   slot-a
+                   slot-b)
+                 slot-a slot-a
+                 slot-b slot-b
+                 :else nil)]
+    (long (or (:applied-lsn curr) 0))))
+
+(defn- txlog-state-next-lsn
+  [lmdb]
+  (try
+    (when-let [state (txlog/state lmdb)]
+      (when-let [next-lsn-v (:next-lsn state)]
+        (let [next-lsn @next-lsn-v]
+          (when (some? next-lsn)
+            (long next-lsn)))))
+    (catch Exception _
+      nil)))
+
+(defn- txn-log-next-lsn
+  [lmdb]
+  (when (txn-log-enabled? lmdb)
+    (let [state-next  (txlog-state-next-lsn lmdb)
+          marker-next (inc (marker-applied-lsn lmdb))]
+      (long (or state-next marker-next 1)))))
+
+(defn- txn-log-applied-lsn
+  [lmdb]
+  (when (txn-log-enabled? lmdb)
+    (long (marker-applied-lsn lmdb))))
+
+(defn- meta-map
+  [v]
+  (if (map? v) v {}))
+
+(defn- maybe-long
+  [x]
+  (when (some? x) (long x)))
+
+(defn- nonneg-long
+  [x]
+  (long (max 0 (or x 0))))
+
+(defn- current-snapshot-lsn
+  [meta]
+  (txlog/parse-optional-floor-lsn
+   (or (:current-snapshot-lsn meta)
+       (:vec-current-snapshot-lsn meta))
+   [:vec-meta :current-snapshot-lsn]))
+
+(defn- previous-snapshot-lsn
+  [meta]
+  (txlog/parse-optional-floor-lsn
+   (or (:previous-snapshot-lsn meta)
+       (:vec-previous-snapshot-lsn meta))
+   [:vec-meta :previous-snapshot-lsn]))
+
+(defn- replay-floor-lsn
+  [meta]
+  (txlog/parse-optional-floor-lsn
+   (:vec-replay-floor-lsn meta)
+   [:vec-meta :vec-replay-floor-lsn]))
+
+(defn- checkpoint-stats-snapshot
+  [checkpoint-stats total-bytes]
+  (let [m (if (some? checkpoint-stats) @checkpoint-stats {})
+        bytes (or (:vec-checkpoint-bytes m) total-bytes)]
+    {:vec-checkpoint-count (nonneg-long (:vec-checkpoint-count m))
+     :vec-checkpoint-duration-ms
+     (nonneg-long (:vec-checkpoint-duration-ms m))
+     :vec-checkpoint-bytes (when (some? bytes) (nonneg-long bytes))
+     :vec-checkpoint-failure-count
+     (nonneg-long (:vec-checkpoint-failure-count m))}))
+
+(defn- checkpoint-replay-lag-lsn
+  [lmdb meta]
+  (when (txn-log-enabled? lmdb)
+    (let [applied-lsn  (txn-log-applied-lsn lmdb)
+          replay-floor (replay-floor-lsn meta)]
+      (if (and (number? applied-lsn)
+               (number? replay-floor))
+        ;; Replay lag is defined as retained vector delta count from replay floor.
+        (nonneg-long (inc (- ^long applied-lsn ^long replay-floor)))
+        0))))
+
+(defn- checkpoint-state
+  [lmdb meta checkpoint-stats]
+  (let [m (meta-map meta)
+        stats (checkpoint-stats-snapshot checkpoint-stats
+                                         (maybe-long (:total-bytes m)))]
+    {:current-snapshot-lsn  (current-snapshot-lsn m)
+     :previous-snapshot-lsn (previous-snapshot-lsn m)
+     :vec-replay-floor-lsn  (replay-floor-lsn m)
+     :chunk-count           (maybe-long (:chunk-count m))
+     :total-bytes           (maybe-long (:total-bytes m))
+     :last-checkpoint-ms    (maybe-long (:last-checkpoint-ms m))
+     :checksum              (:checksum m)
+     :version               (:version m)
+     :vec-checkpoint-count  (:vec-checkpoint-count stats)
+     :vec-checkpoint-duration-ms (:vec-checkpoint-duration-ms stats)
+     :vec-checkpoint-bytes  (:vec-checkpoint-bytes stats)
+     :vec-checkpoint-failure-count (:vec-checkpoint-failure-count stats)
+     :vec-replay-lag-lsn    (checkpoint-replay-lag-lsn lmdb m)}))
+
+(defn- snapshot-covers-lsn?
+  [meta lsn]
+  (let [current  (current-snapshot-lsn meta)
+        previous (previous-snapshot-lsn meta)]
+    (or (and (some? current) (>= ^long current ^long lsn))
+        (and (some? previous) (>= ^long previous ^long lsn)))))
+
+(defn- replay-floor-meta
+  [meta commit-lsn]
+  (let [meta0      (meta-map meta)
+        old-replay (replay-floor-lsn meta0)]
+    (if (snapshot-covers-lsn? meta0 commit-lsn)
+      meta0
+      (assoc meta0 :vec-replay-floor-lsn
+             (long (if (some? old-replay)
+                     (min ^long old-replay ^long commit-lsn)
+                     commit-lsn))))))
+
+(defn- replay-floor-put-tx
+  [lmdb domain commit-lsn]
+  (when (and (some? commit-lsn) (>= ^long commit-lsn 0))
+    (let [old-meta (meta-map (i/get-value lmdb c/vec-meta-dbi domain
+                                          :string :data))
+          new-meta (replay-floor-meta old-meta commit-lsn)]
+      (when (not= old-meta new-meta)
+        (l/kv-tx :put c/vec-meta-dbi domain new-meta :string :data)))))
+
+(defn- checkpoint-meta
+  [old-meta chunk-count total-bytes target-lsn]
+  (let [now-ms     (System/currentTimeMillis)
+        meta0      (-> (meta-map old-meta)
+                       (dissoc :vec-current-snapshot-lsn
+                               :vec-previous-snapshot-lsn))
+        old-current (current-snapshot-lsn meta0)
+        old-replay  (replay-floor-lsn meta0)
+        meta1       (assoc meta0
+                           :chunk-count chunk-count
+                           :total-bytes total-bytes
+                           :last-checkpoint-ms now-ms)
+        meta2       (if (some? target-lsn)
+                      (cond-> (assoc meta1 :current-snapshot-lsn target-lsn)
+                        (some? old-current)
+                        (assoc :previous-snapshot-lsn old-current))
+                      meta1)]
+    (if (and (some? old-replay)
+             (some? target-lsn)
+             (>= ^long target-lsn ^long old-replay))
+      (dissoc meta2 :vec-replay-floor-lsn)
+      meta2)))
+
 (defn- checkpoint-to-lmdb
   [lmdb ^DTLV$usearch_index_t index ^String domain]
-  (let [total-bytes  (VecIdx/serializedLength index)
-        chunk-size   (long c/*vec-chunk-bytes*)
-        safe-buffer  (long (min (long c/*vec-max-buffer-bytes*)
+  (let [target-lsn   (txn-log-applied-lsn lmdb)
+        total-bytes  (VecIdx/serializedLength index)
+        chunk-size   (vec-checkpoint-chunk-bytes lmdb)
+        safe-buffer  (long (min (vec-checkpoint-max-buffer-bytes lmdb)
                                 (long Integer/MAX_VALUE)))
         old-meta     (i/get-value lmdb c/vec-meta-dbi domain :string :data)
         old-chunks   (long (or (:chunk-count old-meta) 0))
@@ -210,17 +451,20 @@
           (finally
             (.delete tmp-file)))))
     (.add txs (l/kv-tx :put c/vec-meta-dbi domain
-                       {:chunk-count chunk-count
-                        :total-bytes total-bytes}
+                       (checkpoint-meta old-meta chunk-count total-bytes
+                                        target-lsn)
                        :string :data))
-    (i/transact-kv lmdb txs)))
+    (i/transact-kv lmdb txs)
+    {:chunk-count chunk-count
+     :total-bytes (long total-bytes)
+     :target-lsn target-lsn}))
 
 (defn- load-from-lmdb
   [lmdb ^DTLV$usearch_index_t index ^String domain]
   (when-let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)]
     (let [total-bytes (long (:total-bytes meta-val))
           chunk-count (long (:chunk-count meta-val))
-          safe-buffer (long (min (long c/*vec-max-buffer-bytes*)
+          safe-buffer (long (min (vec-checkpoint-max-buffer-bytes lmdb)
                                  (long Integer/MAX_VALUE)))]
       (if (<= total-bytes safe-buffer)
         ;; Buffer mode: load chunks into one byte[] then call native load.
@@ -267,6 +511,56 @@
       (.add txs (l/kv-tx :del c/vec-meta-dbi domain :string))
       (i/transact-kv lmdb txs))))
 
+(defn- checkpoint-stats-success!
+  [checkpoint-stats total-bytes duration-ms completed-ms]
+  (when (some? checkpoint-stats)
+    (swap! checkpoint-stats
+           (fn [m]
+             (let [m (or m {})]
+               (-> m
+                   (update :vec-checkpoint-count (fnil inc 0))
+                   (update :vec-checkpoint-duration-ms
+                           (fnil + 0)
+                           (nonneg-long duration-ms))
+                   (assoc :vec-checkpoint-bytes (nonneg-long total-bytes)
+                          :last-checkpoint-ms (nonneg-long completed-ms))))))))
+
+(defn- checkpoint-stats-failure!
+  [checkpoint-stats]
+  (when (some? checkpoint-stats)
+    (swap! checkpoint-stats update :vec-checkpoint-failure-count (fnil inc 0))))
+
+(defn- checkpoint-last-checkpoint-ms
+  [meta checkpoint-stats]
+  (or (maybe-long (:last-checkpoint-ms meta))
+      (some-> checkpoint-stats deref :last-checkpoint-ms maybe-long)))
+
+(defn- auto-checkpoint?
+  [lmdb domain checkpoint-stats]
+  (if-not (txn-log-enabled? lmdb)
+    true
+    (let [meta               (meta-map (i/get-value lmdb c/vec-meta-dbi domain
+                                                    :string :data))
+          now-ms             (System/currentTimeMillis)
+          snapshot-lsn       (current-snapshot-lsn meta)
+          applied-lsn        (txn-log-applied-lsn lmdb)
+          max-lsn-delta      (vec-checkpoint-max-lsn-delta lmdb)
+          interval-ms        (vec-checkpoint-interval-ms lmdb)
+          lag-lsn            (when (some? applied-lsn)
+                               (if (some? snapshot-lsn)
+                                 (nonneg-long (- ^long applied-lsn
+                                                 ^long snapshot-lsn))
+                                 (nonneg-long (inc ^long applied-lsn))))
+          lag-trigger?       (and (some? lag-lsn)
+                                  (>= ^long lag-lsn ^long max-lsn-delta))
+          last-checkpoint-ms (checkpoint-last-checkpoint-ms meta checkpoint-stats)
+          interval-trigger?  (or (nil? last-checkpoint-ms)
+                                 (>= (- now-ms ^long last-checkpoint-ms)
+                                     ^long interval-ms))]
+      (or (nil? snapshot-lsn)
+          lag-trigger?
+          interval-trigger?))))
+
 (def default-search-opts {:display    :refs
                           :top        10
                           :vec-filter (constantly true)})
@@ -275,7 +569,16 @@
 
 (def vec-save-key (memoize vec-save-key*))
 
-(deftype AsyncVecSave [lmdb-lock vec-index fname ^ReentrantReadWriteLock vec-lock]
+(def ^:dynamic *submit-async-vec-save*
+  (fn [work]
+    (a/exec (a/get-executor) work)))
+
+(defn submit-async-vec-save!
+  [work]
+  (*submit-async-vec-save* work))
+
+(deftype AsyncVecSave [lmdb-lock vec-index lmdb ^String domain checkpoint-stats
+                       fname ^ReentrantReadWriteLock vec-lock]
   IAsyncWork
   (work-key [_] (vec-save-key fname))
   (do-work [_]
@@ -285,7 +588,8 @@
       (let [rlock (.readLock vec-lock)]
         (when (.tryLock rlock)
           (try
-            (when-not (i/vec-closed? vec-index)
+            (when (and (not (i/vec-closed? vec-index))
+                       (auto-checkpoint? lmdb domain checkpoint-stats))
               (i/persist-vecs vec-index))
             (catch Throwable _)
             (finally
@@ -310,6 +614,7 @@
                       ^SpillableMap vecs     ; vec-id -> vec-ref
                       ^AtomicLong max-vec
                       ^Map search-opts
+                      checkpoint-stats
                       ^ReentrantReadWriteLock vec-lock]
   IVectorIndex
   (add-vec [this vec-ref vec-data]
@@ -324,24 +629,42 @@
         (let [id (.incrementAndGet max-vec)]
           (vreset! vec-id id)
           ;; Apply LMDB mapping first; mutate in-memory index only after success.
-          (i/transact-kv lmdb [(l/kv-tx :put vecs-dbi vec-ref id :data :id)])
+          (let [commit-lsn (txn-log-next-lsn lmdb)
+                meta-op    (replay-floor-put-tx lmdb domain commit-lsn)
+                txs        (cond-> [(l/kv-tx :put vecs-dbi vec-ref id
+                                              :data :id)]
+                             (some? meta-op) (conj meta-op))]
+            (i/transact-kv lmdb txs))
           (try
+            (maybe-run-txn-log-vector-apply-failpoint!
+             lmdb :add-vec
+             {:domain domain :vec-ref vec-ref :vec-id id})
             (add index quantization id vec-arr)
             (.put vecs id vec-ref)
             (catch Throwable e
-              (try
-                (i/transact-kv
-                  lmdb [(l/kv-tx :del-list vecs-dbi vec-ref [id] :data :id)])
-                (catch Throwable rollback-e
-                  (throw (ex-info "Fail to rollback vector ref mapping"
+              (if (txn-log-enabled? lmdb)
+                (vector-commit-unknown!
+                 lmdb :add-vec
+                 {:domain domain
+                  :vec-ref vec-ref
+                  :vec-id id}
+                 e)
+                (do
+                  (try
+                    (i/transact-kv
+                     lmdb [(l/kv-tx :del-list vecs-dbi vec-ref [id] :data :id)])
+                    (catch Throwable rollback-e
+                      (throw (ex-info "Fail to rollback vector ref mapping"
+                                      {:vec-ref vec-ref :vec-id id}
+                                      rollback-e))))
+                  (throw (ex-info "Fail to add vector after LMDB apply"
                                   {:vec-ref vec-ref :vec-id id}
-                                  rollback-e))))
-              (throw (ex-info "Fail to add vector after LMDB apply"
-                              {:vec-ref vec-ref :vec-id id}
-                              e)))))
+                                  e)))))))
         (finally
           (.unlock wlock)))
-      (a/exec (a/get-executor) (AsyncVecSave. tx-lock this fname vec-lock))
+      (submit-async-vec-save!
+       (AsyncVecSave. tx-lock this lmdb domain checkpoint-stats
+                      fname vec-lock))
       @vec-id))
 
   (get-vec [_ vec-ref]
@@ -364,33 +687,62 @@
           (raise "Vector index is closed." {:domain domain}))
         (let [ids (vec (i/get-list lmdb vecs-dbi vec-ref :data :id))]
           ;; Apply LMDB deletion first; mutate in-memory index only after success.
-          (i/transact-kv lmdb [(l/kv-tx :del vecs-dbi vec-ref)])
+          (let [commit-lsn (txn-log-next-lsn lmdb)
+                meta-op    (when (seq ids)
+                             (replay-floor-put-tx lmdb domain commit-lsn))
+                txs        (cond-> [(l/kv-tx :del vecs-dbi vec-ref)]
+                             (some? meta-op) (conj meta-op))]
+            (i/transact-kv lmdb txs))
           (try
+            (maybe-run-txn-log-vector-apply-failpoint!
+             lmdb :remove-vec
+             {:domain domain :vec-ref vec-ref :ids ids})
             (doseq [^long id ids]
-              (VecIdx/remove index id))
+              (remove-id index id))
             (doseq [^long id ids]
               (.remove vecs id))
             (vreset! removed? (boolean (seq ids)))
             (catch Throwable e
-              (when (seq ids)
-                (try
-                  (i/transact-kv
-                    lmdb [(l/kv-tx :put-list vecs-dbi vec-ref ids :data :id)])
-                  (catch Throwable rollback-e
-                    (throw (ex-info "Fail to rollback vector ref mapping"
-                                    {:vec-ref vec-ref :ids ids}
-                                    rollback-e)))))
-              (throw (ex-info "Fail to remove vector after LMDB apply"
-                              {:vec-ref vec-ref :ids ids}
-                              e)))))
+              (if (txn-log-enabled? lmdb)
+                (vector-commit-unknown!
+                 lmdb :remove-vec
+                 {:domain domain
+                  :vec-ref vec-ref
+                  :ids ids}
+                 e)
+                (do
+                  (when (seq ids)
+                    (try
+                      (i/transact-kv
+                       lmdb [(l/kv-tx :put-list vecs-dbi vec-ref ids :data :id)])
+                      (catch Throwable rollback-e
+                        (throw (ex-info "Fail to rollback vector ref mapping"
+                                        {:vec-ref vec-ref :ids ids}
+                                        rollback-e)))))
+                  (throw (ex-info "Fail to remove vector after LMDB apply"
+                                  {:vec-ref vec-ref :ids ids}
+                                  e)))))))
         (finally
           (.unlock wlock)))
       (when @removed?
-        (a/exec (a/get-executor) (AsyncVecSave. tx-lock this fname vec-lock)))))
+        (submit-async-vec-save!
+         (AsyncVecSave. tx-lock this lmdb domain checkpoint-stats
+                        fname vec-lock)))
+      nil))
 
   (persist-vecs [_]
     (when-not @closed?
-      (checkpoint-to-lmdb lmdb index domain)))
+      (let [started-ms (System/currentTimeMillis)]
+        (try
+          (let [{:keys [total-bytes]} (checkpoint-to-lmdb lmdb index domain)
+                completed-ms (System/currentTimeMillis)
+                duration-ms (nonneg-long
+                             (- completed-ms started-ms))]
+            (checkpoint-stats-success! checkpoint-stats total-bytes duration-ms
+                                       completed-ms))
+          (catch Throwable e
+            (checkpoint-stats-failure! checkpoint-stats)
+            (throw e))))))
 
   (close-vecs [this]
     (let [wlock (.writeLock vec-lock)]
@@ -418,18 +770,22 @@
     (let [rlock (.readLock vec-lock)]
       (.lock rlock)
       (try
-        (let [^VecIdx$IndexInfo info (VecIdx/info index)]
+        (let [^VecIdx$IndexInfo info (VecIdx/info index)
+              meta-val               (i/get-value lmdb c/vec-meta-dbi domain
+                                                  :string :data)]
           {:size             (.getSize info)
            :memory           (.getMemory info)
            :capacity         (.getCapacity info)
            :hardware         (.getHardware info)
            :filename         fname
+           :domain           domain
            :dimensions       dimensions
            :metric-type      metric-type
            :quantization     quantization
            :connectivity     connectivity
            :expansion-add    expansion-add
-           :expansion-search expansion-search})
+           :expansion-search expansion-search
+           :checkpoint       (checkpoint-state lmdb meta-val checkpoint-stats)})
         (finally
           (.unlock rlock)))))
 
@@ -524,6 +880,13 @@
           (VecIdx/load index fname)
           (checkpoint-to-lmdb lmdb index domain)
           (u/delete-files fname)))
+      (let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)
+            checkpoint-stats
+            (atom {:vec-checkpoint-count 0
+                   :vec-checkpoint-duration-ms 0
+                   :vec-checkpoint-bytes
+                   (nonneg-long (or (:total-bytes meta-val) 0))
+                   :vec-checkpoint-failure-count 0})]
       (let [vi (->VectorIndex lmdb
                               (volatile! false)
                               index
@@ -539,9 +902,10 @@
                               vecs
                               (AtomicLong. max-vec-id)
                               search-opts
+                              checkpoint-stats
                               (ReentrantReadWriteLock.))]
         (swap! l/vector-indices assoc fname vi)
-        vi))))
+        vi)))))
 
 (defn new-vector-index
   [lmdb opts]
@@ -566,6 +930,7 @@
                  (.-vecs old)
                  (.-max-vec old)
                  (.-search-opts old)
+                 (.-checkpoint-stats old)
                  (ReentrantReadWriteLock.)))
 
 (defn attr-domain [attr] (s/replace (u/keyword->string attr) "/" "_"))

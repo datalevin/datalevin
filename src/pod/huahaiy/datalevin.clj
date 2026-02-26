@@ -369,6 +369,79 @@
 
 (defn sync [db] (when-let [d (get-kv db)] (d/sync d)))
 
+(defn txlog-watermarks [db]
+  (when-let [d (get-kv db)] (d/txlog-watermarks d)))
+
+(defn open-tx-log
+  ([db from-lsn]
+   (open-tx-log db from-lsn nil))
+  ([db from-lsn upto-lsn]
+   (when-let [d (get-kv db)] (d/open-tx-log d from-lsn upto-lsn))))
+
+(defn force-txlog-sync! [db]
+  (when-let [d (get-kv db)] (d/force-txlog-sync! d)))
+
+(defn force-lmdb-sync! [db]
+  (when-let [d (get-kv db)] (d/force-lmdb-sync! d)))
+
+(defn create-snapshot! [db]
+  (when-let [d (get-kv db)] (d/create-snapshot! d)))
+
+(defn list-snapshots [db]
+  (when-let [d (get-kv db)] (d/list-snapshots d)))
+
+(defn snapshot-scheduler-state [db]
+  (when-let [d (get-kv db)] (d/snapshot-scheduler-state d)))
+
+(defn read-commit-marker [db]
+  (when-let [d (get-kv db)] (d/read-commit-marker d)))
+
+(defn verify-commit-marker! [db]
+  (when-let [d (get-kv db)] (d/verify-commit-marker! d)))
+
+(defn txlog-retention-state [db]
+  (when-let [d (get-kv db)] (d/txlog-retention-state d)))
+
+(defn gc-txlog-segments!
+  ([db]
+   (gc-txlog-segments! db nil))
+  ([db retain-floor-lsn]
+   (when-let [d (get-kv db)] (d/gc-txlog-segments! d retain-floor-lsn))))
+
+(defn txlog-update-snapshot-floor!
+  ([db snapshot-lsn]
+   (txlog-update-snapshot-floor! db snapshot-lsn nil))
+  ([db snapshot-lsn previous-snapshot-lsn]
+   (when-let [d (get-kv db)]
+     (d/txlog-update-snapshot-floor! d snapshot-lsn previous-snapshot-lsn))))
+
+(defn txlog-clear-snapshot-floor!
+  [db]
+  (when-let [d (get-kv db)]
+    (d/txlog-clear-snapshot-floor! d)))
+
+(defn txlog-update-replica-floor!
+  [db replica-id applied-lsn]
+  (when-let [d (get-kv db)]
+    (d/txlog-update-replica-floor! d replica-id applied-lsn)))
+
+(defn txlog-clear-replica-floor!
+  [db replica-id]
+  (when-let [d (get-kv db)]
+    (d/txlog-clear-replica-floor! d replica-id)))
+
+(defn txlog-pin-backup-floor!
+  ([db pin-id floor-lsn]
+   (txlog-pin-backup-floor! db pin-id floor-lsn nil))
+  ([db pin-id floor-lsn expires-ms]
+   (when-let [d (get-kv db)]
+     (d/txlog-pin-backup-floor! d pin-id floor-lsn expires-ms))))
+
+(defn txlog-unpin-backup-floor!
+  [db pin-id]
+  (when-let [d (get-kv db)]
+    (d/txlog-unpin-backup-floor! d pin-id)))
+
 (defn get-env-flags [db] (when-let [d (get-kv db)] (d/get-env-flags d)))
 
 (defn set-env-flags [db ks on-off]
@@ -817,6 +890,14 @@
   [index]
   (when-let [i (get-index index)] (d/vector-index-info i)))
 
+(defn force-vec-checkpoint!
+  [index]
+  (when-let [i (get-index index)] (d/force-vec-checkpoint! i)))
+
+(defn vector-checkpoint-state
+  [index]
+  (when-let [i (get-index index)] (d/vector-checkpoint-state i)))
+
 (defn search-vec
   ([index query]
    (when-let [i (get-index index)] (d/search-vec i query)))
@@ -890,6 +971,23 @@
    'entries                   entries
    'open-transact-kv          open-transact-kv
    'sync                      sync
+   'txlog-watermarks          txlog-watermarks
+   'open-tx-log               open-tx-log
+   'force-txlog-sync!         force-txlog-sync!
+   'force-lmdb-sync!          force-lmdb-sync!
+   'create-snapshot!          create-snapshot!
+   'list-snapshots            list-snapshots
+   'snapshot-scheduler-state  snapshot-scheduler-state
+   'read-commit-marker        read-commit-marker
+   'verify-commit-marker!     verify-commit-marker!
+   'txlog-retention-state     txlog-retention-state
+   'gc-txlog-segments!        gc-txlog-segments!
+   'txlog-update-snapshot-floor! txlog-update-snapshot-floor!
+   'txlog-clear-snapshot-floor!  txlog-clear-snapshot-floor!
+   'txlog-update-replica-floor! txlog-update-replica-floor!
+   'txlog-clear-replica-floor!  txlog-clear-replica-floor!
+   'txlog-pin-backup-floor!     txlog-pin-backup-floor!
+   'txlog-unpin-backup-floor!   txlog-unpin-backup-floor!
    'set-env-flags             set-env-flags
    'get-env-flags             get-env-flags
    'close-transact-kv         close-transact-kv
@@ -945,6 +1043,8 @@
    'clear-vector-index        clear-vector-index
    'close-vector-index        close-vector-index
    'vector-index-info         vector-index-info
+   'force-vec-checkpoint!     force-vec-checkpoint!
+   'vector-checkpoint-state   vector-checkpoint-state
    'search-vec                search-vec
    're-index                  re-index
    })

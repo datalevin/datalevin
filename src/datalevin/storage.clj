@@ -38,7 +38,8 @@
             list-range-first-n get-list list-range-filter-count max-aid
             list-range-some list-range-keep visit-list-range max-gt max-tx
             open-list-dbi open-dbi attrs add-doc remove-doc opts swap-attr
-            add-vec remove-vec schema closed? a-size db-name populated?]]
+            add-vec remove-vec schema closed? a-size db-name populated?
+            get-env-flags set-env-flags]]
    [clojure.string :as str])
   (:import
    [java.util List Comparator Collection HashMap UUID]
@@ -1518,6 +1519,11 @@
 
 (defn- transact-opts
   [lmdb opts]
+  (when (true? (:txn-log? opts))
+    (let [flags (or (get-env-flags lmdb) #{})]
+      (when (and (not (contains? flags :nosync))
+                 (not (contains? flags :rdonly)))
+        (set-env-flags lmdb #{:nosync} true))))
   (transact-kv
     lmdb (conj (for [[k v] opts]
                  (lmdb/kv-tx :put c/opts k v :attr :data))
@@ -1638,6 +1644,25 @@
       (assoc m domain (idoc/new-idoc-index lmdb opts)))
     {} domains))
 
+(defn- txlog-opt-key?
+  [k]
+  (and (keyword? k)
+       (str/starts-with? (name k) "txn-log")))
+
+(defn- propagate-top-level-txlog-opts-to-kv-opts
+  [opts]
+  (let [opts      (or opts {})
+        kv-opts   (or (:kv-opts opts) {})
+        txlog-opts (into {}
+                         (keep (fn [[k v]]
+                                 (when (and (txlog-opt-key? k)
+                                            (not (contains? kv-opts k)))
+                                   [k v])))
+                         opts)]
+    (if (seq txlog-opts)
+      (assoc opts :kv-opts (merge kv-opts txlog-opts))
+      opts)))
+
 (defn open
   "Open and return the storage."
   ([]
@@ -1646,10 +1671,11 @@
    (open dir nil))
   ([dir schema]
    (open dir schema nil))
-  ([dir schema
-    {:keys [kv-opts search-opts search-domains vector-opts vector-domains]
-     :as   opts}]
-   (let [dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
+  ([dir schema opts0]
+   (let [opts (propagate-top-level-txlog-opts-to-kv-opts opts0)
+         {:keys [kv-opts search-opts search-domains vector-opts vector-domains]}
+         opts
+         dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
          lmdb (lmdb/open-kv dir kv-opts)]
      (open-dbis lmdb)
      (let [opts0     (load-opts lmdb)
@@ -1658,6 +1684,43 @@
                         :auto-entity-time?    false
                         :closed-schema?       false
                         :background-sampling? c/*db-background-sampling?*
+                        :txn-log?             c/*txn-log?*
+                        :txn-log-rollout-mode c/*txn-log-rollout-mode*
+                        :txn-log-rollback?    c/*txn-log-rollback?*
+                        :txn-log-durability-profile
+                        c/*txn-log-durability-profile*
+                        :txn-log-commit-marker? c/*txn-log-commit-marker?*
+                        :txn-log-commit-marker-version
+                        c/*txn-log-commit-marker-version*
+                        :txn-log-sync-mode            c/*txn-log-sync-mode*
+                        :txn-log-group-commit         c/*txn-log-group-commit*
+                        :txn-log-group-commit-ms      c/*txn-log-group-commit-ms*
+                        :txn-log-meta-flush-max-txs
+                        c/*txn-log-meta-flush-max-txs*
+                        :txn-log-meta-flush-max-ms
+                        c/*txn-log-meta-flush-max-ms*
+                        :txn-log-commit-wait-ms       c/*txn-log-commit-wait-ms*
+                        :txn-log-sync-adaptive?       c/*txn-log-sync-adaptive?*
+                        :txn-log-segment-max-bytes c/*txn-log-segment-max-bytes*
+                        :txn-log-segment-max-ms    c/*txn-log-segment-max-ms*
+                        :txn-log-segment-prealloc?
+                        c/*txn-log-segment-prealloc?*
+                        :txn-log-segment-prealloc-mode
+                        c/*txn-log-segment-prealloc-mode*
+                        :txn-log-segment-prealloc-bytes
+                        c/*txn-log-segment-prealloc-bytes*
+                        :txn-log-retention-bytes c/*txn-log-retention-bytes*
+                        :txn-log-retention-ms    c/*txn-log-retention-ms*
+                        :txn-log-retention-pin-backpressure-threshold-ms
+                        c/*txn-log-retention-pin-backpressure-threshold-ms*
+                        :txn-log-vec-checkpoint-interval-ms
+                        c/*txn-log-vec-checkpoint-interval-ms*
+                        :txn-log-vec-max-lsn-delta
+                        c/*txn-log-vec-max-lsn-delta*
+                        :txn-log-vec-max-buffer-bytes
+                        c/*txn-log-vec-max-buffer-bytes*
+                        :txn-log-vec-chunk-bytes
+                        c/*txn-log-vec-chunk-bytes*
                         :db-name              (str (UUID/randomUUID))
                         :cache-limit          512}
                        opts0)

@@ -89,6 +89,8 @@
   (close-kv [db] "Close this LMDB env")
   (closed-kv? [db] "Return true if this LMDB env is closed")
   (env-dir [db] "Return the directory path of LMDB env")
+  (kv-info [db]
+    "Return internal kv runtime state holder (a volatile map) when available, nil otherwise")
   (env-opts [db] "Return the option map of LMDB env")
   (dbi-opts [db dbi-name] "Return option map of a given DBI")
   (max-val-size [db] "Return the max size for value buffer")
@@ -260,6 +262,57 @@ values;")
     [db dbi-name indices visitor k-range k-type]
     [db dbi-name indices visitor k-range k-type raw-pred?]
     "visit a key range, presumably for side effects of vistor call"))
+
+(defprotocol ITxLog
+  (txlog-watermarks [db]
+    "Return txn-log runtime watermarks and related metadata.")
+  (open-tx-log
+    [db from-lsn]
+    [db from-lsn upto-lsn]
+    "Return txn-log records in LSN order, optionally capped by `upto-lsn`.
+     Records include derived `:tx-kind` classification (e.g. `:user`,
+     `:vector-checkpoint`).")
+  (force-txlog-sync! [db]
+    "Force txn-log fsync/fdatasync on the active segment and advance durable LSN.")
+  (force-lmdb-sync! [db]
+    "Force LMDB env sync (`mdb_env_sync`) for the store.")
+  (create-snapshot! [db]
+    "Create/rotate durable LMDB snapshot (`current`/`previous`) and update snapshot floor bookkeeping.")
+  (list-snapshots [db]
+    "List available snapshots and their metadata.")
+  (snapshot-scheduler-state [db]
+    "Return snapshot scheduler runtime state.")
+  (read-commit-marker [db]
+    "Read LMDB dual-slot commit marker state.")
+  (verify-commit-marker! [db]
+    "Verify commit marker integrity and txlog-reference validity.")
+  (txlog-retention-state [db]
+    "Return computed txn-log retention floors, GC safety watermark, and pressure state.")
+  (gc-txlog-segments!
+    [db]
+    [db retain-floor-lsn]
+    "Run txn-log segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer.")
+  (txlog-update-snapshot-floor!
+    [db snapshot-lsn]
+    [db snapshot-lsn previous-snapshot-lsn]
+    "Update txn-log snapshot floor bookkeeping in kv-info.
+     2-arity rotates previous <- old current. 3-arity sets both explicitly.")
+  (txlog-clear-snapshot-floor!
+    [db]
+    "Clear txn-log snapshot floor bookkeeping in kv-info.")
+  (txlog-update-replica-floor!
+    [db replica-id applied-lsn]
+    "Upsert replica heartbeat floor (`applied-lsn`) for txn-log retention safety.")
+  (txlog-clear-replica-floor!
+    [db replica-id]
+    "Remove replica heartbeat floor for txn-log retention safety.")
+  (txlog-pin-backup-floor!
+    [db pin-id floor-lsn]
+    [db pin-id floor-lsn expires-ms]
+    "Upsert backup/snapshot pin floor for txn-log retention safety. Optional `expires-ms` auto-expires the pin.")
+  (txlog-unpin-backup-floor!
+    [db pin-id]
+    "Remove backup/snapshot pin floor."))
 
 (defprotocol IAdmin
   "Some administrative functions"

@@ -404,18 +404,25 @@
     (is (nil? (vld/validate-option-mutation :closed-schema? false)))
     (is (nil? (vld/validate-option-mutation :validate-data? true)))
     (is (nil? (vld/validate-option-mutation :auto-entity-time? false)))
-    (is (nil? (vld/validate-option-mutation :background-sampling? true))))
+    (is (nil? (vld/validate-option-mutation :background-sampling? true)))
+    (is (nil? (vld/validate-option-mutation :txn-log? true)))
+    (is (nil? (vld/validate-option-mutation :txn-log-sync-adaptive? false)))
+    (is (nil? (vld/validate-option-mutation :txn-log-rollback? false))))
 
   (testing "boolean options reject non-booleans"
     (is (thrown-with-msg? Exception #"expects a boolean"
           (vld/validate-option-mutation :closed-schema? "yes")))
     (is (thrown-with-msg? Exception #"expects a boolean"
-          (vld/validate-option-mutation :validate-data? 1))))
+          (vld/validate-option-mutation :validate-data? 1)))
+    (is (thrown-with-msg? Exception #"expects a boolean"
+          (vld/validate-option-mutation :txn-log-rollback? :rollback))))
 
   (testing ":cache-limit accepts non-negative integers"
     (is (nil? (vld/validate-option-mutation :cache-limit 0)))
     (is (nil? (vld/validate-option-mutation :cache-limit 512)))
-    (is (nil? (vld/validate-option-mutation :cache-limit 1024))))
+    (is (nil? (vld/validate-option-mutation :cache-limit 1024)))
+    (is (nil? (vld/validate-option-mutation :txn-log-group-commit 0)))
+    (is (nil? (vld/validate-option-mutation :txn-log-group-commit-ms 4))))
 
   (testing ":cache-limit rejects non-integers and negatives"
     (is (thrown-with-msg? Exception #"non-negative integer"
@@ -423,7 +430,32 @@
     (is (thrown-with-msg? Exception #"non-negative integer"
           (vld/validate-option-mutation :cache-limit "big")))
     (is (thrown-with-msg? Exception #"non-negative integer"
-          (vld/validate-option-mutation :cache-limit 3.14))))
+          (vld/validate-option-mutation :cache-limit 3.14)))
+    (is (thrown-with-msg? Exception #"non-negative integer"
+          (vld/validate-option-mutation :txn-log-group-commit -1))))
+
+  (testing "txn-log positive integer options"
+    (is (nil? (vld/validate-option-mutation :txn-log-commit-wait-ms 1)))
+    (is (nil? (vld/validate-option-mutation :txn-log-segment-max-bytes 1024)))
+    (is (nil? (vld/validate-option-mutation :txn-log-vec-checkpoint-interval-ms
+                                             300000)))
+    (is (nil? (vld/validate-option-mutation :txn-log-vec-max-lsn-delta
+                                             100000)))
+    (is (nil? (vld/validate-option-mutation :txn-log-vec-max-buffer-bytes
+                                             1024)))
+    (is (nil? (vld/validate-option-mutation :txn-log-vec-chunk-bytes
+                                             2048)))
+    (is (nil? (vld/validate-option-mutation
+               :txn-log-retention-pin-backpressure-threshold-ms 1)))
+    (is (thrown-with-msg? Exception #"positive integer"
+          (vld/validate-option-mutation :txn-log-commit-wait-ms 0)))
+    (is (thrown-with-msg? Exception #"positive integer"
+          (vld/validate-option-mutation :txn-log-vec-max-buffer-bytes 0)))
+    (is (thrown-with-msg? Exception #"positive integer"
+          (vld/validate-option-mutation :txn-log-retention-ms -10)))
+    (is (thrown-with-msg? Exception #"positive integer"
+          (vld/validate-option-mutation
+           :txn-log-retention-pin-backpressure-threshold-ms 0))))
 
   (testing ":db-name accepts strings"
     (is (nil? (vld/validate-option-mutation :db-name "my-db"))))
@@ -431,6 +463,20 @@
   (testing ":db-name rejects non-strings"
     (is (thrown-with-msg? Exception #"expects a string"
           (vld/validate-option-mutation :db-name 42))))
+
+  (testing "txn-log keyword enums"
+    (is (nil? (vld/validate-option-mutation :txn-log-durability-profile :relaxed)))
+    (is (nil? (vld/validate-option-mutation :txn-log-durability-profile :strict)))
+    (is (nil? (vld/validate-option-mutation :txn-log-sync-mode :fdatasync)))
+    (is (nil? (vld/validate-option-mutation :txn-log-segment-prealloc-mode :native)))
+    (is (nil? (vld/validate-option-mutation :txn-log-segment-prealloc-mode :mmap)))
+    (is (nil? (vld/validate-option-mutation :txn-log-rollout-mode :rollback)))
+    (is (thrown-with-msg? Exception #"expects one of"
+          (vld/validate-option-mutation :txn-log-durability-profile :bad-profile)))
+    (is (thrown-with-msg? Exception #"expects one of"
+          (vld/validate-option-mutation :txn-log-sync-mode :bad-mode)))
+    (is (thrown-with-msg? Exception #"expects one of"
+          (vld/validate-option-mutation :txn-log-rollout-mode :bad-mode))))
 
   (testing "unknown options pass through without error"
     (is (nil? (vld/validate-option-mutation :some-custom-opt "anything")))))

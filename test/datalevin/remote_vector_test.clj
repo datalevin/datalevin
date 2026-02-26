@@ -44,6 +44,15 @@
         (is (= (info1 :size) 1))
         (is (<= 1 (info1 :capacity)))
         (is (<= 1 (info1 :memory))))
+      (d/force-vec-checkpoint! index)
+      (let [cp-state (d/vector-checkpoint-state index)]
+        (is (pos? (:chunk-count cp-state)))
+        (is (pos? (:total-bytes cp-state)))
+        (is (<= 1 (:vec-checkpoint-count cp-state)))
+        (is (<= 0 (:vec-checkpoint-duration-ms cp-state)))
+        (is (pos? (:vec-checkpoint-bytes cp-state)))
+        (is (= 0 (:vec-checkpoint-failure-count cp-state)))
+        (is (nil? (:vec-replay-lag-lsn cp-state))))
       (is (= [:ok] (d/search-vec index v1)))
       (is (= [[:ok 0.0]] (d/search-vec index v1 {:display :refs+dists})))
 
