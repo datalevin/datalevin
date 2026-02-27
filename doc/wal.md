@@ -6,7 +6,7 @@ operationally manageable.
 
 Concurrent writers receive tangible throughput benefits in WAL mode. The
 scaling is sub-linear, e.g. 4 concurrent write threads may produce 2X throughout
-increase.
+increase compared with a single write thread.
 
 ## Enable WAL
 
@@ -44,9 +44,11 @@ For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
 
 WAL supports two profiles:
 
-* `:strict`: each transaction waits for durable WAL acknowledgment.
+* `:strict`: each transaction waits for durable WAL acknowledgment, so it has
+  the same durability guarantee as non-WAL default sync write, whose throughput
+  is bounded by a single writer.
 * `:relaxed`: transactions can return before durability is forced for every
-  single write, using batched syncs for much higher throughput.
+  single write, using batched syncs for a much higher throughput.
 
 In `:relaxed`, an untimely crash can lose a recent tail of transactions that were
 appended but not yet durably synced to disk.

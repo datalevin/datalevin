@@ -1,15 +1,25 @@
 # Transactions in Datalevin
 
+Datalevin offers a rich set of transaction configurations to support
+diverse use cases and needs. A description of the performance characteristics of
+these different configurations can be found in [write
+benchmark](../benchmarks/write-bench).
+
+The foundation of all these transaction modes is a LMDB transaction.
+
+## LMDB Transaction
+
 Datalevin relies on the transaction mechanism of the underlying key-value store,
 LMDB (Lightening Memory-Mapped Database), to achieve ACID. Datalevin transaction
 and LMDB transaction have an one-to-one correspondence.
 
-In LMDB, read and write are independent and do not block each other. Read
-requires a read transaction. Write requires a read-write transaction. These are
-normally two different transactions.
+LMDB implements multiversion concurrency control (MVCC), so read and write are
+independent and do not block each other. Read requires a read transaction. Write
+requires a read-write transaction. These are normally two different
+transactions.
 
-Writes are serialized, only one thread can write at a time. When multiple
-threads write concurrently to the same key, whoever writes later wins
+Writes are serialized in LMDB, only one thread can write at a time. When
+multiple threads write concurrently to the same key, whoever writes later wins
 eventually, because writes are serialized. The first write succeeds, but the
 value will then be overwritten by the second write.
 
@@ -25,19 +35,26 @@ LMDB suggests that:
 > by newer write transactions, thus the database can grow quickly. Write
 > transactions prevent other write transactions, since writes are serialized.
 
-Detailed description of Datalevin's transaction performance can be found in
-[write benchmark](../benchmarks/write-bench).
-
-## Asynchronous Transaction
+## Additional Transaction Mechanisms
 
 By default, each write transaction in LMDB flushes to disk when it commits,
-which is an expensive operation even with today's SSD disks. To improve
-transaction throughput and latency, one can use asynchronous transaction
-functions that automatically batch transactions together to reduce the number of
-such expensive commit calls: `transact-kv-async` for KV store, `transact-async`
-for Datalog store. Both return a `future`, that is only realized after the data
-is flushed to disk, and they optionally take a callback function, that will only
-be called after the data is flushed to disk.
+which is an expensive operation even with today's SSD disks. Datalevin builds
+two layers of additional transaction mechanisms on top to achieve higher level
+of write throughput: WAL mode and asynchronous transaction functions.
+
+### WAL mode
+
+WAL mode enables Datalevin to escape the single writer limitation of LMDB. It
+uses a sync queue to amortize the cost of expensive disk sync operations.
+Details of the WAL mode are documented [here](wal.md).
+
+### Asynchronous Transaction
+
+Asynchronous transaction functions automatically batch transactions together to
+reduce the number of expensive commit calls: `transact-kv-async` for KV
+store, `transact-async` for Datalog store. Both return a `future`, that is only
+realized after the data is flushed to disk, and they optionally take a callback
+function, that will only be called after the data is flushed to disk.
 
 `transact` function is a blocked version of `transact-async`, that will block
 until the future is realized. One can call a sequence of `transact-async`,
@@ -47,7 +64,7 @@ order, so the last realized future indicates all the prior calls are
 already committed. Or one can `deref` the future of the last asynchronous calls
 manually, or put in a callback for the last call.
 
-The batching of asynchronous transactions is adaptive to write load. The higher
+The batching of asynchronous transactions is adaptive to work load. The higher
 the load, the bigger the batch size. Asynchronous transactions is recommended
 for heavy write workload as they can increase throughput orders of magnitude
 while providing low latency. See [blog
@@ -57,14 +74,14 @@ It is still useful to manually batch transaction data in user code, as the
 effect of auto batching and manual batching compounds. The compound batching
 effect in KV transaction is more pronounced than in Datalog transaction.
 
-## Non-durable Environment Flags
+## Non-durable LMDB Environment Flags
 
-Datalevin write transactions by default are guranteed to be durable, i.e. no
+Datalevin write transactions by default are guaranteed to be durable, i.e. no
 risk of data loss or DB corruption in case of system crash. As mentioned above,
 this fully safe durable write condition has some performance implications since
 syncing to disk is expensive.
 
-Datalevin supports some faster, albeit less durable write conditions. By passing
+LMDB supports some faster, albeit less durable write conditions. By passing
 in some environment flags when opening the DB, or calling `set-env-flags`
 function, significant write speed up can be achieved, with some caveats. The
 follwing table lists these flags and their implications.
@@ -72,7 +89,7 @@ follwing table lists these flags and their implications.
 | Flags | Meaning | Speedup in Mixed Read/Write | Implications |
 |----|----|----|---|
 | `:nometasync` | Only sync data pages when commit, do not sync meta pages | up to 5X | Last transaction may be lost at untimely system crashes, but integrity of DB is retained |
-| `:nosync` | Don't fsync when commit | up to 20X | OS is responsible for syncing the data. Untimely system crash may render the DB corrupted. |
+| `:nosync` | Don't msync when commit | up to 20X | OS is responsible for syncing the data. Untimely system crash may render the DB corrupted. |
 | `:writemap` + `:mapasync` | Use writable memory map and asynchronous commit | up to 25X | Untimely system crash may render the DB corrupted; Buggy external code may accidentally overwrite DB memory; Some OS fully preallocates the disk to the specified map size. |
 
 Here are some examples of passing the env flags:
@@ -112,11 +129,11 @@ writes are treated as a single atomic action, Datalevin exposes explicit
 synchronous transaction as another mechanism.
 
 For key-value API, `with-transaction-kv` macro is used for explicit transaction.
-`with-transaction` macro is used for Datalog API. Basically, all the code in the
-body of the macros run inside a single read/write transaction with a single
-thread. These work the same in all modes of Datalevin: embedded, client/server,
-or babashka pod. For usage examples, see tests in `datalevin.withtxn-test` or
-`datalevin.remote-withtxnkv-test`.
+`with-transaction` macro is similarly used for Datalog API. Basically, all the
+code in the body of the macros run inside a single read/write transaction with a
+single thread. These work the same in all modes of Datalevin: embedded,
+client/server, or babashka pod. For usage examples, see tests in
+`datalevin.withtxn-test` or `datalevin.remote-withtxnkv-test`.
 
 Rollback from within the transaction can be done with `abort-transact-kv` and
 `abort-transact`.
@@ -153,12 +170,13 @@ For usage examples, see tests in `datalevin.test.transact`.
 ### By Transaction
 
 The most straightforward method of transacting data at a time using `transact!`
-works quite well for many cases. To have a much higher throughput, use
-`transact-async` instead.
+works quite well for many cases, especially in WAL mode. To have a much higher
+throughput, use `transact-async` instead.
 
-Because Datalevin supports only a single write thread at a time, parallel
-transactions actually slow writes down significantly due to mutex contention and
-thread switching overhead.
+In non-WAL mode, a single write thread is effective at a time, parallel
+transactions actually slow writes down due to mutex contention and
+thread switching overhead. Use WAL mode (default in Datalog store) if
+concurrent writers are needed.
 
 Transacting Datalog data involves a great number of data transformation and
 integrity checks. When initializing a DB with data, it may not be necessary to
@@ -175,7 +193,7 @@ Similarly, `fill-db` can be used to bulk load additional collections of prepared
 datoms into a DB that is not empty. The same caution on datoms preparation need
 to apply.
 
-The manual datoms prepared process is mainly about making up approximate entity
+The manual datoms prepared process is mainly about making up correct entity
 IDs, which would not be too difficult if the numbers of entities to load is
 known ahead of time. See JOB benchmark to see [an
 example](../benchmarks/JOB-bench/src/datalevin_bench/core.clj).
