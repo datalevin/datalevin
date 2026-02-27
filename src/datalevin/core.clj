@@ -197,9 +197,15 @@ Only usable for debug output.
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
-   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` waits for durable WAL acknowledgement
- per transaction; `:relaxed` improves throughput by batching durability and may
- lose a small tail of recent transactions on a crash.
+   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` waits for durable WAL acknowledgement per transaction; `:relaxed` improves throughput by batching durability and may lose a small tail of recent transactions on a crash.
+
+   * `:wal-group-commit`, maximum transactions per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit*`.
+
+   * `:wal-group-commit-ms`, maximum milliseconds per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit-ms*`.
 
    * `:client-opts` is the option map passed to the client if `dir` is a
  remote URI string.
@@ -274,6 +280,14 @@ Only usable for debug output.
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
    * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
+
+   * `:wal-group-commit`, maximum transactions per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit*`.
+
+   * `:wal-group-commit-ms`, maximum milliseconds per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit-ms*`.
 
  See also [[datom]], [[new-search-engine]]."}
   init-db db/init-db)
@@ -654,6 +668,14 @@ Only usable for debug output.
 
    * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
 
+   * `:wal-group-commit`, maximum transactions per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit*`.
+
+   * `:wal-group-commit-ms`, maximum milliseconds per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit-ms*`.
+
   "}
   conn-from-datoms conn/conn-from-datoms)
 
@@ -686,6 +708,14 @@ Only usable for debug output.
    * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` maximizes durability; `:relaxed`
  improves write throughput with a small risk of losing the latest transactions
  on a crash.
+
+   * `:wal-group-commit`, maximum transactions per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit*`.
+
+   * `:wal-group-commit-ms`, maximum milliseconds per durability batch in
+ `:relaxed` mode. Default comes from
+ `datalevin.constants/*wal-group-commit-ms*`.
 
    * `:client-opts` is the option map passed to the client if `dir` is a remote URI string.
 
@@ -976,6 +1006,12 @@ Only usable for debug output.
   * `:wal-durability-profile` is one of `:strict` or `:relaxed`. `:strict` waits for durable WAL
    acknowledgement per write transaction; `:relaxed` batches durability for
    higher throughput with a small crash window.
+  * `:wal-group-commit` sets the max transactions per durability batch in
+   `:relaxed` mode. Default comes from
+   `datalevin.constants/*wal-group-commit*`.
+  * `:wal-group-commit-ms` sets the max milliseconds per durability batch in
+   `:relaxed` mode. Default comes from
+   `datalevin.constants/*wal-group-commit-ms*`.
   * `:client-opts` is the option map passed to the client if `dir` is a
    remote server URI string.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior
@@ -1187,14 +1223,6 @@ set of keywords. See [[set-env-flags]] for their meanings."}
   open-tx-log kv/open-tx-log)
 
 (def ^{:arglists '([db])
-       :doc      "Force WAL sync on the active segment and wait until current appended LSN is durable."}
-  force-txlog-sync! kv/force-txlog-sync!)
-
-(def ^{:arglists '([db])
-       :doc      "Force LMDB environment sync (`mdb_env_sync(force=1)`) for a WAL-enabled KV store."}
-  force-lmdb-sync! kv/force-lmdb-sync!)
-
-(def ^{:arglists '([db])
        :doc      "Create/rotate LMDB snapshots (`current`/`previous`) and update WAL snapshot floor bookkeeping."}
   create-snapshot! kv/create-snapshot!)
 
@@ -1202,52 +1230,10 @@ set of keywords. See [[set-env-flags]] for their meanings."}
        :doc      "List available LMDB snapshots and metadata."}
   list-snapshots kv/list-snapshots)
 
-(def ^{:arglists '([db])
-       :doc      "Return snapshot scheduler runtime state. Current implementation is manual-only (no background scheduler)."}
-  snapshot-scheduler-state kv/snapshot-scheduler-state)
-
-(def ^{:arglists '([db])
-       :doc      "Read LMDB dual-slot WAL commit marker state."}
-  read-commit-marker kv/read-commit-marker)
-
-(def ^{:arglists '([db])
-       :doc      "Verify commit marker integrity and marker->WAL record reference."}
-  verify-commit-marker! kv/verify-commit-marker!)
-
-(def ^{:arglists '([db])
-       :doc      "Return WAL retention floors, safety watermark, pressure state, and GC candidates."}
-  txlog-retention-state kv/txlog-retention-state)
-
 (def ^{:arglists '([db]
                    [db retain-floor-lsn])
        :doc      "Run WAL segment GC. Optional `retain-floor-lsn` keeps records from that floor and newer."}
   gc-txlog-segments! kv/gc-txlog-segments!)
-
-(def ^{:arglists '([db snapshot-lsn]
-                   [db snapshot-lsn previous-snapshot-lsn])
-       :doc      "Update WAL snapshot floor bookkeeping used by retention safety. 2-arity rotates previous <- old current; 3-arity sets both explicitly."}
-  txlog-update-snapshot-floor! kv/txlog-update-snapshot-floor!)
-
-(def ^{:arglists '([db])
-       :doc      "Clear WAL snapshot floor bookkeeping used by retention safety."}
-  txlog-clear-snapshot-floor! kv/txlog-clear-snapshot-floor!)
-
-(def ^{:arglists '([db replica-id applied-lsn])
-       :doc      "Upsert replica heartbeat floor (`applied-lsn`) used by WAL retention safety."}
-  txlog-update-replica-floor! kv/txlog-update-replica-floor!)
-
-(def ^{:arglists '([db replica-id])
-       :doc      "Remove a replica heartbeat floor used by WAL retention safety."}
-  txlog-clear-replica-floor! kv/txlog-clear-replica-floor!)
-
-(def ^{:arglists '([db pin-id floor-lsn]
-                   [db pin-id floor-lsn expires-ms])
-       :doc      "Upsert backup/snapshot pin floor used by WAL retention safety. Optional `expires-ms` auto-expires the pin."}
-  txlog-pin-backup-floor! kv/txlog-pin-backup-floor!)
-
-(def ^{:arglists '([db pin-id])
-       :doc      "Remove a backup/snapshot pin floor used by WAL retention safety."}
-  txlog-unpin-backup-floor! kv/txlog-unpin-backup-floor!)
 
 (def ^{:arglists '([db dbi-name k]
                    [db dbi-name k k-type]

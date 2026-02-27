@@ -8,7 +8,12 @@
   to disk; while in `:relaxed` profile, transaction returns success after WAL is
   written. Disk sync in DLMDB is done later at checkpoint. This increases write
   speed while keeping durability guarantees. Moreover, WAL mode provides
-  tangible speedup for concurrent writers.
+  tangible speedup for concurrent writers. WAL related functions:
+  - `open-tx-log` for WAL log access.
+  - `txlog-watermarks`  returns WAL status.
+  - `create-snapshot!` for create/rotate LMDB snapshots.
+  - `list-snapshots` list the snapshots and metadata.
+  - `gc-txlog-segments!` perform log garbage collection.
 - [KV] `:inmemory` mode, where the env resides entirely in memory and all data is
   lost on close. It has even faster write speed than `:nosync`.
 - [Datalog] Support atomic migration from default EDN blob to a specific data
