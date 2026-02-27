@@ -1552,13 +1552,6 @@
         (stop-snapshot-scheduler! info-v)
         (let [append-lock (or (:append-lock state) state)
               ch          (locking append-lock
-                            (when-let [segment-mmap-v (:segment-mmap state)]
-                              (when-let [^java.nio.MappedByteBuffer mmap
-                                         @segment-mmap-v]
-                                (try
-                                  (.force mmap)
-                                  (catch Exception _))
-                                (vreset! segment-mmap-v nil)))
                             (when-let [segment-channel-v
                                        (:segment-channel state)]
                               (let [ch @segment-channel-v]
@@ -2651,7 +2644,6 @@
   (list-range-some [this a0 a1 a2 a3 a4 a5] (i/list-range-some db a0 a1 a2 a3 a4 a5))
   (list-range-some [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-some db a0 a1 a2 a3 a4 a5 a6))
   (near-list [this a0 a1 a2 a3 a4] (i/near-list db a0 a1 a2 a3 a4))
-  (operate-list-val-range [this a0 a1 a2 a3] (i/operate-list-val-range db a0 a1 a2 a3))
   (put-list-items [this a0 a1 a2 a3 a4] (i/put-list-items db a0 a1 a2 a3 a4))
   (visit-list [this a0 a1 a2 a3] (i/visit-list db a0 a1 a2 a3))
   (visit-list [this a0 a1 a2 a3 a4] (i/visit-list db a0 a1 a2 a3 a4))
@@ -2682,15 +2674,15 @@
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
       (txlog/select-open-records
-       (txlog-records state from-lsn)
-       from-lsn
-       upto-lsn)
+        (txlog-records state from-lsn)
+        from-lsn
+        upto-lsn)
       (if (txlog-config-enabled? db)
         []
         (txlog/select-open-records
-         (txlog-records (txlog/enabled-state db) from-lsn)
-         from-lsn
-         upto-lsn))))
+          (txlog-records (txlog/enabled-state db) from-lsn)
+          from-lsn
+          upto-lsn))))
 
   (force-txlog-sync! [_]
     (cond
@@ -2699,9 +2691,9 @@
 
       (not (txlog-write-path-enabled? db))
       (let [rollout-mode (txlog-rollout-mode db)]
-        {:synced? false
-         :skipped? true
-         :reason :rollback
+        {:synced?    false
+         :skipped?   true
+         :reason     :rollback
          :watermarks (txlog-rollout-watermarks db rollout-mode)})
 
       :else
@@ -2713,7 +2705,7 @@
     (if (txlog-config-enabled? db)
       (do
         (force-lmdb-sync-now! db)
-        {:synced? true
+        {:synced?    true
          :watermarks (if-let [state (txlog/state db)]
                        (txlog-watermarks-map db state)
                        (txlog-rollout-watermarks db
@@ -2725,9 +2717,9 @@
       (create-snapshot-now! db)
       (if (txlog-config-enabled? db)
         (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok? false
-           :skipped? true
-           :reason :rollback
+          {:ok?        false
+           :skipped?   true
+           :reason     :rollback
            :watermarks (txlog-rollout-watermarks db rollout-mode)})
         (txlog/enabled-state db))))
 
@@ -2743,18 +2735,18 @@
              :commit-marker? (boolean (:commit-marker? state))
              :marker-revision (long @(:marker-revision state)))
       {:commit-marker? false
-       :slot-a nil
-       :slot-b nil
-       :current nil}))
+       :slot-a         nil
+       :slot-b         nil
+       :current        nil}))
 
   (verify-commit-marker! [_]
     (if-let [state (txlog/state db)]
       (verify-commit-marker-state db state)
       (if (txlog-config-enabled? db)
         (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok? false
-           :skipped? true
-           :reason :rollback
+          {:ok?        false
+           :skipped?   true
+           :reason     :rollback
            :watermarks (txlog-rollout-watermarks db rollout-mode)})
         (verify-commit-marker-state db (txlog/enabled-state db)))))
 

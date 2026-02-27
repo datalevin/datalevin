@@ -165,10 +165,20 @@
            name)
       name))))
 
+(defn- wal-task? [nf] (s/ends-with? nf "-wal"))
+
+(defn- base-task
+  [nf]
+  (if (s/ends-with? nf "-wal")
+    (subs nf 0 (- (count nf) 4))
+    nf))
+
 (defn write
   [{:keys [base-dir batch f threads durability-profile]
     :or   {threads 1}}]
   (let [nf       (name f)
+        base-nf  (base-task nf)
+        wal?     (wal-task? nf)
         threads  (long threads)
         _        (when (not (pos? threads))
                    (throw (ex-info ":threads must be a positive integer"
@@ -178,11 +188,10 @@
                    (throw (ex-info ":durability-profile must be :strict or :relaxed"
                                    {:durability-profile durability-profile})))
         dir      (run-dir base-dir f batch threads)
-        kv?      (s/starts-with? nf "kv")
-        dl?      (s/starts-with? nf "dl")
-        sql?     (s/starts-with? nf "sql")
-        async?   (s/ends-with? nf "async")
-        txlog?   (or (= "dl-txlog" nf) (= "kv-txlog" nf))
+        kv?      (s/starts-with? base-nf "kv")
+        dl?      (s/starts-with? base-nf "dl")
+        sql?     (s/starts-with? base-nf "sql")
+        async?   (s/ends-with? base-nf "async")
         _        (when (and (string? base-dir) (not (s/blank? base-dir)))
                    (.mkdirs (java.io.File. base-dir)))
         kvdb     (when kv?
@@ -194,9 +203,9 @@
                                                           ;; (conj :nosync)
                                                           ;; (conj :nometasync)
                                                           )}
-                                      txlog? (assoc :txn-log? true)
-                                      (and txlog? durability-profile)
-                                      (assoc :txn-log-durability-profile
+                                      wal? (assoc :wal? true)
+                                      (and wal? durability-profile)
+                                      (assoc :wal-durability-profile
                                              durability-profile)))
                      (d/open-dbi max-write-dbi)))
         kv-async (fn [txs measure]
@@ -219,9 +228,9 @@
                                                      ;; (conj :nosync)
                                                      ;; (conj :nometasync)
                                                      )}}
-                       txlog? (assoc :txn-log? true)
-                       (and txlog? durability-profile)
-                       (assoc :txn-log-durability-profile
+                       wal? (assoc :wal? true)
+                       (and wal? durability-profile)
+                       (assoc :wal-durability-profile
                               durability-profile))))
         dl-async (fn [txs measure] (d/transact-async conn txs nil measure))
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
@@ -241,14 +250,14 @@
                    (measure (sql/insert-multi! sql-conn :my_table txs)))
         sql-add  (fn [^FastList txs]
                    (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
-        tx-fn    (case f
-                   kv-async kv-async
-                   kv-sync  kv-sync
-                   kv-txlog kv-sync
-                   dl-async dl-async
-                   dl-sync  dl-sync
-                   dl-txlog dl-sync
-                   sql-tx   sql-tx)
+        tx-fn    (case base-nf
+                   "kv-async" kv-async
+                   "kv-sync"  kv-sync
+                   "dl-async" dl-async
+                   "dl-sync"  dl-sync
+                   "sql-tx"   sql-tx
+                   (throw (ex-info "Unsupported write benchmark task"
+                                   {:f f :base-task base-nf})))
         add-fn   (cond
                    kv?  kv-add
                    dl?  dl-add
@@ -257,9 +266,11 @@
       (= threads 1)
       (max-write-bench batch tx-fn add-fn async?)
 
-      (and dl? (not txlog?))
-      (throw (ex-info "Multi-thread write benchmark for Datalog transact! requires txlog mode (use dl-txlog)."
-                      {:threads threads :f f}))
+      (and dl? (not wal?))
+      (throw
+        (ex-info
+          "Multi-thread write benchmark for Datalog transact! requires WAL mode (use dl-sync-wal)."
+          {:threads threads :f f}))
 
       async?
       (throw (ex-info "Multi-thread write benchmark supports synchronous writers only"
@@ -291,20 +302,30 @@
 (defn random-int [] (.nextInt random keyspace))
 
 (defn mixed
-  [{:keys [dir f]}]
+  [{:keys [dir f durability-profile]}]
   (let [nf       (name f)
-        kv?      (s/starts-with? nf "kv")
-        dl?      (s/starts-with? nf "dl")
-        sql?     (s/starts-with? nf "sql")
+        base-nf  (base-task nf)
+        wal?     (wal-task? nf)
+        _        (when (and durability-profile
+                            (not (#{:strict :relaxed} durability-profile)))
+                   (throw (ex-info ":durability-profile must be :strict or :relaxed"
+                                   {:durability-profile durability-profile})))
+        kv?      (s/starts-with? base-nf "kv")
+        dl?      (s/starts-with? base-nf "dl")
+        sql?     (s/starts-with? base-nf "sql")
         kvdb     (when kv?
                    (doto (d/open-kv dir
-                                    {:mapsize 60000
-                                     :flags   (-> c/default-env-flags
-                                                  ;; (conj :writemap)
-                                                  ;; (conj :mapasync)
-                                                  ;; (conj :nosync)
-                                                  ;; (conj :nometasync)
-                                                  )})
+                                    (cond-> {:mapsize 60000
+                                             :flags   (-> c/default-env-flags
+                                                          ;; (conj :writemap)
+                                                          ;; (conj :mapasync)
+                                                          ;; (conj :nosync)
+                                                          ;; (conj :nometasync)
+                                                          )}
+                                      wal? (assoc :wal? true)
+                                      (and wal? durability-profile)
+                                      (assoc :wal-durability-profile
+                                             durability-profile)))
                      (d/open-dbi max-write-dbi)))
         kv-async (fn [txs measure]
                    (d/get-value kvdb max-write-dbi (random-int) :id :string)
@@ -317,15 +338,20 @@
         kv-add   (fn [^FastList txs]
                    (.add txs [:put (random-int) (str (random-uuid))]))
         conn     (when dl?
-                   (d/get-conn dir {:k {:db/valueType :db.type/long}
-                                    :v {:db/valueType :db.type/string}}
-                               {:kv-opts {:mapsize 60000
-                                          :flags   (-> c/default-env-flags
-                                                       ;; (conj :writemap)
-                                                       ;; (conj :mapasync)
-                                                       ;; (conj :nosync)
-                                                       ;; (conj :nometasync)
-                                                       )}}))
+                   (d/get-conn
+                     dir
+                     {:k {:db/valueType :db.type/long}
+                      :v {:db/valueType :db.type/string}}
+                     (cond-> {:kv-opts {:mapsize 60000
+                                        :flags   (-> c/default-env-flags
+                                                     ;; (conj :writemap)
+                                                     ;; (conj :mapasync)
+                                                     ;; (conj :nosync)
+                                                     ;; (conj :nometasync)
+                                                     )}}
+                       wal? (assoc :wal? true)
+                       (and wal? durability-profile)
+                       (assoc :wal-durability-profile durability-profile))))
         query    '[:find (pull ?e [:v])
                    :in $ ?k
                    :where [?e :k ?k]]
@@ -353,12 +379,14 @@
                      (measure (jdbc/execute! sql-conn [tx (first vs) (peek vs)]))))
         sql-add  (fn [^FastList txs]
                    (.add txs [(random-int) (str (random-uuid))]))
-        tx-fn    (case f
-                   kv-async kv-async
-                   kv-sync  kv-sync
-                   dl-async dl-async
-                   dl-sync  dl-sync
-                   sql-tx   sql-tx)
+        tx-fn    (case base-nf
+                   "kv-async" kv-async
+                   "kv-sync"  kv-sync
+                   "dl-async" dl-async
+                   "dl-sync"  dl-sync
+                   "sql-tx"   sql-tx
+                   (throw (ex-info "Unsupported mixed benchmark task"
+                                   {:f f :base-task base-nf})))
         add-fn   (cond
                    kv?  kv-add
                    dl?  dl-add

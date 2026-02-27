@@ -130,7 +130,7 @@
 (def ^:private keyword-enum-opts
   {:wal-durability-profile #{:strict :relaxed}
    :wal-sync-mode          #{:fsync :fdatasync :none}
-   :wal-segment-prealloc-mode #{:native :mmap :none}
+   :wal-segment-prealloc-mode #{:native :none}
    :wal-rollout-mode       #{:active :rollback}})
 
 (defn validate-option-mutation

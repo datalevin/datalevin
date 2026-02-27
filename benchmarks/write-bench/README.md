@@ -80,17 +80,25 @@ with batch size 10, and save the results in `dl-async-10.csv`:
 time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 10 :f dl-async > dl-10-async.csv
 ```
 
-For synchronous KV writers (`kv-sync`, `kv-txlog`), you can run multiple
-calling threads to test concurrent write ingress in strict txn-log mode, e.g.:
+WAL mode is available for Datalevin tasks by appending `-wal` to task names
+(for example `kv-sync-wal`, `kv-async-wal`, `dl-sync-wal`, `dl-async-wal`).
+You can also set `:durability-profile` to `:strict` (default) or `:relaxed`.
+
+For synchronous KV writers, you can run multiple calling threads to test
+concurrent write ingress in WAL mode, e.g.:
 
 ```bash
-time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-txlog :durability-profile :strict :threads 8 > kv-txlog-strict-1-t8.csv
+time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-sync-wal :durability-profile :strict :threads 8 > kv-sync-wal-strict-1-t8.csv
 ```
 
-This command runs mixed read/write benchmark following the pure write task above:
+This command runs mixed read/write benchmark following the pure write task
+above:
 
 ```bash
 time clj -Xmixed :dir \"/tmp/dl/dl-async-10\" :f dl-async > dl-10-async-mixed.csv
+
+# WAL example:
+time clj -Xmixed :dir \"/tmp/dl/dl-async-wal-10\" :f dl-async-wal > dl-10-async-wal-mixed.csv
 ```
 
 The command below runs pure write benchmark for Sqlite `INSERT`  with batch size

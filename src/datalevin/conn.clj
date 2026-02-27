@@ -24,7 +24,8 @@
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork]
-   [org.eclipse.collections.impl.list.mutable FastList]))
+   [org.eclipse.collections.impl.list.mutable FastList]
+   [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
 (defn conn?
   [conn]
@@ -33,7 +34,9 @@
 (defn conn-from-db
   [db]
   {:pre [(db/db? db)]}
-  (atom db :meta {:listeners (atom {})}))
+  (atom db :meta {:listeners (atom {})
+                  :sync-queue-direct-active (AtomicBoolean. false)
+                  :sync-queue-pending (AtomicLong. 0)}))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -149,20 +152,73 @@
     report))
 
 (def ^:dynamic *sync-queue-worker?* false)
+(def ^:dynamic *txlog-sync-path-observer* nil)
+
+(defn- observe-txlog-sync-path!
+  [path]
+  (when (fn? *txlog-sync-path-observer*)
+    (*txlog-sync-path-observer* path)))
+
+(defn- ensure-sync-queue-state!
+  [conn]
+  (let [m (meta conn)
+        direct-active (:sync-queue-direct-active m)
+        queued-pending (:sync-queue-pending m)]
+    (if (and (instance? AtomicBoolean direct-active)
+             (instance? AtomicLong queued-pending))
+      {:direct-active direct-active
+       :queued-pending queued-pending}
+      (let [direct-active (if (instance? AtomicBoolean direct-active)
+                            direct-active
+                            (AtomicBoolean. false))
+            queued-pending (if (instance? AtomicLong queued-pending)
+                             queued-pending
+                             (AtomicLong. 0))]
+        (alter-meta! conn assoc
+                     :sync-queue-direct-active direct-active
+                     :sync-queue-pending queued-pending)
+        {:direct-active direct-active
+         :queued-pending queued-pending}))))
+
+(defn- sync-queue-pending-counter
+  [conn]
+  ^AtomicLong (:queued-pending (ensure-sync-queue-state! conn)))
+
+(defn- queue-pending-dec-by!
+  [conn n]
+  (let [^AtomicLong pending (sync-queue-pending-counter conn)
+        after (.addAndGet pending (- (long n)))]
+    (when (neg? after)
+      (.set pending 0))))
+
+(defn- begin-relaxed-direct-fast-path!
+  [conn]
+  (let [{:keys [direct-active queued-pending]} (ensure-sync-queue-state! conn)]
+    (when (and (zero? (.get ^AtomicLong queued-pending))
+               (.compareAndSet ^AtomicBoolean direct-active false true))
+      ^AtomicBoolean direct-active)))
+
+(defn- current-thread-holds-store-write-lock?
+  [^Store store]
+  (boolean
+    (when-let [write-lock (l/write-txn store)]
+      (Thread/holdsLock write-lock))))
 
 (defn- txlog-sync-queue-profile
   [conn]
-  (and (not *sync-queue-worker?*)
-       (conn? conn)
-       (let [store (.-store ^DB @conn)]
-         (and (instance? Store store)
-              (let [lmdb (.-lmdb ^Store store)
-                    env-opts (i/env-opts lmdb)
-                    profile (or (:wal-durability-profile env-opts)
-                                c/*wal-durability-profile*)]
-                (and (not (l/writing? lmdb))
+  (when (and (not *sync-queue-worker?*)
+             (conn? conn))
+    (let [store (.-store ^DB @conn)]
+      (when (instance? Store store)
+        (let [lmdb (.-lmdb ^Store store)
+              env-opts (i/env-opts lmdb)
+              profile (or (:wal-durability-profile env-opts)
+                          c/*wal-durability-profile*)]
+          (when (and (not (current-thread-holds-store-write-lock? ^Store store))
+                     (not (l/writing? lmdb))
                      (true? (:wal? env-opts))
-                     profile))))))
+                     profile)
+            profile))))))
 
 (defn- strict-txlog-sync-queue?
   [conn]
@@ -173,9 +229,34 @@
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
-   (if (txlog-sync-queue-profile conn)
-     (queued-transact! conn tx-data tx-meta)
-     (run-transact-now! conn tx-data tx-meta))))
+   (let [profile (txlog-sync-queue-profile conn)]
+     (cond
+       (nil? profile)
+       (do
+         (observe-txlog-sync-path! :direct-no-wal)
+         (run-transact-now! conn tx-data tx-meta))
+
+       (= :strict profile)
+       (do
+         (observe-txlog-sync-path! :queued-strict)
+         (queued-transact! conn tx-data tx-meta))
+
+       (= :relaxed profile)
+       (if-let [^AtomicBoolean direct-active
+                (begin-relaxed-direct-fast-path! conn)]
+         (try
+           (observe-txlog-sync-path! :direct-relaxed)
+           (run-transact-now! conn tx-data tx-meta)
+           (finally
+             (.set direct-active false)))
+         (do
+           (observe-txlog-sync-path! :queued-relaxed)
+           (queued-transact! conn tx-data tx-meta)))
+
+       :else
+       (do
+         (observe-txlog-sync-path! :queued-other)
+         (queued-transact! conn tx-data tx-meta))))))
 
 (defn reset-conn!
   ([conn db] (reset-conn! conn db nil))
@@ -351,51 +432,61 @@
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]
   (let [n (int (.size requests))]
-    (if (= n 1)
-      (let [^SyncQueuedReq req (.get requests 0)]
-        (try
-          (let [report-v (volatile! nil)]
+    (try
+      (if (= n 1)
+        (let [^SyncQueuedReq req (.get requests 0)]
+          (try
+            (let [report-v (volatile! nil)]
+              (binding [*sync-queue-worker?* true]
+                (with-transaction [c conn]
+                  (assert (conn? c))
+                  (let [^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
+                    (reset! c (:db-after report))
+                    (vreset! report-v report))))
+              (deliver-sync-queued-success!
+                req
+                (finalize-sync-queued-report ^TxReport @report-v @conn)))
+            (catch Throwable e
+              (deliver-sync-queued-error! req e)))
+          nil)
+        (let [reports (object-array n)]
+          (try
             (binding [*sync-queue-worker?* true]
               (with-transaction [c conn]
                 (assert (conn? c))
-                (let [^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
-                  (reset! c (:db-after report))
-                  (vreset! report-v report))))
-            (deliver-sync-queued-success!
-              req
-              (finalize-sync-queued-report ^TxReport @report-v @conn)))
-          (catch Throwable e
-            (deliver-sync-queued-error! req e)))
-        nil)
-      (let [reports (object-array n)]
-        (try
-          (binding [*sync-queue-worker?* true]
-            (with-transaction [c conn]
-              (assert (conn? c))
+                (dotimes [i n]
+                  (let [^SyncQueuedReq req (.get requests i)
+                        ^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
+                    (reset! c (:db-after report))
+                    (aset reports i report)))))
+            (let [db-after @conn]
               (dotimes [i n]
-                (let [^SyncQueuedReq req (.get requests i)
-                      ^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
-                  (reset! c (:db-after report))
-                  (aset reports i report)))))
-          (let [db-after @conn]
-            (dotimes [i n]
-              (deliver-sync-queued-success!
-                (.get requests i)
-                (finalize-sync-queued-report
-                  ^TxReport (aget reports i)
-                  db-after))))
-          (catch Throwable e
-            (dotimes [i n]
-              (deliver-sync-queued-error! (.get requests i) e))))
-        nil))))
+                (deliver-sync-queued-success!
+                  (.get requests i)
+                  (finalize-sync-queued-report
+                    ^TxReport (aget reports i)
+                    db-after))))
+            (catch Throwable e
+              (dotimes [i n]
+                (deliver-sync-queued-error! (.get requests i) e))))
+          nil))
+      (finally
+        (queue-pending-dec-by! conn n)))))
 
 (defn- queued-transact!
   [conn tx-data tx-meta]
-  (let [result-promise (promise)
+  (let [^AtomicLong pending (sync-queue-pending-counter conn)
+        _ (.incrementAndGet pending)
+        result-promise (promise)
         requests       (doto (FastList. 1)
                          (.add (->SyncQueuedReq tx-data tx-meta result-promise)))]
-    (a/exec-noresult (a/get-executor)
-                     (->SyncQueuedDLTx conn requests))
+    (try
+      (a/exec-noresult (a/get-executor)
+                       (->SyncQueuedDLTx conn requests))
+      (catch Throwable e
+        ;; Worker did not run, so rollback pending queue count locally.
+        (queue-pending-dec-by! conn 1)
+        (throw e)))
     (let [^SyncQueuedResult result @result-promise]
       (if-let [e (.-error result)]
         (throw ^Throwable e)

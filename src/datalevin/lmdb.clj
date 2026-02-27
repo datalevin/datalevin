@@ -77,13 +77,9 @@
   (iterate-list-sample
     [this rtx cur indices k-range k-type]
     "Return an Iterable of a sample of key-values given key range,
-     and an array of indices, applicable only to list dbi")
+    and an array of indices, applicable only to list dbi")
   (iterate-list-key-range-val-full [this crt cur k-range k-type]
     "Return an Iterable that walks all values of given key range forwardly,
-     applicable only to list dbi")
-  (iterate-list-val [this rtx cur v-range v-type]
-    "Return a IListRandKeyValIterable given the value range,
-     which allows randomly seek key and iterate its values forwardly,
      applicable only to list dbi")
   (iterate-list-val-full [this rtx cur]
     "Return a IListRandKeyValIterable,

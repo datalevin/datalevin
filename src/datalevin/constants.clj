@@ -492,7 +492,7 @@
 
 (def ^{:dynamic true
        :doc     "WAL durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn."}
-  *wal-durability-profile* :relaxed)
+  *wal-durability-profile* :strict)
 
 (def ^{:dynamic true
        :doc     "Enable LMDB dual-slot commit marker in WAL mode."}
@@ -543,7 +543,7 @@
   *wal-segment-prealloc?* true)
 
 (def ^{:dynamic true
-       :doc     "WAL segment preallocation mode. :native uses file preallocation, :mmap uses memory-mapped preallocated segments, :none disables preallocation."}
+       :doc     "WAL segment preallocation mode. :native uses file preallocation, :none disables preallocation."}
   *wal-segment-prealloc-mode* :native)
 
 (def ^{:dynamic true

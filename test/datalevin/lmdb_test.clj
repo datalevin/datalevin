@@ -1,7 +1,6 @@
 (ns datalevin.lmdb-test
   (:require
    [datalevin.lmdb :as l]
-   [datalevin.binding.cpp :as cpp]
    [datalevin.bits :as b]
    [datalevin.interpret :as i]
    [datalevin.kv :as kv]
@@ -12,6 +11,7 @@
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.test.core :as tdc :refer [db-fixture]]
+   [clojure.java.io :as io]
    [clojure.string :as s]
    [clojure.test :refer [deftest testing is use-fixtures]]
    [clojure.test.check.generators :as gen]
@@ -454,19 +454,19 @@
         lmdb    (l/open-kv dir {:flags (conj c/default-env-flags :nosync)})
         sum     (volatile! 0)
         visitor (i/inter-fn
-                    [vb]
+                  [vb]
                   (let [^long v (b/read-buffer vb :long)]
                     (vswap! sum #(+ ^long %1 ^long %2) v)))
         joins   (volatile! "")
         kvisit  (i/inter-fn
-                    [bf]
+                  [bf]
                   (let [k (b/read-buffer bf :string)]
                     (vswap! joins #(s/join " " [% k]))))
         values  (volatile! [])
         op-gen  (i/inter-fn
-                    [k kt]
+                  [k kt]
                   (i/inter-fn
-                      [^IListRandKeyValIterable iterable]
+                    [^IListRandKeyValIterable iterable]
                     (let [^IListRandKeyValIterator iter
                           (l/val-iterator iterable)]
                       (loop [next? (l/seek-key iter k kt)]
@@ -499,26 +499,6 @@
     (is (= (if/key-range lmdb "list" [:all] :string) ["a" "b" "c"]))
     (is (= (if/key-range-count lmdb "list" [:greater-than "b"] :string) 1))
     (is (= (if/key-range lmdb "list" [:less-than "b"] :string) ["a"]))
-
-    (if/operate-list-val-range lmdb "list" (op-gen "b" :string) [:all] :long)
-    (is (= [5 6 7] @values))
-    (vreset! values [])
-
-    (if/operate-list-val-range lmdb "list" (op-gen "b" :string)
-                               [:closed 5 6] :long)
-    (is (= [5 6] @values))
-    (vreset! values [])
-
-    ;; we no longer support open boundary for list val
-    (if/operate-list-val-range lmdb "list" (op-gen "b" :string)
-                               [:closed 5 6] :long)
-    (is (= [5 6] @values))
-    (vreset! values [])
-
-    (if/operate-list-val-range lmdb "list"  (op-gen "d" :string)
-                               [:closed 5 6] :long)
-    (is (= [] @values))
-    (vreset! values [])
 
     (is (= [["a" 1] ["a" 2] ["a" 3] ["a" 4] ["b" 5] ["b" 6] ["b" 7]
             ["c" 3] ["c" 6] ["c" 9]]
@@ -1968,12 +1948,12 @@
     (let [lmdb (l/open-kv nil)]
       (if/open-dbi lmdb "a")
       (if/transact-kv lmdb [[:put "a" 1 "hello" :long :string]
-                             [:put "a" 2 "world" :long :string]])
+                            [:put "a" 2 "world" :long :string]])
       (is (= "hello" (if/get-value lmdb "a" 1 :long :string)))
       (is (= "world" (if/get-value lmdb "a" 2 :long :string)))
       (is (= [[1 "hello"] [2 "world"]]
              (if/get-range lmdb "a" [:all] :long :string)))
-      (is (not (.exists (clojure.java.io/file (if/env-dir lmdb) c/data-file-name))))
+      (is (not (.exists (io/file (if/env-dir lmdb) c/data-file-name))))
       (if/close-kv lmdb)))
 
   (testing "explicit :inmemory? opt"
@@ -1982,7 +1962,7 @@
       (if/open-dbi lmdb "a")
       (if/transact-kv lmdb [[:put "a" :x 42]])
       (is (= 42 (if/get-value lmdb "a" :x)))
-      (is (not (.exists (clojure.java.io/file dir c/data-file-name))))
+      (is (not (.exists (io/file dir c/data-file-name))))
       (if/close-kv lmdb)
       (u/delete-files dir)))
 

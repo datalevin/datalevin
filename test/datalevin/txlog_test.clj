@@ -2,7 +2,6 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [clojure.java.io :as io]
-   [datalevin.binding.cpp :as cpp]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
@@ -13,6 +12,7 @@
   (:import
    [java.io RandomAccessFile]
    [java.nio ByteBuffer]
+   [java.nio.channels FileChannel]
    [java.nio.file Files StandardOpenOption]
    [java.nio.charset StandardCharsets]
    [java.util UUID Random]))
@@ -1009,7 +1009,7 @@
   (with-temp-dir [dir]
     (let [path (sut/segment-path dir 1)
           body (->bytes "hello append")]
-      (with-open [^java.nio.channels.FileChannel ch (sut/open-segment-channel path)]
+      (with-open [^FileChannel ch (sut/open-segment-channel path)]
         (let [{:keys [offset size checksum]}
               (sut/append-record-at! ch 0 body {:compressed? true})
               {:keys [records partial-tail? valid-end]}
@@ -1120,19 +1120,19 @@
 
 (deftest segment-summaries-cache-reuses-unchanged-segments-test
   (with-temp-dir [dir]
-    (let [seg1 (sut/segment-path dir 1)
-          seg2 (sut/segment-path dir 2)
-          seg3 (sut/segment-path dir 3)
+    (let [seg1      (sut/segment-path dir 1)
+          seg2      (sut/segment-path dir 2)
+          seg3      (sut/segment-path dir 3)
           append-lsns!
           (fn [path lsns]
-            (with-open [^java.nio.channels.FileChannel ch
+            (with-open [^FileChannel ch
                         (sut/open-segment-channel path)]
               (doseq [lsn lsns]
                 (sut/append-record! ch
                                     (sut/encode-commit-row-payload
-                                     lsn
-                                     (* 1000 lsn)
-                                     [[:put "dbi" lsn lsn]])))))
+                                      lsn
+                                      (* 1000 lsn)
+                                      [[:put "dbi" lsn lsn]])))))
           lsn-calls (atom 0)
           record->lsn
           (fn [record]
@@ -1142,40 +1142,40 @@
                     sut/decode-commit-row-payload
                     :lsn
                     long))
-          cache-v (volatile! {})]
+          cache-v   (volatile! {})]
       (append-lsns! seg1 [1 2])
       (append-lsns! seg2 [3 4])
       (append-lsns! seg3 [5 6])
       (sut/segment-summaries
-       dir
-       {:record->lsn record->lsn
-        :cache-v cache-v
-        :cache-key :test-lsn})
+        dir
+        {:record->lsn record->lsn
+         :cache-v     cache-v
+         :cache-key   :test-lsn})
       (is (= 6 @lsn-calls))
       (reset! lsn-calls 0)
       (append-lsns! seg3 [7])
       (let [summary (sut/segment-summaries
-                     dir
-                     {:record->lsn record->lsn
-                      :cache-v cache-v
-                      :cache-key :test-lsn})]
+                      dir
+                      {:record->lsn record->lsn
+                       :cache-v     cache-v
+                       :cache-key   :test-lsn})]
         (is (= 2 @lsn-calls))
         (is (= 7 (-> summary :segments peek :max-lsn)))))))
 
 (deftest segment-summaries-cache-fast-path-skips-metadata-stat-test
   (with-temp-dir [dir]
-    (let [seg1 (sut/segment-path dir 1)
-          seg2 (sut/segment-path dir 2)
+    (let [seg1      (sut/segment-path dir 1)
+          seg2      (sut/segment-path dir 2)
           append-lsns!
           (fn [path lsns]
-            (with-open [^java.nio.channels.FileChannel ch
+            (with-open [^FileChannel ch
                         (sut/open-segment-channel path)]
               (doseq [lsn lsns]
                 (sut/append-record! ch
                                     (sut/encode-commit-row-payload
-                                     lsn
-                                     (* 1000 lsn)
-                                     [[:put "dbi" lsn lsn]])))))
+                                      lsn
+                                      (* 1000 lsn)
+                                      [[:put "dbi" lsn lsn]])))))
           lsn-calls (atom 0)
           record->lsn
           (fn [record]
@@ -1185,32 +1185,32 @@
                     sut/decode-commit-row-payload
                     :lsn
                     long))
-          cache-v (volatile! {})]
+          cache-v   (volatile! {})]
       (append-lsns! seg1 [1 2])
       (append-lsns! seg2 [3 4])
       (let [active-offset (long (.length (io/file seg2)))]
         (sut/segment-summaries
-         dir
-         {:record->lsn record->lsn
-          :cache-v cache-v
-          :cache-key :test-lsn
-          :active-segment-id 2
-          :active-segment-offset active-offset})
+          dir
+          {:record->lsn           record->lsn
+           :cache-v               cache-v
+           :cache-key             :test-lsn
+           :active-segment-id     2
+           :active-segment-offset active-offset})
         (is (= 4 @lsn-calls))
         (reset! lsn-calls 0)
 
         ;; Change only metadata on a closed segment. Cache fast-path should
         ;; still reuse this entry and avoid rescanning.
-        (let [f (io/file seg1)
+        (let [f        (io/file seg1)
               touched? (.setLastModified f (+ 1000 (System/currentTimeMillis)))]
           (is touched?)
           (let [summary (sut/segment-summaries
-                         dir
-                         {:record->lsn record->lsn
-                          :cache-v cache-v
-                          :cache-key :test-lsn
-                          :active-segment-id 2
-                          :active-segment-offset active-offset})]
+                          dir
+                          {:record->lsn           record->lsn
+                           :cache-v               cache-v
+                           :cache-key             :test-lsn
+                           :active-segment-id     2
+                           :active-segment-offset active-offset})]
             (is (= 0 @lsn-calls))
             (is (= 2 (count (:segments summary))))
             (is (= 4 (-> summary :segments peek :max-lsn)))))))))
@@ -1222,14 +1222,14 @@
           seg3 (sut/segment-path dir 3)
           append-lsns!
           (fn [path lsns]
-            (with-open [^java.nio.channels.FileChannel ch
+            (with-open [^FileChannel ch
                         (sut/open-segment-channel path)]
               (doseq [lsn lsns]
                 (sut/append-record! ch
                                     (sut/encode-commit-row-payload
-                                     lsn
-                                     (* 1000 lsn)
-                                     [[:put "dbi" lsn lsn]])))))]
+                                      lsn
+                                      (* 1000 lsn)
+                                      [[:put "dbi" lsn lsn]])))))]
       (append-lsns! seg1 [1 2])
       (append-lsns! seg2 [3 4])
       (append-lsns! seg3 [5 6])
@@ -1247,25 +1247,25 @@
 
 (deftest txlog-records-cache-reuses-unchanged-segments-test
   (with-temp-dir [dir]
-    (let [seg1 (sut/segment-path dir 1)
-          seg2 (sut/segment-path dir 2)
-          state {:dir dir
+    (let [seg1  (sut/segment-path dir 1)
+          seg2  (sut/segment-path dir 2)
+          state {:dir                 dir
                  :txlog-records-cache (volatile! {})}
           append-lsns!
           (fn [path lsns]
-            (with-open [^java.nio.channels.FileChannel ch
+            (with-open [^FileChannel ch
                         (sut/open-segment-channel path)]
               (doseq [lsn lsns]
                 (sut/append-record! ch
                                     (sut/encode-commit-row-payload
-                                     lsn
-                                     (* 1000 lsn)
-                                     [[:put "dbi" lsn lsn]])))))]
+                                      lsn
+                                      (* 1000 lsn)
+                                      [[:put "dbi" lsn lsn]])))))]
       (append-lsns! seg1 [1 2])
       (append-lsns! seg2 [3 4])
       (is (= [1 2 3 4]
              (mapv :lsn (kv/txlog-records state 0))))
-      (let [cache1 @(:txlog-records-cache state)
+      (let [cache1       @(:txlog-records-cache state)
             seg1-entry-1 (get cache1 1)
             seg2-entry-1 (get cache1 2)]
         (is (= 2 (count cache1)))
@@ -1298,7 +1298,7 @@
 (deftest scan-and-truncate-partial-tail-test
   (with-temp-dir [dir]
     (let [^String path (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel ch (sut/open-segment-channel path)]
+      (with-open [^FileChannel ch (sut/open-segment-channel path)]
         (sut/append-record! ch (->bytes "a"))
         (sut/append-record! ch (->bytes "bb")))
       (Files/write (.toPath (io/file path))
@@ -1325,7 +1325,7 @@
 (deftest interior-corruption-fails-test
   (with-temp-dir [dir]
     (let [^String path (sut/segment-path dir 2)]
-      (with-open [^java.nio.channels.FileChannel ch (sut/open-segment-channel path)]
+      (with-open [^FileChannel ch (sut/open-segment-channel path)]
         (sut/append-record! ch (->bytes "good-1"))
         (sut/append-record! ch (->bytes "good-2")))
       (with-open [raf (RandomAccessFile. path "rw")]
@@ -1362,7 +1362,7 @@
   (with-temp-dir [dir]
     (let [path (sut/segment-path dir 11)]
       (sut/prepare-segment! path 4096)
-      (with-open [^java.nio.channels.FileChannel ch (sut/open-segment-channel path)]
+      (with-open [^FileChannel ch (sut/open-segment-channel path)]
         (let [{:keys [size]} (sut/append-record-at! ch 0 (->bytes "v1"))]
           (sut/append-record-at! ch size (->bytes "v2"))))
       (is (thrown? clojure.lang.ExceptionInfo (sut/scan-segment path)))
@@ -1399,58 +1399,55 @@
 
 (deftest init-runtime-state-prepares-next-segment-test
   (with-temp-dir [dir]
-    (doseq [mode [:native :mmap]]
-      (let [root (str dir u/+separator+ (name mode))
-            txlog-dir (str root u/+separator+ "txlog")
-            {:keys [state]}
-            (sut/init-runtime-state
-             {:dir root
-              :wal? true
-              :wal-segment-prealloc? true
-              :wal-segment-prealloc-mode mode
-              :wal-segment-prealloc-bytes 512}
-             {})]
-        (try
-          (is (= 1 @(:segment-id state)))
-          (let [tmp-path (sut/prepared-segment-path txlog-dir 2)]
-            (is (.exists (io/file tmp-path)))
-            (is (= 512 (.length (io/file tmp-path)))))
-          (when (= :mmap mode)
-            (is (some? @(:segment-mmap state))))
-          (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
+    (let [root      (str dir u/+separator+ "native")
+          txlog-dir (str root u/+separator+ "txlog")
+          {:keys [state]}
+          (sut/init-runtime-state
+            {:dir                        root
+             :wal?                       true
+             :wal-segment-prealloc?      true
+             :wal-segment-prealloc-mode  :native
+             :wal-segment-prealloc-bytes 512}
+            {})]
+      (try
+        (is (= 1 @(:segment-id state)))
+        (let [tmp-path (sut/prepared-segment-path txlog-dir 2)]
+          (is (.exists (io/file tmp-path)))
+          (is (= 512 (.length (io/file tmp-path)))))
+        (finally
+          (.close ^FileChannel @(:segment-channel state)))))))
 
 (deftest append-durable-rolls-into-preallocated-segment-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel _ (sut/open-segment-channel path1)])
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
       (sut/prepare-next-segment! dir 2 2048)
-      (let [state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! 0)
-                   :segment-channel (volatile! (sut/open-segment-channel path1))
-                   :segment-offset (volatile! 0)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :relaxed
-                   :segment-max-bytes 0
-                   :segment-max-ms 600000
-                   :segment-prealloc? true
-                   :segment-prealloc-mode :native
-                   :segment-prealloc-bytes 2048
-                   :sync-mode :fdatasync
-                   :commit-wait-ms 100
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! 0)
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              0
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              true
+                   :segment-prealloc-mode          :native
+                   :segment-prealloc-bytes         2048
+                   :sync-mode                      :fdatasync
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
                    :segment-prealloc-success-count (volatile! 0)
                    :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 1
-                                   :group-commit-ms 0
-                                   :sync-adaptive? true
-                                   :last-sync-ms 0})}]
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1
+                                                      :group-commit-ms 0
+                                                      :sync-adaptive?  true
+                                                      :last-sync-ms    0})}]
         (try
           (let [res (sut/append-durable! state [[:put :k :v]] {})]
             (is (= 2 @(:segment-id state)))
@@ -1476,88 +1473,39 @@
             (is (<= 1 @(:segment-prealloc-success-count state)))
             (is (= 0 @(:segment-prealloc-failure-count state))))
           (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
-
-(deftest append-durable-mmap-preallocated-segment-test
-  (with-temp-dir [dir]
-    (let [path1 (sut/segment-path dir 1)]
-      (sut/prepare-segment! path1 2048)
-      (let [ch (sut/open-segment-channel path1)
-            mmap (.map ^java.nio.channels.FileChannel ch
-                       java.nio.channels.FileChannel$MapMode/READ_WRITE
-                       0 2048)
-            state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! (System/currentTimeMillis))
-                   :segment-channel (volatile! ch)
-                   :segment-mmap (volatile! mmap)
-                   :segment-offset (volatile! 0)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :relaxed
-                   :segment-max-bytes 4096
-                   :segment-max-ms 600000
-                   :segment-prealloc? true
-                   :segment-prealloc-mode :mmap
-                   :segment-prealloc-bytes 2048
-                   :sync-mode :none
-                   :commit-wait-ms 100
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
-                   :segment-prealloc-success-count (volatile! 0)
-                   :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 1000
-                                   :group-commit-ms 100000
-                                   :sync-adaptive? false
-                                   :last-sync-ms 0})}]
-        (try
-          (let [res (sut/append-durable! state [[:put :k :v]] {})]
-            (is (= 0 (:offset res)))
-            (is (pos? (:size res)))
-            (is (= (+ (long (:offset res)) (long (:size res)))
-                   @(:segment-offset state)))
-            (let [{:keys [records partial-tail? preallocated-tail?]}
-                  (sut/scan-segment path1 {:allow-preallocated-tail? true})]
-              (is (= 1 (count records)))
-              (is partial-tail?)
-              (is preallocated-tail?)))
-          (finally
-            (.close ^java.nio.channels.FileChannel ch)))))))
+            (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest append-durable-near-roll-latency-metric-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel _ (sut/open-segment-channel path1)])
-      (let [state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! (System/currentTimeMillis))
-                   :segment-channel (volatile! (sut/open-segment-channel path1))
-                   :segment-offset (volatile! 9)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :relaxed
-                   :segment-max-bytes 10
-                   :segment-max-ms 600000
-                   :segment-prealloc? false
-                   :segment-prealloc-mode :none
-                   :segment-prealloc-bytes 0
-                   :sync-mode :fdatasync
-                   :commit-wait-ms 100
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
-                   :segment-prealloc-success-count (volatile! 0)
-                   :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                               dir
+                   :segment-id                        (volatile! 1)
+                   :segment-created-ms                (volatile! (System/currentTimeMillis))
+                   :segment-channel                   (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                    (volatile! 9)
+                   :append-lock                       (Object.)
+                   :next-lsn                          (volatile! 1)
+                   :durability-profile                :relaxed
+                   :segment-max-bytes                 10
+                   :segment-max-ms                    600000
+                   :segment-prealloc?                 false
+                   :segment-prealloc-mode             :none
+                   :segment-prealloc-bytes            0
+                   :sync-mode                         :fdatasync
+                   :commit-wait-ms                    100
+                   :segment-roll-count                (volatile! 0)
+                   :segment-roll-duration-ms          (volatile! 0)
+                   :segment-prealloc-success-count    (volatile! 0)
+                   :segment-prealloc-failure-count    (volatile! 0)
+                   :append-near-roll-durations        (volatile! [])
                    :append-near-roll-sorted-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 1
-                                   :group-commit-ms 0
-                                   :sync-adaptive? true
-                                   :last-sync-ms 0})}]
+                   :append-p99-near-roll-ms           (volatile! nil)
+                   :sync-manager                      (sut/new-sync-manager
+                                                        {:group-commit    1
+                                                         :group-commit-ms 0
+                                                         :sync-adaptive?  true
+                                                         :last-sync-ms    0})}]
         (try
           (sut/append-durable! state [[:put :k :v]] {})
           (is (= 0 @(:segment-roll-count state)))
@@ -1566,7 +1514,7 @@
           (is (number? @(:append-p99-near-roll-ms state)))
           (is (<= 0 (long @(:append-p99-near-roll-ms state))))
           (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
+            (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest append-near-roll-p99-sliding-window-test
   (let [max-n (var-get #'sut/append-near-roll-sample-max)
@@ -1601,34 +1549,34 @@
 (deftest append-durable-trailing-sync-batch-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel _ (sut/open-segment-channel path1)])
-      (let [state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! (System/currentTimeMillis))
-                   :segment-channel (volatile! (sut/open-segment-channel path1))
-                   :segment-offset (volatile! 0)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :relaxed
-                   :segment-max-bytes 1024
-                   :segment-max-ms 600000
-                   :segment-prealloc? false
-                   :segment-prealloc-mode :none
-                   :segment-prealloc-bytes 0
-                   :sync-mode :none
-                   :commit-wait-ms 100
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :none
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
                    :segment-prealloc-success-count (volatile! 0)
                    :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 3
-                                   :group-commit-ms 100000
-                                   :sync-adaptive? false
-                                   :last-sync-ms
-                                   (System/currentTimeMillis)})}]
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    3
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}]
         (try
           (sut/append-durable! state [[:put "dbi" :k1 :v1]] {})
           (let [s1 (sut/sync-manager-state (:sync-manager state))]
@@ -1650,39 +1598,39 @@
             (is (= 1 (:batched-sync-count s3)))
             (is (= 1 (get-in s3 [:sync-count-by-reason :batch-count]))))
           (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
+            (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest append-durable-relaxed-group-commit-one-durable-per-append-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel _ (sut/open-segment-channel path1)])
-      (let [state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! (System/currentTimeMillis))
-                   :segment-channel (volatile! (sut/open-segment-channel path1))
-                   :segment-offset (volatile! 0)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :relaxed
-                   :segment-max-bytes 1024
-                   :segment-max-ms 600000
-                   :segment-prealloc? false
-                   :segment-prealloc-mode :none
-                   :segment-prealloc-bytes 0
-                   :sync-mode :fdatasync
-                   :commit-wait-ms 100
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :fdatasync
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
                    :segment-prealloc-success-count (volatile! 0)
                    :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 1
-                                   :group-commit-ms 100000
-                                   :sync-adaptive? false
-                                   :last-sync-ms
-                                   (System/currentTimeMillis)})}]
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}]
         (try
           (let [r1 (sut/append-durable! state [[:put "dbi" :k1 :v1]] {})
                 s1 (sut/sync-manager-state (:sync-manager state))]
@@ -1699,39 +1647,39 @@
             (is (= 0 (:pending-count s2)))
             (is (= 2 (get-in s2 [:sync-count-by-reason :batch-count]))))
           (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
+            (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest append-durable-strict-single-writer-durable-per-append-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
-      (with-open [^java.nio.channels.FileChannel _ (sut/open-segment-channel path1)])
-      (let [state {:dir dir
-                   :segment-id (volatile! 1)
-                   :segment-created-ms (volatile! (System/currentTimeMillis))
-                   :segment-channel (volatile! (sut/open-segment-channel path1))
-                   :segment-offset (volatile! 0)
-                   :append-lock (Object.)
-                   :next-lsn (volatile! 1)
-                   :durability-profile :strict
-                   :segment-max-bytes 1024
-                   :segment-max-ms 600000
-                   :segment-prealloc? false
-                   :segment-prealloc-mode :none
-                   :segment-prealloc-bytes 0
-                   :sync-mode :none
-                   :commit-wait-ms 1000
-                   :segment-roll-count (volatile! 0)
-                   :segment-roll-duration-ms (volatile! 0)
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :strict
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :none
+                   :commit-wait-ms                 1000
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
                    :segment-prealloc-success-count (volatile! 0)
                    :segment-prealloc-failure-count (volatile! 0)
-                   :append-near-roll-durations (volatile! [])
-                   :append-p99-near-roll-ms (volatile! nil)
-                   :sync-manager (sut/new-sync-manager
-                                  {:group-commit 1000
-                                   :group-commit-ms 100000
-                                   :sync-adaptive? false
-                                   :last-sync-ms
-                                   (System/currentTimeMillis)})}]
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1000
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}]
         (try
           (let [r1 (sut/append-durable! state [[:put "dbi" :k1 :v1]] {})
                 s1 (sut/sync-manager-state (:sync-manager state))]
@@ -1748,7 +1696,7 @@
             (is (= 0 (:pending-count s2)))
             (is (= 2 (:forced-sync-count s2))))
           (finally
-            (.close ^java.nio.channels.FileChannel @(:segment-channel state))))))))
+            (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest sync-manager-trailing-target-batches-multiple-enqueued-lsns-test
   (let [mgr (sut/new-sync-manager {:group-commit 1000
@@ -1805,23 +1753,23 @@
 
 (deftest segment-summaries-test
   (with-temp-dir [dir]
-    (let [path1 (sut/segment-path dir 1)
-          path2 (sut/segment-path dir 2)
+    (let [path1      (sut/segment-path dir 1)
+          path2      (sut/segment-path dir 2)
           decode-lsn (fn [{:keys [body]}]
                        (long (aget ^bytes body 0)))
           marker-offset
-          (with-open [^java.nio.channels.FileChannel ch1 (sut/open-segment-channel path1)
-                      ^java.nio.channels.FileChannel ch2 (sut/open-segment-channel path2)]
+          (with-open [^FileChannel ch1 (sut/open-segment-channel path1)
+                      ^FileChannel ch2 (sut/open-segment-channel path2)]
             (sut/append-record! ch1 (byte-array [(byte 1)]))
             (let [{:keys [offset]} (sut/append-record! ch1 (byte-array [(byte 2)]))]
               (sut/append-record! ch2 (byte-array [(byte 3)]))
               offset))
           {:keys [segments marker-record min-retained-lsn newest-segment-id]}
           (sut/segment-summaries dir
-                                {:record->lsn decode-lsn
-                                 :marker-segment-id 1
-                                 :marker-offset marker-offset
-                                 :min-retained-fallback 999})]
+                                 {:record->lsn           decode-lsn
+                                  :marker-segment-id     1
+                                  :marker-offset         marker-offset
+                                  :min-retained-fallback 999})]
       (is (= 2 (count segments)))
       (is (= 1 min-retained-lsn))
       (is (= 2 newest-segment-id))

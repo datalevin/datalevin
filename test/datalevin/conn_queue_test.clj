@@ -8,7 +8,8 @@
   (:import
    [java.util UUID]
    [datalevin.db DB]
-   [datalevin.storage Store]))
+   [datalevin.storage Store]
+   [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
 (defn- with-temp-dl-conn
   [kv-opts f]
@@ -38,6 +39,23 @@
         (testing "inside an existing write transaction, queueing is disabled"
           (is (false? (#'conn/strict-txlog-sync-queue? cn))))))))
 
+(deftest strict-profile-with-transaction-transact-does-not-queue-or-hang-test
+  (with-temp-dl-conn
+    {:wal? true
+     :wal-durability-profile :strict}
+    (fn [c]
+      (let [paths (atom [])
+            fut   (future
+                    (binding [conn/*txlog-sync-path-observer*
+                              #(swap! paths conj %)]
+                      (d/with-transaction [cn c]
+                        (d/transact! cn [{:k 11}]))))]
+        (is (not= ::timeout (deref fut 5000 ::timeout)))
+        (is (= [:direct-no-wal] @paths))
+        (is (= 1 (d/q '[:find (count ?e) .
+                        :where [?e :k]]
+                      (d/db c))))))))
+
 (deftest relaxed-profile-skips-sync-queue-test
   (with-temp-dl-conn
     {:wal? true
@@ -45,21 +63,51 @@
     (fn [c]
       (is (false? (#'conn/strict-txlog-sync-queue? c))))))
 
-(deftest relaxed-profile-uses-sync-queue-test
+(deftest relaxed-profile-prefers-direct-fast-path-test
   (with-temp-dl-conn
     {:wal? true
      :wal-durability-profile :relaxed}
     (fn [c]
-      (let [queued? (atom false)]
-        (with-redefs [conn/queued-transact!
-                      (fn [conn' tx-data tx-meta]
-                        (reset! queued? true)
-                        (#'conn/run-transact-now! conn' tx-data tx-meta))]
+      (let [paths (atom [])]
+        (binding [conn/*txlog-sync-path-observer*
+                  #(swap! paths conj %)]
           (d/transact! c [{:k 2}]))
-        (is (true? @queued?))
+        (is (= [:direct-relaxed] @paths))
         (is (= 1 (d/q '[:find (count ?e) .
                         :where [?e :k]]
                       (d/db c))))))))
+
+(deftest relaxed-profile-queues-when-direct-path-is-busy-test
+  (with-temp-dl-conn
+    {:wal? true
+     :wal-durability-profile :relaxed}
+    (fn [c]
+      (let [^AtomicBoolean direct-active (:sync-queue-direct-active (meta c))
+            paths (atom [])]
+        (.set direct-active true)
+        (try
+          (binding [conn/*txlog-sync-path-observer*
+                    #(swap! paths conj %)]
+            (d/transact! c [{:k 3}]))
+          (is (= [:queued-relaxed] @paths))
+          (finally
+            (.set direct-active false)))))))
+
+(deftest relaxed-profile-queues-when-backlog-exists-test
+  (with-temp-dl-conn
+    {:wal? true
+     :wal-durability-profile :relaxed}
+    (fn [c]
+      (let [^AtomicLong pending (:sync-queue-pending (meta c))
+            paths (atom [])]
+        (.set pending 1)
+        (try
+          (binding [conn/*txlog-sync-path-observer*
+                    #(swap! paths conj %)]
+            (d/transact! c [{:k 4}]))
+          (is (= [:queued-relaxed] @paths))
+          (finally
+            (.set pending 0)))))))
 
 (deftest strict-profile-report-db-after-is-usable-test
   (with-temp-dl-conn

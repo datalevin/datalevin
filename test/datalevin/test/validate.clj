@@ -476,7 +476,7 @@
     (is (nil? (vld/validate-option-mutation :wal-sync-mode :fdatasync)))
     (is (nil? (vld/validate-option-mutation :wal-sync-mode :fdatasync)))
     (is (nil? (vld/validate-option-mutation :wal-segment-prealloc-mode :native)))
-    (is (nil? (vld/validate-option-mutation :wal-segment-prealloc-mode :mmap)))
+    (is (nil? (vld/validate-option-mutation :wal-segment-prealloc-mode :none)))
     (is (nil? (vld/validate-option-mutation :wal-rollout-mode :rollback)))
     (is (nil? (vld/validate-option-mutation :wal-rollout-mode :rollback)))
     (is (thrown-with-msg? Exception #"expects one of"
@@ -485,6 +485,8 @@
           (vld/validate-option-mutation :wal-durability-profile :bad-profile)))
     (is (thrown-with-msg? Exception #"expects one of"
           (vld/validate-option-mutation :wal-sync-mode :bad-mode)))
+    (is (thrown-with-msg? Exception #"expects one of"
+          (vld/validate-option-mutation :wal-segment-prealloc-mode :mmap)))
     (is (thrown-with-msg? Exception #"expects one of"
           (vld/validate-option-mutation :wal-rollout-mode :bad-mode))))
 

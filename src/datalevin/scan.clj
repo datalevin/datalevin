@@ -594,8 +594,12 @@
 (defn visit-list-key-range
   [lmdb dbi-name visitor k-range k-type v-type raw-pred?]
   (scan
-    (let [iterable (l/iterate-list dbi rtx cur k-range k-type
-                                   [:all] v-type)]
+    (let [range-type (first k-range)
+          iterable   (if (and (keyword? range-type)
+                              (.endsWith ^String (name range-type) "-back"))
+                       (l/iterate-list dbi rtx cur k-range k-type [:all] v-type)
+                       (l/iterate-list-key-range-val-full dbi rtx cur
+                                                         k-range k-type))]
       (visit* iterable visitor raw-pred? k-type v-type))
     (raise "Fail to visit list key range: " e
            {:dbi dbi-name :key-range k-range})))
@@ -615,14 +619,6 @@
       (visit* iterable visitor raw-pred? k-type nil))
     (raise "Fail to visit key sample: " e
            {:dbi dbi-name :key-range k-range})))
-
-(defn operate-list-val-range
-  [lmdb dbi-name operator v-range v-type]
-  (scan
-    (let [iterable (l/iterate-list-val dbi rtx cur v-range v-type)]
-      (operator iterable))
-    (raise "Fail to operate list val range: " e
-           {:dbi dbi-name :val-range v-range})))
 
 (defn visit-list*
   [iter visitor k kt vt raw-pred?]

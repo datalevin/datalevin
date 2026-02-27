@@ -8,8 +8,9 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.txlog
-  "Txn-log record codec, segment management, sync state, and metadata helpers."
+  "WAL record codec, segment management, sync state, and metadata helpers."
   (:require
+   [datalevin.buffer :as bf]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.interface :as i]
@@ -18,12 +19,12 @@
    [datalevin.util :as u :refer [raise map+]])
   (:import
    [java.io File]
-   [java.nio ByteBuffer ByteOrder BufferOverflowException MappedByteBuffer]
-   [java.nio.channels FileChannel FileChannel$MapMode]
+   [java.nio ByteBuffer ByteOrder BufferOverflowException]
+   [java.nio.channels FileChannel]
    [java.nio.file Files Path StandardCopyOption StandardOpenOption
     AtomicMoveNotSupportedException]
    [java.nio.charset StandardCharsets]
-   [java.util Arrays HashMap List]
+   [java.util Arrays HashMap List Collection]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.util.zip CRC32C]))
 
@@ -49,7 +50,7 @@
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x43) (byte 0x4d)])) ; DLCM
 
 (def ^:private sync-mode-values #{:fsync :fdatasync :none})
-(def ^:private segment-prealloc-mode-values #{:native :mmap :none})
+(def ^:private segment-prealloc-mode-values #{:native :none})
 
 (declare segment-files
          scan-segment
@@ -60,7 +61,6 @@
          read-meta-file
          meta-path
          ensure-next-segment-prepared!
-         ensure-segment-mapped!
          new-sync-manager
          request-sync-on-append!
          begin-sync!
@@ -69,9 +69,7 @@
          await-durable-lsn!
          decode-commit-row-payload)
 
-(defn enabled?
-  [info]
-  (true? (:wal? info)))
+(defn enabled? [info] (true? (:wal? info)))
 
 (defn sync-mode
   [info]
@@ -150,183 +148,178 @@
   (let [profile (durability-profile info)
         allowed #{:strict :relaxed}]
     (when-not (allowed profile)
-      (raise "Unsupported txn-log durability profile"
+      (raise "Unsupported WAL durability profile"
              {:wal-durability-profile profile
-              :allowed allowed})))
+              :allowed                allowed})))
   (let [version (long (commit-marker-version info))]
     (when-not (= version commit-marker-format-major)
-      (raise "Unsupported txn-log commit marker version"
+      (raise "Unsupported WAL commit marker version"
              {:wal-commit-marker-version version
-              :supported commit-marker-format-major})))
+              :supported                 commit-marker-format-major})))
   (let [mode (segment-prealloc-mode info)]
     (when-not (segment-prealloc-mode-values mode)
-      (raise "Unsupported txn-log segment preallocation mode"
+      (raise "Unsupported WAL segment preallocation mode"
              {:wal-segment-prealloc-mode mode
-              :allowed segment-prealloc-mode-values})))
+              :allowed                   segment-prealloc-mode-values})))
   (let [bytes (long (segment-prealloc-bytes info))]
     (when (neg? bytes)
-      (raise "Txn-log segment preallocation bytes must be non-negative"
+      (raise "WAL segment preallocation bytes must be non-negative"
              {:wal-segment-prealloc-bytes bytes}))))
 
 (defn init-runtime-state
   [info marker-state]
   (validate-runtime-config! info)
-  (let [dir (or (:wal-dir info)
-                (str (:dir info) u/+separator+ "txlog"))
-        _ (u/create-dirs dir)
-        segments (segment-files dir)
+  (let [dir               (or (:wal-dir info)
+                              (str (:dir info) u/+separator+ "txlog"))
+        _                 (u/create-dirs dir)
+        segments          (segment-files dir)
         closed-last-lsn-v (volatile! nil)
-        _ (doseq [{:keys [file]} (butlast segments)]
-            (let [last-record-v (volatile! nil)
-                  {:keys [partial-tail?]}
-                  (scan-segment (.getPath ^File file)
-                                {:collect-records? false
-                                 :on-record
-                                 (fn [record]
-                                   (vreset! last-record-v record))})]
-              (when partial-tail?
-                (raise "Partial tail found on closed txn-log segment"
-                       {:type :txlog/corrupt
-                        :path (.getPath ^File file)}))
-              (when-let [last-record @last-record-v]
-                (vreset! closed-last-lsn-v
-                         (long (-> last-record
-                                   :body
-                                   decode-commit-row-payload
-                                   :lsn))))))
-        active-id (long (if (seq segments) (:id (last segments)) 1))
-        active-path (segment-path dir active-id)
-        _ (when-not (.exists (io/file active-path))
-            (let [^FileChannel tmp-ch
-                  (open-segment-channel active-path)]
-              (try
-                nil
-                (finally
-                  (.close tmp-ch)))))
-        active-scan (truncate-partial-tail!
-                     active-path {:allow-preallocated-tail? true})
-        active-offset (segment-end-offset active-scan)
-        closed-bytes (reduce (fn [acc {:keys [id file]}]
-                               (if (= ^long (long id) ^long active-id)
-                                 acc
-                                 (+ ^long acc ^long (.length ^File file))))
-                             0
-                             segments)
-        total-bytes (+ ^long closed-bytes ^long active-offset)
-        meta-path (meta-path dir)
-        meta (read-meta-file meta-path)
-        meta-cur (:current meta)
-        marker-cur (:current marker-state)
-        last-from-active (long (or (some-> active-scan
-                                           :records
-                                           peek
-                                           :body
-                                           decode-commit-row-payload
-                                           :lsn)
-                                   0))
-        last-from-closed (long (or @closed-last-lsn-v 0))
-        last-from-seg (long (max last-from-active last-from-closed))
-        last-committed (max (long (or (:last-committed-lsn meta-cur) 0))
-                            last-from-seg)
-        last-durable (max (long (or (:last-durable-lsn meta-cur) 0))
-                          last-committed)
-        last-applied (long (or (:last-applied-lsn meta-cur) 0))
-        last-sync-ms (long (or (:updated-ms meta-cur)
-                               (System/currentTimeMillis)))
-        now (System/currentTimeMillis)
-        ch (open-segment-channel active-path)
-        profile (durability-profile info)
-        prealloc-mode (segment-prealloc-mode info)
-        prealloc? (and (segment-prealloc? info)
-                       (not= prealloc-mode :none))
-        state {:dir dir
-               :meta-path meta-path
-               :segment-id (volatile! active-id)
-               :segment-created-ms (volatile! now)
-               :segment-channel (volatile! ch)
-               :segment-mmap (volatile! nil)
-               :segment-offset (volatile! active-offset)
-               :append-lock (Object.)
-               :next-lsn (volatile! (inc last-committed))
-               :segment-max-bytes (long (segment-max-bytes info))
-               :segment-max-ms (long (segment-max-ms info))
-               :segment-prealloc? prealloc?
-               :segment-prealloc-mode prealloc-mode
-               :segment-prealloc-bytes (long (segment-prealloc-bytes info))
-               :durability-profile profile
-               :sync-mode (sync-mode info)
-               :commit-marker? (commit-marker? info)
-               :commit-marker-version
-               (long (commit-marker-version info))
-               :meta-last-applied-lsn last-applied
-               :meta-publish-lock (Object.)
-               :meta-flush-max-txs (long (meta-flush-max-txs info))
-               :meta-flush-max-ms (long (meta-flush-max-ms info))
-               :meta-last-flush-ms (volatile! last-sync-ms)
-               :meta-pending-txs (volatile! 0)
-               :marker-revision (volatile! (long (or (:revision marker-cur)
-                                                     -1)))
-               :commit-wait-ms (long (commit-wait-ms info))
-               :sync-manager
-               (new-sync-manager
-                {:last-durable-lsn last-durable
-                 :last-appended-lsn last-committed
-                 :last-sync-ms last-sync-ms
-                 :group-commit (long (group-commit info))
-                 :group-commit-ms (long (group-commit-ms info))
-                 :sync-adaptive? (sync-adaptive? info)
-                 :track-trailing? (= :strict profile)})
-               :segment-roll-count (volatile! 0)
-               :segment-roll-duration-ms (volatile! 0)
-               :segment-prealloc-success-count (volatile! 0)
-               :segment-prealloc-failure-count (volatile! 0)
-               :append-near-roll-durations (volatile! (FastList.))
-               :append-near-roll-sorted-durations (volatile! (FastList.))
-               :append-p99-near-roll-ms (volatile! nil)
-               :retention-backpressure-last-check-ms (volatile! 0)
-               :retention-backpressure-state (volatile! nil)
-               :retention-backpressure-blocked-since-ms (volatile! nil)
-               :segment-summaries-cache (volatile! {})
-               :txlog-records-cache (volatile! {})
-               :retention-total-bytes (volatile! total-bytes)
-               :fatal-error (volatile! nil)}]
-    (ensure-segment-mapped! state)
-    (ensure-next-segment-prepared! state)
-    {:dir dir
-     :state state}))
+        _
+        (doseq [{:keys [file]} (butlast segments)]
+          (let [last-record-v (volatile! nil)
+                {:keys [partial-tail?]}
+                (scan-segment (.getPath ^File file)
+                              {:collect-records? false
+                               :on-record
+                               (fn [record]
+                                 (vreset! last-record-v record))})]
+            (when partial-tail?
+              (raise "Partial tail found on closed txn-log segment"
+                     {:type :txlog/corrupt
+                      :path (.getPath ^File file)}))
+            (when-let [last-record @last-record-v]
+              (vreset! closed-last-lsn-v
+                       (long (-> last-record
+                                 :body
+                                 decode-commit-row-payload
+                                 :lsn))))))
+        active-id         (if (seq segments) (:id (last segments)) 1)
+        active-path       (segment-path dir active-id)
+        _                 (when-not (.exists (io/file active-path))
+                            (let [^FileChannel tmp-ch
+                                  (open-segment-channel active-path)]
+                              (try
+                                nil
+                                (finally
+                                  (.close tmp-ch)))))
+        active-scan       (truncate-partial-tail!
+                            active-path {:allow-preallocated-tail? true})
+        active-offset     (segment-end-offset active-scan)
+        closed-bytes      (reduce
+                            (fn [acc {:keys [id file]}]
+                              (if (= ^long (long id) ^long active-id)
+                                acc
+                                (+ ^long acc ^long (.length ^File file))))
+                            0 segments)
+        total-bytes       (+ ^long closed-bytes ^long active-offset)
+        meta-path         (meta-path dir)
+        meta              (read-meta-file meta-path)
+        meta-cur          (:current meta)
+        marker-cur        (:current marker-state)
+        last-from-active  (long (or (some-> active-scan
+                                            :records
+                                            peek
+                                            :body
+                                            decode-commit-row-payload
+                                            :lsn)
+                                    0))
+        last-from-closed  (long (or @closed-last-lsn-v 0))
+        last-from-seg     (long (max last-from-active last-from-closed))
+        last-committed    (max (long (or (:last-committed-lsn meta-cur) 0))
+                               last-from-seg)
+        last-durable      (max (long (or (:last-durable-lsn meta-cur) 0))
+                               last-committed)
+        last-applied      (long (or (:last-applied-lsn meta-cur) 0))
+        last-sync-ms      (long (or (:updated-ms meta-cur)
+                                    (System/currentTimeMillis)))
+        now               (System/currentTimeMillis)
+        ch                (open-segment-channel active-path)
+        profile           (durability-profile info)
+        prealloc-mode     (segment-prealloc-mode info)
+        prealloc?         (and (segment-prealloc? info)
+                               (not= prealloc-mode :none))
+        state
+        {:dir                    dir
+         :meta-path              meta-path
+         :segment-id             (volatile! active-id)
+         :segment-created-ms     (volatile! now)
+         :segment-channel        (volatile! ch)
+         :segment-offset         (volatile! active-offset)
+         :append-lock            (Object.)
+         :next-lsn               (volatile! (inc last-committed))
+         :segment-max-bytes      (long (segment-max-bytes info))
+         :segment-max-ms         (long (segment-max-ms info))
+         :segment-prealloc?      prealloc?
+         :segment-prealloc-mode  prealloc-mode
+         :segment-prealloc-bytes (long (segment-prealloc-bytes info))
+         :durability-profile     profile
+         :sync-mode              (sync-mode info)
+         :commit-marker?         (commit-marker? info)
+         :commit-marker-version  (long (commit-marker-version info))
+         :meta-last-applied-lsn  last-applied
+         :meta-publish-lock      (Object.)
+         :meta-flush-max-txs     (long (meta-flush-max-txs info))
+         :meta-flush-max-ms      (long (meta-flush-max-ms info))
+         :meta-last-flush-ms     (volatile! last-sync-ms)
+         :meta-pending-txs       (volatile! 0)
+         :marker-revision        (volatile! (or (:revision marker-cur)
+                                                -1))
+         :commit-wait-ms         (long (commit-wait-ms info))
 
-(defn segment-file-name
-  [^long segment-id]
-  (format "segment-%016d.wal" segment-id))
+         :sync-manager (new-sync-manager
+                         {:last-durable-lsn  last-durable
+                          :last-appended-lsn last-committed
+                          :last-sync-ms      last-sync-ms
+                          :group-commit      (long (group-commit info))
+                          :group-commit-ms   (long (group-commit-ms info))
+                          :sync-adaptive?    (sync-adaptive? info)
+                          :track-trailing?   (= :strict profile)})
+
+         :segment-roll-count                      (volatile! 0)
+         :segment-roll-duration-ms                (volatile! 0)
+         :segment-prealloc-success-count          (volatile! 0)
+         :segment-prealloc-failure-count          (volatile! 0)
+         :append-near-roll-durations              (volatile! (FastList.))
+         :append-near-roll-sorted-durations       (volatile! (FastList.))
+         :append-p99-near-roll-ms                 (volatile! nil)
+         :retention-backpressure-last-check-ms    (volatile! 0)
+         :retention-backpressure-state            (volatile! nil)
+         :retention-backpressure-blocked-since-ms (volatile! nil)
+         :segment-summaries-cache                 (volatile! {})
+         :txlog-records-cache                     (volatile! {})
+         :retention-total-bytes                   (volatile! total-bytes)
+         :fatal-error                             (volatile! nil)}]
+    (ensure-next-segment-prepared! state)
+    {:dir dir :state state}))
+
+(defn segment-file-name [segment-id] (format "segment-%016d.wal" segment-id))
 
 (defn segment-path
-  [^String dir ^long segment-id]
+  [dir segment-id]
   (str dir u/+separator+ (segment-file-name segment-id)))
 
 (defn prepared-segment-file-name
-  [^long segment-id]
+  [segment-id]
   (str (segment-file-name segment-id) ".tmp"))
 
 (defn prepared-segment-path
-  [^String dir ^long segment-id]
+  [dir segment-id]
   (str dir u/+separator+ (prepared-segment-file-name segment-id)))
 
-(defn meta-path
-  [^String dir]
-  (str dir u/+separator+ meta-file-name))
+(defn meta-path [dir] (str dir u/+separator+ meta-file-name))
 
 (defn parse-segment-id
-  [^String file-name]
+  [file-name]
   (when-let [[_ sid] (re-matches segment-pattern file-name)]
     (Long/parseLong sid)))
 
 (defn parse-prepared-segment-id
-  [^String file-name]
+  [file-name]
   (when-let [[_ sid] (re-matches prepared-segment-pattern file-name)]
     (Long/parseLong sid)))
 
 (defn segment-files
-  [^String dir]
+  [dir]
   (->> (or (u/list-files dir) [])
        (keep (fn [^File f]
                (when-let [sid (parse-segment-id (.getName f))]
@@ -335,7 +328,7 @@
        vec))
 
 (defn prepared-segment-files
-  [^String dir]
+  [dir]
   (->> (or (u/list-files dir) [])
        (keep (fn [^File f]
                (when-let [sid (parse-prepared-segment-id (.getName f))]
@@ -361,18 +354,18 @@
          (.order ByteOrder/BIG_ENDIAN))))))
 
 (defn- checked-record-body-len
-  ^long [^bytes body]
-  (let [body-len (long (alength body))]
+  [^bytes body]
+  (let [body-len (alength body)]
     (when (neg? body-len)
       (raise "Invalid record body length" {:body-len body-len}))
     body-len))
 
 (defn- record-body-checksum
-  ^long [^bytes body]
-  (long (bit-and 0xffffffff (crc32c body))))
+  [body]
+  (bit-and 0xffffffff ^int (crc32c body)))
 
 (defn- write-record-header!
-  ^ByteBuffer [^ByteBuffer header-bf ^long body-len compressed? ^long checksum]
+  [^ByteBuffer header-bf body-len compressed? checksum]
   (.clear header-bf)
   (.put header-bf ^bytes magic-bytes)
   (.put header-bf (byte format-major))
@@ -425,19 +418,19 @@
      (raise "Unsupported txn-log sync mode"
             {:sync-mode sync-mode :allowed sync-mode-values}))
    (case sync-mode
-     :none nil
+     :none      nil
      :fdatasync (.force ch false)
-     :fsync (.force ch true))
+     :fsync     (.force ch true))
    sync-mode))
 
 (defn encode-record
-  ([^bytes body] (encode-record body {}))
+  ([body] (encode-record body {}))
   ([^bytes body {:keys [compressed?]
-                 :or {compressed? false}}]
-   (let [body-len (checked-record-body-len body)
-         checksum (record-body-checksum body)
+                 :or   {compressed? false}}]
+   (let [body-len  (checked-record-body-len body)
+         checksum  (record-body-checksum body)
          total-len (+ record-header-size body-len)
-         record (byte-array (int total-len))
+         record    (byte-array (int total-len))
          header-bf (doto (ByteBuffer/wrap record 0 record-header-size)
                      (.order ByteOrder/BIG_ENDIAN))]
      (write-record-header! header-bf body-len (boolean compressed?) checksum)
@@ -445,35 +438,58 @@
        (System/arraycopy body 0 record record-header-size (int body-len)))
      record)))
 
-(defn- read-int-unsigned
-  [^ByteBuffer bf]
-  (bit-and 0xffffffff (.getInt bf)))
+(defn- read-int-unsigned [^ByteBuffer bf] (bit-and 0xffffffff (.getInt bf)))
 
-(defn- decode-header-bytes
-  [^bytes header-bytes ^long offset]
-  (when-not (= (alength header-bytes) record-header-size)
+(defn- decode-header-buffer
+  [^ByteBuffer header offset]
+  (when-not (= (.remaining header) record-header-size)
     (raise "Invalid txn-log record header size"
-           {:offset offset :size (alength header-bytes)}))
-  (let [header (doto (ByteBuffer/wrap header-bytes)
-                 (.order ByteOrder/BIG_ENDIAN))
-        magic (byte-array 4)]
-    (.get header magic)
-    (when-not (Arrays/equals magic ^bytes magic-bytes)
+           {:offset offset :size (.remaining header)}))
+  (let [m0 (bit-and 0xff (int (.get header)))
+        m1 (bit-and 0xff (int (.get header)))
+        m2 (bit-and 0xff (int (.get header)))
+        m3 (bit-and 0xff (int (.get header)))
+        g0 (bit-and 0xff (int (aget ^bytes magic-bytes 0)))
+        g1 (bit-and 0xff (int (aget ^bytes magic-bytes 1)))
+        g2 (bit-and 0xff (int (aget ^bytes magic-bytes 2)))
+        g3 (bit-and 0xff (int (aget ^bytes magic-bytes 3)))]
+    (when-not (and (= m0 g0) (= m1 g1) (= m2 g2) (= m3 g3))
       (raise "Invalid txn-log record magic"
-             {:offset offset :magic (vec magic)}))
-    (let [major (int (.get header))
-          flags (bit-and 0xff (int (.get header)))
-          body-len (long (read-int-unsigned header))
-          checksum (long (read-int-unsigned header))]
+             {:offset offset :magic [m0 m1 m2 m3]}))
+    (let [major    (int (.get header))
+          flags    (bit-and 0xff (int (.get header)))
+          body-len (read-int-unsigned header)
+          checksum (read-int-unsigned header)]
       (when-not (= major format-major)
         (raise "Unsupported txn-log record format major"
                {:offset offset :major major :expected format-major}))
-      {:major major
-       :flags flags
+      {:major    major
+       :flags    flags
        :body-len body-len
        :checksum checksum})))
 
+(defn- decode-header-bytes
+  [^bytes header-bytes offset]
+  (let [header (doto (ByteBuffer/wrap header-bytes)
+                 (.order ByteOrder/BIG_ENDIAN))]
+    (decode-header-buffer header offset)))
+
+(defn- read-fully-at!
+  ^ByteBuffer [^FileChannel ch ^long pos ^ByteBuffer bf]
+  (loop [p pos]
+    (if (.hasRemaining bf)
+      (let [n (.read ch bf p)]
+        (when (neg? n)
+          (raise "Unexpected EOF reading txn-log segment"
+                 {:position p :remaining (.remaining bf)}))
+        (when (zero? n)
+          (raise "Unable to progress while reading txn-log segment"
+                 {:position p :remaining (.remaining bf)}))
+        (recur (+ p n)))
+      bf)))
+
 (defn decode-record-bytes
+  "for test only"
   ([^bytes data] (decode-record-bytes data 0))
   ([^bytes data ^long offset]
    (let [total (alength data)]
@@ -484,59 +500,62 @@
                                       (int (+ offset record-header-size)))
            {:keys [major flags body-len checksum]}
            (decode-header-bytes header offset)
-           end (+ offset record-header-size body-len)]
-       (when (> end total)
+           end    (+ offset ^long record-header-size ^long body-len)]
+       (when (> ^long end total)
          (raise "Not enough bytes to decode txn-log record body"
                 {:offset offset :body-len body-len :size total}))
        (let [body (Arrays/copyOfRange data
                                       (int (+ offset record-header-size))
                                       (int end))]
-         (when-not (= checksum (long (bit-and 0xffffffff (crc32c body))))
+         (when-not (= ^int checksum (bit-and 0xffffffff ^int (crc32c body)))
            (raise "Txn-log record checksum mismatch"
                   {:offset offset :expected checksum}))
-         {:offset offset
+         {:offset      offset
           :next-offset end
-          :major major
-          :flags flags
-          :compressed? (pos? (bit-and flags compressed-flag))
-          :body-len body-len
-          :checksum checksum
-          :body body})))))
+          :major       major
+          :flags       flags
+          :compressed? (pos? ^long (bit-and flags compressed-flag))
+          :body-len    body-len
+          :checksum    checksum
+          :body        body})))))
 
 (defn- read-fully-at
   [^FileChannel ch ^long pos ^long len]
-  (let [^ByteBuffer bf (ByteBuffer/allocate (int len))]
-    (loop [p pos]
-      (if (.hasRemaining bf)
-        (let [n (.read ch bf p)]
-          (when (neg? n)
-            (raise "Unexpected EOF reading txn-log segment"
-                   {:position p :remaining (.remaining bf)}))
-          (when (zero? n)
-            (raise "Unable to progress while reading txn-log segment"
-                   {:position p :remaining (.remaining bf)}))
-          (recur (+ p n)))
-        (.array bf)))))
+  (let [out (byte-array (int len))
+        bf  (ByteBuffer/wrap out)]
+    (read-fully-at! ch pos bf)
+    out))
 
-(defn- bytes-all-zero?
-  [^bytes bs]
-  (loop [i (int 0)]
-    (if (< i (alength bs))
-      (if (zero? (aget bs i))
-        (recur (unchecked-inc-int i))
-        false)
-      true)))
+(defn- buffer-all-zero?
+  [^ByteBuffer bf]
+  (let [start (.position bf)
+        end   (.limit bf)]
+    (loop [i start]
+      (if (< i end)
+        (if (zero? (int (.get bf i)))
+          (recur (unchecked-inc-int i))
+          false)
+        true))))
 
 (defn- tail-all-zero?
-  [^FileChannel ch ^long offset ^long size]
-  (loop [pos offset]
-    (if (>= pos size)
-      true
-      (let [len (min 8192 (- size pos))
-            bs (read-fully-at ch pos len)]
-        (if (bytes-all-zero? bs)
-          (recur (+ pos len))
-          false)))))
+  ([^FileChannel ch ^long offset ^long size]
+   (let [^ByteBuffer read-bf (bf/get-array-buffer 8192)]
+     (try
+       (tail-all-zero? ch offset size read-bf)
+       (finally
+         (bf/return-array-buffer read-bf)))))
+  ([^FileChannel ch ^long offset ^long size ^ByteBuffer read-bf]
+   (loop [pos offset]
+     (if (>= pos size)
+       true
+       (let [len (int (min 8192 (- size pos)))]
+         (.clear read-bf)
+         (.limit read-bf len)
+         (read-fully-at! ch pos read-bf)
+         (.flip read-bf)
+         (if (buffer-all-zero? read-bf)
+           (recur (+ pos len))
+           false))))))
 
 (defn scan-segment
   "Scan a txn-log segment.
@@ -553,98 +572,110 @@
   - `:on-record` callback invoked for each decoded record"
   ([^String path] (scan-segment path {}))
   ([^String path {:keys [allow-preallocated-tail? collect-records? on-record]
-                  :or {allow-preallocated-tail? false
-                       collect-records? true}}]
+                  :or   {allow-preallocated-tail? false
+                         collect-records?         true}}]
    (let [f (io/file path)]
      (with-open [^FileChannel ch (FileChannel/open
-                                  (.toPath f)
-                                  (into-array StandardOpenOption
-                                              [StandardOpenOption/READ]))]
-       (let [size (.size ch)]
-         (loop [offset 0
-                records (when collect-records? [])]
-           (let [remaining (- size offset)]
-             (cond
-               (zero? remaining)
-               {:records records
-                :valid-end offset
-                :size size
-                :partial-tail? false}
+                                   (.toPath f)
+                                   (into-array StandardOpenOption
+                                               [StandardOpenOption/READ]))]
+       (let [size                (.size ch)
+             ^ByteBuffer read-bf (doto (bf/get-array-buffer 8192)
+                                   (.order ByteOrder/BIG_ENDIAN))]
+         (try
+           (loop [offset  0
+                  records (when collect-records? [])]
+             (let [remaining (- size offset)]
+               (cond
+                 (zero? remaining)
+                 {:records       records
+                  :valid-end     offset
+                  :size          size
+                  :partial-tail? false}
 
-               (< remaining record-header-size)
-               {:records records
-                :valid-end offset
-                :size size
-                :partial-tail? true}
+                 (< remaining record-header-size)
+                 {:records       records
+                  :valid-end     offset
+                  :size          size
+                  :partial-tail? true}
 
-               :else
-               (let [header-bytes (read-fully-at ch offset record-header-size)
-                     header-map (try
-                                  (decode-header-bytes header-bytes offset)
-                                  (catch Exception e
-                                    (if (and allow-preallocated-tail?
-                                             (tail-all-zero? ch offset size))
-                                      :txlog/preallocated-tail
-                                      (throw (ex-info "Txn-log segment corruption"
-                                                      {:type :txlog/corrupt
-                                                       :path path
-                                                       :offset offset}
-                                                      e)))))
-                     body-len (when (map? header-map)
-                                (long (:body-len header-map)))
-                     total-len (when body-len
-                                 (+ record-header-size body-len))]
-                 (cond
-                   (= header-map :txlog/preallocated-tail)
-                   {:records records
-                    :valid-end offset
-                    :size size
-                    :partial-tail? true
-                    :preallocated-tail? true}
+                 :else
+                 (let [_         (doto read-bf
+                                   (.clear)
+                                   (.limit record-header-size))
+                       _         (read-fully-at! ch offset read-bf)
+                       _         (.flip read-bf)
+                       header-map
+                       (try
+                         (decode-header-buffer read-bf offset)
+                         (catch Exception e
+                           (if (and allow-preallocated-tail?
+                                    (tail-all-zero? ch offset size read-bf))
+                             :txlog/preallocated-tail
+                             (throw (ex-info "Txn-log segment corruption"
+                                             {:type   :txlog/corrupt
+                                              :path   path
+                                              :offset offset}
+                                             e)))))
+                       body-len  (when (map? header-map)
+                                   (:body-len header-map))
+                       total-len (when body-len
+                                   (+ ^long record-header-size
+                                      ^long body-len))]
+                   (cond
+                     (identical? header-map :txlog/preallocated-tail)
+                     {:records            records
+                      :valid-end          offset
+                      :size               size
+                      :partial-tail?      true
+                      :preallocated-tail? true}
 
-                   (> total-len remaining)
-                   {:records records
-                    :valid-end offset
-                    :size size
-                    :partial-tail? true}
+                     (> ^long total-len ^long remaining)
+                     {:records       records
+                      :valid-end     offset
+                      :size          size
+                      :partial-tail? true}
 
-                   :else
-                   (let [record (try
-                                  (let [{:keys [major flags body-len checksum]}
-                                        header-map
-                                        body (read-fully-at
-                                              ch
-                                              (+ offset record-header-size)
-                                              body-len)]
-                                    (when-not (= checksum
-                                                 (long (bit-and 0xffffffff
-                                                                (crc32c body))))
-                                      (raise "Txn-log record checksum mismatch"
-                                             {:offset offset
-                                              :expected checksum}))
-                                    {:major major
-                                     :flags flags
-                                     :compressed? (pos? (bit-and flags
-                                                                 compressed-flag))
-                                     :body-len body-len
-                                     :checksum checksum
-                                     :body body})
-                                  (catch Exception e
-                                    (throw (ex-info "Txn-log segment corruption"
-                                                    {:type :txlog/corrupt
-                                                     :path path
-                                                     :offset offset}
-                                                    e))))
-                         next-offset (long (+ offset total-len))
-                         record* (assoc record
-                                        :offset offset
-                                        :next-offset next-offset)]
-                     (when on-record
-                       (on-record record*))
-                     (recur next-offset
-                            (if collect-records?
-                              (conj records record*)
-                              records)))))))))))))
+                     :else
+                     (let [record
+                           (try
+                             (let [{:keys [major flags body-len checksum]}
+                                   header-map
+                                   body (read-fully-at
+                                          ch
+                                          (+ offset record-header-size)
+                                          body-len)]
+                               (when-not (= checksum
+                                            ^long (bit-and 0xffffffff
+                                                           (crc32c body)))
+                                 (raise "Txn-log record checksum mismatch"
+                                        {:offset   offset
+                                         :expected checksum}))
+                               {:major       major
+                                :flags       flags
+                                :compressed? (pos? (bit-and flags
+                                                            compressed-flag))
+                                :body-len    body-len
+                                :checksum    checksum
+                                :body        body})
+                             (catch Exception e
+                               (throw (ex-info "Txn-log segment corruption"
+                                               {:type   :txlog/corrupt
+                                                :path   path
+                                                :offset offset}
+                                               e))))
+                           next-offset (long (+ offset total-len))
+                           record*     (assoc record
+                                              :offset offset
+                                              :next-offset next-offset)]
+                       (when on-record
+                         (on-record record*))
+                       (recur next-offset
+                              (if collect-records?
+                                (conj records record*)
+                                records))))))))
+           (finally
+             (bf/return-array-buffer read-bf))))))))
 
 (defn truncate-partial-tail!
   ([^String path] (truncate-partial-tail! path {}))
@@ -653,9 +684,9 @@
          (scan-segment path scan-opts)]
      (if partial-tail?
        (with-open [^FileChannel ch (FileChannel/open
-                                    (.toPath (io/file path))
-                                    (into-array StandardOpenOption
-                                                [StandardOpenOption/WRITE]))]
+                                     (.toPath (io/file path))
+                                     (into-array StandardOpenOption
+                                                 [StandardOpenOption/WRITE]))]
          (.truncate ch (long valid-end))
          (assoc scan
                 :size valid-end
@@ -691,48 +722,21 @@
 (defn append-record-at!
   ([^FileChannel ch ^long offset ^bytes body]
    (append-record-at! ch offset body {}))
-  ([^FileChannel ch ^long offset ^bytes body {:keys [compressed?]
-                                              :or {compressed? false}}]
-   (let [body-len (checked-record-body-len body)
-         checksum (record-body-checksum body)
-         total-size (+ record-header-size body-len)
+  ([^FileChannel ch ^long offset ^bytes body
+    {:keys [compressed?] :or {compressed? false}}]
+   (let [body-len        (checked-record-body-len body)
+         checksum        (record-body-checksum body)
+         total-size      (+ record-header-size body-len)
          ^ByteBuffer hdr (write-record-header!
-                          (.get tl-record-header-buffer)
-                          body-len
-                          (boolean compressed?)
-                          checksum)]
+                           (.get tl-record-header-buffer)
+                           body-len
+                           (boolean compressed?)
+                           checksum)]
      (.position ch offset)
      (if (pos? body-len)
        (write-fully-buffers! ch
                              (into-array ByteBuffer [hdr (ByteBuffer/wrap body)]))
        (write-fully! ch hdr))
-     {:offset offset :size total-size :checksum checksum})))
-
-(defn append-record-at-mapped!
-  ([^MappedByteBuffer mmap ^long offset ^bytes body]
-   (append-record-at-mapped! mmap offset body {}))
-  ([^MappedByteBuffer mmap ^long offset ^bytes body {:keys [compressed?]
-                                                     :or {compressed? false}}]
-   (let [body-len (checked-record-body-len body)
-         checksum (record-body-checksum body)
-         total-size (+ record-header-size body-len)
-         end-offset (+ offset total-size)]
-     (when (> end-offset (long (.capacity mmap)))
-       (raise "Txn-log mmap append exceeds mapped segment capacity"
-              {:type :txlog/mmap-capacity-exceeded
-               :offset offset
-               :record-size total-size
-               :mapped-bytes (long (.capacity mmap))}))
-     (let [^ByteBuffer hdr (write-record-header!
-                            (.get tl-record-header-buffer)
-                            body-len
-                            (boolean compressed?)
-                            checksum)
-           ^ByteBuffer out (.duplicate mmap)]
-       (.position out (int offset))
-       (.put out ^ByteBuffer (.duplicate hdr))
-       (when (pos? body-len)
-         (.put out body 0 (int body-len))))
      {:offset offset :size total-size :checksum checksum})))
 
 (defn append-record!
@@ -742,79 +746,21 @@
    (let [offset (.size ch)]
      (append-record-at! ch offset body opts))))
 
-(defn- mmap-mode-state?
-  [state]
-  (= :mmap (:segment-prealloc-mode state)))
-
-(defn- ensure-channel-size-at-least!
-  [^FileChannel ch ^long bytes]
-  (when (pos? bytes)
-    (let [size (.size ch)]
-      (when (< size bytes)
-        (.position ch (dec bytes))
-        (write-fully! ch (ByteBuffer/wrap (byte-array [(byte 0x00)])))))))
-
-(defn- desired-mmap-bytes
-  ^long [state ^long min-bytes]
-  (let [prealloc-bytes (long (or (:segment-prealloc-bytes state) 0))
-        segment-max-bytes (long (or (:segment-max-bytes state) 0))]
-    (long (max 1 min-bytes prealloc-bytes segment-max-bytes))))
-
-(defn- segment-mapped-buffer
-  [state]
-  (when-let [mmap-v (:segment-mmap state)]
-    @mmap-v))
-
-(defn ensure-segment-mapped!
-  [state]
-  (when (and (:segment-prealloc? state)
-             (mmap-mode-state? state))
-    (when-let [mmap-v (:segment-mmap state)]
-      (when-let [^FileChannel ch @(:segment-channel state)]
-        (let [offset (long (if-let [segment-offset (:segment-offset state)]
-                             @segment-offset
-                             (.size ch)))
-              map-bytes (desired-mmap-bytes state (inc (max 0 offset)))
-              existing ^MappedByteBuffer @mmap-v
-              existing-cap (when existing (long (.capacity existing)))]
-          (when (> map-bytes Integer/MAX_VALUE)
-            (raise "Txn-log mmap mode requires segment size <= 2GB"
-                   {:type :txlog/mmap-size-too-large
-                    :wal-segment-prealloc-bytes map-bytes
-                    :max Integer/MAX_VALUE}))
-          (when (or (nil? existing) (< existing-cap map-bytes))
-            (ensure-channel-size-at-least! ch map-bytes)
-            (vreset! mmap-v (.map ch FileChannel$MapMode/READ_WRITE
-                                  0 map-bytes)))
-          (long (.capacity ^MappedByteBuffer @mmap-v)))))))
-
-(defn close-segment-mapping!
-  [state]
-  (when-let [mmap-v (:segment-mmap state)]
-    (when-let [^MappedByteBuffer mmap @mmap-v]
-      (try
-        (.force mmap)
-        (catch Exception _))
-      (vreset! mmap-v nil)))
-  true)
-
 (defn force-segment!
   [state ^FileChannel ch sync-mode]
-  (when-let [^MappedByteBuffer mmap (segment-mapped-buffer state)]
-    (.force mmap))
   (force-channel! ch sync-mode))
 
 (defn prepare-segment!
   "Create and preallocate a segment at `tmp-path`."
   [^String tmp-path ^long bytes]
   (let [p (.toPath (io/file tmp-path))]
-    (with-open [^FileChannel ch (FileChannel/open
-                                 p
-                                 (into-array StandardOpenOption
-                                             [StandardOpenOption/CREATE
-                                              StandardOpenOption/TRUNCATE_EXISTING
-                                              StandardOpenOption/READ
-                                              StandardOpenOption/WRITE]))]
+    (with-open [^FileChannel ch
+                (FileChannel/open
+                  p (into-array StandardOpenOption
+                                [StandardOpenOption/CREATE
+                                 StandardOpenOption/TRUNCATE_EXISTING
+                                 StandardOpenOption/READ
+                                 StandardOpenOption/WRITE]))]
       (when (pos? bytes)
         (.position ch (dec bytes))
         (.write ch (ByteBuffer/wrap (byte-array [(byte 0x00)]))))
@@ -844,43 +790,45 @@
 (defn activate-next-segment!
   "Activate preallocated next segment if present, else create empty segment."
   [^String dir ^long segment-id]
-  (let [tmp-path (prepared-segment-path dir segment-id)
+  (let [tmp-path   (prepared-segment-path dir segment-id)
         final-path (segment-path dir segment-id)
-        tmp-file (io/file tmp-path)
+        tmp-file   (io/file tmp-path)
         final-file (io/file final-path)]
     (cond
       (.exists final-file) final-path
-      (.exists tmp-file) (activate-prepared-segment! tmp-path final-path)
-      :else (do
-              (with-open [^FileChannel _ (open-segment-channel final-path)])
-              final-path))))
+      (.exists tmp-file)   (activate-prepared-segment! tmp-path final-path)
+      :else
+      (do
+        (with-open [^FileChannel _ (open-segment-channel final-path)])
+        final-path))))
 
 (defn preallocation-enabled-state?
   [state]
   (and (:segment-prealloc? state)
-       (contains? #{:native :mmap} (:segment-prealloc-mode state))
+       (contains? #{:native} (:segment-prealloc-mode state))
        (pos? (long (or (:segment-prealloc-bytes state) 0)))))
 
 (defn- inc-volatile-long!
   [v]
   (when (some? v)
-    (vreset! v (inc (long @v)))))
+    (vswap! v u/long-inc)
+    #_(vreset! v (u/long-inc @v))))
 
 (defn- add-volatile-long!
   [v delta]
   (when (some? v)
-    (vreset! v (+ (long @v) (long (or delta 0))))))
+    (vreset! v (+ ^long @v ^long (or delta 0)))))
 
 (defn ensure-next-segment-prepared!
   [state]
   (when (preallocation-enabled-state? state)
-    (let [next-id (inc ^long @(:segment-id state))
-          dir (:dir state)
-          tmp-file (io/file (prepared-segment-path dir next-id))
+    (let [next-id    (inc ^long @(:segment-id state))
+          dir        (:dir state)
+          tmp-file   (io/file (prepared-segment-path dir next-id))
           final-file (io/file (segment-path dir next-id))]
       (cond
         (.exists final-file) false
-        (.exists tmp-file) true
+        (.exists tmp-file)   true
         :else
         (try
           (prepare-next-segment! dir next-id
@@ -894,27 +842,26 @@
 (defn- activated-segment-offset
   [^String path preserve-preallocated-tail?]
   (let [scan (scan-segment path {:allow-preallocated-tail? true
-                                 :collect-records? false})]
+                                 :collect-records?         false})]
     (cond
       (and preserve-preallocated-tail?
            (:preallocated-tail? scan))
-      (long (:valid-end scan))
+      (:valid-end scan)
 
       (:partial-tail? scan)
       (segment-end-offset
-       (truncate-partial-tail! path {:allow-preallocated-tail? true}))
+        (truncate-partial-tail! path {:allow-preallocated-tail? true}))
 
       :else
-      (long (:valid-end scan)))))
+      (:valid-end scan))))
 
 (def ^:private append-near-roll-sample-max 512)
 
 (defn- near-roll-threshold
   [^long segment-max-bytes]
   (if (pos? segment-max-bytes)
-    (long (max 1
-               (min (quot segment-max-bytes 20)
-                    (* 16 1024 1024))))
+    (max 1 ^long (min (quot ^long segment-max-bytes 20)
+                      (* 16 1024 1024)))
     0))
 
 (defn- near-roll-append?
@@ -927,20 +874,15 @@
 (defn- ensure-fast-list
   ^FastList [x]
   (cond
-    (instance? FastList x)
-    x
+    (instance? FastList x) x
 
-    (instance? java.util.Collection x)
-    (FastList. ^java.util.Collection x)
+    (instance? Collection x) (FastList. ^Collection x)
 
-    (nil? x)
-    (FastList.)
+    (nil? x) (FastList.)
 
-    :else
-    (let [^FastList out (FastList.)]
-      (doseq [v x]
-        (.add out v))
-      out)))
+    :else (let [^FastList out (FastList.)]
+            (doseq [v x] (.add out v))
+            out)))
 
 (defn- ensure-fast-list-volatile!
   ^FastList [v]
@@ -983,18 +925,18 @@
 (defn- record-append-near-roll-ms!
   [state duration-ms]
   (when-let [samples-v (:append-near-roll-durations state)]
-    (let [duration (long (max 0 (or duration-ms 0)))
-          sorted-v (:append-near-roll-sorted-durations state)
-          p99-v (:append-p99-near-roll-ms state)
+    (let [duration     (long (max 0 (or duration-ms 0)))
+          sorted-v     (:append-near-roll-sorted-durations state)
+          p99-v        (:append-p99-near-roll-ms state)
           metrics-lock (or (:append-lock state) state)]
       (locking metrics-lock
         (let [^FastList samples (ensure-fast-list-volatile! samples-v)
-              ^FastList sorted (when sorted-v
-                                 (ensure-fast-list-volatile! sorted-v))]
+              ^FastList sorted  (when sorted-v
+                                  (ensure-fast-list-volatile! sorted-v))]
           (when (and sorted
                      (not= (.size sorted) (.size samples)))
             (.clear sorted)
-            (.addAll sorted ^java.util.Collection samples)
+            (.addAll sorted ^Collection samples)
             (.sort sorted nil))
           (when (>= (.size samples) append-near-roll-sample-max)
             (let [dropped (long (.get samples 0))]
@@ -1005,7 +947,7 @@
           (if sorted
             (insert-sorted-long! sorted duration)
             (when p99-v
-              (let [tmp (doto (FastList. ^java.util.Collection samples)
+              (let [tmp (doto (FastList. ^Collection samples)
                           (.sort nil))]
                 (vreset! p99-v (p99-from-sorted-ms tmp)))))
           (when (and sorted p99-v)
@@ -1032,7 +974,6 @@
            {:segment-max-bytes (:segment-max-bytes state)
             :segment-max-ms (:segment-max-ms state)})
       (let [roll-start-ms (System/currentTimeMillis)]
-        (close-segment-mapping! state)
         (.truncate ch bytes)
         (force-channel! ch (:sync-mode state))
         (.close ch)
@@ -1061,7 +1002,6 @@
           (add-volatile-long!
            (:segment-roll-duration-ms state)
            (- (System/currentTimeMillis) roll-start-ms))
-          (ensure-segment-mapped! state)
           (ensure-next-segment-prepared! state))))))
 
 (def ^:const no-floor-lsn
@@ -1958,11 +1898,19 @@
   [^FileChannel ch ^long offset]
   (let [size (.size ch)]
     (when (<= (+ offset meta-slot-size) size)
-      (let [slot-bytes (read-fully-at ch offset meta-slot-size)]
+      (let [^ByteBuffer slot-bf (bf/get-array-buffer meta-slot-size)]
         (try
-          (decode-meta-slot-bytes slot-bytes)
+          (.clear slot-bf)
+          (.limit slot-bf meta-slot-size)
+          (read-fully-at! ch offset slot-bf)
+          (.flip slot-bf)
+          (let [slot-bytes (byte-array meta-slot-size)]
+            (.get slot-bf slot-bytes)
+            (decode-meta-slot-bytes slot-bytes))
           (catch Exception _
-            nil))))))
+            nil)
+          (finally
+            (bf/return-array-buffer slot-bf)))))))
 
 (defn read-meta-file
   [^String path]
@@ -2274,7 +2222,7 @@
                   context))))
 
 (defn- bb-put-byte!
-  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^long v]
+  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl v]
   (let [bf (ensure-room! bf tl 1)]
     (.put bf (byte v))
     bf))
@@ -2466,16 +2414,11 @@
             (recur new-bf))
           (let [^ByteBuffer done result]
             (maybe-shrink-threadlocal-buffer!
-             tl-bits-buffer
-             done
-             (.remaining done)
-             tl-bits-buffer-initial-cap)
+              tl-bits-buffer
+              done
+              (.remaining done)
+              tl-bits-buffer-initial-cap)
             done))))))
-
-(defn- encode-bits
-  [x t]
-  (let [^ByteBuffer bf (encode-to-buf x t)]
-    (b/get-bytes (.duplicate bf))))
 
 (defn- decode-bits
   [^bytes bs t]
@@ -2892,12 +2835,9 @@
                        (.size ch)))
         append-start-ms now
         near-roll? (near-roll-append? state offset)
-        mmap (segment-mapped-buffer state)
         {:keys [body lmdb-rows]}
         (encode-commit-row-payload+lmdb-rows lsn now rows)
-        append-res (if mmap
-                     (append-record-at-mapped! mmap offset body)
-                     (append-record-at! ch offset body))
+        append-res (append-record-at! ch offset body)
         next-offset (+ offset (long (:size append-res)))]
     (when segment-offset
       (vreset! segment-offset next-offset))
@@ -3096,15 +3036,10 @@
 (defn- sync-reason-array->map
   [^longs arr]
   (persistent!
-   (reduce-kv (fn [acc idx reason]
-                (assoc! acc reason (long (aget arr idx))))
-              (transient {})
-              sync-reasons)))
-
-(defn- batched-sync-reason?
-  [reason]
-  (or (= reason :batch-count)
-      (= reason :batch-time)))
+    (reduce-kv (fn [acc idx reason]
+                 (assoc! acc reason (long (aget arr idx))))
+               (transient {})
+               sync-reasons)))
 
 (defn- avg-ms
   [total count]

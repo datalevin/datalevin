@@ -507,12 +507,13 @@
   (attrs [_] attrs)
 
   (init-max-eid [_]
-    (let [e    (volatile! c/e0)
-          read (fn [kv]
-                 (when-let [res (b/read-buffer (lmdb/k kv) :id)]
-                   (vreset! e res)
-                   :datalevin/terminate-visit))]
-      (visit lmdb c/eav read [:all-back])
+    (let [e (volatile! c/e0)]
+      (scan/visit-key-range
+        lmdb c/eav
+        (fn [eid]
+          (vreset! e eid)
+          :datalevin/terminate-visit)
+        [:all-back] :id false)
       @e))
 
   (swap-attr [this attr f]
