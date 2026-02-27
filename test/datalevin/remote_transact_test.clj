@@ -1,5 +1,6 @@
 (ns datalevin.remote-transact-test
   (:require
+   [datalevin.conn :as conn]
    [datalevin.core :as d]
    [datalevin.util :as u]
    [datalevin.datom :as dd]
@@ -139,3 +140,23 @@
                   :where [1 :aka ?v]] @conn)
            #{["Devil"] ["Tupen"]}))
     (d/close conn)))
+
+(deftest remote-non-explicit-writes-use-sync-queue-test
+  (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
+                   (UUID/randomUUID))
+        conn  (d/create-conn
+                dir
+                {:id {:db/valueType :db.type/long}}
+                {:kv-opts {:wal? true
+                           :wal-durability-profile :strict}})
+        paths (atom [])]
+    (try
+      (binding [conn/*txlog-sync-path-observer*
+                #(swap! paths conj %)]
+        (d/transact! conn [{:id 1}]))
+      (is (= [:queued-strict] @paths))
+      (is (= 1 (d/q '[:find (count ?e) .
+                      :where [?e :id]]
+                    (d/db conn))))
+      (finally
+        (d/close conn)))))

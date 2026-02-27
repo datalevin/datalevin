@@ -199,26 +199,47 @@
       ^AtomicBoolean direct-active)))
 
 (defn- current-thread-holds-store-write-lock?
-  [^Store store]
+  [store]
   (boolean
     (when-let [write-lock (l/write-txn store)]
       (Thread/holdsLock write-lock))))
+
+(defn- wal-sync-queue-profile-from-opts
+  [opts]
+  (let [opts    (c/canonicalize-wal-opts opts)
+        profile (or (:wal-durability-profile opts)
+                    c/*wal-durability-profile*)]
+    (when (and (true? (:wal? opts)) profile)
+      profile)))
+
+(defn- cached-remote-store-opts
+  [conn ^DatalogStore store]
+  (if-some [entry (find (meta conn) :remote-store-opts-cache)]
+    (val entry)
+    (let [opts (c/canonicalize-wal-opts (i/opts store))]
+      (alter-meta! conn assoc :remote-store-opts-cache opts)
+      opts)))
 
 (defn- txlog-sync-queue-profile
   [conn]
   (when (and (not *sync-queue-worker?*)
              (conn? conn))
     (let [store (.-store ^DB @conn)]
-      (when (instance? Store store)
-        (let [lmdb (.-lmdb ^Store store)
-              env-opts (i/env-opts lmdb)
-              profile (or (:wal-durability-profile env-opts)
-                          c/*wal-durability-profile*)]
-          (when (and (not (current-thread-holds-store-write-lock? ^Store store))
-                     (not (l/writing? lmdb))
-                     (true? (:wal? env-opts))
-                     profile)
-            profile))))))
+      (when (and (not (current-thread-holds-store-write-lock? store))
+                 (or (and (instance? Store store)
+                          (not (l/writing? (.-lmdb ^Store store))))
+                     (and (instance? DatalogStore store)
+                          (not (l/writing? store)))))
+        (cond
+          (instance? Store store)
+          (wal-sync-queue-profile-from-opts
+            (i/env-opts (.-lmdb ^Store store)))
+
+          (instance? DatalogStore store)
+          (wal-sync-queue-profile-from-opts
+            (cached-remote-store-opts conn store))
+
+          :else nil)))))
 
 (defn- strict-txlog-sync-queue?
   [conn]
@@ -295,7 +316,13 @@
 
 (defn opts
   [conn]
-  (i/opts ^Store (.-store ^DB @conn)))
+  (let [store (.-store ^DB @conn)
+        opts  (i/opts store)]
+    (when (instance? DatalogStore store)
+      (alter-meta! conn assoc
+                   :remote-store-opts-cache
+                   (c/canonicalize-wal-opts opts)))
+    opts))
 
 (defn schema
   "Return the schema of Datalog DB"

@@ -268,6 +268,8 @@ for EDN data.
 
 Please refer to the [API
 documentation](https://cljdoc.org/d/datalevin/datalevin) for more details.
+The [WAL guide](doc/wal.md) documents durability profiles, risk-window knobs,
+and WAL operational APIs.
 
 ## :bar_chart: Benchmarks
 

@@ -1,4 +1,4 @@
-# Datalevin Rules Engine
+# Datalevin Rule Engine
 
 Datalevin has an innovative rule engine that implements an efficient rules
 evaluation strategy that leverages the cost based query optimizer.
