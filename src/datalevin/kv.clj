@@ -1485,9 +1485,10 @@
             (txlog/complete-sync-success! sync-manager
                                           target-lsn
                                           (System/currentTimeMillis)
-                                          reason)
+                                          reason
+                                          false)
             (catch Exception e
-              (txlog/complete-sync-failure! sync-manager e)
+              (txlog/complete-sync-failure! sync-manager e false)
               (txlog-mark-fatal! state e)
               (throw e)))))
       (txlog/await-durable-lsn! sync-manager target-lsn timeout-ms

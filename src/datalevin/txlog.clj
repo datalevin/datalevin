@@ -2866,16 +2866,17 @@
         (force-segment! state ch (:sync-mode state))
         (let [force-end-ms (System/currentTimeMillis)
               reason (:reason sync-begin)]
-          (record-fsync-ms! sync-manager (- force-end-ms force-start-ms))
+          (record-fsync-ms! sync-manager (- force-end-ms force-start-ms) false)
           (complete-sync-success! sync-manager
                                   target-lsn
                                   force-end-ms
-                                  reason)
+                                  reason
+                                  false)
           {:target-lsn target-lsn
            :sync-done-ms force-end-ms
            :sync-reason reason}))
       (catch Exception e
-        (complete-sync-failure! sync-manager e)
+        (complete-sync-failure! sync-manager e false)
         (when mark-fatal!
           (mark-fatal! state e))
         (throw e)))))
@@ -2969,7 +2970,8 @@
         done-ms (or sync-done-ms (System/currentTimeMillis))]
     (record-commit-wait-ms! sync-manager
                             (- done-ms append-start-ms)
-                            sync-reason)
+                            sync-reason
+                            false)
     (when near-roll?
       (record-append-near-roll-ms! state (- done-ms append-start-ms)))
     (assoc append-res
@@ -3254,18 +3256,23 @@
      ^long @(:last-durable-lsn sync-manager)))
 
 (defn record-fsync-ms!
-  [{:keys [monitor] :as manager} duration-ms]
-  (let [v (long (max 0 (or duration-ms 0)))
-        now (now-ms)]
-    (locking monitor
-      (vreset! (:last-fsync-ms manager) v)
-      (vreset! (:last-fsync-at-ms manager) now)
-      (sync-manager-state manager))))
+  ([manager duration-ms]
+   (record-fsync-ms! manager duration-ms true))
+  ([{:keys [monitor] :as manager} duration-ms snapshot?]
+   (let [v (long (max 0 (or duration-ms 0)))
+         now (now-ms)]
+     (locking monitor
+       (vreset! (:last-fsync-ms manager) v)
+       (vreset! (:last-fsync-at-ms manager) now)
+       (when snapshot?
+         (sync-manager-state manager))))))
 
 (defn record-commit-wait-ms!
   ([manager duration-ms]
-   (record-commit-wait-ms! manager duration-ms nil))
-  ([{:keys [monitor] :as manager} duration-ms reason]
+   (record-commit-wait-ms! manager duration-ms nil true))
+  ([manager duration-ms reason]
+   (record-commit-wait-ms! manager duration-ms reason true))
+  ([{:keys [monitor] :as manager} duration-ms reason snapshot?]
    (let [v (long (max 0 (or duration-ms 0)))
          now (now-ms)]
      (locking monitor
@@ -3285,26 +3292,33 @@
          (aset-long wait-totals idx (+ ^long (aget wait-totals idx) v))
          (aset-long wait-counts idx
                     (long (inc (long (aget wait-counts idx))))))
-       (sync-manager-state manager)))))
+       (when snapshot?
+         (sync-manager-state manager))))))
 
 (defn reset-sync-health!
-  [{:keys [monitor] :as manager}]
-  (locking monitor
-    (vreset! (:healthy? manager) true)
-    (vreset! (:failure manager) nil)
-    (.notifyAll monitor)
-    (sync-manager-state manager)))
+  ([manager]
+   (reset-sync-health! manager true))
+  ([{:keys [monitor] :as manager} snapshot?]
+   (locking monitor
+     (vreset! (:healthy? manager) true)
+     (vreset! (:failure manager) nil)
+     (.notifyAll monitor)
+     (when snapshot?
+       (sync-manager-state manager)))))
 
 (defn- mark-unhealthy!
-  [{:keys [monitor] :as manager} ex]
-  (locking monitor
-    (vreset! (:sync-in-progress? manager) false)
-    (vreset! (:sync-requested? manager) false)
-    (vreset! (:sync-request-reason manager) nil)
-    (vreset! (:healthy? manager) false)
-    (vreset! (:failure manager) ex)
-    (.notifyAll monitor)
-    (sync-manager-state manager)))
+  ([manager ex]
+   (mark-unhealthy! manager ex true))
+  ([{:keys [monitor] :as manager} ex snapshot?]
+   (locking monitor
+     (vreset! (:sync-in-progress? manager) false)
+     (vreset! (:sync-requested? manager) false)
+     (vreset! (:sync-request-reason manager) nil)
+     (vreset! (:healthy? manager) false)
+     (vreset! (:failure manager) ex)
+     (.notifyAll monitor)
+     (when snapshot?
+       (sync-manager-state manager)))))
 
 (defn request-sync-on-append!
   ([manager lsn] (request-sync-on-append! manager lsn (now-ms)))
@@ -3429,10 +3443,12 @@
              nil)))))))
 
 (defn complete-sync-success!
-  ([manager] (complete-sync-success! manager nil (now-ms)))
+  ([manager] (complete-sync-success! manager nil (now-ms) nil true))
   ([manager target-lsn now]
-   (complete-sync-success! manager target-lsn now nil))
-  ([{:keys [monitor] :as manager} target-lsn now reason]
+   (complete-sync-success! manager target-lsn now nil true))
+  ([manager target-lsn now reason]
+   (complete-sync-success! manager target-lsn now reason true))
+  ([{:keys [monitor] :as manager} target-lsn now reason snapshot?]
    (locking monitor
      (let [last-durable-lsn (long @(:last-durable-lsn manager))
            last-appended-lsn (long @(:last-appended-lsn manager))
@@ -3472,12 +3488,15 @@
          (vreset! (:forced-sync-count manager)
                   (long (inc (long @(:forced-sync-count manager))))))
        (.notifyAll monitor)
-       (sync-manager-state manager)))))
+       (when snapshot?
+         (sync-manager-state manager))))))
 
 (defn complete-sync-failure!
-  [manager ex]
-  (let [failure (or ex (ex-info "Txn-log sync failed" {:type :txlog/sync-failed}))]
-    (mark-unhealthy! manager failure)))
+  ([manager ex]
+   (complete-sync-failure! manager ex true))
+  ([manager ex snapshot?]
+   (let [failure (or ex (ex-info "Txn-log sync failed" {:type :txlog/sync-failed}))]
+     (mark-unhealthy! manager failure snapshot?))))
 
 (defn await-durable-lsn!
   ([manager lsn timeout-ms]
@@ -3510,5 +3529,5 @@
                               {:type :txlog/commit-timeout
                                :lsn lsn
                                :timeout-ms timeout-ms})]
-                 (mark-unhealthy! manager timeout-ex)
+                 (mark-unhealthy! manager timeout-ex false)
                  (throw timeout-ex))))))))))

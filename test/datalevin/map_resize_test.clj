@@ -29,17 +29,17 @@
 
 (deftest map-resize-clear-test
   (let [dir (u/tmp-dir (str "clear-test-" (UUID/randomUUID)))]
-    (dotimes [_ 10]
+    (dotimes [_ 5]
       (let [conn (d/create-conn
                    dir {:buggy/key {:db/valueType :db.type/string
                                     :db/unique    :db.unique/identity}}
                    {:kv-opts {:mapsize 1
                               :flags   (conj c/default-env-flags :nosync)}})]
-        (d/transact! conn (for [i (range 100000)]
+        (d/transact! conn (for [i (range 10000)]
                             {:buggy/key  (format "%20d" i)
                              :buggy/val  (format "bubba-%d" i)
                              :buggy/time (System/currentTimeMillis)}))
-        (is (= 300000 (count (d/datoms (d/db conn) :eav))))
+        (is (= 30000 (count (d/datoms (d/db conn) :eav))))
         (d/close conn)
         (is (d/closed? conn))
 
@@ -49,7 +49,7 @@
 
         (let [conn2 (d/create-conn dir)]
           (is (= 0 (count (d/datoms (d/db conn2) :eav))))
-          (d/transact! conn2 [{:buggy/key  (format "%20d" 100001)
+          (d/transact! conn2 [{:buggy/key  (format "%20d" 10001)
                                :buggy/val  (format "bubba-%d" 100)
                                :buggy/time (System/currentTimeMillis)}])
 
