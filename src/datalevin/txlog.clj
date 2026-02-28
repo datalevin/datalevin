@@ -36,6 +36,15 @@
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x57) (byte 0x4c)]))
 (def ^:private segment-pattern #"^segment-(\d{16})\.wal$")
 (def ^:private prepared-segment-pattern #"^segment-(\d{16})\.wal\.tmp$")
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  open-segment-read-options
+  (into-array StandardOpenOption [StandardOpenOption/READ]))
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  open-segment-create-read-write-options
+  (into-array StandardOpenOption
+              [StandardOpenOption/CREATE
+               StandardOpenOption/READ
+               StandardOpenOption/WRITE]))
 
 (def ^:const meta-slot-payload-size 64)
 (def ^:const meta-slot-size (+ meta-slot-payload-size 4))
@@ -343,9 +352,15 @@
        (sort-by :id)
        vec))
 
+(def ^:private ^ThreadLocal tl-crc32c
+  (ThreadLocal/withInitial
+   (reify java.util.function.Supplier
+     (get [_] (CRC32C.)))))
+
 (defn- crc32c
   [^bytes bs]
-  (let [crc (CRC32C.)]
+  (let [^CRC32C crc (.get tl-crc32c)]
+    (.reset crc)
     (.update crc bs 0 (alength bs))
     (unchecked-int (.getValue crc))))
 
@@ -584,8 +599,7 @@
    (let [f (io/file path)]
      (with-open [^FileChannel ch (FileChannel/open
                                    (.toPath f)
-                                   (into-array StandardOpenOption
-                                               [StandardOpenOption/READ]))]
+                                   open-segment-read-options)]
        (let [size                (.size ch)
              ^ByteBuffer read-bf (doto (bf/get-array-buffer 8192)
                                    (.order ByteOrder/BIG_ENDIAN))]
@@ -721,10 +735,7 @@
   [^String path]
   (FileChannel/open
    (.toPath (io/file path))
-   (into-array StandardOpenOption
-               [StandardOpenOption/CREATE
-                StandardOpenOption/READ
-                StandardOpenOption/WRITE])))
+   open-segment-create-read-write-options))
 
 (defn append-record-at!
   ([^FileChannel ch ^long offset ^bytes body]
@@ -2345,6 +2356,15 @@
         (when (< new-cap cap)
           (.set tl (ByteBuffer/allocate (int new-cap))))))))
 
+(defn- maybe-shrink-bits-buffer!
+  []
+  (let [^ByteBuffer bf (.get tl-bits-buffer)]
+    (maybe-shrink-threadlocal-buffer!
+     tl-bits-buffer
+     bf
+     (.remaining bf)
+     tl-bits-buffer-initial-cap)))
+
 (defn- ensure-readable!
   [^ByteBuffer bf ^long needed context]
   (when (< (.remaining bf) needed)
@@ -2545,13 +2565,7 @@
           (let [new-bf (ByteBuffer/allocate (* 2 (.capacity bf)))]
             (.set tl-bits-buffer new-bf)
             (recur new-bf))
-          (let [^ByteBuffer done result]
-            (maybe-shrink-threadlocal-buffer!
-              tl-bits-buffer
-              done
-              (.remaining done)
-              tl-bits-buffer-initial-cap)
-            done))))))
+          ^ByteBuffer result)))))
 
 (defn- decode-bits
   [^bytes bs t]
@@ -2765,6 +2779,8 @@
      bfN
      len
      tl-row-encode-buffer-initial-cap)
+    ;; Parallel row encoding runs on worker threads, so keep their bits buffer bounded.
+    (maybe-shrink-bits-buffer!)
     out))
 
 (defn- append-kv-row-bytes!
@@ -2853,6 +2869,7 @@
      bfN
      len
      tl-commit-body-buffer-initial-cap)
+    (maybe-shrink-bits-buffer!)
     out))
 
 (defn- encode-commit-row-payload+lmdb-rows
@@ -2887,6 +2904,7 @@
      bfN
      len
      tl-commit-body-buffer-initial-cap)
+    (maybe-shrink-bits-buffer!)
     {:body out
      :lmdb-rows lmdb-rows}))
 

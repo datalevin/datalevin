@@ -1907,6 +1907,49 @@
           (finally
             (.close ^FileChannel @(:segment-channel state))))))))
 
+(deftest append-durable-strict-commit-wait-metrics-skip-snapshot-test
+  (with-temp-dir [dir]
+    (let [path1 (sut/segment-path dir 1)]
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :strict
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :none
+                   :commit-wait-ms                 1000
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
+                   :segment-prealloc-success-count (volatile! 0)
+                   :segment-prealloc-failure-count (volatile! 0)
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1000
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}
+            called (atom nil)]
+        (try
+          (with-redefs [sut/record-commit-wait-ms!
+                        (fn [& args]
+                          (reset! called args))]
+            (let [res (sut/append-durable! state [[:put "dbi" :k :v]] {})]
+              (is (true? (:synced? res)))
+              (is (= 4 (count @called)))
+              (is (false? (nth @called 3)))))
+          (finally
+            (.close ^FileChannel @(:segment-channel state))))))))
+
 (deftest sync-manager-trailing-target-batches-multiple-enqueued-lsns-test
   (let [mgr (sut/new-sync-manager {:group-commit 1000
                                    :group-commit-ms 100000
