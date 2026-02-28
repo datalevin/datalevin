@@ -343,6 +343,7 @@
          :commit-marker?         (commit-marker? info)
          :commit-marker-version  (long (commit-marker-version info))
          :meta-last-applied-lsn  last-applied
+         :meta-revision          (volatile! (long (or (:revision meta-cur) -1)))
          :meta-publish-lock      (Object.)
          :meta-flush-max-txs     (long (meta-flush-max-txs info))
          :meta-flush-max-ms      (long (meta-flush-max-ms info))
@@ -2142,9 +2143,13 @@
    (write-meta-file! path meta {}))
   ([^String path meta {:keys [sync-mode]
                        :or {sync-mode :fdatasync}}]
-   (let [existing (read-meta-file path)
-         prev-revision (long (or (get-in existing [:current :revision]) -1))
-         revision (long (or (:revision meta) (inc prev-revision)))
+   (let [revision (long
+                   (if-some [rev (:revision meta)]
+                     rev
+                     (let [existing (read-meta-file path)
+                           prev-revision
+                           (long (or (get-in existing [:current :revision]) -1))]
+                       (inc prev-revision))))
          slot-index (int (bit-and revision 0x1))
          slot-offset (long (* slot-index meta-slot-size))
          payload (assoc meta :revision revision)
@@ -2172,16 +2177,20 @@
 (defn publish-meta-best-effort!
   [state {:keys [lsn segment-id offset]}]
   (try
-    (let [sync-state (sync-manager-state (:sync-manager state))]
+    (let [sync-state (sync-manager-state (:sync-manager state))
+          meta-revision-v (:meta-revision state)
+          revision (when meta-revision-v
+                     (long (vswap! meta-revision-v inc)))]
       (write-meta-file!
        (:meta-path state)
-       {:last-committed-lsn lsn
-        :last-durable-lsn (:last-durable-lsn sync-state)
-        :last-applied-lsn lsn
-        :segment-id segment-id
-        :segment-offset offset
-        :updated-ms (System/currentTimeMillis)}
-       {:sync-mode (:sync-mode state)}))
+       (cond-> {:last-committed-lsn lsn
+                :last-durable-lsn (:last-durable-lsn sync-state)
+                :last-applied-lsn lsn
+                :segment-id segment-id
+                :segment-offset offset
+                :updated-ms (System/currentTimeMillis)}
+         (some? revision) (assoc :revision revision))
+       {:sync-mode :none}))
     (catch Exception _)))
 
 (defn maybe-publish-meta-best-effort!

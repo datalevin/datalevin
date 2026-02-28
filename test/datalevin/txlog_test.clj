@@ -2154,6 +2154,25 @@
         (is (= 0 (:revision current)))
         (is (= 10 (:last-committed-lsn current)))))))
 
+(deftest write-meta-file-explicit-revision-skips-read-test
+  (with-temp-dir [dir]
+    (let [path (sut/meta-path dir)]
+      (with-redefs [sut/read-meta-file
+                    (fn [_]
+                      (throw (ex-info "read-meta-file should not be called"
+                                      {})))]
+        (sut/write-meta-file! path {:revision 11
+                                    :last-committed-lsn 10
+                                    :last-durable-lsn 9
+                                    :last-applied-lsn 9
+                                    :segment-id 1
+                                    :segment-offset 100
+                                    :updated-ms 1000}
+                             {:sync-mode :none}))
+      (let [{:keys [current]} (sut/read-meta-file path)]
+        (is (= 11 (:revision current)))
+        (is (= 10 (:last-committed-lsn current)))))))
+
 (deftest maybe-publish-meta-best-effort-threshold-test
   (with-temp-dir [dir]
     (let [path (sut/meta-path dir)
@@ -2181,6 +2200,29 @@
       (let [{:keys [current]} (sut/read-meta-file path)]
         (is (= 2 (:last-committed-lsn current)))
         (is (= 2 (:last-durable-lsn current)))))))
+
+(deftest publish-meta-best-effort-uses-in-memory-revision-test
+  (with-temp-dir [dir]
+    (let [path (sut/meta-path dir)
+          mgr (sut/new-sync-manager {:last-durable-lsn 8
+                                     :last-appended-lsn 8
+                                     :group-commit 100
+                                     :group-commit-ms 100
+                                     :last-sync-ms (System/currentTimeMillis)})
+          state {:meta-path path
+                 :meta-revision (volatile! 4)
+                 :sync-manager mgr}
+          append-res {:lsn 9 :segment-id 2 :offset 123}]
+      (with-redefs [sut/read-meta-file
+                    (fn [_]
+                      (throw (ex-info "read-meta-file should not be called"
+                                      {})))]
+        (sut/publish-meta-best-effort! state append-res))
+      (is (= 5 @(:meta-revision state)))
+      (let [{:keys [current]} (sut/read-meta-file path)]
+        (is (= 5 (:revision current)))
+        (is (= 9 (:last-committed-lsn current)))
+        (is (= 8 (:last-durable-lsn current)))))))
 
 (deftest maybe-publish-meta-best-effort-releases-lock-before-publish-test
   (let [state {:meta-publish-lock (Object.)
