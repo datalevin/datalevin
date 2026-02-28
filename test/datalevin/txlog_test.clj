@@ -1649,6 +1649,69 @@
           (finally
             (.close ^FileChannel @(:segment-channel state))))))))
 
+(deftest append-durable-relaxed-releases-append-lock-before-sync-test
+  (with-temp-dir [dir]
+    (let [path1 (sut/segment-path dir 1)]
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :invalid
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
+                   :segment-prealloc-success-count (volatile! 0)
+                   :segment-prealloc-failure-count (volatile! 0)
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}
+            fatal-entered (promise)
+            allow-fatal   (promise)]
+        (try
+          (let [f1 (future
+                     (try
+                       (sut/append-durable! state
+                                            [[:put "dbi" :k1 :v1]]
+                                            {:mark-fatal!
+                                             (fn [_ _]
+                                               (deliver fatal-entered true)
+                                               @allow-fatal)})
+                       :ok
+                       (catch Exception _
+                         :failed)))]
+            (is (true? (deref fatal-entered 2000 false)))
+            (let [f2 (future
+                       (try
+                         (sut/append-durable! state [[:put "dbi" :k2 :v2]] {})
+                         :ok
+                         (catch Exception _
+                           :failed)))
+                  r2 (deref f2 3000 ::timeout)]
+              (is (not= ::timeout r2))
+              (is (= :failed r2))
+              (is (= 3 (long @(:next-lsn state))))
+              (is (= ::timeout (deref f1 100 ::timeout)))
+              (deliver allow-fatal true)
+              (is (= :failed (deref f1 2000 ::timeout)))))
+          (finally
+            (deliver allow-fatal true)
+            (.close ^FileChannel @(:segment-channel state))))))))
+
 (deftest append-durable-strict-single-writer-durable-per-append-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
