@@ -80,6 +80,7 @@
          complete-sync-success!
          complete-sync-failure!
          await-durable-lsn!
+         classify-record-kind
          decode-commit-row-payload)
 
 (defn enabled? [info] (true? (:wal? info)))
@@ -179,6 +180,70 @@
       (raise "WAL segment preallocation bytes must be non-negative"
              {:wal-segment-prealloc-bytes bytes}))))
 
+(defn- decode-scanned-record-entry
+  [^long segment-id ^String path record]
+  (try
+    (let [payload (decode-commit-row-payload ^bytes (:body record))
+          lsn     (long (or (:lsn payload) 0))]
+      (when-not (pos? lsn)
+        (raise "Txn-log payload missing valid positive LSN"
+               {:type :txlog/corrupt
+                :segment-id segment-id
+                :path path
+                :offset (long (:offset record))
+                :record record}))
+      (let [tx-time (long (or (:tx-time payload)
+                              (:ts payload)
+                              0))
+            rows    (vec (or (:ops payload) []))
+            tx-kind (classify-record-kind rows)]
+        {:lsn lsn
+         :tx-kind tx-kind
+         :tx-time tx-time
+         :rows rows
+         :segment-id segment-id
+         :offset (long (:offset record))
+         :checksum (long (:checksum record))
+         :path path}))
+    (catch Exception e
+      (raise "Malformed txn-log payload"
+             e
+             {:type :txlog/corrupt
+              :segment-id segment-id
+              :path path
+              :offset (long (:offset record))}))))
+
+(defn- txlog-records-cache-entry
+  [segment-id path file-bytes modified-ms records]
+  {:segment-id segment-id
+   :path path
+   :file-bytes file-bytes
+   :modified-ms modified-ms
+   :min-lsn (some-> records first :lsn long)
+   :records records})
+
+(defn- scan-segment-records-cache-entry
+  [^long segment-id ^File file allow-preallocated-tail?]
+  (let [path (.getPath file)
+        file-bytes (long (.length file))
+        modified-ms (long (.lastModified file))
+        acc (FastList.)
+        scan (scan-segment path
+                           {:allow-preallocated-tail? allow-preallocated-tail?
+                            :collect-records? false
+                            :on-record
+                            (fn [record]
+                              (.add acc
+                                    (decode-scanned-record-entry
+                                     segment-id
+                                     path
+                                     record)))})
+        records (vec acc)]
+    {:cache-entry (txlog-records-cache-entry
+                   segment-id path file-bytes modified-ms records)
+     :partial-tail? (boolean (:partial-tail? scan))
+     :last-lsn (some-> records peek :lsn long)}))
+
 (defn init-runtime-state
   [info marker-state]
   (validate-runtime-config! info)
@@ -186,26 +251,20 @@
                               (str (:dir info) u/+separator+ "txlog"))
         _                 (u/create-dirs dir)
         segments          (segment-files dir)
-        closed-last-lsn-v (volatile! nil)
-        _
-        (doseq [{:keys [file]} (butlast segments)]
-          (let [last-record-v (volatile! nil)
-                {:keys [partial-tail?]}
-                (scan-segment (.getPath ^File file)
-                              {:collect-records? false
-                               :on-record
-                               (fn [record]
-                                 (vreset! last-record-v record))})]
-            (when partial-tail?
-              (raise "Partial tail found on closed txn-log segment"
-                     {:type :txlog/corrupt
-                      :path (.getPath ^File file)}))
-            (when-let [last-record @last-record-v]
-              (vreset! closed-last-lsn-v
-                       (long (-> last-record
-                                 :body
-                                 decode-commit-row-payload
-                                 :lsn))))))
+        [closed-record-cache last-from-closed]
+        (reduce
+         (fn [[cache ^long closed-last-lsn] {:keys [id file]}]
+           (let [segment-id (long id)
+                 {:keys [cache-entry partial-tail? last-lsn]}
+                 (scan-segment-records-cache-entry segment-id file false)]
+             (when partial-tail?
+               (raise "Partial tail found on closed txn-log segment"
+                      {:type :txlog/corrupt
+                       :path (.getPath ^File file)}))
+             [(assoc cache segment-id cache-entry)
+              (long (or last-lsn closed-last-lsn))]))
+         [{} 0]
+         (butlast segments))
         active-id         (if (seq segments) (:id (last segments)) 1)
         active-path       (segment-path dir active-id)
         _                 (when-not (.exists (io/file active-path))
@@ -217,7 +276,24 @@
                                   (.close tmp-ch)))))
         active-scan       (truncate-partial-tail!
                             active-path {:allow-preallocated-tail? true})
+        active-records    (mapv (fn [record]
+                                  (decode-scanned-record-entry
+                                   (long active-id)
+                                   active-path
+                                   record))
+                                (or (:records active-scan) []))
         active-offset     (segment-end-offset active-scan)
+        active-file       (io/file active-path)
+        active-record-cache
+        (txlog-records-cache-entry
+         (long active-id)
+         active-path
+         (long (.length ^File active-file))
+         (long (.lastModified ^File active-file))
+         active-records)
+        txlog-records-cache (assoc closed-record-cache
+                                   (long active-id)
+                                   active-record-cache)
         closed-bytes      (reduce
                             (fn [acc {:keys [id file]}]
                               (if (= ^long (long id) ^long active-id)
@@ -229,14 +305,10 @@
         meta              (read-meta-file meta-path)
         meta-cur          (:current meta)
         marker-cur        (:current marker-state)
-        last-from-active  (long (or (some-> active-scan
-                                            :records
+        last-from-active  (long (or (some-> active-records
                                             peek
-                                            :body
-                                            decode-commit-row-payload
                                             :lsn)
                                     0))
-        last-from-closed  (long (or @closed-last-lsn-v 0))
         last-from-seg     (long (max last-from-active last-from-closed))
         last-committed    (max (long (or (:last-committed-lsn meta-cur) 0))
                                last-from-seg)
@@ -302,7 +374,7 @@
          :retention-backpressure-state            (volatile! nil)
          :retention-backpressure-blocked-since-ms (volatile! nil)
          :segment-summaries-cache                 (volatile! {})
-         :txlog-records-cache                     (volatile! {})
+         :txlog-records-cache                     (volatile! txlog-records-cache)
          :retention-total-bytes                   (volatile! total-bytes)
          :fatal-error                             (volatile! nil)}]
     (ensure-next-segment-prepared! state)

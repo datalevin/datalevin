@@ -1300,6 +1300,40 @@
           (is (not (identical? seg2-entry-1 (get cache3 2))))
           (is (= 5 (-> cache3 (get 2) :records peek :lsn))))))))
 
+(deftest init-runtime-state-warms-txlog-records-cache-test
+  (with-temp-dir [dir]
+    (let [root      dir
+          txlog-dir (str root u/+separator+ "txlog")
+          seg1      (sut/segment-path txlog-dir 1)
+          seg2      (sut/segment-path txlog-dir 2)
+          append-lsns!
+          (fn [path lsns]
+            (with-open [^FileChannel ch
+                        (sut/open-segment-channel path)]
+              (doseq [lsn lsns]
+                (sut/append-record! ch
+                                    (sut/encode-commit-row-payload
+                                      lsn
+                                      (* 1000 lsn)
+                                      [[:put "dbi" lsn lsn]])))))
+          _         (u/create-dirs txlog-dir)
+          _         (append-lsns! seg1 [1 2])
+          _         (append-lsns! seg2 [3 4])
+          {:keys [state]}
+          (sut/init-runtime-state {:dir root :wal? true} {})]
+      (try
+        (let [cache0 @(:txlog-records-cache state)]
+          (is (= [1 2] (mapv :lsn (get-in cache0 [1 :records]))))
+          (is (= [3 4] (mapv :lsn (get-in cache0 [2 :records]))))
+          ;; Recovery/open read should reuse init-time cache and avoid rescanning.
+          (with-redefs [sut/scan-segment
+                        (fn [& _]
+                          (throw (ex-info "unexpected txlog scan" {})))]
+            (is (= [1 2 3 4]
+                   (mapv :lsn (kv/txlog-records state 0))))))
+        (finally
+          (.close ^FileChannel @(:segment-channel state)))))))
+
 (deftest segment-order-and-parse-test
   (with-temp-dir [dir]
     (doseq [f ["segment-0000000000000010.wal"
