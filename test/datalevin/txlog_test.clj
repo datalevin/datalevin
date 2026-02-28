@@ -1712,6 +1712,64 @@
             (deliver allow-fatal true)
             (.close ^FileChannel @(:segment-channel state))))))))
 
+(deftest append-durable-relaxed-releases-append-lock-before-sync-request-test
+  (with-temp-dir [dir]
+    (let [path1 (sut/segment-path dir 1)]
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :none
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
+                   :segment-prealloc-success-count (volatile! 0)
+                   :segment-prealloc-failure-count (volatile! 0)
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1000
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}
+            request-entered (promise)
+            allow-request   (promise)
+            calls           (atom 0)]
+        (try
+          (with-redefs [sut/request-sync-on-append!
+                        (fn [_ _ _]
+                          (if (= 1 (swap! calls inc))
+                            (do
+                              (deliver request-entered true)
+                              @allow-request
+                              nil)
+                            nil))]
+            (let [f1 (future
+                       (sut/append-durable! state [[:put "dbi" :k1 :v1]] {}))]
+              (is (true? (deref request-entered 2000 false)))
+              (let [f2 (future
+                         (sut/append-durable! state [[:put "dbi" :k2 :v2]] {}))
+                    r2 (deref f2 2000 ::timeout)]
+                (is (not= ::timeout r2))
+                (is (= 3 (long @(:next-lsn state))))
+                (is (= ::timeout (deref f1 100 ::timeout)))
+                (deliver allow-request true)
+                (is (not= ::timeout (deref f1 2000 ::timeout))))))
+          (finally
+            (deliver allow-request true)
+            (.close ^FileChannel @(:segment-channel state))))))))
+
 (deftest append-durable-strict-single-writer-durable-per-append-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
@@ -1785,7 +1843,7 @@
       (is (= 0 (:pending-count s)))
       (is (= 2 (:forced-sync-count s))))))
 
-(deftest sync-manager-begin-sync-for-lsn-trailing-only-test
+(deftest sync-manager-begin-sync-for-lsn-allows-trailing-target-test
   (let [mgr (sut/new-sync-manager {:group-commit 1000
                                    :group-commit-ms 100000
                                    :sync-adaptive? false
@@ -1799,9 +1857,8 @@
     (is (nil? (sut/request-sync-on-append! mgr 2 now)))
     (is (nil? (sut/begin-sync! mgr 2)))
     (sut/complete-sync-success! mgr 1 now :forced)
-    (is (nil? (sut/begin-sync! mgr 1)))
     (is (= {:target-lsn 2 :reason :forced}
-           (sut/begin-sync! mgr 2)))))
+           (sut/begin-sync! mgr 1)))))
 
 (deftest segment-roll-predicate-test
   (is (false? (sut/should-roll-segment? 10 1000 1010

@@ -2910,10 +2910,7 @@
      :near-roll? near-roll?
      :sid sid
      :sync-manager sync-manager
-     :sync-request (request-sync-on-append! sync-manager lsn now)
      :timeout-ms (long (:commit-wait-ms state))}))
-
-(def ^:private strict-wait-step-ms 10)
 
 (defn- perform-sync-round!
   [state ^FileChannel ch sync-manager sync-begin mark-fatal!]
@@ -2981,19 +2978,18 @@
                       :else
                       (let [remaining-ms
                             (max 1 (- ^long deadline
-                                      ^long (System/currentTimeMillis)))
-                            wait-ms (long (min strict-wait-step-ms
-                                               remaining-ms))]
-                        (.wait monitor wait-ms)))))
+                                      ^long (System/currentTimeMillis)))]
+                        (.wait monitor (long remaining-ms))))))
                 (recur last-sync-ms last-sync-reason)))))))))
 
 (defn- append-durable-relaxed!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
   (let [append-lock (or (:append-lock state) state)
         {:keys [append-res append-start-ms ch lsn lmdb-rows near-roll?
-                sid sync-manager sync-request]}
+                sid sync-manager]}
         (locking append-lock
           (append-record-under-lock! state rows throw-if-fatal!))
+        sync-request (request-sync-on-append! sync-manager lsn append-start-ms)
         sync-res (when sync-request
                    (perform-sync-round! state
                                         ch
@@ -3023,6 +3019,7 @@
                 sid sync-manager timeout-ms]}
         (locking append-lock
           (append-record-under-lock! state rows throw-if-fatal!))
+        _ (request-sync-on-append! sync-manager lsn append-start-ms)
         _ (request-sync-now! sync-manager)
         {:keys [sync-done-ms sync-reason]}
         (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal!)
@@ -3392,7 +3389,6 @@
        (let [last-appended-lsn (long @(:last-appended-lsn manager))
              unsynced-count (long @(:unsynced-count manager))
              sync-requested? (boolean @(:sync-requested? manager))
-             track-trailing? (boolean (:track-trailing? manager))
              group-commit (long @(:group-commit manager))
              group-commit-ms (long @(:group-commit-ms manager))
              last-sync-ms (long @(:last-sync-ms manager))
@@ -3400,7 +3396,6 @@
              new-appended (max last-appended-lsn lsn*)
              appended-delta (max 0 (- ^long new-appended ^long last-appended-lsn))
              unsynced-after (+ ^long unsynced-count ^long appended-delta)
-             appended? (pos? appended-delta)
              elapsed (max 0 (- ^long (long now) ^long last-sync-ms))
              count? (>= ^long unsynced-after ^long group-commit)
              time? (and (pos? unsynced-after)
@@ -3411,8 +3406,6 @@
                       time? :batch-time
                       :else nil)]
          (vreset! (:last-appended-lsn manager) new-appended)
-         (when (and track-trailing? appended?)
-           (enqueue-pending-lsn! manager lsn*))
          (vreset! (:unsynced-count manager) unsynced-after)
          (when (and reason (not sync-requested?))
            (vreset! (:sync-requested? manager) true)
@@ -3486,7 +3479,7 @@
                                         last-appended-lsn)
                                     last-appended-lsn))
                  lsn* (when (some? lsn) (long lsn))]
-             (if (and lsn* (not= lsn* target-lsn))
+            (if (and lsn* (> lsn* target-lsn))
                nil
                (let [reason (if sync-requested?
                               (or sync-request-reason :unknown)
