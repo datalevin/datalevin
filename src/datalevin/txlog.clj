@@ -54,6 +54,8 @@
 (def ^:private segment-prealloc-mode-values #{:native :none})
 
 (declare segment-files
+         append-near-roll-sample-max
+         append-near-roll-stats-array-size
          scan-segment
          segment-path
          open-segment-channel
@@ -282,8 +284,10 @@
          :segment-roll-duration-ms                (volatile! 0)
          :segment-prealloc-success-count          (volatile! 0)
          :segment-prealloc-failure-count          (volatile! 0)
-         :append-near-roll-durations              (volatile! (FastList.))
-         :append-near-roll-sorted-durations       (volatile! (FastList.))
+         :append-near-roll-durations
+         (volatile! (long-array append-near-roll-sample-max))
+         :append-near-roll-sorted-durations
+         (volatile! (long-array append-near-roll-stats-array-size))
          :append-p99-near-roll-ms                 (volatile! nil)
          :retention-backpressure-last-check-ms    (volatile! 0)
          :retention-backpressure-state            (volatile! nil)
@@ -859,6 +863,20 @@
       (:valid-end scan))))
 
 (def ^:private append-near-roll-sample-max 512)
+(def ^:private append-near-roll-linear-bucket-max-ms 255)
+(def ^:private append-near-roll-linear-bucket-count
+  (inc append-near-roll-linear-bucket-max-ms))
+(def ^:private append-near-roll-tail-bucket-count 32)
+(def ^:private append-near-roll-tail-base-shift 8) ; 2^8 = 256ms
+(def ^:private append-near-roll-hist-bucket-count
+  (+ append-near-roll-linear-bucket-count
+     append-near-roll-tail-bucket-count))
+(def ^:private append-near-roll-stats-head-idx 0)
+(def ^:private append-near-roll-stats-size-idx 1)
+(def ^:private append-near-roll-stats-hist-offset 2)
+(def ^:private append-near-roll-stats-array-size
+  (+ append-near-roll-stats-hist-offset append-near-roll-hist-bucket-count))
+(def ^:private long-array-class (class (long-array 0)))
 
 (defn- near-roll-threshold
   [^long segment-max-bytes]
@@ -887,75 +905,102 @@
             (doseq [v x] (.add out v))
             out)))
 
-(defn- ensure-fast-list-volatile!
-  ^FastList [v]
-  (let [x @v]
-    (if (instance? FastList x)
-      x
-      (let [^FastList out (ensure-fast-list x)]
-        (vreset! v out)
-        out))))
+(defn- append-near-roll-bucket-idx
+  ^long [^long duration-ms]
+  (if (<= duration-ms append-near-roll-linear-bucket-max-ms)
+    duration-ms
+    (let [lg (long (- 63 (Long/numberOfLeadingZeros duration-ms)))
+          tail-idx (max 0 (- lg append-near-roll-tail-base-shift))]
+      (+ append-near-roll-linear-bucket-count
+         (min (dec append-near-roll-tail-bucket-count) tail-idx)))))
 
-(defn- p99-from-sorted-ms
-  [^List sorted]
-  (let [n (.size sorted)]
-    (when (pos? n)
-      (let [idx (min (dec n)
-                     (int (Math/floor (* 0.99 (dec n)))))]
-        (long (.get sorted idx))))))
+(defn- append-near-roll-bucket-upper-ms
+  ^long [^long bucket-idx]
+  (if (< bucket-idx append-near-roll-linear-bucket-count)
+    bucket-idx
+    (let [tail-idx (max 0 (- bucket-idx append-near-roll-linear-bucket-count))
+          shift (+ (inc append-near-roll-tail-base-shift) tail-idx)]
+      (if (>= shift 63)
+        Long/MAX_VALUE
+        (dec (bit-shift-left 1 shift))))))
 
-(defn- remove-one-sorted-long!
-  ^FastList [^FastList sorted ^long x]
-  (let [idx (.indexOf sorted (Long/valueOf x))]
-    (when (>= idx 0)
-      (.remove sorted idx))
-    sorted))
+(defn- append-near-roll-hist-inc!
+  [^longs stats ^long duration-ms]
+  (let [bucket-idx (append-near-roll-bucket-idx duration-ms)
+        hist-idx (+ append-near-roll-stats-hist-offset bucket-idx)]
+    (aset-long stats hist-idx
+               (long (inc (long (aget stats hist-idx)))))))
 
-(defn- insert-sorted-long!
-  ^FastList [^FastList sorted ^long x]
-  (let [n (.size sorted)
-        idx (loop [lo 0
-                   hi n]
-              (if (< lo hi)
-                (let [mid (quot (+ lo hi) 2)]
-                  (if (<= (long (.get sorted mid)) x)
-                    (recur (inc mid) hi)
-                    (recur lo mid)))
-                lo))]
-    (.add sorted idx (Long/valueOf x))
-    sorted))
+(defn- append-near-roll-hist-dec!
+  [^longs stats ^long duration-ms]
+  (let [bucket-idx (append-near-roll-bucket-idx duration-ms)
+        hist-idx (+ append-near-roll-stats-hist-offset bucket-idx)
+        current (long (aget stats hist-idx))]
+    (when (pos? current)
+      (aset-long stats hist-idx (dec current)))))
+
+(defn- append-near-roll-p99-from-hist
+  ^long [^longs stats ^long sample-size]
+  (if (pos? sample-size)
+    (let [rank (long (inc (quot (* 99 (dec sample-size)) 100)))]
+      (loop [bucket-idx 0
+             seen 0]
+        (if (< bucket-idx append-near-roll-hist-bucket-count)
+          (let [cnt (long (aget stats (+ append-near-roll-stats-hist-offset
+                                         bucket-idx)))
+                seen* (+ ^long seen ^long cnt)]
+            (if (>= seen* rank)
+              (append-near-roll-bucket-upper-ms bucket-idx)
+              (recur (inc bucket-idx) seen*)))
+          (append-near-roll-bucket-upper-ms
+           (dec append-near-roll-hist-bucket-count)))))
+    0))
+
+(defn- ensure-append-near-roll-structures!
+  [samples-v sorted-v]
+  (let [ring0 @samples-v
+        stats0 @sorted-v
+        ring-ok? (and (instance? long-array-class ring0)
+                      (= (alength ^longs ring0)
+                         append-near-roll-sample-max))
+        stats-ok? (and (instance? long-array-class stats0)
+                       (= (alength ^longs stats0)
+                          append-near-roll-stats-array-size))]
+    (if (and ring-ok? stats-ok?)
+      [ring0 stats0]
+      (let [^longs ring (long-array append-near-roll-sample-max)
+            ^longs stats (long-array append-near-roll-stats-array-size)]
+        (vreset! samples-v ring)
+        (vreset! sorted-v stats)
+        [ring stats]))))
 
 (defn- record-append-near-roll-ms!
   [state duration-ms]
   (when-let [samples-v (:append-near-roll-durations state)]
-    (let [duration     (long (max 0 (or duration-ms 0)))
-          sorted-v     (:append-near-roll-sorted-durations state)
-          p99-v        (:append-p99-near-roll-ms state)
-          metrics-lock (or (:append-lock state) state)]
-      (locking metrics-lock
-        (let [^FastList samples (ensure-fast-list-volatile! samples-v)
-              ^FastList sorted  (when sorted-v
-                                  (ensure-fast-list-volatile! sorted-v))]
-          (when (and sorted
-                     (not= (.size sorted) (.size samples)))
-            (.clear sorted)
-            (.addAll sorted ^Collection samples)
-            (.sort sorted nil))
-          (when (>= (.size samples) append-near-roll-sample-max)
-            (let [dropped (long (.get samples 0))]
-              (.remove samples 0)
-              (when sorted
-                (remove-one-sorted-long! sorted dropped))))
-          (.add samples (Long/valueOf duration))
-          (if sorted
-            (insert-sorted-long! sorted duration)
+    (when-let [sorted-v (:append-near-roll-sorted-durations state)]
+      (let [duration-ms  (long (max 0 (or duration-ms 0)))
+            p99-v        (:append-p99-near-roll-ms state)
+            metrics-lock (or (:append-lock state) state)]
+        (locking metrics-lock
+          (let [[^longs ring ^longs stats]
+                (ensure-append-near-roll-structures! samples-v sorted-v)
+                head (long (aget stats append-near-roll-stats-head-idx))
+                size (long (aget stats append-near-roll-stats-size-idx))
+                full? (>= size append-near-roll-sample-max)
+                dropped (when full?
+                          (long (aget ring (int head))))
+                size* (if full? size (inc size))
+                next-head (if (= (inc head) append-near-roll-sample-max)
+                            0
+                            (inc head))]
+            (when full?
+              (append-near-roll-hist-dec! stats dropped))
+            (aset-long ring (int head) duration-ms)
+            (append-near-roll-hist-inc! stats duration-ms)
+            (aset-long stats append-near-roll-stats-head-idx next-head)
+            (aset-long stats append-near-roll-stats-size-idx size*)
             (when p99-v
-              (let [tmp (doto (FastList. ^Collection samples)
-                          (.sort nil))]
-                (vreset! p99-v (p99-from-sorted-ms tmp)))))
-          (when (and sorted p99-v)
-            (vreset! p99-v
-                     (p99-from-sorted-ms sorted))))))))
+              (vreset! p99-v (append-near-roll-p99-from-hist stats size*)))))))))
 
 (defn should-roll-segment?
   [^long segment-bytes ^long segment-created-ms ^long now-ms
@@ -2036,31 +2081,36 @@
     (catch Exception _)))
 
 (defn maybe-publish-meta-best-effort!
-  [state append-res]
-  (locking (or (:meta-publish-lock state) state)
-    (let [pending-v (:meta-pending-txs state)
-          last-flush-v (:meta-last-flush-ms state)
-          now-ms (System/currentTimeMillis)
-          flush-txs (max 1 (long (or (:meta-flush-max-txs state)
-                                     c/*wal-meta-flush-max-txs*)))
-          flush-ms (max 0 (long (or (:meta-flush-max-ms state)
-                                    c/*wal-meta-flush-max-ms*)))
-          pending (if pending-v
-                    (let [v (inc (long @pending-v))]
-                      (vreset! pending-v v)
-                      v)
-                    1)
-          last-flush (if last-flush-v
-                       (long @last-flush-v)
-                       0)
-          due? (or (>= pending flush-txs)
-                   (>= (- now-ms last-flush) flush-ms))]
-      (when due?
-        (publish-meta-best-effort! state append-res)
-        (when pending-v
-          (vreset! pending-v 0))
-        (when last-flush-v
-          (vreset! last-flush-v now-ms))))))
+  ([state append-res]
+   (maybe-publish-meta-best-effort! state append-res publish-meta-best-effort!))
+  ([state append-res publish-fn]
+   (let [publish? (locking (or (:meta-publish-lock state) state)
+                    (let [pending-v (:meta-pending-txs state)
+                          last-flush-v (:meta-last-flush-ms state)
+                          now-ms (System/currentTimeMillis)
+                          flush-txs (max 1 (long (or (:meta-flush-max-txs state)
+                                                     c/*wal-meta-flush-max-txs*)))
+                          flush-ms (max 0 (long (or (:meta-flush-max-ms state)
+                                                    c/*wal-meta-flush-max-ms*)))
+                          pending (if pending-v
+                                    (let [v (inc (long @pending-v))]
+                                      (vreset! pending-v v)
+                                      v)
+                                    1)
+                          last-flush (if last-flush-v
+                                       (long @last-flush-v)
+                                       0)
+                          due? (or (>= pending flush-txs)
+                                   (>= (- now-ms last-flush) flush-ms))]
+                      (when due?
+                        ;; Reserve this flush while under lock, then do I/O outside lock.
+                        (when pending-v
+                          (vreset! pending-v 0))
+                        (when last-flush-v
+                          (vreset! last-flush-v now-ms))
+                        true)))]
+     (when publish?
+       (publish-fn state append-res)))))
 
 (defn note-gc-deleted-bytes!
   [state deleted-bytes]
@@ -2217,7 +2267,7 @@
 (def ^:private tl-bits-buffer-initial-cap 4096)
 (def ^:private tl-row-encode-buffer-initial-cap 4096)
 (def ^:private tl-buffer-max-retained-cap (* 1024 1024))
-(def ^:private tl-buffer-shrink-trigger-cap (* 4 tl-buffer-max-retained-cap))
+(def ^:private tl-buffer-shrink-trigger-cap tl-buffer-max-retained-cap)
 (def ^:private parallel-row-encode-min-rows 1024)
 
 (def ^:private ^ThreadLocal tl-commit-body-buffer

@@ -1508,29 +1508,42 @@
                                                          :last-sync-ms    0})}]
         (try
           (sut/append-durable! state [[:put :k :v]] {})
+          (let [^longs ring  @(:append-near-roll-durations state)
+                ^longs stats @(:append-near-roll-sorted-durations state)
+                size-idx     (var-get #'sut/append-near-roll-stats-size-idx)]
+            (is (instance? (class (long-array 0)) ring))
+            (is (instance? (class (long-array 0)) stats))
+            (is (= 1 (long (aget stats size-idx)))))
           (is (= 0 @(:segment-roll-count state)))
-          (is (= 1 (count @(:append-near-roll-durations state))))
-          (is (= 1 (count @(:append-near-roll-sorted-durations state))))
           (is (number? @(:append-p99-near-roll-ms state)))
           (is (<= 0 (long @(:append-p99-near-roll-ms state))))
           (finally
             (.close ^FileChannel @(:segment-channel state))))))))
 
 (deftest append-near-roll-p99-sliding-window-test
-  (let [max-n (var-get #'sut/append-near-roll-sample-max)
+  (let [max-n (long (var-get #'sut/append-near-roll-sample-max))
+        size-idx (var-get #'sut/append-near-roll-stats-size-idx)
+        durations (mapv #(mod % 200) (range (+ max-n 64)))
         state {:append-near-roll-durations (volatile! [])
                :append-near-roll-sorted-durations (volatile! [])
                :append-p99-near-roll-ms (volatile! nil)}]
-    (doseq [n (range (inc max-n))]
-      (#'sut/record-append-near-roll-ms! state n))
-    (let [samples @(:append-near-roll-durations state)
-          sorted  @(:append-near-roll-sorted-durations state)
-          p99     @(:append-p99-near-roll-ms state)
-          idx     (min (dec (count sorted))
-                       (int (Math/floor (* 0.99 (dec (count sorted))))))
+    (doseq [d durations]
+      (#'sut/record-append-near-roll-ms! state d))
+    (let [^longs stats @(:append-near-roll-sorted-durations state)
+          p99 @(:append-p99-near-roll-ms state)
+          window (reduce (fn [acc d]
+                           (let [acc* (conj acc d)]
+                             (if (> (count acc*) max-n)
+                               (subvec acc* 1)
+                               acc*)))
+                         []
+                         durations)
+          sorted (vec (sort window))
+          n (count sorted)
+          idx (min (dec n)
+                   (int (Math/floor (* 0.99 (dec n)))))
           expected (long (nth sorted idx))]
-      (is (= max-n (count samples)))
-      (is (= samples sorted))
+      (is (= max-n (long (aget stats size-idx))))
       (is (= expected p99)))))
 
 (deftest threadlocal-buffers-shrink-after-large-record-test
@@ -1545,6 +1558,19 @@
      [[:put "dbi" :k :v]])
     (is (< (.capacity ^ByteBuffer (.get commit-tl)) big-cap))
     (is (< (.capacity ^ByteBuffer (.get bits-tl)) big-cap))))
+
+(deftest threadlocal-buffers-shrink-after-medium-spike-test
+  (let [^ThreadLocal commit-tl (var-get #'sut/tl-commit-body-buffer)
+        ^ThreadLocal bits-tl   (var-get #'sut/tl-bits-buffer)
+        medium-cap (* 2 1024 1024)]
+    (.set commit-tl (ByteBuffer/allocate medium-cap))
+    (.set bits-tl (ByteBuffer/allocate medium-cap))
+    (sut/encode-commit-row-payload
+     1
+     1
+     [[:put "dbi" :k :v]])
+    (is (< (.capacity ^ByteBuffer (.get commit-tl)) medium-cap))
+    (is (< (.capacity ^ByteBuffer (.get bits-tl)) medium-cap))))
 
 (deftest append-durable-trailing-sync-batch-test
   (with-temp-dir [dir]
@@ -1974,6 +2000,38 @@
       (let [{:keys [current]} (sut/read-meta-file path)]
         (is (= 2 (:last-committed-lsn current)))
         (is (= 2 (:last-durable-lsn current)))))))
+
+(deftest maybe-publish-meta-best-effort-releases-lock-before-publish-test
+  (let [state {:meta-publish-lock (Object.)
+               :meta-flush-max-txs 1
+               :meta-flush-max-ms 100000
+               :meta-last-flush-ms (volatile! (System/currentTimeMillis))
+               :meta-pending-txs (volatile! 0)}
+        append-res {:lsn 1 :segment-id 1 :offset 10}
+        first-entered (promise)
+        second-entered (promise)
+        allow-first (promise)
+        calls (atom 0)
+        publish!
+        (fn [_ _]
+          (if (= 1 (swap! calls inc))
+            (do
+              (deliver first-entered true)
+              @allow-first
+              nil)
+            (do
+              (deliver second-entered true)
+              nil)))]
+    (let [f1 (future (sut/maybe-publish-meta-best-effort! state append-res publish!))]
+      (is (true? (deref first-entered 2000 false)))
+      (let [f2 (future (sut/maybe-publish-meta-best-effort! state append-res publish!))
+            r2 (deref f2 2000 ::timeout)]
+        (is (true? (deref second-entered 2000 false)))
+        (is (not= ::timeout r2))
+        (is (= ::timeout (deref f1 100 ::timeout)))
+        (deliver allow-first true)
+        (is (not= ::timeout (deref f1 2000 ::timeout)))
+        (is (= 2 @calls))))))
 
 (deftest sync-manager-request-and-complete-test
   (let [mgr (sut/new-sync-manager {:group-commit 1
