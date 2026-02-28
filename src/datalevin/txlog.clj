@@ -2303,6 +2303,8 @@
 (def ^:private tl-buffer-max-retained-cap (* 1024 1024))
 (def ^:private tl-buffer-shrink-trigger-cap tl-buffer-max-retained-cap)
 (def ^:private parallel-row-encode-min-rows 1024)
+(def ^:private parallel-row-encode-target-tasks-per-core 2)
+(def ^:private parallel-row-encode-min-chunk-size 64)
 
 (def ^:private ^ThreadLocal tl-commit-body-buffer
   (ThreadLocal/withInitial
@@ -2633,30 +2635,26 @@
            {:type :txlog/corrupt
             :row row})))
 
-(defn- buffer->bytes
-  ^bytes [^ByteBuffer bf]
-  (let [^ByteBuffer src (.duplicate bf)
-        len (.remaining src)
-        out (byte-array len)]
-    (.get src out)
-    out))
+(defn- body-slice-buffer
+  ^ByteBuffer [^bytes body ^long offset ^long len]
+  (.slice ^ByteBuffer (ByteBuffer/wrap body (int offset) (int len))))
 
 (defn- lmdb-row-from-encoded
-  [{:keys [op dbi v vt flags row]} ^bytes k-bytes ^bytes v-bytes]
+  [{:keys [op dbi v vt flags row]} k-raw v-raw]
   (let [dbi-name (dbi-name->string dbi)]
     (case op
       :put
-      (datalevin.lmdb.KVTxData. op dbi-name k-bytes v-bytes :raw :raw flags)
+      (datalevin.lmdb.KVTxData. op dbi-name k-raw v-raw :raw :raw flags)
 
       :del
-      (datalevin.lmdb.KVTxData. op dbi-name k-bytes nil :raw nil flags)
+      (datalevin.lmdb.KVTxData. op dbi-name k-raw nil :raw nil flags)
 
       ;; List ops still need per-element LMDB processing, but key encoding can be reused.
       :put-list
-      (datalevin.lmdb.KVTxData. op dbi-name k-bytes v :raw (or vt :data) flags)
+      (datalevin.lmdb.KVTxData. op dbi-name k-raw v :raw (or vt :data) flags)
 
       :del-list
-      (datalevin.lmdb.KVTxData. op dbi-name k-bytes v :raw (or vt :data) flags)
+      (datalevin.lmdb.KVTxData. op dbi-name k-raw v :raw (or vt :data) flags)
 
       row)))
 
@@ -2669,15 +2667,14 @@
     ^ByteBuffer bf
     row
     ^HashMap dbi-cache
-    ^FastList lmdb-rows]
+    ^FastList lmdb-row-spans]
    (let [{:keys [op dbi k v kt vt flags] :as components}
          (row->kv-components row)
          ^bytes dbi-bs (dbi-name-bytes dbi dbi-cache)
          dbi-len (alength dbi-bs)
          k-type (or kt :data)
          ^ByteBuffer k-bf (encode-to-buf k k-type)
-         k-len (.remaining k-bf)
-         ^bytes k-bytes (when lmdb-rows (buffer->bytes k-bf))]
+         k-len (.remaining k-bf)]
      (case op
        :put
        (let [bf1 (-> bf
@@ -2685,32 +2682,44 @@
                      (bb-put-u16! tl dbi-len)
                      (bb-put-bytes! tl dbi-bs)
                      (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len)
-                     (bb-put-buffer! tl k-bf))
+                     (bb-put-u16! tl k-len))
+             k-offset (.position bf1)
+             bf2 (bb-put-buffer! bf1 tl k-bf)
              v-type (or vt :data)
              ^ByteBuffer v-bf (encode-to-buf v v-type)
              v-len (.remaining v-bf)
-             ^bytes v-bytes (when lmdb-rows (buffer->bytes v-bf))
-             bf' (-> bf1
+             bf3 (-> bf2
                      (bb-write-type! tl v-type)
-                     (bb-put-u32! tl v-len)
+                     (bb-put-u32! tl v-len))
+             v-offset (.position bf3)
+             bf' (-> bf3
                      (bb-put-buffer! tl v-bf)
                      (bb-write-flags! tl flags))]
-         (when lmdb-rows
-           (.add lmdb-rows (lmdb-row-from-encoded components k-bytes v-bytes)))
+         (when lmdb-row-spans
+           (.add lmdb-row-spans
+                 {:components components
+                  :k-offset (long k-offset)
+                  :k-len (long k-len)
+                  :v-offset (long v-offset)
+                  :v-len (long v-len)}))
          bf')
 
        :del
-       (let [bf' (-> bf
+       (let [bf1 (-> bf
                      (bb-put-byte! tl (int op-kv-del))
                      (bb-put-u16! tl dbi-len)
                      (bb-put-bytes! tl dbi-bs)
                      (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len)
+                     (bb-put-u16! tl k-len))
+             k-offset (.position bf1)
+             bf' (-> bf1
                      (bb-put-buffer! tl k-bf)
                      (bb-write-flags! tl flags))]
-         (when lmdb-rows
-           (.add lmdb-rows (lmdb-row-from-encoded components k-bytes nil)))
+         (when lmdb-row-spans
+           (.add lmdb-row-spans
+                 {:components components
+                  :k-offset (long k-offset)
+                  :k-len (long k-len)}))
          bf')
 
        :put-list
@@ -2719,19 +2728,23 @@
                      (bb-put-u16! tl dbi-len)
                      (bb-put-bytes! tl dbi-bs)
                      (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len)
-                     (bb-put-buffer! tl k-bf))
+                     (bb-put-u16! tl k-len))
+             k-offset (.position bf1)
+             bf2 (bb-put-buffer! bf1 tl k-bf)
              v-type (or vt :data)
              ;; Keep list payload as :data for compact, fast decode.
              ^ByteBuffer v-bf (encode-to-buf v :data)
              v-len (.remaining v-bf)
-             bf' (-> bf1
+             bf' (-> bf2
                      (bb-write-type! tl v-type)
                      (bb-put-u32! tl v-len)
                      (bb-put-buffer! tl v-bf)
                      (bb-write-flags! tl flags))]
-         (when lmdb-rows
-           (.add lmdb-rows (lmdb-row-from-encoded components k-bytes nil)))
+         (when lmdb-row-spans
+           (.add lmdb-row-spans
+                 {:components components
+                  :k-offset (long k-offset)
+                  :k-len (long k-len)}))
          bf')
 
        :del-list
@@ -2740,19 +2753,23 @@
                      (bb-put-u16! tl dbi-len)
                      (bb-put-bytes! tl dbi-bs)
                      (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len)
-                     (bb-put-buffer! tl k-bf))
+                     (bb-put-u16! tl k-len))
+             k-offset (.position bf1)
+             bf2 (bb-put-buffer! bf1 tl k-bf)
              v-type (or vt :data)
              ;; Keep list payload as :data for compact, fast decode.
              ^ByteBuffer v-bf (encode-to-buf v :data)
              v-len (.remaining v-bf)
-             bf' (-> bf1
+             bf' (-> bf2
                      (bb-write-type! tl v-type)
                      (bb-put-u32! tl v-len)
                      (bb-put-buffer! tl v-bf)
                      (bb-write-flags! tl flags))]
-         (when lmdb-rows
-           (.add lmdb-rows (lmdb-row-from-encoded components k-bytes nil)))
+         (when lmdb-row-spans
+           (.add lmdb-row-spans
+                 {:components components
+                  :k-offset (long k-offset)
+                  :k-len (long k-len)}))
          bf')
 
        (raise "Unsupported txn-log KV op"
@@ -2760,16 +2777,48 @@
                :op op
                :row row})))))
 
+(defn- lmdb-rows-from-spans
+  ^FastList [^bytes body ^FastList lmdb-row-spans]
+  (let [n (.size lmdb-row-spans)
+        ^FastList lmdb-rows (FastList. n)]
+    (dotimes [i n]
+      (let [{:keys [components k-offset k-len v-offset v-len]}
+            (.get lmdb-row-spans i)
+            k-raw (body-slice-buffer body k-offset k-len)
+            v-raw (when (some? v-offset)
+                    (body-slice-buffer body v-offset v-len))]
+        (.add lmdb-rows (lmdb-row-from-encoded components k-raw v-raw))))
+    lmdb-rows))
+
 (defn- use-parallel-row-encoding?
   [^long row-count]
   (and (>= row-count (long parallel-row-encode-min-rows))
        (> (.availableProcessors (Runtime/getRuntime)) 1)))
 
-(defn- encode-kv-row-bytes
-  ^bytes [row]
+(defn- parallel-row-encode-chunk-size
+  ^long [^long row-count]
+  (let [cores (long (max 1 (.availableProcessors (Runtime/getRuntime))))
+        target-task-count (long (max 1
+                                    (* parallel-row-encode-target-tasks-per-core
+                                       cores)))
+        ceil-size (long (quot (+ row-count (dec target-task-count))
+                              target-task-count))]
+    (long (max parallel-row-encode-min-chunk-size ceil-size))))
+
+(defn- encode-kv-row-chunk-bytes
+  ^bytes [^FastList rowsv ^long start ^long end]
   (let [^ThreadLocal tl tl-row-encode-buffer
+        ^HashMap dbi-cache (.get tl-dbi-name-cache)
+        _ (.clear dbi-cache)
+        end* (int end)
         ^ByteBuffer bf0 (.clear ^ByteBuffer (.get tl))
-        ^ByteBuffer bfN (write-kv-row! tl bf0 row nil)
+        ^ByteBuffer bfN
+        (loop [i (int start)
+               ^ByteBuffer bf bf0]
+          (if (< i end*)
+            (recur (unchecked-inc-int i)
+                   (write-kv-row! tl bf (.get rowsv i) dbi-cache))
+            bf))
         len (.position bfN)
         out (byte-array len)]
     (.flip bfN)
@@ -2779,7 +2828,8 @@
      bfN
      len
      tl-row-encode-buffer-initial-cap)
-    ;; Parallel row encoding runs on worker threads, so keep their bits buffer bounded.
+    ;; Chunk encoding runs on worker threads, so keep worker-local bits
+    ;; buffers bounded.
     (maybe-shrink-bits-buffer!)
     out))
 
@@ -2789,6 +2839,22 @@
             (bb-put-bytes! acc tl row-bytes))
           bf
           rows))
+
+(defn- append-parallel-kv-row-bytes!
+  ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^FastList rowsv ^long row-count]
+  (let [chunk-size (parallel-row-encode-chunk-size row-count)
+        ranges (loop [start (long 0)
+                      acc []]
+                 (if (< start row-count)
+                   (let [end (min row-count (+ start chunk-size))]
+                     (recur end (conj acc [start end])))
+                   acc))]
+    (append-kv-row-bytes!
+     bf
+     tl
+     (map+ (fn [[start end]]
+             (encode-kv-row-chunk-bytes rowsv (long start) (long end)))
+           ranges))))
 
 (defn- decode-kv-row
   [^ByteBuffer bf]
@@ -2849,10 +2915,10 @@
                             (bb-put-long! tl (long tx-time))
                             (bb-put-u32! tl row-count))
         ^ByteBuffer bfN (if parallel-rows?
-                          (append-kv-row-bytes! bf1
-                                                tl
-                                                (map+ encode-kv-row-bytes
-                                                      rowsv))
+                          (append-parallel-kv-row-bytes! bf1
+                                                         tl
+                                                         rowsv
+                                                         row-count)
                           (loop [i 0
                                  ^ByteBuffer bf bf1]
                             (if (< i row-count)
@@ -2880,7 +2946,7 @@
         ^ByteBuffer bf0 (.clear ^ByteBuffer (.get tl))
         ^HashMap dbi-cache (.get tl-dbi-name-cache)
         _ (.clear dbi-cache)
-        ^FastList lmdb-rows (FastList. (.size rowsv))
+        ^FastList lmdb-row-spans (FastList. (.size rowsv))
         ^ByteBuffer bfN
         (loop [i 0
                ^ByteBuffer bf (-> bf0
@@ -2893,7 +2959,7 @@
                                   (bb-put-u32! tl row-count))]
           (if (< i row-count)
             (recur (unchecked-inc-int i)
-                   (write-kv-row! tl bf (.get rowsv i) dbi-cache lmdb-rows))
+                   (write-kv-row! tl bf (.get rowsv i) dbi-cache lmdb-row-spans))
             bf))
         len (.position bfN)
         out (byte-array len)]
@@ -2906,7 +2972,7 @@
      tl-commit-body-buffer-initial-cap)
     (maybe-shrink-bits-buffer!)
     {:body out
-     :lmdb-rows lmdb-rows}))
+     :lmdb-rows (lmdb-rows-from-spans out lmdb-row-spans)}))
 
 (defn- patch-commit-row-payload-header!
   [^bytes body ^long lsn ^long tx-time]

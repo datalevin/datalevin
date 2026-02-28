@@ -343,6 +343,9 @@
 
 (defn put-bytes [^ByteBuffer bb ^bytes bs] (.put bb bs))
 
+(defn- put-byte-buffer [^ByteBuffer bb ^ByteBuffer src]
+  (.put bb (.duplicate src)))
+
 (defn- put-byte [^ByteBuffer bb b] (.put bb ^byte (unchecked-byte b)))
 
 (defn encode-bigint
@@ -972,7 +975,17 @@
                        (i/put-sorted-ints bf i2))
      :attr           (put-attr bf x)
      :avg            (put-avg bf x)
-     :raw            (put-bytes bf x)
+     :raw            (cond
+                       (bytes? x)
+                       (put-bytes bf x)
+
+                       (instance? ByteBuffer x)
+                       (put-byte-buffer bf x)
+
+                       :else
+                       (u/raise "Raw value must be bytes or ByteBuffer, got "
+                                (type x)
+                                {:input x}))
      (if (vector? x-type)
        (if (= 1 (count x-type))
          (do (put-byte bf c/type-homo-tuple)

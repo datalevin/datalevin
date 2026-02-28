@@ -1046,6 +1046,12 @@
               (l/kv-tx :put-list "dbi" :lk [1 2] :keyword :long)]
         {:keys [body lmdb-rows]}
         (#'sut/encode-commit-row-payload+lmdb-rows 7 11 rows)
+        raw->bf (fn [x]
+                  (cond
+                    (bytes? x) (ByteBuffer/wrap ^bytes x)
+                    (instance? ByteBuffer x) (.duplicate ^ByteBuffer x)
+                    :else (throw (ex-info "Unexpected raw row type"
+                                          {:value-type (type x)}))))
         decoded (:ops (sut/decode-commit-row-payload body))
         ^datalevin.lmdb.KVTxData put-row  (nth lmdb-rows 0)
         ^datalevin.lmdb.KVTxData del-row  (nth lmdb-rows 1)
@@ -1056,17 +1062,26 @@
            decoded))
     (is (= 3 (count lmdb-rows)))
 
+    (is (instance? ByteBuffer (.-k put-row)))
+    (is (instance? ByteBuffer (.-v put-row)))
+    (is (instance? ByteBuffer (.-k del-row)))
+    (is (instance? ByteBuffer (.-k list-row)))
+    (is (identical? body (.array ^ByteBuffer (.-k put-row))))
+    (is (identical? body (.array ^ByteBuffer (.-v put-row))))
+    (is (identical? body (.array ^ByteBuffer (.-k del-row))))
+    (is (identical? body (.array ^ByteBuffer (.-k list-row))))
+
     (is (= :raw (.-kt put-row)))
     (is (= :raw (.-vt put-row)))
-    (is (= :k (b/read-buffer (ByteBuffer/wrap ^bytes (.-k put-row)) :keyword)))
-    (is (= :v (b/read-buffer (ByteBuffer/wrap ^bytes (.-v put-row)) :keyword)))
+    (is (= :k (b/read-buffer (raw->bf (.-k put-row)) :keyword)))
+    (is (= :v (b/read-buffer (raw->bf (.-v put-row)) :keyword)))
 
     (is (= :raw (.-kt del-row)))
-    (is (= :k2 (b/read-buffer (ByteBuffer/wrap ^bytes (.-k del-row)) :keyword)))
+    (is (= :k2 (b/read-buffer (raw->bf (.-k del-row)) :keyword)))
 
     (is (= :raw (.-kt list-row)))
     (is (= :long (.-vt list-row)))
-    (is (= :lk (b/read-buffer (ByteBuffer/wrap ^bytes (.-k list-row)) :keyword)))
+    (is (= :lk (b/read-buffer (raw->bf (.-k list-row)) :keyword)))
     (is (= [1 2] (.-v list-row)))))
 
 (deftest txlog-apply-after-append-retries-resized-test

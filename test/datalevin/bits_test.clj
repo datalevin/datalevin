@@ -732,3 +732,17 @@
                                            (compare tk tk1)
                                            (compare tl tl1)
                                            (compare tf tf1)))))))
+
+(deftest raw-byte-buffer-input-test
+  (let [^bytes payload (.getBytes "raw-bytes" StandardCharsets/UTF_8)
+        expected (Arrays/copyOfRange payload 1 7)
+        ^ByteBuffer src (doto (ByteBuffer/wrap payload)
+                          (.position 1)
+                          (.limit 7))
+        ^ByteBuffer dst (bf/allocate-buffer 16)]
+    (sut/put-bf dst src :raw)
+    (is (= 6 (.remaining dst)))
+    (is (Arrays/equals expected ^bytes (sut/read-buffer dst :raw)))
+    ;; :raw should not mutate the source ByteBuffer position/limit.
+    (is (= 1 (.position src)))
+    (is (= 7 (.limit src)))))
