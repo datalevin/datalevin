@@ -15,7 +15,8 @@
    [java.nio.channels FileChannel]
    [java.nio.file Files StandardOpenOption]
    [java.nio.charset StandardCharsets]
-   [java.util UUID Random]))
+   [java.util UUID Random]
+   [java.util.concurrent.locks ReentrantLock]))
 
 (defmacro with-temp-dir
   [[sym] & body]
@@ -1675,6 +1676,67 @@
           (finally
             (.close ^FileChannel @(:segment-channel state))))))))
 
+(deftest append-durable-relaxed-releases-append-lock-before-encode-test
+  (with-temp-dir [dir]
+    (let [path1 (sut/segment-path dir 1)]
+      (with-open [^FileChannel _ (sut/open-segment-channel path1)])
+      (let [state {:dir                            dir
+                   :segment-id                     (volatile! 1)
+                   :segment-created-ms             (volatile! (System/currentTimeMillis))
+                   :segment-channel                (volatile! (sut/open-segment-channel path1))
+                   :segment-offset                 (volatile! 0)
+                   :append-lock                    (Object.)
+                   :next-lsn                       (volatile! 1)
+                   :durability-profile             :relaxed
+                   :segment-max-bytes              1024
+                   :segment-max-ms                 600000
+                   :segment-prealloc?              false
+                   :segment-prealloc-mode          :none
+                   :segment-prealloc-bytes         0
+                   :sync-mode                      :none
+                   :commit-wait-ms                 100
+                   :segment-roll-count             (volatile! 0)
+                   :segment-roll-duration-ms       (volatile! 0)
+                   :segment-prealloc-success-count (volatile! 0)
+                   :segment-prealloc-failure-count (volatile! 0)
+                   :append-near-roll-durations     (volatile! [])
+                   :append-p99-near-roll-ms        (volatile! nil)
+                   :sync-manager                   (sut/new-sync-manager
+                                                     {:group-commit    1000
+                                                      :group-commit-ms 100000
+                                                      :sync-adaptive?  false
+                                                      :last-sync-ms
+                                                      (System/currentTimeMillis)})}
+            encode-entered (promise)
+            allow-encode   (promise)
+            block-once?    (atom true)
+            blocking-row
+            (let [row [:put "dbi" :k1 :v1]]
+              (proxy [java.util.AbstractList] []
+                (size [] (count row))
+                (get [idx]
+                  (when (and (zero? (int idx))
+                             (compare-and-set! block-once? true false))
+                    (deliver encode-entered true)
+                    @allow-encode)
+                  (nth row idx))))]
+        (try
+          (let [f1 (future
+                     (sut/append-durable! state [blocking-row] {}))]
+            (is (true? (deref encode-entered 2000 false)))
+            (let [f2 (future
+                       (sut/append-durable! state [[:put "dbi" :k2 :v2]] {}))
+                  r2 (deref f2 2000 ::timeout)]
+              (is (not= ::timeout r2))
+              (is (= 2 (long @(:next-lsn state))))
+              (is (= ::timeout (deref f1 100 ::timeout)))
+              (deliver allow-encode true)
+              (is (not= ::timeout (deref f1 2000 ::timeout)))
+              (is (= 3 (long @(:next-lsn state))))))
+          (finally
+            (deliver allow-encode true)
+            (.close ^FileChannel @(:segment-channel state))))))))
+
 (deftest append-durable-relaxed-releases-append-lock-before-sync-test
   (with-temp-dir [dir]
     (let [path1 (sut/segment-path dir 1)]
@@ -1896,6 +1958,33 @@
   (is (true? (sut/should-roll-segment? 10 1000 3001
                                        {:segment-max-bytes 1000
                                         :segment-max-ms 2000}))))
+
+(deftest maybe-roll-segment-skips-append-lock-when-clearly-not-due-test
+  (let [append-lock (Object.)
+        entered (promise)
+        release (promise)
+        now (System/currentTimeMillis)
+        state {:append-lock         append-lock
+               :segment-roll-lock   (ReentrantLock.)
+               :segment-created-ms  (volatile! now)
+               :segment-offset      (volatile! 0)
+               :segment-max-bytes   1024
+               :segment-max-ms      600000}
+        holder (future
+                 (locking append-lock
+                   (deliver entered true)
+                   @release))]
+    (try
+      (is (true? (deref entered 2000 false)))
+      (is (= :done
+             (deref (future
+                      (sut/maybe-roll-segment! state now)
+                      :done)
+                    300
+                    ::timeout)))
+      (finally
+        (deliver release true)
+        (deref holder 2000 nil)))))
 
 (deftest segment-summaries-test
   (with-temp-dir [dir]

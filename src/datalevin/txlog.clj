@@ -1010,104 +1010,125 @@
   (or (>= segment-bytes segment-max-bytes)
       (>= (- now-ms segment-created-ms) segment-max-ms)))
 
+(defn- maybe-roll-segment-candidate?
+  [state ^long now-ms]
+  (let [created-src (:segment-created-ms state)
+        created (long (if (instance? clojure.lang.IDeref created-src)
+                        @created-src
+                        (or created-src now-ms)))
+        offset-src (:segment-offset state)
+        offset (when (some? offset-src)
+                 (long (if (instance? clojure.lang.IDeref offset-src)
+                         @offset-src
+                         offset-src)))]
+    (if (some? offset)
+      (should-roll-segment? offset
+                            created
+                            now-ms
+                            {:segment-max-bytes (:segment-max-bytes state)
+                             :segment-max-ms (:segment-max-ms state)})
+      ;; When fast byte probe is unavailable, keep previous behavior.
+      true)))
+
 (defn maybe-roll-segment!
   [state now-ms]
-  (let [roll-once!
-        (fn []
-          (let [append-lock (or (:append-lock state) state)
-                roll-candidate
-                (locking append-lock
-                  (let [sync-manager (:sync-manager state)
-                        pending? (and sync-manager
-                                      (sync-manager-pending? sync-manager))
-                        ^FileChannel ch @(:segment-channel state)
-                        created (long @(:segment-created-ms state))
-                        bytes (if-let [segment-offset (:segment-offset state)]
-                                (long @segment-offset)
-                                (.size ch))]
-                    (when (and (not pending?)
-                               (should-roll-segment?
-                                bytes created now-ms
-                                {:segment-max-bytes (:segment-max-bytes state)
-                                 :segment-max-ms (:segment-max-ms state)}))
-                      {:segment-id (long @(:segment-id state))
-                       :channel ch})))]
-            (when-let [{:keys [segment-id channel]} roll-candidate]
-              (let [roll-start-ms (System/currentTimeMillis)
-                    next-id (inc ^long segment-id)
-                    dir (:dir state)
-                    tmp-path (prepared-segment-path dir next-id)
-                    next-path (segment-path dir next-id)
-                    tmp-file (io/file tmp-path)
-                    next-file (io/file next-path)
-                    tmp-exists? (.exists tmp-file)
-                    next-exists? (.exists next-file)
-                    final-path (activate-next-segment! dir next-id)
-                    preserve-preallocated-tail?
-                    (and (preallocation-enabled-state? state)
-                         tmp-exists?
-                         (not next-exists?))
-                    next-offset (activated-segment-offset
-                                 final-path
-                                 preserve-preallocated-tail?)
-                    ^FileChannel next-ch (open-segment-channel next-path)
-                    swapped? (volatile! false)]
-                (try
-                  (let [swap-result
-                        (locking append-lock
-                          (let [sync-manager (:sync-manager state)
-                                pending? (and sync-manager
-                                              (sync-manager-pending? sync-manager))
-                                current-segment-id (long @(:segment-id state))
-                                ^FileChannel current-channel @(:segment-channel state)
-                                created (long @(:segment-created-ms state))
-                                bytes (if-let [segment-offset (:segment-offset state)]
-                                        (long @segment-offset)
-                                        (.size current-channel))]
-                            (when (and (= segment-id current-segment-id)
-                                       (identical? channel current-channel)
-                                       (not pending?)
-                                       (should-roll-segment?
-                                        bytes created now-ms
-                                        {:segment-max-bytes
-                                         (:segment-max-bytes state)
-                                         :segment-max-ms
-                                         (:segment-max-ms state)}))
-                              (vreset! swapped? true)
-                              (vreset! (:segment-id state) next-id)
-                              (vreset! (:segment-channel state) next-ch)
-                              (when-let [segment-offset (:segment-offset state)]
-                                (vreset! segment-offset next-offset))
-                              (vreset! (:segment-created-ms state) now-ms)
-                              {:old-channel current-channel
-                               :old-bytes bytes})))]
-                    (if-let [{:keys [old-channel old-bytes]} swap-result]
-                      (do
+  (when (maybe-roll-segment-candidate? state now-ms)
+    (let [roll-once!
+          (fn []
+            (let [append-lock (or (:append-lock state) state)
+                  roll-candidate
+                  (locking append-lock
+                    (let [sync-manager (:sync-manager state)
+                          pending? (and sync-manager
+                                        (sync-manager-pending? sync-manager))
+                          ^FileChannel ch @(:segment-channel state)
+                          created (long @(:segment-created-ms state))
+                          bytes (if-let [segment-offset (:segment-offset state)]
+                                  (long @segment-offset)
+                                  (.size ch))]
+                      (when (and (not pending?)
+                                 (should-roll-segment?
+                                  bytes created now-ms
+                                  {:segment-max-bytes (:segment-max-bytes state)
+                                   :segment-max-ms (:segment-max-ms state)}))
+                        {:segment-id (long @(:segment-id state))
+                         :channel ch})))]
+              (when-let [{:keys [segment-id channel]} roll-candidate]
+                (let [roll-start-ms (System/currentTimeMillis)
+                      next-id (inc ^long segment-id)
+                      dir (:dir state)
+                      tmp-path (prepared-segment-path dir next-id)
+                      next-path (segment-path dir next-id)
+                      tmp-file (io/file tmp-path)
+                      next-file (io/file next-path)
+                      tmp-exists? (.exists tmp-file)
+                      next-exists? (.exists next-file)
+                      final-path (activate-next-segment! dir next-id)
+                      preserve-preallocated-tail?
+                      (and (preallocation-enabled-state? state)
+                           tmp-exists?
+                           (not next-exists?))
+                      next-offset (activated-segment-offset
+                                   final-path
+                                   preserve-preallocated-tail?)
+                      ^FileChannel next-ch (open-segment-channel next-path)
+                      swapped? (volatile! false)]
+                  (try
+                    (let [swap-result
+                          (locking append-lock
+                            (let [sync-manager (:sync-manager state)
+                                  pending? (and sync-manager
+                                                (sync-manager-pending? sync-manager))
+                                  current-segment-id (long @(:segment-id state))
+                                  ^FileChannel current-channel @(:segment-channel state)
+                                  created (long @(:segment-created-ms state))
+                                  bytes (if-let [segment-offset (:segment-offset state)]
+                                          (long @segment-offset)
+                                          (.size current-channel))]
+                              (when (and (= segment-id current-segment-id)
+                                         (identical? channel current-channel)
+                                         (not pending?)
+                                         (should-roll-segment?
+                                          bytes created now-ms
+                                          {:segment-max-bytes
+                                           (:segment-max-bytes state)
+                                           :segment-max-ms
+                                           (:segment-max-ms state)}))
+                                (vreset! swapped? true)
+                                (vreset! (:segment-id state) next-id)
+                                (vreset! (:segment-channel state) next-ch)
+                                (when-let [segment-offset (:segment-offset state)]
+                                  (vreset! segment-offset next-offset))
+                                (vreset! (:segment-created-ms state) now-ms)
+                                {:old-channel current-channel
+                                 :old-bytes bytes})))]
+                      (if-let [{:keys [old-channel old-bytes]} swap-result]
+                        (do
+                          (try
+                            (.truncate ^FileChannel old-channel ^long old-bytes)
+                            (force-channel! old-channel (:sync-mode state))
+                            (finally
+                              (.close ^FileChannel old-channel)))
+                          (inc-volatile-long! (:segment-roll-count state))
+                          (add-volatile-long!
+                           (:segment-roll-duration-ms state)
+                           (- (System/currentTimeMillis) roll-start-ms))
+                          (ensure-next-segment-prepared! state))
+                        (.close next-ch)))
+                    (catch Exception e
+                      (when-not @swapped?
                         (try
-                          (.truncate ^FileChannel old-channel ^long old-bytes)
-                          (force-channel! old-channel (:sync-mode state))
-                          (finally
-                            (.close ^FileChannel old-channel)))
-                        (inc-volatile-long! (:segment-roll-count state))
-                        (add-volatile-long!
-                         (:segment-roll-duration-ms state)
-                         (- (System/currentTimeMillis) roll-start-ms))
-                        (ensure-next-segment-prepared! state))
-                      (.close next-ch)))
-                  (catch Exception e
-                    (when-not @swapped?
-                      (try
-                        (.close next-ch)
-                        (catch Exception _)))
-                    (throw e)))))))]
-    (if-let [^ReentrantLock roll-lock (:segment-roll-lock state)]
-      (when (.tryLock roll-lock)
-        (try
-          (roll-once!)
-          (finally
-            (.unlock roll-lock))))
-      (locking state
-        (roll-once!)))))
+                          (.close next-ch)
+                          (catch Exception _)))
+                      (throw e)))))))]
+      (if-let [^ReentrantLock roll-lock (:segment-roll-lock state)]
+        (when (.tryLock roll-lock)
+          (try
+            (roll-once!)
+            (finally
+              (.unlock roll-lock))))
+        (locking state
+          (roll-once!))))))
 
 (def ^:const no-floor-lsn
   Long/MAX_VALUE)
@@ -2232,6 +2253,8 @@
 (def ^:private commit-payload-format-major 1)
 (def ^:private commit-payload-magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x54) (byte 0x58)])) ; DLTX
+(def ^:private commit-payload-lsn-offset 8)
+(def ^:private commit-payload-tx-time-offset 16)
 
 (def ^:const op-kv-put (byte 0x10))
 (def ^:const op-kv-del (byte 0x11))
@@ -2867,6 +2890,15 @@
     {:body out
      :lmdb-rows lmdb-rows}))
 
+(defn- patch-commit-row-payload-header!
+  [^bytes body ^long lsn ^long tx-time]
+  (let [^ByteBuffer bf (ByteBuffer/wrap body)]
+    (.position bf (int commit-payload-lsn-offset))
+    (.putLong bf (long lsn))
+    (.position bf (int commit-payload-tx-time-offset))
+    (.putLong bf (long tx-time)))
+  body)
+
 (defn decode-commit-row-payload
   "Decode raw binary txn-log payload bytes."
   [^bytes body]
@@ -2921,7 +2953,7 @@
              {:type :txlog/not-enabled})))
 
 (defn- append-record-under-lock!
-  [state rows throw-if-fatal!]
+  [state prepared-payload throw-if-fatal!]
   (when throw-if-fatal!
     (throw-if-fatal! state))
   (let [lsn-v (:next-lsn state)
@@ -2942,8 +2974,9 @@
                        (.size ch)))
         append-start-ms now
         near-roll? (near-roll-append? state offset)
-        {:keys [body lmdb-rows]}
-        (encode-commit-row-payload+lmdb-rows lsn now rows)
+        ^bytes body (:body prepared-payload)
+        lmdb-rows (:lmdb-rows prepared-payload)
+        _ (patch-commit-row-payload-header! body lsn now)
         append-res (append-record-at! ch offset body)
         next-offset (+ offset (long (:size append-res)))]
     (when segment-offset
@@ -3034,11 +3067,12 @@
 
 (defn- append-durable-relaxed!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
-  (let [append-lock (or (:append-lock state) state)
+  (let [prepared-payload (encode-commit-row-payload+lmdb-rows 0 0 rows)
+        append-lock (or (:append-lock state) state)
         {:keys [append-res append-start-ms ch lsn lmdb-rows near-roll?
                 sid sync-manager]}
         (locking append-lock
-          (append-record-under-lock! state rows throw-if-fatal!))
+          (append-record-under-lock! state prepared-payload throw-if-fatal!))
         sync-request (request-sync-on-append! sync-manager lsn append-start-ms)
         sync-res (when sync-request
                    (perform-sync-round! state
@@ -3064,11 +3098,12 @@
 
 (defn- append-durable-strict!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
-  (let [append-lock (or (:append-lock state) state)
+  (let [prepared-payload (encode-commit-row-payload+lmdb-rows 0 0 rows)
+        append-lock (or (:append-lock state) state)
         {:keys [append-res append-start-ms ch lsn lmdb-rows near-roll?
                 sid sync-manager timeout-ms]}
         (locking append-lock
-          (append-record-under-lock! state rows throw-if-fatal!))
+          (append-record-under-lock! state prepared-payload throw-if-fatal!))
         _ (request-sync-on-append! sync-manager lsn append-start-ms)
         _ (request-sync-now! sync-manager)
         {:keys [sync-done-ms sync-reason]}
