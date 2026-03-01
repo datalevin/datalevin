@@ -883,6 +883,48 @@
           (u/delete-files dir)
           (catch Exception _))))))
 
+(deftest datalog-default-wal-persists-on-reopen-test
+  (let [dir (u/tmp-dir (str "datalog-default-wal-reopen-" (UUID/randomUUID)))
+        schema {:k {:db/valueType :db.type/long}
+                :v {:db/valueType :db.type/string}}
+        count-q '[:find (count ?e) .
+                  :where [?e :k]]]
+    (try
+      (let [conn (dc/create-conn dir schema {:kv-opts {:mapsize 64}})]
+        (try
+          (dc/transact! conn [{:k 1 :v "v1"}])
+          (let [^DB db      @conn
+                ^Store s    (.-store db)
+                lmdb        (.-lmdb s)
+                env-opts    (if/env-opts lmdb)
+                watermarks  (if/txlog-watermarks lmdb)]
+            (is (true? (:wal? env-opts)))
+            (is (= :strict (:wal-durability-profile env-opts)))
+            (is (:wal? watermarks))
+            (is (= :strict (:durability-profile watermarks)))
+            (is (= 1 (dc/q count-q (dc/db conn)))))
+          (finally
+            (dc/close conn))))
+      (let [conn (dc/create-conn dir schema {:kv-opts {:mapsize 64}})]
+        (try
+          (let [^DB db      @conn
+                ^Store s    (.-store db)
+                lmdb        (.-lmdb s)
+                env-opts    (if/env-opts lmdb)
+                watermarks  (if/txlog-watermarks lmdb)]
+            (is (true? (:wal? env-opts)))
+            (is (= :strict (:wal-durability-profile env-opts)))
+            (is (:wal? watermarks))
+            (is (= :strict (:durability-profile watermarks)))
+            (dc/transact! conn [{:k 2 :v "v2"}])
+            (is (= 2 (dc/q count-q (dc/db conn)))))
+          (finally
+            (dc/close conn))))
+      (finally
+        (try
+          (u/delete-files dir)
+          (catch Exception _))))))
+
 (deftest txn-log-replay-from-commit-marker-test
   (let [dir (u/tmp-dir (str "txlog-replay-" (UUID/randomUUID)))]
     (try

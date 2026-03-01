@@ -61,7 +61,7 @@ involves only a few functions: `new-search-engine`, `add-doc`, `remove-doc`, and
 (def lmdb (d/open-kv "/tmp/search-db"))
 (def engine (d/new-search-engine lmdb {:index-position? true}))
 
-;; Here are the documents to be indxed, keyed by doc-id
+;; Here are the documents to be indexed, keyed by doc-id
 (def docs
   {1 "The quick red fox jumped over the lazy red dogs."
    2 "Mary had a little lamb whose fleece was red as fire."
@@ -81,7 +81,7 @@ involves only a few functions: `new-search-engine`, `add-doc`, `remove-doc`, and
 (d/search engine [:and {:phrase "little lamb"} "fleece"])
 ;=> (2)
 
-;; we can alter the display to show offets of term occurrences as well, useful
+;; we can alter the display to show offsets of term occurrences as well, useful
 ;; e.g. to highlight matched terms in documents
 (d/search engine "red" {:display :offsets})
 ;=> ([1 (["red" [10 39]])] [2 (["red" [40]])])
@@ -101,10 +101,16 @@ domain name the same as attribute name.
 
 A query function `fulltext` is provided to allow full-text search in Datalog
 queries. This function takes the db, the query and an optional option map (same
-as `search`), and returns a sequence of matching datoms in the form of `[e a v]`
-for easy destructuring, ordered by relevance to the query. The query is the same
-as that of the standalone search engine, so you can use the same search
-expression.
+as `search`), and returns a sequence of matching datom tuples ordered by
+relevance to the query. By default (`:display :refs`), each tuple is `[e a v]`
+for easy destructuring. With other `:display` values, `fulltext` returns:
+
+* `:texts` as `[e a v text]`
+* `:offsets` as `[e a v offsets]`
+* `:texts+offsets` as `[e a v text offsets]`
+
+The query is the same as that of the standalone search engine, so you can use
+the same search expression.
 
 ```Clojure
 (let [db (-> (d/empty-db "/tmp/mydb"
@@ -142,6 +148,26 @@ expression.
 In the above example, we destructure the results into three variables,
 `?e`, `?a` and `?v`.
 
+When `:display` is not `:refs`, destructure extra values in the result tuple:
+
+```Clojure
+;; include document text
+(d/q '[:find ?e ?a ?v ?text
+       :in $ ?q
+       :where [(fulltext $ ?q {:top 1 :display :texts})
+               [[?e ?a ?v ?text]]]]
+     db
+     "red fox")
+
+;; include both text and offsets
+(d/q '[:find ?e ?a ?v ?text ?offsets
+       :in $ ?q
+       :where [(fulltext $ ?q {:top 1 :display :texts+offsets})
+               [[?e ?a ?v ?text ?offsets]]]]
+     db
+     "red fox")
+```
+
 The search can be across the whole database, specific to an
 attribute, or specific to a list of domains.
 
@@ -175,11 +201,13 @@ last argument at run time to customize search. It can have these keys:
 is 2,
 * `:proximity-max-dist` is max distance considered for proximity search, default
 is 45,
-* `:display` sepcifies how results are displayed, could be one of these:
+* `:display` specifies how results are displayed, could be one of these:
    - `:refs` only returns `doc-ref`, the default.
    - `:texts` add the raw text of the documents to the results.
    - `:offsets` add the offsets of the matched tokens to the results.
    - `:texts+offsets` add both texts and offsets to results.
+  In Datalog `fulltext`, these map to tuple shapes `[e a v]`, `[e a v text]`,
+  `[e a v offsets]`, and `[e a v text offsets]`.
 * `:doc-filter` is a boolean function that takes `doc-ref` and determine if to
   return the document.
 * `:domains` specifies a list of domains to be searched (see below).

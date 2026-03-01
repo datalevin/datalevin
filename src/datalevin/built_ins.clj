@@ -162,6 +162,16 @@
   e.g. [(or (= ?g \"f\"\") (like ?n \"A%\"\"))]"
   or-fn)
 
+(defn- doc-ref->eav
+  [lmdb aid->attr doc-ref]
+  (if (and (vector? doc-ref)
+           (clojure.core/= :g (first doc-ref)))
+    (let [d (idx/gt->datom lmdb (second doc-ref))]
+      [(dd/datom-e d) (dd/datom-a d) (dd/datom-v d)])
+    [(nth doc-ref 0)
+     (aid->attr (nth doc-ref 1))
+     (peek doc-ref)]))
+
 (defn- make-emit-fn
   "Create an emit function that produces tuples with only the needed indices.
    If needed is nil, produces full [e a v] tuples."
@@ -170,13 +180,7 @@
     (let [n (alength needed)]
       (fn [doc-ref]
         (let [^objects arr (object-array n)
-              [e a v]      (if (and (vector? doc-ref)
-                                    (clojure.core/= :g (first doc-ref)))
-                             (let [d (idx/gt->datom lmdb (second doc-ref))]
-                               [(dd/datom-e d) (dd/datom-a d) (dd/datom-v d)])
-                             [(nth doc-ref 0)
-                              (aid->attr (nth doc-ref 1))
-                              (peek doc-ref)])]
+              [e a v]      (doc-ref->eav lmdb aid->attr doc-ref)]
           (dotimes [j n]
             (aset arr j (case (aget needed j)
                           0 e
@@ -184,20 +188,46 @@
                           2 v)))
           arr)))
     (fn [doc-ref]
-      (if (and (vector? doc-ref)
-               (clojure.core/= :g (first doc-ref)))
-        (let [d (idx/gt->datom lmdb (second doc-ref))]
-          (object-array [(dd/datom-e d)
-                         (dd/datom-a d)
-                         (dd/datom-v d)]))
-        (object-array [(nth doc-ref 0)
-                       (aid->attr (nth doc-ref 1))
-                       (peek doc-ref)])))))
+      (object-array (doc-ref->eav lmdb aid->attr doc-ref)))))
+
+(defn- fulltext-doc-ref+extras
+  [display result]
+  (case display
+    :texts         [(nth result 0) [(nth result 1)]]
+    :offsets       [(nth result 0) [(nth result 1)]]
+    :texts+offsets [(nth result 0) [(nth result 1) (nth result 2)]]
+    [result nil]))
+
+(defn- make-fulltext-emit-fn
+  [lmdb aid->attr display ^ints needed]
+  (if needed
+    (let [n (alength needed)]
+      (fn [result]
+        (let [[doc-ref extras] (fulltext-doc-ref+extras display result)
+              [e a v]          (doc-ref->eav lmdb aid->attr doc-ref)
+              ^objects arr     (object-array n)]
+          (dotimes [j n]
+            (let [i (aget needed j)]
+              (aset arr j (case i
+                            0 e
+                            1 a
+                            2 v
+                            (nth extras (clojure.core/- i 3) nil)))))
+          arr)))
+    (fn [result]
+      (let [[doc-ref extras] (fulltext-doc-ref+extras display result)
+            [e a v]          (doc-ref->eav lmdb aid->attr doc-ref)]
+        (object-array (if (seq extras)
+                        (into [e a v] extras)
+                        [e a v]))))))
 
 (defn- fulltext*
   [^FastList res aid->attr lmdb engines query opts domain ^ints needed]
-  (let [engine (engines domain)
-        emit   (make-emit-fn lmdb aid->attr needed)]
+  (let [engine  (engines domain)
+        display (or (:display opts)
+                    (get-in engine [:search-opts :display])
+                    :refs)
+        emit    (make-fulltext-emit-fn lmdb aid->attr display needed)]
     (doseq [d (search engine query opts)]
       (.add res (emit d)))))
 
@@ -209,14 +239,24 @@
     (some-> arg1 clojure.core/meta :tuple-needed)))
 
 (defn fulltext
-  "Function that does fulltext search. Returns matching tuples of
-  (e a v) for convenient destructuring.
+  "Function that does fulltext search. Returns matching tuples ordered by
+  relevance.
+
+  By default (`:display :refs`), each result tuple is `[e a v]`.
 
   The last argument of the 4 arity function is the search option map.
   See [[datalevin.core.search]].
 
-  When neither an attribute nor a `:domans` is specified, a full DB search
+  Additional values are returned when `:display` is set in the options:
+  * `:texts` returns `[e a v text]`
+  * `:offsets` returns `[e a v offsets]`
+  * `:texts+offsets` returns `[e a v text offsets]`
+
+  When neither an attribute nor a `:domains` is specified, a full DB search
   is performed.
+
+  Attribute-specific search requires `:db.fulltext/autoDomain true` on the
+  attribute.
 
   For example:
 
@@ -226,7 +266,12 @@
 
   * Domain specific search:
 
-    `[(fulltext $ \"red\" {:domains [\"color\"]} [[?e ?a ?v]])]`"
+    `[(fulltext $ \"red\" {:domains [\"color\"]} [[?e ?a ?v]])]`
+
+  * Search with text and offsets:
+
+    `[(fulltext $ \"red\" {:display :texts+offsets})
+      [[?e ?a ?v ?text ?offsets]]]`"
   ([db query]
    (fulltext db query nil))
   ([db arg1 arg2]

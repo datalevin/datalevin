@@ -37,7 +37,7 @@
             list-count key-range-list-count key-range-count rschema
             list-range-first-n get-list list-range-filter-count max-aid
             list-range-some list-range-keep visit-list-range max-gt max-tx
-            open-list-dbi open-dbi attrs add-doc remove-doc opts swap-attr
+            open-list-dbi open-dbi attrs add-doc remove-doc opts env-opts kv-info swap-attr
             add-vec remove-vec schema closed? a-size db-name populated?
             get-env-flags set-env-flags]]
    [clojure.string :as str])
@@ -1540,6 +1540,19 @@
   (c/canonicalize-wal-opts
    (into {} (get-range lmdb c/opts [:all] :attr :data))))
 
+(defn- sync-wal-runtime-opts!
+  [lmdb opts]
+  (let [opts (c/canonicalize-wal-opts opts)]
+    (when (true? (:wal? opts))
+      (let [runtime-opts (or (env-opts lmdb) {})
+            info-v       (kv-info lmdb)]
+        (when (and info-v (not (true? (:wal? runtime-opts))))
+          (let [wal-opts (into {}
+                               (filter (fn [[k _]]
+                                         (c/wal-option-key? k)))
+                               opts)]
+            (vswap! info-v merge wal-opts)))))))
+
 (defn- open-dbis
   [lmdb]
   (open-list-dbi lmdb c/ave {:key-size c/+max-key-size+
@@ -1738,6 +1751,7 @@
                        opts0)
            opts2     (c/canonicalize-wal-opts
                       (merge opts1 opts))
+           _         (sync-wal-runtime-opts! lmdb opts2)
            schema    (init-schema lmdb schema)
            s-domains (init-search-domains (:search-domains opts2)
                                           schema search-opts search-domains)

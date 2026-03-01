@@ -464,6 +464,54 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest fulltext-display-option-test
+  (let [analyzer (i/inter-fn
+                    [^String text]
+                  (map-indexed (fn [i ^String t]
+                                 [t i (.indexOf text t)])
+                               (s/split text #"\s")))
+        dir      (u/tmp-dir (str "fulltext-display-" (UUID/randomUUID)))
+        conn     (d/create-conn
+                   dir {:a/id     {:db/valueType :db.type/long
+                                   :db/unique    :db.unique/identity}
+                        :a/string {:db/valueType           :db.type/string
+                                   :db/fulltext            true
+                                   :db.fulltext/autoDomain true}}
+                   {:search-opts {:analyzer        analyzer
+                                  :index-position? true
+                                  :include-text?   true}})
+        s        "The quick brown fox jumps over the lazy dog"]
+    (d/transact! conn [{:a/id 1 :a/string s}])
+    (is (= s
+           (d/q '[:find ?text .
+                  :in $ ?q
+                  :where
+                  [(fulltext $ ?q {:top 1 :display :texts}) [[_ _ _ ?text]]]]
+                (d/db conn) "brown fox")))
+    (let [offsets    (d/q '[:find ?offsets .
+                            :in $ ?q
+                            :where
+                            [(fulltext $ ?q {:top 1 :display :offsets})
+                             [[_ _ _ ?offsets]]]]
+                          (d/db conn) "brown fox")
+          offset-map (into {} offsets)]
+      (is (= [10] (get offset-map "brown")))
+      (is (= [16] (get offset-map "fox"))))
+    (let [[text offsets] (first
+                           (d/q '[:find ?text ?offsets
+                                  :in $ ?q
+                                  :where
+                                  [(fulltext $ ?q {:top 1
+                                                   :display :texts+offsets})
+                                   [[_ _ _ ?text ?offsets]]]]
+                                (d/db conn) "brown fox"))
+          offset-map     (into {} offsets)]
+      (is (= s text))
+      (is (= [10] (get offset-map "brown")))
+      (is (= [16] (get offset-map "fox"))))
+    (d/close conn)
+    (u/delete-files dir)))
+
 (defn- rows->maps [csv]
   (let [headers (map keyword (first csv))
         rows    (rest csv)]

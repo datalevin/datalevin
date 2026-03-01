@@ -18,6 +18,7 @@
   lost on close. It has even faster write speed than `:nosync`.
 - [Datalog] Support atomic migration from default EDN blob to a specific data
   type when `update-schema`.
+- [Datalog] `fulltext` function honors `:display` option.
 - [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf]
 
 ### Improved
