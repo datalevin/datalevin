@@ -21,7 +21,7 @@
   (:import
    [java.io ByteArrayInputStream ByteArrayOutputStream]
    [java.nio ByteBuffer]
-   [java.nio.channels SocketChannel]
+   [java.nio.channels SocketChannel Selector SelectionKey]
    [datalevin.io ByteBufferInputStream ByteBufferOutputStream]
    [datalevin.spill SpillableVector]
    [datalevin.datom Datom]
@@ -253,12 +253,38 @@
   "Send all data in buffer to channel, will block if channel is busy.
   Close the channel and raise exception if something is wrong"
   [^SocketChannel ch ^ByteBuffer bf ]
-  (loop []
-    (when (.hasRemaining bf)
-      (if (= (send-ch ch bf) -1)
-        (do (.close ch)
-            (u/raise "Socket channel is closed." {}))
-        (recur)))))
+  (let [non-blocking? (not (.isBlocking ch))
+        selector      (volatile! nil)]
+    (try
+      (loop []
+        (when (.hasRemaining bf)
+          (let [n (send-ch ch bf)]
+            (cond
+              (= n -1)
+              (do (.close ch)
+                  (u/raise "Socket channel is closed." {}))
+
+              (pos? n)
+              (recur)
+
+              non-blocking?
+              (let [^Selector sel (or @selector
+                                      (let [^Selector s (Selector/open)]
+                                        (.register ch s SelectionKey/OP_WRITE)
+                                        (vreset! selector s)
+                                        s))]
+                ;; Avoid busy-spinning on non-blocking sockets under backpressure.
+                (.select sel)
+                (.clear (.selectedKeys sel))
+                (recur))
+
+              :else
+              (do
+                (Thread/yield)
+                (recur))))))
+      (finally
+        (when-let [^Selector sel @selector]
+          (.close sel))))))
 
 (defn write-message-blocking
   "Write a message in blocking mode"
