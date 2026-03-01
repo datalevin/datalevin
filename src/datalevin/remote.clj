@@ -24,9 +24,59 @@
    [datalevin.interface ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
+   [java.util.concurrent ConcurrentHashMap]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
    [java.security MessageDigest]
    [java.net URI]))
+
+(def ^:dynamic *chatty-kv-detect-threshold*
+  "Minimum streak length before recording a chatty remote point-read detection."
+  32)
+
+(def ^:dynamic *chatty-kv-detect-window-ms*
+  "Maximum gap between sequential calls in a streak."
+  100)
+
+(defonce ^:private ^ConcurrentHashMap chatty-kv-seq-state
+  (ConcurrentHashMap.))
+
+(defonce ^:private ^ConcurrentHashMap chatty-kv-stats*
+  (ConcurrentHashMap.))
+
+(defn reset-chatty-kv-stats!
+  "Reset runtime chatty-KV detection state and counters."
+  []
+  (.clear chatty-kv-seq-state)
+  (.clear chatty-kv-stats*)
+  nil)
+
+(defn chatty-kv-stats
+  "Return detected chatty remote KV calls as {[db-name dbi-name op] count}."
+  []
+  (into {}
+        (map (fn [^java.util.Map$Entry e]
+               [(.getKey e) (.getValue e)]))
+        (.entrySet chatty-kv-stats*)))
+
+(defn- inc-chatty-kv-stat!
+  [stat-key]
+  (let [n (.get chatty-kv-stats* stat-key)]
+    (.put chatty-kv-stats* stat-key (if n (inc ^long n) 1))))
+
+(defn- detect-chatty-kv!
+  [db-name dbi-name op]
+  (let [now-ms    (System/currentTimeMillis)
+        tid       (.getId (Thread/currentThread))
+        state-key [tid db-name dbi-name op]
+        prev      (.get chatty-kv-seq-state state-key)
+        streak    (if (and prev
+                           (<= (- now-ms ^long (:ts prev))
+                               ^long *chatty-kv-detect-window-ms*))
+                    (inc ^long (:streak prev))
+                    1)]
+    (.put chatty-kv-seq-state state-key {:ts now-ms :streak streak})
+    (when (>= streak ^long *chatty-kv-detect-threshold*)
+      (inc-chatty-kv-stat! [db-name dbi-name op]))))
 
 (defn dtlv-uri?
   "return true if the given string is a Datalevin connection string"
@@ -743,6 +793,7 @@
   (get-value [db dbi-name k k-type v-type]
     (.get-value db dbi-name k k-type v-type true))
   (get-value [_ dbi-name k k-type v-type ignore-key?]
+    (detect-chatty-kv! db-name dbi-name :get-value)
     (cl/normal-request
       client :get-value
       [db-name dbi-name k k-type v-type ignore-key?] writing?))
@@ -750,6 +801,7 @@
   (get-rank [db dbi-name k]
     (.get-rank db dbi-name k :data))
   (get-rank [_ dbi-name k k-type]
+    (detect-chatty-kv! db-name dbi-name :get-rank)
     (cl/normal-request
       client :get-rank
       [db-name dbi-name k k-type] writing?))
@@ -761,6 +813,7 @@
   (get-by-rank [db dbi-name rank k-type v-type]
     (.get-by-rank db dbi-name rank k-type v-type true))
   (get-by-rank [_ dbi-name rank k-type v-type ignore-key?]
+    (detect-chatty-kv! db-name dbi-name :get-by-rank)
     (cl/normal-request
       client :get-by-rank
       [db-name dbi-name rank k-type v-type ignore-key?] writing?))
@@ -970,6 +1023,7 @@
     (.transact-kv db [[:del-list dbi-name k vs kt vt]]))
 
   (get-list [_ dbi-name k kt vt]
+    (detect-chatty-kv! db-name dbi-name :get-list)
     (cl/normal-request client :get-list
                        [db-name dbi-name k kt vt] writing?))
 
@@ -984,10 +1038,12 @@
         [db-name dbi-name frozen-visitor k kt vt raw-pred?] writing?)))
 
   (list-count [_ dbi-name k kt]
+    (detect-chatty-kv! db-name dbi-name :list-count)
     (cl/normal-request client :list-count
                        [db-name dbi-name k kt] writing?))
 
   (in-list? [_ dbi-name k v kt vt]
+    (detect-chatty-kv! db-name dbi-name :in-list?)
     (cl/normal-request client :in-count?
                        [db-name dbi-name k v kt vt] writing?))
 
@@ -1089,6 +1145,22 @@
                      :batch-kv
                      [(.-db-name store) calls]
                      (.-writing? store)))
+
+(defn get-values
+  "Batch key lookups for remote KV store in one RPC.
+
+  Returns a vector of results in the same order as `ks`."
+  ([^KVStore store dbi-name ks]
+   (get-values store dbi-name ks :data :data true))
+  ([^KVStore store dbi-name ks k-type]
+   (get-values store dbi-name ks k-type :data true))
+  ([^KVStore store dbi-name ks k-type v-type]
+   (get-values store dbi-name ks k-type v-type true))
+  ([^KVStore store dbi-name ks k-type v-type ignore-key?]
+   (batch-kv store
+             (mapv (fn [k]
+                     [:get-value dbi-name k k-type v-type ignore-key?])
+                   ks))))
 
 ;; remote search
 

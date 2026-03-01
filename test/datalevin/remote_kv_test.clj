@@ -202,6 +202,27 @@
       (finally
         (if/close-kv store)))))
 
+(deftest get-values-batch-test
+  (let [db-name (str "get-values-batch-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri)]
+    (try
+      (if/open-dbi store "a")
+      (if/transact-kv store [[:put "a" 1 2 :long :long]
+                             [:put "a" 2 3 :long :long]
+                             [:put "a" 3 4 :long :long]])
+      (sut/reset-chatty-kv-stats!)
+      (binding [sut/*chatty-kv-detect-threshold* 3
+                sut/*chatty-kv-detect-window-ms* 10000]
+        (is (= [2 3 4 nil]
+               (sut/get-values store "a" [1 2 3 4] :long :long true)))
+        (is (= [[1 2] [2 3]]
+               (sut/get-values store "a" [1 2] :long :long false)))
+        ;; This path should not trigger per-key get-value chatty detection.
+        (is (zero? (or (get (sut/chatty-kv-stats) [db-name "a" :get-value]) 0))))
+      (finally
+        (if/close-kv store)))))
+
 (deftest range-seq-uses-batch-kv-test
   (let [db-name (str "range-seq-batch-kv-" (UUID/randomUUID))
         uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
@@ -221,6 +242,24 @@
                   (if/range-seq store "a" [:closed-back 5 2]
                                 :long :long true {:batch-size 2})]
         (is (= [50 40 30 20] (seq rs))))
+      (finally
+        (if/close-kv store)))))
+
+(deftest chatty-kv-detection-test
+  (let [db-name (str "chatty-kv-detect-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri)]
+    (try
+      (if/open-dbi store "a")
+      (if/transact-kv store [[:put "a" 1 2 :long :long]])
+      (sut/reset-chatty-kv-stats!)
+      (binding [sut/*chatty-kv-detect-threshold* 3
+                sut/*chatty-kv-detect-window-ms* 10000]
+        (dotimes [_ 5]
+          (if/get-value store "a" 1 :long :long true)))
+      (is (pos? (or (get (sut/chatty-kv-stats)
+                         [db-name "a" :get-value])
+                    0)))
       (finally
         (if/close-kv store)))))
 
