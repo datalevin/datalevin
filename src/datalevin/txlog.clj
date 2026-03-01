@@ -2675,54 +2675,27 @@
            bs)))
      (dbi-name-bytes dbi-name))))
 
-(defn- row->kv-components
-  [row]
-  (cond
-    (instance? datalevin.lmdb.KVTxData row)
-    (let [^datalevin.lmdb.KVTxData tx row]
-      {:op (.-op tx)
-       :dbi (.-dbi-name tx)
-       :k (.-k tx)
-       :v (.-v tx)
-       :kt (.-kt tx)
-       :vt (.-vt tx)
-       :flags (.-flags tx)
-       :row row})
-
-    (vector? row)
-    {:op (nth row 0 nil)
-     :dbi (nth row 1 nil)
-     :k (nth row 2 nil)
-     :v (nth row 3 nil)
-     :kt (nth row 4 nil)
-     :vt (nth row 5 nil)
-     :flags (nth row 6 nil)
-     :row row}
-
-    (instance? java.util.List row)
-    (let [^List row* row
-          n (.size row*)]
-      {:op (when (< 0 n) (.get row* 0))
-       :dbi (when (< 1 n) (.get row* 1))
-       :k (when (< 2 n) (.get row* 2))
-       :v (when (< 3 n) (.get row* 3))
-       :kt (when (< 4 n) (.get row* 4))
-       :vt (when (< 5 n) (.get row* 5))
-       :flags (when (< 6 n) (.get row* 6))
-       :row row})
-
-    :else
-    (raise "Txn-log row must be a vector or KVTxData"
-           {:type :txlog/corrupt
-            :row row})))
-
 (defn- body-slice-buffer
   ^ByteBuffer [^bytes body ^long offset ^long len]
   (.slice ^ByteBuffer (ByteBuffer/wrap body (int offset) (int len))))
 
-(defn- lmdb-row-from-encoded
-  [{:keys [op dbi v vt flags row]} k-raw v-raw]
-  (let [dbi-name (dbi-name->string dbi)]
+(deftype ^:private LMDBRowSpan [op
+                                ^String dbi-name
+                                v
+                                vt
+                                flags
+                                ^long k-offset
+                                ^long k-len
+                                ^long v-offset
+                                ^long v-len])
+
+(defn- lmdb-row-from-span
+  [^LMDBRowSpan span k-raw v-raw]
+  (let [op (.-op span)
+        ^String dbi-name (.-dbi-name span)
+        v (.-v span)
+        vt (.-vt span)
+        flags (.-flags span)]
     (case op
       :put
       (datalevin.lmdb.KVTxData. op dbi-name k-raw v-raw :raw :raw flags)
@@ -2737,7 +2710,152 @@
       :del-list
       (datalevin.lmdb.KVTxData. op dbi-name k-raw v :raw (or vt :data) flags)
 
-      row)))
+      (raise "Unsupported txn-log KV op"
+             {:type :txlog/corrupt
+              :op op}))))
+
+(defn- write-kv-components!
+  ^ByteBuffer [^ThreadLocal tl
+               ^ByteBuffer bf
+               op
+               dbi
+               k
+               v
+               kt
+               vt
+               flags
+               row
+               ^HashMap dbi-cache
+               ^FastList lmdb-row-spans]
+  (let [^String dbi-name (dbi-name->string dbi)
+        ^bytes dbi-bs (dbi-name-bytes dbi-name dbi-cache)
+        dbi-len (alength dbi-bs)
+        k-type (or kt :data)
+        ^ByteBuffer k-bf (encode-to-buf k k-type)
+        k-len (.remaining k-bf)]
+    (case op
+      :put
+      (let [bf1 (-> bf
+                    (bb-put-byte! tl (int op-kv-put))
+                    (bb-put-u16! tl dbi-len)
+                    (bb-put-bytes! tl dbi-bs)
+                    (bb-write-type! tl k-type)
+                    (bb-put-u16! tl k-len))
+            k-offset (.position bf1)
+            bf2 (bb-put-buffer! bf1 tl k-bf)
+            v-type (or vt :data)
+            ^ByteBuffer v-bf (encode-to-buf v v-type)
+            v-len (.remaining v-bf)
+            bf3 (-> bf2
+                    (bb-write-type! tl v-type)
+                    (bb-put-u32! tl v-len))
+            v-offset (.position bf3)
+            bf' (-> bf3
+                    (bb-put-buffer! tl v-bf)
+                    (bb-write-flags! tl flags))]
+        (when lmdb-row-spans
+          (.add lmdb-row-spans
+                (LMDBRowSpan. op
+                              dbi-name
+                              nil
+                              nil
+                              flags
+                              (long k-offset)
+                              (long k-len)
+                              (long v-offset)
+                              (long v-len))))
+        bf')
+
+      :del
+      (let [bf1 (-> bf
+                    (bb-put-byte! tl (int op-kv-del))
+                    (bb-put-u16! tl dbi-len)
+                    (bb-put-bytes! tl dbi-bs)
+                    (bb-write-type! tl k-type)
+                    (bb-put-u16! tl k-len))
+            k-offset (.position bf1)
+            bf' (-> bf1
+                    (bb-put-buffer! tl k-bf)
+                    (bb-write-flags! tl flags))]
+        (when lmdb-row-spans
+          (.add lmdb-row-spans
+                (LMDBRowSpan. op
+                              dbi-name
+                              nil
+                              nil
+                              flags
+                              (long k-offset)
+                              (long k-len)
+                              -1
+                              -1)))
+        bf')
+
+      :put-list
+      (let [bf1 (-> bf
+                    (bb-put-byte! tl (int op-kv-put-list))
+                    (bb-put-u16! tl dbi-len)
+                    (bb-put-bytes! tl dbi-bs)
+                    (bb-write-type! tl k-type)
+                    (bb-put-u16! tl k-len))
+            k-offset (.position bf1)
+            bf2 (bb-put-buffer! bf1 tl k-bf)
+            v-type (or vt :data)
+            ;; Keep list payload as :data for compact, fast decode.
+            ^ByteBuffer v-bf (encode-to-buf v :data)
+            v-len (.remaining v-bf)
+            bf' (-> bf2
+                    (bb-write-type! tl v-type)
+                    (bb-put-u32! tl v-len)
+                    (bb-put-buffer! tl v-bf)
+                    (bb-write-flags! tl flags))]
+        (when lmdb-row-spans
+          (.add lmdb-row-spans
+                (LMDBRowSpan. op
+                              dbi-name
+                              v
+                              v-type
+                              flags
+                              (long k-offset)
+                              (long k-len)
+                              -1
+                              -1)))
+        bf')
+
+      :del-list
+      (let [bf1 (-> bf
+                    (bb-put-byte! tl (int op-kv-del-list))
+                    (bb-put-u16! tl dbi-len)
+                    (bb-put-bytes! tl dbi-bs)
+                    (bb-write-type! tl k-type)
+                    (bb-put-u16! tl k-len))
+            k-offset (.position bf1)
+            bf2 (bb-put-buffer! bf1 tl k-bf)
+            v-type (or vt :data)
+            ;; Keep list payload as :data for compact, fast decode.
+            ^ByteBuffer v-bf (encode-to-buf v :data)
+            v-len (.remaining v-bf)
+            bf' (-> bf2
+                    (bb-write-type! tl v-type)
+                    (bb-put-u32! tl v-len)
+                    (bb-put-buffer! tl v-bf)
+                    (bb-write-flags! tl flags))]
+        (when lmdb-row-spans
+          (.add lmdb-row-spans
+                (LMDBRowSpan. op
+                              dbi-name
+                              v
+                              v-type
+                              flags
+                              (long k-offset)
+                              (long k-len)
+                              -1
+                              -1)))
+        bf')
+
+      (raise "Unsupported txn-log KV op"
+             {:type :txlog/corrupt
+              :op op
+              :row row}))))
 
 (defn- write-kv-row!
   ([^ThreadLocal tl ^ByteBuffer bf row]
@@ -2749,126 +2867,71 @@
     row
     ^HashMap dbi-cache
     ^FastList lmdb-row-spans]
-   (let [{:keys [op dbi k v kt vt flags] :as components}
-         (row->kv-components row)
-         ^bytes dbi-bs (dbi-name-bytes dbi dbi-cache)
-         dbi-len (alength dbi-bs)
-         k-type (or kt :data)
-         ^ByteBuffer k-bf (encode-to-buf k k-type)
-         k-len (.remaining k-bf)]
-     (case op
-       :put
-       (let [bf1 (-> bf
-                     (bb-put-byte! tl (int op-kv-put))
-                     (bb-put-u16! tl dbi-len)
-                     (bb-put-bytes! tl dbi-bs)
-                     (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len))
-             k-offset (.position bf1)
-             bf2 (bb-put-buffer! bf1 tl k-bf)
-             v-type (or vt :data)
-             ^ByteBuffer v-bf (encode-to-buf v v-type)
-             v-len (.remaining v-bf)
-             bf3 (-> bf2
-                     (bb-write-type! tl v-type)
-                     (bb-put-u32! tl v-len))
-             v-offset (.position bf3)
-             bf' (-> bf3
-                     (bb-put-buffer! tl v-bf)
-                     (bb-write-flags! tl flags))]
-         (when lmdb-row-spans
-           (.add lmdb-row-spans
-                 {:components components
-                  :k-offset (long k-offset)
-                  :k-len (long k-len)
-                  :v-offset (long v-offset)
-                  :v-len (long v-len)}))
-         bf')
+   (cond
+     (instance? datalevin.lmdb.KVTxData row)
+     (let [^datalevin.lmdb.KVTxData tx row]
+       (write-kv-components! tl
+                             bf
+                             (.-op tx)
+                             (.-dbi-name tx)
+                             (.-k tx)
+                             (.-v tx)
+                             (.-kt tx)
+                             (.-vt tx)
+                             (.-flags tx)
+                             row
+                             dbi-cache
+                             lmdb-row-spans))
 
-       :del
-       (let [bf1 (-> bf
-                     (bb-put-byte! tl (int op-kv-del))
-                     (bb-put-u16! tl dbi-len)
-                     (bb-put-bytes! tl dbi-bs)
-                     (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len))
-             k-offset (.position bf1)
-             bf' (-> bf1
-                     (bb-put-buffer! tl k-bf)
-                     (bb-write-flags! tl flags))]
-         (when lmdb-row-spans
-           (.add lmdb-row-spans
-                 {:components components
-                  :k-offset (long k-offset)
-                  :k-len (long k-len)}))
-         bf')
+     (vector? row)
+     (write-kv-components! tl
+                           bf
+                           (nth row 0 nil)
+                           (nth row 1 nil)
+                           (nth row 2 nil)
+                           (nth row 3 nil)
+                           (nth row 4 nil)
+                           (nth row 5 nil)
+                           (nth row 6 nil)
+                           row
+                           dbi-cache
+                           lmdb-row-spans)
 
-       :put-list
-       (let [bf1 (-> bf
-                     (bb-put-byte! tl (int op-kv-put-list))
-                     (bb-put-u16! tl dbi-len)
-                     (bb-put-bytes! tl dbi-bs)
-                     (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len))
-             k-offset (.position bf1)
-             bf2 (bb-put-buffer! bf1 tl k-bf)
-             v-type (or vt :data)
-             ;; Keep list payload as :data for compact, fast decode.
-             ^ByteBuffer v-bf (encode-to-buf v :data)
-             v-len (.remaining v-bf)
-             bf' (-> bf2
-                     (bb-write-type! tl v-type)
-                     (bb-put-u32! tl v-len)
-                     (bb-put-buffer! tl v-bf)
-                     (bb-write-flags! tl flags))]
-         (when lmdb-row-spans
-           (.add lmdb-row-spans
-                 {:components components
-                  :k-offset (long k-offset)
-                  :k-len (long k-len)}))
-         bf')
+     (instance? java.util.List row)
+     (let [^List row* row
+           n (.size row*)]
+       (write-kv-components! tl
+                             bf
+                             (when (< 0 n) (.get row* 0))
+                             (when (< 1 n) (.get row* 1))
+                             (when (< 2 n) (.get row* 2))
+                             (when (< 3 n) (.get row* 3))
+                             (when (< 4 n) (.get row* 4))
+                             (when (< 5 n) (.get row* 5))
+                             (when (< 6 n) (.get row* 6))
+                             row
+                             dbi-cache
+                             lmdb-row-spans))
 
-       :del-list
-       (let [bf1 (-> bf
-                     (bb-put-byte! tl (int op-kv-del-list))
-                     (bb-put-u16! tl dbi-len)
-                     (bb-put-bytes! tl dbi-bs)
-                     (bb-write-type! tl k-type)
-                     (bb-put-u16! tl k-len))
-             k-offset (.position bf1)
-             bf2 (bb-put-buffer! bf1 tl k-bf)
-             v-type (or vt :data)
-             ;; Keep list payload as :data for compact, fast decode.
-             ^ByteBuffer v-bf (encode-to-buf v :data)
-             v-len (.remaining v-bf)
-             bf' (-> bf2
-                     (bb-write-type! tl v-type)
-                     (bb-put-u32! tl v-len)
-                     (bb-put-buffer! tl v-bf)
-                     (bb-write-flags! tl flags))]
-         (when lmdb-row-spans
-           (.add lmdb-row-spans
-                 {:components components
-                  :k-offset (long k-offset)
-                  :k-len (long k-len)}))
-         bf')
-
-       (raise "Unsupported txn-log KV op"
-              {:type :txlog/corrupt
-               :op op
-               :row row})))))
+     :else
+     (raise "Txn-log row must be a vector or KVTxData"
+            {:type :txlog/corrupt
+             :row row}))))
 
 (defn- lmdb-rows-from-spans
   ^FastList [^bytes body ^FastList lmdb-row-spans]
   (let [n (.size lmdb-row-spans)
         ^FastList lmdb-rows (FastList. n)]
     (dotimes [i n]
-      (let [{:keys [components k-offset k-len v-offset v-len]}
-            (.get lmdb-row-spans i)
+      (let [^LMDBRowSpan span (.get lmdb-row-spans i)
+            k-offset (long (.-k-offset span))
+            k-len (long (.-k-len span))
+            v-offset (long (.-v-offset span))
+            v-len (long (.-v-len span))
             k-raw (body-slice-buffer body k-offset k-len)
-            v-raw (when (some? v-offset)
+            v-raw (when (>= v-offset 0)
                     (body-slice-buffer body v-offset v-len))]
-        (.add lmdb-rows (lmdb-row-from-encoded components k-raw v-raw))))
+        (.add lmdb-rows (lmdb-row-from-span span k-raw v-raw))))
     lmdb-rows))
 
 (defn- use-parallel-row-encoding?
