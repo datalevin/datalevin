@@ -254,35 +254,48 @@
     (let [success? (volatile! false)
           start    (System/currentTimeMillis)]
       (loop []
-        (let [conn (get-connection pool)
-              res  (when-let [{:keys [type] :as result}
-                              (try
-                                (send-n-receive conn req)
-                                (catch Exception _
-                                  (close conn)
-                                  nil)
-                                (finally (release-connection pool conn)))]
-                     (vreset! success? true)
-                     (case type
-                       :copy-out-response (copy-out conn req result)
-                       :command-complete  result
-                       :error-response    result
-                       :reopen
-                       (let [{:keys [db-name db-type]} result]
-                         (vreset! success? false)
-                         (open-database client db-name db-type))
-                       :reconnect
-                       (let [client-id
-                             (authenticate host port username password)]
-                         (close conn)
-                         (vreset! success? false)
-                         (set! id client-id)
-                         (set! pool (new-connectionpool host port client-id
-                                                        pool-size time-out)))))]
-          (if (>= (- (System/currentTimeMillis) start) ^long (.-time-out pool))
+        (let [^ConnectionPool pool' pool
+              conn                 (get-connection pool')
+              response             (try
+                                     (send-n-receive conn req)
+                                     (catch Exception _
+                                       (close conn)
+                                       nil))
+              res                  (try
+                                     (when-let [{:keys [type] :as result}
+                                                response]
+                                       (vreset! success? true)
+                                       (case type
+                                         :copy-out-response (copy-out conn req result)
+                                         :command-complete  result
+                                         :error-response    result
+                                         :reopen
+                                         (let [{:keys [db-name db-type]} result]
+                                           (vreset! success? false)
+                                           (open-database client db-name db-type))
+                                         :reconnect
+                                         (let [client-id
+                                               (authenticate host port username
+                                                             password)]
+                                           (close conn)
+                                           (vreset! success? false)
+                                           {:request-status :reconnect
+                                            :client-id      client-id})))
+                                     (finally
+                                       (release-connection pool' conn)))
+              res'                 (if (= :reconnect (:request-status res))
+                                     (let [client-id (:client-id res)]
+                                       (set! id client-id)
+                                       (set! pool (new-connectionpool
+                                                    host port client-id
+                                                    pool-size time-out))
+                                       nil)
+                                     res)]
+          (if (>= (- (System/currentTimeMillis) start)
+                  ^long (.-time-out pool'))
             (u/raise "Timeout in making request" {})
             (if @success?
-              res
+              res'
               (recur)))))))
 
   (copy-in [client req data batch-size]
