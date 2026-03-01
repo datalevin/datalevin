@@ -76,6 +76,7 @@
          new-sync-manager
          sync-manager-pending?
          request-sync-on-append!
+         append-sync-transition!
          begin-sync!
          complete-sync-success!
          complete-sync-failure!
@@ -448,6 +449,12 @@
        (doto (ByteBuffer/allocate record-header-size)
          (.order ByteOrder/BIG_ENDIAN))))))
 
+(def ^:private ^ThreadLocal tl-record-write-buffers
+  (ThreadLocal/withInitial
+   (reify java.util.function.Supplier
+     (get [_]
+       (make-array ByteBuffer 2)))))
+
 (defn- checked-record-body-len
   [^bytes body]
   (let [body-len (alength body)]
@@ -501,6 +508,18 @@
       (when-not (pos? n)
         (raise "Unable to progress while writing txn-log data"
                {:remaining (total-buffers-remaining bufs)})))))
+
+(defn- write-fully-record!
+  [^FileChannel ch ^ByteBuffer header-bf ^bytes body]
+  (let [^"[Ljava.nio.ByteBuffer;" bufs (.get tl-record-write-buffers)]
+    (aset bufs 0 header-bf)
+    (aset bufs 1 (ByteBuffer/wrap body))
+    (try
+      (write-fully-buffers! ch bufs)
+      (finally
+        ;; Avoid retaining the last body byte[] through thread-local buffers.
+        (aset bufs 0 nil)
+        (aset bufs 1 nil)))))
 
 (defn force-channel!
   "Force channel to disk according to sync mode:
@@ -825,8 +844,7 @@
                            checksum)]
      (.position ch offset)
      (if (pos? body-len)
-       (write-fully-buffers! ch
-                             (into-array ByteBuffer [hdr (ByteBuffer/wrap body)]))
+       (write-fully-record! ch hdr body)
        (write-fully! ch hdr))
      {:offset offset :size total-size :checksum checksum})))
 
@@ -3247,51 +3265,59 @@
         (throw e)))))
 
 (defn- wait-strict-durable!
-  [state ^FileChannel ch sync-manager lsn timeout-ms mark-fatal!]
-  (let [lsn (long lsn)
-        timeout-ms (long timeout-ms)
-        start-ms (System/currentTimeMillis)
-        deadline (+ ^long start-ms (max 0 timeout-ms))
-        ^Object monitor (:monitor sync-manager)]
-    (loop [last-sync-ms nil
-           last-sync-reason nil]
-      (let [durable (long @(:last-durable-lsn sync-manager))]
-        (if (<= ^long lsn ^long durable)
-          {:sync-done-ms last-sync-ms
-           :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
-          (let [now (System/currentTimeMillis)
-                remaining (- ^long deadline ^long now)]
-            (when-not (pos? remaining)
-              (await-durable-lsn! sync-manager lsn 0 now))
-            (if-let [sync-res
-                     (perform-sync-round! state
-                                          ch
-                                          sync-manager
-                                          (begin-sync! sync-manager lsn)
-                                          mark-fatal!)]
-              (recur (:sync-done-ms sync-res)
-                     (:sync-reason sync-res))
-              (do
-                (locking monitor
-                  (let [durable-now (long @(:last-durable-lsn sync-manager))
-                        healthy? (boolean @(:healthy? sync-manager))
-                        failure @(:failure sync-manager)]
-                    (cond
-                      (<= ^long lsn ^long durable-now)
-                      nil
+  ([state ^FileChannel ch sync-manager lsn timeout-ms mark-fatal!]
+   (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal! nil))
+  ([state ^FileChannel ch sync-manager lsn timeout-ms mark-fatal! initial-sync-begin]
+   (let [lsn (long lsn)
+         timeout-ms (long timeout-ms)
+         start-ms (System/currentTimeMillis)
+         deadline (+ ^long start-ms (max 0 timeout-ms))
+         ^Object monitor (:monitor sync-manager)]
+     (loop [last-sync-ms nil
+            last-sync-reason nil
+            sync-begin initial-sync-begin]
+       (let [durable (long @(:last-durable-lsn sync-manager))]
+         (if (<= ^long lsn ^long durable)
+           {:sync-done-ms last-sync-ms
+            :sync-reason (or last-sync-reason @(:last-sync-reason sync-manager))}
+           (let [now (System/currentTimeMillis)
+                 remaining (- ^long deadline ^long now)]
+             (when-not (pos? remaining)
+               (await-durable-lsn! sync-manager lsn 0 now))
+             (if-let [sync-res
+                      (perform-sync-round! state
+                                           ch
+                                           sync-manager
+                                           ;; Reuse the first sync begin from append path
+                                           ;; so strict mode avoids an immediate extra
+                                           ;; monitor-lock round-trip.
+                                           (or sync-begin
+                                               (begin-sync! sync-manager lsn))
+                                           mark-fatal!)]
+               (recur (:sync-done-ms sync-res)
+                      (:sync-reason sync-res)
+                      nil)
+               (do
+                 (locking monitor
+                   (let [durable-now (long @(:last-durable-lsn sync-manager))
+                         healthy? (boolean @(:healthy? sync-manager))
+                         failure @(:failure sync-manager)]
+                     (cond
+                       (<= ^long lsn ^long durable-now)
+                       nil
 
-                      (not healthy?)
-                      (throw (ex-info "Txn-log sync manager is unhealthy"
-                                      {:type :txlog/unhealthy
-                                       :lsn lsn}
-                                      failure))
+                       (not healthy?)
+                       (throw (ex-info "Txn-log sync manager is unhealthy"
+                                       {:type :txlog/unhealthy
+                                        :lsn lsn}
+                                       failure))
 
-                      :else
-                      (let [remaining-ms
-                            (max 1 (- ^long deadline
-                                      ^long (System/currentTimeMillis)))]
-                        (.wait monitor (long remaining-ms))))))
-                (recur last-sync-ms last-sync-reason)))))))))
+                       :else
+                       (let [remaining-ms
+                             (max 1 (- ^long deadline
+                                       ^long (System/currentTimeMillis)))]
+                         (.wait monitor (long remaining-ms))))))
+                 (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
@@ -3301,12 +3327,12 @@
                 sid sync-manager]}
         (locking append-lock
           (append-record-under-lock! state prepared-payload throw-if-fatal!))
-        sync-request (request-sync-on-append! sync-manager lsn append-start-ms)
-        sync-res (when sync-request
+        sync-begin (append-sync-transition! sync-manager lsn append-start-ms)
+        sync-res (when sync-begin
                    (perform-sync-round! state
                                         ch
                                         sync-manager
-                                        (begin-sync! sync-manager)
+                                        sync-begin
                                         mark-fatal!))
         synced? (or (some? sync-res)
                     (<= ^long lsn
@@ -3332,10 +3358,11 @@
                 sid sync-manager timeout-ms]}
         (locking append-lock
           (append-record-under-lock! state prepared-payload throw-if-fatal!))
-        _ (request-sync-on-append! sync-manager lsn append-start-ms)
-        _ (request-sync-now! sync-manager)
+        sync-begin (append-sync-transition! sync-manager lsn append-start-ms
+                                            {:force? true :begin-lsn lsn})
         {:keys [sync-done-ms sync-reason]}
-        (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal!)
+        (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal!
+                              sync-begin)
         done-ms (or sync-done-ms (System/currentTimeMillis))]
     (record-commit-wait-ms! sync-manager
                             (- done-ms append-start-ms)
@@ -3690,123 +3717,145 @@
      (when snapshot?
        (sync-manager-state manager)))))
 
+(defn- ensure-sync-manager-healthy!
+  [manager]
+  (when-not (boolean @(:healthy? manager))
+    (raise "Txn-log sync manager is unhealthy"
+           {:type :txlog/unhealthy
+            :failure @(:failure manager)})))
+
+(defn- request-sync-on-append-under-monitor!
+  [manager lsn now]
+  (ensure-sync-manager-healthy! manager)
+  (let [last-appended-lsn (long @(:last-appended-lsn manager))
+        unsynced-count (long @(:unsynced-count manager))
+        sync-requested? (boolean @(:sync-requested? manager))
+        group-commit (long @(:group-commit manager))
+        group-commit-ms (long @(:group-commit-ms manager))
+        last-sync-ms (long @(:last-sync-ms manager))
+        lsn* (long lsn)
+        new-appended (max last-appended-lsn lsn*)
+        appended-delta (max 0 (- ^long new-appended ^long last-appended-lsn))
+        unsynced-after (+ ^long unsynced-count ^long appended-delta)
+        elapsed (max 0 (- ^long (long now) ^long last-sync-ms))
+        count? (>= ^long unsynced-after ^long group-commit)
+        time? (and (pos? unsynced-after)
+                   (pos? group-commit-ms)
+                   (>= elapsed group-commit-ms))
+        reason (cond
+                 count? :batch-count
+                 time? :batch-time
+                 :else nil)]
+    (vreset! (:last-appended-lsn manager) new-appended)
+    (vreset! (:unsynced-count manager) unsynced-after)
+    (when (and reason (not sync-requested?))
+      (vreset! (:sync-requested? manager) true)
+      (vreset! (:sync-request-reason manager) reason)
+      {:request? true
+       :reason reason})))
+
 (defn request-sync-on-append!
   ([manager lsn] (request-sync-on-append! manager lsn (now-ms)))
   ([{:keys [monitor] :as manager} lsn now]
    (locking monitor
-     (let [healthy? (boolean @(:healthy? manager))]
-       (when-not healthy?
-         (raise "Txn-log sync manager is unhealthy"
-                {:type :txlog/unhealthy
-                 :failure @(:failure manager)}))
-       (let [last-appended-lsn (long @(:last-appended-lsn manager))
-             unsynced-count (long @(:unsynced-count manager))
-             sync-requested? (boolean @(:sync-requested? manager))
-             group-commit (long @(:group-commit manager))
-             group-commit-ms (long @(:group-commit-ms manager))
-             last-sync-ms (long @(:last-sync-ms manager))
-             lsn* (long lsn)
-             new-appended (max last-appended-lsn lsn*)
-             appended-delta (max 0 (- ^long new-appended ^long last-appended-lsn))
-             unsynced-after (+ ^long unsynced-count ^long appended-delta)
-             elapsed (max 0 (- ^long (long now) ^long last-sync-ms))
-             count? (>= ^long unsynced-after ^long group-commit)
-             time? (and (pos? unsynced-after)
-                        (pos? group-commit-ms)
-                        (>= elapsed group-commit-ms))
-             reason (cond
-                      count? :batch-count
-                      time? :batch-time
-                      :else nil)]
-         (vreset! (:last-appended-lsn manager) new-appended)
-         (vreset! (:unsynced-count manager) unsynced-after)
-         (when (and reason (not sync-requested?))
-           (vreset! (:sync-requested? manager) true)
-           (vreset! (:sync-request-reason manager) reason)
-           {:request? true
-            :reason reason}))))))
+     (request-sync-on-append-under-monitor! manager lsn now))))
 
 (defn request-sync-if-needed!
   ([manager] (request-sync-if-needed! manager (now-ms)))
   ([{:keys [monitor] :as manager} now]
    (locking monitor
-     (let [healthy? (boolean @(:healthy? manager))]
-       (when-not healthy?
-         (raise "Txn-log sync manager is unhealthy"
-                {:type :txlog/unhealthy
-                 :failure @(:failure manager)}))
-       (let [pending (max 0 (long @(:unsynced-count manager)))
-             sync-requested? (boolean @(:sync-requested? manager))
-             group-commit (long @(:group-commit manager))
-             group-commit-ms (long @(:group-commit-ms manager))
-             last-sync-ms (long @(:last-sync-ms manager))
-             elapsed (max 0 (- ^long (long now) ^long last-sync-ms))]
-         (when (and (pos? pending)
-                    (not sync-requested?)
-                    (or (>= pending group-commit)
-                        (and (pos? group-commit-ms)
-                             (>= elapsed group-commit-ms))))
-           (let [reason (if (>= pending group-commit)
-                          :batch-count
-                          :batch-time)]
-             (vreset! (:sync-requested? manager) true)
-             (vreset! (:sync-request-reason manager) reason)
-             {:request? true :reason reason})))))))
+     (ensure-sync-manager-healthy! manager)
+     (let [pending (max 0 (long @(:unsynced-count manager)))
+           sync-requested? (boolean @(:sync-requested? manager))
+           group-commit (long @(:group-commit manager))
+           group-commit-ms (long @(:group-commit-ms manager))
+           last-sync-ms (long @(:last-sync-ms manager))
+           elapsed (max 0 (- ^long (long now) ^long last-sync-ms))]
+       (when (and (pos? pending)
+                  (not sync-requested?)
+                  (or (>= pending group-commit)
+                      (and (pos? group-commit-ms)
+                           (>= elapsed group-commit-ms))))
+         (let [reason (if (>= pending group-commit)
+                        :batch-count
+                        :batch-time)]
+           (vreset! (:sync-requested? manager) true)
+           (vreset! (:sync-request-reason manager) reason)
+           {:request? true :reason reason}))))))
+
+(defn- request-sync-now-under-monitor!
+  [manager]
+  (ensure-sync-manager-healthy! manager)
+  (let [pending (max 0 (long @(:unsynced-count manager)))
+        sync-requested? (boolean @(:sync-requested? manager))]
+    (when (and (pos? pending) (not sync-requested?))
+      (vreset! (:sync-requested? manager) true)
+      (vreset! (:sync-request-reason manager) :forced)
+      {:request? true :reason :forced})))
 
 (defn request-sync-now!
   [{:keys [monitor] :as manager}]
   (locking monitor
-    (let [healthy? (boolean @(:healthy? manager))]
-      (when-not healthy?
-        (raise "Txn-log sync manager is unhealthy"
-               {:type :txlog/unhealthy
-                :failure @(:failure manager)}))
-      (let [pending (max 0 (long @(:unsynced-count manager)))
-            sync-requested? (boolean @(:sync-requested? manager))]
-        (when (and (pos? pending) (not sync-requested?))
-          (vreset! (:sync-requested? manager) true)
-          (vreset! (:sync-request-reason manager) :forced)
-          {:request? true :reason :forced})))))
+    (request-sync-now-under-monitor! manager)))
+
+(defn- begin-sync-under-monitor!
+  [manager lsn]
+  (ensure-sync-manager-healthy! manager)
+  (let [sync-in-progress? (boolean @(:sync-in-progress? manager))
+        last-appended-lsn (long @(:last-appended-lsn manager))
+        last-durable-lsn (long @(:last-durable-lsn manager))
+        sync-requested? (boolean @(:sync-requested? manager))
+        sync-request-reason @(:sync-request-reason manager)
+        track-trailing? (boolean (:track-trailing? manager))]
+    (if sync-in-progress?
+      nil
+      (if (> ^long last-appended-lsn ^long last-durable-lsn)
+        (let [target-lsn (long (if track-trailing?
+                                 (or (pending-trailing-lsn manager)
+                                     last-appended-lsn)
+                                 last-appended-lsn))
+              lsn* (when (some? lsn) (long lsn))]
+          (if (and lsn* (> lsn* target-lsn))
+            nil
+            (let [reason (if sync-requested?
+                           (or sync-request-reason :unknown)
+                           :forced)]
+              (vreset! (:sync-requested? manager) false)
+              (vreset! (:sync-request-reason manager) nil)
+              (vreset! (:sync-in-progress? manager) true)
+              (vreset! (:last-sync-reason manager) reason)
+              {:target-lsn target-lsn
+               :reason reason})))
+        (when sync-requested?
+          (vreset! (:sync-requested? manager) false)
+          (vreset! (:sync-request-reason manager) nil)
+          nil)))))
 
 (defn begin-sync!
   ([manager]
    (begin-sync! manager nil))
   ([{:keys [monitor] :as manager} lsn]
    (locking monitor
-     (let [healthy? (boolean @(:healthy? manager))
-           sync-in-progress? (boolean @(:sync-in-progress? manager))
-           last-appended-lsn (long @(:last-appended-lsn manager))
-           last-durable-lsn (long @(:last-durable-lsn manager))
-           sync-requested? (boolean @(:sync-requested? manager))
-           sync-request-reason @(:sync-request-reason manager)
-           track-trailing? (boolean (:track-trailing? manager))]
-       (when-not healthy?
-         (raise "Txn-log sync manager is unhealthy"
-                {:type :txlog/unhealthy
-                 :failure @(:failure manager)}))
-       (if sync-in-progress?
-         nil
-         (if (> ^long last-appended-lsn ^long last-durable-lsn)
-           (let [target-lsn (long (if track-trailing?
-                                    (or (pending-trailing-lsn manager)
-                                        last-appended-lsn)
-                                    last-appended-lsn))
-                 lsn* (when (some? lsn) (long lsn))]
-            (if (and lsn* (> lsn* target-lsn))
-               nil
-               (let [reason (if sync-requested?
-                              (or sync-request-reason :unknown)
-                              :forced)]
-                 (vreset! (:sync-requested? manager) false)
-                 (vreset! (:sync-request-reason manager) nil)
-                 (vreset! (:sync-in-progress? manager) true)
-                 (vreset! (:last-sync-reason manager) reason)
-                 {:target-lsn target-lsn
-                  :reason reason})))
-           (when sync-requested?
-             (vreset! (:sync-requested? manager) false)
-             (vreset! (:sync-request-reason manager) nil)
-             nil)))))))
+     (begin-sync-under-monitor! manager lsn))))
+
+(defn append-sync-transition!
+  "Run append-side sync-manager transitions under one monitor lock.
+   Returns the optional begin-sync payload for the caller to perform fsync."
+  ([sync-manager lsn now]
+   (append-sync-transition! sync-manager lsn now {}))
+  ([{:keys [monitor] :as sync-manager} lsn now
+    {:keys [force? begin-lsn]
+     :or {force? false begin-lsn nil}}]
+   (locking monitor
+     (let [requested? (boolean
+                       (request-sync-on-append-under-monitor! sync-manager
+                                                              lsn
+                                                              now))
+           _ (when force?
+               (request-sync-now-under-monitor! sync-manager))
+           sync-begin (when (or force? requested?)
+                        (begin-sync-under-monitor! sync-manager begin-lsn))]
+       sync-begin))))
 
 (defn complete-sync-success!
   ([manager] (complete-sync-success! manager nil (now-ms) nil true))

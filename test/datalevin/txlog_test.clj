@@ -1884,8 +1884,8 @@
             allow-request   (promise)
             calls           (atom 0)]
         (try
-          (with-redefs [sut/request-sync-on-append!
-                        (fn [_ _ _]
+          (with-redefs [sut/append-sync-transition!
+                        (fn [& _]
                           (if (= 1 (swap! calls inc))
                             (do
                               (deliver request-entered true)
