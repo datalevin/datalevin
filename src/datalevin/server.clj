@@ -740,14 +740,18 @@
 (defn- copy-out
   "Continiously write data out to client in batches"
   ([^SelectionKey skey data batch-size]
-   (copy-out skey data batch-size nil))
+   (copy-out skey data batch-size nil nil))
   ([^SelectionKey skey data batch-size copy-meta]
+   (copy-out skey data batch-size copy-meta nil))
+  ([^SelectionKey skey data batch-size copy-meta response-meta]
    (let [state                             (.attachment skey)
          {:keys [^ByteBuffer write-bf]}    @state
          ^SocketChannel                 ch (.channel skey)
          response                          (cond-> {:type :copy-out-response}
                                              copy-meta
-                                             (assoc :copy-meta copy-meta))]
+                                             (assoc :copy-meta copy-meta)
+                                             (seq response-meta)
+                                             (merge response-meta))]
      (locking write-bf
        (p/write-message-blocking ch write-bf response)
        (doseq [batch (partition batch-size batch-size nil data)]
@@ -1749,9 +1753,11 @@
                     (assoc :new-attributes (:new-attributes rp)))]
           (if (< ct ^long c/+wire-datom-batch-size+)
             (write-message skey {:type :command-complete :result res})
-            (let [{:keys [tx-data tempids]} res]
+            (let [{:keys [tx-data tempids]} res
+                  response-meta            (dissoc res :tx-data :tempids)]
               (copy-out skey (into tx-data tempids)
-                        c/+wire-datom-batch-size+))))))))
+                        c/+wire-datom-batch-size+
+                        nil response-meta))))))))
 
 (defn- fetch
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -1837,9 +1843,11 @@
                     (assoc :db-info db-info))]
           (if (< ct ^long c/+wire-datom-batch-size+)
             (write-message skey {:type :command-complete :result res})
-            (let [{:keys [tx-data tempids]} res]
+            (let [{:keys [tx-data tempids]} res
+                  response-meta            (dissoc res :tx-data :tempids)]
               (copy-out skey (into tx-data tempids)
-                        c/+wire-datom-batch-size+))))))))
+                        c/+wire-datom-batch-size+
+                        nil response-meta))))))))
 
 (defn- start-sampling
   [^Server server ^SelectionKey skey {:keys [args writing?]}]

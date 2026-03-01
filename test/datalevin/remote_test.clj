@@ -244,6 +244,26 @@
                       (d/datom c/emax nil nil) (d/datom c/e0 nil nil))))
     (if/close store)))
 
+(deftest tx-data-copy-out-preserves-db-info-and-new-attributes-test
+  (let [dir   (str "dtlv://datalevin:datalevin@localhost/tx-data-copy-out-meta-"
+                   (UUID/randomUUID))
+        store (sut/open dir)
+        n     (+ c/+wire-datom-batch-size+ 20)
+        attr  :copyout/new-attr
+        txs   (mapv (fn [i] {:db/id (+ c/e0 i) attr i}) (range n))]
+    (try
+      (let [res (sut/tx-data store txs false)]
+        (is (map? res))
+        (is (seq (:tx-data res)))
+        (is (map? (:tempids res)))
+        (is (contains? (set (:new-attributes res)) attr))
+        (is (map? (:db-info res)))
+        (is (number? (get-in res [:db-info :max-eid])))
+        (is (number? (get-in res [:db-info :max-tx])))
+        (is (number? (get-in res [:db-info :last-modified]))))
+      (finally
+        (if/close store)))))
+
 (deftest same-client-multiple-dbs-test
   (let [uri-str "dtlv://datalevin:datalevin@localhost"
         client  (cl/new-client uri-str)

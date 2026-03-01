@@ -131,7 +131,7 @@
   (close-pool [this]
     (dotimes [_ (.size used)] (close ^Connection (.poll used)))
     (.clear used)
-    (dotimes [_ (.size used)] (close ^Connection (.poll available)))
+    (dotimes [_ (.size available)] (close ^Connection (.poll available)))
     (.clear available))
 
   (closed-pool? [this]
@@ -219,11 +219,10 @@
            (if (map? msg)
              (let [{:keys [type]} msg]
                (if (= type :copy-done)
-                 (cond-> {:type :command-complete
-                          :result (persistent! data)}
-                   (and (map? copy-out-response)
-                        (contains? copy-out-response :copy-meta))
-                   (assoc :copy-meta (:copy-meta copy-out-response)))
+                 (merge {:type :command-complete
+                         :result (persistent! data)}
+                        (when (map? copy-out-response)
+                          (dissoc copy-out-response :type)))
                  (u/raise "Server error while copying out data" {:msg msg})))
              (do (doseq [d msg] (conj! data d))
                  (recur))))))

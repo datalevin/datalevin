@@ -16,6 +16,7 @@
    [datalevin.interface]
    [datalevin.client :as cl]
    [datalevin.bits :as b]
+   [datalevin.datom :as d]
    [datalevin.lmdb :as l :refer [IWriting]]
    [clojure.string :as str])
   (:import
@@ -44,7 +45,8 @@
                :txs      :tx-data
                :txs+info :tx-data+db-info
                :load-datoms)
-         {:keys [type message result err-data]}
+         {:keys [type message result err-data]
+          :as   response}
          (if (< (count datoms) ^long c/+wire-datom-batch-size+)
            (cl/request client {:type     t
                                :mode     :request
@@ -63,7 +65,20 @@
        (if (:resized err-data)
          (u/raise message err-data)
          (u/raise "Error loading datoms to server:" message {}))
-       result))))
+       (if (and tx?
+                (or (contains? response :db-info)
+                    (contains? response :new-attributes)))
+         (let [[tx-data tempids] (if (map? result)
+                                   [(:tx-data result) (:tempids result)]
+                                   (let [[tx-data tempids] (split-with d/datom?
+                                                                       result)]
+                                     [tx-data (apply hash-map tempids)]))]
+           (cond-> {:tx-data tx-data :tempids tempids}
+             (contains? response :db-info)
+             (assoc :db-info (:db-info response))
+             (contains? response :new-attributes)
+             (assoc :new-attributes (:new-attributes response))))
+         result)))))
 
 ;; remote datalog db
 
