@@ -237,18 +237,19 @@
   (let [opts (or (i/env-opts lmdb) {})
         interval-ms (:lmdb-sync-interval-ms opts)
         interval-s (:lmdb-sync-interval opts)
-        fallback-ms (* 1000 (long c/lmdb-sync-interval))]
+        fallback-ms (long (* 1000 (long c/lmdb-sync-interval)))]
     (long (max 1
-               (cond
-                 (number? interval-ms) (long interval-ms)
-                 (number? interval-s) (* 1000 (long interval-s))
-                 :else fallback-ms)))))
+               (long
+                (cond
+                  (number? interval-ms) (long interval-ms)
+                  (number? interval-s) (long (* 1000 (long interval-s)))
+                  :else fallback-ms))))))
 
 (defn- checkpoint-stale-threshold-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
         configured (:wal-checkpoint-stale-threshold-ms opts)
-        fallback (* 2 (lmdb-sync-interval-ms lmdb))]
+        fallback (long (* 2 (long (lmdb-sync-interval-ms lmdb))))]
     (long (max 1
                (if (number? configured)
                  (long configured)
@@ -408,30 +409,30 @@
         thresholds (merge snapshot-default-contention-thresholds
                           (or (:snapshot-contention-thresholds opts) {}))]
     {:commit-wait-p99-ms
-     (long (max 0 (or (:commit-wait-p99-ms thresholds) 0)))
+     (long (max 0 (long (or (:commit-wait-p99-ms thresholds) 0))))
      :queue-depth
-     (long (max 0 (or (:queue-depth thresholds) 0)))
+     (long (max 0 (long (or (:queue-depth thresholds) 0))))
      :fsync-p99-ms
-     (long (max 0 (or (:fsync-p99-ms thresholds) 0)))}))
+     (long (max 0 (long (or (:fsync-p99-ms thresholds) 0))))}))
 
 (defn- snapshot-contention-sample-max-age-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})]
-    (long (max 0 (or (:snapshot-contention-sample-max-age-ms opts)
-                     snapshot-default-contention-sample-max-age-ms)))))
+    (long (max 0 (long (or (:snapshot-contention-sample-max-age-ms opts)
+                           snapshot-default-contention-sample-max-age-ms))))))
 
 (defn- snapshot-defer-backoff-min-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})]
-    (long (max 0 (or (:snapshot-defer-backoff-min-ms opts)
-                     snapshot-default-defer-backoff-min-ms)))))
+    (long (max 0 (long (or (:snapshot-defer-backoff-min-ms opts)
+                           snapshot-default-defer-backoff-min-ms))))))
 
 (defn- snapshot-defer-backoff-max-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
-        min-ms (snapshot-defer-backoff-min-ms lmdb)
-        requested (long (max 0 (or (:snapshot-defer-backoff-max-ms opts)
-                                   snapshot-default-defer-backoff-max-ms)))]
+        min-ms (long (snapshot-defer-backoff-min-ms lmdb))
+        requested (long (max 0 (long (or (:snapshot-defer-backoff-max-ms opts)
+                                         snapshot-default-defer-backoff-max-ms))))]
     (long (max min-ms requested))))
 
 (defn- parse-offpeak-minute
@@ -494,10 +495,12 @@
   [windows now-ms]
   (if (empty? windows)
     true
-    (let [minute (local-minute-of-day now-ms)]
+    (let [minute (long (local-minute-of-day now-ms))]
       (boolean
        (some
         (fn [{:keys [start-min end-min]}]
+          (let [start-min (long start-min)
+                end-min (long end-min)]
           (cond
             (= start-min end-min)
             true
@@ -508,17 +511,19 @@
 
             :else
             (or (<= start-min minute)
-                (< minute end-min))))
+                (< minute end-min)))))
         windows)))))
 
 (defn- snapshot-scheduler-contention-state
   [lmdb now-ms]
   (when-let [state (txlog/state lmdb)]
     (let [sync-state (txlog/sync-manager-state (:sync-manager state))
-          sample-age-ms (snapshot-contention-sample-max-age-ms lmdb)
+          sample-age-ms (long (snapshot-contention-sample-max-age-ms lmdb))
           recent-sample? (fn [sample-at]
                            (and (number? sample-at)
-                                (<= (max 0 (- now-ms (long sample-at)))
+                                (<= (long (max 0
+                                              (- (long now-ms)
+                                                 (long sample-at))))
                                     sample-age-ms)))
           commit-wait-ms (when (recent-sample?
                                 (:last-commit-wait-at-ms sync-state))
@@ -533,7 +538,7 @@
 
 (defn- snapshot-scheduler-poll-ms
   [lmdb]
-  (let [interval-ms (snapshot-interval-ms lmdb)
+  (let [interval-ms (long (snapshot-interval-ms lmdb))
         quarter-ms (if (pos? interval-ms)
                      (quot interval-ms 4)
                      1000)]
@@ -631,12 +636,13 @@
                                            (:created-ms latest-snapshot))]
                             (long v))
         latest-lsn (snapshot-current-lsn latest-snapshot)
-        max-age-ms (snapshot-max-age-ms lmdb)
+        max-age-ms (long (snapshot-max-age-ms lmdb))
         watermarks (when-let [state (txlog/state lmdb)]
                      (txlog-watermarks-map lmdb state))
         applied-lsn (long (or (:last-applied-lsn watermarks) 0))
         snapshot-age-ms (when (some? latest-created-ms)
-                          (max 0 (- now-ms latest-created-ms)))
+                          (long (max 0 (- (long now-ms)
+                                          (long latest-created-ms)))))
         failure-count (long (or (:snapshot-scheduler-failure-count info) 0))
         consecutive-failure-count
         (long (or (:snapshot-scheduler-consecutive-failure-count info) 0))
@@ -796,8 +802,8 @@
                                   applied-lsn)
         pin-floor-lsn (long (:floor-lsn snapshot-pin-floor-state))
         pin-id (str "snapshot-build/" snapshot-id)
-        pin-ttl-ms (max 60000 (snapshot-max-age-ms lmdb))
-        pin-expires-ms (+ started-ms pin-ttl-ms)]
+        pin-ttl-ms (long (max 60000 (long (snapshot-max-age-ms lmdb))))
+        pin-expires-ms (long (+ (long started-ms) pin-ttl-ms))]
     (u/create-dirs root-dir)
     (when (u/file-exists tmp-path)
       (u/delete-files tmp-path))
@@ -915,11 +921,12 @@
                      (txlog-watermarks-map lmdb state))
         applied-lsn (long (or (:last-applied-lsn watermarks) 0))
         snapshot-age-ms (when (some? latest-created)
-                          (max 0 (- now-ms latest-created)))
-        interval-ms (snapshot-interval-ms lmdb)
-        max-lsn-delta (snapshot-max-lsn-delta lmdb)
-        max-log-bytes-delta (snapshot-max-log-bytes-delta lmdb)
-        max-age-ms (snapshot-max-age-ms lmdb)
+                          (long (max 0 (- (long now-ms)
+                                          (long latest-created)))))
+        interval-ms (long (snapshot-interval-ms lmdb))
+        max-lsn-delta (long (snapshot-max-lsn-delta lmdb))
+        max-log-bytes-delta (long (snapshot-max-log-bytes-delta lmdb))
+        max-age-ms (long (snapshot-max-age-ms lmdb))
         bytes-state (when (and (some? latest-lsn)
                                (pos? max-log-bytes-delta))
                       (try
@@ -942,10 +949,12 @@
                             (true? (:degraded? pressure)))
         interval-due? (and (pos? interval-ms)
                            (some? latest-created)
-                           (>= (- now-ms latest-created) interval-ms))
+                           (>= (- (long now-ms) (long latest-created))
+                               interval-ms))
         lsn-delta-due? (and (some? latest-lsn)
                             (pos? max-lsn-delta)
-                            (>= (- applied-lsn latest-lsn) max-lsn-delta))
+                            (>= (- applied-lsn (long latest-lsn))
+                                max-lsn-delta))
         log-bytes-due? (and (number? bytes-since-snapshot)
                             (pos? max-log-bytes-delta)
                             (>= ^long bytes-since-snapshot
@@ -1035,8 +1044,10 @@
                                      now-ms)))))
                     (if-let [defer (snapshot-scheduler-defer-reason
                                     lmdb trigger now-ms)]
-                      (let [min-backoff-ms (snapshot-defer-backoff-min-ms lmdb)
-                            max-backoff-ms (snapshot-defer-backoff-max-ms lmdb)
+                      (let [min-backoff-ms (long
+                                             (snapshot-defer-backoff-min-ms lmdb))
+                            max-backoff-ms (long
+                                             (snapshot-defer-backoff-max-ms lmdb))
                             m (vswap! info-v
                                       (fn [m]
                                         (let [reason (:reason defer)
@@ -1062,11 +1073,11 @@
                                                              max-backoff-ms
                                                              (max
                                                               min-backoff-ms
-                                                              (* 2
-                                                                 prev-backoff-ms))))
+                                                              (long (* 2
+                                                                       prev-backoff-ms)))))
                                                            min-backoff-ms)
-                                              next-ms (+ now-ms
-                                                         backoff-ms)
+                                              next-ms (long (+ (long now-ms)
+                                                               backoff-ms))
                                               defer* (assoc defer
                                                             :backoff-ms
                                                             backoff-ms
@@ -1325,7 +1336,7 @@
 
 (defn- nonneg-long
   [x]
-  (long (max 0 (or x 0))))
+  (long (max 0 (long (or x 0)))))
 
 (defn- txlog-vector-domain
   [db-dir fname index-info]
@@ -1411,7 +1422,8 @@
         durable-applied-lag-threshold-lsn (txlog-lag-alert-threshold-lsn lmdb)
         last-checkpoint-ms (some-> (:txlog-last-checkpoint-ms info) long)
         checkpoint-staleness-ms (when (some? last-checkpoint-ms)
-                                  (max 0 (- now-ms last-checkpoint-ms)))
+                                  (long (max 0 (- (long now-ms)
+                                                  (long last-checkpoint-ms)))))
         checkpoint-stale-threshold-ms (checkpoint-stale-threshold-ms lmdb)
         checkpoint-stale? (and (some? checkpoint-staleness-ms)
                                (>= ^long checkpoint-staleness-ms
@@ -2019,9 +2031,9 @@
         tighten? (or bytes-pressure?
                      (true? (:degraded-now? cached-report))
                      (true? (:degraded? cached-report)))
-        interval-ms (if tighten?
-                      txlog-retention-backpressure-check-interval-ms
-                      txlog-retention-backpressure-idle-check-interval-ms)
+        interval-ms (long (if tighten?
+                            txlog-retention-backpressure-check-interval-ms
+                            txlog-retention-backpressure-idle-check-interval-ms))
         cached?  (and (some? check-v)
                       (some? cached-v)
                       (< (- now-ms (long @check-v))
@@ -2050,7 +2062,8 @@
                                :else
                                nil)
             blocked-for-ms (when (some? blocked-since-ms)
-                             (max 0 (- now-ms blocked-since-ms)))
+                             (long (max 0 (- (long now-ms)
+                                             (long blocked-since-ms)))))
             degraded? (if (and degraded-now? pin-limited?)
                         (and blocked-for-ms
                              (>= ^long blocked-for-ms ^long threshold-ms))
@@ -2443,7 +2456,7 @@
          segments   (vec (txlog/segment-files dir))
          cache-v    (:txlog-records-cache state)
          _          (prune-txlog-records-cache! cache-v segments)
-         from       (long (max 0 (or from-lsn 0)))
+         from       (long (max 0 (long (or from-lsn 0))))
          tail-scan? (pos? from)
          records    (if tail-scan?
                       (loop [remaining  (seq (rseq segments))
@@ -2455,7 +2468,7 @@
                                                   (cons records collected)
                                                   collected)]
                             (if (and (some? min-lsn)
-                                     (<= min-lsn from))
+                                     (<= (long min-lsn) from))
                               (->> collected' (mapcat identity) vec)
                               (recur (next remaining) collected')))
                           (->> collected (mapcat identity) vec)))
@@ -2582,8 +2595,9 @@
           started-ms (System/currentTimeMillis)
           pin-id (str "backup-copy/" started-ms "-"
                       (java.util.UUID/randomUUID))
-          pin-ttl-ms (max 60000 (snapshot-max-age-ms raw-lmdb))
-          pin-expires-ms (+ started-ms pin-ttl-ms)]
+          pin-ttl-ms (long (max 60000
+                                (long (snapshot-max-age-ms raw-lmdb))))
+          pin-expires-ms (long (+ (long started-ms) pin-ttl-ms))]
       (txlog-pin-backup-floor-state! raw-lmdb
                                      pin-id
                                      pin-floor-lsn

@@ -179,7 +179,7 @@
                       (:vec-max-buffer-bytes opts)
                       c/*wal-vec-max-buffer-bytes*
                       c/*vec-max-buffer-bytes*)]
-    (long (max 1 requested))))
+    (long (max 1 (long requested)))))
 
 (defn- vec-checkpoint-chunk-bytes
   [lmdb]
@@ -188,21 +188,21 @@
                       (:vec-chunk-bytes opts)
                       c/*wal-vec-chunk-bytes*
                       c/*vec-chunk-bytes*)]
-    (long (max 1 requested))))
+    (long (max 1 (long requested)))))
 
 (defn- vec-checkpoint-interval-ms
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
         requested (or (:wal-vec-checkpoint-interval-ms opts)
                       c/*wal-vec-checkpoint-interval-ms*)]
-    (long (max 1 requested))))
+    (long (max 1 (long requested)))))
 
 (defn- vec-checkpoint-max-lsn-delta
   [lmdb]
   (let [opts (or (i/env-opts lmdb) {})
         requested (or (:wal-vec-max-lsn-delta opts)
                       c/*wal-vec-max-lsn-delta*)]
-    (long (max 1 requested))))
+    (long (max 1 (long requested)))))
 
 (def ^:dynamic *wal-vector-apply-failpoint*
   nil)
@@ -272,7 +272,7 @@
   [lmdb]
   (when (txn-log-enabled? lmdb)
     (let [state-next  (txlog-state-next-lsn lmdb)
-          marker-next (inc (marker-applied-lsn lmdb))]
+          marker-next (unchecked-add (long (marker-applied-lsn lmdb)) 1)]
       (long (or state-next marker-next 1)))))
 
 (defn- txn-log-applied-lsn
@@ -290,7 +290,7 @@
 
 (defn- nonneg-long
   [x]
-  (long (max 0 (or x 0))))
+  (long (max 0 (long (or x 0)))))
 
 (defn- current-snapshot-lsn
   [meta]
@@ -407,8 +407,8 @@
   [lmdb ^DTLV$usearch_index_t index ^String domain]
   (let [target-lsn   (txn-log-applied-lsn lmdb)
         total-bytes  (VecIdx/serializedLength index)
-        chunk-size   (vec-checkpoint-chunk-bytes lmdb)
-        safe-buffer  (long (min (vec-checkpoint-max-buffer-bytes lmdb)
+        chunk-size   (long (vec-checkpoint-chunk-bytes lmdb))
+        safe-buffer  (long (min (long (vec-checkpoint-max-buffer-bytes lmdb))
                                 (long Integer/MAX_VALUE)))
         old-meta     (i/get-value lmdb c/vec-meta-dbi domain :string :data)
         old-chunks   (long (or (:chunk-count old-meta) 0))
@@ -426,8 +426,11 @@
           (let [all-bytes (byte-array (int total-bytes))]
             (.get buf all-bytes)
             (dotimes [i chunk-count]
-              (let [offset (int (* i chunk-size))
-                    end    (int (min (+ offset chunk-size) total-bytes))
+              (let [offset-l (unchecked-multiply (long i) (long chunk-size))
+                    offset   (int offset-l)
+                    end      (int (min (unchecked-add offset-l
+                                                     (long chunk-size))
+                                       total-bytes))
                     chunk  (Arrays/copyOfRange all-bytes offset end)]
                 (.add txs (l/kv-tx :put c/vec-index-dbi
                                    [domain i] chunk :data :bytes)))))
@@ -439,7 +442,7 @@
         (try
           (VecIdx/save index (.getAbsolutePath tmp-file))
           (with-open [fis (FileInputStream. tmp-file)]
-            (let [read-buf (byte-array (int (min chunk-size
+            (let [read-buf (byte-array (int (min (long chunk-size)
                                              (long Integer/MAX_VALUE))))]
               (loop [chunk-id 0]
                 (let [n (.read fis read-buf)]
@@ -464,7 +467,7 @@
   (when-let [meta-val (i/get-value lmdb c/vec-meta-dbi domain :string :data)]
     (let [total-bytes (long (:total-bytes meta-val))
           chunk-count (long (:chunk-count meta-val))
-          safe-buffer (long (min (vec-checkpoint-max-buffer-bytes lmdb)
+          safe-buffer (long (min (long (vec-checkpoint-max-buffer-bytes lmdb))
                                  (long Integer/MAX_VALUE)))]
       (if (<= total-bytes safe-buffer)
         ;; Buffer mode: load chunks into one byte[] then call native load.

@@ -27,6 +27,12 @@
   `datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
 - [Server] Reduce the number of network round trips needed for a transaction.
 
+### Fixed
+- [Datalog] correct free vars when `not-join` is in rules
+  [#354](https://github.com/juji-io/datalevin/issues/354).
+- [KV] Stale prefix-compression cache cross transactions
+  [#355](https://github.com/juji-io/datalevin/issues/355).
+
 ## 0.10.5 (2026-02-08)
 
 ### Added
