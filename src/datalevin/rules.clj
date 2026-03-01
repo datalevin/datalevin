@@ -1665,12 +1665,20 @@
                (cons 'not
                      (expand-clauses context to-rm rules deps sub-clauses)))])
 
+          ;; not-join
+          (= 'not-join head)
+          (let [[vars & sub-clauses] args]
+            [(ensure-src
+               src
+               (apply list 'not-join (filterv qu/free-var? vars)
+                      (expand-clauses context to-rm rules deps sub-clauses)))])
+
           ;; (not-join ...)
           (and (sequential? head) (= 'not-join (first head)))
           (let [[_ vars & sub-clauses] head]
             [(ensure-src
                src
-               (apply list 'not-join vars
+               (apply list 'not-join (filterv qu/free-var? vars)
                       (expand-clauses context to-rm rules deps sub-clauses)))])
 
           ;; (or-join ...)

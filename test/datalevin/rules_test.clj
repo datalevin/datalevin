@@ -1050,6 +1050,22 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest not-join-in-rule-with-constant-arg-354-test
+  (let [query '[:find ?id
+                :in $ %
+                :where
+                (entity-by-category ?e "cat")
+                [?e :id ?id]]
+        rules '[[(entity-by-category ?e ?cat)
+                 [?e :category ?cat]
+                 [?e :score ?score]
+                 (not-join [?score ?cat]
+                           [?other :category ?cat]
+                           [?other :score ?other-score]
+                           [(> ?other-score ?score)])]]]
+    (is (= #{}
+           (d/q query [] rules)))))
+
 (deftest or-join-in-rules-test
   (let [dir  (u/tmp-dir (str "or-join-in-rules-test-" (UUID/randomUUID)))
         conn (d/get-conn dir {:name    {:db/unique :db.unique/identity}

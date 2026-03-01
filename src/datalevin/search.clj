@@ -1014,18 +1014,22 @@
 (defn- open-dbis
   [lmdb terms-dbi docs-dbi positions-dbi rawtext-dbi]
   (assert (not (closed-kv? lmdb)) "LMDB env is closed.")
+  ;; Prefix compression can trigger MDB_BAD_VALSIZE under heavy update churn
+  ;; (e.g. autocomplete/prefix analyzers repeatedly updating term-info).
+  (let [flags (disj c/default-dbi-flags :prefix-compression)]
 
-  ;; term -> term-id,max-weight,doc-freq
-  (open-dbi lmdb terms-dbi {:key-size c/+max-key-size+})
+    ;; term -> term-id,max-weight,doc-freq
+    (open-dbi lmdb terms-dbi {:key-size c/+max-key-size+ :flags flags})
 
-  ;; doc-ref -> doc-id,norm,term-set
-  (open-dbi lmdb docs-dbi {:key-size c/+max-key-size+})
+    ;; doc-ref -> doc-id,norm,term-set
+    (open-dbi lmdb docs-dbi {:key-size c/+max-key-size+ :flags flags})
 
-  ;; doc-id,term-id -> positions,offsets
-  (open-dbi lmdb positions-dbi {:key-size (* 2 Integer/BYTES)})
+    ;; doc-id,term-id -> positions,offsets
+    (open-dbi lmdb positions-dbi
+              {:key-size (* 2 Integer/BYTES) :flags flags})
 
-  ;; doc-id -> raw-text
-  (open-dbi lmdb rawtext-dbi {:key-size Integer/BYTES}))
+    ;; doc-id -> raw-text
+    (open-dbi lmdb rawtext-dbi {:key-size Integer/BYTES :flags flags})))
 
 (defn- init-terms
   [lmdb terms-dbi]

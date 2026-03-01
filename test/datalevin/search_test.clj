@@ -105,6 +105,25 @@
     (if/close-kv lmdb)
     (u/delete-files dir)))
 
+(deftest prefix-analyzer-bulk-ingest-355-test
+  (let [dir      (u/tmp-dir (str "search-355-" (UUID/randomUUID)))
+        lmdb     (l/open-kv dir {:flags (conj c/default-env-flags :nosync)})
+        analyzer (a/create-analyzer {:tokenizer a/en-analyzer
+                                     :token-filters [a/prefix-token-filter]})
+        engine   (sut/new-search-engine lmdb {:analyzer analyzer
+                                              :include-text? true})
+        n        4500]
+    (try
+      (doseq [idx (range n)]
+        (if/add-doc engine idx "american" false))
+      (is (= n (if/doc-count engine)))
+      (catch Exception e
+        (is false (str "bulk prefix ingest should not fail: "
+                       (.getMessage e))))
+      (finally
+        (if/close-kv lmdb)
+        (u/delete-files dir)))))
+
 (deftest boolean-expression-test
   (let [dir    (u/tmp-dir (str "test-" (UUID/randomUUID)))
         lmdb   (l/open-kv dir)
