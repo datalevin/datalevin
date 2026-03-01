@@ -348,11 +348,13 @@
   "Open a database on server. `db-type` can be \"datalog\", \"kv\",
   or \"engine\""
   ([client db-name db-type]
-   (open-database client db-name db-type nil nil))
+   (open-database client db-name db-type nil nil false))
   ([client db-name db-type opts]
-   (open-database client db-name db-type nil opts))
+   (open-database client db-name db-type nil opts false))
   ([client db-name db-type schema opts]
-   (let [{:keys [type message]}
+   (open-database client db-name db-type schema opts false))
+  ([client db-name db-type schema opts return-db-info?]
+   (let [{:keys [type message result]}
          (request client
                   (cond
                     (= db-type c/db-store-kv)
@@ -360,12 +362,15 @@
                     (= db-type c/db-store-datalog)
                     (cond-> {:type :open :db-name db-name}
                       schema (assoc :schema schema)
-                      opts   (assoc :opts (assoc opts :db-name db-name)))
+                      opts   (assoc :opts (assoc opts :db-name db-name))
+                      return-db-info? (assoc :return-db-info? true))
                     :else
                     {:type :new-search-engine :db-name db-name :opts opts}))]
      (when (= type :error-response)
        (u/raise "Unable to open database:" db-name " " message
-                {:db-type db-type})))))
+                {:db-type db-type}))
+     (when return-db-info?
+       result))))
 
 (defn new-client
   "Create a new client that maintains pooled connections to a remote

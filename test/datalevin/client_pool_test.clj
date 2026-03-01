@@ -157,3 +157,29 @@
       (finally
         (.close ch)
         (.close server)))))
+
+(deftest open-database-can-request-db-info-test
+  (let [req*     (atom nil)
+        db-info  {:max-eid 10 :max-tx 9 :last-modified 8 :opts {:k :v}}]
+    (with-redefs [sut/request (fn [_ req]
+                                (reset! req* req)
+                                {:type :command-complete :result db-info})]
+      (is (= db-info
+             (sut/open-database :client "open-db-info-test"
+                                c/db-store-datalog nil {:foo :bar} true)))
+      (is (= :open (:type @req*)))
+      (is (= true (:return-db-info? @req*)))
+      (is (= {:foo :bar :db-name "open-db-info-test"}
+             (:opts @req*))))))
+
+(deftest open-database-default-does-not-request-db-info-test
+  (let [req* (atom nil)]
+    (with-redefs [sut/request (fn [_ req]
+                                (reset! req* req)
+                                {:type :command-complete
+                                 :result {:max-eid 1}})]
+      (is (nil?
+            (sut/open-database :client "open-db-info-test"
+                               c/db-store-datalog nil {:foo :bar})))
+      (is (= :open (:type @req*)))
+      (is (nil? (:return-db-info? @req*))))))

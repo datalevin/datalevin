@@ -668,6 +668,13 @@
        :doc     "Datalog DB starts background sampling or not"}
   *db-background-sampling?* true)
 
+(def ^{:dynamic true
+       :doc     "Minimum interval between remote DB freshness checks in `db?`.
+When positive, repeated `db?` calls within this window reuse the previous
+freshness check and skip the remote `last-modified` round trip.
+Set to 0 for strict check-on-every-call behavior."}
+  *remote-db-last-modified-check-interval-ms* 0)
+
 ;; datalog query engine
 
 (def ^{:dynamic true

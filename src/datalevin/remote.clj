@@ -160,6 +160,7 @@
                        ^Client client
                        write-txn
                        writing?
+                       open-db-info
                        ^AtomicBoolean sampling-started?]
   IWriting
   (writing? [_] writing?)
@@ -168,6 +169,7 @@
 
   (mark-write [_]
     (->DatalogStore uri db-name client (volatile! :remote-dl-mutex) true
+                    open-db-info
                     sampling-started?))
 
   IStore
@@ -342,7 +344,11 @@
     (cl/normal-request client :fulltext-datoms [db-name query opts] writing?))
 
   (db-info [_]
-    (cl/normal-request client :db-info [db-name] writing?))
+    (if-let [cached @open-db-info]
+      (do
+        (vreset! open-db-info nil)
+        cached)
+      (cl/normal-request client :db-info [db-name] writing?)))
 
   (tx-data [_ data simulated?]
     (load-datoms* client db-name data :txs+info simulated? writing?))
@@ -430,10 +436,11 @@
    (let [uri (URI. uri-str)]
      (if-let [db-name (cl/parse-db uri)]
        (let [store (or (get (cl/parse-query uri) "store")
-                       c/db-store-datalog)]
-         (cl/open-database client db-name store schema opts)
+                       c/db-store-datalog)
+             db-info (cl/open-database client db-name store schema opts true)]
          (->DatalogStore uri-str db-name client
                          (volatile! :remote-dl-mutex) false
+                         (volatile! db-info)
                          (AtomicBoolean. false)))
        (u/raise "URI should contain a database name" {})))))
 
@@ -1171,10 +1178,16 @@
   ([^KVStore store dbi-name ks k-type v-type]
    (get-values store dbi-name ks k-type v-type true))
   ([^KVStore store dbi-name ks k-type v-type ignore-key?]
-   (batch-kv store
-             (mapv (fn [k]
-                     [:get-value dbi-name k k-type v-type ignore-key?])
-                   ks))))
+   (let [batch-size (max 1 (long c/+wire-datom-batch-size+))]
+     (->> (partition-all batch-size ks)
+          (mapcat
+            (fn [batch]
+              (batch-kv store
+                        (mapv (fn [k]
+                                [:get-value dbi-name k k-type v-type
+                                 ignore-key?])
+                              batch))))
+          vec))))
 
 ;; remote search
 

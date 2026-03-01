@@ -1030,7 +1030,8 @@
 
 (defn- open-server-store
   "Open a store. NB. stores are left open"
-  [^Server server ^SelectionKey skey {:keys [db-name schema opts]} db-type]
+  [^Server server ^SelectionKey skey
+   {:keys [db-name schema opts return-db-info?]} db-type]
   (wrap-error
     (let [{:keys [client-id]} @(.attachment skey)
           {:keys [username]}  (get-client server client-id)
@@ -1068,7 +1069,14 @@
             (update-client server client-id
                            #(assoc % :permissions
                                    (user-permissions sys-conn username))))
-          (write-message skey {:type :command-complete}))))))
+          (let [db-info (when (and return-db-info? datalog?)
+                          {:max-eid       (i/init-max-eid store)
+                           :max-tx        (i/max-tx store)
+                           :last-modified (i/last-modified store)
+                           :opts          (i/opts store)})]
+            (write-message skey
+                           (cond-> {:type :command-complete}
+                             db-info (assoc :result db-info)))))))))
 
 (defn- session-lmdb [sys-conn] (.-lmdb ^Store (.-store ^DB (d/db sys-conn))))
 

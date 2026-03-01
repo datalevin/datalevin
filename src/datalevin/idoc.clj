@@ -18,6 +18,7 @@
    [datalevin.index :as idx]
    [datalevin.interface :as i
     :refer [open-dbi open-list-dbi get-value visit transact-kv]]
+   [datalevin.remote :as r]
    [datalevin.lmdb :as l]
    [datalevin.util :as u :refer [raise map+]]
    [jsonista.core :as json]
@@ -960,6 +961,12 @@
        (invalidate-range-cache! index)
        :doc-added))))
 
+(defn- remote-doc-ref-ids
+  [lmdb doc-ref-dbi docs]
+  (when (instance? datalevin.remote.KVStore lmdb)
+    (zipmap (map first docs)
+            (r/get-values lmdb doc-ref-dbi (map first docs) :data :int true))))
+
 (defn add-docs
   ([index docs] (add-docs index docs true))
   ([^IdocIndex index docs check-exist?]
@@ -969,10 +976,14 @@
            index-dbi   (.-doc-index-dbi index)
            doc-ref-dbi (.-doc-ref-dbi index)
            doc-refs    (.-doc-refs index)
+           doc-ref-ids (when check-exist?
+                         (remote-doc-ref-ids lmdb doc-ref-dbi docs))
            idx->ids    (HashMap.)]
        (doseq [[doc-ref doc] docs]
          (when-not (and check-exist?
-                        (get-value lmdb doc-ref-dbi doc-ref :data :int))
+                        (if doc-ref-ids
+                          (get doc-ref-ids doc-ref)
+                          (get-value lmdb doc-ref-dbi doc-ref :data :int)))
            (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
              (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
              (.put ^IntObjectHashMap doc-refs (int doc-id) doc-ref)
@@ -1020,9 +1031,12 @@
           index-dbi   (.-doc-index-dbi index)
           doc-ref-dbi (.-doc-ref-dbi index)
           doc-refs    (.-doc-refs index)
+          doc-ref-ids (remote-doc-ref-ids lmdb doc-ref-dbi docs)
           idx->ids    (HashMap.)]
       (doseq [[doc-ref doc] docs]
-        (when-let [doc-id (get-value lmdb doc-ref-dbi doc-ref :data :int)]
+        (when-let [doc-id (if doc-ref-ids
+                            (get doc-ref-ids doc-ref)
+                            (get-value lmdb doc-ref-dbi doc-ref :data :int))]
           (doseq [[path values] (doc->path-values-mutable doc)
                   :let          [pid (get-path-id index path)]]
             (when pid

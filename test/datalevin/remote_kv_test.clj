@@ -223,6 +223,32 @@
       (finally
         (if/close-kv store)))))
 
+(deftest get-values-chunks-large-key-sets-test
+  (let [calls* (atom [])
+        client (reify cl/IClient
+                 (request [_ req]
+                   (swap! calls* conj req)
+                   {:type   :command-complete
+                    :result (mapv (fn [[_ _ k _ _ _]] (inc k))
+                                  (second (:args req)))})
+                 (copy-in [_ _ _ _]
+                   (throw (ex-info "copy-in not expected" {})))
+                 (disconnect [_] nil)
+                 (disconnected? [_] false)
+                 (get-pool [_] nil)
+                 (get-id [_] nil))
+        store  (sut/->KVStore "dtlv://mock" "mock-db" client
+                              (volatile! :remote-kv-mutex) false)
+        n      (+ c/+wire-datom-batch-size+ 5)
+        ks     (vec (range n))]
+    (is (= (mapv inc ks)
+           (sut/get-values store "a" ks :long :long true)))
+    (is (= 2 (count @calls*)))
+    (is (= c/+wire-datom-batch-size+
+           (count (second (:args (first @calls*))))))
+    (is (= 5
+           (count (second (:args (second @calls*))))))))
+
 (deftest range-seq-uses-batch-kv-test
   (let [db-name (str "range-seq-batch-kv-" (UUID/randomUUID))
         uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)

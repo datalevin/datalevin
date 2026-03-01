@@ -12,6 +12,7 @@
    [clojure.test :refer [is testing deftest use-fixtures]])
   (:import
    [java.util UUID]
+   [java.util.concurrent.atomic AtomicBoolean]
    [datalevin.datom Datom]))
 
 (use-fixtures :each server-fixture)
@@ -263,6 +264,92 @@
         (is (number? (get-in res [:db-info :last-modified]))))
       (finally
         (if/close store)))))
+
+(deftest remote-start-sampling-idempotent-across-mark-write-test
+  (let [dir                (str "dtlv://datalevin:datalevin@localhost/"
+                                (UUID/randomUUID))
+        store              (sut/open dir)
+        info               (sut/db-info store)
+        wstore             (.mark-write ^datalevin.remote.DatalogStore store)
+        ^AtomicBoolean s?  (.-sampling_started_QMARK_
+                             ^datalevin.remote.DatalogStore store)
+        ^AtomicBoolean ws? (.-sampling_started_QMARK_
+                             ^datalevin.remote.DatalogStore wstore)
+        db*                (atom nil)]
+    (try
+      (is (identical? s? ws?))
+      (is (false? (.get s?)))
+
+      ;; If this triggers a redundant start-sampling RPC, db/new-db will throw
+      ;; because the client has been disconnected.
+      (db/refresh-cache store (:last-modified info))
+      (.set s? true)
+      (cl/disconnect (.-client ^datalevin.remote.DatalogStore store))
+      (reset! db* (db/new-db wstore info))
+      (is (instance? datalevin.db.DB @db*))
+      (finally
+        (.set s? false)
+        (when-let [db @db*]
+          (db/close-db db))
+        (when-not (if/closed? store)
+          (if/close store))))))
+
+(deftest remote-db-freshness-check-interval-test
+  (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
+                   (UUID/randomUUID))
+        conn  (dc/create-conn dir)
+        dbv   @conn
+        store (.-store ^datalevin.db.DB dbv)]
+    (try
+      ;; Prime freshness-check state while client is connected.
+      (is (db/db? dbv))
+      (binding [c/*remote-db-last-modified-check-interval-ms* 60000]
+        (cl/disconnect (.-client ^datalevin.remote.DatalogStore store))
+        (is (db/db? dbv)))
+      (binding [c/*remote-db-last-modified-check-interval-ms* 0]
+        (is (thrown? Exception (db/db? dbv))))
+      (finally
+        (dc/close conn)))))
+
+(deftest open-db-info-cache-test
+  (let [client  (cl/new-client "dtlv://datalevin:datalevin@localhost")
+        db-name (str "open-db-info-cache-test-" (UUID/randomUUID))
+        cached  {:max-eid 7 :max-tx 6 :last-modified 5 :opts {:x 1}}]
+    (try
+      (cl/open-database client db-name c/db-store-datalog nil nil)
+      (let [store (sut/->DatalogStore
+                    (str "dtlv://datalevin:datalevin@localhost/" db-name)
+                    db-name
+                    client
+                    (volatile! :remote-dl-mutex)
+                    false
+                    (volatile! cached)
+                    (java.util.concurrent.atomic.AtomicBoolean. false))]
+        (is (= cached (sut/db-info store)))
+        (let [real-info (sut/db-info store)]
+          (is (map? real-info))
+          (is (number? (:max-eid real-info)))
+          (is (number? (:max-tx real-info)))
+          (is (number? (:last-modified real-info)))
+          (is (not= cached real-info)))
+        (if/close store))
+      (finally
+        (when-not (cl/disconnected? client)
+          (cl/disconnect client))))))
+
+(deftest open-database-return-db-info-test
+  (let [client  (cl/new-client "dtlv://datalevin:datalevin@localhost")
+        db-name (str "open-db-info-return-test-" (UUID/randomUUID))]
+    (try
+      (let [db-info (cl/open-database client db-name c/db-store-datalog nil nil true)]
+        (is (map? db-info))
+        (is (number? (:max-eid db-info)))
+        (is (number? (:max-tx db-info)))
+        (is (number? (:last-modified db-info)))
+        (is (map? (:opts db-info))))
+      (finally
+        (when-not (cl/disconnected? client)
+          (cl/disconnect client))))))
 
 (deftest same-client-multiple-dbs-test
   (let [uri-str "dtlv://datalevin:datalevin@localhost"

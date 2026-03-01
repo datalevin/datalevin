@@ -112,20 +112,44 @@
 
 ;; read caches
 (defonce ^:private caches (ConcurrentHashMap.))
+(defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
+
+(defn- mark-remote-cache-check!
+  [store]
+  (when (instance? DatalogStore store)
+    (.put ^ConcurrentHashMap remote-cache-check-ms
+          (dir store)
+          (System/currentTimeMillis))))
+
+(defn- should-check-remote-cache?
+  [store cache]
+  (if (instance? DatalogStore store)
+    (let [interval ^long c/*remote-db-last-modified-check-interval-ms*]
+      (or (nil? cache)
+          (<= interval 0)
+          (let [last-check-ms (.get ^ConcurrentHashMap remote-cache-check-ms
+                                    (dir store))]
+            (or (nil? last-check-ms)
+                (>= (- (System/currentTimeMillis) ^long last-check-ms)
+                    interval)))))
+    true))
 
 (defn refresh-cache
   ([store]
    (refresh-cache store (last-modified store)))
   ([store target]
    (.put ^ConcurrentHashMap caches (dir store)
-         (LRUCache. (:cache-limit (opts store)) target))))
+         (LRUCache. (:cache-limit (opts store)) target))
+   (mark-remote-cache-check! store)))
 
 (defn- ensure-cache
   [store target]
   (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
     (if (< ^long (.target cache) ^long target)
       (refresh-cache store target)
-      (.setTarget cache target))
+      (do
+        (.setTarget cache target)
+        (mark-remote-cache-check! store)))
     (refresh-cache store target)))
 
 (defn cache-disabled?
@@ -150,7 +174,8 @@
 
 (defn remove-cache
   [store]
-  (.remove ^ConcurrentHashMap caches (dir store)))
+  (.remove ^ConcurrentHashMap caches (dir store))
+  (.remove ^ConcurrentHashMap remote-cache-check-ms (dir store)))
 
 (defmacro wrap-cache
   [store pattern body]
@@ -615,11 +640,13 @@
   [x]
   (when (-searchable? x)
     (let [store  (.-store ^DB x)
-          target (last-modified store)
           cache  (.get ^ConcurrentHashMap caches (dir store))]
-      (when (or (nil? cache)
-                (< ^long (.target ^LRUCache cache) ^long target))
-        (refresh-cache store target)))
+      (when (should-check-remote-cache? store cache)
+        (let [target (last-modified store)]
+          (mark-remote-cache-check! store)
+          (when (or (nil? cache)
+                    (< ^long (.target ^LRUCache cache) ^long target))
+            (refresh-cache store target)))))
     true))
 
 (defn search-datoms [db e a v] (-search db [e a v]))
