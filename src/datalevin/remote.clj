@@ -23,6 +23,7 @@
    [datalevin.client Client]
    [datalevin.interface ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
+   [java.security MessageDigest]
    [java.net URI]))
 
 (defn dtlv-uri?
@@ -414,10 +415,10 @@
 
   (list-dbis [db] (cl/normal-request client :list-dbis [db-name] writing?))
 
-  ;; TODO need to zip the dir and checksum
   (copy [db dest] (.copy db dest false))
   (copy [_ dest compact?]
-    (let [{:keys [type message result copy-meta]}
+    (let [{:keys [type message result copy-meta copy-format checksum
+                  checksum-algo bytes]}
           (cl/request client {:type     :copy
                               :mode     :request
                               :writing? writing?
@@ -428,17 +429,44 @@
                           {:type :copy
                            :args [db-name compact?]
                            :writing? writing?}))
-          bs   (->> result
-                    (apply str)
-                    b/decode-base64)
           dir  (Paths/get dest (into-array String []))
           file (Paths/get (str dest u/+separator+ c/data-file-name)
-                          (into-array String []))]
+                          (into-array String []))
+          opts (into-array StandardOpenOption
+                           [StandardOpenOption/CREATE
+                            StandardOpenOption/TRUNCATE_EXISTING
+                            StandardOpenOption/WRITE])]
       (when-not (Files/exists dir (into-array LinkOption []))
         (u/create-dirs dest))
-      (Files/write file ^bytes bs
-                   ^"[Ljava.nio.file.StandardOpenOption;"
-                   (into-array StandardOpenOption []))
+      (if (= :binary-chunks copy-format)
+        (let [^MessageDigest md (MessageDigest/getInstance "SHA-256")
+              written-bytes
+              (with-open [out (Files/newOutputStream file opts)]
+                (reduce
+                  (fn ^long [^long n chunk]
+                    (let [^bytes bs chunk
+                          len       (alength bs)]
+                      (.write out bs 0 len)
+                      (.update md bs 0 len)
+                      (unchecked-add n len)))
+                  0 result))
+              actual-checksum (u/hexify (.digest md))]
+          (when (and checksum-algo (not= :sha-256 checksum-algo))
+            (u/raise "Unsupported checksum algorithm from server"
+                     {:checksum-algo checksum-algo}))
+          (when (and bytes (not= (long bytes) (long written-bytes)))
+            (u/raise "Copy size mismatch"
+                     {:expected-bytes (long bytes)
+                      :actual-bytes   (long written-bytes)}))
+          (when (and checksum (not= checksum actual-checksum))
+            (u/raise "Copy checksum mismatch"
+                     {:expected-checksum checksum
+                      :actual-checksum   actual-checksum})))
+        (let [bs (->> result
+                      (apply str)
+                      b/decode-base64)]
+          (Files/write file ^bytes bs
+                       ^"[Ljava.nio.file.StandardOpenOption;" opts)))
       (spit (str dest u/+separator+ c/version-file-name) c/version)
       copy-meta))
 

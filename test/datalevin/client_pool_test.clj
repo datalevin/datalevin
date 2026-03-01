@@ -98,7 +98,10 @@
                                                     :copy-meta      {:duration-ms 3}})
                          (p/write-message-blocking server-ch write-bf [[:payload]])
                          (p/write-message-blocking server-ch write-bf
-                                                   {:type :copy-done})))
+                                                   {:type          :copy-done
+                                                    :checksum      "abc"
+                                                    :checksum-algo :sha-256
+                                                    :bytes         7})))
                      :server-done)
         client-id  (UUID/randomUUID)
         available  (ConcurrentLinkedQueue.)
@@ -113,13 +116,17 @@
                                  1 1000 client-id pool)]
     (.add available conn)
     (try
-      (let [{:keys [type result db-info new-attributes copy-meta]}
+      (let [{:keys [type result db-info new-attributes copy-meta
+                    checksum checksum-algo bytes]}
             (sut/request client {:type :test-copy-out-with-meta})]
         (is (= :command-complete type))
         (is (= [[:payload]] result))
         (is (= {:max-eid 10 :max-tx 9} db-info))
         (is (= [:x/new] new-attributes))
         (is (= {:duration-ms 3} copy-meta))
+        (is (= "abc" checksum))
+        (is (= :sha-256 checksum-algo))
+        (is (= 7 bytes))
         (is (= :server-done (deref server-fut 3000 ::timeout))))
       (finally
         (.close ch)

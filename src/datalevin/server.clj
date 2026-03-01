@@ -33,10 +33,10 @@
   (:import
    [java.nio.charset StandardCharsets]
    [java.nio ByteBuffer BufferOverflowException]
-   [java.nio.file Files Paths]
+   [java.nio.file Files Paths OpenOption]
    [java.nio.channels Selector SelectionKey ServerSocketChannel SocketChannel]
    [java.net InetSocketAddress]
-   [java.security SecureRandom]
+   [java.security SecureRandom MessageDigest]
    [java.util Iterator UUID Map]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService
@@ -758,6 +758,43 @@
          (write-message skey batch))
        (p/write-message-blocking ch write-bf {:type :copy-done}))
      (log/debug "Copied out" (count data) "data items"))))
+
+(defn- copy-file-out
+  "Stream a copied LMDB file to client as raw binary chunks with checksum."
+  [^SelectionKey skey path copy-meta]
+  (let [chunk-bytes ^long c/+buffer-size+
+        response    (cond-> {:type          :copy-out-response
+                             :copy-format   :binary-chunks
+                             :checksum-algo :sha-256
+                             :chunk-bytes   chunk-bytes}
+                      copy-meta
+                      (assoc :copy-meta copy-meta))
+        ^MessageDigest md (MessageDigest/getInstance "SHA-256")
+        chunk             (byte-array chunk-bytes)]
+    (write-message skey response)
+    (with-open [in (Files/newInputStream path
+                                         (into-array OpenOption []))]
+      (loop [written-bytes 0
+             chunk-count   0]
+        (let [n (.read in chunk)]
+          (if (neg? n)
+            (let [checksum (u/hexify (.digest md))]
+              (write-message skey {:type          :copy-done
+                                   :copy-format   :binary-chunks
+                                   :checksum-algo :sha-256
+                                   :checksum      checksum
+                                   :bytes         written-bytes
+                                   :chunks        chunk-count})
+              (log/debug "Copied out" written-bytes "bytes in" chunk-count
+                         "chunks"))
+            (let [^bytes out-chunk (if (= n chunk-bytes)
+                                     chunk
+                                     (let [tail (byte-array n)]
+                                       (System/arraycopy chunk 0 tail 0 n)
+                                       tail))]
+              (.update md out-chunk 0 n)
+              (write-message skey [out-chunk])
+              (recur (+ written-bytes n) (inc chunk-count)))))))))
 
 (defn- open-port
   [port]
@@ -2007,7 +2044,6 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error (normal-kv-store-handler list-dbis)))
 
-;; TODO use LMDB copyfd to write to socket directly
 (defn- copy
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
@@ -2032,10 +2068,7 @@
                                  :compact? (boolean compact?)}
                           (map? @copy-backup-pin)
                           (assoc :backup-pin @copy-backup-pin))]
-          (copy-out skey
-                    (b/encode-base64 (Files/readAllBytes path))
-                    8192
-                    copy-meta))
+          (copy-file-out skey path copy-meta))
         (finally (u/delete-files tf))))))
 
 (defn- stat

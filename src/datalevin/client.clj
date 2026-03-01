@@ -219,10 +219,12 @@
            (if (map? msg)
              (let [{:keys [type]} msg]
                (if (= type :copy-done)
-                 (merge {:type :command-complete
-                         :result (persistent! data)}
-                        (when (map? copy-out-response)
-                          (dissoc copy-out-response :type)))
+                 (merge
+                   {:type :command-complete
+                    :result (persistent! data)}
+                   (when (map? copy-out-response)
+                     (dissoc copy-out-response :type))
+                   (dissoc msg :type))
                  (u/raise "Server error while copying out data" {:msg msg})))
              (do (doseq [d msg] (conj! data d))
                  (recur))))))

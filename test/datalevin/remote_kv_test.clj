@@ -13,7 +13,8 @@
    [datalevin.test.core :refer [server-fixture]]
    [clojure.test :refer [is testing deftest use-fixtures]])
   (:import
-   [java.util UUID Arrays]))
+   [java.util UUID Arrays]
+   [java.security MessageDigest]))
 
 (use-fixtures :each server-fixture)
 
@@ -91,13 +92,30 @@
       (cl/open-database client db-name c/db-store-kv)
       (if/open-dbi store "z")
       (if/transact-kv store [[:put "z" :k :v]])
-      (let [{:keys [type result copy-meta]}
+      (let [{:keys [type result copy-meta copy-format checksum
+                    checksum-algo bytes chunk-bytes chunks]}
             (cl/request client {:type :copy :mode :request
                                 :args [db-name true]})
-            bs (->> result (apply str) b/decode-base64)]
+            ^MessageDigest md (MessageDigest/getInstance "SHA-256")
+            copied-bytes (reduce
+                          (fn [n chunk]
+                            (let [^bytes bs chunk]
+                              (.update md bs 0 (alength bs))
+                              (+ n (alength bs))))
+                          0 result)
+            actual-checksum (u/hexify (.digest md))]
         (is (= :command-complete type))
+        (is (= :binary-chunks copy-format))
+        (is (= :sha-256 checksum-algo))
+        (is (number? chunk-bytes))
+        (is (pos? chunk-bytes))
+        (is (number? chunks))
+        (is (pos? chunks))
         (is (seq result))
-        (is (pos? (alength ^bytes bs)))
+        (is (every? #(instance? (class (byte-array 0)) %) result))
+        (is (pos? copied-bytes))
+        (is (= (long copied-bytes) (long bytes)))
+        (is (= checksum actual-checksum))
         (is (map? copy-meta))
         (is (number? (:started-ms copy-meta)))
         (is (number? (:completed-ms copy-meta)))
