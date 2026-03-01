@@ -19,7 +19,7 @@
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel]
    [java.util UUID]
-   [java.util.concurrent ConcurrentLinkedQueue]
+   [java.util.concurrent ConcurrentLinkedQueue ConcurrentHashMap]
    [java.net InetSocketAddress StandardSocketOptions URI]))
 
 (defprotocol ^:no-doc IConnection
@@ -29,15 +29,31 @@
   (receive [conn] "Receive a message, a blocking call")
   (close [conn]))
 
+(defonce ^:private ^ConcurrentHashMap connection-wire-opts
+  (ConcurrentHashMap.))
+
+(defn- conn-wire-opts
+  [^SocketChannel ch]
+  (or (.get connection-wire-opts ch)
+      (p/default-wire-opts)))
+
+(defn- set-conn-wire-opts!
+  [^SocketChannel ch wire-opts]
+  (.put connection-wire-opts ch wire-opts))
+
+(defn- clear-conn-wire-opts!
+  [^SocketChannel ch]
+  (.remove connection-wire-opts ch))
+
 (deftype ^:no-doc Connection [^SocketChannel ch
                               ^:volatile-mutable ^ByteBuffer bf]
   IConnection
   (send-n-receive [this msg]
     (try
       (locking bf
-        (p/write-message-blocking ch bf msg)
+        (p/write-message-blocking ch bf msg (conn-wire-opts ch))
         (.clear bf)
-        (let [[resp bf'] (p/receive-ch ch bf)]
+        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch))]
           (when-not (identical? bf' bf) (set! bf bf'))
           resp))
       (catch BufferOverflowException _
@@ -50,7 +66,7 @@
 
   (send-only [this msg]
     (try
-      (p/write-message-blocking ch bf msg)
+      (p/write-message-blocking ch bf msg (conn-wire-opts ch))
       (catch BufferOverflowException _
         (let [size (* ^long c/+buffer-grow-factor+ (.capacity bf))]
           (set! bf (bf/allocate-buffer size))
@@ -60,14 +76,17 @@
 
   (receive [this]
     (try
-      (let [[resp bf'] (p/receive-ch ch bf)]
+      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch))]
         (when-not (identical? bf' bf) (set! bf bf'))
         resp)
       (catch Exception e
         (u/raise "Error receiving data:" e {}))))
 
   (close [this]
-    (.close ch)))
+    (try
+      (.close ch)
+      (finally
+        (clear-conn-wire-opts! ch)))))
 
 (defn- ^SocketChannel connect-socket
   "connect to server and return the client socket channel"
@@ -83,15 +102,19 @@
 
 (defn- new-connection
   [host port]
-  (->Connection (connect-socket host port)
-                (bf/allocate-buffer c/+buffer-size+)))
+  (let [ch (connect-socket host port)]
+    (set-conn-wire-opts! ch (p/default-wire-opts))
+    (->Connection ch (bf/allocate-buffer c/+buffer-size+))))
 
 (defn- set-client-id
   [conn client-id]
-  (let [{:keys [type message]}
-        (send-n-receive conn {:type      :set-client-id
-                              :client-id client-id})]
-    (when-not (= type :set-client-id-ok) (u/raise message {}))))
+  (let [{:keys [type message wire-capabilities]}
+        (send-n-receive conn {:type              :set-client-id
+                              :client-id         client-id
+                              :wire-capabilities (p/local-wire-capabilities)})]
+    (when-not (= type :set-client-id-ok) (u/raise message {}))
+    (set-conn-wire-opts! (.-ch ^Connection conn)
+                         (p/negotiate-wire-opts wire-capabilities))))
 
 (defprotocol ^:no-doc IConnectionPool
   (get-connection [this] "Get a connection from the pool")

@@ -494,8 +494,8 @@
 
 (defmacro wrap-permission
   [req-act req-obj req-tgt message & body]
-  `(let [{:keys [~'client-id ~'write-bf]} @(~'.attachment ~'skey)
-         ~'ch                             (~'.channel ~'skey)
+  `(let [{:keys [~'client-id ~'write-bf ~'wire-opts]} @(~'.attachment ~'skey)
+         ~'ch                                         (~'.channel ~'skey)
          {:keys [~'permissions]}          (get-client ~'server ~'client-id)]
      (if ~'permissions
        (if (has-permission? ~req-act ~req-obj ~req-tgt ~'permissions)
@@ -503,7 +503,9 @@
          (u/raise ~message {}))
        (do
          (remove-client ~'server ~'client-id)
-         (p/write-message-blocking ~'ch ~'write-bf {:type :reconnect})))))
+         (p/write-message-blocking ~'ch ~'write-bf
+                                   {:type :reconnect}
+                                   ~'wire-opts)))))
 
 (declare event-loop close-conn store->db-name session-lmdb remove-store)
 
@@ -678,10 +680,10 @@
   "write a message to channel, auto grow the buffer"
   [^SelectionKey skey msg]
   (let [state                          (.attachment skey)
-        {:keys [^ByteBuffer write-bf]} @state
+        {:keys [^ByteBuffer write-bf wire-opts]} @state
         ^SocketChannel  ch             (.channel skey)]
     (try
-      (p/write-message-blocking ch write-bf msg)
+      (p/write-message-blocking ch write-bf msg wire-opts)
       (catch BufferOverflowException _
         (let [size (* ^long c/+buffer-grow-factor+ ^int (.capacity write-bf))]
           (vswap! state assoc :write-bf (bf/allocate-buffer size))
@@ -698,13 +700,14 @@
                  (volatile! {:read-bf  (bf/allocate-buffer
                                          c/+buffer-size+)
                              :write-bf (bf/allocate-buffer
-                                         c/+buffer-size+)})))))
+                                         c/+buffer-size+)
+                             :wire-opts (p/default-wire-opts)})))))
 
 (defn- copy-in
   "Continuously read batched data from the client"
   [^Server server ^SelectionKey skey]
   (let [state                      (.attachment skey)
-        {:keys [read-bf write-bf]} @state
+        {:keys [read-bf write-bf wire-opts]} @state
         ^Selector selector         (.selector skey)
         ^SocketChannel ch          (.channel skey)
         data                       (transient [])]
@@ -712,10 +715,11 @@
     (.cancel skey)
     (.configureBlocking ch true)
     (try
-      (p/write-message-blocking ch write-bf {:type :copy-in-response})
+      (p/write-message-blocking ch write-bf {:type :copy-in-response}
+                                wire-opts)
       (.clear ^ByteBuffer read-bf)
       (loop [bf read-bf]
-        (let [[msg bf'] (p/receive-ch ch bf)]
+        (let [[msg bf'] (p/receive-ch ch bf wire-opts)]
           (when-not (identical? bf bf') (vswap! state assoc :read-bf bf'))
           (if (map? msg)
             (let [{:keys [type]} msg]
@@ -745,7 +749,7 @@
    (copy-out skey data batch-size copy-meta nil))
   ([^SelectionKey skey data batch-size copy-meta response-meta]
    (let [state                             (.attachment skey)
-         {:keys [^ByteBuffer write-bf]}    @state
+         {:keys [^ByteBuffer write-bf wire-opts]}    @state
          ^SocketChannel                 ch (.channel skey)
          response                          (cond-> {:type :copy-out-response}
                                              copy-meta
@@ -753,10 +757,11 @@
                                              (seq response-meta)
                                              (merge response-meta))]
      (locking write-bf
-       (p/write-message-blocking ch write-bf response)
+       (p/write-message-blocking ch write-bf response wire-opts)
        (doseq [batch (partition batch-size batch-size nil data)]
          (write-message skey batch))
-       (p/write-message-blocking ch write-bf {:type :copy-done}))
+       (p/write-message-blocking ch write-bf {:type :copy-done}
+                                 wire-opts))
      (log/debug "Copied out" (count data) "data items"))))
 
 (defn- copy-file-out
@@ -815,18 +820,19 @@
 
 (defn- error-response
   [^SelectionKey skey error-msg error-data]
-  (let [{:keys [^ByteBuffer write-bf]} @(.attachment skey)
+  (let [{:keys [^ByteBuffer write-bf wire-opts]} @(.attachment skey)
         ^SocketChannel ch              (.channel skey)]
     (p/write-message-blocking ch write-bf
                               {:type     :error-response
                                :message  error-msg
-                               :err-data error-data})))
+                               :err-data error-data}
+                              wire-opts)))
 
 (defn- reopen-response
   [^SelectionKey skey msg]
-  (let [{:keys [^ByteBuffer write-bf]} @(.attachment skey)
+  (let [{:keys [^ByteBuffer write-bf wire-opts]} @(.attachment skey)
         ^SocketChannel ch              (.channel skey)]
-    (p/write-message-blocking ch write-bf msg)))
+    (p/write-message-blocking ch write-bf msg wire-opts)))
 
 (defmacro wrap-error
   [& body]
@@ -1349,8 +1355,14 @@
 
 (defn- set-client-id
   [^Server server ^SelectionKey skey message]
-  (vswap! (.attachment skey) assoc :client-id (message :client-id))
-  (write-message skey {:type :set-client-id-ok}))
+  (let [client-id         (message :client-id)
+        wire-capabilities (:wire-capabilities message)
+        wire-opts         (p/negotiate-wire-opts wire-capabilities)]
+    ;; Respond in the legacy raw format, then enable negotiated wire options.
+    (write-message skey {:type              :set-client-id-ok
+                         :wire-capabilities (p/local-wire-capabilities)})
+    (vswap! (.attachment skey)
+            assoc :client-id client-id :wire-opts wire-opts)))
 
 (defn- create-user
   [^Server server ^SelectionKey skey {:keys [args]}]
@@ -2882,7 +2894,9 @@
 (defn- handle-message
   [^Server server ^SelectionKey skey fmt msg ]
   (try
-    (let [{:keys [type writing?] :as message} (p/read-value fmt msg)]
+    (let [wire-opts                       (:wire-opts @(.attachment skey))
+          {:keys [type writing?] :as message}
+          (p/read-value fmt msg wire-opts)]
       (log/debug "Message received:" (dissoc message :password :args))
       (set-last-active server skey)
       (if writing?

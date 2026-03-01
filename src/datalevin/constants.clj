@@ -384,6 +384,8 @@
 
 (def ^:no-doc ^:const message-format-transit (unchecked-byte 0x01))
 (def ^:no-doc ^:const message-format-nippy (unchecked-byte 0x02))
+(def ^:no-doc ^:const message-format-mask 0x0F)
+(def ^:no-doc ^:const message-flag-zstd 0x10)
 
 (def ^:const vector-index-suffix
   "Legacy file name suffix for vector index is `.vid`"
@@ -431,6 +433,15 @@
        :doc     "set of additional serializable classes, e.g.
                   `#{\"my.package.*\"}`"}
   *data-serializable-classes* #{})
+
+(def ^{:dynamic true :no-doc true
+       :doc     "Minimum serialized wire message bytes before trying zstd
+                 compression for client/server protocol messages."}
+  *wire-compression-threshold* 8192)
+
+(def ^{:dynamic true :no-doc true
+       :doc     "Zstd compression level for client/server protocol messages."}
+  *wire-compression-level* 3)
 
 ;; lmdb
 

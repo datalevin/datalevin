@@ -131,3 +131,29 @@
       (finally
         (.close ch)
         (.close server)))))
+
+(deftest set-client-id-sends-wire-capabilities-test
+  (let [server     (doto (ServerSocketChannel/open)
+                     (.bind (InetSocketAddress. "127.0.0.1" 0)))
+        port       (.getLocalPort (.socket server))
+        server-fut (future
+                     (with-open [^SocketChannel server-ch (.accept server)]
+                       (let [^ByteBuffer read-bf  (ByteBuffer/allocate c/+buffer-size+)
+                             ^ByteBuffer write-bf (ByteBuffer/allocate c/+buffer-size+)
+                             [msg _]              (p/receive-ch server-ch read-bf)]
+                         (is (= :set-client-id (:type msg)))
+                         (is (contains?
+                               (set (get-in msg [:wire-capabilities :compression]))
+                               :zstd))
+                         (p/write-message-blocking server-ch write-bf
+                                                   {:type :set-client-id-ok})))
+                     :server-done)
+        ch         (doto (SocketChannel/open)
+                     (.connect (InetSocketAddress. "127.0.0.1" port)))
+        conn       (sut/->Connection ch (ByteBuffer/allocate c/+buffer-size+))]
+    (try
+      (#'sut/set-client-id conn (UUID/randomUUID))
+      (is (= :server-done (deref server-fut 3000 ::timeout)))
+      (finally
+        (.close ch)
+        (.close server)))))

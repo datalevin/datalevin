@@ -49,6 +49,38 @@
         (is (= pos (.getInt bf)))
         (is (= v (sut/read-transit-bf bf)))))))
 
+(deftest wire-capability-negotiation-test
+  (is (= :zstd (:compression
+                (sut/negotiate-wire-opts {:compression [:zstd]}))))
+  (is (nil? (:compression
+             (sut/negotiate-wire-opts {:compression []}))))
+  (is (nil? (:compression (sut/negotiate-wire-opts nil)))))
+
+(deftest wire-compression-threshold-test
+  (let [msg           {:payload (apply str (repeat 3000 "aaaaaaaaaaaa"))}
+        no-comp-opts  {:compression :zstd :compression-threshold 1000000}
+        comp-opts     {:compression :zstd :compression-threshold 64}
+        ^ByteBuffer b1 (bf/allocate-buffer (* 2 c/+buffer-size+))
+        ^ByteBuffer b2 (bf/allocate-buffer (* 2 c/+buffer-size+))]
+    (sut/write-message-bf b1 msg c/message-format-nippy no-comp-opts)
+    (.flip b1)
+    (let [fmt      (.get b1)
+          length   (.getInt b1)
+          payload  (byte-array (- length c/message-header-size))]
+      (.get b1 payload)
+      (is (zero? (bit-and (bit-and (int fmt) 0xFF) c/message-flag-zstd)))
+      (is (= msg (sut/read-value fmt payload nil))))
+
+    (sut/write-message-bf b2 msg c/message-format-nippy comp-opts)
+    (.flip b2)
+    (let [fmt      (.get b2)
+          length   (.getInt b2)
+          payload  (byte-array (- length c/message-header-size))]
+      (.get b2 payload)
+      (is (pos? (bit-and (bit-and (int fmt) 0xFF) c/message-flag-zstd)))
+      (is (thrown? Exception (sut/read-value fmt payload nil)))
+      (is (= msg (sut/read-value fmt payload comp-opts))))))
+
 (deftest small-receive-one-messages-test
   (let [src-arr         (byte-array 200)
         ^ByteBuffer src (ByteBuffer/wrap src-arr)
