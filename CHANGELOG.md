@@ -25,7 +25,8 @@
 - [Vector] Vector index persists inside LMDB, keeping atomic guarantees.
 - [Datalog] Giants DBI is compressed when the value is greater than
   `datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
-- [Server] Reduce the number of network round trips needed for a transaction.
+- [Server] Reduce the number of network round trips needed for operations
+  [#350](https://github.com/juji-io/datalevin/issues/350).
 
 ### Fixed
 - [Datalog] correct free vars when `not-join` is in rules
