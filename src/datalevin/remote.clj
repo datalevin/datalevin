@@ -25,6 +25,7 @@
    [clojure.lang Seqable IReduceInit]
    [java.lang AutoCloseable]
    [java.util.concurrent ConcurrentHashMap]
+   [java.util.concurrent.atomic AtomicBoolean]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
    [java.security MessageDigest]
    [java.net URI]))
@@ -158,14 +159,16 @@
                        ^String db-name
                        ^Client client
                        write-txn
-                       writing?]
+                       writing?
+                       ^AtomicBoolean sampling-started?]
   IWriting
   (writing? [_] writing?)
 
   (write-txn [_] write-txn)
 
   (mark-write [_]
-    (->DatalogStore uri db-name client (volatile! :remote-dl-mutex) true))
+    (->DatalogStore uri db-name client (volatile! :remote-dl-mutex) true
+                    sampling-started?))
 
   IStore
   (opts [_] (cl/normal-request client :opts [db-name] writing?))
@@ -256,10 +259,20 @@
     (cl/normal-request client :e-first-datom [db-name e] writing?))
 
   (start-sampling [_]
-    (cl/normal-request client :start-sampling [db-name] writing?))
+    (when (.compareAndSet sampling-started? false true)
+      (try
+        (cl/normal-request client :start-sampling [db-name] writing?)
+        (catch Exception e
+          (.set sampling-started? false)
+          (throw e)))))
 
   (stop-sampling [_]
-    (cl/normal-request client :stop-sampling [db-name] writing?))
+    (when (.compareAndSet sampling-started? true false)
+      (try
+        (cl/normal-request client :stop-sampling [db-name] writing?)
+        (catch Exception e
+          (.set sampling-started? true)
+          (throw e)))))
 
   (analyze [_ attr]
     (cl/normal-request client :analyze [db-name attr]))
@@ -420,7 +433,8 @@
                        c/db-store-datalog)]
          (cl/open-database client db-name store schema opts)
          (->DatalogStore uri-str db-name client
-                         (volatile! :remote-dl-mutex) false))
+                         (volatile! :remote-dl-mutex) false
+                         (AtomicBoolean. false)))
        (u/raise "URI should contain a database name" {})))))
 
 ;; remote kv store
