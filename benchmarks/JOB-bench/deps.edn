@@ -6,10 +6,10 @@
          com.taoensso/nippy                            {:mvn/version "3.6.0"}
          me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.10"}
          ;; org.clojars.huahaiy/dtlvnative-macosx-arm64   {:local/root "../../lib/dtlvnative-macosx-arm64-0.13.22.jar"}
-         org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.16.2"}
-         org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.16.2"}
-         org.clojars.huahaiy/dtlvnative-linux-x86_64   {:mvn/version "0.16.2"}
-         org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version "0.16.2"}
+         org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.16.4"}
+         org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.16.4"}
+         org.clojars.huahaiy/dtlvnative-linux-x86_64   {:mvn/version "0.16.4"}
+         org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version "0.16.4"}
          org.roaringbitmap/RoaringBitmap               {:mvn/version "1.3.0"}
          org.eclipse.collections/eclipse-collections   {:mvn/version "13.0.0"}
          com.github.luben/zstd-jni                     {:mvn/version "1.5.7-6"}
