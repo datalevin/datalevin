@@ -22,6 +22,8 @@
   (:import
    [datalevin.client Client]
    [datalevin.interface ILMDB ITxLog IList IAdmin IStore ISearchEngine IVectorIndex]
+   [clojure.lang Seqable IReduceInit]
+   [java.lang AutoCloseable]
    [java.nio.file Files Paths StandardOpenOption LinkOption]
    [java.security MessageDigest]
    [java.net URI]))
@@ -375,6 +377,158 @@
 
 (declare ->KVStore)
 
+(defn- backward-range-type?
+  [range-type]
+  (str/ends-with? (name range-type) "-back"))
+
+(defn- base-range-type
+  [range-type]
+  (if (backward-range-type? range-type)
+    (keyword (subs (name range-type) 0 (- (count (name range-type)) 5)))
+    range-type))
+
+(defn- k-range->interval
+  [[range-type k1 k2 :as k-range]]
+  (let [back? (backward-range-type? range-type)
+        base  (base-range-type range-type)]
+    (case base
+      :all         {:back? back? :lower nil :upper nil}
+      :at-least    {:back? back? :lower {:v k1 :incl? true}  :upper nil}
+      :greater-than {:back? back? :lower {:v k1 :incl? false} :upper nil}
+      :at-most     {:back? back? :lower nil :upper {:v k1 :incl? true}}
+      :less-than   {:back? back? :lower nil :upper {:v k1 :incl? false}}
+      :closed      {:back? back?
+                    :lower {:v (if back? k2 k1) :incl? true}
+                    :upper {:v (if back? k1 k2) :incl? true}}
+      :closed-open {:back? back?
+                    :lower {:v (if back? k2 k1) :incl? true}
+                    :upper {:v (if back? k1 k2) :incl? false}}
+      :open        {:back? back?
+                    :lower {:v (if back? k2 k1) :incl? false}
+                    :upper {:v (if back? k1 k2) :incl? false}}
+      :open-closed {:back? back?
+                    :lower {:v (if back? k2 k1) :incl? false}
+                    :upper {:v (if back? k1 k2) :incl? true}}
+      (u/raise "Unsupported key range type for remote range-seq"
+               {:k-range k-range}))))
+
+(defn- interval->k-range
+  [{:keys [back? lower upper]}]
+  (let [base (cond
+               (and (nil? lower) (nil? upper))
+               :all
+
+               (and lower (nil? upper))
+               (if (:incl? lower) :at-least :greater-than)
+
+               (and (nil? lower) upper)
+               (if (:incl? upper) :at-most :less-than)
+
+               (and lower upper)
+               (cond
+                 (and (:incl? lower) (:incl? upper))  :closed
+                 (and (:incl? lower) (not (:incl? upper))) :closed-open
+                 (and (not (:incl? lower)) (not (:incl? upper))) :open
+                 :else :open-closed))
+        range-type (if back?
+                     (keyword (str (name base) "-back"))
+                     base)]
+    (cond
+      (and (nil? lower) (nil? upper))
+      [range-type]
+
+      (and lower (nil? upper))
+      [range-type (:v lower)]
+
+      (and (nil? lower) upper)
+      [range-type (:v upper)]
+
+      back?
+      [range-type (:v upper) (:v lower)]
+
+      :else
+      [range-type (:v lower) (:v upper)])))
+
+(defn- advance-k-range
+  [k-range next-key]
+  (let [{:keys [back?] :as interval} (k-range->interval k-range)
+        interval'                    (if back?
+                                       (assoc interval :upper {:v next-key :incl? true})
+                                       (assoc interval :lower {:v next-key :incl? true}))]
+    (interval->k-range interval')))
+
+(defn- project-range-item
+  [item ignore-key? v-type]
+  (if ignore-key?
+    (if (= v-type :ignore) true (second item))
+    item))
+
+(defn- find-index
+  [item coll]
+  (second (u/some-indexed #(= item %) coll)))
+
+(defn- remote-range-seq*
+  [fetch-first-n get-range dbi-name k-range k-type v-type ignore-key? opts]
+  (let [batch-size (max 1 (long (or (:batch-size opts) 100)))
+        request-n  (inc batch-size)
+        fetch      (fn [{:keys [k-range resume]}]
+                     (let [raw     (vec (fetch-first-n dbi-name request-n k-range
+                                                       k-type v-type))
+                           tail    (if resume
+                                     (if-let [idx (find-index resume raw)]
+                                       (subvec raw (inc idx))
+                                       ;; Dense duplicate-key ranges (e.g. dupsort/list DBI)
+                                       ;; may not include `resume` in a small page. Fall back
+                                       ;; to one eager range request to preserve correctness.
+                                       (let [all (vec (get-range dbi-name k-range
+                                                                 k-type v-type))]
+                                         (if-let [idx2 (find-index resume all)]
+                                           (subvec all (inc idx2))
+                                           [])))
+                                     raw)
+                           chunk   (if (> (count tail) batch-size)
+                                     (subvec tail 0 batch-size)
+                                     tail)
+                           batch   (mapv #(project-range-item % ignore-key? v-type)
+                                         chunk)
+                           more?   (> (count tail) batch-size)
+                           next-k  (when more?
+                                     (first (peek chunk)))]
+                       {:batch      batch
+                        :next-state (when next-k
+                                      {:k-range (advance-k-range k-range next-k)
+                                       :resume  (peek chunk)})}))
+        init-state {:k-range k-range :resume nil}]
+    (reify
+      Seqable
+      (seq [_]
+        (u/lazy-concat
+          ((fn next-page [ret]
+             (when (seq (:batch ret))
+               (cons (:batch ret)
+                     (when-some [state (:next-state ret)]
+                       (lazy-seq (next-page (fetch state)))))))
+           (fetch init-state))))
+
+      IReduceInit
+      (reduce [_ rf init]
+        (loop [acc init
+               ret (fetch init-state)]
+          (if (seq (:batch ret))
+            (let [acc (rf acc (:batch ret))]
+              (if (reduced? acc)
+                @acc
+                (if-some [state (:next-state ret)]
+                  (recur acc (fetch state))
+                  acc)))
+            acc)))
+
+      AutoCloseable
+      (close [_] nil)
+
+      Object
+      (toString [this] (str (apply list this))))))
+
 (deftype KVStore [^String uri
                   ^String db-name
                   ^Client client
@@ -682,19 +836,29 @@
         [db-name dbi-name frozen-visitor k-range k-type raw-pred?]
         writing?)))
 
-  ;; TODO implements batch remote request
-  ;; (range-seq [db dbi-name k-range]
-  ;;   (.range-seq db dbi-name k-range :data :data false nil))
-  ;; (range-seq [db dbi-name k-range k-type]
-  ;;   (.range-seq db dbi-name k-range k-type :data false nil))
-  ;; (range-seq [db dbi-name k-range k-type v-type]
-  ;;   (.range-seq db dbi-name k-range k-type v-type false nil))
-  ;; (range-seq [db dbi-name k-range k-type v-type ignore-key?]
-  ;;   (.range-seq db dbi-name k-range k-type v-type ignore-key? nil))
-  ;; (range-seq [_ dbi-name k-range k-type v-type ignore-key? opts]
-  ;;   (cl/normal-request
-  ;;     client :get-range
-  ;;     [db-name dbi-name k-range k-type v-type ignore-key?] writing?))
+  (range-seq [db dbi-name k-range]
+    (.range-seq db dbi-name k-range :data :data false nil))
+  (range-seq [db dbi-name k-range k-type]
+    (.range-seq db dbi-name k-range k-type :data false nil))
+  (range-seq [db dbi-name k-range k-type v-type]
+    (.range-seq db dbi-name k-range k-type v-type false nil))
+  (range-seq [db dbi-name k-range k-type v-type ignore-key?]
+    (.range-seq db dbi-name k-range k-type v-type ignore-key? nil))
+  (range-seq [_ dbi-name k-range k-type v-type ignore-key? opts]
+    (remote-range-seq*
+      (fn [dbi-name n k-range k-type v-type]
+        (let [[res]
+              (cl/normal-request
+                client :batch-kv
+                [db-name [[:get-first-n dbi-name n k-range k-type v-type false]]]
+                writing?)]
+          res))
+      (fn [dbi-name k-range k-type v-type]
+        (cl/normal-request
+          client :get-range
+          [db-name dbi-name k-range k-type v-type false]
+          writing?))
+      dbi-name k-range k-type v-type ignore-key? opts))
 
   (range-count [db dbi-name k-range]
     (.range-count db dbi-name k-range :data))
@@ -910,6 +1074,21 @@
            (->KVStore uri-str db-name client
                       (volatile! :remote-kv-mutex) false))
        (u/raise "URI should contain a database name" {})))))
+
+(defn batch-kv
+  "Run multiple KV calls against a remote KV store in one RPC round trip.
+
+  Each call is a vector `[op & args]`, where `op` is one of:
+  `:get-value`, `:get-rank`, `:get-by-rank`, `:sample-kv`, `:get-first`,
+  `:get-first-n`, `:get-range`, `:key-range`, `:key-range-count`,
+  `:key-range-list-count`, `:range-count`, `:get-list`, `:list-count`,
+  `:in-count?`, `:list-range`, `:list-range-count`, `:list-range-first`,
+  or `:list-range-first-n`."
+  [^KVStore store calls]
+  (cl/normal-request (.-client store)
+                     :batch-kv
+                     [(.-db-name store) calls]
+                     (.-writing? store)))
 
 ;; remote search
 

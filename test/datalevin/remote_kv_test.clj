@@ -177,6 +177,53 @@
       (finally
         (if/close-kv store)))))
 
+(deftest batch-kv-rpc-test
+  (let [db-name (str "batch-kv-rpc-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri)]
+    (try
+      (if/open-dbi store "a")
+      (if/transact-kv store [[:put "a" 1 2 :long :long]
+                             [:put "a" 2 3 :long :long]
+                             [:put "a" 3 4 :long :long]])
+      (is (= [2 [[1 2] [2 3]] 3]
+             (sut/batch-kv
+               store
+               [[:get-value "a" 1 :long :long true]
+                [:get-first-n "a" 2 [:all] :long :long false]
+                [:range-count "a" [:all] :long]])))
+      (let [{:keys [type message]}
+            (cl/request
+              (.-client ^datalevin.remote.KVStore store)
+              {:type :batch-kv
+               :args [db-name [[:unsupported-call "a"]]]})]
+        (is (= :error-response type))
+        (is (re-find #"Unsupported batch-kv call" message)))
+      (finally
+        (if/close-kv store)))))
+
+(deftest range-seq-uses-batch-kv-test
+  (let [db-name (str "range-seq-batch-kv-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri)]
+    (try
+      (if/open-dbi store "a")
+      (if/transact-kv store [[:put "a" 1 10 :long :long]
+                             [:put "a" 2 20 :long :long]
+                             [:put "a" 3 30 :long :long]
+                             [:put "a" 4 40 :long :long]
+                             [:put "a" 5 50 :long :long]])
+      (with-open [^java.lang.AutoCloseable rs
+                  (if/range-seq store "a" [:closed 2 5]
+                                :long :long true {:batch-size 2})]
+        (is (= [20 30 40 50] (seq rs))))
+      (with-open [^java.lang.AutoCloseable rs
+                  (if/range-seq store "a" [:closed-back 5 2]
+                                :long :long true {:batch-size 2})]
+        (is (= [50 40 30 20] (seq rs))))
+      (finally
+        (if/close-kv store)))))
+
 (deftest txn-log-rollback-switch-test
   (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
                    (UUID/randomUUID))

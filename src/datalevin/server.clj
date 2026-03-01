@@ -1278,6 +1278,7 @@
    'sample-kv
    'get-first
    'get-first-n
+   'batch-kv
    'key-range
    'key-range-count
    'key-range-list-count
@@ -1492,7 +1493,7 @@
             ::create ::database did
             "Don't have permission to close the database"
             (doseq [[cid {:keys [stores]}] (.-clients server)
-                    :when                  (stores db-name)]
+                    :when                  (get stores db-name)]
               (when (not= client-id cid)
                 (disconnect-client* server cid)))
             (remove-store server db-name)
@@ -2492,6 +2493,51 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error (normal-kv-store-handler get-first-n)))
 
+(defn- run-batch-kv-call
+  [kv-store call]
+  (let [[op & op-args] call]
+    (case op
+      :get-value            (apply i/get-value kv-store op-args)
+      :get-rank             (apply i/get-rank kv-store op-args)
+      :get-by-rank          (apply i/get-by-rank kv-store op-args)
+      :sample-kv            (apply i/sample-kv kv-store op-args)
+      :get-first            (apply i/get-first kv-store op-args)
+      :get-first-n          (apply i/get-first-n kv-store op-args)
+      :get-range            (apply i/get-range kv-store op-args)
+      :key-range            (apply i/key-range kv-store op-args)
+      :key-range-count      (apply i/key-range-count kv-store op-args)
+      :key-range-list-count (apply i/key-range-list-count kv-store op-args)
+      :range-count          (apply i/range-count kv-store op-args)
+      :get-list             (apply i/get-list kv-store op-args)
+      :list-count           (apply i/list-count kv-store op-args)
+      :in-count?            (apply i/in-list? kv-store op-args)
+      :in-list?             (apply i/in-list? kv-store op-args)
+      :list-range           (apply i/list-range kv-store op-args)
+      :list-range-count     (apply i/list-range-count kv-store op-args)
+      :list-range-first     (apply i/list-range-first kv-store op-args)
+      :list-range-first-n   (apply i/list-range-first-n kv-store op-args)
+      (u/raise "Unsupported batch-kv call"
+               {:call op :call-args op-args}))))
+
+(defn- batch-kv
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [[db-name calls] args
+          kv-store        (lmdb server skey db-name writing?)]
+      (when-not (sequential? calls)
+        (u/raise "batch-kv calls must be a sequential collection"
+                 {:calls calls}))
+      (write-message
+        skey
+        {:type   :command-complete
+         :result (mapv
+                   (fn [call]
+                     (when-not (sequential? call)
+                       (u/raise "Each batch-kv call must be a vector [op & args]"
+                                {:call call}))
+                     (run-batch-kv-call kv-store call))
+                   calls)}))))
+
 (defn- get-range
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
@@ -2888,8 +2934,10 @@
   [^Server server ^SelectionKey skey]
   (let [{:keys [client-id]} @(.attachment skey)]
     (when client-id
-      (update-client server client-id
-                     #(assoc % :last-active (System/currentTimeMillis))))))
+      ;; Avoid durable session writes on every request; this path is hot.
+      (when-let [session (get-client server client-id)]
+        (.put ^Map (.-clients server) client-id
+              (assoc session :last-active (System/currentTimeMillis)))))))
 
 (defn- handle-message
   [^Server server ^SelectionKey skey fmt msg ]
