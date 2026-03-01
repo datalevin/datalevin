@@ -119,17 +119,84 @@ having a single remote data source, the entire query processing is done remotely
 to save networking traffic. For other cases, only low level data access
 functions are handled on the server.
 
-Each client always check `last-modified` time of the remote database before data
-access, so when multiple clients are accessing the same database on the server,
-all see the same most update-to-date data, as long as the clients and the server
-have clock synchronization, which is a mild condition that most modern server
-deployment environment should meet, with ntp or chrony services being part of
-the standard server environment. In term of CAP theorem, Datalevin favors
-consistency over availability, in consistent with our goal of simplifying data access.
+By default, each client checks `last-modified` time of the remote database
+before data access, so when multiple clients are accessing the same database on
+the server, all see the same most update-to-date data, as long as the clients
+and the server have clock synchronization, which is a mild condition that most
+modern server deployment environment should meet, with ntp or chrony services
+being part of the standard server environment. In term of CAP theorem,
+Datalevin favors consistency over availability, in consistent with our goal of
+simplifying data access.
 
 All these are transparent to the users and the same data access API works for
 all cases.  Further optimizations can be implemented behind the scene
 without having to introduce new operational complexities.
+
+### Tuning knobs
+
+Most deployments work well with defaults, but these knobs control common
+latency/throughput trade-offs.
+
+#### Client cache freshness vs remote round trips
+
+`datalevin.constants/*remote-db-last-modified-check-interval-ms*` (default
+`0`) sets the minimum interval between remote `last-modified` checks performed
+by `db?`.
+
+* `0` means check on every call (strict freshness, more network round trips).
+* A positive value reuses the previous freshness check inside the interval
+  (fewer round trips, but remote updates may be observed later, up to the
+  interval).
+
+Example:
+
+```clojure
+(require '[datalevin.constants :as c]
+         '[datalevin.core :as d])
+
+(binding [c/*remote-db-last-modified-check-interval-ms* 250]
+  (d/get-conn "dtlv://user:pass@db-host:8898/app"))
+```
+
+#### Client connection pool
+
+`datalevin.client/new-client` accepts:
+
+* `:pool-size` (default `3`): max pooled connections per client instance.
+* `:time-out` (default `60000` ms): timeout for getting a connection and for
+  retrying requests.
+
+Example:
+
+```clojure
+(require '[datalevin.client :as cl])
+
+(def client
+  (cl/new-client "dtlv://user:pass@db-host:8898"
+                 {:pool-size 12
+                  :time-out 120000}))
+```
+
+#### Server idle session timeout
+
+CLI option `--idle-timeout` (default `172800000` ms, i.e. 48 hours) controls
+when inactive sessions are disconnected to reclaim resources.
+
+```console
+dtlv serv -r /data/dtlv --idle-timeout 3600000
+```
+
+#### Wire compression
+
+These dynamic vars tune client/server protocol compression (zstd):
+
+* `datalevin.constants/*wire-compression-threshold*` (default `8192` bytes):
+  minimum payload size before attempting compression.
+* `datalevin.constants/*wire-compression-level*` (default `3`): zstd
+  compression level.
+
+Lower threshold and higher level can reduce bandwidth at the cost of more CPU.
+Set these on both client and server processes if you want symmetric behavior.
 
 ### Networking
 
