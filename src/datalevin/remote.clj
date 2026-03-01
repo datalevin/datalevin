@@ -532,7 +532,7 @@
                         {:type     :transact-kv
                          :mode     :copy-in
                          :writing? writing?
-                         :args     [db-name dbi-name txs k-type v-type]}
+                         :args     [db-name dbi-name k-type v-type]}
                         txs c/+wire-datom-batch-size+))]
       (when (= type :error-response)
         (if (:resized err-data)

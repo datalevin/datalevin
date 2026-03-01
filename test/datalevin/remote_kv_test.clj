@@ -143,6 +143,22 @@
         (if/close-kv store)
         (u/delete-files dst)))))
 
+(deftest transact-kv-copy-in-uses-request-params-test
+  (let [db-name (str "tx-kv-copy-in-params-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store   (sut/open-kv uri)]
+    (try
+      (if/open-dbi store "a")
+      (let [txs (mapv (fn [i] [:put i (inc i)])
+                      (range c/+wire-datom-batch-size+))]
+        ;; Force copy-in path with compact tx vectors that rely on pulled-out
+        ;; dbi-name/k-type/v-type request args.
+        (if/transact-kv store "a" txs :long :long)
+        (is (= c/+wire-datom-batch-size+ (if/entries store "a")))
+        (is (= 43 (if/get-value store "a" 42 :long :long))))
+      (finally
+        (if/close-kv store)))))
+
 (deftest txn-log-rollback-switch-test
   (let [dir   (str "dtlv://datalevin:datalevin@localhost/"
                    (UUID/randomUUID))

@@ -2396,7 +2396,21 @@
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
         (case mode
-          :copy-in (do (i/transact-kv kv-store (copy-in server skey))
+          :copy-in (let [txs (copy-in server skey)]
+                     ;; copy-in payload format used to include txs in args.
+                     ;; Keep backward compatibility while honoring pulled-out
+                     ;; dbi-name/key-type/value-type args for compact tx forms.
+                     (case (count args)
+                       1 (i/transact-kv kv-store txs)
+                       2 (i/transact-kv kv-store (nth args 1) txs)
+                       3 (i/transact-kv kv-store (nth args 1) txs
+                                        (nth args 2))
+                       4 (i/transact-kv kv-store (nth args 1) txs
+                                        (nth args 2) (nth args 3))
+                       5 (i/transact-kv kv-store (nth args 1) txs
+                                        (nth args 3) (nth args 4))
+                       (u/raise "Invalid :args for transact-kv copy-in"
+                                {:args args :mode mode}))
                        (write-message skey {:type :command-complete}))
           :request (normal-kv-store-handler transact-kv)
           (u/raise "Missing :mode when transacting kv" {}))))))
