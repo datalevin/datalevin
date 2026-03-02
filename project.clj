@@ -66,14 +66,6 @@
                     [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                      #"\.csv" #"\.edn" #"\.txt"]
                     :uberjar-name "test0.uberjar.jar"}
-   :test1-uberjar  {:main         datalevin.test1
-                    :aot          [datalevin.test1],
-                    :dependencies [[org.clojure/test.check]
-                                   [joda-time/joda-time]]
-                    :jar-inclusions
-                    [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
-                     #"\.csv" #"\.edn"  #"\.txt"]
-                    :uberjar-name "test1.uberjar.jar"}
    :dev            {:main datalevin.test0
                     :dependencies
                     [[org.clojure/test.check]

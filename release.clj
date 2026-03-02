@@ -21,6 +21,7 @@
   (second (re-find #"def version \"([0-9\.]+)\"" (slurp "project.clj"))))
 
 (def ^:dynamic *env* {})
+(def dtlvtest-dir "../dtlvtest")
 
 (defn sh [& args]
   (apply println "Running" (if (empty? *env*) "" (str :env " " *env*)) args)
@@ -73,6 +74,9 @@
   (println "\n\n[ Running lein tests ]\n")
   (sh "./lein-test" :dir "script")
 
+  (println "\n\n[ Running test1 lein tests (dtlvtest) ]\n")
+  (sh "lein" "test" :dir dtlvtest-dir)
+
   (println "\n\n[ Running JOB tests ]\n")
   (sh "./job-test" :dir "script")
 
@@ -96,8 +100,8 @@
   (println "\n\n[ Running native tests ]\n")
   (sh "script/compile-native")
   (sh "./dtlv-test0")
-  (sh "script/compile-native-test1")
-  (sh "./dtlv-test1")
+  (sh "./script/compile-native-test1" :dir dtlvtest-dir)
+  (sh "./dtlv-test1" :dir dtlvtest-dir)
   )
 
 (defn- str->json [s]

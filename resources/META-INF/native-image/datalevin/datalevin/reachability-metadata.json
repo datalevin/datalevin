@@ -693,6 +693,105 @@
             "allPublicConstructors": true
         },
         {
+            "type": "com.github.luben.zstd.Zstd",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdInputStreamNoFinalizer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdOutputStreamNoFinalizer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictTrainer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictCompress",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictDecompress",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdException",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.util.Native",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.util.Native$1",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.util.Native$2",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.util.ZstdVersion",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
             "type":"org.tartarus.snowball.SnowballStemmer",
             "allPublicConstructors" : true,
             "allPublicMethods" : true,
@@ -997,6 +1096,69 @@
         },
         {
             "type": "java.nio.Buffer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "java.nio.ByteBuffer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.Zstd",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdInputStreamNoFinalizer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdOutputStreamNoFinalizer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictTrainer",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictCompress",
+            "allDeclaredConstructors": true,
+            "allPublicConstructors": true,
+            "allDeclaredMethods": true,
+            "allPublicMethods": true,
+            "allDeclaredFields": true,
+            "allPublicFields": true
+        },
+        {
+            "type": "com.github.luben.zstd.ZstdDictDecompress",
             "allDeclaredConstructors": true,
             "allPublicConstructors": true,
             "allDeclaredMethods": true,

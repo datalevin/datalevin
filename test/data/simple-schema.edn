@@ -1,2 +1,0 @@
-{:name   {:db/valueType :db.type/string}
- :height {:db/valueType :db.type/float}}
