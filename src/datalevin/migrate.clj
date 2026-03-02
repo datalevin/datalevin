@@ -37,7 +37,7 @@
 (defn ensure-jar
   [major minor patch]
   (let [version (str major "." minor "." patch)
-        jar-dir (io/file (u/tmp-dir "datalevin-migrate") "jars" version)
+        ^File jar-dir (io/file (u/tmp-dir "datalevin-migrate") "jars" version)
         jar     (io/file jar-dir (str "datalevin-" version "-standalone.jar"))]
     (u/create-dirs (.getPath jar-dir))
     (when-not (.exists jar)
@@ -140,8 +140,8 @@
   [dir major minor patch]
   (let [jar       (ensure-jar major minor patch)
         datalog?  (check-datalog jar dir)
-        tmp-root  (io/file (u/tmp-dir
-                             (str "datalevin-migrate-" (UUID/randomUUID))))
+        ^File tmp-root (io/file (u/tmp-dir
+                                 (str "datalevin-migrate-" (UUID/randomUUID))))
         dump-file (io/file tmp-root "dump.nippy")
         dump-path (.getAbsolutePath dump-file)]
     (try

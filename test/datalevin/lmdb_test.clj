@@ -747,8 +747,9 @@
   (let [txlog-dir (str dir u/+separator+ "txlog")]
     (->> (txlog/segment-files txlog-dir)
          (mapcat (fn [{:keys [id file]}]
-                   (let [{:keys [records]}
-                         (txlog/scan-segment (.getPath file))]
+                   (let [^java.io.File txlog-file file
+                         {:keys [records]}
+                         (txlog/scan-segment (.getPath txlog-file))]
                      (mapv (fn [record]
                              (let [{:keys [lsn ops]}
                                    (txlog/decode-commit-row-payload

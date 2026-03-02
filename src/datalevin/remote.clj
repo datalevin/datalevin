@@ -546,15 +546,17 @@
                      (let [raw     (vec (fetch-first-n dbi-name request-n k-range
                                                        k-type v-type))
                            tail    (if resume
-                                     (if-let [idx (find-index resume raw)]
-                                       (subvec raw (inc idx))
+                                     (if-some [idx (find-index resume raw)]
+                                       (let [idx* (long idx)]
+                                         (subvec raw (int (unchecked-inc idx*))))
                                        ;; Dense duplicate-key ranges (e.g. dupsort/list DBI)
                                        ;; may not include `resume` in a small page. Fall back
                                        ;; to one eager range request to preserve correctness.
                                        (let [all (vec (get-range dbi-name k-range
                                                                  k-type v-type))]
-                                         (if-let [idx2 (find-index resume all)]
-                                           (subvec all (inc idx2))
+                                         (if-some [idx2 (find-index resume all)]
+                                           (let [idx2* (long idx2)]
+                                             (subvec all (int (unchecked-inc idx2*))))
                                            [])))
                                      raw)
                            chunk   (if (> (count tail) batch-size)

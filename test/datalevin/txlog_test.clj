@@ -13,7 +13,7 @@
    [java.io RandomAccessFile]
    [java.nio ByteBuffer]
    [java.nio.channels FileChannel]
-   [java.nio.file Files StandardOpenOption]
+   [java.nio.file Files OpenOption Path StandardOpenOption]
    [java.nio.charset StandardCharsets]
    [java.util UUID Random]
    [java.util.concurrent.locks ReentrantLock]))
@@ -46,8 +46,9 @@
   (let [txlog-dir (str dir u/+separator+ "txlog")]
     (->> (sut/segment-files txlog-dir)
          (mapcat (fn [{:keys [file]}]
-                   (let [{:keys [records]}
-                         (sut/scan-segment (.getPath file)
+                   (let [^java.io.File segment-file file
+                         {:keys [records]}
+                         (sut/scan-segment (.getPath segment-file)
                                            {:allow-preallocated-tail? true})]
                      (mapv (fn [{:keys [body]}]
                              (-> body
@@ -1249,7 +1250,7 @@
       (append-lsns! seg1 [1 2])
       (append-lsns! seg2 [3 4])
       (append-lsns! seg3 [5 6])
-      (with-open [raf (RandomAccessFile. seg1 "rw")]
+      (with-open [^RandomAccessFile raf (RandomAccessFile. ^String seg1 "rw")]
         (.seek raf 0)
         (.write raf (int 0x00)))
       (testing "tail scan from high LSN avoids scanning corrupted old segments"
@@ -1351,9 +1352,11 @@
       (with-open [^FileChannel ch (sut/open-segment-channel path)]
         (sut/append-record! ch (->bytes "a"))
         (sut/append-record! ch (->bytes "bb")))
-      (Files/write (.toPath (io/file path))
-                   (byte-array [(byte 1) (byte 2) (byte 3) (byte 4)])
-                   (into-array StandardOpenOption [StandardOpenOption/APPEND]))
+      (let [^Path p (.toPath (io/file path))
+            ^bytes buf (byte-array [(byte 1) (byte 2) (byte 3) (byte 4)])
+            ^"[Ljava.nio.file.OpenOption;" opts
+            (into-array OpenOption [StandardOpenOption/APPEND])]
+        (Files/write p buf opts))
       (let [{:keys [records partial-tail? valid-end size]} (sut/scan-segment path)]
         (is (= 2 (count records)))
         (is partial-tail?)
@@ -2145,7 +2148,7 @@
         (is (= 1 (:revision current)))
         (is (= 20 (:last-committed-lsn current))))
       ;; Corrupt slot-b payload. Reader should fall back to slot-a.
-      (with-open [raf (RandomAccessFile. path "rw")]
+      (with-open [^RandomAccessFile raf (RandomAccessFile. ^String path "rw")]
         (.seek raf (+ sut/meta-slot-size 8))
         (.write raf (int 0x7f)))
       (let [{:keys [current slot-a slot-b]} (sut/read-meta-file path)]

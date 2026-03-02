@@ -258,13 +258,13 @@
     (try
       (loop []
         (when (.hasRemaining bf)
-          (let [n (send-ch ch bf)]
+          (let [n (long (send-ch ch bf))]
             (cond
-              (= n -1)
+              (== n -1)
               (do (.close ch)
                   (u/raise "Socket channel is closed." {}))
 
-              (pos? n)
+              (> n 0)
               (recur)
 
               non-blocking?

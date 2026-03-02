@@ -12,6 +12,10 @@
             "allPublicFields": true
         },
         {
+            "type": "java.io.File",
+            "allPublicMethods": true
+        },
+        {
             "type": "org.joda.time.DateTime"
         },
         {
@@ -123,7 +127,13 @@
             "type": "datalevin.binding.cpp.Rtx"
         },
         {
-            "type": "datalevin.bits.Indexable"
+            "type": "datalevin.bits.Indexable",
+            "allDeclaredConstructors" : true,
+            "allPublicConstructors" : true,
+            "allDeclaredMethods" : true,
+            "allPublicMethods" : true,
+            "allPublicFields" : true,
+            "allDeclaredFields" : true
         },
         {
             "type": "datalevin.bits.Retrieved",
@@ -893,6 +903,21 @@
         },
         {
             "glob": "datalevin/dtlvnative/macosx-arm64/libomp.dylib"
+        },
+        {
+            "glob": "darwin/aarch64/libzstd-jni-*.dylib"
+        },
+        {
+            "glob": "darwin/x86_64/libzstd-jni-*.dylib"
+        },
+        {
+            "glob": "linux/aarch64/libzstd-jni-*.so"
+        },
+        {
+            "glob": "linux/amd64/libzstd-jni-*.so"
+        },
+        {
+            "glob": "win/amd64/libzstd-jni-*.dll"
         }
     ],
     "jni": [

@@ -124,14 +124,15 @@
 (defn- should-check-remote-cache?
   [store cache]
   (if (instance? DatalogStore store)
-    (let [interval ^long c/*remote-db-last-modified-check-interval-ms*]
+    (let [interval-ms (long c/*remote-db-last-modified-check-interval-ms*)]
       (or (nil? cache)
-          (<= interval 0)
+          (not (pos? interval-ms))
           (let [last-check-ms (.get ^ConcurrentHashMap remote-cache-check-ms
                                     (dir store))]
             (or (nil? last-check-ms)
-                (>= (- (System/currentTimeMillis) ^long last-check-ms)
-                    interval)))))
+                (let [elapsed-ms (- (System/currentTimeMillis)
+                                    (long last-check-ms))]
+                  (>= elapsed-ms interval-ms))))))
     true))
 
 (defn refresh-cache
