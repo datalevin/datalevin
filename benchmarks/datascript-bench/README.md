@@ -41,7 +41,8 @@ without going through the transaction process. Datomic does not have this
 option.
 
 ```Clojure
-      (d/init-db datoms nil schema {:kv-opts {:inmemory? true}})
+      (d/init-db datoms nil schema {:wal? false
+                                    :kv-opts {:inmemory? true :wal? false}})
 ```
 
 |DB|Init Latency (ms)|
@@ -68,7 +69,8 @@ This transacts one datom at a time.
             (d/db-with [[:db/add (:db/id p) :sex       (:sex p)]])
             (d/db-with [[:db/add (:db/id p) :age       (:age p)]])
             (d/db-with [[:db/add (:db/id p) :salary    (:salary p)]])))
-      (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+      (d/empty-db nil schema {:wal? false
+                              :kv-opts {:inmemory? true :wal? false}})
       core/people20k)
 ```
 
@@ -91,7 +93,8 @@ This transacts one entity (5 datoms) at a time.
 
 ```Clojure
           (reduce (fn [db p] (d/db-with db [p]))
-            (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+            (d/empty-db nil schema {:wal? false
+                                    :kv-opts {:inmemory? true :wal? false}})
             core/people20k)
 ```
 
@@ -112,7 +115,8 @@ This transacts all 100K datoms in one go.
 
 ```Clojure
     (d/db-with
-      (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+      (d/empty-db nil schema {:wal? false
+                              :kv-opts {:inmemory? true :wal? false}})
       core/people20k)
 ```
 

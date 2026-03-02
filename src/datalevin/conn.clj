@@ -25,7 +25,7 @@
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
+   [java.util.concurrent.atomic AtomicLong]))
 
 (defn conn?
   [conn]
@@ -35,7 +35,6 @@
   [db]
   {:pre [(db/db? db)]}
   (atom db :meta {:listeners (atom {})
-                  :sync-queue-direct-active (AtomicBoolean. false)
                   :sync-queue-pending (AtomicLong. 0)}))
 
 (defn conn-from-datoms
@@ -87,9 +86,9 @@
      (let [db#  ^DB (deref ~orig-conn)
            s#   (.-store db#)
            old# (db/cache-disabled? s#)]
-       (locking (l/write-txn s#)
-         (db/disable-cache s#)
-         (if (instance? DatalogStore s#)
+       (db/disable-cache s#)
+       (if (instance? DatalogStore s#)
+         (locking (l/write-txn s#)
            (let [res#    (if (l/writing? s#)
                            (let [~conn ~orig-conn]
                              ~@body)
@@ -106,22 +105,22 @@
                  new-db# (db/new-db s#)]
              (reset! ~orig-conn new-db#)
              (when-not old# (db/enable-cache s#))
-             res#)
-           (let [kv#     (.-lmdb ^Store s#)
-                 s1#     (volatile! nil)
-                 res1#   (l/with-transaction-kv [kv1# kv#]
-                           (let [conn1# (atom (db/transfer
-                                                db# (s/transfer s# kv1#))
-                                              :meta (meta ~orig-conn))
-                                 res#   (let [~conn conn1#]
-                                          ~@body)]
-                             (vreset! s1# (.-store ^DB (deref conn1#)))
-                             res#))
-                 new-s#  (s/transfer (deref s1#) kv#)
-                 new-db# (db/new-db new-s#)]
-             (reset! ~orig-conn new-db#)
-             (when-not old# (db/enable-cache new-s#))
-             res1#))))))
+             res#))
+         (let [kv#     (.-lmdb ^Store s#)
+               s1#     (volatile! nil)
+               res1#   (l/with-transaction-kv [kv1# kv#]
+                         (let [conn1# (atom (db/transfer
+                                              db# (s/transfer s# kv1#))
+                                            :meta (meta ~orig-conn))
+                               res#   (let [~conn conn1#]
+                                        ~@body)]
+                           (vreset! s1# (.-store ^DB (deref conn1#)))
+                           res#))
+               new-s#  (s/transfer (deref s1#) kv#)
+               new-db# (db/new-db new-s#)]
+           (reset! ~orig-conn new-db#)
+           (when-not old# (db/enable-cache new-s#))
+           res1#)))))
 
 (defn with
   ([db tx-data] (with db tx-data {} false))
@@ -162,23 +161,12 @@
 (defn- ensure-sync-queue-state!
   [conn]
   (let [m (meta conn)
-        direct-active (:sync-queue-direct-active m)
         queued-pending (:sync-queue-pending m)]
-    (if (and (instance? AtomicBoolean direct-active)
-             (instance? AtomicLong queued-pending))
-      {:direct-active direct-active
-       :queued-pending queued-pending}
-      (let [direct-active (if (instance? AtomicBoolean direct-active)
-                            direct-active
-                            (AtomicBoolean. false))
-            queued-pending (if (instance? AtomicLong queued-pending)
-                             queued-pending
-                             (AtomicLong. 0))]
-        (alter-meta! conn assoc
-                     :sync-queue-direct-active direct-active
-                     :sync-queue-pending queued-pending)
-        {:direct-active direct-active
-         :queued-pending queued-pending}))))
+    (if (instance? AtomicLong queued-pending)
+      {:queued-pending queued-pending}
+      (let [queued-pending (AtomicLong. 0)]
+        (alter-meta! conn assoc :sync-queue-pending queued-pending)
+        {:queued-pending queued-pending}))))
 
 (defn- sync-queue-pending-counter
   [conn]
@@ -191,18 +179,15 @@
     (when (neg? after)
       (.set pending 0))))
 
-(defn- begin-relaxed-direct-fast-path!
-  [conn]
-  (let [{:keys [direct-active queued-pending]} (ensure-sync-queue-state! conn)]
-    (when (and (zero? (.get ^AtomicLong queued-pending))
-               (.compareAndSet ^AtomicBoolean direct-active false true))
-      ^AtomicBoolean direct-active)))
-
 (defn- current-thread-holds-store-write-lock?
   [store]
   (boolean
-    (when-let [write-lock (l/write-txn store)]
-      (Thread/holdsLock write-lock))))
+    (or
+      (when-let [write-lock (l/write-txn store)]
+        (Thread/holdsLock write-lock))
+      (when (instance? Store store)
+        (when-let [lmdb-write-lock (l/write-txn (.-lmdb ^Store store))]
+          (Thread/holdsLock lmdb-write-lock))))))
 
 (defn- wal-sync-queue-profile-from-opts
   [opts]
@@ -263,16 +248,9 @@
          (queued-transact! conn tx-data tx-meta))
 
        (= :relaxed profile)
-       (if-let [^AtomicBoolean direct-active
-                (begin-relaxed-direct-fast-path! conn)]
-         (try
-           (observe-txlog-sync-path! :direct-relaxed)
-           (run-transact-now! conn tx-data tx-meta)
-           (finally
-             (.set direct-active false)))
-         (do
-           (observe-txlog-sync-path! :queued-relaxed)
-           (queued-transact! conn tx-data tx-meta)))
+       (do
+         (observe-txlog-sync-path! :queued-relaxed)
+         (queued-transact! conn tx-data tx-meta))
 
        :else
        (do

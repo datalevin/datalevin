@@ -2,6 +2,7 @@
   (:require
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing is use-fixtures]]
+   [datalevin.conn :as dc]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.constants :as c]
@@ -211,3 +212,20 @@
                           :updated-at (Date.)}])
       (is (= 2 (count (d/datoms @conn :eav)))))
     (u/delete-files dir)))
+
+(deftest test-relaxed-transact-uses-queued-path
+  (let [conn  (d/create-conn nil
+                             {:k {:db/valueType :db.type/long}}
+                             {:wal? true
+                              :wal-durability-profile :relaxed
+                              :kv-opts {:inmemory? true}})
+        paths (atom [])]
+    (try
+      (binding [dc/*txlog-sync-path-observer*
+                (fn [path] (swap! paths conj path))]
+        (dotimes [i 32]
+          (d/transact! conn [{:db/id i :k i}])))
+      (is (= 32 (count @paths)))
+      (is (every? #{:queued-relaxed} @paths))
+      (finally
+        (d/close conn)))))

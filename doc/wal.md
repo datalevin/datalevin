@@ -4,9 +4,10 @@ Datalevin supports write-ahead logging (WAL) for both KV and Datalog writes.
 WAL improves write throughput while keeping crash recovery explicit and
 operationally manageable.
 
-Concurrent writers receive tangible throughput benefits in WAL mode. The
-scaling is sub-linear, e.g. 4 concurrent write threads may produce 2X throughout
-increase compared with a single write thread.
+Concurrent writers receive tangible throughput benefits in WAL mode. The scaling
+is sub-linear, e.g. 2 concurrent write threads may produce close to 2X
+throughout increase compared with a single write thread, while 4 threads produce
+a little over 3X increases.
 
 ## Enable WAL
 

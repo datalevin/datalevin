@@ -14,6 +14,11 @@
    :age       {:db/valueType :db.type/long}
    :salary    {:db/valueType :db.type/long}})
 
+(def in-memory-opts
+  {:wal?    false
+   :kv-opts {:inmemory? true
+             :wal?      false}})
+
 
 (defn- wide-db
   "depth = 3 width = 2
@@ -33,7 +38,8 @@
      └ 7
        ├ 14
        └ 15"
-  ([depth width] (d/db-with (d/empty-db nil schema) (wide-db 1 depth width)))
+  ([depth width] (d/db-with (d/empty-db nil schema in-memory-opts)
+                            (wide-db 1 depth width)))
   ([id depth width]
    (if (pos? depth)
      (let [children (map #(+ (* id width) %) (range width))]
@@ -55,7 +61,7 @@
    ↓  ↓  ↓  ↓   ↓
    3  6  9  12  15"
   [depth width]
-  (d/db-with (d/empty-db nil schema)
+  (d/db-with (d/empty-db nil schema in-memory-opts)
              (apply concat
                     (for [x    (range width)
                           y    (range depth)
@@ -68,14 +74,14 @@
                         :name  "Ivan"}]))))
 
 
-(def db100k-1  (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-2  (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-2s (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-3  (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-4  (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-5  (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-p1 (d/db-with (d/empty-db nil schema) core/people20k))
-(def db100k-p2 (d/db-with (d/empty-db nil schema) core/people20k))
+(def db100k-1  (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-2  (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-2s (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-3  (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-4  (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-5  (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-p1 (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
+(def db100k-p2 (d/db-with (d/empty-db nil schema in-memory-opts) core/people20k))
 
 (defn ^:export add-1 []
   (core/bench-10
@@ -88,7 +94,7 @@
               (d/db-with [[:db/add (:db/id p) :sex       (:sex p)]])
               (d/db-with [[:db/add (:db/id p) :age       (:age p)]])
               (d/db-with [[:db/add (:db/id p) :salary    (:salary p)]])))
-        (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+        (d/empty-db nil schema in-memory-opts)
         core/people20k))))
 
 
@@ -96,7 +102,7 @@
   (core/bench-10
     (d/close-db
       (reduce (fn [db p] (d/db-with db [p]))
-              (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+              (d/empty-db nil schema in-memory-opts)
               core/people20k))))
 
 
@@ -104,7 +110,7 @@
   (core/bench-10
     (d/close-db
       (d/db-with
-        (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+        (d/empty-db nil schema in-memory-opts)
         core/people20k))))
 
 
@@ -118,12 +124,12 @@
                        (d/datom id k v)))]
     (core/bench-10
       (d/close-db
-        (d/init-db datoms nil schema {:kv-opts {:inmemory? true}})))))
+        (d/init-db datoms nil schema in-memory-opts)))))
 
 
 (defn ^:export retract-5 []
   (let [db   (d/db-with
-               (d/empty-db nil schema {:kv-opts {:inmemory? true}})
+               (d/empty-db nil schema in-memory-opts)
                core/people20k)
         eids (->> (d/datoms db :ave :name) (map :e) (shuffle))
         res  (core/bench-10
