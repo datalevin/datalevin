@@ -467,6 +467,8 @@
   [x]
   (cond
     (bytes? x)         (inc (alength ^bytes x))
+    (instance? ByteBuffer x)
+    (.remaining ^ByteBuffer x)
     (int? x)           8
     (instance? Byte x) 1
     :else              (alength ^bytes (serialize x))))

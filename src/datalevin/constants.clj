@@ -518,12 +518,12 @@
   *wal-sync-mode* :fdatasync)
 
 (def ^{:dynamic true
-       :doc     "WAL group-commit threshold by number of records."}
-  *wal-group-commit* 100)
+       :doc     "WAL group-commit threshold by number of records (primarily affects `:relaxed` durability profile)."}
+  *wal-group-commit* 512)
 
 (def ^{:dynamic true
-       :doc     "WAL group-commit threshold by milliseconds."}
-  *wal-group-commit-ms* 100)
+       :doc     "WAL group-commit threshold by milliseconds (primarily affects `:relaxed` durability profile)."}
+  *wal-group-commit-ms* 10)
 
 (def ^{:dynamic true
        :doc     "WAL metadata publish threshold by number of durable commits."}

@@ -19,6 +19,7 @@
    [datalevin.util :as u
     :refer [case-tree defrecord-updatable conjv conjs concatv cond+]]
    [datalevin.idoc :as idoc]
+   [datalevin.lmdb :as l]
    [datalevin.storage :as s]
    [datalevin.index :as idx]
    [datalevin.prepare :as prepare]
@@ -36,7 +37,8 @@
             datom-count populated? rslice cardinality default-ratio
             av-range-size init-max-eid db-name start-sampling load-datoms
             stop-sampling close av-first-e ea-first-v v-datoms assoc-opt
-            max-tx get-env-flags set-env-flags sync abort-transact-kv]])
+            max-tx get-env-flags set-env-flags sync abort-transact-kv
+            kv-info]])
   (:import
    [datalevin.datom Datom]
    [datalevin.interface IStore]
@@ -763,14 +765,51 @@
     (close store)
     nil))
 
+(defn- with-bulk-load-direct-write-path
+  [lmdb f]
+  (if-let [info-v (kv-info lmdb)]
+    (let [info @info-v]
+      (if (true? (:wal? info))
+        (let [had-rollout?  (contains? info :wal-rollout-mode)
+              had-rollback? (contains? info :wal-rollback?)
+              prev-rollout  (:wal-rollout-mode info)
+              prev-rollback (:wal-rollback? info)]
+          ;; Bulk loads prefer throughput over WAL append/replay guarantees.
+          ;; Keep the override runtime-only and restore after loading.
+          (vswap! info-v assoc :wal-rollout-mode :rollback :wal-rollback? true)
+          (try
+            (f)
+            (finally
+              (vswap! info-v
+                      (fn [m]
+                        (cond-> m
+                          had-rollout?
+                          (assoc :wal-rollout-mode prev-rollout)
+
+                          (not had-rollout?)
+                          (dissoc :wal-rollout-mode)
+
+                          had-rollback?
+                          (assoc :wal-rollback? prev-rollback)
+
+                          (not had-rollback?)
+                          (dissoc :wal-rollback?)))))))
+        (f)))
+    (f)))
+
 (defn- quick-fill
   [^Store store datoms]
   (let [lmdb    (.-lmdb store)
         flags   (get-env-flags lmdb)
         nosync? (:nosync flags)]
     (set-env-flags lmdb #{:nosync} true)
-    (pour store datoms)
-    (when-not nosync? (set-env-flags lmdb #{:nosync} false))
+    (try
+      (with-bulk-load-direct-write-path
+        lmdb
+        #(l/with-transaction-kv [_ lmdb]
+           (pour store datoms)))
+      (finally
+        (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
     (sync lmdb)))
 
 (defn ^DB init-db

@@ -9,7 +9,8 @@
   (:import
    [java.util Random]
    [java.util.concurrent Semaphore Executors TimeUnit]
-   [java.util.concurrent.atomic AtomicLong]
+   [java.util.concurrent.atomic AtomicLong AtomicReference]
+   [java.util.function Supplier]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 ;; for kv
@@ -95,10 +96,13 @@
                        sync-time prev-time start-time)))))))
 
 (defn max-write-bench-sync-mt
-  [batch-size tx-fn add-fn threads]
+  [batch-size tx-fn add-fn threads async?]
   (print-header)
   (let [batch-size   (long batch-size)
         threads      (long threads)
+        sem          (when async?
+                       (Semaphore. (int (* in-flight batch-size))))
+        latest-fut   (when async? (AtomicReference. nil))
         write-time   (volatile! 0)
         sync-count   (volatile! 0)
         inserted     (volatile! 0)
@@ -109,6 +113,8 @@
         metrics-lock (Object.)
         counter      (AtomicLong. 0)
         measure      (fn [_]
+                       (when sem
+                         (.release ^Semaphore sem (int batch-size)))
                        (locking metrics-lock
                          (vreset! sync-time (System/currentTimeMillis))
                          (vswap! sync-count inc)
@@ -126,12 +132,32 @@
                          (let [idx (.getAndIncrement counter)
                                written (* idx batch-size)]
                            (when (< written total)
+                             (when sem
+                               (.acquire ^Semaphore sem (int batch-size)))
                              (let [txs    (build-batch-txs batch-size add-fn)
                                    before (System/currentTimeMillis)]
-                               (tx-fn txs measure)
-                               (locking metrics-lock
-                                 (vswap! write-time + (- (System/currentTimeMillis)
-                                                         before))))
+                               (try
+                                 (let [fut (tx-fn txs measure)]
+                                   (when latest-fut
+                                     (loop []
+                                       (let [cur (.get ^AtomicReference latest-fut)]
+                                         (if (or (nil? cur)
+                                                 (> ^long idx ^long (:idx cur)))
+                                           (when-not (.compareAndSet
+                                                       ^AtomicReference latest-fut
+                                                       cur
+                                                       {:idx idx :fut fut})
+                                             (recur))
+                                           nil))))
+                                   (locking metrics-lock
+                                     (vswap! write-time
+                                             +
+                                             (- (System/currentTimeMillis)
+                                                before))))
+                                 (catch Throwable t
+                                   (when sem
+                                     (.release ^Semaphore sem (int batch-size)))
+                                   (throw t))))
                              (recur)))))]
     (if (= threads 1)
       (worker)
@@ -144,6 +170,9 @@
           (finally
             (.shutdown pool)
             (.awaitTermination pool 1 TimeUnit/MINUTES)))))
+    (when latest-fut
+      (when-let [fut (:fut (.get ^AtomicReference latest-fut))]
+        @fut))
     (when (pos? @sync-count)
       (print-row @inserted inserted write-time sync-count
                  sync-time prev-time start-time))))
@@ -236,18 +265,37 @@
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
         dl-add   (fn [^FastList txs]
                    (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
-        sql-conn (when sql?
-                   (let [conn (jdbc/get-connection
-                                {:dbtype "sqlite"
-                                 :dbname (run-dir base-dir "sqlite" batch)})]
-                     (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
-                     (jdbc/execute! conn ["PRAGMA synchronous=FULL;"])
-                     (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
-                     (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
-                     k INTEGER PRIMARY KEY, v TEXT)"])
-                     conn))
-        sql-tx   (fn [txs measure]
-                   (measure (sql/insert-multi! sql-conn :my_table txs)))
+        sql-spec  (when sql?
+                    {:dbtype "sqlite"
+                     :dbname (run-dir base-dir "sqlite" batch threads)})
+        sql-conn  (when (and sql? (= threads 1))
+                    (let [conn (jdbc/get-connection sql-spec)]
+                      (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
+                      (jdbc/execute! conn ["PRAGMA synchronous=FULL;"])
+                      (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                      (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
+                      k INTEGER PRIMARY KEY, v TEXT)"])
+                      conn))
+        sql-conns (atom [])
+        sql-tl    (when (and sql? (> threads 1))
+                    (with-open [conn (jdbc/get-connection sql-spec)]
+                      (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
+                      (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                      (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
+                      k INTEGER PRIMARY KEY, v TEXT)"]))
+                    (ThreadLocal/withInitial
+                      (reify Supplier
+                        (get [_]
+                          (let [conn (jdbc/get-connection sql-spec)]
+                            (jdbc/execute! conn ["PRAGMA busy_timeout=5000;"])
+                            (swap! sql-conns conj conn)
+                            conn)))))
+        sql-tx    (if sql-tl
+                    (fn [txs measure]
+                      (measure (sql/insert-multi!
+                                 (.get ^ThreadLocal sql-tl) :my_table txs)))
+                    (fn [txs measure]
+                      (measure (sql/insert-multi! sql-conn :my_table txs))))
         sql-add  (fn [^FastList txs]
                    (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
         tx-fn    (case base-nf
@@ -272,16 +320,8 @@
           "Multi-thread write benchmark for Datalog transact! requires WAL mode (use dl-sync-wal)."
           {:threads threads :f f}))
 
-      async?
-      (throw (ex-info "Multi-thread write benchmark supports synchronous writers only"
-                      {:threads threads :f f}))
-
-      sql?
-      (throw (ex-info "Multi-thread write benchmark for SQLite is not supported"
-                      {:threads threads :f f}))
-
       :else
-      (max-write-bench-sync-mt batch tx-fn add-fn threads))
+      (max-write-bench-sync-mt batch tx-fn add-fn threads async?))
     (when kvdb
       (let [written (d/entries kvdb max-write-dbi)]
         (when-not (= written total) (println "Write only" written)))
@@ -290,12 +330,17 @@
       (let [datoms (d/count-datoms (d/db conn) nil nil nil)]
         (when-not (= datoms (* 2 total)) (println "Write only" datoms)))
       (d/close conn))
-    (when sql-conn
-      (let [written (-> (jdbc/execute! sql-conn ["SELECT count(1) FROM my_table"])
-                        ffirst
-                        val)]
-        (when-not (= written total) (println "Write only" written)))
-      (.close sql-conn))))
+    (when (or sql-conn sql-tl)
+      (let [verify-conn (or sql-conn (jdbc/get-connection sql-spec))
+            written     (-> (jdbc/execute! verify-conn
+                                           ["SELECT count(1) FROM my_table"])
+                            ffirst
+                            val)]
+        (when-not (= written total) (println "Write only" written))
+        (when sql-conn (.close sql-conn))
+        (when sql-tl
+          (.close verify-conn)
+          (doseq [c @sql-conns] (.close c)))))))
 
 (def random (Random.))
 

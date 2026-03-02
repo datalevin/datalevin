@@ -16,7 +16,7 @@
    [clojure.test.check.clojure-test :as test]
    [clojure.test.check.properties :as prop])
   (:import
-   [java.util UUID Arrays]
+   [java.util UUID Arrays Base64 Random]
    [java.lang Long]
    [datalevin.lmdb IListRandKeyValIterable IListRandKeyValIterator]))
 
@@ -737,6 +737,29 @@
 
     (if/close-kv lmdb)
     (u/delete-files dir)))
+
+(defn- random-base64-string
+  ^String [^long n]
+  (let [^bytes ba (byte-array n)]
+    (.nextBytes (Random.) ba)
+    (.encodeToString (Base64/getEncoder) ba)))
+
+(deftest wal-giant-value-buffer-growth-test
+  (when-not (u/windows?)
+    (let [dir    (u/tmp-dir (str "wal-giant-overflow-" (UUID/randomUUID)))
+          schema {:x/v {:db/valueType :db.type/string}}
+          v      (random-base64-string 50000)
+          db     (dc/empty-db dir schema
+                              {:closed-schema? true
+                               :kv-opts        {:flags (conj c/default-env-flags
+                                                             :nosync)
+                                                :wal? true}})]
+      (try
+        (let [db' (dc/fill-db db [(d/datom 1 :x/v v)])]
+          (is (= 1 (count (dc/datoms db' :eav)))))
+        (finally
+          (dc/close-db db)
+          (u/delete-files dir))))))
 
 (deftest open-again-resized-test
   (let [dir  (u/tmp-dir (str "again-resize-" (UUID/randomUUID)))

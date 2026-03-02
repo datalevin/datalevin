@@ -357,6 +357,38 @@
     (sut/close-db db)
     (u/delete-files dir)))
 
+(deftest fill-db-bypasses-wal-append-test
+  (when-not (u/windows?)
+    (let [dir  (u/tmp-dir (str "fill-db-wal-bypass-" (UUID/randomUUID)))
+          db   (sut/empty-db dir
+                             {:x/v {:db/valueType :db.type/string}}
+                             {:closed-schema? true
+                              :kv-opts        {:wal? true
+                                               :flags (conj c/default-env-flags
+                                                            :nosync)}})
+          lmdb (.-lmdb ^datalevin.storage.Store (:store db))]
+      (try
+        (let [wm0      (sut/txlog-watermarks lmdb)
+              lsn0     (:last-appended-lsn wm0)
+              records0 (count (sut/open-tx-log lmdb 1))]
+          (sut/fill-db db [(sut/datom 1 :x/v "a")
+                           (sut/datom 2 :x/v "b")])
+          (let [wm1      (sut/txlog-watermarks lmdb)
+                records1 (count (sut/open-tx-log lmdb 1))]
+            (is (= lsn0 (:last-appended-lsn wm1)))
+            (is (= (:last-durable-lsn wm0) (:last-durable-lsn wm1)))
+            (is (= (:last-applied-lsn wm0) (:last-applied-lsn wm1)))
+            (is (= records0 records1))
+            (is (= #{"a" "b"}
+                   (set (map first
+                             (sut/q '[:find ?v
+                                      :where
+                                      [?e :x/v ?v]]
+                                    db)))))))
+        (finally
+          (sut/close-db db)
+          (u/delete-files dir))))))
+
 (deftest number-transact-test
   (let [schema {:name   {:db/valueType :db.type/string}
                 :height {:db/valueType :db.type/float}}

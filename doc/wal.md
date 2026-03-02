@@ -6,7 +6,7 @@ operationally manageable.
 
 Concurrent writers receive tangible throughput benefits in WAL mode. The scaling
 is sub-linear, e.g. 2 concurrent write threads may produce close to 2X
-throughout increase compared with a single write thread, while 4 threads produce
+throughput increase compared with a single write thread, while 4 threads produce
 a little over 3X increases.
 
 ## Enable WAL
@@ -51,6 +51,11 @@ WAL supports two profiles:
 * `:relaxed`: transactions can return before durability is forced for every
   single write, using batched syncs for a much higher throughput.
 
+For Datalog `transact!` in WAL mode, both `:strict` and `:relaxed` go through
+the sync queue. `:strict` waits for durable WAL acknowledgment per transaction,
+while `:relaxed` acknowledges transactions before per-transaction durability and
+relies on batch durability.
+
 In `:relaxed`, an untimely crash can lose a recent tail of transactions that were
 appended but not yet durably synced to disk.
 
@@ -65,8 +70,8 @@ Batch durability is triggered when either threshold is reached first.
 
 Defaults come from dynamic vars:
 
-* `datalevin.constants/*wal-group-commit*` (default `100`)
-* `datalevin.constants/*wal-group-commit-ms*` (default `100`)
+* `datalevin.constants/*wal-group-commit*` (default `512`)
+* `datalevin.constants/*wal-group-commit-ms*` (default `10`)
 
 You can set them per database via options:
 
@@ -93,6 +98,13 @@ For Datalog, top-level WAL options passed to `create-conn`/`get-conn` are
 propagated to the underlying KV WAL configuration.
 If both top-level options and `:kv-opts` provide the same WAL key, `:kv-opts`
 takes precedence.
+
+### Bulk Load Exception (`init-db` / `fill-db`)
+
+`init-db` and `fill-db` are treated as bulk-load paths. When WAL is enabled,
+Datalevin temporarily switches these operations to direct LMDB writes (rollback
+rollout mode) for throughput. As a result, these writes are not appended to the
+WAL txlog and will not appear in `open-tx-log` replay/history.
 
 ## How WAL Works
 
