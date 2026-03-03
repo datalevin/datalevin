@@ -1,12 +1,12 @@
 name: Build
 
-on: push
+# on: push
 # on: workflow_dispatch
-# on:
-#   workflow_dispatch:
-#   release:
-#     types:
-#       - created
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - created
 
 jobs:
   build:
@@ -14,12 +14,12 @@ jobs:
     strategy:
       matrix:
         include:
-          # - os: macos-14
-          #   arch: aarch64
-          # - os: ubuntu-22.04
-          #   arch: amd64
-          # - os: ubuntu-24.04-arm
-          #   arch: aarch64
+          - os: macos-14
+            arch: aarch64
+          - os: ubuntu-22.04
+            arch: amd64
+          - os: ubuntu-24.04-arm
+            arch: aarch64
           - os: windows-latest
             arch: amd64
 
