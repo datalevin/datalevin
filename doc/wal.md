@@ -43,16 +43,16 @@ For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
 
 ## Durability Profiles
 
-WAL supports three profiles:
+WAL supports three durability profiles in WAL:
 
 * `:strict`: each transaction waits for durable WAL acknowledgment, i.e,
-  `fsync` successful for the WAL file. This is the default.
+  `fsync` success for the WAL segment file. This is the default.
 * `:relaxed`: transactions can return before durability is forced for every
   single write, using batched syncs for a higher throughput.
 * `:extra`: each transaction waits for stricter durability than `:strict`,
-  similar to SQLite `synchronous=EXTRA`.
+  on macOS, that is `fcntl(F_FULLSYNC)`.
 
-In WAL mode, `:strict`, `:relaxed`, and `:extra` all go through a sync queue.
+`:strict`, `:relaxed`, and `:extra` all go through a sync queue.
 
 In `:strict`, the durability guarantee follows the OS's `fsync` guidance, which
 is not the same for different OS. On macOS, `fsync` is not full durable. Getting
@@ -98,13 +98,6 @@ For Datalog, top-level WAL options passed to `create-conn`/`get-conn` are
 propagated to the underlying KV WAL configuration.
 If both top-level options and `:kv-opts` provide the same WAL key, `:kv-opts`
 takes precedence.
-
-### Bulk Load Exception (`init-db` / `fill-db`)
-
-`init-db` and `fill-db` are treated as bulk-load paths. When WAL is enabled,
-Datalevin temporarily switches these operations to direct LMDB writes (rollback
-rollout mode) for throughput. As a result, these writes are not appended to the
-WAL txlog and will not appear in `open-tx-log` replay/history.
 
 ## How WAL Works
 
@@ -204,3 +197,11 @@ For long-running WAL-enabled KV services:
 1. Periodically call `create-snapshot!`.
 2. Periodically call `gc-txlog-segments!`.
 3. Use `txlog-watermarks` and `open-tx-log` for monitoring/replay consumers.
+
+## Bulk Load Exception (`init-db` / `fill-db`)
+
+`init-db` and `fill-db` are treated as bulk-load paths that do not have
+transaction log. When WAL is enabled, Datalevin temporarily switches these
+operations to direct LMDB writes (rollback rollout mode) for throughput. As a
+result, these writes are not appended to the WAL and will not appear in
+`open-tx-log` replay/history.

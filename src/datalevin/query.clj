@@ -61,7 +61,7 @@
 
 (declare -collect -resolve-clause resolve-clause execute-steps
          hash-join-execute hash-join-execute-into sip-hash-join-execute
-         estimate-hash-join-cost get-or-join-vars get-or-join-source)
+         estimate-hash-join-cost get-or-join-vars get-or-join-source cols->attrs)
 
 ;; Records
 
@@ -319,6 +319,38 @@
 
   (-explain [_ _]
     (str "Or-join from " bound-var " to " tgt " via " tgt-attr ".")))
+
+(defrecord NotJoinStep [clause vars sources rules in out cols strata seen-or-joins]
+
+  IStep
+  (-type [_] :not-join)
+
+  (-execute [_ _ tuples]
+    (if (and tuples (pos? (.size ^List tuples)))
+      (let [context {:sources sources
+                     :rules   rules
+                     :rels    [(r/relation! (cols->attrs cols) tuples)]}
+            result  (binding [qu/*implicit-source* (get sources '$)]
+                      (resolve-clause context clause))
+            rels    (:rels result)]
+        (if (seq rels)
+          (:tuples (if (< 1 (count rels))
+                     (reduce j/hash-join rels)
+                     (first rels)))
+          (FastList.)))
+      (FastList.)))
+
+  (-execute-pipe [this db src sink]
+    (let [input (FastList.)]
+      (when src
+        (loop []
+          (when-let [tuple (p/produce src)]
+            (.add input tuple)
+            (recur))))
+      (.addAll ^Collection sink (-execute this db input))))
+
+  (-explain [_ _]
+    (str "Anti-join by " vars ".")))
 
 (defrecord Node [links mpath mcount bound free])
 
@@ -1196,6 +1228,55 @@
        (= 'or-join (first clause))
        (some #(= % s) (tree-seq sequential? seq (second clause)))))
 
+(defn- not-join-clause?
+  [clause]
+  (and (sequential? clause)
+       (not (vector? clause))
+       (= 'not-join
+          (if (qu/source? (first clause))
+            (second clause)
+            (first clause)))))
+
+(defn- get-not-join-vars
+  [clause]
+  (let [clause (if (qu/source? (first clause)) (next clause) clause)
+        [_ vars & _] clause]
+    (into [] (filter qu/binding-var?) vars)))
+
+(defn- get-not-join-source
+  [clause]
+  (if (qu/source? (first clause)) (first clause) '$))
+
+(defn- clause-source-symbol
+  [source]
+  (if (instance? DefaultSrc source) '$ (:symbol source)))
+
+(defn- not-join-optimizable?
+  "Conservative check for planner-handled not-join.
+   Easy cases only: explicit not-join form, non-empty join vars, pattern-only
+   body, single source, and all join vars used in the body."
+  [sources parsed-clause orig-clause]
+  (when (and (instance? Not parsed-clause) (not-join-clause? orig-clause))
+    (let [vars             (into []
+                                 (comp (map :symbol) (filter qu/binding-var?))
+                                 (:vars parsed-clause))
+          clauses          (:clauses parsed-clause)
+          src              (get-not-join-source orig-clause)
+          pattern-only?    (every? #(instance? Pattern %) clauses)
+          clause-sources   (into #{} (map #(clause-source-symbol (:source %)))
+                                 clauses)
+          body-vars        (qu/collect-vars clauses)
+          all-vars-used?   (set/subset? (set vars) body-vars)
+          searchable-src?  (when-let [db (get sources src)]
+                             (db/-searchable? db))]
+      (when (and searchable-src?
+                 (seq vars)
+                 pattern-only?
+                 (= 1 (count clause-sources))
+                 (= src (first clause-sources))
+                 all-vars-used?)
+        orig-clause))))
+
 (defn- plugin-inputs*
   [parsed-q inputs]
   (let [qins    (:qin parsed-q)
@@ -1678,7 +1759,7 @@
         input-bound (reduce (fn [s {:keys [attrs]}]
                               (into s (keys attrs)))
                             #{} rels)
-        qwhere      (:qwhere parsed-q)
+        qwhere      (vec (:qwhere parsed-q))
         clauses     (:qorig-where parsed-q)
 
         ;; Collect entity vars from patterns (these will be graph nodes)
@@ -1694,6 +1775,15 @@
         (filterv #(or-join-optimizable? sources resolved % pattern-entity-vars
                                         nil)
                  qwhere)
+
+        ;; Find optimizable not-joins (easy cases only)
+        not-join-idxs
+        (set
+          (keep-indexed
+            (fn [i clause]
+              (let [orig (nth clauses i)]
+                (when (not-join-optimizable? sources clause orig) i)))
+            qwhere))
 
         ;; Find variables derived from rules
         ;; Use all-derived which includes both rule-derived and or-join-derived
@@ -1715,7 +1805,10 @@
     (assoc context
            :opt-clauses (u/keep-idxs ptn-idxs clauses)
            :optimizable-or-joins (u/keep-idxs or-join-idxs clauses)
-           :late-clauses (u/remove-idxs (set/union ptn-idxs or-join-idxs)
+           :optimizable-not-joins (u/keep-idxs not-join-idxs clauses)
+           :late-clauses (u/remove-idxs (set/union ptn-idxs
+                                                   or-join-idxs
+                                                   not-join-idxs)
                                         clauses))))
 
 (defn- make-node
@@ -3088,6 +3181,60 @@
         context graph))
     context))
 
+(defn- component-binds-vars?
+  [plans vars]
+  (when-let [step (some-> plans last :steps last)]
+    (let [cols (:cols step)]
+      (every? #(some? (find-index % cols)) vars))))
+
+(defn- add-not-join-step
+  [plans clause sources rules]
+  (let [plans     (vec plans)
+        plan-idx  (dec (count plans))
+        last-plan (plans plan-idx)
+        last-step (some-> last-plan :steps peek)
+        vars      (get-not-join-vars clause)
+        nstep     (NotJoinStep. clause vars sources rules
+                                (:out last-step) (:out last-step)
+                                (:cols last-step) (:strata last-step)
+                                (:seen-or-joins last-step))]
+    (assoc plans plan-idx (update last-plan :steps conj nstep))))
+
+(defn- plan-not-joins
+  "Attach optimizable not-join clauses to source plans when all join vars are
+   bound by a single component. Unlinked clauses remain in :late-clauses."
+  [{:keys [plan sources rules optimizable-not-joins] :as context}]
+  (if (seq optimizable-not-joins)
+    (let [plan'                (into {} (map (fn [[src comps]]
+                                               [src (mapv vec comps)]))
+                                    plan)
+          [planned unlinked]
+          (reduce
+            (fn [[p u] clause]
+              (let [src        (get-not-join-source clause)
+                    vars       (get-not-join-vars clause)
+                    components (get p src)]
+                (if (and (seq vars) (seq components))
+                  (let [idxs (keep-indexed
+                               (fn [i comp]
+                                 (when (component-binds-vars? comp vars) i))
+                               components)]
+                    (if (= 1 (count idxs))
+                      (let [idx (first idxs)]
+                        [(assoc-in p [src idx]
+                                   (add-not-join-step
+                                     (nth components idx) clause sources rules))
+                         u])
+                      [p (conj u clause)]))
+                  [p (conj u clause)])))
+            [plan' []]
+            optimizable-not-joins)]
+      (-> context
+          (assoc :plan planned)
+          (update :late-clauses into unlinked)
+          (assoc :optimizable-not-joins [])))
+    context))
+
 (defn- save-intermediates
   [context steps ^objects sinks ^List tuples]
   (when-let [res (:intermediates context)]
@@ -3339,7 +3486,8 @@
   (-> context
       build-graph
       ((fn [c] (build-explain) c))
-      build-plan))
+      build-plan
+      plan-not-joins))
 
 (defn -q
   [context run?]

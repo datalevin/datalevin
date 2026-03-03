@@ -186,6 +186,21 @@ benefits from a form of SIP by passing in bound values to `or-join` operation.
 The choice of these join methods in the query plan and their ordering is
 determined by the optimizer based on its cost estimation.
 
+#### Not-join `:not-join` (easy cases)
+
+For a restricted class of `not-join` clauses, we can plan an anti-join step
+instead of always deferring evaluation to the late clause stage. The currently
+optimized shape is conservative: explicit `not-join` join variables, pattern
+bodies only, and a single source. When those join variables become bound in a
+single plan component, the planner inserts an anti-join filter step directly in
+that component.
+
+This allows negative filtering to happen earlier than full late-clause
+evaluation in common cases and can reduce intermediate relation sizes before
+subsequent work. Clauses outside these conditions (e.g. nested complex clauses,
+cross-source shapes, or ambiguous binding points) still fall back to late
+resolution.
+
 ### Directional join result size estimation (new)
 
 The traditional join result size estimation formula used in RDBMS like PostgreSQL
@@ -265,8 +280,9 @@ of next step. Each step is processed by a dedicated thread.
 In addition to patterns and single variable predicates, Datalevin supports
 complex clauses, such as `and`, `or`, `not`, `not-join`, multi-variable
 predicates, function bindings, as well as rules. We are gradually expanding the
-coverage of the optimizer to handle more clause types. Right
-now, `or-join` is optimized. Other complex clauses are deferred until the
+coverage of the optimizer to handle more clause types. Right now, `or-join`
+and easy-case `not-join` are optimized. Other complex clauses are deferred
+until the
 indices access clauses have produced intermediate result. Heuristics and
 variable dependencies are considered to reorder these complex clauses to
 optimize performance. Rules are executed last, see [rules](rules.md) for details

@@ -3,12 +3,9 @@
 ## 0.10.6 (2026-03-02)
 
 ### Added
-- [WAL] Write Ahead Log (WAL) mode for both KV and Datalog transactions. In
-  `:strict` durability profile, transaction returns success after WAL is flushed
-  to disk; while in `:relaxed` profile, transaction returns success after WAL is
-  written. Disk sync in DLMDB is done later at checkpoint. This increases write
-  speed while keeping durability guarantees. Moreover, WAL mode provides
-  tangible speedup for concurrent writers. WAL related functions:
+- [WAL] Write Ahead Log (WAL) write mode, default in Datalog store, explicitly
+  set in KV store with `wal? true` option. Details are in [doc](doc/wal.md).
+- [WAL] WAL related functions:
   - `open-tx-log` for WAL log access.
   - `txlog-watermarks`  returns WAL status.
   - `create-snapshot!` for create/rotate LMDB snapshots.
@@ -18,11 +15,12 @@
   lost on close. It has even faster write speed than `:nosync`.
 - [Datalog] Support atomic migration from default EDN blob to a specific data
   type when `update-schema`.
-- [Datalog] `fulltext` function honors `:display` option.
-- [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf]
+- [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf].
 
 ### Improved
 - [Vector] Vector index persists inside LMDB, keeping atomic guarantees.
+- [Datalog] `fulltext` function honors `:display` option.
+- [Datalog] Optimizer coverage for certain cases of `not-join`.
 - [Datalog] Giants DBI is compressed when the value is greater than
   `datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
 - [Server] Reduce the number of network round trips needed for operations
@@ -31,7 +29,7 @@
 ### Fixed
 - [Datalog] correct free vars when `not-join` is in rules
   [#354](https://github.com/juji-io/datalevin/issues/354).
-- [KV] Stale prefix-compression cache cross transactions
+- [KV] Stale prefix-compression cache cross transactions and size inflation bug
   [#355](https://github.com/juji-io/datalevin/issues/355).
 
 ## 0.10.5 (2026-02-08)

@@ -136,6 +136,16 @@
                      [(even? ?e)]
                      [(even? ?e2)]]])
              #{[4 6] [2 4]})))
+    (testing "Using not-join inside rule"
+      (is (= (d/q '[:find ?x ?y
+                    :in $ %
+                    :where (filtered-follow ?x ?y)]
+                  db
+                  '[[(filtered-follow ?x ?y)
+                     [?x :follow ?y]
+                     (not-join [?x]
+                               [?x :follow 4])]])
+             #{[1 2] [4 6] [5 3]})))
     (testing "Calling rule twice (#44)"
       (d/q '[:find ?p
              :in $ % ?fn

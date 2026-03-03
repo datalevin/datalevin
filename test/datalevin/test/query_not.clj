@@ -203,3 +203,38 @@
     (d/close-db db2)
     (u/delete-files dir1)
     (u/delete-files dir2)))
+
+(deftest test-not-join-planner-coverage
+  (let [dir     (u/tmp-dir (str "query-not-plan-" (UUID/randomUUID)))
+        test-db (d/db-with (d/empty-db dir) test-data)]
+    (testing "simple not-join gets planned"
+      (let [q   '[:find ?e
+                  :where [?e :name]
+                  (not-join [?e]
+                            [?e :name "Ivan"])]
+            exp (d/explain {} q test-db)
+            steps
+            (->> exp
+                 :plan
+                 vals
+                 (mapcat identity)
+                 (mapcat identity)
+                 (mapcat :steps)
+                 vec)]
+        (is (= #{[3] [4]} (d/q q test-db)))
+        (is (some #(re-find #"Anti-join by" %) steps))
+        (is (not-any? #(= '(not-join [?e] [?e :name "Ivan"]) %)
+                      (:late-clauses exp)))))
+
+    (testing "complex not-join still falls back to late-clauses"
+      (let [q   '[:find ?e
+                  :where [?e :name]
+                  (not-join [?e]
+                            (not [?e :age 10]))]
+            exp (d/explain {} q test-db)]
+        (is (= #{[1] [3] [5]} (d/q q test-db)))
+        (is (some #(= '(not-join [?e] (not [?e :age 10])) %)
+                  (:late-clauses exp)))))
+
+    (d/close-db test-db)
+    (u/delete-files dir)))
