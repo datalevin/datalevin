@@ -1,6 +1,7 @@
 # Change Log
 
-## 0.10.6 (2026-03-02)
+
+## 0.10.7 (2026-03-03)
 
 ### Added
 - [WAL] Write Ahead Log (WAL) write mode, default in Datalog store, explicitly
