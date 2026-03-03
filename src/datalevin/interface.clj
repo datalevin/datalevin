@@ -270,7 +270,7 @@ values;")
      Records include derived `:tx-kind` classification (e.g. `:user`,
      `:vector-checkpoint`).")
   (force-txlog-sync! [db]
-    "Force txn-log fsync/fdatasync on the active segment and advance durable LSN.")
+    "Force txn-log sync on the active segment (fsync/fdatasync/extra) and advance durable LSN.")
   (force-lmdb-sync! [db]
     "Force LMDB env sync (`mdb_env_sync`) for the store.")
   (create-snapshot! [db]

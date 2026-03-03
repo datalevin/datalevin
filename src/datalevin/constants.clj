@@ -502,7 +502,7 @@
   *wal-rollback?* false)
 
 (def ^{:dynamic true
-       :doc     "WAL durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn."}
+       :doc     "WAL durability profile. `:relaxed` enables batched durability. `:strict` waits for durable log ack per txn using fsync semantics. `:extra` is stricter (SQLite-style extra durability, e.g. fullsync on macOS)."}
   *wal-durability-profile* :strict)
 
 (def ^{:dynamic true
@@ -514,8 +514,8 @@
   *wal-commit-marker-version* 1)
 
 (def ^{:dynamic true
-       :doc     "WAL force mode for segment fsync operations."}
-  *wal-sync-mode* :fdatasync)
+       :doc     "WAL force mode for segment sync operations: `:fdatasync`, `:fsync`, `:extra`, or `:none`."}
+  *wal-sync-mode* :fsync)
 
 (def ^{:dynamic true
        :doc     "WAL group-commit threshold by number of records (primarily affects `:relaxed` durability profile)."}

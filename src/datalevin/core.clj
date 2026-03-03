@@ -197,7 +197,11 @@ Only usable for debug output.
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
-   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` waits for durable WAL acknowledgement per transaction; `:relaxed` improves throughput by batching durability and may lose a small tail of recent transactions on a crash.
+   * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
+ `:strict` waits for durable WAL acknowledgement per transaction with fsync
+ semantics; `:relaxed` improves throughput by batching durability and may lose
+ a small tail of recent transactions on a crash; `:extra` is stricter than
+ `:strict` (SQLite-style extra durability, e.g. fullsync on macOS).
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -279,7 +283,7 @@ Only usable for debug output.
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
-   * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
+   * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -666,7 +670,7 @@ Only usable for debug output.
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
-   * `:wal-durability-profile`, one of `:strict` or `:relaxed`.
+   * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -705,9 +709,11 @@ Only usable for debug output.
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
-   * `:wal-durability-profile`, one of `:strict` or `:relaxed`. `:strict` maximizes durability; `:relaxed`
- improves write throughput with a small risk of losing the latest transactions
- on a crash.
+   * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
+ `:strict` maximizes durability with fsync semantics; `:relaxed` improves write
+ throughput with a small risk of losing the latest transactions on a crash;
+ `:extra` is stricter than `:strict` (SQLite-style extra durability, e.g.
+ fullsync on macOS).
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -1003,9 +1009,11 @@ Only usable for debug output.
    `dir` also implies in-memory mode without needing to set this option.
   * `:wal?` is a boolean, enabling WAL mode for direct KV writes. Default is
    `false` for `open-kv`.
-  * `:wal-durability-profile` is one of `:strict` or `:relaxed`. `:strict` waits for durable WAL
-   acknowledgement per write transaction; `:relaxed` batches durability for
-   higher throughput with a small crash window.
+  * `:wal-durability-profile` is one of `:strict`, `:relaxed`, or `:extra`.
+   `:strict` waits for durable WAL acknowledgement per write transaction with
+   fsync semantics; `:relaxed` batches durability for higher throughput with a
+   small crash window; `:extra` is stricter than `:strict` (SQLite-style extra
+   durability, e.g. fullsync on macOS).
   * `:wal-group-commit` sets the max transactions per durability batch in
    `:relaxed` mode. Default comes from
    `datalevin.constants/*wal-group-commit*`.

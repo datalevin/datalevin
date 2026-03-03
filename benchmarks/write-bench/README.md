@@ -83,7 +83,8 @@ time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 10 :f dl-async > dl-10-async.csv
 WAL mode is available by appending `-wal` to task names
 (for example `kv-sync-wal`, `kv-async-wal`, `dl-sync-wal`, `dl-async-wal`,
 `sql-tx-wal`).
-You can also set `:durability-profile` to `:strict` (default) or `:relaxed`.
+You can also set `:durability-profile` to `:strict` (default), `:extra`, or
+`:relaxed`.
 
 For Datalevin tasks, you can run multiple calling threads to test concurrent
 write ingress in WAL mode. For Datalog, use `-wal` tasks, e.g.:
@@ -96,6 +97,12 @@ Async multi-thread example:
 
 ```bash
 time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-async-wal :durability-profile :relaxed :threads 8 > kv-async-wal-relaxed-1-t8.csv
+```
+
+Extra durability example:
+
+```bash
+time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 1 :f kv-sync-wal :durability-profile :extra :threads 8 > kv-sync-wal-extra-1-t8.csv
 ```
 
 SQLite multi-thread example (uses WAL mode with `busy_timeout`, each thread

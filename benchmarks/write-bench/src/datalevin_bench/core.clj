@@ -202,6 +202,23 @@
     (subs nf 0 (- (count nf) 4))
     nf))
 
+(def ^:private valid-durability-profiles #{:strict :extra :relaxed})
+
+(defn- validate-durability-profile!
+  [durability-profile]
+  (when (and durability-profile
+             (not (valid-durability-profiles durability-profile)))
+    (throw (ex-info
+             ":durability-profile must be one of :strict, :extra, or :relaxed"
+             {:durability-profile durability-profile}))))
+
+(defn- sql-sync-mode-for
+  [durability-profile]
+  (case durability-profile
+    :relaxed "NORMAL"
+    :extra   "EXTRA"
+    "FULL"))
+
 (defn write
   [{:keys [base-dir batch f threads durability-profile]
     :or   {threads 1}}]
@@ -212,14 +229,9 @@
         _        (when (not (pos? threads))
                    (throw (ex-info ":threads must be a positive integer"
                                    {:threads threads})))
-        _        (when (and durability-profile
-                            (not (#{:strict :relaxed} durability-profile)))
-                   (throw (ex-info ":durability-profile must be :strict or :relaxed"
-                                   {:durability-profile durability-profile})))
+        _        (validate-durability-profile! durability-profile)
         sql-journal-mode (if wal? "WAL" "DELETE")
-        sql-sync-mode (if (= durability-profile :relaxed)
-                        "NORMAL"
-                        "FULL")
+        sql-sync-mode (sql-sync-mode-for durability-profile)
         dir      (run-dir base-dir f batch threads)
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
@@ -376,13 +388,8 @@
         base-nf  (base-task nf)
         wal?     (wal-task? nf)
         sql-journal-mode (if wal? "WAL" "DELETE")
-        sql-sync-mode    (if (= durability-profile :relaxed)
-                           "NORMAL"
-                           "FULL")
-        _        (when (and durability-profile
-                            (not (#{:strict :relaxed} durability-profile)))
-                   (throw (ex-info ":durability-profile must be :strict or :relaxed"
-                                   {:durability-profile durability-profile})))
+        sql-sync-mode    (sql-sync-mode-for durability-profile)
+        _        (validate-durability-profile! durability-profile)
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
         sql?     (s/starts-with? base-nf "sql")

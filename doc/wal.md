@@ -43,25 +43,25 @@ For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
 
 ## Durability Profiles
 
-WAL supports two profiles:
+WAL supports three profiles:
 
-* `:strict`: each transaction waits for durable WAL acknowledgment, so it has
-  the same durability guarantee as non-WAL default sync write, whose throughput
-  is bounded by a single writer.
+* `:strict`: each transaction waits for durable WAL acknowledgment, i.e,
+  `fsync` successful for the WAL file. This is the default.
 * `:relaxed`: transactions can return before durability is forced for every
-  single write, using batched syncs for a much higher throughput.
+  single write, using batched syncs for a higher throughput.
+* `:extra`: each transaction waits for stricter durability than `:strict`,
+  similar to SQLite `synchronous=EXTRA`.
 
-For Datalog `transact!` in WAL mode, both `:strict` and `:relaxed` go through
-the sync queue. `:strict` waits for durable WAL acknowledgment per transaction,
-while `:relaxed` acknowledges transactions before per-transaction durability and
-relies on batch durability.
+In WAL mode, `:strict`, `:relaxed`, and `:extra` all go through a sync queue.
+
+In `:strict`, the durability guarantee follows the OS's `fsync` guidance, which
+is not the same for different OS. On macOS, `fsync` is not full durable. Getting
+full durability on MacOS requires `:extra`. On Linux and Windows, `:strict` and
+`:extra` are mostly the same.
 
 In `:relaxed`, an untimely crash can lose a recent tail of transactions that were
-appended but not yet durably synced to disk.
-
-### Durability Risk Window Controls
-
-The `:relaxed` crash-risk window is bounded by two thresholds:
+appended but not yet durably synced to disk. The `:relaxed` crash-risk window is
+bounded by two thresholds:
 
 * count threshold: `:wal-group-commit` (max writes per durability batch)
 * time threshold: `:wal-group-commit-ms` (max milliseconds per durability batch)
@@ -78,7 +78,7 @@ You can set them per database via options:
 ```clojure
 {:wal? true
  :wal-durability-profile :relaxed
- :wal-group-commit 200
+ :wal-group-commit 2048
  :wal-group-commit-ms 50}
 ```
 
@@ -88,7 +88,7 @@ Or by dynamic binding (for process defaults):
 (require '[datalevin.constants :as c]
          '[datalevin.core :as d])
 
-(binding [c/*wal-group-commit* 200
+(binding [c/*wal-group-commit* 2048
           c/*wal-group-commit-ms* 50]
   (d/open-kv "/tmp/my-kv-db" {:wal? true
                               :wal-durability-profile :relaxed}))
@@ -134,6 +134,7 @@ At a high level:
 3. Durability acknowledgment depends on profile:
    * `:strict`: transaction waits until required sync makes that LSN durable.
    * `:relaxed`: transaction may return before that LSN is durable; sync is batched.
+   * `:extra`: transaction waits for stricter sync semantics than `:strict`.
 4. Periodically, the DB is synced to disk, and the snapshots of DB are also taken.
 5. Periodic WAL segment GC is performed to bound resource usage.
 6. On restart/recovery, Datalevin scans WAL segments, validates records, ignores/truncates

@@ -12,12 +12,13 @@
   (:require
    [datalevin.buffer :as bf]
    [datalevin.bits :as b]
-   [datalevin.constants :as c]
-   [datalevin.interface :as i]
-   [datalevin.lmdb]
-   [clojure.java.io :as io]
-   [datalevin.util :as u :refer [raise map+]])
+  [datalevin.constants :as c]
+  [datalevin.interface :as i]
+  [datalevin.lmdb]
+  [clojure.java.io :as io]
+  [datalevin.util :as u :refer [raise map+]])
   (:import
+   [datalevin.io PosixFsync]
    [java.io File]
    [java.nio ByteBuffer ByteOrder BufferOverflowException]
    [java.nio.channels FileChannel]
@@ -59,7 +60,7 @@
 (def ^:private commit-marker-magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x43) (byte 0x4d)])) ; DLCM
 
-(def ^:private sync-mode-values #{:fsync :fdatasync :none})
+(def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 (def ^:private segment-prealloc-mode-values #{:native :none})
 
 (declare segment-files
@@ -82,13 +83,18 @@
          complete-sync-failure!
          await-durable-lsn!
          classify-record-kind
-         decode-commit-row-payload)
+         decode-commit-row-payload
+         durability-profile)
 
 (defn enabled? [info] (true? (:wal? info)))
 
 (defn sync-mode
   [info]
-  (or (:wal-sync-mode info) c/*wal-sync-mode*))
+  (let [mode (or (:wal-sync-mode info) c/*wal-sync-mode*)
+        profile (durability-profile info)]
+    (if (= :extra profile)
+      (if (= :none mode) :none :extra)
+      mode)))
 
 (defn durability-profile
   [info]
@@ -161,7 +167,7 @@
 (defn validate-runtime-config!
   [info]
   (let [profile (durability-profile info)
-        allowed #{:strict :relaxed}]
+        allowed #{:strict :relaxed :extra}]
     (when-not (allowed profile)
       (raise "Unsupported WAL durability profile"
              {:wal-durability-profile profile
@@ -362,7 +368,7 @@
                           :group-commit      (long (group-commit info))
                           :group-commit-ms   (long (group-commit-ms info))
                           :sync-adaptive?    (sync-adaptive? info)
-                          :track-trailing?   (= :strict profile)})
+                          :track-trailing?   (not= :relaxed profile)})
 
          :segment-roll-count                      (volatile! 0)
          :segment-roll-duration-ms                (volatile! 0)
@@ -524,8 +530,9 @@
 
 (defn force-channel!
   "Force channel to disk according to sync mode:
-  - `:fsync` -> force data + metadata
-  - `:fdatasync` -> force data only
+  - `:fsync` -> fsync (data + metadata)
+  - `:fdatasync` -> fdatasync-like (currently fsync fallback)
+  - `:extra` -> extra durable full sync (e.g. F_FULLFSYNC on macOS)
   - `:none` -> no force"
   ([^FileChannel ch] (force-channel! ch :fdatasync))
   ([^FileChannel ch sync-mode]
@@ -534,8 +541,9 @@
             {:sync-mode sync-mode :allowed sync-mode-values}))
    (case sync-mode
      :none      nil
-     :fdatasync (.force ch false)
-     :fsync     (.force ch true))
+     :fdatasync (PosixFsync/fdatasync ch)
+     :fsync     (PosixFsync/fsync ch)
+     :extra     (PosixFsync/fullsync ch))
    sync-mode))
 
 (defn encode-record
@@ -3393,14 +3401,14 @@
            :synced? true
            :lmdb-rows lmdb-rows)))
 
-(defn- strict-profile-state?
+(defn- per-tx-durable-profile-state?
   [state]
-  (= :strict (:durability-profile state)))
+  (not= :relaxed (:durability-profile state)))
 
 (defn append-durable!
   [state rows hooks]
   (maybe-roll-segment! state (System/currentTimeMillis))
-  (if (strict-profile-state? state)
+  (if (per-tx-durable-profile-state? state)
     (append-durable-strict! state rows hooks)
     (append-durable-relaxed! state rows hooks)))
 

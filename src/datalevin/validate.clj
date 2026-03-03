@@ -128,8 +128,8 @@
     :wal-vec-chunk-bytes})
 
 (def ^:private keyword-enum-opts
-  {:wal-durability-profile #{:strict :relaxed}
-   :wal-sync-mode          #{:fsync :fdatasync :none}
+  {:wal-durability-profile #{:strict :relaxed :extra}
+   :wal-sync-mode          #{:fsync :fdatasync :extra :none}
    :wal-segment-prealloc-mode #{:native :none}
    :wal-rollout-mode       #{:active :rollback}})
 

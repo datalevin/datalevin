@@ -252,6 +252,11 @@
          (observe-txlog-sync-path! :queued-relaxed)
          (queued-transact! conn tx-data tx-meta))
 
+       (= :extra profile)
+       (do
+         (observe-txlog-sync-path! :queued-extra)
+         (queued-transact! conn tx-data tx-meta))
+
        :else
        (do
          (observe-txlog-sync-path! :queued-other)
