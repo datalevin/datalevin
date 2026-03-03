@@ -10,7 +10,7 @@ cd "$(dirname "$0")"
 
 java --add-opens=java.base/java.nio=ALL-UNNAMED \
      --add-opens=java.base/sun.nio.ch=ALL-UNNAMED \
-     -jar ../target/datalevin-0.10.5-standalone.jar exec << EOF
+     -jar ../target/datalevin-0.10.6-standalone.jar exec << EOF
 (def conn (get-conn "/tmp/test-db"))
 (transact! conn [{:name "world"}])
 (q '[:find ?g :where [_ :name ?g]] @conn)

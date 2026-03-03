@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 0.10.6 (2026-03-02)
 
 ### Added
 - [WAL] Write Ahead Log (WAL) mode for both KV and Datalog transactions. In
