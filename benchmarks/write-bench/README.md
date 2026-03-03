@@ -80,8 +80,9 @@ with batch size 10, and save the results in `dl-async-10.csv`:
 time clj -Xwrite :base-dir \"/tmp/dl/\" :batch 10 :f dl-async > dl-10-async.csv
 ```
 
-WAL mode is available for Datalevin tasks by appending `-wal` to task names
-(for example `kv-sync-wal`, `kv-async-wal`, `dl-sync-wal`, `dl-async-wal`).
+WAL mode is available by appending `-wal` to task names
+(for example `kv-sync-wal`, `kv-async-wal`, `dl-sync-wal`, `dl-async-wal`,
+`sql-tx-wal`).
 You can also set `:durability-profile` to `:strict` (default) or `:relaxed`.
 
 For Datalevin tasks, you can run multiple calling threads to test concurrent
@@ -101,7 +102,7 @@ SQLite multi-thread example (uses WAL mode with `busy_timeout`, each thread
 gets its own connection via ThreadLocal):
 
 ```bash
-time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx :threads 8 > sqlite-1-t8.csv
+time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx-wal :threads 8 > sqlite-wal-1-t8.csv
 ```
 
 This command runs mixed read/write benchmark following the pure write task
@@ -114,17 +115,27 @@ time clj -Xmixed :dir \"/tmp/dl/dl-async-10\" :f dl-async > dl-10-async-mixed.cs
 time clj -Xmixed :dir \"/tmp/dl/dl-async-wal-10\" :f dl-async-wal > dl-10-async-wal-mixed.csv
 ```
 
-The command below runs pure write benchmark for Sqlite `INSERT`  with batch size
-1, and save the results in `sqlite-1.csv`
+The command below runs pure write benchmark for Sqlite `INSERT` with batch size
+1 using SQLite default journal mode (non-WAL), and saves the results in
+`sqlite-1.csv`:
 
 ```bash
 time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx > sqlite-1.csv
+```
+
+WAL variant:
+
+```bash
+time clj -Xwrite :base-dir \"/tmp/sql/\" :batch 1 :f sql-tx-wal > sqlite-wal-1.csv
 ```
 
 This command runs the read/write mixed task following the pure write above:
 
 ```bash
 time clj -Xmixed :dir \"/tmp/sql/sqlite-1\" :f sql-tx > sqlite-1-mixed.csv
+
+# WAL example:
+time clj -Xmixed :dir \"/tmp/sql/sqlite-wal-1\" :f sql-tx-wal > sqlite-wal-1-mixed.csv
 ```
 
 The total wall clock time, system time and user time are also recorded.

@@ -1459,6 +1459,11 @@
                          :as opts}]
   (try
     (let [inmemory? (some #{:inmemory} flags)
+          ;; MDB_INMEMORY on Windows expects a simple env identifier instead of
+          ;; a filesystem path (which may include ':' or '\').
+          env-path (if (and inmemory? (u/windows?))
+                     (str "datalevin-inmemory-" (java.util.UUID/randomUUID))
+                     dir)
           mapsize (* (long (if (or inmemory? (not (.exists ^File db-file)))
                              mapsize
                              (c/pick-mapsize db-file)))
@@ -1466,7 +1471,7 @@
           flags (cond
                   (or inmemory? temp?) (conj flags :nosync)
                   :else flags)
-          ^Env env (Env/create dir mapsize max-readers max-dbs
+          ^Env env (Env/create env-path mapsize max-readers max-dbs
                                (kv-flags flags))
           info (cond-> (merge opts {:dir dir
                                     :flags flags

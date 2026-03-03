@@ -216,6 +216,10 @@
                             (not (#{:strict :relaxed} durability-profile)))
                    (throw (ex-info ":durability-profile must be :strict or :relaxed"
                                    {:durability-profile durability-profile})))
+        sql-journal-mode (if wal? "WAL" "DELETE")
+        sql-sync-mode (if (= durability-profile :relaxed)
+                        "NORMAL"
+                        "FULL")
         dir      (run-dir base-dir f batch threads)
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
@@ -265,22 +269,33 @@
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
         dl-add   (fn [^FastList txs]
                    (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
-        sql-dir   (when sql? (run-dir base-dir "sqlite" batch threads))
+        sql-dir   (when sql?
+                    (run-dir base-dir
+                             (if wal? "sqlite-wal" "sqlite")
+                             batch
+                             threads))
         sql-spec  (when sql?
                     {:dbtype "sqlite" :dbname sql-dir})
         sql-conn  (when (and sql? (= threads 1))
                     (let [conn (jdbc/get-connection sql-spec)]
-                      (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
-                      (jdbc/execute! conn ["PRAGMA synchronous=FULL;"])
-                      (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                      (jdbc/execute!
+                        conn
+                        [(str "PRAGMA journal_mode=" sql-journal-mode ";")])
+                      (jdbc/execute!
+                        conn
+                        [(str "PRAGMA synchronous=" sql-sync-mode ";")])
                       (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
                       k INTEGER PRIMARY KEY, v TEXT)"])
                       conn))
         sql-conns (atom [])
         sql-tl    (when (and sql? (> threads 1))
                     (with-open [conn (jdbc/get-connection sql-spec)]
-                      (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
-                      (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                      (jdbc/execute!
+                        conn
+                        [(str "PRAGMA journal_mode=" sql-journal-mode ";")])
+                      (jdbc/execute!
+                        conn
+                        [(str "PRAGMA synchronous=" sql-sync-mode ";")])
                       (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
                       k INTEGER PRIMARY KEY, v TEXT)"]))
                     (let [mt-spec {:jdbcUrl (str "jdbc:sqlite:" sql-dir
@@ -289,7 +304,14 @@
                         (reify Supplier
                           (get [_]
                             (let [conn (jdbc/get-connection mt-spec)]
-                              (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                              (jdbc/execute!
+                                conn
+                                [(str "PRAGMA journal_mode="
+                                      sql-journal-mode
+                                      ";")])
+                              (jdbc/execute!
+                                conn
+                                [(str "PRAGMA synchronous=" sql-sync-mode ";")])
                               (swap! sql-conns conj conn)
                               conn))))))
         sql-tx    (if sql-tl
@@ -353,6 +375,10 @@
   (let [nf       (name f)
         base-nf  (base-task nf)
         wal?     (wal-task? nf)
+        sql-journal-mode (if wal? "WAL" "DELETE")
+        sql-sync-mode    (if (= durability-profile :relaxed)
+                           "NORMAL"
+                           "FULL")
         _        (when (and durability-profile
                             (not (#{:strict :relaxed} durability-profile)))
                    (throw (ex-info ":durability-profile must be :strict or :relaxed"
@@ -413,6 +439,12 @@
         sql-conn (when sql?
                    (let [conn (jdbc/get-connection {:dbtype "sqlite"
                                                     :dbname dir})]
+                     (jdbc/execute!
+                       conn
+                       [(str "PRAGMA journal_mode=" sql-journal-mode ";")])
+                     (jdbc/execute!
+                       conn
+                       [(str "PRAGMA synchronous=" sql-sync-mode ";")])
                      (jdbc/execute! conn
                                     ["CREATE TABLE IF NOT EXISTS my_table (
                      k INTEGER PRIMARY KEY, v TEXT)"])

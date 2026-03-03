@@ -40,7 +40,7 @@
    [java.util Iterator UUID Map]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService
-    ConcurrentLinkedQueue ConcurrentHashMap Semaphore]
+    ConcurrentLinkedQueue ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]
@@ -511,6 +511,15 @@
 
 (def session-dbi "datalevin-server/sessions")
 
+(defn- shutdown-executor!
+  [^ExecutorService es label]
+  (.shutdown es)
+  (when-not (.awaitTermination es 5000 TimeUnit/MILLISECONDS)
+    (log/warn label "did not terminate in 5s, forcing shutdown")
+    (.shutdownNow es)
+    (when-not (.awaitTermination es 5000 TimeUnit/MILLISECONDS)
+      (log/warn label "did not terminate after forced shutdown"))))
+
 (deftype Server [^AtomicBoolean running
                  ^int port
                  ^String root
@@ -553,8 +562,8 @@
     (doseq [skey (.keys selector)] (close-conn skey))
     (.close server-socket)
     (when (.isOpen selector) (.close selector))
-    (.shutdown dispatcher)
-    (.shutdown work-executor)
+    (shutdown-executor! dispatcher "Server dispatcher")
+    (shutdown-executor! work-executor "Server worker executor")
     (doseq [db-name (keys dbs)] (remove-store server db-name))
     (d/close sys-conn)
     (log/info "Datalevin server shuts down.")))
