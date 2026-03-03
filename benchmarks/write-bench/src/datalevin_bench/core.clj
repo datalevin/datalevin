@@ -265,9 +265,9 @@
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
         dl-add   (fn [^FastList txs]
                    (.add txs {:k (.addAndGet id 2) :v (str (random-uuid))}))
+        sql-dir   (when sql? (run-dir base-dir "sqlite" batch threads))
         sql-spec  (when sql?
-                    {:dbtype "sqlite"
-                     :dbname (run-dir base-dir "sqlite" batch threads)})
+                    {:dbtype "sqlite" :dbname sql-dir})
         sql-conn  (when (and sql? (= threads 1))
                     (let [conn (jdbc/get-connection sql-spec)]
                       (jdbc/execute! conn ["PRAGMA journal_mode=WAL;"])
@@ -283,13 +283,15 @@
                       (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
                       (jdbc/execute! conn ["CREATE TABLE IF NOT EXISTS my_table (
                       k INTEGER PRIMARY KEY, v TEXT)"]))
-                    (ThreadLocal/withInitial
-                      (reify Supplier
-                        (get [_]
-                          (let [conn (jdbc/get-connection sql-spec)]
-                            (jdbc/execute! conn ["PRAGMA busy_timeout=5000;"])
-                            (swap! sql-conns conj conn)
-                            conn)))))
+                    (let [mt-spec {:jdbcUrl (str "jdbc:sqlite:" sql-dir
+                                                 "?busy_timeout=10000")}]
+                      (ThreadLocal/withInitial
+                        (reify Supplier
+                          (get [_]
+                            (let [conn (jdbc/get-connection mt-spec)]
+                              (jdbc/execute! conn ["PRAGMA synchronous=NORMAL;"])
+                              (swap! sql-conns conj conn)
+                              conn))))))
         sql-tx    (if sql-tl
                     (fn [txs measure]
                       (measure (sql/insert-multi!
