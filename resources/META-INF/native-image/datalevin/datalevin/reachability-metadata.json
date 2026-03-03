@@ -1,6 +1,11 @@
 {
     "reflection": [
         {
+            "type": "clojure.lang.RT",
+            "allDeclaredMethods": true,
+            "allPublicMethods": true
+        },
+        {
             "type": "org.bytedeco.javacpp.presets.javacpp",
             "allDeclaredConstructors": true,
             "allPublicConstructors": true
