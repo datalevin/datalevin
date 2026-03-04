@@ -7,6 +7,7 @@
             :url  "https://www.eclipse.org/legal/epl-1.0/"}
   :managed-dependencies
   [[babashka/babashka.pods "0.2.0"]
+   [com.alipay.sofa/jraft-core "1.4.0"]
    [com.cognitect/transit-clj "1.0.333"]
    [com.github.clj-easy/graal-build-time "1.0.5"]
    [com.taoensso/nippy "3.6.0"]
@@ -30,6 +31,7 @@
    [com.github.luben/zstd-jni "1.5.7-6"]]
   :dependencies
   [[org.clojure/clojure :scope "provided"]
+   [com.alipay.sofa/jraft-core]
    [org.clojars.huahaiy/dtlvnative-macosx-arm64]
    [org.clojars.huahaiy/dtlvnative-linux-arm64]
    [org.clojars.huahaiy/dtlvnative-linux-x86_64]

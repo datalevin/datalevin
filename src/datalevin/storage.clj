@@ -449,6 +449,7 @@
           new-opts (-> opts
                        (dissoc k)
                        (assoc k' v))]
+      (vld/validate-ha-options new-opts)
       (set! opts new-opts)
       (transact-opts lmdb new-opts)))
 
@@ -1709,6 +1710,13 @@
                         :auto-entity-time?    false
                         :closed-schema?       false
                         :background-sampling? c/*db-background-sampling?*
+                        :ha-mode c/*ha-mode*
+                        :ha-lease-renew-ms c/*ha-lease-renew-ms*
+                        :ha-lease-timeout-ms c/*ha-lease-timeout-ms*
+                        :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
+                        :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
+                        :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
+                        :ha-control-plane c/*ha-control-plane*
                         :wal?             c/*datalog-wal?*
                         :wal-rollout-mode c/*wal-rollout-mode*
                         :wal-rollback?    c/*wal-rollback?*
@@ -1751,6 +1759,7 @@
                        opts0)
            opts2     (c/canonicalize-wal-opts
                       (merge opts1 opts))
+           _         (vld/validate-ha-options opts2)
            _         (sync-wal-runtime-opts! lmdb opts2)
            schema    (init-schema lmdb schema)
            s-domains (init-search-domains (:search-domains opts2)
