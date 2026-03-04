@@ -675,6 +675,36 @@ freshness check and skip the remote `last-modified` round trip.
 Set to 0 for strict check-on-every-call behavior."}
   *remote-db-last-modified-check-interval-ms* 0)
 
+;; HA control plane (consensus lease)
+
+(def ^{:dynamic true
+       :doc     "Default HA mode. Nil keeps HA disabled unless explicitly configured."}
+  *ha-mode* nil)
+
+(def ^{:dynamic true
+       :doc     "Default leader lease renew interval in milliseconds for consensus-lease HA."}
+  *ha-lease-renew-ms* 5000)
+
+(def ^{:dynamic true
+       :doc     "Default leader lease timeout in milliseconds for consensus-lease HA."}
+  *ha-lease-timeout-ms* 15000)
+
+(def ^{:dynamic true
+       :doc     "Default base delay in milliseconds before candidate promotion attempt."}
+  *ha-promotion-base-delay-ms* 300)
+
+(def ^{:dynamic true
+       :doc     "Default per-rank delay in milliseconds for deterministic candidate staggering."}
+  *ha-promotion-rank-delay-ms* 700)
+
+(def ^{:dynamic true
+       :doc     "Default maximum LSN lag allowed for automatic promotion."}
+  *ha-max-promotion-lag-lsn* 0)
+
+(def ^{:dynamic true
+       :doc     "Default consensus control-plane config map. Nil requires explicit configuration when HA is enabled."}
+  *ha-control-plane* nil)
+
 ;; datalog query engine
 
 (def ^{:dynamic true

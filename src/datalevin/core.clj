@@ -725,6 +725,27 @@ Only usable for debug output.
 
    * `:client-opts` is the option map passed to the client if `dir` is a remote URI string.
 
+   * `:ha-mode`, when set to `:consensus-lease`, enables consensus-lease HA
+   behavior (server/replica workflows).
+
+   * `:ha-lease-renew-ms`, lease renew interval in milliseconds. Default is
+   `datalevin.constants/*ha-lease-renew-ms*`.
+
+   * `:ha-lease-timeout-ms`, lease timeout in milliseconds. Default is
+   `datalevin.constants/*ha-lease-timeout-ms*`.
+
+   * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
+   Default is `datalevin.constants/*ha-promotion-base-delay-ms*`.
+
+   * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
+   Default is `datalevin.constants/*ha-promotion-rank-delay-ms*`.
+
+   * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
+   Default is `datalevin.constants/*ha-max-promotion-lag-lsn*`.
+
+   * `:ha-control-plane`, consensus control-plane configuration map required
+   when `:ha-mode` is `:consensus-lease`.
+
   For Datalog stores opened through this API, the default for a new local
   store is `:wal? true` with `:wal-durability-profile :strict`.
 
@@ -907,7 +928,8 @@ Only usable for debug output.
        :doc      "Obtain an open connection to a Datalog database. `dir` could be a local directory path or a dtlv connection URI string. Create the database if it does not exist. Reuse the same connection if a connection to the same database already exists. Open the database if it is closed. Return the connection.
 
   `opts` accepts the same WAL settings as [[create-conn]], including `:wal?`
-  and `:wal-durability-profile`.
+  and `:wal-durability-profile`, plus consensus-lease HA options such as
+  `:ha-mode`, timing knobs, and `:ha-control-plane`.
 
   See also [[create-conn]] and [[with-conn]]"}
   get-conn conn/get-conn)
@@ -1022,6 +1044,15 @@ Only usable for debug output.
    `datalevin.constants/*wal-group-commit-ms*`.
   * `:client-opts` is the option map passed to the client if `dir` is a
    remote server URI string.
+  * `:ha-mode`, when set to `:consensus-lease`, enables consensus-lease HA
+   behavior (server/replica workflows).
+  * `:ha-lease-renew-ms`, lease renew interval in milliseconds.
+  * `:ha-lease-timeout-ms`, lease timeout in milliseconds.
+  * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
+  * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
+  * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
+  * `:ha-control-plane`, consensus control-plane configuration map required
+   when `:ha-mode` is `:consensus-lease`.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior
    for `get-range` and `range-filter` functions, which may have the following
    keys:
