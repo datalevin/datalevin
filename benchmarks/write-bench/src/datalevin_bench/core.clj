@@ -32,20 +32,34 @@
   (println
     "Number of Writes,Time (seconds),Throughput (writes/second),Call Latency (milliseconds),Commit Latency (milliseconds)"))
 
+(defn- ns->seconds
+  ^double [^long ns]
+  (/ (double ns) 1000000000.0))
+
 (defn print-row
   [written inserted write-time sync-count sync-time prev-time start-time]
-  (let [duration (- @sync-time start-time)]
+  (let [duration-ns (- (long @sync-time) (long start-time))
+        duration-sec (ns->seconds duration-ns)
+        call-latency-ms (double
+                          (/ (double @write-time)
+                             (double @sync-count)
+                             1000000.0))
+        commit-latency-ms (double
+                            (/ (double (- (long @sync-time)
+                                          (long @prev-time)))
+                               (double @sync-count)
+                               1000000.0))]
     (println
       (str
         written
         ","
-        (format "%.2f" (double (/ duration 1000)))
+        (format "%.2f" duration-sec)
         ","
-        (format "%.2f" (double (* (/ @inserted duration) 1000)))
+        (format "%.2f" (double (/ @inserted duration-sec)))
         ","
-        (format "%.2f" (double (/ @write-time @sync-count)))
+        (format "%.2f" call-latency-ms)
         ","
-        (format "%.2f" (double (/ (- @sync-time @prev-time) @sync-count)))))))
+        (format "%.2f" commit-latency-ms)))))
 
 (defn- build-batch-txs
   ^FastList [^long batch-size add-fn]
@@ -62,12 +76,12 @@
         write-time (volatile! 0)
         sync-count (volatile! 0)
         inserted   (volatile! 0)
-        start-time (System/currentTimeMillis)
+        start-time (System/nanoTime)
         prev-time  (volatile! start-time)
         sync-time  (volatile! start-time)
         measure    (fn [_]
                      (.release sem batch-size)
-                     (vreset! sync-time (System/currentTimeMillis))
+                     (vreset! sync-time (System/nanoTime))
                      (vswap! sync-count inc)
                      (vswap! inserted + batch-size))]
     (loop [counter 0
@@ -86,9 +100,9 @@
               (vreset! prev-time @sync-time)
               (vreset! sync-count 0))
             (let [txs    (build-batch-txs batch-size add-fn)
-                  before (System/currentTimeMillis)
+                  before (System/nanoTime)
                   fut    (tx-fn txs measure)]
-              (vswap! write-time + (- (System/currentTimeMillis) before))
+              (vswap! write-time + (- (System/nanoTime) before))
               (recur (inc counter) fut)))
           (do
             (when async? @fut)
@@ -106,7 +120,7 @@
         write-time   (volatile! 0)
         sync-count   (volatile! 0)
         inserted     (volatile! 0)
-        start-time   (System/currentTimeMillis)
+        start-time   (System/nanoTime)
         prev-time    (volatile! start-time)
         sync-time    (volatile! start-time)
         next-report  (volatile! report)
@@ -116,7 +130,7 @@
                        (when sem
                          (.release ^Semaphore sem (int batch-size)))
                        (locking metrics-lock
-                         (vreset! sync-time (System/currentTimeMillis))
+                         (vreset! sync-time (System/nanoTime))
                          (vswap! sync-count inc)
                          (vswap! inserted + batch-size)
                          (when (and (>= @inserted @next-report)
@@ -135,7 +149,7 @@
                              (when sem
                                (.acquire ^Semaphore sem (int batch-size)))
                              (let [txs    (build-batch-txs batch-size add-fn)
-                                   before (System/currentTimeMillis)]
+                                   before (System/nanoTime)]
                                (try
                                  (let [fut (tx-fn txs measure)]
                                    (when latest-fut
@@ -152,7 +166,7 @@
                                    (locking metrics-lock
                                      (vswap! write-time
                                              +
-                                             (- (System/currentTimeMillis)
+                                             (- (System/nanoTime)
                                                 before))))
                                  (catch Throwable t
                                    (when sem
@@ -179,14 +193,24 @@
 
 (def id (AtomicLong. 0))
 
+(defn- effective-durability-profile
+  [wal? durability-profile]
+  (when wal?
+    (or durability-profile :strict)))
+
 (defn- run-dir
   ([base-dir f batch]
-   (run-dir base-dir f batch 1))
+   (run-dir base-dir f batch 1 nil))
   ([base-dir f batch threads]
+   (run-dir base-dir f batch threads nil))
+  ([base-dir f batch threads durability-profile]
    (let [suffix (if (> (long threads) 1)
                   (str "-t" threads)
                   "")
-         name   (str f "-" batch suffix)]
+         profile-suffix (if durability-profile
+                          (str "-" (name durability-profile))
+                          "")
+         name   (str f "-" batch suffix profile-suffix)]
     (if (and (string? base-dir) (not (s/blank? base-dir)))
       (str (if (s/ends-with? base-dir "/")
              base-dir
@@ -226,13 +250,14 @@
         base-nf  (base-task nf)
         wal?     (wal-task? nf)
         threads  (long threads)
+        effective-profile (effective-durability-profile wal? durability-profile)
         _        (when (not (pos? threads))
                    (throw (ex-info ":threads must be a positive integer"
                                    {:threads threads})))
         _        (validate-durability-profile! durability-profile)
         sql-journal-mode (if wal? "WAL" "DELETE")
-        sql-sync-mode (sql-sync-mode-for durability-profile)
-        dir      (run-dir base-dir f batch threads)
+        sql-sync-mode (sql-sync-mode-for effective-profile)
+        dir      (run-dir base-dir f batch threads effective-profile)
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
         sql?     (s/starts-with? base-nf "sql")
@@ -249,9 +274,9 @@
                                                           ;; (conj :nometasync)
                                                           )}
                                       wal? (assoc :wal? true)
-                                      (and wal? durability-profile)
+                                      (and wal? effective-profile)
                                       (assoc :wal-durability-profile
-                                             durability-profile)))
+                                             effective-profile)))
                      (d/open-dbi max-write-dbi)))
         kv-async (fn [txs measure]
                    (d/transact-kv-async kvdb max-write-dbi txs
@@ -274,9 +299,9 @@
                                                      ;; (conj :nometasync)
                                                      )}}
                        wal? (assoc :wal? true)
-                       (and wal? durability-profile)
+                       (and wal? effective-profile)
                        (assoc :wal-durability-profile
-                              durability-profile))))
+                              effective-profile))))
         dl-async (fn [txs measure] (d/transact-async conn txs nil measure))
         dl-sync  (fn [txs measure] (measure (d/transact! conn txs nil)))
         dl-add   (fn [^FastList txs]
@@ -285,7 +310,8 @@
                     (run-dir base-dir
                              (if wal? "sqlite-wal" "sqlite")
                              batch
-                             threads))
+                             threads
+                             effective-profile))
         sql-spec  (when sql?
                     {:dbtype "sqlite" :dbname sql-dir})
         sql-conn  (when (and sql? (= threads 1))
