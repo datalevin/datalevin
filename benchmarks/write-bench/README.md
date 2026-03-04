@@ -3,7 +3,7 @@
 The purpose of this benchmark is to study the write throughput and latency under
 various conditions in Datalevin. Hopefully, this gives users some reference data
 points to help choosing the right transaction function, the right data batch
-size and environment flags for specific use cases.
+size, transaction mode and environment flags for specific use cases.
 
 We also compare Datalevin's Datalog transaction speed with SQLite, as it is the
 most widely deployed embedded database that has a reputation for being fast.
@@ -13,10 +13,10 @@ most widely deployed embedded database that has a reputation for being fast.
 The benchmark is conducted on a 2016 Intel Core i7-6850K CPU @ 3.60GHz with 6
 cores, 64GB RAM, Samsung 860 EVO 1TB SSD.
 
-The OS is x86_64 GNU/Linux 6.1.0-31-amd64 #1 SMP PREEMPT_DYNAMIC Debian
-6.1.128-1 (2025-02-07), running OpenJDK version "17.0.14" 2025-01-21, and
-Clojure version is 1.12.0. Datalevin is version 0.9.19. SQLite is from SQLite
-JDBC driver 3.48.0.0, using next.jdbc Clojure library 1.3.981.
+The OS is x86_64 GNU/Linux 6.12.73+deb13-amd64, Debian 13 (trixie), running
+OpenJDK version "21.0.10" 2024-10-15, and Clojure version is 1.12.4. Datalevin
+is version 0.10.7. SQLite is from SQLite JDBC driver 3.48.0.0, using next.jdbc
+Clojure library 1.3.981.
 
 ### Tasks
 
@@ -478,3 +478,121 @@ be little behind sometimes, perhaps due to the overhead of asynchronous processi
 
 Unlike Datalog store, batching in KV store has more impact, and the growth seem
 to be linear with batch size increases.
+
+## WAL Mode Transaction
+
+Datalevin 0.10.7 introduced WAL (Write-Ahead Log) mode, enabled by passing
+`:wal? true` when opening a KV or Datalog store. WAL mode allows concurrent
+reads from multiple threads while writes proceed, and supports configurable
+durability profiles.
+
+### Durability Profiles
+
+WAL mode exposes three durability profiles via `:wal-durability-profile`:
+
+* `:strict` (default) — `fsync` per commit; strong durability guarantee
+* `:extra` — this only matters for macOS, as its `fsync` is not durable, so
+  this option calls `fcntl(F_FULLSYNC)` instad.
+* `:relaxed` — group flushing; fastest, with a risk of small window of losing a
+  tail of transactions (by default 10ms) in untimely system crash.
+
+### Write Conditions
+
+All WAL benchmarks below use batch size 1 and vary the thread count from 1 to 8:
+
+* **kv-sync-wal**: `transact-kv` in WAL mode; each call blocks until the WAL
+  commit is durable
+* **kv-async-wal**: `transact-kv-async` in WAL mode
+* **dl-sync-wal**: `transact!` in WAL mode
+* **dl-async-wal**: `transact-async` in WAL mode
+* **sql-tx-wal**: SQLite WAL journal mode; each thread uses its own connection
+  via `ThreadLocal`
+
+### Results
+
+In the interest of space, we only report results of batch size 1 in the WAL
+benchmarks. Throughput is in writes per second and latency in milliseconds.
+
+#### KV WAL: Durability Profile Comparison (Single Thread)
+
+| Durability | kv-sync throughput | kv-sync commit latency | kv-async throughput | kv-async commit latency |
+|---|---|---|---|---|
+| strict  | 19,346  | 0.07 | 207,426 | 0.01 |
+| relaxed | 36,535  | 0.03  | 250,878 | 0.00 |
+
+Note: `:extra` is only meaningful on macOS, where it forces `fcntl(F_FULLFSYNC)`
+instead of the standard `fsync`. On Linux, `:extra` and `:strict` call the same
+underlying syscall and have identical performance.
+
+For single-threaded use, `kv-async-wal` is roughly 10× faster than `kv-sync-wal`
+because the asynchronous path decouples the caller from the WAL fsync. Relaxed
+durability gives about a 2× throughput gain over strict for sync writes.
+
+#### KV WAL: Multi-Thread Scalability
+
+Strict durability:
+
+| Threads | kv-sync-wal-strict | kv-async-wal-strict |
+|---|---|---|
+| 1 | 19,346      | 207,426 |
+| 2 | 22,628      | 268,384 |
+| 4 | 6,527     | 270,270 |
+| 8 | 6,027     | 259,538 |
+
+Relaxed durability:
+
+| Threads | kv-sync-wal-relaxed | kv-async-wal-relaxed |
+|---|---|---|
+| 1 | 36,535      | 250,878 |
+| 2 | 39,216      | 286,862 |
+| 4 | 14,274    | 274,725 |
+| 8 | 5,804     | 364,431 |
+
+**Key observations:**
+
+- `kv-sync-wal` does not scale beyond 2 threads, due to the limited amount of
+  overlapping work in KV sync writes. With 4+ threads the WAL serializes fsyncs
+  across competing callers, causing severe contention (2–4× slowdown).
+- `kv-async-wal` scales well through 8 threads for relaxed durability. The
+  system batches commits from multiple callers, amortizing the
+  fsync cost. With 8 threads and relaxed durability it reaches 364k writes/sec.
+
+#### Datalog WAL Performance
+
+| Condition    | 1 thread throughput | 4 threads throughput | 8 threads throughput | commit latency (t=1) |
+|---|---|---|---|---|
+| dl-sync-wal  | 1,511  | 2,716 | 2,449        | 0.66 |
+| dl-async-wal | 31,757         | 33,458         | 31,572         | 0.03 |
+
+WAL batching reduces the per-transaction disk overhead, accounting for the
+large speedup in the sync case. `dl-async-wal` throughput does not improve
+significantly with more threads, as the WAL writer serializes commits; with
+relaxed durability the throughput is similar across all tested thread counts.
+
+#### SQLite WAL: Multi-Thread Comparison
+
+| Threads | sql-tx-wal throughput |
+|---|---|
+| 1 | 23,412 |
+| 2 | 14,464 |
+| 4 |  9,404 |
+| 8 |  9,251 |
+
+SQLite WAL does not scale with multiple writers at all. Throughput decreases as thread
+count increases because SQLite serializes write transactions through a single
+write lock, and per-thread connection overhead and `busy_timeout` coordination
+add latency. At 4 and 8 threads the throughput converges near 9,400 writes/sec,
+suggesting the write lock is the bottleneck.
+
+### Remark
+
+For concurrent write workloads with WAL mode:
+
+- Use `kv-async-wal` (not `kv-sync-wal`) for multi-thread KV writes.
+  Async WAL batches WAL entries, providing much better multi-thread scalability.
+- Choose the durability profile based on your data loss tolerance:
+  `:relaxed` is about 2× faster than `:strict` for sync writes.
+- Use `dl-async-wal` for multi-thread Datalog writes. It maintains stable
+  throughput (~31–33k writes/sec) across all tested thread counts.
+- SQLite WAL degrades significantly under multi-thread write pressure;
+  Datalevin WAL is a better choice for concurrent write workloads.

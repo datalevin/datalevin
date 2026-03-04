@@ -49,8 +49,8 @@ public class Env {
         if (closed) {
             return;
         }
-        DTLV.mdb_env_close(env);
         closed = true;
+        DTLV.mdb_env_close(env);
     }
 
     /**

@@ -787,8 +787,9 @@
         (a/shutdown-executor)
         (u/shutdown-worker-thread-pool)
         (u/shutdown-scheduler))
-      (.sync env 1)
-      (.close env)
+      (locking write-txn
+        (.sync env 1)
+        (.close env))
       (when (@info :temp?) (u/delete-files (@info :dir)))
       nil))
 

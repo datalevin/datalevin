@@ -120,6 +120,7 @@
         write-time   (volatile! 0)
         sync-count   (volatile! 0)
         inserted     (volatile! 0)
+        timeout-count (volatile! 0)
         start-time   (System/nanoTime)
         prev-time    (volatile! start-time)
         sync-time    (volatile! start-time)
@@ -171,7 +172,16 @@
                                  (catch Throwable t
                                    (when sem
                                      (.release ^Semaphore sem (int batch-size)))
-                                   (throw t))))
+                                   (if (= :txlog/commit-timeout
+                                          (:type (ex-data t)))
+                                     ;; Transient strict-mode timeout: store
+                                     ;; is still healthy, just skip this write
+                                     (locking metrics-lock
+                                       (vswap! timeout-count inc)
+                                       (vswap! write-time
+                                               +
+                                               (- (System/nanoTime) before)))
+                                     (throw t)))))
                              (recur)))))]
     (if (= threads 1)
       (worker)
@@ -189,7 +199,10 @@
         @fut))
     (when (pos? @sync-count)
       (print-row @inserted inserted write-time sync-count
-                 sync-time prev-time start-time))))
+                 sync-time prev-time start-time))
+    (when (pos? @timeout-count)
+      (binding [*out* *err*]
+        (println "Commit timeouts (strict mode contention):" @timeout-count)))))
 
 (def id (AtomicLong. 0))
 

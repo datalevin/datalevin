@@ -3964,10 +3964,7 @@
                (do
                  (.wait monitor remaining)
                  (recur deadline))
-               (let [timeout-ex
-                     (ex-info "Timed out waiting for durable LSN"
-                              {:type :txlog/commit-timeout
-                               :lsn lsn
-                               :timeout-ms timeout-ms})]
-                 (mark-unhealthy! manager timeout-ex false)
-                 (throw timeout-ex))))))))))
+               (throw (ex-info "Timed out waiting for durable LSN"
+                             {:type :txlog/commit-timeout
+                              :lsn lsn
+                              :timeout-ms timeout-ms}))))))))))
