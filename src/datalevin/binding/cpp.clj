@@ -597,6 +597,33 @@
       (vld/validate-kv-tx-data tx validate?)
       (put-tx dbi txn tx))))
 
+(defn- transact1-prepared*
+  [txs ^DBI dbi txn]
+  (let [validate? (.-validate-data? dbi)]
+    (doseq [^KVTxData tx txs]
+      (vld/validate-kv-tx-data tx validate?)
+      (put-tx dbi txn tx))))
+
+(defn- transact-prepared*
+  [txs ^HashMap dbis txn]
+  (doseq [^KVTxData tx txs]
+    (let [dbi-name (.-dbi-name tx)
+          ^DBI dbi (or (.get dbis dbi-name)
+                       (raise dbi-name " is not open" {}))
+          validate? (.-validate-data? dbi)]
+      (vld/validate-kv-tx-data tx validate?)
+      (put-tx dbi txn tx))))
+
+(defn- prepare-kvtxs
+  [txs dbi-name kt vt]
+  (let [out (transient [])]
+    (if dbi-name
+      (doseq [t txs]
+        (conj! out (l/->kv-tx-data t kt vt)))
+      (doseq [t txs]
+        (conj! out (l/->kv-tx-data t))))
+    (persistent! out)))
+
 (defn- kv-tx->row
   [^KVTxData tx]
   (let [op   (.-op tx)
@@ -1036,36 +1063,49 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [this dbi-name txs k-type v-type]
-    (locking write-txn
-      (.check-ready this)
-      (let [^Rtx rtx  @write-txn
-            one-shot? (nil? rtx)
-            ^DBI dbi  (when dbi-name
-                        (or (.get dbis dbi-name)
-                            (raise dbi-name " is not open" {})))
-            ^Txn txn  (if one-shot?
-                        (Txn/create env)
-                        (.-txn rtx))]
-        (try
-          (if dbi
-            (transact1* txs dbi txn k-type v-type)
-            (transact* txs dbis txn))
-          (when (:max-val-size-changed? @info)
-            (transact* [[:put c/kv-info :max-val-size (:max-val-size @info)]]
-                       dbis txn)
-            (vswap! info assoc :max-val-size-changed? false))
-          (when one-shot? (.commit txn))
-          :transacted
-          (catch Util$MapFullException _
-            (.close txn)
-            (up-db-size env)
-            (if one-shot?
-              (.transact-kv this dbi-name txs k-type v-type)
-              (do (.reset-write this)
-                  (raise "DB resized" {:resized true}))))
-          (catch Exception e
-            (when one-shot? (.close txn))
-            (raise "Fail to transact to LMDB: " e {}))))))
+    (let [^clojure.lang.IPersistentVector prepared-one-shot
+          (let [tx-open? (some? @write-txn)]
+            (when-not tx-open?
+              (prepare-kvtxs txs dbi-name k-type v-type)))]
+      (letfn [(do-transact [prepared]
+              (.check-ready this)
+              (let [^Rtx rtx  @write-txn
+                    one-shot? (nil? rtx)
+                    ^DBI dbi  (when dbi-name
+                                (or (.get dbis dbi-name)
+                                    (raise dbi-name " is not open" {})))
+                    ^Txn txn  (if one-shot?
+                                (Txn/create env)
+                                (.-txn rtx))]
+                (try
+                  (let [work-txs (or prepared txs)]
+                    (if dbi
+                      (if prepared
+                        (transact1-prepared* work-txs dbi txn)
+                        (transact1* work-txs dbi txn k-type v-type))
+                      (if prepared
+                        (transact-prepared* work-txs dbis txn)
+                        (transact* work-txs dbis txn))))
+                  (when (:max-val-size-changed? @info)
+                    (transact* [[:put c/kv-info :max-val-size (:max-val-size @info)]]
+                               dbis txn)
+                    (vswap! info assoc :max-val-size-changed? false))
+                  (when one-shot? (.commit txn))
+                  :transacted
+                  (catch Util$MapFullException _
+                    (.close txn)
+                    (up-db-size env)
+                    (if one-shot?
+                      (.transact-kv this dbi-name txs k-type v-type)
+                      (do (.reset-write this)
+                          (raise "DB resized" {:resized true}))))
+                  (catch Exception e
+                    (when one-shot? (.close txn))
+                    (raise "Fail to transact to LMDB: " e {})))))]
+        (if (Thread/holdsLock write-txn)
+          (do-transact nil)
+          (locking write-txn
+            (do-transact prepared-one-shot))))))
 
   (set-env-flags [_ ks on-off] (.setFlags env (kv-flags ks) (if on-off 1 0)))
 

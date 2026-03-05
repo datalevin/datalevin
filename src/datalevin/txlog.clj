@@ -531,7 +531,7 @@
 (defn force-channel!
   "Force channel to disk according to sync mode:
   - `:fsync` -> fsync (data + metadata)
-  - `:fdatasync` -> fdatasync-like (currently fsync fallback)
+  - `:fdatasync` -> fdatasync-like (macOS uses fsync path; others use force(false))
   - `:extra` -> extra durable full sync (e.g. F_FULLFSYNC on macOS)
   - `:none` -> no force"
   ([^FileChannel ch] (force-channel! ch :fdatasync))
@@ -2347,9 +2347,14 @@
          :checksum expected-check}))))
 
 (defn next-commit-marker-entry
-  [commit-state append-info]
-  (when (:commit-marker? commit-state)
-    (let [revision (inc (long (:marker-revision commit-state)))
+  ([commit-state append-info]
+   (next-commit-marker-entry
+    (:commit-marker? commit-state)
+    (:marker-revision commit-state)
+    append-info))
+  ([commit-marker? marker-revision append-info]
+   (when commit-marker?
+    (let [revision (inc (long marker-revision))
           marker {:revision revision
                   :applied-lsn (long (:lsn append-info))
                   :txlog-segment-id (long (:segment-id append-info))
@@ -2363,7 +2368,7 @@
                slot :keyword :bytes]]
       {:revision revision
        :marker marker
-       :row row})))
+       :row row}))))
 
 (defn vector-checkpoint-op?
   "Return true if canonical txn-log op targets vector checkpoint DBIs."
@@ -2717,45 +2722,6 @@
            bs)))
      (dbi-name-bytes dbi-name))))
 
-(defn- body-slice-buffer
-  ^ByteBuffer [^bytes body ^long offset ^long len]
-  (.slice ^ByteBuffer (ByteBuffer/wrap body (int offset) (int len))))
-
-(deftype ^:private LMDBRowSpan [op
-                                ^String dbi-name
-                                v
-                                vt
-                                flags
-                                ^long k-offset
-                                ^long k-len
-                                ^long v-offset
-                                ^long v-len])
-
-(defn- lmdb-row-from-span
-  [^LMDBRowSpan span k-raw v-raw]
-  (let [op (.-op span)
-        ^String dbi-name (.-dbi-name span)
-        v (.-v span)
-        vt (.-vt span)
-        flags (.-flags span)]
-    (case op
-      :put
-      (datalevin.lmdb.KVTxData. op dbi-name k-raw v-raw :raw :raw flags)
-
-      :del
-      (datalevin.lmdb.KVTxData. op dbi-name k-raw nil :raw nil flags)
-
-      ;; List ops still need per-element LMDB processing, but key encoding can be reused.
-      :put-list
-      (datalevin.lmdb.KVTxData. op dbi-name k-raw v :raw (or vt :data) flags)
-
-      :del-list
-      (datalevin.lmdb.KVTxData. op dbi-name k-raw v :raw (or vt :data) flags)
-
-      (raise "Unsupported txn-log KV op"
-             {:type :txlog/corrupt
-              :op op}))))
-
 (defn- write-kv-components!
   ^ByteBuffer [^ThreadLocal tl
                ^ByteBuffer bf
@@ -2767,8 +2733,7 @@
                vt
                flags
                row
-               ^HashMap dbi-cache
-               ^FastList lmdb-row-spans]
+               ^HashMap dbi-cache]
   (let [^String dbi-name (dbi-name->string dbi)
         ^bytes dbi-bs (dbi-name-bytes dbi-name dbi-cache)
         dbi-len (alength dbi-bs)
@@ -2795,17 +2760,6 @@
             bf' (-> bf3
                     (bb-put-buffer! tl v-bf)
                     (bb-write-flags! tl flags))]
-        (when lmdb-row-spans
-          (.add lmdb-row-spans
-                (LMDBRowSpan. op
-                              dbi-name
-                              nil
-                              nil
-                              flags
-                              (long k-offset)
-                              (long k-len)
-                              (long v-offset)
-                              (long v-len))))
         bf')
 
       :del
@@ -2819,17 +2773,6 @@
             bf' (-> bf1
                     (bb-put-buffer! tl k-bf)
                     (bb-write-flags! tl flags))]
-        (when lmdb-row-spans
-          (.add lmdb-row-spans
-                (LMDBRowSpan. op
-                              dbi-name
-                              nil
-                              nil
-                              flags
-                              (long k-offset)
-                              (long k-len)
-                              -1
-                              -1)))
         bf')
 
       :put-list
@@ -2850,17 +2793,6 @@
                     (bb-put-u32! tl v-len)
                     (bb-put-buffer! tl v-bf)
                     (bb-write-flags! tl flags))]
-        (when lmdb-row-spans
-          (.add lmdb-row-spans
-                (LMDBRowSpan. op
-                              dbi-name
-                              v
-                              v-type
-                              flags
-                              (long k-offset)
-                              (long k-len)
-                              -1
-                              -1)))
         bf')
 
       :del-list
@@ -2881,17 +2813,6 @@
                     (bb-put-u32! tl v-len)
                     (bb-put-buffer! tl v-bf)
                     (bb-write-flags! tl flags))]
-        (when lmdb-row-spans
-          (.add lmdb-row-spans
-                (LMDBRowSpan. op
-                              dbi-name
-                              v
-                              v-type
-                              flags
-                              (long k-offset)
-                              (long k-len)
-                              -1
-                              -1)))
         bf')
 
       (raise "Unsupported txn-log KV op"
@@ -2901,14 +2822,8 @@
 
 (defn- write-kv-row!
   ([^ThreadLocal tl ^ByteBuffer bf row]
-   (write-kv-row! tl bf row nil nil))
+   (write-kv-row! tl bf row nil))
   ([^ThreadLocal tl ^ByteBuffer bf row ^HashMap dbi-cache]
-   (write-kv-row! tl bf row dbi-cache nil))
-  ([^ThreadLocal tl
-    ^ByteBuffer bf
-    row
-    ^HashMap dbi-cache
-    ^FastList lmdb-row-spans]
    (cond
      (instance? datalevin.lmdb.KVTxData row)
      (let [^datalevin.lmdb.KVTxData tx row]
@@ -2922,8 +2837,7 @@
                              (.-vt tx)
                              (.-flags tx)
                              row
-                             dbi-cache
-                             lmdb-row-spans))
+                             dbi-cache))
 
      (vector? row)
      (write-kv-components! tl
@@ -2936,8 +2850,7 @@
                            (nth row 5 nil)
                            (nth row 6 nil)
                            row
-                           dbi-cache
-                           lmdb-row-spans)
+                           dbi-cache)
 
      (instance? java.util.List row)
      (let [^List row* row
@@ -2952,29 +2865,12 @@
                              (when (< 5 n) (.get row* 5))
                              (when (< 6 n) (.get row* 6))
                              row
-                             dbi-cache
-                             lmdb-row-spans))
+                             dbi-cache))
 
      :else
      (raise "Txn-log row must be a vector or KVTxData"
             {:type :txlog/corrupt
              :row row}))))
-
-(defn- lmdb-rows-from-spans
-  ^FastList [^bytes body ^FastList lmdb-row-spans]
-  (let [n (.size lmdb-row-spans)
-        ^FastList lmdb-rows (FastList. n)]
-    (dotimes [i n]
-      (let [^LMDBRowSpan span (.get lmdb-row-spans i)
-            k-offset (long (.-k-offset span))
-            k-len (long (.-k-len span))
-            v-offset (long (.-v-offset span))
-            v-len (long (.-v-len span))
-            k-raw (body-slice-buffer body k-offset k-len)
-            v-raw (when (>= v-offset 0)
-                    (body-slice-buffer body v-offset v-len))]
-        (.add lmdb-rows (lmdb-row-from-span span k-raw v-raw))))
-    lmdb-rows))
 
 (defn- use-parallel-row-encoding?
   [^long row-count]
@@ -3124,42 +3020,6 @@
     (maybe-shrink-bits-buffer!)
     out))
 
-(defn- encode-commit-row-payload+lmdb-rows
-  [lsn tx-time rows]
-  (let [^FastList rowsv (ensure-fast-list rows)
-        row-count (long (.size rowsv))
-        ^ThreadLocal tl tl-commit-body-buffer
-        ^ByteBuffer bf0 (.clear ^ByteBuffer (.get tl))
-        ^HashMap dbi-cache (.get tl-dbi-name-cache)
-        _ (.clear dbi-cache)
-        ^FastList lmdb-row-spans (FastList. (.size rowsv))
-        ^ByteBuffer bfN
-        (loop [i 0
-               ^ByteBuffer bf (-> bf0
-                                  (bb-put-bytes! tl commit-payload-magic-bytes)
-                                  (bb-put-byte! tl commit-payload-format-major)
-                                  (bb-put-byte! tl 0)
-                                  (bb-put-u16! tl 0)
-                                  (bb-put-long! tl (long lsn))
-                                  (bb-put-long! tl (long tx-time))
-                                  (bb-put-u32! tl row-count))]
-          (if (< i row-count)
-            (recur (unchecked-inc-int i)
-                   (write-kv-row! tl bf (.get rowsv i) dbi-cache lmdb-row-spans))
-            bf))
-        len (.position bfN)
-        out (byte-array len)]
-    (.flip bfN)
-    (.get bfN out)
-    (maybe-shrink-threadlocal-buffer!
-     tl
-     bfN
-     len
-     tl-commit-body-buffer-initial-cap)
-    (maybe-shrink-bits-buffer!)
-    {:body out
-     :lmdb-rows (lmdb-rows-from-spans out lmdb-row-spans)}))
-
 (defn- patch-commit-row-payload-header!
   [^bytes body ^long lsn ^long tx-time]
   (let [^ByteBuffer bf (ByteBuffer/wrap body)]
@@ -3245,7 +3105,6 @@
         append-start-ms now
         near-roll? (near-roll-append? state offset)
         ^bytes body (:body prepared-payload)
-        lmdb-rows (:lmdb-rows prepared-payload)
         _ (patch-commit-row-payload-header! body lsn now)
         append-res (append-record-at! ch offset body)
         next-offset (+ offset (long (:size append-res)))]
@@ -3258,7 +3117,6 @@
     {:append-res append-res
      :append-start-ms append-start-ms
      :ch ch
-     :lmdb-rows lmdb-rows
      :lsn lsn
      :near-roll? near-roll?
      :sid sid
@@ -3345,9 +3203,9 @@
 
 (defn- append-durable-relaxed!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
-  (let [prepared-payload (encode-commit-row-payload+lmdb-rows 0 0 rows)
+  (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
         append-lock (or (:append-lock state) state)
-        {:keys [append-res append-start-ms ch lsn lmdb-rows near-roll?
+        {:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
         (locking append-lock
           (append-record-under-lock! state prepared-payload throw-if-fatal!))
@@ -3371,14 +3229,13 @@
     (assoc append-res
            :lsn lsn
            :segment-id sid
-           :synced? synced?
-           :lmdb-rows lmdb-rows)))
+           :synced? synced?)))
 
 (defn- append-durable-strict!
   [state rows {:keys [throw-if-fatal! mark-fatal!]}]
-  (let [prepared-payload (encode-commit-row-payload+lmdb-rows 0 0 rows)
+  (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
         append-lock (or (:append-lock state) state)
-        {:keys [append-res append-start-ms ch lsn lmdb-rows near-roll?
+        {:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager timeout-ms]}
         (locking append-lock
           (append-record-under-lock! state prepared-payload throw-if-fatal!))
@@ -3398,8 +3255,7 @@
     (assoc append-res
            :lsn lsn
            :segment-id sid
-           :synced? true
-           :lmdb-rows lmdb-rows)))
+           :synced? true)))
 
 (defn- per-tx-durable-profile-state?
   [state]

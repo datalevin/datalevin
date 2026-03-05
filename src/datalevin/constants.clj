@@ -515,11 +515,7 @@
 
 (def ^{:dynamic true
        :doc     "WAL force mode for segment sync operations: `:fdatasync`, `:fsync`, `:extra`, or `:none`."}
-  *wal-sync-mode* :fsync)
-
-(def ^{:dynamic true
-       :doc     "Enable overlapping LMDB apply with WAL durability wait using a dedicated LMDB writer thread."}
-  *wal-lmdb-overlap?* false)
+  *wal-sync-mode* :fdatasync)
 
 (def ^{:dynamic true
        :doc     "WAL group-commit threshold by number of records (primarily affects `:relaxed` durability profile)."}
