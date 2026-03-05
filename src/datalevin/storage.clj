@@ -1541,9 +1541,31 @@
                                (retrieved->v lmdb r)])))
     res))
 
+(def ^:private nippy-meta-protocol-key
+  :taoensso.nippy/meta-protocol-key)
+
+(def ^:private legacy-ha-nil-sentinel-keys
+  [:ha-mode
+   :ha-control-plane
+   :ha-members
+   :ha-fencing-hook
+   :ha-membership-hash])
+
+(defn- encode-legacy-ha-nil-sentinels
+  [opts]
+  (reduce
+    (fn [m k]
+      (if (and (contains? m k) (nil? (get m k)))
+        (assoc m k nippy-meta-protocol-key)
+        m))
+    (or opts {})
+    legacy-ha-nil-sentinel-keys))
+
 (defn- transact-opts
   [lmdb opts]
-  (let [opts (c/canonicalize-wal-opts opts)]
+  (let [opts (-> opts
+                 c/canonicalize-wal-opts
+                 encode-legacy-ha-nil-sentinels)]
     (when (true? (:wal? opts))
       (let [flags (or (get-env-flags lmdb) #{})]
         (when (and (not (contains? flags :nosync))
@@ -1554,16 +1576,6 @@
                    (lmdb/kv-tx :put c/opts k v :attr :data))
                  (lmdb/kv-tx :put c/meta :last-modified
                              (System/currentTimeMillis) :attr :long)))))
-
-(def ^:private nippy-meta-protocol-key
-  :taoensso.nippy/meta-protocol-key)
-
-(def ^:private legacy-ha-nil-sentinel-keys
-  [:ha-mode
-   :ha-control-plane
-   :ha-members
-   :ha-fencing-hook
-   :ha-membership-hash])
 
 (defn- normalize-legacy-ha-nil-sentinels
   [opts]
