@@ -14,6 +14,12 @@ import java.nio.channels.FileChannel;
 public final class PosixFsync {
 
     private static final Field FILE_CHANNEL_FD_FIELD = initFileChannelFdField();
+    private static final boolean IS_MACOS = initIsMacOS();
+
+    private static boolean initIsMacOS() {
+        String os = System.getProperty("os.name", "");
+        return os.toLowerCase().contains("mac");
+    }
 
     private static Field initFileChannelFdField() {
         try {
@@ -64,11 +70,18 @@ public final class PosixFsync {
     /**
      * Force file data with fdatasync(2)-like semantics.
      *
-     * Java does not expose a distinct fdatasync call, so this currently
-     * falls back to fsync behavior.
+     * Java does not expose a distinct fdatasync call.
+     *
+     * On macOS, avoid FileChannel.force(false) because JDK may route through
+     * F_FULLFSYNC; use fsync path instead.
+     * On non-macOS, use force(false) to approximate data-focused flush.
      */
     public static void fdatasync(FileChannel ch) throws IOException {
-        fsync(ch);
+        if (IS_MACOS) {
+            fsync(ch);
+        } else {
+            ch.force(false);
+        }
     }
 
     /**

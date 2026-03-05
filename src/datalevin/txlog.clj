@@ -531,7 +531,7 @@
 (defn force-channel!
   "Force channel to disk according to sync mode:
   - `:fsync` -> fsync (data + metadata)
-  - `:fdatasync` -> fdatasync-like (currently fsync fallback)
+  - `:fdatasync` -> fdatasync-like (macOS uses fsync path; others use force(false))
   - `:extra` -> extra durable full sync (e.g. F_FULLFSYNC on macOS)
   - `:none` -> no force"
   ([^FileChannel ch] (force-channel! ch :fdatasync))

@@ -22,7 +22,7 @@
    [datalevin.constants :as c]
    [datalevin.interface
     :refer [close-kv list-dbis entries get-range open-dbi transact-kv clear-dbi
-            env-dir copy open-transact-kv close-transact-kv stat kv-info]])
+            env-dir copy open-transact-kv close-transact-kv stat]])
   (:import
    [datalevin.async IAsyncWork]
    [datalevin.cpp Util]
@@ -368,14 +368,6 @@
                               ^long (:overflow-pages m)))))
              0 (list-dbis db))))
 
-(defn ^:no-doc txlog-write-serialize-lock
-  [db]
-  (when-let [info-v (try
-                      (kv-info db)
-                      (catch Exception _ nil))]
-    (when-let [state (:txlog-state @info-v)]
-      (or (:lmdb-write-serialize-lock state) state))))
-
 (defmacro with-transaction-kv
   "Evaluate body within the context of a single new read/write transaction,
   ensuring atomicity of key-value operations. Works with synchronous `transact-kv`.
@@ -392,35 +384,19 @@
               (transact-kv kv [[:put \"a\" :counter (inc now)]])
               (get-value kv \"a\" :counter)))"
   [[db orig-db] & body]
-  `(let [serialize-lock# (txlog-write-serialize-lock ~orig-db)]
-     (if serialize-lock#
-       (locking serialize-lock#
-         (locking (write-txn ~orig-db)
-           (let [writing#   (writing? ~orig-db)
-                 condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
+  `(locking (write-txn ~orig-db)
+     (let [writing#   (writing? ~orig-db)
+           condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
+       (u/repeat-try-catch
+           ~c/+in-tx-overflow-times+
+           condition#
+         (try
+           (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
              (u/repeat-try-catch
                  ~c/+in-tx-overflow-times+
                  condition#
-               (try
-                 (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
-                   (u/repeat-try-catch
-                       ~c/+in-tx-overflow-times+
-                       condition#
-                     ~@body))
-                 (finally (when-not writing# (close-transact-kv ~orig-db))))))))
-       (locking (write-txn ~orig-db)
-         (let [writing#   (writing? ~orig-db)
-               condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
-           (u/repeat-try-catch
-               ~c/+in-tx-overflow-times+
-               condition#
-             (try
-               (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
-                 (u/repeat-try-catch
-                     ~c/+in-tx-overflow-times+
-                     condition#
-                   ~@body))
-               (finally (when-not writing# (close-transact-kv ~orig-db))))))))))
+               ~@body))
+           (finally (when-not writing# (close-transact-kv ~orig-db))))))))
 
 ;; for shutting down various executors when the last LMDB exits
 (defonce lmdb-dirs (atom #{}))
