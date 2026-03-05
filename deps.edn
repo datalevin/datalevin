@@ -29,14 +29,18 @@
 
  :aliases {
            :dev {
-                 :jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                 :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                            "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                            "--add-opens=java.base/java.util=ALL-UNNAMED"
                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                             "--enable-native-access=ALL-UNNAMED"
                             "-Dclojure.compiler.direct-linking=true"]
                  }
 
            :pod   {
-                   :jvm-opts   ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   :jvm-opts   ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                                "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                "--add-opens=java.base/java.util=ALL-UNNAMED"
                                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                                 "--enable-native-access=ALL-UNNAMED"
                                 "-Dclojure.compiler.direct-linking=true"]
@@ -45,7 +49,9 @@
                    :exec-fn    run}
            :test  {
                    :extra-paths ["test"]
-                   :jvm-opts    ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                   :jvm-opts    ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+                                 "--add-opens=java.base/java.nio=ALL-UNNAMED"
+                                 "--add-opens=java.base/java.util=ALL-UNNAMED"
                                  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                                  "--enable-native-access=ALL-UNNAMED"
                                  "-Dclojure.compiler.direct-linking=true"]

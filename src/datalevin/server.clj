@@ -628,9 +628,44 @@
   [store]
   (dha/consensus-ha-opts store))
 
+(defn- sanitize-ha-path-segment
+  [x]
+  (-> x
+      str
+      (s/replace #"[^A-Za-z0-9._-]" "_")))
+
+(defn- default-ha-control-raft-dir
+  [root db-name ha-opts]
+  (let [cp           (:ha-control-plane ha-opts)
+        group-id     (sanitize-ha-path-segment (:group-id cp))
+        local-peer-id (sanitize-ha-path-segment (:local-peer-id cp))
+        db-segment   (u/hexify-string db-name)]
+    (str root
+         u/+separator+
+         "ha-control"
+         u/+separator+
+         group-id
+         u/+separator+
+         local-peer-id
+         u/+separator+
+         db-segment)))
+
+(defn- with-default-ha-control-raft-dir
+  [root db-name ha-opts]
+  (if (and (= :sofa-jraft (get-in ha-opts [:ha-control-plane :backend]))
+           (nil? (get-in ha-opts [:ha-control-plane :raft-dir])))
+    (assoc-in ha-opts
+              [:ha-control-plane :raft-dir]
+              (default-ha-control-raft-dir root db-name ha-opts))
+    ha-opts))
+
 (defn- start-ha-authority
-  [db-name ha-opts]
-  (dha/start-ha-authority db-name ha-opts))
+  ([db-name ha-opts]
+   (dha/start-ha-authority db-name ha-opts))
+  ([db-name root ha-opts]
+   (dha/start-ha-authority
+    db-name
+    (with-default-ha-control-raft-dir root db-name ha-opts))))
 
 (defn- stop-ha-authority
   [db-name m]
@@ -640,6 +675,41 @@
   [db-name m]
   (dha/ha-renew-step db-name m))
 
+(defn- ha-loop-sleep-ms
+  ([m]
+   (ha-loop-sleep-ms m (System/currentTimeMillis)))
+  ([m now-ms]
+   (let [renew-ms  (long (max 100
+                              (long (or (:ha-lease-renew-ms m)
+                                        c/*ha-lease-renew-ms*))))
+         role      (:ha-role m)
+         deadlines (cond-> []
+                     (and (= :candidate role)
+                          (integer? (:ha-candidate-since-ms m))
+                          (integer? (:ha-candidate-delay-ms m)))
+                     (conj (+ (long (:ha-candidate-since-ms m))
+                              (long (:ha-candidate-delay-ms m))))
+
+                     (and (= :follower role)
+                          (integer? (:ha-follower-next-sync-not-before-ms m)))
+                     (conj (long (:ha-follower-next-sync-not-before-ms m)))
+
+                     (and (= :demoting role)
+                          (integer? (:ha-demoted-at-ms m)))
+                     (conj (u/long-inc (long (:ha-demoted-at-ms m)))))
+         next-deadline (when (seq deadlines)
+                         (long (reduce min (map long deadlines))))
+         remaining-ms  (when (some? next-deadline)
+                         (let [delta (- (long next-deadline)
+                                        (long now-ms))]
+                           (long (if (neg? delta) 0 delta))))]
+     (if (some? remaining-ms)
+       (cond
+         (< (long remaining-ms) 1) 1
+         (< (long remaining-ms) renew-ms) (long remaining-ms)
+         :else renew-ms)
+       renew-ms))))
+
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running?]
   (loop []
@@ -648,17 +718,18 @@
       (let [m (get (.-dbs server) db-name)]
         (if (or (nil? m) (nil? (:ha-authority m)))
           (.set running? false)
-          (do
+          (let [next-state-v (volatile! nil)]
             (update-db server db-name
                        (fn [state]
                          (if (and state
                                   (identical? running?
                                               (:ha-renew-loop-running? state)))
-                           (ha-renew-step db-name state)
+                           (let [next-state (ha-renew-step db-name state)]
+                             (vreset! next-state-v next-state)
+                             next-state)
                            state)))
-            (let [sleep-ms (long (max 100
-                                      (long (or (:ha-lease-renew-ms m)
-                                                c/*ha-lease-renew-ms*))))]
+            (let [next-state (or @next-state-v m)
+                  sleep-ms   (long (ha-loop-sleep-ms next-state))]
               (try
                 (Thread/sleep sleep-ms)
                 (catch InterruptedException _
@@ -692,11 +763,11 @@
   (dha/ha-write-admission-error (.-dbs server) message))
 
 (defn- ensure-ha-runtime
-  [db-name m store]
+  [root db-name m store]
   (if-let [ha-opts (consensus-ha-opts store)]
     (if (:ha-authority m)
       m
-      (merge m (start-ha-authority db-name ha-opts)))
+      (merge m (start-ha-authority db-name root ha-opts)))
     (do
       (stop-ha-renew-loop m)
       (stop-ha-authority db-name m)
@@ -707,7 +778,7 @@
   (update-db server db-name
              #(let [m (cond-> (assoc % :store store)
                         (instance? IStore store) (assoc :dt-db (db/new-db store)))]
-                (ensure-ha-runtime db-name m store)))
+                (ensure-ha-runtime (.-root server) db-name m store)))
   (ensure-ha-renew-loop server db-name))
 
 (defn- get-db
@@ -1220,7 +1291,7 @@
             :when (not (get-in dbs [db-name :store]))
             :let  [m (get dbs db-name {})]]
       (let [store (open-store root db-name dbis datalog?)
-            next-m (ensure-ha-runtime db-name (assoc m :store store) store)]
+            next-m (ensure-ha-runtime root db-name (assoc m :store store) store)]
         (.put dbs db-name next-m)))
     (doseq [db-name engines
             :when   (not (get-in dbs [db-name :engine]))

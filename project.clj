@@ -79,6 +79,8 @@
              "-Xlint:all"
              "-Dclojure.compiler.direct-linking=true"
              "--enable-native-access=ALL-UNNAMED"
+             "--add-opens=java.base/java.lang=ALL-UNNAMED"
+             "--add-opens=java.base/java.util=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"
              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
   :javac-options ["--release" "17"]

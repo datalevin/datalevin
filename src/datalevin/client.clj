@@ -18,7 +18,7 @@
   (:import
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.channels SocketChannel]
-   [java.util UUID]
+   [java.util UUID WeakHashMap Collections]
    [java.util.concurrent ConcurrentLinkedQueue ConcurrentHashMap]
    [java.net InetSocketAddress StandardSocketOptions URI]))
 
@@ -31,6 +31,9 @@
 
 (defonce ^:private ^ConcurrentHashMap connection-wire-opts
   (ConcurrentHashMap.))
+
+(defonce ^:private ^java.util.Map ha-preferred-endpoints
+  (Collections/synchronizedMap (WeakHashMap.)))
 
 (defn- conn-wire-opts
   [^SocketChannel ch]
@@ -231,6 +234,18 @@
          (map #(s/split % #"="))
          (into {}))))
 
+(def ^:private ha-endpoint-pattern
+  #"^([^:]+):(\d+)$")
+
+(defn- parse-ha-endpoint
+  [endpoint]
+  (when-let [[_ host port-str]
+             (and (string? endpoint)
+                  (re-matches ha-endpoint-pattern endpoint))]
+    {:endpoint endpoint
+     :host     host
+     :port     (Long/parseLong port-str)}))
+
 (defn- copy-out
   ([conn req]
    (copy-out conn req nil))
@@ -332,9 +347,12 @@
         (finally (release-connection pool conn)))))
 
   (disconnect [client]
-    (let [conn (get-connection pool)]
-      (send-only conn {:type :disconnect})
-      (release-connection pool conn))
+    (try
+      (let [conn (get-connection pool)]
+        (send-only conn {:type :disconnect})
+        (release-connection pool conn))
+      (finally
+        (.remove ha-preferred-endpoints client)))
     (close-pool pool))
 
   (disconnected? [client]
@@ -398,7 +416,215 @@
          port      (parse-port uri)
          client-id (authenticate host port username password)
          pool      (new-connectionpool host port client-id pool-size time-out)]
-     (->Client username password host port pool-size time-out client-id pool))))
+     (->Client username password host port pool-size time-out
+               client-id pool))))
+
+(defn- endpoint-key
+  [host port]
+  (str host ":" port))
+
+(defn- retryable-ha-write-reject?
+  [err-data]
+  (and (map? err-data)
+       (= :ha/write-rejected (:error err-data))
+       (true? (:retryable? err-data))))
+
+(defn- raise-normal-request-error
+  [req message err-data extra-data]
+  (u/raise "Request to Datalevin server failed: "
+           message
+           (merge req
+                  {:err-data err-data
+                   :server-message message}
+                  extra-data)))
+
+(defn- collect-ha-retry-endpoints
+  [seen endpoints]
+  (reduce
+    (fn [[acc seen'] endpoint]
+      (if-let [{:keys [host port] :as parsed} (parse-ha-endpoint endpoint)]
+        (let [ek (endpoint-key host port)]
+          (if (contains? seen' ek)
+            [acc seen']
+            [(conj acc parsed) (conj seen' ek)]))
+        [acc seen']))
+    [[] seen]
+    endpoints))
+
+(defn- ^:redef client-retry-context
+  [client]
+  (when (instance? Client client)
+    {:username  (.-username ^Client client)
+     :password  (.-password ^Client client)
+     :pool-size (.-pool-size ^Client client)
+     :time-out  (.-time-out ^Client client)
+     :host      (.-host ^Client client)
+     :port      (.-port ^Client client)}))
+
+(defn- read-preferred-ha-endpoint
+  [client]
+  (let [endpoint (.get ha-preferred-endpoints client)]
+    (when (and (string? endpoint) (not (s/blank? endpoint)))
+      endpoint)))
+
+(defn- set-preferred-ha-endpoint!
+  [client endpoint]
+  (if (and (some? endpoint) (string? endpoint) (not (s/blank? endpoint)))
+    (.put ha-preferred-endpoints client endpoint)
+    (.remove ha-preferred-endpoints client)))
+
+(defn- clear-preferred-ha-endpoint!
+  [client]
+  (set-preferred-ha-endpoint! client nil))
+
+(defn- preferred-ha-endpoint
+  [client retry-context]
+  (let [self-endpoint (endpoint-key (:host retry-context) (:port retry-context))
+        endpoint      (read-preferred-ha-endpoint client)]
+    (when (and endpoint (not= endpoint self-endpoint))
+      endpoint)))
+
+(defn- new-client-for-endpoint
+  [{:keys [username password pool-size time-out]} host port]
+  (let [client-id (authenticate host port username password)
+        pool      (new-connectionpool host port client-id pool-size time-out)]
+    (->Client username password host port pool-size time-out
+              client-id pool)))
+
+(defn- attempt-ha-endpoint-request
+  [req retry-context host port request-fn disconnect-fn new-client-fn]
+  (try
+    (let [retry-client (new-client-fn retry-context host port)]
+      (try
+        (let [{:keys [type message result err-data]}
+              (request-fn retry-client req)]
+          (if (= type :error-response)
+            {:kind :error
+             :message message
+             :err-data err-data}
+            {:kind :success
+             :result result}))
+        (finally
+          (try
+            (disconnect-fn retry-client)
+            (catch Exception _ nil)))))
+    (catch Exception e
+      {:kind :exception
+       :exception e})))
+
+(defn- retry-ha-write-request*
+  ([req message err-data retry-context request-fn disconnect-fn new-client-fn]
+   (retry-ha-write-request*
+     req
+     message
+     err-data
+     retry-context
+     request-fn
+     disconnect-fn
+     new-client-fn
+     (constantly nil)))
+  ([req message err-data retry-context request-fn disconnect-fn new-client-fn
+    on-success-endpoint!]
+   (let [self-key (endpoint-key (:host retry-context) (:port retry-context))
+         [pending seen]
+         (collect-ha-retry-endpoints
+           #{self-key}
+           (:ha-retry-endpoints err-data))]
+     (loop [remaining    pending
+            seen         seen
+            last-message message
+            last-err     err-data
+            attempts     []]
+       (if-let [{:keys [endpoint host port]} (first remaining)]
+         (let [outcome (attempt-ha-endpoint-request
+                         req retry-context host port
+                         request-fn disconnect-fn new-client-fn)]
+           (cond
+             (= :success (:kind outcome))
+             (do
+               (on-success-endpoint! endpoint)
+               (:result outcome))
+
+             (= :exception (:kind outcome))
+             (recur (rest remaining)
+                    seen
+                    last-message
+                    last-err
+                    (conj attempts
+                          {:endpoint endpoint
+                           :type :exception
+                           :message (ex-message (:exception outcome))}))
+
+             :else
+             (let [retry-err     (:err-data outcome)
+                   retry-message (:message outcome)]
+               (if (retryable-ha-write-reject? retry-err)
+                 (let [[extra seen']
+                       (collect-ha-retry-endpoints
+                         seen
+                         (:ha-retry-endpoints retry-err))]
+                   (recur (concat (rest remaining) extra)
+                          seen'
+                          retry-message
+                          retry-err
+                          (conj attempts
+                                {:endpoint endpoint
+                                 :type :error-response
+                                 :reason (:reason retry-err)})))
+                 (raise-normal-request-error
+                   req retry-message retry-err
+                   {:ha-retry-attempts
+                    (conj attempts
+                          {:endpoint endpoint
+                           :type :error-response
+                           :reason (:reason retry-err)})})))))
+        (raise-normal-request-error req last-message last-err
+                                    {:ha-retry-attempts attempts}))))))
+
+(defn- ^:redef try-preferred-ha-write-request*
+  [client req retry-context request-fn disconnect-fn new-client-fn retry-fn]
+  (when-let [endpoint (preferred-ha-endpoint client retry-context)]
+    (if-let [{:keys [host port]} (parse-ha-endpoint endpoint)]
+      (let [outcome (attempt-ha-endpoint-request
+                      req retry-context host port
+                      request-fn disconnect-fn new-client-fn)]
+        (case (:kind outcome)
+          :success
+          (do
+            (set-preferred-ha-endpoint! client endpoint)
+            {:handled? true
+             :result (:result outcome)})
+
+          :error
+          (if (retryable-ha-write-reject? (:err-data outcome))
+            {:handled? true
+             :result (retry-fn client req
+                               (:message outcome)
+                               (:err-data outcome))}
+            (raise-normal-request-error
+              req (:message outcome) (:err-data outcome) nil))
+
+          :exception
+          (do
+            (clear-preferred-ha-endpoint! client)
+            {:handled? false})))
+      (do
+        (clear-preferred-ha-endpoint! client)
+        {:handled? false}))))
+
+(defn- ^:redef retry-ha-write-request
+  [client req message err-data]
+  (if-let [retry-context (client-retry-context client)]
+    (retry-ha-write-request*
+      req
+      message
+      err-data
+      retry-context
+      request
+      disconnect
+      new-client-for-endpoint
+      #(set-preferred-ha-endpoint! client %))
+    (raise-normal-request-error req message err-data nil)))
 
 (defn ^:no-doc normal-request
   "Send request to server and returns results. Does not use the
@@ -407,12 +633,29 @@
   ([client call args]
    (normal-request client call args false))
   ([client call args writing?]
-   (let [req {:type call :args args :writing? writing?}
-
-         {:keys [type message result]} (request client req)]
-     (if (= type :error-response)
-       (u/raise "Request to Datalevin server failed: " message req)
-       result))))
+   (let [req                 {:type call :args args :writing? writing?}
+         retry-context       (and writing? (client-retry-context client))
+         preferred-attempt   (when retry-context
+                               (try-preferred-ha-write-request*
+                                 client
+                                 req
+                                 retry-context
+                                 request
+                                 disconnect
+                                 new-client-for-endpoint
+                                 retry-ha-write-request))]
+     (if (:handled? preferred-attempt)
+       (:result preferred-attempt)
+       (let [{:keys [type message result err-data]} (request client req)]
+         (if (= type :error-response)
+           (if (and writing?
+                    (retryable-ha-write-reject? err-data))
+             (retry-ha-write-request client req message err-data)
+             (raise-normal-request-error req message err-data nil))
+           (do
+             (when retry-context
+               (clear-preferred-ha-endpoint! client))
+             result)))))))
 
 ;; we do input validation and normalization in the server, as
 ;; 3rd party clients may be written
