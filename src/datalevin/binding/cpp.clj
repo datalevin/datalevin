@@ -770,25 +770,42 @@
     (vswap! info assoc :max-val-size size :max-val-size-changed? true))
 
   (close-kv [this]
-    (when-not (.isClosed env)
-      (stop-scheduled-sync scheduled-sync)
-      (let [dir-prefix (str (.env-dir this) u/+separator+)
-            indices    (->> @l/vector-indices
-                            (keep (fn [[fname idx]]
-                                    (when (and (string? fname)
-                                               (s/starts-with? fname dir-prefix))
-                                      idx)))
-                            vec)]
-        ;; Close vector indices while LMDB env is still valid.
-        (doseq [idx indices]
-          (close-vecs idx)))
-      (swap! l/lmdb-dirs disj (env-dir this))
-      (when (zero? (count @l/lmdb-dirs))
-        (l/shutdown-last-lmdb-executors!))
-      (locking write-txn
-        (.sync env 1)
-        (.close env))
-      (when (@info :temp?) (u/delete-files (@info :dir)))
+    (let [dir         (env-dir this)
+          close-error (volatile! nil)]
+      (when-not (.isClosed env)
+        (stop-scheduled-sync scheduled-sync)
+        (let [dir-prefix (str (.env-dir this) u/+separator+)
+              indices    (->> @l/vector-indices
+                              (keep (fn [[fname idx]]
+                                      (when (and (string? fname)
+                                                 (s/starts-with? fname dir-prefix))
+                                        idx)))
+                              vec)]
+          ;; Close vector indices while LMDB env is still valid.
+          (doseq [idx indices]
+            (try
+              (close-vecs idx)
+              (catch Throwable e
+                (when-not @close-error
+                  (vreset! close-error e))))))
+        (locking write-txn
+          (try
+            (.sync env 1)
+            (catch Throwable e
+              (when-not @close-error
+                (vreset! close-error e))))
+          (try
+            (.close env)
+            (catch Throwable e
+              (when-not @close-error
+                (vreset! close-error e)))))
+        (when (@info :temp?) (u/delete-files (@info :dir))))
+      (when (.isClosed env)
+        (swap! l/lmdb-dirs disj dir)
+        (when (zero? (count @l/lmdb-dirs))
+          (l/shutdown-last-lmdb-executors!)))
+      (when-let [e @close-error]
+        (throw e))
       nil))
 
   (closed-kv? [_] (.isClosed env))

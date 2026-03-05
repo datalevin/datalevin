@@ -23,12 +23,15 @@
    [datalevin.db DB TxReport]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
-   [datalevin.async IAsyncWork]
+   [datalevin.async IAsyncWork AsyncExecutor]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
     ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
     TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
+
+(declare closed? shutdown-transact-async-executor!
+         shutdown-transact-async-executor-if-idle!)
 
 (defn conn?
   [conn]
@@ -54,8 +57,10 @@
 
 (defn close
   [conn]
-  (when-let [store (.-store ^DB @conn)]
-    (i/close ^Store store))
+  (when (and conn (not (closed? conn)))
+    (when-let [store (.-store ^DB @conn)]
+      (i/close ^Store store))
+    (shutdown-transact-async-executor-if-idle!))
   nil)
 
 (defn closed?
@@ -403,6 +408,23 @@
     (when-let [executor @transact-async-executor-atom]
       (a/stop executor)
       (reset! transact-async-executor-atom nil)))
+  nil)
+
+(defn ^:no-doc shutdown-transact-async-executor-if-idle!
+  []
+  (locking transact-async-executor-atom
+    (when-let [^AsyncExecutor executor @transact-async-executor-atom]
+      (let [^LinkedBlockingQueue event-queue (.-event-queue executor)
+            workers                         (.-workers executor)
+            ^ThreadPoolExecutor worker-pool (when (instance? ThreadPoolExecutor workers)
+                                               workers)
+            workers-idle?                   (if worker-pool
+                                             (and (zero? (.getActiveCount worker-pool))
+                                                  (.isEmpty (.getQueue worker-pool)))
+                                             true)]
+        (when (and (.isEmpty event-queue) workers-idle?)
+          (a/stop executor)
+          (reset! transact-async-executor-atom nil)))))
   nil)
 
 (defn get-conn

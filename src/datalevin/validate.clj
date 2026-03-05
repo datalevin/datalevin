@@ -423,12 +423,18 @@
             promotable-node-id-set (->> voters
                                         (filter :promotable?)
                                         (map :ha-node-id)
-                                        set)]
+                                        set)
+            db-identity (:db-identity opts)]
         (when-not (positive-int? node-id)
           (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
                    {:error :ha/validation
                     :option :ha-node-id
                     :value node-id}))
+        (when-not (non-blank-string? db-identity)
+          (u/raise "Option :db-identity must be a non-blank string in consensus mode"
+                   {:error :ha/validation
+                    :option :db-identity
+                    :value db-identity}))
         (when-not (contains? member-id-set node-id)
           (u/raise "Option :ha-node-id must exist in :ha-members"
                    {:error :ha/validation
@@ -515,6 +521,11 @@
       (= k :ha-membership-hash)
       (when-not (or (nil? v) (non-blank-string? v))
         (u/raise "Option :ha-membership-hash expects nil or a non-blank string"
+                 {:option k :value v}))
+
+      (= k :db-identity)
+      (when-not (non-blank-string? v)
+        (u/raise "Option :db-identity expects a non-blank string"
                  {:option k :value v}))
 
       (boolean-opts k)
@@ -966,205 +977,3 @@
   (when-some [not-datom (first (drop-while d/datom? datoms))]
     (u/raise "init-db expects list of Datoms, got " (type not-datom)
              {:error :init-db})))
-
-;; ---- HA option validation ----
-
-(defn- non-blank-string?
-  [x]
-  (and (string? x) (not (s/blank? x))))
-
-(defn- positive-int?
-  [x]
-  (and (integer? x) (pos? ^long x)))
-
-(defn- non-negative-int?
-  [x]
-  (and (integer? x) (not (neg? ^long x))))
-
-(defn- parse-peer-id-port
-  [peer-id where]
-  (when-not (non-blank-string? peer-id)
-    (u/raise "HA peer-id must be a non-blank string"
-             {:error :ha/validation
-              :where where
-              :peer-id peer-id}))
-  (let [^String peer-id peer-id
-        idx (.lastIndexOf peer-id ":")]
-    (when (or (neg? idx) (= idx (dec (count peer-id))))
-      (u/raise "HA peer-id must be in host:port format"
-               {:error :ha/validation
-                :where where
-                :peer-id peer-id}))
-    (let [port-str (subs peer-id (inc idx))]
-      (try
-        (let [port (Long/parseLong port-str)]
-          (when (or (<= port 0) (> port 65535))
-            (u/raise "HA peer-id port must be a valid integer in range 1..65535"
-                     {:error :ha/validation
-                      :where where
-                      :peer-id peer-id
-                      :port port}))
-          port)
-        (catch NumberFormatException _
-          (u/raise "HA peer-id port must be a valid integer"
-                   {:error :ha/validation
-                    :where where
-                    :peer-id peer-id
-                    :port port-str})))))) 
-
-(defn- canonical-ha-members
-  [opts]
-  (->> (:ha-members opts)
-       (map (fn [{:keys [node-id endpoint]}]
-              [node-id (str endpoint)]))
-       (sort-by first)
-       vec))
-
-(defn- canonical-promotable-voters
-  [opts]
-  (->> (get-in opts [:ha-control-plane :voters])
-       (keep (fn [{:keys [ha-node-id peer-id promotable?]}]
-               (when (true? promotable?)
-                 [ha-node-id (str peer-id)])))
-       (sort-by first)
-       vec))
-
-(defn derive-ha-membership-hash
-  "Derive deterministic HA membership hash from canonicalized members and
-   promotable control-plane voter mapping."
-  [opts]
-  (let [payload (str "members=" (pr-str (canonical-ha-members opts))
-                     ";promotable-voters="
-                     (pr-str (canonical-promotable-voters opts)))
-        ^MessageDigest md (MessageDigest/getInstance "SHA-256")]
-    (.update md (.getBytes payload StandardCharsets/UTF_8))
-    (u/hexify (.digest md))))
-
-(defn validate-ha-options
-  "Validate :consensus-lease HA options and return opts unchanged."
-  [opts]
-  (if (not= :consensus-lease (:ha-mode opts))
-    opts
-    (let [node-id              (:ha-node-id opts)
-          members              (vec (:ha-members opts))
-          {:keys [group-id local-peer-id voters backend]
-           :as   control-plane} (:ha-control-plane opts)
-          voters               (vec voters)
-          {:keys [cmd timeout-ms retries retry-delay-ms]}
-          (:ha-fencing-hook opts)
-          renew-ms             (:ha-lease-renew-ms opts)
-          timeout-ms*          (:ha-lease-timeout-ms opts)
-          base-delay-ms        (:ha-promotion-base-delay-ms opts)
-          rank-delay-ms        (:ha-promotion-rank-delay-ms opts)
-          max-lag-lsn          (:ha-max-promotion-lag-lsn opts)]
-      (when-not (positive-int? node-id)
-        (u/raise "HA :ha-node-id must be a positive integer"
-                 {:error :ha/validation :value node-id}))
-      (when-not (seq members)
-        (u/raise "HA :ha-members must be a non-empty collection"
-                 {:error :ha/validation :value members}))
-      (let [member-node-ids (mapv :node-id members)]
-        (doseq [[idx m] (map-indexed vector members)]
-          (when-not (and (map? m)
-                         (positive-int? (:node-id m))
-                         (non-blank-string? (:endpoint m)))
-            (u/raise "HA member must contain positive :node-id and non-blank :endpoint"
-                     {:error :ha/validation
-                      :where [:ha-members idx]
-                      :member m})))
-        (when-not (= member-node-ids (vec (sort member-node-ids)))
-          (u/raise "HA :ha-members must be ordered by ascending :node-id"
-                   {:error :ha/validation :ha-members members}))
-        (when-not (= (count member-node-ids) (count (distinct member-node-ids)))
-          (u/raise "HA :ha-members must have unique :node-id values"
-                   {:error :ha/validation :ha-members members}))
-        (when-not (some #(= node-id %) member-node-ids)
-          (u/raise "HA :ha-members must include local :ha-node-id"
-                   {:error :ha/validation
-                    :ha-node-id node-id
-                    :ha-members members}))
-        (when-not (and (non-blank-string? group-id)
-                       (non-blank-string? local-peer-id)
-                       (= backend :sofa-jraft))
-          (u/raise "HA :ha-control-plane must include :backend :sofa-jraft, non-blank :group-id and :local-peer-id"
-                   {:error :ha/validation :ha-control-plane control-plane}))
-        (parse-peer-id-port local-peer-id [:ha-control-plane :local-peer-id])
-        (when (< (count voters) 3)
-          (u/raise "HA :ha-control-plane :voters must contain at least 3 entries for quorum"
-                   {:error :ha/validation :voters voters}))
-        (doseq [[idx v] (map-indexed vector voters)]
-          (when-not (and (map? v)
-                         (non-blank-string? (:peer-id v))
-                         (or (true? (:promotable? v))
-                             (false? (:promotable? v))))
-            (u/raise "HA control-plane voter must contain :peer-id and boolean :promotable?"
-                     {:error :ha/validation
-                      :where [:ha-control-plane :voters idx]
-                      :voter v}))
-          (parse-peer-id-port (:peer-id v) [:ha-control-plane :voters idx :peer-id])
-          (when (and (true? (:promotable? v))
-                     (not (positive-int? (:ha-node-id v))))
-            (u/raise "HA promotable voter must contain positive :ha-node-id"
-                     {:error :ha/validation
-                      :where [:ha-control-plane :voters idx]
-                      :voter v})))
-        (let [peer-ids (mapv :peer-id voters)
-              local-peer-count (count (filter #(= local-peer-id %) peer-ids))
-              promotable-voters (filterv :promotable? voters)
-              promotable-node-ids (mapv :ha-node-id promotable-voters)
-              members-set (set member-node-ids)]
-          (when-not (= (count peer-ids) (count (distinct peer-ids)))
-            (u/raise "HA control-plane voters must have unique :peer-id values"
-                     {:error :ha/validation :voters voters}))
-          (when-not (= 1 local-peer-count)
-            (u/raise "HA :local-peer-id must appear exactly once in :voters"
-                     {:error :ha/validation
-                      :local-peer-id local-peer-id
-                      :voters voters}))
-          (when-not (= (count promotable-node-ids)
-                       (count (distinct promotable-node-ids)))
-            (u/raise "HA promotable voters must have unique :ha-node-id values"
-                     {:error :ha/validation
-                      :promotable-voters promotable-voters}))
-          (when-not (= members-set (set promotable-node-ids))
-            (u/raise "HA promotable voter mapping must match :ha-members :node-id set"
-                     {:error :ha/validation
-                      :members members
-                      :promotable-voters promotable-voters})))
-        (when-not (and (sequential? cmd)
-                       (seq cmd)
-                       (every? non-blank-string? cmd)
-                       (positive-int? timeout-ms)
-                       (non-negative-int? retries)
-                       (non-negative-int? retry-delay-ms))
-          (u/raise "HA :ha-fencing-hook must contain valid :cmd, :timeout-ms, :retries, and :retry-delay-ms"
-                   {:error :ha/validation
-                    :ha-fencing-hook (:ha-fencing-hook opts)}))
-        (when-not (and (positive-int? renew-ms)
-                       (positive-int? timeout-ms*)
-                       (positive-int? base-delay-ms)
-                       (positive-int? rank-delay-ms)
-                       (non-negative-int? max-lag-lsn))
-          (u/raise "HA timing options must be positive integers, except :ha-max-promotion-lag-lsn which must be non-negative"
-                   {:error :ha/validation
-                    :ha-options (select-keys
-                                  opts
-                                  [:ha-lease-renew-ms
-                                   :ha-lease-timeout-ms
-                                   :ha-promotion-base-delay-ms
-                                   :ha-promotion-rank-delay-ms
-                                   :ha-max-promotion-lag-lsn])}))
-        (when (< ^long timeout-ms* (* 2 ^long renew-ms))
-          (u/raise "HA :ha-lease-timeout-ms must be at least 2x :ha-lease-renew-ms"
-                   {:error :ha/validation
-                    :ha-lease-timeout-ms timeout-ms*
-                    :ha-lease-renew-ms renew-ms})))
-      (let [derived-hash  (derive-ha-membership-hash opts)
-            provided-hash (:ha-membership-hash opts)]
-        (when (and provided-hash
-                   (not= provided-hash derived-hash))
-          (u/raise "HA membership hash does not match authoritative hash"
-                   {:error :ha/validation
-                    :provided-hash provided-hash
-                    :derived-hash derived-hash})))
-      opts)))

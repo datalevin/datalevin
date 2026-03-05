@@ -1555,10 +1555,31 @@
                  (lmdb/kv-tx :put c/meta :last-modified
                              (System/currentTimeMillis) :attr :long)))))
 
+(def ^:private nippy-meta-protocol-key
+  :taoensso.nippy/meta-protocol-key)
+
+(def ^:private legacy-ha-nil-sentinel-keys
+  [:ha-mode
+   :ha-control-plane
+   :ha-members
+   :ha-fencing-hook
+   :ha-membership-hash])
+
+(defn- normalize-legacy-ha-nil-sentinels
+  [opts]
+  (reduce
+    (fn [m k]
+      (if (= nippy-meta-protocol-key (get m k))
+        (assoc m k nil)
+        m))
+    (or opts {})
+    legacy-ha-nil-sentinel-keys))
+
 (defn- load-opts
   [lmdb]
-  (c/canonicalize-wal-opts
-   (into {} (get-range lmdb c/opts [:all] :attr :data))))
+  (-> (into {} (get-range lmdb c/opts [:all] :attr :data))
+      c/canonicalize-wal-opts
+      normalize-legacy-ha-nil-sentinels))
 
 (defn- sync-wal-runtime-opts!
   [lmdb opts]
@@ -1778,15 +1799,19 @@
                        opts0)
            opts2     (c/canonicalize-wal-opts
                       (merge opts1 opts))
-           _         (vld/validate-ha-options opts2)
-           _         (sync-wal-runtime-opts! lmdb opts2)
+           db-identity (or (:db-identity opts2)
+                           (:db-name opts2)
+                           (str (UUID/randomUUID)))
+           opts3     (assoc opts2 :db-identity db-identity)
+           _         (vld/validate-ha-options opts3)
+           _         (sync-wal-runtime-opts! lmdb opts3)
            schema    (init-schema lmdb schema)
-           s-domains (init-search-domains (:search-domains opts2)
+           s-domains (init-search-domains (:search-domains opts3)
                                           schema search-opts search-domains)
-           v-domains (init-vector-domains (:vector-domains opts2)
+           v-domains (init-vector-domains (:vector-domains opts3)
                                           schema vector-opts vector-domains)
            i-domains (init-idoc-domains schema)]
-       (transact-opts lmdb opts2)
+       (transact-opts lmdb opts3)
        (->Store lmdb
                 (init-engines lmdb s-domains)
                 (init-indices lmdb v-domains)

@@ -21,6 +21,7 @@
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
+   [datalevin.ha :as dha]
    [datalevin.search :as sc]
    [datalevin.vector :as v]
    [datalevin.kv :as kv]
@@ -623,11 +624,91 @@
         new      (f (get dbs db-name {}))]
     (.put dbs db-name new)))
 
+(defn- consensus-ha-opts
+  [store]
+  (dha/consensus-ha-opts store))
+
+(defn- start-ha-authority
+  [db-name ha-opts]
+  (dha/start-ha-authority db-name ha-opts))
+
+(defn- stop-ha-authority
+  [db-name m]
+  (dha/stop-ha-authority db-name m))
+
+(defn- ha-renew-step
+  [db-name m]
+  (dha/ha-renew-step db-name m))
+
+(defn- run-ha-renew-loop
+  [^Server server db-name ^AtomicBoolean running?]
+  (loop []
+    (when (and (.get running?)
+               (.get ^AtomicBoolean (.-running server)))
+      (let [m (get (.-dbs server) db-name)]
+        (if (or (nil? m) (nil? (:ha-authority m)))
+          (.set running? false)
+          (do
+            (update-db server db-name
+                       (fn [state]
+                         (if (and state
+                                  (identical? running?
+                                              (:ha-renew-loop-running? state)))
+                           (ha-renew-step db-name state)
+                           state)))
+            (let [sleep-ms (long (max 100
+                                      (long (or (:ha-lease-renew-ms m)
+                                                c/*ha-lease-renew-ms*))))]
+              (try
+                (Thread/sleep sleep-ms)
+                (catch InterruptedException _
+                  (.set running? false)))))))
+      (recur))))
+
+(declare execute)
+
+(defn- ensure-ha-renew-loop
+  [^Server server db-name]
+  (let [new-running-v (volatile! nil)]
+    (update-db server db-name
+               (fn [m]
+                 (if (and m
+                          (:ha-authority m)
+                          (nil? (:ha-renew-loop-running? m)))
+                   (let [running? (AtomicBoolean. true)]
+                     (vreset! new-running-v running?)
+                     (assoc m :ha-renew-loop-running? running?))
+                   m)))
+    (when-let [running? @new-running-v]
+      (execute server #(run-ha-renew-loop server db-name running?)))))
+
+(defn- stop-ha-renew-loop
+  [m]
+  (when-let [^AtomicBoolean running? (:ha-renew-loop-running? m)]
+    (.set running? false)))
+
+(defn- ha-write-admission-error
+  [^Server server message]
+  (dha/ha-write-admission-error (.-dbs server) message))
+
+(defn- ensure-ha-runtime
+  [db-name m store]
+  (if-let [ha-opts (consensus-ha-opts store)]
+    (if (:ha-authority m)
+      m
+      (merge m (start-ha-authority db-name ha-opts)))
+    (do
+      (stop-ha-renew-loop m)
+      (stop-ha-authority db-name m)
+      (dha/clear-ha-runtime-state m))))
+
 (defn- add-store
   [^Server server db-name store]
   (update-db server db-name
-             #(cond-> (assoc % :store store)
-                (instance? IStore store) (assoc :dt-db (db/new-db store)))))
+             #(let [m (cond-> (assoc % :store store)
+                        (instance? IStore store) (assoc :dt-db (db/new-db store)))]
+                (ensure-ha-runtime db-name m store)))
+  (ensure-ha-renew-loop server db-name))
 
 (defn- get-db
   ([server db-name]
@@ -638,10 +719,13 @@
 
 (defn- remove-store
   [^Server server db-name]
-  (when-let [store (get-store server db-name)]
-    (if-let [db (get-db server db-name)]
-      (db/close-db db)
-      (close-store store)))
+  (let [m (get (.-dbs server) db-name)]
+    (stop-ha-renew-loop m)
+    (stop-ha-authority db-name m)
+    (when-let [store (:store m)]
+      (if-let [db (:dt-db m)]
+        (db/close-db db)
+        (close-store store))))
   (.remove ^Map (.-dbs server) db-name))
 
 (defn- update-cached-role
@@ -1135,8 +1219,9 @@
             stores
             :when (not (get-in dbs [db-name :store]))
             :let  [m (get dbs db-name {})]]
-      (.put dbs db-name
-            (assoc m :store (open-store root db-name dbis datalog?))))
+      (let [store (open-store root db-name dbis datalog?)
+            next-m (ensure-ha-runtime db-name (assoc m :store store) store)]
+        (.put dbs db-name next-m)))
     (doseq [db-name engines
             :when   (not (get-in dbs [db-name :engine]))
             :let    [m (get dbs db-name {})]]
@@ -2964,9 +3049,11 @@
           (p/read-value fmt msg wire-opts)]
       (log/debug "Message received:" (dissoc message :password :args))
       (set-last-active server skey)
-      (if writing?
-        (handle-writing server skey message)
-        (message-cases skey type)))
+      (if-let [err (ha-write-admission-error server message)]
+        (error-response skey "HA write admission rejected" err)
+        (if writing?
+          (handle-writing server skey message)
+          (message-cases skey type))))
     (catch Exception e
       ;; (stt/print-stack-trace e)
       (log/error "Error Handling message:" e))))
@@ -3064,17 +3151,20 @@
           dbs                                (ConcurrentHashMap.)]
       (reopen-dbs root clients dbs)
       (.register server-socket selector SelectionKey/OP_ACCEPT)
-      (->Server running
-                port
-                root
-                idle-timeout
-                server-socket
-                selector
-                (ConcurrentLinkedQueue.)
-                (Executors/newSingleThreadExecutor)
-                (Executors/newCachedThreadPool) ; with-txn may be many
-                sys-conn
-                clients
-                dbs))
+      (let [server (->Server running
+                             port
+                             root
+                             idle-timeout
+                             server-socket
+                             selector
+                             (ConcurrentLinkedQueue.)
+                             (Executors/newSingleThreadExecutor)
+                             (Executors/newCachedThreadPool) ; with-txn may be many
+                             sys-conn
+                             clients
+                             dbs)]
+        (doseq [db-name (keys dbs)]
+          (ensure-ha-renew-loop server db-name))
+        server))
     (catch Exception e
       (u/raise "Error creating server:" (ex-message e) {}))))

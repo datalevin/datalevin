@@ -45,6 +45,26 @@
              (db/-datoms @conn :eav nil nil nil))])
      (dump-datalog conn))))
 
+(def ^:private nippy-meta-protocol-key
+  :taoensso.nippy/meta-protocol-key)
+
+(def ^:private legacy-ha-nil-sentinel-keys
+  [:ha-mode
+   :ha-control-plane
+   :ha-members
+   :ha-fencing-hook
+   :ha-membership-hash])
+
+(defn- normalize-legacy-ha-nil-sentinels
+  [opts]
+  (reduce
+    (fn [m k]
+      (if (= nippy-meta-protocol-key (get m k))
+        (assoc m k nil)
+        m))
+    (or opts {})
+    legacy-ha-nil-sentinel-keys))
+
 (defn- dump
   [conn ^String dumpfile]
   (let [d (DataOutputStream. (FileOutputStream. dumpfile))]
@@ -57,6 +77,8 @@
    (if nippy?
      (try
        (let [[old-opts old-schema datoms] (nippy/thaw-from-in! in)
+             old-opts                     (normalize-legacy-ha-nil-sentinels
+                                            old-opts)
              new-opts                     (merge old-opts opts)
              new-schema                   (merge old-schema schema)]
          (db/init-db (for [d datoms] (apply dd/datom d))
