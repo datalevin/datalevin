@@ -597,31 +597,32 @@
       (vld/validate-kv-tx-data tx validate?)
       (put-tx dbi txn tx))))
 
-(defn- transact1-prepared*
-  [txs ^DBI dbi txn]
-  (let [validate? (.-validate-data? dbi)]
-    (doseq [^KVTxData tx txs]
-      (vld/validate-kv-tx-data tx validate?)
+(defn- transact-prepared-ops*
+  [ops txn]
+  (doseq [op ops]
+    (let [^DBI dbi (nth op 0)
+          ^KVTxData tx (nth op 1)]
       (put-tx dbi txn tx))))
 
-(defn- transact-prepared*
-  [txs ^HashMap dbis txn]
-  (doseq [^KVTxData tx txs]
-    (let [dbi-name (.-dbi-name tx)
-          ^DBI dbi (or (.get dbis dbi-name)
-                       (raise dbi-name " is not open" {}))
-          validate? (.-validate-data? dbi)]
-      (vld/validate-kv-tx-data tx validate?)
-      (put-tx dbi txn tx))))
-
-(defn- prepare-kvtxs
-  [txs dbi-name kt vt]
+(defn- prepare-kvtx-ops
+  [txs ^HashMap dbis dbi-name kt vt]
   (let [out (transient [])]
     (if dbi-name
+      (let [^DBI dbi (or (.get dbis dbi-name)
+                         (raise dbi-name " is not open" {}))
+            validate? (.-validate-data? dbi)]
+        (doseq [t txs]
+          (let [^KVTxData tx (l/->kv-tx-data t kt vt)]
+            (vld/validate-kv-tx-data tx validate?)
+            (conj! out [dbi tx]))))
       (doseq [t txs]
-        (conj! out (l/->kv-tx-data t kt vt)))
-      (doseq [t txs]
-        (conj! out (l/->kv-tx-data t))))
+        (let [^KVTxData tx (l/->kv-tx-data t)
+              dbi-name* (.-dbi-name tx)
+              ^DBI dbi (or (.get dbis dbi-name*)
+                           (raise dbi-name* " is not open" {}))
+              validate? (.-validate-data? dbi)]
+          (vld/validate-kv-tx-data tx validate?)
+          (conj! out [dbi tx]))))
     (persistent! out)))
 
 (defn- kv-tx->row
@@ -1049,7 +1050,7 @@
     (let [^clojure.lang.IPersistentVector prepared-one-shot
           (let [tx-open? (some? @write-txn)]
             (when-not tx-open?
-              (prepare-kvtxs txs dbi-name k-type v-type)))]
+              (prepare-kvtx-ops txs dbis dbi-name k-type v-type)))]
       (letfn [(do-transact [prepared]
               (.check-ready this)
               (let [^Rtx rtx  @write-txn
@@ -1061,14 +1062,11 @@
                                 (Txn/create env)
                                 (.-txn rtx))]
                 (try
-                  (let [work-txs (or prepared txs)]
+                  (if prepared
+                    (transact-prepared-ops* prepared txn)
                     (if dbi
-                      (if prepared
-                        (transact1-prepared* work-txs dbi txn)
-                        (transact1* work-txs dbi txn k-type v-type))
-                      (if prepared
-                        (transact-prepared* work-txs dbis txn)
-                        (transact* work-txs dbis txn))))
+                      (transact1* txs dbi txn k-type v-type)
+                      (transact* txs dbis txn)))
                   (when (:max-val-size-changed? @info)
                     (transact* [[:put c/kv-info :max-val-size (:max-val-size @info)]]
                                dbis txn)
