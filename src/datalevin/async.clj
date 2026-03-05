@@ -201,10 +201,11 @@
 (defn get-executor
   "access the async executor"
   []
-  (let [e @executor-atom]
-    (if (and e (running? e))
-      e
-      (new-executor))))
+  (locking executor-atom
+    (let [e @executor-atom]
+      (if (and e (running? e))
+        e
+        (new-executor)))))
 
 (defn exec-noresult
   "Submit work without creating/returning a future. Useful when completion is
@@ -219,4 +220,8 @@
       (exec executor work)
       nil)))
 
-(defn shutdown-executor [] (when-let [e @executor-atom] (stop e)))
+(defn shutdown-executor []
+  (locking executor-atom
+    (when-let [e @executor-atom]
+      (stop e)
+      (reset! executor-atom nil))))

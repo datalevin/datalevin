@@ -416,6 +416,8 @@
         (b/read-buffer (.rewind bf) :avg)))))
 
 (declare insert-datom delete-datom fulltext-index vector-index idoc-index check
+         prepare-datoms-kv-plan
+         commit-datoms-kv-plan!
          migrate-attr-values transact-opts ->SamplingWork e-sample*
          default-ratio* analyze*)
 
@@ -566,29 +568,10 @@
     (entries lmdb (if (string? index) index (index->dbi index))))
 
   (load-datoms [this datoms]
-    (let [txs    (FastList. (* 3 (count datoms)))
-          ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-          ;; or [:r d gt]
-          ft-ds  (FastList.)
-          ;; vector, same
-          vi-ds  (FastList.)
-          ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-          ;; or [:r d [gt v]]
-          id-ds  (FastList.)
-          giants (HashMap.)]
-      (locking (lmdb/write-txn lmdb)
-        (doseq [datom datoms]
-          (if (d/datom-added datom)
-            (insert-datom this datom txs ft-ds vi-ds id-ds giants)
-            (delete-datom this datom txs ft-ds vi-ds id-ds giants)))
-        (.add txs (lmdb/kv-tx :put c/meta :max-tx
-                              (.advance-max-tx this) :attr :long))
-        (.add txs (lmdb/kv-tx :put c/meta :last-modified
-                              (System/currentTimeMillis) :attr :long))
-        (fulltext-index search-engines ft-ds)
-        (vector-index vector-indices vi-ds)
-        (idoc-index idoc-indices id-ds)
-        (transact-kv lmdb txs))))
+    (locking write-txn
+      (->> (prepare-datoms-kv-plan this datoms)
+           (commit-datoms-kv-plan!
+             lmdb search-engines vector-indices idoc-indices))))
 
   (fetch [_ datom]
     (mapv #(retrieved->datom lmdb attrs %)
@@ -1399,6 +1382,42 @@
       (when (identical? vt :db.type/vec)
         (.add vi-ds [(conjv (props :db.vec/domains) (v/attr-domain attr))
                      (if gt [:r gt] [:d [e aid v]])])))))
+
+(defn- prepare-datoms-kv-plan
+  "Prepare KV write plan for a datom batch.
+   This is an extraction step toward sharing DL/KV commit flow."
+  [^Store store datoms]
+  (let [txs    (FastList. (* 3 (count datoms)))
+        ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
+        ;; or [:r d gt]
+        ft-ds  (FastList.)
+        ;; vector, same
+        vi-ds  (FastList.)
+        ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
+        ;; or [:r d [gt v]]
+        id-ds  (FastList.)
+        giants (HashMap.)]
+    (doseq [datom datoms]
+      (if (d/datom-added datom)
+        (insert-datom store datom txs ft-ds vi-ds id-ds giants)
+        (delete-datom store datom txs ft-ds vi-ds id-ds giants)))
+    (.add txs (lmdb/kv-tx :put c/meta :max-tx
+                          (.advance-max-tx store) :attr :long))
+    (.add txs (lmdb/kv-tx :put c/meta :last-modified
+                          (System/currentTimeMillis) :attr :long))
+    {:txs txs
+     :ft-ds ft-ds
+     :vi-ds vi-ds
+     :id-ds id-ds}))
+
+(defn- commit-datoms-kv-plan!
+  "Commit a prepared datom KV plan."
+  [lmdb search-engines vector-indices idoc-indices
+   {:keys [txs ft-ds vi-ds id-ds]}]
+  (fulltext-index search-engines ft-ds)
+  (vector-index vector-indices vi-ds)
+  (idoc-index idoc-indices id-ds)
+  (transact-kv lmdb txs))
 
 (defn vpred
   [v]

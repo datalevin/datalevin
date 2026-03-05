@@ -1,12 +1,14 @@
 (ns datalevin-bench.core
   "Max write throughput benchmark"
   (:require
+   [datalevin.async :as a]
    [datalevin.core :as d]
    [datalevin.constants :as c]
    [clojure.string :as s]
    [next.jdbc :as jdbc]
    [next.jdbc.sql :as sql])
   (:import
+   [datalevin.io PosixFsync]
    [java.util Random]
    [java.util.concurrent Semaphore Executors TimeUnit]
    [java.util.concurrent.atomic AtomicLong AtomicReference]
@@ -256,6 +258,19 @@
     :extra   "EXTRA"
     "FULL"))
 
+(defn- ensure-native-wal-sync-path!
+  [nf wal? kv? dl?]
+  (when (and wal? (or kv? dl?) (not (PosixFsync/available)))
+    (throw
+      (ex-info
+        (str "Native WAL fsync path unavailable for " nf
+             "; falling back to FileChannel.force(false) would skew this benchmark. "
+             "Run with --add-opens=java.base/sun.nio.ch=ALL-UNNAMED "
+             "(for example, use the :write/:mixed aliases).")
+        {:task nf
+         :wal? wal?
+         :posix-fsync-available? false}))))
+
 (defn write
   [{:keys [base-dir batch f threads durability-profile]
     :or   {threads 1}}]
@@ -274,6 +289,7 @@
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
         sql?     (s/starts-with? base-nf "sql")
+        _        (ensure-native-wal-sync-path! nf wal? kv? dl?)
         async?   (s/ends-with? base-nf "async")
         _        (when (and (string? base-dir) (not (s/blank? base-dir)))
                    (.mkdirs (java.io.File. base-dir)))
@@ -415,7 +431,8 @@
         (when sql-conn (.close sql-conn))
         (when sql-tl
           (.close verify-conn)
-          (doseq [c @sql-conns] (.close c)))))))
+          (doseq [c @sql-conns] (.close c))))
+      (a/shutdown-executor))))
 
 (def random (Random.))
 
@@ -432,6 +449,7 @@
         kv?      (s/starts-with? base-nf "kv")
         dl?      (s/starts-with? base-nf "dl")
         sql?     (s/starts-with? base-nf "sql")
+        _        (ensure-native-wal-sync-path! nf wal? kv? dl?)
         kvdb     (when kv?
                    (doto (d/open-kv dir
                                     (cond-> {:mapsize 60000
@@ -519,7 +537,8 @@
     (max-write-bench 1 tx-fn add-fn false)
     (when kvdb (d/close-kv kvdb))
     (when conn (d/close conn))
-    (when sql-conn (.close sql-conn))))
+    (when sql-conn (.close sql-conn))
+    (a/shutdown-executor)))
 
 (defn dl-init
   [{:keys [dir]}]

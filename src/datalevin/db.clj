@@ -1773,6 +1773,8 @@
         :else
         (vld/validate-tx-entity-type entity)))))
 
+(declare commit-prepared-tx-data!)
+
 (defn- local-transact-tx-data
   ([initial-report initial-es tx-time]
    (local-transact-tx-data initial-report initial-es tx-time false))
@@ -1794,11 +1796,18 @@
                   (seq (:new-attributes ptx))
                   (assoc :new-attributes (:new-attributes ptx))))
               (execute-tx-loop initial-report initial-es tx-time))
-         pstore (.-store ^DB (:db-after rp))]
+         db-after ^DB (:db-after rp)]
      (when-not simulated?
-       (load-datoms pstore (:tx-data rp))
-       (invalidate-cache pstore (:tx-data rp) (last-modified pstore)))
+       (commit-prepared-tx-data! db-after (:tx-data rp)))
      rp)))
+
+(defn ^:no-doc commit-prepared-tx-data!
+  "Persist already prepared tx-data to the given DB store."
+  [^DB db tx-data]
+  (let [store (.-store db)]
+    (load-datoms store tx-data)
+    (invalidate-cache store tx-data (last-modified store))
+    db))
 
 (defn- remote-tx-result
   [res]

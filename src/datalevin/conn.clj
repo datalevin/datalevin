@@ -25,7 +25,10 @@
    [datalevin.remote DatalogStore]
    [datalevin.async IAsyncWork]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util.concurrent.atomic AtomicLong]))
+   [java.util.concurrent Executors LinkedBlockingQueue ConcurrentHashMap
+    ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
+    TimeUnit]
+   [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
 (defn conn?
   [conn]
@@ -133,11 +136,41 @@
   [db tx-data]
   (:db-after (with db tx-data)))
 
+(defn- local-direct-transact-eligible?
+  [conn]
+  (let [store (.-store ^DB @conn)]
+    (and (instance? Store store)
+         (let [lmdb (.-lmdb ^Store store)]
+           ;; In WAL mode, route through with-transaction-kv so transaction
+           ;; boundaries are explicitly anchored to LMDB write transactions.
+           (and (not (true? (:wal? (i/env-opts lmdb))))
+                (not (l/writing? lmdb)))))))
+
+(defn- direct-local-transact!
+  [conn tx-data tx-meta]
+  (locking conn
+    (let [db    ^DB (deref conn)
+          store (.-store db)
+          old   (db/cache-disabled? store)]
+      (db/disable-cache store)
+      (try
+        (let [report (u/repeat-try-catch
+                       c/+in-tx-overflow-times+
+                       l/resized?
+                       (with db tx-data tx-meta))]
+          (reset! conn (:db-after report))
+          (assoc report :db-after @conn))
+        (finally
+          (when-not old
+            (db/enable-cache (.-store ^DB @conn))))))))
+
 (defn- -transact! [conn tx-data tx-meta]
-  (let [report (with-transaction [c conn]
-                 (assert (conn? c))
-                 (with @c tx-data tx-meta))]
-    (assoc report :db-after @conn)))
+  (if (local-direct-transact-eligible? conn)
+    (direct-local-transact! conn tx-data tx-meta)
+    (let [report (with-transaction [c conn]
+                   (assert (conn? c))
+                   (with @c tx-data tx-meta))]
+      (assoc report :db-after @conn))))
 
 (defn- notify-listeners!
   [conn report]
@@ -329,6 +362,7 @@
      (schema conn))))
 
 (defonce ^:private connections (atom {}))
+(defonce ^:private transact-async-executor-atom (atom nil))
 
 (defn- add-conn [dir conn] (swap! connections assoc dir conn))
 
@@ -337,6 +371,39 @@
   (let [conn (create-conn dir schema opts)]
     (add-conn dir conn)
     conn))
+
+(defn- new-transact-async-executor
+  []
+  (let [threads (.availableProcessors (Runtime/getRuntime))
+        workers (ThreadPoolExecutor.
+                  threads threads 0 TimeUnit/MILLISECONDS
+                  (ArrayBlockingQueue. (* 4 threads))
+                  (ThreadPoolExecutor$CallerRunsPolicy.))
+        executor (a/->AsyncExecutor (Executors/newSingleThreadExecutor)
+                                    workers
+                                    (LinkedBlockingQueue.)
+                                    (ConcurrentHashMap.)
+                                    (AtomicBoolean. false))]
+    (a/start executor)
+    executor))
+
+(defn- get-transact-async-executor
+  []
+  (locking transact-async-executor-atom
+    (let [executor @transact-async-executor-atom]
+      (if (and executor (a/running? executor))
+        executor
+        (let [executor (new-transact-async-executor)]
+          (reset! transact-async-executor-atom executor)
+          executor)))))
+
+(defn ^:no-doc shutdown-transact-async-executor!
+  []
+  (locking transact-async-executor-atom
+    (when-let [executor @transact-async-executor-atom]
+      (a/stop executor)
+      (reset! transact-async-executor-atom nil)))
+  nil)
 
 (defn get-conn
   ([dir]
@@ -378,6 +445,7 @@
        (finally (close conn#)))))
 
 (declare dl-tx-combine
+         transact!
          sync-queued-dl-tx-combine
          run-sync-queued-dl-batch!)
 
@@ -390,10 +458,11 @@
 (deftype ^:no-doc SyncQueuedReq [tx-data tx-meta result-promise])
 (deftype ^:no-doc SyncQueuedResult [report error])
 
-(deftype ^:no-doc AsyncDLTx [conn store tx-data tx-meta cb]
+(deftype ^:no-doc AsyncDLTx [conn tx-data tx-meta cb]
   IAsyncWork
   (work-key [_] (->> (.-store ^DB @conn) i/db-name dl-work-key))
-  (do-work [_] (run-transact-now! conn tx-data tx-meta))
+  ;; Async transact stays at the API layer and delegates execution to transact!.
+  (do-work [_] (transact! conn tx-data tx-meta))
   (combine [_] dl-tx-combine)
   (callback [_] cb))
 
@@ -410,7 +479,6 @@
     (if (nil? (next coll))
       fw
       (->AsyncDLTx (.-conn fw)
-                   (.-store fw)
                    (into [] (comp (map #(.-tx-data ^AsyncDLTx %)) cat) coll)
                    (.-tx-meta fw)
                    (.-cb fw)))))
@@ -439,6 +507,29 @@
   ;; db-after to the final shared connection snapshot.
   (assoc report :db-after db-after))
 
+(defn- prepare-sync-queued-batch-reports!
+  [conn ^FastList requests ^objects reports]
+  (let [n (alength ^objects reports)]
+    (loop [i 0
+           db ^DB @conn]
+      (when (< i n)
+        (let [^SyncQueuedReq req (.get requests i)
+              ^TxReport report (with db
+                                 (.-tx-data req)
+                                 (.-tx-meta req)
+                                 true)]
+          (aset reports i report)
+          (recur (inc i) (:db-after report)))))))
+
+(defn- commit-sync-queued-batch-reports!
+  [conn ^objects reports]
+  (let [n (alength ^objects reports)]
+    (with-transaction [c conn]
+      (assert (conn? c))
+      (dotimes [i n]
+        (let [^TxReport report (aget reports i)]
+          (db/commit-prepared-tx-data! @c (:tx-data report)))))))
+
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]
   (let [n (int (.size requests))]
@@ -446,29 +537,24 @@
       (if (= n 1)
         (let [^SyncQueuedReq req (.get requests 0)]
           (try
-            (let [report-v (volatile! nil)]
-              (binding [*sync-queue-worker?* true]
-                (with-transaction [c conn]
-                  (assert (conn? c))
-                  (let [^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
-                    (reset! c (:db-after report))
-                    (vreset! report-v report))))
-              (deliver-sync-queued-success!
-                req
-                (finalize-sync-queued-report ^TxReport @report-v @conn)))
+            (binding [*sync-queue-worker?* true]
+              (let [^TxReport report (-transact! conn
+                                                 (.-tx-data req)
+                                                 (.-tx-meta req))]
+                (deliver-sync-queued-success!
+                  req
+                  (finalize-sync-queued-report report @conn))))
             (catch Throwable e
               (deliver-sync-queued-error! req e)))
           nil)
-        (let [reports (object-array n)]
+        ;; Batch queued strict requests in a single write txn for throughput.
+        (let [^objects reports (object-array n)]
           (try
             (binding [*sync-queue-worker?* true]
-              (with-transaction [c conn]
-                (assert (conn? c))
-                (dotimes [i n]
-                  (let [^SyncQueuedReq req (.get requests i)
-                        ^TxReport report (with @c (.-tx-data req) (.-tx-meta req))]
-                    (reset! c (:db-after report))
-                    (aset reports i report)))))
+              ;; Prepare reports first (no write txn open), then persist all
+              ;; prepared tx-data in one explicit write txn.
+              (prepare-sync-queued-batch-reports! conn requests reports)
+              (commit-sync-queued-batch-reports! conn reports))
             (let [db-after @conn]
               (dotimes [i n]
                 (deliver-sync-queued-success!
@@ -508,12 +594,8 @@
   ([conn tx-data] (transact-async conn tx-data nil))
   ([conn tx-data tx-meta] (transact-async conn tx-data tx-meta nil))
   ([conn tx-data tx-meta callback]
-   (a/exec (a/get-executor)
-           (let [store (.-store ^DB @conn)]
-             (if (instance? DatalogStore store)
-               (->AsyncDLTx conn store tx-data tx-meta callback)
-               (let [lmdb (.-lmdb ^Store store)]
-                 (->AsyncDLTx conn lmdb tx-data tx-meta callback)))))))
+   (a/exec (get-transact-async-executor)
+           (->AsyncDLTx conn tx-data tx-meta callback))))
 
 (defn transact
   ([conn tx-data] (transact conn tx-data nil))

@@ -19,6 +19,8 @@
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]])
   (:import
+   [java.util.concurrent Callable ExecutorService ExecutionException Executors
+    Future TimeUnit]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (declare txlog-retention-state-map
@@ -501,17 +503,17 @@
         (fn [{:keys [start-min end-min]}]
           (let [start-min (long start-min)
                 end-min (long end-min)]
-          (cond
-            (= start-min end-min)
-            true
+            (cond
+              (= start-min end-min)
+              true
 
-            (< start-min end-min)
-            (and (<= start-min minute)
-                 (< minute end-min))
+              (< start-min end-min)
+              (and (<= start-min minute)
+                   (< minute end-min))
 
-            :else
-            (or (<= start-min minute)
-                (< minute end-min)))))
+              :else
+              (or (<= start-min minute)
+                  (< minute end-min)))))
         windows)))))
 
 (defn- snapshot-scheduler-contention-state
@@ -522,8 +524,8 @@
           recent-sample? (fn [sample-at]
                            (and (number? sample-at)
                                 (<= (long (max 0
-                                              (- (long now-ms)
-                                                 (long sample-at))))
+                                               (- (long now-ms)
+                                                  (long sample-at))))
                                     sample-age-ms)))
           commit-wait-ms (when (recent-sample?
                                 (:last-commit-wait-at-ms sync-state))
@@ -767,7 +769,7 @@
 
 (defn- ensure-txlog-nosync-flag!
   [lmdb info-v]
-  (let [info  @info-v
+  (let [info @info-v
         flags (or (i/get-env-flags lmdb) #{})]
     (when (and (txlog/enabled? info)
                (not (contains? flags :nosync))
@@ -1045,9 +1047,9 @@
                     (if-let [defer (snapshot-scheduler-defer-reason
                                     lmdb trigger now-ms)]
                       (let [min-backoff-ms (long
-                                             (snapshot-defer-backoff-min-ms lmdb))
+                                            (snapshot-defer-backoff-min-ms lmdb))
                             max-backoff-ms (long
-                                             (snapshot-defer-backoff-max-ms lmdb))
+                                            (snapshot-defer-backoff-max-ms lmdb))
                             m (vswap! info-v
                                       (fn [m]
                                         (let [reason (:reason defer)
@@ -1354,27 +1356,27 @@
   [lmdb]
   (let [db-dir (i/env-dir lmdb)
         prefix (str db-dir u/+separator+)
-        init   {:vec-checkpoint-count 0
-                :vec-checkpoint-duration-ms 0
-                :vec-checkpoint-bytes 0
-                :vec-checkpoint-failure-count 0
-                :vec-replay-lag-lsn 0
-                :vec-checkpoint-domains {}}]
+        init {:vec-checkpoint-count 0
+              :vec-checkpoint-duration-ms 0
+              :vec-checkpoint-bytes 0
+              :vec-checkpoint-failure-count 0
+              :vec-replay-lag-lsn 0
+              :vec-checkpoint-domains {}}]
     (reduce-kv
      (fn [acc fname vec-index]
        (if (and (string? fname) (str/starts-with? fname prefix))
          (let [index-info (try
                             (i/vecs-info vec-index)
                             (catch Throwable _ nil))
-               cp-state   (if (map? (:checkpoint index-info))
-                            (:checkpoint index-info)
-                            {})
-               count      (nonneg-long (:vec-checkpoint-count cp-state))
-               duration   (nonneg-long (:vec-checkpoint-duration-ms cp-state))
-               bytes      (nonneg-long (:vec-checkpoint-bytes cp-state))
-               failures   (nonneg-long (:vec-checkpoint-failure-count cp-state))
+               cp-state (if (map? (:checkpoint index-info))
+                          (:checkpoint index-info)
+                          {})
+               count (nonneg-long (:vec-checkpoint-count cp-state))
+               duration (nonneg-long (:vec-checkpoint-duration-ms cp-state))
+               bytes (nonneg-long (:vec-checkpoint-bytes cp-state))
+               failures (nonneg-long (:vec-checkpoint-failure-count cp-state))
                replay-lag (nonneg-long (:vec-replay-lag-lsn cp-state))
-               domain     (txlog-vector-domain db-dir fname index-info)]
+               domain (txlog-vector-domain db-dir fname index-info)]
            (-> acc
                (update :vec-checkpoint-count + count)
                (update :vec-checkpoint-duration-ms + duration)
@@ -1473,6 +1475,7 @@
      (:vec-checkpoint-failure-count vec-summary)
      :vec-replay-lag-lsn (:vec-replay-lag-lsn vec-summary)
      :vec-checkpoint-domains (:vec-checkpoint-domains vec-summary)
+     :lmdb-overlap? (boolean (:lmdb-overlap? state))
      :sync-manager sync-state
      :commit-marker marker-state
      :commit-marker? (boolean (:commit-marker? state))
@@ -1537,6 +1540,49 @@
            :marker-state marker-state
            :from-lsn (long (:applied-lsn recovery)))))
 
+(defn- txlog-lmdb-overlap-enabled?
+  [info]
+  (if (contains? info :wal-lmdb-overlap?)
+    (boolean (:wal-lmdb-overlap? info))
+    (boolean c/*wal-lmdb-overlap?*)))
+
+(defn- txlog-lmdb-overlap-eligible?
+  [lmdb state]
+  ;; Overlap requires that the caller is not already holding LMDB write monitor;
+  ;; otherwise overlap worker and caller can deadlock on lock inversion.
+  (let [write-lock (l/write-txn lmdb)]
+    (and (:lmdb-overlap? state)
+         (not (and write-lock
+                   (Thread/holdsLock write-lock))))))
+
+(defn- new-lmdb-overlap-executor
+  []
+  (Executors/newSingleThreadExecutor))
+
+(defn- shutdown-lmdb-overlap-executor!
+  [state]
+  (when-let [^ExecutorService executor (:lmdb-overlap-executor state)]
+    (try
+      (.shutdownNow executor)
+      (.awaitTermination executor 100 TimeUnit/MILLISECONDS)
+      (catch Exception _))))
+
+(defn- txlog-write-serialize-lock
+  [state]
+  (or (:lmdb-write-serialize-lock state)
+      state))
+
+(defn- with-txlog-write-serialization
+  [state f]
+  (locking (txlog-write-serialize-lock state)
+    (f)))
+
+(defn- with-lmdb-txlog-write-serialization
+  [lmdb f]
+  (if-let [state (txlog/state lmdb)]
+    (with-txlog-write-serialization state f)
+    (f)))
+
 (defn init-txlog-state!
   ([lmdb]
    (when-let [info-v (i/kv-info lmdb)]
@@ -1547,7 +1593,13 @@
      (when (txlog/enabled? info)
        (let [marker (read-commit-marker-state lmdb)
              {:keys [dir state]}
-             (txlog/init-runtime-state info marker)]
+             (txlog/init-runtime-state info marker)
+             overlap? (txlog-lmdb-overlap-enabled? info)
+             state (cond-> (assoc state
+                                  :lmdb-write-serialize-lock (Object.)
+                                  :lmdb-overlap? overlap?)
+                     overlap? (assoc :lmdb-overlap-executor
+                                     (new-lmdb-overlap-executor)))]
          (vswap! info-v assoc
                  :wal-dir dir
                  :txlog-state state
@@ -1563,14 +1615,15 @@
     (when (some? info-v)
       (when-let [state (:txlog-state @info-v)]
         (stop-snapshot-scheduler! info-v)
+        (shutdown-lmdb-overlap-executor! state)
         (let [append-lock (or (:append-lock state) state)
-              ch          (locking append-lock
-                            (when-let [segment-channel-v
-                                       (:segment-channel state)]
-                              (let [ch @segment-channel-v]
-                                (when ch
-                                  (vreset! segment-channel-v nil))
-                                ch)))]
+              ch (locking append-lock
+                   (when-let [segment-channel-v
+                              (:segment-channel state)]
+                     (let [ch @segment-channel-v]
+                       (when ch
+                         (vreset! segment-channel-v nil))
+                       ch)))]
           (when ch
             (try
               (.close ^java.io.Closeable ch)
@@ -1607,7 +1660,10 @@
                 :txlog-last-lmdb-sync-ms
                 :txlog-last-lmdb-sync-error
                 :txlog-lmdb-sync-count
-                :snapshot-scheduler-last-error)))))
+                :snapshot-scheduler-last-error
+                :lmdb-overlap-executor
+                :lmdb-overlap?
+                :lmdb-write-serialize-lock)))))
 
 (def ^:private txlog-recovery-reopen-opt-keys
   [:mapsize :max-readers :flags :max-dbs :temp? :key-compress :val-compress
@@ -1619,6 +1675,7 @@
    :wal-commit-marker?
    :wal-commit-marker-version
    :wal-sync-mode
+   :wal-lmdb-overlap?
    :wal-group-commit
    :wal-group-commit-ms
    :wal-meta-flush-max-txs
@@ -1844,7 +1901,9 @@
           :marker-revision (long @(:marker-revision state))}
          append-res
          (:rows record))]
-    (i/transact-kv lmdb rows)
+    (with-lmdb-txlog-write-serialization
+      lmdb
+      #(i/transact-kv lmdb rows))
     (txlog/commit-finished! state marker-entry)
     record))
 
@@ -2015,12 +2074,12 @@
 
 (defn- txlog-retention-backpressure-state
   [lmdb state]
-  (let [check-v  (:retention-backpressure-last-check-ms state)
+  (let [check-v (:retention-backpressure-last-check-ms state)
         cached-v (:retention-backpressure-state state)
         blocked-v (:retention-backpressure-blocked-since-ms state)
         total-bytes-v (:retention-total-bytes state)
-        now-ms   (System/currentTimeMillis)
-        info     (or (i/env-opts lmdb) {})
+        now-ms (System/currentTimeMillis)
+        info (or (i/env-opts lmdb) {})
         retention-bytes (long (or (:wal-retention-bytes info)
                                   c/*wal-retention-bytes*))
         total-bytes (when (some? total-bytes-v) (long @total-bytes-v))
@@ -2034,14 +2093,14 @@
         interval-ms (long (if tighten?
                             txlog-retention-backpressure-check-interval-ms
                             txlog-retention-backpressure-idle-check-interval-ms))
-        cached?  (and (some? check-v)
-                      (some? cached-v)
-                      (< (- now-ms (long @check-v))
-                         interval-ms))]
+        cached? (and (some? check-v)
+                     (some? cached-v)
+                     (< (- now-ms (long @check-v))
+                        interval-ms))]
     (if cached?
       cached-report
       (let [state-map (txlog-retention-state-map lmdb nil false)
-            pressure  (:pressure state-map)
+            pressure (:pressure state-map)
             floor-limiters (vec (:floor-limiters state-map))
             degraded-now? (true? (:degraded? pressure))
             pin-limited? (boolean (some txlog-retention-pin-floor-limiters
@@ -2068,20 +2127,20 @@
                         (and blocked-for-ms
                              (>= ^long blocked-for-ms ^long threshold-ms))
                         degraded-now?)
-            report    (when (map? state-map)
-                        {:degraded?                 degraded?
-                         :degraded-now?             degraded-now?
-                         :pin-limited?              pin-limited?
-                         :pin-backpressure-threshold-ms
-                         (when pin-limited? threshold-ms)
-                         :pin-blocked-since-ms      blocked-since-ms
-                         :pin-blocked-for-ms        blocked-for-ms
-                         :pressure                  pressure
-                         :required-retained-floor-lsn
-                         (:required-retained-floor-lsn state-map)
-                         :gc-safety-watermark-lsn
-                         (:gc-safety-watermark-lsn state-map)
-                         :floor-limiters            floor-limiters})]
+            report (when (map? state-map)
+                     {:degraded? degraded?
+                      :degraded-now? degraded-now?
+                      :pin-limited? pin-limited?
+                      :pin-backpressure-threshold-ms
+                      (when pin-limited? threshold-ms)
+                      :pin-blocked-since-ms blocked-since-ms
+                      :pin-blocked-for-ms blocked-for-ms
+                      :pressure pressure
+                      :required-retained-floor-lsn
+                      (:required-retained-floor-lsn state-map)
+                      :gc-safety-watermark-lsn
+                      (:gc-safety-watermark-lsn state-map)
+                      :floor-limiters floor-limiters})]
         (when (some? check-v)
           (vreset! check-v now-ms))
         (when (some? cached-v)
@@ -2101,80 +2160,187 @@
   [lmdb state rows]
   (try
     (u/repeat-try-catch
-        c/+in-tx-overflow-times+
-        l/resized?
-      (i/transact-kv lmdb rows))
+     c/+in-tx-overflow-times+
+     l/resized?
+     (i/transact-kv lmdb rows))
     (catch Exception e
       (txlog-mark-fatal! state e)
       (throw e))))
+
+(defn- future-get!
+  [^Future f]
+  (try
+    (.get f)
+    (catch ExecutionException e
+      (throw (or (.getCause e) e)))
+    (catch InterruptedException e
+      (.interrupt (Thread/currentThread))
+      (throw e))))
+
+(defn- start-lmdb-overlap-apply!
+  [lmdb state lmdb-base-rows]
+  (let [^ExecutorService executor (:lmdb-overlap-executor state)]
+    (when-not executor
+      (raise "LMDB overlap executor is not available"
+             {:type :txlog/lmdb-overlap-unavailable}))
+    (let [staged (promise)
+          decision (promise)
+          future (.submit
+                  executor
+                  ^Callable
+                  (fn []
+                    (locking (l/write-txn lmdb)
+                      (let [opened? (volatile! false)]
+                        (try
+                          (i/open-transact-kv lmdb)
+                          (vreset! opened? true)
+                          (u/repeat-try-catch
+                           c/+in-tx-overflow-times+
+                           l/resized?
+                           (i/transact-kv lmdb lmdb-base-rows))
+                          (deliver staged {:ok? true})
+                          (let [{:keys [action marker-row]} @decision]
+                            (case action
+                              :commit
+                              (do
+                                (when marker-row
+                                  (u/repeat-try-catch
+                                   c/+in-tx-overflow-times+
+                                   l/resized?
+                                   (i/transact-kv lmdb (doto (FastList. 1)
+                                                         (.add marker-row)))))
+                                (i/close-transact-kv lmdb))
+
+                              :abort
+                              (do
+                                (i/abort-transact-kv lmdb)
+                                (i/close-transact-kv lmdb))
+
+                              (raise "Invalid LMDB overlap action"
+                                     {:type :txlog/lmdb-overlap-invalid-action
+                                      :action action})))
+                          :done
+                          (catch Exception e
+                            (when-not (realized? staged)
+                              (deliver staged {:ok? false :error e}))
+                            (when @opened?
+                              (try
+                                (i/abort-transact-kv lmdb)
+                                (catch Exception _))
+                              (try
+                                (i/close-transact-kv lmdb)
+                                (catch Exception _)))
+                            (throw e)))))))]
+      {:staged staged
+       :decision decision
+       :future future})))
+
+(defn- complete-lmdb-overlap-apply!
+  [job action marker-row]
+  (deliver (:decision job) {:action action :marker-row marker-row})
+  (future-get! ^Future (:future job)))
+
+(defn- transact-with-txlog-overlap!
+  [lmdb state tx-data]
+  (let [job (start-lmdb-overlap-apply! lmdb state tx-data)
+        decision-sent? (volatile! false)]
+    (try
+      (let [append-res (txlog/append-durable!
+                        state tx-data txlog-append-hooks)
+            {:keys [ok? error]} @(:staged job)]
+        (when-not ok?
+          (throw error))
+        (let [marker-entry (txlog/next-commit-marker-entry
+                            (txlog-commit-state state)
+                            append-res)]
+          (vreset! decision-sent? true)
+          (complete-lmdb-overlap-apply! job :commit (:row marker-entry))
+          (txlog/commit-finished! state marker-entry)
+          (when (:synced? append-res)
+            (txlog/maybe-publish-meta-best-effort! state append-res))
+          :transacted))
+      (catch Exception e
+        (when-not @decision-sent?
+          (try
+            (vreset! decision-sent? true)
+            (complete-lmdb-overlap-apply! job :abort nil)
+            (catch Exception _)))
+        (txlog-mark-fatal! state e)
+        (throw e)))))
 
 (defn- transact-with-txlog!
   [lmdb state dbi-name txs k-type v-type]
   (let [tx-data (canonicalize-input-kvtxs dbi-name txs k-type v-type)]
     (if (pos? (.size ^java.util.List tx-data))
-      (if (write-txn-open? lmdb)
-        (let [res (i/transact-kv lmdb tx-data)]
-          (txlog-add-pending! (i/kv-info lmdb) tx-data)
-          res)
-        (let [append-res (txlog/append-durable!
-                          state tx-data txlog-append-hooks)
-              lmdb-base-rows (or (:lmdb-rows append-res) tx-data)
-              marker-entry (txlog/next-commit-marker-entry
-                            (txlog-commit-state state)
-                            append-res)
-              rows (if marker-entry
-                     (doto (ensure-fast-list lmdb-base-rows)
-                       (.add (:row marker-entry)))
-                     lmdb-base-rows)]
-          (try
-            (apply-lmdb-after-txlog-append! lmdb state rows)
-            (txlog/commit-finished! state marker-entry)
-            (when (:synced? append-res)
-              (txlog/maybe-publish-meta-best-effort! state append-res))
-            :transacted
-            (catch Exception e
-              (txlog-mark-fatal! state e)
-              (throw e)))))
+      (with-txlog-write-serialization
+        state
+        #(if (write-txn-open? lmdb)
+           (let [res (i/transact-kv lmdb tx-data)]
+             (txlog-add-pending! (i/kv-info lmdb) tx-data)
+             res)
+           (if (txlog-lmdb-overlap-eligible? lmdb state)
+             (transact-with-txlog-overlap! lmdb state tx-data)
+             (let [append-res (txlog/append-durable!
+                               state tx-data txlog-append-hooks)
+                   lmdb-base-rows (or (:lmdb-rows append-res) tx-data)
+                   marker-entry (txlog/next-commit-marker-entry
+                                 (txlog-commit-state state)
+                                 append-res)
+                   rows (if marker-entry
+                          (doto (ensure-fast-list lmdb-base-rows)
+                            (.add (:row marker-entry)))
+                          lmdb-base-rows)]
+               (try
+                 (apply-lmdb-after-txlog-append! lmdb state rows)
+                 (txlog/commit-finished! state marker-entry)
+                 (when (:synced? append-res)
+                   (txlog/maybe-publish-meta-best-effort! state append-res))
+                 :transacted
+                 (catch Exception e
+                   (txlog-mark-fatal! state e)
+                   (throw e)))))))
       (i/transact-kv lmdb dbi-name txs k-type v-type))))
 
 (defn- close-with-txlog!
   [lmdb state]
-  (let [info-v (i/kv-info lmdb)]
-    (if (write-txn-open? lmdb)
-      (let [pending (txlog-pending-rows info-v)]
-        (try
-          (if (pos? (.size ^java.util.List pending))
-            (let [append-res (txlog/append-durable!
-                              state pending txlog-append-hooks)
-                  marker-entry (txlog/next-commit-marker-entry
-                                (txlog-commit-state state)
-                                append-res)
-                  commit-rows (when marker-entry
-                                (doto (FastList. 1)
-                                  (.add (:row marker-entry))))]
-              (try
-                (when commit-rows
-                  (apply-lmdb-after-txlog-append! lmdb state commit-rows))
-                (let [status (i/close-transact-kv lmdb)]
-                  (when (= status :committed)
-                    (txlog/commit-finished! state marker-entry)
-                    (when (:synced? append-res)
-                      (txlog/maybe-publish-meta-best-effort! state append-res)))
-                  (when-not (write-txn-open? lmdb)
-                    (txlog-reset-pending! info-v))
-                  status)
-                (catch Exception e
-                  (txlog-mark-fatal! state e)
-                  (throw e))))
-            (let [status (i/close-transact-kv lmdb)]
-              (when-not (write-txn-open? lmdb)
-                (txlog-reset-pending! info-v))
-              status))
-          (catch Exception e
-            (when-not (write-txn-open? lmdb)
-              (txlog-reset-pending! info-v))
-            (throw e))))
-      (i/close-transact-kv lmdb))))
+  (with-txlog-write-serialization
+    state
+    #(let [info-v (i/kv-info lmdb)]
+       (if (write-txn-open? lmdb)
+         (let [pending (txlog-pending-rows info-v)]
+           (try
+             (if (pos? (.size ^java.util.List pending))
+               (let [append-res (txlog/append-durable!
+                                 state pending txlog-append-hooks)
+                     marker-entry (txlog/next-commit-marker-entry
+                                   (txlog-commit-state state)
+                                   append-res)
+                     commit-rows (when marker-entry
+                                   (doto (FastList. 1)
+                                     (.add (:row marker-entry))))]
+                 (try
+                   (when commit-rows
+                     (apply-lmdb-after-txlog-append! lmdb state commit-rows))
+                   (let [status (i/close-transact-kv lmdb)]
+                     (when (= status :committed)
+                       (txlog/commit-finished! state marker-entry)
+                       (when (:synced? append-res)
+                         (txlog/maybe-publish-meta-best-effort! state append-res)))
+                     (when-not (write-txn-open? lmdb)
+                       (txlog-reset-pending! info-v))
+                     status)
+                   (catch Exception e
+                     (txlog-mark-fatal! state e)
+                     (throw e))))
+               (let [status (i/close-transact-kv lmdb)]
+                 (when-not (write-txn-open? lmdb)
+                   (txlog-reset-pending! info-v))
+                 status))
+             (catch Exception e
+               (when-not (write-txn-open? lmdb)
+                 (txlog-reset-pending! info-v))
+               (throw e))))
+         (i/close-transact-kv lmdb)))))
 
 (defn- maybe-domain-name
   [x]
@@ -2274,9 +2440,11 @@
 
 (defn- write-kv-info-map!
   [lmdb k m]
-  (if (seq m)
-    (i/transact-kv lmdb c/kv-info [[:put k m]] :keyword :data)
-    (i/transact-kv lmdb c/kv-info [[:del k]] :keyword :data))
+  (with-lmdb-txlog-write-serialization
+    lmdb
+    #(if (seq m)
+       (i/transact-kv lmdb c/kv-info [[:put k m]] :keyword :data)
+       (i/transact-kv lmdb c/kv-info [[:del k]] :keyword :data)))
   m)
 
 (defn txlog-update-snapshot-floor-state!
@@ -2288,7 +2456,9 @@
              (kv-info-value lmdb c/wal-snapshot-previous-lsn)
              c/wal-snapshot-current-lsn
              c/wal-snapshot-previous-lsn)]
-    (i/transact-kv lmdb c/kv-info (:txs res) :keyword :data)
+    (with-lmdb-txlog-write-serialization
+      lmdb
+      #(i/transact-kv lmdb c/kv-info (:txs res) :keyword :data))
     (dissoc res :txs)))
 
 (defn txlog-clear-snapshot-floor-state!
@@ -2298,7 +2468,9 @@
              (kv-info-value lmdb c/wal-snapshot-previous-lsn)
              c/wal-snapshot-current-lsn
              c/wal-snapshot-previous-lsn)]
-    (i/transact-kv lmdb c/kv-info (:txs res) :keyword :data)
+    (with-lmdb-txlog-write-serialization
+      lmdb
+      #(i/transact-kv lmdb c/kv-info (:txs res) :keyword :data))
     (dissoc res :txs)))
 
 (defn txlog-update-replica-floor-state!
@@ -2365,11 +2537,11 @@
 (defn- txlog-record-entry
   [segment-id path record]
   (let [payload (txlog-record-payload record)
-        lsn     (long (or (:lsn payload) 0))
+        lsn (long (or (:lsn payload) 0))
         tx-time (long (or (:tx-time payload)
                           (:ts payload)
                           0))
-        rows    (vec (or (:ops payload) []))
+        rows (vec (or (:ops payload) []))
         tx-kind (txlog/classify-record-kind rows)]
     {:lsn lsn
      :tx-kind tx-kind
@@ -2385,7 +2557,7 @@
   (let [{:keys [id file]} segment
         segment-id (long id)
         path (.getPath ^java.io.File file)
-        acc  (FastList.)]
+        acc (FastList.)]
     (txlog/scan-segment
      path
      {:allow-preallocated-tail? true
@@ -2452,45 +2624,45 @@
   ([state]
    (txlog-records state nil))
   ([state from-lsn]
-  (let [dir        (:dir state)
-         segments   (vec (txlog/segment-files dir))
-         cache-v    (:txlog-records-cache state)
-         _          (prune-txlog-records-cache! cache-v segments)
-         from       (long (max 0 (long (or from-lsn 0))))
+   (let [dir (:dir state)
+         segments (vec (txlog/segment-files dir))
+         cache-v (:txlog-records-cache state)
+         _ (prune-txlog-records-cache! cache-v segments)
+         from (long (max 0 (long (or from-lsn 0))))
          tail-scan? (pos? from)
-         records    (if tail-scan?
-                      (loop [remaining  (seq (rseq segments))
-                             collected  '()]
-                        (if-let [segment (first remaining)]
-                          (let [{:keys [records min-lsn]}
-                                (txlog-segment-records-entry segment cache-v)
-                                collected'      (if (seq records)
-                                                  (cons records collected)
-                                                  collected)]
-                            (if (and (some? min-lsn)
-                                     (<= (long min-lsn) from))
-                              (->> collected' (mapcat identity) vec)
-                              (recur (next remaining) collected')))
-                          (->> collected (mapcat identity) vec)))
-                      (->> segments
-                           (mapcat #(-> (txlog-segment-records-entry
-                                         %
-                                         cache-v)
-                                        :records))
-                           vec))]
-    (loop [prev nil
-           [record & more] records]
-      (when record
-        (let [lsn (:lsn record)]
-          (when (or (not (pos? ^long lsn))
-                    (and prev (not= lsn (inc ^long prev))))
-            (raise "Txn-log sequence is invalid"
-                   {:type :txlog/corrupt
-                    :previous-lsn prev
-                    :lsn lsn
-                    :record record}))
-          (recur lsn more))))
-    records)))
+         records (if tail-scan?
+                   (loop [remaining (seq (rseq segments))
+                          collected '()]
+                     (if-let [segment (first remaining)]
+                       (let [{:keys [records min-lsn]}
+                             (txlog-segment-records-entry segment cache-v)
+                             collected' (if (seq records)
+                                          (cons records collected)
+                                          collected)]
+                         (if (and (some? min-lsn)
+                                  (<= (long min-lsn) from))
+                           (->> collected' (mapcat identity) vec)
+                           (recur (next remaining) collected')))
+                       (->> collected (mapcat identity) vec)))
+                   (->> segments
+                        (mapcat #(-> (txlog-segment-records-entry
+                                      %
+                                      cache-v)
+                                     :records))
+                        vec))]
+     (loop [prev nil
+            [record & more] records]
+       (when record
+         (let [lsn (:lsn record)]
+           (when (or (not (pos? ^long lsn))
+                     (and prev (not= lsn (inc ^long prev))))
+             (raise "Txn-log sequence is invalid"
+                    {:type :txlog/corrupt
+                     :previous-lsn prev
+                     :lsn lsn
+                     :record record}))
+           (recur lsn more))))
+     records)))
 
 (defn- local-dir?
   [dir]
@@ -2689,15 +2861,15 @@
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
       (txlog/select-open-records
-        (txlog-records state from-lsn)
-        from-lsn
-        upto-lsn)
+       (txlog-records state from-lsn)
+       from-lsn
+       upto-lsn)
       (if (txlog-config-enabled? db)
         []
         (txlog/select-open-records
-          (txlog-records (txlog/enabled-state db) from-lsn)
-          from-lsn
-          upto-lsn))))
+         (txlog-records (txlog/enabled-state db) from-lsn)
+         from-lsn
+         upto-lsn))))
 
   (force-txlog-sync! [_]
     (cond
@@ -2706,9 +2878,9 @@
 
       (not (txlog-write-path-enabled? db))
       (let [rollout-mode (txlog-rollout-mode db)]
-        {:synced?    false
-         :skipped?   true
-         :reason     :rollback
+        {:synced? false
+         :skipped? true
+         :reason :rollback
          :watermarks (txlog-rollout-watermarks db rollout-mode)})
 
       :else
@@ -2720,7 +2892,7 @@
     (if (txlog-config-enabled? db)
       (do
         (force-lmdb-sync-now! db)
-        {:synced?    true
+        {:synced? true
          :watermarks (if-let [state (txlog/state db)]
                        (txlog-watermarks-map db state)
                        (txlog-rollout-watermarks db
@@ -2732,9 +2904,9 @@
       (create-snapshot-now! db)
       (if (txlog-config-enabled? db)
         (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok?        false
-           :skipped?   true
-           :reason     :rollback
+          {:ok? false
+           :skipped? true
+           :reason :rollback
            :watermarks (txlog-rollout-watermarks db rollout-mode)})
         (txlog/enabled-state db))))
 
@@ -2750,18 +2922,18 @@
              :commit-marker? (boolean (:commit-marker? state))
              :marker-revision (long @(:marker-revision state)))
       {:commit-marker? false
-       :slot-a         nil
-       :slot-b         nil
-       :current        nil}))
+       :slot-a nil
+       :slot-b nil
+       :current nil}))
 
   (verify-commit-marker! [_]
     (if-let [state (txlog/state db)]
       (verify-commit-marker-state db state)
       (if (txlog-config-enabled? db)
         (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok?        false
-           :skipped?   true
-           :reason     :rollback
+          {:ok? false
+           :skipped? true
+           :reason :rollback
            :watermarks (txlog-rollout-watermarks db rollout-mode)})
         (verify-commit-marker-state db (txlog/enabled-state db)))))
 

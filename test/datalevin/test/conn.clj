@@ -228,4 +228,82 @@
       (is (= 32 (count @paths)))
       (is (every? #{:queued-relaxed} @paths))
       (finally
+        (dc/shutdown-transact-async-executor!)
         (d/close conn)))))
+
+(deftest test-strict-transact-async-no-stall
+  (let [n    256
+        conn (d/create-conn nil
+                            {:k {:db/valueType :db.type/long}}
+                            {:wal? true
+                             :wal-durability-profile :strict
+                             :kv-opts {:inmemory? true}})]
+    (try
+      (let [futs    (doall
+                      (for [i (range n)]
+                        (d/transact-async conn [{:db/id i :k i}])))
+            results (doall (map #(deref % 10000 ::timeout) futs))]
+        (is (not-any? #{::timeout} results))
+        (is (= n
+               (d/q '[:find (count ?e) .
+                      :where [?e :k]]
+                    (d/db conn)))))
+      (finally
+        (dc/shutdown-transact-async-executor!)
+        (d/close conn)))))
+
+(defn- wait-until
+  [pred timeout-ms]
+  (let [^long timeout-ms timeout-ms]
+    (loop [elapsed 0]
+      (cond
+        (pred) true
+        (>= ^long elapsed timeout-ms) false
+        :else
+        (do
+          (Thread/sleep 25)
+          (recur (+ elapsed 25)))))))
+
+(defn- transact-async-executor-atom
+  []
+  (some-> (ns-resolve 'datalevin.conn 'transact-async-executor-atom)
+          var-get))
+
+(deftest test-strict-with-transaction-transact-uses-direct-path
+  (let [conn  (d/create-conn nil
+                             {:k {:db/valueType :db.type/long}}
+                             {:wal? true
+                              :wal-durability-profile :strict
+                              :kv-opts {:inmemory? true}})
+        paths (atom [])]
+    (try
+      (binding [dc/*txlog-sync-path-observer*
+                (fn [path] (swap! paths conj path))]
+        (d/with-transaction [cn conn]
+          (dotimes [i 8]
+            (d/transact! cn [{:db/id (- (inc i)) :k i}]))))
+      (is (= 8 (count @paths)))
+      (is (every? #{:direct-no-wal} @paths))
+      (is (= 8
+             (d/q '[:find (count ?e) .
+                    :where [?e :k]]
+                  (d/db conn))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-last-lmdb-close-shuts-down-transact-async-executor
+  (let [dir     (u/tmp-dir (str "strict-async-shutdown-test-" (UUID/randomUUID)))
+        ex-atom (transact-async-executor-atom)
+        conn    (d/create-conn dir
+                               {:k {:db/valueType :db.type/long}}
+                               {:wal? true
+                                :wal-durability-profile :strict})]
+    (try
+      (d/transact! conn [{:db/id -1 :k 1}])
+      @(d/transact-async conn [{:db/id -2 :k 2}])
+      (is (some? @ex-atom))
+      (d/close conn)
+      (is (wait-until #(nil? @ex-atom) 2000))
+      (finally
+        (dc/shutdown-transact-async-executor!)
+        (u/delete-files dir)))))
