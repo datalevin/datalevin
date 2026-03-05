@@ -13,15 +13,21 @@
    [clojure.string :as s]
    [datalevin.client :as cl]
    [datalevin.constants :as c]
+   [datalevin.db :as db]
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.lease :as lease]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.remote :as r]
+   [datalevin.storage :as st]
    [datalevin.util :as u]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
-   [datalevin.interface IStore]
+   [datalevin.interface IStore ILMDB]
+   [java.io File]
+   [java.nio.file Files Paths StandardCopyOption]
+   [java.util UUID]
    [java.util.concurrent TimeUnit]))
 
 (defn consensus-ha-opts
@@ -119,7 +125,8 @@
 (defn- refresh-ha-local-watermarks
   [m]
   (if (local-kv-store m)
-    (let [local-lsn (read-ha-local-last-applied-lsn m)]
+    (let [local-lsn (long (max (long (or (:ha-local-last-applied-lsn m) 0))
+                              (long (read-ha-local-last-applied-lsn m))))]
       (cond-> (assoc m :ha-local-last-applied-lsn local-lsn)
         (= :leader (:ha-role m))
         (assoc :ha-leader-last-applied-lsn local-lsn)))
@@ -157,22 +164,101 @@
                  (<= 1 (long port) 65535))
         {:host host :port (long port)}))))
 
-(defn ^:redef fetch-leader-watermark-lsn
-  [db-name m lease]
-  (let [leader-endpoint (:leader-endpoint lease)
-        authority-lsn   (long (or (:leader-last-applied-lsn lease) 0))]
-    (cond
-      (or (nil? leader-endpoint) (s/blank? leader-endpoint))
-      {:reachable? false
-       :reason :missing-leader-endpoint}
+(defn- ha-endpoint-uri
+  [db-name endpoint]
+  (when-let [{:keys [host port]} (parse-endpoint endpoint)]
+    (str "dtlv://"
+         c/default-username
+         ":"
+         c/default-password
+         "@"
+         host
+         ":"
+         port
+         "/"
+         db-name)))
 
-      (= leader-endpoint (:ha-local-endpoint m))
+(defn- copy-dir-contents!
+  [src-dir dest-dir]
+  (u/create-dirs dest-dir)
+  (doseq [^File f (or (u/list-files src-dir) [])]
+    (let [dst (str dest-dir u/+separator+ (.getName f))]
+      (if (.isDirectory f)
+        (copy-dir-contents! (.getPath f) dst)
+        (u/copy-file (.getPath f) dst)))))
+
+(defn- move-path!
+  [src dst]
+  (let [src-path (Paths/get src (into-array String []))
+        dst-path (Paths/get dst (into-array String []))
+        opts     (into-array java.nio.file.CopyOption
+                             [StandardCopyOption/REPLACE_EXISTING
+                              StandardCopyOption/ATOMIC_MOVE])]
+    (try
+      (Files/move src-path dst-path opts)
+      (catch Exception _
+        (Files/move src-path dst-path
+                    (into-array java.nio.file.CopyOption
+                                [StandardCopyOption/REPLACE_EXISTING]))))))
+
+(defn- close-ha-local-store!
+  [m]
+  (if-let [dt-db (:dt-db m)]
+    (db/close-db dt-db)
+    (when-let [store (:store m)]
+      (cond
+        (instance? IStore store) (i/close store)
+        (instance? ILMDB store)  (i/close-kv store)
+        :else nil))))
+
+(defn- open-ha-store-dbis!
+  [store]
+  (when-let [kv-store (cond
+                        (instance? IStore store)
+                        (try
+                          (.-lmdb store)
+                          (catch Throwable _
+                            nil))
+
+                        (instance? ILMDB store)
+                        store
+
+                        :else nil)]
+    (doseq [dbi-name (or (i/list-dbis kv-store) [])]
+      (let [dbi-opts (try
+                       (i/dbi-opts kv-store dbi-name)
+                       (catch Exception _
+                         nil))]
+        (if (map? dbi-opts)
+          (i/open-dbi kv-store dbi-name dbi-opts)
+          (i/open-dbi kv-store dbi-name)))))
+  store)
+
+(defn- ha-snapshot-open-opts
+  [m db-name db-identity]
+  (let [store (:store m)
+        base-opts (if (instance? IStore store)
+                    (i/opts store)
+                    {})]
+    (assoc (or base-opts {})
+           :db-name db-name
+           :db-identity db-identity)))
+
+(defn ^:redef fetch-ha-endpoint-watermark-lsn
+  [db-name m endpoint]
+  (let [local-endpoint (:ha-local-endpoint m)]
+    (cond
+      (or (nil? endpoint) (s/blank? endpoint))
+      {:reachable? false
+       :reason :missing-endpoint}
+
+      (= endpoint local-endpoint)
       {:reachable? true
        :last-applied-lsn (ha-local-last-applied-lsn m)
        :source :local}
 
       :else
-      (if-let [{:keys [host port]} (parse-endpoint leader-endpoint)]
+      (if-let [{:keys [host port]} (parse-endpoint endpoint)]
         (let [uri (str "dtlv://"
                        c/default-username
                        ":"
@@ -197,17 +283,38 @@
                                    false)]
                   {:reachable? true
                    :last-applied-lsn
-                   (long (or (:last-applied-lsn watermarks) authority-lsn))
+                   (long (or (:last-applied-lsn watermarks) 0))
                    :source :remote})
                 (finally
                   (cl/disconnect client))))
             (catch Exception e
               {:reachable? false
-               :reason :leader-watermark-fetch-failed
+               :reason :endpoint-watermark-fetch-failed
                :message (ex-message e)})))
         {:reachable? false
-         :reason :invalid-leader-endpoint
-         :leader-endpoint leader-endpoint}))))
+         :reason :invalid-endpoint
+         :endpoint endpoint}))))
+
+(defn ^:redef fetch-leader-watermark-lsn
+  [db-name m lease]
+  (let [leader-endpoint (:leader-endpoint lease)
+        authority-lsn   (long (or (:leader-last-applied-lsn lease) 0))
+        result          (fetch-ha-endpoint-watermark-lsn
+                          db-name m leader-endpoint)]
+    (if (:reachable? result)
+      (update result
+              :last-applied-lsn
+              #(long (or % authority-lsn)))
+      (cond-> result
+        (= :missing-endpoint (:reason result))
+        (assoc :reason :missing-leader-endpoint)
+
+        (= :invalid-endpoint (:reason result))
+        (assoc :reason :invalid-leader-endpoint
+               :leader-endpoint leader-endpoint)
+
+        (= :endpoint-watermark-fetch-failed (:reason result))
+        (assoc :reason :leader-watermark-fetch-failed)))))
 
 (def ^:private ha-follower-max-batch-records 256)
 (def ^:private ha-follower-max-sync-backoff-ms 30000)
@@ -265,13 +372,73 @@
          distinct
          vec)))
 
+(defn- ha-gap-fallback-source-endpoints
+  [db-name m lease next-lsn]
+  (let [required-lsn    (long (max 0 (dec (long next-lsn))))
+        local-endpoint  (:ha-local-endpoint m)
+        leader-endpoint (ha-leader-endpoint m lease)
+        followers
+        (->> (:ha-members m)
+             (sort-by :node-id)
+             (keep (fn [{:keys [endpoint node-id]}]
+                     (when (and (string? endpoint)
+                                (not (s/blank? endpoint))
+                                (not= endpoint local-endpoint)
+                                (not= endpoint leader-endpoint))
+                       (let [watermark (fetch-ha-endpoint-watermark-lsn
+                                         db-name m endpoint)
+                             last-lsn  (when (:reachable? watermark)
+                                         (long (or (:last-applied-lsn watermark)
+                                                   0)))
+                             eligible? (and (some? last-lsn)
+                                            (>= last-lsn required-lsn))]
+                         {:endpoint endpoint
+                          :node-id node-id
+                          :last-applied-lsn last-lsn
+                          :eligible? eligible?})))))
+        eligible-followers
+        (sort-by (juxt (comp - :last-applied-lsn) :node-id)
+                 (filter :eligible? followers))
+        unknown-followers
+        (sort-by :node-id (remove :eligible? followers))]
+    (->> (concat (when (and (string? leader-endpoint)
+                            (not (s/blank? leader-endpoint))
+                            (not= leader-endpoint local-endpoint))
+                   [leader-endpoint])
+                 (map :endpoint eligible-followers)
+                 (map :endpoint unknown-followers))
+         distinct
+         vec)))
+
 (declare fetch-ha-leader-txlog-batch)
 (declare assert-contiguous-lsn!)
+
+(defn- ha-source-advertised-last-applied-lsn
+  [db-name m lease source-endpoint]
+  (let [leader-endpoint (ha-leader-endpoint m lease)
+        authority-lsn   (long (or (:leader-last-applied-lsn lease) 0))]
+    (if (= source-endpoint leader-endpoint)
+      (let [watermark  (fetch-ha-endpoint-watermark-lsn
+                         db-name m source-endpoint)
+            remote-lsn (when (:reachable? watermark)
+                         (long (or (:last-applied-lsn watermark) 0)))]
+        {:known? true
+         :last-applied-lsn (long (max authority-lsn (or remote-lsn 0)))
+         :watermark watermark})
+      (let [watermark (fetch-ha-endpoint-watermark-lsn
+                        db-name m source-endpoint)
+            last-lsn  (when (:reachable? watermark)
+                        (long (or (:last-applied-lsn watermark) 0)))]
+        {:known? (some? last-lsn)
+         :last-applied-lsn last-lsn
+         :watermark watermark}))))
 
 (defn- fetch-ha-follower-records-with-gap-fallback
   [db-name m lease next-lsn upto-lsn]
   (let [sources (ha-follower-source-endpoints m lease)]
     (loop [remaining sources
+           source-order sources
+           reordered? false
            gap-errors []]
       (if-let [source-endpoint (first remaining)]
         (let [attempt
@@ -283,11 +450,40 @@
                                          next-lsn
                                          upto-lsn)
                                        []))]
-                  (assert-contiguous-lsn! next-lsn records)
-                  {:ok? true
-                   :value {:source-endpoint source-endpoint
-                           :records records
-                           :source-order sources}})
+                  (if (seq records)
+                    (do
+                      (assert-contiguous-lsn! next-lsn records)
+                      {:ok? true
+                       :value {:source-endpoint source-endpoint
+                               :records records
+                               :source-order source-order}})
+                    (let [{:keys [known? last-applied-lsn]}
+                          (ha-source-advertised-last-applied-lsn
+                           db-name m lease source-endpoint)]
+                      (cond
+                        (and known?
+                             (>= (long (or last-applied-lsn 0))
+                                 (long next-lsn)))
+                        {:ok? false
+                         :gap-error
+                         {:source-endpoint source-endpoint
+                          :message
+                          "Follower txlog replay detected empty source gap"
+                          :data {:error :ha/txlog-gap
+                                 :expected-lsn (long next-lsn)
+                                 :actual-lsn nil
+                                 :source-last-applied-lsn
+                                 (long (or last-applied-lsn 0))}}}
+
+                        reordered?
+                        {:ok? false
+                         :skip? true}
+
+                        :else
+                        {:ok? true
+                         :value {:source-endpoint source-endpoint
+                                 :records records
+                                 :source-order source-order}}))))
                 (catch Exception e
                   (if (ha-follower-gap-error? e)
                     {:ok? false
@@ -295,15 +491,32 @@
                                  :message (ex-message e)
                                  :data (ex-data e)}}
                     (throw e))))]
-          (if (:ok? attempt)
+          (cond
+            (:ok? attempt)
             (:value attempt)
-            (recur (rest remaining)
-                   (conj gap-errors (:gap-error attempt)))))
+
+            (:skip? attempt)
+            (recur (rest remaining) source-order reordered? gap-errors)
+
+            :else
+            (let [remaining' (if reordered?
+                               (rest remaining)
+                               (->> (ha-gap-fallback-source-endpoints
+                                      db-name m lease next-lsn)
+                                    (remove #{source-endpoint})
+                                    vec))
+                  source-order' (if reordered?
+                                  source-order
+                                  (vec (cons source-endpoint remaining')))]
+              (recur remaining'
+                     source-order'
+                     true
+                     (conj gap-errors (:gap-error attempt))))))
         (u/raise "Follower txlog replay gap unresolved across deterministic sources"
                  {:error :ha/txlog-gap-unresolved
                   :expected-lsn next-lsn
                   :upto-lsn upto-lsn
-                  :source-order sources
+                  :source-order source-order
                   :gap-errors gap-errors})))))
 
 (defn ^:redef fetch-ha-leader-txlog-batch
@@ -402,6 +615,283 @@
               :leader-endpoint leader-endpoint
               :applied-lsn applied-lsn})))
 
+(defn ^:redef fetch-ha-endpoint-snapshot-copy!
+  [db-name m endpoint dest-dir]
+  (if-let [uri (ha-endpoint-uri db-name endpoint)]
+    (let [timeout-ms (long (max 1000
+                                (min 60000
+                                     (* 4
+                                        (long (or (:ha-lease-renew-ms m)
+                                                  c/*ha-lease-renew-ms*))))))
+          remote-store (r/open-kv uri {:client-opts {:pool-size 1
+                                                     :time-out timeout-ms}})]
+      (try
+        {:copy-meta (i/copy remote-store dest-dir false)}
+        (finally
+          (i/close-kv remote-store))))
+    (u/raise "Invalid HA endpoint for snapshot copy"
+             {:error :ha/follower-invalid-snapshot-endpoint
+              :db-name db-name
+              :source-endpoint endpoint})))
+
+(defn- validate-ha-snapshot-copy!
+  [db-name m source-endpoint snapshot-dir copy-meta required-lsn]
+  (let [snapshot-db-name     (:db-name copy-meta)
+        snapshot-db-identity (:db-identity copy-meta)
+        snapshot-last-lsn    (:snapshot-last-applied-lsn copy-meta)]
+    (when (not= db-name snapshot-db-name)
+      (u/raise "HA snapshot copy DB name mismatch"
+               {:error :ha/follower-snapshot-db-name-mismatch
+                :db-name db-name
+                :snapshot-db-name snapshot-db-name
+                :source-endpoint source-endpoint}))
+    (when (or (nil? snapshot-db-identity) (s/blank? snapshot-db-identity))
+      (u/raise "HA snapshot copy is missing DB identity"
+               {:error :ha/follower-snapshot-missing-db-identity
+                :db-name db-name
+                :source-endpoint source-endpoint}))
+    (when (not= (:ha-db-identity m) snapshot-db-identity)
+      (u/raise "HA snapshot copy DB identity mismatch"
+               {:error :ha/follower-snapshot-db-identity-mismatch
+                :db-name db-name
+                :local-db-identity (:ha-db-identity m)
+                :snapshot-db-identity snapshot-db-identity
+                :source-endpoint source-endpoint}))
+    (when-not (integer? snapshot-last-lsn)
+      (u/raise "HA snapshot copy is missing snapshot last applied LSN"
+               {:error :ha/follower-snapshot-missing-last-applied-lsn
+                :db-name db-name
+                :source-endpoint source-endpoint
+                :copy-meta copy-meta}))
+    (let [snapshot-last-lsn (long snapshot-last-lsn)]
+      (when (< snapshot-last-lsn (long required-lsn))
+        (u/raise "HA snapshot copy is older than the required follower floor"
+                 {:error :ha/follower-snapshot-too-stale
+                  :db-name db-name
+                  :required-lsn (long required-lsn)
+                  :snapshot-last-applied-lsn snapshot-last-lsn
+                  :source-endpoint source-endpoint}))
+      (let [snapshot-store (st/open snapshot-dir nil
+                                    (ha-snapshot-open-opts
+                                     m db-name snapshot-db-identity))]
+        (try
+          (let [verified-lsn  (read-ha-local-last-applied-lsn
+                               {:store snapshot-store})]
+            {:db-name db-name
+             :db-identity snapshot-db-identity
+             :snapshot-last-applied-lsn snapshot-last-lsn
+             :payload-last-applied-lsn (long verified-lsn)})
+          (finally
+            (i/close snapshot-store)))))))
+
+(defn ^:redef install-ha-local-snapshot!
+  [m snapshot-dir]
+  (let [store (:store m)]
+    (if-not (instance? IStore store)
+      {:ok? false
+       :state m
+       :error {:error :ha/follower-missing-store
+               :message "HA follower snapshot install requires a local store"}}
+      (let [env-dir    (i/dir store)
+            backup-dir (str env-dir ".ha-backup-" (UUID/randomUUID))
+            open-opts  (ha-snapshot-open-opts
+                        m
+                        (:db-name (i/opts store))
+                        (:ha-db-identity m))]
+        (try
+          ;; Validate that the copied snapshot is openable before swapping paths.
+          (let [snapshot-store (st/open snapshot-dir nil open-opts)]
+            (try
+              (i/opts snapshot-store)
+              (finally
+                (i/close snapshot-store))))
+          (close-ha-local-store! m)
+          (when (u/file-exists backup-dir)
+            (u/delete-files backup-dir))
+          (move-path! env-dir backup-dir)
+          (u/create-dirs env-dir)
+          (copy-dir-contents! snapshot-dir env-dir)
+          (let [new-store (open-ha-store-dbis!
+                           (st/open env-dir nil open-opts))
+                new-db    (db/new-db new-store)]
+            (when (u/file-exists backup-dir)
+              (u/delete-files backup-dir))
+            {:ok? true
+             :state (-> m
+                        (assoc :store new-store
+                               :dt-db new-db)
+                        (dissoc :engine :index))})
+          (catch Exception e
+            (log/error e "HA follower snapshot install failed"
+                       {:db-name (some-> store i/db-name)
+                        :env-dir env-dir})
+            (try
+              (when (u/file-exists env-dir)
+                (u/delete-files env-dir))
+              (when (u/file-exists backup-dir)
+                (move-path! backup-dir env-dir))
+              (let [restored-store (open-ha-store-dbis!
+                                    (st/open env-dir nil open-opts))
+                    restored-db    (db/new-db restored-store)]
+                {:ok? false
+                 :state (-> m
+                            (assoc :store restored-store
+                                   :dt-db restored-db)
+                            (dissoc :engine :index))
+                 :error {:error :ha/follower-snapshot-install-failed
+                         :message (ex-message e)
+                         :data (ex-data e)}})
+              (catch Exception restore-e
+                {:ok? false
+                 :state (-> m
+                            (dissoc :store :dt-db :engine :index))
+                 :error {:error :ha/follower-snapshot-install-restore-failed
+                         :message (ex-message e)
+                         :data (merge (or (ex-data e) {})
+                                      {:restore-message (ex-message restore-e)
+                                       :restore-data (ex-data restore-e)})}}))))))))
+
+(defn- sync-ha-follower-batch
+  [db-name m lease next-lsn now-ms]
+  (let [leader-endpoint (ha-leader-endpoint m lease)
+        local-node-id   (:ha-node-id m)]
+    (when (or (nil? leader-endpoint) (s/blank? leader-endpoint))
+      (u/raise "HA follower is missing leader endpoint for txlog sync"
+               {:error :ha/follower-missing-leader-endpoint
+                :lease lease}))
+    (let [upto-lsn (long (+ (long next-lsn)
+                            (dec (long ha-follower-max-batch-records))))
+          {:keys [records source-endpoint source-order]}
+          (fetch-ha-follower-records-with-gap-fallback
+           db-name m lease next-lsn upto-lsn)
+          _               (doseq [record records]
+                            (apply-ha-follower-txlog-record! m record))
+          local-lsn-after (read-ha-local-last-applied-lsn m)
+          last-record-lsn (when-let [record (peek records)]
+                            (long (:lsn record)))
+          applied-lsn     (long (max local-lsn-after
+                                     (or last-record-lsn
+                                         (dec (long next-lsn)))))]
+      (try
+        (report-ha-replica-floor!
+         db-name m leader-endpoint applied-lsn)
+        (catch Exception e
+          (log/warn e "HA follower failed to update leader replica floor"
+                    {:db-name db-name
+                     :ha-node-id local-node-id
+                     :leader-endpoint leader-endpoint
+                     :applied-lsn applied-lsn})))
+      {:records records
+       :applied-lsn applied-lsn
+       :leader-endpoint leader-endpoint
+       :source-endpoint source-endpoint
+       :source-order source-order
+       :state (assoc m
+                     :ha-local-last-applied-lsn applied-lsn
+                     :ha-follower-next-lsn (unchecked-inc applied-lsn)
+                     :ha-follower-last-batch-size (count records)
+                     :ha-follower-last-sync-ms now-ms
+                     :ha-follower-leader-endpoint leader-endpoint
+                     :ha-follower-source-endpoint source-endpoint
+                     :ha-follower-source-order source-order
+                     :ha-follower-last-bootstrap-ms nil
+                     :ha-follower-bootstrap-source-endpoint nil
+                     :ha-follower-bootstrap-snapshot-last-applied-lsn nil
+                     :ha-follower-sync-backoff-ms nil
+                     :ha-follower-next-sync-not-before-ms nil
+                     :ha-follower-degraded? nil
+                     :ha-follower-degraded-reason nil
+                     :ha-follower-degraded-details nil
+                     :ha-follower-degraded-since-ms nil
+                     :ha-follower-last-error nil
+                     :ha-follower-last-error-details nil
+                     :ha-follower-last-error-ms nil)})))
+
+(defn- bootstrap-ha-follower-from-snapshot
+  [db-name m lease source-order next-lsn now-ms]
+  (let [required-lsn (long (max 0 (dec (long next-lsn))))]
+    (loop [remaining source-order
+           current-m m
+           errors []]
+      (if-let [source-endpoint (first remaining)]
+        (let [snapshot-dir (u/tmp-dir (str "ha-snapshot-copy-"
+                                           (UUID/randomUUID)))
+              attempt
+              (try
+                (let [{:keys [copy-meta]}
+                      (fetch-ha-endpoint-snapshot-copy!
+                       db-name current-m source-endpoint snapshot-dir)
+                      manifest
+                      (validate-ha-snapshot-copy!
+                       db-name current-m source-endpoint snapshot-dir
+                       copy-meta required-lsn)
+                      install-res
+                      (install-ha-local-snapshot! current-m snapshot-dir)]
+                  (if (:ok? install-res)
+                    (let [snapshot-lsn (long (:snapshot-last-applied-lsn
+                                              manifest))
+                          resume-next-lsn (unchecked-inc snapshot-lsn)
+                          installed-state
+                          (-> (:state install-res)
+                              (assoc
+                               :ha-local-last-applied-lsn snapshot-lsn
+                               :ha-follower-next-lsn resume-next-lsn
+                               :ha-follower-last-bootstrap-ms now-ms
+                               :ha-follower-bootstrap-source-endpoint
+                               source-endpoint
+                               :ha-follower-bootstrap-snapshot-last-applied-lsn
+                               snapshot-lsn))]
+                      (try
+                        (let [sync-res   (sync-ha-follower-batch
+                                          db-name installed-state lease
+                                          resume-next-lsn now-ms)
+                              next-state (-> (:state sync-res)
+                                             (assoc
+                                              :ha-follower-last-bootstrap-ms
+                                              now-ms
+                                              :ha-follower-bootstrap-source-endpoint
+                                              source-endpoint
+                                              :ha-follower-bootstrap-snapshot-last-applied-lsn
+                                              snapshot-lsn))]
+                          {:ok? true
+                           :state next-state})
+                        (catch Exception e
+                          {:ok? false
+                           :state installed-state
+                           :error {:error (or (:error (ex-data e))
+                                              :ha/follower-snapshot-resume-failed)
+                                   :message (ex-message e)
+                                   :data (merge
+                                          (or (ex-data e) {})
+                                          {:snapshot-last-applied-lsn
+                                           snapshot-lsn
+                                           :resume-next-lsn
+                                           resume-next-lsn})}})))
+                    {:ok? false
+                     :state (:state install-res)
+                     :error (:error install-res)}))
+                (catch Exception e
+                  {:ok? false
+                   :state current-m
+                   :error {:error (or (:error (ex-data e))
+                                      :ha/follower-snapshot-bootstrap-failed)
+                           :message (ex-message e)
+                           :data (ex-data e)}})
+                (finally
+                  (when (u/file-exists snapshot-dir)
+                    (u/delete-files snapshot-dir))))]
+          (if (:ok? attempt)
+            attempt
+            (recur (rest remaining)
+                   (:state attempt)
+                   (conj errors
+                         (assoc (:error attempt)
+                                :source-endpoint source-endpoint)))))
+        {:ok? false
+         :state current-m
+         :source-order (vec source-order)
+         :errors errors}))))
+
 (defn- sync-ha-follower-state
   [db-name m now-ms]
   (if (not= :follower (:ha-role m))
@@ -431,76 +921,58 @@
                    :ha-follower-last-error :missing-leader-endpoint
                    :ha-follower-last-error-details {:lease lease}
                    :ha-follower-last-error-ms now-ms)
-            (try
-              (let [next-lsn (long (max 1
-                                        (or (:ha-follower-next-lsn m)
-                                            (unchecked-inc
-                                              (long (ha-local-last-applied-lsn m))))))
-                    upto-lsn (long (+ next-lsn
-                                      (dec (long ha-follower-max-batch-records))))
-                    {:keys [records source-endpoint source-order]}
-                    (fetch-ha-follower-records-with-gap-fallback
-                      db-name m lease next-lsn upto-lsn)
-                    _        (doseq [record records]
-                               (apply-ha-follower-txlog-record! m record))
-                    local-lsn-after (read-ha-local-last-applied-lsn m)
-                    last-record-lsn (when-let [record (peek records)]
-                                      (long (:lsn record)))
-                    applied-lsn     (long (max local-lsn-after
-                                               (or last-record-lsn
-                                                   (dec next-lsn))))]
-                (try
-                  (report-ha-replica-floor!
-                    db-name m leader-endpoint applied-lsn)
-                  (catch Exception e
-                    (log/warn e "HA follower failed to update leader replica floor"
-                              {:db-name db-name
-                               :ha-node-id local-node-id
-                               :leader-endpoint leader-endpoint
-                               :applied-lsn applied-lsn})))
-                (assoc m
-                       :ha-local-last-applied-lsn applied-lsn
-                       :ha-follower-next-lsn (unchecked-inc applied-lsn)
-                       :ha-follower-last-batch-size (count records)
-                       :ha-follower-last-sync-ms now-ms
-                       :ha-follower-leader-endpoint leader-endpoint
-                       :ha-follower-source-endpoint source-endpoint
-                       :ha-follower-source-order source-order
-                       :ha-follower-sync-backoff-ms nil
-                       :ha-follower-next-sync-not-before-ms nil
-                       :ha-follower-degraded? nil
-                       :ha-follower-degraded-reason nil
-                       :ha-follower-degraded-details nil
-                       :ha-follower-degraded-since-ms nil
-                       :ha-follower-last-error nil
-                       :ha-follower-last-error-details nil
-                       :ha-follower-last-error-ms nil))
-              (catch Exception e
-                (let [gap?       (ha-follower-gap-error? e)
-                       details    {:message (ex-message e)
-                                   :data (ex-data e)
-                                   :leader-endpoint leader-endpoint
-                                   :source-order
-                                   (ha-follower-source-endpoints m lease)}
-                       backoff-ms (when-not gap?
-                                    (next-ha-follower-sync-backoff-ms m))]
-                  (cond-> (assoc m
+            (let [next-lsn (long (max 1
+                                      (or (:ha-follower-next-lsn m)
+                                          (unchecked-inc
+                                            (long (ha-local-last-applied-lsn m))))))]
+              (try
+                (:state (sync-ha-follower-batch
+                         db-name m lease next-lsn now-ms))
+                (catch Exception e
+                  (if (ha-follower-gap-error? e)
+                    (let [source-order (vec (or (:source-order (ex-data e))
+                                                (ha-gap-fallback-source-endpoints
+                                                 db-name m lease next-lsn)))
+                          bootstrap    (bootstrap-ha-follower-from-snapshot
+                                        db-name m lease source-order
+                                        next-lsn now-ms)]
+                      (if (:ok? bootstrap)
+                        (:state bootstrap)
+                        (let [details {:message
+                                       "Follower txlog gap unresolved and snapshot bootstrap failed"
+                                       :data
+                                       {:error :ha/follower-snapshot-bootstrap-failed
+                                        :gap-error {:message (ex-message e)
+                                                    :data (ex-data e)}
+                                        :snapshot-errors (:errors bootstrap)}
+                                       :leader-endpoint leader-endpoint
+                                       :source-order source-order}]
+                          (assoc (:state bootstrap)
                                  :ha-follower-last-error :sync-failed
                                  :ha-follower-last-error-details details
-                                 :ha-follower-last-error-ms now-ms)
-                    gap?
-                    (assoc :ha-follower-degraded? true
-                           :ha-follower-degraded-reason :wal-gap
-                           :ha-follower-degraded-details details
-                           :ha-follower-degraded-since-ms
-                           (or (:ha-follower-degraded-since-ms m) now-ms)
-                           :ha-follower-sync-backoff-ms nil
-                           :ha-follower-next-sync-not-before-ms nil)
-
-                    (not gap?)
-                    (assoc :ha-follower-sync-backoff-ms backoff-ms
-                           :ha-follower-next-sync-not-before-ms
-                           (+ (long now-ms) (long backoff-ms)))))))))))))
+                                 :ha-follower-last-error-ms now-ms
+                                 :ha-follower-degraded? true
+                                 :ha-follower-degraded-reason :wal-gap
+                                 :ha-follower-degraded-details details
+                                 :ha-follower-degraded-since-ms
+                                 (or (:ha-follower-degraded-since-ms
+                                      (:state bootstrap))
+                                     now-ms)
+                                 :ha-follower-sync-backoff-ms nil
+                                 :ha-follower-next-sync-not-before-ms nil))))
+                    (let [details    {:message (ex-message e)
+                                      :data (ex-data e)
+                                      :leader-endpoint leader-endpoint
+                                      :source-order
+                                      (ha-follower-source-endpoints m lease)}
+                          backoff-ms (next-ha-follower-sync-backoff-ms m)]
+                      (assoc m
+                             :ha-follower-last-error :sync-failed
+                             :ha-follower-last-error-details details
+                             :ha-follower-last-error-ms now-ms
+                             :ha-follower-sync-backoff-ms backoff-ms
+                             :ha-follower-next-sync-not-before-ms
+                             (+ (long now-ms) (long backoff-ms))))))))))))))
 
 (defn ^:redef maybe-wait-unreachable-leader-before-pre-cas!
   [m lease]
@@ -983,6 +1455,9 @@
           :ha-follower-next-lsn :ha-follower-last-batch-size
           :ha-follower-last-sync-ms :ha-follower-leader-endpoint
           :ha-follower-source-endpoint :ha-follower-source-order
+          :ha-follower-last-bootstrap-ms
+          :ha-follower-bootstrap-source-endpoint
+          :ha-follower-bootstrap-snapshot-last-applied-lsn
           :ha-follower-sync-backoff-ms
           :ha-follower-next-sync-not-before-ms
           :ha-follower-degraded? :ha-follower-degraded-reason

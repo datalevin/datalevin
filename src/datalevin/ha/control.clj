@@ -27,6 +27,7 @@
     RpcRequests$ErrorResponse ProtobufMsgFactory]
    [com.alipay.sofa.jraft.storage.snapshot SnapshotReader SnapshotWriter]
    [com.alipay.sofa.jraft.util RpcFactoryHelper]
+   [datalevin.ha LMDBJRaftServiceFactory]
    [java.io File]
    [java.nio ByteBuffer]
    [java.nio.file Files Paths StandardCopyOption]
@@ -1257,6 +1258,8 @@
                   fsm                (new-jraft-fsm fsm-state)
                   ^NodeOptions opts  (doto (NodeOptions.)
                                        (.setFsm fsm)
+                                       (.setServiceFactory
+                                        LMDBJRaftServiceFactory/INSTANCE)
                                        (.setInitialConf conf)
                                        (.setElectionTimeoutMs
                                         (int election-timeout-ms))

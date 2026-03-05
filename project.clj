@@ -31,7 +31,7 @@
    [com.github.luben/zstd-jni "1.5.7-6"]]
   :dependencies
   [[org.clojure/clojure :scope "provided"]
-   [com.alipay.sofa/jraft-core]
+   [com.alipay.sofa/jraft-core :exclusions [org.rocksdb/rocksdbjni]]
    [org.clojars.huahaiy/dtlvnative-macosx-arm64]
    [org.clojars.huahaiy/dtlvnative-linux-arm64]
    [org.clojars.huahaiy/dtlvnative-linux-x86_64]

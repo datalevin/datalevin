@@ -628,6 +628,22 @@
   [store]
   (dha/consensus-ha-opts store))
 
+(def ^:dynamic *consensus-ha-opts-fn*
+  consensus-ha-opts)
+
+(def ^:private ha-runtime-option-keys
+  [:ha-mode
+   :db-identity
+   :ha-node-id
+   :ha-members
+   :ha-lease-renew-ms
+   :ha-lease-timeout-ms
+   :ha-promotion-base-delay-ms
+   :ha-promotion-rank-delay-ms
+   :ha-max-promotion-lag-lsn
+   :ha-fencing-hook
+   :ha-control-plane])
+
 (defn- sanitize-ha-path-segment
   [x]
   (-> x
@@ -758,20 +774,41 @@
   (when-let [^AtomicBoolean running? (:ha-renew-loop-running? m)]
     (.set running? false)))
 
+(def ^:dynamic *start-ha-authority-fn*
+  start-ha-authority)
+
+(def ^:dynamic *stop-ha-authority-fn*
+  stop-ha-authority)
+
+(def ^:dynamic *stop-ha-renew-loop-fn*
+  stop-ha-renew-loop)
+
+(defn- resolved-ha-runtime-opts
+  [root db-name store]
+  (when-let [ha-opts (*consensus-ha-opts-fn* store)]
+    (-> (with-default-ha-control-raft-dir root db-name ha-opts)
+        (select-keys ha-runtime-option-keys))))
+
+(defn- stop-ha-runtime
+  [db-name m]
+  (*stop-ha-renew-loop-fn* m)
+  (*stop-ha-authority-fn* db-name m)
+  (dissoc (dha/clear-ha-runtime-state m) :ha-runtime-opts))
+
 (defn- ha-write-admission-error
   [^Server server message]
   (dha/ha-write-admission-error (.-dbs server) message))
 
 (defn- ensure-ha-runtime
   [root db-name m store]
-  (if-let [ha-opts (consensus-ha-opts store)]
-    (if (:ha-authority m)
+  (if-let [ha-opts (resolved-ha-runtime-opts root db-name store)]
+    (if (and (:ha-authority m)
+             (= (:ha-runtime-opts m) ha-opts))
       m
-      (merge m (start-ha-authority db-name root ha-opts)))
-    (do
-      (stop-ha-renew-loop m)
-      (stop-ha-authority db-name m)
-      (dha/clear-ha-runtime-state m))))
+      (-> (stop-ha-runtime db-name m)
+          (merge (*start-ha-authority-fn* db-name ha-opts))
+          (assoc :ha-runtime-opts ha-opts)))
+    (stop-ha-runtime db-name m)))
 
 (defn- add-store
   [^Server server db-name store]
@@ -964,6 +1001,31 @@
               (.update md out-chunk 0 n)
               (write-message skey [out-chunk])
               (recur (+ written-bytes n) (inc chunk-count)))))))))
+
+(defn- copy-source-kv-store
+  [store]
+  (cond
+    (instance? Store store) (.-lmdb ^Store store)
+    (instance? ILMDB store) store
+    :else nil))
+
+(defn- copy-response-meta
+  [db-name store base-meta]
+  (let [store-opts (when (instance? IStore store)
+                     (i/opts store))
+        kv-store   (copy-source-kv-store store)
+        watermarks (when kv-store
+                     (try
+                       (kv/txlog-watermarks kv-store)
+                       (catch Exception _
+                         nil)))
+        snapshot-lsn (:last-applied-lsn watermarks)]
+    (cond-> (assoc base-meta :db-name db-name)
+      (some? (:db-identity store-opts))
+      (assoc :db-identity (:db-identity store-opts))
+
+      (some? snapshot-lsn)
+      (assoc :snapshot-last-applied-lsn (long snapshot-lsn)))))
 
 (defn- open-port
   [port]
@@ -1872,7 +1934,17 @@
 
 (defn- assoc-opt
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
-  (wrap-error (normal-dt-store-handler assoc-opt)))
+  (wrap-error
+    (let [db-name (nth args 0)
+          store   (store server skey db-name writing?)
+          result  (apply i/assoc-opt store (rest args))]
+      ;; Defer HA lifecycle changes for staged write transactions until commit.
+      (when-not writing?
+        (update-db server db-name
+                   #(ensure-ha-runtime (.-root server) db-name % store))
+        (ensure-ha-renew-loop server db-name))
+      (write-message skey {:type :command-complete
+                           :result result}))))
 
 (defn- last-modified
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -2234,6 +2306,7 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
     (let [[db-name compact?] args
+          source-store        (lmdb server skey db-name writing?)
           started-ms          (System/currentTimeMillis)
           copy-backup-pin     (atom nil)
           tf                 (u/tmp-dir (str "copy-" (UUID/randomUUID)))
@@ -2246,14 +2319,17 @@
                             {:pin-id pin-id
                              :floor-lsn pin-floor-lsn
                              :expires-ms pin-expires-ms}))]
-          (i/copy (lmdb server skey db-name writing?) tf compact?))
+          (i/copy source-store tf compact?))
         (let [completed-ms (System/currentTimeMillis)
-              copy-meta (cond-> {:started-ms started-ms
-                                 :completed-ms completed-ms
-                                 :duration-ms (- completed-ms started-ms)
-                                 :compact? (boolean compact?)}
-                          (map? @copy-backup-pin)
-                          (assoc :backup-pin @copy-backup-pin))]
+              copy-meta (copy-response-meta
+                          db-name
+                          source-store
+                          (cond-> {:started-ms started-ms
+                                   :completed-ms completed-ms
+                                   :duration-ms (- completed-ms started-ms)
+                                   :compact? (boolean compact?)}
+                            (map? @copy-backup-pin)
+                            (assoc :backup-pin @copy-backup-pin)))]
           (copy-file-out skey path copy-meta))
         (finally (u/delete-files tf))))))
 

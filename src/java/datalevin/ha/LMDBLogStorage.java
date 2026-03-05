@@ -1,0 +1,534 @@
+package datalevin.ha;
+
+import com.alipay.sofa.jraft.conf.Configuration;
+import com.alipay.sofa.jraft.conf.ConfigurationEntry;
+import com.alipay.sofa.jraft.conf.ConfigurationManager;
+import com.alipay.sofa.jraft.entity.EnumOutter.EntryType;
+import com.alipay.sofa.jraft.entity.LogEntry;
+import com.alipay.sofa.jraft.entity.LogId;
+import com.alipay.sofa.jraft.entity.codec.LogEntryDecoder;
+import com.alipay.sofa.jraft.entity.codec.LogEntryEncoder;
+import com.alipay.sofa.jraft.option.LogStorageOptions;
+import com.alipay.sofa.jraft.option.RaftOptions;
+import com.alipay.sofa.jraft.storage.LogStorage;
+import com.alipay.sofa.jraft.util.Describer;
+import datalevin.cpp.BufVal;
+import datalevin.cpp.Cursor;
+import datalevin.cpp.Dbi;
+import datalevin.cpp.Env;
+import datalevin.cpp.Txn;
+import datalevin.cpp.Util;
+import datalevin.dtlvnative.DTLV;
+import java.io.File;
+import java.nio.ByteBuffer;
+import java.nio.charset.StandardCharsets;
+import java.util.Collections;
+import java.util.List;
+import java.util.concurrent.locks.Lock;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+public final class LMDBLogStorage implements LogStorage, Describer {
+
+    private static final Logger LOG = LoggerFactory.getLogger(LMDBLogStorage.class);
+
+    private static final String LOG_DBI_NAME = "datalevin.jraft/log";
+    private static final String CONF_DBI_NAME = "datalevin.jraft/conf";
+    private static final String META_DBI_NAME = "datalevin.jraft/meta";
+    private static final byte[] FIRST_LOG_INDEX_KEY =
+        "first-log-index".getBytes(StandardCharsets.UTF_8);
+    private static final int MAX_DBS = 4;
+    private static final int MAX_READERS = 256;
+    private static final long MAP_SIZE_BYTES = 64L * 1024L * 1024L;
+
+    private final String path;
+    private final boolean sync;
+    private final ReentrantReadWriteLock dbLock = new ReentrantReadWriteLock();
+    private final Lock readLock = this.dbLock.readLock();
+    private final Lock writeLock = this.dbLock.writeLock();
+
+    private Env env;
+    private Dbi logDbi;
+    private Dbi confDbi;
+    private Dbi metaDbi;
+    private String groupId;
+    private LogEntryEncoder logEntryEncoder;
+    private LogEntryDecoder logEntryDecoder;
+    private long firstLogIndex = 1L;
+    private boolean hasLoadedFirstLogIndex;
+
+    public LMDBLogStorage(final String path, final RaftOptions raftOptions) {
+        this.path = path;
+        this.sync = raftOptions.isSync();
+    }
+
+    @Override
+    public boolean init(final LogStorageOptions opts) {
+        this.writeLock.lock();
+        try {
+            if (this.env != null && !this.env.isClosed()) {
+                LOG.warn("LMDBLogStorage init() in {} already.", this.path);
+                return true;
+            }
+            if (opts.getConfigurationManager() == null) {
+                throw new IllegalArgumentException("Null conf manager");
+            }
+            if (opts.getLogEntryCodecFactory() == null) {
+                throw new IllegalArgumentException("Null log entry codec factory");
+            }
+            this.groupId = opts.getGroupId();
+            this.logEntryEncoder = opts.getLogEntryCodecFactory().encoder();
+            this.logEntryDecoder = opts.getLogEntryCodecFactory().decoder();
+            if (this.logEntryEncoder == null || this.logEntryDecoder == null) {
+                throw new IllegalArgumentException("Null log entry codec");
+            }
+            openEnv();
+            if (!loadConfigurationEntries(opts.getConfigurationManager())) {
+                closeEnv();
+                return false;
+            }
+            return true;
+        } catch (final Exception e) {
+            LOG.error("Fail to init LMDBLogStorage, path={}.", this.path, e);
+            closeEnv();
+            return false;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void shutdown() {
+        this.writeLock.lock();
+        try {
+            closeEnv();
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public long getFirstLogIndex() {
+        this.readLock.lock();
+        try {
+            if (this.hasLoadedFirstLogIndex) {
+                return this.firstLogIndex;
+            }
+            final Long persisted = readMetaLong(FIRST_LOG_INDEX_KEY);
+            if (persisted != null) {
+                setFirstLogIndex(persisted);
+                return persisted;
+            }
+            final Long first = getBoundaryIndex(this.logDbi, DTLV.MDB_FIRST);
+            if (first != null) {
+                setFirstLogIndex(first);
+                return first;
+            }
+            return 1L;
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public long getLastLogIndex() {
+        this.readLock.lock();
+        try {
+            final Long last = getBoundaryIndex(this.logDbi, DTLV.MDB_LAST);
+            return last == null ? 0L : last;
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public LogEntry getEntry(final long index) {
+        this.readLock.lock();
+        try {
+            if (this.hasLoadedFirstLogIndex && index < this.firstLogIndex) {
+                return null;
+            }
+            return readEntry(index);
+        } catch (final Exception e) {
+            LOG.error("Fail to get log entry at index {} in data path: {}.",
+                index, this.path, e);
+            return null;
+        } finally {
+            this.readLock.unlock();
+        }
+    }
+
+    @Override
+    public long getTerm(final long index) {
+        final LogEntry entry = getEntry(index);
+        return entry == null ? 0L : entry.getId().getTerm();
+    }
+
+    @Override
+    public boolean appendEntry(final LogEntry entry) {
+        return appendEntries(Collections.singletonList(entry)) == 1;
+    }
+
+    @Override
+    public int appendEntries(final List<LogEntry> entries) {
+        if (entries == null || entries.isEmpty()) {
+            return 0;
+        }
+        this.writeLock.lock();
+        try {
+            ensureOpen();
+            final Txn txn = Txn.create(this.env);
+            try {
+                for (final LogEntry entry : entries) {
+                    writeEntry(txn, entry);
+                }
+                txn.commit();
+                syncEnv();
+                return entries.size();
+            } finally {
+                txn.close();
+            }
+        } catch (final Exception e) {
+            LOG.error("Fail to append {} log entries in data path: {}.",
+                entries.size(), this.path, e);
+            return 0;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean truncatePrefix(final long firstIndexKept) {
+        this.writeLock.lock();
+        try {
+            ensureOpen();
+            final long currentFirst = getFirstLogIndex();
+            final long currentLast = getLastLogIndex();
+            final Txn txn = Txn.create(this.env);
+            try {
+                if (firstIndexKept < currentFirst) {
+                    LOG.warn("Try to truncate logs before {}, but the firstLogIndex is {}.",
+                        firstIndexKept, currentFirst);
+                    txn.abort();
+                    return false;
+                }
+                final long deleteThrough = Math.min(firstIndexKept - 1, currentLast);
+                for (long idx = currentFirst; idx <= deleteThrough; idx++) {
+                    deleteEntry(txn, idx);
+                }
+                writeMetaLong(txn, FIRST_LOG_INDEX_KEY, firstIndexKept);
+                txn.commit();
+                syncEnv();
+                setFirstLogIndex(firstIndexKept);
+                return true;
+            } finally {
+                txn.close();
+            }
+        } catch (final Exception e) {
+            LOG.error("Fail to truncatePrefix in data path: {}, firstIndexKept={}.",
+                this.path, firstIndexKept, e);
+            return false;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean truncateSuffix(final long lastIndexKept) {
+        this.writeLock.lock();
+        try {
+            ensureOpen();
+            final long currentFirst = getFirstLogIndex();
+            final long currentLast = getLastLogIndex();
+            final Txn txn = Txn.create(this.env);
+            try {
+                final long deleteFrom = Math.max(currentFirst, lastIndexKept + 1);
+                for (long idx = deleteFrom; idx <= currentLast; idx++) {
+                    deleteEntry(txn, idx);
+                }
+                txn.commit();
+                syncEnv();
+                return true;
+            } finally {
+                txn.close();
+            }
+        } catch (final Exception e) {
+            LOG.error("Fail to truncateSuffix {} in data path: {}.",
+                lastIndexKept, this.path, e);
+            return false;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public boolean reset(final long nextLogIndex) {
+        if (nextLogIndex <= 0) {
+            throw new IllegalArgumentException("Invalid next log index.");
+        }
+        this.writeLock.lock();
+        try {
+            ensureOpen();
+            LogEntry entry = readEntry(nextLogIndex);
+            if (entry == null) {
+                entry = new LogEntry();
+                entry.setType(EntryType.ENTRY_TYPE_NO_OP);
+                entry.setId(new LogId(nextLogIndex, 0));
+                LOG.warn("Entry not found for nextLogIndex {} when reset in data path: {}.",
+                    nextLogIndex, this.path);
+            }
+            final Txn txn = Txn.create(this.env);
+            try {
+                Util.checkRc(DTLV.mdb_drop(txn.get(), this.logDbi.get(), 0));
+                Util.checkRc(DTLV.mdb_drop(txn.get(), this.confDbi.get(), 0));
+                Util.checkRc(DTLV.mdb_drop(txn.get(), this.metaDbi.get(), 0));
+                writeMetaLong(txn, FIRST_LOG_INDEX_KEY, nextLogIndex);
+                writeEntry(txn, entry);
+                txn.commit();
+                syncEnv();
+                setFirstLogIndex(nextLogIndex);
+                return true;
+            } finally {
+                txn.close();
+            }
+        } catch (final Exception e) {
+            LOG.error("Fail to reset next log index in data path: {}.", this.path, e);
+            return false;
+        } finally {
+            this.writeLock.unlock();
+        }
+    }
+
+    @Override
+    public void describe(final Printer out) {
+        final long currentFirst = getFirstLogIndex();
+        final long currentLast = getLastLogIndex();
+        out.print("  lmdbStorage: [")
+            .print(currentFirst)
+            .print(", ")
+            .print(currentLast)
+            .println(']');
+        out.print("  path: ").println(this.path);
+        out.print("  groupId: ").println(this.groupId);
+    }
+
+    private void openEnv() {
+        final File dir = new File(this.path);
+        if (!dir.exists() && !dir.mkdirs()) {
+            throw new IllegalStateException("Failed to create log dir " + this.path);
+        }
+        this.env = Env.create(this.path, MAP_SIZE_BYTES, MAX_READERS, MAX_DBS, 0);
+        this.logDbi = Dbi.create(this.env, LOG_DBI_NAME, DTLV.MDB_CREATE);
+        this.confDbi = Dbi.create(this.env, CONF_DBI_NAME, DTLV.MDB_CREATE);
+        this.metaDbi = Dbi.create(this.env, META_DBI_NAME, DTLV.MDB_CREATE);
+        this.firstLogIndex = 1L;
+        this.hasLoadedFirstLogIndex = false;
+    }
+
+    private void closeEnv() {
+        closeQuietly(this.logDbi);
+        closeQuietly(this.confDbi);
+        closeQuietly(this.metaDbi);
+        closeQuietly(this.env);
+        this.logDbi = null;
+        this.confDbi = null;
+        this.metaDbi = null;
+        this.env = null;
+        this.firstLogIndex = 1L;
+        this.hasLoadedFirstLogIndex = false;
+    }
+
+    private void ensureOpen() {
+        if (this.env == null || this.env.isClosed()) {
+            throw new IllegalStateException("LMDBLogStorage is not initialized.");
+        }
+    }
+
+    private void setFirstLogIndex(final long index) {
+        this.firstLogIndex = index;
+        this.hasLoadedFirstLogIndex = true;
+    }
+
+    private boolean loadConfigurationEntries(final ConfigurationManager confManager) {
+        final Txn txn = Txn.createReadOnly(this.env);
+        final BufVal key = new BufVal(Long.BYTES);
+        final BufVal val = new BufVal(0);
+        Cursor cursor = null;
+        try {
+            cursor = Cursor.create(txn, this.confDbi, key, val);
+            if (!cursor.seek(DTLV.MDB_FIRST)) {
+                return true;
+            }
+            do {
+                final LogEntry entry = decodeEntry(copyBytes(cursor.val()));
+                if (entry == null) {
+                    return false;
+                }
+                if (!confManager.add(toConfigurationEntry(entry))) {
+                    LOG.error("Fail to load configuration entry at path={} index={}.",
+                        this.path, entry.getId().getIndex());
+                    return false;
+                }
+            } while (cursor.seek(DTLV.MDB_NEXT));
+            return true;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            txn.close();
+        }
+    }
+
+    private LogEntry readEntry(final long index) {
+        ensureOpen();
+        final Txn txn = Txn.createReadOnly(this.env);
+        try {
+            final byte[] bytes = getBytes(txn, this.logDbi, longToBytes(index));
+            return bytes == null ? null : decodeEntry(bytes);
+        } finally {
+            txn.close();
+        }
+    }
+
+    private void writeEntry(final Txn txn, final LogEntry entry) {
+        final long index = entry.getId().getIndex();
+        final byte[] keyBytes = longToBytes(index);
+        final byte[] entryBytes = this.logEntryEncoder.encode(entry);
+        putBytes(txn, this.logDbi, keyBytes, entryBytes);
+        if (entry.getType() == EntryType.ENTRY_TYPE_CONFIGURATION) {
+            putBytes(txn, this.confDbi, keyBytes, entryBytes);
+        }
+    }
+
+    private void deleteEntry(final Txn txn, final long index) {
+        final BufVal key = newBufVal(longToBytes(index));
+        this.logDbi.del(txn, key, null);
+        key.reset();
+        this.confDbi.del(txn, key, null);
+    }
+
+    private void writeMetaLong(final Txn txn, final byte[] keyBytes, final long value) {
+        putBytes(txn, this.metaDbi, keyBytes, longToBytes(value));
+    }
+
+    private Long readMetaLong(final byte[] keyBytes) {
+        ensureOpen();
+        final Txn txn = Txn.createReadOnly(this.env);
+        try {
+            final byte[] bytes = getBytes(txn, this.metaDbi, keyBytes);
+            if (bytes == null) {
+                return null;
+            }
+            return ByteBuffer.wrap(bytes).getLong();
+        } finally {
+            txn.close();
+        }
+    }
+
+    private Long getBoundaryIndex(final Dbi dbi, final int op) {
+        ensureOpen();
+        final Txn txn = Txn.createReadOnly(this.env);
+        final BufVal key = new BufVal(Long.BYTES);
+        final BufVal val = new BufVal(0);
+        Cursor cursor = null;
+        try {
+            cursor = Cursor.create(txn, dbi, key, val);
+            if (!cursor.seek(op)) {
+                return null;
+            }
+            return cursor.key().outBuf().getLong();
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+            txn.close();
+        }
+    }
+
+    private byte[] getBytes(final Txn txn, final Dbi dbi, final byte[] keyBytes) {
+        final BufVal key = newBufVal(keyBytes);
+        final BufVal val = new BufVal(0);
+        final int rc = DTLV.mdb_get(txn.get(), dbi.get(), key.ptr(), val.ptr());
+        Util.checkRc(rc);
+        if (rc == DTLV.MDB_NOTFOUND) {
+            return null;
+        }
+        return copyBytes(val);
+    }
+
+    private void putBytes(final Txn txn, final Dbi dbi,
+                          final byte[] keyBytes, final byte[] valBytes) {
+        final BufVal key = newBufVal(keyBytes);
+        final BufVal val = newBufVal(valBytes);
+        dbi.put(txn, key, val, 0);
+    }
+
+    private LogEntry decodeEntry(final byte[] bytes) {
+        final LogEntry entry = this.logEntryDecoder.decode(bytes);
+        if (entry == null) {
+            LOG.error("Bad log entry format in data path: {}.", this.path);
+        }
+        return entry;
+    }
+
+    private ConfigurationEntry toConfigurationEntry(final LogEntry entry) {
+        final ConfigurationEntry confEntry = new ConfigurationEntry();
+        confEntry.setId(new LogId(entry.getId().getIndex(), entry.getId().getTerm()));
+        confEntry.setConf(new Configuration(entry.getPeers(), entry.getLearners()));
+        if (entry.getOldPeers() != null) {
+            confEntry.setOldConf(new Configuration(entry.getOldPeers(),
+                entry.getOldLearners()));
+        }
+        return confEntry;
+    }
+
+    private void syncEnv() {
+        if (this.sync && this.env != null && !this.env.isClosed()) {
+            this.env.sync(1);
+        }
+    }
+
+    private static byte[] copyBytes(final BufVal bufVal) {
+        final ByteBuffer buffer = bufVal.outBuf().duplicate();
+        final byte[] bytes = new byte[buffer.remaining()];
+        buffer.get(bytes);
+        return bytes;
+    }
+
+    private static byte[] longToBytes(final long value) {
+        final byte[] bytes = new byte[Long.BYTES];
+        ByteBuffer.wrap(bytes).putLong(value);
+        return bytes;
+    }
+
+    private static BufVal newBufVal(final byte[] bytes) {
+        final BufVal bufVal = new BufVal(Math.max(1, bytes.length));
+        final ByteBuffer buffer = bufVal.inBuf();
+        buffer.clear();
+        buffer.put(bytes);
+        buffer.flip();
+        bufVal.ptr().mv_size(bytes.length);
+        return bufVal;
+    }
+
+    private static void closeQuietly(final Dbi dbi) {
+        if (dbi != null) {
+            try {
+                dbi.close();
+            } catch (final Exception e) {
+                LOG.warn("Failed to close LMDB dbi.", e);
+            }
+        }
+    }
+
+    private static void closeQuietly(final Env env) {
+        if (env != null) {
+            try {
+                env.close();
+            } catch (final Exception e) {
+                LOG.warn("Failed to close LMDB env.", e);
+            }
+        }
+    }
+}
