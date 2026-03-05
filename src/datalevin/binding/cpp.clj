@@ -784,9 +784,7 @@
           (close-vecs idx)))
       (swap! l/lmdb-dirs disj (env-dir this))
       (when (zero? (count @l/lmdb-dirs))
-        (a/shutdown-executor)
-        (u/shutdown-worker-thread-pool)
-        (u/shutdown-scheduler))
+        (l/shutdown-last-lmdb-executors!))
       (locking write-txn
         (.sync env 1)
         (.close env))

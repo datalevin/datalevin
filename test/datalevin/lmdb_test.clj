@@ -761,6 +761,65 @@
           (dc/close-db db)
           (u/delete-files dir))))))
 
+(deftest wal-lmdb-overlap-commit-test
+  (when-not (u/windows?)
+    (let [dir  (u/tmp-dir (str "wal-lmdb-overlap-" (UUID/randomUUID)))
+          lmdb (l/open-kv dir {:wal? true
+                               :wal-lmdb-overlap? true
+                               :flags (conj c/default-env-flags :nosync)})]
+      (try
+        (if/open-dbi lmdb "a")
+        (dotimes [i 20]
+          (if/transact-kv lmdb [[:put "a" i (str "v-" i) :long :string]]))
+        (is (= "v-19" (if/get-value lmdb "a" 19 :long :string)))
+        (let [wm (if/txlog-watermarks lmdb)
+              marker-check (if/verify-commit-marker! lmdb)]
+          (is (:wal? wm))
+          (is (:lmdb-overlap? wm))
+          (is (pos? (long (:last-applied-lsn wm))))
+          (is (:ok? marker-check)))
+        (finally
+          (if/close-kv lmdb)
+          (u/delete-files dir))))))
+
+(deftest wal-lmdb-overlap-explicit-tx-no-deadlock-test
+  (when-not (u/windows?)
+    (let [dir  (u/tmp-dir (str "wal-lmdb-overlap-explicit-tx-"
+                               (UUID/randomUUID)))
+          lmdb (l/open-kv dir {:wal? true
+                               :wal-lmdb-overlap? true
+                               :flags (conj c/default-env-flags :nosync)})]
+      (try
+        (if/open-dbi lmdb "a")
+        (let [started      (promise)
+              release-tx   (promise)
+              explicit-fut (future
+                             (dc/with-transaction-kv [db lmdb]
+                               (deliver started true)
+                               ;; Keep explicit txn open while a concurrent
+                               ;; one-shot writer attempts a WAL write.
+                               (Thread/sleep 50)
+                               (if/transact-kv db
+                                               [[:put "a" 1 "explicit"
+                                                 :long :string]])
+                               @release-tx
+                               :explicit-done))
+              one-shot-fut (future
+                             @started
+                             (if/transact-kv lmdb
+                                             [[:put "a" 2 "one-shot"
+                                               :long :string]])
+                             :one-shot-done)]
+          (Thread/sleep 150)
+          (deliver release-tx true)
+          (is (= :explicit-done (deref explicit-fut 5000 :timeout)))
+          (is (= :one-shot-done (deref one-shot-fut 5000 :timeout)))
+          (is (= "explicit" (if/get-value lmdb "a" 1 :long :string)))
+          (is (= "one-shot" (if/get-value lmdb "a" 2 :long :string))))
+        (finally
+          (if/close-kv lmdb)
+          (u/delete-files dir))))))
+
 (deftest open-again-resized-test
   (let [dir  (u/tmp-dir (str "again-resize-" (UUID/randomUUID)))
         lmdb (l/open-kv dir {:mapsize 1

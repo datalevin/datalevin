@@ -22,7 +22,7 @@
    [datalevin.constants :as c]
    [datalevin.interface
     :refer [close-kv list-dbis entries get-range open-dbi transact-kv clear-dbi
-            env-dir copy open-transact-kv close-transact-kv stat]])
+            env-dir copy open-transact-kv close-transact-kv stat kv-info]])
   (:import
    [datalevin.async IAsyncWork]
    [datalevin.cpp Util]
@@ -363,10 +363,18 @@
      ^long (reduce
              (fn [^long pages dbi]
                (+ pages (let [m (stat db dbi)]
-                          (+ ^long (:branch-pages m)
-                             ^long (:leaf-pages m)
-                             ^long (:overflow-pages m)))))
+               (+ ^long (:branch-pages m)
+                              ^long (:leaf-pages m)
+                              ^long (:overflow-pages m)))))
              0 (list-dbis db))))
+
+(defn ^:no-doc txlog-write-serialize-lock
+  [db]
+  (when-let [info-v (try
+                      (kv-info db)
+                      (catch Exception _ nil))]
+    (when-let [state (:txlog-state @info-v)]
+      (or (:lmdb-write-serialize-lock state) state))))
 
 (defmacro with-transaction-kv
   "Evaluate body within the context of a single new read/write transaction,
@@ -384,22 +392,58 @@
               (transact-kv kv [[:put \"a\" :counter (inc now)]])
               (get-value kv \"a\" :counter)))"
   [[db orig-db] & body]
-  `(locking (write-txn ~orig-db)
-     (let [writing#   (writing? ~orig-db)
-           condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
-       (u/repeat-try-catch
-           ~c/+in-tx-overflow-times+
-           condition#
-         (try
-           (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
+  `(let [serialize-lock# (txlog-write-serialize-lock ~orig-db)]
+     (if serialize-lock#
+       (locking serialize-lock#
+         (locking (write-txn ~orig-db)
+           (let [writing#   (writing? ~orig-db)
+                 condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
              (u/repeat-try-catch
                  ~c/+in-tx-overflow-times+
                  condition#
-               ~@body))
-           (finally (when-not writing# (close-transact-kv ~orig-db))))))))
+               (try
+                 (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
+                   (u/repeat-try-catch
+                       ~c/+in-tx-overflow-times+
+                       condition#
+                     ~@body))
+                 (finally (when-not writing# (close-transact-kv ~orig-db))))))))
+       (locking (write-txn ~orig-db)
+         (let [writing#   (writing? ~orig-db)
+               condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
+           (u/repeat-try-catch
+               ~c/+in-tx-overflow-times+
+               condition#
+             (try
+               (let [~db (if writing# ~orig-db (open-transact-kv ~orig-db))]
+                 (u/repeat-try-catch
+                     ~c/+in-tx-overflow-times+
+                     condition#
+                   ~@body))
+               (finally (when-not writing# (close-transact-kv ~orig-db))))))))))
 
 ;; for shutting down various executors when the last LMDB exits
 (defonce lmdb-dirs (atom #{}))
+
+(defn- shutdown-transact-async-executor-if-loaded!
+  []
+  ;; Avoid loading datalevin.conn from low-level KV paths; if it is already
+  ;; loaded, stop its dedicated transact-async executor as part of global
+  ;; LMDB teardown.
+  (when-let [conn-ns (find-ns 'datalevin.conn)]
+    (when-let [shutdown! (ns-resolve conn-ns
+                                     'shutdown-transact-async-executor!)]
+      (try
+        (shutdown!)
+        (catch Throwable _ nil)))))
+
+(defn ^:no-doc shutdown-last-lmdb-executors!
+  []
+  (a/shutdown-executor)
+  (shutdown-transact-async-executor-if-loaded!)
+  (u/shutdown-worker-thread-pool)
+  (u/shutdown-scheduler)
+  nil)
 
 ;; for freeing in-memory vector index objects when an LMDB exits
 (defonce vector-indices (atom {}))  ; fname -> VectorIndex
