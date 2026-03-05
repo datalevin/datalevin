@@ -1907,29 +1907,58 @@
 
 (defn- canonicalize-input-kvtxs
   [dbi-name txs kt vt]
-  (let [^FastList out
-        (if (instance? java.util.Collection txs)
-          (FastList. (.size ^java.util.Collection txs))
-          (FastList.))]
-    (if (instance? java.util.List txs)
-      (let [^java.util.List tx-list txs
-            n (.size tx-list)]
-        (dotimes [i n]
-          (let [t (.get tx-list i)
-                tx (if (instance? datalevin.lmdb.KVTxData t)
-                     t
-                     (if dbi-name
-                       (l/->kv-tx-data t kt vt)
-                       (l/->kv-tx-data t)))]
-            (.add out (ensure-tx-dbi dbi-name tx)))))
-      (doseq [t txs]
-        (let [tx (if (instance? datalevin.lmdb.KVTxData t)
-                   t
-                   (if dbi-name
-                     (l/->kv-tx-data t kt vt)
-                     (l/->kv-tx-data t)))]
-          (.add out (ensure-tx-dbi dbi-name tx)))))
-    out))
+  (letfn [(canonical-kvtx-list?
+            [xs]
+            (when (instance? java.util.List xs)
+              (let [^java.util.List lst xs
+                    n (.size lst)]
+                (loop [i 0]
+                  (if (< i n)
+                    (let [x (.get lst i)]
+                      (if (instance? datalevin.lmdb.KVTxData x)
+                        (let [^datalevin.lmdb.KVTxData tx x]
+                          (if (or (nil? dbi-name) (some? (.-dbi-name tx)))
+                            (recur (inc i))
+                            false))
+                        false))
+                    true)))))]
+    (if (canonical-kvtx-list? txs)
+      txs
+      (let [^FastList out
+            (if (instance? java.util.Collection txs)
+              (FastList. (.size ^java.util.Collection txs))
+              (FastList.))]
+        (if (instance? java.util.List txs)
+          (let [^java.util.List tx-list txs
+                n (.size tx-list)]
+            (dotimes [i n]
+              (let [t (.get tx-list i)
+                    tx (if (instance? datalevin.lmdb.KVTxData t)
+                         t
+                         (if dbi-name
+                           (l/->kv-tx-data t kt vt)
+                           (l/->kv-tx-data t)))]
+                (.add out (ensure-tx-dbi dbi-name tx)))))
+          (doseq [t txs]
+            (let [tx (if (instance? datalevin.lmdb.KVTxData t)
+                       t
+                       (if dbi-name
+                         (l/->kv-tx-data t kt vt)
+                         (l/->kv-tx-data t)))]
+              (.add out (ensure-tx-dbi dbi-name tx)))))
+        out))))
+
+(def ^:private tl-single-row-fast-list
+  (ThreadLocal/withInitial
+   (reify java.util.function.Supplier
+     (get [_] (FastList. 1)))))
+
+(defn- single-row-fast-list
+  ^FastList [row]
+  (let [^FastList rows (.get ^ThreadLocal tl-single-row-fast-list)]
+    (.clear rows)
+    (.add rows row)
+    rows))
 
 (def ^:private txlog-append-hooks
   {:throw-if-fatal! txlog-throw-if-fatal!
@@ -2150,8 +2179,7 @@
                                 (txlog-commit-state state)
                                 append-res)
                   commit-rows (when marker-entry
-                                (doto (FastList. 1)
-                                  (.add (:row marker-entry))))]
+                                (single-row-fast-list (:row marker-entry)))]
               (try
                 (when commit-rows
                   (apply-lmdb-after-txlog-append! lmdb state commit-rows))
