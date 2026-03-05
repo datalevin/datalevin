@@ -1970,11 +1970,6 @@
     (and (some? tx-v)
          (some? @tx-v))))
 
-(defn- txlog-commit-state
-  [state]
-  {:commit-marker? (:commit-marker? state)
-   :marker-revision (long @(:marker-revision state))})
-
 (defn- txlog-config-enabled?
   [lmdb]
   (when-let [info-v (i/kv-info lmdb)]
@@ -2147,14 +2142,14 @@
           res)
         (let [append-res (txlog/append-durable!
                           state tx-data txlog-append-hooks)
-              lmdb-base-rows (or (:lmdb-rows append-res) tx-data)
               marker-entry (txlog/next-commit-marker-entry
-                            (txlog-commit-state state)
+                            (:commit-marker? state)
+                            (long @(:marker-revision state))
                             append-res)
               rows (if marker-entry
-                     (doto (ensure-fast-list lmdb-base-rows)
+                     (doto (ensure-fast-list tx-data)
                        (.add (:row marker-entry)))
-                     lmdb-base-rows)]
+                     tx-data)]
           (try
             (apply-lmdb-after-txlog-append! lmdb state rows)
             (txlog/commit-finished! state marker-entry)
@@ -2176,7 +2171,8 @@
             (let [append-res (txlog/append-durable!
                               state pending txlog-append-hooks)
                   marker-entry (txlog/next-commit-marker-entry
-                                (txlog-commit-state state)
+                                (:commit-marker? state)
+                                (long @(:marker-revision state))
                                 append-res)
                   commit-rows (when marker-entry
                                 (single-row-fast-list (:row marker-entry)))]
