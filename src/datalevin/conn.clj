@@ -41,7 +41,8 @@
   [db]
   {:pre [(db/db? db)]}
   (atom db :meta {:listeners (atom {})
-                  :sync-queue-pending (AtomicLong. 0)}))
+                  :sync-queue-pending (AtomicLong. 0)
+                  :sync-queue-last-enqueue-ms (AtomicLong. 0)}))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -199,16 +200,29 @@
 (defn- ensure-sync-queue-state!
   [conn]
   (let [m (meta conn)
-        queued-pending (:sync-queue-pending m)]
-    (if (instance? AtomicLong queued-pending)
-      {:queued-pending queued-pending}
-      (let [queued-pending (AtomicLong. 0)]
-        (alter-meta! conn assoc :sync-queue-pending queued-pending)
-        {:queued-pending queued-pending}))))
+        queued-pending (:sync-queue-pending m)
+        last-enqueue-ms (:sync-queue-last-enqueue-ms m)
+        pending* (if (instance? AtomicLong queued-pending)
+                   queued-pending
+                   (AtomicLong. 0))
+        last-enqueue-ms* (if (instance? AtomicLong last-enqueue-ms)
+                           last-enqueue-ms
+                           (AtomicLong. 0))]
+    (when (or (not (identical? pending* queued-pending))
+              (not (identical? last-enqueue-ms* last-enqueue-ms)))
+      (alter-meta! conn assoc
+                   :sync-queue-pending pending*
+                   :sync-queue-last-enqueue-ms last-enqueue-ms*))
+    {:queued-pending pending*
+     :last-enqueue-ms last-enqueue-ms*}))
 
 (defn- sync-queue-pending-counter
   [conn]
   ^AtomicLong (:queued-pending (ensure-sync-queue-state! conn)))
+
+(defn- sync-queue-last-enqueue-ms-counter
+  [conn]
+  ^AtomicLong (:last-enqueue-ms (ensure-sync-queue-state! conn)))
 
 (defn- queue-pending-dec-by!
   [conn n]
@@ -270,6 +284,24 @@
 
 (declare queued-transact!)
 
+(def ^:private wal-idle-direct-cooldown-ms
+  5)
+
+(defn- try-direct-wal-transact-when-idle!
+  [conn tx-data tx-meta]
+  (let [now-ms (System/currentTimeMillis)
+        ^AtomicLong last-enqueue-ms (sync-queue-last-enqueue-ms-counter conn)]
+    (if (< (- now-ms (.get last-enqueue-ms))
+           wal-idle-direct-cooldown-ms)
+      [false nil]
+      (let [^AtomicLong pending (sync-queue-pending-counter conn)]
+        (if (.compareAndSet pending 0 1)
+          (try
+            [true (run-transact-now! conn tx-data tx-meta)]
+            (finally
+              (queue-pending-dec-by! conn 1)))
+          [false nil])))))
+
 (defn transact!
   ([conn tx-data] (transact! conn tx-data nil))
   ([conn tx-data tx-meta]
@@ -281,24 +313,48 @@
          (run-transact-now! conn tx-data tx-meta))
 
        (= :strict profile)
-       (do
-         (observe-txlog-sync-path! :queued-strict)
-         (queued-transact! conn tx-data tx-meta))
+       (let [[direct? report]
+             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+         (if direct?
+           (do
+             (observe-txlog-sync-path! :direct-wal-idle-strict)
+             report)
+           (do
+             (observe-txlog-sync-path! :queued-strict)
+             (queued-transact! conn tx-data tx-meta))))
 
        (= :relaxed profile)
-       (do
-         (observe-txlog-sync-path! :queued-relaxed)
-         (queued-transact! conn tx-data tx-meta))
+       (let [[direct? report]
+             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+         (if direct?
+           (do
+             (observe-txlog-sync-path! :direct-wal-idle-relaxed)
+             report)
+           (do
+             (observe-txlog-sync-path! :queued-relaxed)
+             (queued-transact! conn tx-data tx-meta))))
 
        (= :extra profile)
-       (do
-         (observe-txlog-sync-path! :queued-extra)
-         (queued-transact! conn tx-data tx-meta))
+       (let [[direct? report]
+             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+         (if direct?
+           (do
+             (observe-txlog-sync-path! :direct-wal-idle-extra)
+             report)
+           (do
+             (observe-txlog-sync-path! :queued-extra)
+             (queued-transact! conn tx-data tx-meta))))
 
        :else
-       (do
-         (observe-txlog-sync-path! :queued-other)
-         (queued-transact! conn tx-data tx-meta))))))
+       (let [[direct? report]
+             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
+         (if direct?
+           (do
+             (observe-txlog-sync-path! :direct-wal-idle-other)
+             report)
+           (do
+             (observe-txlog-sync-path! :queued-other)
+             (queued-transact! conn tx-data tx-meta))))))))
 
 (defn reset-conn!
   ([conn db] (reset-conn! conn db nil))
@@ -594,6 +650,8 @@
 (defn- queued-transact!
   [conn tx-data tx-meta]
   (let [^AtomicLong pending (sync-queue-pending-counter conn)
+        ^AtomicLong last-enqueue-ms (sync-queue-last-enqueue-ms-counter conn)
+        _ (.set last-enqueue-ms (System/currentTimeMillis))
         _ (.incrementAndGet pending)
         result-promise (promise)
         requests       (doto (FastList. 1)
