@@ -288,7 +288,7 @@
                          "args" {"conn" conn1
                                  "tx-data" [{:db/id bob-id
                                              :counter 7}]}})
-            _schema2  (ok-result
+            schema2   (ok-result
                         {"op" "update-schema"
                          "args" {"conn" conn1
                                  "schema-update"
@@ -327,7 +327,12 @@
                          "args" {"conn" conn1
                                  "query"
                                  "[:find ?c . :in $ ?e :where [?e :counter ?c]]"
-                                 "inputs" [bob-id]}})]
+                                 "inputs" [bob-id]}})
+            schema3   (ok-result
+                        {"op" "update-schema"
+                         "args" {"conn" conn1
+                                 "del-attrs" ["nickname"]
+                                 "rename-map" {"age" "years"}}})]
         (is (seq (get report1 "tx-data")))
         (is (integer? (get report1 "tx-id")))
         (is (= alice-id (get-in report1 ["tempids" "-1"])))
@@ -356,9 +361,10 @@
                  [carol-id :bio "Carol likes pizza"]}
                (set fulltext*)))
         (is (seq (get simulated "tx-data")))
-        (is (contains? (ok-result {"op" "schema"
-                                   "args" {"conn" conn1}})
-                       :nickname))
+        (is (contains? schema2 :nickname))
+        (is (contains? schema3 :years))
+        (is (not (contains? schema3 :age)))
+        (is (not (contains? schema3 :nickname)))
         (is (= 1 tx-result))
         (is (= 1 counter1))
         (is (nil? aborted))

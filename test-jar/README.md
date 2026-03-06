@@ -7,6 +7,14 @@ release artifacts in these scenarios:
 
 Done with `test.sh`.
 
+## Using Datalevin library as a dependency in a JVM Java project
+
+Done with `test-java.sh`.
+
+This script builds and installs the separate `datalevin/datalevin-java`
+artifact into `../target/java-release/m2`, then compiles and runs a small Java
+program against that installed jar.
+
 ## Running Datalevin standalone uberjar
 
 Done with `test-uber.sh`.
