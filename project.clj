@@ -83,7 +83,7 @@
              "--add-opens=java.base/java.util=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"
              "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
-  :javac-options ["--release" "17"]
+  :javac-options ["--release" "21"]
   :jar-exclusions [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                    #"\.csv" #"\.edn" #"\.java"
                    #"\.md" #"\.txt"]
