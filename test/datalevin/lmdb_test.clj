@@ -114,11 +114,15 @@
 
     (testing "get-rank"
       (if/open-dbi lmdb "rank-test")
+      (if/open-dbi lmdb "rank-string-test")
       (if/transact-kv lmdb [[:put "rank-test" 10 "ten" :long :string]
                             [:put "rank-test" 20 "twenty" :long :string]
                             [:put "rank-test" 30 "thirty" :long :string]
                             [:put "rank-test" 40 "forty" :long :string]
-                            [:put "rank-test" 50 "fifty" :long :string]])
+                            [:put "rank-test" 50 "fifty" :long :string]
+                            [:put "rank-string-test" "a" "alpha" :string :string]
+                            [:put "rank-string-test" "b" "beta" :string :string]
+                            [:put "rank-string-test" "c" "gamma" :string :string]])
       (is (= 0 (if/get-rank lmdb "rank-test" 10 :long)))
       (is (= 1 (if/get-rank lmdb "rank-test" 20 :long)))
       (is (= 2 (if/get-rank lmdb "rank-test" 30 :long)))
@@ -134,6 +138,8 @@
       (is (= "fifty" (if/get-by-rank lmdb "rank-test" 4 :long :string)))
       (is (= [10 "ten"] (if/get-by-rank lmdb "rank-test" 0 :long :string false)))
       (is (= [50 "fifty"] (if/get-by-rank lmdb "rank-test" 4 :long :string false)))
+      (is (= ["c" "gamma"]
+             (if/get-by-rank lmdb "rank-string-test" 2 :string :string false)))
       (is (nil? (if/get-by-rank lmdb "rank-test" 99 :long :string))))
 
     (testing "sample-kv"
@@ -536,7 +542,6 @@
     (is (= [["b" 5]]
            (if/list-range lmdb "list" [:open "a" "c"] :string
                           [:less-than 6] :long)))
-
     (is (= (if/list-count lmdb "list" "a" :string) 4))
     (is (= (if/list-count lmdb "list" "b" :string) 3))
 

@@ -598,10 +598,7 @@
       lmdb (index->dbi index)
       [:closed
        (index->k index schema low-datom false)
-       (index->k index schema high-datom true)] (index->ktype index)
-      [:closed
-       (index->v index schema low-datom false)
-       (index->v index schema high-datom true)] (index->vtype index)))
+       (index->k index schema high-datom true)] (index->ktype index)))
 
   (e-size [_ e] (list-count lmdb c/eav e :id))
 

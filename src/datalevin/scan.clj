@@ -65,16 +65,27 @@
   (let [dbi (i/get-dbi lmdb dbi-name false)
         rtx (if (l/writing? lmdb)
               @(l/write-txn lmdb)
-              (i/get-rtx lmdb))]
+              (i/get-rtx lmdb))
+        cur (l/get-cursor dbi rtx)]
     (try
-      (when-let [[kb vb] (l/get-key-by-rank dbi rtx rank)]
-        (if ignore-key?
-          (b/read-buffer vb v-type)
-          [(b/read-buffer kb k-type) (b/read-buffer vb v-type)]))
+      (let [indices (long-array [rank])
+            iterable (if (i/list-dbi? lmdb dbi-name)
+                       (l/iterate-list-sample dbi rtx cur indices [:all] k-type)
+                       (l/iterate-key-sample dbi rtx cur indices [:all] k-type))]
+        (with-open [^AutoCloseable iter (.iterator ^Iterable iterable)]
+          (when (.hasNext ^Iterator iter)
+            (let [kv (.next ^Iterator iter)
+                  v  (b/read-buffer (l/v kv) v-type)]
+              (if ignore-key?
+                v
+                [(b/read-buffer (l/k kv) k-type) v])))))
       (catch Throwable e
         (raise "Fail to get-by-rank: " e
                {:dbi dbi-name :rank rank :k-type k-type :v-type v-type}))
       (finally
+        (if (l/read-only? rtx)
+          (l/return-cursor dbi cur)
+          (l/close-cursor dbi cur))
         (when-not (l/writing? lmdb)
           (i/return-rtx lmdb rtx))))))
 

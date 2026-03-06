@@ -324,15 +324,9 @@
              (queued-transact! conn tx-data tx-meta))))
 
        (= :relaxed profile)
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-relaxed)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-relaxed)
-             (queued-transact! conn tx-data tx-meta))))
+       (do
+         (observe-txlog-sync-path! :queued-relaxed)
+         (queued-transact! conn tx-data tx-meta))
 
        (= :extra profile)
        (let [[direct? report]

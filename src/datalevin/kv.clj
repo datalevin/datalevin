@@ -2671,7 +2671,7 @@
   (list-count [this a0 a1 a2] (i/list-count db a0 a1 a2))
   (list-dbi? [this a0] (i/list-dbi? db a0))
   (list-range [this a0 a1 a2 a3 a4] (i/list-range db a0 a1 a2 a3 a4))
-  (list-range-count [this a0 a1 a2 a3 a4] (i/list-range-count db a0 a1 a2 a3 a4))
+  (list-range-count [this a0 a1 a2] (i/list-range-count db a0 a1 a2))
   (list-range-filter [this a0 a1 a2 a3 a4 a5] (i/list-range-filter db a0 a1 a2 a3 a4 a5))
   (list-range-filter [this a0 a1 a2 a3 a4 a5 a6] (i/list-range-filter db a0 a1 a2 a3 a4 a5 a6))
   (list-range-filter-count [this a0 a1 a2 a3 a4 a5] (i/list-range-filter-count db a0 a1 a2 a3 a4 a5))
