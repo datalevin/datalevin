@@ -743,6 +743,13 @@ Only usable for debug output.
    * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
    Default is `datalevin.constants/*ha-max-promotion-lag-lsn*`.
 
+   * `:ha-clock-skew-budget-ms`, maximum tolerated clock skew in milliseconds
+   before auto-failover pauses. Default is
+   `datalevin.constants/*ha-clock-skew-budget-ms*`.
+
+   * `:ha-clock-skew-hook`, optional command hook that reports observed clock
+   skew in milliseconds on stdout.
+
    * `:ha-control-plane`, consensus control-plane configuration map required
    when `:ha-mode` is `:consensus-lease`.
 
@@ -929,7 +936,7 @@ Only usable for debug output.
 
   `opts` accepts the same WAL settings as [[create-conn]], including `:wal?`
   and `:wal-durability-profile`, plus consensus-lease HA options such as
-  `:ha-mode`, timing knobs, and `:ha-control-plane`.
+  `:ha-mode`, timing knobs, skew guard settings, and `:ha-control-plane`.
 
   See also [[create-conn]] and [[with-conn]]"}
   get-conn conn/get-conn)
@@ -1051,6 +1058,10 @@ Only usable for debug output.
   * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
   * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
   * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
+  * `:ha-clock-skew-budget-ms`, maximum tolerated clock skew before
+   auto-failover pauses.
+  * `:ha-clock-skew-hook`, optional command hook that reports observed clock
+   skew in milliseconds on stdout.
   * `:ha-control-plane`, consensus control-plane configuration map required
    when `:ha-mode` is `:consensus-lease`.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior

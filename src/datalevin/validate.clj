@@ -136,7 +136,8 @@
     :ha-lease-renew-ms
     :ha-lease-timeout-ms
     :ha-promotion-base-delay-ms
-    :ha-promotion-rank-delay-ms})
+    :ha-promotion-rank-delay-ms
+    :ha-clock-skew-budget-ms})
 
 (def ^:private keyword-enum-opts
   {:wal-durability-profile #{:strict :relaxed :extra}
@@ -241,31 +242,45 @@
                   :expected-order sorted-ids})))
     members))
 
-(defn- validate-ha-fencing-hook-shape
-  [hook]
+(defn- validate-ha-command-hook-shape
+  [option hook-label hook]
   (when-not (map? hook)
-    (u/raise "Option :ha-fencing-hook expects a map"
+    (u/raise (str "Option " option " expects a map")
              {:error :ha/validation
-              :option :ha-fencing-hook
+              :option option
               :value hook}))
   (let [cmd (:cmd hook)]
     (when-not (and (vector? cmd) (seq cmd) (every? non-blank-string? cmd))
-      (u/raise "HA fencing hook :cmd must be a non-empty vector of non-blank strings"
+      (u/raise (str "HA " hook-label
+                    " hook :cmd must be a non-empty vector of non-blank strings")
                {:error :ha/validation
-                :option :ha-fencing-hook
+                :option option
                 :hook hook})))
   (doseq [[k pred msg] [[:timeout-ms positive-int?
-                         "HA fencing hook :timeout-ms must be a positive integer"]
+                         (str "HA " hook-label
+                              " hook :timeout-ms must be a positive integer")]
                         [:retries non-negative-int?
-                         "HA fencing hook :retries must be a non-negative integer"]
+                         (str "HA " hook-label
+                              " hook :retries must be a non-negative integer")]
                         [:retry-delay-ms non-negative-int?
-                         "HA fencing hook :retry-delay-ms must be a non-negative integer"]]]
+                         (str "HA " hook-label
+                              " hook :retry-delay-ms must be a non-negative integer")]]]
     (when-not (pred (get hook k))
       (u/raise msg
                {:error :ha/validation
-                :option :ha-fencing-hook
+                :option option
                 :hook hook})))
   true)
+
+(defn- validate-ha-fencing-hook-shape
+  [hook]
+  (validate-ha-command-hook-shape
+    :ha-fencing-hook "fencing" hook))
+
+(defn- validate-ha-clock-skew-hook-shape
+  [hook]
+  (validate-ha-command-hook-shape
+    :ha-clock-skew-hook "clock skew" hook))
 
 (defn- validate-ha-voter
   [v idx]
@@ -416,6 +431,9 @@
             base-delay-ms (:ha-promotion-base-delay-ms opts)
             rank-delay-ms (:ha-promotion-rank-delay-ms opts)
             max-lag-lsn (:ha-max-promotion-lag-lsn opts)
+            clock-skew-budget-ms
+            (long (or (:ha-clock-skew-budget-ms opts)
+                      c/*ha-clock-skew-budget-ms*))
             cp (validate-ha-control-plane-shape (:ha-control-plane opts))
             voters (:voters cp)
             local-peer-id (:local-peer-id cp)
@@ -456,12 +474,19 @@
                    {:error :ha/validation
                     :option :ha-max-promotion-lag-lsn
                     :value max-lag-lsn}))
+        (when-not (positive-int? clock-skew-budget-ms)
+          (u/raise "Option :ha-clock-skew-budget-ms must be a positive integer"
+                   {:error :ha/validation
+                    :option :ha-clock-skew-budget-ms
+                    :value clock-skew-budget-ms}))
         (when (< (long timeout-ms) (unchecked-multiply 2 (long renew-ms)))
           (u/raise "Option :ha-lease-timeout-ms must be >= 2 * :ha-lease-renew-ms"
                    {:error :ha/validation
                     :ha-lease-timeout-ms timeout-ms
                     :ha-lease-renew-ms renew-ms}))
         (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
+        (when (some? (:ha-clock-skew-hook opts))
+          (validate-ha-clock-skew-hook-shape (:ha-clock-skew-hook opts)))
         (when-not (:promotable? local-voter)
           (u/raise "Local control-plane voter must be promotable in consensus mode"
                    {:error :ha/validation
@@ -517,6 +542,10 @@
       (= k :ha-fencing-hook)
       (when (some? v)
         (validate-ha-fencing-hook-shape v))
+
+      (= k :ha-clock-skew-hook)
+      (when (some? v)
+        (validate-ha-clock-skew-hook-shape v))
 
       (= k :ha-membership-hash)
       (when-not (or (nil? v) (non-blank-string? v))

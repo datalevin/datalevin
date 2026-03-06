@@ -53,6 +53,7 @@
    :ha-control-plane
    :ha-members
    :ha-fencing-hook
+   :ha-clock-skew-hook
    :ha-membership-hash])
 
 (defn- normalize-legacy-ha-nil-sentinels

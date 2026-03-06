@@ -1109,6 +1109,108 @@
                          :attempt attempt
                          :fence-op-id fence-op-id))))))))))
 
+(defn- parse-ha-clock-skew-output
+  [output]
+  (let [trimmed (some-> output s/trim)]
+    (cond
+      (s/blank? trimmed)
+      {:ok? false
+       :reason :invalid-output
+       :message "Clock skew hook returned blank output"
+       :output output}
+
+      :else
+      (try
+        {:ok? true
+         :clock-skew-ms (Math/abs (long (Long/parseLong trimmed)))}
+        (catch NumberFormatException _
+          {:ok? false
+           :reason :invalid-output
+           :message "Clock skew hook output must be an integer millisecond value"
+           :output output})))))
+
+(defn ^:redef run-ha-clock-skew-hook
+  [db-name m]
+  (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
+                            c/*ha-clock-skew-budget-ms*))
+        {:keys [cmd timeout-ms retries retry-delay-ms]} (:ha-clock-skew-hook m)]
+    (if-not (and (vector? cmd) (seq cmd))
+      {:ok? true
+       :skipped? true
+       :paused? false
+       :reason :clock-skew-hook-unconfigured
+       :budget-ms budget-ms}
+      (let [env            {"DTLV_DB_NAME" db-name
+                            "DTLV_HA_NODE_ID" (str (or (:ha-node-id m) ""))
+                            "DTLV_HA_ENDPOINT"
+                            (str (or (:ha-local-endpoint m) ""))
+                            "DTLV_CLOCK_SKEW_BUDGET_MS" (str budget-ms)}
+            max-attempts   (inc (long (or retries 0)))
+            timeout-ms     (long (or timeout-ms 3000))
+            retry-delay-ms (long (or retry-delay-ms 1000))]
+        (loop [attempt 1]
+          (let [result  (run-command-with-timeout cmd env timeout-ms)
+                parsed  (if (:ok? result)
+                          (merge result
+                                 (parse-ha-clock-skew-output
+                                   (:output result)))
+                          result)
+                paused? (if (:ok? parsed)
+                          (> (long (or (:clock-skew-ms parsed) 0))
+                             budget-ms)
+                          true)]
+            (if (:ok? parsed)
+              (assoc parsed
+                     :attempt attempt
+                     :budget-ms budget-ms
+                     :paused? paused?
+                     :reason (if paused?
+                               :clock-skew-budget-breached
+                               :clock-skew-within-budget))
+              (if (< attempt max-attempts)
+                (do
+                  (Thread/sleep retry-delay-ms)
+                  (recur (u/long-inc attempt)))
+                (assoc parsed
+                       :attempt attempt
+                       :budget-ms budget-ms
+                       :paused? true)))))))))
+
+(defn- refresh-ha-clock-skew-state
+  [db-name m]
+  (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
+                            c/*ha-clock-skew-budget-ms*))
+        result    (try
+                    (run-ha-clock-skew-hook db-name m)
+                    (catch Exception e
+                      {:ok? false
+                       :paused? true
+                       :reason :exception
+                       :budget-ms budget-ms
+                       :message (ex-message e)}))
+        now-ms    (System/currentTimeMillis)]
+    (assoc m
+           :ha-clock-skew-budget-ms budget-ms
+           :ha-clock-skew-paused? (true? (:paused? result))
+           :ha-clock-skew-last-check-ms now-ms
+           :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
+           :ha-clock-skew-last-result result)))
+
+(defn- ha-clock-skew-promotion-failure-details
+  [m]
+  (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
+                            c/*ha-clock-skew-budget-ms*))
+        result    (:ha-clock-skew-last-result m)
+        base      {:budget-ms budget-ms
+                   :last-check-ms (:ha-clock-skew-last-check-ms m)
+                   :check result}]
+    (if (= :clock-skew-budget-breached (:reason result))
+      (assoc base
+             :reason :clock-skew-budget-breached
+             :clock-skew-ms (:clock-skew-ms result))
+      (assoc base
+             :reason :clock-skew-check-failed))))
+
 (defn- fail-ha-candidate
   [m reason details]
   (-> m
@@ -1147,6 +1249,12 @@
            :ha-promotion-failure-details
            {:reason (:ha-follower-degraded-reason m)
             :details (:ha-follower-degraded-details m)})
+
+    (true? (:ha-clock-skew-paused? m))
+    (assoc m
+           :ha-promotion-last-failure :clock-skew-paused
+           :ha-promotion-failure-details
+           (ha-clock-skew-promotion-failure-details m))
 
     :else
     (if-let [delay-ms (ha-promotion-delay-ms m)]
@@ -1301,6 +1409,10 @@
               (fail-ha-candidate m :lease-not-expired
                                  {:lease observed-lease})
 
+              (true? (:ha-clock-skew-paused? m))
+              (fail-ha-candidate m :clock-skew-paused
+                                 (ha-clock-skew-promotion-failure-details m))
+
               :else
               (let [lag-check-1 (ha-promotion-lag-guard m observed-lease)]
                 (if-not (:ok? lag-check-1)
@@ -1432,8 +1544,9 @@
                                    :renew-exception
                                    {:message (ex-message e)}
                                    now-ms)))
-          m3 (advance-ha-follower-or-candidate db-name m2 now-ms)]
-      (-> (maybe-demote-on-refresh-timeout db-name m3 now-ms)
+          m3 (refresh-ha-clock-skew-state db-name m2)
+          m4 (advance-ha-follower-or-candidate db-name m3 now-ms)]
+      (-> (maybe-demote-on-refresh-timeout db-name m4 now-ms)
           (maybe-finish-ha-demotion now-ms)))))
 
 (defn clear-ha-runtime-state
@@ -1447,9 +1560,14 @@
           :ha-lease-renew-ms :ha-lease-timeout-ms
           :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
           :ha-max-promotion-lag-lsn :ha-fencing-hook
+          :ha-clock-skew-budget-ms :ha-clock-skew-hook
           :ha-authority-lease :ha-authority-version
           :ha-authority-owner-node-id :ha-authority-term
           :ha-lease-until-ms :ha-last-authority-refresh-ms
+          :ha-clock-skew-paused?
+          :ha-clock-skew-last-check-ms
+          :ha-clock-skew-last-observed-ms
+          :ha-clock-skew-last-result
           :ha-role :ha-leader-term
           :ha-local-last-applied-lsn
           :ha-follower-next-lsn :ha-follower-last-batch-size
@@ -1614,7 +1732,11 @@
         max-promotion-lag-lsn
         (long (or (:ha-max-promotion-lag-lsn ha-opts)
                   c/*ha-max-promotion-lag-lsn*))
+        clock-skew-budget-ms
+        (long (or (:ha-clock-skew-budget-ms ha-opts)
+                  c/*ha-clock-skew-budget-ms*))
         fencing-hook (:ha-fencing-hook ha-opts)
+        clock-skew-hook (:ha-clock-skew-hook ha-opts)
         local-endpoint (local-ha-endpoint ha-opts)
         authority (ctrl/new-authority cp)]
     (try
@@ -1669,6 +1791,12 @@
          :ha-promotion-rank-delay-ms   promotion-rank-delay-ms
          :ha-max-promotion-lag-lsn     max-promotion-lag-lsn
          :ha-fencing-hook              fencing-hook
+         :ha-clock-skew-budget-ms      clock-skew-budget-ms
+         :ha-clock-skew-hook           clock-skew-hook
+         :ha-clock-skew-paused?        false
+         :ha-clock-skew-last-check-ms  nil
+         :ha-clock-skew-last-observed-ms nil
+         :ha-clock-skew-last-result    nil
          :ha-authority-lease           lease
          :ha-authority-version         version
          :ha-authority-owner-node-id   (:leader-node-id lease)

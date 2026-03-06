@@ -642,6 +642,8 @@
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
    :ha-fencing-hook
+   :ha-clock-skew-budget-ms
+   :ha-clock-skew-hook
    :ha-control-plane])
 
 (defn- sanitize-ha-path-segment

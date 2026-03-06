@@ -702,6 +702,10 @@ Set to 0 for strict check-on-every-call behavior."}
   *ha-max-promotion-lag-lsn* 0)
 
 (def ^{:dynamic true
+       :doc     "Default maximum tolerated clock skew in milliseconds before auto-failover pauses."}
+  *ha-clock-skew-budget-ms* 100)
+
+(def ^{:dynamic true
        :doc     "Default consensus control-plane config map. Nil requires explicit configuration when HA is enabled."}
   *ha-control-plane* nil)
 

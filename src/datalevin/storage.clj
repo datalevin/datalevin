@@ -1549,6 +1549,7 @@
    :ha-control-plane
    :ha-members
    :ha-fencing-hook
+   :ha-clock-skew-hook
    :ha-membership-hash])
 
 (defn- encode-legacy-ha-nil-sentinels
@@ -1768,6 +1769,7 @@
                         :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
                         :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
                         :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
+                        :ha-clock-skew-budget-ms c/*ha-clock-skew-budget-ms*
                         :ha-control-plane c/*ha-control-plane*
                         :wal?             c/*datalog-wal?*
                         :wal-rollout-mode c/*wal-rollout-mode*
