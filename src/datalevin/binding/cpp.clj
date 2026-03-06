@@ -1219,7 +1219,7 @@
   (range-count [lmdb dbi-name k-range k-type]
     (let [dupsort? (.-dupsort? ^DBI (.get dbis dbi-name))]
       (if dupsort?
-        (.list-range-count lmdb dbi-name k-range k-type [:all] nil)
+        (.list-range-count lmdb dbi-name k-range k-type)
         (.key-range-count lmdb dbi-name k-range k-type))))
 
   (get-some [this dbi-name pred k-range]
@@ -1354,7 +1354,7 @@
   (list-range [this dbi-name k-range kt v-range vt]
     (scan/list-range this dbi-name k-range kt v-range vt))
 
-  (list-range-count [lmdb dbi-name k-range k-type v-range v-type]
+  (list-range-count [lmdb dbi-name k-range k-type]
     (key-range-list-count-fast lmdb dbi-name k-range k-type))
 
   (list-range-first [this dbi-name k-range kt v-range vt]

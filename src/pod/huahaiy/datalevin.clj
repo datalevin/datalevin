@@ -711,9 +711,9 @@
     (into [] (d/list-range d dbi-name k-range kt v-range vt))))
 
 (defn list-range-count
-  [db dbi-name k-range kt v-range vt]
+  [db dbi-name k-range kt]
   (when-let [d (get-kv db)]
-    (d/list-range-count d dbi-name k-range kt v-range vt)))
+    (d/list-range-count d dbi-name k-range kt)))
 
 (defn list-range-first
   [db dbi-name k-range kt v-range vt]

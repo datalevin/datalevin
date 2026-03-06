@@ -1869,13 +1869,13 @@ To access store on a server, [[interpret.inter-fn]] should be used to define the
      supported for both `k-range` and `v-range`."}
   list-range i/list-range)
 
-(def ^{:arglists '([db list-name k-range k-type v-range v-type])
-       :doc      "Return the number of key-values in the specified value
-     range and the specified key range of a sub-database opened by
-     [[open-list-dbi]].
+(def ^{:arglists '([db list-name k-range k-type])
+       :doc      "Return the approximate number of key-values in the
+     specified key range of a sub-database opened by [[open-list-dbi]].
+     This count ignores the value range boundary.
 
      The same range specification as `k-range` in [[get-range]] is
-     supported for both `k-range` and `v-range`."}
+     supported for `k-range`."}
   list-range-count i/list-range-count)
 
 (def ^{:arglists '([db list-name k-range k-type v-range v-type])

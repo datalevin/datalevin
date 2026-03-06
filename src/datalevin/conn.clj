@@ -331,7 +331,7 @@
              (observe-txlog-sync-path! :queued-strict)
              (queued-transact! conn tx-data tx-meta))))
 
-       (= :relaxed profile)
+      (= :relaxed profile)
        ;; Relaxed durability relies on the sync queue to batch fsync work.
        ;; Allowing an idle direct fast path defeats the expected batching
        ;; semantics and makes the behavior diverge from the documented model.

@@ -300,7 +300,7 @@
           src-dir  (u/tmp-dir (str "src-dump-dl-" (UUID/randomUUID)))
           conn     (d/create-conn src-dir schema opts)
           dest-dir (u/tmp-dir (str "dest-load-dl-" (UUID/randomUUID)))
-          dl-file  (str (u/tmp-dir) "dl")
+          dl-file  (str (u/tmp-dir) "dl-" (UUID/randomUUID))
           s        "The quick brown fox jumps over the lazy dog"
           now      (Date.)
           uuid     (UUID/randomUUID)
@@ -427,7 +427,7 @@
           src-dir  (u/tmp-dir (str "src-dump-dl-nippy-" (UUID/randomUUID)))
           conn     (d/create-conn src-dir schema opts)
           dest-dir (u/tmp-dir (str "dest-load-dl-nippy-" (UUID/randomUUID)))
-          dl-file  (str (u/tmp-dir) "dl-nippy")
+          dl-file  (str (u/tmp-dir) "dl-nippy-" (UUID/randomUUID))
           s        "The quick brown fox jumps over the lazy dog"
           now      (Date.)
           uuid     (UUID/randomUUID)

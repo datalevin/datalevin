@@ -552,10 +552,8 @@
            (if/list-range lmdb "a" [:closed-back 5 0] :long
                           [:closed-back 5 0] :long)))
     (is (= 16
-           (if/list-range-count lmdb "a" [:closed-back 5 0] :long
-                                [:closed-back 5 0] :long)))
-    (is (= 11 (if/list-range-count lmdb "a" [:greater-than 3] :long
-                                   [:greater-than 20] :long)))
+           (if/list-range-count lmdb "a" [:closed-back 5 0] :long)))
+    (is (= 11 (if/list-range-count lmdb "a" [:greater-than 3] :long)))
     (is (= [5 30]
            (if/list-range-first lmdb "a" [:greater-than 3] :long
                                 [:greater-than 20] :long)))

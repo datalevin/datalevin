@@ -45,7 +45,7 @@
     "Return the first n key-value pairs in the specified value range of the
      specified key range")
   (list-range-count
-    [db list-name k-range k-type v-range v-type]
+    [db list-name k-range k-type]
     "Return the approximate number of key-values in the specified key range,
      ignoring the value range boundary")
   (list-range-filter
@@ -367,7 +367,7 @@ values;")
   (populated? [this index low-datom high-datom]
     "Return true if there exists at least one datom in the given boundary (inclusive)")
   (size [this index low-datom high-datom]
-    "Return the approximate number of datoms within the given range (inclusive)")
+    "Return the approximate number of datoms within the given range (inclusive). On list-backed indexes, this may ignore the value portion of the range.")
   (e-size [this e]
     "Return the numbers of datoms with the given e value")
   (a-size [this a]

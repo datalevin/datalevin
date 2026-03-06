@@ -1093,9 +1093,9 @@
     (cl/normal-request client :list-range
                        [db-name dbi-name k-range kt v-range vt] writing?))
 
-  (list-range-count [_ dbi-name k-range kt v-range vt]
+  (list-range-count [_ dbi-name k-range kt]
     (cl/normal-request client :list-range-count
-                       [db-name dbi-name k-range kt v-range vt] writing?))
+                       [db-name dbi-name k-range kt] writing?))
 
   (list-range-first [_ dbi-name k-range kt v-range vt]
     (cl/normal-request client :list-range-first

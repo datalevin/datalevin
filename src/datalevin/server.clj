@@ -196,7 +196,7 @@
 
 (defn- eid->role-key
   [sys-conn eid]
-  (:user/name (d/pull @sys-conn [:user/anme] eid)))
+  (:role/key (d/pull @sys-conn [:role/key] eid)))
 
 (defn- query-users [sys-conn]
   (d/q '[:find [?uname ...]
@@ -257,7 +257,6 @@
                :in $ ?rk
                :where
                [?r :role/key ?rk]
-               [?ur :user-role/role ?r]
                [?rp :role-perm/role ?r]
                [?rp :role-perm/perm ?p]]
              @sys-conn role-key)))
@@ -440,10 +439,17 @@
 
 (defn- transact-revoke-permission
   [sys-conn rid perm-act perm-obj perm-tgt]
-  (if-let [pid (permission-eid sys-conn perm-act perm-obj perm-tgt)]
-    (when-let [rpid (role-permission-eid sys-conn rid pid)]
-      (d/transact! sys-conn [[:db/retractEntity rpid]]))
-    (u/raise "Permission does not exist." {})))
+  (if perm-tgt
+    (if-let [tid (perm-tgt-eid sys-conn perm-obj perm-tgt)]
+      (if-let [pid (permission-eid sys-conn perm-act perm-obj tid)]
+        (when-let [rpid (role-permission-eid sys-conn rid pid)]
+          (d/transact! sys-conn [[:db/retractEntity rpid]]))
+        (u/raise "Permission does not exist." {}))
+      (u/raise "Permission target does not exist." {}))
+    (if-let [pid (permission-eid sys-conn perm-act perm-obj nil)]
+      (when-let [rpid (role-permission-eid sys-conn rid pid)]
+        (d/transact! sys-conn [[:db/retractEntity rpid]]))
+      (u/raise "Permission does not exist." {}))))
 
 (defn- transact-new-db
   [sys-conn username db-type db-name]
@@ -1366,7 +1372,8 @@
 (defn- open-server-store
   "Open a store. NB. stores are left open"
   [^Server server ^SelectionKey skey
-   {:keys [db-name schema opts return-db-info?]} db-type]
+   {:keys [db-name schema opts return-db-info? respond?]
+    :or   {respond? true}} db-type]
   (wrap-error
     (let [{:keys [client-id]} @(.attachment skey)
           {:keys [username]}  (get-client server client-id)
@@ -1409,9 +1416,11 @@
                            :max-tx        (i/max-tx store)
                            :last-modified (i/last-modified store)
                            :opts          (i/opts store)})]
-            (write-message skey
-                           (cond-> {:type :command-complete}
-                             db-info (assoc :result db-info)))))))))
+            (when respond?
+              (write-message skey
+                             (cond-> {:type :command-complete}
+                               db-info (assoc :result db-info))))
+            db-info))))))
 
 (defn- session-lmdb [sys-conn] (.-lmdb ^Store (.-store ^DB (d/db sys-conn))))
 
@@ -1806,11 +1815,8 @@
 (defn- create-database
   [^Server server ^SelectionKey skey {:keys [args]}]
   (wrap-error
-    (let [sys-conn            (.-sys-conn server)
-          {:keys [client-id]} @(.attachment skey)
-          {:keys [username]}  (get-client server client-id)
-          [db-name db-type]   args
-          db-name             (u/lisp-case db-name)]
+    (let [[db-name db-type] args
+          db-name           (u/lisp-case db-name)]
       (wrap-permission
         ::create ::database nil
         "Don't have permission to create database"
@@ -1818,11 +1824,9 @@
           (u/raise "Database already exists." {:db db-name})
           (do
             (open-server-store server skey
-                               {:db-name db-name} db-type)
-            (transact-new-db sys-conn username db-type db-name)
-            (update-client server client-id
-                           #(assoc % :permissions
-                                   (user-permissions sys-conn username)))))
+                               {:db-name db-name
+                                :respond? false} db-type)
+            nil))
         (write-message skey {:type :command-complete})))))
 
 (defn- close-database
