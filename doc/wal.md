@@ -52,7 +52,14 @@ WAL supports three durability profiles in WAL:
 * `:extra`: each transaction waits for stricter durability than `:strict`,
   on macOS, that is `fcntl(F_FULLSYNC)`.
 
-`:strict`, `:relaxed`, and `:extra` all go through a sync queue.
+Dispatch policy differs by profile:
+
+* `:strict`: prefers a direct fast path for idle single-thread local writes,
+  and falls back to the sync queue when work is already pending.
+* `:relaxed`: always goes through the sync queue so durability batching stays
+  effective and predictable.
+* `:extra`: follows the same adaptive direct-or-queued dispatch as `:strict`,
+  but with stricter durability on the sync side.
 
 In `:strict`, the durability guarantee follows the OS's `fsync` guidance, which
 is not the same for different OS. On macOS, `fsync` is not full durable. Getting

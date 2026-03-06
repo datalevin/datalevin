@@ -609,6 +609,10 @@
   "kv-info key for snapshot previous LSN used by WAL retention floor computation."
   :wal/snapshot-previous-lsn)
 
+(def ^:const ha-local-applied-lsn
+  "kv-info key for persisted HA follower applied LSN."
+  :ha/local-applied-lsn)
+
 (def ^:const wal-replica-floors
   "kv-info key for replica floor heartbeat map used by WAL retention floor computation."
   :wal/replica-floors)

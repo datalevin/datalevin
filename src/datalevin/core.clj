@@ -201,7 +201,9 @@ Only usable for debug output.
  `:strict` waits for durable WAL acknowledgement per transaction with fsync
  semantics; `:relaxed` improves throughput by batching durability and may lose
  a small tail of recent transactions on a crash; `:extra` is stricter than
- `:strict` (SQLite-style extra durability, e.g. fullsync on macOS).
+ `:strict` (SQLite-style extra durability, e.g. fullsync on macOS). For local
+ single-thread idle writes, `:strict` and `:extra` may take a direct fast path;
+ `:relaxed` always uses the sync queue so batching remains effective.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -284,6 +286,8 @@ Only usable for debug output.
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
+ `:strict` and `:extra` may take an idle local direct fast path; `:relaxed`
+ always uses the sync queue so durability batching remains effective.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -671,6 +675,8 @@ Only usable for debug output.
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
 
    * `:wal-durability-profile`, one of `:strict`, `:relaxed`, or `:extra`.
+ `:strict` and `:extra` may take an idle local direct fast path; `:relaxed`
+ always uses the sync queue so durability batching remains effective.
 
    * `:wal-group-commit`, maximum transactions per durability batch in
  `:relaxed` mode. Default comes from
@@ -1042,7 +1048,9 @@ Only usable for debug output.
    `:strict` waits for durable WAL acknowledgement per write transaction with
    fsync semantics; `:relaxed` batches durability for higher throughput with a
    small crash window; `:extra` is stricter than `:strict` (SQLite-style extra
-   durability, e.g. fullsync on macOS).
+   durability, e.g. fullsync on macOS). For local single-thread idle writes,
+   `:strict` and `:extra` may take a direct fast path; `:relaxed` always uses
+   the sync queue so batching remains effective.
   * `:wal-group-commit` sets the max transactions per durability batch in
    `:relaxed` mode. Default comes from
    `datalevin.constants/*wal-group-commit*`.

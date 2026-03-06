@@ -1981,8 +1981,8 @@
      :applied-lsn (long applied-lsn)
      :valid-marker valid-marker}))
 
-(defn select-open-records
-  [records from-lsn upto-lsn]
+(defn- select-open-records*
+  [records from-lsn upto-lsn transform-record]
   (let [from (max 0 (long (or from-lsn 0)))
         upto (when (some? upto-lsn) (long upto-lsn))]
     (when (and upto (< (long upto) (long from)))
@@ -1995,10 +1995,26 @@
          (filter #(if upto
                     (<= (long (:lsn %)) (long upto))
                     true))
-         (mapv (fn [{:keys [rows] :as r}]
-                 (-> r
-                     (dissoc :rows :path)
-                     (assoc :ops rows)))))))
+         (mapv transform-record))))
+
+(defn select-open-records
+  [records from-lsn upto-lsn]
+  (select-open-records*
+   records
+   from-lsn
+   upto-lsn
+   (fn [{:keys [rows] :as r}]
+     (-> r
+         (dissoc :rows :path)
+         (assoc :ops rows)))))
+
+(defn select-open-record-rows
+  [records from-lsn upto-lsn]
+  (select-open-records*
+   records
+   from-lsn
+   upto-lsn
+   #(dissoc % :path)))
 
 (defn retention-floors
   [{:keys [snapshot-state

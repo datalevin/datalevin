@@ -324,6 +324,8 @@
                     (volatile! :remote-dl-mutex)
                     false
                     (volatile! cached)
+                    (java.util.concurrent.atomic.AtomicBoolean. false)
+                    false
                     (java.util.concurrent.atomic.AtomicBoolean. false))]
         (is (= cached (sut/db-info store)))
         (let [real-info (sut/db-info store)]

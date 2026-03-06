@@ -1720,6 +1720,7 @@
 (defn- propagate-top-level-txlog-opts-to-kv-opts
   [opts]
   (let [opts      (or opts {})
+        kv-opts?  (contains? opts :kv-opts)
         kv-opts   (c/canonicalize-wal-opts (or (:kv-opts opts) {}))
         txlog-opts (into {}
                          (keep (fn [[k v]]
@@ -1728,10 +1729,36 @@
                                               (not (contains? kv-opts k')))
                                      [k' v]))))
                          opts)]
-    (-> (c/canonicalize-wal-opts opts)
-        (assoc :kv-opts (if (seq txlog-opts)
-                          (merge kv-opts txlog-opts)
-                          kv-opts)))))
+    (cond-> (c/canonicalize-wal-opts opts)
+      (or kv-opts? (seq txlog-opts))
+      (assoc :kv-opts (if (seq txlog-opts)
+                        (merge kv-opts txlog-opts)
+                        kv-opts)))))
+
+(defn- txlog-dir-path
+  [dir]
+  (str dir u/+separator+ "txlog"))
+
+(defn- existing-store?
+  [dir]
+  (or (u/file-exists (str dir u/+separator+ c/data-file-name))
+      (u/file-exists (txlog-dir-path dir))))
+
+(defn- existing-store-open-kv-opts
+  [dir kv-opts]
+  (cond-> (or kv-opts {})
+    (u/file-exists (txlog-dir-path dir))
+    (assoc :wal? true)))
+
+(defn- load-existing-store-opts
+  [dir kv-opts]
+  (when (existing-store? dir)
+    (let [probe (lmdb/open-kv dir (existing-store-open-kv-opts dir kv-opts))]
+      (try
+        (open-dbis probe)
+        (not-empty (load-opts probe))
+        (finally
+          (close-kv probe))))))
 
 (defn open
   "Open and return the storage."
@@ -1746,19 +1773,23 @@
          {:keys [kv-opts search-opts search-domains vector-opts vector-domains]}
          opts
          dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
-         data-file (java.io.File. (str dir u/+separator+ c/data-file-name))
-         new-db? (not (.exists ^java.io.File data-file))
+         persisted-opts (load-existing-store-opts dir kv-opts)
+         persisted-kv-opts
+         (c/canonicalize-wal-opts (or (:kv-opts persisted-opts) {}))
+         new-db? (not (existing-store? dir))
          wal-default-kv-opts (when new-db?
                                {:wal? c/*datalog-wal?*
                                 :wal-durability-profile
                                 c/*datalog-wal-durability-profile*})
-         kv-opts (if wal-default-kv-opts
-                   (merge wal-default-kv-opts kv-opts)
-                   kv-opts)
+         kv-opts (cond-> (merge persisted-kv-opts kv-opts)
+                   wal-default-kv-opts (merge wal-default-kv-opts)
+                   (u/file-exists (txlog-dir-path dir)) (assoc :wal? true))
          lmdb (lmdb/open-kv dir kv-opts)]
      (open-dbis lmdb)
-     (let [opts0     (load-opts lmdb)
-           opts1     (if (empty opts0)
+     (let [opts0     (or persisted-opts
+                         (not-empty (load-opts lmdb))
+                         {})
+           opts1     (if (empty? opts0)
                        {:validate-data?       false
                         :auto-entity-time?    false
                         :closed-schema?       false
@@ -1818,6 +1849,30 @@
                            (str (UUID/randomUUID)))
            opts3     (assoc opts2 :db-identity db-identity)
            _         (vld/validate-ha-options opts3)
+           _         (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
+                       (prn :storage-open
+                            {:dir dir
+                             :incoming-opts opts
+                             :persisted-opts (select-keys opts0
+                                                          [:ha-mode
+                                                           :db-name
+                                                           :db-identity
+                                                           :ha-node-id
+                                                           :ha-members
+                                                           :ha-control-plane
+                                                           :ha-fencing-hook
+                                                           :wal?
+                                                           :kv-opts])
+                             :opts3 (select-keys opts3
+                                                 [:ha-mode
+                                                  :db-name
+                                                  :db-identity
+                                                  :ha-node-id
+                                                  :ha-members
+                                                  :ha-control-plane
+                                                  :ha-fencing-hook
+                                                  :wal?
+                                                  :kv-opts])}))
            _         (sync-wal-runtime-opts! lmdb opts3)
            schema    (init-schema lmdb schema)
            s-domains (init-search-domains (:search-domains opts3)
@@ -1831,7 +1886,7 @@
                 (init-indices lmdb v-domains)
                 (init-idoc-indices lmdb i-domains)
                 (ConcurrentHashMap.)
-                (load-opts lmdb)
+                opts3
                 schema
                 (schema->rschema schema)
                 (init-attrs schema)

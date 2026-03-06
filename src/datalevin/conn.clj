@@ -260,23 +260,28 @@
 (defn- txlog-sync-queue-profile
   [conn]
   (when (and (not *sync-queue-worker?*)
-             (conn? conn))
-    (let [store (.-store ^DB @conn)]
-      (when (and (not (current-thread-holds-store-write-lock? store))
-                 (or (and (instance? Store store)
-                          (not (l/writing? (.-lmdb ^Store store))))
-                     (and (instance? DatalogStore store)
-                          (not (l/writing? store)))))
-        (cond
-          (instance? Store store)
-          (wal-sync-queue-profile-from-opts
-            (i/env-opts (.-lmdb ^Store store)))
+             (instance? clojure.lang.IDeref conn))
+    (let [db @conn]
+      ;; `conn?` refreshes remote cache state via `last-modified`, which is
+      ;; unnecessary for picking the local sync path and can stall writes
+      ;; during HA failover when leadership is still converging.
+      (when (instance? DB db)
+        (let [store (.-store ^DB db)]
+          (when (and (not (current-thread-holds-store-write-lock? store))
+                     (or (and (instance? Store store)
+                              (not (l/writing? (.-lmdb ^Store store))))
+                         (and (instance? DatalogStore store)
+                              (not (l/writing? store)))))
+            (cond
+              (instance? Store store)
+              (wal-sync-queue-profile-from-opts
+                (i/env-opts (.-lmdb ^Store store)))
 
-          (instance? DatalogStore store)
-          (wal-sync-queue-profile-from-opts
-            (cached-remote-store-opts conn store))
+              (instance? DatalogStore store)
+              (wal-sync-queue-profile-from-opts
+                (cached-remote-store-opts conn store))
 
-          :else nil)))))
+              :else nil)))))))
 
 (defn- strict-txlog-sync-queue?
   [conn]
@@ -313,6 +318,9 @@
          (run-transact-now! conn tx-data tx-meta))
 
        (= :strict profile)
+       ;; Strict durability can take the idle direct fast path when there is no
+       ;; queue pressure, but falls back to the sync queue adaptively once work
+       ;; is already pending.
        (let [[direct? report]
              (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
          (if direct?
@@ -324,17 +332,16 @@
              (queued-transact! conn tx-data tx-meta))))
 
        (= :relaxed profile)
-       (let [[direct? report]
-             (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
-         (if direct?
-           (do
-             (observe-txlog-sync-path! :direct-wal-idle-relaxed)
-             report)
-           (do
-             (observe-txlog-sync-path! :queued-relaxed)
-             (queued-transact! conn tx-data tx-meta))))
+       ;; Relaxed durability relies on the sync queue to batch fsync work.
+       ;; Allowing an idle direct fast path defeats the expected batching
+       ;; semantics and makes the behavior diverge from the documented model.
+       (do
+         (observe-txlog-sync-path! :queued-relaxed)
+         (queued-transact! conn tx-data tx-meta))
 
        (= :extra profile)
+       ;; Extra durability follows the same adaptive dispatch as strict, with a
+       ;; stricter sync primitive on the durability side.
        (let [[direct? report]
              (try-direct-wal-transact-when-idle! conn tx-data tx-meta)]
          (if direct?

@@ -35,12 +35,14 @@
    [java.nio.charset StandardCharsets]
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.file Files Paths OpenOption]
-   [java.nio.channels Selector SelectionKey ServerSocketChannel SocketChannel]
+   [java.nio.channels ClosedChannelException Selector SelectionKey
+    ServerSocketChannel SocketChannel]
    [java.net InetSocketAddress]
    [java.security SecureRandom MessageDigest]
    [java.util Iterator UUID Map]
+   [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
-   [java.util.concurrent Executors Executor ExecutorService
+   [java.util.concurrent Executors Executor ExecutorService Future
     ConcurrentLinkedQueue ConcurrentHashMap Semaphore TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -620,9 +622,15 @@
 
 (defn- update-db
   [^Server server db-name f]
-  (let [^Map dbs (.-dbs server)
-        new      (f (get dbs db-name {}))]
-    (.put dbs db-name new)))
+  (let [^ConcurrentHashMap dbs (.-dbs server)
+        new-v                 (volatile! nil)]
+    (.compute dbs db-name
+              (reify BiFunction
+                (apply [_ _ old]
+                  (let [new (f (or old {}))]
+                    (vreset! new-v new)
+                    new))))
+    @new-v))
 
 (defn- consensus-ha-opts
   [store]
@@ -733,25 +741,30 @@
   (loop []
     (when (and (.get running?)
                (.get ^AtomicBoolean (.-running server)))
-      (let [m (get (.-dbs server) db-name)]
-        (if (or (nil? m) (nil? (:ha-authority m)))
-          (.set running? false)
-          (let [next-state-v (volatile! nil)]
-            (update-db server db-name
-                       (fn [state]
-                         (if (and state
-                                  (identical? running?
-                                              (:ha-renew-loop-running? state)))
-                           (let [next-state (ha-renew-step db-name state)]
-                             (vreset! next-state-v next-state)
-                             next-state)
-                           state)))
-            (let [next-state (or @next-state-v m)
-                  sleep-ms   (long (ha-loop-sleep-ms next-state))]
-              (try
-                (Thread/sleep sleep-ms)
-                (catch InterruptedException _
-                  (.set running? false)))))))
+      (try
+        (let [m (get (.-dbs server) db-name)]
+          (if (or (nil? m) (nil? (:ha-authority m)))
+            (.set running? false)
+            (let [next-state-v (volatile! nil)]
+              (update-db server db-name
+                         (fn [state]
+                           (if (and state
+                                    (identical? running?
+                                                (:ha-renew-loop-running? state)))
+                             (let [next-state (ha-renew-step db-name state)]
+                               (vreset! next-state-v next-state)
+                               next-state)
+                             state)))
+              (let [next-state (or @next-state-v m)
+                    sleep-ms   (long (ha-loop-sleep-ms next-state))]
+                (try
+                  (Thread/sleep sleep-ms)
+                  (catch InterruptedException _
+                    (.set running? false)))))))
+        (catch Throwable t
+          (log/error t "HA renew loop crashed"
+                     {:db-name db-name})
+          (.set running? false)))
       (recur))))
 
 (declare execute)
@@ -762,19 +775,45 @@
     (update-db server db-name
                (fn [m]
                  (if (and m
-                          (:ha-authority m)
-                          (nil? (:ha-renew-loop-running? m)))
-                   (let [running? (AtomicBoolean. true)]
-                     (vreset! new-running-v running?)
-                     (assoc m :ha-renew-loop-running? running?))
+                          (:ha-authority m))
+                   (let [running?    (:ha-renew-loop-running? m)
+                         loop-future (:ha-renew-loop-future m)
+                         active?     (and (instance? AtomicBoolean running?)
+                                          (.get ^AtomicBoolean running?)
+                                          (instance? Future loop-future)
+                                          (not (.isDone ^Future loop-future)))]
+                     (if active?
+                       m
+                       (do
+                         (when (instance? AtomicBoolean running?)
+                           (.set ^AtomicBoolean running? false))
+                         (let [new-running? (AtomicBoolean. true)]
+                           (vreset! new-running-v new-running?)
+                           (assoc m
+                                  :ha-renew-loop-running? new-running?
+                                  :ha-renew-loop-future nil)))))
                    m)))
     (when-let [running? @new-running-v]
-      (execute server #(run-ha-renew-loop server db-name running?)))))
+      (let [future (.submit ^ExecutorService
+                            (.-work-executor server)
+                            ^Runnable #(run-ha-renew-loop
+                                         server
+                                         db-name
+                                         running?))]
+        (update-db server db-name
+                   (fn [m]
+                     (if (and m
+                              (identical? running?
+                                          (:ha-renew-loop-running? m)))
+                       (assoc m :ha-renew-loop-future future)
+                       m)))))))
 
 (defn- stop-ha-renew-loop
   [m]
   (when-let [^AtomicBoolean running? (:ha-renew-loop-running? m)]
-    (.set running? false)))
+    (.set running? false))
+  (when-let [^Future future (:ha-renew-loop-future m)]
+    (.cancel future true)))
 
 (def ^:dynamic *start-ha-authority-fn*
   start-ha-authority)
@@ -795,7 +834,9 @@
   [db-name m]
   (*stop-ha-renew-loop-fn* m)
   (*stop-ha-authority-fn* db-name m)
-  (dissoc (dha/clear-ha-runtime-state m) :ha-runtime-opts))
+  (dissoc (dha/clear-ha-runtime-state m)
+          :ha-runtime-opts
+          :ha-renew-loop-future))
 
 (defn- ha-write-admission-error
   [^Server server message]
@@ -1016,15 +1057,29 @@
   (let [store-opts (when (instance? IStore store)
                      (i/opts store))
         kv-store   (copy-source-kv-store store)
+        kv-opts    (when kv-store
+                     (try
+                       (i/env-opts kv-store)
+                       (catch Exception _
+                         nil)))
+        stored-db-identity
+        (when kv-store
+          (try
+            (i/get-value kv-store c/opts :db-identity :attr :data)
+            (catch Exception _
+              nil)))
         watermarks (when kv-store
                      (try
                        (kv/txlog-watermarks kv-store)
                        (catch Exception _
                          nil)))
-        snapshot-lsn (:last-applied-lsn watermarks)]
+        snapshot-lsn (:last-applied-lsn watermarks)
+        db-identity (or (:db-identity store-opts)
+                        (:db-identity kv-opts)
+                        stored-db-identity)]
     (cond-> (assoc base-meta :db-name db-name)
-      (some? (:db-identity store-opts))
-      (assoc :db-identity (:db-identity store-opts))
+      (some? db-identity)
+      (assoc :db-identity db-identity)
 
       (some? snapshot-lsn)
       (assoc :snapshot-last-applied-lsn (long snapshot-lsn)))))
@@ -1046,6 +1101,25 @@
   [^SelectionKey skey]
   (.close ^SocketChannel (.channel skey)))
 
+(defn- client-disconnect?
+  [e]
+  (boolean
+    (some
+      (fn [cause]
+        (let [message (ex-message cause)]
+          (or (instance? ClosedChannelException cause)
+              (= message "Socket channel is closed.")
+              (and (string? message)
+                   (or (s/includes? message "Connection reset by peer")
+                       (s/includes? message "Broken pipe"))))))
+      (take-while some? (iterate ex-cause e)))))
+
+(defn- close-conn-quietly
+  [^SelectionKey skey]
+  (try
+    (close-conn skey)
+    (catch Exception _ nil)))
+
 (defn- error-response
   [^SelectionKey skey error-msg error-data]
   (let [{:keys [^ByteBuffer write-bf wire-opts]} @(.attachment skey)
@@ -1062,16 +1136,37 @@
         ^SocketChannel ch              (.channel skey)]
     (p/write-message-blocking ch write-bf msg wire-opts)))
 
+(defn- handle-message-error!
+  [^SelectionKey skey e]
+  (let [data (ex-data e)]
+    (cond
+      (client-disconnect? e)
+      (close-conn-quietly skey)
+
+      (= (:type data) :reopen)
+      (try
+        (reopen-response skey data)
+        (catch Exception reopen-e
+          (when-not (client-disconnect? reopen-e)
+            (log/error reopen-e "Failed to send reopen response"))
+          (close-conn-quietly skey)))
+
+      :else
+      (do
+        (log/error e)
+        (try
+          (error-response skey (ex-message e) data)
+          (catch Exception response-e
+            (when-not (client-disconnect? response-e)
+              (log/error response-e "Failed to send error response"))
+            (close-conn-quietly skey)))))))
+
 (defmacro wrap-error
   [& body]
   `(try
      ~@body
      (catch Exception ~'e
-       (let [data# (ex-data ~'e)]
-         (if (= (:type data#) :reopen)
-           (reopen-response ~'skey data#)
-           (do (log/error ~'e)
-               (error-response ~'skey (ex-message ~'e) (ex-data ~'e))))))))
+       (handle-message-error! ~'skey ~'e))))
 
 ;; db
 
@@ -1099,6 +1194,14 @@
       (instance? ILMDB store)  (i/env-dir store)
       :else                    (u/raise "Unknown store type" {}))))
 
+(defn- detach-client-store!
+  [^Server server ^SelectionKey skey db-name]
+  (let [{:keys [client-id]} @(.attachment skey)]
+    (update-client server client-id
+                   #(-> %
+                        (update :stores dissoc db-name)
+                        (update :dt-dbs disj db-name)))))
+
 (defn- db-store
   [^Server server ^SelectionKey skey db-name]
   (when (get (:stores (get-client server (:client-id @(.attachment skey))))
@@ -1123,9 +1226,13 @@
 
 (defn- lmdb
   [^Server server ^SelectionKey skey db-name writing?]
-  (or (if writing?
-        (writing-lmdb server db-name)
-        (db-store server skey db-name))
+  (or (some-> (if writing?
+                (writing-lmdb server db-name)
+                (db-store server skey db-name))
+              ((fn [store]
+                 (if (instance? Store store)
+                   (.-lmdb ^Store store)
+                   store))))
       (u/raise "LMDB store not found"
                {:type :reopen :db-name db-name :db-type "kv"})))
 
@@ -1457,6 +1564,7 @@
    'sync
    'txlog-watermarks
    'open-tx-log
+   'open-tx-log-rows
    'read-commit-marker
    'verify-commit-marker!
    'force-txlog-sync!
@@ -1919,7 +2027,9 @@
 
 (defn- close
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
-  (wrap-error (normal-dt-store-handler close)))
+  (wrap-error
+    (detach-client-store! server skey (nth args 0))
+    (write-message skey {:type :command-complete})))
 
 (defn- closed?
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -2263,8 +2373,8 @@
 (defn- close-kv
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
-    (update-db server (nth args 0) #(dissoc % :wlmdb :lock))
-    (normal-kv-store-handler close-kv)))
+    (detach-client-store! server skey (nth args 0))
+    (write-message skey {:type :command-complete})))
 
 (defn- closed-kv?
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -2498,6 +2608,19 @@
       (write-message skey
                      {:type :command-complete
                       :result (kv/open-tx-log kv-store from-lsn upto-lsn)}))))
+
+(defn- open-tx-log-rows
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name  (nth args 0)
+          from-lsn (nth args 1)
+          upto-lsn (nth args 2 nil)
+          kv-store (lmdb server skey db-name writing?)]
+      (write-message skey
+                     {:type :command-complete
+                      :result (kv/open-tx-log-rows kv-store
+                                                   from-lsn
+                                                   upto-lsn)}))))
 
 (defn- read-commit-marker
   [^Server server ^SelectionKey skey {:keys [args writing?]}]

@@ -161,7 +161,9 @@
                        write-txn
                        writing?
                        open-db-info
-                       ^AtomicBoolean sampling-started?]
+                       ^AtomicBoolean sampling-started?
+                       owns-client?
+                       ^AtomicBoolean closed?]
   IWriting
   (writing? [_] writing?)
 
@@ -170,7 +172,9 @@
   (mark-write [_]
     (->DatalogStore uri db-name client (volatile! :remote-dl-mutex) true
                     open-db-info
-                    sampling-started?))
+                    sampling-started?
+                    owns-client?
+                    closed?))
 
   IStore
   (opts [_] (cl/normal-request client :opts [db-name] writing?))
@@ -183,11 +187,14 @@
   (dir [_] uri)
 
   (close [_]
-    (when-not (cl/disconnected? client)
-      (cl/normal-request client :close [db-name] writing?)))
+    (when (.compareAndSet closed? false true)
+      (when-not (cl/disconnected? client)
+        (cl/normal-request client :close [db-name] writing?))
+      (when (and owns-client? (not (cl/disconnected? client)))
+        (cl/disconnect client))))
 
   (closed? [_]
-    (if (cl/disconnected? client)
+    (if (or (.get closed?) (cl/disconnected? client))
       true
       (cl/normal-request client :closed? [db-name] writing?)))
 
@@ -429,10 +436,14 @@
   ([uri-str]
    (open uri-str nil))
   ([uri-str schema]
-   (open (cl/new-client uri-str) uri-str schema nil))
+   (let [client (cl/new-client uri-str)]
+     (open client uri-str schema nil true)))
   ([uri-str schema opts]
-   (open (cl/new-client uri-str (:client-opts opts)) uri-str schema opts))
+   (let [client (cl/new-client uri-str (:client-opts opts))]
+     (open client uri-str schema opts true)))
   ([client uri-str schema opts]
+   (open client uri-str schema opts false))
+  ([client uri-str schema opts owns-client?]
    (let [uri (URI. uri-str)]
      (if-let [db-name (cl/parse-db uri)]
        (let [store (or (get (cl/parse-query uri) "store")
@@ -441,6 +452,8 @@
          (->DatalogStore uri-str db-name client
                          (volatile! :remote-dl-mutex) false
                          (volatile! db-info)
+                         (AtomicBoolean. false)
+                         owns-client?
                          (AtomicBoolean. false)))
        (u/raise "URI should contain a database name" {})))))
 
@@ -606,23 +619,29 @@
                   ^String db-name
                   ^Client client
                   write-txn
-                  writing?]
+                  writing?
+                  owns-client?
+                  ^AtomicBoolean closed?]
   IWriting
   (writing? [_] writing?)
 
   (write-txn [_] write-txn)
 
   (mark-write [_]
-    (->KVStore uri db-name client (volatile! :remote-kv-mutex) true))
+    (->KVStore uri db-name client (volatile! :remote-kv-mutex) true
+               owns-client? closed?))
 
   ILMDB
 
   (close-kv [_]
-    (when-not (cl/disconnected? client)
-      (cl/normal-request client :close-kv [db-name])))
+    (when (.compareAndSet closed? false true)
+      (when-not (cl/disconnected? client)
+        (cl/normal-request client :close-kv [db-name]))
+      (when (and owns-client? (not (cl/disconnected? client)))
+        (cl/disconnect client))))
 
   (closed-kv? [_]
-    (if (cl/disconnected? client)
+    (if (or (.get closed?) (cl/disconnected? client))
       true
       (cl/normal-request client :closed-kv? [db-name])))
 
@@ -1142,8 +1161,11 @@
   ([uri-str]
    (open-kv uri-str nil))
   ([uri-str opts]
-   (open-kv (cl/new-client uri-str (:client-opts opts)) uri-str opts))
+   (let [client (cl/new-client uri-str (:client-opts opts))]
+     (open-kv client uri-str opts true)))
   ([client uri-str opts]
+   (open-kv client uri-str opts false))
+  ([client uri-str opts owns-client?]
    (let [uri     (URI. uri-str)
          uri-str (str uri-str
                       (if (cl/parse-query uri) "&" "?")
@@ -1151,7 +1173,9 @@
      (if-let [db-name (cl/parse-db uri)]
        (do (cl/open-database client db-name c/db-store-kv opts)
            (->KVStore uri-str db-name client
-                      (volatile! :remote-kv-mutex) false))
+                      (volatile! :remote-kv-mutex) false
+                      owns-client?
+                      (AtomicBoolean. false)))
        (u/raise "URI should contain a database name" {})))))
 
 (defn batch-kv

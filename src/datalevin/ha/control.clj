@@ -550,6 +550,16 @@
                 :membership-hash existing
                 :expected membership-hash}})))
 
+(defn- apply-read-state-transition
+  [state db-identity]
+  (require-non-blank-string! db-identity :db-identity)
+  (let [{:keys [lease version]} (lease-entry state db-identity)]
+    {:state state
+     :result {:lease lease
+              :version version
+              :membership-hash (:membership-hash state)
+              :voters (:voters state)}}))
+
 (defn- apply-state-command
   [state {:keys [op] :as cmd}]
   (case op
@@ -557,6 +567,7 @@
     :renew-lease         (apply-renew-transition state (:req cmd))
     :init-membership-hash (apply-init-membership-hash-transition
                            state (:membership-hash cmd))
+    :read-state          (apply-read-state-transition state (:db-identity cmd))
     (u/raise "Unsupported HA control command"
              {:error :ha/control-invalid-command
               :command cmd})))
@@ -584,12 +595,31 @@
 (def ^:private default-election-timeout-ms 3000)
 (def ^:private default-operation-timeout-ms 5000)
 (def ^:private default-snapshot-interval-secs 300)
+(def ^:private max-read-index-attempt-timeout-ms 500)
 (def ^:private read-retryable-errors
   #{RaftError/EAGAIN
     RaftError/EBUSY
     RaftError/EPERM
     RaftError/ETIMEDOUT
     RaftError/ERAFTTIMEDOUT})
+
+(defn- retryable-read-status?
+  [^Status status]
+  (let [message (some-> status .getErrorMsg)]
+    (or (contains? read-retryable-errors
+                   (.getRaftError status))
+        (and (string? message)
+             (or (s/includes? message "leader stepped down")
+                 (s/includes? message
+                              "leader has not committed any log entry at its term")
+                 (s/includes? message
+                              "current node's apply index between leader's commit index over maxReadIndexLag"))))))
+
+(defn- read-index-attempt-timeout-ms
+  [remaining]
+  (long (max 1
+             (min (long remaining)
+                  (long max-read-index-attempt-timeout-ms)))))
 
 (defn- single-voter-authority?
   [{:keys [voters]}]
@@ -779,6 +809,14 @@
        sort
        vec))
 
+(defn- safe-node-value
+  [f]
+  (try
+    (f)
+    (catch Exception e
+      {:error (ex-message e)
+       :class (some-> e class .getName)})))
+
 (defn- configuration-peer-ids
   [^Configuration conf]
   (->> (.listPeers conf)
@@ -917,6 +955,8 @@
     {:node node
      :rpc-client rpc-client}))
 
+(declare authority-diagnostics)
+
 (defn- await-linearizable-read!
   [{:keys [operation-timeout-ms] :as authority}]
   (let [deadline (+ (System/currentTimeMillis) (long operation-timeout-ms))]
@@ -928,9 +968,10 @@
                    {:error :ha/control-timeout
                     :where :read-index
                     :attempt attempt
-                    :leader? (.isLeader node)})
+                    :leader? (.isLeader node)
+                    :authority (authority-diagnostics authority)})
           (let [status-p   (promise)
-                timeout-ms (long (max 1 remaining))
+                timeout-ms (read-index-attempt-timeout-ms remaining)
                 invoked?   (try
                              (.readIndex node (byte-array 0)
                                          (proxy [ReadIndexClosure] []
@@ -955,15 +996,15 @@
                   (.isOk ^Status status)
                   true
 
-                  (contains? read-retryable-errors
-                             (.getRaftError ^Status status))
+                  (retryable-read-status? ^Status status)
                   (do (Thread/sleep 20)
                       (recur (inc attempt)))
 
                   :else
                   (u/raise "HA control readIndex failed"
                            {:error :ha/control-read-failed
-                            :status (status-data ^Status status)}))))))))))
+                            :status (status-data ^Status status)
+                            :authority (authority-diagnostics authority)}))))))))))
 
 (defn- forward-request-processor
   [authority]
@@ -1481,6 +1522,113 @@
                     (recur (inc attempt))))))))))
 
   )
+
+(defn authority-diagnostics
+  "Best-effort runtime snapshot for HA control authorities."
+  [authority]
+  (try
+    (cond
+      (instance? InMemoryLeaseAuthority authority)
+      (let [{:keys [group-id state running-v initial-voters]} authority
+            snapshot @state]
+        {:backend :in-memory
+         :group-id group-id
+         :running? (running? running-v)
+         :initial-voters initial-voters
+         :voters (:voters snapshot)
+         :membership-hash (:membership-hash snapshot)
+         :lease-count (count (:leases snapshot))})
+
+      (instance? SofaJraftLeaseAuthority authority)
+      (let [{:keys [group-id local-peer-id voters
+                    rpc-timeout-ms election-timeout-ms
+                    operation-timeout-ms fsm-state node-v
+                    running-v]} authority
+            snapshot @fsm-state
+            ^Node node @node-v
+            leader-id (when node
+                        (safe-node-value
+                          #(peer-id-string (leader-peer-id node))))
+            peer-ids (when node
+                       (safe-node-value
+                         #(node-peer-ids node)))
+            alive-peer-ids (when node
+                             (safe-node-value
+                               #(->> (.listAlivePeers node)
+                                     (map peer-id-string)
+                                     (remove nil?)
+                                     sort
+                                     vec)))]
+        {:backend :sofa-jraft
+         :group-id group-id
+         :local-peer-id local-peer-id
+         :running? (running? running-v)
+         :configured-voters (mapv :peer-id voters)
+         :rpc-timeout-ms rpc-timeout-ms
+         :election-timeout-ms election-timeout-ms
+         :operation-timeout-ms operation-timeout-ms
+         :fsm-voters (:voters snapshot)
+         :fsm-membership-hash (:membership-hash snapshot)
+         :fsm-lease-count (count (:leases snapshot))
+         :node-available? (some? node)
+         :node-leader? (when node (.isLeader node))
+         :node-state (when node (safe-node-value #(.getNodeState node)))
+         :last-log-index (when node (safe-node-value #(.getLastLogIndex node)))
+         :last-committed-index (when node
+                                 (safe-node-value
+                                   #(.getLastCommittedIndex node)))
+         :last-applied-log-index (when node
+                                   (safe-node-value
+                                     #(.getLastAppliedLogIndex node)))
+         :leader-peer-id leader-id
+         :node-peer-ids peer-ids
+         :alive-peer-ids alive-peer-ids})
+
+      :else
+      {:backend :unknown
+       :class (some-> authority class .getName)})
+    (catch Exception e
+      {:backend :diagnostics-failed
+       :class (some-> authority class .getName)
+       :message (ex-message e)})))
+
+(defn read-state
+  "Read the HA control snapshot for db-identity.
+
+  For the SOFAJRaft backend this uses the replicated command path instead of
+  readIndex, because the full DB-server HA startup path can stall in readIndex
+  even when the raft group is otherwise healthy."
+  [authority db-identity]
+  (require-non-blank-string! db-identity :db-identity)
+  (cond
+    (instance? InMemoryLeaseAuthority authority)
+    (let [{:keys [group-id state running-v]} authority]
+      (ensure-running! running-v)
+      (lease/lease-key group-id db-identity)
+      (let [{:keys [lease version]} (lease-entry @state db-identity)]
+        {:lease lease
+         :version version
+         :membership-hash (:membership-hash @state)
+         :voters (:voters @state)}))
+
+    (instance? SofaJraftLeaseAuthority authority)
+    (let [{:keys [group-id running-v]} authority]
+      (ensure-running! running-v)
+      (lease/lease-key group-id db-identity)
+      (submit-command! authority {:op :read-state
+                                  :db-identity db-identity}))
+
+    (satisfies? ILeaseAuthority authority)
+    (let [{:keys [lease version]} (read-lease authority db-identity)]
+      {:lease lease
+       :version version
+       :membership-hash (read-membership-hash authority)
+       :voters (read-voters authority)})
+
+    :else
+    (u/raise "Unsupported HA control authority type"
+             {:error :ha/control-unsupported-authority
+              :class (some-> authority class .getName)})))
 
 (defn new-in-memory-authority
   "Create an in-memory authority adapter for deterministic tests."

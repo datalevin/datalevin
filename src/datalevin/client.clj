@@ -311,7 +311,9 @@
                                          :reopen
                                          (let [{:keys [db-name db-type]} result]
                                            (vreset! success? false)
-                                           (open-database client db-name db-type))
+                                           {:request-status :reopen
+                                            :db-name        db-name
+                                            :db-type        db-type})
                                          :reconnect
                                          (let [client-id
                                                (authenticate host port username
@@ -322,13 +324,20 @@
                                             :client-id      client-id})))
                                      (finally
                                        (release-connection pool' conn)))
-              res'                 (if (= :reconnect (:request-status res))
+              res'                 (case (:request-status res)
+                                     :reconnect
                                      (let [client-id (:client-id res)]
                                        (set! id client-id)
                                        (set! pool (new-connectionpool
                                                     host port client-id
                                                     pool-size time-out))
                                        nil)
+
+                                     :reopen
+                                     (let [{:keys [db-name db-type]} res]
+                                       (open-database client db-name db-type)
+                                       nil)
+
                                      res)]
           (if (>= (- (System/currentTimeMillis) start)
                   ^long (.-time-out pool'))

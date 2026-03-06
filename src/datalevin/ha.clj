@@ -11,6 +11,7 @@
   "Consensus-lease HA runtime helpers shared by server runtime."
   (:require
    [clojure.string :as s]
+   [datalevin.bits :as b]
    [datalevin.client :as cl]
    [datalevin.constants :as c]
    [datalevin.db :as db]
@@ -26,6 +27,8 @@
   (:import
    [datalevin.interface IStore ILMDB]
    [java.io File]
+   [java.net ConnectException]
+   [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
    [java.util.concurrent TimeUnit]))
@@ -105,16 +108,42 @@
                     nil))
                 store))))
 
+(defn- read-ha-local-persisted-lsn
+  [kv-store]
+  (long (or (try
+              (i/get-value kv-store c/kv-info
+                           c/ha-local-applied-lsn
+                           :keyword :data)
+              (catch Exception _
+                nil))
+            0)))
+
+(defn- persist-ha-local-applied-lsn!
+  [m applied-lsn]
+  (when-let [kv-store (local-kv-store m)]
+    (i/transact-kv kv-store c/kv-info
+                   [[:put c/ha-local-applied-lsn (long applied-lsn)]]
+                   :keyword :data))
+  applied-lsn)
+
 (defn ^:redef read-ha-local-last-applied-lsn
   [m]
   (try
     (if-let [kv-store (local-kv-store m)]
-      (long (or (get (kv/txlog-watermarks kv-store) :last-applied-lsn) 0))
-      0)
+      (let [watermark-lsn (long (or (get (kv/txlog-watermarks kv-store)
+                                         :last-applied-lsn)
+                                    0))
+            persisted-lsn (read-ha-local-persisted-lsn kv-store)
+            state-lsn     (long (or (:ha-local-last-applied-lsn m) 0))
+            ha-lsn        (long (max persisted-lsn state-lsn))]
+        (if (pos? ha-lsn)
+          ha-lsn
+          watermark-lsn))
+      (long (or (:ha-local-last-applied-lsn m) 0)))
     (catch Exception e
       (log/warn e "Unable to read local txlog watermarks for HA lag guard"
                 {:db-name (some-> (:store m) i/opts :db-name)})
-      0)))
+      (long (or (:ha-local-last-applied-lsn m) 0)))))
 
 (defn- ha-local-last-applied-lsn
   [m]
@@ -164,6 +193,19 @@
                  (<= 1 (long port) 65535))
         {:host host :port (long port)}))))
 
+(defn- close-ha-client!
+  [client]
+  (when client
+    (try
+      ;; These clients are one-shot internal HA probes. Close the pool directly
+      ;; instead of running the network disconnect handshake, which reacquires a
+      ;; pooled connection and can mask a successful request with a pool timeout.
+      (cl/close-pool (cl/get-pool client))
+      (catch Throwable _
+        (try
+          (cl/disconnect client)
+          (catch Throwable _ nil))))))
+
 (defn- ha-endpoint-uri
   [db-name endpoint]
   (when-let [{:keys [host port]} (parse-endpoint endpoint)]
@@ -211,6 +253,16 @@
         (instance? ILMDB store)  (i/close-kv store)
         :else nil))))
 
+(defn- refresh-ha-local-dt-db
+  [m]
+  (let [store (:store m)]
+    (if (instance? IStore store)
+      (let [info {:max-eid       (i/init-max-eid store)
+                  :max-tx        (long (i/max-tx store))
+                  :last-modified (long (i/last-modified store))}]
+        (assoc m :dt-db (db/new-db store info)))
+      m)))
+
 (defn- open-ha-store-dbis!
   [store]
   (when-let [kv-store (cond
@@ -233,6 +285,22 @@
           (i/open-dbi kv-store dbi-name dbi-opts)
           (i/open-dbi kv-store dbi-name)))))
   store)
+
+(defn- ha-class-name
+  [x]
+  (some-> x class .getName))
+
+(defn- ha-retrieved-like?
+  [x]
+  (= "datalevin.bits.Retrieved" (ha-class-name x)))
+
+(defn- ha-reflect-field
+  [x field-name]
+  (when x
+    (let [^Class cls (class x)
+          field      (.getDeclaredField cls field-name)]
+      (.setAccessible field true)
+      (.get field x))))
 
 (defn- ha-snapshot-open-opts
   [m db-name db-identity]
@@ -286,7 +354,7 @@
                    (long (or (:last-applied-lsn watermarks) 0))
                    :source :remote})
                 (finally
-                  (cl/disconnect client))))
+                  (close-ha-client! client))))
             (catch Exception e
               {:reachable? false
                :reason :endpoint-watermark-fetch-failed
@@ -540,11 +608,11 @@
       (try
         (cl/normal-request
           client
-          :open-tx-log
+          :open-tx-log-rows
           [db-name (long from-lsn) (long upto-lsn)]
           false)
         (finally
-          (cl/disconnect client))))
+          (close-ha-client! client))))
     (u/raise "Invalid HA leader endpoint for txlog fetch"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint})))
@@ -573,16 +641,82 @@
 
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
-  (let [kv-store (local-kv-store m)
+  (let [store    (:store m)
+        kv-store (local-kv-store m)
+        rows     (:rows record)
         ops      (:ops record)]
     (when-not kv-store
       (u/raise "Follower txlog replay requires a local KV store"
                {:error :ha/follower-missing-store}))
-    (when-not (sequential? ops)
-      (u/raise "Follower txlog replay record is missing :ops"
+    (cond
+      (sequential? rows)
+      (let [store        (:store m)
+            giant-values (into {}
+                               (keep (fn [[op dbi k v kt]]
+                                       (when (and (= op :put)
+                                                  (= dbi c/giants)
+                                                  (= kt :id))
+                                         [k v])))
+                               rows)
+            normalize-avg
+            (fn [e r]
+              (let [aid (ha-reflect-field r "a")
+                    attr (when (instance? IStore store)
+                           (get (i/attrs store) aid))
+                    vt  (when attr
+                          (get-in (i/schema store) [attr :db/valueType]))
+                    g   (or (ha-reflect-field r "g") c/normal)
+                    rv  (if (= g c/normal)
+                          (ha-reflect-field r "v")
+                          (or (get giant-values g)
+                              (i/get-value kv-store c/giants g :id :data)))]
+                (when-not vt
+                  (u/raise "Follower txlog replay is missing attr value type"
+                           {:error :ha/follower-invalid-record
+                            :aid aid
+                            :record record}))
+                (b/indexable (long e) aid rv vt (long g))))
+            replay-rows
+            (mapv (fn [[op dbi k v kt vt :as row]]
+                    (cond
+                      (and (#{:put :del} op)
+                           (= kt :avg)
+                           (ha-retrieved-like? k)
+                           (integer? v))
+                      (assoc row 2 (normalize-avg v k))
+
+                      (and (#{:put :del} op)
+                           (= vt :avg)
+                           (ha-retrieved-like? v)
+                           (integer? k))
+                      (assoc row 3 (normalize-avg k v))
+
+                      :else
+                      row))
+                  rows)]
+        (i/transact-kv kv-store replay-rows)
+        (when (instance? IStore store)
+          (when-let [target-max-tx
+                     (some->> replay-rows
+                              (keep (fn [[op dbi k v]]
+                                      (when (and (= op :put)
+                                                 (= dbi c/meta)
+                                                 (= k :max-tx)
+                                                 (integer? v))
+                                        (long v))))
+                              last)]
+            (loop [cur (long (i/max-tx store))]
+              (when (< cur target-max-tx)
+                (i/advance-max-tx store)
+                (recur (long (i/max-tx store))))))))
+
+      (sequential? ops)
+      (i/transact-kv kv-store ops)
+
+      :else
+      (u/raise "Follower txlog replay record is missing rows"
                {:error :ha/follower-invalid-record
-                :record record}))
-    (i/transact-kv kv-store ops)))
+                :record record}))))
 
 (defn ^:redef report-ha-replica-floor!
   [db-name m leader-endpoint applied-lsn]
@@ -609,11 +743,28 @@
           [db-name (:ha-node-id m) (long applied-lsn)]
           false)
         (finally
-          (cl/disconnect client))))
+          (close-ha-client! client))))
     (u/raise "Invalid HA leader endpoint for replica-floor update"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint
               :applied-lsn applied-lsn})))
+
+(defn- ha-replica-floor-transport-failure?
+  [e]
+  (boolean
+    (some
+      (fn [cause]
+        (let [message (ex-message cause)]
+          (or (instance? ClosedChannelException cause)
+              (instance? ConnectException cause)
+              (and (string? message)
+                   (or (s/includes? message "Socket channel is closed.")
+                       (s/includes? message "ClosedChannelException")
+                       (s/includes? message "Unable to connect to server:")
+                       (s/includes? message "Connection refused")
+                       (s/includes? message "Connection reset by peer")
+                       (s/includes? message "Broken pipe"))))))
+      (take-while some? (iterate ex-cause e)))))
 
 (defn ^:redef fetch-ha-endpoint-snapshot-copy!
   [db-name m endpoint dest-dir]
@@ -772,40 +923,49 @@
           applied-lsn     (long (max local-lsn-after
                                      (or last-record-lsn
                                          (dec (long next-lsn)))))]
+      (persist-ha-local-applied-lsn! m applied-lsn)
       (try
         (report-ha-replica-floor!
          db-name m leader-endpoint applied-lsn)
         (catch Exception e
-          (log/warn e "HA follower failed to update leader replica floor"
-                    {:db-name db-name
-                     :ha-node-id local-node-id
-                     :leader-endpoint leader-endpoint
-                     :applied-lsn applied-lsn})))
+          (if (ha-replica-floor-transport-failure? e)
+            (log/debug "HA follower skipped replica-floor update because the leader endpoint is unavailable"
+                       {:db-name db-name
+                        :ha-node-id local-node-id
+                        :leader-endpoint leader-endpoint
+                        :applied-lsn applied-lsn
+                        :message (ex-message e)})
+            (log/warn e "HA follower failed to update leader replica floor"
+                      {:db-name db-name
+                       :ha-node-id local-node-id
+                       :leader-endpoint leader-endpoint
+                       :applied-lsn applied-lsn}))))
       {:records records
        :applied-lsn applied-lsn
        :leader-endpoint leader-endpoint
        :source-endpoint source-endpoint
        :source-order source-order
-       :state (assoc m
-                     :ha-local-last-applied-lsn applied-lsn
-                     :ha-follower-next-lsn (unchecked-inc applied-lsn)
-                     :ha-follower-last-batch-size (count records)
-                     :ha-follower-last-sync-ms now-ms
-                     :ha-follower-leader-endpoint leader-endpoint
-                     :ha-follower-source-endpoint source-endpoint
-                     :ha-follower-source-order source-order
-                     :ha-follower-last-bootstrap-ms nil
-                     :ha-follower-bootstrap-source-endpoint nil
-                     :ha-follower-bootstrap-snapshot-last-applied-lsn nil
-                     :ha-follower-sync-backoff-ms nil
-                     :ha-follower-next-sync-not-before-ms nil
-                     :ha-follower-degraded? nil
-                     :ha-follower-degraded-reason nil
-                     :ha-follower-degraded-details nil
-                     :ha-follower-degraded-since-ms nil
-                     :ha-follower-last-error nil
-                     :ha-follower-last-error-details nil
-                     :ha-follower-last-error-ms nil)})))
+       :state (-> (assoc m
+                         :ha-local-last-applied-lsn applied-lsn
+                         :ha-follower-next-lsn (unchecked-inc applied-lsn)
+                         :ha-follower-last-batch-size (count records)
+                         :ha-follower-last-sync-ms now-ms
+                         :ha-follower-leader-endpoint leader-endpoint
+                         :ha-follower-source-endpoint source-endpoint
+                         :ha-follower-source-order source-order
+                         :ha-follower-last-bootstrap-ms nil
+                         :ha-follower-bootstrap-source-endpoint nil
+                         :ha-follower-bootstrap-snapshot-last-applied-lsn nil
+                         :ha-follower-sync-backoff-ms nil
+                         :ha-follower-next-sync-not-before-ms nil
+                         :ha-follower-degraded? nil
+                         :ha-follower-degraded-reason nil
+                         :ha-follower-degraded-details nil
+                         :ha-follower-degraded-since-ms nil
+                         :ha-follower-last-error nil
+                         :ha-follower-last-error-details nil
+                         :ha-follower-last-error-ms nil)
+                  refresh-ha-local-dt-db)})))
 
 (defn- bootstrap-ha-follower-from-snapshot
   [db-name m lease source-order next-lsn now-ms]
@@ -831,6 +991,9 @@
                     (let [snapshot-lsn (long (:snapshot-last-applied-lsn
                                               manifest))
                           resume-next-lsn (unchecked-inc snapshot-lsn)
+                          _               (persist-ha-local-applied-lsn!
+                                           (:state install-res)
+                                           snapshot-lsn)
                           installed-state
                           (-> (:state install-res)
                               (assoc
@@ -1008,8 +1171,9 @@
   [m]
   (let [authority   (:ha-authority m)
         db-identity (:ha-db-identity m)
-        {:keys [lease version]} (ctrl/read-lease authority db-identity)
-        authority-membership-hash (ctrl/read-membership-hash authority)
+        {:keys [lease version membership-hash]}
+        (ctrl/read-state authority db-identity)
+        authority-membership-hash membership-hash
         db-identity-mismatch?
         (and lease (not= db-identity (:db-identity lease)))
         membership-mismatch?
@@ -1211,6 +1375,61 @@
       (assoc base
              :reason :clock-skew-check-failed))))
 
+(defn- ha-authority-read-failure-details
+  [m]
+  (or (:ha-authority-read-error m)
+      {:reason :authority-read-failed}))
+
+(defn- ha-rejoin-promotion-failure-details
+  [m]
+  {:reason :rejoin-in-progress
+   :blocked-until-ms (:ha-rejoin-promotion-blocked-until-ms m)
+   :authority-owner-node-id (:ha-authority-owner-node-id m)
+   :local-last-applied-lsn (ha-local-last-applied-lsn m)
+   :leader-last-applied-lsn
+   (long (or (get-in m [:ha-authority-lease :leader-last-applied-lsn]) 0))
+   :ha-follower-last-error (:ha-follower-last-error m)
+   :ha-follower-degraded? (:ha-follower-degraded? m)})
+
+(defn- clear-ha-rejoin-promotion-block
+  [m]
+  (-> m
+      (assoc :ha-rejoin-promotion-blocked? false
+             :ha-rejoin-promotion-blocked-until-ms nil
+             :ha-rejoin-promotion-cleared-ms (System/currentTimeMillis))
+      (dissoc :ha-rejoin-started-at-ms)))
+
+(defn- maybe-clear-ha-rejoin-promotion-block
+  [m now-ms]
+  (if-not (:ha-rejoin-promotion-blocked? m)
+    m
+    (let [blocked-until-ms (long (or (:ha-rejoin-promotion-blocked-until-ms m) 0))
+          owner-node-id    (:ha-authority-owner-node-id m)
+          local-node-id    (:ha-node-id m)
+          leader-lsn       (long (or (get-in m [:ha-authority-lease
+                                                :leader-last-applied-lsn])
+                                     0))
+          local-lsn        (ha-local-last-applied-lsn m)
+          lag-lsn          (max 0 (- leader-lsn local-lsn))
+          lag-ok?          (<= lag-lsn
+                               (long (or (:ha-max-promotion-lag-lsn m) 0)))
+          synced?          (and (true? (:ha-authority-read-ok? m))
+                                (integer? owner-node-id)
+                                (not= owner-node-id local-node-id)
+                                (not (:ha-follower-degraded? m))
+                                (nil? (:ha-follower-last-error m))
+                                lag-ok?)]
+      (cond
+        synced?
+        (clear-ha-rejoin-promotion-block m)
+
+        (and (pos? blocked-until-ms)
+             (>= (long now-ms) blocked-until-ms))
+        (clear-ha-rejoin-promotion-block m)
+
+        :else
+        m))))
+
 (defn- fail-ha-candidate
   [m reason details]
   (-> m
@@ -1255,6 +1474,18 @@
            :ha-promotion-last-failure :clock-skew-paused
            :ha-promotion-failure-details
            (ha-clock-skew-promotion-failure-details m))
+
+    (true? (:ha-rejoin-promotion-blocked? m))
+    (assoc m
+           :ha-promotion-last-failure :rejoin-in-progress
+           :ha-promotion-failure-details
+           (ha-rejoin-promotion-failure-details m))
+
+    (false? (:ha-authority-read-ok? m))
+    (assoc m
+           :ha-promotion-last-failure :authority-read-failed
+           :ha-promotion-failure-details
+           (ha-authority-read-failure-details m))
 
     :else
     (if-let [delay-ms (ha-promotion-delay-ms m)]
@@ -1413,6 +1644,10 @@
               (fail-ha-candidate m :clock-skew-paused
                                  (ha-clock-skew-promotion-failure-details m))
 
+              (false? (:ha-authority-read-ok? m))
+              (fail-ha-candidate m :authority-read-failed
+                                 (ha-authority-read-failure-details m))
+
               :else
               (let [lag-check-1 (ha-promotion-lag-guard m observed-lease)]
                 (if-not (:ok? lag-check-1)
@@ -1438,16 +1673,18 @@
   [db-name m now-ms]
   (if (contains? #{:follower :candidate} (:ha-role m))
     (let [m0 (sync-ha-follower-state db-name m now-ms)
-          m1 (maybe-enter-ha-candidate m0 now-ms)]
-      (maybe-promote-ha-candidate db-name m1 now-ms))
+          m1 (maybe-clear-ha-rejoin-promotion-block m0 now-ms)
+          m2 (maybe-enter-ha-candidate m1 now-ms)]
+      (maybe-promote-ha-candidate db-name m2 now-ms))
     m))
 
 (defn- read-ha-authority-state
   [db-name m now-ms]
   (let [authority   (:ha-authority m)
         db-identity (:ha-db-identity m)
-        {:keys [lease version]} (ctrl/read-lease authority db-identity)
-        authority-membership-hash (ctrl/read-membership-hash authority)
+        {:keys [lease version membership-hash]}
+        (ctrl/read-state authority db-identity)
+        authority-membership-hash membership-hash
         db-identity-mismatch?
         (and lease (not= db-identity (:db-identity lease)))
         membership-mismatch?
@@ -1462,6 +1699,8 @@
                       :ha-authority-membership-hash authority-membership-hash
                       :ha-db-identity-mismatch? db-identity-mismatch?
                       :ha-membership-mismatch? membership-mismatch?
+                      :ha-authority-read-ok? true
+                      :ha-authority-read-error nil
                       :ha-last-authority-refresh-ms now-ms))]
     (cond
       (and db-identity-mismatch? (= :leader (:ha-role m1)))
@@ -1536,7 +1775,12 @@
                (catch Exception e
                  (log/warn e "HA read-lease failed"
                            {:db-name db-name})
-                 m0))
+                 (assoc m0
+                        :ha-authority-read-ok? false
+                        :ha-authority-read-error
+                        {:reason :authority-read-failed
+                         :message (ex-message e)
+                         :data (ex-data e)})))
           m2 (try
                (renew-ha-leader-state db-name m1 now-ms)
                (catch Exception e
@@ -1564,6 +1808,8 @@
           :ha-authority-lease :ha-authority-version
           :ha-authority-owner-node-id :ha-authority-term
           :ha-lease-until-ms :ha-last-authority-refresh-ms
+          :ha-authority-read-ok?
+          :ha-authority-read-error
           :ha-clock-skew-paused?
           :ha-clock-skew-last-check-ms
           :ha-clock-skew-last-observed-ms
@@ -1585,6 +1831,10 @@
           :ha-promotion-last-failure :ha-promotion-failure-details
           :ha-candidate-since-ms :ha-candidate-delay-ms
           :ha-candidate-rank-index
+          :ha-rejoin-promotion-blocked?
+          :ha-rejoin-promotion-blocked-until-ms
+          :ha-rejoin-promotion-cleared-ms
+          :ha-rejoin-started-at-ms
           :ha-renew-loop-running?))
 
 (def ^:private ha-write-command-types
@@ -1715,6 +1965,25 @@
 
             :else nil))))))
 
+(defn- startup-read-ha-authority-state
+  [db-name authority db-identity]
+  (try
+    (let [{:keys [lease version]}
+          (ctrl/read-state authority db-identity)]
+      {:ok? true
+       :lease lease
+       :version version
+       :error nil})
+    (catch Exception e
+      (log/warn e "HA startup read-lease failed; deferring to renew loop"
+                {:db-name db-name})
+      {:ok? false
+       :lease nil
+       :version nil
+       :error {:reason :startup-authority-read-failed
+               :message (ex-message e)
+               :data (ex-data e)}})))
+
 (defn start-ha-authority
   [db-name ha-opts]
   (let [cp        (:ha-control-plane ha-opts)
@@ -1753,7 +2022,9 @@
       (let [now-ms       (System/currentTimeMillis)
             derived-hash (vld/derive-ha-membership-hash ha-opts)
             init-result  (ctrl/init-membership-hash! authority derived-hash)
-            {:keys [lease version]} (ctrl/read-lease authority db-identity)
+            startup-read
+            (startup-read-ha-authority-state db-name authority db-identity)
+            {:keys [lease version error]} startup-read
             _ (when (and lease (not= db-identity (:db-identity lease)))
                 (u/raise "HA lease db identity mismatch at startup"
                          {:error :ha/db-identity-mismatch
@@ -1763,7 +2034,18 @@
             local-authority-owner? (and lease
                                       (= node-id (:leader-node-id lease))
                                       (not (lease/lease-expired? lease now-ms))
-                                      (= db-identity (:db-identity lease)))]
+                                      (= db-identity (:db-identity lease)))
+            rejoin-promotion-blocked?
+            (and lease
+                 (integer? (:leader-node-id lease))
+                 (not= node-id (:leader-node-id lease))
+                 (not (lease/lease-expired? lease now-ms))
+                 (= db-identity (:db-identity lease)))
+            rejoin-promotion-blocked-until-ms
+            (when rejoin-promotion-blocked?
+              (long (max (+ (long now-ms) (long renew-ms))
+                         (+ (long (or (:lease-until-ms lease) now-ms))
+                            (long renew-ms)))))]
         (when-not (:ok? init-result)
           (u/raise "HA membership hash mismatch with authoritative control plane"
                    {:error :ha/membership-hash-mismatch
@@ -1802,7 +2084,13 @@
          :ha-authority-owner-node-id   (:leader-node-id lease)
          :ha-authority-term            (:term lease)
          :ha-lease-until-ms            (:lease-until-ms lease)
+         :ha-authority-read-ok?        (:ok? startup-read)
+         :ha-authority-read-error      error
          :ha-last-authority-refresh-ms now-ms
+         :ha-rejoin-promotion-blocked? rejoin-promotion-blocked?
+         :ha-rejoin-promotion-blocked-until-ms
+         rejoin-promotion-blocked-until-ms
+         :ha-rejoin-started-at-ms (when rejoin-promotion-blocked? now-ms)
          :ha-role                      :follower
          :ha-leader-term               nil})
       (catch Exception e

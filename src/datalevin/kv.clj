@@ -32,6 +32,7 @@
          txlog-config-enabled?
          txlog-rollout-mode
          txlog-rollout-watermarks
+         ensure-txlog-ready!
          txlog-write-path-enabled?
          txlog-watermarks-map
          txlog-update-snapshot-floor-state!
@@ -57,6 +58,24 @@
    (i/open-tx-log db from-lsn))
   ([db from-lsn upto-lsn]
    (i/open-tx-log db from-lsn upto-lsn)))
+
+(defn open-tx-log-rows
+  ([db from-lsn]
+   (open-tx-log-rows db from-lsn nil))
+  ([db from-lsn upto-lsn]
+   (if-let [state (or (txlog/state db)
+                      (when (txlog-write-path-enabled? db)
+                        (ensure-txlog-ready! db)))]
+     (txlog/select-open-record-rows
+      (txlog-records state from-lsn)
+      from-lsn
+      upto-lsn)
+     (if (txlog-config-enabled? db)
+       []
+       (txlog/select-open-record-rows
+        (txlog-records (txlog/enabled-state db) from-lsn)
+        from-lsn
+        upto-lsn)))))
 
 (defn force-txlog-sync!
   [db]
@@ -2296,11 +2315,45 @@
   [lmdb k]
   (txlog/parse-floor-provider-map (kv-info-value lmdb k) k))
 
+(defn- with-runtime-txlog-rollback
+  [lmdb f]
+  (if-let [info-v (i/kv-info lmdb)]
+    (let [info @info-v]
+      (if (true? (:wal? info))
+        (let [had-rollout?  (contains? info :wal-rollout-mode)
+              had-rollback? (contains? info :wal-rollback?)
+              prev-rollout  (:wal-rollout-mode info)
+              prev-rollback (:wal-rollback? info)]
+          ;; Retention-floor bookkeeping is leader-local metadata and should
+          ;; not consume replicated WAL LSNs used by HA promotion checks.
+          (vswap! info-v assoc :wal-rollout-mode :rollback :wal-rollback? true)
+          (try
+            (f)
+            (finally
+              (vswap! info-v
+                      (fn [m]
+                        (cond-> m
+                          had-rollout?
+                          (assoc :wal-rollout-mode prev-rollout)
+
+                          (not had-rollout?)
+                          (dissoc :wal-rollout-mode)
+
+                          had-rollback?
+                          (assoc :wal-rollback? prev-rollback)
+
+                          (not had-rollback?)
+                          (dissoc :wal-rollback?)))))))
+        (f)))
+    (f)))
+
 (defn- write-kv-info-map!
   [lmdb k m]
-  (if (seq m)
-    (i/transact-kv lmdb c/kv-info [[:put k m]] :keyword :data)
-    (i/transact-kv lmdb c/kv-info [[:del k]] :keyword :data))
+  (with-runtime-txlog-rollback
+    lmdb
+    #(if (seq m)
+       (i/transact-kv lmdb c/kv-info [[:put k m]] :keyword :data)
+       (i/transact-kv lmdb c/kv-info [[:del k]] :keyword :data)))
   m)
 
 (defn txlog-update-snapshot-floor-state!

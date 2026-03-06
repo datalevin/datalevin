@@ -4,6 +4,7 @@
    [datalevin.util :as u]
    [datalevin.constants :as c]
    [datalevin.interface :as if]
+   [datalevin.txlog :as txlog]
    [datalevin.datom :as d]
    [datalevin.pipe :as p]
    [datalevin.test.core :as tdc :refer [db-fixture]]
@@ -21,6 +22,138 @@
    [datalevin.datom Datom]))
 
 (use-fixtures :each db-fixture)
+
+(defn- valid-ha-store-opts
+  []
+  {:wal? true
+   :db-name "ha-storage"
+   :db-identity "ha-storage-db"
+   :ha-mode :consensus-lease
+   :ha-node-id 1
+   :ha-lease-renew-ms 1000
+   :ha-lease-timeout-ms 3000
+   :ha-promotion-base-delay-ms 100
+   :ha-promotion-rank-delay-ms 200
+   :ha-max-promotion-lag-lsn 0
+   :ha-clock-skew-budget-ms 1000
+   :ha-fencing-hook {:cmd ["/bin/sh" "-c" "exit 0"]
+                     :timeout-ms 1000
+                     :retries 0
+                     :retry-delay-ms 0}
+   :ha-members [{:node-id 1 :endpoint "127.0.0.1:1"}
+                {:node-id 2 :endpoint "127.0.0.1:2"}
+                {:node-id 3 :endpoint "127.0.0.1:3"}]
+   :ha-control-plane
+   {:backend :sofa-jraft
+    :group-id "ha-storage-group"
+    :local-peer-id "127.0.0.1:101"
+    :rpc-timeout-ms 1000
+    :election-timeout-ms 1000
+    :operation-timeout-ms 1000
+    :voters [{:peer-id "127.0.0.1:101" :ha-node-id 1 :promotable? true}
+             {:peer-id "127.0.0.1:102" :ha-node-id 2 :promotable? true}
+             {:peer-id "127.0.0.1:103" :ha-node-id 3 :promotable? true}]}})
+
+(def ^:private persisted-ha-store-opt-keys
+  [:wal?
+   :db-name
+   :db-identity
+   :ha-mode
+   :ha-node-id
+   :ha-members
+   :ha-control-plane
+   :ha-lease-renew-ms
+   :ha-lease-timeout-ms
+   :ha-promotion-base-delay-ms
+   :ha-promotion-rank-delay-ms
+   :ha-max-promotion-lag-lsn
+   :ha-clock-skew-budget-ms
+   :ha-fencing-hook
+   :kv-opts])
+
+(defn- repo-tmp-dir
+  [prefix]
+  (str (.getAbsolutePath (java.io.File. "tmp"))
+       java.io.File/separator
+       prefix
+       (UUID/randomUUID)))
+
+(defn- txlog-opts-ops
+  [dir]
+  (let [txlog-dir (java.io.File. (str dir java.io.File/separator "txlog"))]
+    (if (.exists txlog-dir)
+      (->> (txlog/segment-files (.getPath txlog-dir))
+           (mapcat
+             (fn [{:keys [file]}]
+               (keep
+                 (fn [record]
+                   (let [ops (-> record :body txlog/decode-commit-row-payload :ops)
+                         opt-ops (filter #(= c/opts (nth % 1 nil)) ops)]
+                     (when (seq opt-ops)
+                       {:file (.getName ^java.io.File file)
+                        :ops (vec opt-ops)})))
+                 (:records (txlog/scan-segment (.getPath ^java.io.File file))))))
+           vec)
+      [])))
+
+(deftest reopen-wal-store-preserves-ha-opts-test
+  (let [dir      (repo-tmp-dir "storage-ha-reopen-")
+        opts     (valid-ha-store-opts)
+        store    (sut/open dir nil opts)
+        expected (select-keys (if/opts store) persisted-ha-store-opt-keys)
+        live-persisted
+        (select-keys
+          (#'sut/load-opts (.-lmdb ^Store store))
+          persisted-ha-store-opt-keys)]
+    (try
+      (is (= expected live-persisted)
+          (pr-str {:dir dir
+                   :live-persisted live-persisted
+                   :store-opts expected}))
+      (if/close store)
+      (let [incoming   (#'sut/propagate-top-level-txlog-opts-to-kv-opts nil)
+            persisted  (#'sut/load-existing-store-opts dir (:kv-opts incoming))
+            debug-info {:dir dir
+                        :txlog-opts-ops (txlog-opts-ops dir)
+                        :persisted-existing?
+                        (#'sut/existing-store? dir)
+                        :persisted
+                        (select-keys persisted persisted-ha-store-opt-keys)}]
+        (is (= expected
+               (select-keys persisted persisted-ha-store-opt-keys))
+            (pr-str debug-info)))
+      (let [reopened (sut/open dir nil)
+            debug-info {:dir dir
+                        :txlog-opts-ops (txlog-opts-ops dir)
+                        :persisted
+                        (select-keys
+                          (#'sut/load-existing-store-opts dir nil)
+                          persisted-ha-store-opt-keys)
+                        :reopened
+                        (select-keys (if/opts reopened)
+                                     persisted-ha-store-opt-keys)}]
+        (is (= expected
+               (select-keys (if/opts reopened)
+                            persisted-ha-store-opt-keys))
+            (pr-str debug-info))
+        (if/close reopened))
+      (let [reopened (sut/open dir nil {:wal? true})
+            debug-info {:dir dir
+                        :txlog-opts-ops (txlog-opts-ops dir)
+                        :persisted
+                        (select-keys
+                          (#'sut/load-existing-store-opts dir {:wal? true})
+                          persisted-ha-store-opt-keys)
+                        :reopened
+                        (select-keys (if/opts reopened)
+                                     persisted-ha-store-opt-keys)}]
+        (is (= expected
+               (select-keys (if/opts reopened)
+                            persisted-ha-store-opt-keys))
+            (pr-str debug-info))
+        (if/close reopened))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest basic-ops-test
   (let [dir   (u/tmp-dir (str "storage-test-" (UUID/randomUUID)))

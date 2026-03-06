@@ -231,6 +231,42 @@
         (dc/shutdown-transact-async-executor!)
         (d/close conn)))))
 
+(deftest test-strict-transact-prefers-direct-path-when-idle
+  (let [conn  (d/create-conn nil
+                             {:k {:db/valueType :db.type/long}}
+                             {:wal? true
+                              :wal-durability-profile :strict
+                              :kv-opts {:inmemory? true}})
+        paths (atom [])]
+    (try
+      (binding [dc/*txlog-sync-path-observer*
+                (fn [path] (swap! paths conj path))]
+        (dotimes [i 16]
+          (d/transact! conn [{:db/id i :k i}])))
+      (is (= 16 (count @paths)))
+      (is (every? #{:direct-wal-idle-strict} @paths))
+      (finally
+        (dc/shutdown-transact-async-executor!)
+        (d/close conn)))))
+
+(deftest test-extra-transact-prefers-direct-path-when-idle
+  (let [conn  (d/create-conn nil
+                             {:k {:db/valueType :db.type/long}}
+                             {:wal? true
+                              :wal-durability-profile :extra
+                              :kv-opts {:inmemory? true}})
+        paths (atom [])]
+    (try
+      (binding [dc/*txlog-sync-path-observer*
+                (fn [path] (swap! paths conj path))]
+        (dotimes [i 16]
+          (d/transact! conn [{:db/id i :k i}])))
+      (is (= 16 (count @paths)))
+      (is (every? #{:direct-wal-idle-extra} @paths))
+      (finally
+        (dc/shutdown-transact-async-executor!)
+        (d/close conn)))))
+
 (deftest test-strict-transact-async-no-stall
   (let [n    256
         conn (d/create-conn nil

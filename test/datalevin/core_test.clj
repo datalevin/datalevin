@@ -2,6 +2,7 @@
   (:require
    [datalevin.core :as sut]
    [datalevin.datom :as dd]
+   [datalevin.kv :as kv]
    [datalevin.util :as u]
    [datalevin.constants :as c]
    [datalevin.test.core :as tdc :refer [db-fixture]]
@@ -387,6 +388,35 @@
                                     db)))))))
         (finally
           (sut/close-db db)
+          (u/delete-files dir))))))
+
+(deftest replica-floor-bookkeeping-bypasses-wal-append-test
+  (when-not (u/windows?)
+    (let [dir  (u/tmp-dir (str "replica-floor-wal-bypass-"
+                               (UUID/randomUUID)))
+          lmdb (sut/open-kv dir {:wal? true
+                                 :flags (conj c/default-env-flags
+                                              :nosync)})
+          dbi  "a"]
+      (try
+        (sut/open-dbi lmdb dbi)
+        (sut/transact-kv lmdb [[:put dbi "Hello" "Datalevin"]])
+        (let [wm0      (sut/txlog-watermarks lmdb)
+              lsn0     (:last-appended-lsn wm0)
+              records0 (count (sut/open-tx-log lmdb 1))
+              applied0 (:last-applied-lsn wm0)]
+          (kv/txlog-update-replica-floor! lmdb 2 applied0)
+          (let [wm1        (sut/txlog-watermarks lmdb)
+                records1   (count (sut/open-tx-log lmdb 1))
+                retention1 (kv/txlog-retention-state lmdb)]
+            (is (= lsn0 (:last-appended-lsn wm1)))
+             (is (= (:last-durable-lsn wm0) (:last-durable-lsn wm1)))
+             (is (= applied0 (:last-applied-lsn wm1)))
+             (is (= records0 records1))
+             (is (= applied0
+                    (get-in retention1 [:floors :replica-floor-lsn])))))
+        (finally
+          (sut/close-kv lmdb)
           (u/delete-files dir))))))
 
 (deftest number-transact-test
