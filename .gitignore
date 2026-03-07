@@ -69,6 +69,8 @@ native/test-jar/jar-test
 */reports/
 */*/reports/
 *.build_artifacts.txt
+jepsen/store/
+jepsen/results/
 
 .lsp/.cache
 .portal

@@ -1,0 +1,97 @@
+(ns datalevin.jepsen.core
+  (:require
+   [clojure.string :as str]
+   [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.nemesis :as datalevin.nemesis]
+   [datalevin.jepsen.workload.append :as append]
+   [datalevin.jepsen.workload.append-cas :as append-cas]
+   [datalevin.jepsen.workload.bank :as bank]
+   [datalevin.jepsen.workload.grant :as grant]
+   [datalevin.jepsen.workload.internal :as internal]
+   [jepsen.checker :as checker]
+   [jepsen.checker.timeline :as timeline]
+   [jepsen.generator :as gen]
+   [jepsen.tests :as tests])
+  (:import
+   [java.util UUID]))
+
+(def workloads
+  {:append append/workload
+   :append-cas append-cas/workload
+   :bank bank/workload
+   :grant grant/workload
+   :internal internal/workload})
+
+(defn parse-nemesis-spec
+  [spec]
+  (->> (str/split spec #",")
+       (remove str/blank?)
+       (map keyword)
+       (mapcat datalevin.nemesis/expand-fault)
+       vec))
+
+(def supported-nemeses
+  datalevin.nemesis/supported-faults)
+
+(defn- validate-nemesis-compatibility!
+  [{:keys [control-backend nemesis]}]
+  (when (and (some #{:leader-failover :quorum-loss :clock-skew-pause} nemesis)
+             (not= :sofa-jraft control-backend))
+    (throw (ex-info
+            "HA disruption nemeses currently require --control-backend sofa-jraft"
+            {:nemesis nemesis
+             :control-backend control-backend}))))
+
+(defn datalevin-test
+  [opts]
+  (let [_              (validate-nemesis-compatibility! opts)
+        cluster-id     (str (UUID/randomUUID))
+        nodes          (vec (or (seq (:nodes opts)) local/default-nodes))
+        workload-name  (:workload opts)
+        workload       ((workloads workload-name) opts)
+        rate           (double (:rate opts))
+        time-limit     (:time-limit opts)
+        nemesis-faults (:nemesis opts)
+        {:keys [nemesis generator final-generator]}
+        (datalevin.nemesis/nemesis-package {:faults nemesis-faults})
+        workload-final-generator
+        (:final-generator workload)
+        client-gen     (->> (:generator workload)
+                            (gen/stagger (/ rate)))
+        combined-gen   (if generator
+                         (gen/clients client-gen generator)
+                         (gen/clients client-gen))
+        timed-gen      (->> combined-gen
+                            (gen/time-limit time-limit))
+        phases         (cond-> [timed-gen]
+                         workload-final-generator
+                         (conj (gen/clients workload-final-generator))
+
+                         final-generator
+                         (conj (gen/nemesis final-generator)))
+        ssh-opts       (assoc (merge {:username "root"
+                                      :password "root"
+                                      :strict-host-key-checking false}
+                                     (:ssh opts))
+                         :dummy? true)]
+    (merge tests/noop-test
+           opts
+           {:name (str (name workload-name) " "
+                       (if (= :sofa-jraft (:control-backend opts))
+                         "sofa-jraft"
+                         "in-memory"))
+            :nodes nodes
+            :db (local/db cluster-id)
+            :client (:client workload)
+            :nemesis nemesis
+            :checker (checker/compose
+                      {:timeline   (timeline/html)
+                       :exceptions (checker/unhandled-exceptions)
+                       :workload   (:checker workload)})
+            :generator (apply gen/phases phases)
+            :schema (:schema workload)
+            :db-name (:db-name opts)
+            :control-backend (:control-backend opts)
+            :ssh ssh-opts
+            :datalevin/nemesis-faults nemesis-faults
+            :datalevin/cluster-id cluster-id})))

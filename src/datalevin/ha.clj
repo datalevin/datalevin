@@ -126,6 +126,20 @@
                    :keyword :data))
   applied-lsn)
 
+(defn ^:redef read-ha-snapshot-payload-lsn
+  [m]
+  (if-let [kv-store (local-kv-store m)]
+    (let [persisted-lsn (read-ha-local-persisted-lsn kv-store)
+          snapshot-lsn  (long (or (try
+                                    (i/get-value kv-store c/kv-info
+                                                 c/wal-snapshot-current-lsn
+                                                 :keyword :data)
+                                    (catch Exception _
+                                      nil))
+                                  0))]
+      (long (max persisted-lsn snapshot-lsn)))
+    0))
+
 (defn ^:redef read-ha-local-last-applied-lsn
   [m]
   (try
@@ -658,13 +672,37 @@
                                                   (= kt :id))
                                          [k v])))
                                rows)
+            schema-overrides
+            (reduce
+             (fn [overrides [op dbi attr props]]
+               (if (= dbi c/schema)
+                 (case op
+                   :put (assoc overrides attr props)
+                   :del (dissoc overrides attr)
+                   overrides)
+                 overrides))
+             {}
+             rows)
+            pending-attrs
+            (into {}
+                  (keep (fn [[attr props]]
+                          (when-let [aid (:db/aid props)]
+                            [aid attr])))
+                  schema-overrides)
+            attr-props
+            (fn [aid]
+              (when-let [attr (or (get pending-attrs aid)
+                                  (when (instance? IStore store)
+                                    (get (i/attrs store) aid)))]
+                (merge (when (instance? IStore store)
+                         (get (i/schema store) attr))
+                       (get schema-overrides attr))))
             normalize-avg
             (fn [e r]
               (let [aid (ha-reflect-field r "a")
-                    attr (when (instance? IStore store)
-                           (get (i/attrs store) aid))
-                    vt  (when attr
-                          (get-in (i/schema store) [attr :db/valueType]))
+                    props (attr-props aid)
+                    vt  (when props
+                          (or (:db/valueType props) :data))
                     g   (or (ha-reflect-field r "g") c/normal)
                     rv  (if (= g c/normal)
                           (ha-reflect-field r "v")
@@ -695,6 +733,9 @@
                       row))
                   rows)]
         (i/transact-kv kv-store replay-rows)
+        (when (and (instance? IStore store)
+                   (seq schema-overrides))
+          (st/refresh-store-schema-cache! store))
         (when (instance? IStore store)
           (when-let [target-max-tx
                      (some->> replay-rows
@@ -822,18 +863,9 @@
                   :required-lsn (long required-lsn)
                   :snapshot-last-applied-lsn snapshot-last-lsn
                   :source-endpoint source-endpoint}))
-      (let [snapshot-store (st/open snapshot-dir nil
-                                    (ha-snapshot-open-opts
-                                     m db-name snapshot-db-identity))]
-        (try
-          (let [verified-lsn  (read-ha-local-last-applied-lsn
-                               {:store snapshot-store})]
-            {:db-name db-name
-             :db-identity snapshot-db-identity
-             :snapshot-last-applied-lsn snapshot-last-lsn
-             :payload-last-applied-lsn (long verified-lsn)})
-          (finally
-            (i/close snapshot-store)))))))
+      {:db-name db-name
+       :db-identity snapshot-db-identity
+       :snapshot-last-applied-lsn snapshot-last-lsn})))
 
 (defn ^:redef install-ha-local-snapshot!
   [m snapshot-dir]
@@ -953,9 +985,6 @@
                          :ha-follower-leader-endpoint leader-endpoint
                          :ha-follower-source-endpoint source-endpoint
                          :ha-follower-source-order source-order
-                         :ha-follower-last-bootstrap-ms nil
-                         :ha-follower-bootstrap-source-endpoint nil
-                         :ha-follower-bootstrap-snapshot-last-applied-lsn nil
                          :ha-follower-sync-backoff-ms nil
                          :ha-follower-next-sync-not-before-ms nil
                          :ha-follower-degraded? nil
@@ -988,8 +1017,10 @@
                       install-res
                       (install-ha-local-snapshot! current-m snapshot-dir)]
                   (if (:ok? install-res)
-                    (let [snapshot-lsn (long (:snapshot-last-applied-lsn
-                                              manifest))
+                    (let [snapshot-lsn (long (or (:payload-last-applied-lsn
+                                                  manifest)
+                                                 (:snapshot-last-applied-lsn
+                                                  manifest)))
                           resume-next-lsn (unchecked-inc snapshot-lsn)
                           _               (persist-ha-local-applied-lsn!
                                            (:state install-res)

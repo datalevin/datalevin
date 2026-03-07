@@ -96,6 +96,19 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest test-conn-cas-with-lookup-ref
+  (let [dir  (u/tmp-dir (str "cas-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir {:name {:db/unique :db.unique/identity}}
+               {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+    (d/transact! conn [{:db/id 1 :name "Petr" :age 31}])
+    (d/transact! conn [[:db/cas [:name "Petr"] :age 31 32]])
+    (d/transact! conn [[:db/cas [:name "Petr"] :age 32 33]
+                       [:db/cas [:name "Petr"] :age 33 34]])
+    (is (= 34 (:age (d/entity @conn [:name "Petr"]))))
+    (d/close conn)
+    (u/delete-files dir)))
+
 (deftest test-resolve-eid-1
   (let [dir    (u/tmp-dir (str "eid-" (UUID/randomUUID)))
         db     (d/empty-db

@@ -151,6 +151,16 @@
 (defn- init-attrs [schema]
   (into {} (map (fn [[k v]] [(v :db/aid) k])) schema))
 
+(defn refresh-store-schema-cache!
+  [^Store store]
+  (let [lmdb   (.-lmdb store)
+        schema (load-schema lmdb)]
+    (set! (.-schema store) schema)
+    (set! (.-rschema store) (schema->rschema schema))
+    (set! (.-attrs store) (init-attrs schema))
+    (set! (.-max-aid store) (init-max-aid schema))
+    store))
+
 (defn- init-max-gt
   [lmdb]
   (or (when-let [gt (-> (get-first lmdb c/giants [:all-back] :id :ignore)
@@ -1779,7 +1789,7 @@
                                 :wal-durability-profile
                                 c/*datalog-wal-durability-profile*})
          kv-opts (cond-> (merge persisted-kv-opts kv-opts)
-                   wal-default-kv-opts (merge wal-default-kv-opts)
+                   wal-default-kv-opts (#(merge wal-default-kv-opts %))
                    (u/file-exists (txlog-dir-path dir)) (assoc :wal? true))
          lmdb (lmdb/open-kv dir kv-opts)]
      (open-dbis lmdb)

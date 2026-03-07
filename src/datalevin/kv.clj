@@ -1893,10 +1893,20 @@
   (when (and (snapshot-bootstrap-force? lmdb)
              (not (rdonly-env? lmdb))
              (snapshot-source-ready? lmdb))
-    (let [snapshots (list-snapshot-entries lmdb)]
-      (when (< (count snapshots) 1)
+    (let [snapshots (list-snapshot-entries lmdb)
+          restored-snapshot? (and (empty? snapshots)
+                                  (some? (kv-info-value
+                                          lmdb
+                                          c/wal-snapshot-current-lsn)))]
+      ;; Restored HA snapshot copies persist the snapshot floor in kv-info but
+      ;; do not carry over snapshot slot directories. Treat that persisted floor
+      ;; as already bootstrapped rather than synthesizing a new snapshot at a
+      ;; lower txlog-applied LSN during open.
+      (when (and (not restored-snapshot?)
+                 (< (count snapshots) 1))
         (create-snapshot-now! lmdb))
-      (when (< (count (list-snapshot-entries lmdb)) 2)
+      (when (and (not restored-snapshot?)
+                 (< (count (list-snapshot-entries lmdb)) 2))
         (create-snapshot-now! lmdb)))))
 
 (defn ensure-txlog-ready!

@@ -22,6 +22,7 @@
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
    [datalevin.ha :as dha]
+   [datalevin.ha.control :as ctrl]
    [datalevin.search :as sc]
    [datalevin.vector :as v]
    [datalevin.kv :as kv]
@@ -844,6 +845,18 @@
           :ha-runtime-opts
           :ha-renew-loop-future))
 
+(defn- ha-authority-running?
+  [authority]
+  (if authority
+    (let [diagnostics (try
+                        (ctrl/authority-diagnostics authority)
+                        (catch Throwable _
+                          nil))]
+      (if (contains? diagnostics :running?)
+        (true? (:running? diagnostics))
+        true))
+    false))
+
 (defn- ha-write-admission-error
   [^Server server message]
   (dha/ha-write-admission-error (.-dbs server) message))
@@ -851,8 +864,8 @@
 (defn- ensure-ha-runtime
   [root db-name m store]
   (if-let [ha-opts (resolved-ha-runtime-opts root db-name store)]
-    (if (and (:ha-authority m)
-             (= (:ha-runtime-opts m) ha-opts))
+    (if (and (= (:ha-runtime-opts m) ha-opts)
+             (ha-authority-running? (:ha-authority m)))
       m
       (-> (stop-ha-runtime db-name m)
           (merge (*start-ha-authority-fn* db-name ha-opts))
@@ -1074,12 +1087,12 @@
             (i/get-value kv-store c/opts :db-identity :attr :data)
             (catch Exception _
               nil)))
-        watermarks (when kv-store
-                     (try
-                       (kv/txlog-watermarks kv-store)
-                       (catch Exception _
-                         nil)))
-        snapshot-lsn (:last-applied-lsn watermarks)
+        snapshot-lsn
+        (when kv-store
+          (try
+            (long (dha/read-ha-snapshot-payload-lsn {:store store}))
+            (catch Exception _
+              0)))
         db-identity (or (:db-identity store-opts)
                         (:db-identity kv-opts)
                         stored-db-identity)]
@@ -2437,16 +2450,21 @@
                              :expires-ms pin-expires-ms}))]
           (i/copy source-store tf compact?))
         (let [completed-ms (System/currentTimeMillis)
-              copy-meta (copy-response-meta
-                          db-name
-                          source-store
-                          (cond-> {:started-ms started-ms
-                                   :completed-ms completed-ms
-                                   :duration-ms (- completed-ms started-ms)
-                                   :compact? (boolean compact?)}
-                            (map? @copy-backup-pin)
-                            (assoc :backup-pin @copy-backup-pin)))]
-          (copy-file-out skey path copy-meta))
+              copied-store (st/open tf nil nil)]
+          (try
+            (let [copy-meta (copy-response-meta
+                             db-name
+                             copied-store
+                             (cond-> {:started-ms started-ms
+                                      :completed-ms completed-ms
+                                      :duration-ms (- completed-ms started-ms)
+                                      :compact? (boolean compact?)}
+                               (map? @copy-backup-pin)
+                               (assoc :backup-pin @copy-backup-pin)))]
+              (copy-file-out skey path copy-meta))
+            (finally
+              (when-not (i/closed? copied-store)
+                (i/close copied-store)))))
         (finally (u/delete-files tf))))))
 
 (defn- stat
@@ -3412,13 +3430,15 @@
 (defn create
   "Create a Datalevin server. Initially not running, call `start` to run."
   [{:keys [port root idle-timeout verbose]
+    :as   opts
     :or   {port         8898
            root         "/var/lib/datalevin"
            idle-timeout c/default-idle-timeout
            verbose      false}}]
   {:pre [(int? port) (not (s/blank? root))]}
   (try
-    (log/set-min-level! (if verbose :debug :info))
+    (when (contains? opts :verbose)
+      (log/set-min-level! (if verbose :debug :info)))
     (let [^ServerSocketChannel server-socket (open-port port)
           ^Selector selector                 (Selector/open)
           running                            (AtomicBoolean. false)

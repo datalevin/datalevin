@@ -358,6 +358,51 @@
     (sut/close-db db)
     (u/delete-files dir)))
 
+(deftest with-derived-db-characterization-test
+  (let [dir    (u/tmp-dir (str "with-derived-db-" (UUID/randomUUID)))
+        schema {:append/key   {:db/valueType :db.type/long
+                               :db/index true}
+                :append/value {:db/valueType :db.type/long}}
+        conn   (sut/create-conn
+                 dir schema
+                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})
+        values (fn [db]
+                 (->> (sut/q '[:find ?v
+                               :in $ ?k
+                               :where
+                               [?e :append/key ?k]
+                               [?e :append/value ?v]]
+                             db 1)
+                      (map first)
+                      sort
+                      vec))]
+    (try
+      (sut/transact! conn [{:append/key 1 :append/value 10}])
+      (let [db0    @conn
+            report (sut/with db0 [{:append/key 1 :append/value 11}])
+            db1    (:db-after report)
+            db2    (sut/db-with db1 [{:append/key 1 :append/value 12}])]
+        ;; `with`/`db-with` derived DBs share the same mutable overlay state.
+        (is (= [10 11 12] (values db0)))
+        (is (= [10 11 12] (values db1)))
+        (is (= [10 11 12] (values @conn)))
+        (is (= [10 11 12] (values db2)))
+        (is (= 3 (count (values db2))))
+        (sut/close conn)
+        (let [fresh-conn (sut/create-conn
+                           dir schema
+                           {:kv-opts {:flags (conj c/default-env-flags
+                                                   :nosync)}})]
+          (try
+            ;; `with`/`db-with` persist to the underlying store too.
+            (is (= [10 11 12] (values @fresh-conn)))
+            (finally
+              (sut/close fresh-conn)))))
+      (finally
+        (when-not (sut/closed? conn)
+          (sut/close conn))
+        (u/delete-files dir)))))
+
 (deftest fill-db-bypasses-wal-append-test
   (when-not (u/windows?)
     (let [dir  (u/tmp-dir (str "fill-db-wal-bypass-" (UUID/randomUUID)))

@@ -1385,7 +1385,7 @@
         ov            (if (ref? db a) (entid-strict db ov) ov)
         nv            (if (ref? db a) (entid-strict db nv) nv)
         _             (vld/validate-val nv entity)
-        datoms        (clojure.set/union
+        datoms        (concat
                         (.subSet ^TreeSortedSet (:eavt db)
                                  (datom e a nil tx0)
                                  (datom e a nil txmax))
