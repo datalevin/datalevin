@@ -1,7 +1,8 @@
 package datalevin;
 
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collection;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -15,29 +16,36 @@ import java.util.Objects;
  */
 public final class Connection extends HandleResource {
 
-    Connection(String handle) {
-        super(handle, "close", "conn");
+    Connection(Object conn) {
+        super(conn,
+              resource -> ClojureBridge.core("close", resource),
+              "conn",
+              "conn");
     }
 
     /**
      * Returns whether this handle has been closed.
      */
     public boolean closed() {
-        return isReleased() || JsonBridge.asBoolean(call("closed?"));
+        return isReleased() || ClojureBridge.javaBoolean(ClojureBridge.core("closed?", resource()));
     }
 
     /**
      * Returns the current schema map.
      */
     public Map<String, Object> schema() {
-        return JsonBridge.asMap(call("schema"));
+        return ClojureBridge.javaMap(ClojureBridge.core("schema", resource()));
     }
 
     /**
      * Applies a raw schema update and returns the updated schema.
      */
     public Map<String, Object> updateSchema(Map<String, ?> schemaUpdate) {
-        return JsonBridge.asMap(call("update-schema", Datalevin.mapOf("schema-update", schemaUpdate)));
+        return ClojureBridge.javaMap(
+                ClojureBridge.core("update-schema",
+                                   resource(),
+                                   ClojureBridge.schemaInput(schemaUpdate))
+        );
     }
 
     /**
@@ -53,14 +61,29 @@ public final class Connection extends HandleResource {
     public Map<String, Object> updateSchema(Map<String, ?> schemaUpdate,
                                             Collection<?> delAttrs,
                                             Map<?, ?> renameMap) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("schema-update", schemaUpdate);
-        if (delAttrs != null) {
-            args.put("del-attrs", delAttrs);
-        }
+        Object normalizedSchema = ClojureBridge.schemaInput(schemaUpdate);
+        Object normalizedDelAttrs = ClojureBridge.deleteAttrsInput(delAttrs);
+        Object normalizedRenameMap = ClojureBridge.renameMapInput(renameMap);
         if (renameMap != null) {
-            args.put("rename-map", renameMap);
+            return ClojureBridge.javaMap(
+                    ClojureBridge.core("update-schema",
+                                       resource(),
+                                       normalizedSchema,
+                                       normalizedDelAttrs,
+                                       normalizedRenameMap)
+            );
         }
-        return JsonBridge.asMap(call("update-schema", args));
+        if (delAttrs != null) {
+            return ClojureBridge.javaMap(
+                    ClojureBridge.core("update-schema",
+                                       resource(),
+                                       normalizedSchema,
+                                       normalizedDelAttrs)
+            );
+        }
+        return ClojureBridge.javaMap(
+                ClojureBridge.core("update-schema", resource(), normalizedSchema)
+        );
     }
 
     /**
@@ -76,56 +99,69 @@ public final class Connection extends HandleResource {
      * Returns the connection option map.
      */
     public Map<String, Object> opts() {
-        return JsonBridge.asMap(call("opts"));
+        return ClojureBridge.javaMap(ClojureBridge.core("opts", resource()));
     }
 
     /**
      * Clears all data from the underlying database.
      */
     public void clear() {
-        call("clear");
+        ClojureBridge.core("clear", resource());
     }
 
     /**
      * Returns the highest entity id currently allocated.
      */
     public long maxEid() {
-        return JsonBridge.asLong(call("max-eid"));
+        return ClojureBridge.javaLong(ClojureBridge.core("max-eid", db()));
     }
 
     /**
      * Returns the current datalog index cache limit.
      */
     public long datalogIndexCacheLimit() {
-        return JsonBridge.asLong(call("datalog-index-cache-limit"));
+        return ClojureBridge.javaLong(ClojureBridge.core("datalog-index-cache-limit", db()));
     }
 
     /**
      * Sets and returns the datalog index cache limit.
      */
     public long datalogIndexCacheLimit(long limit) {
-        return JsonBridge.asLong(call("datalog-index-cache-limit", Datalevin.mapOf("limit", limit)));
+        return ClojureBridge.javaLong(
+                ClojureBridge.core("datalog-index-cache-limit", db(), limit)
+        );
     }
 
     /**
      * Resolves an entity id or lookup ref to an entity id.
      */
     public Object entid(Object eid) {
-        return call("entid", Datalevin.mapOf("eid", eid));
+        return ClojureBridge.toJava(
+                ClojureBridge.core("entid", db(), ClojureBridge.lookupRefInput(eid))
+        );
     }
 
     /**
      * Returns a touched entity map for the given entity id or lookup ref.
      */
     public Map<String, Object> entity(Object eid) {
-        return JsonBridge.asMapOrNull(call("entity", Datalevin.mapOf("eid", eid)));
+        Object entity = ClojureBridge.core("entity", db(), ClojureBridge.lookupRefInput(eid));
+        if (entity == null) {
+            return null;
+        }
+        return ClojureBridge.javaMapOrNull(ClojureBridge.core("touch", entity));
     }
 
     /**
      * Pulls one entity using a raw selector value.
      */
     public Map<String, Object> pull(Object selector, Object eid) {
-        return JsonBridge.asMapOrNull(call("pull", Datalevin.mapOf("selector", selector, "eid", eid)));
+        return ClojureBridge.javaMapOrNull(
+                ClojureBridge.core("pull",
+                                   db(),
+                                   ClojureBridge.pullSelectorInput(selector),
+                                   ClojureBridge.lookupRefInput(eid))
+        );
     }
 
     /**
@@ -139,7 +175,16 @@ public final class Connection extends HandleResource {
      * Pulls many entities using a raw selector value.
      */
     public List<Object> pullMany(Object selector, List<?> eids) {
-        return JsonBridge.asList(call("pull-many", Datalevin.mapOf("selector", selector, "eids", eids)));
+        ArrayList<Object> normalized = new ArrayList<>(eids.size());
+        for (Object eid : eids) {
+            normalized.add(ClojureBridge.lookupRefInput(eid));
+        }
+        return ClojureBridge.javaList(
+                ClojureBridge.core("pull-many",
+                                   db(),
+                                   ClojureBridge.pullSelectorInput(selector),
+                                   ClojureBridge.genericInput(normalized))
+        );
     }
 
     /**
@@ -153,22 +198,14 @@ public final class Connection extends HandleResource {
      * Runs a query expressed as EDN text with positional inputs.
      */
     public Object query(String query, Object... inputs) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("query", query);
-        if (inputs.length > 0) {
-            args.put("inputs", Datalevin.listOf(inputs));
-        }
-        return call("q", args);
+        return runQuery(ClojureBridge.queryForm(query), Arrays.asList(inputs));
     }
 
     /**
      * Runs a query expressed as EDN text with positional inputs.
      */
     public Object query(String query, List<?> inputs) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("query", query);
-        if (inputs != null && !inputs.isEmpty()) {
-            args.put("inputs", inputs);
-        }
-        return call("q", args);
+        return runQuery(ClojureBridge.queryForm(query), inputs);
     }
 
     /**
@@ -199,33 +236,27 @@ public final class Connection extends HandleResource {
      * Explains a query expressed as EDN text with positional inputs.
      */
     public Object explain(String query, Object... inputs) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("query", query);
-        if (inputs.length > 0) {
-            args.put("inputs", Datalevin.listOf(inputs));
-        }
-        return call("explain", args);
+        return runExplain(ClojureBridge.explainOpts(null),
+                          ClojureBridge.queryForm(query),
+                          Arrays.asList(inputs));
     }
 
     /**
      * Explains a query expressed as EDN text with positional inputs.
      */
     public Object explain(String query, List<?> inputs) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("query", query);
-        if (inputs != null && !inputs.isEmpty()) {
-            args.put("inputs", inputs);
-        }
-        return call("explain", args);
+        return runExplain(ClojureBridge.explainOpts(null),
+                          ClojureBridge.queryForm(query),
+                          inputs);
     }
 
     /**
      * Explains a query expressed as EDN text using explicit explain options.
      */
     public Object explain(String optsEdn, String query, List<?> inputs) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("opts", optsEdn, "query", query);
-        if (inputs != null && !inputs.isEmpty()) {
-            args.put("inputs", inputs);
-        }
-        return call("explain", args);
+        return runExplain(ClojureBridge.explainOpts(optsEdn),
+                          ClojureBridge.queryForm(query),
+                          inputs);
     }
 
     /**
@@ -264,7 +295,9 @@ public final class Connection extends HandleResource {
      * Transacts raw transaction data and returns the transaction report.
      */
     public Map<String, Object> transact(Object txData) {
-        return JsonBridge.asMap(call("transact!", Datalevin.mapOf("tx-data", txData)));
+        return ClojureBridge.javaMap(
+                ClojureBridge.core("transact!", resource(), ClojureBridge.txDataInput(txData))
+        );
     }
 
     /**
@@ -278,11 +311,15 @@ public final class Connection extends HandleResource {
      * Transacts raw transaction data with optional transaction metadata.
      */
     public Map<String, Object> transact(Object txData, Map<String, ?> txMeta) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("tx-data", txData);
-        if (txMeta != null) {
-            args.put("tx-meta", txMeta);
+        if (txMeta == null) {
+            return transact(txData);
         }
-        return JsonBridge.asMap(call("transact!", args));
+        return ClojureBridge.javaMap(
+                ClojureBridge.core("transact!",
+                                   resource(),
+                                   ClojureBridge.txDataInput(txData),
+                                   ClojureBridge.genericInput(txMeta))
+        );
     }
 
     /**
@@ -296,6 +333,39 @@ public final class Connection extends HandleResource {
      * Escape hatch for calling a connection-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {
-        return super.call(op, args);
+        return execJson(op, args);
+    }
+
+    private Object db() {
+        return ClojureBridge.core("db", resource());
+    }
+
+    private Object runQuery(Object queryForm, List<?> inputs) {
+        ArrayList<Object> args = new ArrayList<>();
+        args.add(queryForm);
+        args.add(db());
+        if (inputs != null) {
+            for (Object input : inputs) {
+                args.add(ClojureBridge.genericInput(input));
+            }
+        }
+        return ClojureBridge.toJava(
+                ClojureBridge.core("q", args.toArray())
+        );
+    }
+
+    private Object runExplain(Object opts, Object queryForm, List<?> inputs) {
+        ArrayList<Object> args = new ArrayList<>();
+        args.add(opts);
+        args.add(queryForm);
+        args.add(db());
+        if (inputs != null) {
+            for (Object input : inputs) {
+                args.add(ClojureBridge.genericInput(input));
+            }
+        }
+        return ClojureBridge.toJava(
+                ClojureBridge.core("explain", args.toArray())
+        );
     }
 }

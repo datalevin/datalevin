@@ -1,6 +1,6 @@
 package datalevin;
 
-import java.util.LinkedHashMap;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
@@ -12,186 +12,211 @@ import java.util.Map;
  */
 public final class KV extends HandleResource {
 
-    KV(String handle) {
-        super(handle, "close-kv", "kv");
+    KV(Object kv) {
+        super(kv,
+              resource -> ClojureBridge.core("close-kv", resource),
+              "kv",
+              "kv");
     }
 
     /**
      * Returns whether this handle has been closed.
      */
     public boolean closed() {
-        return isReleased() || JsonBridge.asBoolean(call("closed-kv?"));
+        return isReleased() || ClojureBridge.javaBoolean(ClojureBridge.core("closed-kv?", resource()));
     }
 
     /**
      * Returns the root directory backing this KV store.
      */
     public String dir() {
-        return JsonBridge.asString(call("dir"));
+        return ClojureBridge.javaString(ClojureBridge.core("dir", resource()));
     }
 
     /**
      * Opens a regular DBI with default options.
      */
     public void openDbi(String dbiName) {
-        call("open-dbi", Datalevin.mapOf("dbi-name", dbiName));
+        ClojureBridge.core("open-dbi", resource(), dbiName);
     }
 
     /**
      * Opens a regular DBI with explicit options.
      */
     public void openDbi(String dbiName, Map<String, ?> opts) {
-        call("open-dbi", Datalevin.mapOf("dbi-name", dbiName, "opts", opts));
+        ClojureBridge.core("open-dbi", resource(), dbiName, ClojureBridge.optionsInput(opts));
     }
 
     /**
      * Opens a list DBI with default options.
      */
     public void openListDbi(String listName) {
-        call("open-list-dbi", Datalevin.mapOf("list-name", listName));
+        ClojureBridge.core("open-list-dbi", resource(), listName);
     }
 
     /**
      * Opens a list DBI with explicit options.
      */
     public void openListDbi(String listName, Map<String, ?> opts) {
-        call("open-list-dbi", Datalevin.mapOf("list-name", listName, "opts", opts));
+        ClojureBridge.core("open-list-dbi", resource(), listName, ClojureBridge.optionsInput(opts));
     }
 
     /**
      * Clears all entries from the named DBI.
      */
     public void clearDbi(String dbiName) {
-        call("clear-dbi", Datalevin.mapOf("dbi-name", dbiName));
+        ClojureBridge.core("clear-dbi", resource(), dbiName);
     }
 
     /**
      * Drops the named DBI.
      */
     public void dropDbi(String dbiName) {
-        call("drop-dbi", Datalevin.mapOf("dbi-name", dbiName));
+        ClojureBridge.core("drop-dbi", resource(), dbiName);
     }
 
     /**
      * Lists all DBIs in the store.
      */
     public List<Object> listDbis() {
-        return JsonBridge.asList(call("list-dbis"));
+        return ClojureBridge.javaList(ClojureBridge.core("list-dbis", resource()));
     }
 
     /**
      * Returns environment statistics.
      */
     public Map<String, Object> stat() {
-        return JsonBridge.asMap(call("stat"));
+        return ClojureBridge.javaMap(ClojureBridge.core("stat", resource()));
     }
 
     /**
      * Returns statistics for the named DBI.
      */
     public Map<String, Object> stat(String dbiName) {
-        return JsonBridge.asMap(call("stat", Datalevin.mapOf("dbi-name", dbiName)));
+        return ClojureBridge.javaMap(ClojureBridge.core("stat", resource(), dbiName));
     }
 
     /**
      * Returns the number of entries in the named DBI.
      */
     public long entries(String dbiName) {
-        return JsonBridge.asLong(call("entries", Datalevin.mapOf("dbi-name", dbiName)));
+        return ClojureBridge.javaLong(ClojureBridge.core("entries", resource(), dbiName));
     }
 
     /**
      * Applies KV transactions with default type inference.
      */
     public Object transact(Object txs) {
-        return call("transact-kv", Datalevin.mapOf("txs", txs));
+        return ClojureBridge.toJava(ClojureBridge.core("transact-kv",
+                                                       resource(),
+                                                       ClojureBridge.kvTxsInput(txs)));
     }
 
     /**
      * Applies KV transactions against the named DBI.
      */
     public Object transact(String dbiName, Object txs) {
-        return call("transact-kv", Datalevin.mapOf("dbi-name", dbiName, "txs", txs));
+        return ClojureBridge.toJava(ClojureBridge.core("transact-kv",
+                                                       resource(),
+                                                       dbiName,
+                                                       ClojureBridge.kvTxsInput(txs)));
     }
 
     /**
      * Applies KV transactions with an explicit key type.
      */
     public Object transact(String dbiName, Object txs, String kType) {
-        return call("transact-kv", Datalevin.mapOf("dbi-name", dbiName, "txs", txs, "k-type", kType));
+        return ClojureBridge.toJava(ClojureBridge.core("transact-kv",
+                                                       resource(),
+                                                       dbiName,
+                                                       ClojureBridge.kvTxsInput(txs),
+                                                       ClojureBridge.typeKeyword(kType)));
     }
 
     /**
      * Applies KV transactions with explicit key and value types.
      */
     public Object transact(String dbiName, Object txs, String kType, String vType) {
-        return call("transact-kv", Datalevin.mapOf(
-                "dbi-name", dbiName,
-                "txs", txs,
-                "k-type", kType,
-                "v-type", vType
-        ));
+        return ClojureBridge.toJava(ClojureBridge.core("transact-kv",
+                                                       resource(),
+                                                       dbiName,
+                                                       ClojureBridge.kvTxsInput(txs),
+                                                       ClojureBridge.typeKeyword(kType),
+                                                       ClojureBridge.typeKeyword(vType)));
     }
 
     /**
      * Returns the value for {@code key} from the named DBI.
      */
     public Object getValue(String dbi, Object key) {
-        return call("get-value", Datalevin.mapOf("dbi", dbi, "k", key));
+        return ClojureBridge.toJava(ClojureBridge.core("get-value",
+                                                       resource(),
+                                                       dbi,
+                                                       ClojureBridge.genericInput(key)));
     }
 
     /**
      * Returns the value for {@code key} from the named DBI with explicit types.
      */
     public Object getValue(String dbi, Object key, String kType, String vType, boolean ignoreKey) {
-        return call("get-value", Datalevin.mapOf(
-                "dbi", dbi,
-                "k", key,
-                "k-type", kType,
-                "v-type", vType,
-                "ignore-key?", ignoreKey
-        ));
+        return ClojureBridge.toJava(ClojureBridge.core("get-value",
+                                                       resource(),
+                                                       dbi,
+                                                       ClojureBridge.genericInput(key),
+                                                       ClojureBridge.typeKeyword(kType),
+                                                       ClojureBridge.typeKeyword(vType),
+                                                       ignoreKey));
     }
 
     /**
      * Returns the sorted rank of {@code key}, or {@code null} when absent.
      */
     public Long getRank(String dbi, Object key) {
-        return JsonBridge.asNullableLong(call("get-rank", Datalevin.mapOf("dbi", dbi, "k", key)));
+        return ClojureBridge.javaNullableLong(ClojureBridge.core("get-rank",
+                                                                 resource(),
+                                                                 dbi,
+                                                                 ClojureBridge.genericInput(key)));
     }
 
     /**
      * Returns the sorted rank of {@code key} with an explicit key type.
      */
     public Long getRank(String dbi, Object key, String kType) {
-        return JsonBridge.asNullableLong(call("get-rank", Datalevin.mapOf("dbi", dbi, "k", key, "k-type", kType)));
+        return ClojureBridge.javaNullableLong(ClojureBridge.core("get-rank",
+                                                                 resource(),
+                                                                 dbi,
+                                                                 ClojureBridge.genericInput(key),
+                                                                 ClojureBridge.typeKeyword(kType)));
     }
 
     /**
      * Returns the entry at the given rank.
      */
     public Object getByRank(String dbi, long rank) {
-        return call("get-by-rank", Datalevin.mapOf("dbi", dbi, "rank", rank));
+        return ClojureBridge.toJava(ClojureBridge.core("get-by-rank", resource(), dbi, rank));
     }
 
     /**
      * Returns the entry at the given rank with explicit types.
      */
     public Object getByRank(String dbi, long rank, String kType, String vType, boolean ignoreKey) {
-        return call("get-by-rank", Datalevin.mapOf(
-                "dbi", dbi,
-                "rank", rank,
-                "k-type", kType,
-                "v-type", vType,
-                "ignore-key?", ignoreKey
-        ));
+        return ClojureBridge.toJava(ClojureBridge.core("get-by-rank",
+                                                       resource(),
+                                                       dbi,
+                                                       rank,
+                                                       ClojureBridge.typeKeyword(kType),
+                                                       ClojureBridge.typeKeyword(vType),
+                                                       ignoreKey));
     }
 
     /**
      * Returns entries in the given key range.
      */
     public List<Object> getRange(String dbi, List<?> kRange) {
-        return JsonBridge.asList(call("get-range", Datalevin.mapOf("dbi", dbi, "k-range", kRange)));
+        return ClojureBridge.javaList(ClojureBridge.core("get-range",
+                                                         resource(),
+                                                         dbi,
+                                                         ClojureBridge.rangeInput(kRange)));
     }
 
     /**
@@ -203,79 +228,101 @@ public final class KV extends HandleResource {
                                  String vType,
                                  Integer limit,
                                  Integer offset) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("dbi", dbi, "k-range", kRange);
-        if (kType != null) {
-            args.put("k-type", kType);
+        ArrayList<Object> args = new ArrayList<>();
+        args.add(resource());
+        args.add(dbi);
+        args.add(ClojureBridge.rangeInput(kRange));
+        if (kType != null || vType != null) {
+            args.add(ClojureBridge.typeKeyword(kType));
         }
         if (vType != null) {
-            args.put("v-type", vType);
+            args.add(ClojureBridge.typeKeyword(vType));
         }
-        if (limit != null) {
-            args.put("limit", limit);
-        }
-        if (offset != null) {
-            args.put("offset", offset);
-        }
-        return JsonBridge.asList(call("get-range", args));
+        return page(ClojureBridge.javaList(ClojureBridge.core("get-range", args.toArray())),
+                    limit,
+                    offset);
     }
 
     /**
      * Returns keys in the given range.
      */
     public List<Object> keyRange(String dbi, List<?> kRange, String kType, Integer limit, Integer offset) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("dbi", dbi, "k-range", kRange);
+        ArrayList<Object> args = new ArrayList<>();
+        args.add(resource());
+        args.add(dbi);
+        args.add(ClojureBridge.rangeInput(kRange));
         if (kType != null) {
-            args.put("k-type", kType);
+            args.add(ClojureBridge.typeKeyword(kType));
         }
-        if (limit != null) {
-            args.put("limit", limit);
-        }
-        if (offset != null) {
-            args.put("offset", offset);
-        }
-        return JsonBridge.asList(call("key-range", args));
+        return page(ClojureBridge.javaList(ClojureBridge.core("key-range", args.toArray())),
+                    limit,
+                    offset);
     }
 
     /**
      * Returns the number of keys in the given range.
      */
     public long keyRangeCount(String dbi, List<?> kRange, String kType) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("dbi", dbi, "k-range", kRange);
-        if (kType != null) {
-            args.put("k-type", kType);
+        if (kType == null) {
+            return ClojureBridge.javaLong(ClojureBridge.core("key-range-count",
+                                                             resource(),
+                                                             dbi,
+                                                             ClojureBridge.rangeInput(kRange)));
         }
-        return JsonBridge.asLong(call("key-range-count", args));
+        return ClojureBridge.javaLong(ClojureBridge.core("key-range-count",
+                                                         resource(),
+                                                         dbi,
+                                                         ClojureBridge.rangeInput(kRange),
+                                                         ClojureBridge.typeKeyword(kType)));
     }
 
     /**
      * Returns the approximate number of entries in the given range.
      */
     public long rangeCount(String dbi, List<?> kRange, String kType) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("dbi", dbi, "k-range", kRange);
-        if (kType != null) {
-            args.put("k-type", kType);
+        if (kType == null) {
+            return ClojureBridge.javaLong(ClojureBridge.core("range-count",
+                                                             resource(),
+                                                             dbi,
+                                                             ClojureBridge.rangeInput(kRange)));
         }
-        return JsonBridge.asLong(call("range-count", args));
+        return ClojureBridge.javaLong(ClojureBridge.core("range-count",
+                                                         resource(),
+                                                         dbi,
+                                                         ClojureBridge.rangeInput(kRange),
+                                                         ClojureBridge.typeKeyword(kType)));
     }
 
     /**
      * Flushes store state to disk.
      */
     public void sync() {
-        call("sync");
+        ClojureBridge.core("sync", resource());
     }
 
     /**
      * Flushes store state to disk using the given force flag.
      */
     public void sync(long force) {
-        call("sync", Datalevin.mapOf("force", force));
+        ClojureBridge.core("sync", resource(), force);
     }
 
     /**
      * Escape hatch for calling a KV-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {
-        return super.call(op, args);
+        return execJson(op, args);
+    }
+
+    private List<Object> page(List<Object> items, Integer limit, Integer offset) {
+        int start = offset == null ? 0 : Math.max(offset, 0);
+        if (start >= items.size()) {
+            return List.of();
+        }
+        int end = limit == null ? items.size() : Math.min(items.size(), start + Math.max(limit, 0));
+        if (end <= start) {
+            return List.of();
+        }
+        return new ArrayList<>(items.subList(start, end));
     }
 }

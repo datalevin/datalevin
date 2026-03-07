@@ -1,67 +1,73 @@
 package datalevin;
 
-import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
 abstract class HandleResource implements AutoCloseable {
 
-    private final String closeOp;
-    private final String handleArg;
-    private String handle;
-
-    HandleResource(String handle, String closeOp, String handleArg) {
-        this.handle = Objects.requireNonNull(handle, "handle");
-        this.closeOp = Objects.requireNonNull(closeOp, "closeOp");
-        this.handleArg = Objects.requireNonNull(handleArg, "handleArg");
+    @FunctionalInterface
+    interface ResourceCloser {
+        void close(Object resource);
     }
 
-    public final String handle() {
+    private final ResourceCloser closer;
+    private final String jsonHandlePrefix;
+    private final String jsonHandleArg;
+    private Object resource;
+
+    HandleResource(Object resource,
+                   ResourceCloser closer,
+                   String jsonHandlePrefix,
+                   String jsonHandleArg) {
+        this.resource = Objects.requireNonNull(resource, "resource");
+        this.closer = Objects.requireNonNull(closer, "closer");
+        this.jsonHandlePrefix = Objects.requireNonNull(jsonHandlePrefix, "jsonHandlePrefix");
+        this.jsonHandleArg = Objects.requireNonNull(jsonHandleArg, "jsonHandleArg");
+    }
+
+    public final Object handle() {
         ensureOpen();
-        return handle;
+        return resource;
     }
 
     public final boolean isOpen() {
-        return handle != null;
+        return resource != null;
     }
 
-    protected final Object call(String op) {
-        return call(op, Map.of());
-    }
-
-    protected final Object call(String op, Map<String, ?> args) {
+    protected final Object resource() {
         ensureOpen();
-        LinkedHashMap<String, Object> request = new LinkedHashMap<>();
-        request.put(handleArg, handle);
-        if (args != null) {
-            request.putAll(args);
-        }
-        return JsonBridge.call(op, request);
+        return resource;
     }
 
-    protected final void releaseLocalHandle() {
-        handle = null;
+    protected final Object execJson(String op) {
+        return execJson(op, Map.of());
+    }
+
+    protected final Object execJson(String op, Map<String, ?> args) {
+        ensureOpen();
+        return ClojureBridge.execWithJsonHandle(jsonHandlePrefix,
+                                                jsonHandleArg,
+                                                resource,
+                                                op,
+                                                args);
     }
 
     protected final boolean isReleased() {
-        return handle == null;
+        return resource == null;
     }
 
     private void ensureOpen() {
-        if (handle == null) {
+        if (resource == null) {
             throw new IllegalStateException(getClass().getSimpleName() + " is closed.");
         }
     }
 
     @Override
     public void close() {
-        if (handle == null) {
+        if (resource == null) {
             return;
         }
-
-        LinkedHashMap<String, Object> request = new LinkedHashMap<>();
-        request.put(handleArg, handle);
-        JsonBridge.call(closeOp, request);
-        handle = null;
+        closer.close(resource);
+        resource = null;
     }
 }

@@ -53,23 +53,23 @@ public final class Datalevin {
      * underlying Datalevin runtime.
      */
     public static Connection createConn() {
-        return new Connection(JsonBridge.asString(JsonBridge.call("create-conn")));
+        return new Connection(ClojureBridge.core("create-conn"));
     }
 
     /**
      * Creates or opens a Datalog connection rooted at {@code dir}.
      */
     public static Connection createConn(String dir) {
-        return new Connection(JsonBridge.asString(JsonBridge.call("create-conn", mapOf("dir", dir))));
+        return new Connection(ClojureBridge.core("create-conn", dir));
     }
 
     /**
      * Creates or opens a Datalog connection with a raw schema map.
      */
     public static Connection createConn(String dir, Map<String, ?> schema) {
-        return new Connection(JsonBridge.asString(
-                JsonBridge.call("create-conn", mapOf("dir", dir, "schema", schema))
-        ));
+        return new Connection(ClojureBridge.core("create-conn",
+                                                 dir,
+                                                 ClojureBridge.schemaInput(schema)));
     }
 
     /**
@@ -83,9 +83,10 @@ public final class Datalevin {
      * Creates or opens a Datalog connection with a raw schema map and options.
      */
     public static Connection createConn(String dir, Map<String, ?> schema, Map<String, ?> opts) {
-        return new Connection(JsonBridge.asString(
-                JsonBridge.call("create-conn", mapOf("dir", dir, "schema", schema, "opts", opts))
-        ));
+        return new Connection(ClojureBridge.core("create-conn",
+                                                 dir,
+                                                 ClojureBridge.schemaInput(schema),
+                                                 ClojureBridge.optionsInput(opts)));
     }
 
     /**
@@ -100,23 +101,23 @@ public final class Datalevin {
      * Returns the current shared connection when one is available.
      */
     public static Connection getConn() {
-        return new Connection(JsonBridge.asString(JsonBridge.call("get-conn")));
+        return new Connection(ClojureBridge.core("get-conn"));
     }
 
     /**
      * Returns a shared connection for {@code dir}, opening it if needed.
      */
     public static Connection getConn(String dir) {
-        return new Connection(JsonBridge.asString(JsonBridge.call("get-conn", mapOf("dir", dir))));
+        return new Connection(ClojureBridge.core("get-conn", dir));
     }
 
     /**
      * Returns a shared connection and updates it with the given raw schema.
      */
     public static Connection getConn(String dir, Map<String, ?> schema) {
-        return new Connection(JsonBridge.asString(
-                JsonBridge.call("get-conn", mapOf("dir", dir, "schema", schema))
-        ));
+        return new Connection(ClojureBridge.core("get-conn",
+                                                 dir,
+                                                 ClojureBridge.schemaInput(schema)));
     }
 
     /**
@@ -130,9 +131,10 @@ public final class Datalevin {
      * Returns a shared connection with the given raw schema and options.
      */
     public static Connection getConn(String dir, Map<String, ?> schema, Map<String, ?> opts) {
-        return new Connection(JsonBridge.asString(
-                JsonBridge.call("get-conn", mapOf("dir", dir, "schema", schema, "opts", opts))
-        ));
+        return new Connection(ClojureBridge.core("get-conn",
+                                                 dir,
+                                                 ClojureBridge.schemaInput(schema),
+                                                 ClojureBridge.optionsInput(opts)));
     }
 
     /**
@@ -146,32 +148,30 @@ public final class Datalevin {
      * Opens a local KV store rooted at {@code dir}.
      */
     public static KV openKV(String dir) {
-        return new KV(JsonBridge.asString(JsonBridge.call("open-kv", mapOf("dir", dir))));
+        return new KV(ClojureBridge.core("open-kv", dir));
     }
 
     /**
      * Opens a local KV store with the given options.
      */
     public static KV openKV(String dir, Map<String, ?> opts) {
-        return new KV(JsonBridge.asString(
-                JsonBridge.call("open-kv", mapOf("dir", dir, "opts", opts))
-        ));
+        return new KV(ClojureBridge.core("open-kv", dir, ClojureBridge.optionsInput(opts)));
     }
 
     /**
      * Opens a remote admin client for the given Datalevin URI.
      */
     public static Client newClient(String uri) {
-        return new Client(JsonBridge.asString(JsonBridge.call("new-client", mapOf("uri", uri))));
+        return new Client(ClojureBridge.client("new-client", uri));
     }
 
     /**
      * Opens a remote admin client for the given Datalevin URI and options.
      */
     public static Client newClient(String uri, Map<String, ?> opts) {
-        return new Client(JsonBridge.asString(
-                JsonBridge.call("new-client", mapOf("uri", uri, "opts", opts))
-        ));
+        return new Client(ClojureBridge.client("new-client",
+                                               uri,
+                                               ClojureBridge.optionsInput(opts)));
     }
 
     /**

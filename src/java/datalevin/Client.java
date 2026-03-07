@@ -1,6 +1,7 @@
 package datalevin;
 
-import java.util.LinkedHashMap;
+import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -13,8 +14,11 @@ import java.util.UUID;
  */
 public final class Client extends HandleResource {
 
-    Client(String handle) {
-        super(handle, "close-client", "client");
+    Client(Object client) {
+        super(client,
+              resource -> ClojureBridge.client("disconnect", resource),
+              "client",
+              "client");
     }
 
     /**
@@ -28,21 +32,21 @@ public final class Client extends HandleResource {
      * Returns whether this client has been disconnected.
      */
     public boolean disconnected() {
-        return isReleased() || JsonBridge.asBoolean(call("disconnected?"));
+        return isReleased() || ClojureBridge.javaBoolean(ClojureBridge.client("disconnected?", resource()));
     }
 
     /**
      * Returns the server-assigned client id.
      */
     public UUID clientId() {
-        return JsonBridge.asUuid(call("client-id"));
+        return ClojureBridge.javaUuid(ClojureBridge.client("get-id", resource()));
     }
 
     /**
      * Opens a database on the remote server.
      */
     public void openDatabase(String dbName, String dbType) {
-        call("open-database", Datalevin.mapOf("db-name", dbName, "db-type", dbType));
+        ClojureBridge.client("open-database", resource(), dbName, dbType);
     }
 
     /**
@@ -52,197 +56,215 @@ public final class Client extends HandleResource {
                                                 String dbType,
                                                 Map<String, ?> schema,
                                                 Map<String, ?> opts) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf(
-                "db-name", dbName,
-                "db-type", dbType,
-                "return-db-info?", true
+        return ClojureBridge.javaMapOrNull(
+                ClojureBridge.client("open-database",
+                                     resource(),
+                                     dbName,
+                                     dbType,
+                                     ClojureBridge.schemaInput(schema),
+                                     ClojureBridge.optionsInput(opts),
+                                     true)
         );
-        if (schema != null) {
-            args.put("schema", schema);
-        }
-        if (opts != null) {
-            args.put("opts", opts);
-        }
-        return JsonBridge.asMapOrNull(call("open-database", args));
     }
 
     /**
      * Closes a remote database handle.
      */
     public void closeDatabase(String dbName) {
-        call("close-database", Datalevin.mapOf("db-name", dbName));
+        ClojureBridge.client("close-database", resource(), dbName);
     }
 
     /**
      * Creates a remote database.
      */
     public void createDatabase(String dbName, String dbType) {
-        call("create-database", Datalevin.mapOf("db-name", dbName, "db-type", dbType));
+        ClojureBridge.client("create-database",
+                             resource(),
+                             dbName,
+                             ClojureBridge.createDatabaseType(dbType));
     }
 
     /**
      * Drops a remote database.
      */
     public void dropDatabase(String dbName) {
-        call("drop-database", Datalevin.mapOf("db-name", dbName));
+        ClojureBridge.client("drop-database", resource(), dbName);
     }
 
     /**
      * Lists all databases visible to the client.
      */
     public List<Object> listDatabases() {
-        return JsonBridge.asList(call("list-databases"));
+        return ClojureBridge.javaList(ClojureBridge.client("list-databases", resource()));
     }
 
     /**
      * Lists databases currently in use on the server.
      */
     public List<Object> listDatabasesInUse() {
-        return JsonBridge.asList(call("list-databases-in-use"));
+        return ClojureBridge.javaList(ClojureBridge.client("list-databases-in-use", resource()));
     }
 
     /**
      * Creates a user account.
      */
     public void createUser(String username, String password) {
-        call("create-user", Datalevin.mapOf("username", username, "password", password));
+        ClojureBridge.client("create-user", resource(), username, password);
     }
 
     /**
      * Drops a user account.
      */
     public void dropUser(String username) {
-        call("drop-user", Datalevin.mapOf("username", username));
+        ClojureBridge.client("drop-user", resource(), username);
     }
 
     /**
      * Resets a user's password.
      */
     public void resetPassword(String username, String password) {
-        call("reset-password", Datalevin.mapOf("username", username, "password", password));
+        ClojureBridge.client("reset-password", resource(), username, password);
     }
 
     /**
      * Lists users visible to the client.
      */
     public List<Object> listUsers() {
-        return JsonBridge.asList(call("list-users"));
+        return ClojureBridge.javaList(ClojureBridge.client("list-users", resource()));
     }
 
     /**
      * Creates a role.
      */
     public void createRole(String role) {
-        call("create-role", Datalevin.mapOf("role", role));
+        ClojureBridge.client("create-role", resource(), ClojureBridge.roleInput(role));
     }
 
     /**
      * Drops a role.
      */
     public void dropRole(String role) {
-        call("drop-role", Datalevin.mapOf("role", role));
+        ClojureBridge.client("drop-role", resource(), ClojureBridge.roleInput(role));
     }
 
     /**
      * Lists all roles.
      */
     public List<Object> listRoles() {
-        return JsonBridge.asList(call("list-roles"));
+        return ClojureBridge.javaList(ClojureBridge.client("list-roles", resource()));
     }
 
     /**
      * Assigns a role to a user.
      */
     public void assignRole(String role, String username) {
-        call("assign-role", Datalevin.mapOf("role", role, "username", username));
+        ClojureBridge.client("assign-role",
+                             resource(),
+                             ClojureBridge.roleInput(role),
+                             username);
     }
 
     /**
      * Withdraws a role from a user.
      */
     public void withdrawRole(String role, String username) {
-        call("withdraw-role", Datalevin.mapOf("role", role, "username", username));
+        ClojureBridge.client("withdraw-role",
+                             resource(),
+                             ClojureBridge.roleInput(role),
+                             username);
     }
 
     /**
      * Lists roles assigned to a user.
      */
     public List<Object> listUserRoles(String username) {
-        return JsonBridge.asList(call("list-user-roles", Datalevin.mapOf("username", username)));
+        return ClojureBridge.javaList(ClojureBridge.client("list-user-roles", resource(), username));
     }
 
     /**
      * Grants a permission to a role.
      */
     public void grantPermission(String role, String act, String obj, Object tgt) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("role", role, "act", act, "obj", obj);
-        args.put("tgt", tgt);
-        call("grant-permission", args);
+        ClojureBridge.client("grant-permission",
+                             resource(),
+                             ClojureBridge.roleInput(role),
+                             ClojureBridge.permissionKeyword(act),
+                             ClojureBridge.permissionKeyword(obj),
+                             ClojureBridge.permissionTarget(obj, tgt));
     }
 
     /**
      * Revokes a permission from a role.
      */
     public void revokePermission(String role, String act, String obj, Object tgt) {
-        LinkedHashMap<String, Object> args = Datalevin.mapOf("role", role, "act", act, "obj", obj);
-        args.put("tgt", tgt);
-        call("revoke-permission", args);
+        ClojureBridge.client("revoke-permission",
+                             resource(),
+                             ClojureBridge.roleInput(role),
+                             ClojureBridge.permissionKeyword(act),
+                             ClojureBridge.permissionKeyword(obj),
+                             ClojureBridge.permissionTarget(obj, tgt));
     }
 
     /**
      * Lists permissions granted to a role.
      */
     public List<Object> listRolePermissions(String role) {
-        return JsonBridge.asList(call("list-role-permissions", Datalevin.mapOf("role", role)));
+        return ClojureBridge.javaList(
+                ClojureBridge.client("list-role-permissions",
+                                     resource(),
+                                     ClojureBridge.roleInput(role))
+        );
     }
 
     /**
      * Lists effective permissions for a user.
      */
     public List<Object> listUserPermissions(String username) {
-        return JsonBridge.asList(call("list-user-permissions", Datalevin.mapOf("username", username)));
+        return ClojureBridge.javaList(ClojureBridge.client("list-user-permissions", resource(), username));
     }
 
     /**
      * Runs a system query expressed as EDN text with positional arguments.
      */
     public Object querySystem(String query, Object... args) {
-        LinkedHashMap<String, Object> request = Datalevin.mapOf("query", query);
-        if (args.length > 0) {
-            request.put("args", Datalevin.listOf(args));
-        }
-        return call("query-system", request);
+        return querySystem(query, Arrays.asList(args));
     }
 
     /**
      * Runs a system query expressed as EDN text with positional arguments.
      */
     public Object querySystem(String query, List<?> args) {
-        LinkedHashMap<String, Object> request = Datalevin.mapOf("query", query);
-        if (args != null && !args.isEmpty()) {
-            request.put("args", args);
+        ArrayList<Object> inputs = new ArrayList<>();
+        if (args != null) {
+            for (Object arg : args) {
+                inputs.add(ClojureBridge.genericInput(arg));
+            }
         }
-        return call("query-system", request);
+        ArrayList<Object> request = new ArrayList<>();
+        request.add(resource());
+        request.add(ClojureBridge.queryForm(query));
+        request.addAll(inputs);
+        return ClojureBridge.toJava(ClojureBridge.client("query-system", request.toArray()));
     }
 
     /**
      * Shows connected clients on the remote server.
      */
-    public List<Object> showClients() {
-        return JsonBridge.asList(call("show-clients"));
+    public Map<Object, Object> showClients() {
+        return ClojureBridge.javaAnyMap(ClojureBridge.client("show-clients", resource()));
     }
 
     /**
      * Disconnects another client by id.
      */
     public void disconnectClient(UUID clientId) {
-        call("disconnect-client", Datalevin.mapOf("client-id", clientId));
+        ClojureBridge.client("disconnect-client", resource(), clientId);
     }
 
     /**
      * Escape hatch for calling a client-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {
-        return super.call(op, args);
+        return execJson(op, args);
     }
 }

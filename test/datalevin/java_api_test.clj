@@ -27,6 +27,9 @@
 
 (use-fixtures :each clean-java-api-state)
 
+(defn- handle-count []
+  (.size ^java.util.Map (var-get #'sut/handles)))
+
 (deftest java-friendly-local-api-test
   (let [conn-dir (u/tmp-dir "java-friendly-conn")
         kv-dir   (u/tmp-dir "java-friendly-kv")
@@ -43,6 +46,7 @@
         kv       (Datalevin/openKV kv-dir)]
     (try
       (is (instance? Map (Datalevin/apiInfo)))
+      (is (zero? (handle-count)))
       (with-open [^Connection c conn
                   ^KV k kv]
         (let [e-var     (Datalevin/var "e")
@@ -169,6 +173,7 @@
           (is (= ["c" "gamma"] (vec by-rank)))
           (is (= [["b" "beta"] ["c" "gamma"]]
                  (mapv vec range)))))
+      (is (zero? (handle-count)))
       (is (.closed conn))
       (is (.closed kv))
       (finally
@@ -186,13 +191,17 @@
             (let [client-id (.clientId c)
                   _         (.createDatabase c db-name Datalevin/DB_DATALOG)
                   open-info (.openDatabaseInfo c db-name Datalevin/DB_DATALOG nil nil)
-                  dbs       (set (.listDatabases c))]
+                  dbs       (set (.listDatabases c))
+                  clients   (.showClients c)]
+              (is (zero? (handle-count)))
               (is (instance? UUID client-id))
               (is (= false (.disconnected c)))
               (is (instance? Map open-info))
+              (is (instance? Map clients))
               (is (contains? dbs db-name))
               (.closeDatabase c db-name)
               (.dropDatabase c db-name)))
+          (is (zero? (handle-count)))
           (is (.disconnected client))
           (finally
             (when-not (.disconnected client)
