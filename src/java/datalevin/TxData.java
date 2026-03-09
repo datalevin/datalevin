@@ -10,6 +10,7 @@ import java.util.Map;
 public final class TxData {
 
     private final List<Object> items = new ArrayList<>();
+    private Object cachedForm;
 
     TxData() {
     }
@@ -18,14 +19,16 @@ public final class TxData {
      * Adds an entity-map transaction item built with {@link Tx.Entity}.
      */
     public TxData entity(Tx.Entity entity) {
-        items.add(entity.build());
+        cachedForm = null;
+        items.add(entity.buildForm());
         return this;
     }
 
     /**
      * Adds an entity-map transaction item from a raw map.
      */
-    public TxData entity(Map<String, ?> entity) {
+    public TxData entity(Map<?, ?> entity) {
+        cachedForm = null;
         items.add(entity);
         return this;
     }
@@ -34,6 +37,7 @@ public final class TxData {
      * Adds a {@code :db/add} form.
      */
     public TxData add(Object entityId, String attr, Object value) {
+        cachedForm = null;
         items.add(Tx.add(entityId, attr, value));
         return this;
     }
@@ -42,6 +46,7 @@ public final class TxData {
      * Adds a {@code :db/retract} form.
      */
     public TxData retract(Object entityId, String attr, Object value) {
+        cachedForm = null;
         items.add(Tx.retract(entityId, attr, value));
         return this;
     }
@@ -50,6 +55,7 @@ public final class TxData {
      * Adds a {@code :db/retractEntity} form.
      */
     public TxData retractEntity(Object entityId) {
+        cachedForm = null;
         items.add(Tx.retractEntity(entityId));
         return this;
     }
@@ -58,6 +64,7 @@ public final class TxData {
      * Adds a raw transaction item.
      */
     public TxData raw(Object txItem) {
+        cachedForm = null;
         items.add(txItem);
         return this;
     }
@@ -66,6 +73,7 @@ public final class TxData {
      * Adds multiple raw transaction items.
      */
     public TxData raw(Object... txItems) {
+        cachedForm = null;
         for (Object txItem : txItems) {
             items.add(txItem);
         }
@@ -77,5 +85,12 @@ public final class TxData {
      */
     public List<Object> build() {
         return new ArrayList<>(items);
+    }
+
+    Object buildForm() {
+        if (cachedForm == null) {
+            cachedForm = DatalevinForms.txDataInput(items);
+        }
+        return cachedForm;
     }
 }

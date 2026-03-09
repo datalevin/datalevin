@@ -1,6 +1,5 @@
 package datalevin;
 
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
@@ -16,7 +15,7 @@ public final class Client extends HandleResource {
 
     Client(Object client) {
         super(client,
-              resource -> ClojureBridge.client("disconnect", resource),
+              resource -> ClojureRuntime.client("disconnect", resource),
               "client",
               "client");
     }
@@ -32,135 +31,166 @@ public final class Client extends HandleResource {
      * Returns whether this client has been disconnected.
      */
     public boolean disconnected() {
-        return isReleased() || ClojureBridge.javaBoolean(ClojureBridge.client("disconnected?", resource()));
+        return isReleased() || ClojureCodec.javaBoolean(ClojureRuntime.client("disconnected?", resource()));
     }
 
     /**
      * Returns the server-assigned client id.
      */
     public UUID clientId() {
-        return ClojureBridge.javaUuid(ClojureBridge.client("get-id", resource()));
+        return ClojureCodec.javaUuid(ClojureRuntime.client("get-id", resource()));
     }
 
     /**
      * Opens a database on the remote server.
      */
     public void openDatabase(String dbName, String dbType) {
-        ClojureBridge.client("open-database", resource(), dbName, dbType);
+        ClojureRuntime.client("open-database", resource(), dbName, dbType);
+    }
+
+    /**
+     * Opens a database on the remote server.
+     */
+    public void openDatabase(String dbName, DatabaseType dbType) {
+        ClojureRuntime.client("open-database", resource(), dbName, dbType.wireName());
     }
 
     /**
      * Opens a database and returns the resulting database info map.
      */
-    public Map<String, Object> openDatabaseInfo(String dbName,
-                                                String dbType,
-                                                Map<String, ?> schema,
-                                                Map<String, ?> opts) {
-        return ClojureBridge.javaMapOrNull(
-                ClojureBridge.client("open-database",
-                                     resource(),
-                                     dbName,
-                                     dbType,
-                                     ClojureBridge.schemaInput(schema),
-                                     ClojureBridge.optionsInput(opts),
-                                     true)
-        );
+    public Map<?, ?> openDatabaseInfo(String dbName,
+                                      String dbType,
+                                      Map<?, ?> schema,
+                                      Map<?, ?> opts) {
+        return (Map<?, ?>) ClojureRuntime.client("open-database",
+                                                resource(),
+                                                dbName,
+                                                dbType,
+                                                DatalevinForms.schemaInput(schema),
+                                                DatalevinForms.optionsInput(opts),
+                                                true);
+    }
+
+    /**
+     * Opens a database and returns the resulting database info map.
+     */
+    public Map<?, ?> openDatabaseInfo(String dbName,
+                                      DatabaseType dbType,
+                                      Map<?, ?> schema,
+                                      Map<?, ?> opts) {
+        return (Map<?, ?>) ClojureRuntime.client("open-database",
+                                                resource(),
+                                                dbName,
+                                                dbType.wireName(),
+                                                DatalevinForms.schemaInput(schema),
+                                                DatalevinForms.optionsInput(opts),
+                                                true);
     }
 
     /**
      * Closes a remote database handle.
      */
     public void closeDatabase(String dbName) {
-        ClojureBridge.client("close-database", resource(), dbName);
+        ClojureRuntime.client("close-database", resource(), dbName);
     }
 
     /**
      * Creates a remote database.
      */
     public void createDatabase(String dbName, String dbType) {
-        ClojureBridge.client("create-database",
+        ClojureRuntime.client("create-database",
                              resource(),
                              dbName,
-                             ClojureBridge.createDatabaseType(dbType));
+                             DatalevinForms.createDatabaseType(dbType));
+    }
+
+    /**
+     * Creates a remote database.
+     */
+    public void createDatabase(String dbName, DatabaseType dbType) {
+        ClojureRuntime.client("create-database",
+                             resource(),
+                             dbName,
+                             DatalevinForms.createDatabaseType(dbType));
     }
 
     /**
      * Drops a remote database.
      */
     public void dropDatabase(String dbName) {
-        ClojureBridge.client("drop-database", resource(), dbName);
+        ClojureRuntime.client("drop-database", resource(), dbName);
     }
 
     /**
      * Lists all databases visible to the client.
      */
-    public List<Object> listDatabases() {
-        return ClojureBridge.javaList(ClojureBridge.client("list-databases", resource()));
+    public List<?> listDatabases() {
+        return ResultSupport.sequence(ClojureRuntime.client("list-databases", resource()));
     }
 
     /**
      * Lists databases currently in use on the server.
      */
-    public List<Object> listDatabasesInUse() {
-        return ClojureBridge.javaList(ClojureBridge.client("list-databases-in-use", resource()));
+    public List<?> listDatabasesInUse() {
+        return ResultSupport.sequence(ClojureRuntime.client("list-databases-in-use", resource()));
     }
 
     /**
      * Creates a user account.
      */
     public void createUser(String username, String password) {
-        ClojureBridge.client("create-user", resource(), username, password);
+        ClojureRuntime.client("create-user", resource(), username, password);
     }
 
     /**
      * Drops a user account.
      */
     public void dropUser(String username) {
-        ClojureBridge.client("drop-user", resource(), username);
+        ClojureRuntime.client("drop-user", resource(), username);
     }
 
     /**
      * Resets a user's password.
      */
     public void resetPassword(String username, String password) {
-        ClojureBridge.client("reset-password", resource(), username, password);
+        ClojureRuntime.client("reset-password", resource(), username, password);
     }
 
     /**
      * Lists users visible to the client.
      */
-    public List<Object> listUsers() {
-        return ClojureBridge.javaList(ClojureBridge.client("list-users", resource()));
+    public List<?> listUsers() {
+        return ResultSupport.sequence(ClojureRuntime.client("list-users", resource()));
     }
 
     /**
      * Creates a role.
      */
     public void createRole(String role) {
-        ClojureBridge.client("create-role", resource(), ClojureBridge.roleInput(role));
+        ClojureRuntime.client("create-role", resource(), DatalevinForms.roleInput(role));
     }
 
     /**
      * Drops a role.
      */
     public void dropRole(String role) {
-        ClojureBridge.client("drop-role", resource(), ClojureBridge.roleInput(role));
+        ClojureRuntime.client("drop-role", resource(), DatalevinForms.roleInput(role));
     }
 
     /**
      * Lists all roles.
      */
-    public List<Object> listRoles() {
-        return ClojureBridge.javaList(ClojureBridge.client("list-roles", resource()));
+    public List<?> listRoles() {
+        return ResultSupport.sequence(ClojureRuntime.client("list-roles", resource()));
     }
 
     /**
      * Assigns a role to a user.
      */
     public void assignRole(String role, String username) {
-        ClojureBridge.client("assign-role",
+        ClojureRuntime.client("assign-role",
                              resource(),
-                             ClojureBridge.roleInput(role),
+                             DatalevinForms.roleInput(role),
                              username);
     }
 
@@ -168,59 +198,87 @@ public final class Client extends HandleResource {
      * Withdraws a role from a user.
      */
     public void withdrawRole(String role, String username) {
-        ClojureBridge.client("withdraw-role",
+        ClojureRuntime.client("withdraw-role",
                              resource(),
-                             ClojureBridge.roleInput(role),
+                             DatalevinForms.roleInput(role),
                              username);
     }
 
     /**
      * Lists roles assigned to a user.
      */
-    public List<Object> listUserRoles(String username) {
-        return ClojureBridge.javaList(ClojureBridge.client("list-user-roles", resource(), username));
+    public List<?> listUserRoles(String username) {
+        return ResultSupport.sequence(ClojureRuntime.client("list-user-roles", resource(), username));
     }
 
     /**
      * Grants a permission to a role.
      */
     public void grantPermission(String role, String act, String obj, Object tgt) {
-        ClojureBridge.client("grant-permission",
+        ClojureRuntime.client("grant-permission",
                              resource(),
-                             ClojureBridge.roleInput(role),
-                             ClojureBridge.permissionKeyword(act),
-                             ClojureBridge.permissionKeyword(obj),
-                             ClojureBridge.permissionTarget(obj, tgt));
+                             DatalevinForms.roleInput(role),
+                             DatalevinForms.permissionKeyword(act),
+                             DatalevinForms.permissionKeyword(obj),
+                             DatalevinForms.permissionTarget(obj, tgt));
+    }
+
+    /**
+     * Grants a built-in permission to a role.
+     */
+    public void grantPermission(String role,
+                                PermissionAction act,
+                                PermissionObject obj,
+                                Object tgt) {
+        ClojureRuntime.client("grant-permission",
+                             resource(),
+                             DatalevinForms.roleInput(role),
+                             DatalevinForms.permissionKeyword(act.keyword()),
+                             DatalevinForms.permissionKeyword(obj.keyword()),
+                             DatalevinForms.permissionTarget(obj.keyword(), tgt));
     }
 
     /**
      * Revokes a permission from a role.
      */
     public void revokePermission(String role, String act, String obj, Object tgt) {
-        ClojureBridge.client("revoke-permission",
+        ClojureRuntime.client("revoke-permission",
                              resource(),
-                             ClojureBridge.roleInput(role),
-                             ClojureBridge.permissionKeyword(act),
-                             ClojureBridge.permissionKeyword(obj),
-                             ClojureBridge.permissionTarget(obj, tgt));
+                             DatalevinForms.roleInput(role),
+                             DatalevinForms.permissionKeyword(act),
+                             DatalevinForms.permissionKeyword(obj),
+                             DatalevinForms.permissionTarget(obj, tgt));
+    }
+
+    /**
+     * Revokes a built-in permission from a role.
+     */
+    public void revokePermission(String role,
+                                 PermissionAction act,
+                                 PermissionObject obj,
+                                 Object tgt) {
+        ClojureRuntime.client("revoke-permission",
+                             resource(),
+                             DatalevinForms.roleInput(role),
+                             DatalevinForms.permissionKeyword(act.keyword()),
+                             DatalevinForms.permissionKeyword(obj.keyword()),
+                             DatalevinForms.permissionTarget(obj.keyword(), tgt));
     }
 
     /**
      * Lists permissions granted to a role.
      */
-    public List<Object> listRolePermissions(String role) {
-        return ClojureBridge.javaList(
-                ClojureBridge.client("list-role-permissions",
-                                     resource(),
-                                     ClojureBridge.roleInput(role))
-        );
+    public List<?> listRolePermissions(String role) {
+        return ResultSupport.sequence(ClojureRuntime.client("list-role-permissions",
+                                                           resource(),
+                                                           DatalevinForms.roleInput(role)));
     }
 
     /**
      * Lists effective permissions for a user.
      */
-    public List<Object> listUserPermissions(String username) {
-        return ClojureBridge.javaList(ClojureBridge.client("list-user-permissions", resource(), username));
+    public List<?> listUserPermissions(String username) {
+        return ResultSupport.sequence(ClojureRuntime.client("list-user-permissions", resource(), username));
     }
 
     /**
@@ -234,31 +292,30 @@ public final class Client extends HandleResource {
      * Runs a system query expressed as EDN text with positional arguments.
      */
     public Object querySystem(String query, List<?> args) {
-        ArrayList<Object> inputs = new ArrayList<>();
+        int argCount = args == null ? 0 : args.size();
+        Object[] request = new Object[argCount + 2];
+        request[0] = resource();
+        request[1] = DatalevinForms.queryForm(query);
         if (args != null) {
-            for (Object arg : args) {
-                inputs.add(ClojureBridge.genericInput(arg));
+            for (int i = 0; i < args.size(); i++) {
+                request[i + 2] = ClojureCodec.runtimeInput(args.get(i));
             }
         }
-        ArrayList<Object> request = new ArrayList<>();
-        request.add(resource());
-        request.add(ClojureBridge.queryForm(query));
-        request.addAll(inputs);
-        return ClojureBridge.toJava(ClojureBridge.client("query-system", request.toArray()));
+        return ClojureRuntime.client("query-system", request);
     }
 
     /**
      * Shows connected clients on the remote server.
      */
-    public Map<Object, Object> showClients() {
-        return ClojureBridge.javaAnyMap(ClojureBridge.client("show-clients", resource()));
+    public Map<?, ?> showClients() {
+        return (Map<?, ?>) ClojureRuntime.client("show-clients", resource());
     }
 
     /**
      * Disconnects another client by id.
      */
     public void disconnectClient(UUID clientId) {
-        ClojureBridge.client("disconnect-client", resource(), clientId);
+        ClojureRuntime.client("disconnect-client", resource(), clientId);
     }
 
     /**

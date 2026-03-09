@@ -3,6 +3,9 @@ package datalevin;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Arrays;
+
+import clojure.lang.PersistentVector;
 
 /**
  * Static helpers for Datalevin transaction forms.
@@ -30,21 +33,34 @@ public final class Tx {
      * Creates a {@code :db/add} transaction form.
      */
     public static List<Object> add(Object entityId, String attr, Object value) {
-        return Datalevin.listOf(":db/add", entityId, Datalevin.keyword(attr), value);
+        return PersistentVector.create(Arrays.asList(
+                Datalevin.kw("db/add"),
+                DatalevinForms.lookupRefInput(entityId),
+                Datalevin.kw(attr),
+                ClojureCodec.runtimeInput(value)
+        ));
     }
 
     /**
      * Creates a {@code :db/retract} transaction form.
      */
     public static List<Object> retract(Object entityId, String attr, Object value) {
-        return Datalevin.listOf(":db/retract", entityId, Datalevin.keyword(attr), value);
+        return PersistentVector.create(Arrays.asList(
+                Datalevin.kw("db/retract"),
+                DatalevinForms.lookupRefInput(entityId),
+                Datalevin.kw(attr),
+                ClojureCodec.runtimeInput(value)
+        ));
     }
 
     /**
      * Creates a {@code :db/retractEntity} transaction form.
      */
     public static List<Object> retractEntity(Object entityId) {
-        return Datalevin.listOf(":db/retractEntity", entityId);
+        return PersistentVector.create(Arrays.asList(
+                Datalevin.kw("db/retractEntity"),
+                DatalevinForms.lookupRefInput(entityId)
+        ));
     }
 
     /**
@@ -52,13 +68,13 @@ public final class Tx {
      */
     public static final class Entity {
 
-        private final LinkedHashMap<String, Object> values = new LinkedHashMap<>();
+        private final LinkedHashMap<Object, Object> values = new LinkedHashMap<>();
 
         /**
          * Sets {@code :db/id}.
          */
         public Entity id(Object dbId) {
-            values.put(":db/id", dbId);
+            values.put(Datalevin.kw("db/id"), dbId);
             return this;
         }
 
@@ -66,14 +82,14 @@ public final class Tx {
          * Adds a keyword attribute and value.
          */
         public Entity put(String attr, Object value) {
-            values.put(Datalevin.keyword(attr), value);
+            values.put(Datalevin.kw(attr), value);
             return this;
         }
 
         /**
          * Adds a raw key and value.
          */
-        public Entity putRaw(String key, Object value) {
+        public Entity putRaw(Object key, Object value) {
             values.put(key, value);
             return this;
         }
@@ -81,8 +97,16 @@ public final class Tx {
         /**
          * Returns a mutable entity map suitable for transaction assembly.
          */
-        public Map<String, Object> build() {
+        public Map<Object, Object> build() {
             return new LinkedHashMap<>(values);
         }
+
+        Object buildForm() {
+            return firstTxItem(DatalevinForms.txDataInput(List.of(values)));
+        }
+    }
+
+    private static Object firstTxItem(Object txData) {
+        return ((List<?>) txData).get(0);
     }
 }

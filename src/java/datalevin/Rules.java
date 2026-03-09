@@ -1,5 +1,7 @@
 package datalevin;
 
+import clojure.lang.PersistentVector;
+
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Objects;
@@ -9,7 +11,8 @@ import java.util.Objects;
  */
 public final class Rules {
 
-    private final List<String> rules = new ArrayList<>();
+    private final List<Object> rules = new ArrayList<>();
+    private Object cachedForm;
 
     Rules() {
     }
@@ -25,14 +28,7 @@ public final class Rules {
      * Renders the full rules value to EDN text.
      */
     public String toEdn() {
-        StringBuilder builder = new StringBuilder("[");
-        for (int i = 0; i < rules.size(); i++) {
-            if (i > 0) {
-                builder.append(" ");
-            }
-            builder.append(rules.get(i));
-        }
-        return builder.append("]").toString();
+        return Edn.render(buildForm());
     }
 
     @Override
@@ -40,13 +36,21 @@ public final class Rules {
         return toEdn();
     }
 
-    EdnLiteral asInput() {
-        return new EdnLiteral(toEdn());
+    Object asInput() {
+        return buildForm();
     }
 
-    private Rules addRule(String edn) {
-        rules.add(edn);
+    private Rules addRule(Object rule) {
+        cachedForm = null;
+        rules.add(rule);
         return this;
+    }
+
+    Object buildForm() {
+        if (cachedForm == null) {
+            cachedForm = ClojureCodec.toClojure(rules);
+        }
+        return cachedForm;
     }
 
     /**
@@ -55,24 +59,25 @@ public final class Rules {
     public static final class RuleBuilder {
 
         private final Rules parent;
-        private final String head;
-        private final List<String> body = new ArrayList<>();
+        private final Object head;
+        private final List<QueryClause> body = new ArrayList<>();
 
         private RuleBuilder(Rules parent, String name, String... headArgs) {
             this.parent = parent;
             Objects.requireNonNull(name, "name");
-            StringBuilder builder = new StringBuilder("(").append(name);
+            ArrayList<Object> headItems = new ArrayList<>(headArgs.length + 1);
+            headItems.add(ClojureCodec.symbol(name));
             for (String arg : headArgs) {
-                builder.append(" ").append(arg);
+                headItems.add(QueryClause.patternValue(arg));
             }
-            this.head = builder.append(")").toString();
+            this.head = clojure.lang.PersistentList.create(headItems);
         }
 
         /**
          * Adds a prebuilt clause to the rule body.
          */
         public RuleBuilder where(QueryClause clause) {
-            body.add(clause.toEdn());
+            body.add(clause);
             return this;
         }
 
@@ -160,7 +165,12 @@ public final class Rules {
             if (body.isEmpty()) {
                 throw new IllegalStateException("Rule requires at least one body clause.");
             }
-            return parent.addRule("[" + head + " " + String.join(" ", body) + "]");
+            ArrayList<Object> rule = new ArrayList<>(body.size() + 1);
+            rule.add(head);
+            for (QueryClause clause : body) {
+                rule.add(clause.form());
+            }
+            return parent.addRule(PersistentVector.create(rule));
         }
     }
 }

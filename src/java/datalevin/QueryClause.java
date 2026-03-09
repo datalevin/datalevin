@@ -1,6 +1,13 @@
 package datalevin;
 
+import clojure.lang.Keyword;
+import clojure.lang.PersistentList;
+import clojure.lang.PersistentVector;
+import clojure.lang.Symbol;
+
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.Objects;
 
 /**
@@ -11,10 +18,12 @@ import java.util.Objects;
  */
 public final class QueryClause {
 
-    private final String edn;
+    private final Object form;
+    private final boolean requiresDb;
 
-    private QueryClause(String edn) {
-        this.edn = edn;
+    private QueryClause(Object form, boolean requiresDb) {
+        this.form = form;
+        this.requiresDb = requiresDb;
     }
 
     /**
@@ -22,26 +31,25 @@ public final class QueryClause {
      */
     public static QueryClause raw(String clauseEdn) {
         Objects.requireNonNull(clauseEdn, "clauseEdn");
-        return new QueryClause(clauseEdn);
+        return new QueryClause(ClojureRuntime.readEdn(clauseEdn), true);
     }
 
     /**
      * Creates a datom clause using the default source.
      */
     public static QueryClause datom(Object e, Object a, Object v) {
-        return new QueryClause("[" + Edn.renderQuery(e) + " "
-                + Edn.renderAttribute(a) + " "
-                + Edn.renderQuery(v) + "]");
+        return new QueryClause(vectorForm(queryValue(e), attributeValue(a), queryValue(v)), true);
     }
 
     /**
      * Creates a datom clause with an explicit source variable.
      */
     public static QueryClause datom(Object source, Object e, Object a, Object v) {
-        return new QueryClause("[" + Edn.renderPattern(source) + " "
-                + Edn.renderQuery(e) + " "
-                + Edn.renderAttribute(a) + " "
-                + Edn.renderQuery(v) + "]");
+        return new QueryClause(vectorForm(patternValue(source),
+                                          queryValue(e),
+                                          attributeValue(a),
+                                          queryValue(v)),
+                               true);
     }
 
     /**
@@ -55,14 +63,14 @@ public final class QueryClause {
      * Creates a binding clause such as {@code [(ground 42) ?x]}.
      */
     public static QueryClause bind(String fn, Object binding, Object... args) {
-        return new QueryClause("[" + renderCall(fn, args) + " " + Edn.renderPattern(binding) + "]");
+        return new QueryClause(vectorForm(callForm(fn, args), patternValue(binding)), false);
     }
 
     /**
      * Creates a rule invocation clause.
      */
     public static QueryClause rule(String name, Object... args) {
-        return new QueryClause(renderCall(name, args));
+        return new QueryClause(callForm(name, args), true);
     }
 
     /**
@@ -107,32 +115,47 @@ public final class QueryClause {
         return Arrays.asList(vars);
     }
 
+    Object form() {
+        return form;
+    }
+
+    boolean requiresDb() {
+        return requiresDb;
+    }
+
     String toEdn() {
-        return edn;
+        return Edn.render(form);
     }
 
     @Override
     public String toString() {
-        return edn;
+        return toEdn();
     }
 
     private static QueryClause bracketedCall(String fn, Object... args) {
-        return new QueryClause("[" + renderCall(fn, args) + "]");
+        return new QueryClause(vectorForm(callForm(fn, args)), false);
     }
 
     private static QueryClause nested(String op, QueryClause... clauses) {
         requireClauses(op, clauses);
-        StringBuilder builder = new StringBuilder("(").append(op);
+        ArrayList<Object> items = new ArrayList<>(clauses.length + 1);
+        items.add(ClojureCodec.symbol(op));
         for (QueryClause clause : clauses) {
-            builder.append(" ").append(clause.toEdn());
+            items.add(clause.form());
         }
-        return new QueryClause(builder.append(")").toString());
+        return new QueryClause(listForm(items),
+                               Arrays.stream(clauses).anyMatch(QueryClause::requiresDb));
     }
 
     private static QueryClause joined(String op, Object joinVars, QueryClause... clauses) {
         requireClauses(op, clauses);
-        return new QueryClause("(" + op + " " + Edn.renderPattern(joinVars) + " "
-                + joinClauses(clauses) + ")");
+        ArrayList<Object> items = new ArrayList<>(clauses.length + 2);
+        items.add(ClojureCodec.symbol(op));
+        items.add(patternValue(joinVars));
+        for (QueryClause clause : clauses) {
+            items.add(clause.form());
+        }
+        return new QueryClause(listForm(items), true);
     }
 
     private static void requireClauses(String op, QueryClause[] clauses) {
@@ -142,23 +165,96 @@ public final class QueryClause {
         }
     }
 
-    private static String renderCall(String fn, Object... args) {
+    private static Object callForm(String fn, Object... args) {
         Objects.requireNonNull(fn, "fn");
-        StringBuilder builder = new StringBuilder("(").append(fn);
+        ArrayList<Object> items = new ArrayList<>(args.length + 1);
+        items.add(ClojureCodec.symbol(fn));
         for (Object arg : args) {
-            builder.append(" ").append(Edn.renderQuery(arg));
+            items.add(queryValue(arg));
         }
-        return builder.append(")").toString();
+        return listForm(items);
     }
 
-    private static String joinClauses(QueryClause[] clauses) {
-        StringBuilder builder = new StringBuilder();
-        for (int i = 0; i < clauses.length; i++) {
-            if (i > 0) {
-                builder.append(" ");
-            }
-            builder.append(clauses[i].toEdn());
+    static Object queryValue(Object value) {
+        if (value instanceof Keyword
+                || value instanceof Symbol) {
+            return value;
         }
-        return builder.toString();
+
+        if (value instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+
+        if (value instanceof String s) {
+            return new LiteralString(s);
+        }
+
+        if (value instanceof Collection<?> collection) {
+            ArrayList<Object> items = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                items.add(queryValue(item));
+            }
+            return vectorForm(items);
+        }
+
+        if (value instanceof Object[] array) {
+            ArrayList<Object> items = new ArrayList<>(array.length);
+            for (Object item : array) {
+                items.add(queryValue(item));
+            }
+            return vectorForm(items);
+        }
+
+        return value;
+    }
+
+    static Object patternValue(Object value) {
+        if (value instanceof String s && isPatternToken(s)) {
+            return ClojureCodec.symbol(s);
+        }
+        if (value instanceof Collection<?> collection) {
+            ArrayList<Object> items = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                items.add(patternValue(item));
+            }
+            return vectorForm(items);
+        }
+        if (value instanceof Object[] array) {
+            ArrayList<Object> items = new ArrayList<>(array.length);
+            for (Object item : array) {
+                items.add(patternValue(item));
+            }
+            return vectorForm(items);
+        }
+        return queryValue(value);
+    }
+
+    static Object attributeValue(Object value) {
+        if (value instanceof String s) {
+            return ClojureCodec.keyword(s);
+        }
+        return queryValue(value);
+    }
+
+    private static Object vectorForm(Object... items) {
+        return PersistentVector.create(Arrays.asList(items));
+    }
+
+    private static Object vectorForm(Collection<?> items) {
+        return PersistentVector.create(items);
+    }
+
+    private static Object listForm(Collection<?> items) {
+        return PersistentList.create(new ArrayList<>(items));
+    }
+
+    private static boolean isPatternToken(String value) {
+        return value.startsWith("?")
+                || value.startsWith("$")
+                || value.startsWith("%")
+                || "_".equals(value)
+                || ".".equals(value)
+                || "...".equals(value)
+                || "*".equals(value);
     }
 }

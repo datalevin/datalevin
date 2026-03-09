@@ -2,26 +2,28 @@
  * User-facing Java wrappers for Datalevin.
  *
  * <p>The main entry point is {@link datalevin.Datalevin}, which opens typed
- * handles for Datalog, KV, and remote admin operations. These wrappers sit on
- * top of the JSON API and translate common Java values to and from Datalevin's
- * data model.
+ * handles for Datalog, KV, and remote admin operations. For bridge-oriented
+ * bindings such as JPype or node-java-bridge, {@link datalevin.DatalevinInterop}
+ * exposes a smaller raw-handle surface with direct Clojure runtime values.
  *
- * <p>Keyword-like values are represented as strings such as {@code ":name"} and
- * {@code ":db.type/string"}. Query, transaction, schema, pull, and rule
- * builders are available to avoid hand-writing most EDN forms.
+ * <p>Keyword and symbol values can be passed directly as
+ * {@link clojure.lang.Keyword} and {@link clojure.lang.Symbol}. Query,
+ * transaction, schema, pull, and rule builders are available to avoid
+ * hand-writing most EDN forms.
  *
  * <p>Typical usage:
  *
  * <pre>{@code
  * try (Connection conn = Datalevin.createConn("/tmp/example",
  *         Datalevin.schema()
- *             .attr("name", Schema.attribute().valueType("db.type/string")))) {
+ *             .attr("name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
  *     conn.transact(Datalevin.tx()
  *         .entity(Tx.entity(-1).put("name", "Alice")));
  *
- *     Object names = conn.query(Datalevin.query()
+ *     List<String> names = conn.queryCollection(Datalevin.query()
  *         .findAll("?name")
- *         .whereDatom(Datalevin.var("e"), "name", Datalevin.var("name")));
+ *         .whereDatom(Datalevin.var("e"), "name", Datalevin.var("name")),
+ *         String.class);
  * }
  * }</pre>
  */

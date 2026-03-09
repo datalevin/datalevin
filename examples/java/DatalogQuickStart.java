@@ -5,14 +5,10 @@ import datalevin.PullSelector;
 import datalevin.Schema;
 import datalevin.Tx;
 
-import java.io.IOException;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.Comparator;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Stream;
 
 public final class DatalogQuickStart {
 
@@ -27,11 +23,11 @@ public final class DatalogQuickStart {
                 Datalevin.schema()
                         .attr("person/name",
                                 Schema.attribute()
-                                        .valueType("db.type/string")
-                                        .unique("db.unique/identity"))
+                                        .valueType(Schema.ValueType.STRING)
+                                        .unique(Schema.Unique.IDENTITY))
                         .attr("person/age",
                                 Schema.attribute()
-                                        .valueType("db.type/long")))) {
+                                        .valueType(Schema.ValueType.LONG)))) {
 
             conn.transact(Datalevin.tx()
                     .entity(Tx.entity(-1)
@@ -51,33 +47,15 @@ public final class DatalogQuickStart {
                     .attr("person/name")
                     .attr("person/age");
 
-            List<Object> adults = Datalevin.listResult(conn.query(adultsQuery));
-            Map<String, Object> alice = conn.pull(
+            List<String> adults = conn.queryCollection(adultsQuery, String.class);
+            Map<?, ?> alice = conn.pull(
                     personSelector,
-                    Datalevin.listOf(":person/name", "Alice"));
+                    Datalevin.listOf(Datalevin.kw("person/name"), "Alice"));
 
             System.out.println("Adults: " + adults);
             System.out.println("Alice: " + alice);
         } finally {
-            deleteTree(dir);
-        }
-    }
-
-    private static void deleteTree(Path root) throws IOException {
-        if (root == null || Files.notExists(root)) {
-            return;
-        }
-
-        try (Stream<Path> paths = Files.walk(root)) {
-            paths.sorted(Comparator.reverseOrder()).forEach(path -> {
-                try {
-                    Files.deleteIfExists(path);
-                } catch (IOException e) {
-                    throw new UncheckedIOException(e);
-                }
-            });
-        } catch (UncheckedIOException e) {
-            throw e.getCause();
+            ExampleSupport.deleteTree(dir);
         }
     }
 }

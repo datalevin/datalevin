@@ -19,7 +19,7 @@ java_artifact_jar() {
     local version local_repo
     version=$(datalevin_version)
     local_repo=$(datalevin_java_local_repo)
-    printf '%s/datalevin/datalevin-java/%s/datalevin-java-%s.jar' \
+    printf '%s/org/datalevin/datalevin-java/%s/datalevin-java-%s.jar' \
         "$local_repo" "$version" "$version"
 }
 
@@ -29,7 +29,7 @@ java_artifact_classpath() {
     repo_classpath=$(cd "$repo_root" && clojure -Spath)
     classpath=$(printf '%s' "$repo_classpath" | awk -v RS=: -v ORS=: \
         -v src="$repo_root/src" -v classes="$repo_root/target/classes" \
-        '$0 != src && $0 != classes && length($0) > 0')
+        '$0 != src && $0 != classes && $0 !~ /\/org\/clojars\/huahaiy\/dtlvnative-/ && length($0) > 0')
     printf '%s:%s\n' "$artifact_jar" "${classpath%:}"
 }
 

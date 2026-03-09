@@ -10,6 +10,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
 
+import clojure.lang.Keyword;
+import clojure.lang.IPersistentList;
+import clojure.lang.Symbol;
+
 final class Edn {
 
     private enum StringMode {
@@ -40,6 +44,14 @@ final class Edn {
 
         if (value instanceof EdnLiteral ednLiteral) {
             return ednLiteral.value();
+        }
+
+        if (value instanceof LiteralString literalString) {
+            return quote(literalString.value());
+        }
+
+        if (value instanceof Keyword || value instanceof Symbol) {
+            return value.toString();
         }
 
         if (value instanceof String s) {
@@ -79,6 +91,10 @@ final class Edn {
             return renderMap(map, stringMode);
         }
 
+        if (value instanceof IPersistentList list) {
+            return "(" + join((java.util.List<?>) list, " ", item -> render(item, stringMode)) + ")";
+        }
+
         if (value instanceof Set<?> set) {
             return "#{" + join(set, " ", item -> render(item, stringMode)) + "}";
         }
@@ -107,7 +123,7 @@ final class Edn {
             return ednLiteral.value();
         }
         if (value instanceof String s && !looksLikeRawEdn(s)) {
-            return Datalevin.keyword(s);
+            return Datalevin.kw(s).toString();
         }
         return render(value);
     }

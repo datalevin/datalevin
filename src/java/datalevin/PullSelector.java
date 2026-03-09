@@ -1,7 +1,11 @@
 package datalevin;
 
+import clojure.lang.IPersistentCollection;
+import clojure.lang.IPersistentMap;
+import clojure.lang.PersistentArrayMap;
+import clojure.lang.PersistentVector;
+
 import java.util.ArrayList;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -11,6 +15,7 @@ import java.util.Map;
 public final class PullSelector {
 
     private final List<Object> items = new ArrayList<>();
+    private Object cachedForm;
 
     PullSelector() {
     }
@@ -19,7 +24,8 @@ public final class PullSelector {
      * Adds a keyword attribute such as {@code :name}.
      */
     public PullSelector attr(String attr) {
-        items.add(Datalevin.keyword(attr));
+        invalidateForm();
+        items.add(ClojureCodec.keyword(attr));
         return this;
     }
 
@@ -27,6 +33,7 @@ public final class PullSelector {
      * Adds a raw selector item.
      */
     public PullSelector attrRaw(Object attr) {
+        invalidateForm();
         items.add(attr);
         return this;
     }
@@ -35,7 +42,8 @@ public final class PullSelector {
      * Adds a prebuilt attribute expression.
      */
     public PullSelector attr(Attribute attr) {
-        items.add(attr.build());
+        invalidateForm();
+        items.add(attr.buildForm());
         return this;
     }
 
@@ -43,7 +51,8 @@ public final class PullSelector {
      * Adds the wildcard selector.
      */
     public PullSelector wildcard() {
-        items.add("*");
+        invalidateForm();
+        items.add(ClojureCodec.symbol("*"));
         return this;
     }
 
@@ -58,9 +67,8 @@ public final class PullSelector {
      * Adds a nested pull expression for the given attribute expression.
      */
     public PullSelector nested(Attribute attr, PullSelector pattern) {
-        LinkedHashMap<Object, Object> nested = new LinkedHashMap<>(1);
-        nested.put(attr.build(), pattern.build());
-        items.add(nested);
+        invalidateForm();
+        items.add(PersistentArrayMap.EMPTY.assoc(attr.buildForm(), pattern.buildForm()));
         return this;
     }
 
@@ -68,6 +76,7 @@ public final class PullSelector {
      * Adds a raw selector item.
      */
     public PullSelector raw(Object item) {
+        invalidateForm();
         items.add(item);
         return this;
     }
@@ -81,7 +90,7 @@ public final class PullSelector {
 
     @Override
     public String toString() {
-        return Edn.render(items);
+        return Edn.render(buildForm());
     }
 
     /**
@@ -98,6 +107,7 @@ public final class PullSelector {
     public static final class Attribute {
 
         private final List<Object> expr = new ArrayList<>();
+        private Object cachedForm;
 
         private Attribute(Object attr) {
             expr.add(normalizeAttr(attr));
@@ -121,14 +131,15 @@ public final class PullSelector {
          * Adds an {@code :as} alias option.
          */
         public Attribute as(String alias) {
-            return option(":as", Datalevin.keyword(alias));
+            return option(":as", ClojureCodec.keyword(alias));
         }
 
         /**
          * Adds an arbitrary option pair.
          */
         public Attribute option(String key, Object value) {
-            expr.add(Datalevin.keyword(key));
+            cachedForm = null;
+            expr.add(ClojureCodec.keyword(key));
             expr.add(value);
             return this;
         }
@@ -142,14 +153,73 @@ public final class PullSelector {
 
         @Override
         public String toString() {
-            return Edn.render(expr);
+            return Edn.render(buildForm());
         }
 
         private static Object normalizeAttr(Object attr) {
             if (attr instanceof String s) {
-                return Datalevin.keyword(s);
+                return ClojureCodec.keyword(s);
             }
             return attr;
         }
+
+        Object buildForm() {
+            if (cachedForm == null) {
+                cachedForm = selectorItemForm(expr);
+            }
+            return cachedForm;
+        }
+    }
+
+    Object buildForm() {
+        if (cachedForm == null) {
+            cachedForm = selectorItemForm(items);
+        }
+        return cachedForm;
+    }
+
+    private void invalidateForm() {
+        cachedForm = null;
+    }
+
+    private static Object selectorItemForm(Object item) {
+        if (item instanceof clojure.lang.Keyword || item instanceof clojure.lang.Symbol) {
+            return item;
+        }
+        if (item instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+        if (item instanceof String s) {
+            return s;
+        }
+        if (item instanceof Attribute attr) {
+            return attr.buildForm();
+        }
+        if (item instanceof IPersistentMap || item instanceof IPersistentCollection) {
+            return item;
+        }
+        if (item instanceof List<?> list) {
+            ArrayList<Object> converted = new ArrayList<>(list.size());
+            for (Object value : list) {
+                converted.add(selectorItemForm(value));
+            }
+            return PersistentVector.create(converted);
+        }
+        if (item instanceof Map<?, ?> map) {
+            IPersistentMap converted = PersistentArrayMap.EMPTY;
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                converted = converted.assoc(selectorItemForm(entry.getKey()),
+                                            selectorItemForm(entry.getValue()));
+            }
+            return converted;
+        }
+        if (item instanceof Object[] array) {
+            ArrayList<Object> converted = new ArrayList<>(array.length);
+            for (Object value : array) {
+                converted.add(selectorItemForm(value));
+            }
+            return PersistentVector.create(converted);
+        }
+        return ClojureCodec.runtimeInput(item);
     }
 }

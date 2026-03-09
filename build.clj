@@ -1,8 +1,11 @@
 (ns build
   (:require [clojure.edn :as edn]
+            [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.tools.build.api :as b])
-  (:import [java.io File]))
+  (:import [java.io File InputStream]
+           [java.security MessageDigest]
+           [java.util.jar JarFile]))
 
 (def class-dir "target/classes")
 (def java-release-dir "target/java-release")
@@ -10,15 +13,21 @@
 (def java-source-dir (str java-release-dir "/sources"))
 (def javadoc-dir (str java-release-dir "/javadoc"))
 (def local-repo (str java-release-dir "/m2"))
+(def java-central-dir "target/java-central")
+(def java-central-staging-dir (str java-central-dir "/staging"))
 (def version (or (some->> (slurp "project.clj")
                           (re-find #"\(def version \"([^\"]+)\"\)")
                           second)
                  "dev"))
-(def java-lib 'datalevin/datalevin-java)
+(def java-lib 'org.datalevin/datalevin-java)
+(def clojure-runtime-lib 'org.clojure/clojure)
+(def javacpp-lib 'org.bytedeco/javacpp)
 (def java-jar-file (format "target/datalevin-java-%s.jar" version))
 (def java-pom-file (format "target/datalevin-java-%s.pom" version))
 (def java-source-jar-file (format "target/datalevin-java-%s-sources.jar" version))
 (def java-javadoc-jar-file (format "target/datalevin-java-%s-javadoc.jar" version))
+(def java-central-bundle-file
+  (format "%s/datalevin-java-%s-central-bundle.zip" java-central-dir version))
 (def deps-config (edn/read-string (slurp "deps.edn")))
 (def runtime-deps (:deps deps-config))
 (def basis (b/create-basis {:project "deps.edn"}))
@@ -26,6 +35,24 @@
           :developerConnection "scm:git:git@github.com:datalevin/datalevin.git"
           :tag                 (str "v" version)
           :url                 "https://github.com/datalevin/datalevin"})
+(def bundled-native-libs
+  '#{org.clojars.huahaiy/dtlvnative-macosx-arm64
+     org.clojars.huahaiy/dtlvnative-linux-arm64
+     org.clojars.huahaiy/dtlvnative-linux-x86_64
+     org.clojars.huahaiy/dtlvnative-windows-x86_64})
+(def java-pom-deps
+  (assoc (apply dissoc runtime-deps bundled-native-libs)
+         javacpp-lib
+         {:mvn/version "1.5.13"}))
+(def developers
+  [{:id "huahaiy"
+    :name "Huahai Yang"
+    :email "huahai.yang@gmail.com"}])
+(def checksum-algorithms
+  [["MD5" "md5"]
+   ["SHA-1" "sha1"]
+   ["SHA-256" "sha256"]
+   ["SHA-512" "sha512"]])
 
 (defn- existing-dirs
   [dirs]
@@ -45,10 +72,12 @@
 
 (defn clean-java [_]
   (doseq [path [java-release-dir
+                java-central-dir
                 java-jar-file
                 java-pom-file
                 java-source-jar-file
-                java-javadoc-jar-file]]
+                java-javadoc-jar-file
+                java-central-bundle-file]]
     (b/delete {:path path})))
 
 (defn- java-classpath []
@@ -119,6 +148,15 @@
                                                   "        </exclusion>\n")))
                                     "      </exclusions>\n"))
                              "    </dependency>\n")))
+        developers->xml
+        (fn [{:keys [id name email]}]
+          (str "    <developer>\n"
+               (when id
+                 (str "      <id>" id "</id>\n"))
+               "      <name>" name "</name>\n"
+               (when email
+                 (str "      <email>" email "</email>\n"))
+               "    </developer>\n"))
         pom-xml     (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
                          "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n"
                          "         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
@@ -143,14 +181,11 @@
                          "    <developerConnection>" (:developerConnection scm) "</developerConnection>\n"
                          "    <tag>" (:tag scm) "</tag>\n"
                          "  </scm>\n"
-                         "  <repositories>\n"
-                         "    <repository>\n"
-                         "      <id>clojars</id>\n"
-                         "      <url>https://repo.clojars.org/</url>\n"
-                         "    </repository>\n"
-                         "  </repositories>\n"
+                         "  <developers>\n"
+                         (apply str (map developers->xml developers))
+                         "  </developers>\n"
                          "  <dependencies>\n"
-                         (->> runtime-deps
+                         (->> java-pom-deps
                               (sort-by (comp str key))
                               (map deps->xml)
                               (apply str))
@@ -165,6 +200,29 @@
     (b/delete {:path java-pom-file})
     (spit java-pom-file pom-xml)))
 
+(defn- native-jar-paths []
+  (->> (:classpath-roots basis)
+       (filter #(re-find #"/dtlvnative-[^/]+-\d[^/]*\.jar$" %))
+       sort))
+
+(defn- copy-jar-prefix!
+  [jar-path prefix target-dir]
+  (with-open [jar (JarFile. jar-path)]
+    (doseq [entry (enumeration-seq (.entries jar))
+            :let [entry-name (.getName entry)]
+            :when (and (not (.isDirectory entry))
+                       (str/starts-with? entry-name prefix))]
+      (let [target-file (File. target-dir entry-name)]
+        (.mkdirs (.getParentFile target-file))
+        (with-open [in (.getInputStream jar entry)
+                    out (io/output-stream target-file)]
+          (io/copy in out))))))
+
+(defn- copy-bundled-native-payloads!
+  []
+  (doseq [jar-path (native-jar-paths)]
+    (copy-jar-prefix! jar-path "datalevin/dtlvnative/" java-artifact-dir)))
+
 (defn- prep-java-artifact! []
   (compile-java nil)
   (b/delete {:path java-artifact-dir})
@@ -173,6 +231,7 @@
   ;; Keep the release jar free of embedded Java sources; they go in the
   ;; separate sources jar instead.
   (b/delete {:path (str java-artifact-dir "/java")})
+  (copy-bundled-native-payloads!)
   (write-java-poms!))
 
 (defn java-jar [_]
@@ -262,3 +321,89 @@
    :source-jar  java-source-jar-file
    :javadoc-jar java-javadoc-jar-file
    :local-repo  local-repo})
+
+(defn- digest-file
+  [algorithm path]
+  (let [digest (MessageDigest/getInstance algorithm)
+        buffer (byte-array 8192)]
+    (with-open [^InputStream in (io/input-stream path)]
+      (loop []
+        (let [read (.read in buffer)]
+          (when (pos? read)
+            (.update digest buffer 0 read)
+            (recur)))))
+    (apply str (map #(format "%02x" (bit-and % 0xff)) (.digest digest)))))
+
+(defn- sign-artifact!
+  [artifact]
+  (let [signature (str artifact ".asc")
+        gpg-home  (System/getenv "JAVA_GPG_HOME")
+        key-id    (System/getenv "JAVA_GPG_KEY_ID")
+        command   (vec (concat ["gpg" "--batch" "--yes" "--armor"]
+                               (when (seq gpg-home)
+                                 ["--homedir" gpg-home])
+                               (when (seq key-id)
+                                 ["--local-user" key-id])
+                               ["--detach-sign"
+                                "--output" signature
+                                artifact]))]
+    (run-process! command)
+    signature))
+
+(defn- write-checksums!
+  [artifact]
+  (doseq [[algorithm extension] checksum-algorithms]
+    (spit (str artifact "." extension)
+          (str (digest-file algorithm artifact) "\n"))))
+
+(defn- central-artifact-dir []
+  (str java-central-staging-dir
+       "/"
+       (str/replace (namespace java-lib) "." "/")
+       "/"
+       (name java-lib)
+       "/"
+       version))
+
+(defn- bundle-artifacts!
+  [{:keys [sign?]}]
+  (java-release nil)
+  (let [artifact-dir (central-artifact-dir)
+        artifacts    [{:src java-jar-file
+                       :name (format "datalevin-java-%s.jar" version)}
+                      {:src java-pom-file
+                       :name (format "datalevin-java-%s.pom" version)}
+                      {:src java-source-jar-file
+                       :name (format "datalevin-java-%s-sources.jar" version)}
+                      {:src java-javadoc-jar-file
+                       :name (format "datalevin-java-%s-javadoc.jar" version)}]]
+    (b/delete {:path java-central-dir})
+    (.mkdirs (File. artifact-dir))
+    (doseq [{:keys [src name]} artifacts]
+      (b/copy-file {:src src
+                    :target (str artifact-dir "/" name)}))
+    (let [artifact-paths (->> artifacts
+                              (mapv #(str artifact-dir "/" (:name %))))
+          files-to-hash  (if sign?
+                           (into artifact-paths (map sign-artifact! artifact-paths))
+                           artifact-paths)]
+      (doseq [artifact files-to-hash]
+        (write-checksums! artifact))
+      {:artifact-dir artifact-dir
+       :artifacts    artifact-paths})))
+
+(defn central-java-bundle
+  [{:keys [sign]
+    :or   {sign true}}]
+  (bundle-artifacts! {:sign? sign})
+  (b/delete {:path java-central-bundle-file})
+  (run-process!
+    ["jar"
+     "--create"
+     "--file" java-central-bundle-file
+     "-C" java-central-staging-dir
+     "."])
+  (println "Generated Maven Central bundle at" java-central-bundle-file)
+  {:bundle-file  java-central-bundle-file
+   :artifact-dir (central-artifact-dir)
+   :signed?      sign})

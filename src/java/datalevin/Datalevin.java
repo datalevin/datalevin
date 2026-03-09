@@ -8,6 +8,9 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 
+import clojure.lang.Keyword;
+import clojure.lang.Symbol;
+
 /**
  * Static entry point for the high-level Java API.
  *
@@ -53,125 +56,139 @@ public final class Datalevin {
      * underlying Datalevin runtime.
      */
     public static Connection createConn() {
-        return new Connection(ClojureBridge.core("create-conn"));
+        return new Connection(ClojureRuntime.core("create-conn"));
     }
 
     /**
      * Creates or opens a Datalog connection rooted at {@code dir}.
      */
     public static Connection createConn(String dir) {
-        return new Connection(ClojureBridge.core("create-conn", dir));
+        return new Connection(ClojureRuntime.core("create-conn", dir));
     }
 
     /**
      * Creates or opens a Datalog connection with a raw schema map.
      */
-    public static Connection createConn(String dir, Map<String, ?> schema) {
-        return new Connection(ClojureBridge.core("create-conn",
+    public static Connection createConn(String dir, Map<?, ?> schema) {
+        return new Connection(ClojureRuntime.core("create-conn",
                                                  dir,
-                                                 ClojureBridge.schemaInput(schema)));
+                                                 DatalevinForms.schemaInput(schema)));
     }
 
     /**
      * Creates or opens a Datalog connection with a typed schema builder.
      */
     public static Connection createConn(String dir, Schema schema) {
-        return createConn(dir, schema == null ? null : schema.build());
+        return new Connection(ClojureRuntime.core("create-conn",
+                                                 dir,
+                                                 schema == null ? null : schema.buildForm()));
     }
 
     /**
      * Creates or opens a Datalog connection with a raw schema map and options.
      */
-    public static Connection createConn(String dir, Map<String, ?> schema, Map<String, ?> opts) {
-        return new Connection(ClojureBridge.core("create-conn",
+    public static Connection createConn(String dir, Map<?, ?> schema, Map<?, ?> opts) {
+        return new Connection(ClojureRuntime.core("create-conn",
                                                  dir,
-                                                 ClojureBridge.schemaInput(schema),
-                                                 ClojureBridge.optionsInput(opts)));
+                                                 DatalevinForms.schemaInput(schema),
+                                                 DatalevinForms.optionsInput(opts)));
     }
 
     /**
      * Creates or opens a Datalog connection with a typed schema builder and
      * options.
      */
-    public static Connection createConn(String dir, Schema schema, Map<String, ?> opts) {
-        return createConn(dir, schema == null ? null : schema.build(), opts);
+    public static Connection createConn(String dir, Schema schema, Map<?, ?> opts) {
+        return new Connection(ClojureRuntime.core("create-conn",
+                                                 dir,
+                                                 schema == null ? null : schema.buildForm(),
+                                                 DatalevinForms.optionsInput(opts)));
     }
 
     /**
-     * Returns the current shared connection when one is available.
+     * Returns an anonymous connection managed by the Datalevin runtime.
+     *
+     * <p>The underlying Clojure API only supports shared lookup for
+     * path-addressed connections, so the no-argument Java convenience mirrors
+     * {@link #createConn()}.
      */
     public static Connection getConn() {
-        return new Connection(ClojureBridge.core("get-conn"));
+        return createConn();
     }
 
     /**
      * Returns a shared connection for {@code dir}, opening it if needed.
      */
     public static Connection getConn(String dir) {
-        return new Connection(ClojureBridge.core("get-conn", dir));
+        return new Connection(ClojureRuntime.core("get-conn", dir));
     }
 
     /**
      * Returns a shared connection and updates it with the given raw schema.
      */
-    public static Connection getConn(String dir, Map<String, ?> schema) {
-        return new Connection(ClojureBridge.core("get-conn",
+    public static Connection getConn(String dir, Map<?, ?> schema) {
+        return new Connection(ClojureRuntime.core("get-conn",
                                                  dir,
-                                                 ClojureBridge.schemaInput(schema)));
+                                                 DatalevinForms.schemaInput(schema)));
     }
 
     /**
      * Returns a shared connection and updates it with the given typed schema.
      */
     public static Connection getConn(String dir, Schema schema) {
-        return getConn(dir, schema == null ? null : schema.build());
+        return new Connection(ClojureRuntime.core("get-conn",
+                                                 dir,
+                                                 schema == null ? null : schema.buildForm()));
     }
 
     /**
      * Returns a shared connection with the given raw schema and options.
      */
-    public static Connection getConn(String dir, Map<String, ?> schema, Map<String, ?> opts) {
-        return new Connection(ClojureBridge.core("get-conn",
+    public static Connection getConn(String dir, Map<?, ?> schema, Map<?, ?> opts) {
+        return new Connection(ClojureRuntime.core("get-conn",
                                                  dir,
-                                                 ClojureBridge.schemaInput(schema),
-                                                 ClojureBridge.optionsInput(opts)));
+                                                 DatalevinForms.schemaInput(schema),
+                                                 DatalevinForms.optionsInput(opts)));
     }
 
     /**
      * Returns a shared connection with the given typed schema and options.
      */
-    public static Connection getConn(String dir, Schema schema, Map<String, ?> opts) {
-        return getConn(dir, schema == null ? null : schema.build(), opts);
+    public static Connection getConn(String dir, Schema schema, Map<?, ?> opts) {
+        return new Connection(ClojureRuntime.core("get-conn",
+                                                 dir,
+                                                 schema == null ? null : schema.buildForm(),
+                                                 DatalevinForms.optionsInput(opts)));
     }
 
     /**
      * Opens a local KV store rooted at {@code dir}.
      */
     public static KV openKV(String dir) {
-        return new KV(ClojureBridge.core("open-kv", dir));
+        return new KV(ClojureRuntime.core("open-kv", dir));
     }
 
     /**
      * Opens a local KV store with the given options.
      */
-    public static KV openKV(String dir, Map<String, ?> opts) {
-        return new KV(ClojureBridge.core("open-kv", dir, ClojureBridge.optionsInput(opts)));
+    public static KV openKV(String dir, Map<?, ?> opts) {
+        return new KV(ClojureRuntime.core("open-kv", dir, DatalevinForms.optionsInput(opts)));
     }
 
     /**
      * Opens a remote admin client for the given Datalevin URI.
      */
     public static Client newClient(String uri) {
-        return new Client(ClojureBridge.client("new-client", uri));
+        return new Client(ClojureRuntime.client("new-client", uri));
     }
 
     /**
      * Opens a remote admin client for the given Datalevin URI and options.
      */
-    public static Client newClient(String uri, Map<String, ?> opts) {
-        return new Client(ClojureBridge.client("new-client",
+    public static Client newClient(String uri, Map<?, ?> opts) {
+        return new Client(ClojureRuntime.client("new-client",
                                                uri,
-                                               ClojureBridge.optionsInput(opts)));
+                                               DatalevinForms.optionsInput(opts)));
     }
 
     /**
@@ -210,12 +227,10 @@ public final class Datalevin {
     }
 
     /**
-     * Normalizes a keyword-like string to the {@code :keyword} representation
-     * used by the Java wrapper.
+     * Creates the unbounded range spec {@code [:all]}.
      */
-    public static String keyword(String value) {
-        Objects.requireNonNull(value, "value");
-        return value.startsWith(":") ? value : ":" + value;
+    public static RangeSpec allRange() {
+        return RangeSpec.all();
     }
 
     /**
@@ -230,17 +245,17 @@ public final class Datalevin {
      * Marks a keyword value such as {@code :person/name} for APIs that need an
      * EDN keyword rather than a Java string.
      */
-    public static Object kw(String value) {
-        return edn(keyword(value));
+    public static Keyword kw(String value) {
+        return ClojureCodec.keyword(value);
     }
 
     /**
      * Marks a Datalog variable such as {@code ?e} for query builder positions
      * that accept either variables or literal values.
      */
-    public static Object var(String value) {
+    public static Symbol var(String value) {
         Objects.requireNonNull(value, "value");
-        return new EdnLiteral(value.startsWith("?") ? value : "?" + value);
+        return ClojureCodec.symbol(value.startsWith("?") ? value : "?" + value);
     }
 
     /**
@@ -301,25 +316,25 @@ public final class Datalevin {
 
     @SuppressWarnings("unchecked")
     /**
-     * Casts a result value to a string-keyed map.
+     * Casts a result value to a map.
      */
-    public static Map<String, Object> mapResult(Object value) {
-        return (Map<String, Object>) value;
+    public static Map<Object, Object> mapResult(Object value) {
+        return (Map<Object, Object>) value;
     }
 
     @SuppressWarnings("unchecked")
     /**
      * Casts a result value to a list.
      */
-    public static List<Object> listResult(Object value) {
-        return (List<Object>) value;
+    public static List<?> listResult(Object value) {
+        return (List<?>) value;
     }
 
     @SuppressWarnings("unchecked")
     /**
      * Casts a result value to a set.
      */
-    public static Set<Object> setResult(Object value) {
-        return (Set<Object>) value;
+    public static Set<?> setResult(Object value) {
+        return (Set<?>) value;
     }
 }

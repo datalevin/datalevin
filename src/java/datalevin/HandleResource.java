@@ -1,5 +1,6 @@
 package datalevin;
 
+import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.Objects;
 
@@ -45,11 +46,20 @@ abstract class HandleResource implements AutoCloseable {
 
     protected final Object execJson(String op, Map<String, ?> args) {
         ensureOpen();
-        return ClojureBridge.execWithJsonHandle(jsonHandlePrefix,
-                                                jsonHandleArg,
-                                                resource,
-                                                op,
-                                                args);
+        String handle = (String) ClojureRuntime.jsonApi("register!",
+                                                        jsonHandlePrefix,
+                                                        ClojureCodec.keyword(jsonHandlePrefix),
+                                                        resource);
+        try {
+            LinkedHashMap<String, Object> request = new LinkedHashMap<>();
+            request.put(jsonHandleArg, handle);
+            if (args != null) {
+                request.putAll(args);
+            }
+            return JsonBridge.call(op, request);
+        } finally {
+            ClojureRuntime.jsonApi("unregister!", handle);
+        }
     }
 
     protected final boolean isReleased() {
