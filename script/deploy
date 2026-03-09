@@ -5,4 +5,4 @@ set -eou pipefail
 cd ..
 
 lein clean
-lein deploy clojars
+lein with-profile core-release deploy clojars

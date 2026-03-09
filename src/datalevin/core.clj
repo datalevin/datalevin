@@ -1838,8 +1838,8 @@ To access store on a server, [[interpret.inter-fn]] should be used to define the
                    [db list-name visitor k k-type v-type]
                    [db list-name visitor k k-type v-type raw-pred?])
        :doc      "Visit the list associated with a key, presumably for
-  side effects. The list items were added by [[put-list-items]]. When `raw-pred?` is true (default), the visitor call is `(visitor kv)`, where `kv`
-     is a raw `IKV` object, with both key and value fields being a `ByteBuffer`; otherwise, the call is `(visitor k v)`, where `k` and `v` are already decoded key and value. "}
+  side effects. The list items were added by [[put-list-items]]. When `raw-pred?` is true (default), the visitor call is `(visitor v)`, where `v`
+     is a raw `ByteBuffer`; otherwise, the call is `(visitor v)`, where `v` is the decoded value. "}
   visit-list i/visit-list)
 
 (def ^{:arglists '([db list-name k k-type])

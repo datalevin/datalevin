@@ -38,6 +38,7 @@
    datalevin.storage-test
    datalevin.query-test
    datalevin.remote-test
+   datalevin.java-api-test
    datalevin.json-api-test
    datalevin.search-test
    datalevin.vector-test
@@ -86,6 +87,7 @@
           'datalevin.storage-test
           'datalevin.query-test
           'datalevin.remote-test
+          'datalevin.java-api-test
           'datalevin.json-api-test
           'datalevin.search-test
           'datalevin.vector-test

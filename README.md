@@ -123,6 +123,32 @@ versions.
 
 Datalevin is aimed to be a versatile database.
 
+### Use from Java
+
+The Java API lives in package `datalevin` and starts from
+`datalevin.Datalevin`.
+
+- Use `Connection` for local Datalog databases.
+- Use `KV` for local key-value stores.
+- Use `Client` for remote server administration.
+- Use `DatalevinInterop` for raw-handle bridge use cases such as JPype or
+  node-java-bridge.
+
+Java results may contain raw Clojure runtime classes such as
+`clojure.lang.Keyword` and persistent collections. That is intentional.
+
+The Java release artifact is `org.datalevin:datalevin-java:0.10.7`. It bundles
+the Datalevin runtime payload, including the native Datalevin libraries, so
+Java consumers only need Maven Central enabled. See
+[`examples/java/README.md`](examples/java/README.md) for Maven and Gradle
+snippets and runnable examples, and [`doc/java-release.md`](doc/java-release.md)
+for the Maven Central publishing procedure:
+
+- `DatalogQuickStart.java`
+- `KVQuickStart.java`
+- `ClientQuickStart.java`
+- `InteropQuickStart.java`
+
 ### Use as a Datalog store
 
 In addition to [our API doc](https://cljdoc.org/d/datalevin/datalevin),
