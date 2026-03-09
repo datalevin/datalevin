@@ -28,7 +28,8 @@
                  [org.slf4j/slf4j-api "2.0.7"]
                  [ch.qos.logback/logback-classic "1.4.4"]]
   :source-paths ["src" "../src"]
-  :resource-paths ["../resources" "../target/classes"]
+  :java-source-paths ["src/java"]
+  :resource-paths ["resources" "../resources" "../target/classes"]
   :test-paths ["test"]
   :main datalevin.jepsen.cli
   :repl-options {:init-ns datalevin.jepsen.cli}

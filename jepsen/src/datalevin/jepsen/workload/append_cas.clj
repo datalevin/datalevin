@@ -2,8 +2,9 @@
   (:require
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.client :as client]
-   [jepsen.tests.cycle.append :as append]))
+   [jepsen.tests.cycle.append :as cycle.append]))
 
 (def schema
   {:append/key          {:db/valueType :db.type/long
@@ -172,15 +173,21 @@
 
 (defn workload
   [opts]
-  (let [opts' (merge {:min-txn-length 1
-                      :max-txn-length 1}
-                     (select-keys opts [:key-count
-                                        :min-txn-length
-                                        :max-txn-length
-                                        :max-writes-per-key]))]
-    (-> (append/test opts')
+  (let [opts'         (merge {:min-txn-length 1
+                              :max-txn-length 1}
+                             (select-keys opts [:key-count
+                                                :min-txn-length
+                                                :max-txn-length
+                                                :max-writes-per-key]))
+        base-checker  (cycle.append/checker
+                        {:consistency-models
+                         [:strong-session-snapshot-isolation]})
+        base-workload (cycle.append/test opts')]
+    (-> base-workload
         (assoc :client (->Client nil)
-               :checker (append/checker
-                         {:consistency-models
-                          [:strong-session-snapshot-isolation]})
+               :checker (workload.util/wrap-empty-graph-checker
+                          base-checker
+                          (fn [op]
+                            (= :txn (:f op)))
+                          [:f :error])
                :schema schema))))

@@ -5,7 +5,9 @@
    [jepsen.cli :as cli]))
 
 (def ^:private supported-nemesis-labels
-  (->> (concat [:none :failover] core/supported-nemeses)
+  (->> (concat [:none :failover :pause :partition :asymmetric :degraded
+                :rejoin :quorum :clock-skew]
+               core/supported-nemeses)
        (map name)
        sort
        (str/join ", ")))
@@ -24,7 +26,7 @@
 
    [nil "--keep-work-dir" "Keep local cluster work directories after success"]
 
-   [nil "--key-count NUM" "Number of append keys in active rotation"
+   [nil "--key-count NUM" "Number of active workload keys when applicable"
     :default 8
     :parse-fn parse-long
     :validate [pos? "Must be a positive integer"]]
@@ -54,7 +56,7 @@
     :parse-fn parse-long
     :validate [pos? "Must be a positive integer"]]
 
-   [nil "--nemesis FAULTS" "Comma-separated faults. Supported: none, failover, leader-failover."
+   [nil "--nemesis FAULTS" "Comma-separated faults. Supported faults and aliases are shown in the validation error."
     :parse-fn core/parse-nemesis-spec
     :default []
     :validate [(partial every? core/supported-nemeses)

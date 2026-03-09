@@ -36,7 +36,8 @@
             visit entries list-range list-range-first list-range-count
             list-count key-range-list-count key-range-count rschema
             list-range-first-n get-list list-range-filter-count max-aid
-            list-range-some list-range-keep visit-list-range max-gt max-tx
+            list-range-some list-range-keep visit-list-range
+            max-gt advance-max-gt max-tx
             open-list-dbi open-dbi attrs add-doc remove-doc opts env-opts kv-info swap-attr
             add-vec remove-vec schema closed? a-size db-name populated?
             get-env-flags set-env-flags]]
@@ -150,16 +151,6 @@
 
 (defn- init-attrs [schema]
   (into {} (map (fn [[k v]] [(v :db/aid) k])) schema))
-
-(defn refresh-store-schema-cache!
-  [^Store store]
-  (let [lmdb   (.-lmdb store)
-        schema (load-schema lmdb)]
-    (set! (.-schema store) schema)
-    (set! (.-rschema store) (schema->rschema schema))
-    (set! (.-attrs store) (init-attrs schema))
-    (set! (.-max-aid store) (init-max-aid schema))
-    store))
 
 (defn- init-max-gt
   [lmdb]
@@ -1168,11 +1159,15 @@
       (.sample-ave-tuples store ts a as [[[:closed c/v0] [:closed c/vmax]]]
                           nil false)
       (when-not (.closed? store)
-        (transact-kv lmdb (map-indexed
-                            (fn [i ^objects t]
-                              [:put c/meta [aid i] ^long (aget t 0)
-                               :int-int :id])
-                            ts)))
+        ;; Sampling metadata is an advisory cache; query reads should still
+        ;; succeed if persisting it loses a WAL race or times out.
+        (try
+          (transact-kv lmdb (map-indexed
+                              (fn [i ^objects t]
+                                [:put c/meta [aid i] ^long (aget t 0)
+                                 :int-int :id])
+                              ts))
+          (catch Exception _)))
       ts)))
 
 (defn default-ratio*
@@ -1184,7 +1179,9 @@
         (let [ratio (double (/ ^long (.a-size store a) card))
               lmdb  (.-lmdb store)]
           (when-not (.closed? store)
-            (transact-kv lmdb [[:put c/meta [aid :ratio] ratio :data :double]]))
+            (try
+              (transact-kv lmdb [[:put c/meta [aid :ratio] ratio :data :double]])
+              (catch Exception _)))
           ratio)))))
 
 (defn- analyze*
@@ -1935,3 +1932,14 @@
            (.-scheduled-sampling old)
            (.-write-txn old)
            (ReentrantReadWriteLock.)))
+
+(defn sync-max-gt-floor!
+  "Advance an open store's in-memory giant-id cursor to at least `next-gt`.
+  HA follower replay writes raw giant rows directly into LMDB, so the cursor
+  must be kept in sync without reopening the store."
+  [^Store store next-gt]
+  (loop [current (long (max-gt store))
+         target (long next-gt)]
+    (if (< current target)
+      (recur (long (advance-max-gt store)) target)
+      current)))

@@ -840,6 +840,12 @@
 (defn- stop-ha-runtime
   [db-name m]
   (*stop-ha-renew-loop-fn* m)
+  (try
+    (dha/persist-ha-runtime-local-applied-lsn! m)
+    (catch Throwable t
+      (log/warn t "Failed to persist HA local applied LSN during shutdown"
+                {:db-name db-name
+                 :ha-node-id (:ha-node-id m)})))
   (*stop-ha-authority-fn* db-name m)
   (dissoc (dha/clear-ha-runtime-state m)
           :ha-runtime-opts
@@ -2528,11 +2534,20 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
     (let [db-name  (nth args 0)
-          sys-conn (.-sys-conn server)]
+          kv-store (get-kv-store server db-name)
+          sys-conn (.-sys-conn server)
+          dbs      (.-dbs server)]
       (wrap-permission
         ::alter ::database (db-eid sys-conn db-name)
         "Don't have permission to alter the database"
-        (normal-kv-store-handler abort-transact-kv)))))
+        (try
+          (i/abort-transact-kv kv-store)
+          (i/close-transact-kv kv-store)
+          (finally
+            (halt-run (get-in dbs [db-name :runner]))
+            (update-db server db-name #(dissoc % :runner :wlmdb))
+            (.release ^Semaphore (get-in dbs [db-name :lock]))))
+        (write-message skey {:type :command-complete})))))
 
 (defn- open-transact
   [^Server server ^SelectionKey skey {:keys [args] :as message}]
@@ -2583,11 +2598,19 @@
   (wrap-error
     (let [db-name  (nth args 0)
           kv-store (get-kv-store server db-name)
-          sys-conn (.-sys-conn server)]
+          sys-conn (.-sys-conn server)
+          dbs      (.-dbs server)]
       (wrap-permission
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
-        (i/abort-transact-kv kv-store)
+        (try
+          (i/abort-transact-kv kv-store)
+          (i/close-transact-kv kv-store)
+          (finally
+            (halt-run (get-in dbs [db-name :runner]))
+            (update-db server db-name
+                       #(dissoc % :wlmdb :wstore :wdt-db :runner))
+            (.release ^Semaphore (get-in dbs [db-name :lock]))))
         (write-message skey {:type :command-complete})))))
 
 (defn- get-env-flags

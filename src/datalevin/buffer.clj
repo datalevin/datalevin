@@ -34,17 +34,27 @@
   ^ByteBuffer [size]
   (ByteBuffer/wrap (byte-array size)))
 
+(defn- take-buffer!
+  ^ByteBuffer [^ConcurrentLinkedDeque buffers allocate ^long size]
+  (let [cap (+ size Integer/BYTES)] ;; for storing length
+    (loop [skipped []]
+      (if-let [^ByteBuffer bf (.pollFirst buffers)]
+        (if (<= cap (.capacity bf))
+          (do
+            (doseq [^ByteBuffer skipped-bf skipped]
+              (.offer buffers skipped-bf))
+            (.clear bf)
+            bf)
+          (recur (conj skipped bf)))
+        (do
+          (doseq [^ByteBuffer skipped-bf skipped]
+            (.offer buffers skipped-bf))
+          (allocate cap))))))
+
 (defn get-array-buffer
   ([] (get-array-buffer (+ c/+max-key-size+ Integer/BYTES)))
   (^ByteBuffer [^long size]
-   (let [cap (+ size Integer/BYTES)] ;; for storing length
-     (or (some (fn [^ByteBuffer bf]
-                 (when (<= cap (.capacity bf))
-                   (.remove array-buffers bf)
-                   (.clear bf)
-                   bf))
-               array-buffers)
-         (allocate-array-buffer cap)))))
+   (take-buffer! array-buffers allocate-array-buffer size)))
 
 (defn return-array-buffer [bf] (.offer array-buffers bf))
 
@@ -56,16 +66,9 @@
   (ByteBuffer/allocateDirect size))
 
 (defn get-direct-buffer
-  ([] (get-array-buffer (+ c/+max-key-size+ Integer/BYTES)))
+  ([] (get-direct-buffer (+ c/+max-key-size+ Integer/BYTES)))
   (^ByteBuffer [^long size]
-   (let [cap (+ size Integer/BYTES)] ;; for storing length
-     (or (some (fn [^ByteBuffer bf]
-                 (when (<= cap (.capacity bf))
-                   (.remove direct-buffers bf)
-                   (.clear bf)
-                   bf))
-               direct-buffers)
-         (allocate-buffer cap)))))
+   (take-buffer! direct-buffers allocate-buffer size)))
 
 (defn return-direct-buffer [bf] (.offer direct-buffers bf))
 

@@ -23,6 +23,7 @@
    [datalevin.storage :as s]
    [datalevin.index :as idx]
    [datalevin.prepare :as prepare]
+   [datalevin.query-util :as qu]
    [datalevin.validate :as vld]
    [datalevin.remote :as r]
    [datalevin.relation :as rel]
@@ -213,6 +214,16 @@
              (contains? values v)
              (contains? (get values-by-attr a #{}) v)))))
 
+(defn- unresolved-entid?
+  [x]
+  (or (qu/lookup-ref? x)
+      (keyword? x)))
+
+(defn- unresolved-pattern?
+  [e v]
+  (or (unresolved-entid? e)
+      (unresolved-entid? v)))
+
 (defn- index-components->pattern
   [index c1 c2 c3]
   (case index
@@ -266,39 +277,47 @@
 
         :search
         (let [[_ e a v] k]
-          (tx-affects-pattern? touches e a v))
+          (or (unresolved-pattern? e v)
+              (tx-affects-pattern? touches e a v)))
 
         :search-tuples
         (let [[_ e a v] k]
-          (tx-affects-pattern? touches e a v))
+          (or (unresolved-pattern? e v)
+              (tx-affects-pattern? touches e a v)))
 
         :first
         (let [[_ e a v] k]
-          (tx-affects-pattern? touches e a v))
+          (or (unresolved-pattern? e v)
+              (tx-affects-pattern? touches e a v)))
 
         :count
         (let [[_ e a v] k]
-          (tx-affects-pattern? touches e a v))
+          (or (unresolved-pattern? e v)
+              (tx-affects-pattern? touches e a v)))
 
         :populated?
         (let [[_ index c1 c2 c3] k]
           (if-some [[e a v] (index-components->pattern index c1 c2 c3)]
-            (tx-affects-pattern? touches e a v)
+            (or (unresolved-pattern? e v)
+                (tx-affects-pattern? touches e a v))
             true))
 
         :datoms
         (let [[_ index c1 c2 c3] k]
           (if-some [[e a v] (index-components->pattern index c1 c2 c3)]
-            (tx-affects-pattern? touches e a v)
+            (or (unresolved-pattern? e v)
+                (tx-affects-pattern? touches e a v))
             true))
 
         :e-datoms
         (let [[_ e] k]
-          (tx-affects-pattern? touches e nil nil))
+          (or (unresolved-entid? e)
+              (tx-affects-pattern? touches e nil nil)))
 
         :av-datoms
         (let [[_ a v] k]
-          (tx-affects-pattern? touches nil a v))
+          (or (unresolved-entid? v)
+              (tx-affects-pattern? touches nil a v)))
 
         :range-datoms
         true
@@ -306,13 +325,17 @@
         :seek
         (let [[_ index c1 c2 c3] k]
           (if-some [[e a _] (index-components->pattern index c1 c2 c3)]
-            (tx-affects-pattern? touches e a nil)
+            (let [[e* _ v*] (index-components->pattern index c1 c2 c3)]
+              (or (unresolved-pattern? e* v*)
+                  (tx-affects-pattern? touches e* a nil)))
             true))
 
         :rseek
         (let [[_ index c1 c2 c3] k]
           (if-some [[e a _] (index-components->pattern index c1 c2 c3)]
-            (tx-affects-pattern? touches e a nil)
+            (let [[e* _ v*] (index-components->pattern index c1 c2 c3)]
+              (or (unresolved-pattern? e* v*)
+                  (tx-affects-pattern? touches e* a nil)))
             true))
 
         :cardinality
@@ -320,12 +343,16 @@
           (contains? attrs a))
 
         :index-range
-        (let [[_ a] k]
-          (contains? attrs a))
+        (let [[_ a start end] k]
+          (or (unresolved-pattern? nil start)
+              (unresolved-pattern? nil end)
+              (contains? attrs a)))
 
         :index-range-size
-        (let [[_ a] k]
-          (contains? attrs a))
+        (let [[_ a start end] k]
+          (or (unresolved-pattern? nil start)
+              (unresolved-pattern? nil end)
+              (contains? attrs a)))
 
         :query-result
         (let [[_ deps] k]

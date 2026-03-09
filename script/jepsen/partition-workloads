@@ -1,0 +1,319 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+jepsen_dir="$repo_root/jepsen"
+
+default_workloads=(
+  append
+  append-cas
+  bank
+  fencing
+  giant-values
+  grant
+  identity-upsert
+  index-consistency
+  internal
+  register
+  rejoin-bootstrap
+  tx-fn-register
+)
+
+usage() {
+  cat <<'EOF'
+Usage: script/jepsen/partition-workloads [workload ...] [-- extra-jepsen-args]
+
+Runs the real Jepsen leader-partition nemesis against the selected workloads.
+
+Examples:
+  script/jepsen/partition-workloads
+  script/jepsen/partition-workloads append bank
+  script/jepsen/partition-workloads append bank -- --time-limit 15 --rate 10
+
+Defaults:
+  nemesis: partition
+  control backend: sofa-jraft
+  nodes: n1,n2,n3
+  key count: 4
+  rate/time-limit: 6/5 for most workloads
+  fencing rate/time-limit: 1/2
+  rejoin-bootstrap rate/time-limit: 4/8
+
+Environment overrides:
+  DTLV_JEPSEN_PARTITION_KEY_COUNT
+  DTLV_JEPSEN_PARTITION_RATE
+  DTLV_JEPSEN_PARTITION_TIME_LIMIT
+  DTLV_JEPSEN_PARTITION_FENCING_RATE
+  DTLV_JEPSEN_PARTITION_FENCING_TIME_LIMIT
+  DTLV_JEPSEN_PARTITION_REJOIN_RATE
+  DTLV_JEPSEN_PARTITION_REJOIN_TIME_LIMIT
+  DTLV_JEPSEN_PARTITION_ACCOUNT_BALANCE
+  DTLV_JEPSEN_PARTITION_MAX_TRANSFER
+  DTLV_JEPSEN_PARTITION_MAX_WRITES_PER_KEY
+  DTLV_JEPSEN_PARTITION_MIN_TXN_LENGTH
+  DTLV_JEPSEN_PARTITION_MAX_TXN_LENGTH
+  DTLV_JEPSEN_PORT_RETRY_COUNT
+  DTLV_JEPSEN_PORT_RETRY_DELAY_S
+EOF
+}
+
+list_workloads() {
+  printf '%s\n' "${default_workloads[@]}"
+}
+
+known_workload() {
+  local candidate="$1"
+  local workload
+  for workload in "${default_workloads[@]}"; do
+    if [[ "$workload" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+latest_results_file() {
+  local workload="$1"
+  local results_dir="$jepsen_dir/store/${workload} sofa-jraft"
+  if [[ ! -d "$results_dir" ]]; then
+    return 1
+  fi
+  find "$results_dir" -mindepth 2 -maxdepth 2 -name results.edn -print 2>/dev/null \
+    | sort \
+    | tail -n 1
+}
+
+print_result_summary() {
+  local results_file="$1"
+  (
+    cd "$repo_root"
+    RESULTS_FILE="$results_file" clojure -M -e '
+      (let [m (clojure.edn/read-string
+                {:default (fn [_ value] value)}
+                (slurp (System/getenv "RESULTS_FILE")))
+            summary {:valid? (:valid? m)
+                     :exceptions (get-in m [:exceptions :valid?])
+                     :workload (get-in m [:workload :valid?])}]
+        (println (pr-str summary))
+        (when-not (true? (:valid? m))
+          (System/exit 1)))'
+  )
+}
+
+run_jepsen() {
+  local log_file="$1"
+  shift
+
+  local attempt=0
+  local run_exit=0
+
+  while true; do
+    if [[ "$stream_logs" == "1" ]]; then
+      if (
+        cd "$jepsen_dir"
+        "$@" 2>&1 | tee "$log_file"
+      ); then
+        return 0
+      else
+        run_exit=$?
+      fi
+    else
+      if (
+        cd "$jepsen_dir"
+        "$@" >"$log_file" 2>&1
+      ); then
+        return 0
+      else
+        run_exit=$?
+      fi
+    fi
+
+    if ! grep -Fq "Unable to reserve Jepsen server port" "$log_file"; then
+      return "$run_exit"
+    fi
+
+    if (( attempt >= port_retry_count )); then
+      return "$run_exit"
+    fi
+
+    attempt=$((attempt + 1))
+    printf '    retry: port reservation failed, retrying (%d/%d)\n' \
+      "$attempt" \
+      "$port_retry_count"
+    sleep "$port_retry_delay_s"
+  done
+}
+
+selected_workloads=()
+extra_args=()
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --list)
+      list_workloads
+      exit 0
+      ;;
+    --)
+      shift
+      extra_args=("$@")
+      break
+      ;;
+    *)
+      if ! known_workload "$1"; then
+        echo "Unknown workload: $1" >&2
+        echo >&2
+        usage >&2
+        exit 2
+      fi
+      selected_workloads+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#selected_workloads[@]} -eq 0 ]]; then
+  selected_workloads=("${default_workloads[@]}")
+fi
+
+key_count="${DTLV_JEPSEN_PARTITION_KEY_COUNT:-4}"
+rate="${DTLV_JEPSEN_PARTITION_RATE:-6}"
+time_limit="${DTLV_JEPSEN_PARTITION_TIME_LIMIT:-5}"
+fencing_rate="${DTLV_JEPSEN_PARTITION_FENCING_RATE:-1}"
+fencing_time_limit="${DTLV_JEPSEN_PARTITION_FENCING_TIME_LIMIT:-2}"
+rejoin_rate="${DTLV_JEPSEN_PARTITION_REJOIN_RATE:-4}"
+rejoin_time_limit="${DTLV_JEPSEN_PARTITION_REJOIN_TIME_LIMIT:-8}"
+account_balance="${DTLV_JEPSEN_PARTITION_ACCOUNT_BALANCE:-100}"
+max_transfer="${DTLV_JEPSEN_PARTITION_MAX_TRANSFER:-5}"
+max_writes_per_key="${DTLV_JEPSEN_PARTITION_MAX_WRITES_PER_KEY:-8}"
+min_txn_length="${DTLV_JEPSEN_PARTITION_MIN_TXN_LENGTH:-1}"
+max_txn_length="${DTLV_JEPSEN_PARTITION_MAX_TXN_LENGTH:-1}"
+
+common_args=(
+  run
+  test
+  --no-ssh
+  --nodes
+  n1,n2,n3
+  --control-backend
+  sofa-jraft
+  --nemesis
+  partition
+)
+
+status=0
+summaries=()
+run_id="$(date +%Y%m%dT%H%M%S)"
+log_dir="$repo_root/tmp/jepsen-partition-workloads/$run_id"
+stream_logs="${DTLV_JEPSEN_PARTITION_STREAM_LOGS:-0}"
+port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
+port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
+
+mkdir -p "$log_dir"
+
+for workload in "${selected_workloads[@]}"; do
+  workload_rate="$rate"
+  workload_time_limit="$time_limit"
+  if [[ "$workload" == "fencing" ]]; then
+    workload_rate="$fencing_rate"
+    workload_time_limit="$fencing_time_limit"
+  elif [[ "$workload" == "rejoin-bootstrap" ]]; then
+    workload_rate="$rejoin_rate"
+    workload_time_limit="$rejoin_time_limit"
+  fi
+
+  run_args=(
+    --workload
+    "$workload"
+    --db-name
+    "partition-$workload"
+    --time-limit
+    "$workload_time_limit"
+    --rate
+    "$workload_rate"
+    --key-count
+    "$key_count"
+    --account-balance
+    "$account_balance"
+    --max-transfer
+    "$max_transfer"
+    --max-writes-per-key
+    "$max_writes_per_key"
+    --min-txn-length
+    "$min_txn_length"
+    --max-txn-length
+    "$max_txn_length"
+  )
+
+  before_results="$(latest_results_file "$workload" || true)"
+  log_file="$log_dir/${workload}.log"
+
+  extra_args_display=""
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    extra_args_display=" ${extra_args[*]}"
+  fi
+
+  printf '==> [%s] lein %s %s%s\n' \
+    "$workload" \
+    "${common_args[*]}" \
+    "${run_args[*]}" \
+    "$extra_args_display"
+  printf '    log: %s\n' "$log_file"
+
+  run_exit=0
+  cmd=(lein "${common_args[@]}" "${run_args[@]}")
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    cmd+=("${extra_args[@]}")
+  fi
+  if run_jepsen "$log_file" "${cmd[@]}"; then
+    run_exit=0
+  else
+    run_exit=$?
+  fi
+
+  after_results="$(latest_results_file "$workload" || true)"
+
+  if [[ -n "$after_results" && "$after_results" != "$before_results" ]]; then
+    if summary="$(print_result_summary "$after_results" 2>&1)"; then
+      summary="${summary//$'\n'/ }"
+      summary="${summary//$'\r'/ }"
+      if [[ "$run_exit" -ne 0 ]]; then
+        summary="$summary exit=$run_exit"
+      fi
+      summaries+=("$workload ok $summary results=$after_results log=$log_file")
+    else
+      status=1
+      summary="${summary//$'\n'/ }"
+      summary="${summary//$'\r'/ }"
+      if [[ "$run_exit" -ne 0 ]]; then
+        summary="$summary exit=$run_exit"
+      fi
+      summaries+=("$workload invalid $summary results=$after_results log=$log_file")
+    fi
+    continue
+  fi
+
+  if [[ "$run_exit" -ne 0 ]]; then
+    status=1
+    summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+    continue
+  fi
+
+  if [[ -z "$after_results" || "$after_results" == "$before_results" ]]; then
+    echo "Missing new results for workload $workload" >&2
+    status=1
+    summaries+=("$workload missing-results log=$log_file")
+    continue
+  fi
+done
+
+printf '\nPartition sweep summary:\n'
+for summary in "${summaries[@]}"; do
+  printf '  %s\n' "$summary"
+done
+
+exit "$status"

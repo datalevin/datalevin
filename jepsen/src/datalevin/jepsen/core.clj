@@ -6,8 +6,15 @@
    [datalevin.jepsen.workload.append :as append]
    [datalevin.jepsen.workload.append-cas :as append-cas]
    [datalevin.jepsen.workload.bank :as bank]
+   [datalevin.jepsen.workload.fencing :as fencing]
+   [datalevin.jepsen.workload.giant-values :as giant-values]
    [datalevin.jepsen.workload.grant :as grant]
+   [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
+   [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
+   [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
+   [datalevin.jepsen.workload.register :as register]
+   [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [jepsen.checker :as checker]
    [jepsen.checker.timeline :as timeline]
    [jepsen.generator :as gen]
@@ -19,8 +26,15 @@
   {:append append/workload
    :append-cas append-cas/workload
    :bank bank/workload
+   :fencing fencing/workload
+   :giant-values giant-values/workload
    :grant grant/workload
-   :internal internal/workload})
+   :identity-upsert identity-upsert/workload
+   :index-consistency index-consistency/workload
+   :internal internal/workload
+   :rejoin-bootstrap rejoin-bootstrap/workload
+   :register register/workload
+   :tx-fn-register tx-fn-register/workload})
 
 (defn parse-nemesis-spec
   [spec]
@@ -35,12 +49,28 @@
 
 (defn- validate-nemesis-compatibility!
   [{:keys [control-backend nemesis]}]
-  (when (and (some #{:leader-failover :quorum-loss :clock-skew-pause} nemesis)
+  (when (and (some #{:leader-failover
+                     :leader-pause
+                     :leader-partition
+                     :asymmetric-partition
+                     :degraded-network
+                     :quorum-loss
+                     :clock-skew-pause
+                     :follower-rejoin} nemesis)
              (not= :sofa-jraft control-backend))
     (throw (ex-info
             "HA disruption nemeses currently require --control-backend sofa-jraft"
             {:nemesis nemesis
              :control-backend control-backend}))))
+
+(defn- compose-generator-phases
+  [timed-gen workload-final-generator nemesis-final-generator]
+  (cond-> [timed-gen]
+    nemesis-final-generator
+    (conj (gen/nemesis nemesis-final-generator))
+
+    workload-final-generator
+    (conj (gen/clients workload-final-generator))))
 
 (defn datalevin-test
   [opts]
@@ -63,12 +93,9 @@
                          (gen/clients client-gen))
         timed-gen      (->> combined-gen
                             (gen/time-limit time-limit))
-        phases         (cond-> [timed-gen]
-                         workload-final-generator
-                         (conj (gen/clients workload-final-generator))
-
-                         final-generator
-                         (conj (gen/nemesis final-generator)))
+        phases         (compose-generator-phases timed-gen
+                                                workload-final-generator
+                                                final-generator)
         ssh-opts       (assoc (merge {:username "root"
                                       :password "root"
                                       :strict-host-key-checking false}
@@ -82,6 +109,7 @@
                          "in-memory"))
             :nodes nodes
             :db (local/db cluster-id)
+            :net (local/net cluster-id)
             :client (:client workload)
             :nemesis nemesis
             :checker (checker/compose
@@ -92,6 +120,7 @@
             :schema (:schema workload)
             :db-name (:db-name opts)
             :control-backend (:control-backend opts)
+            :datalevin/cluster-opts (:datalevin/cluster-opts workload)
             :ssh ssh-opts
             :datalevin/nemesis-faults nemesis-faults
             :datalevin/cluster-id cluster-id})))

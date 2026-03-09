@@ -2468,56 +2468,85 @@
      :path path}))
 
 (defn- txlog-segment-records
-  [segment]
+  [state segment]
   (let [{:keys [id file]} segment
         segment-id (long id)
         path (.getPath ^java.io.File file)
+        active-segment-id (some-> state :segment-id deref long)
+        active-segment-offset (some-> state :segment-offset deref long)
+        max-offset (when (and (some? active-segment-id)
+                              (= segment-id active-segment-id)
+                              (some? active-segment-offset))
+                     active-segment-offset)
         acc (FastList.)]
     (txlog/scan-segment
      path
      {:allow-preallocated-tail? true
+      :max-offset max-offset
       :collect-records? false
       :on-record (fn [record]
                    (.add acc (txlog-record-entry segment-id path record)))})
     (vec acc)))
 
 (defn- txlog-segment-cache-valid?
-  [entry path file-bytes modified-ms]
+  [entry path file-bytes modified-ms active-segment? active-offset]
   (and entry
        (= path (:path entry))
-       (= file-bytes (long (:file-bytes entry)))
-       (= modified-ms (long (:modified-ms entry)))))
+       (if (and active-segment? (some? active-offset))
+         (= (long (min file-bytes
+                       (long active-offset)))
+            (long (or (:scan-bytes entry) -1)))
+         (and (= file-bytes (long (:file-bytes entry)))
+              (= modified-ms (long (:modified-ms entry)))))))
 
 (defn- txlog-segment-cache-entry
-  [segment]
-  (let [records (txlog-segment-records segment)
+  [state segment]
+  (let [records (txlog-segment-records state segment)
         {:keys [id file]} segment
         path (.getPath ^java.io.File file)
         file-bytes (long (.length ^java.io.File file))
-        modified-ms (long (.lastModified ^java.io.File file))]
+        modified-ms (long (.lastModified ^java.io.File file))
+        active-segment-id (some-> state :segment-id deref long)
+        active-segment-offset (some-> state :segment-offset deref long)
+        scan-bytes (if (and (some? active-segment-id)
+                            (= (long id) active-segment-id)
+                            (some? active-segment-offset))
+                     (long (min file-bytes
+                                (long active-segment-offset)))
+                     file-bytes)]
     {:segment-id (long id)
      :path path
      :file-bytes file-bytes
      :modified-ms modified-ms
+     :scan-bytes scan-bytes
      :min-lsn (some-> records first :lsn long)
      :records records}))
 
 (defn- txlog-segment-records-entry
-  [segment cache-v]
+  [state segment cache-v]
   (if cache-v
     (let [{:keys [id file]} segment
           segment-id (long id)
           path (.getPath ^java.io.File file)
           file-bytes (long (.length ^java.io.File file))
           modified-ms (long (.lastModified ^java.io.File file))
+          active-segment-id (some-> state :segment-id deref long)
+          active-segment-offset (some-> state :segment-offset deref long)
+          active-segment? (and (some? active-segment-id)
+                               (= segment-id active-segment-id))
           cache0 (or @cache-v {})
           cached (get cache0 segment-id)]
-      (if (txlog-segment-cache-valid? cached path file-bytes modified-ms)
+      (if (txlog-segment-cache-valid? cached
+                                      path
+                                      file-bytes
+                                      modified-ms
+                                      active-segment?
+                                      active-segment-offset)
         cached
-        (let [entry (txlog-segment-cache-entry segment)]
+        (let [entry (txlog-segment-cache-entry state segment)]
           (vreset! cache-v (assoc cache0 segment-id entry))
           entry)))
-    (txlog-segment-cache-entry segment)))
+    (txlog-segment-cache-entry state segment)))
 
 (defn- prune-txlog-records-cache!
   [cache-v segments]
@@ -2550,7 +2579,7 @@
                           collected '()]
                      (if-let [segment (first remaining)]
                        (let [{:keys [records min-lsn]}
-                             (txlog-segment-records-entry segment cache-v)
+                             (txlog-segment-records-entry state segment cache-v)
                              collected' (if (seq records)
                                           (cons records collected)
                                           collected)]
@@ -2561,6 +2590,7 @@
                        (->> collected (mapcat identity) vec)))
                    (->> segments
                         (mapcat #(-> (txlog-segment-records-entry
+                                      state
                                       %
                                       cache-v)
                                      :records))

@@ -353,6 +353,67 @@
         (when-not (cl/disconnected? client)
           (cl/disconnect client))))))
 
+(defn- safe-disconnect!
+  [client]
+  (when (and client (not (cl/disconnected? client)))
+    (try
+      (cl/disconnect client)
+      (catch Throwable _ nil))))
+
+(deftest remote-abort-transact-releases-lock-test
+  (let [uri     "dtlv://datalevin:datalevin@localhost"
+        db-name (str "abort-transact-lock-test-" (UUID/randomUUID))
+        opts    {:pool-size 1 :time-out 2000}
+        client1 (cl/new-client uri opts)
+        client2 (cl/new-client uri opts)]
+    (try
+      (cl/open-database client1 db-name c/db-store-datalog nil nil)
+      (cl/open-database client2 db-name c/db-store-datalog nil nil)
+      (is (= :command-complete
+             (:type (cl/request client1 {:type :open-transact
+                                         :args [db-name]}))))
+      (is (= :command-complete
+             (:type (cl/request client1 {:type :abort-transact
+                                         :args [db-name]
+                                         :writing? true}))))
+      (is (= :command-complete
+             (:type (cl/request client2 {:type :open-transact
+                                         :args [db-name]}))))
+      (is (= :command-complete
+             (:type (cl/request client2 {:type :abort-transact
+                                         :args [db-name]
+                                         :writing? true}))))
+      (finally
+        (safe-disconnect! client2)
+        (safe-disconnect! client1)))))
+
+(deftest remote-abort-transact-kv-releases-lock-test
+  (let [uri     "dtlv://datalevin:datalevin@localhost"
+        db-name (str "abort-transact-kv-lock-test-" (UUID/randomUUID))
+        opts    {:pool-size 1 :time-out 2000}
+        client1 (cl/new-client uri opts)
+        client2 (cl/new-client uri opts)]
+    (try
+      (cl/open-database client1 db-name c/db-store-kv nil nil)
+      (cl/open-database client2 db-name c/db-store-kv nil nil)
+      (is (= :command-complete
+             (:type (cl/request client1 {:type :open-transact-kv
+                                         :args [db-name]}))))
+      (is (= :command-complete
+             (:type (cl/request client1 {:type :abort-transact-kv
+                                         :args [db-name]
+                                         :writing? true}))))
+      (is (= :command-complete
+             (:type (cl/request client2 {:type :open-transact-kv
+                                         :args [db-name]}))))
+      (is (= :command-complete
+             (:type (cl/request client2 {:type :abort-transact-kv
+                                         :args [db-name]
+                                         :writing? true}))))
+      (finally
+        (safe-disconnect! client2)
+        (safe-disconnect! client1)))))
+
 (deftest same-client-multiple-dbs-test
   (let [uri-str "dtlv://datalevin:datalevin@localhost"
         client  (cl/new-client uri-str)

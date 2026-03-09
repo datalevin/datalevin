@@ -168,12 +168,21 @@
 (defn- internal-checker
   []
   (reify checker/Checker
-    (check [_ _test history _opts]
+    (check [_ test history _opts]
       (let [completed  (filter (comp some? :internal/case-id) history)
             terminal   (filter (comp #{:ok :fail :info} :type) completed)
-            oks        (filter (comp #{:ok} :type) terminal)
-            failures   (filter (comp #{:fail :info} :type) terminal)
-            mismatches (->> terminal
+            disruption-failures
+            (->> terminal
+                 (filter (fn [{:keys [error]}]
+                           (local/expected-disruption-write-failure?
+                             test
+                             error)))
+                 vec)
+            checked-terminal
+            (remove (set disruption-failures) terminal)
+            oks        (filter (comp #{:ok} :type) checked-terminal)
+            failures   (filter (comp #{:fail :info} :type) checked-terminal)
+            mismatches (->> checked-terminal
                             (keep (fn [op]
                                     (let [expected (expected-outcome op)
                                           actual   (cond-> {:type (:type op)}
@@ -189,9 +198,15 @@
                                          :actual   actual}))))
                             vec)]
         {:valid?           (and (empty? mismatches)
-                                (pos? (count oks)))
+                                (pos? (+ (count oks)
+                                         (count disruption-failures))))
          :ok-count         (count oks)
          :failure-count    (count failures)
+         :disruption-failure-count (count disruption-failures)
+         :disruption-failure-samples
+         (vec (take 10
+                    (map #(select-keys % [:f :internal/case-id :error])
+                         disruption-failures)))
          :mismatch-count   (count mismatches)
          :mismatch-samples (vec (take 10 mismatches))}))))
 

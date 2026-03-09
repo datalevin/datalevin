@@ -299,6 +299,79 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest lookup-ref-cache-invalidation-test
+  (let [dir    (u/tmp-dir (str "lookup-ref-cache-" (UUID/randomUUID)))
+        schema {:index/case  {:db/valueType :db.type/long}
+                :index/key   {:db/valueType :db.type/string
+                              :db/unique :db.unique/identity}
+                :index/name  {:db/valueType :db.type/string}
+                :index/value {:db/valueType :db.type/long}
+                :index/ref   {:db/valueType :db.type/ref}
+                :index/tags  {:db/valueType :db.type/string
+                              :db/cardinality :db.cardinality/many}}
+        norm   (fn [db datoms]
+                 (into #{}
+                       (map (fn [datom]
+                              [(:a datom)
+                               (if (= :index/ref (:a datom))
+                                 (:index/key (d/entity db (:v datom)))
+                                 (:v datom))]))
+                       datoms))]
+    (d/with-conn [conn dir schema]
+      (d/transact! conn
+                   [{:db/id "root"
+                     :index/case 1
+                     :index/key "index-00000001-root"
+                     :index/name "root-index-00000001"
+                     :index/value 1
+                     :index/tags ["index-00000001-tag-a"
+                                  "index-00000001-tag-b"]
+                     :index/ref "child-a"}
+                    {:db/id "child-a"
+                     :index/case 1
+                     :index/key "index-00000001-child-a"
+                     :index/name "child-a-index-00000001"}])
+
+      ;; Prime caches using lookup refs; the second transaction must invalidate
+      ;; these slices even though the cached key stores unresolved entity ids.
+      (d/datoms @conn :eav [:index/key "index-00000001-root"])
+      (d/datoms @conn :ave :index/ref [:index/key "index-00000001-child-a"])
+
+      (d/transact! conn
+                   [{:db/id "child-b"
+                     :index/case 1
+                     :index/key "index-00000001-child-b"
+                     :index/name "child-b-index-00000001"}
+                    [:db/retract [:index/key "index-00000001-root"]
+                     :index/tags "index-00000001-tag-a"]
+                    [:db/add [:index/key "index-00000001-root"]
+                     :index/tags "index-00000001-tag-c"]
+                    [:db/retract [:index/key "index-00000001-root"]
+                     :index/ref [:index/key "index-00000001-child-a"]]
+                    [:db/add [:index/key "index-00000001-root"]
+                     :index/ref "child-b"]
+                    [:db/cas [:index/key "index-00000001-root"] :index/value 1 2]])
+
+      (is (= #{[:index/case 1]
+               [:index/key "index-00000001-root"]
+               [:index/name "root-index-00000001"]
+               [:index/value 2]
+               [:index/ref "index-00000001-child-b"]
+               [:index/tags "index-00000001-tag-b"]
+               [:index/tags "index-00000001-tag-c"]}
+             (norm @conn
+                   (d/datoms @conn :eav [:index/key "index-00000001-root"]))))
+
+      (is (= #{}
+             (into #{} (d/datoms @conn :ave :index/ref
+                                 [:index/key "index-00000001-child-a"]))))
+
+      (is (= #{[:index/ref "index-00000001-child-b"]}
+             (norm @conn
+                   (d/datoms @conn :ave :index/ref
+                             [:index/key "index-00000001-child-b"])))))
+    (u/delete-files dir)))
+
 (deftest test-lookup-refs-query
   (let [schema {:name   { :db/unique :db.unique/identity }
                 :friend { :db/valueType :db.type/ref }}

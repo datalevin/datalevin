@@ -1,9 +1,11 @@
 (ns datalevin.storage-test
   (:require
+   [clojure.java.io :as io]
    [datalevin.storage :as sut]
    [datalevin.util :as u]
    [datalevin.constants :as c]
    [datalevin.interface :as if]
+   [datalevin.kv :as kv]
    [datalevin.txlog :as txlog]
    [datalevin.datom :as d]
    [datalevin.pipe :as p]
@@ -95,6 +97,43 @@
                  (:records (txlog/scan-segment (.getPath ^java.io.File file))))))
            vec)
       [])))
+
+(deftest active-txlog-read-bounds-to-runtime-segment-offset-test
+  (let [dir              (repo-tmp-dir "storage-active-txlog-read-")
+        txlog-dir        (str dir java.io.File/separator "txlog")
+        path             (str txlog-dir
+                              java.io.File/separator
+                              "segment-0000000000000001.wal")
+        rows             [[:put "active" 1 2 :long :long]]
+        committed-bytes  (txlog/encode-record
+                          (txlog/encode-commit-row-payload 1 100 rows))
+        trailing-bytes   (txlog/encode-commit-row-payload 2 200 rows)
+        committed-offset (long (alength ^bytes committed-bytes))
+        state            {:dir txlog-dir
+                          :txlog-records-cache (volatile! {})
+                          :segment-id (volatile! 1)
+                          :segment-offset (volatile! committed-offset)}]
+    (try
+      (u/create-dirs txlog-dir)
+      (with-open [out (io/output-stream path)]
+        (.write out ^bytes committed-bytes)
+        (.write out ^bytes trailing-bytes))
+      (let [records (kv/txlog-records state)
+            summary (txlog/segment-summaries
+                     txlog-dir
+                     {:record->lsn kv/txlog-record-lsn
+                      :active-segment-id 1
+                      :active-segment-offset committed-offset})]
+        (is (= 1 (count records)))
+        (is (= rows (:rows (first records))))
+        (is (= committed-offset
+               (long (get-in summary [:segments 0 :bytes]))))
+        (is (= 1
+               (long (get-in summary [:segments 0 :record-count]))))
+        (is (= 1
+               (long (get-in summary [:segments 0 :max-lsn])))))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest reopen-wal-store-preserves-ha-opts-test
   (let [dir      (repo-tmp-dir "storage-ha-reopen-")
@@ -901,3 +940,23 @@
                new-sample))))
     (if/close store)
     (u/delete-files dir)))
+
+(deftest sampling-metadata-persistence-is-best-effort-test
+  (let [dir   (u/tmp-dir (str "sampling-metadata-best-effort-" (UUID/randomUUID)))
+        store (sut/open dir
+                        {:a {:db/valueType :db.type/long}}
+                        {:kv-opts {:flags (conj c/default-env-flags :nosync)}})
+        aid-a (-> (if/schema store) :a :db/aid)]
+    (try
+      (if/load-datoms store (mapv #(d/datom % :a %) (range 1 11)))
+      (with-redefs [if/transact-kv
+                    (fn [& _]
+                      (throw (ex-info "simulated sampling metadata failure"
+                                      {:type :txlog/commit-timeout})))]
+        (let [sample (mapv #(aget ^objects % 0) (sut/e-sample* store :a aid-a))
+              ratio  (sut/default-ratio* store :a aid-a)]
+          (is (= (range 1 11) sample))
+          (is (= 1.0 ^double ratio))))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))

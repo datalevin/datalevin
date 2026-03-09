@@ -41,10 +41,9 @@
 (defonce ^:private initialized-clusters (atom #{}))
 (def ^:private setup-timeout-ms 15000)
 (def ^:private tx-fn-query
-  '[:find ?ident .
-    :in $ ?ident
+  '[:find ?fn .
     :where
-    [?e :db/ident ?ident]
+    [?e :db/ident :bank/transfer]
     [?e :db/fn ?fn]])
 (def ^:private balances-query
   '[:find ?account-id ?balance
@@ -107,8 +106,7 @@
   [cluster-id logical-node account-count]
   (let [transfer-fn (local/local-query cluster-id
                                        logical-node
-                                       tx-fn-query
-                                       :bank/transfer)
+                                       tx-fn-query)
         rows        (local/local-query cluster-id
                                        logical-node
                                        balances-query)]
@@ -120,7 +118,7 @@
        :ready? false}
 
       (= ::local/unavailable rows)
-      {:transfer-fn-visible? (= :bank/transfer transfer-fn)
+      {:transfer-fn-visible? (fn? transfer-fn)
        :balances ::local/unavailable
        :node-diagnostics (local/node-diagnostics cluster-id logical-node)
        :ready? false}
@@ -132,10 +130,10 @@
                                      rows)
             balances            (mapv balances-by-account
                                       (range (long account-count)))]
-        {:transfer-fn-visible? (= :bank/transfer transfer-fn)
+        {:transfer-fn-visible? (fn? transfer-fn)
          :balances balances
          :node-diagnostics (local/node-diagnostics cluster-id logical-node)
-         :ready? (and (= :bank/transfer transfer-fn)
+         :ready? (and (fn? transfer-fn)
                       (= (long account-count) (count balances))
                       (every? integer? balances))}))))
 

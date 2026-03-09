@@ -60,6 +60,7 @@
        "Scenarios:\n"
        "  failover\n"
        "  follower-rejoin\n"
+       "  rejoin-bootstrap\n"
        "  membership-hash-drift\n"
        "  fencing-hook-verify\n"
        "  clock-skew-pause\n"
@@ -1230,6 +1231,212 @@
                                                     (:live-node-ids
                                                      @ctx-atom))}})))))
 
+(defn- run-rejoin-bootstrap!
+  [ctx-atom]
+  (let [write-sleep-ms     150
+        writes-per-batch   4
+        base-opts          (assoc (base-ha-opts (:nodes @ctx-atom)
+                                                (:group-id @ctx-atom)
+                                                (:db-identity @ctx-atom)
+                                                (:control-backend @ctx-atom))
+                             :wal-segment-max-ms 100
+                             :wal-segment-prealloc? false
+                             :wal-segment-prealloc-mode :none
+                             :wal-replica-floor-ttl-ms 500
+                             :snapshot-scheduler? false)]
+    (step! "Starting local 3-node HA cluster for rejoin-bootstrap drill")
+    (let [ctx                 (setup-cluster! ctx-atom 0 {:base-opts base-opts})
+          {:keys [leader-id]} (wait-for-single-leader! (:servers ctx)
+                                                       (:db-name ctx)
+                                                       (:live-node-ids ctx)
+                                                       20000)
+          initial-leader-id   leader-id
+          initial-endpoint    (get-in ctx [:nodes (dec leader-id) :endpoint])]
+      (step! "Initial leader:" initial-leader-id initial-endpoint)
+      (write-value! (:conns ctx) initial-leader-id "seed" "v1")
+      (let [target-lsn (effective-local-lsn ctx initial-leader-id)]
+        (wait-for-replication! ctx (:live-node-ids ctx) target-lsn)
+        (verify-value-on-nodes! ctx (:live-node-ids ctx) "seed" "v1"))
+      (let [baseline-lsn (effective-local-lsn ctx initial-leader-id)]
+        (step! "Stopping leader to force rejoin bootstrap:" initial-leader-id)
+        (swap! ctx-atom stop-node! initial-leader-id)
+        (let [ctx                 @ctx-atom
+              {:keys [leader-id]} (wait-for-single-leader! (:servers ctx)
+                                                           (:db-name ctx)
+                                                           (:live-node-ids ctx)
+                                                           20000)
+              failover-leader-id  leader-id
+              failover-endpoint   (get-in ctx [:nodes (dec leader-id) :endpoint])
+              source-node-ids     (->> (:live-node-ids ctx)
+                                       sort
+                                       vec)
+              source-endpoints    (->> source-node-ids
+                                       (map #(get-in ctx [:nodes (dec %) :endpoint]))
+                                       set)]
+          (step! "Failover leader:" failover-leader-id failover-endpoint)
+          (write-value! (:conns ctx) failover-leader-id "post-failover" "v2")
+          (let [target-lsn (effective-local-lsn ctx failover-leader-id)]
+            (wait-for-replication! ctx (:live-node-ids ctx) target-lsn)
+            (verify-value-on-nodes! ctx (:live-node-ids ctx)
+                                    "post-failover"
+                                    "v2"))
+          (create-snapshots-on-nodes! ctx source-node-ids)
+          (let [batch-2-lsn       (write-series-with-rolls! ctx
+                                                            failover-leader-id
+                                                            "gap-batch-1"
+                                                            writes-per-batch
+                                                            write-sleep-ms)
+                snapshot-2        (create-snapshots-on-nodes! ctx
+                                                              source-node-ids)
+                batch-3-lsn       (write-series-with-rolls! ctx
+                                                            failover-leader-id
+                                                            "gap-batch-2"
+                                                            writes-per-batch
+                                                            write-sleep-ms)
+                snapshot-3        (create-snapshots-on-nodes! ctx
+                                                              source-node-ids)
+                follower-next-lsn (unchecked-inc (long baseline-lsn))
+                retention-before  (await-value
+                                   "replica floor expiry before rejoin bootstrap WAL GC"
+                                   10000
+                                   200
+                                   (fn []
+                                     (let [state (retention-state-on-node
+                                                  @ctx-atom
+                                                  failover-leader-id)]
+                                       (when (and (= 1 (long (or (get-in state
+                                                                          [:floor-providers
+                                                                           :replica
+                                                                           :active-count])
+                                                                 0)))
+                                                  (> (long (or
+                                                            (:required-retained-floor-lsn
+                                                             state)
+                                                            0))
+                                                     (long follower-next-lsn)))
+                                         state))))
+                gc-results        (into {}
+                                        (map (fn [node-id]
+                                               [node-id
+                                                (gc-txlog-segments-on-node!
+                                                 @ctx-atom node-id)]))
+                                        source-node-ids)]
+            (doseq [[node-id gc-result] gc-results
+                    :let [min-retained-lsn
+                          (long (or (get-in gc-result [:after :min-retained-lsn])
+                                    0))]]
+              (when (zero? (:deleted-count gc-result))
+                (throw (ex-info "Rejoin-bootstrap drill did not delete any WAL segments on a live source"
+                                {:node-id node-id
+                                 :gc-result gc-result})))
+              (when (<= min-retained-lsn (long follower-next-lsn))
+                (throw (ex-info "Rejoin-bootstrap drill did not advance retained WAL floor beyond the stopped leader"
+                                {:node-id node-id
+                                 :follower-id initial-leader-id
+                                 :follower-next-lsn follower-next-lsn
+                                 :gc-result gc-result}))))
+            (step! "Forced WAL GC on surviving nodes for rejoin bootstrap:"
+                   source-node-ids)
+            (swap! ctx-atom restart-node!
+                   initial-leader-id
+                   (node-ha-opts base-opts
+                                 (control-node @ctx-atom initial-leader-id)
+                                 (:fence-script @ctx-atom)
+                                 0
+                                 0))
+            (step! "Restarted former leader for rejoin bootstrap:"
+                   initial-leader-id)
+            (let [ctx                 @ctx-atom
+                  {:keys [leader-id]} (wait-for-single-leader! (:servers ctx)
+                                                               (:db-name ctx)
+                                                               (:live-node-ids ctx)
+                                                               20000)
+                  current-leader-id   leader-id
+                  current-endpoint    (get-in ctx [:nodes (dec leader-id) :endpoint])
+                  _                   (when (= current-leader-id initial-leader-id)
+                                        (throw
+                                          (ex-info "Rejoin-bootstrap drill node unexpectedly became leader"
+                                                   {:initial-leader-id initial-leader-id
+                                                    :probe-snapshot
+                                                    (probe-snapshot (:servers ctx)
+                                                                    (:db-name ctx)
+                                                                    (:live-node-ids ctx))})))
+                  bootstrap-state     (wait-for-follower-bootstrap!
+                                       ctx-atom
+                                       initial-leader-id
+                                       (long (or (get-in snapshot-2
+                                                         [failover-leader-id
+                                                          :snapshot
+                                                          :applied-lsn])
+                                                 0)))
+                  _                   (when-not (= :follower
+                                                  (:ha-role bootstrap-state))
+                                        (throw
+                                          (ex-info "Rejoin-bootstrap drill node did not remain follower during bootstrap"
+                                                   {:node-id initial-leader-id
+                                                    :bootstrap-state bootstrap-state})))
+                  _                   (when-not (contains?
+                                                source-endpoints
+                                                (:ha-follower-bootstrap-source-endpoint
+                                                 bootstrap-state))
+                                        (throw
+                                          (ex-info "Rejoin-bootstrap drill used unexpected snapshot source endpoint"
+                                                   {:expected-source-endpoints
+                                                    source-endpoints
+                                                    :bootstrap-state bootstrap-state})))
+                  rejoin-state        (wait-for-follower-rejoin! ctx-atom
+                                                                 initial-leader-id
+                                                                 current-leader-id
+                                                                 batch-3-lsn)]
+              (step! "Rejoined node bootstrapped from:"
+                     (:ha-follower-bootstrap-source-endpoint bootstrap-state)
+                     "snapshot-lsn:"
+                     (:ha-follower-bootstrap-snapshot-last-applied-lsn
+                      bootstrap-state))
+              (step! "Rejoined node is following leader after bootstrap:"
+                     current-leader-id
+                     current-endpoint
+                     "term:" (:ha-authority-term rejoin-state))
+              (write-value! (:conns ctx)
+                            current-leader-id
+                            "post-rejoin-bootstrap"
+                            "v-final")
+              (let [target-lsn    (effective-local-lsn ctx current-leader-id)
+                    replica-floor (wait-for-replica-floor! ctx-atom
+                                                           current-leader-id
+                                                           initial-leader-id
+                                                           target-lsn)]
+                (wait-for-replication! @ctx-atom
+                                       (:live-node-ids @ctx-atom)
+                                       target-lsn)
+                (verify-value-on-nodes! @ctx-atom
+                                        (:live-node-ids @ctx-atom)
+                                        "post-rejoin-bootstrap"
+                                        "v-final")
+                {:ctx @ctx-atom
+                 :result {:scenario :rejoin-bootstrap
+                          :initial-leader-id initial-leader-id
+                          :initial-leader-endpoint initial-endpoint
+                          :failover-leader-id failover-leader-id
+                          :failover-leader-endpoint failover-endpoint
+                          :current-leader-id current-leader-id
+                          :current-leader-endpoint current-endpoint
+                          :rejoined-node-id initial-leader-id
+                          :baseline-lsn baseline-lsn
+                          :follower-next-lsn follower-next-lsn
+                          :retention-before retention-before
+                          :gc-results gc-results
+                          :source-node-ids source-node-ids
+                          :source-endpoints source-endpoints
+                          :bootstrap-state bootstrap-state
+                          :rejoin-state rejoin-state
+                          :replica-floor replica-floor
+                          :snapshots {:mid-gap snapshot-2
+                                      :pre-rejoin snapshot-3}
+                          :watermarks (watermarks-by-node @ctx-atom
+                                                          (:live-node-ids
+                                                           @ctx-atom))}}))))))))
+
 (defn- run-membership-hash-drift!
   [ctx-atom]
   (step! "Starting local 3-node HA cluster for membership-hash-drift drill")
@@ -2023,6 +2230,7 @@
                   (case scenario
                     "failover"        (run-failover! ctx-atom)
                     "follower-rejoin" (run-follower-rejoin! ctx-atom)
+                    "rejoin-bootstrap" (run-rejoin-bootstrap! ctx-atom)
                     "membership-hash-drift" (run-membership-hash-drift! ctx-atom)
                     "fencing-hook-verify" (run-fencing-hook-verify! ctx-atom)
                     "clock-skew-pause" (run-clock-skew-pause! ctx-atom)

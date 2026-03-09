@@ -15,9 +15,11 @@ Datalevin's HA design:
 The first cut is intentionally narrow:
 
 * local 3-node HA cluster backend
-* append, append-cas, and bank workloads
+* append, append-cas, bank, register, giant-values, tx-fn-register,
+  fencing, rejoin-bootstrap, identity-upsert, and index-consistency workloads
 * Datalevin-specific `grant` and `internal` characterization workloads
-* local leader failover, quorum-loss, and clock-skew nemeses
+* local leader pause, leader failover, leader partition, follower rejoin,
+  quorum-loss, and clock-skew nemeses
 * list-append transactions support reads, appends, and mixed read/write
   sequences
 
@@ -33,6 +35,21 @@ does not claim full parity with the Datomic Jepsen suite.
   using transaction-local CAS guards for write-write conflicts
 * `src/datalevin/jepsen/workload/bank.clj`: transfer workload checking
   conservation of total balance and non-negative account state
+* `src/datalevin/jepsen/workload/giant_values.clj`: linearizable register
+  workload that stores oversized payloads and validates exact replay/readback
+* `src/datalevin/jepsen/workload/fencing.clj`: HA admission/fencing workload
+  that probes every node directly and fails on split-brain write admission
+* `src/datalevin/jepsen/workload/register.clj`: linearizable per-key register
+  workload using Jepsen's independent register checker
+* `src/datalevin/jepsen/workload/tx_fn_register.clj`: linearizable register
+  workload whose writes and CAS operations go through installed giant `:db/fn`s
+* `src/datalevin/jepsen/workload/identity_upsert.clj`: unique-identity,
+  lookup-ref, and tempid/upsert characterization workload
+* `src/datalevin/jepsen/workload/index_consistency.clj`: cross-checks the
+  same logical state through entity, pull, query, datoms, and index-range
+* `src/datalevin/jepsen/workload/rejoin_bootstrap.clj`: follower rejoin
+  convergence workload that restarts missing nodes and verifies cluster-wide
+  register state after catch-up
 * `src/datalevin/jepsen/workload/grant.clj`: transaction-function workload for
   single-decision grant approval races
 * `src/datalevin/jepsen/workload/internal.clj`: single-threaded internal
@@ -83,6 +100,55 @@ cd jepsen
 lein run test --workload bank --time-limit 30 --rate 10 --key-count 8 --account-balance 100 --max-transfer 5
 ```
 
+Run the linearizable register workload:
+
+```bash
+cd jepsen
+lein run test --workload register --time-limit 30 --rate 10 --key-count 8
+```
+
+Run the giant-value register workload:
+
+```bash
+cd jepsen
+lein run test --workload giant-values --time-limit 30 --rate 10 --key-count 8
+```
+
+Run the public transaction-function register workload:
+
+```bash
+cd jepsen
+lein run test --workload tx-fn-register --time-limit 30 --rate 10 --key-count 8
+```
+
+Run the follower rejoin convergence workload:
+
+```bash
+cd jepsen
+lein run test --workload rejoin-bootstrap --control-backend sofa-jraft --nemesis rejoin --time-limit 30 --rate 10 --key-count 8
+```
+
+Run the identity-upsert characterization workload:
+
+```bash
+cd jepsen
+lein run test --workload identity-upsert --time-limit 15 --rate 5
+```
+
+Run the index-consistency characterization workload:
+
+```bash
+cd jepsen
+lein run test --workload index-consistency --time-limit 15 --rate 5
+```
+
+Run the fencing workload:
+
+```bash
+cd jepsen
+lein run test --workload fencing --control-backend sofa-jraft --nemesis failover --time-limit 30 --rate 5
+```
+
 Run the internal semantics workload:
 
 ```bash
@@ -95,6 +161,82 @@ Run the same workload with the first HA fault mode:
 ```bash
 cd jepsen
 lein run test --workload append --control-backend sofa-jraft --nemesis failover --time-limit 30 --rate 10
+```
+
+Run a pause-only lease/election stall without killing the process:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis pause --time-limit 30 --rate 10
+```
+
+Exercise the leader-pause nemesis across the local workload set:
+
+```bash
+script/jepsen/pause-workloads
+```
+
+Run a targeted pause subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/pause-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run a leader-isolating network partition:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis partition --time-limit 30 --rate 10
+```
+
+Exercise the leader-partition nemesis across the local workload set:
+
+```bash
+script/jepsen/partition-workloads
+```
+
+Run a targeted subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/partition-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run an asymmetric network cut:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis asymmetric --time-limit 30 --rate 10
+```
+
+Exercise the asymmetric-partition nemesis across the local workload set:
+
+```bash
+script/jepsen/asymmetric-workloads
+```
+
+Run a targeted asymmetric subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/asymmetric-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run a degraded network profile with delay, jitter, and packet loss:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis degraded --time-limit 30 --rate 10
+```
+
+Exercise the degraded-network nemesis across the local workload set:
+
+```bash
+script/jepsen/degraded-workloads
+```
+
+Run a targeted degraded subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/degraded-workloads append bank -- --time-limit 15 --rate 10
 ```
 
 Run a quorum-loss cycle:
@@ -120,7 +262,8 @@ iteration.
 
 The next meaningful increments are:
 
-* more nemeses for pause, partition, and clock skew
+* stronger forced WAL-gap/snapshot-bootstrap scenarios inside the rejoin path
+* full workload characterization under quorum-loss and clock-skew faults
 * JRaft-backed runs as part of the normal matrix
 * Datalevin-specific checkers for fencing and no-split-brain behavior
 * remote multi-host deployment instead of the current single-host harness

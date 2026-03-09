@@ -1,5 +1,15 @@
 # Change Log
 
+## WIP
+### Added
+- [Server] Read only replicas and high availability with auto roll-over and
+  promotion (Raft consensus based)
+  [#72](https://github.com/datalevin/datalevin/issues/72). This implementation comes with a Jepsen
+  test suite for checking correctness
+  [#252](https://github.com/datalevin/datalevin/issues/252). Details in
+  [doc](doc/ha.md).
+- [API] Java API. Release Datalevin as a Java library to maven central.
+- [API] JSON API.
 
 ## 0.10.7 (2026-03-03)
 
@@ -8,6 +18,7 @@
   set in KV store with `wal? true` option. Details are in [doc](doc/wal.md).
 - [WAL] WAL related functions:
   - `open-tx-log` for WAL log access.
+    [#106](https://github.com/datalevin/datalevin/issues/106)
   - `txlog-watermarks`  returns WAL status.
   - `create-snapshot!` for create/rotate LMDB snapshots.
   - `list-snapshots` list the snapshots and metadata.

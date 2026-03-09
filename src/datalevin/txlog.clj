@@ -692,16 +692,23 @@
   Options:
   - `:allow-preallocated-tail?` accept all-zero trailing bytes
   - `:collect-records?` retain decoded records in `:records` (default true)
+  - `:max-offset` only scan the segment prefix up to this byte offset
   - `:on-record` callback invoked for each decoded record"
   ([^String path] (scan-segment path {}))
-  ([^String path {:keys [allow-preallocated-tail? collect-records? on-record]
+  ([^String path {:keys [allow-preallocated-tail? collect-records?
+                         max-offset on-record]
                   :or   {allow-preallocated-tail? false
                          collect-records?         true}}]
    (let [f (io/file path)]
      (with-open [^FileChannel ch (FileChannel/open
                                    (.toPath f)
                                    open-segment-read-options)]
-       (let [size                (.size ch)
+       (let [file-size           (.size ch)
+             size                (if (some? max-offset)
+                                   (long (min ^long file-size
+                                              (long (max 0
+                                                         (long max-offset)))))
+                                   (long file-size))
              ^ByteBuffer read-bf (doto (bf/get-array-buffer 8192)
                                    (.order ByteOrder/BIG_ENDIAN))]
          (try
@@ -1684,7 +1691,8 @@
      :preallocated-tail? (boolean (:preallocated-tail? entry))}))
 
 (defn- scan-segment-summary-entry
-  [segment-id ^File file allow-preallocated-tail? record->lsn marker-offset]
+  [segment-id ^File file allow-preallocated-tail? record->lsn marker-offset
+   max-offset]
   (let [path (.getPath file)
         file-bytes (long (.length file))
         created-ms (long (.lastModified file))
@@ -1704,11 +1712,12 @@
         scan (scan-segment
               path
               {:allow-preallocated-tail? allow-preallocated-tail?
+               :max-offset max-offset
                :collect-records? false
                :on-record on-record})
         bytes (if (:partial-tail? scan)
                 (long (:valid-end scan))
-                file-bytes)
+                (long (:size scan)))
         first-record @first-record-v
         last-record @last-record-v
         marker-record* @marker-rec-v
@@ -1801,6 +1810,9 @@
                  reusable-entry? (or reuse-closed?
                                      reuse-active-by-offset?
                                      reuse-by-metadata?)
+                 max-offset* (when (and active-segment?
+                                        (some? active-offset))
+                               active-offset)
                  {:keys [entry marker-record]}
                  (if reusable-entry?
                    {:entry cached-entry
@@ -1811,7 +1823,8 @@
                                                file
                                                allow-preallocated-tail?
                                                record->lsn
-                                               marker-offset*))]
+                                               marker-offset*
+                                               max-offset*))]
              [(conj acc (segment-summary-from-cache-entry entry now-ms))
               (or marker marker-record)
               (assoc cache* segment-id entry)]))
