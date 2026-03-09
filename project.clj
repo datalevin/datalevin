@@ -58,6 +58,11 @@
   :profiles
   {:uberjar        {:main datalevin.main
                     :aot  [datalevin.main]}
+   :core-release   {:java-source-paths ^:replace ["src/java/datalevin/cpp"
+                                                  "src/java/datalevin/ha"
+                                                  "src/java/datalevin/io"
+                                                  "src/java/datalevin/utl"
+                                                  "src/java/org"]}
    :native-uberjar {:aot          [datalevin.main],
                     :uberjar-name "main.uberjar.jar"}
    :test0-uberjar  {:main         datalevin.test0
@@ -86,7 +91,9 @@
   :javac-options ["--release" "21"]
   :jar-exclusions [#"_test" #"\/test\/" #"test\d" #"\/data\.json" #"all\.json"
                    #"\.csv" #"\.edn" #"\.java"
-                   #"\.md" #"\.txt"]
+                   #"\.md" #"\.txt"
+                   #"^java/"
+                   #"client_quickstart_check\.clj"]
   :uberjar-exclusions [#"pod.huahaiy.datalevin-test"]
   :deploy-repositories [["clojars" {:url           "https://repo.clojars.org"
                                     :username      :env/clojars_username

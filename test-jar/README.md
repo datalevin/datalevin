@@ -7,6 +7,27 @@ release artifacts in these scenarios:
 
 Done with `test.sh`.
 
+## Using Datalevin library as a dependency in a JVM Java project
+
+Done with `test-java.sh`.
+
+This script installs the separate `org.datalevin/datalevin-java` artifact into
+`../target/java-release/m2`, then compiles and runs a small Java program
+against the self-contained Java jar layout. The smoke classpath filters out the
+separate `dtlvnative-*` jars so the test verifies that the Java artifact really
+bundles the Datalevin runtime payload. This smoke test also compiles and runs
+the documented
+`examples/java/ClientQuickStart.java` example against a temporary local
+Datalevin server.
+
+## Measuring Java API overhead
+
+Done with `bench-java.sh`.
+
+This script installs the `org.datalevin/datalevin-java` artifact, then compiles
+and runs a small Java benchmark that compares the wrapper layer against direct
+`ClojureRuntime` calls in the same JVM.
+
 ## Running Datalevin standalone uberjar
 
 Done with `test-uber.sh`.

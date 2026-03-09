@@ -51,6 +51,7 @@
     (update-file "test-jar/test-uber.sh" old->new)
     (update-file "doc/install.md" old->new)
     (update-file "doc/dtlv.md" old->new)
+    (update-file "examples/java/README.md" old->new)
     (update-file "src/datalevin/constants.clj" old->new)
     (update-file "README.md" old->new)))
 
@@ -63,6 +64,7 @@
       "test-jar/test-uber.sh"
       "doc/install.md"
       "doc/dtlv.md"
+      "examples/java/README.md"
       "src/datalevin/constants.clj"
       "README.md")
 

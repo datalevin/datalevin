@@ -285,6 +285,36 @@
                       {:code  :invalid-request
                        :field field})))))
 
+(defn- normalize-attr-set
+  [x field]
+  (cond
+    (nil? x) nil
+    (set? x) (into #{} (map #(require-keyword % field)) x)
+    (sequential? x) (into #{} (map #(require-keyword % field)) x)
+    (instance? java.util.Collection x)
+    (into #{} (map #(require-keyword % field)) x)
+    :else
+    (throw (ex-info (str field " must be a collection of attributes.")
+                    {:code  :invalid-request
+                     :field field}))))
+
+(defn- normalize-rename-map
+  [x field]
+  (cond
+    (nil? x) nil
+    (map? x)
+    (into {}
+          (map (fn [[old new]]
+                 [(require-keyword old field)
+                  (require-keyword new field)]))
+          x)
+    (instance? java.util.Map x)
+    (normalize-rename-map (into {} x) field)
+    :else
+    (throw (ex-info (str field " must be an object.")
+                    {:code  :invalid-request
+                     :field field}))))
+
 (defn- normalize-db-store-type
   [x field]
   (case x
@@ -621,8 +651,9 @@
   [args context]
   (d/update-schema (resolve-conn context (get args "conn"))
                    (get args "schema-update")
-                   (get args "del-attrs")
-                   (get args "rename-map")))
+                   (normalize-attr-set (get args "del-attrs") "del-attrs")
+                   (normalize-rename-map (get args "rename-map")
+                                         "rename-map")))
 
 (defn- handle-opts
   [args context]
