@@ -492,6 +492,30 @@
     (instance? ILMDB store)  (i/close-kv store)
     :else                    (u/raise "Unknown store" {})))
 
+(declare store-closed?)
+
+(defn- reopen-store
+  [store]
+  (cond
+    (instance? IStore store)
+    (st/open (i/dir store) (i/schema store) (i/opts store))
+
+    (instance? ILMDB store)
+    (l/open-kv (i/env-dir store) (i/env-opts store))
+
+    :else
+    (u/raise "Unknown store" {})))
+
+(defn- closed-store-race?
+  [t store]
+  (or (try
+        (store-closed? store)
+        (catch Throwable _
+          true))
+      (and t
+           (s/includes? (or (ex-message t) "")
+                        "LMDB env is closed"))))
+
 (defn- has-permission?
   [req-act req-obj req-tgt user-permissions]
   (some (fn [{:keys [permission/act permission/obj permission/tgt] :as p}]
@@ -880,11 +904,25 @@
 
 (defn- add-store
   [^Server server db-name store]
-  (update-db server db-name
-             #(let [m (cond-> (assoc % :store store)
-                        (instance? IStore store) (assoc :dt-db (db/new-db store)))]
-                (ensure-ha-runtime (.-root server) db-name m store)))
-  (ensure-ha-renew-loop server db-name))
+  (letfn [(add-store* [store]
+            (update-db server db-name
+                       #(let [m (cond-> (assoc % :store store)
+                                  (instance? IStore store)
+                                  (assoc :dt-db (db/new-db store)))]
+                          (ensure-ha-runtime (.-root server) db-name m store)))
+            (ensure-ha-renew-loop server db-name)
+            store)
+          (attempt-add-store [store retries]
+            (try
+              (add-store* store)
+              (catch Throwable t
+                (if (and (pos? retries)
+                         (closed-store-race? t store))
+                  (do
+                    (Thread/sleep 50)
+                    (attempt-add-store (reopen-store store) (dec retries)))
+                  (throw t)))))]
+    (attempt-add-store store 3)))
 
 (defn- get-db
   ([server db-name]
@@ -1417,8 +1455,8 @@
                            (case db-type
                              :datalog   (st/open dir schema opts)
                              :key-value (l/open-kv dir opts)))
+              store    (add-store server db-name store)
               datalog? (instance? Store store)]
-          (add-store server db-name store)
           (update-client server client-id
                          #(cond-> %
                             true     (update :stores assoc db-name

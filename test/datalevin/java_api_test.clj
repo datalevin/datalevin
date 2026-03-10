@@ -12,13 +12,14 @@
    [clojure.edn :as edn]
    [clojure.string :as str]
    [clojure.test :refer [deftest is use-fixtures]]
-	   [datalevin.json-api :as sut]
-	   [datalevin.test.core :as tdc]
-	   [datalevin.util :as u])
+   [datalevin.json-api :as sut]
+   [datalevin.json-api.shared :as shared]
+   [datalevin.test.core :as tdc]
+   [datalevin.util :as u])
   (:import
-	   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData]
-	   [java.util List Map UUID]
-	   [java.util.function BiConsumer BiFunction BiPredicate Consumer]))
+   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData]
+   [java.util List Map UUID]
+   [java.util.function BiConsumer BiFunction BiPredicate Consumer]))
 
 (defn- clean-java-api-state
   [f]
@@ -31,7 +32,8 @@
 (use-fixtures :each clean-java-api-state)
 
 (defn- handle-count []
-  (.size ^java.util.Map (var-get #'sut/handles)))
+  (.size ^java.util.Map
+         (:handles (var-get #'shared/default-session-state))))
 
 (defn- java-map
   [& key-values]

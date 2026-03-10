@@ -2569,6 +2569,56 @@
                (ex-info "authentication failed" {}
                         (RuntimeException. "boom"))))))
 
+(deftest ha-request-timeout-prefers-control-plane-rpc-budget-test
+  (let [m {:ha-lease-renew-ms 1000
+           :ha-control-plane {:rpc-timeout-ms 5000}}]
+    (is (= 5000 (#'dha/ha-request-timeout-ms m 10000)))
+    (is (= 5000 (#'dha/ha-request-timeout-ms m 5000)))
+    (is (= 1000 (#'dha/ha-request-timeout-ms
+                 {:ha-lease-renew-ms 250}
+                 10000)))))
+
+(deftest add-store-reopens-datalog-store-after-closed-lmdb-race-test
+  (let [dir (u/tmp-dir (str "server-add-store-race-" (UUID/randomUUID)))
+        server (srv/create {:port 0 :root dir})
+        db-name "orders"
+        store-dir (#'srv/db-dir dir db-name)
+        schema {:name {:db/valueType :db.type/string}}
+        opts {:db-name db-name
+              :wal? true}
+        store (st/open store-dir schema opts)
+        original-new-db db/new-db
+        fail-once? (atom true)]
+    (try
+      (with-redefs [db/new-db
+                    (fn
+                      ([store]
+                       (if (compare-and-set! fail-once? true false)
+                         (do
+                           (i/close store)
+                           (throw
+                            (AssertionError.
+                             "Assert failed: LMDB env is closed.\n(not (.closed-kv? this))")))
+                         (original-new-db store)))
+                      ([store info]
+                       (if (compare-and-set! fail-once? true false)
+                         (do
+                           (i/close store)
+                           (throw
+                            (AssertionError.
+                             "Assert failed: LMDB env is closed.\n(not (.closed-kv? this))")))
+                         (original-new-db store info))))]
+        (let [added-store (#'srv/add-store server db-name store)]
+          (is (instance? Store added-store))
+          (is (not (identical? store added-store)))
+          (is (false? (i/closed? added-store)))
+          (is (= added-store (#'srv/get-store server db-name)))
+          (is (some? (#'srv/get-db server db-name)))
+          (is (= c/e0 (i/init-max-eid added-store)))))
+      (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
+
 (deftest ha-follower-replica-floor-keeps-leader-retention-safe-while-fresh-test
   (let [leader-dir (u/tmp-dir (str "ha-leader-retention-"
                                    (UUID/randomUUID)))

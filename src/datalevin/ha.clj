@@ -48,6 +48,15 @@
     (:endpoint (first (filter #(= node-id (:node-id %))
                               (:ha-members ha-opts))))))
 
+(defn- ha-request-timeout-ms
+  [m max-ms]
+  (let [renew-ms (long (or (:ha-lease-renew-ms m)
+                           c/*ha-lease-renew-ms*))
+        rpc-timeout-ms (long (or (get-in m [:ha-control-plane :rpc-timeout-ms])
+                                 0))
+        budget-ms (max 1000 renew-ms rpc-timeout-ms)]
+    (long (min (long max-ms) budget-ms))))
+
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
   (if (= :leader (:ha-role m))
@@ -460,10 +469,7 @@
                        host
                        ":"
                        port)
-              timeout-ms (long (max 500
-                                    (min 5000
-                                         (long (or (:ha-lease-renew-ms m)
-                                                   c/*ha-lease-renew-ms*)))))
+              timeout-ms (ha-request-timeout-ms m 5000)
               client-opts {:pool-size 1
                            :time-out timeout-ms}]
           (try
@@ -739,10 +745,7 @@
                    host
                    ":"
                    port)
-          timeout-ms (long (max 500
-                                (min 10000
-                                     (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))
+          timeout-ms (ha-request-timeout-ms m 10000)
           client-opts {:pool-size 1
                        :time-out timeout-ms}
           client (cl/new-client uri client-opts)]
@@ -936,10 +939,7 @@
                    host
                    ":"
                    port)
-          timeout-ms (long (max 500
-                                (min 10000
-                                     (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))
+          timeout-ms (ha-request-timeout-ms m 10000)
           client-opts {:pool-size 1
                        :time-out timeout-ms}
           client (cl/new-client uri client-opts)]
