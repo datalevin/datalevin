@@ -24,6 +24,8 @@
    [java.util UUID]))
 
 (def ^:private default-port-base 19001)
+(def ^:private default-port-limit 31999)
+(def ^:private port-block-size 32)
 (def ^:private cluster-timeout-ms 10000)
 ; Keep request timeout close to Jepsen's leader wait so paused nodes fail fast.
 (def ^:private conn-client-opts {:pool-size 1 :time-out cluster-timeout-ms})
@@ -36,10 +38,38 @@
   {:delay-ms 0
    :jitter-ms 0
    :drop-probability 0.3})
+(def ^:private degraded-network-profile-templates
+  [{:delay-ms 25
+    :jitter-ms 10
+    :drop-probability 0.02}
+   {:delay-ms 100
+    :jitter-ms 25
+    :drop-probability 0.05}
+   {:delay-ms 250
+    :jitter-ms 100
+    :drop-probability 0.1}
+   {:delay-ms 500
+    :jitter-ms 200
+    :drop-probability 0.2}
+   {:delay-ms 750
+    :jitter-ms 300
+    :drop-probability 0.35}])
+(def ^:private graph-cut-direction-modes
+  [:none :left->right :right->left :bidirectional])
+(def ^:private storage-fault-modes
+  #{:stall :disk-full})
+(def ^:private storage-fault-default-stages
+  #{:txlog-append
+    :txlog-sync
+    :txlog-replay
+    :txlog-force-sync
+    :lmdb-sync})
+(def ^:private storage-stall-poll-ms 100)
 
 (def default-nodes ["n1" "n2" "n3"])
 
 (defonce ^:private clusters (atom {}))
+(defonce ^:private next-port-block (atom -1))
 
 (def ^:private base-fetch-ha-leader-txlog-batch dha/fetch-ha-leader-txlog-batch)
 (def ^:private base-report-ha-replica-floor! dha/report-ha-replica-floor!)
@@ -69,6 +99,69 @@
         dest-logical-node
         " via "
         endpoint)))
+
+(defn- authority-diagnostics-snapshot
+  [authority]
+  (when authority
+    (if-let [f (try
+                 (requiring-resolve 'datalevin.ha.control/authority-diagnostics)
+                 (catch Throwable _
+                   nil))]
+      (f authority)
+      {:backend :diagnostics-unavailable})))
+
+(defn- normalize-storage-fault
+  [{:keys [mode stages] :as fault}]
+  (let [mode* (keyword (or mode :stall))]
+    (when-not (contains? storage-fault-modes mode*)
+      (u/raise "Unsupported Jepsen storage fault mode"
+               {:mode mode*
+                :allowed storage-fault-modes}))
+    (assoc fault
+           :mode mode*
+           :stages (set (or stages storage-fault-default-stages)))))
+
+(defn storage-fault
+  [cluster-id logical-node]
+  (get-in @clusters [cluster-id :storage-faults logical-node]))
+
+(defn- active-storage-fault-target
+  [{:keys [db-identity ha-node-id]}]
+  (when (and (string? db-identity)
+             (some? ha-node-id))
+    (when-let [[cluster-id cluster] (cluster-entry-for-db-identity db-identity)]
+      (when-let [logical-node (get-in cluster [:node-by-id ha-node-id])]
+        (when-let [fault (storage-fault cluster-id logical-node)]
+          {:cluster-id cluster-id
+           :logical-node logical-node
+           :fault fault})))))
+
+(defn- disk-full-exception
+  [cluster-id logical-node stage]
+  (ex-info "No space left on device"
+           {:type :jepsen/disk-full
+            :cluster-id cluster-id
+            :logical-node logical-node
+            :stage stage}))
+
+(defn maybe-apply-storage-fault!
+  [{:keys [stage] :as context}]
+  (when-let [{:keys [cluster-id logical-node fault]}
+             (active-storage-fault-target context)]
+    (when (contains? (:stages fault) stage)
+      (case (:mode fault)
+        :disk-full
+        (throw (disk-full-exception cluster-id logical-node stage))
+
+        :stall
+        (loop []
+          (when-let [current (storage-fault cluster-id logical-node)]
+            (when (and (= :stall (:mode current))
+                       (contains? (:stages current) stage))
+              (Thread/sleep (long storage-stall-poll-ms))
+              (recur))))
+
+        nil))))
 
 (defn blocked-link?
   [cluster-id src-logical-node dest-logical-node]
@@ -166,6 +259,11 @@
                     (constantly partition-aware-fetch-ha-endpoint-snapshot-copy!))
     true))
 
+(defonce ^:private storage-fault-hook-installed?
+  (do
+    (kv/set-storage-fault-hook! maybe-apply-storage-fault!)
+    true))
+
 (defn- existing-canonical-path
   [& path-parts]
   (let [^java.io.File file (apply io/file path-parts)]
@@ -184,49 +282,92 @@
   []
   (System/currentTimeMillis))
 
-(defn- random-port-candidate
+(defn- port-block-count
   []
-  (+ 35000 (rand-int 20000)))
+  (inc (quot (- default-port-limit default-port-base) port-block-size)))
 
 (defn- reserve-port-socket
-  [chosen]
-  (loop [attempt 0]
-    (when (>= attempt 256)
-      (u/raise "Unable to reserve Jepsen server port"
-               {:chosen chosen
-                :attempt attempt}))
-    (let [candidate (random-port-candidate)]
-      (if (contains? chosen candidate)
-        (recur (inc attempt))
-        (let [socket (try
-                       (doto (ServerSocket.)
-                         (.bind (InetSocketAddress. candidate)))
-                       (catch Exception _
-                         ::retry))]
-          (if (identical? ::retry socket)
-            (recur (inc attempt))
-            socket))))))
+  [^long port]
+  (doto (ServerSocket.)
+    (.setReuseAddress false)
+    (.bind (InetSocketAddress. "127.0.0.1" (int port)))))
+
+(defn- port-bind-error
+  [^long port ^Exception e]
+  {:port    port
+   :class   (.getName (class e))
+   :message (.getMessage e)})
+
+(defn- reserve-port-block
+  [^long base ^long n]
+  (loop [idx     0
+         sockets []]
+    (if (= idx n)
+      {:sockets sockets}
+      (let [port   (+ base idx)
+            result (try
+                     {:socket (reserve-port-socket port)}
+                     (catch Exception e
+                       {:error (port-bind-error port e)}))]
+        (if-let [error (:error result)]
+          (do
+            (doseq [^ServerSocket socket sockets]
+              (try
+                (.close socket)
+                (catch Exception _
+                  nil)))
+            {:base  base
+             :error error})
+          (recur (inc idx) (conj sockets (:socket result))))))))
 
 (defn- reserve-ports
   [n]
-  (let [sockets (loop [chosen  #{}
-                       sockets []]
-                  (if (= n (count sockets))
-                    sockets
-                    (let [socket (reserve-port-socket chosen)
-                          port   (.getLocalPort ^ServerSocket socket)]
-                      (recur (conj chosen port)
-                             (conj sockets socket)))))]
-    (try
-      (mapv (fn [^ServerSocket socket]
-              (.getLocalPort socket))
-            sockets)
-      (finally
-        (doseq [^ServerSocket socket sockets]
+  (when (> n port-block-size)
+    (u/raise "Unable to reserve Jepsen server ports"
+             {:requested-ports n
+              :port-block-size port-block-size}))
+  (let [block-count    (port-block-count)
+        start-block    (mod (swap! next-port-block inc) block-count)
+        sample-limit   8]
+    (loop [attempt 0
+           errors  []]
+      (when (>= attempt block-count)
+        (let [data {:requested-ports n
+                    :attempt attempt
+                    :port-base default-port-base
+                    :port-limit default-port-limit
+                    :port-block-size port-block-size
+                    :sample-bind-errors errors}
+              sample-error (some-> errors first :error)
+              message      (cond-> "Unable to reserve Jepsen server ports"
+                             sample-error
+                             (str " (sample bind error: "
+                                  (:class sample-error)
+                                  " on port "
+                                  (:port sample-error)
+                                  ": "
+                                  (:message sample-error)
+                                  ")"))]
+          (u/raise message
+                   data)))
+      (let [block-idx (mod (+ start-block attempt) block-count)
+            base      (+ default-port-base (* block-idx port-block-size))
+            result    (reserve-port-block base n)]
+        (if-let [sockets (:sockets result)]
           (try
-            (.close socket)
-            (catch Exception _
-              nil)))))))
+            (mapv (fn [^ServerSocket socket]
+                    (.getLocalPort socket))
+                  sockets)
+            (finally
+              (doseq [^ServerSocket socket sockets]
+                (try
+                  (.close socket)
+                  (catch Exception _
+                    nil)))))
+          (recur (inc attempt)
+                 (cond-> errors
+                   (< (count errors) sample-limit)
+                   (conj result))))))))
 
 (defn- make-nodes
   [work-dir logical-nodes]
@@ -661,7 +802,7 @@
     (when-let [state (db-state (get servers logical-node) db-name)]
       (let [authority-diagnostics
             (when-let [authority (:ha-authority state)]
-              (ctrl/authority-diagnostics authority))]
+              (authority-diagnostics-snapshot authority))]
         {:ha-role (:ha-role state)
          :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
          :ha-authority-term (:ha-authority-term state)
@@ -691,6 +832,7 @@
          (:ha-follower-next-sync-not-before-ms state)
          :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
                                     logical-node)
+         :jepsen-storage-fault (storage-fault cluster-id logical-node)
          :ha-effective-local-lsn (effective-local-lsn cluster-id logical-node)}))))
 
 (defn local-query
@@ -757,6 +899,58 @@
                  [link profile']))
           (nodes->directed-links nodes))))
 
+(defn- link-profile-summary
+  [link-behaviors]
+  (let [profiles (vec (vals link-behaviors))
+        delays   (mapv :delay-ms profiles)
+        jitters  (mapv :jitter-ms profiles)
+        drops    (mapv :drop-probability profiles)]
+    {:distinct-profile-count (count (set profiles))
+     :delay-ms {:min (apply min delays)
+                :max (apply max delays)}
+     :jitter-ms {:min (apply min jitters)
+                 :max (apply max jitters)}
+     :drop-probability {:min (apply min drops)
+                        :max (apply max drops)}}))
+
+(defn- behavior->link-behaviors
+  [nodes behavior]
+  (cond
+    (:link-profiles behavior)
+    (into (sorted-map)
+          (keep (fn [[[src dest] profile]]
+                  (when (and (some? src)
+                             (some? dest)
+                             (not= src dest)
+                             (some #{src} nodes)
+                             (some #{dest} nodes))
+                    [[src dest] (normalized-link-profile profile)])))
+          (:link-profiles behavior))
+
+    (:profile behavior)
+    (nodes->link-behaviors nodes (:profile behavior))
+
+    :else
+    (nodes->link-behaviors nodes behavior)))
+
+(defn- behavior->network-state
+  [nodes behavior link-behaviors]
+  (cond
+    (:link-profiles behavior)
+    (merge (select-keys behavior [:kind])
+           {:nodes nodes
+            :link-profiles link-behaviors
+            :profile-summary (or (:profile-summary behavior)
+                                 (link-profile-summary link-behaviors))})
+
+    (:profile behavior)
+    {:nodes nodes
+     :profile (normalized-link-profile (:profile behavior))}
+
+    :else
+    {:nodes nodes
+     :profile (normalized-link-profile behavior)}))
+
 (defn network-link-behaviors
   [cluster-id]
   (get-in @clusters [cluster-id :link-behaviors]))
@@ -768,13 +962,16 @@
 (declare heal-network!)
 
 (defn apply-network-shape!
-  [cluster-id nodes profile]
+  [cluster-id nodes behavior]
   (let [nodes' (->> nodes
                     (filter some?)
                     distinct
                     sort
                     vec)
-        link-behaviors (nodes->link-behaviors nodes' profile)]
+        link-behaviors (behavior->link-behaviors nodes' behavior)
+        network-state  (behavior->network-state nodes'
+                                                behavior
+                                                link-behaviors)]
     (heal-network! cluster-id)
     (doseq [[[src-logical-node dest-logical-node]
              {:keys [delay-ms jitter-ms drop-probability]}]
@@ -790,13 +987,12 @@
              (if (contains? clusters* cluster-id)
                (-> clusters*
                    (assoc-in [cluster-id :link-behaviors] link-behaviors)
-                   (assoc-in [cluster-id :network-behavior]
-                             {:nodes nodes'
-                              :profile (normalized-link-profile profile)}))
+                   (assoc-in [cluster-id :network-behavior] network-state))
                clusters*)))
     {:cluster-id cluster-id
      :nodes nodes'
-     :link-behaviors link-behaviors}))
+     :link-behaviors link-behaviors
+     :behavior network-state}))
 
 (defn heal-network!
   [cluster-id]
@@ -849,32 +1045,120 @@
                     [follower [leader]]))
              followers)))))
 
+(defn- random-node-groups
+  [nodes]
+  (let [shuffled    (vec (shuffle nodes))
+        group-count (if (= 2 (count shuffled))
+                      2
+                      (+ 2 (rand-int (dec (count shuffled)))))
+        cut-points  (->> (range 1 (count shuffled))
+                         shuffle
+                         (take (dec group-count))
+                         sort
+                         vec)
+        bounds      (vec (concat [0] cut-points [(count shuffled)]))]
+    (->> (partition 2 1 bounds)
+         (mapv (fn [[start end]]
+                 (vec (subvec shuffled start end)))))))
+
+(defn- add-blocked-links
+  [grudge srcs dests]
+  (reduce (fn [grudge' dest]
+            (update grudge' dest (fnil into []) srcs))
+          grudge
+          dests))
+
+(defn- pair-cut->grudge
+  [grudge groups {:keys [left-group right-group mode]}]
+  (let [left  (nth groups left-group)
+        right (nth groups right-group)]
+    (case mode
+      :left->right
+      (add-blocked-links grudge left right)
+
+      :right->left
+      (add-blocked-links grudge right left)
+
+      :bidirectional
+      (-> grudge
+          (add-blocked-links left right)
+          (add-blocked-links right left))
+
+      grudge)))
+
+(defn- random-pair-cuts
+  [group-count]
+  (vec
+   (for [left-group (range group-count)
+         right-group (range (inc left-group) group-count)
+         :let [mode (rand-nth graph-cut-direction-modes)]
+         :when (not= :none mode)]
+     {:left-group left-group
+      :right-group right-group
+      :mode mode})))
+
+(defn- fallback-graph-cut
+  [nodes]
+  (let [[src & rest-nodes] nodes
+        groups            [(vector src) (vec rest-nodes)]
+        pair-cuts         [{:left-group 0
+                            :right-group 1
+                            :mode :left->right}]
+        grudge            (normalized-grudge
+                           (pair-cut->grudge {} groups (first pair-cuts)))]
+    {:groups groups
+     :pair-cuts pair-cuts
+     :grudge grudge
+     :dropped-links (grudge->dropped-links grudge)}))
+
 (defn random-graph-cut
   [cluster-id]
   (let [live-nodes (-> (cluster-state cluster-id) :live-nodes sort vec)]
     (when (> (count live-nodes) 1)
-      (let [shuffled  (vec (shuffle live-nodes))
-            split-idx (inc (rand-int (dec (count shuffled))))
-            left      (vec (take split-idx shuffled))
-            right     (vec (drop split-idx shuffled))
-            direction (rand-nth [:left->right :right->left :bidirectional])
-            grudge    (case direction
-                        :left->right
-                        (into (sorted-map)
-                              (map (fn [dest] [dest left]))
-                              right)
-                        :right->left
-                        (into (sorted-map)
-                              (map (fn [dest] [dest right]))
-                              left)
-                        :bidirectional
-                        (into (sorted-map)
-                              (concat (map (fn [dest] [dest left]) right)
-                                      (map (fn [dest] [dest right]) left))))]
-        {:left left
-         :right right
-         :direction direction
-         :grudge grudge}))))
+      (let [total-links (count (nodes->directed-links live-nodes))]
+        (loop [attempt 0]
+          (if (>= attempt 32)
+            (fallback-graph-cut live-nodes)
+            (let [groups         (random-node-groups live-nodes)
+                  pair-cuts      (random-pair-cuts (count groups))
+                  grudge         (normalized-grudge
+                                  (reduce (fn [grudge' pair-cut]
+                                            (pair-cut->grudge grudge'
+                                                              groups
+                                                              pair-cut))
+                                          {}
+                                          pair-cuts))
+                  dropped-links  (grudge->dropped-links grudge)]
+              (if (and (seq dropped-links)
+                       (< (count dropped-links) total-links))
+                {:groups groups
+                 :pair-cuts pair-cuts
+                 :grudge grudge
+                 :dropped-links dropped-links}
+                (recur (inc attempt))))))))))
+
+(defn- random-link-profiles
+  [links]
+  (loop [attempt 0]
+    (let [link-profiles (into (sorted-map)
+                              (map (fn [link]
+                                     [link (rand-nth degraded-network-profile-templates)]))
+                              links)]
+      (if (or (<= (count links) 1)
+              (> (count (set (vals link-profiles))) 1)
+              (>= attempt 16))
+        link-profiles
+        (recur (inc attempt))))))
+
+(defn random-degraded-network-shape
+  [cluster-id]
+  (let [nodes (-> (cluster-state cluster-id) :live-nodes sort vec)]
+    (when (> (count nodes) 1)
+      (let [link-profiles (random-link-profiles (nodes->directed-links nodes))]
+        {:kind :heterogeneous
+         :nodes nodes
+         :link-profiles link-profiles
+         :profile-summary (link-profile-summary link-profiles)}))))
 
 (defrecord LocalClusterNet [cluster-id]
   net.proto/Net
@@ -930,13 +1214,18 @@
 (def ^:private disruption-write-failure-markers
   ["HA write admission rejected"
    "Timed out waiting for single leader"
-   "Timeout in making request"])
+   "Timeout in making request"
+   "No space left on device"])
 
 (def ^:private write-disruption-faults
   #{:leader-partition
     :leader-pause
+    :node-pause
+    :multi-node-pause
     :asymmetric-partition
-    :degraded-network})
+    :degraded-network
+    :leader-io-stall
+    :leader-disk-full})
 
 (defn write-disruption-fault-active?
   [test]
@@ -1237,6 +1526,26 @@
                      (update-in [cluster-id :paused-nodes] disj logical-node))))))
     true))
 
+(defn wedge-node-storage!
+  [cluster-id logical-node fault]
+  (locking clusters
+    (when-let [cluster (get @clusters cluster-id)]
+      (when-not (contains? (:live-nodes cluster) logical-node)
+        (u/raise "Cannot wedge storage on unavailable Jepsen node"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node}))
+      (let [fault* (assoc (normalize-storage-fault fault)
+                          :faulted-at-ms (now-ms))]
+        (swap! clusters assoc-in [cluster-id :storage-faults logical-node] fault*)
+        fault*))))
+
+(defn heal-node-storage!
+  [cluster-id logical-node]
+  (locking clusters
+    (let [fault (storage-fault cluster-id logical-node)]
+      (swap! clusters update-in [cluster-id :storage-faults] dissoc logical-node)
+      fault)))
+
 (defn- resolve-work-dir
   [cluster-id test]
   (if-let [base-dir (:work-dir test)]
@@ -1336,6 +1645,7 @@
                      :network-behavior nil
                      :paused-nodes    #{}
                      :paused-node-info {}
+                     :storage-faults  {}
                      :stopped-node-info {}
                      :teardown-nodes  #{}}]
         (swap! clusters assoc cluster-id cluster)

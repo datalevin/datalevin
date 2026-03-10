@@ -18,7 +18,9 @@ The first cut is intentionally narrow:
 * append, append-cas, bank, register, giant-values, tx-fn-register,
   fencing, rejoin-bootstrap, identity-upsert, and index-consistency workloads
 * Datalevin-specific `grant` and `internal` characterization workloads
-* local leader pause, leader failover, leader partition, follower rejoin,
+* local leader pause, arbitrary-node pause, multi-node pause, leader failover,
+  leader partition, asymmetric multi-way graph cuts, heterogeneous per-link
+  degraded links, leader IO-stall, leader disk-full, follower rejoin,
   quorum-loss, and clock-skew nemeses
 * list-append transactions support reads, appends, and mixed read/write
   sequences
@@ -170,10 +172,36 @@ cd jepsen
 lein run test --workload append --control-backend sofa-jraft --nemesis pause --time-limit 30 --rate 10
 ```
 
+Run an arbitrary single-node pause so follower stalls are exercised too:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis pause-any --time-limit 30 --rate 10
+```
+
+Run a mixed partial stall by pausing a random multi-node subset:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis pause-multi --time-limit 30 --rate 10
+```
+
 Exercise the leader-pause nemesis across the local workload set:
 
 ```bash
 script/jepsen/pause-workloads
+```
+
+Exercise the arbitrary single-node pause nemesis across the local workload set:
+
+```bash
+script/jepsen/pause-any-workloads
+```
+
+Exercise the multi-node pause nemesis across the local workload set:
+
+```bash
+script/jepsen/pause-multi-workloads
 ```
 
 Run a targeted pause subset with extra Jepsen CLI overrides:
@@ -201,7 +229,7 @@ Run a targeted subset with extra Jepsen CLI overrides:
 script/jepsen/partition-workloads append bank -- --time-limit 15 --rate 10
 ```
 
-Run an asymmetric network cut:
+Run an asymmetric multi-way network cut:
 
 ```bash
 cd jepsen
@@ -220,7 +248,7 @@ Run a targeted asymmetric subset with extra Jepsen CLI overrides:
 script/jepsen/asymmetric-workloads append bank -- --time-limit 15 --rate 10
 ```
 
-Run a degraded network profile with delay, jitter, and packet loss:
+Run a degraded network profile with heterogeneous per-link delay, jitter, and packet loss:
 
 ```bash
 cd jepsen
@@ -237,6 +265,44 @@ Run a targeted degraded subset with extra Jepsen CLI overrides:
 
 ```bash
 script/jepsen/degraded-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run a leader IO-stall without killing the process or breaking the network:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis io-stall --time-limit 30 --rate 10
+```
+
+Exercise the leader-io-stall nemesis across the local workload set:
+
+```bash
+script/jepsen/io-stall-workloads
+```
+
+Run a targeted IO-stall subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/io-stall-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run a leader disk-full fault without killing the process or breaking the network:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis disk-full --time-limit 30 --rate 10
+```
+
+Exercise the leader-disk-full nemesis across the local workload set:
+
+```bash
+script/jepsen/disk-full-workloads
+```
+
+Run a targeted disk-full subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/disk-full-workloads append bank -- --time-limit 15 --rate 10
 ```
 
 Run a quorum-loss cycle:

@@ -298,15 +298,45 @@
                     (update :txlog-lmdb-sync-count (fnil inc 0))))))
     now-ms))
 
+(defonce ^:private storage-fault-hook* (atom nil))
+
 (defn- force-lmdb-sync-now!
   [lmdb]
   (try
+    (when-let [f @storage-fault-hook*]
+      (f (merge (select-keys (or (i/env-opts lmdb) {})
+                             [:db-identity :ha-node-id :db-name])
+                {:stage :lmdb-sync})))
     (i/sync lmdb 1)
     (mark-lmdb-checkpoint! lmdb)
     (catch Exception e
       (when-let [info-v (i/kv-info lmdb)]
         (vswap! info-v assoc :txlog-last-lmdb-sync-error (.getMessage e)))
       (throw e))))
+
+(defn set-storage-fault-hook!
+  "Install a testing hook that can block or fail specific write-path stages.
+   The hook receives a context map with at least `:stage`, `:db-identity`,
+   `:ha-node-id`, and `:db-name` when available."
+  [f]
+  (reset! storage-fault-hook* f))
+
+(defn clear-storage-fault-hook!
+  []
+  (reset! storage-fault-hook* nil))
+
+(defn- maybe-run-storage-fault-context!
+  [fault-context stage extra]
+  (when-let [f @storage-fault-hook*]
+    (f (merge fault-context {:stage stage} extra))))
+
+(defn- maybe-run-storage-fault-lmdb!
+  [lmdb stage extra]
+  (maybe-run-storage-fault-context!
+   (select-keys (or (i/env-opts lmdb) {})
+                [:db-identity :ha-node-id :db-name])
+   stage
+   extra))
 
 (defn- snapshot-root-dir
   [lmdb]
@@ -1512,6 +1542,12 @@
             (raise "Txn-log segment channel is not available"
                    {:type :txlog/no-segment-channel}))
           (try
+            (maybe-run-storage-fault-context!
+             (:fault-context state)
+             :txlog-force-sync
+             {:target-lsn target-lsn
+              :reason reason
+              :sync-mode (:sync-mode state)})
             (txlog/force-segment! state ch (:sync-mode state))
             (txlog/complete-sync-success! sync-manager
                                           target-lsn
@@ -1863,6 +1899,10 @@
           :marker-revision (long @(:marker-revision state))}
          append-res
          (:rows record))]
+    (maybe-run-storage-fault-lmdb! lmdb
+                                   :txlog-replay
+                                   {:lsn (:lsn record)
+                                    :segment-id (:segment-id record)})
     (i/transact-kv lmdb rows)
     (txlog/commit-finished! state marker-entry)
     record))
@@ -1991,7 +2031,19 @@
 
 (def ^:private txlog-append-hooks
   {:throw-if-fatal! txlog-throw-if-fatal!
-   :mark-fatal! txlog-mark-fatal!})
+   :mark-fatal! txlog-mark-fatal!
+   :before-append!
+   (fn [state]
+     (maybe-run-storage-fault-context! (:fault-context state)
+                                       :txlog-append
+                                       {:sync-mode (:sync-mode state)}))
+   :before-sync!
+   (fn [state sync-begin]
+     (maybe-run-storage-fault-context! (:fault-context state)
+                                       :txlog-sync
+                                       {:target-lsn (:target-lsn sync-begin)
+                                        :reason (:reason sync-begin)
+                                        :sync-mode (:sync-mode state)}))})
 
 (defn- write-txn-open?
   [lmdb]

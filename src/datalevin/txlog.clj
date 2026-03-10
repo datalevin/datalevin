@@ -333,6 +333,9 @@
                                (not= prealloc-mode :none))
         state
         {:dir                    dir
+         :fault-context          (select-keys info [:db-identity
+                                                    :ha-node-id
+                                                    :db-name])
          :meta-path              meta-path
          :segment-id             (volatile! active-id)
          :segment-created-ms     (volatile! now)
@@ -3112,9 +3115,11 @@
              {:type :txlog/not-enabled})))
 
 (defn- append-record-under-lock!
-  [state prepared-payload throw-if-fatal!]
+  [state prepared-payload {:keys [throw-if-fatal! before-append!]}]
   (when throw-if-fatal!
     (throw-if-fatal! state))
+  (when before-append!
+    (before-append! state))
   (let [lsn-v (:next-lsn state)
         lsn (long @lsn-v)
         now (System/currentTimeMillis)
@@ -3153,9 +3158,12 @@
      :timeout-ms (long (:commit-wait-ms state))}))
 
 (defn- perform-sync-round!
-  [state ^FileChannel ch sync-manager sync-begin mark-fatal!]
+  [state ^FileChannel ch sync-manager sync-begin
+   {:keys [mark-fatal! before-sync!]}]
   (when-let [target-lsn (:target-lsn sync-begin)]
     (try
+      (when before-sync!
+        (before-sync! state sync-begin))
       (let [force-start-ms (System/currentTimeMillis)]
         (force-segment! state ch (:sync-mode state))
         (let [force-end-ms (System/currentTimeMillis)
@@ -3176,9 +3184,9 @@
         (throw e)))))
 
 (defn- wait-strict-durable!
-  ([state ^FileChannel ch sync-manager lsn timeout-ms mark-fatal!]
-   (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal! nil))
-  ([state ^FileChannel ch sync-manager lsn timeout-ms mark-fatal! initial-sync-begin]
+  ([state ^FileChannel ch sync-manager lsn timeout-ms hooks]
+   (wait-strict-durable! state ch sync-manager lsn timeout-ms hooks nil))
+  ([state ^FileChannel ch sync-manager lsn timeout-ms hooks initial-sync-begin]
    (let [lsn (long lsn)
          timeout-ms (long timeout-ms)
          start-ms (System/currentTimeMillis)
@@ -3204,7 +3212,7 @@
                                            ;; monitor-lock round-trip.
                                            (or sync-begin
                                                (begin-sync! sync-manager lsn))
-                                           mark-fatal!)]
+                                           hooks)]
                (recur (:sync-done-ms sync-res)
                       (:sync-reason sync-res)
                       nil)
@@ -3231,20 +3239,20 @@
                  (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
-  [state rows {:keys [throw-if-fatal! mark-fatal!]}]
+  [state rows {:keys [mark-fatal!] :as hooks}]
   (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
         append-lock (or (:append-lock state) state)
         {:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager]}
         (locking append-lock
-          (append-record-under-lock! state prepared-payload throw-if-fatal!))
+          (append-record-under-lock! state prepared-payload hooks))
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms)
         sync-res (when sync-begin
                    (perform-sync-round! state
                                         ch
                                         sync-manager
                                         sync-begin
-                                        mark-fatal!))
+                                        hooks))
         synced? (or (some? sync-res)
                     (<= ^long lsn
                         ^long @(:last-durable-lsn sync-manager)))
@@ -3261,17 +3269,17 @@
            :synced? synced?)))
 
 (defn- append-durable-strict!
-  [state rows {:keys [throw-if-fatal! mark-fatal!]}]
+  [state rows {:as hooks}]
   (let [prepared-payload {:body (encode-commit-row-payload 0 0 rows)}
         append-lock (or (:append-lock state) state)
         {:keys [append-res append-start-ms ch lsn near-roll?
                 sid sync-manager timeout-ms]}
         (locking append-lock
-          (append-record-under-lock! state prepared-payload throw-if-fatal!))
+          (append-record-under-lock! state prepared-payload hooks))
         sync-begin (append-sync-transition! sync-manager lsn append-start-ms
                                             {:force? true :begin-lsn lsn})
         {:keys [sync-done-ms sync-reason]}
-        (wait-strict-durable! state ch sync-manager lsn timeout-ms mark-fatal!
+        (wait-strict-durable! state ch sync-manager lsn timeout-ms hooks
                               sync-begin)
         done-ms (or sync-done-ms (System/currentTimeMillis))]
     (record-commit-wait-ms! sync-manager

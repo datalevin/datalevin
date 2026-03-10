@@ -5,8 +5,9 @@
    [jepsen.cli :as cli]))
 
 (def ^:private supported-nemesis-labels
-  (->> (concat [:none :failover :pause :partition :asymmetric :degraded
-                :rejoin :quorum :clock-skew]
+  (->> (concat [:none :failover :pause :pause-any :pause-multi
+                :partition :asymmetric :degraded
+                :io-stall :disk-full :rejoin :quorum :clock-skew]
                core/supported-nemeses)
        (map name)
        sort

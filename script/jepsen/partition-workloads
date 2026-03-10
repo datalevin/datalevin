@@ -129,6 +129,11 @@ run_jepsen() {
       fi
     fi
 
+    if grep -Fq "Operation not permitted" "$log_file"; then
+      printf '    port reservation denied by environment: see %s\n' "$log_file" >&2
+      return "$run_exit"
+    fi
+
     if ! grep -Fq "Unable to reserve Jepsen server port" "$log_file"; then
       return "$run_exit"
     fi

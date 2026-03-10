@@ -22,17 +22,17 @@ default_workloads=(
 
 usage() {
   cat <<'EOF'
-Usage: script/jepsen/asymmetric-workloads [workload ...] [-- extra-jepsen-args]
+Usage: script/jepsen/disk-full-workloads [workload ...] [-- extra-jepsen-args]
 
-Runs the real Jepsen asymmetric-partition nemesis against the selected workloads.
+Runs the real Jepsen leader-disk-full nemesis against the selected workloads.
 
 Examples:
-  script/jepsen/asymmetric-workloads
-  script/jepsen/asymmetric-workloads append bank
-  script/jepsen/asymmetric-workloads append bank -- --time-limit 15 --rate 10
+  script/jepsen/disk-full-workloads
+  script/jepsen/disk-full-workloads append bank
+  script/jepsen/disk-full-workloads append bank -- --time-limit 15 --rate 10
 
 Defaults:
-  nemesis: asymmetric
+  nemesis: disk-full
   control backend: sofa-jraft
   nodes: n1,n2,n3
   key count: 4
@@ -41,18 +41,18 @@ Defaults:
   rejoin-bootstrap rate/time-limit: 4/8
 
 Environment overrides:
-  DTLV_JEPSEN_ASYMMETRIC_KEY_COUNT
-  DTLV_JEPSEN_ASYMMETRIC_RATE
-  DTLV_JEPSEN_ASYMMETRIC_TIME_LIMIT
-  DTLV_JEPSEN_ASYMMETRIC_FENCING_RATE
-  DTLV_JEPSEN_ASYMMETRIC_FENCING_TIME_LIMIT
-  DTLV_JEPSEN_ASYMMETRIC_REJOIN_RATE
-  DTLV_JEPSEN_ASYMMETRIC_REJOIN_TIME_LIMIT
-  DTLV_JEPSEN_ASYMMETRIC_ACCOUNT_BALANCE
-  DTLV_JEPSEN_ASYMMETRIC_MAX_TRANSFER
-  DTLV_JEPSEN_ASYMMETRIC_MAX_WRITES_PER_KEY
-  DTLV_JEPSEN_ASYMMETRIC_MIN_TXN_LENGTH
-  DTLV_JEPSEN_ASYMMETRIC_MAX_TXN_LENGTH
+  DTLV_JEPSEN_DISK_FULL_KEY_COUNT
+  DTLV_JEPSEN_DISK_FULL_RATE
+  DTLV_JEPSEN_DISK_FULL_TIME_LIMIT
+  DTLV_JEPSEN_DISK_FULL_FENCING_RATE
+  DTLV_JEPSEN_DISK_FULL_FENCING_TIME_LIMIT
+  DTLV_JEPSEN_DISK_FULL_REJOIN_RATE
+  DTLV_JEPSEN_DISK_FULL_REJOIN_TIME_LIMIT
+  DTLV_JEPSEN_DISK_FULL_ACCOUNT_BALANCE
+  DTLV_JEPSEN_DISK_FULL_MAX_TRANSFER
+  DTLV_JEPSEN_DISK_FULL_MAX_WRITES_PER_KEY
+  DTLV_JEPSEN_DISK_FULL_MIN_TXN_LENGTH
+  DTLV_JEPSEN_DISK_FULL_MAX_TXN_LENGTH
   DTLV_JEPSEN_PORT_RETRY_COUNT
   DTLV_JEPSEN_PORT_RETRY_DELAY_S
 EOF
@@ -185,18 +185,18 @@ if [[ ${#selected_workloads[@]} -eq 0 ]]; then
   selected_workloads=("${default_workloads[@]}")
 fi
 
-key_count="${DTLV_JEPSEN_ASYMMETRIC_KEY_COUNT:-4}"
-rate="${DTLV_JEPSEN_ASYMMETRIC_RATE:-6}"
-time_limit="${DTLV_JEPSEN_ASYMMETRIC_TIME_LIMIT:-5}"
-fencing_rate="${DTLV_JEPSEN_ASYMMETRIC_FENCING_RATE:-1}"
-fencing_time_limit="${DTLV_JEPSEN_ASYMMETRIC_FENCING_TIME_LIMIT:-2}"
-rejoin_rate="${DTLV_JEPSEN_ASYMMETRIC_REJOIN_RATE:-4}"
-rejoin_time_limit="${DTLV_JEPSEN_ASYMMETRIC_REJOIN_TIME_LIMIT:-8}"
-account_balance="${DTLV_JEPSEN_ASYMMETRIC_ACCOUNT_BALANCE:-100}"
-max_transfer="${DTLV_JEPSEN_ASYMMETRIC_MAX_TRANSFER:-5}"
-max_writes_per_key="${DTLV_JEPSEN_ASYMMETRIC_MAX_WRITES_PER_KEY:-8}"
-min_txn_length="${DTLV_JEPSEN_ASYMMETRIC_MIN_TXN_LENGTH:-1}"
-max_txn_length="${DTLV_JEPSEN_ASYMMETRIC_MAX_TXN_LENGTH:-1}"
+key_count="${DTLV_JEPSEN_DISK_FULL_KEY_COUNT:-4}"
+rate="${DTLV_JEPSEN_DISK_FULL_RATE:-6}"
+time_limit="${DTLV_JEPSEN_DISK_FULL_TIME_LIMIT:-5}"
+fencing_rate="${DTLV_JEPSEN_DISK_FULL_FENCING_RATE:-1}"
+fencing_time_limit="${DTLV_JEPSEN_DISK_FULL_FENCING_TIME_LIMIT:-2}"
+rejoin_rate="${DTLV_JEPSEN_DISK_FULL_REJOIN_RATE:-4}"
+rejoin_time_limit="${DTLV_JEPSEN_DISK_FULL_REJOIN_TIME_LIMIT:-8}"
+account_balance="${DTLV_JEPSEN_DISK_FULL_ACCOUNT_BALANCE:-100}"
+max_transfer="${DTLV_JEPSEN_DISK_FULL_MAX_TRANSFER:-5}"
+max_writes_per_key="${DTLV_JEPSEN_DISK_FULL_MAX_WRITES_PER_KEY:-8}"
+min_txn_length="${DTLV_JEPSEN_DISK_FULL_MIN_TXN_LENGTH:-1}"
+max_txn_length="${DTLV_JEPSEN_DISK_FULL_MAX_TXN_LENGTH:-1}"
 
 common_args=(
   run
@@ -207,14 +207,14 @@ common_args=(
   --control-backend
   sofa-jraft
   --nemesis
-  asymmetric
+  disk-full
 )
 
 status=0
 summaries=()
 run_id="$(date +%Y%m%dT%H%M%S)"
-log_dir="$repo_root/tmp/jepsen-asymmetric-workloads/$run_id"
-stream_logs="${DTLV_JEPSEN_ASYMMETRIC_STREAM_LOGS:-0}"
+log_dir="$repo_root/tmp/jepsen-disk-full-workloads/$run_id"
+stream_logs="${DTLV_JEPSEN_DISK_FULL_STREAM_LOGS:-0}"
 port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
 
@@ -235,7 +235,7 @@ for workload in "${selected_workloads[@]}"; do
     --workload
     "$workload"
     --db-name
-    "asymmetric-$workload"
+    "disk-full-$workload"
     --time-limit
     "$workload_time_limit"
     --rate

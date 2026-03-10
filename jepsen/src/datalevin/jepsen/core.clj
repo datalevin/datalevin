@@ -51,9 +51,13 @@
   [{:keys [control-backend nemesis]}]
   (when (and (some #{:leader-failover
                      :leader-pause
+                     :node-pause
+                     :multi-node-pause
                      :leader-partition
                      :asymmetric-partition
                      :degraded-network
+                     :leader-io-stall
+                     :leader-disk-full
                      :quorum-loss
                      :clock-skew-pause
                      :follower-rejoin} nemesis)

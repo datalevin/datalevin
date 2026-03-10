@@ -28,7 +28,7 @@
     (catch Throwable _
       nil)))
 
-(defn- probe-node*
+(defn- ^:redef probe-node*
   [cluster-id db-name logical-node]
   (let [client* (volatile! nil)]
     (try

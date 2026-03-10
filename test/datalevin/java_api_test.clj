@@ -1192,7 +1192,6 @@
             (is (DatalevinInterop/connectionClosed anon)))))
 
       (let [conn        (DatalevinInterop/createConnection conn-dir schema-map opts)
-            shared      (DatalevinInterop/getConnection conn-dir schema-map opts)
             raw-schema  (DatalevinInterop/coreInvoke "schema" [conn])
             db          (DatalevinInterop/connectionDb conn)
             kv          (DatalevinInterop/openKeyValue kv-dir (java-map))
@@ -1242,16 +1241,19 @@
                   [kv "items" "b" string-type string-type true])))
           (is (= ["items"]
                  (vec (DatalevinInterop/coreInvoke "list-dbis" [kv]))))
-          (is (= #{"Ada"}
-                 (set (DatalevinInterop/coreInvoke
-                       "q"
-                       [(DatalevinInterop/readEdn
-                         "[:find [?name ...] :where [?e :full-name ?name]]")
-                        (DatalevinInterop/connectionDb shared)]))))
-          (finally
+          (let [shared (DatalevinInterop/getConnection conn-dir schema-map opts)]
             (try
-              (DatalevinInterop/closeConnection shared)
-              (catch Exception _))
+              (is (= #{"Ada"}
+                     (set (DatalevinInterop/coreInvoke
+                           "q"
+                           [(DatalevinInterop/readEdn
+                             "[:find [?name ...] :where [?e :full-name ?name]]")
+                            (DatalevinInterop/connectionDb shared)]))))
+              (finally
+                (try
+                  (DatalevinInterop/closeConnection shared)
+                  (catch Exception _)))))
+          (finally
             (try
               (DatalevinInterop/closeConnection conn)
               (catch Exception _))
