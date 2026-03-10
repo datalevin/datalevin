@@ -13,6 +13,7 @@
    [datalevin.client :as dc]
    [datalevin.constants :as c]
    [datalevin.json-api :as sut]
+   [datalevin.json-api.shared :as shared]
    [datalevin.json-convert :as jc]
    [datalevin.test.core :as tdc]
    [datalevin.util :as u])
@@ -98,6 +99,31 @@
     (is (identical? obj2 (#'sut/resolve-handle handle)))
     (is (= {:type :search :obj obj2}
            (#'sut/resolve-entry handle)))))
+
+(deftest exec-request-session-isolation-test
+  (let [dir      (u/tmp-dir (str "json-api-session-" (UUID/randomUUID)))
+        session1 (shared/new-session-state)
+        session2 (shared/new-session-state)]
+    (try
+      (let [handle (get-in (shared/exec-request
+                             session1
+                             {"op" "get-conn"
+                              "args" {"dir" dir}})
+                           ["result"])]
+        (is (string? handle))
+        (let [error (try
+                      (shared/exec-request session2
+                                           {"op" "closed?"
+                                            "args" {"conn" handle}})
+                      nil
+                      (catch clojure.lang.ExceptionInfo e
+                        e))]
+          (is (instance? clojure.lang.ExceptionInfo error))
+          (is (= :invalid-handle (:code (ex-data error))))))
+      (finally
+        (shared/clear-handles! session1)
+        (shared/clear-handles! session2)
+        (u/delete-files dir)))))
 
 (deftest exec-api-info-test
   (let [response (parse-response
