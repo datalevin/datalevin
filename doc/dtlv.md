@@ -19,6 +19,7 @@ Commands:
   exec  Execute database transactions or queries
   help  Show help messages
   load  Load data from standard input into a database
+  mcp   Run a MCP server over stdio
   repl  Enter an interactive shell
   serv  Run as a server
   stat  Display statistics of database
@@ -38,6 +39,7 @@ Options:
   -r, --root ROOT                  /var/lib/datalevin  Server root data directory
   -v, --verbose                                        Show verbose server debug log
   -V, --version                                        Show Datalevin version and exit
+  -w, --allow-writes                                   Allow write tools for MCP
 
 Type 'dtlv help <command>' to read about a specific command.
 
@@ -227,6 +229,29 @@ $ dtlv help load
       dtlv -d /data/companydb -f ~/sales-data load new-sales
       dtlv -d /data/companydb -f ~/sales-data -g load
 ```
+
+## MCP Server
+
+`dtlv mcp` runs a local MCP server over `stdio`.
+
+```console
+$ dtlv mcp
+```
+
+Write tools are disabled by default. Enable them explicitly when needed:
+
+```console
+$ dtlv --allow-writes mcp
+```
+
+The MCP server can open both local filesystem-backed databases and remote
+`dtlv://...` targets behind the same local process.
+
+The intended integration target is generic: any MCP-compliant client that can
+launch a local `stdio` server, especially custom AI-powered applications.
+
+See [MCP Server Documentation](mcp.md) for tool details and large-response
+truncation metadata.
 
 `dtlv drop` and `dtlv stat` exposes some functionalities of the underlying LMDB
 databases. `dtlv drop` clear/delete LMDB sub-databases. `dtlv stat` show

@@ -21,6 +21,7 @@
    [datalevin.util :as u]
    [datalevin.interpret :as i]
    [datalevin.lmdb :as l]
+   [datalevin.mcp :as mcp]
    [datalevin.server :as srv]
    [datalevin.interface :as if]
    [pod.huahaiy.datalevin :as pod]
@@ -45,7 +46,7 @@
      (Integer/parseInt non-breaking)]))
 
 (def ^:private commands
-  #{"copy" "drop" "dump" "exec" "help" "load" "repl" "serv" "stat"})
+  #{"copy" "drop" "dump" "exec" "help" "load" "mcp" "repl" "serv" "stat"})
 
 (def ^:private serv-help
   "
@@ -75,6 +76,18 @@
       dtlv -d /data/companydb stat
       dtlv -d /data/companydb -a stat
       dtlv -d /data/companydb stat sales products")
+
+(def ^:private mcp-help
+  "
+  Command mcp - run a Datalevin MCP server over stdio.
+
+  The server reads JSON-RPC requests from stdin and writes JSON-RPC responses
+  to stdout. This command is intended for MCP hosts that spawn a local process.
+  Write tools are disabled by default; pass --allow-writes to enable them.
+
+  Examples:
+      dtlv mcp
+      dtlv --allow-writes mcp")
 
 (def ^:private dump-help
   "
@@ -201,6 +214,7 @@
         "  exec  Execute database transactions or queries"
         "  help  Show help messages"
         "  load  Load data from standard input into a database"
+        "  mcp   Run a MCP server over stdio"
         "  repl  Enter an interactive shell"
         "  serv  Run as a server"
         "  stat  Display statistics of database"
@@ -224,6 +238,7 @@
 
 (def ^:private cli-opts
   [["-a" "--all" "Include all of the sub-databases"]
+   ["-w" "--allow-writes" "Allow write tools for MCP"]
    ["-c" "--compact" "Compact while copying"]
    ["-d" "--dir PATH" "Path to the database directory"]
    ["-D" "--delete" "Delete the sub-database, not just empty it"]
@@ -288,6 +303,7 @@
                 "drop" drop-help
                 "dump" dump-help
                 "load" load-help
+                "mcp"  mcp-help
                 "stat" stat-help
                 (str "Unknown command: " command))))
     (exit 0 (usage summary))))
@@ -538,6 +554,7 @@
         "exec" (dtlv-exec arguments)
         "help" (dtlv-help arguments summary)
         "load" (dtlv-load options arguments)
+        "mcp"  (mcp/run options)
         "pods" (pod/run)
         "repl" (dtlv-repl)
         "serv" (srv/start (srv/create options))

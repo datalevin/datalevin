@@ -149,6 +149,22 @@ for the Maven Central publishing procedure:
 - `ClientQuickStart.java`
 - `InteropQuickStart.java`
 
+### Use as an MCP server
+
+Datalevin also ships a local MCP server entrypoint:
+
+```console
+dtlv mcp
+```
+
+Use `dtlv --allow-writes mcp` to enable write tools.
+
+The MCP integration target is generic: any MCP-compliant client that can launch
+a local `stdio` server, especially custom AI-powered applications.
+
+See [MCP server documentation](doc/mcp.md) for the transport model, tool
+surface, and large-response truncation metadata.
+
 ### Use as a Datalog store
 
 In addition to [our API doc](https://cljdoc.org/d/datalevin/datalevin),

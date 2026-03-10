@@ -4,12 +4,13 @@
 ### Added
 - [Server] Read only replicas and high availability with auto roll-over and
   promotion (Raft consensus based)
-  [#72](https://github.com/datalevin/datalevin/issues/72). This implementation comes with a Jepsen
-  test suite for checking correctness
+  [#72](https://github.com/datalevin/datalevin/issues/72). This implementation
+  comes with a Jepsen test suite for checking correctness
   [#252](https://github.com/datalevin/datalevin/issues/252). Details in
   [doc](doc/ha.md).
 - [API] Java API. Release Datalevin as a Java library to maven central.
-- [API] JSON API.
+- [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
+- [MCP] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 
 ## 0.10.7 (2026-03-03)
 
