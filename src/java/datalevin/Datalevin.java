@@ -227,6 +227,42 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a raw UDF registry handle.
+     */
+    public static Object createUdfRegistry() {
+        return DatalevinInterop.createUdfRegistry();
+    }
+
+    /**
+     * Normalizes a UDF descriptor into the raw Clojure form expected by
+     * Datalevin.
+     */
+    public static Object udfDescriptor(Map<?, ?> descriptor) {
+        return DatalevinInterop.udfDescriptor(descriptor);
+    }
+
+    /**
+     * Registers a Java-backed UDF in a registry.
+     */
+    public static Object registerUdf(Object registry, Map<?, ?> descriptor, UdfFunction fn) {
+        return DatalevinInterop.registerUdf(registry, descriptor, fn);
+    }
+
+    /**
+     * Unregisters a UDF from a registry.
+     */
+    public static Object unregisterUdf(Object registry, Map<?, ?> descriptor) {
+        return DatalevinInterop.unregisterUdf(registry, descriptor);
+    }
+
+    /**
+     * Returns whether a descriptor is registered in a registry.
+     */
+    public static boolean registeredUdf(Object registry, Map<?, ?> descriptor) {
+        return DatalevinInterop.registeredUdf(registry, descriptor);
+    }
+
+    /**
      * Creates the unbounded range spec {@code [:all]}.
      */
     public static RangeSpec allRange() {

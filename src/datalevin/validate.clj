@@ -16,6 +16,7 @@
     :refer [schema opts populated? visit-list-range]]
    [datalevin.index :as idx]
    [datalevin.datom :as d]
+   [datalevin.udf :as udf]
    [datalevin.constants :as c]
    [datalevin.util :as u]
    [datalevin.bits :as b]
@@ -882,6 +883,33 @@
     (u/raise "Entity " op " expected to have :db/fn attribute with fn? value"
              {:error :transact/syntax, :operation :db.fn/call, :tx-data entity})))
 
+(defn validate-installed-callable-entity
+  "Validate stored function attributes on an entity map."
+  [entity]
+  (when (and (contains? entity :db/fn) (contains? entity :db/udf))
+    (u/raise "Entity cannot have both :db/fn and :db/udf at " entity
+             {:error :transact/syntax, :tx-data entity}))
+  (when (contains? entity :db/udf)
+    (let [descriptor (udf/descriptor (:db/udf entity))]
+      (when-let [ident (:db/ident entity)]
+        (when-not (= ident (:udf/id descriptor))
+          (u/raise "Installed :db/udf id must match :db/ident at " entity
+                   {:error      :transact/syntax
+                    :tx-data    entity
+                    :db/ident   ident
+                    :descriptor descriptor})))
+      descriptor)))
+
+(defn validate-installed-udf-ident
+  "Validate that an installed descriptor matches the entity ident when known."
+  [ident descriptor at]
+  (when (and ident (not= ident (:udf/id descriptor)))
+    (u/raise "Installed :db/udf id must match :db/ident at " at
+             {:error      :transact/syntax
+              :db/ident   ident
+              :descriptor descriptor
+              :context    at})))
+
 (defn validate-custom-tx-fn-entity
   "Validate that an entity exists for a custom transaction function."
   [ident op entity]
@@ -899,7 +927,7 @@
 (defn validate-tx-op
   "Validate that the operation is a known transaction operation."
   [op entity]
-  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
+  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
            {:error :transact/syntax, :operation op, :tx-data entity}))
 
 (defn validate-tx-entity-type

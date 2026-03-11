@@ -39,6 +39,7 @@ final class ClojureRuntime {
         require("datalevin.client");
         require("datalevin.datom");
         require("datalevin.json-api");
+        require("datalevin.udf");
     }
 
     private ClojureRuntime() {

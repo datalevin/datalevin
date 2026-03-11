@@ -2,8 +2,10 @@
   (:require
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing are is use-fixtures]]
+   [clojure.string :as str]
    [datalevin.util :as u]
-   [datalevin.core :as d])
+   [datalevin.core :as d]
+   [datalevin.udf :as udf])
   (:import [clojure.lang ExceptionInfo]
            [java.util UUID]))
 
@@ -76,6 +78,87 @@
     (is (= (set [3])
            (set (d/q q-t db "%Lucky%" "%book%" "%random%"))))
     (d/close-db db)
+    (u/delete-files dir)))
+
+(deftest test-query-udf
+  (let [dir        (u/tmp-dir (str "query-udf-" (UUID/randomUUID)))
+        schema     {:email {:db/valueType :db.type/string}}
+        descriptor {:udf/lang :test
+                    :udf/kind :query-fn
+                    :udf/id   :normalize-email}
+        registry-1 (doto (udf/create-registry)
+                     (udf/register! descriptor str/lower-case))
+        registry-2 (doto (udf/create-registry)
+                     (udf/register! descriptor str/upper-case))
+        conn-1     (d/get-conn
+                     dir schema
+                     {:runtime-opts {:udf-registry registry-1}})
+        _          (d/transact! conn-1 [{:db/id 1 :email "A@B.COM"}])
+        query      '[:find ?email .
+                     :in $
+                     :where
+                     [?e :email ?raw]
+                     [(udf :normalize-email ?raw) ?email]]
+        conn-2     (d/get-conn
+                     dir schema
+                     {:runtime-opts {:udf-registry registry-2}})]
+    (is (not (identical? conn-1 conn-2)))
+    (is (= "a@b.com" (d/q query @conn-1)))
+    (is (= "A@B.COM" (d/q query @conn-2)))
+
+    (udf/register! registry-1 descriptor #(str/replace % "@" "+"))
+    (is (= "A+B.COM" (d/q query @conn-1)))
+
+    (d/close conn-1)
+    (d/close conn-2)
+    (u/delete-files dir)))
+
+(deftest test-installed-query-udf
+  (let [dir        (u/tmp-dir (str "query-installed-udf-" (UUID/randomUUID)))
+        schema     {:email {:db/valueType :db.type/string}}
+        descriptor {:udf/lang :test
+                    :udf/kind :query-fn
+                    :udf/id   :normalize-email}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor str/lower-case))
+        conn       (d/create-conn
+                     dir schema
+                     {:closed-schema? true
+                      :runtime-opts  {:udf-registry registry}})]
+    (d/transact! conn [{:db/ident :normalize-email
+                        :db/udf   descriptor}
+                       {:db/id 1 :email "A@B.COM"}])
+    (is (= "a@b.com"
+           (d/q '[:find ?email .
+                  :in $
+                  :where
+                  [?e :email ?raw]
+                  [(udf :normalize-email ?raw) ?email]]
+                @conn)))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest test-inline-query-udf-descriptor
+  (let [dir        (u/tmp-dir (str "query-inline-udf-" (UUID/randomUUID)))
+        schema     {:email {:db/valueType :db.type/string}}
+        descriptor {:udf/lang :test
+                    :udf/kind :query-fn
+                    :udf/id   :normalize-email}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor str/lower-case))
+        conn       (d/create-conn
+                     dir schema
+                     {:runtime-opts {:udf-registry registry}})]
+    (d/transact! conn [{:db/id 1 :email "A@B.COM"}])
+    (is (= "a@b.com"
+           (d/q '[:find ?email .
+                  :in $ ?descriptor
+                  :where
+                  [?e :email ?raw]
+                  [(udf ?descriptor ?raw) ?email]]
+                @conn
+                descriptor)))
+    (d/close conn)
     (u/delete-files dir)))
 
 (deftest test-like-fn

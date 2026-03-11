@@ -114,6 +114,17 @@ final class DatalevinForms {
         return keywordMap(opts, true);
     }
 
+    static Object udfDescriptorInput(Map<?, ?> descriptor) {
+        if (descriptor == null) {
+            return null;
+        }
+        if (descriptor instanceof IPersistentMap
+                && normalizedKeywordMap(descriptor, true)) {
+            return descriptor;
+        }
+        return keywordMap(descriptor, true);
+    }
+
     static Object renameMapInput(Map<?, ?> renameMap) {
         if (renameMap == null) {
             return null;
@@ -300,6 +311,8 @@ final class DatalevinForms {
             Object value = list.get(i);
             if (i == 0 && op != null) {
                 converted.add(ClojureCodec.keyword(op));
+            } else if (i == 1 && ":db.fn/call".equals(op)) {
+                converted.add(callableTargetInput(value));
             } else if (i == 1) {
                 converted.add(lookupRefInput(value));
             } else if (i == 2 && op != null && expectsAttrInThirdPosition(op, list.size())) {
@@ -328,8 +341,13 @@ final class DatalevinForms {
     }
 
     private static Object txEntityValue(Object value) {
-        if (value instanceof Map<?, ?> map && looksLikeNestedEntity(map)) {
-            return txEntityMap(map);
+        if (value instanceof Map<?, ?> map) {
+            if (looksLikeUdfDescriptor(map)) {
+                return udfDescriptorInput(map);
+            }
+            if (looksLikeNestedEntity(map)) {
+                return txEntityMap(map);
+            }
         }
         if (value instanceof Collection<?> collection) {
             ArrayList<Object> converted = new ArrayList<>(collection.size());
@@ -348,12 +366,38 @@ final class DatalevinForms {
         return ClojureCodec.runtimeInput(value);
     }
 
+    private static Object callableTargetInput(Object value) {
+        if (value instanceof Map<?, ?> map && looksLikeUdfDescriptor(map)) {
+            return udfDescriptorInput(map);
+        }
+        String keyword = extractKeywordString(value);
+        if (keyword != null) {
+            return ClojureCodec.keyword(keyword);
+        }
+        return ClojureCodec.runtimeInput(value);
+    }
+
     private static boolean looksLikeNestedEntity(Map<?, ?> map) {
         for (Object key : map.keySet()) {
             if (key instanceof String s && s.startsWith(":")) {
                 return true;
             }
             if (key instanceof Keyword || key instanceof EdnLiteral) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean looksLikeUdfDescriptor(Map<?, ?> map) {
+        return containsKeywordLikeKey(map, ":udf/lang")
+                && containsKeywordLikeKey(map, ":udf/kind")
+                && containsKeywordLikeKey(map, ":udf/id");
+    }
+
+    private static boolean containsKeywordLikeKey(Map<?, ?> map, String keyName) {
+        for (Object key : map.keySet()) {
+            if (keyName.equals(extractKeywordString(key))) {
                 return true;
             }
         }

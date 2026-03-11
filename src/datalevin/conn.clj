@@ -41,6 +41,7 @@
   [db]
   {:pre [(db/db? db)]}
   (atom db :meta {:listeners (atom {})
+                  :runtime-opts (db/runtime-opts db)
                   :sync-queue-pending (AtomicLong. 0)
                   :sync-queue-last-enqueue-ms (AtomicLong. 0)}))
 
@@ -111,7 +112,7 @@
                                    ~c/+in-tx-overflow-times+
                                    l/resized? (w#))
                                (finally (r/close-transact s#)))))
-                 new-db# (db/new-db s#)]
+                 new-db# (db/carry-runtime-opts (db/new-db s#) db#)]
              (reset! ~orig-conn new-db#)
              (when-not old# (db/enable-cache s#))
              res#))
@@ -126,7 +127,7 @@
                            (vreset! s1# (.-store ^DB (deref conn1#)))
                            res#))
                new-s#  (s/transfer (deref s1#) kv#)
-               new-db# (db/new-db new-s#)]
+               new-db# (db/carry-runtime-opts (db/new-db new-s#) db#)]
            (reset! ~orig-conn new-db#)
            (when-not old# (db/enable-cache new-s#))
            res1#)))))
@@ -164,7 +165,7 @@
                        c/+in-tx-overflow-times+
                        l/resized?
                        (with db tx-data tx-meta))]
-          (reset! conn (:db-after report))
+          (reset! conn (db/carry-runtime-opts (:db-after report) db))
           (assoc report :db-after @conn))
         (finally
           (when-not old
@@ -496,9 +497,11 @@
   ([dir schema]
    (get-conn dir schema nil))
   ([dir schema opts]
-   (if-let [c (get @connections dir)]
-     (if (closed? c) (new-conn dir schema opts) c)
-     (new-conn dir schema opts))))
+   (if (and (map? opts) (contains? opts :runtime-opts))
+     (create-conn dir schema opts)
+     (if-let [c (get @connections dir)]
+       (if (closed? c) (new-conn dir schema opts) c)
+       (new-conn dir schema opts)))))
 
 (defmacro with-conn
   "Evaluate body in the context of an connection to the Datalog database.

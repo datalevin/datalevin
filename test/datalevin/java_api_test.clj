@@ -17,7 +17,7 @@
    [datalevin.test.core :as tdc]
    [datalevin.util :as u])
   (:import
-   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData]
+   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData UdfFunction]
    [java.util List Map UUID]
    [java.util.function BiConsumer BiFunction BiPredicate Consumer]))
 
@@ -115,7 +115,9 @@
 
 (def java-friendly-surface
   {Datalevin        #{"apiInfo" "exec" "createConn" "getConn" "openKV" "newClient"
-                      "query" "tx" "rules" "pull" "schema" "allRange"
+                      "query" "tx" "rules" "pull" "schema" "createUdfRegistry"
+                      "udfDescriptor" "registerUdf" "unregisterUdf"
+                      "registeredUdf" "allRange"
                       "edn" "kw" "var" "mapOf" "orderedMap"
                       "listOf" "setOf" "mapResult" "listResult" "setResult"}
    Connection       #{"closed" "schema" "updateSchema" "opts" "clear"
@@ -147,7 +149,9 @@
                       "connectionClosed" "connectionDb" "openKeyValue"
                       "closeKeyValue" "keyValueClosed" "newClient"
                       "closeClient" "clientDisconnected" "keyword"
-                      "symbol" "schema" "options" "renameMap" "deleteAttrs"
+                      "symbol" "schema" "options" "udfDescriptor"
+                      "createUdfRegistry" "registerUdf" "unregisterUdf"
+                      "registeredUdf" "renameMap" "deleteAttrs"
                       "lookupRef" "txData" "kvTxs" "kvType" "databaseType"
                       "role" "permissionKeyword" "permissionTarget"}})
 
@@ -1154,12 +1158,19 @@
     (try
       (let [raw-schema    (DatalevinInterop/schema schema-map)
             raw-opts      (DatalevinInterop/options opts)
+            raw-udf       (DatalevinInterop/udfDescriptor
+                           (java-map ":udf/lang" ":java"
+                                     ":udf/kind" ":query-fn"
+                                     ":udf/id" ":math/inc"))
             raw-rename    (DatalevinInterop/renameMap
                            (java-map "name" "full-name"))
             raw-delete    (DatalevinInterop/deleteAttrs
                            (Datalevin/listOf (into-array Object ["age"])))
             normalized-schema {:name {:db/valueType :db.type/string}}
             normalized-opts   {:cache-limit 64}
+            normalized-udf    {:udf/lang :java
+                               :udf/kind :query-fn
+                               :udf/id   :math/inc}
             normalized-rename {:name :full-name}
             normalized-delete #{:age}
             normalized-tx     [{:db/id -1 :name "Ada"}]
@@ -1169,12 +1180,17 @@
         (is (= :db.unique/identity (mget (mget raw-schema :name) :db/unique)))
         (is (= :db.type/long (mget (mget raw-schema :age) :db/valueType)))
         (is (= 64 (mget raw-opts :cache-limit)))
+        (is (= :java (mget raw-udf :udf/lang)))
+        (is (= :query-fn (mget raw-udf :udf/kind)))
+        (is (= :math/inc (mget raw-udf :udf/id)))
         (is (= :full-name (mget raw-rename :name)))
         (is (= #{:age} (set raw-delete)))
         (is (identical? normalized-schema
                         (DatalevinInterop/schema normalized-schema)))
         (is (identical? normalized-opts
                         (DatalevinInterop/options normalized-opts)))
+        (is (identical? normalized-udf
+                        (DatalevinInterop/udfDescriptor normalized-udf)))
         (is (identical? normalized-rename
                         (DatalevinInterop/renameMap normalized-rename)))
         (is (identical? normalized-delete
@@ -1265,6 +1281,92 @@
       (finally
         (delete-files-retry conn-dir)
         (delete-files-retry kv-dir)))))
+
+(deftest java-interop-udf-test
+  (let [conn-dir          (test-dir "java-interop-udf")
+        schema            (java-map "name"  (java-map ":db/valueType" ":db.type/string"
+                                                      ":db/unique" ":db.unique/identity")
+                                    "score" (java-map ":db/valueType" ":db.type/long"))
+        tx-descriptor     (java-map ":udf/lang" ":java"
+                                    ":udf/kind" ":tx-fn"
+                                    ":udf/id"   ":person/bootstrap")
+        query-descriptor  (java-map ":udf/lang" ":java"
+                                    ":udf/kind" ":query-fn"
+                                    ":udf/id"   ":math/inc")
+        registry          (Datalevin/createUdfRegistry)
+        conn              (DatalevinInterop/createConnection
+                           conn-dir
+                           schema
+                           (java-map ":runtime-opts"
+                                     (java-map ":udf-registry" registry)))]
+    (try
+      (is (false? (DatalevinInterop/registeredUdf registry tx-descriptor)))
+      (DatalevinInterop/registerUdf
+       registry
+       tx-descriptor
+       (reify UdfFunction
+         (invoke [_ args]
+           (let [name (.get ^List args 1)]
+             (Datalevin/listOf
+              (into-array Object
+                          [(Datalevin/mapOf
+                            (into-array Object
+                                        [":db/id" -1
+                                         "name" name
+                                         "score" 10]))]))))))
+      (Datalevin/registerUdf
+       registry
+       query-descriptor
+       (reify UdfFunction
+         (invoke [_ args]
+           (+ 1 (long (.get ^List args 0))))))
+      (is (DatalevinInterop/registeredUdf registry tx-descriptor))
+      (is (Datalevin/registeredUdf registry query-descriptor))
+      (is (= :java
+             (mget (Datalevin/udfDescriptor query-descriptor) :udf/lang)))
+
+      (DatalevinInterop/coreInvoke
+       "transact!"
+       [conn
+        (DatalevinInterop/txData
+         [{":db/ident" (Datalevin/kw "math/inc")
+           ":db/udf"   query-descriptor}
+          (Datalevin/listOf
+           (into-array Object
+                       [":db.fn/call"
+                        (DatalevinInterop/udfDescriptor tx-descriptor)
+                        "Ada"]))])])
+
+      (let [db          (DatalevinInterop/connectionDb conn)
+            names       (set (DatalevinInterop/coreInvoke
+                              "q"
+                              [(DatalevinInterop/readEdn
+                                "[:find [?name ...] :where [?e :name ?name]]")
+                               db]))
+            inline-v    (DatalevinInterop/coreInvoke
+                         "q"
+                         [(DatalevinInterop/readEdn
+                           "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]")
+                          db
+                          (Datalevin/udfDescriptor query-descriptor)
+                          9])
+            installed-v (DatalevinInterop/coreInvoke
+                         "q"
+                         [(DatalevinInterop/readEdn
+                           "[:find ?v . :in $ ?n :where [(udf :math/inc ?n) ?v]]")
+                          db
+                          41])]
+        (is (= #{"Ada"} names))
+        (is (= 10 inline-v))
+        (is (= 42 installed-v)))
+
+      (Datalevin/unregisterUdf registry query-descriptor)
+      (DatalevinInterop/unregisterUdf registry tx-descriptor)
+      (is (false? (Datalevin/registeredUdf registry query-descriptor)))
+      (is (false? (DatalevinInterop/registeredUdf registry tx-descriptor)))
+      (finally
+        (DatalevinInterop/closeConnection conn)
+        (delete-files-retry conn-dir)))))
 
 (deftest java-friendly-client-api-test
   (tdc/server-fixture

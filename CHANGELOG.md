@@ -11,6 +11,9 @@
 - [API] Java API. Release Datalevin as a Java library to maven central.
 - [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
 - [MCP] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
+- [Datalog] allow to register a `:db/udf` to specify a user defined function.
+  This is cross platform, will resolve in runtime environment and does not
+  restore in DB.
 
 ## 0.10.7 (2026-03-03)
 

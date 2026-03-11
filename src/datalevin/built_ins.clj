@@ -23,6 +23,7 @@
    [datalevin.storage :as st]
    [datalevin.index :as idx]
    [datalevin.idoc :as idoc]
+   [datalevin.udf :as udf-reg]
    [datalevin.vector :as v]
    [datalevin.entity :as de]
    [datalevin.remote :as r]
@@ -832,12 +833,34 @@
   "Function similar to Clojure `identity`"
   clojure.core/identity)
 
+(def ^:dynamic *udf-db* nil)
+
 (defn query-apply
   "Apply for use in queries. The first argument should be a function,
    which is resolved by the query engine from built-in functions or
    clojure.core before being passed here."
   [f & args]
   (apply apply f args))
+
+(defn udf
+  "Resolve and invoke a runtime UDF descriptor in query context."
+  [descriptor & args]
+  (when-not (instance? DB *udf-db*)
+    (raise "Query UDF requires a database input"
+           {:error :udf/query-context}))
+  (let [registry    (db/udf-registry *udf-db*)
+        descriptor  (or (db/installed-udf-descriptor
+                          *udf-db* #{:query-fn :predicate} descriptor)
+                        (udf-reg/descriptor-or-registered
+                          registry #{:query-fn :predicate} descriptor))
+        callable   (udf-reg/materialize
+                     registry
+                     {:db        *udf-db*
+                      :kind      (:udf/kind descriptor)
+                      :embedded? true
+                      :store     (.-store ^DB *udf-db*)}
+                     descriptor)]
+    (apply callable args)))
 
 (def query-fns
   {'=             =,
@@ -878,6 +901,7 @@
    'identical?    identical?,
    'identity      identity,
    'apply         query-apply,
+   'udf           udf,
    'keyword       keyword,
    'meta          meta,
    'name          name,

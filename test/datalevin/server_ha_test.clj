@@ -14,10 +14,12 @@
    [datalevin.kv :as kv]
    [datalevin.server :as srv]
    [datalevin.storage :as st]
+   [datalevin.udf :as udf]
    [datalevin.util :as u]
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
+   [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.server Server]
    [java.net ConnectException]
@@ -2754,7 +2756,20 @@
         (u/delete-files leader-dir)
         (u/delete-files follower-dir)))))
 
-(deftest ha-apply-follower-txlog-record-replays-schema-attr-added-in-record-test
+(defn- txlog-record-with-max-tx
+  [store tx]
+  (->> (kv/open-tx-log-rows (.-lmdb store) 1 64)
+       (filter
+         (fn [record]
+           (some (fn [[op dbi k v]]
+                   (and (= op :put)
+                        (= dbi c/meta)
+                        (= k :max-tx)
+                        (= v tx)))
+                 (:rows record))))
+       last))
+
+(deftest ha-apply-follower-txlog-record-replays-installed-db-fn-test
   (let [padding (apply str (repeat 512 "bank-transfer-padding-"))
         tx-fn (interp/inter-fn [db from-id to-id amount]
                                (let [_ padding]
@@ -2776,21 +2791,9 @@
                                  :db/fn tx-fn}])
       (vreset! leader-store-v (st/open leader-dir nil opts))
       (vreset! follower-store-v (st/open follower-dir nil opts))
-      (let [record
-            (->> (kv/open-tx-log-rows (.-lmdb @leader-store-v) 1 64)
-                 (filter (fn [record]
-                           (some (fn [[op dbi k]]
-                                   (and (= op :put)
-                                        (= dbi c/schema)
-                                        (= k :db/fn)))
-                                 (:rows record))))
-                 last)]
+      (let [record (txlog-record-with-max-tx @leader-store-v 2)]
         (is record)
         (is (seq (:rows record)))
-        (is (some (fn [[op dbi]]
-                    (and (= op :put)
-                         (= dbi c/giants)))
-                  (:rows record)))
         (let [next-state (#'dha/apply-ha-follower-txlog-record!
                           {:store @follower-store-v}
                           record)]
@@ -2801,6 +2804,52 @@
           (is (fn? (i/ea-first-v @follower-store-v
                                  tx-fn-eid
                                  :db/fn)))))
+      (finally
+        (when-let [follower-store @follower-store-v]
+          (when-not (i/closed? follower-store)
+            (i/close follower-store)))
+        (when-let [leader-store @leader-store-v]
+          (when-not (i/closed? leader-store)
+            (i/close leader-store)))
+        (d/close leader-conn)
+        (u/delete-files leader-dir)
+        (u/delete-files follower-dir)))))
+
+(deftest ha-apply-follower-txlog-record-replays-installed-db-udf-test
+  (let [descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :bank/transfer}
+        tx-udf-query '[:find ?e .
+                       :where
+                       [?e :db/ident :bank/transfer]
+                       [?e :db/udf ?descriptor]]
+        leader-dir (u/tmp-dir (str "ha-leader-udf-" (UUID/randomUUID)))
+        follower-dir (u/tmp-dir (str "ha-follower-udf-" (UUID/randomUUID)))
+        opts {:db-name "orders"
+              :db-identity "db-1"
+              :wal? true}
+        leader-conn (d/get-conn leader-dir nil opts)
+        leader-store-v (volatile! nil)
+        follower-store-v (volatile! nil)]
+    (try
+      (d/transact! leader-conn [{:db/ident :bank/transfer
+                                 :db/udf descriptor}])
+      (vreset! leader-store-v (st/open leader-dir nil opts))
+      (vreset! follower-store-v (st/open follower-dir nil opts))
+      (let [record (txlog-record-with-max-tx @leader-store-v 2)]
+        (is record)
+        (is (seq (:rows record)))
+        (let [next-state (#'dha/apply-ha-follower-txlog-record!
+                          {:store @follower-store-v}
+                          record)]
+          (vreset! follower-store-v (:store next-state)))
+        (let [tx-udf-eid (d/q tx-udf-query
+                              (db/new-db @follower-store-v))]
+          (is (integer? tx-udf-eid))
+          (is (= descriptor
+                 (i/ea-first-v @follower-store-v
+                               tx-udf-eid
+                               :db/udf)))))
       (finally
         (when-let [follower-store @follower-store-v]
           (when-not (i/closed? follower-store)
@@ -3447,6 +3496,55 @@
                   nil
                   (ConcurrentHashMap.)
                   dbs)))
+
+(defn- acquire-leader-state
+  [runtime opts]
+  (let [now-ms (System/currentTimeMillis)
+        acquire (ha/try-acquire-lease
+                 (:ha-authority runtime)
+                 {:db-identity (:db-identity opts)
+                  :leader-node-id (:ha-node-id opts)
+                  :leader-endpoint "10.0.0.12:8898"
+                  :lease-renew-ms (:ha-lease-renew-ms opts)
+                  :lease-timeout-ms (:ha-lease-timeout-ms opts)
+                  :leader-last-applied-lsn 1
+                  :now-ms now-ms
+                  :observed-version 0
+                  :observed-lease nil})]
+    (is (:ok? acquire))
+    (-> runtime
+        (assoc :ha-role :leader
+               :ha-authority-owner-node-id (:ha-node-id opts)
+               :ha-lease-until-ms (+ now-ms 10000)
+               :ha-leader-term (:term acquire)
+               :ha-authority-term (:term acquire)))))
+
+(deftest add-store-attaches-server-udf-registry-to-published-db-test
+  (let [dir        (u/tmp-dir (str "server-udf-runtime-" (UUID/randomUUID)))
+        descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :bank/transfer}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor
+                       (fn [_]
+                         [[:db/add 1 :udf/ok true]])))
+        conn       (d/create-conn dir {:udf/ok {:db/valueType :db.type/boolean}})
+        store      (.-store ^DB @conn)
+        server     (fake-server-with-db-state "orders" {})]
+    (try
+      (d/transact! conn [{:db/ident :bank/transfer
+                          :db/udf   descriptor}])
+      (binding [srv/*server-runtime-opts-fn*
+                (fn [_ _ _ _]
+                  {:udf-registry registry})]
+        (#'srv/add-store server "orders" store))
+      (let [dt-db  (get-in (.-dbs server) ["orders" :dt-db])
+            report (d/with dt-db [[:bank/transfer]])]
+        (is (identical? registry (db/udf-registry dt-db)))
+        (is (= true (some-> report :tx-data first :v))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest ensure-ha-runtime-restarts-on-ha-config-change-test
   (let [root "/srv/dtlv"
@@ -4198,6 +4296,76 @@
                    server {:type :transact-kv :args ["orders"]}))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-write-admission-rejects-leader-when-udf-readiness-required-and-missing-test
+  (let [dir        (u/tmp-dir (str "ha-write-udf-missing-" (UUID/randomUUID)))
+        descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :bank/transfer}
+        conn       (d/create-conn dir {:udf/ok {:db/valueType :db.type/boolean}})
+        store      (.-store ^DB @conn)
+        server     (fake-server-with-db-state "orders" {})
+        opts       (valid-ha-opts)
+        runtime    (#'srv/start-ha-authority "orders" opts)]
+    (try
+      (d/transact! conn [{:db/ident :bank/transfer
+                          :db/udf   descriptor}])
+      (binding [srv/*server-runtime-opts-fn*
+                (fn [_ _ _ _]
+                  {:ha-require-udf-ready? true})]
+        (#'srv/add-store server "orders" store))
+      (#'srv/update-db server "orders"
+                       #(merge % (acquire-leader-state runtime opts)))
+      (let [err   (#'srv/ha-write-admission-error
+                   server {:type :tx-data :args ["orders" [] false]})
+            state (get-in (.-dbs server) ["orders"])]
+        (is (= :ha/write-rejected (:error err)))
+        (is (= :udf-not-ready (:reason err)))
+        (is (false? (:retryable? err)))
+        (is (= :bank/transfer
+               (get-in err [:udf-missing 0 :db/ident])))
+        (is (false? (:udf-ready? state)))
+        (is (= :bank/transfer
+               (get-in state [:udf-missing 0 :db/ident]))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest ha-write-admission-allows-leader-when-udf-ready-test
+  (let [dir        (u/tmp-dir (str "ha-write-udf-ready-" (UUID/randomUUID)))
+        descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :bank/transfer}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor
+                       (fn [_]
+                         [[:db/add 1 :udf/ok true]])))
+        conn       (d/create-conn dir {:udf/ok {:db/valueType :db.type/boolean}})
+        store      (.-store ^DB @conn)
+        server     (fake-server-with-db-state "orders" {})
+        opts       (valid-ha-opts)
+        runtime    (#'srv/start-ha-authority "orders" opts)]
+    (try
+      (d/transact! conn [{:db/ident :bank/transfer
+                          :db/udf   descriptor}])
+      (binding [srv/*server-runtime-opts-fn*
+                (fn [_ _ _ _]
+                  {:udf-registry registry
+                   :ha-require-udf-ready? true})]
+        (#'srv/add-store server "orders" store))
+      (#'srv/update-db server "orders"
+                       #(merge % (acquire-leader-state runtime opts)))
+      (let [err   (#'srv/ha-write-admission-error
+                   server {:type :tx-data :args ["orders" [] false]})
+            state (get-in (.-dbs server) ["orders"])]
+        (is (nil? err))
+        (is (true? (:udf-ready? state)))
+        (is (= [] (:udf-missing state))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest ha-control-quorum-loss-demotes-leader-and-blocks-writes-test
   (let [authority (reify ha/ILeaseAuthority

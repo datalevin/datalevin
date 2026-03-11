@@ -109,20 +109,21 @@
       (is (instance? datalevin.remote.DatalogStore store))
       (is (= c/implicit-schema (if/schema store)))
       (is (= c/e0 (if/init-max-eid store)))
-      (let [a  :a/b
+      (let [aid0 (count c/implicit-schema)
+            a  :a/b
             v  (UUID/randomUUID)
             d  (d/datom c/e0 a v)
-            s  (assoc (if/schema store) a {:db/aid 3})
+            s  (assoc (if/schema store) a {:db/aid aid0})
             b  :b/c
             p1 {:db/valueType :db.type/uuid}
             v1 (UUID/randomUUID)
             d1 (d/datom c/e0 b v1)
-            s1 (assoc s b (merge p1 {:db/aid 4}))
+            s1 (assoc s b (merge p1 {:db/aid (inc aid0)}))
             c  :c/d
             p2 {:db/valueType :db.type/ref}
             v2 (long (rand c/emax))
             d2 (d/datom c/e0 c v2)
-            s2 (assoc s1 c (merge p2 {:db/aid 5}))
+            s2 (assoc s1 c (merge p2 {:db/aid (+ aid0 2)}))
             t1 (if/last-modified store)]
         (if/load-datoms store [d])
         (is (<= t1 (if/last-modified store)))
@@ -200,8 +201,9 @@
           (if/close store))
         (let [d     :d/e
               p3    {:db/valueType :db.type/long}
-              s3    (assoc s2 d (merge p3 {:db/aid 6}))
-              s4    (assoc s3 :f/g {:db/aid 7 :db/valueType :db.type/string})
+              s3    (assoc s2 d (merge p3 {:db/aid (+ aid0 3)}))
+              s4    (assoc s3 :f/g {:db/aid (+ aid0 4)
+                                    :db/valueType :db.type/string})
               store (sut/open dir {d p3})]
           (is (= s3 (if/schema store)))
           (if/set-schema store {:f/g {:db/valueType :db.type/string}})

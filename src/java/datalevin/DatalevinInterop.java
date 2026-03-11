@@ -186,6 +186,56 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Normalizes a UDF descriptor into the raw Clojure form expected by
+     * Datalevin.
+     */
+    public static Object udfDescriptor(Map<?, ?> descriptor) {
+        return DatalevinForms.udfDescriptorInput(descriptor);
+    }
+
+    /**
+     * Creates a raw UDF registry handle.
+     */
+    public static Object createUdfRegistry() {
+        return ClojureRuntime.invoke("datalevin.udf", "create-registry");
+    }
+
+    /**
+     * Registers a Java-backed UDF in a registry.
+     */
+    public static Object registerUdf(Object registry,
+                                     Map<?, ?> descriptor,
+                                     UdfFunction fn) {
+        Object normalizedDescriptor = DatalevinForms.udfDescriptorInput(descriptor);
+        return ClojureRuntime.invoke("datalevin.udf",
+                                     "register!",
+                                     registry,
+                                     normalizedDescriptor,
+                                     ClojureFns.udfFunction(fn, normalizedDescriptor));
+    }
+
+    /**
+     * Unregisters a UDF from a registry.
+     */
+    public static Object unregisterUdf(Object registry, Map<?, ?> descriptor) {
+        return ClojureRuntime.invoke("datalevin.udf",
+                                     "unregister!",
+                                     registry,
+                                     DatalevinForms.udfDescriptorInput(descriptor));
+    }
+
+    /**
+     * Returns whether a descriptor is registered in a registry.
+     */
+    public static boolean registeredUdf(Object registry, Map<?, ?> descriptor) {
+        return ClojureCodec.javaBoolean(
+                ClojureRuntime.invoke("datalevin.udf",
+                                      "registered?",
+                                      registry,
+                                      DatalevinForms.udfDescriptorInput(descriptor)));
+    }
+
+    /**
      * Normalizes a schema rename map into the raw Clojure form expected by
      * Datalevin.
      */

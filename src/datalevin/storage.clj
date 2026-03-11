@@ -140,13 +140,19 @@
 
 (defn- init-schema
   [lmdb schema]
-  (when (empty? (load-schema lmdb))
-    (transact-schema lmdb c/implicit-schema))
+  (let [now     (load-schema lmdb)
+        missing (reduce-kv
+                  (fn [acc attr props]
+                    (if (contains? now attr) acc (assoc acc attr props)))
+                  {} c/implicit-schema)]
+    (cond
+      (empty? now)
+      (transact-schema lmdb c/implicit-schema)
+
+      (seq missing)
+      (transact-schema lmdb (update-schema now missing))))
   (when schema
     (transact-schema lmdb (update-schema (load-schema lmdb) schema)))
-  (let [now (load-schema lmdb)]
-    (when-not (now :db/created-at)
-      (transact-schema lmdb (update-schema now c/entity-time-schema))))
   (load-schema lmdb))
 
 (defn- init-attrs [schema]

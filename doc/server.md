@@ -198,6 +198,39 @@ These dynamic vars tune client/server protocol compression (zstd):
 Lower threshold and higher level can reduce bandwidth at the cost of more CPU.
 Set these on both client and server processes if you want symmetric behavior.
 
+#### Runtime UDFs
+
+Remote transaction UDFs run where the transaction executes: on the server.
+Descriptor-backed `:db/udf` therefore requires server-side runtime setup.
+
+Embedded/local databases can be opened with:
+
+```clojure
+{:runtime-opts {:udf-registry registry}}
+```
+
+In server mode, the equivalent runtime registry or resolver must be installed in
+the server process when databases are opened or reopened. Client-local runtime
+registries are not consulted for remote transaction execution.
+
+Stored Clojure `:db/fn` transaction functions defined with `inter-fn` continue
+to work as before. Non-Clojure or host-managed UDFs should use `:db/udf`, where
+the database stores only a descriptor such as:
+
+```clojure
+{:udf/lang :java
+ :udf/kind :tx-fn
+ :udf/id   :user/bootstrap}
+```
+
+In HA deployments, optional runtime setting `:ha-require-udf-ready? true` makes
+the leader reject writes until all installed `:db/udf` transaction descriptors
+can be resolved by the server runtime.
+
+At present, the standalone `dtlv serv` CLI does not provide a dedicated flag
+for installing foreign-language registries, so non-Clojure server-side UDFs
+need programmatic server setup.
+
 ### Networking
 
 The server employs a non-blocking event driven architecture, so it can support a
@@ -241,12 +274,12 @@ copy-in/copy-out sub-protocol, where data are continuously streamed. The
 copy-in/copy-out data stream messages are batched data in EDN vectors
 instead of maps.
 
-User defined functions (e.g. filtering predicates) are serialized and sent to
-server for execution. They are first evaluated in the sandbox using a Clojure
-interpreter, i.e. [sci](https://github.com/borkdude/sci) based on a white list.
-Once interpreted, they become the same kind of Clojure functions as if compiled,
-so the performance hit is minimal. It is also more secure, as there's less
-danger of malicious user code bringing down the server.
+Clojure transaction functions defined with `inter-fn` can be serialized and
+sent to the server for execution. They are first evaluated in the sandbox using
+a Clojure interpreter, i.e. [sci](https://github.com/borkdude/sci) based on a
+white list. Descriptor-backed `:db/udf` works differently: only the descriptor
+crosses the wire, and the server resolves it against its own runtime registry
+or resolver.
 
 ### Security
 

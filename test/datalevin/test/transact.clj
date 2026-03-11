@@ -5,6 +5,7 @@
    [datalevin.core :as d]
    [datalevin.datom :as dd]
    [datalevin.interpret :as i]
+   [datalevin.udf :as udf]
    [datalevin.util :as u]
    [datalevin.constants :as c :refer [tx0]])
   (:import
@@ -93,6 +94,102 @@
     (let [e (d/entity @conn 1)]
       (is (= (:age e) 32))
       (is (:had-birthday e)))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest test-db-ident-fn-closed-schema
+  (let [dir     (u/tmp-dir (str "skip-" (UUID/randomUUID)))
+        conn    (d/create-conn
+                  dir {:name {:db/unique :db.unique/identity}
+                       :age  {:db/valueType :db.type/long}}
+                  {:closed-schema? true
+                   :kv-opts        {:flags (conj c/default-env-flags :nosync)}})
+        inc-age (i/inter-fn [db name]
+                  (if-some [ent (d/entity db [:name name])]
+                    [{:db/id (:db/id ent)
+                      :age   (inc ^long (:age ent))}]
+                    []))]
+    (d/transact! conn [{:db/id    1
+                        :name     "Petr"
+                        :age      31}
+                       {:db/ident :inc-age
+                        :db/fn    inc-age}])
+    (d/transact! conn [[:inc-age "Petr"]])
+    (is (= 32 (:age (d/entity @conn 1))))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest test-db-udf-call
+  (let [dir        (u/tmp-dir (str "udf-tx-" (UUID/randomUUID)))
+        descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :people/inc-age}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor
+                       (fn [db name]
+                         (if-let [[eid age] (first (d/q '{:find  [?e ?age]
+                                                          :in    [$ ?name]
+                                                          :where [[?e :name ?name]
+                                                                  [?e :age ?age]]}
+                                                        db name))]
+                           [{:db/id eid :age (inc ^long age)}]
+                           []))))
+        conn       (d/create-conn
+                     dir {:name {:db/unique :db.unique/identity}}
+                     {:runtime-opts {:udf-registry registry}
+                      :kv-opts      {:flags (conj c/default-env-flags :nosync)}})]
+    (d/transact! conn [{:db/id 1 :name "Petr" :age 31}])
+    (d/transact! conn [[:db.fn/call descriptor "Petr"]])
+    (is (= 32 (:age (d/entity @conn 1))))
+
+    (udf/register! registry descriptor
+      (fn [db name]
+        (if-let [[eid age] (first (d/q '{:find  [?e ?age]
+                                         :in    [$ ?name]
+                                         :where [[?e :name ?name]
+                                                 [?e :age ?age]]}
+                                       db name))]
+          [{:db/id eid :age (+ 10 ^long age)}]
+          [])))
+    (d/transact! conn [[:db.fn/call descriptor "Petr"]])
+    (is (= 42 (:age (d/entity @conn 1))))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest test-db-ident-udf
+  (let [dir        (u/tmp-dir (str "udf-ident-" (UUID/randomUUID)))
+        descriptor {:udf/lang :test
+                    :udf/kind :tx-fn
+                    :udf/id   :people/inc-age}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor
+                       (fn [db name]
+                         (if-let [[eid age] (first (d/q '{:find  [?e ?age]
+                                                          :in    [$ ?name]
+                                                          :where [[?e :name ?name]
+                                                                  [?e :age ?age]]}
+                                                        db name))]
+                           [{:db/id eid :age (inc ^long age)}]
+                           []))))
+        conn       (d/create-conn
+                     dir {:name {:db/unique :db.unique/identity}
+                          :age  {:db/valueType :db.type/long}}
+                     {:closed-schema? true
+                      :runtime-opts  {:udf-registry registry}
+                      :kv-opts       {:flags (conj c/default-env-flags :nosync)}})]
+    (d/transact! conn [{:db/id 1 :name "Petr" :age 31}
+                       {:db/ident :people/inc-age
+                        :db/udf   descriptor}])
+    (d/transact! conn [[:people/inc-age "Petr"]])
+    (is (= 32 (:age (d/entity @conn 1))))
+    (d/transact! conn [[:db.fn/call :people/inc-age "Petr"]])
+    (is (= 33 (:age (d/entity @conn 1))))
+    (is (thrown-with-msg?
+          Exception
+          #"cannot have both :db/fn and :db/udf"
+          (d/transact! conn [{:db/ident :bad/fn
+                              :db/fn    identity
+                              :db/udf   descriptor}])))
     (d/close conn)
     (u/delete-files dir)))
 
