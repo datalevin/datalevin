@@ -17,9 +17,33 @@
 (defn- new-state
   ([] (new-state {}))
   ([opts]
-   (atom {:initialized?  false
+   (atom {:phase         :new
+          :initialized?  false
           :allow-writes? (true? (:allow-writes? opts))
           :session-state (shared/new-session-state)})))
+
+(def ^:private default-initialize-params
+  {"protocolVersion" "2025-06-18"
+   "capabilities"    {}
+   "clientInfo"      {"name"    "test-client"
+                      "version" "1.0"}})
+
+(defn- initialized-state
+  ([] (initialized-state {}))
+  ([opts]
+   (let [state (new-state opts)]
+     (sut/handle-message
+       state
+       {"jsonrpc" "2.0"
+        "id"      0
+        "method"  "initialize"
+        "params"  default-initialize-params})
+     (sut/handle-message
+       state
+       {"jsonrpc" "2.0"
+        "method"  "notifications/initialized"
+        "params"  {}})
+     state)))
 
 (def expected-tool-names
   ["datalevin_add_document"
@@ -55,27 +79,45 @@
    "datalevin_vector_indexed"
    "datalevin_vector_search"])
 
+(defn- json-byte-count
+  [value]
+  (count (.getBytes (jc/write-json-ready-string value) "UTF-8")))
+
 (deftest initialize-tools-and-notification-test
-  (let [state      (new-state)
-        initialize (sut/handle-message
-                     state
-                     {"jsonrpc" "2.0"
-                      "id"      1
-                      "method"  "initialize"
-                      "params"  {"protocolVersion" "2025-06-18"
-                                  "clientInfo"      {"name"    "test-client"
-                                                     "version" "1.0"}}})
-        tools      (sut/handle-message
-                     state
-                     {"jsonrpc" "2.0"
-                      "id"      2
-                      "method"  "tools/list"
-                      "params"  {}})
-        notified   (sut/handle-message
-                     state
-                     {"jsonrpc" "2.0"
-                      "method"  "notifications/initialized"
-                      "params"  {}})]
+  (let [state          (new-state)
+        pre-init-tool  (sut/handle-message
+                         state
+                         {"jsonrpc" "2.0"
+                          "id"      11
+                          "method"  "tools/call"
+                          "params"  {"name"      "datalevin_api_info"
+                                      "arguments" {}}})
+        initialize     (sut/handle-message
+                         state
+                         {"jsonrpc" "2.0"
+                          "id"      1
+                          "method"  "initialize"
+                          "params"  default-initialize-params})
+        pre-ready-list (sut/handle-message
+                         state
+                         {"jsonrpc" "2.0"
+                          "id"      12
+                          "method"  "tools/list"
+                          "params"  {}})
+        notified       (sut/handle-message
+                         state
+                         {"jsonrpc" "2.0"
+                          "method"  "notifications/initialized"
+                          "params"  {}})
+        tools          (sut/handle-message
+                         state
+                         {"jsonrpc" "2.0"
+                          "id"      2
+                          "method"  "tools/list"
+                          "params"  {}})]
+    (is (= -32600 (get-in pre-init-tool ["error" "code"])))
+    (is (= "Requests are not allowed before initialize."
+           (get-in pre-init-tool ["error" "message"])))
     (is (= "2.0" (get initialize "jsonrpc")))
     (is (= 1 (get initialize "id")))
     (is (= "2025-06-18"
@@ -84,13 +126,17 @@
            (get-in initialize ["result" "serverInfo" "name"])))
     (is (= c/version
            (get-in initialize ["result" "serverInfo" "version"])))
+    (is (= -32600 (get-in pre-ready-list ["error" "code"])))
+    (is (= "Requests are not allowed before initialized."
+           (get-in pre-ready-list ["error" "message"])))
     (is (= expected-tool-names
            (mapv #(get % "name") (get-in tools ["result" "tools"]))))
     (is (nil? notified))
+    (is (= :ready (:phase @state)))
     (is (true? (:initialized? @state)))))
 
 (deftest api-info-tool-test
-  (let [state    (new-state)
+  (let [state    (initialized-state)
         response (sut/handle-message
                    state
                    {"jsonrpc" "2.0"
@@ -113,7 +159,7 @@
     (is (string? (get-in response ["result" "content" 0 "text"])))))
 
 (deftest unknown-method-test
-  (let [state    (new-state)
+  (let [state    (initialized-state)
         response (sut/handle-message
                    state
                    {"jsonrpc" "2.0"
@@ -123,6 +169,97 @@
     (is (= -32601 (get-in response ["error" "code"])))
     (is (= "Unsupported method: frobnicate"
            (get-in response ["error" "message"])))))
+
+(deftest initialize-validation-test
+  (let [missing-params     (sut/handle-message
+                             (new-state)
+                             {"jsonrpc" "2.0"
+                              "id"      92
+                              "method"  "initialize"})
+        empty-params       (sut/handle-message
+                             (new-state)
+                             {"jsonrpc" "2.0"
+                              "id"      93
+                              "method"  "initialize"
+                              "params"  {}})
+        missing-capability (sut/handle-message
+                             (new-state)
+                             {"jsonrpc" "2.0"
+                              "id"      94
+                              "method"  "initialize"
+                              "params"  {"protocolVersion" "2025-06-18"
+                                          "clientInfo"      {"name"    "test-client"
+                                                             "version" "1.0"}}})
+        missing-client     (sut/handle-message
+                             (new-state)
+                             {"jsonrpc" "2.0"
+                              "id"      95
+                              "method"  "initialize"
+                              "params"  {"protocolVersion" "2025-06-18"
+                                          "capabilities"    {}}})]
+    (is (= -32602 (get-in missing-params ["error" "code"])))
+    (is (= "protocolVersion is required."
+           (get-in missing-params ["error" "message"])))
+    (is (= -32602 (get-in empty-params ["error" "code"])))
+    (is (= "protocolVersion is required."
+           (get-in empty-params ["error" "message"])))
+    (is (= -32602 (get-in missing-capability ["error" "code"])))
+    (is (= "capabilities is required."
+           (get-in missing-capability ["error" "message"])))
+    (is (= -32602 (get-in missing-client ["error" "code"])))
+    (is (= "clientInfo is required."
+           (get-in missing-client ["error" "message"])))))
+
+(deftest request-id-required-test
+  (let [missing-init-id (sut/handle-message
+                          (new-state)
+                          {"jsonrpc" "2.0"
+                           "method"  "initialize"
+                           "params"  default-initialize-params})
+        missing-list-id (sut/handle-message
+                          (initialized-state)
+                          {"jsonrpc" "2.0"
+                           "method"  "tools/list"
+                           "params"  {}})
+        nil-call-id     (sut/handle-message
+                          (initialized-state)
+                          {"jsonrpc" "2.0"
+                           "id"      nil
+                           "method"  "tools/call"
+                           "params"  {"name"      "datalevin_api_info"
+                                       "arguments" {}}})]
+    (is (= -32600 (get-in missing-init-id ["error" "code"])))
+    (is (= "id is required for requests."
+           (get-in missing-init-id ["error" "message"])))
+    (is (nil? (get missing-init-id "id")))
+    (is (= -32600 (get-in missing-list-id ["error" "code"])))
+    (is (= "id is required for requests."
+           (get-in missing-list-id ["error" "message"])))
+    (is (nil? (get missing-list-id "id")))
+    (is (= -32600 (get-in nil-call-id ["error" "code"])))
+    (is (= "id must be a string or number."
+           (get-in nil-call-id ["error" "message"])))
+    (is (nil? (get nil-call-id "id")))))
+
+(deftest invalid-method-request-test
+  (let [state             (initialized-state)
+        missing-method    (sut/handle-message
+                            state
+                            {"jsonrpc" "2.0"
+                             "id"      90
+                             "params"  {}})
+        non-string-method (sut/handle-message
+                            state
+                            {"jsonrpc" "2.0"
+                             "id"      91
+                             "method"  42
+                             "params"  {}})]
+    (is (= -32600 (get-in missing-method ["error" "code"])))
+    (is (= "method must be a string."
+           (get-in missing-method ["error" "message"])))
+    (is (= -32600 (get-in non-string-method ["error" "code"])))
+    (is (= "method must be a string."
+           (get-in non-string-method ["error" "message"])))))
 
 (deftest command-line-args-test
   (let [result (main/validate-args ["--allow-writes" "mcp"])]
@@ -150,16 +287,16 @@
             "clientOpts" {"pool-size" 3
                           "time-out" 120000}})))
   (let [both-error (sut/handle-message
-                     (new-state)
+                     (initialized-state)
                      {"jsonrpc" "2.0"
                       "id"      4
                       "method"  "tools/call"
                       "params"  {"name"      "datalevin_open_database"
                                   "arguments"
-                                  {"dir" "/tmp/local-db"
-                                   "uri" "dtlv://user:pass@localhost/app"}}})
+                                   {"dir" "/tmp/local-db"
+                                    "uri" "dtlv://user:pass@localhost/app"}}})
         none-error (sut/handle-message
-                     (new-state)
+                     (initialized-state)
                      {"jsonrpc" "2.0"
                       "id"      5
                       "method"  "tools/call"
@@ -183,7 +320,7 @@
                                    :bio   "Alice enjoys pizza"}])
         alice  (get (:tempids report) -1)
         _      (d/close conn)
-        state  (new-state)]
+        state  (initialized-state)]
     (try
       (let [open-response  (sut/handle-message
                              state
@@ -335,7 +472,7 @@
                                  [:put "items" "b" "beta"]
                                  [:put "items" "c" "gamma"]])
         _     (d/close-kv kv)
-        state (new-state)]
+        state (initialized-state)]
     (try
       (let [open-response  (sut/handle-message
                              state
@@ -415,7 +552,7 @@
   (let [dir   (u/tmp-dir (str "datalevin-mcp-search-" (UUID/randomUUID)))
         kv    (d/open-kv dir)
         _     (d/close-kv kv)
-        state (new-state {:allow-writes? true})]
+        state (initialized-state {:allow-writes? true})]
     (try
       (let [open-kv        (sut/handle-message
                              state
@@ -576,14 +713,16 @@
 (deftest response-truncation-test
   (let [dir   (u/tmp-dir (str "datalevin-mcp-truncate-" (UUID/randomUUID)))
         blob  (apply str (repeat 700000 "x"))
+        mid   (apply str (repeat 260000 "x"))
         kv    (d/open-kv dir)
         _     (d/open-dbi kv "items")
         _     (d/transact-kv kv [[:put "items" "a" "alpha"]
                                  [:put "items" "b" "beta"]
                                  [:put "items" "c" "gamma"]
+                                 [:put "items" "mid" mid]
                                  [:put "items" "blob" blob]])
         _     (d/close-kv kv)
-        state (new-state)]
+        state (initialized-state)]
     (try
       (let [open-kv (sut/handle-message
                       state
@@ -615,12 +754,12 @@
             (is (= "items"
                    (get-in range-response ["result" "structuredContent"
                                            "meta" "truncations" 0 "kind"])))
-            (is (= 4
+            (is (= 5
                    (get-in range-response ["result" "structuredContent"
                                            "meta" "truncations" 0 "original"])))))
         (binding [sut/*mcp-limits* (assoc sut/default-mcp-limits
                                           :max-result-items nil
-                                          :max-response-bytes 256
+                                          :max-response-bytes 320
                                           :preview-chars 16)]
           (let [get-response (sut/handle-message
                                state
@@ -631,7 +770,8 @@
                                             "arguments"
                                             {"kv"  kv-id
                                              "dbi" "items"
-                                             "key" "blob"}}})]
+                                             "key" "blob"}}})
+                response-bytes (json-byte-count get-response)]
             (is (= "preview"
                    (get-in get-response ["result" "structuredContent"
                                          "meta" "truncations" 0 "mode"])))
@@ -643,7 +783,51 @@
                                          "result"])))
             (is (str/includes?
                   (get-in get-response ["result" "content" 0 "text"])
-                  "Result truncated."))))
+                  "Result truncated."))
+            (is (<= response-bytes 320))))
+        (binding [sut/*mcp-limits* (assoc sut/default-mcp-limits
+                                          :max-result-items nil
+                                          :max-response-bytes 256
+                                          :preview-chars 16)]
+          (let [too-small-response (sut/handle-message
+                                     state
+                                     {"jsonrpc" "2.0"
+                                      "id"      3660
+                                      "method"  "tools/call"
+                                      "params"  {"name"      "datalevin_kv_get"
+                                                  "arguments"
+                                                  {"kv"  kv-id
+                                                   "dbi" "items"
+                                                   "key" "blob"}}})
+                response-bytes    (json-byte-count too-small-response)]
+            (is (= -32000
+                   (get-in too-small-response ["error" "code"])))
+            (is (= ":result-too-large"
+                   (get-in too-small-response ["error" "data" ":code"])))
+            (is (<= response-bytes 256))))
+        (binding [sut/*mcp-limits* (assoc sut/default-mcp-limits
+                                          :max-result-items nil
+                                          :max-response-bytes 300000)]
+          (let [mid-response    (sut/handle-message
+                                  state
+                                  {"jsonrpc" "2.0"
+                                   "id"      3661
+                                   "method"  "tools/call"
+                                   "params"  {"name"      "datalevin_kv_get"
+                                               "arguments"
+                                               {"kv"  kv-id
+                                                "dbi" "items"
+                                                "key" "mid"}}})
+                structured      (get-in mid-response ["result"
+                                                      "structuredContent"])
+                structured-bytes (json-byte-count structured)
+                response-bytes   (json-byte-count mid-response)]
+            (is (nil? (get-in mid-response ["result" "structuredContent"
+                                            "meta" "truncated"])))
+            (is (= "See structuredContent."
+                   (get-in mid-response ["result" "content" 0 "text"])))
+            (is (< structured-bytes 300000))
+            (is (<= response-bytes 300000))))
         (let [default-get-response
               (sut/handle-message
                 state
@@ -654,7 +838,8 @@
                              "arguments"
                              {"kv"  kv-id
                               "dbi" "items"
-                              "key" "blob"}}})]
+                              "key" "blob"}}})
+              response-bytes (json-byte-count default-get-response)]
           (is (= "2.0" (get default-get-response "jsonrpc")))
           (is (contains? default-get-response "result"))
           (is (= true
@@ -666,7 +851,9 @@
                                                "kind"])))
           (is (str/includes?
                 (get-in default-get-response ["result" "content" 0 "text"])
-                "Result truncated."))))
+                "Result truncated."))
+          (is (<= response-bytes
+                  (:max-response-bytes sut/default-mcp-limits)))))
       (finally
         (shared/clear-handles! (:session-state @state))
         (u/delete-files dir)))))
@@ -677,7 +864,7 @@
     (let [dir   (u/tmp-dir (str "datalevin-mcp-vec-" (UUID/randomUUID)))
           kv    (d/open-kv dir)
           _     (d/close-kv kv)
-          state (new-state {:allow-writes? true})]
+          state (initialized-state {:allow-writes? true})]
       (try
         (let [open-kv       (sut/handle-message
                               state
@@ -818,6 +1005,118 @@
           (shared/clear-handles! (:session-state @state))
           (u/delete-files dir))))))
 
+(deftest close-kv-closes-dependent-indexes-test
+  (if (u/windows?)
+    (is true)
+    (let [dir   (u/tmp-dir (str "datalevin-mcp-kv-dependents-" (UUID/randomUUID)))
+          kv    (d/open-kv dir)
+          _     (d/close-kv kv)
+          state (initialized-state {:allow-writes? true})]
+      (try
+        (let [open-kv      (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3981
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_open_kv"
+                                          "arguments" {"dir" dir}}})
+              kv-id        (get-in open-kv ["result" "structuredContent" "kv"])
+              open-search  (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3982
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_open_search_index"
+                                          "arguments" {"kv" kv-id}}})
+              search-id    (get-in open-search ["result" "structuredContent"
+                                                "searchIndex"])
+              open-vector  (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3983
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_open_vector_index"
+                                          "arguments"
+                                          {"kv"   kv-id
+                                           "opts" {":dimensions" 3}}}})
+              vector-id    (get-in open-vector ["result" "structuredContent"
+                                                "vectorIndex"])
+              count-open   (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3984
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_document_count"
+                                          "arguments" {"searchIndex" search-id}}})
+              info-open    (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3985
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_vector_index_info"
+                                          "arguments"
+                                          {"vectorIndex" vector-id}}})
+              close-kv     (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3986
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_close_kv"
+                                          "arguments" {"kv" kv-id}}})
+              count-closed (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3987
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_document_count"
+                                          "arguments" {"searchIndex" search-id}}})
+              info-closed  (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3988
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_vector_index_info"
+                                          "arguments"
+                                          {"vectorIndex" vector-id}}})
+              close-search (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3989
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_close_search_index"
+                                          "arguments"
+                                          {"searchIndex" search-id}}})
+              close-vector (sut/handle-message
+                             state
+                             {"jsonrpc" "2.0"
+                              "id"      3990
+                              "method"  "tools/call"
+                              "params"  {"name"      "datalevin_close_vector_index"
+                                          "arguments"
+                                          {"vectorIndex" vector-id}}})]
+          (is (= 0
+                 (get-in count-open ["result" "structuredContent" "result"])))
+          (is (= 0
+                 (get-in info-open ["result" "structuredContent" "result"
+                                    ":size"])))
+          (is (= true
+                 (get-in close-kv ["result" "structuredContent" "closed"])))
+          (is (= true (get-in count-closed ["result" "isError"])))
+          (is (= ":unknown-search-index"
+                 (get-in count-closed ["result" "structuredContent" "code"])))
+          (is (= true (get-in info-closed ["result" "isError"])))
+          (is (= ":unknown-vector-index"
+                 (get-in info-closed ["result" "structuredContent" "code"])))
+          (is (= true (get-in close-search ["result" "isError"])))
+          (is (= ":unknown-search-index"
+                 (get-in close-search ["result" "structuredContent" "code"])))
+          (is (= true (get-in close-vector ["result" "isError"])))
+          (is (= ":unknown-vector-index"
+                 (get-in close-vector ["result" "structuredContent" "code"]))))
+        (finally
+          (shared/clear-handles! (:session-state @state))
+          (u/delete-files dir))))))
+
 (deftest remote-uri-tools-test
   (tdc/server-fixture
     (fn []
@@ -825,7 +1124,7 @@
                         (UUID/randomUUID))
             kv-uri (str "dtlv://datalevin:datalevin@localhost/mcp-remote-kv-"
                         (UUID/randomUUID))
-            state  (new-state {:allow-writes? true})]
+            state  (initialized-state {:allow-writes? true})]
         (try
           (let [open-db
                 (sut/handle-message
@@ -912,7 +1211,7 @@
         kv    (d/open-kv kvdir)
         _     (d/open-dbi kv "items")
         _     (d/close-kv kv)
-        state (new-state)]
+        state (initialized-state)]
     (try
       (let [open-db     (sut/handle-message
                           state
@@ -986,7 +1285,7 @@
 (deftest write-tools-enabled-test
   (let [dir   (u/tmp-dir (str "datalevin-mcp-write-on-" (UUID/randomUUID)))
         kvdir (u/tmp-dir (str "datalevin-mcp-kv-write-on-" (UUID/randomUUID)))
-        state (new-state {:allow-writes? true})]
+        state (initialized-state {:allow-writes? true})]
     (try
       (let [open-db       (sut/handle-message
                             state
@@ -1080,7 +1379,7 @@
                                    :counter 0}])
         alice (get (:tempids report) -1)
         _     (d/close conn)
-        state (new-state {:allow-writes? true})]
+        state (initialized-state {:allow-writes? true})]
     (try
       (let [open-db     (sut/handle-message
                           state
@@ -1123,7 +1422,7 @@
         kv    (d/open-kv dir)
         _     (d/open-dbi kv "items")
         _     (d/close-kv kv)
-        state (new-state {:allow-writes? true})]
+        state (initialized-state {:allow-writes? true})]
     (try
       (let [open-kv   (sut/handle-message
                         state
@@ -1165,7 +1464,7 @@
                     {"jsonrpc" "2.0"
                      "id"      1
                      "method"  "initialize"
-                     "params"  {"protocolVersion" "2025-06-18"}})
+                     "params"  default-initialize-params})
                   (jc/write-json-ready-string
                     {"jsonrpc" "2.0"
                      "method"  "notifications/initialized"
@@ -1188,18 +1487,18 @@
                    (get-in (second responses) ["result" "tools"])))))))
 
 (deftest batch-request-test
-  (let [state     (new-state)
-        responses (sut/handle-input
-                    state
-                    [{"jsonrpc" "2.0"
-                      "id"      20
-                      "method"  "initialize"
-                      "params"  {"protocolVersion" "2025-06-18"}}
-                     {"jsonrpc" "2.0"
-                      "id"      21
-                      "method"  "tools/list"
-                      "params"  {}}])]
-    (is (= [20 21] (mapv #(get % "id") responses)))
-    (is (= expected-tool-names
-           (mapv #(get % "name")
-                 (get-in (second responses) ["result" "tools"])))))) 
+  (let [state    (new-state)
+        response (sut/handle-input
+                   state
+                   [{"jsonrpc" "2.0"
+                     "id"      20
+                     "method"  "initialize"
+                     "params"  default-initialize-params}
+                    {"jsonrpc" "2.0"
+                     "id"      21
+                     "method"  "tools/list"
+                     "params"  {}}])]
+    (is (= -32600 (get-in response ["error" "code"])))
+    (is (= "JSON-RPC batch requests are not supported."
+           (get-in response ["error" "message"])))
+    (is (nil? (get response "id")))))
