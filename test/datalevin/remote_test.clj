@@ -8,6 +8,9 @@
    [datalevin.db :as db]
    [datalevin.constants :as c]
    [datalevin.client :as cl]
+   [datalevin.server :as srv]
+   [datalevin.lmdb :as l]
+   [datalevin.util :as u]
    [datalevin.test.core :refer [server-fixture]]
    [clojure.test :refer [is testing deftest use-fixtures]])
   (:import
@@ -65,6 +68,91 @@
                    db
                    {:status "active"}))))
     (dc/close conn)))
+
+(deftest concurrent-remote-open-test
+  (let [dir     (str "dtlv://datalevin:datalevin@localhost/concurrent-open-"
+                     (UUID/randomUUID))
+        schema  {:name {:db/valueType :db.type/string}}
+        start   (promise)
+        futures (mapv (fn [_]
+                        (future
+                          @start
+                          (dc/create-conn dir schema)))
+                      (range 4))
+        _       (deliver start true)
+        conns   (mapv deref futures)]
+    (try
+      (dc/transact! (first conns) [{:db/id -1 :name "Ada"}])
+      (is (= #{"Ada"}
+             (set (dc/q '[:find [?name ...]
+                          :where
+                          [?e :name ?name]]
+                        @(second conns)))))
+      (finally
+        (doseq [conn conns]
+          (dc/close conn))))))
+
+(deftest remote-open-kv-does-not-clobber-closed-datalog-db-test
+  (let [db-name (str "remote-open-kv-datalog-" (UUID/randomUUID))
+        uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        admin   (cl/new-client "dtlv://datalevin:datalevin@localhost")
+        kv*     (atom nil)
+        conn*   (atom nil)]
+    (try
+      (cl/create-database admin db-name :datalog)
+      (cl/close-database admin db-name)
+      (reset! kv* (dc/open-kv uri))
+      (is (false? (dc/closed-kv? @kv*)))
+      (reset! conn* (dc/create-conn uri
+                                    {:value {:db/valueType :db.type/long}}))
+      (is (false? (dc/closed? @conn*)))
+      (dc/transact! @conn* [{:db/id -1 :value 1}])
+      (is (= 1
+             (dc/q '[:find (count ?e) .
+                     :where
+                     [?e :value _]]
+                   (dc/db @conn*))))
+      (finally
+        (when-let [conn @conn*]
+          (try
+            (dc/close conn)
+            (catch Exception _)))
+        (when-let [kv @kv*]
+          (try
+            (dc/close-kv kv)
+            (catch Exception _)))
+        (try
+          (cl/close-database admin db-name)
+          (catch Exception _))
+        (try
+          (cl/drop-database admin db-name)
+          (catch Exception _))
+        (cl/disconnect admin)))))
+
+(deftest get-kv-store-raises-reopen-for-closed-store-test
+  (let [root    (u/tmp-dir (str "server-closed-kv-" (UUID/randomUUID)))
+        server  (binding [c/*db-background-sampling?* false]
+                  (srv/create {:port 0 :root root}))
+        db-name (str "closed-kv-" (UUID/randomUUID))
+        lmdb    (l/open-kv (#'srv/db-dir root db-name))]
+    (try
+      (#'srv/update-db server db-name #(assoc % :store lmdb))
+      (if/close-kv lmdb)
+      (let [e (try
+                (#'srv/get-kv-store server db-name)
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  e)
+                (catch Throwable e
+                  e))]
+        (is (instance? clojure.lang.ExceptionInfo e))
+        (is (= {:type :reopen
+                :db-name db-name
+                :db-type "kv"}
+               (select-keys (ex-data e) [:type :db-name :db-type]))))
+      (finally
+        (srv/stop server)
+        (u/delete-files root)))))
 
 (deftest dt-store-ops-test
   (testing "permission"
@@ -264,6 +352,63 @@
         (is (number? (get-in res [:db-info :last-modified]))))
       (finally
         (if/close store)))))
+
+(deftest remote-copy-succeeds-when-server-temp-cleanup-fails-test
+  (let [db-name            (str "remote-copy-cleanup-failure-" (UUID/randomUUID))
+        uri                (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store              (dc/open-kv uri)
+        dest-root          (u/tmp-dir (str "remote-copy-cleanup-failure-"
+                                           (UUID/randomUUID)))
+        dest               (str dest-root u/+separator+ "copy")
+        cleanup-attempted? (atom false)
+        copied-store*      (atom nil)]
+    (try
+      (dc/open-dbi store "a")
+      (dc/transact-kv store [[:put "a" "hello" "world"]])
+      (let [copy-meta
+            (with-redefs-fn
+              {#'srv/cleanup-copy-tmp-dir!
+               (fn [_]
+                 (reset! cleanup-attempted? true)
+                 (throw (ex-info "copy cleanup failed" {})))}
+              (fn []
+                (if/copy store dest false)))]
+        (is @cleanup-attempted?)
+        (is (map? copy-meta))
+        (reset! copied-store* (l/open-kv dest))
+        (dc/open-dbi @copied-store* "a")
+        (is (= "world"
+               (dc/get-value @copied-store* "a" "hello"))))
+      (finally
+        (when-let [copied-store @copied-store*]
+          (dc/close-kv copied-store))
+        (dc/close-kv store)
+        (u/delete-files dest-root)))))
+
+(deftest remote-copy-does-not-leak-backup-pin-test
+  (let [db-name   (str "remote-copy-backup-pin-" (UUID/randomUUID))
+        uri       (str "dtlv://datalevin:datalevin@localhost/" db-name)
+        store     (dc/open-kv uri {:wal? true})
+        dest-root (u/tmp-dir (str "remote-copy-backup-pin-"
+                                  (UUID/randomUUID)))
+        dest      (str dest-root u/+separator+ "copy")]
+    (try
+      (dc/open-dbi store "a")
+      (dc/transact-kv store [[:put "a" "hello" "world"]])
+      (let [copy-meta (if/copy store dest false)
+            retention (if/txlog-retention-state store)
+            backup    (get-in retention [:floor-providers :backup])]
+        (is (map? copy-meta))
+        (is (string? (get-in copy-meta [:backup-pin :pin-id])))
+        (is (= 0 (:active-count backup)))
+        (is (empty? (:pins backup)))
+        (is (= Long/MAX_VALUE
+               (get-in retention [:floors :backup-pin-floor-lsn]))))
+      (finally
+        (dc/close-kv store)
+        (try
+          (u/delete-files dest-root)
+          (catch Exception _))))))
 
 (deftest remote-start-sampling-idempotent-across-mark-write-test
   (let [dir                (str "dtlv://datalevin:datalevin@localhost/"

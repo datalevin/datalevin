@@ -617,13 +617,16 @@
                    [(l/kv-tx :put session-dbi client-id session :uuid :data)])
     (.put ^Map (.-clients server) client-id session)))
 
+(declare store-closed?)
+
 (defn- get-stores
   [^Server server]
   (into {} (map (fn [[db-name m]] [db-name (:store m)]) (.-dbs server))))
 
 (defn- get-store
   ([^Server server db-name writing?]
-   (get-in (.-dbs server) [db-name (if writing? :wstore :store)]))
+   (some-> (get-in (.-dbs server) [db-name (if writing? :wstore :store)])
+           (#(when-not (store-closed? %) %))))
   ([server db-name]
    (get-store server db-name false)))
 
@@ -638,6 +641,23 @@
                     (vreset! new-v new)
                     new))))
     @new-v))
+
+(defn- replace-db-state-if-current
+  [^Server server db-name expected-state guard-fn new-state]
+  (let [updated? (volatile! false)
+        final-v  (volatile! nil)]
+    (update-db server db-name
+               (fn [state]
+                 (let [next (if (and (identical? state expected-state)
+                                     (guard-fn state))
+                              (do
+                                (vreset! updated? true)
+                                new-state)
+                              state)]
+                   (vreset! final-v next)
+                   next)))
+    {:updated? @updated?
+     :state @final-v}))
 
 (defn- consensus-ha-opts
   [store]
@@ -750,24 +770,34 @@
                (.get ^AtomicBoolean (.-running server)))
       (try
         (let [m (get (.-dbs server) db-name)]
-          (if (or (nil? m) (nil? (:ha-authority m)))
+          (if (or (nil? m)
+                  (nil? (:ha-authority m))
+                  (not (identical? running?
+                                   (:ha-renew-loop-running? m))))
             (.set running? false)
-            (let [next-state-v (volatile! nil)]
-              (update-db server db-name
-                         (fn [state]
-                           (if (and state
-                                    (identical? running?
-                                                (:ha-renew-loop-running? state)))
-                             (let [next-state (ha-renew-step db-name state)]
-                               (vreset! next-state-v next-state)
-                               next-state)
-                             state)))
-              (let [next-state (or @next-state-v m)
-                    sleep-ms   (long (ha-loop-sleep-ms next-state))]
-                (try
-                  (Thread/sleep sleep-ms)
-                  (catch InterruptedException _
-                    (.set running? false)))))))
+            ;; HA renew steps can perform remote authority and watermark reads.
+            ;; Compute the next state outside `update-db` so peer/internal HA
+            ;; requests can still acquire per-DB state while this loop is in
+            ;; flight, then commit only if the DB entry is still the same
+            ;; generation.
+            (let [next-state (ha-renew-step db-name m)
+                  {:keys [state]}
+                  (replace-db-state-if-current
+                   server
+                   db-name
+                   m
+                   #(identical? running? (:ha-renew-loop-running? %))
+                   next-state)]
+              (if (or (nil? state)
+                      (nil? (:ha-authority state))
+                      (not (identical? running?
+                                       (:ha-renew-loop-running? state))))
+                (.set running? false)
+                (let [sleep-ms (long (ha-loop-sleep-ms state))]
+                  (try
+                    (Thread/sleep sleep-ms)
+                    (catch InterruptedException _
+                      (.set running? false))))))))
         (catch Throwable t
           (log/error t "HA renew loop crashed"
                      {:db-name db-name})
@@ -1096,6 +1126,15 @@
         snapshot-lsn
         (when kv-store
           (try
+            (long (or (i/get-value kv-store c/kv-info
+                                   c/wal-snapshot-current-lsn
+                                   :keyword :data)
+                      0))
+            (catch Exception _
+              0)))
+        payload-lsn
+        (when kv-store
+          (try
             (long (dha/read-ha-snapshot-payload-lsn {:store store}))
             (catch Exception _
               0)))
@@ -1107,7 +1146,10 @@
       (assoc :db-identity db-identity)
 
       (some? snapshot-lsn)
-      (assoc :snapshot-last-applied-lsn (long snapshot-lsn)))))
+      (assoc :snapshot-last-applied-lsn (long snapshot-lsn))
+
+      (some? payload-lsn)
+      (assoc :payload-last-applied-lsn (long payload-lsn)))))
 
 (defn- open-port
   [port]
@@ -1388,6 +1430,62 @@
         (doseq [dbi dbis] (i/open-dbi lmdb dbi))
         lmdb))))
 
+(defn- reusable-open-store
+  [store schema]
+  (cond
+    (instance? Store store)
+    (when-not (i/closed? store)
+      (when schema
+        (i/set-schema store schema))
+      store)
+
+    (some? store)
+    (when-not (i/closed-kv? store)
+      store)
+
+    :else
+    nil))
+
+(defn- effective-db-type
+  [^Server server db-name requested-db-type]
+  (or (some-> (pull-db (.-sys-conn server) db-name)
+              :database/type)
+      requested-db-type))
+
+(defn- reusable-store-for-db-type
+  [store schema db-type]
+  (case db-type
+    :datalog
+    (when (instance? Store store)
+      (reusable-open-store store schema))
+
+    (reusable-open-store store schema)))
+
+(defn- multiple-lmdb-open-error?
+  [e]
+  (s/includes? (or (ex-message e) "")
+               "Please do not open multiple LMDB connections"))
+
+(defn- await-reusable-store
+  [^Server server db-name schema db-type]
+  (loop [attempts 40]
+    (if-let [store (some-> (get-store server db-name)
+                           (reusable-store-for-db-type schema db-type))]
+      store
+      (when (pos? attempts)
+        (Thread/sleep (long 25))
+        (recur (dec attempts))))))
+
+(defn- db-open-lock
+  [^Server server db-name]
+  (let [lock-v (volatile! nil)]
+    (update-db server db-name
+               (fn [m]
+                 (let [lock (or (:open-lock m) (Object.))]
+                   (vreset! lock-v lock)
+                   (assoc m :open-lock lock))))
+    @lock-v))
+
 (defn- open-server-store
   "Open a store. NB. stores are left open"
   [^Server server ^SelectionKey skey
@@ -1405,41 +1503,46 @@
           ::database
           (when existing-db? (db-eid sys-conn db-name))
           "Don't have permission to open database"
-        (let [dir      (db-dir (.-root server) db-name)
-              store    (or (when-let [ds (get-store server db-name)]
-                             (if (instance? Store ds)
-                               (when-not (i/closed? ds)
-                                 (when schema
-                                   (i/set-schema ds schema))
-                                 ds)
-                               (when-not (i/closed-kv? ds)
-                                 ds)))
-                           (case db-type
-                             :datalog   (st/open dir schema opts)
-                             :key-value (l/open-kv dir opts)))
-              datalog? (instance? Store store)]
-          (add-store server db-name store)
-          (update-client server client-id
-                         #(cond-> %
-                            true     (update :stores assoc db-name
-                                             {:datalog? datalog?
-                                              :dbis     #{}})
-                            datalog? (update :dt-dbs conj db-name)))
-          (when-not existing-db?
-            (transact-new-db sys-conn username db-type db-name)
+        (locking (db-open-lock server db-name)
+          (let [dir              (db-dir (.-root server) db-name)
+                existing-db-now? (db-exists? server db-name)
+                db-type          (effective-db-type server db-name db-type)
+                store            (or (some-> (get-store server db-name)
+                                             (reusable-store-for-db-type
+                                               schema db-type))
+                                     (try
+                                       (case db-type
+                                         :datalog   (st/open dir schema opts)
+                                         :key-value (l/open-kv dir opts))
+                                       (catch Exception e
+                                         (if (multiple-lmdb-open-error? e)
+                                           (or (await-reusable-store
+                                                server db-name schema db-type)
+                                               (throw e))
+                                           (throw e)))))
+                datalog?         (instance? Store store)]
+            (add-store server db-name store)
             (update-client server client-id
-                           #(assoc % :permissions
-                                   (user-permissions sys-conn username))))
-          (let [db-info (when (and return-db-info? datalog?)
-                          {:max-eid       (i/init-max-eid store)
-                           :max-tx        (i/max-tx store)
-                           :last-modified (i/last-modified store)
-                           :opts          (i/opts store)})]
-            (when respond?
-              (write-message skey
-                             (cond-> {:type :command-complete}
-                               db-info (assoc :result db-info))))
-            db-info))))))
+                           #(cond-> %
+                              true     (update :stores assoc db-name
+                                               {:datalog? datalog?
+                                                :dbis     #{}})
+                              datalog? (update :dt-dbs conj db-name)))
+            (when-not existing-db-now?
+              (transact-new-db sys-conn username db-type db-name)
+              (update-client server client-id
+                             #(assoc % :permissions
+                                     (user-permissions sys-conn username))))
+            (let [db-info (when (and return-db-info? datalog?)
+                            {:max-eid       (i/init-max-eid store)
+                             :max-tx        (i/max-tx store)
+                             :last-modified (i/last-modified store)
+                             :opts          (i/opts store)})]
+              (when respond?
+                (write-message skey
+                               (cond-> {:type :command-complete}
+                                 db-info (assoc :result db-info))))
+              db-info)))))))
 
 (defn- session-lmdb [sys-conn] (.-lmdb ^Store (.-store ^DB (d/db sys-conn))))
 
@@ -1490,22 +1593,38 @@
             :when (not (get-in dbs [db-name :store]))
             :let  [m (get dbs db-name {})]]
       (let [store (open-store root db-name dbis datalog?)
-            next-m (ensure-ha-runtime root db-name (assoc m :store store) store)]
-        (.put dbs db-name next-m)))
+            consensus-ha? (and datalog?
+                               (some? (*consensus-ha-opts-fn* store)))]
+        (if consensus-ha?
+          (do
+            ;; Consensus HA runtime identity is node-local. Restoring a DB from
+            ;; persisted client sessions before a fresh explicit open can start
+            ;; the wrong peer from stale store metadata after restart.
+            (close-store store)
+            (log/info "Skipping automatic reopen of consensus HA database"
+                      {:db-name db-name
+                       :root root}))
+          (let [next-m (ensure-ha-runtime root db-name
+                                          (assoc m :store store)
+                                          store)]
+            (.put dbs db-name next-m)))))
     (doseq [db-name engines
-            :when   (not (get-in dbs [db-name :engine]))
+            :when   (and (not (get-in dbs [db-name :engine]))
+                         (get-in dbs [db-name :store]))
             :let    [m (get dbs db-name {})]]
       (.put dbs db-name
             (assoc m :engine
                    (d/new-search-engine (get-in dbs [db-name :store])))))
     (doseq [db-name indices
-            :when   (not (get-in dbs [db-name :index]))
+            :when   (and (not (get-in dbs [db-name :index]))
+                         (get-in dbs [db-name :store]))
             :let    [m (get dbs db-name {})]]
       (.put dbs db-name
             (assoc m :index
                    (d/new-vector-index (get-in dbs [db-name :store])))))
     (doseq [db-name dt-dbs
-            :when   (not (get-in dbs [db-name :dt-db]))
+            :when   (and (not (get-in dbs [db-name :dt-db]))
+                         (get-in dbs [db-name :store]))
             :let    [m (get dbs db-name {})]]
       (.put dbs db-name
             (assoc m :dt-db
@@ -1590,6 +1709,7 @@
    'set-env-flags
    'get-env-flags
    'sync
+   'ha-watermark
    'txlog-watermarks
    'open-tx-log
    'open-tx-log-rows
@@ -2059,7 +2179,7 @@
   (wrap-error
     (let [db-name (nth args 0)
           res     (if-let [s (store server skey db-name writing?)]
-                    (i/closed? s)
+                    (store-closed? s)
                     true)]
       (write-message skey {:type :command-complete :result res}))))
 
@@ -2437,6 +2557,36 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error (normal-kv-store-handler list-dbis)))
 
+(defn- ^:redef cleanup-copy-tmp-dir!
+  [tf]
+  (u/delete-files tf))
+
+(def ^:private ^:redef server-copy-store!
+  i/copy)
+
+(def ^:private ^:redef open-server-copied-store!
+  st/open)
+
+(def ^:private ^:redef close-server-copied-store!
+  i/close)
+
+(def ^:private ^:redef copy-server-file-out!
+  copy-file-out)
+
+(def ^:private ^:redef unpin-server-copy-backup-floor!
+  kv/txlog-unpin-backup-floor!)
+
+(defn- best-effort-unpin-server-copy-backup-floor!
+  [db-name source-store copy-backup-pin]
+  (when-let [pin-id (:pin-id copy-backup-pin)]
+    (try
+      (unpin-server-copy-backup-floor! source-store pin-id)
+      (catch Throwable e
+        (log/debug e
+                   "Best-effort server copy backup pin cleanup failed"
+                   {:db-name db-name
+                    :pin-id pin-id})))))
+
 (defn- copy
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
@@ -2454,9 +2604,9 @@
                             {:pin-id pin-id
                              :floor-lsn pin-floor-lsn
                              :expires-ms pin-expires-ms}))]
-          (i/copy source-store tf compact?))
+          (server-copy-store! source-store tf compact?))
         (let [completed-ms (System/currentTimeMillis)
-              copied-store (st/open tf nil nil)]
+              copied-store (open-server-copied-store! tf nil nil)]
           (try
             (let [copy-meta (copy-response-meta
                              db-name
@@ -2467,11 +2617,21 @@
                                       :compact? (boolean compact?)}
                                (map? @copy-backup-pin)
                                (assoc :backup-pin @copy-backup-pin)))]
-              (copy-file-out skey path copy-meta))
+              (copy-server-file-out! skey path copy-meta))
             (finally
               (when-not (i/closed? copied-store)
-                (i/close copied-store)))))
-        (finally (u/delete-files tf))))))
+                (close-server-copied-store! copied-store)))))
+        (finally
+          (best-effort-unpin-server-copy-backup-floor!
+           db-name
+           source-store
+           @copy-backup-pin)
+          (try
+            (cleanup-copy-tmp-dir! tf)
+            (catch Throwable e
+              (log/warn e
+                        "Unable to delete temporary copy directory"
+                        {:path (str tf)}))))))))
 
 (defn- stat
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -2493,7 +2653,10 @@
 (defn- get-kv-store
   [server db-name]
   (let [s (get-store server db-name)]
-    (if (instance? Store s) (.-lmdb ^Store s) s)))
+    (or (when s
+          (if (instance? Store s) (.-lmdb ^Store s) s))
+        (u/raise "LMDB store not found"
+                 {:type :reopen :db-name db-name :db-type "kv"}))))
 
 (declare write-txn-runner run-calls halt-run)
 
@@ -2642,6 +2805,40 @@
       (write-message skey
                      {:type :command-complete
                       :result (kv/txlog-watermarks kv-store)}))))
+
+(defn- ha-watermark
+  [^Server server ^SelectionKey skey {:keys [args writing?]}]
+  (wrap-error
+    (let [db-name          (nth args 0)
+          kv-store         (lmdb server skey db-name writing?)
+          txlog-watermarks (kv/txlog-watermarks kv-store)
+          db-state         (get (.-dbs server) db-name)
+          authority        (:ha-authority db-state)
+          authority-diag   (when authority
+                             (try
+                               (ctrl/authority-diagnostics authority)
+                               (catch Throwable _
+                                 nil)))
+          txlog-lsn        (long (or (:last-applied-lsn txlog-watermarks) 0))
+          runtime-lsn      (when authority
+                             (long (dha/read-ha-local-last-applied-lsn
+                                    db-state)))
+          effective-lsn    (long (or runtime-lsn txlog-lsn))]
+      (write-message
+       skey
+       {:type :command-complete
+        :result
+        (cond-> {:last-applied-lsn effective-lsn
+                 :txlog-last-applied-lsn txlog-lsn
+                 :ha-runtime? (boolean authority)}
+          (some? runtime-lsn)
+          (assoc :ha-local-last-applied-lsn runtime-lsn
+                 :ha-role (:ha-role db-state))
+
+          authority-diag
+          (assoc :ha-control-node-leader? (:node-leader? authority-diag)
+                 :ha-control-node-state
+                 (some-> (:node-state authority-diag) str)))}))))
 
 (defn- open-tx-log
   [^Server server ^SelectionKey skey {:keys [args writing?]}]

@@ -17,10 +17,18 @@
 
 (def ^:private initial-value 0)
 (def ^:private default-payload-bytes 12000)
-(def ^:private setup-timeout-ms 15000)
+(def ^:private default-setup-timeout-ms 15000)
 (defonce ^:private initialized-clusters (atom #{}))
 (def ^:private giant-rows-query
   '[:find ?key ?version ?payload
+    :where
+    [?e :giant/key ?key]
+    [?e :giant/version ?version]
+    [?e :giant/payload ?payload]])
+
+(def ^:private giant-state-query
+  '[:find ?version ?payload
+    :in $ ?key
     :where
     [?e :giant/key ?key]
     [?e :giant/version ?version]
@@ -66,9 +74,8 @@
 
 (defn- giant-state
   [db payload-bytes k]
-  (if-some [ent (d/entity db [:giant/key (long k)])]
-    (let [version        (some-> (:giant/version ent) long)
-          payload        (:giant/payload ent)
+  (if-some [[version payload] (first (d/q giant-state-query db (long k)))]
+    (let [version        (some-> version long)
           expected       (when (some? version)
                            (payload-for k version payload-bytes))
           payload-valid? (and (string? payload)
@@ -129,7 +136,9 @@
 
 (defn- wait-for-giants-visible-on-live-nodes!
   [cluster-id key-count payload-bytes]
-  (let [deadline (+ (System/currentTimeMillis) setup-timeout-ms)]
+  (let [timeout-ms (local/workload-setup-timeout-ms cluster-id
+                                                    default-setup-timeout-ms)
+        deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop [last-snapshot nil]
       (let [live-nodes (-> (local/cluster-state cluster-id) :live-nodes sort)
             snapshot   (into {}
@@ -155,7 +164,7 @@
           :else
           (throw (ex-info "Timed out waiting for giant values on live nodes"
                           {:cluster-id cluster-id
-                           :timeout-ms setup-timeout-ms
+                           :timeout-ms timeout-ms
                            :payload-bytes payload-bytes
                            :snapshot snapshot
                            :previous-snapshot last-snapshot})))))))
@@ -186,7 +195,11 @@
   [conn payload-bytes k version]
   (let [version (long version)]
     (d/transact! conn [(giant-entity k version payload-bytes)])
-    (giant-state @conn payload-bytes k)))
+    ;; Linearizability should reflect the requested write value, not a later
+    ;; overlapping state observed by an immediate readback.
+    {:version        version
+     :payload-valid? true
+     :payload-bytes  (long payload-bytes)}))
 
 (defn- cas-giant!
   [conn payload-bytes k [expected new-value]]
@@ -206,7 +219,9 @@
                             [:giant/key (long k)]
                             :giant/payload
                             payload]])
-        (giant-state @conn payload-bytes k))
+        {:version        new-value
+         :payload-valid? true
+         :payload-bytes  (long payload-bytes)})
       ::cas-failed)))
 
 (defn- execute-op!

@@ -7,7 +7,8 @@
 (def ^:private supported-nemesis-labels
   (->> (concat [:none :failover :pause :pause-any :pause-multi
                 :partition :asymmetric :degraded
-                :io-stall :disk-full :rejoin :quorum :clock-skew]
+                :io-stall :disk-full :rejoin :quorum :clock-skew
+                :clock-leader-fast :clock-leader-slow :clock-mixed]
                core/supported-nemeses)
        (map name)
        sort

@@ -11,9 +11,10 @@
    :register/value {:db/valueType :db.type/long}})
 
 (def ^:private initial-value 0)
-(def ^:private setup-timeout-ms 15000)
+(def ^:private default-setup-timeout-ms 15000)
 (def ^:private converge-timeout-ms 30000)
 (def ^:private wal-gap-gc-timeout-ms 10000)
+(def ^:private wal-gap-write-timeout-ms 30000)
 (def ^:private wal-gap-retry-sleep-ms 250)
 (def ^:private wal-gap-write-sleep-ms 150)
 (def ^:private wal-gap-writes-per-batch 4)
@@ -86,11 +87,34 @@
     (when (seq missing)
       (d/transact! conn missing))))
 
-(defn- local-node-register-state
-  [cluster-id logical-node key-count]
-  (let [rows (local/local-query cluster-id
-                                logical-node
-                                register-rows-query)]
+(defn- in-process-node-register-state
+  [test logical-node key-count]
+  (let [cluster-id (:datalevin/cluster-id test)
+        rows       (local/local-query cluster-id
+                                      logical-node
+                                      register-rows-query)]
+    (if (= ::local/unavailable rows)
+      {:values ::local/unavailable
+       :node-diagnostics (local/node-diagnostics cluster-id logical-node)
+       :ready? false}
+      (let [values (register-values-from-rows rows key-count)]
+        {:values values
+         :node-diagnostics (local/node-diagnostics cluster-id logical-node)
+         :ready? (and (= (long key-count) (count values))
+                      (every? integer? values))}))))
+
+(defn- remote-node-register-state
+  [test logical-node key-count]
+  (let [cluster-id (:datalevin/cluster-id test)
+        rows       (try
+                     (local/with-node-conn
+                       test
+                       logical-node
+                       schema
+                       (fn [conn]
+                         (d/q register-rows-query @conn)))
+                     (catch Throwable _
+                       ::local/unavailable))]
     (if (= ::local/unavailable rows)
       {:values ::local/unavailable
        :node-diagnostics (local/node-diagnostics cluster-id logical-node)
@@ -102,17 +126,17 @@
                       (every? integer? values))}))))
 
 (defn- wait-for-expected-registers-on-live-nodes!
-  [cluster-id key-count expected-values timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+  [test key-count expected-values timeout-ms node-state-fn]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline (+ (System/currentTimeMillis) (long timeout-ms))]
     (loop [last-snapshot nil]
       (let [live-nodes (-> (local/cluster-state cluster-id) :live-nodes sort)
             snapshot   (into {}
                              (map (fn [logical-node]
                                     [logical-node
-                                     (local-node-register-state
-                                      cluster-id
-                                      logical-node
-                                      key-count)]))
+                                     (node-state-fn test
+                                                    logical-node
+                                                    key-count)]))
                              live-nodes)]
         (cond
           (every? (fn [[_ {:keys [ready? values]}]]
@@ -135,13 +159,15 @@
                            :previous-snapshot last-snapshot})))))))
 
 (defn- wait-for-registers-visible-on-live-nodes!
-  [cluster-id key-count]
+  [test key-count]
   (let [expected (vec (repeat (long key-count) (long initial-value)))]
     (wait-for-expected-registers-on-live-nodes!
-      cluster-id
+      test
       key-count
       expected
-      setup-timeout-ms)))
+      (local/workload-setup-timeout-ms (:datalevin/cluster-id test)
+                                       default-setup-timeout-ms)
+      in-process-node-register-state)))
 
 (defn- ensure-registers-initialized!
   [test key-count]
@@ -154,7 +180,7 @@
             schema
             (fn [conn]
               (ensure-registers! conn key-count)))
-          (wait-for-registers-visible-on-live-nodes! cluster-id key-count)
+          (wait-for-registers-visible-on-live-nodes! test key-count)
           (swap! initialized-clusters conj cluster-id))))))
 
 (defn- keyed-value
@@ -208,12 +234,48 @@
         (Thread/sleep (long sleep-ms)))))
   (let [cluster-id (:datalevin/cluster-id test)
         {:keys [leader]} (local/wait-for-single-leader! cluster-id
-                                                        converge-timeout-ms)
-        target-lsn (local/effective-local-lsn cluster-id leader)]
-    (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                             target-lsn
-                                             converge-timeout-ms)
-    target-lsn))
+                                                        converge-timeout-ms)]
+    ;; Forced WAL-gap bootstrap only needs an authoritative source to retain
+    ;; the post-stop writes. Waiting for every remaining live follower to catch
+    ;; up here can deadlock the setup under combo faults before the target node
+    ;; is even restarted.
+    (local/effective-local-lsn cluster-id leader)))
+
+(defn- write-register-until-leader-lsn!
+  [test key-count start-value min-leader-lsn]
+  (let [cluster-id (:datalevin/cluster-id test)
+        target-lsn (long min-leader-lsn)
+        deadline   (+ (System/currentTimeMillis)
+                      wal-gap-write-timeout-ms)]
+    (loop [next-start-value (long start-value)
+           leader-lsn
+           (let [{:keys [leader]} (local/wait-for-single-leader! cluster-id
+                                                                 converge-timeout-ms)]
+             (long (local/effective-local-lsn cluster-id leader)))]
+      (cond
+        (>= leader-lsn target-lsn)
+        {:leader-lsn leader-lsn
+         :next-start-value next-start-value}
+
+        (< (System/currentTimeMillis) deadline)
+        (let [next-leader-lsn
+              (write-register-batch-with-rolls! test
+                                                key-count
+                                                next-start-value
+                                                wal-gap-writes-per-batch
+                                                wal-gap-write-sleep-ms)]
+          (recur (+ next-start-value wal-gap-writes-per-batch)
+                 (long next-leader-lsn)))
+
+        :else
+        (throw
+         (ex-info "Timed out advancing Jepsen leader LSN before forcing WAL gap"
+                  {:cluster-id cluster-id
+                   :target-lsn target-lsn
+                   :leader-lsn leader-lsn
+                   :start-value start-value
+                   :next-start-value next-start-value
+                   :timeout-ms wal-gap-write-timeout-ms}))))))
 
 (defn- merge-gc-result
   [old new]
@@ -228,19 +290,38 @@
                   :else new)]
     (assoc best :deleted-count (max old-del new-del))))
 
+(defn- wal-gap-source?
+  [follower-next-lsn result]
+  (let [after            (or (:after result) result)
+        min-retained-lsn (long (or (:min-retained-lsn after) 0))]
+    (> min-retained-lsn (long follower-next-lsn))))
+
+(defn- realized-wal-gap-sources
+  [follower-next-lsn gc-results]
+  (->> gc-results
+       (keep (fn [[logical-node result]]
+               (when (wal-gap-source? follower-next-lsn result)
+                 logical-node)))
+       sort
+       vec))
+
 (defn- wal-gap-realized?
   [follower-next-lsn gc-results]
-  (every? (fn [[_ result]]
-            (and (pos? (long (or (:deleted-count result) 0)))
-                 (> (long (or (get-in result [:after :min-retained-lsn]) 0))
-                    (long follower-next-lsn))))
-          gc-results))
+  (boolean (seq (realized-wal-gap-sources follower-next-lsn gc-results))))
 
 (defn- wait-for-real-wal-gap!
   [cluster-id source-nodes follower-next-lsn]
   (let [deadline (+ (System/currentTimeMillis) wal-gap-gc-timeout-ms)]
-    (loop [best-results {}]
-      (let [attempt-results (into {}
+    (loop [best-results {}
+           best-cleanup {}]
+      (let [cleanup-results (into {}
+                                 (map (fn [logical-node]
+                                        [logical-node
+                                         (local/clear-copy-backup-pins-on-node!
+                                           cluster-id
+                                           logical-node)]))
+                                 source-nodes)
+            attempt-results (into {}
                                   (map (fn [logical-node]
                                          [logical-node
                                           (local/gc-txlog-segments-on-node!
@@ -249,15 +330,25 @@
                                   source-nodes)
             gc-results      (merge-with merge-gc-result
                                         best-results
-                                        attempt-results)]
+                                        attempt-results)
+            cleanup-state   (merge-with
+                             (fn [old new]
+                               (if (seq (:remaining-pin-ids new))
+                                 new
+                                 old))
+                             best-cleanup
+                             cleanup-results)]
         (cond
-          (wal-gap-realized? follower-next-lsn gc-results)
-          gc-results
+          (wal-gap-realized? follower-next-lsn attempt-results)
+          {:gc-results attempt-results
+           :realized-source-nodes
+           (realized-wal-gap-sources follower-next-lsn attempt-results)
+           :copy-pin-cleanup cleanup-results}
 
           (< (System/currentTimeMillis) deadline)
           (do
             (Thread/sleep wal-gap-retry-sleep-ms)
-            (recur gc-results))
+            (recur gc-results cleanup-state))
 
           :else
           (throw
@@ -265,7 +356,11 @@
                      {:cluster-id cluster-id
                       :source-nodes source-nodes
                       :follower-next-lsn follower-next-lsn
-                      :gc-results gc-results})))))))
+                      :realized-source-nodes
+                      (realized-wal-gap-sources follower-next-lsn gc-results)
+                      :gc-results gc-results
+                      :copy-pin-cleanup cleanup-state
+                      :last-gc-results attempt-results})))))))
 
 (defn- choose-bootstrap-target!
   [test]
@@ -310,9 +405,9 @@
                            :leader leader
                            :live-nodes live-nodes})))
         (let [leader-lsn (local/effective-local-lsn cluster-id leader)]
-          (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                                   leader-lsn
-                                                   converge-timeout-ms)
+          ;; The bootstrap target's stopped metadata records the exact follower
+          ;; LSN. Requiring every live node to match the leader first is stricter
+          ;; than the workload needs and breaks under sustained clock skew.
           (local/stop-node! cluster-id follower)
           (let [stopped-info (or (local/stopped-node-info cluster-id follower)
                                  {:effective-local-lsn leader-lsn})]
@@ -321,57 +416,134 @@
              :stopped-info stopped-info
              :stopped-during-converge? true}))))))
 
+(defn- stopped-node-baseline-lsn
+  [stopped-info]
+  (let [effective-lsn (long (or (:effective-local-lsn stopped-info) 0))
+        runtime-lsn   (long (or (get-in stopped-info
+                                        [:node-diagnostics
+                                         :ha-local-last-applied-lsn])
+                                0))
+        next-lsn      (long (or (get-in stopped-info
+                                        [:node-diagnostics
+                                         :ha-follower-next-lsn])
+                                0))
+        resume-lsn    (long (max 0 (dec next-lsn)))]
+    ;; The stopped-node snapshot captures both a conservative local floor and
+    ;; the HA runtime's own replay cursor. Rejoin bootstrap must target the
+    ;; higher of those values; otherwise the live sources can snapshot/GC below
+    ;; what the restarted follower will actually require on resume.
+    (long (max effective-lsn runtime-lsn resume-lsn))))
+
 (defn- force-snapshot-bootstrap!
   [test key-count]
   (let [cluster-id (:datalevin/cluster-id test)
         {:keys [leader logical-node stopped-info stopped-during-converge?]}
         (choose-bootstrap-target! test)
-        baseline-lsn      (long (or (:effective-local-lsn stopped-info) 0))
+        baseline-lsn      (stopped-node-baseline-lsn stopped-info)
         follower-next-lsn (unchecked-inc baseline-lsn)
+        phase-1           (write-register-until-leader-lsn! test
+                                                            key-count
+                                                            1000
+                                                            follower-next-lsn)
+        _                 (local/wait-for-live-nodes-at-least-lsn!
+                           cluster-id
+                           follower-next-lsn
+                           converge-timeout-ms)
+        source-leader     (:leader (local/wait-for-single-leader! cluster-id
+                                                                  converge-timeout-ms))
         source-nodes      (->> (get-in (local/cluster-state cluster-id)
                                        [:live-nodes])
+                               (remove #{logical-node})
                                sort
                                vec)
         _                 (when (empty? source-nodes)
                             (throw (ex-info "No live Jepsen source nodes available for bootstrap"
                                             {:cluster-id cluster-id
                                              :logical-node logical-node})))
-        _                 (write-register-batch-with-rolls! test
-                                                            key-count
-                                                            1000
-                                                            wal-gap-writes-per-batch
-                                                            wal-gap-write-sleep-ms)
         snapshot-1        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)
-        _                 (write-register-batch-with-rolls! test
+        min-snapshot-lsn  (apply min
+                                 (map (fn [source-node]
+                                        (long (or (get-in snapshot-1
+                                                          [source-node
+                                                           :snapshot
+                                                           :applied-lsn])
+                                                  0)))
+                                      source-nodes))
+        phase-2-target-lsn (long (max (unchecked-inc follower-next-lsn)
+                                      (+ min-snapshot-lsn
+                                         wal-gap-writes-per-batch)))
+        phase-2           (write-register-until-leader-lsn! test
                                                             key-count
-                                                            2000
-                                                            wal-gap-writes-per-batch
-                                                            wal-gap-write-sleep-ms)
+                                                            (:next-start-value phase-1)
+                                                            phase-2-target-lsn)
+        _                 (local/wait-for-live-nodes-at-least-lsn!
+                           cluster-id
+                           phase-2-target-lsn
+                           converge-timeout-ms)
         snapshot-2        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)
-        min-snapshot-lsn  (long (or (get-in snapshot-1
-                                            [leader :snapshot :applied-lsn])
-                                    0))
-        gc-results        (wait-for-real-wal-gap! cluster-id
-                                                  source-nodes
-                                                  follower-next-lsn)
+        required-snapshot-lsn
+        (apply min
+               (map (fn [source-node]
+                      (long (or (get-in snapshot-2
+                                        [source-node
+                                         :snapshot
+                                         :applied-lsn])
+                                0)))
+                    source-nodes))
+        {:keys [gc-results realized-source-nodes copy-pin-cleanup]}
+        (wait-for-real-wal-gap! cluster-id
+                                source-nodes
+                                follower-next-lsn)
         _                 (local/restart-node! cluster-id logical-node)
-        bootstrap-state   (local/wait-for-follower-bootstrap! cluster-id
-                                                              logical-node
-                                                              min-snapshot-lsn
-                                                              converge-timeout-ms)]
+        bootstrap-state
+        (try
+          (local/wait-for-follower-bootstrap! cluster-id
+                                             logical-node
+                                             required-snapshot-lsn
+                                             converge-timeout-ms)
+          (catch clojure.lang.ExceptionInfo e
+            (let [last-state    (:last-state (ex-data e))
+                  applied-lsn   (long (or (:ha-local-last-applied-lsn last-state)
+                                          0))
+                  effective-lsn (long (or (:ha-effective-local-lsn last-state)
+                                          applied-lsn))
+                  next-lsn      (long (or (:ha-follower-next-lsn last-state)
+                                          0))]
+              (if (and (map? last-state)
+                       (#{:follower nil} (:ha-role last-state))
+                       (nil? (:ha-follower-last-error last-state))
+                       (>= effective-lsn required-snapshot-lsn)
+                       (>= next-lsn (unchecked-inc required-snapshot-lsn)))
+                (assoc last-state
+                       :jepsen-bootstrap-inferred? true
+                       :ha-follower-last-bootstrap-ms
+                       (or (:ha-follower-last-bootstrap-ms last-state)
+                           (:ha-follower-last-sync-ms last-state))
+                       :ha-follower-bootstrap-source-endpoint
+                       (or (:ha-follower-bootstrap-source-endpoint last-state)
+                           (:ha-follower-source-endpoint last-state))
+                       :ha-follower-bootstrap-snapshot-last-applied-lsn
+                       required-snapshot-lsn)
+                (throw e)))))]
     {:bootstrap-state bootstrap-state
      :restarted-nodes [logical-node]
      :wal-gap {:target-node logical-node
                :source-nodes source-nodes
                :leader-at-stop leader
+               :leader-at-bootstrap source-leader
                :stopped-during-converge? stopped-during-converge?
                :stopped-node-info stopped-info
                :baseline-lsn baseline-lsn
                :follower-next-lsn follower-next-lsn
+               :required-snapshot-lsn required-snapshot-lsn
+               :phase-1 phase-1
+               :phase-2 phase-2
                :snapshots {:initial snapshot-1
                            :latest snapshot-2}
+               :realized-source-nodes realized-source-nodes
+               :copy-pin-cleanup copy-pin-cleanup
                :gc-results gc-results}}))
 
 (defn- convergence-result
@@ -379,6 +551,7 @@
   (let [cluster-id        (:datalevin/cluster-id test)
         bootstrap-result  (force-snapshot-bootstrap! test key-count)
         restarted-nodes   (:restarted-nodes bootstrap-result)
+        restarted-set     (set restarted-nodes)
         {:keys [leader]}  (local/wait-for-single-leader! cluster-id
                                                          converge-timeout-ms)
         expected-values   (leader-register-values test key-count)
@@ -397,10 +570,17 @@
                                                :message (ex-message e))}
                                 (throw e))))
         live-node-state   (wait-for-expected-registers-on-live-nodes!
-                            cluster-id
+                            test
                             key-count
                             expected-values
-                            converge-timeout-ms)]
+                            converge-timeout-ms
+                            (fn [test logical-node key-count]
+                              ((if (contains? restarted-set logical-node)
+                                 remote-node-register-state
+                                 in-process-node-register-state)
+                               test
+                               logical-node
+                               key-count)))]
     {:leader leader
      :expected expected-values
      :target-lsn target-lsn

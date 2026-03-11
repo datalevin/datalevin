@@ -39,7 +39,7 @@
     :db/fn transfer-balance}])
 
 (defonce ^:private initialized-clusters (atom #{}))
-(def ^:private setup-timeout-ms 15000)
+(def ^:private default-setup-timeout-ms 15000)
 (def ^:private tx-fn-query
   '[:find ?fn .
     :where
@@ -139,7 +139,9 @@
 
 (defn- wait-for-bank-visible-on-live-nodes!
   [cluster-id account-count initial-balance]
-  (let [deadline (+ (System/currentTimeMillis) setup-timeout-ms)
+  (let [timeout-ms (local/workload-setup-timeout-ms cluster-id
+                                                    default-setup-timeout-ms)
+        deadline (+ (System/currentTimeMillis) timeout-ms)
         expected-balances (vec (repeat (long account-count)
                                        (long initial-balance)))]
     (loop [last-snapshot nil]
@@ -167,7 +169,7 @@
           :else
           (throw (ex-info "Timed out waiting for bank seed state on live nodes"
                           {:cluster-id cluster-id
-                           :timeout-ms setup-timeout-ms
+                           :timeout-ms timeout-ms
                            :expected-balances expected-balances
                            :snapshot snapshot
                            :previous-snapshot last-snapshot})))))))

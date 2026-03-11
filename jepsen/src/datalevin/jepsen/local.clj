@@ -9,10 +9,12 @@
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.remote :as r]
    [datalevin.server :as srv]
    [datalevin.util :as u]
    [jepsen.db :as db]
-   [jepsen.net.proto :as net.proto])
+   [jepsen.net.proto :as net.proto]
+   [taoensso.timbre :as log])
   (:import
    [datalevin.jepsen PartitionFaults]
    [datalevin.storage Store]
@@ -27,6 +29,7 @@
 (def ^:private default-port-limit 31999)
 (def ^:private port-block-size 32)
 (def ^:private cluster-timeout-ms 10000)
+(def ^:private default-cluster-setup-timeout-ms 30000)
 ; Keep request timeout close to Jepsen's leader wait so paused nodes fail fast.
 (def ^:private conn-client-opts {:pool-size 1 :time-out cluster-timeout-ms})
 (def ^:private leader-connect-retry-sleep-ms 250)
@@ -450,6 +453,26 @@
       (assoc :ha-node-id (:node-id node))
       (assoc-in [:ha-control-plane :local-peer-id] (:peer-id node))))
 
+(defn- cluster-setup-timeout-ms
+  [base-opts]
+  (let [control-plane (:ha-control-plane base-opts)
+        election-ms   (long (or (:election-timeout-ms control-plane) 0))
+        operation-ms  (long (or (:operation-timeout-ms control-plane)
+                                default-cluster-setup-timeout-ms))]
+    (long (max default-cluster-setup-timeout-ms
+               (+ election-ms operation-ms 10000)))))
+
+(defn workload-setup-timeout-ms
+  ([cluster-id]
+   (workload-setup-timeout-ms cluster-id default-cluster-setup-timeout-ms))
+  ([cluster-id default-timeout-ms]
+   (let [default-timeout-ms (long default-timeout-ms)]
+     (long
+       (max default-timeout-ms
+            (or (some-> (get-in @clusters [cluster-id :base-opts])
+                        cluster-setup-timeout-ms)
+                default-cluster-setup-timeout-ms))))))
+
 (defn- start-server!
   [{:keys [port root]} verbose?]
   (u/create-dirs root)
@@ -481,24 +504,51 @@
       (u/delete-files path)
       (catch Throwable _ nil))))
 
-(defn- open-ha-conn!
-  [node db-name schema opts]
-  (d/create-conn (db-uri (:endpoint node) db-name)
-                 schema
-                 (assoc opts :client-opts conn-client-opts)))
+(declare create-conn-with-timeout!
+         transport-failure?)
 
-(defn- create-conn-with-timeout!
+(defn- open-ha-conn!
+  ([node db-name schema opts]
+   (open-ha-conn! node db-name schema opts cluster-timeout-ms))
+  ([node db-name schema opts timeout-ms]
+   (let [uri        (db-uri (:endpoint node) db-name)
+         timeout-ms (long timeout-ms)
+         deadline   (+ (now-ms) timeout-ms)]
+     (loop []
+       (let [remaining-ms      (- deadline (now-ms))
+             attempt-timeout-ms (long (max 1 (min timeout-ms remaining-ms)))
+             outcome           (try
+                                 {:conn (create-conn-with-timeout! uri
+                                                                   schema
+                                                                   opts
+                                                                   attempt-timeout-ms)}
+                                 (catch Throwable e
+                                   {:error e}))]
+         (if-let [conn (:conn outcome)]
+           conn
+           (let [e (:error outcome)]
+             (if (and (< (now-ms) deadline)
+                      (transport-failure? e))
+               (do
+                 (Thread/sleep (long leader-connect-retry-sleep-ms))
+                 (recur))
+               (throw e)))))))))
+
+(defn- ^:redef create-conn-with-timeout!
   ([uri schema]
-   (create-conn-with-timeout! uri schema cluster-timeout-ms))
+   (create-conn-with-timeout! uri schema {} cluster-timeout-ms))
   ([uri schema timeout-ms]
+   (create-conn-with-timeout! uri schema {} timeout-ms))
+  ([uri schema opts timeout-ms]
    (let [timeout-ms (long timeout-ms)
          timed-out? (atom false)
          result-f   (future
                       (try
                         (let [conn (d/create-conn uri
                                                   schema
-                                                  {:client-opts
-                                                   conn-client-opts})]
+                                                  (assoc opts
+                                                         :client-opts
+                                                         conn-client-opts))]
                           (if @timed-out?
                             (do
                               (safe-close-conn! conn)
@@ -587,6 +637,20 @@
               nil))
           0))))
 
+(defn- local-snapshot-lsn
+  [state]
+  (let [store (:store state)
+        lmdb  (if (instance? Store store)
+                (.-lmdb ^Store store)
+                store)]
+    (long
+      (or (try
+            (i/get-value lmdb c/kv-info c/wal-snapshot-current-lsn
+                         :keyword :data)
+            (catch Throwable _
+              nil))
+          0))))
+
 (defn effective-local-lsn
   [cluster-id logical-node]
   (let [{:keys [db-name servers]} (get @clusters cluster-id)]
@@ -596,12 +660,34 @@
                                        (get servers logical-node)
                                        db-name))
                                     0))
+            snapshot-lsn  (local-snapshot-lsn state)
+            runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
+            persisted-lsn (local-ha-persisted-lsn state)
+            comparable    (long (max runtime-lsn persisted-lsn))
+            local-truth   (long (max txlog-lsn snapshot-lsn))]
+        (if (= :leader (:ha-role state))
+          (long (max local-truth comparable))
+          (if (pos? local-truth)
+            local-truth
+            comparable)))
+      0)))
+
+(defn node-progress-lsn
+  [cluster-id logical-node]
+  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
+    (if-let [state (db-state (get servers logical-node) db-name)]
+      (let [txlog-lsn     (long (or (:last-applied-lsn
+                                     (local-watermarks
+                                      (get servers logical-node)
+                                      db-name))
+                                    0))
             runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
             persisted-lsn (local-ha-persisted-lsn state)
             comparable    (long (max runtime-lsn persisted-lsn))]
-        (if (= :leader (:ha-role state))
-          (long (max txlog-lsn comparable))
-          comparable))
+        ;; Snapshot-floor metadata is a historical retention marker, not proof
+        ;; that a live node has replayed newer WAL. Catch-up waits must use the
+        ;; node's actual applied progress so later snapshots cannot regress.
+        (long (max txlog-lsn comparable)))
       0)))
 
 (defn wait-for-live-nodes-at-least-lsn!
@@ -614,8 +700,8 @@
        (let [{:keys [live-nodes]} (get @clusters cluster-id)
              snapshot            (into {}
                                        (map (fn [logical-node]
-                                              [logical-node
-                                               (effective-local-lsn
+                                             [logical-node
+                                               (node-progress-lsn
                                                  cluster-id
                                                  logical-node)]))
                                        live-nodes)]
@@ -668,6 +754,8 @@
           {:status :probe-failed
            :message (ex-message e)})))))
 
+(declare node-diagnostics)
+
 (defn wait-for-single-leader!
   ([cluster-id]
    (wait-for-single-leader! cluster-id cluster-timeout-ms))
@@ -685,6 +773,37 @@
                                      (get servers logical-node)
                                      db-name)]))
                             live-nodes)
+             diagnostics-snapshot
+             (into {}
+                   (map (fn [logical-node]
+                          [logical-node
+                           (select-keys
+                            (node-diagnostics cluster-id logical-node)
+                            [:ha-role
+                             :ha-authority-owner-node-id
+                             :ha-authority-term
+                             :ha-control-local-peer-id
+                             :ha-control-leader-peer-id
+                             :ha-control-node-leader?
+                             :ha-control-node-state
+                             :ha-local-last-applied-lsn
+                             :ha-follower-next-lsn
+                             :ha-follower-last-sync-ms
+                             :ha-follower-last-bootstrap-ms
+                             :ha-follower-degraded?
+                             :ha-follower-degraded-reason
+                             :ha-follower-last-error
+                             :ha-follower-last-error-details
+                             :ha-clock-skew-paused?
+                             :ha-clock-skew-last-observed-ms
+                             :ha-clock-skew-last-result
+                             :ha-promotion-last-failure
+                             :ha-promotion-failure-details
+                             :ha-rejoin-promotion-blocked?
+                             :ha-rejoin-promotion-blocked-until-ms
+                             :ha-lease-until-ms
+                             :ha-last-authority-refresh-ms])]))
+                   live-nodes)
              leaders (->> snapshot
                           (keep (fn [[logical-node {:keys [status]}]]
                                   (when (= :leader status) logical-node)))
@@ -700,10 +819,14 @@
              (recur snapshot))
 
            :else
-           (throw (ex-info "Timed out waiting for single leader"
-                           {:timeout-ms timeout-ms
-                            :probe-snapshot snapshot
-                            :previous-snapshot last-snapshot}))))))))
+           (let [data {:timeout-ms timeout-ms
+                       :probe-snapshot snapshot
+                       :diagnostics-snapshot diagnostics-snapshot
+                       :previous-snapshot last-snapshot}]
+             (log/warn "Jepsen timed out waiting for single Datalevin leader"
+                       data)
+             (throw (ex-info "Timed out waiting for single leader"
+                             data)))))))))
 
 (defn maybe-wait-for-single-leader
   ([cluster-id]
@@ -728,8 +851,6 @@
 (defn- authority-leader-logical-node
   [cluster-id peer-id]
   (get-in @clusters [cluster-id :peer-id->node peer-id]))
-
-(declare node-diagnostics)
 
 (defn wait-for-authority-leader!
   ([cluster-id]
@@ -830,6 +951,26 @@
          (:ha-follower-last-error-details state)
          :ha-follower-next-sync-not-before-ms
          (:ha-follower-next-sync-not-before-ms state)
+         :ha-clock-skew-paused? (:ha-clock-skew-paused? state)
+         :ha-clock-skew-last-observed-ms
+         (:ha-clock-skew-last-observed-ms state)
+         :ha-clock-skew-last-result (:ha-clock-skew-last-result state)
+         :ha-lease-until-ms (:ha-lease-until-ms state)
+         :ha-last-authority-refresh-ms
+         (:ha-last-authority-refresh-ms state)
+         :ha-authority-read-ok? (:ha-authority-read-ok? state)
+         :ha-promotion-last-failure
+         (:ha-promotion-last-failure state)
+         :ha-promotion-failure-details
+         (:ha-promotion-failure-details state)
+         :ha-rejoin-promotion-blocked?
+         (:ha-rejoin-promotion-blocked? state)
+         :ha-rejoin-promotion-blocked-until-ms
+         (:ha-rejoin-promotion-blocked-until-ms state)
+         :ha-rejoin-promotion-cleared-ms
+         (:ha-rejoin-promotion-cleared-ms state)
+         :ha-candidate-since-ms (:ha-candidate-since-ms state)
+         :ha-candidate-delay-ms (:ha-candidate-delay-ms state)
          :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
                                     logical-node)
          :jepsen-storage-fault (storage-fault cluster-id logical-node)
@@ -1195,16 +1336,19 @@
   (boolean
     (some
       (fn [cause]
-        (let [message (ex-message cause)]
+        (let [message (ex-message cause)
+              data    (ex-data cause)]
           (or (instance? ClosedChannelException cause)
               (instance? ConnectException cause)
+              (= :open-conn (:phase data))
               (and (string? message)
                    (or (str/includes? message "Socket channel is closed.")
                        (str/includes? message "ClosedChannelException")
                        (str/includes? message "Unable to connect to server:")
                        (str/includes? message "Connection refused")
                        (str/includes? message "Connection reset by peer")
-                       (str/includes? message "Broken pipe"))))))
+                       (str/includes? message "Broken pipe")
+                       (str/includes? message "Timeout in making request"))))))
       (take-while some? (iterate ex-cause e)))))
 
 (defn transport-failure?
@@ -1218,14 +1362,20 @@
    "No space left on device"])
 
 (def ^:private write-disruption-faults
-  #{:leader-partition
+  #{:leader-failover
+    :leader-partition
+    :quorum-loss
     :leader-pause
     :node-pause
     :multi-node-pause
     :asymmetric-partition
     :degraded-network
     :leader-io-stall
-    :leader-disk-full})
+    :leader-disk-full
+    :clock-skew-pause
+    :clock-skew-leader-fast
+    :clock-skew-leader-slow
+    :clock-skew-mixed})
 
 (defn write-disruption-fault-active?
   [test]
@@ -1293,6 +1443,41 @@
       (finally
         (d/close conn)))))
 
+(defn open-node-conn!
+  [test logical-node schema]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (now-ms) cluster-timeout-ms)]
+    (loop []
+      (let [node        (get-in @clusters [cluster-id :node-by-name logical-node])
+            endpoint    (:endpoint node)
+            outcome     (if (string? endpoint)
+                          (try
+                            {:conn (create-conn-with-timeout!
+                                    (db-uri endpoint (:db-name test))
+                                    schema)}
+                            (catch Throwable e
+                              {:error e}))
+                          {:error (ex-info "Missing Jepsen node endpoint"
+                                           {:cluster-id cluster-id
+                                            :logical-node logical-node})})]
+        (if-let [conn (:conn outcome)]
+          conn
+          (let [e (:error outcome)]
+            (if (and (< (now-ms) deadline)
+                     (transport-failure? e))
+              (do
+                (Thread/sleep (long leader-connect-retry-sleep-ms))
+                (recur))
+              (throw e))))))))
+
+(defn with-node-conn
+  [test logical-node schema f]
+  (let [conn (open-node-conn! test logical-node schema)]
+    (try
+      (f conn)
+      (finally
+        (d/close conn)))))
+
 (defn stopped-node-info
   [cluster-id logical-node]
   (get-in @clusters [cluster-id :stopped-node-info logical-node]))
@@ -1307,6 +1492,48 @@
                     store)]
         (when (store-open? lmdb)
           (i/txlog-retention-state lmdb))))))
+
+(defn copy-backup-pin-ids
+  [cluster-id logical-node]
+  (->> (get-in (txlog-retention-state cluster-id logical-node)
+               [:floor-providers :backup :pins])
+       (keep (fn [{:keys [pin-id expired?]}]
+               (when (and (string? pin-id)
+                          (not expired?)
+                          (str/starts-with? pin-id "backup-copy/"))
+                 pin-id)))
+       sort
+       vec))
+
+(defn- with-node-kv-store
+  [cluster-id logical-node f]
+  (let [{:keys [db-name node-by-name]} (get @clusters cluster-id)
+        endpoint (get-in node-by-name [logical-node :endpoint])
+        kv-store (r/open-kv (db-uri endpoint db-name)
+                            {:client-opts conn-client-opts})]
+    (try
+      (f kv-store)
+      (finally
+        (i/close-kv kv-store)))))
+
+(defn clear-copy-backup-pins-on-node!
+  [cluster-id logical-node]
+  (let [{:keys [db-name servers]} (get @clusters cluster-id)
+        state (db-state (get servers logical-node) db-name)]
+    (when-not state
+      (u/raise "Cannot clear copy backup pins on unavailable Jepsen node"
+               {:cluster-id cluster-id
+                :logical-node logical-node}))
+    (let [pin-ids  (copy-backup-pin-ids cluster-id logical-node)]
+      (when (seq pin-ids)
+        (with-node-kv-store
+          cluster-id
+          logical-node
+          (fn [kv-store]
+            (doseq [pin-id pin-ids]
+              (i/txlog-unpin-backup-floor! kv-store pin-id)))))
+      {:cleared-pin-ids pin-ids
+       :remaining-pin-ids (copy-backup-pin-ids cluster-id logical-node)})))
 
 (defn create-snapshot-on-node!
   [cluster-id logical-node]
@@ -1375,9 +1602,7 @@
                 (integer? (:ha-follower-last-bootstrap-ms state))
                 (string? (:ha-follower-bootstrap-source-endpoint state))
                 (>= applied-lsn snapshot-lsn)
-                (>= snapshot-lsn min-snapshot-lsn)
-                (not (:ha-follower-degraded? state))
-                (nil? (:ha-follower-last-error state)))
+                (>= snapshot-lsn min-snapshot-lsn))
            state
 
            (< (now-ms) deadline)
@@ -1425,25 +1650,27 @@
   [cluster-id logical-node]
   (locking clusters
     (let [{:keys [db-name schema base-opts node-by-name verbose? control-backend]}
-          (get @clusters cluster-id)
-          node   (get node-by-name logical-node)
-          server (start-server! node verbose?)
-          conn   (with-control-backend
-                   control-backend
-                   #(open-ha-conn! node
-                                   db-name
-                                   schema
-                                   (node-ha-opts base-opts node)))]
-      (swap! clusters
-             (fn [clusters*]
-               (-> clusters*
-                   (assoc-in [cluster-id :servers logical-node] server)
-                   (assoc-in [cluster-id :admin-conns logical-node] conn)
-                   (update-in [cluster-id :stopped-node-info] dissoc logical-node)
-                   (update-in [cluster-id :paused-node-info] dissoc logical-node)
-                   (update-in [cluster-id :paused-nodes] disj logical-node)
-                   (update-in [cluster-id :live-nodes] conj logical-node))))
-      true)))
+          (get @clusters cluster-id)]
+      (if (get-in @clusters [cluster-id :servers logical-node])
+        true
+        (let [node   (get node-by-name logical-node)
+              server (start-server! node verbose?)
+              conn   (with-control-backend
+                       control-backend
+                       #(open-ha-conn! node
+                                       db-name
+                                       schema
+                                       (node-ha-opts base-opts node)))]
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (assoc-in [cluster-id :servers logical-node] server)
+                       (assoc-in [cluster-id :admin-conns logical-node] conn)
+                       (update-in [cluster-id :stopped-node-info] dissoc logical-node)
+                       (update-in [cluster-id :paused-node-info] dissoc logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)
+                       (update-in [cluster-id :live-nodes] conj logical-node))))
+          true)))))
 
 (defn- pause-server-loop!
   [^Server server]
@@ -1468,6 +1695,26 @@
           (.close ^java.nio.channels.SocketChannel channel)
           (catch Throwable _ nil))))))
 
+(defn- rebuild-node-ha-runtime!
+  [control-backend ^Server server db-name]
+  (when-not server
+    (u/raise "Cannot rebuild HA runtime for missing Jepsen server"
+             {:db-name db-name}))
+  (when-not (db-state server db-name)
+    (u/raise "Cannot rebuild HA runtime for missing Jepsen db state"
+             {:db-name db-name}))
+  (with-control-backend
+    control-backend
+    #(do
+       (#'srv/update-db
+        server
+        db-name
+        (fn [m]
+          (if-let [store (:store m)]
+            (#'srv/ensure-ha-runtime (.-root server) db-name m store)
+            m)))
+       (#'srv/ensure-ha-renew-loop server db-name))))
+
 (defn pause-node!
   [cluster-id logical-node]
   (locking clusters
@@ -1480,12 +1727,17 @@
         (let [server   (get-in cluster [:servers logical-node])
               db-name  (:db-name cluster)
               db-state (db-state server db-name)
+              conn     (get-in cluster [:admin-conns logical-node])
               pause-info
               (when db-state
                 {:paused-at-ms (now-ms)
                  :ha-role (:ha-role db-state)
                  :effective-local-lsn (effective-local-lsn cluster-id logical-node)
                  :node-diagnostics (node-diagnostics cluster-id logical-node)})]
+          ;; Close the harness admin connection before stalling the server loop.
+          ;; Once the node is paused, remote close can block forever waiting on a
+          ;; server that no longer services requests.
+          (safe-close-conn! conn)
           (when-let [authority (:ha-authority db-state)]
             (#'srv/stop-ha-renew-loop db-state)
             (ctrl/stop-authority! authority))
@@ -1497,6 +1749,7 @@
           (swap! clusters
                  (fn [clusters*]
                    (-> clusters*
+                       (assoc-in [cluster-id :admin-conns logical-node] nil)
                        (assoc-in [cluster-id :paused-node-info logical-node]
                                  pause-info)
                        (update-in [cluster-id :paused-nodes] conj logical-node)))))))
@@ -1510,16 +1763,26 @@
         (u/raise "Cannot resume unpaused Jepsen node"
                  {:cluster-id cluster-id
                   :logical-node logical-node}))
-      (let [server   (get-in cluster [:servers logical-node])
-            db-name  (:db-name cluster)
-            db-state (db-state server db-name)]
-        (when-let [authority (:ha-authority db-state)]
-          (ctrl/start-authority! authority)
-          (#'srv/ensure-ha-renew-loop server db-name))
+      (let [{:keys [db-name node-by-name control-backend]} cluster
+            server   (get-in cluster [:servers logical-node])
+            node     (get node-by-name logical-node)
+            _        (when-not server
+                       (u/raise "Cannot resume missing Jepsen server"
+                                {:cluster-id cluster-id
+                                 :logical-node logical-node}))
+            _        (when-not node
+                       (u/raise "Cannot resume unknown Jepsen node"
+                                {:cluster-id cluster-id
+                                 :logical-node logical-node}))]
         (srv/start server)
+        (rebuild-node-ha-runtime! control-backend server db-name)
+        ;; The harness admin connection is only used for setup/teardown.
+        ;; Reopening it synchronously here can wedge the nemesis on a node
+        ;; that is still coming back, so leave it nil after resume.
         (swap! clusters
                (fn [clusters*]
                  (-> clusters*
+                     (assoc-in [cluster-id :admin-conns logical-node] nil)
                      (update-in [cluster-id :paused-node-info]
                                 dissoc
                                 logical-node)
@@ -1567,7 +1830,11 @@
         schema           (:schema test)
         control-backend  (:control-backend test)
         nemesis-faults   (set (:datalevin/nemesis-faults test))
-        clock-skew?      (contains? nemesis-faults :clock-skew-pause)
+        clock-skew?      (some #{:clock-skew-pause
+                                 :clock-skew-leader-fast
+                                 :clock-skew-leader-slow
+                                 :clock-skew-mixed}
+                               nemesis-faults)
         clock-skew-dir   (when clock-skew?
                            (str work-dir u/+separator+ "clock-skew"))
         group-id         (str "datalevin-jepsen-" cluster-id)
@@ -1583,6 +1850,7 @@
                            (assoc :ha-clock-skew-hook
                                   (clock-skew-hook-config clock-skew-dir)))
         verbose?         (boolean (:verbose test))
+        setup-timeout-ms (cluster-setup-timeout-ms base-opts)
         servers-atom     (atom {})
         conns-atom       (atom {})]
     (try
@@ -1609,7 +1877,8 @@
                                   (open-ha-conn! node
                                                  db-name
                                                  schema
-                                                 (node-ha-opts base-opts node))])))
+                                                 (node-ha-opts base-opts node)
+                                                 setup-timeout-ms)])))
                        (mapv deref))]
             (swap! conns-atom assoc logical-node conn))))
       (let [cluster {:cluster-id      cluster-id
@@ -1649,7 +1918,7 @@
                      :stopped-node-info {}
                      :teardown-nodes  #{}}]
         (swap! clusters assoc cluster-id cluster)
-        (wait-for-single-leader! cluster-id)
+        (wait-for-single-leader! cluster-id setup-timeout-ms)
         cluster)
       (catch Throwable e
         (doseq [conn (vals @conns-atom)]

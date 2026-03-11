@@ -20,7 +20,7 @@
 (def ^:private default-payload-bytes 12000)
 (def ^:private tx-fn-padding
   (apply str (repeat 512 "tx-fn-register-padding-")))
-(def ^:private setup-timeout-ms 15000)
+(def ^:private default-setup-timeout-ms 15000)
 (defonce ^:private initialized-clusters (atom #{}))
 (def ^:private txreg-rows-query
   '[:find ?key ?version ?payload
@@ -218,7 +218,9 @@
 
 (defn- wait-for-txreg-visible-on-live-nodes!
   [cluster-id key-count payload-bytes]
-  (let [deadline (+ (System/currentTimeMillis) setup-timeout-ms)]
+  (let [timeout-ms (local/workload-setup-timeout-ms cluster-id
+                                                    default-setup-timeout-ms)
+        deadline (+ (System/currentTimeMillis) timeout-ms)]
     (loop [last-snapshot nil]
       (let [live-nodes (-> (local/cluster-state cluster-id) :live-nodes sort)
             snapshot   (into {}
@@ -244,7 +246,7 @@
           :else
           (throw (ex-info "Timed out waiting for tx-fn register state"
                           {:cluster-id cluster-id
-                           :timeout-ms setup-timeout-ms
+                           :timeout-ms timeout-ms
                            :payload-bytes payload-bytes
                            :snapshot snapshot
                            :previous-snapshot last-snapshot})))))))

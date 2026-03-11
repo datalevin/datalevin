@@ -21,7 +21,8 @@ The first cut is intentionally narrow:
 * local leader pause, arbitrary-node pause, multi-node pause, leader failover,
   leader partition, asymmetric multi-way graph cuts, heterogeneous per-link
   degraded links, leader IO-stall, leader disk-full, follower rejoin,
-  quorum-loss, and clock-skew nemeses
+  quorum-loss, and richer clock-skew nemeses covering follower-fast,
+  leader-fast, leader-slow, and mixed-sign skew plans
 * list-append transactions support reads, appends, and mixed read/write
   sequences
 
@@ -229,6 +230,30 @@ Run a targeted subset with extra Jepsen CLI overrides:
 script/jepsen/partition-workloads append bank -- --time-limit 15 --rate 10
 ```
 
+Exercise the leader-failover nemesis across the local workload set:
+
+```bash
+script/jepsen/failover-workloads
+```
+
+Run a targeted failover subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/failover-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Exercise the follower-rejoin nemesis across the local workload set:
+
+```bash
+script/jepsen/rejoin-workloads
+```
+
+Run a targeted rejoin subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/rejoin-workloads append bank -- --time-limit 15 --rate 10
+```
+
 Run an asymmetric multi-way network cut:
 
 ```bash
@@ -312,11 +337,44 @@ cd jepsen
 lein run test --workload append --control-backend sofa-jraft --nemesis quorum-loss --time-limit 30 --rate 10
 ```
 
+Exercise the quorum-loss nemesis across the local workload set:
+
+```bash
+script/jepsen/quorum-workloads
+```
+
+Run a targeted quorum-loss subset with extra Jepsen CLI overrides:
+
+```bash
+script/jepsen/quorum-workloads append bank -- --time-limit 15 --rate 10
+```
+
 Run a clock-skew pause combined with leader failover:
 
 ```bash
 cd jepsen
 lein run test --workload append --control-backend sofa-jraft --nemesis clock-skew,failover --time-limit 30 --rate 10
+```
+
+Exercise a likely compound fault against the sentinel workload set:
+
+```bash
+script/jepsen/combo-workloads clock-skew,failover
+script/jepsen/combo-workloads degraded,rejoin
+```
+
+Expand a compound fault run to the full local workload set:
+
+```bash
+script/jepsen/combo-workloads clock-skew,failover --all-workloads
+```
+
+Run an explicit leader-fast or mixed clock skew:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis clock-leader-fast --time-limit 30 --rate 10
+lein run test --workload append --control-backend sofa-jraft --nemesis clock-mixed --time-limit 30 --rate 10
 ```
 
 The HA disruption nemeses currently require `--control-backend sofa-jraft`,

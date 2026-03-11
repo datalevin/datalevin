@@ -688,6 +688,40 @@
       (.close txn)
       (catch Exception _))))
 
+(defn- reusable-reader-rtx
+  [this ^ThreadLocal tl-reader]
+  (when-not (.isVirtual (Thread/currentThread))
+    (when-let [^Rtx rtx (.get tl-reader)]
+      (when (<= ^long (.max-val-size this)
+                ^int (.capacity ^ByteBuffer (l/val-bf rtx)))
+        (try
+          (.renew rtx)
+          (catch Exception _
+            ;; Storage faults can leave a cached reader txn stale even though
+            ;; the LMDB env itself remains valid. Drop the stale reader and let
+            ;; the caller open a fresh one instead of surfacing a misleading
+            ;; "multiple connections" error for subsequent reads.
+            (close-txn-quiet! (.-txn rtx))
+            (.remove tl-reader)
+            nil))))))
+
+(defn- fresh-reader-rtx
+  [this ^Env env ^ThreadLocal tl-reader]
+  (let [rtx (Rtx. this
+                  (Txn/createReadOnly env)
+                  (volatile! 1)
+                  (new-bufval c/+max-key-size+)
+                  (new-bufval 0)
+                  (new-bufval c/+max-key-size+)
+                  (new-bufval c/+max-key-size+)
+                  (new-bufval c/+max-key-size+)
+                  (new-bufval c/+max-key-size+)
+                  (bf/allocate-buffer c/+max-key-size+)
+                  (bf/allocate-buffer (.max-val-size this))
+                  (volatile! false))]
+    (.set tl-reader rtx)
+    rtx))
+
 (defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
 
 (def sync-key (memoize sync-key*))
@@ -838,7 +872,9 @@
 
   (closed-kv? [_] (.isClosed env))
 
-  (check-ready [this] (assert (not (.closed-kv? this)) "LMDB env is closed."))
+  (check-ready [this]
+    (when (.closed-kv? this)
+      (raise "LMDB env is closed." {:type :lmdb/closed})))
 
   (env-dir [_] (@info :dir))
   (kv-info [_] info)
@@ -946,25 +982,8 @@
   (get-rtx [this]
     (when-not (.closed-kv? this)
       (try
-        (or (when-not (.isVirtual (Thread/currentThread))
-              (when-let [^Rtx rtx (.get tl-reader)]
-                (when (<= ^long (.max-val-size this)
-                          ^int (.capacity ^ByteBuffer (l/val-bf rtx)))
-                  (.renew rtx))))
-            (let [rtx (Rtx. this
-                            (Txn/createReadOnly env)
-                            (volatile! 1)
-                            (new-bufval c/+max-key-size+)
-                            (new-bufval 0)
-                            (new-bufval c/+max-key-size+)
-                            (new-bufval c/+max-key-size+)
-                            (new-bufval c/+max-key-size+)
-                            (new-bufval c/+max-key-size+)
-                            (bf/allocate-buffer c/+max-key-size+)
-                            (bf/allocate-buffer (.max-val-size this))
-                            (volatile! false))]
-              (.set tl-reader rtx)
-              rtx))
+        (or (reusable-reader-rtx this tl-reader)
+            (fresh-reader-rtx this env tl-reader))
         (catch Exception e
           (raise "Please do not open multiple LMDB connections to the same DB
            in the same process. Instead, a LMDB connection should be held onto

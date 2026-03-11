@@ -16,6 +16,7 @@
 (def ^:private default-quorum-restore-delay-s 5)
 (def ^:private default-clock-skew-interval-s 10)
 (def ^:private default-clock-skew-apply-delay-s 3)
+(def ^:private default-final-leader-stabilize-timeout-ms 30000)
 (def ^:private default-partition-interval-s 10)
 (def ^:private default-partition-heal-delay-s 5)
 (def ^:private default-asymmetric-partition-interval-s 10)
@@ -39,7 +40,10 @@
     :leader-disk-full
     :follower-rejoin
     :quorum-loss
-    :clock-skew-pause})
+    :clock-skew-pause
+    :clock-skew-leader-fast
+    :clock-skew-leader-slow
+    :clock-skew-mixed})
 
 (def ^:private alias-faults
   {:none []
@@ -54,7 +58,135 @@
    :disk-full [:leader-disk-full]
    :rejoin [:follower-rejoin]
    :quorum [:quorum-loss]
-   :clock-skew [:clock-skew-pause]})
+   :clock-skew [:clock-skew-pause]
+   :clock-leader-fast [:clock-skew-leader-fast]
+   :clock-leader-slow [:clock-skew-leader-slow]
+   :clock-mixed [:clock-skew-mixed]})
+
+(def ^:private legacy-clock-skew-patterns
+  [:followers-fast :leader-fast :leader-slow :mixed])
+
+(def ^:private explicit-clock-skew-patterns
+  {:clock-skew-leader-fast :leader-fast
+   :clock-skew-leader-slow :leader-slow
+   :clock-skew-mixed :mixed})
+
+(def ^:private explicit-clock-skew-fault-order
+  [:clock-skew-leader-fast
+   :clock-skew-leader-slow
+   :clock-skew-mixed])
+
+(defn clock-skew-fault?
+  [fault]
+  (or (= :clock-skew-pause fault)
+      (contains? explicit-clock-skew-patterns fault)))
+
+(defn- active-clock-skew-patterns
+  [faults]
+  (let [faults (set faults)]
+    (->> (concat
+          (when (contains? faults :clock-skew-pause)
+            legacy-clock-skew-patterns)
+          (map explicit-clock-skew-patterns
+               (filter faults explicit-clock-skew-fault-order)))
+       distinct
+       vec)))
+
+(defn- clock-skew-plan
+  [{:keys [leader live-nodes budget-ms pattern]}]
+  (let [live-nodes  (->> live-nodes sort vec)
+        followers   (vec (remove #{leader} live-nodes))
+        skew-ms     (long (max 250 (* 2 (long budget-ms))))
+        slow-skew   (- skew-ms)
+        mixed-skews (into {leader skew-ms}
+                          (map-indexed
+                           (fn [idx node]
+                             [node (if (even? idx) slow-skew skew-ms)]))
+                          followers)]
+    {:leader leader
+     :pattern pattern
+     :clock-skew-ms skew-ms
+     :skews (case pattern
+              :followers-fast
+              (zipmap followers (repeat skew-ms))
+
+              :leader-fast
+              (into {leader skew-ms}
+                    (map (fn [node] [node slow-skew]))
+                    followers)
+
+              :leader-slow
+              (into {leader slow-skew}
+                    (map (fn [node] [node skew-ms]))
+                    followers)
+
+              :mixed
+              mixed-skews)}))
+
+(defn- clock-skew-phase-ops
+  [patterns apply-delay interval]
+  (mapcat (fn [pattern]
+            [{:type :info
+              :f :inject-clock-skew
+              :value {:pattern pattern}}
+             (gen/sleep apply-delay)
+             {:type :info :f :clear-clock-skew}
+             (gen/sleep interval)])
+          patterns))
+
+(defn- clock-skew-failover-phase-ops
+  [patterns apply-delay restart-delay failover-interval]
+  (mapcat (fn [pattern]
+            [{:type :info
+              :f :inject-clock-skew
+              :value {:pattern pattern}}
+             (gen/sleep apply-delay)
+             {:type :info :f :kill-leader}
+             (gen/sleep restart-delay)
+             {:type :info :f :restart-node}
+             {:type :info :f :clear-clock-skew}
+             (gen/sleep failover-interval)])
+          patterns))
+
+(defn- final-phase-ops
+  [{:keys [failover?
+           leader-pause?
+           node-pause?
+           multi-node-pause?
+           partition?
+           asymmetric-partition?
+           degraded-network?
+           io-stall?
+           disk-full?
+           follower-rejoin?
+           quorum-loss?
+           clock-skew?]}]
+  (let [clock-skew-failover? (and failover? clock-skew?)]
+    (concat
+     (when clock-skew-failover?
+       [{:type :info :f :clear-clock-skew}
+        {:type :info :f :restart-node}
+        {:type :info :f :stabilize-leader}])
+     (when (and failover? (not clock-skew-failover?))
+       [{:type :info :f :restart-node}])
+     (when (or leader-pause?
+               node-pause?
+               multi-node-pause?)
+       [{:type :info :f :resume-node}])
+     (when partition?
+       [{:type :info :f :heal-partition}])
+     (when asymmetric-partition?
+       [{:type :info :f :heal-asymmetric}])
+     (when degraded-network?
+       [{:type :info :f :restore-network}])
+     (when (or io-stall? disk-full?)
+       [{:type :info :f :heal-storage}])
+     (when follower-rejoin?
+       [{:type :info :f :restart-follower}])
+     (when quorum-loss?
+       [{:type :info :f :restore-quorum}])
+     (when (and clock-skew? (not clock-skew-failover?))
+       [{:type :info :f :clear-clock-skew}]))))
 
 (defn expand-fault
   [fault]
@@ -150,7 +282,7 @@
         paused-nodes (atom #{})
         rejoin-stopped-node (atom nil)
         quorum-stopped-nodes (atom [])
-        skewed-nodes (atom [])
+        active-clock-skew (atom nil)
         active-partition (atom nil)
         active-asymmetric-partition (atom nil)
         active-degraded-network (atom nil)
@@ -158,7 +290,7 @@
     (reify
       n/Reflection
       (fs [_]
-        #{:kill-leader :restart-node
+        #{:kill-leader :restart-node :stabilize-leader
           :pause-leader :pause-node :pause-nodes
           :resume-node :resume-nodes
           :partition-leader :heal-partition
@@ -181,7 +313,7 @@
               (let [{:keys [leader]} (local/wait-for-single-leader! cluster-id)]
                 (local/stop-node! cluster-id leader)
                 (reset! stopped-node leader)
-                (if (seq @skewed-nodes)
+                (if @active-clock-skew
                   (info-op op {:stopped leader
                                :leader nil
                                :status :leader-paused})
@@ -201,13 +333,22 @@
                   (if-let [{leader :leader}
                            (local/maybe-wait-for-single-leader
                             cluster-id
-                            (if (seq @skewed-nodes) 1000 10000))]
+                            (if @active-clock-skew 1000 10000))]
                     (info-op op {:restarted node
                                  :leader leader})
                     (info-op op {:restarted node
                                  :leader nil
                                  :status :leader-unavailable})))
                 (info-op op :noop))
+
+              :stabilize-leader
+              (if-let [{leader :leader}
+                       (local/maybe-wait-for-single-leader
+                        cluster-id
+                        default-final-leader-stabilize-timeout-ms)]
+                (info-op op {:leader leader})
+                (info-op op {:leader nil
+                             :status :leader-unavailable}))
 
               :pause-leader
               (if (seq @paused-nodes)
@@ -537,9 +678,10 @@
                 (info-op op :noop))
 
               :inject-clock-skew
-              (if (seq @skewed-nodes)
-                (info-op op {:skewed-nodes @skewed-nodes
-                             :status :already-skewed})
+              (if @active-clock-skew
+                (info-op op (assoc @active-clock-skew
+                              :skewed-nodes (vec (keys (:skews @active-clock-skew)))
+                              :status :already-skewed))
                 (if-not (local/clock-skew-enabled? cluster-id)
                   (info-op-error op :clock-skew-not-configured)
                   (let [{:keys [leader]} (local/wait-for-single-leader!
@@ -548,23 +690,27 @@
                                        :live-nodes
                                        sort
                                        vec)
-                        nodes-to-skew (vec (remove #{leader} live-nodes))
                         budget-ms (local/clock-skew-budget-ms cluster-id)
-                        skew-ms (long (max 250 (* 2 budget-ms)))]
-                    (doseq [node nodes-to-skew]
+                        pattern (or (get-in op [:value :pattern])
+                                    (rand-nth legacy-clock-skew-patterns))
+                        plan (clock-skew-plan {:leader leader
+                                               :live-nodes live-nodes
+                                               :budget-ms budget-ms
+                                               :pattern pattern})]
+                    (doseq [[node skew-ms] (:skews plan)]
                       (local/set-node-clock-skew! cluster-id node skew-ms))
-                    (reset! skewed-nodes nodes-to-skew)
-                    (info-op op {:leader leader
-                                 :skewed-nodes nodes-to-skew
-                                 :clock-skew-ms skew-ms}))))
+                    (reset! active-clock-skew plan)
+                    (info-op op (assoc plan
+                                  :skewed-nodes (vec (keys (:skews plan))))))))
 
               :clear-clock-skew
-              (if (seq @skewed-nodes)
-                (let [nodes-to-clear @skewed-nodes]
+              (if-let [plan @active-clock-skew]
+                (let [nodes-to-clear (vec (keys (:skews plan)))]
                   (doseq [node nodes-to-clear]
                     (local/set-node-clock-skew! cluster-id node 0))
-                  (reset! skewed-nodes [])
-                  (info-op op {:cleared-nodes nodes-to-clear}))
+                  (reset! active-clock-skew nil)
+                  (info-op op {:cleared-nodes nodes-to-clear
+                               :pattern (:pattern plan)}))
                 (info-op op :noop))
 
               (info-op-error op [:unsupported-nemesis-op (:f op)]))
@@ -608,7 +754,8 @@
         disk-full? (contains? faults :leader-disk-full)
         follower-rejoin? (contains? faults :follower-rejoin)
         quorum-loss? (contains? faults :quorum-loss)
-        clock-skew? (contains? faults :clock-skew-pause)
+        clock-skew-patterns (active-clock-skew-patterns faults)
+        clock-skew? (seq clock-skew-patterns)
         restart-delay (or restart-delay-s default-restart-delay-s)
         pause-resume-delay
         (or pause-resume-delay-s default-pause-resume-delay-s)
@@ -652,13 +799,11 @@
         (or clock-skew-interval-s default-clock-skew-interval-s)
         phases (concat
                 (if (and clock-skew? failover?)
-                  [{:type :info :f :inject-clock-skew}
-                   (gen/sleep clock-skew-apply-delay)
-                   {:type :info :f :kill-leader}
-                   (gen/sleep restart-delay)
-                   {:type :info :f :restart-node}
-                   {:type :info :f :clear-clock-skew}
-                   (gen/sleep failover-interval)]
+                  (clock-skew-failover-phase-ops
+                   clock-skew-patterns
+                   clock-skew-apply-delay
+                   restart-delay
+                   failover-interval)
                   (concat
                    (when failover?
                      [{:type :info :f :kill-leader}
@@ -710,10 +855,10 @@
                       {:type :info :f :heal-storage}
                       (gen/sleep disk-full-interval)])
                    (when clock-skew?
-                     [{:type :info :f :inject-clock-skew}
-                      (gen/sleep clock-skew-apply-delay)
-                      {:type :info :f :clear-clock-skew}
-                      (gen/sleep clock-skew-interval)])))
+                     (clock-skew-phase-ops
+                      clock-skew-patterns
+                      clock-skew-apply-delay
+                      clock-skew-interval))))
                 (when follower-rejoin?
                   [{:type :info :f :stop-follower}
                    (gen/sleep follower-rejoin-delay)
@@ -724,27 +869,19 @@
                    (gen/sleep quorum-restore-delay)
                    {:type :info :f :restore-quorum}
                    (gen/sleep quorum-loss-interval)]))
-        final-phases (concat
-                      (when failover?
-                        [{:type :info :f :restart-node}])
-                      (when (or leader-pause?
-                                node-pause?
-                                multi-node-pause?)
-                        [{:type :info :f :resume-node}])
-                      (when partition?
-                        [{:type :info :f :heal-partition}])
-                      (when asymmetric-partition?
-                        [{:type :info :f :heal-asymmetric}])
-                      (when degraded-network?
-                        [{:type :info :f :restore-network}])
-                      (when (or io-stall? disk-full?)
-                        [{:type :info :f :heal-storage}])
-                      (when follower-rejoin?
-                        [{:type :info :f :restart-follower}])
-                      (when quorum-loss?
-                        [{:type :info :f :restore-quorum}])
-                      (when clock-skew?
-                        [{:type :info :f :clear-clock-skew}]))
+        final-phases (final-phase-ops
+                      {:failover? failover?
+                       :leader-pause? leader-pause?
+                       :node-pause? node-pause?
+                       :multi-node-pause? multi-node-pause?
+                       :partition? partition?
+                       :asymmetric-partition? asymmetric-partition?
+                       :degraded-network? degraded-network?
+                       :io-stall? io-stall?
+                       :disk-full? disk-full?
+                       :follower-rejoin? follower-rejoin?
+                       :quorum-loss? quorum-loss?
+                       :clock-skew? clock-skew?})
         needed? (seq phases)]
     {:generator (when needed?
                   (gen/cycle (apply gen/phases phases)))

@@ -613,6 +613,10 @@
   "kv-info key for persisted HA follower applied LSN."
   :ha/local-applied-lsn)
 
+(def ^:const wal-local-payload-lsn
+  "kv-info key for the exact WAL-applied LSN visible in the local LMDB payload."
+  :wal/local-payload-lsn)
+
 (def ^:const wal-replica-floors
   "kv-info key for replica floor heartbeat map used by WAL retention floor computation."
   :wal/replica-floors)

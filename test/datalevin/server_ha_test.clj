@@ -1981,6 +1981,84 @@
     (is (= explicit
            (get-in resolved [:ha-control-plane :raft-dir])))))
 
+(deftest create-does-not-auto-reopen-consensus-ha-db-from-persisted-sessions-test
+  (let [port       (random-port-candidate)
+        root       (u/tmp-dir (str "server-ha-reopen-" (UUID/randomUUID)))
+        group-id   (str "server-ha-reopen-" (UUID/randomUUID))
+        local-peer "127.0.0.1:17801"
+        peer-2     "127.0.0.1:17802"
+        peer-3     "127.0.0.1:17803"
+        db-name    "orders"
+        endpoint-1 (str "127.0.0.1:" port)
+        endpoint-2 "127.0.0.1:28899"
+        endpoint-3 "127.0.0.1:28900"
+        client-id  (UUID/randomUUID)
+        ha-opts    {:wal? true
+                    :ha-mode :consensus-lease
+                    :db-identity (str "db-" (UUID/randomUUID))
+                    :ha-node-id 1
+                    :ha-lease-renew-ms 1000
+                    :ha-lease-timeout-ms 3000
+                    :ha-promotion-base-delay-ms 100
+                    :ha-promotion-rank-delay-ms 200
+                    :ha-max-promotion-lag-lsn 0
+                    :ha-clock-skew-budget-ms 1000
+                    :ha-fencing-hook {:cmd ["/bin/sh" "-c" "exit 0"]
+                                      :timeout-ms 1000
+                                      :retries 0
+                                      :retry-delay-ms 0}
+                    :ha-members [{:node-id 1 :endpoint endpoint-1}
+                                 {:node-id 2 :endpoint endpoint-2}
+                                 {:node-id 3 :endpoint endpoint-3}]
+                    :ha-control-plane
+                    {:backend :sofa-jraft
+                     :group-id group-id
+                     :local-peer-id local-peer
+                     :rpc-timeout-ms 5000
+                     :election-timeout-ms 5000
+                     :operation-timeout-ms 30000
+                     :voters [{:peer-id local-peer
+                               :ha-node-id 1
+                               :promotable? true}
+                              {:peer-id peer-2
+                               :ha-node-id 2
+                               :promotable? true}
+                              {:peer-id peer-3
+                               :ha-node-id 3
+                               :promotable? true}]}}]
+    (try
+      (let [server-1 (binding [c/*db-background-sampling?* false]
+                       (srv/create {:port port :root root}))]
+        (try
+          (let [store (st/open (#'srv/db-dir root db-name)
+                               e2e-ha-schema
+                               ha-opts)]
+            (try
+              (#'srv/add-client server-1 "127.0.0.1" client-id c/default-username)
+              (#'srv/update-client server-1
+                                   client-id
+                                   #(-> %
+                                        (update :stores assoc db-name
+                                                {:datalog? true
+                                                 :dbis #{}})
+                                        (update :dt-dbs conj db-name)))
+              (is (contains? (set (keys (.-clients ^Server server-1))) client-id))
+              (finally
+                (i/close store))))
+          (srv/stop server-1)
+          (let [server-2 (binding [c/*db-background-sampling?* false]
+                           (srv/create {:port port :root root}))]
+            (try
+              (is (nil? (get (.-dbs ^Server server-2) db-name)))
+              (is (contains? (set (keys (.-clients ^Server server-2))) client-id))
+              (finally
+                (srv/stop server-2))))
+          (finally
+            (when (.get ^AtomicBoolean (.-running ^Server server-1))
+              (srv/stop server-1)))))
+      (finally
+        (safe-delete-dir! root)))))
+
 (deftest start-ha-authority-fails-closed-on-membership-mismatch-test
   (let [group-id (str "ha-test-" (UUID/randomUUID))
         opts-a (valid-ha-opts group-id)
@@ -2158,6 +2236,33 @@
             next-state (#'srv/ha-renew-step "orders" follower-runtime)]
         (is (= :leader (:ha-role next-state)))
         (is (= 1 (:ha-leader-term next-state))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-renew-step-promotes-from-empty-lease-using-local-watermark-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)]
+    (try
+      (let [follower-runtime (-> runtime
+                                 (assoc :ha-role :follower
+                                        :ha-promotion-base-delay-ms 0
+                                        :ha-promotion-rank-delay-ms 0
+                                        :ha-max-promotion-lag-lsn 0
+                                        :ha-local-last-applied-lsn 0))
+            next-state (with-redefs-fn
+                         {#'dha/read-ha-local-watermark-lsn
+                          (fn [_]
+                            3)
+                          #'dha/run-ha-fencing-hook
+                          (fn [_ _ _]
+                            {:ok? true})}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+        (is (= :leader (:ha-role next-state)))
+        (is (= 1 (:ha-leader-term next-state)))
+        (is (= 3
+               (get-in next-state
+                       [:ha-authority-lease :leader-last-applied-lsn]))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
@@ -2369,7 +2474,7 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
-(deftest ha-renew-step-candidate-pre-cas-lag-uses-reachable-watermark-test
+(deftest ha-renew-step-candidate-lag-input-uses-reachable-watermark-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)]
     (try
@@ -2402,13 +2507,72 @@
                            (#'srv/ha-renew-step "orders" follower-runtime)))]
         (is (= :follower (:ha-role next-state)))
         (is (= :lag-guard-failed (:ha-promotion-last-failure next-state)))
-        (is (= :pre-cas
+        (is (= :pre-fence
                (get-in next-state [:ha-promotion-failure-details :phase])))
         (is (= 10
                (get-in next-state
                        [:ha-promotion-failure-details
                         :leader-lag-input
                         :leader-watermark-last-applied-lsn]))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-renew-step-candidate-expired-reachable-leader-behind-uses-best-reachable-watermark-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)]
+    (try
+      (let [authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity (:ha-db-identity runtime)
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn 17
+                :now-ms 1000
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :ha-role :follower
+                                        :ha-promotion-base-delay-ms 0
+                                        :ha-promotion-rank-delay-ms 0
+                                        :ha-max-promotion-lag-lsn 0
+                                        :ha-local-last-applied-lsn 10))
+            next-state (with-redefs-fn
+                         {#'dha/run-ha-fencing-hook
+                          (fn [_ _ _] {:ok? true})
+                          #'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ endpoint]
+                            (case endpoint
+                              "10.0.0.11:8898"
+                              {:reachable? true
+                               :last-applied-lsn 4
+                               :source :remote}
+
+                              "10.0.0.12:8898"
+                              {:reachable? true
+                               :last-applied-lsn 10
+                               :source :local}
+
+                              "10.0.0.13:8898"
+                              {:reachable? true
+                               :last-applied-lsn 10
+                               :source :remote}
+
+                              {:reachable? false
+                               :reason :missing-endpoint}))}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+        (is (= :leader (:ha-role next-state)))
+        (is (= 2 (:ha-authority-owner-node-id next-state)))
+        (is (= 10
+               (get-in next-state
+                       [:ha-authority-lease :leader-last-applied-lsn])))
+        (is (= 10
+               (get-in next-state
+                       [:ha-local-last-applied-lsn])))
+        (is (nil? (:ha-promotion-last-failure next-state))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
@@ -2451,6 +2615,65 @@
         (is (= 1 @wait-calls))
         (is (= :leader (:ha-role next-state)))
         (is (= 0 (:ha-promotion-wait-before-cas-ms next-state))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-renew-step-candidate-unreachable-leader-uses-reachable-member-watermark-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)]
+    (try
+      (let [authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity (:ha-db-identity runtime)
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn 17
+                :now-ms 1000
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :ha-role :follower
+                                        :ha-promotion-base-delay-ms 0
+                                        :ha-promotion-rank-delay-ms 0
+                                        :ha-max-promotion-lag-lsn 0
+                                        :ha-local-last-applied-lsn 10))
+            next-state (with-redefs-fn
+                         {#'dha/run-ha-fencing-hook
+                          (fn [_ _ _] {:ok? true})
+                          #'dha/maybe-wait-unreachable-leader-before-pre-cas!
+                          (fn [_ _]
+                            {:slept-ms 0
+                             :wait-until-ms 0})
+                          #'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ endpoint]
+                            (case endpoint
+                              "10.0.0.11:8898"
+                              {:reachable? false
+                               :reason :endpoint-watermark-fetch-failed}
+
+                              "10.0.0.12:8898"
+                              {:reachable? true
+                               :last-applied-lsn 10
+                               :source :local}
+
+                              "10.0.0.13:8898"
+                              {:reachable? true
+                               :last-applied-lsn 10
+                               :source :remote}
+
+                              {:reachable? false
+                               :reason :missing-endpoint}))}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+        (is (= :leader (:ha-role next-state)))
+        (is (= 2 (:ha-authority-owner-node-id next-state)))
+        (is (= 10
+               (get-in next-state
+                       [:ha-authority-lease :leader-last-applied-lsn])))
+        (is (nil? (:ha-promotion-last-failure next-state))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
@@ -2557,6 +2780,82 @@
                (ex-info "replica floor update failed"
                         {:db-name "orders"}
                         (RuntimeException. "boom"))))))
+
+(deftest ha-replica-floor-reset-required-classification-test
+  (is (true? (#'dha/ha-replica-floor-reset-required?
+              (ex-info
+               "Request to Datalevin server failed: \"Replica floor LSN cannot move backward\""
+               {:type :txlog-update-replica-floor!
+                :err-data {:type :txlog/invalid-floor-provider-state
+                           :replica-id 2
+                           :old-lsn 50
+                           :new-lsn 17}}))))
+  (is (true? (#'dha/ha-replica-floor-reset-required?
+              (ex-info "Replica floor LSN cannot move backward"
+                       {:type :txlog/invalid-floor-provider-state
+                        :replica-id 2
+                        :old-lsn 50
+                        :new-lsn 17}))))
+  (is (false? (#'dha/ha-replica-floor-reset-required?
+               (ex-info "replica floor update failed"
+                        {:type :txlog-update-replica-floor!
+                         :err-data {:type :txlog/io-error
+                                    :replica-id 2}})))))
+
+(deftest sync-ha-follower-batch-clears-stale-leader-replica-floor-after-reset-test
+  (let [leader-endpoint "10.0.0.11:8898"
+        local-lsn (atom 16)
+        applied (atom [])
+        calls (atom [])
+        now-ms (System/currentTimeMillis)
+        follower-runtime {:ha-node-id 2
+                          :ha-local-endpoint "10.0.0.12:8898"
+                          :ha-lease-renew-ms 1000}
+        lease {:leader-node-id 1
+               :leader-endpoint leader-endpoint
+               :leader-last-applied-lsn 17}]
+    (let [sync (with-redefs [dha/fetch-ha-leader-txlog-batch
+                             (fn [_ _ endpoint from-lsn _]
+                               (is (= leader-endpoint endpoint))
+                               (is (= 17 from-lsn))
+                               [{:lsn 17 :ops [[:put "a" "k17" "v17"]]}])
+                             dha/apply-ha-follower-txlog-record!
+                             (fn [state record]
+                               (swap! applied conj (:lsn record))
+                               (reset! local-lsn (long (:lsn record)))
+                               state)
+                             dha/read-ha-local-last-applied-lsn
+                             (fn [_] @local-lsn)
+                             dha/report-ha-replica-floor!
+                             (fn [_ m endpoint applied-lsn]
+                               (swap! calls conj [:report endpoint applied-lsn
+                                                  (:ha-node-id m)])
+                               (when (= 1 (count @calls))
+                                 (throw
+                                  (ex-info
+                                   "Request to Datalevin server failed: \"Replica floor LSN cannot move backward\""
+                                   {:type :txlog-update-replica-floor!
+                                    :err-data {:type :txlog/invalid-floor-provider-state
+                                               :replica-id 2
+                                               :old-lsn 50
+                                               :new-lsn 17}})))
+                               {:ok? true})
+                             dha/clear-ha-replica-floor!
+                             (fn [_ m endpoint]
+                               (swap! calls conj [:clear endpoint (:ha-node-id m)])
+                               {:ok? true})]
+                 (#'dha/sync-ha-follower-batch
+                  "orders" follower-runtime lease 17 now-ms))
+          state (:state sync)]
+      (is (= [17] @applied))
+      (is (= [[:report leader-endpoint 17 2]
+              [:clear leader-endpoint 2]
+              [:report leader-endpoint 17 2]]
+             @calls))
+      (is (= 17 (:applied-lsn sync)))
+      (is (= 17 (:ha-local-last-applied-lsn state)))
+      (is (= 18 (:ha-follower-next-lsn state)))
+      (is (nil? (:ha-follower-last-error state))))))
 
 (deftest server-client-disconnect-classification-test
   (is (true? (#'srv/client-disconnect?
@@ -3147,6 +3446,76 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
+(deftest ha-renew-step-follower-sync-clamps-stale-next-lsn-to-local-state-before-bootstrap-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        bootstrap-called (atom nil)
+        now-ms (System/currentTimeMillis)]
+    (try
+      (let [authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity (:ha-db-identity runtime)
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn 26
+                :now-ms now-ms
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :ha-role :follower
+                                        :ha-follower-next-lsn 99
+                                        :ha-local-last-applied-lsn 26))
+            next-state (with-redefs-fn
+                         {#'dha/fetch-ha-leader-txlog-batch
+                          (fn [_ _ endpoint _ _]
+                            (is (contains? #{"10.0.0.11:8898"
+                                             "10.0.0.13:8898"}
+                                           endpoint))
+                            [])
+                          #'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ endpoint]
+                            (case endpoint
+                              "10.0.0.11:8898"
+                              {:reachable? true :last-applied-lsn 26}
+                              "10.0.0.13:8898"
+                              {:reachable? false
+                               :reason :endpoint-watermark-fetch-failed}
+                              (throw (ex-info "unexpected-endpoint"
+                                              {:endpoint endpoint}))))
+                          #'dha/bootstrap-ha-follower-from-snapshot
+                          (fn [_ state lease source-order next-lsn bootstrap-now-ms]
+                            (reset! bootstrap-called
+                                    {:leader-last-applied-lsn
+                                     (:leader-last-applied-lsn lease)
+                                     :source-order source-order
+                                     :next-lsn next-lsn})
+                            {:ok? true
+                             :state (assoc state
+                                           :ha-local-last-applied-lsn 26
+                                           :ha-follower-next-lsn 27
+                                           :ha-follower-last-bootstrap-ms
+                                           bootstrap-now-ms
+                                           :ha-follower-bootstrap-source-endpoint
+                                           "10.0.0.11:8898"
+                                           :ha-follower-bootstrap-snapshot-last-applied-lsn
+                                           26
+                                           :ha-follower-last-error nil
+                                           :ha-follower-degraded? nil)})}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+        (is (= {:leader-last-applied-lsn 26
+                :source-order ["10.0.0.11:8898" "10.0.0.13:8898"]
+                :next-lsn 27}
+               @bootstrap-called))
+        (is (= :follower (:ha-role next-state)))
+        (is (= 26 (:ha-local-last-applied-lsn next-state)))
+        (is (= 27 (:ha-follower-next-lsn next-state))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)))))
+
 (deftest ha-gap-fallback-source-endpoints-prefers-highest-watermark-followers-test
   (let [m {:ha-local-endpoint "10.0.0.12:8898"
            :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
@@ -3155,11 +3524,13 @@
                         {:node-id 4 :endpoint "10.0.0.14:8898"}
                         {:node-id 5 :endpoint "10.0.0.15:8898"}]}
         lease {:leader-node-id 1
-               :leader-endpoint "10.0.0.11:8898"}]
+               :leader-endpoint "10.0.0.11:8898"
+               :leader-last-applied-lsn 80}]
     (with-redefs-fn
       {#'dha/fetch-ha-endpoint-watermark-lsn
        (fn [_ _ endpoint]
          (case endpoint
+           "10.0.0.11:8898" {:reachable? true :last-applied-lsn 80}
            "10.0.0.13:8898" {:reachable? true :last-applied-lsn 25}
            "10.0.0.14:8898" {:reachable? true :last-applied-lsn 60}
            "10.0.0.15:8898" {:reachable? false
@@ -3172,6 +3543,201 @@
                 "10.0.0.15:8898"]
                (#'dha/ha-gap-fallback-source-endpoints
                 "orders" m lease 20)))))))
+
+(deftest ha-gap-fallback-source-endpoints-caps-followers-at-leader-watermark-test
+  (let [m {:ha-local-endpoint "10.0.0.12:8898"
+           :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                        {:node-id 2 :endpoint "10.0.0.12:8898"}
+                        {:node-id 3 :endpoint "10.0.0.13:8898"}
+                        {:node-id 4 :endpoint "10.0.0.14:8898"}]}
+        lease {:leader-node-id 1
+               :leader-endpoint "10.0.0.11:8898"
+               :leader-last-applied-lsn 68}]
+    (with-redefs-fn
+      {#'dha/fetch-ha-endpoint-watermark-lsn
+       (fn [_ _ endpoint]
+         (case endpoint
+           "10.0.0.11:8898" {:reachable? true :last-applied-lsn 68}
+           "10.0.0.13:8898" {:reachable? true :last-applied-lsn 183}
+           "10.0.0.14:8898" {:reachable? true :last-applied-lsn 184}
+           (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))}
+      (fn []
+        (is (= ["10.0.0.11:8898"
+                "10.0.0.13:8898"
+                "10.0.0.14:8898"]
+               (#'dha/ha-gap-fallback-source-endpoints
+                "orders" m lease 80)))))))
+
+(deftest ha-source-advertised-last-applied-lsn-caps-follower-at-leader-watermark-test
+  (let [m {:ha-local-endpoint "10.0.0.12:8898"
+           :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                        {:node-id 2 :endpoint "10.0.0.12:8898"}
+                        {:node-id 3 :endpoint "10.0.0.13:8898"}]}
+        lease {:leader-node-id 1
+               :leader-endpoint "10.0.0.11:8898"
+               :leader-last-applied-lsn 68}]
+    (with-redefs-fn
+      {#'dha/fetch-ha-endpoint-watermark-lsn
+       (fn [_ _ endpoint]
+         (case endpoint
+           "10.0.0.11:8898" {:reachable? true :last-applied-lsn 68}
+           "10.0.0.13:8898" {:reachable? true :last-applied-lsn 183}
+           (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))}
+      (fn []
+        (is (= {:known? true
+                :last-applied-lsn 68
+                :raw-last-applied-lsn 183
+                :leader-safe-lsn 68
+                :watermark {:reachable? true :last-applied-lsn 183}}
+               (#'dha/ha-source-advertised-last-applied-lsn
+                "orders" m lease "10.0.0.13:8898")))))))
+
+(deftest ha-watermark-transport-reuses-cached-client-test
+  (#'dha/clear-ha-client-cache!)
+  (let [request-clients (atom [])
+        new-client-count (atom 0)
+        close-count (atom 0)
+        client {:id :ha-test-client
+                :pool :ha-test-pool}
+        m {:ha-local-endpoint "10.0.0.12:8898"
+           :ha-lease-renew-ms 1000}]
+    (try
+      (with-redefs-fn
+        {#'dha/open-ha-client
+         (fn [_ _ _]
+           (swap! new-client-count inc)
+           client)
+         #'dha/live-ha-client?
+         (fn [_]
+           true)
+         #'dha/ha-client-request
+         (fn [client' op _ _]
+           (swap! request-clients conj [client' op])
+           {:last-applied-lsn 42
+            :ha-runtime? false})
+         #'dha/close-ha-client!
+         (fn [_]
+           (swap! close-count inc)
+           nil)}
+        (fn []
+          (is (= {:reachable? true
+                  :last-applied-lsn 42
+                  :txlog-last-applied-lsn 42
+                  :ha-local-last-applied-lsn nil
+                  :ha-role nil
+                  :ha-runtime? false
+                  :ha-control-node-leader? nil
+                  :ha-control-node-state nil
+                  :source :remote}
+                 (#'dha/fetch-ha-endpoint-watermark-lsn
+                  "orders" m "10.0.0.11:8898")))
+          (is (= {:reachable? true
+                  :last-applied-lsn 42
+                  :txlog-last-applied-lsn 42
+                  :ha-local-last-applied-lsn nil
+                  :ha-role nil
+                  :ha-runtime? false
+                  :ha-control-node-leader? nil
+                  :ha-control-node-state nil
+                  :source :remote}
+                 (#'dha/fetch-ha-endpoint-watermark-lsn
+                  "orders" m "10.0.0.11:8898")))
+          (#'dha/clear-ha-client-cache!)))
+      (is (= 1 @new-client-count))
+      (is (= [[client :ha-watermark]
+              [client :ha-watermark]]
+             @request-clients))
+      (is (= 1 @close-count))
+      (finally
+        (#'dha/clear-ha-client-cache!)))))
+
+(deftest ha-watermark-transport-falls-back-to-txlog-watermarks-test
+  (#'dha/clear-ha-client-cache!)
+  (let [request-clients (atom [])
+        client {:id :ha-test-client
+                :pool :ha-test-pool}]
+    (try
+      (with-redefs-fn
+        {#'dha/open-ha-client
+         (fn [_ _ _]
+           client)
+         #'dha/live-ha-client?
+         (fn [_]
+           true)
+         #'dha/ha-client-request
+         (fn [client' op _ _]
+           (swap! request-clients conj [client' op])
+           (case op
+             :ha-watermark
+             (throw (ex-info "Unknown message type :ha-watermark"
+                             {:error :unknown-message-type}))
+
+             :txlog-watermarks
+             {:last-applied-lsn 42}))
+         #'dha/close-ha-client!
+         (fn [_] nil)}
+        (fn []
+          (is (= {:reachable? true
+                  :last-applied-lsn 42
+                  :txlog-last-applied-lsn 42
+                  :ha-local-last-applied-lsn nil
+                  :ha-role nil
+                  :ha-runtime? nil
+                  :ha-control-node-leader? nil
+                  :ha-control-node-state nil
+                  :source :remote}
+                 (#'dha/fetch-ha-endpoint-watermark-lsn
+                  "orders"
+                  {:ha-local-endpoint "10.0.0.12:8898"
+                   :ha-lease-renew-ms 1000}
+                  "10.0.0.11:8898")))))
+      (is (= [[client :ha-watermark]
+              [client :txlog-watermarks]]
+             @request-clients))
+      (finally
+        (#'dha/clear-ha-client-cache!)))))
+
+(deftest ha-watermark-transport-prefers-remote-ha-local-lsn-test
+  (#'dha/clear-ha-client-cache!)
+  (let [client {:id :ha-test-client
+                :pool :ha-test-pool}]
+    (try
+      (with-redefs-fn
+        {#'dha/open-ha-client
+         (fn [_ _ _]
+           client)
+         #'dha/live-ha-client?
+         (fn [_]
+           true)
+         #'dha/ha-client-request
+         (fn [_ op _ _]
+           (is (= :ha-watermark op))
+           {:last-applied-lsn 3
+            :txlog-last-applied-lsn 37
+            :ha-local-last-applied-lsn 3
+            :ha-role :follower
+            :ha-runtime? true
+            :ha-control-node-leader? false
+            :ha-control-node-state "STATE_FOLLOWER"})
+         #'dha/close-ha-client!
+         (fn [_] nil)}
+        (fn []
+          (is (= {:reachable? true
+                  :last-applied-lsn 3
+                  :txlog-last-applied-lsn 37
+                  :ha-local-last-applied-lsn 3
+                  :ha-role :follower
+                  :ha-runtime? true
+                  :ha-control-node-leader? false
+                  :ha-control-node-state "STATE_FOLLOWER"
+                  :source :remote-ha-runtime}
+                 (#'dha/fetch-ha-endpoint-watermark-lsn
+                  "orders"
+                  {:ha-local-endpoint "10.0.0.12:8898"
+                   :ha-lease-renew-ms 1000}
+                  "10.0.0.11:8898")))))
+      (finally
+        (#'dha/clear-ha-client-cache!)))))
 
 (deftest ha-renew-step-follower-sync-gap-reorders-followers-by-watermark-test
   (let [opts (assoc (valid-ha-opts)
@@ -3525,6 +4091,7 @@
         (is (= "orders" (:db-name meta)))
         (is (= (:db-identity opts) (:db-identity meta)))
         (is (= snapshot-lsn (:snapshot-last-applied-lsn meta)))
+        (is (= watermark-lsn (:payload-last-applied-lsn meta)))
         (is (> watermark-lsn snapshot-lsn)))
       (finally
         (i/close store)
@@ -3552,10 +4119,126 @@
         (is (= "orders" (:db-name meta)))
         (is (= (:db-identity opts) (:db-identity meta)))
         (is (= snapshot-lsn (:snapshot-last-applied-lsn meta)))
+        (is (= watermark-lsn (:payload-last-applied-lsn meta)))
         (is (> watermark-lsn snapshot-lsn)))
       (finally
         (i/close store)
         (u/delete-files dir)))))
+
+(deftest copy-response-meta-prefers-lmdb-payload-lsn-over-runtime-watermark-test
+  (let [dir (u/tmp-dir (str "ha-copy-meta-payload-" (UUID/randomUUID)))
+        opts {:db-name "orders"
+              :db-identity (str "db-" (UUID/randomUUID))}
+        store (st/open dir nil opts)]
+    (try
+      (let [kv (.-lmdb store)
+            _ (i/open-dbi kv "a")
+            _ (i/transact-kv kv [[:put "a" "k1" "v1"]])
+            _ (i/create-snapshot! kv)
+            snapshot-lsn
+            (long (or (i/get-value kv c/kv-info
+                                   c/wal-snapshot-current-lsn
+                                   :keyword :data)
+                      0))
+            _ (i/transact-kv kv [[:put "a" "k2" "v2"]])
+            runtime-lsn
+            (#'dha/read-ha-local-last-applied-lsn
+             {:store store :ha-role :leader})
+            _ (is (> runtime-lsn snapshot-lsn))
+            meta (with-redefs [dha/read-ha-snapshot-payload-lsn
+                               (fn [_] snapshot-lsn)]
+                   (#'srv/copy-response-meta
+                    "orders" store {:compact? false}))]
+        (is (= runtime-lsn
+               (#'dha/read-ha-local-last-applied-lsn
+                {:store store :ha-role :leader})))
+        (is (= snapshot-lsn (:payload-last-applied-lsn meta)))
+        (is (not= runtime-lsn (:payload-last-applied-lsn meta))))
+      (finally
+        (i/close store)
+        (u/delete-files dir)))))
+
+(deftest persist-ha-local-applied-lsn-bypasses-local-txlog-test
+  (let [dir (u/tmp-dir (str "ha-local-applied-persist-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :wal? true})]
+    (try
+      (let [kv (.-lmdb store)
+            _ (i/open-dbi kv "a")
+            _ (i/transact-kv kv [[:put "a" "k1" "v1"]])
+            watermark-before
+            (long (or (:last-applied-lsn (i/txlog-watermarks kv)) 0))
+            _ (#'dha/persist-ha-local-applied-lsn!
+               {:store store}
+               watermark-before)
+            watermark-after
+            (long (or (:last-applied-lsn (i/txlog-watermarks kv)) 0))
+            persisted-lsn
+            (long (or (i/get-value kv c/kv-info
+                                   c/ha-local-applied-lsn
+                                   :keyword :data)
+                      0))]
+        (is (pos? watermark-before))
+        (is (= watermark-before persisted-lsn))
+        (is (= watermark-before watermark-after)))
+      (finally
+        (i/close store)
+        (u/delete-files dir)))))
+
+(deftest validate-ha-snapshot-copy-prefers-payload-lsn-test
+  (let [db-identity (str "db-" (UUID/randomUUID))
+        manifest (#'dha/validate-ha-snapshot-copy!
+                  "orders"
+                  {:ha-db-identity db-identity}
+                  "10.0.0.13:8898"
+                  "/tmp/ignored"
+                  {:db-name "orders"
+                   :db-identity db-identity
+                   :snapshot-last-applied-lsn 7
+                   :payload-last-applied-lsn 11}
+                  11)]
+    (is (= "orders" (:db-name manifest)))
+    (is (= db-identity (:db-identity manifest)))
+    (is (= 7 (:snapshot-last-applied-lsn manifest)))
+    (is (= 11 (:payload-last-applied-lsn manifest)))))
+
+(deftest fetch-ha-endpoint-snapshot-copy-unpins-backup-pin-best-effort-test
+  (let [opened   (atom nil)
+        unpinned (atom [])
+        closed   (atom [])]
+    (with-redefs-fn
+      {#'dha/open-ha-snapshot-remote-store!
+       (fn [uri opts]
+         (reset! opened {:uri uri :opts opts})
+         ::remote-store)
+       #'dha/copy-ha-remote-store!
+       (fn [store dest compact?]
+         (is (= ::remote-store store))
+         (is (= "/tmp/ignored" dest))
+         (is (false? compact?))
+         {:db-name "orders"
+          :backup-pin {:pin-id "backup-copy/test-pin"}})
+       #'dha/unpin-ha-remote-store-backup-floor!
+       (fn [store pin-id]
+         (swap! unpinned conj [store pin-id])
+         (throw (ex-info "cleanup failed" {:pin-id pin-id})))
+       #'dha/close-ha-snapshot-remote-store!
+       (fn [store]
+         (swap! closed conj store))}
+      (fn []
+        (is (= {:copy-meta {:db-name "orders"
+                            :backup-pin
+                            {:pin-id "backup-copy/test-pin"}}}
+               (#'dha/fetch-ha-endpoint-snapshot-copy!
+                "orders"
+                {:ha-lease-renew-ms 1000}
+                "10.0.0.11:8898"
+                "/tmp/ignored")))
+        (is (= [[::remote-store "backup-copy/test-pin"]]
+               @unpinned))
+        (is (= [::remote-store] @closed))
+        (is (= "dtlv://datalevin:datalevin@10.0.0.11:8898/orders"
+               (:uri @opened)))))))
 
 (deftest read-ha-local-last-applied-lsn-uses-persisted-ha-lsn-after-install-test
   (let [db-name "orders"
@@ -3648,7 +4331,7 @@
           (i/close store))
         (u/delete-files dir)))))
 
-(deftest read-ha-local-last-applied-lsn-ignores-watermarks-for-followers-test
+(deftest read-ha-local-last-applied-lsn-prefers-follower-local-truth-test
   (let [dir (u/tmp-dir (str "ha-follower-watermark-" (UUID/randomUUID)))
         store (st/open dir nil {:db-name "orders"
                                 :db-identity (str "db-" (UUID/randomUUID))
@@ -3657,18 +4340,28 @@
     (try
       (i/open-dbi lmdb "a")
       (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
-      (let [watermark-lsn (long (or (:last-applied-lsn
-                                     (i/txlog-watermarks lmdb))
-                                    0))]
-        (is (pos? watermark-lsn))
-        (is (zero?
-             (dha/read-ha-local-last-applied-lsn
-              {:store store
-               :ha-role :follower})))
-        (is (= watermark-lsn
+      (let [initial-watermark-lsn (long (or (:last-applied-lsn
+                                             (i/txlog-watermarks lmdb))
+                                            0))]
+        (is (pos? initial-watermark-lsn))
+        (#'dha/persist-ha-local-applied-lsn!
+         {:store store}
+         (+ initial-watermark-lsn 7))
+        (let [watermark-lsn (long (or (:last-applied-lsn
+                                       (i/txlog-watermarks lmdb))
+                                      0))]
+          ;; Persisting the follower-applied marker itself appends to the WAL,
+          ;; so the local watermark advances as part of the metadata write.
+          (is (> watermark-lsn initial-watermark-lsn))
+          (is (= watermark-lsn
                (dha/read-ha-local-last-applied-lsn
                 {:store store
-                 :ha-role :leader}))))
+                 :ha-role :follower
+                 :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
+          (is (= (+ initial-watermark-lsn 7)
+                 (dha/read-ha-local-last-applied-lsn
+                  {:store store
+                   :ha-role :leader})))))
       (finally
         (when-not (i/closed? store)
           (i/close store))
@@ -3926,6 +4619,68 @@
         (u/delete-files leader-dir)
         (u/delete-files follower-dir)))))
 
+(deftest apply-ha-follower-txlog-record-bypasses-local-txlog-test
+  (let [leader-dir (u/tmp-dir (str "ha-leader-replay-watermark-" (UUID/randomUUID)))
+        follower-dir (u/tmp-dir (str "ha-follower-replay-watermark-" (UUID/randomUUID)))
+        schema {:register/key {:db/valueType :db.type/long
+                               :db/unique :db.unique/identity}
+                :register/value {:db/valueType :db.type/long}}
+        opts {:db-name "orders"
+              :db-identity "db-1"
+              :wal? true}]
+    (try
+      (let [leader-conn (d/create-conn leader-dir schema opts)
+            follower-store (st/open follower-dir schema opts)]
+        (try
+          (d/transact! leader-conn
+                       [{:db/id "register-0"
+                         :register/key 0
+                         :register/value 0}])
+          (d/transact! leader-conn [{:register/key 0 :register/value 7}])
+          (let [leader-store (:store @leader-conn)
+                leader-kv (.-lmdb leader-store)
+                follower-kv (.-lmdb follower-store)
+                records (vec (kv/open-tx-log-rows leader-kv 1 nil))
+                follower-runtime {:store follower-store
+                                  :dt-db (db/new-db follower-store)
+                                  :ha-node-id 2}
+                local-records-before (vec (kv/open-tx-log-rows follower-kv 1 nil))
+                next-state (reduce #'dha/apply-ha-follower-txlog-record!
+                                   follower-runtime
+                                   records)
+                follower-store-after (:store next-state)
+                follower-kv-after (.-lmdb ^Store follower-store-after)
+                local-records-after
+                (vec (kv/open-tx-log-rows follower-kv-after 1 nil))
+                payload-lsn
+                (long (or (i/get-value follower-kv-after
+                                       c/kv-info
+                                       c/wal-local-payload-lsn
+                                       :keyword :data)
+                          0))
+                last-record-lsn (long (:lsn (peek records)))
+                rows (d/q '[:find ?key ?value
+                            :where
+                            [?e :register/key ?key]
+                            [?e :register/value ?value]]
+                          (db/new-db follower-store-after))]
+            (is (seq records))
+            (is (= {0 7}
+                   (into {}
+                         (map (fn [[k v]]
+                                [(long k) (long v)]))
+                         rows)))
+            (is (= (mapv :lsn local-records-before)
+                   (mapv :lsn local-records-after)))
+            (is (= last-record-lsn payload-lsn)))
+          (finally
+            (d/close leader-conn)
+            (when-not (i/closed? follower-store)
+              (i/close follower-store)))))
+      (finally
+        (u/delete-files leader-dir)
+        (u/delete-files follower-dir)))))
+
 (deftest ha-renew-step-follower-gap-bootstraps-from-snapshot-copy-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)
@@ -4039,6 +4794,134 @@
                 :ha-node-id 2
                 :leader-endpoint "10.0.0.11:8898"
                 :applied-lsn (inc @snapshot-lsn*)}
+               @reported)))
+      (finally
+        (when-let [store (:store @next-state)]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-not (i/closed? source-store)
+          (i/close source-store))
+        (when-not (i/closed? local-store)
+          (i/close local-store))
+        (#'srv/stop-ha-authority "orders" runtime)
+        (u/delete-files local-dir)
+        (u/delete-files source-dir)))))
+
+(deftest ha-renew-step-follower-gap-bootstraps-from-copy-payload-newer-than-snapshot-floor-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        local-dir (u/tmp-dir (str "ha-local-copy-payload-" (UUID/randomUUID)))
+        source-dir (u/tmp-dir (str "ha-source-copy-payload-" (UUID/randomUUID)))
+        db-identity (:ha-db-identity runtime)
+        local-store (st/open local-dir nil {:db-name "orders"
+                                            :db-identity db-identity
+                                            :wal? true})
+        source-store (st/open source-dir nil {:db-name "orders"
+                                              :db-identity db-identity
+                                              :wal? true})
+        snapshot-lsn* (atom nil)
+        payload-lsn* (atom nil)
+        reported (atom nil)
+        next-state (atom nil)
+        now-ms (System/currentTimeMillis)]
+    (try
+      (let [local-kv (.-lmdb local-store)
+            source-kv (.-lmdb source-store)
+            _ (i/open-dbi source-kv "a")
+            _ (i/transact-kv source-kv [[:put "a" "k1" "v1"]])
+            _ (i/create-snapshot! source-kv)
+            snapshot-lsn
+            (long (or (i/get-value source-kv c/kv-info
+                                   c/wal-snapshot-current-lsn
+                                   :keyword :data)
+                      0))
+            _ (i/transact-kv source-kv [[:put "a" "k2" "v2"]])
+            payload-lsn
+            (long (or (:last-applied-lsn (i/txlog-watermarks source-kv)) 0))
+            _ (reset! snapshot-lsn* snapshot-lsn)
+            _ (reset! payload-lsn* payload-lsn)
+            authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity db-identity
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn (inc payload-lsn)
+                :now-ms now-ms
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :store local-store
+                                        :ha-role :follower
+                                        :ha-follower-next-lsn 1
+                                        :ha-local-last-applied-lsn 0))]
+        (with-redefs-fn
+          {#'dha/fetch-ha-leader-txlog-batch
+           (fn [_ _ endpoint _ _]
+             (case endpoint
+               "10.0.0.11:8898"
+               [{:lsn (inc payload-lsn)
+                 :ops [[:put "a" "k3" "v3"]]}]
+               "10.0.0.13:8898"
+               [{:lsn (inc payload-lsn)
+                 :ops [[:put "a" "k3" "v3"]]}]
+               []))
+           #'dha/fetch-ha-endpoint-watermark-lsn
+           (fn [_ _ endpoint]
+             (case endpoint
+               "10.0.0.13:8898"
+               {:reachable? true :last-applied-lsn payload-lsn}
+               (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
+           #'dha/fetch-ha-endpoint-snapshot-copy!
+           (fn [_ _ endpoint dest-dir]
+             (case endpoint
+               "10.0.0.11:8898"
+               (throw (ex-info "leader snapshot unavailable"
+                               {:error :ha/follower-snapshot-unavailable}))
+               "10.0.0.13:8898"
+               {:copy-meta
+                (assoc (i/copy source-kv dest-dir false)
+                       :db-name "orders"
+                       :db-identity db-identity
+                       :snapshot-last-applied-lsn snapshot-lsn
+                       :payload-last-applied-lsn payload-lsn)}
+               (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
+           #'dha/report-ha-replica-floor!
+           (fn [db-name m endpoint applied-lsn]
+             (reset! reported {:db-name db-name
+                               :ha-node-id (:ha-node-id m)
+                               :leader-endpoint endpoint
+                               :applied-lsn applied-lsn})
+             {:ok? true})}
+          (fn []
+            (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
+      (let [state @next-state
+            next-kv (.-lmdb (:store state))]
+        (i/open-dbi next-kv "a")
+        (is (= :follower (:ha-role state)))
+        (is (= (inc @payload-lsn*) (:ha-local-last-applied-lsn state)))
+        (is (= (inc @payload-lsn*)
+               (i/get-value next-kv c/kv-info
+                            c/ha-local-applied-lsn
+                            :keyword :data)))
+        (is (= (+ 2 @payload-lsn*) (:ha-follower-next-lsn state)))
+        (is (= 1 (:ha-follower-last-batch-size state)))
+        (is (= "10.0.0.11:8898" (:ha-follower-source-endpoint state)))
+        (is (= "10.0.0.13:8898"
+               (:ha-follower-bootstrap-source-endpoint state)))
+        (is (= @payload-lsn*
+               (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
+        (is (> @payload-lsn* @snapshot-lsn*))
+        (is (nil? (:ha-follower-degraded? state)))
+        (is (= "v1" (i/get-value next-kv "a" "k1")))
+        (is (= "v2" (i/get-value next-kv "a" "k2")))
+        (is (= "v3" (i/get-value next-kv "a" "k3")))
+        (is (= {:db-name "orders"
+                :ha-node-id 2
+                :leader-endpoint "10.0.0.11:8898"
+                :applied-lsn (inc @payload-lsn*)}
                @reported)))
       (finally
         (when-let [store (:store @next-state)]

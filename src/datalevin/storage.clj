@@ -1777,7 +1777,8 @@
          {:keys [kv-opts search-opts search-domains vector-opts vector-domains]}
          opts
          dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
-         persisted-opts (load-existing-store-opts dir kv-opts)
+         persisted-opts (some-> (load-existing-store-opts dir kv-opts)
+                                propagate-top-level-txlog-opts-to-kv-opts)
          persisted-kv-opts
          (c/canonicalize-wal-opts (or (:kv-opts persisted-opts) {}))
          new-db? (not (existing-store? dir))

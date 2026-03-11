@@ -596,6 +596,7 @@
 (def ^:private default-operation-timeout-ms 5000)
 (def ^:private default-snapshot-interval-secs 300)
 (def ^:private max-read-index-attempt-timeout-ms 500)
+(def ^:private max-command-attempt-timeout-ms 5000)
 (def ^:private read-retryable-errors
   #{RaftError/EAGAIN
     RaftError/EBUSY
@@ -620,6 +621,13 @@
   (long (max 1
              (min (long remaining)
                   (long max-read-index-attempt-timeout-ms)))))
+
+(defn- command-attempt-timeout-ms
+  [remaining rpc-timeout-ms]
+  (long (max 1
+             (min (long remaining)
+                  (long (or rpc-timeout-ms max-command-attempt-timeout-ms))
+                  (long max-command-attempt-timeout-ms)))))
 
 (defn- single-voter-authority?
   [{:keys [voters]}]
@@ -1131,8 +1139,11 @@
         (let [{:keys [^Node node ^RpcClient rpc-client]}
               (running-runtime! authority)]
           (if (.isLeader node)
-            (let [local-res (apply-local-command-once!
-                             node cmd (max 1 remaining))]
+            (let [local-timeout (command-attempt-timeout-ms
+                                 remaining
+                                 rpc-timeout-ms)
+                  local-res (apply-local-command-once!
+                             node cmd local-timeout)]
               (cond
                 (:ok? local-res)
                 (:result local-res)
@@ -1439,8 +1450,11 @@
           (let [{:keys [^Node node ^RpcClient rpc-client]}
                 (running-runtime! this)]
             (if (.isLeader node)
-              (let [local-res (change-peers-once!
-                               node peer-ids (max 1 remaining))]
+              (let [local-timeout (command-attempt-timeout-ms
+                                   remaining
+                                   rpc-timeout-ms)
+                    local-res (change-peers-once!
+                               node peer-ids local-timeout)]
                 (cond
                   (:ok? local-res)
                   {:ok? true

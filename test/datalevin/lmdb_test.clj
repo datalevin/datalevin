@@ -18,9 +18,26 @@
   (:import
    [java.util UUID Arrays Base64 Random]
    [java.lang Long]
+   [datalevin.cpp Txn]
+   [datalevin.binding.cpp Rtx]
    [datalevin.lmdb IListRandKeyValIterable IListRandKeyValIterator]))
 
 (use-fixtures :each db-fixture)
+
+(deftest stale-thread-local-reader-recovers-test
+  (let [dir  (u/tmp-dir (str "lmdb-stale-reader-" (UUID/randomUUID)))
+        lmdb (l/open-kv dir)]
+    (try
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" 1 2]])
+      (let [^Rtx rtx (if/get-rtx lmdb)]
+        (if/return-rtx lmdb rtx)
+        (.close ^Txn (.-txn rtx))
+        (is (= 2 (if/get-value lmdb "a" 1)))
+        (is (= 2 (if/get-value lmdb "a" 1))))
+      (finally
+        (if/close-kv lmdb)
+        (u/delete-files dir)))))
 
 (deftest basic-ops-test
   (let [dir  (u/tmp-dir (str "lmdb-test-" (UUID/randomUUID)))
@@ -925,3 +942,21 @@
         (is (nil? (if/get-value lmdb2 "a" :k)))
         (if/close-kv lmdb2))
       (u/delete-files dir))))
+
+(deftest closed-kv-operations-raise-exceptioninfo-test
+  (let [dir  (u/tmp-dir (str "closed-kv-" (UUID/randomUUID)))
+        lmdb (l/open-kv dir)]
+    (try
+      (if/close-kv lmdb)
+      (let [e (try
+                (if/open-dbi lmdb "a")
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  e)
+                (catch Throwable e
+                  e))]
+        (is (instance? clojure.lang.ExceptionInfo e))
+        (is (= :lmdb/closed (:type (ex-data e))))
+        (is (= "LMDB env is closed." (ex-message e))))
+      (finally
+        (u/delete-files dir)))))

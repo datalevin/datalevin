@@ -33,7 +33,7 @@
    [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
-   [java.util.concurrent TimeUnit]))
+   [java.util.concurrent ConcurrentHashMap TimeUnit]))
 
 (defn consensus-ha-opts
   [store]
@@ -119,6 +119,13 @@
                   true))
       kv-store)))
 
+(defn- raw-local-kv-store
+  [m]
+  (when-let [kv-store (local-kv-store m)]
+    (if (instance? datalevin.kv.KVLMDB kv-store)
+      (.-db ^datalevin.kv.KVLMDB kv-store)
+      kv-store)))
+
 (defn- closed-kv-store?
   [kv-store]
   (try
@@ -152,7 +159,7 @@
 
 (defn- persist-ha-local-applied-lsn!
   [m applied-lsn]
-  (when-let [kv-store (local-kv-store m)]
+  (when-let [kv-store (raw-local-kv-store m)]
     (try
       (i/transact-kv kv-store c/kv-info
                      [[:put c/ha-local-applied-lsn (long applied-lsn)]]
@@ -162,20 +169,38 @@
           (throw t)))))
   applied-lsn)
 
+(defn- read-ha-local-snapshot-current-lsn
+  [kv-store]
+  (long (or (try
+              (when-not (closed-kv-store? kv-store)
+                (i/get-value kv-store c/kv-info
+                             c/wal-snapshot-current-lsn
+                             :keyword :data))
+              (catch Throwable t
+                (when-not (closed-kv-race? t kv-store)
+                  (throw t))
+                nil))
+            0)))
+
+(defn- read-ha-local-payload-lsn
+  [kv-store]
+  (long (or (try
+              (when-not (closed-kv-store? kv-store)
+                (i/get-value kv-store c/kv-info
+                             c/wal-local-payload-lsn
+                             :keyword :data))
+              (catch Throwable t
+                (when-not (closed-kv-race? t kv-store)
+                  (throw t))
+                nil))
+            0)))
+
+(declare read-ha-local-last-applied-lsn)
+
 (defn ^:redef read-ha-snapshot-payload-lsn
   [m]
   (if-let [kv-store (local-kv-store m)]
-    (let [persisted-lsn (read-ha-local-persisted-lsn kv-store)
-          snapshot-lsn (long (or (try
-                                   (i/get-value kv-store c/kv-info
-                                                c/wal-snapshot-current-lsn
-                                                :keyword :data)
-                                   (catch Throwable t
-                                     (when-not (closed-kv-race? t kv-store)
-                                       (throw t))
-                                     nil))
-                                 0))]
-      (long (max persisted-lsn snapshot-lsn)))
+    (read-ha-local-payload-lsn kv-store)
     0))
 
 (defn ^:redef read-ha-local-last-applied-lsn
@@ -192,14 +217,19 @@
                                             (throw t))
                                           nil))
                                       0))
+              snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
               persisted-lsn (read-ha-local-persisted-lsn kv-store)
-              ha-lsn (long (max persisted-lsn state-lsn))]
+              ha-lsn (long (max persisted-lsn state-lsn))
+              local-truth (long (max watermark-lsn snapshot-lsn))]
           (cond
+            (= :leader role)
+            (long (max ha-lsn local-truth))
+
+            (pos? local-truth)
+            local-truth
+
             (pos? ha-lsn)
             ha-lsn
-
-            (= :leader role)
-            watermark-lsn
 
             :else
             0))
@@ -210,7 +240,7 @@
                     {:db-name (some-> (:store m) i/opts :db-name)}))
         state-lsn))))
 
-(defn- read-ha-local-watermark-lsn
+(defn- ^:redef read-ha-local-watermark-lsn
   [m]
   (if-let [kv-store (local-kv-store m)]
     (long (or (try
@@ -252,20 +282,43 @@
   [m]
   (if (local-kv-store m)
     (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-          persisted-lsn (long (read-ha-local-last-applied-lsn m))
+          kv-store (local-kv-store m)
+          persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
           watermark-lsn (read-ha-local-watermark-lsn m)
+          snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
+          local-truth (long (max watermark-lsn snapshot-lsn))
           local-lsn (long (if (= :leader (:ha-role m))
-                            (max state-lsn persisted-lsn watermark-lsn)
-                            (max state-lsn persisted-lsn)))]
+                            (max state-lsn persisted-lsn local-truth)
+                            (if (pos? local-truth)
+                              local-truth
+                              (max state-lsn persisted-lsn))))]
       (cond-> (assoc m :ha-local-last-applied-lsn local-lsn)
         (= :leader (:ha-role m))
         (assoc :ha-leader-last-applied-lsn local-lsn)))
     m))
 
+(defn- transact-ha-follower-local!
+  [m rows]
+  (if-let [kv-store (local-kv-store m)]
+    (#'kv/with-runtime-txlog-rollback
+     kv-store
+     #(i/transact-kv kv-store rows))
+    (u/raise "Follower txlog replay requires a local KV store"
+             {:error :ha/follower-missing-store})))
+
+(declare bootstrap-empty-lease?)
+
 (defn- ha-promotion-lag-guard
   [m lease]
   (let [leader-last-applied-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        local-last-applied-lsn (ha-local-last-applied-lsn m)
+        tracked-local-lsn (ha-local-last-applied-lsn m)
+        bootstrap-watermark-lsn
+        (when (and (bootstrap-empty-lease? lease)
+                   (zero? tracked-local-lsn))
+          (read-ha-local-watermark-lsn m))
+        local-last-applied-lsn (long (max tracked-local-lsn
+                                          (long (or bootstrap-watermark-lsn
+                                                    0))))
         lag-lsn (max 0
                      (- leader-last-applied-lsn
                         local-last-applied-lsn))
@@ -294,18 +347,92 @@
                  (<= 1 (long port) 65535))
         {:host host :port (long port)}))))
 
-(defn- close-ha-client!
+(defn- ^:redef close-ha-client!
   [client]
   (when client
     (try
-      ;; These clients are one-shot internal HA probes. Close the pool directly
-      ;; instead of running the network disconnect handshake, which reacquires a
-      ;; pooled connection and can mask a successful request with a pool timeout.
+      ;; Internal HA probes may reuse pooled clients; when we evict one from the
+      ;; cache, close the pool directly instead of running the network
+      ;; disconnect handshake, which reacquires a pooled connection and can mask
+      ;; a successful request with a pool timeout.
       (cl/close-pool (cl/get-pool client))
       (catch Throwable _
         (try
           (cl/disconnect client)
           (catch Throwable _ nil))))))
+
+(defonce ^:private ^ConcurrentHashMap ha-client-cache
+  (ConcurrentHashMap.))
+
+(defn- ha-client-cache-key
+  [uri client-opts]
+  [uri
+   (long (or (:pool-size client-opts) 1))
+   (long (or (:time-out client-opts) c/default-connection-timeout))])
+
+(defn- ^:redef live-ha-client?
+  [client]
+  (and client
+       (try
+         (not (cl/disconnected? client))
+         (catch Throwable _
+           false))))
+
+(defn- ^:redef open-ha-client
+  [uri db-name client-opts]
+  (let [client (cl/new-client uri client-opts)]
+    (cl/open-database client db-name c/db-store-kv)
+    client))
+
+(defn- ^:redef ha-client-request
+  [client type args writing?]
+  (cl/normal-request client type args writing?))
+
+(defn- cached-ha-client
+  [uri db-name client-opts]
+  (let [cache-key (ha-client-cache-key uri client-opts)]
+    (locking ha-client-cache
+      (if-let [client (.get ha-client-cache cache-key)]
+        (if (live-ha-client? client)
+          client
+          (do
+            (close-ha-client! client)
+            (let [new-client (open-ha-client uri db-name client-opts)]
+              (.put ha-client-cache cache-key new-client)
+              new-client)))
+        (let [client (open-ha-client uri db-name client-opts)]
+          (.put ha-client-cache cache-key client)
+          client)))))
+
+(defn- invalidate-cached-ha-client!
+  [uri client-opts client]
+  (let [cache-key (ha-client-cache-key uri client-opts)]
+    (locking ha-client-cache
+      (when (identical? client (.get ha-client-cache cache-key))
+        (.remove ha-client-cache cache-key)
+        (close-ha-client! client)))))
+
+(defn- with-cached-ha-client
+  [uri db-name client-opts f]
+  (let [client (cached-ha-client uri db-name client-opts)]
+    (try
+      (f client)
+      (catch Exception e
+        (invalidate-cached-ha-client! uri client-opts client)
+        (throw e)))))
+
+(defn- unknown-ha-watermark-command?
+  [e]
+  (let [message (or (ex-message e) "")]
+    (or (= :unknown-message-type (:error (ex-data e)))
+        (s/includes? message "Unknown message type :ha-watermark"))))
+
+(defn- clear-ha-client-cache!
+  []
+  (locking ha-client-cache
+    (doseq [client (vals (into {} ha-client-cache))]
+      (close-ha-client! client))
+    (.clear ha-client-cache)))
 
 (defn- ha-endpoint-uri
   [db-name endpoint]
@@ -451,35 +578,50 @@
        :source :local}
 
       :else
-      (if-let [{:keys [host port]} (parse-endpoint endpoint)]
-        (let [uri (str "dtlv://"
-                       c/default-username
-                       ":"
-                       c/default-password
-                       "@"
-                       host
-                       ":"
-                       port)
-              timeout-ms (long (max 500
+      (if-let [uri (ha-endpoint-uri db-name endpoint)]
+        (let [client-opts
+              {:pool-size 1
+               :time-out (long (max 500
                                     (min 5000
                                          (long (or (:ha-lease-renew-ms m)
-                                                   c/*ha-lease-renew-ms*)))))
-              client-opts {:pool-size 1
-                           :time-out timeout-ms}]
+                                                   c/*ha-lease-renew-ms*)))))}]
           (try
-            (let [client (cl/new-client uri client-opts)]
-              (try
-                (let [watermarks (cl/normal-request
-                                  client
-                                  :txlog-watermarks
-                                  [db-name]
-                                  false)]
+            (with-cached-ha-client
+              uri db-name client-opts
+              (fn [client]
+                (let [watermarks
+                      (try
+                        (ha-client-request
+                         client
+                         :ha-watermark
+                         [db-name]
+                         false)
+                        (catch Exception e
+                          (if (unknown-ha-watermark-command? e)
+                            (ha-client-request
+                             client
+                             :txlog-watermarks
+                             [db-name]
+                             false)
+                            (throw e))))]
                   {:reachable? true
                    :last-applied-lsn
                    (long (or (:last-applied-lsn watermarks) 0))
-                   :source :remote})
-                (finally
-                  (close-ha-client! client))))
+                   :txlog-last-applied-lsn
+                   (long (or (:txlog-last-applied-lsn watermarks)
+                             (:last-applied-lsn watermarks)
+                             0))
+                   :ha-local-last-applied-lsn
+                   (some-> (:ha-local-last-applied-lsn watermarks) long)
+                   :ha-role (:ha-role watermarks)
+                   :ha-runtime? (:ha-runtime? watermarks)
+                   :ha-control-node-leader?
+                   (:ha-control-node-leader? watermarks)
+                   :ha-control-node-state
+                   (:ha-control-node-state watermarks)
+                   :source (if (:ha-runtime? watermarks)
+                             :remote-ha-runtime
+                             :remote)})))
             (catch Exception e
               {:reachable? false
                :reason :endpoint-watermark-fetch-failed
@@ -487,6 +629,18 @@
         {:reachable? false
          :reason :invalid-endpoint
          :endpoint endpoint}))))
+
+(def ^:redef open-ha-snapshot-remote-store!
+  r/open-kv)
+
+(def ^:redef copy-ha-remote-store!
+  i/copy)
+
+(def ^:redef unpin-ha-remote-store-backup-floor!
+  i/txlog-unpin-backup-floor!)
+
+(def ^:redef close-ha-snapshot-remote-store!
+  i/close-kv)
 
 (defn ^:redef fetch-leader-watermark-lsn
   [db-name m lease]
@@ -508,6 +662,43 @@
 
         (= :endpoint-watermark-fetch-failed (:reason result))
         (assoc :reason :leader-watermark-fetch-failed)))))
+
+(defn- highest-reachable-ha-member-watermark
+  [db-name m]
+  (let [local-endpoint (:ha-local-endpoint m)
+        endpoints (->> (concat [local-endpoint]
+                               (map :endpoint (:ha-members m)))
+                       (filter #(and (string? %)
+                                     (not (s/blank? %))))
+                       distinct)]
+    (reduce (fn [best endpoint]
+              (let [watermark (fetch-ha-endpoint-watermark-lsn
+                               db-name m endpoint)]
+                (if-not (:reachable? watermark)
+                  best
+                  (let [last-applied-lsn
+                        (long (or (:last-applied-lsn watermark) 0))
+                        candidate {:endpoint endpoint
+                                   :last-applied-lsn last-applied-lsn
+                                   :watermark watermark}]
+                    (cond
+                      (nil? best)
+                      candidate
+
+                      (> last-applied-lsn
+                         (long (:last-applied-lsn best)))
+                      candidate
+
+                      (and (= last-applied-lsn
+                              (long (:last-applied-lsn best)))
+                           (= endpoint local-endpoint)
+                           (not= endpoint (:endpoint best)))
+                      candidate
+
+                      :else
+                      best)))))
+            nil
+            endpoints)))
 
 (def ^:private ha-follower-max-batch-records 256)
 (def ^:private ha-follower-max-sync-backoff-ms 30000)
@@ -569,6 +760,14 @@
 (defn- ha-gap-fallback-source-endpoints
   [db-name m lease next-lsn]
   (let [required-lsn (long (max 0 (dec (long next-lsn))))
+        leader-watermark (fetch-leader-watermark-lsn db-name m lease)
+        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
+        leader-safe-lsn (long (max authority-lsn
+                                   (if (:reachable? leader-watermark)
+                                     (long (or (:last-applied-lsn
+                                                leader-watermark)
+                                               0))
+                                     0)))
         local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
         followers
@@ -581,14 +780,20 @@
                                 (not= endpoint leader-endpoint))
                        (let [watermark (fetch-ha-endpoint-watermark-lsn
                                         db-name m endpoint)
-                             last-lsn (when (:reachable? watermark)
-                                        (long (or (:last-applied-lsn watermark)
-                                                  0)))
+                             raw-last-lsn (when (:reachable? watermark)
+                                            (long (or (:last-applied-lsn
+                                                       watermark)
+                                                      0)))
+                             last-lsn (when (some? raw-last-lsn)
+                                        (long (min raw-last-lsn
+                                                   leader-safe-lsn)))
                              eligible? (and (some? last-lsn)
                                             (>= last-lsn required-lsn))]
                          {:endpoint endpoint
                           :node-id node-id
                           :last-applied-lsn last-lsn
+                          :raw-last-applied-lsn raw-last-lsn
+                          :leader-safe-lsn leader-safe-lsn
                           :eligible? eligible?})))))
         eligible-followers
         (sort-by (juxt (comp - :last-applied-lsn) :node-id)
@@ -610,7 +815,14 @@
 (defn- ha-source-advertised-last-applied-lsn
   [db-name m lease source-endpoint]
   (let [leader-endpoint (ha-leader-endpoint m lease)
-        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))]
+        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
+        leader-watermark (fetch-leader-watermark-lsn db-name m lease)
+        leader-safe-lsn (long (max authority-lsn
+                                   (if (:reachable? leader-watermark)
+                                     (long (or (:last-applied-lsn
+                                                leader-watermark)
+                                               0))
+                                     0)))]
     (if (= source-endpoint leader-endpoint)
       (let [watermark (fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
@@ -621,10 +833,14 @@
          :watermark watermark})
       (let [watermark (fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
-            last-lsn (when (:reachable? watermark)
-                       (long (or (:last-applied-lsn watermark) 0)))]
+            raw-last-lsn (when (:reachable? watermark)
+                           (long (or (:last-applied-lsn watermark) 0)))
+            last-lsn (when (some? raw-last-lsn)
+                       (long (min raw-last-lsn leader-safe-lsn)))]
         {:known? (some? last-lsn)
          :last-applied-lsn last-lsn
+         :raw-last-applied-lsn raw-last-lsn
+         :leader-safe-lsn leader-safe-lsn
          :watermark watermark}))))
 
 (defn- fetch-ha-follower-records-with-gap-fallback
@@ -730,30 +946,21 @@
 
 (defn ^:redef fetch-ha-leader-txlog-batch
   [db-name m leader-endpoint from-lsn upto-lsn]
-  (if-let [{:keys [host port]} (parse-endpoint leader-endpoint)]
-    (let [uri (str "dtlv://"
-                   c/default-username
-                   ":"
-                   c/default-password
-                   "@"
-                   host
-                   ":"
-                   port)
-          timeout-ms (long (max 500
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+    (let [client-opts
+          {:pool-size 1
+           :time-out (long (max 500
                                 (min 10000
                                      (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))
-          client-opts {:pool-size 1
-                       :time-out timeout-ms}
-          client (cl/new-client uri client-opts)]
-      (try
-        (cl/normal-request
-         client
-         :open-tx-log-rows
-         [db-name (long from-lsn) (long upto-lsn)]
-         false)
-        (finally
-          (close-ha-client! client))))
+                                               c/*ha-lease-renew-ms*)))))}]
+      (with-cached-ha-client
+        uri db-name client-opts
+        (fn [client]
+          (ha-client-request
+           client
+           :open-tx-log-rows
+           [db-name (long from-lsn) (long upto-lsn)]
+           false))))
     (u/raise "Invalid HA leader endpoint for txlog fetch"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint})))
@@ -873,6 +1080,10 @@
 
                       :else row))
                   rows)
+            replay-rows
+            (conj replay-rows
+                  [:put c/kv-info c/wal-local-payload-lsn
+                   (long (:lsn record)) :keyword :data])
             replayed-max-gt
             (reduce
              (fn [acc [op dbi k]]
@@ -885,7 +1096,7 @@
              replay-rows)
             next-state
             (do
-              (i/transact-kv kv-store replay-rows)
+              (transact-ha-follower-local! m replay-rows)
               (when (and (instance? IStore store)
                          (pos? (long replayed-max-gt)))
                 (st/sync-max-gt-floor! store replayed-max-gt))
@@ -917,7 +1128,11 @@
 
       (sequential? ops)
       (do
-        (i/transact-kv kv-store ops)
+        (transact-ha-follower-local!
+         m
+         (conj (vec ops)
+               [:put c/kv-info c/wal-local-payload-lsn
+                (long (:lsn record)) :keyword :data]))
         m)
 
       :else
@@ -927,34 +1142,66 @@
 
 (defn ^:redef report-ha-replica-floor!
   [db-name m leader-endpoint applied-lsn]
-  (if-let [{:keys [host port]} (parse-endpoint leader-endpoint)]
-    (let [uri (str "dtlv://"
-                   c/default-username
-                   ":"
-                   c/default-password
-                   "@"
-                   host
-                   ":"
-                   port)
-          timeout-ms (long (max 500
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+    (let [client-opts
+          {:pool-size 1
+           :time-out (long (max 500
                                 (min 10000
                                      (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))
-          client-opts {:pool-size 1
-                       :time-out timeout-ms}
-          client (cl/new-client uri client-opts)]
-      (try
-        (cl/normal-request
-         client
-         :txlog-update-replica-floor!
-         [db-name (:ha-node-id m) (long applied-lsn)]
-         false)
-        (finally
-          (close-ha-client! client))))
+                                               c/*ha-lease-renew-ms*)))))}]
+      (with-cached-ha-client
+        uri db-name client-opts
+        (fn [client]
+          (ha-client-request
+           client
+           :txlog-update-replica-floor!
+           [db-name (:ha-node-id m) (long applied-lsn)]
+           false))))
     (u/raise "Invalid HA leader endpoint for replica-floor update"
              {:error :ha/follower-invalid-leader-endpoint
               :leader-endpoint leader-endpoint
               :applied-lsn applied-lsn})))
+
+(defn ^:redef clear-ha-replica-floor!
+  [db-name m leader-endpoint]
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+    (let [client-opts
+          {:pool-size 1
+           :time-out (long (max 500
+                                (min 10000
+                                     (long (or (:ha-lease-renew-ms m)
+                                               c/*ha-lease-renew-ms*)))))}]
+      (with-cached-ha-client
+        uri db-name client-opts
+        (fn [client]
+          (ha-client-request
+           client
+           :txlog-clear-replica-floor!
+           [db-name (:ha-node-id m)]
+           false))))
+    (u/raise "Invalid HA leader endpoint for replica-floor clear"
+             {:error :ha/follower-invalid-leader-endpoint
+              :leader-endpoint leader-endpoint})))
+
+(defn- ha-replica-floor-reset-required?
+  [e]
+  (boolean
+   (some
+    (fn [cause]
+      (let [data (ex-data cause)
+            err-data (:err-data data)
+            type* (or (:type err-data) (:type data))
+            old-lsn (or (:old-lsn data) (:old-lsn err-data))
+            new-lsn (or (:new-lsn data) (:new-lsn err-data))
+            message (ex-message cause)]
+        (and (= :txlog/invalid-floor-provider-state type*)
+             (or (and (integer? old-lsn)
+                      (integer? new-lsn)
+                      (< (long new-lsn) (long old-lsn)))
+                 (and (string? message)
+                      (s/includes? message
+                                   "Replica floor LSN cannot move backward"))))))
+    (take-while some? (iterate ex-cause e)))))
 
 (defn- ha-replica-floor-transport-failure?
   [e]
@@ -981,12 +1228,24 @@
                                      (* 4
                                         (long (or (:ha-lease-renew-ms m)
                                                   c/*ha-lease-renew-ms*))))))
-          remote-store (r/open-kv uri {:client-opts {:pool-size 1
-                                                     :time-out timeout-ms}})]
+          remote-store (open-ha-snapshot-remote-store!
+                        uri
+                        {:client-opts {:pool-size 1
+                                       :time-out timeout-ms}})]
       (try
-        {:copy-meta (i/copy remote-store dest-dir false)}
+        (let [copy-meta (copy-ha-remote-store! remote-store dest-dir false)]
+          (when-let [pin-id (get-in copy-meta [:backup-pin :pin-id])]
+            (try
+              (unpin-ha-remote-store-backup-floor! remote-store pin-id)
+              (catch Exception e
+                (log/debug e
+                           "Best-effort HA snapshot-copy backup pin cleanup failed"
+                           {:db-name db-name
+                            :source-endpoint endpoint
+                            :pin-id pin-id}))))
+          {:copy-meta copy-meta})
         (finally
-          (i/close-kv remote-store))))
+          (close-ha-snapshot-remote-store! remote-store))))
     (u/raise "Invalid HA endpoint for snapshot copy"
              {:error :ha/follower-invalid-snapshot-endpoint
               :db-name db-name
@@ -996,7 +1255,8 @@
   [db-name m source-endpoint snapshot-dir copy-meta required-lsn]
   (let [snapshot-db-name (:db-name copy-meta)
         snapshot-db-identity (:db-identity copy-meta)
-        snapshot-last-lsn (:snapshot-last-applied-lsn copy-meta)]
+        snapshot-last-lsn (:snapshot-last-applied-lsn copy-meta)
+        payload-last-lsn (:payload-last-applied-lsn copy-meta)]
     (when (not= db-name snapshot-db-name)
       (u/raise "HA snapshot copy DB name mismatch"
                {:error :ha/follower-snapshot-db-name-mismatch
@@ -1015,23 +1275,31 @@
                 :local-db-identity (:ha-db-identity m)
                 :snapshot-db-identity snapshot-db-identity
                 :source-endpoint source-endpoint}))
-    (when-not (integer? snapshot-last-lsn)
-      (u/raise "HA snapshot copy is missing snapshot last applied LSN"
+    (when-not (or (integer? snapshot-last-lsn)
+                  (integer? payload-last-lsn))
+      (u/raise "HA snapshot copy is missing payload last applied LSN"
                {:error :ha/follower-snapshot-missing-last-applied-lsn
                 :db-name db-name
                 :source-endpoint source-endpoint
                 :copy-meta copy-meta}))
-    (let [snapshot-last-lsn (long snapshot-last-lsn)]
-      (when (< snapshot-last-lsn (long required-lsn))
-        (u/raise "HA snapshot copy is older than the required follower floor"
+    (let [snapshot-last-lsn (when (integer? snapshot-last-lsn)
+                              (long snapshot-last-lsn))
+          payload-last-lsn (when (integer? payload-last-lsn)
+                             (long payload-last-lsn))
+          install-last-lsn (long (max (or payload-last-lsn 0)
+                                      (or snapshot-last-lsn 0)))]
+      (when (< install-last-lsn (long required-lsn))
+        (u/raise "HA snapshot copy payload is older than the required follower floor"
                  {:error :ha/follower-snapshot-too-stale
                   :db-name db-name
                   :required-lsn (long required-lsn)
                   :snapshot-last-applied-lsn snapshot-last-lsn
+                  :payload-last-applied-lsn payload-last-lsn
                   :source-endpoint source-endpoint}))
       {:db-name db-name
        :db-identity snapshot-db-identity
-       :snapshot-last-applied-lsn snapshot-last-lsn})))
+       :snapshot-last-applied-lsn (or snapshot-last-lsn install-last-lsn)
+       :payload-last-applied-lsn install-last-lsn})))
 
 (defn ^:redef install-ha-local-snapshot!
   [m snapshot-dir]
@@ -1130,8 +1398,21 @@
           _ (when (seq records)
               (persist-ha-local-applied-lsn! next-m applied-lsn))]
       (try
-        (report-ha-replica-floor!
-         db-name next-m leader-endpoint applied-lsn)
+        (try
+          (report-ha-replica-floor!
+           db-name next-m leader-endpoint applied-lsn)
+          (catch Exception e
+            (if (ha-replica-floor-reset-required? e)
+              (do
+                (log/info "HA follower cleared stale leader replica floor after local reset"
+                          {:db-name db-name
+                           :ha-node-id local-node-id
+                           :leader-endpoint leader-endpoint
+                           :applied-lsn applied-lsn})
+                (clear-ha-replica-floor! db-name next-m leader-endpoint)
+                (report-ha-replica-floor!
+                 db-name next-m leader-endpoint applied-lsn))
+              (throw e))))
         (catch Exception e
           (if (ha-replica-floor-transport-failure? e)
             (log/debug "HA follower skipped replica-floor update because the leader endpoint is unavailable"
@@ -1289,9 +1570,8 @@
                    :ha-follower-last-error-details {:lease lease}
                    :ha-follower-last-error-ms now-ms)
             (let [next-lsn (long (max 1
-                                      (or (:ha-follower-next-lsn m)
-                                          (unchecked-inc
-                                           (long (ha-local-last-applied-lsn m))))))]
+                                      (unchecked-inc
+                                       (long (ha-local-last-applied-lsn m)))))]
               (try
                 (:state (sync-ha-follower-batch
                          db-name m lease next-lsn now-ms))
@@ -1354,22 +1634,47 @@
      :wait-until-ms wait-until-ms}))
 
 (defn- pre-cas-lag-input
-  [db-name m lease]
+  [db-name m lease now-ms]
   (let [authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
+        lease-expired? (lease/lease-expired? lease now-ms)
         leader-watermark (fetch-leader-watermark-lsn db-name m lease)
         reachable? (true? (:reachable? leader-watermark))
         leader-lsn (if reachable?
                      (long (or (:last-applied-lsn leader-watermark)
                                authority-lsn))
-                     authority-lsn)
-        effective-lsn (if reachable?
-                        (max authority-lsn leader-lsn)
-                        authority-lsn)]
+                     0)
+        reachable-member-watermark
+        (when (or (not reachable?)
+                  (and lease-expired?
+                       (< leader-lsn authority-lsn)))
+          (highest-reachable-ha-member-watermark db-name m))
+        reachable-member-lsn
+        (when reachable-member-watermark
+          (long (or (:last-applied-lsn reachable-member-watermark) 0)))
+        effective-lsn
+        (cond
+          (and lease-expired?
+               reachable?
+               (< leader-lsn authority-lsn))
+          (long (max leader-lsn
+                     (or reachable-member-lsn
+                         (ha-local-last-applied-lsn m))))
+
+          reachable?
+          (max authority-lsn leader-lsn)
+
+          :else
+          (long (or reachable-member-lsn
+                    (ha-local-last-applied-lsn m))))]
     {:effective-lease (assoc lease :leader-last-applied-lsn effective-lsn)
+     :lease-expired? lease-expired?
      :leader-endpoint-reachable? reachable?
      :authority-last-applied-lsn authority-lsn
      :leader-watermark-last-applied-lsn (when reachable? leader-lsn)
-     :leader-watermark leader-watermark}))
+     :leader-watermark leader-watermark
+     :reachable-member-last-applied-lsn
+     reachable-member-lsn
+     :reachable-member-watermark reachable-member-watermark}))
 
 (defn- observe-authority-state
   [m]
@@ -1778,7 +2083,7 @@
                          {:lease lease})
 
       :else
-      (let [lag-input (pre-cas-lag-input db-name m1 lease)
+      (let [lag-input (pre-cas-lag-input db-name m1 lease now-ms)
             reachable? (:leader-endpoint-reachable? lag-input)]
         (if (or reachable? (bootstrap-empty-lease? lease))
           (finalize-ha-candidate-promotion
@@ -1817,7 +2122,7 @@
                lease-2
                version-2
                now-ms-2
-               (pre-cas-lag-input db-name m2 lease-2)))))))))
+               (pre-cas-lag-input db-name m2 lease-2 now-ms-2)))))))))
 
 (defn- maybe-promote-ha-candidate
   [db-name m now-ms]
@@ -1853,11 +2158,18 @@
                                  (ha-authority-read-failure-details m))
 
               :else
-              (let [lag-check-1 (ha-promotion-lag-guard m observed-lease)]
+              (let [lag-input-1 (pre-cas-lag-input db-name
+                                                   m
+                                                   observed-lease
+                                                   now-ms)
+                    lag-check-1 (ha-promotion-lag-guard
+                                 m
+                                 (:effective-lease lag-input-1))]
                 (if-not (:ok? lag-check-1)
                   (fail-ha-candidate m :lag-guard-failed
                                      {:phase :pre-fence
-                                      :lag lag-check-1})
+                                      :lag lag-check-1
+                                      :leader-lag-input lag-input-1})
                   (let [fence-result
                         (run-ha-fencing-hook db-name m observed-lease)]
                     (if-not (:ok? fence-result)

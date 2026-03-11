@@ -1456,7 +1456,7 @@
      :updated-ms now-ms
      :pin-count (count m1)}))
 
-(defn backup-pin-floor-clear-plan
+(defn ^:redef backup-pin-floor-clear-plan
   [pin-id entries entries-k]
   (let [pin-id (ensure-floor-provider-id pin-id :backup-pin)
         m0 (parse-floor-provider-map entries entries-k)

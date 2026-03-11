@@ -65,6 +65,35 @@
                            :timeout-ms timeout-ms
                            :last-error (some-> last-error ex-message)})))))))
 
+(defn- write-append-batch!
+  [test key values sleep-ms]
+  (local/with-leader-conn
+    test
+    append/schema
+    (fn [conn]
+      (doseq [value values]
+        (d/transact! conn [{:append/key   (long key)
+                            :append/value (long value)}])
+        (when (pos? (long sleep-ms))
+          (Thread/sleep (long sleep-ms)))))))
+
+(defn- local-append-values
+  [cluster-id logical-node key]
+  (let [values (local/local-query
+                 cluster-id
+                 logical-node
+                 '[:find [?v ...]
+                   :in $ ?key
+                   :where
+                   [?e :append/key ?key]
+                   [?e :append/value ?v]]
+                 (long key))]
+    (when-not (= ::local/unavailable values)
+      (->> values
+           (map long)
+           sort
+           vec))))
+
 (deftest append-workload-smoke-test
   (let [workload (append/workload {:key-count 4
                                    :min-txn-length 2
@@ -232,6 +261,12 @@
   (is (true? (local/expected-disruption-write-failure?
               {:datalevin/nemesis-faults [:leader-io-stall]}
               "Timeout in making request")))
+  (is (true? (local/expected-disruption-write-failure?
+              {:datalevin/nemesis-faults [:quorum-loss]}
+              "Timeout in making request")))
+  (is (true? (local/expected-disruption-write-failure?
+              {:datalevin/nemesis-faults [:leader-failover :clock-skew-pause]}
+              "Timed out waiting for single leader")))
   (is (true? (local/expected-disruption-write-failure?
               {:datalevin/nemesis-faults [:leader-disk-full]}
               "Request to Datalevin server failed: \"No space left on device\""))))
@@ -512,6 +547,115 @@
     (is (true? (:valid? pause-result)))
     (is (= 1 (:disruption-failure-count pause-result)))
     (is (false? (:valid? normal-result)))))
+
+(deftest quorum-loss-checkers-tolerate-disruption-write-loss-test
+  (let [quorum-test {:datalevin/nemesis-faults [:quorum-loss]}
+        identity-checker (:checker (identity-upsert/workload {}))
+        identity-ok {:type :ok
+                     :f :upsert-same-tempid
+                     :identity/case-id 1
+                     :value (#'identity-upsert/expected-states
+                             {:f :upsert-same-tempid
+                              :identity/case-id 1})}
+        identity-fail {:type :fail
+                       :f :string-tempid-upsert-ref
+                       :identity/case-id 2
+                       :error "Timeout in making request"}
+        index-checker (:checker (index-consistency/workload {}))
+        index-ok {:type :ok
+                  :f :ref-create
+                  :index/case-id 1
+                  :value (#'index-consistency/expected-states
+                          {:f :ref-create
+                           :index/case-id 1})}
+        index-fail {:type :fail
+                    :f :ref-retarget
+                    :index/case-id 2
+                    :error "Timeout in making request"}
+        internal-checker (:checker (internal/workload {}))
+        internal-ok {:type :ok
+                     :f :lookup-ref-same
+                     :internal/case-id 1
+                     :value (#'internal/expected-states
+                             {:f :lookup-ref-same
+                              :internal/case-id 1})}
+        internal-fail {:type :fail
+                       :f :lookup-ref-same
+                       :internal/case-id 2
+                       :error "Timeout in making request"}
+        identity-result (checker/check identity-checker
+                                       quorum-test
+                                       [identity-ok identity-fail]
+                                       nil)
+        index-result (checker/check index-checker
+                                    quorum-test
+                                    [index-ok index-fail]
+                                    nil)
+        internal-result (checker/check internal-checker
+                                       quorum-test
+                                       [internal-ok internal-fail]
+                                       nil)]
+    (is (true? (:valid? identity-result)))
+    (is (= 1 (:disruption-failure-count identity-result)))
+    (is (true? (:valid? index-result)))
+    (is (= 1 (:disruption-failure-count index-result)))
+    (is (true? (:valid? internal-result)))
+    (is (= 1 (:disruption-failure-count internal-result)))))
+
+(deftest clock-failover-checkers-tolerate-single-leader-timeout-test
+  (let [combo-test {:datalevin/nemesis-faults [:leader-failover
+                                               :clock-skew-pause]}
+        identity-checker (:checker (identity-upsert/workload {}))
+        identity-ok {:type :ok
+                     :f :upsert-same-tempid
+                     :identity/case-id 1
+                     :value (#'identity-upsert/expected-states
+                             {:f :upsert-same-tempid
+                              :identity/case-id 1})}
+        identity-fail {:type :fail
+                       :f :upsert-intermediate
+                       :identity/case-id 2
+                       :error "Timed out waiting for single leader"}
+        index-checker (:checker (index-consistency/workload {}))
+        index-ok {:type :ok
+                  :f :ref-create
+                  :index/case-id 1
+                  :value (#'index-consistency/expected-states
+                          {:f :ref-create
+                           :index/case-id 1})}
+        index-fail {:type :fail
+                    :f :ref-retarget
+                    :index/case-id 2
+                    :error "Timed out waiting for single leader"}
+        internal-checker (:checker (internal/workload {}))
+        internal-ok {:type :ok
+                     :f :lookup-ref-same
+                     :internal/case-id 1
+                     :value (#'internal/expected-states
+                             {:f :lookup-ref-same
+                              :internal/case-id 1})}
+        internal-fail {:type :fail
+                       :f :tempid-ref
+                       :internal/case-id 2
+                       :error "Timed out waiting for single leader"}
+        identity-result (checker/check identity-checker
+                                       combo-test
+                                       [identity-ok identity-fail]
+                                       nil)
+        index-result (checker/check index-checker
+                                    combo-test
+                                    [index-ok index-fail]
+                                    nil)
+        internal-result (checker/check internal-checker
+                                       combo-test
+                                       [internal-ok internal-fail]
+                                       nil)]
+    (is (true? (:valid? identity-result)))
+    (is (= 1 (:disruption-failure-count identity-result)))
+    (is (true? (:valid? index-result)))
+    (is (= 1 (:disruption-failure-count index-result)))
+    (is (true? (:valid? internal-result)))
+    (is (= 1 (:disruption-failure-count internal-result)))))
 
 (deftest index-consistency-ref-retarget-snapshot-smoke-test
   (let [dir  (u/tmp-dir (str "jepsen-index-consistency-" (UUID/randomUUID)))
@@ -1008,6 +1152,11 @@
         (is (= [stopped-node] (get-in converge-op [:value :restarted-nodes])))
         (is (= stopped-node
                (get-in converge-op [:value :wal-gap :target-node])))
+        (is (= (->> ["n1" "n2" "n3"]
+                    (remove #{stopped-node})
+                    sort
+                    vec)
+               (get-in converge-op [:value :wal-gap :source-nodes])))
         (is (integer? (get-in converge-op
                               [:value
                                :bootstrap-state
@@ -1017,17 +1166,20 @@
                                      :bootstrap-state
                                      :ha-follower-bootstrap-snapshot-last-applied-lsn])
                            0))))
-        (is (every? (fn [[_ gc-result]]
-                      (> (long (or (get-in gc-result [:after :min-retained-lsn])
-                                   0))
-                         (long (or (get-in converge-op
-                                           [:value :wal-gap :follower-next-lsn])
-                                   0))))
-                    (get-in converge-op [:value :wal-gap :gc-results])))
-        (is (= [3 4 0 0] (get-in converge-op [:value :expected])))
-        (is (= {"n1" [3 4 0 0]
-                "n2" [3 4 0 0]
-                "n3" [3 4 0 0]}
+        (is (pos? (long (or (get-in converge-op
+                                    [:value :wal-gap :required-snapshot-lsn])
+                           0))))
+        (is (true? (#'rejoin-bootstrap/wal-gap-realized?
+                    (get-in converge-op [:value :wal-gap :follower-next-lsn])
+                    (get-in converge-op [:value :wal-gap :gc-results]))))
+        (is (seq (get-in converge-op [:value :wal-gap :realized-source-nodes])))
+        (is (every? (set (get-in converge-op [:value :wal-gap :source-nodes]))
+                    (get-in converge-op [:value :wal-gap :realized-source-nodes])))
+        (is (= [2000 2001 2002 2003]
+               (get-in converge-op [:value :expected])))
+        (is (= {"n1" [2000 2001 2002 2003]
+                "n2" [2000 2001 2002 2003]
+                "n3" [2000 2001 2002 2003]}
                (into {}
                      (map (fn [[logical-node {:keys [values]}]]
                             [logical-node values]))
@@ -1035,6 +1187,57 @@
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
+
+(deftest rejoin-bootstrap-wal-gap-realized-when-source-is-behind-test
+  (let [gap? #'rejoin-bootstrap/wal-gap-realized?]
+    (is (false? (gap?
+                 81
+                 {"n1" {:after {:applied-lsn 58
+                                :min-retained-lsn 54}}
+                  "n3" {:after {:applied-lsn 78
+                                :min-retained-lsn 75}}})))
+    (is (false? (gap?
+                 81
+                 {"n1" {:after {:applied-lsn 80
+                                :min-retained-lsn 54}}
+                  "n3" {:after {:applied-lsn 80
+                                :min-retained-lsn 75}}})))
+    (is (true? (gap?
+                81
+                {"n1" {:after {:applied-lsn 120
+                               :min-retained-lsn 82}}
+                 "n3" {:after {:applied-lsn 80
+                               :min-retained-lsn 75}}})))
+    (is (= ["n1"]
+           (#'rejoin-bootstrap/realized-wal-gap-sources
+            81
+            {"n1" {:after {:applied-lsn 120
+                           :min-retained-lsn 82}}
+             "n3" {:after {:applied-lsn 80
+                           :min-retained-lsn 75}}})))
+    (is (true? (gap?
+                81
+                {"n1" {:after {:applied-lsn 120
+                               :min-retained-lsn 82}}
+                 "n3" {:after {:applied-lsn 122
+                               :min-retained-lsn 90}}})))))
+
+(deftest rejoin-bootstrap-baseline-prefers-stopped-runtime-floor-test
+  (let [baseline #'rejoin-bootstrap/stopped-node-baseline-lsn]
+    (is (= 65
+           (baseline
+             {:effective-local-lsn 60
+              :node-diagnostics {:ha-local-last-applied-lsn 65
+                                 :ha-follower-next-lsn 63}})))
+    (is (= 64
+           (baseline
+             {:effective-local-lsn 61
+              :node-diagnostics {:ha-follower-next-lsn 65}})))
+    (is (= 62
+           (baseline
+             {:effective-local-lsn 62
+              :node-diagnostics {:ha-local-last-applied-lsn 60
+                                 :ha-follower-next-lsn 61}})))))
 
 (deftest rejoin-bootstrap-checker-ignores-invoke-and-requires-lsn-catch-up-test
   (let [checker (:checker (rejoin-bootstrap/workload {:key-count 2}))
@@ -1511,6 +1714,81 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
+(deftest resumed-follower-catches-up-before-bootstrap-smoke-test
+  (let [cluster-id  (str (UUID/randomUUID))
+        test-map    {:db-name "pause-rejoin-catchup-smoke"
+                     :schema append/schema
+                     :control-backend :sofa-jraft
+                     :nodes ["n1" "n2" "n3"]
+                     :verbose false
+                     :datalevin/cluster-id cluster-id
+                     :datalevin/nemesis-faults [:node-pause]}
+        db          (local/db cluster-id)
+        nemesis-obj (#'nemesis/leader-failover-nemesis)
+        resume-op   {:type :info
+                     :process :nemesis
+                     :f :resume-node}]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [{leader-before :leader}
+            (local/wait-for-single-leader! cluster-id)
+            followers      (->> (:nodes test-map)
+                                sort
+                                (remove #{leader-before})
+                                vec)
+            stopped-node   (first followers)
+            paused-node    (second followers)
+            pause-op       {:type :info
+                            :process :nemesis
+                            :f :pause-node
+                            :value {:node paused-node}}
+            paused-op      (jn/invoke! nemesis-obj test-map pause-op)]
+        (is (= paused-node
+               (get-in paused-op [:value :paused])))
+        (is (= leader-before
+               (get-in paused-op [:value :leader])))
+        (is (nil? (get-in (local/cluster-state cluster-id)
+                          [:admin-conns paused-node])))
+        (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
+          (is (= paused-node
+                 (get-in resumed-op [:value :resumed])))
+          (is (nil? (get-in (local/cluster-state cluster-id)
+                            [:admin-conns paused-node]))))
+        (local/stop-node! cluster-id stopped-node)
+        (let [written-values (mapv long (range 1000 1016))
+              _              (write-append-batch! test-map
+                                                  0
+                                                  written-values
+                                                  100)
+              {leader-final :leader}
+              (local/wait-for-single-leader! cluster-id 20000)
+              target-lsn    (local/effective-local-lsn cluster-id leader-final)
+              lsn-snapshot  (local/wait-for-live-nodes-at-least-lsn!
+                              cluster-id
+                              target-lsn
+                              20000)
+              paused-values (local-append-values cluster-id paused-node 0)
+              paused-state  (local/node-diagnostics cluster-id paused-node)]
+          (is (= #{leader-final paused-node}
+                 (set (keys lsn-snapshot))))
+          (is (>= (long (get lsn-snapshot paused-node 0))
+                  (long target-lsn))
+              (pr-str {:leader leader-final
+                       :paused-node paused-node
+                       :target-lsn target-lsn
+                       :lsn-snapshot lsn-snapshot
+                       :paused-state paused-state}))
+          (is (= written-values paused-values)
+              (pr-str {:leader leader-final
+                       :paused-node paused-node
+                       :expected written-values
+                       :actual paused-values
+                       :paused-state paused-state}))))
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
 (deftest multi-node-pause-nemesis-smoke-test
   (let [cluster-id  (str (UUID/randomUUID))
         test-map    {:db-name "multi-node-pause-smoke"
@@ -1610,6 +1888,12 @@
          (core/parse-nemesis-spec "clock-skew")))
   (is (= [:clock-skew-pause]
          (core/parse-nemesis-spec "clock-skew-pause")))
+  (is (= [:clock-skew-leader-fast]
+         (core/parse-nemesis-spec "clock-leader-fast")))
+  (is (= [:clock-skew-leader-slow]
+         (core/parse-nemesis-spec "clock-leader-slow")))
+  (is (= [:clock-skew-mixed]
+         (core/parse-nemesis-spec "clock-mixed")))
   (is (= [:leader-failover]
          (core/parse-nemesis-spec "leader-failover")))
   (let [{:keys [nemesis generator final-generator]}
@@ -1671,7 +1955,116 @@
         (nemesis/nemesis-package {:faults [:clock-skew-pause]})]
     (is (some? nemesis))
     (is (some? generator))
+    (is (some? final-generator)))
+  (let [{:keys [nemesis generator final-generator]}
+        (nemesis/nemesis-package {:faults [:clock-skew-leader-fast]})]
+    (is (some? nemesis))
+    (is (some? generator))
+    (is (some? final-generator)))
+  (let [{:keys [nemesis generator final-generator]}
+        (nemesis/nemesis-package {:faults [:clock-skew-leader-slow]})]
+    (is (some? nemesis))
+    (is (some? generator))
+    (is (some? final-generator)))
+  (let [{:keys [nemesis generator final-generator]}
+        (nemesis/nemesis-package {:faults [:clock-skew-mixed]})]
+    (is (some? nemesis))
+    (is (some? generator))
     (is (some? final-generator))))
+
+(deftest clock-skew-pattern-planning-smoke-test
+  (let [legacy-patterns (#'nemesis/active-clock-skew-patterns
+                         [:clock-skew-pause])
+        leader-fast (#'nemesis/clock-skew-plan
+                     {:leader "n1"
+                      :live-nodes ["n1" "n2" "n3"]
+                      :budget-ms 1000
+                      :pattern :leader-fast})
+        leader-slow (#'nemesis/clock-skew-plan
+                     {:leader "n1"
+                      :live-nodes ["n1" "n2" "n3"]
+                      :budget-ms 1000
+                      :pattern :leader-slow})
+        mixed (#'nemesis/clock-skew-plan
+               {:leader "n1"
+                :live-nodes ["n1" "n2" "n3"]
+                :budget-ms 1000
+                :pattern :mixed})]
+    (is (= [:followers-fast :leader-fast :leader-slow :mixed]
+           legacy-patterns))
+    (is (= 2000 (get-in leader-fast [:skews "n1"])))
+    (is (= -2000 (get-in leader-fast [:skews "n2"])))
+    (is (= -2000 (get-in leader-fast [:skews "n3"])))
+    (is (= -2000 (get-in leader-slow [:skews "n1"])))
+    (is (= 2000 (get-in leader-slow [:skews "n2"])))
+    (is (= 2000 (get-in leader-slow [:skews "n3"])))
+    (is (= #{"n1" "n2" "n3"} (set (keys (:skews mixed)))))
+    (is (= #{-2000 2000} (set (vals (:skews mixed)))))))
+
+(deftest clock-skew-nemesis-invoke-smoke-test
+  (let [nemesis-obj (#'nemesis/leader-failover-nemesis)
+        test-map {:datalevin/cluster-id "clock-skew-smoke"}
+        set-calls (atom [])]
+    (with-redefs [local/clock-skew-enabled? (constantly true)
+                  local/wait-for-single-leader! (fn [_] {:leader "n1"})
+                  local/cluster-state (fn [_]
+                                        {:live-nodes ["n1" "n2" "n3"]})
+                  local/clock-skew-budget-ms (constantly 1000)
+                  local/set-node-clock-skew! (fn [_ node skew-ms]
+                                               (swap! set-calls conj [node skew-ms])
+                                               true)]
+      (let [leader-fast-op (jn/invoke! nemesis-obj
+                                       test-map
+                                       {:type :info
+                                        :process :nemesis
+                                        :f :inject-clock-skew
+                                        :value {:pattern :leader-fast}})
+            clear-fast-op (jn/invoke! nemesis-obj
+                                      test-map
+                                      {:type :info
+                                       :process :nemesis
+                                       :f :clear-clock-skew})
+            mixed-op (jn/invoke! nemesis-obj
+                                 test-map
+                                 {:type :info
+                                  :process :nemesis
+                                  :f :inject-clock-skew
+                                  :value {:pattern :mixed}})
+            clear-mixed-op (jn/invoke! nemesis-obj
+                                       test-map
+                                       {:type :info
+                                        :process :nemesis
+                                        :f :clear-clock-skew})]
+        (is (= :leader-fast (get-in leader-fast-op [:value :pattern])))
+        (is (= {"n1" 2000 "n2" -2000 "n3" -2000}
+               (get-in leader-fast-op [:value :skews])))
+        (is (= #{"n1" "n2" "n3"}
+               (->> (take 3 @set-calls)
+                    (map first)
+                    set)))
+        (is (= :leader-fast (get-in clear-fast-op [:value :pattern])))
+        (is (= :mixed (get-in mixed-op [:value :pattern])))
+        (is (= #{"n1" "n2" "n3"}
+               (set (keys (get-in mixed-op [:value :skews])))))
+        (is (= #{-2000 2000}
+               (set (vals (get-in mixed-op [:value :skews])))))
+        (is (= :mixed (get-in clear-mixed-op [:value :pattern])))))))
+
+(deftest clock-skew-failover-final-phases-clear-skew-before-restart-test
+  (is (= [{:type :info :f :clear-clock-skew}
+          {:type :info :f :restart-node}
+          {:type :info :f :stabilize-leader}]
+         (vec (#'nemesis/final-phase-ops
+               {:failover? true
+                :clock-skew? true}))))
+  (is (= [{:type :info :f :restart-node}]
+         (vec (#'nemesis/final-phase-ops
+               {:failover? true
+                :clock-skew? false}))))
+  (is (= [{:type :info :f :clear-clock-skew}]
+         (vec (#'nemesis/final-phase-ops
+               {:failover? false
+                :clock-skew? true})))))
 
 (deftest datalevin-test-with-failover-smoke-test
   (let [test-map (core/datalevin-test {:db-name "smoke"
@@ -1865,6 +2258,75 @@
     (is (some? (:nemesis test-map)))
     (is (some? (:generator test-map)))))
 
+(deftest datalevin-test-with-mixed-clock-skew-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :append
+                                       :rate 10
+                                       :time-limit 5
+                                       :key-count 4
+                                       :min-txn-length 1
+                                       :max-txn-length 1
+                                       :max-writes-per-key 8
+                                       :nodes ["n1" "n2" "n3"]
+                                       :nemesis [:clock-skew-mixed]})]
+    (is (= [:clock-skew-mixed] (:datalevin/nemesis-faults test-map)))
+    (is (some? (:nemesis test-map)))
+    (is (some? (:generator test-map)))))
+
+(deftest datalevin-test-with-clock-skew-failover-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :append
+                                       :rate 10
+                                       :time-limit 5
+                                       :key-count 4
+                                       :min-txn-length 1
+                                       :max-txn-length 1
+                                       :max-writes-per-key 8
+                                       :nodes ["n1" "n2" "n3"]
+                                       :nemesis [:clock-skew-pause
+                                                 :leader-failover]})]
+    (is (= [:clock-skew-pause :leader-failover]
+           (:datalevin/nemesis-faults test-map)))
+    (is (some? (:nemesis test-map)))
+    (is (some? (:generator test-map)))))
+
+(deftest clock-skew-failover-startup-elects-single-leader-smoke-test
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name "clock-skew-failover-startup-smoke"
+                    :schema append/schema
+                    :control-backend :sofa-jraft
+                    :nodes ["n1" "n2" "n3"]
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults [:clock-skew-pause
+                                               :leader-failover]}
+        db         (local/db cluster-id)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [{:keys [leader]} (local/wait-for-single-leader! cluster-id 60000)]
+        (is (contains? #{"n1" "n2" "n3"} leader)))
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(deftest datalevin-test-with-degraded-rejoin-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :rejoin-bootstrap
+                                       :rate 10
+                                       :time-limit 5
+                                       :key-count 4
+                                       :nodes ["n1" "n2" "n3"]
+                                       :nemesis [:degraded-network
+                                                 :follower-rejoin]})]
+    (is (= [:degraded-network :follower-rejoin]
+           (:datalevin/nemesis-faults test-map)))
+    (is (some? (:nemesis test-map)))
+    (is (some? (:generator test-map)))))
+
 (deftest nemesis-partition-net-uses-jepsen-net-test
   (let [dropped      (atom nil)
         healed?      (atom false)
@@ -2023,6 +2485,22 @@
     (is (= "Timeout in making request" (ex-message ex)))
     (is (= :open-conn (:phase (ex-data ex))))))
 
+(deftest open-ha-conn-retries-transport-failure-smoke-test
+  (let [attempts (atom 0)
+        conn     {:ok? true}
+        node     {:endpoint "127.0.0.1:19001"}]
+    (with-redefs [local/create-conn-with-timeout!
+                  (fn [_uri _schema opts _timeout-ms]
+                    (let [attempt (swap! attempts inc)]
+                      (if (< attempt 3)
+                        (throw (ex-info "Timeout in making request"
+                                        {:attempt attempt}))
+                        (assoc conn :opts opts))))]
+      (is (= {:ok? true
+              :opts {}}
+             (#'local/open-ha-conn! node "smoke" {} {})))
+      (is (= 3 @attempts)))))
+
 (deftest datalevin-test-rejects-in-memory-failover-smoke-test
   (testing "HA disruption nemeses need persisted JRaft membership"
     (is (thrown-with-msg?
@@ -2136,7 +2614,21 @@
                                :max-txn-length 1
                                :max-writes-per-key 8
                                :nodes ["n1" "n2" "n3"]
-                               :nemesis [:clock-skew-pause]})))))
+                               :nemesis [:clock-skew-pause]})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"HA disruption nemeses currently require --control-backend sofa-jraft"
+         (core/datalevin-test {:db-name "smoke"
+                               :control-backend :in-memory
+                               :workload :append
+                               :rate 10
+                               :time-limit 5
+                               :key-count 4
+                               :min-txn-length 1
+                               :max-txn-length 1
+                               :max-writes-per-key 8
+                               :nodes ["n1" "n2" "n3"]
+                               :nemesis [:clock-skew-leader-fast]})))))
 
 (deftest execute-mixed-transaction-smoke-test
   (let [dir  (str (System/getProperty "java.io.tmpdir")

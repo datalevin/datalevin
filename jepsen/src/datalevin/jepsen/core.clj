@@ -60,6 +60,9 @@
                      :leader-disk-full
                      :quorum-loss
                      :clock-skew-pause
+                     :clock-skew-leader-fast
+                     :clock-skew-leader-slow
+                     :clock-skew-mixed
                      :follower-rejoin} nemesis)
              (not= :sofa-jraft control-backend))
     (throw (ex-info

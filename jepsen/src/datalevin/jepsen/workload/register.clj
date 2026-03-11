@@ -15,7 +15,7 @@
    :register/value {:db/valueType :db.type/long}})
 
 (def ^:private initial-value 0)
-(def ^:private setup-timeout-ms 15000)
+(def ^:private default-setup-timeout-ms 15000)
 (defonce ^:private initialized-clusters (atom #{}))
 (def ^:private register-rows-query
   '[:find ?key ?value
@@ -82,7 +82,9 @@
 
 (defn- wait-for-registers-visible-on-live-nodes!
   [cluster-id key-count]
-  (let [deadline (+ (System/currentTimeMillis) setup-timeout-ms)
+  (let [timeout-ms (local/workload-setup-timeout-ms cluster-id
+                                                    default-setup-timeout-ms)
+        deadline (+ (System/currentTimeMillis) timeout-ms)
         expected (vec (repeat (long key-count) (long initial-value)))]
     (loop [last-snapshot nil]
       (let [live-nodes (-> (local/cluster-state cluster-id) :live-nodes sort)
@@ -109,7 +111,7 @@
           :else
           (throw (ex-info "Timed out waiting for register seed state on live nodes"
                           {:cluster-id cluster-id
-                           :timeout-ms setup-timeout-ms
+                           :timeout-ms timeout-ms
                            :expected-values expected
                            :snapshot snapshot
                            :previous-snapshot last-snapshot})))))))

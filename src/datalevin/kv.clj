@@ -13,12 +13,16 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]
+   [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.datom :as dd]
    [datalevin.interface :as i]
+   [datalevin.index :as idx]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]])
   (:import
+   [datalevin.bits Retrieved]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (declare txlog-retention-state-map
@@ -135,50 +139,58 @@
         :after (dissoc after :gc-target-segments)})
      (i/gc-txlog-segments! db retain-floor-lsn))))
 
+(declare with-runtime-txlog-state-guard)
+
 (defn- txlog-retention-state-local
   [db]
-  (if-let [state (txlog-retention-state-map db nil false)]
-    (dissoc state :gc-target-segments)
-    (if (txlog-config-enabled? db)
-      (let [rollout-mode (txlog-rollout-mode db)]
-        {:wal? true
-         :skipped? true
-         :reason :rollback
-         :watermarks (txlog-rollout-watermarks db rollout-mode)})
-      {:wal? false})))
+  (with-runtime-txlog-state-guard
+    db
+    (fn []
+      (if-let [state (txlog-retention-state-map db nil false)]
+        (dissoc state :gc-target-segments)
+        (if (txlog-config-enabled? db)
+          (let [rollout-mode (txlog-rollout-mode db)]
+            {:wal? true
+             :skipped? true
+             :reason :rollback
+             :watermarks (txlog-rollout-watermarks db rollout-mode)})
+          {:wal? false})))))
 
 (defn- gc-txlog-segments-local!
   [db retain-floor-lsn]
-  (if-let [before (txlog-retention-state-map db retain-floor-lsn true)]
-    (let [targets (:gc-target-segments before)
-          deleted (mapv delete-txlog-segment! targets)
-          deleted-bytes (reduce (fn [acc {:keys [bytes]}]
-                                  (+ ^long acc ^long bytes))
-                                0 targets)
-          _ (when-let [state (txlog/state db)]
-              (txlog/note-gc-deleted-bytes! state deleted-bytes))
-          after (txlog-retention-state-map db retain-floor-lsn false)]
-      {:ok? true
-       :deleted-count (count deleted)
-       :deleted-bytes deleted-bytes
-       :deleted-segment-ids (mapv :segment-id targets)
-       :deleted-segments deleted
-       :operator-retain-floor-lsn
-       (get-in before [:floors :operator-retain-floor-lsn])
-       :before (dissoc before :gc-target-segments)
-       :after (dissoc after :gc-target-segments)})
-    (if (txlog-config-enabled? db)
-      (let [rollout-mode (txlog-rollout-mode db)]
-        {:ok? false
-         :skipped? true
-         :reason :rollback
-         :retain-floor-lsn retain-floor-lsn
-         :watermarks (txlog-rollout-watermarks db rollout-mode)})
-      {:ok? false
-       :skipped? true
-       :reason :wal-disabled
-       :retain-floor-lsn retain-floor-lsn
-       :watermarks {:wal? false}})))
+  (with-runtime-txlog-state-guard
+    db
+    (fn []
+      (if-let [before (txlog-retention-state-map db retain-floor-lsn true)]
+        (let [targets (:gc-target-segments before)
+              deleted (mapv delete-txlog-segment! targets)
+              deleted-bytes (reduce (fn [acc {:keys [bytes]}]
+                                      (+ ^long acc ^long bytes))
+                                    0 targets)
+              _ (when-let [state (txlog/state db)]
+                  (txlog/note-gc-deleted-bytes! state deleted-bytes))
+              after (txlog-retention-state-map db retain-floor-lsn false)]
+          {:ok? true
+           :deleted-count (count deleted)
+           :deleted-bytes deleted-bytes
+           :deleted-segment-ids (mapv :segment-id targets)
+           :deleted-segments deleted
+           :operator-retain-floor-lsn
+           (get-in before [:floors :operator-retain-floor-lsn])
+           :before (dissoc before :gc-target-segments)
+           :after (dissoc after :gc-target-segments)})
+        (if (txlog-config-enabled? db)
+          (let [rollout-mode (txlog-rollout-mode db)]
+            {:ok? false
+             :skipped? true
+             :reason :rollback
+             :retain-floor-lsn retain-floor-lsn
+             :watermarks (txlog-rollout-watermarks db rollout-mode)})
+          {:ok? false
+           :skipped? true
+           :reason :wal-disabled
+           :retain-floor-lsn retain-floor-lsn
+           :watermarks {:wal? false}})))))
 
 (defn txlog-update-snapshot-floor!
   ([db snapshot-lsn]
@@ -1887,6 +1899,120 @@
         (when (not= dbi-name c/kv-info)
           (txlog-replay-dbi! lmdb dbi-name @info-v))))))
 
+(declare append-payload-lsn-row)
+
+(defn- replay-avg-row?
+  [row]
+  (and (vector? row)
+       (or (= :avg (nth row 4 nil))
+           (= :avg (nth row 5 nil)))))
+
+(defn- load-replay-attr-state
+  [lmdb]
+  (try
+    (let [schema (into {} (i/get-range lmdb c/schema [:all] :attr :data))
+          attrs-by-aid
+          (into {}
+                (keep (fn [[attr props]]
+                        (when-let [aid (:db/aid props)]
+                          [aid attr])))
+                schema)]
+      {:schema schema
+       :attrs-by-aid attrs-by-aid})
+    (catch Throwable _
+      {:schema {}
+       :attrs-by-aid {}})))
+
+(defn- normalize-txlog-replay-avg-rows
+  [lmdb rows record]
+  (if-not (some replay-avg-row? rows)
+    rows
+    (let [{:keys [schema attrs-by-aid]} (load-replay-attr-state lmdb)
+          giant-datoms
+          (into {}
+                (keep (fn [row]
+                        (when (vector? row)
+                          (let [[op dbi k v _ vt] row]
+                            (when (and (= op :put)
+                                       (= dbi c/giants)
+                                       (integer? k))
+                              [k (if (= vt :raw)
+                                   (idx/decode-giant-datom v)
+                                   v)])))))
+                rows)
+          schema-overrides
+          (reduce
+           (fn [overrides row]
+             (if (vector? row)
+               (let [[op dbi attr props] row]
+                 (if (= dbi c/schema)
+                   (case op
+                     :put (assoc overrides attr props)
+                     :del (dissoc overrides attr)
+                     overrides)
+                   overrides))
+               overrides))
+           {}
+           rows)
+          pending-attrs
+          (into {}
+                (keep (fn [[attr props]]
+                        (when-let [aid (:db/aid props)]
+                          [aid attr])))
+                schema-overrides)
+          attr-props
+          (fn [aid]
+            (when-let [attr (or (get pending-attrs aid)
+                                (get attrs-by-aid aid))]
+              (merge (get schema attr)
+                     (get schema-overrides attr))))
+          normalize-avg
+          (fn normalize-avg [e x]
+            (cond
+              (instance? Retrieved x)
+              (let [^Retrieved r x
+                    aid (.-a r)
+                    props (attr-props aid)
+                    vt (when props
+                         (idx/value-type props))
+                    g (or (.-g r) c/normal)
+                    rv (if (= g c/normal)
+                         (.-v r)
+                         (or (some-> (get giant-datoms g)
+                                     dd/datom-v)
+                             (some-> (idx/gt->datom lmdb g)
+                                     dd/datom-v)))]
+                (when-not vt
+                  (raise "Txn-log replay is missing attr value type"
+                         {:type :txlog/replay-missing-attr-type
+                          :aid aid
+                          :record (select-keys record
+                                               [:lsn :segment-id :offset])}))
+                (b/indexable e aid rv vt (long g)))
+
+              (sequential? x)
+              (mapv #(normalize-avg e %) x)
+
+              :else
+              x))]
+      (mapv
+       (fn [row]
+         (if (replay-avg-row? row)
+           (let [[op dbi k v kt vt :as row*] row
+                 k' (if (= kt :avg)
+                      (normalize-avg nil k)
+                      k)
+                 v' (if (= vt :avg)
+                      (normalize-avg (when (integer? k)
+                                       (long k))
+                                     v)
+                      v)]
+             (cond-> row*
+               (not= k' k) (assoc 2 k')
+               (not= v' v) (assoc 3 v')))
+           row))
+       rows))))
+
 (defn- txlog-replay-record!
   [lmdb state record]
   (let [append-res {:lsn (:lsn record)
@@ -1898,7 +2024,9 @@
          {:commit-marker? (:commit-marker? state)
           :marker-revision (long @(:marker-revision state))}
          append-res
-         (:rows record))]
+         (:rows record))
+        rows (-> (normalize-txlog-replay-avg-rows lmdb rows record)
+                 (append-payload-lsn-row (:lsn record)))]
     (maybe-run-storage-fault-lmdb! lmdb
                                    :txlog-replay
                                    {:lsn (:lsn record)
@@ -2028,6 +2156,15 @@
     (.clear rows)
     (.add rows row)
     rows))
+
+(defn- payload-lsn-row
+  [lsn]
+  (l/kv-tx :put c/kv-info c/wal-local-payload-lsn (long lsn) :keyword :data))
+
+(defn- append-payload-lsn-row
+  ^FastList [rows lsn]
+  (doto (ensure-fast-list rows)
+    (.add (payload-lsn-row lsn))))
 
 (def ^:private txlog-append-hooks
   {:throw-if-fatal! txlog-throw-if-fatal!
@@ -2227,10 +2364,9 @@
                             (:commit-marker? state)
                             (long @(:marker-revision state))
                             append-res)
-              rows (if marker-entry
-                     (doto (ensure-fast-list tx-data)
-                       (.add (:row marker-entry)))
-                     tx-data)]
+              rows (append-payload-lsn-row tx-data (:lsn append-res))
+              _ (when marker-entry
+                  (.add ^FastList rows (:row marker-entry)))]
           (try
             (apply-lmdb-after-txlog-append! lmdb state rows)
             (txlog/commit-finished! state marker-entry)
@@ -2255,10 +2391,11 @@
                                 (:commit-marker? state)
                                 (long @(:marker-revision state))
                                 append-res)
-                  commit-rows (when marker-entry
-                                (single-row-fast-list (:row marker-entry)))]
+                  commit-rows (append-payload-lsn-row nil (:lsn append-res))
+                  _ (when marker-entry
+                      (.add ^FastList commit-rows (:row marker-entry)))]
               (try
-                (when commit-rows
+                (when (pos? (.size ^FastList commit-rows))
                   (apply-lmdb-after-txlog-append! lmdb state commit-rows))
                 (let [status (i/close-transact-kv lmdb)]
                   (when (= status :committed)
@@ -2377,37 +2514,49 @@
   [lmdb k]
   (txlog/parse-floor-provider-map (kv-info-value lmdb k) k))
 
-(defn- with-runtime-txlog-rollback
+(defn- with-runtime-txlog-state-guard
   [lmdb f]
   (if-let [info-v (i/kv-info lmdb)]
-    (let [info @info-v]
-      (if (true? (:wal? info))
-        (let [had-rollout?  (contains? info :wal-rollout-mode)
-              had-rollback? (contains? info :wal-rollback?)
-              prev-rollout  (:wal-rollout-mode info)
-              prev-rollback (:wal-rollback? info)]
-          ;; Retention-floor bookkeeping is leader-local metadata and should
-          ;; not consume replicated WAL LSNs used by HA promotion checks.
-          (vswap! info-v assoc :wal-rollout-mode :rollback :wal-rollback? true)
-          (try
-            (f)
-            (finally
-              (vswap! info-v
-                      (fn [m]
-                        (cond-> m
-                          had-rollout?
-                          (assoc :wal-rollout-mode prev-rollout)
-
-                          (not had-rollout?)
-                          (dissoc :wal-rollout-mode)
-
-                          had-rollback?
-                          (assoc :wal-rollback? prev-rollback)
-
-                          (not had-rollback?)
-                          (dissoc :wal-rollback?)))))))
-        (f)))
+    (locking info-v
+      (f))
     (f)))
+
+(defn- with-runtime-txlog-rollback
+  [lmdb f]
+  (with-runtime-txlog-state-guard
+    lmdb
+    (fn []
+      (if-let [info-v (i/kv-info lmdb)]
+        (let [info @info-v]
+          (if (true? (:wal? info))
+            (let [had-rollout?  (contains? info :wal-rollout-mode)
+                  had-rollback? (contains? info :wal-rollback?)
+                  prev-rollout  (:wal-rollout-mode info)
+                  prev-rollback (:wal-rollback? info)]
+              ;; Retention-floor bookkeeping is leader-local metadata and
+              ;; should not consume replicated WAL LSNs used by HA promotion
+              ;; checks. Guard the override so admin APIs do not observe the
+              ;; transient rollback mode.
+              (vswap! info-v assoc :wal-rollout-mode :rollback :wal-rollback? true)
+              (try
+                (f)
+                (finally
+                  (vswap! info-v
+                          (fn [m]
+                            (cond-> m
+                              had-rollout?
+                              (assoc :wal-rollout-mode prev-rollout)
+
+                              (not had-rollout?)
+                              (dissoc :wal-rollout-mode)
+
+                              had-rollback?
+                              (assoc :wal-rollback? prev-rollback)
+
+                              (not had-rollback?)
+                              (dissoc :wal-rollback?)))))))
+            (f)))
+        (f)))))
 
 (defn- write-kv-info-map!
   [lmdb k m]
@@ -2417,6 +2566,15 @@
        (i/transact-kv lmdb c/kv-info [[:put k m]] :keyword :data)
        (i/transact-kv lmdb c/kv-info [[:del k]] :keyword :data)))
   m)
+
+(defn- update-kv-info-map-plan!
+  [lmdb k plan-f]
+  (with-runtime-txlog-state-guard
+    lmdb
+    (fn []
+      (let [res (plan-f (kv-info-map-value lmdb k))]
+        (write-kv-info-map! lmdb k (:entries res))
+        (dissoc res :entries)))))
 
 (defn txlog-update-snapshot-floor-state!
   [lmdb snapshot-lsn previous-snapshot-lsn]
@@ -2442,44 +2600,52 @@
 
 (defn txlog-update-replica-floor-state!
   [lmdb replica-id applied-lsn]
-  (let [res (txlog/replica-floor-update-plan
-             replica-id
-             applied-lsn
-             (System/currentTimeMillis)
-             (kv-info-map-value lmdb c/wal-replica-floors)
-             c/wal-replica-floors)]
-    (write-kv-info-map! lmdb c/wal-replica-floors (:entries res))
-    (dissoc res :entries)))
+  (update-kv-info-map-plan!
+   lmdb
+   c/wal-replica-floors
+   (fn [entries]
+     (txlog/replica-floor-update-plan
+      replica-id
+      applied-lsn
+      (System/currentTimeMillis)
+      entries
+      c/wal-replica-floors))))
 
 (defn txlog-clear-replica-floor-state!
   [lmdb replica-id]
-  (let [res (txlog/replica-floor-clear-plan
-             replica-id
-             (kv-info-map-value lmdb c/wal-replica-floors)
-             c/wal-replica-floors)]
-    (write-kv-info-map! lmdb c/wal-replica-floors (:entries res))
-    (dissoc res :entries)))
+  (update-kv-info-map-plan!
+   lmdb
+   c/wal-replica-floors
+   (fn [entries]
+     (txlog/replica-floor-clear-plan
+      replica-id
+      entries
+      c/wal-replica-floors))))
 
 (defn txlog-pin-backup-floor-state!
   [lmdb pin-id floor-lsn expires-ms]
-  (let [res (txlog/backup-pin-floor-update-plan
-             pin-id
-             floor-lsn
-             expires-ms
-             (System/currentTimeMillis)
-             (kv-info-map-value lmdb c/wal-backup-pins)
-             c/wal-backup-pins)]
-    (write-kv-info-map! lmdb c/wal-backup-pins (:entries res))
-    (dissoc res :entries)))
+  (update-kv-info-map-plan!
+   lmdb
+   c/wal-backup-pins
+   (fn [entries]
+     (txlog/backup-pin-floor-update-plan
+      pin-id
+      floor-lsn
+      expires-ms
+      (System/currentTimeMillis)
+      entries
+      c/wal-backup-pins))))
 
 (defn txlog-unpin-backup-floor-state!
   [lmdb pin-id]
-  (let [res (txlog/backup-pin-floor-clear-plan
-             pin-id
-             (kv-info-map-value lmdb c/wal-backup-pins)
-             c/wal-backup-pins)]
-    (write-kv-info-map! lmdb c/wal-backup-pins (:entries res))
-    (dissoc res :entries)))
+  (update-kv-info-map-plan!
+   lmdb
+   c/wal-backup-pins
+   (fn [entries]
+     (txlog/backup-pin-floor-clear-plan
+      pin-id
+      entries
+      c/wal-backup-pins))))
 
 (defn- txlog-record-payload
   [record]
@@ -2869,21 +3035,24 @@
          upto-lsn))))
 
   (force-txlog-sync! [_]
-    (cond
-      (not (txlog-config-enabled? db))
-      (txlog/enabled-state db)
+    (with-runtime-txlog-state-guard
+      db
+      (fn []
+        (cond
+          (not (txlog-config-enabled? db))
+          (txlog/enabled-state db)
 
-      (not (txlog-write-path-enabled? db))
-      (let [rollout-mode (txlog-rollout-mode db)]
-        {:synced? false
-         :skipped? true
-         :reason :rollback
-         :watermarks (txlog-rollout-watermarks db rollout-mode)})
+          (not (txlog-write-path-enabled? db))
+          (let [rollout-mode (txlog-rollout-mode db)]
+            {:synced? false
+             :skipped? true
+             :reason :rollback
+             :watermarks (txlog-rollout-watermarks db rollout-mode)})
 
-      :else
-      (let [state (txlog/enabled-state db)]
-        (assoc (txlog-force-sync! state)
-               :watermarks (txlog-watermarks-map db state)))))
+          :else
+          (let [state (txlog/enabled-state db)]
+            (assoc (txlog-force-sync! state)
+                   :watermarks (txlog-watermarks-map db state)))))))
 
   (force-lmdb-sync! [_]
     (if (txlog-config-enabled? db)
@@ -2897,15 +3066,18 @@
       (txlog/enabled-state db)))
 
   (create-snapshot! [_]
-    (if (txlog-write-path-enabled? db)
-      (create-snapshot-now! db)
-      (if (txlog-config-enabled? db)
-        (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok? false
-           :skipped? true
-           :reason :rollback
-           :watermarks (txlog-rollout-watermarks db rollout-mode)})
-        (txlog/enabled-state db))))
+    (with-runtime-txlog-state-guard
+      db
+      (fn []
+        (if (txlog-write-path-enabled? db)
+          (create-snapshot-now! db)
+          (if (txlog-config-enabled? db)
+            (let [rollout-mode (txlog-rollout-mode db)]
+              {:ok? false
+               :skipped? true
+               :reason :rollback
+               :watermarks (txlog-rollout-watermarks db rollout-mode)})
+            (txlog/enabled-state db))))))
 
   (list-snapshots [_]
     (list-snapshot-entries db))
@@ -2924,15 +3096,18 @@
        :current nil}))
 
   (verify-commit-marker! [_]
-    (if-let [state (txlog/state db)]
-      (verify-commit-marker-state db state)
-      (if (txlog-config-enabled? db)
-        (let [rollout-mode (txlog-rollout-mode db)]
-          {:ok? false
-           :skipped? true
-           :reason :rollback
-           :watermarks (txlog-rollout-watermarks db rollout-mode)})
-        (verify-commit-marker-state db (txlog/enabled-state db)))))
+    (with-runtime-txlog-state-guard
+      db
+      (fn []
+        (if-let [state (txlog/state db)]
+          (verify-commit-marker-state db state)
+          (if (txlog-config-enabled? db)
+            (let [rollout-mode (txlog-rollout-mode db)]
+              {:ok? false
+               :skipped? true
+               :reason :rollback
+               :watermarks (txlog-rollout-watermarks db rollout-mode)})
+            (verify-commit-marker-state db (txlog/enabled-state db)))))))
 
   (txlog-retention-state [this]
     (txlog-retention-state-local db))

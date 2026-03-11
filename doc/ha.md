@@ -247,7 +247,9 @@ Snapshot/bootstrap protocol:
    (`term=0`, no owner).
 5. Re-check lag guard immediately before CAS using fresh authoritative lease
    read; if leader endpoint is reachable, fetch fresh `txlog-watermarks` and use
-   `max(authoritative-lease-lsn, leader-watermark-lsn)` as guard input.
+   `max(authoritative-lease-lsn, leader-watermark-lsn)` as guard input unless
+   the lease is already expired and the old owner reports a lower watermark, in
+   which case use the highest currently reachable member watermark instead.
 6. If leader endpoint is unreachable, delay CAS by at least one additional renew
    interval beyond lease expiry before final guard re-check.
 7. Attempt authoritative lease CAS acquisition.

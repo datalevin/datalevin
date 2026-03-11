@@ -135,11 +135,152 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest wal-local-payload-lsn-tracks-successful-apply-test
+  (let [dir   (repo-tmp-dir "storage-local-payload-lsn-")
+        store (sut/open dir nil {:db-name "local-payload"
+                                 :wal? true})
+        lmdb  (.-lmdb ^Store store)]
+    (try
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (if/transact-kv lmdb [[:put "a" "k2" "v2"]])
+      (let [watermark-lsn
+            (long (or (:last-applied-lsn (if/txlog-watermarks lmdb)) 0))
+            payload-lsn
+            (long (or (if/get-value lmdb c/kv-info
+                                    c/wal-local-payload-lsn
+                                    :keyword :data)
+                      0))]
+        (is (pos? watermark-lsn))
+        (is (= watermark-lsn payload-lsn)))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
+
+(deftest txlog-replay-record-normalizes-decoded-avg-rows-test
+  (let [source-dir (repo-tmp-dir "storage-txlog-replay-source-")
+        target-dir (repo-tmp-dir "storage-txlog-replay-target-")
+        schema     {:name {:db/valueType :db.type/string}}
+        source     (sut/open source-dir schema {:db-name "txlog-replay-source"
+                                                :wal? true})
+        target     (sut/open target-dir schema {:db-name "txlog-replay-target"
+                                                :wal? true})
+        source-kv  (.-lmdb ^Store source)
+        target-kv  (.-lmdb ^Store target)
+        datom      (d/datom 1 :name "alice")]
+    (try
+      (if/load-datoms source [datom])
+      (let [record
+            (->> (kv/txlog-records (txlog/state source-kv))
+                 (filter
+                  (fn [record]
+                    (some (fn [row]
+                            (and (vector? row)
+                                 (or (= :avg (nth row 4 nil))
+                                     (= :avg (nth row 5 nil)))))
+                          (:rows record))))
+                 last)]
+        (is (some? record))
+        (is (some (fn [row]
+                    (and (vector? row)
+                         (or (instance? datalevin.bits.Retrieved
+                                        (nth row 2 nil))
+                             (instance? datalevin.bits.Retrieved
+                                        (nth row 3 nil)))))
+                  (:rows record)))
+        (is (= [] (if/slice target :eav datom datom)))
+        (#'kv/txlog-replay-record! target-kv (txlog/state target-kv) record)
+        (is (= [datom] (if/slice target :eav datom datom))))
+      (finally
+        (if/close source)
+        (if/close target)
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
+(deftest create-snapshot-waits-out-runtime-rollback-override-test
+  (let [dir     (repo-tmp-dir "storage-snapshot-runtime-rollback-")
+        store   (sut/open dir nil {:db-name "snapshot-runtime-rollback"
+                                   :wal? true})
+        lmdb    (.-lmdb ^Store store)
+        entered (promise)
+        release (promise)]
+    (try
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (let [rollback-f (future
+                         (#'kv/with-runtime-txlog-rollback
+                          lmdb
+                          (fn []
+                            (deliver entered true)
+                            @release)))]
+        (is (true? (deref entered 5000 false)))
+        (let [result (future (if/create-snapshot! lmdb))]
+          (Thread/sleep 100)
+          (deliver release true)
+          (is (= true (get (deref result 5000 ::timeout) :ok?)))
+          (is (not (true? (get (deref result 1000 ::timeout) :skipped?)))))
+        (is (= true (deref rollback-f 5000 ::timeout))))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
+
+(deftest concurrent-backup-pin-clears-do-not-leak-stale-pin-test
+  (let [dir        (repo-tmp-dir "storage-backup-pin-clear-race-")
+        store      (sut/open dir nil {:db-name "backup-pin-clear-race"
+                                      :wal? true})
+        lmdb       (.-lmdb ^Store store)
+        pin-a      "backup-copy/pin-a"
+        pin-b      "backup-copy/pin-b"
+        expires-ms (+ (System/currentTimeMillis) 60000)
+        entered    (promise)
+        release    (promise)
+        update-map! #'kv/update-kv-info-map-plan!]
+    (try
+      (kv/txlog-pin-backup-floor-state! lmdb pin-a 10 expires-ms)
+      (kv/txlog-pin-backup-floor-state! lmdb pin-b 20 expires-ms)
+      (let [clear-a (future
+                      (update-map!
+                       lmdb
+                       c/wal-backup-pins
+                       (fn [entries]
+                         (let [res (txlog/backup-pin-floor-clear-plan
+                                    pin-a
+                                    entries
+                                    c/wal-backup-pins)]
+                           (deliver entered true)
+                           @release
+                           res))))
+            _       (is (true? (deref entered 5000 false)))
+            clear-b (future
+                      (update-map!
+                       lmdb
+                       c/wal-backup-pins
+                       (fn [entries]
+                         (txlog/backup-pin-floor-clear-plan
+                          pin-b
+                          entries
+                          c/wal-backup-pins))))]
+        (deliver release true)
+        (is (:ok? (deref clear-a 5000 ::timeout)))
+        (is (:ok? (deref clear-b 5000 ::timeout))))
+      (let [backup-state (get-in (kv/txlog-retention-state lmdb)
+                                 [:floor-providers :backup])]
+        (is (zero? (long (:active-count backup-state))))
+        (is (empty? (:pins backup-state)))
+        (is (= Long/MAX_VALUE (long (:floor-lsn backup-state)))))
+      (finally
+        (if/close store)
+        (u/delete-files dir)))))
+
 (deftest reopen-wal-store-preserves-ha-opts-test
   (let [dir      (repo-tmp-dir "storage-ha-reopen-")
         opts     (valid-ha-store-opts)
         store    (sut/open dir nil opts)
         expected (select-keys (if/opts store) persisted-ha-store-opt-keys)
+        normalized-expected
+        (select-keys (#'sut/propagate-top-level-txlog-opts-to-kv-opts
+                      (if/opts store))
+                     persisted-ha-store-opt-keys)
         live-persisted
         (select-keys
           (#'sut/load-opts (.-lmdb ^Store store))
@@ -171,7 +312,7 @@
                         :reopened
                         (select-keys (if/opts reopened)
                                      persisted-ha-store-opt-keys)}]
-        (is (= expected
+        (is (= normalized-expected
                (select-keys (if/opts reopened)
                             persisted-ha-store-opt-keys))
             (pr-str debug-info))
@@ -192,6 +333,32 @@
             (pr-str debug-info))
         (if/close reopened))
       (finally
+        (u/delete-files dir)))))
+
+(deftest reopen-data-only-copy-preserves-wal-mode-test
+  (let [dir      (repo-tmp-dir "storage-copy-reopen-")
+        copy-dir (repo-tmp-dir "storage-copy-reopen-copy-")
+        opts     {:db-name "copy-reopen"
+                  :db-identity "copy-reopen-db"
+                  :wal? true}
+        store    (sut/open dir nil opts)
+        lmdb     (.-lmdb ^Store store)]
+    (try
+      (if/open-dbi lmdb "a")
+      (if/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (if/copy lmdb copy-dir false)
+      (is (not (u/file-exists (str copy-dir java.io.File/separator "txlog"))))
+      (let [reopened (sut/open copy-dir nil)]
+        (try
+          (is (true? (:wal? (if/opts reopened))))
+          (is (pos? (long (or (:last-applied-lsn
+                               (kv/txlog-watermarks (.-lmdb ^Store reopened)))
+                              0))))
+          (finally
+            (if/close reopened))))
+      (finally
+        (if/close store)
+        (u/delete-files copy-dir)
         (u/delete-files dir)))))
 
 (deftest basic-ops-test
