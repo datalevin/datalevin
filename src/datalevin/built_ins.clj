@@ -23,6 +23,7 @@
    [datalevin.storage :as st]
    [datalevin.index :as idx]
    [datalevin.idoc :as idoc]
+   [datalevin.embedding :as emb]
    [datalevin.udf :as udf-reg]
    [datalevin.vector :as v]
    [datalevin.entity :as de]
@@ -390,6 +391,87 @@
                       domains
                       (raise "Need a vector search domain." {}))]
        (vec-neighbors* res aid->attr lmdb indices query opts domain needed))
+     res)))
+
+(defn- embedding-neighbors*
+  [^FastList res aid->attr lmdb indices query-vector opts domain ^ints needed]
+  (when-let [index (indices domain)]
+    (let [display    (or (:display opts)
+                         (:display (.-search-opts ^datalevin.vector.VectorIndex index))
+                         :refs)
+          refs+dists (clojure.core/= :refs+dists display)
+          emit       (make-emit-fn lmdb aid->attr needed)]
+      (if refs+dists
+        (if needed
+          (let [n (alength needed)]
+            (doseq [d (search-vec index query-vector opts)]
+              (let [[doc-ref dist] d
+                    [e a v]       (doc-ref->eav lmdb aid->attr doc-ref)
+                    ^objects arr  (object-array n)]
+                (dotimes [j n]
+                  (aset arr j (case (aget needed j)
+                                0 e
+                                1 a
+                                2 v
+                                3 dist)))
+                (.add res arr))))
+          (doseq [d (search-vec index query-vector opts)]
+            (let [[doc-ref dist] d
+                  ^objects tuple (emit doc-ref)]
+              (.add res (object-array [(aget tuple 0)
+                                       (aget tuple 1)
+                                       (aget tuple 2)
+                                       dist])))))
+        (doseq [d (search-vec index query-vector opts)]
+          (.add res (emit d)))))))
+
+(defn embedding-neighbors
+  "Function that does embedding similarity search over `:db/embedding` domains.
+
+  The query input is text. The function embeds the text using the provider
+  configured for each searched domain, then returns matching source datom
+  tuples `[e a v]` or `[e a v dist]` when `:display :refs+dists` is used.
+
+  Attribute-specific search requires `:db.embedding/autoDomain true`."
+  ([db query]
+   (embedding-neighbors db query nil))
+  ([db arg1 arg2]
+   (embedding-neighbors db arg1 arg2 nil))
+  ([^DB db arg1 arg2 arg3]
+   (let [^Store store     (.-store db)
+         lmdb             (.-lmdb store)
+         indices          (.-embedding-indices store)
+         aid->attr        (attrs store)
+         attr?            (keyword? arg1)
+         domains          (if attr?
+                            [(v/attr-domain arg1)]
+                            (:domains arg2))
+         query            (if attr? arg2 arg1)
+         opts             (if attr? arg3 arg2)
+         needed           (extract-needed arg3 arg2 arg1)
+         missing          (seq (remove indices domains))
+         res              (FastList.)]
+     (when attr?
+       (when-not (-> store schema arg1 :db.embedding/autoDomain)
+         (raise ":db.embedding/autoDomain is not true for " arg1 {})))
+     (when-not (string? query)
+       (raise "Embedding query must be a string" {:query query}))
+     (when-not (and (sequential? domains) (seq domains))
+       (raise "Need an embedding search domain." {}))
+     (when missing
+       (raise "Embedding domain not found: " missing {:domains missing}))
+     (doseq [domain domains]
+       (let [provider (st/embedding-provider store domain)]
+         (when-not provider
+           (raise "Embedding provider is not initialized"
+                  {:domain domain}))
+         (let [query-vec (first (emb/embedding provider
+                                               [{:text   query
+                                                 :kind   :query
+                                                 :domain domain}]
+                                               nil))]
+         (embedding-neighbors* res aid->attr lmdb indices query-vec opts domain
+                               needed))))
      res)))
 
 (defn- idoc-domain
@@ -936,6 +1018,7 @@
    'quote         identity,
    'q             q,
    'fulltext      fulltext,
+   'embedding-neighbors embedding-neighbors,
    'idoc-match    idoc-match,
    'idoc-get      idoc-get,
    'vec-neighbors vec-neighbors,

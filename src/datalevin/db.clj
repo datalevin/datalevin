@@ -2013,7 +2013,10 @@
   "Persist already prepared tx-data to the given DB store."
   [^DB db tx-data]
   (let [store (.-store db)]
-    (load-datoms store tx-data)
+    (if (instance? Store store)
+      (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)]
+        (s/load-datoms-with-plan! ^Store store tx-data embedding-plan))
+      (load-datoms store tx-data))
     (invalidate-cache store tx-data (last-modified store))
     db))
 

@@ -192,6 +192,24 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a local llama.cpp text embedder using native defaults.
+     */
+    public static LlamaEmbedder newLlamaEmbedder(String modelPath) {
+        return new LlamaEmbedder(modelPath);
+    }
+
+    /**
+     * Creates a local llama.cpp text embedder with explicit tuning options.
+     */
+    public static LlamaEmbedder newLlamaEmbedder(String modelPath,
+                                                 int gpuLayers,
+                                                 int ctxSize,
+                                                 int batchSize,
+                                                 int threads) {
+        return new LlamaEmbedder(modelPath, gpuLayers, ctxSize, batchSize, threads);
+    }
+
+    /**
      * Creates a typed Datalog query builder.
      */
     public static DatalogQuery query() {

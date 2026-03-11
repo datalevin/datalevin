@@ -431,7 +431,7 @@
 (def ^:private tuple-producing-fns
   "Set of function symbols that produce tuples and can benefit from
    knowing which indices are needed."
-  #{'fulltext 'idoc-match 'vec-neighbors})
+  #{'fulltext 'idoc-match 'vec-neighbors 'embedding-neighbors})
 
 (extend-protocol IBinding
   BindIgnore
