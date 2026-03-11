@@ -15,6 +15,11 @@
 (def local-repo (str java-release-dir "/m2"))
 (def java-central-dir "target/java-central")
 (def java-central-staging-dir (str java-central-dir "/staging"))
+(def python-bindings-dir "bindings/python")
+(def python-runtime-dir "target/python-runtime")
+(def python-runtime-class-dir (str python-runtime-dir "/classes"))
+(def python-runtime-deps-file (str python-runtime-dir "/deps.edn"))
+(def python-jar-dir (str python-bindings-dir "/src/datalevin/jars"))
 (def version (or (some->> (slurp "project.clj")
                           (re-find #"\(def version \"([^\"]+)\"\)")
                           second)
@@ -26,11 +31,57 @@
 (def java-pom-file (format "target/datalevin-java-%s.pom" version))
 (def java-source-jar-file (format "target/datalevin-java-%s-sources.jar" version))
 (def java-javadoc-jar-file (format "target/datalevin-java-%s-javadoc.jar" version))
+(def python-runtime-jar-file (format "target/datalevin-python-runtime-%s.jar" version))
+(def python-vendored-jar-file
+  (format "%s/datalevin-python-runtime-%s.jar" python-jar-dir version))
 (def java-central-bundle-file
   (format "%s/datalevin-java-%s-central-bundle.zip" java-central-dir version))
 (def deps-config (edn/read-string (slurp "deps.edn")))
 (def runtime-deps (:deps deps-config))
 (def basis (b/create-basis {:project "deps.edn"}))
+(def python-runtime-excluded-deps
+  '#{babashka/babashka.pods
+     nrepl/bencode
+     org.babashka/sci
+     org.clojure/tools.cli
+     org.bouncycastle/bcpkix-jdk15on
+     org.bouncycastle/bcprov-jdk15on
+     com.alipay.sofa/jraft-core})
+(def python-runtime-source-excludes
+  ["pod"
+   "datalevin/ha"
+   "datalevin/ha.clj"
+   "datalevin/interpret.clj"
+   "datalevin/main.clj"
+   "datalevin/server.clj"])
+(def python-runtime-class-excludes
+  ["datalevin/ha"])
+(def python-runtime-native-libs
+  {"linux-x86_64" 'org.clojars.huahaiy/dtlvnative-linux-x86_64
+   "linux-arm64" 'org.clojars.huahaiy/dtlvnative-linux-arm64
+   "macosx-arm64" 'org.clojars.huahaiy/dtlvnative-macosx-arm64
+   "windows-x86_64" 'org.clojars.huahaiy/dtlvnative-windows-x86_64})
+(def python-runtime-zstd-excludes
+  {"linux-x86_64" ["linux/(?!amd64/).*"
+                   "win/.*"
+                   "darwin/.*"
+                   "freebsd/.*"
+                   "aix/.*"]
+   "linux-arm64"  ["linux/(?!aarch64/).*"
+                   "win/.*"
+                   "darwin/.*"
+                   "freebsd/.*"
+                   "aix/.*"]
+   "macosx-arm64" ["darwin/(?!aarch64/).*"
+                   "linux/.*"
+                   "win/.*"
+                   "freebsd/.*"
+                   "aix/.*"]
+   "windows-x86_64" ["win/(?!amd64/).*"
+                     "linux/.*"
+                     "darwin/.*"
+                     "freebsd/.*"
+                     "aix/.*"]})
 (def scm {:connection          "scm:git:https://github.com/datalevin/datalevin.git"
           :developerConnection "scm:git:git@github.com:datalevin/datalevin.git"
           :tag                 (str "v" version)
@@ -60,6 +111,77 @@
        (filter #(.exists (File. ^String %)))
        vec))
 
+(defn- delete-under-root!
+  [root paths]
+  (doseq [path paths]
+    (b/delete {:path (str root "/" path)})))
+
+(defn- platform-arg->string
+  [value]
+  (cond
+    (nil? value) nil
+    (keyword? value) (name value)
+    (symbol? value) (name value)
+    :else (str value)))
+
+(defn- detect-python-native-platform []
+  (let [os   (str/lower-case (System/getProperty "os.name" ""))
+        arch (str/lower-case (System/getProperty "os.arch" ""))]
+    (cond
+      (and (str/includes? os "linux")
+           (#{"x86_64" "amd64"} arch))
+      "linux-x86_64"
+
+      (and (str/includes? os "linux")
+           (#{"aarch64" "arm64"} arch))
+      "linux-arm64"
+
+      (and (or (str/includes? os "mac")
+               (str/includes? os "darwin"))
+           (#{"aarch64" "arm64"} arch))
+      "macosx-arm64"
+
+      (and (str/includes? os "win")
+           (#{"x86_64" "amd64"} arch))
+      "windows-x86_64"
+
+      :else
+      nil)))
+
+(defn- normalize-python-native-platform
+  [native-platform]
+  (let [platform (or (platform-arg->string native-platform)
+                     (detect-python-native-platform))]
+    (when-not platform
+      (throw (ex-info "Unsupported host platform for Python runtime jar."
+                      {:os   (System/getProperty "os.name")
+                       :arch (System/getProperty "os.arch")})))
+    (if (= platform "all")
+      :all
+      (do
+        (when-not (contains? python-runtime-native-libs platform)
+          (throw (ex-info "Unsupported Python native platform."
+                          {:native-platform platform
+                           :supported       (sort (keys python-runtime-native-libs))})))
+        platform))))
+
+(defn- python-runtime-deps-for
+  [native-platform]
+  (let [platform    (normalize-python-native-platform native-platform)
+        native-libs (if (= platform :all)
+                      bundled-native-libs
+                      #{(python-runtime-native-libs platform)})
+        deps        (reduce dissoc runtime-deps python-runtime-excluded-deps)
+        deps        (reduce dissoc deps bundled-native-libs)]
+    (merge deps (select-keys runtime-deps native-libs))))
+
+(defn- python-runtime-uber-excludes
+  [native-platform]
+  (let [platform (normalize-python-native-platform native-platform)]
+    (if (= platform :all)
+      []
+      (python-runtime-zstd-excludes platform))))
+
 (defn clean [_]
   (b/delete {:path "target"}))
 
@@ -77,6 +199,8 @@
                 java-pom-file
                 java-source-jar-file
                 java-javadoc-jar-file
+                python-runtime-dir
+                python-runtime-jar-file
                 java-central-bundle-file]]
     (b/delete {:path path})))
 
@@ -321,6 +445,56 @@
    :source-jar  java-source-jar-file
    :javadoc-jar java-javadoc-jar-file
    :local-repo  local-repo})
+
+(defn- prep-python-runtime-artifact! []
+  (compile-java nil)
+  (b/delete {:path python-runtime-class-dir})
+  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
+               :target-dir python-runtime-class-dir})
+  ;; Keep the embeddable runtime jar free of Java sources.
+  (b/delete {:path (str python-runtime-class-dir "/java")})
+  ;; Python bindings do not use the CLI, pod entrypoint, or HA/server runtime.
+  (delete-under-root! python-runtime-class-dir python-runtime-source-excludes)
+  (delete-under-root! python-runtime-class-dir python-runtime-class-excludes))
+
+(defn- write-python-runtime-deps!
+  [native-platform]
+  (.mkdirs (File. python-runtime-dir))
+  (spit python-runtime-deps-file
+        (pr-str {:paths []
+                 :deps  (python-runtime-deps-for native-platform)})))
+
+(defn- python-runtime-basis
+  [native-platform]
+  (write-python-runtime-deps! native-platform)
+  (b/create-basis {:project python-runtime-deps-file}))
+
+(defn python-runtime-jar
+  [{:keys [native-platform] :as _opts}]
+  (prep-python-runtime-artifact!)
+  (b/delete {:path python-runtime-jar-file})
+  (b/uber {:class-dir python-runtime-class-dir
+           :uber-file python-runtime-jar-file
+           :basis     (python-runtime-basis native-platform)
+           :exclude   (python-runtime-uber-excludes native-platform)})
+  (println "Generated Python runtime jar at" python-runtime-jar-file)
+  {:jar-file python-runtime-jar-file})
+
+(defn vendor-python-jar
+  [{:keys [native-platform] :as opts}]
+  (python-runtime-jar opts)
+  (.mkdirs (File. python-jar-dir))
+  (doseq [existing (file-seq (File. python-jar-dir))
+          :when (and (.isFile ^File existing)
+                     (or (str/starts-with? (.getName ^File existing) "datalevin-java-")
+                         (str/starts-with? (.getName ^File existing) "datalevin-python-runtime-"))
+                     (str/ends-with? (.getName ^File existing) ".jar"))]
+    (b/delete {:path (.getPath ^File existing)}))
+  (b/copy-file {:src python-runtime-jar-file
+                :target python-vendored-jar-file})
+  (println "Vendored Python runtime jar at" python-vendored-jar-file)
+  {:jar-file        python-vendored-jar-file
+   :native-platform (normalize-python-native-platform native-platform)})
 
 (defn- digest-file
   [algorithm path]

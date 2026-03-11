@@ -1,0 +1,107 @@
+name: Python Release
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - created
+
+permissions:
+  contents: read
+
+jobs:
+  build-wheels:
+    name: Build ${{ matrix.native_platform }} wheel
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            native_platform: linux-x86_64
+          - os: ubuntu-24.04-arm
+            native_platform: linux-arm64
+          - os: macos-14
+            native_platform: macosx-arm64
+          - os: windows-latest
+            native_platform: windows-x86_64
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: bindings/python/pyproject.toml
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-${{ runner.arch }}-clojure-${{ hashFiles('deps.edn', 'build.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-clojure-
+
+      - name: Build wheel
+        shell: bash
+        env:
+          DATALEVIN_NATIVE_PLATFORM: ${{ matrix.native_platform }}
+        run: |
+          python -m pip install --upgrade pip "setuptools>=69" wheel
+          python -m pip wheel --no-deps --no-build-isolation ./bindings/python -w dist/
+          ls -lh dist/
+
+      - name: Smoke test wheel
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pytest dist/datalevin-*.whl
+          python -m pytest bindings/python/tests/test_smoke.py -q
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel-${{ matrix.native_platform }}
+          path: dist/datalevin-*.whl
+          if-no-files-found: error
+
+  publish-pypi:
+    name: Publish to PyPI
+    needs: build-wheels
+    if: github.event_name == 'release'
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/datalevin
+    permissions:
+      id-token: write
+
+    steps:
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist/
+          pattern: python-wheel-*
+          merge-multiple: true
+
+      - name: List distributions
+        run: ls -lh dist/
+
+      - name: Publish package distributions to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
