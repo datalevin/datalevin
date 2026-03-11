@@ -712,6 +712,25 @@
              TimeUnit/SECONDS)]
     (vreset! scheduled-sync fut)))
 
+(defonce ^:private shutdown-hooks (atom {}))
+
+(defn- register-shutdown-hook!
+  [dir ^Thread hook]
+  (.addShutdownHook (Runtime/getRuntime) hook)
+  (swap! shutdown-hooks assoc dir hook)
+  nil)
+
+(defn- unregister-shutdown-hook!
+  [dir]
+  (when-let [^Thread hook (get @shutdown-hooks dir)]
+    (swap! shutdown-hooks dissoc dir)
+    (try
+      (.removeShutdownHook (Runtime/getRuntime) hook)
+      (catch IllegalStateException _)
+      (catch IllegalArgumentException _)
+      (catch SecurityException _)))
+  nil)
+
 (defn- stop-scheduled-sync
   [scheduled-sync]
   (when-let [fut @scheduled-sync]
@@ -801,6 +820,7 @@
     (let [dir         (env-dir this)
           close-error (volatile! nil)]
       (when-not (.isClosed env)
+        (unregister-shutdown-hook! dir)
         (stop-scheduled-sync scheduled-sync)
         (let [dir-prefix (str (.env-dir this) u/+separator+)
               indices    (->> @l/vector-indices
@@ -1575,8 +1595,7 @@
           (set-max-val-size lmdb (max-val-size lmdb))
           (set-key-compressor lmdb k-comp)
           (set-val-compressor lmdb v-comp)
-          (.addShutdownHook (Runtime/getRuntime)
-                            (Thread. #(close-kv lmdb)))
+          (register-shutdown-hook! dir (Thread. #(close-kv lmdb)))
           (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
       (l/wrap-open-kv lmdb))
     (catch Exception e

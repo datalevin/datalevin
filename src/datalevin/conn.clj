@@ -30,7 +30,7 @@
     TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
-(declare closed? shutdown-transact-async-executor!
+(declare closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
 
 (defn conn?
@@ -59,10 +59,21 @@
 
 (defn close
   [conn]
-  (when (and conn (not (closed? conn)))
-    (when-let [store (.-store ^DB @conn)]
-      (i/close ^Store store))
-    (shutdown-transact-async-executor-if-idle!))
+  (when conn
+    (try
+      (when-not (closed? conn)
+        (when-let [store (.-store ^DB @conn)]
+          (i/close store)))
+      (finally
+        (when (closed? conn)
+          (remove-conn (:dir (meta conn)) conn)
+          (when-let [listeners (:listeners (meta conn))]
+            (when (instance? clojure.lang.IAtom listeners)
+              (reset! listeners {})))
+          (when (instance? clojure.lang.IAtom conn)
+            (reset! conn nil))
+          (alter-meta! conn dissoc :dir :remote-store-opts-cache))
+        (shutdown-transact-async-executor-if-idle!))))
   nil)
 
 (defn closed?
@@ -435,9 +446,20 @@
 
 (defn- add-conn [dir conn] (swap! connections assoc dir conn))
 
+(defn- remove-conn
+  [dir conn]
+  (when dir
+    (swap! connections
+           (fn [m]
+             (if (identical? (get m dir) conn)
+               (dissoc m dir)
+               m))))
+  nil)
+
 (defn- new-conn
   [dir schema opts]
   (let [conn (create-conn dir schema opts)]
+    (alter-meta! conn assoc :dir dir)
     (add-conn dir conn)
     conn))
 

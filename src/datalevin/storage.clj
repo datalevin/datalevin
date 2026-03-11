@@ -2267,7 +2267,10 @@
            (max-tx old)
            (.-scheduled-sampling old)
            (.-write-txn old)
-           (ReentrantReadWriteLock.)))
+           ;; Sampling work may still be queued against an older Store wrapper.
+           ;; Keep close/sampling coordination on a shared lock across wrappers
+           ;; that refer to the same logical store/LMDB lifecycle.
+           (.-sampling-lock old)))
 
 (defn sync-max-gt-floor!
   "Advance an open store's in-memory giant-id cursor to at least `next-gt`.

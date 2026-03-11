@@ -115,7 +115,7 @@
 
 (def java-friendly-surface
   {Datalevin        #{"apiInfo" "exec" "createConn" "getConn" "openKV" "newClient"
-                      "query" "tx" "rules" "pull" "schema" "createUdfRegistry"
+                      "newLlamaEmbedder" "query" "tx" "rules" "pull" "schema" "createUdfRegistry"
                       "udfDescriptor" "registerUdf" "unregisterUdf"
                       "registeredUdf" "allRange"
                       "edn" "kw" "var" "mapOf" "orderedMap"

@@ -11,12 +11,27 @@
 
 (use-fixtures :each db-fixture)
 
+(defn- cached-connections
+  []
+  @(deref #'dc/connections))
+
 (deftest test-close
   (let [dir  (u/tmp-dir (str "test-" (UUID/randomUUID)))
         conn (d/create-conn dir)]
     (is (not (d/closed? conn)))
     (d/close conn)
     (is (d/closed? conn))
+    (is (nil? @conn))
+    (u/delete-files dir)))
+
+(deftest test-close-removes-get-conn-cache-entry
+  (let [dir  (u/tmp-dir (str "get-conn-cache-test-" (UUID/randomUUID)))
+        conn (d/get-conn dir)]
+    (is (identical? conn (get (cached-connections) dir)))
+    (d/close conn)
+    (is (d/closed? conn))
+    (is (nil? @conn))
+    (is (nil? (get (cached-connections) dir)))
     (u/delete-files dir)))
 
 (deftest test-update-schema
