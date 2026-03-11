@@ -1,9 +1,13 @@
 package datalevin;
 
 import clojure.lang.AFn;
+import clojure.lang.ISeq;
 
 import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -50,6 +54,24 @@ final class ClojureFns {
             public Object invoke(Object key, Object value) {
                 consumer.accept(key, value);
                 return null;
+            }
+        };
+    }
+
+    static AFn udfFunction(UdfFunction fn, Object descriptor) {
+        Objects.requireNonNull(fn, "fn");
+        final boolean txFn = isTxFnDescriptor(descriptor);
+        return new AFn() {
+            @Override
+            public Object applyTo(ISeq args) {
+                ArrayList<Object> values = new ArrayList<>();
+                for (ISeq xs = args; xs != null; xs = xs.next()) {
+                    values.add(xs.first());
+                }
+                Object result = fn.invoke(values);
+                return txFn
+                        ? DatalevinForms.txDataInput(result)
+                        : ClojureCodec.runtimeInput(result);
             }
         };
     }
@@ -107,5 +129,13 @@ final class ClojureFns {
         }
 
         abstract Object collect(Object key, Object value);
+    }
+
+    private static boolean isTxFnDescriptor(Object descriptor) {
+        if (!(descriptor instanceof Map<?, ?> map)) {
+            return false;
+        }
+        Object kind = map.get(ClojureCodec.keyword(":udf/kind"));
+        return ":tx-fn".equals(String.valueOf(kind));
     }
 }

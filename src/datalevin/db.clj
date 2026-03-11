@@ -24,6 +24,7 @@
    [datalevin.index :as idx]
    [datalevin.prepare :as prepare]
    [datalevin.query-util :as qu]
+   [datalevin.udf :as udf]
    [datalevin.validate :as vld]
    [datalevin.remote :as r]
    [datalevin.relation :as rel]
@@ -218,6 +219,34 @@
   [x]
   (or (qu/lookup-ref? x)
       (keyword? x)))
+
+(defn runtime-opts
+  [x]
+  (or (:runtime-opts (meta x)) {}))
+
+(defn runtime-opt
+  [x k]
+  (get (runtime-opts x) k))
+
+(defn with-runtime-opts
+  [x opts]
+  (with-meta x
+    (cond-> (or (meta x) {})
+      (some? opts) (assoc :runtime-opts opts)
+      (nil? opts)  (dissoc :runtime-opts))))
+
+(defn carry-runtime-opts
+  [x source]
+  (with-runtime-opts x (runtime-opts source)))
+
+(defn udf-registry
+  [x]
+  (runtime-opt x :udf-registry))
+
+(defn udf-cache-token
+  [x]
+  (when-some [registry (udf-registry x)]
+    [(System/identityHashCode registry) (udf/generation registry)]))
 
 (defn- unresolved-pattern?
   [e v]
@@ -723,6 +752,12 @@
     (r/open dir schema opts)
     (s/open dir schema opts)))
 
+(defn- split-runtime-opts
+  [opts]
+  (if (map? opts)
+    [(dissoc opts :runtime-opts) (:runtime-opts opts)]
+    [opts nil]))
+
 (defn new-db
   ([^IStore store] (new-db store nil))
   ([^IStore store info]
@@ -744,8 +779,10 @@
 
 (defn transfer
   [^DB old store]
-  (DB. store (.-max-eid old) (.-max-tx old) (.-eavt old) (.-avet old)
-       (.-pull-patterns old)))
+  (carry-runtime-opts
+    (DB. store (.-max-eid old) (.-max-tx old) (.-eavt old) (.-avet old)
+         (.-pull-patterns old))
+    old))
 
 (defn ^DB empty-db
   ([] (empty-db nil nil))
@@ -754,7 +791,9 @@
   ([dir schema opts]
    {:pre [(or (nil? schema) (map? schema))]}
    (vld/validate-schema schema)
-   (new-db (open-store dir schema opts))))
+   (let [[store-opts runtime-opts] (split-runtime-opts opts)]
+     (cond-> (new-db (open-store dir schema store-opts))
+       (some? runtime-opts) (with-runtime-opts runtime-opts)))))
 
 (def coerce-inst prepare/coerce-inst)
 
@@ -847,9 +886,11 @@
    {:pre [(or (nil? schema) (map? schema))]}
    (vld/validate-datom-list datoms)
    (vld/validate-schema schema)
-   (let [^Store store (open-store dir schema opts)]
+   (let [[store-opts runtime-opts] (split-runtime-opts opts)
+         ^Store store              (open-store dir schema store-opts)]
      (quick-fill store datoms)
-     (new-db store))))
+     (cond-> (new-db store)
+       (some? runtime-opts) (with-runtime-opts runtime-opts)))))
 
 (defn fill-db [db datoms] (quick-fill (.-store ^DB db) datoms) db)
 
@@ -1232,11 +1273,67 @@
                   _          (when reverse?
                                (vld/validate-reverse-ref-type (ref? db straight-a) a eid vs))]
           v      (maybe-wrap-multival db a vs)]
-      (if (and (ref? db straight-a) (map? v)) ;; another entity specified as nested map
+        (if (and (ref? db straight-a) (map? v)) ;; another entity specified as nested map
         (assoc v (reverse-ref a) eid)
         (if reverse?
           [:db/add v   straight-a eid]
           [:db/add eid straight-a v])))))
+
+(def ^:private missing-attr-state
+  (Object.))
+
+(def ^:private retracted-attr-state
+  (Object.))
+
+(defn- pending-attr-state
+  [report e a]
+  (loop [xs (seq (rseq (vec (:tx-data report))))]
+    (if-some [^Datom d (first xs)]
+      (if (and (= e (.-e d)) (= a (.-a d)))
+        (if (datom-added d) (.-v d) retracted-attr-state)
+        (recur (next xs)))
+      missing-attr-state)))
+
+(defn- effective-attr-value
+  [report db e a]
+  (let [pending (pending-attr-state report e a)]
+    (cond
+      (identical? pending missing-attr-state)
+      (ea-first-v (.-store ^DB db) e a)
+
+      (identical? pending retracted-attr-state)
+      nil
+
+      :else
+      pending)))
+
+(defn- validate-installed-callable-write
+  [report db e a v ent]
+  (case a
+    :db/udf
+    (let [descriptor (udf/descriptor v)
+          ident      (effective-attr-value report db e :db/ident)]
+      (vld/validate-installed-udf-ident ident descriptor ent)
+      (when (some? (effective-attr-value report db e :db/fn))
+        (u/raise "Installed callable entity cannot have both :db/fn and :db/udf at "
+                 ent
+                 {:error   :transact/syntax
+                  :tx-data ent
+                  :db/id   e})))
+
+    :db/fn
+    (when (some? (effective-attr-value report db e :db/udf))
+      (u/raise "Installed callable entity cannot have both :db/fn and :db/udf at "
+               ent
+               {:error   :transact/syntax
+                :tx-data ent
+                :db/id   e}))
+
+    :db/ident
+    (when-some [descriptor (effective-attr-value report db e :db/udf)]
+      (vld/validate-installed-udf-ident v (udf/descriptor descriptor) ent))
+
+    nil))
 
 (defn- transact-add [report [_ e a v tx :as ent]]
   (vld/validate-attr a ent)
@@ -1249,6 +1346,7 @@
                     report
                     (update report ::new-attributes u/conjv a))
         e         (entid-strict db e)
+        _         (validate-installed-callable-write report db e a v ent)
         v         (if (ref? db a) (entid-strict db v) v)
         v'        (correct-value store a v)
         meta*     (meta ent)
@@ -1378,10 +1476,95 @@
      (concat (flush-tuples report) entities)]
     [report entities]))
 
+(defn- lookup-installed-callable
+  [db target]
+  (when-not (udf/descriptor? target)
+    (when-some [eid (entid db target)]
+      (let [store    (.-store ^DB db)
+            fun      (ea-first-v store eid :db/fn)
+            udf-desc (ea-first-v store eid :db/udf)
+            ident    (ea-first-v store eid :db/ident)]
+        (when (and fun udf-desc)
+          (u/raise "Installed callable entity cannot have both :db/fn and :db/udf: "
+                   target
+                   {:error     :transact/syntax
+                    :target    target
+                    :entity-id eid}))
+        {:eid eid :ident ident :fn fun :udf udf-desc}))))
+
+(defn- lookup-tx-fn-value
+  [_db store ident]
+  (ea-first-v store ident :db/fn))
+
+(defn- tx-udf-context
+  [db]
+  {:db        db
+   :kind      :tx-fn
+   :embedded? true
+   :store     (.-store ^DB db)})
+
+(defn installed-udf-descriptor
+  ([db target]
+   (installed-udf-descriptor db nil target))
+  ([db allowed target]
+   (when-some [{:keys [ident udf]} (lookup-installed-callable db target)]
+     (when udf
+       (let [descriptor (udf/descriptor udf)]
+         (vld/validate-installed-udf-ident ident descriptor
+                                           [:db/udf target])
+         (if allowed
+           (udf/ensure-kind descriptor allowed)
+           descriptor))))))
+
+(defn- wrap-tx-udf
+  [db descriptor]
+  (let [registry   (udf-registry db)
+        descriptor (udf/ensure-kind descriptor :tx-fn)]
+    (fn [db* & args]
+      (let [callable (udf/materialize registry (tx-udf-context db*)
+                                      descriptor)]
+        (apply callable db* args)))))
+
+(defn- resolve-installed-tx-callable
+  [db target entity]
+  (when-some [{:keys [udf] :as installed} (lookup-installed-callable db target)]
+    (let [fun (:fn installed)]
+      (cond
+        fun
+        (do
+          (vld/validate-custom-tx-fn-value fun target entity)
+          fun)
+
+        udf
+        (wrap-tx-udf db (installed-udf-descriptor db :tx-fn target))
+
+        :else
+        nil))))
+
+(defn- resolve-tx-callable
+  [db target]
+  (cond
+    (fn? target)
+    target
+
+    (udf/descriptor? target)
+    (wrap-tx-udf db target)
+
+    :else
+    (or (resolve-installed-tx-callable db target [:db.fn/call target])
+        (if (entid db target)
+          (do
+            (vld/validate-custom-tx-fn-value nil target [:db.fn/call target])
+            nil)
+          (wrap-tx-udf db
+                       (udf/descriptor-or-registered
+                         (udf-registry db) :tx-fn target))))))
+
 (defn- handle-fn-call
   "Handle :db.fn/call entity. Returns expanded entities."
   [db entity]
-  (let [[_ f & args] entity]
+  (let [[_ target & args] entity
+        f                (resolve-tx-callable db target)]
     (apply f db args)))
 
 (defn- handle-custom-tx-fn
@@ -1394,11 +1577,8 @@
                             (d/datom emax op nil txmax))))
                   (entid db op))]
     (vld/validate-custom-tx-fn-entity ident op entity)
-    (let [fun  (or (:v (sf (.subSet
-                              ^TreeSortedSet (:eavt db)
-                              (d/datom ident :db/fn nil tx0)
-                              (d/datom ident :db/fn nil txmax))))
-                   (ea-first-v store ident :db/fn))
+    (let [fun  (or (resolve-installed-tx-callable db op entity)
+                   (lookup-tx-fn-value db store ident))
           args (next entity)]
       (vld/validate-custom-tx-fn-value fun op entity)
       (concat (apply fun db args) entities))))
@@ -1617,6 +1797,7 @@
   "Handle map entity. Returns [report' entities'] or calls retry/raises."
   [initial-report report db entity entities initial-es tx-time]
   (let [old-eid (:db/id entity)]
+    (vld/validate-installed-callable-entity entity)
     (cond+
       ;; :db/current-tx  => tx
       (tx-id? old-eid)
@@ -1832,7 +2013,10 @@
   "Persist already prepared tx-data to the given DB store."
   [^DB db tx-data]
   (let [store (.-store db)]
-    (load-datoms store tx-data)
+    (if (instance? Store store)
+      (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)]
+        (s/load-datoms-with-plan! ^Store store tx-data embedding-plan))
+      (load-datoms store tx-data))
     (invalidate-cache store tx-data (last-modified store))
     db))
 
@@ -1911,7 +2095,7 @@
           (let [info (when db-info
                        (assoc db-info :max-eid max-eid))]
           (cond-> (assoc initial-report
-                         :db-after (-> (new-db store info)
+                         :db-after (-> (carry-runtime-opts (new-db store info) db)
                                        (assoc :max-eid max-eid)
                                        (#(if simulated?
                                            (update % :max-tx u/long-inc)

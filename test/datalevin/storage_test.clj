@@ -19,6 +19,7 @@
   (:import
    [java.util UUID Collection]
    [java.util.concurrent LinkedBlockingQueue ConcurrentHashMap]
+   [java.util.concurrent.locks ReentrantReadWriteLock]
    [org.eclipse.collections.impl.list.mutable FastList]
    [datalevin.storage Store]
    [datalevin.datom Datom]))
@@ -369,27 +370,28 @@
         pipe  (LinkedBlockingQueue.)
         res   (FastList.)]
     (is (= c/g0 (if/max-gt store)))
-    (is (= 3 (if/max-aid store)))
+    (is (= (count c/implicit-schema) (if/max-aid store)))
     (is (= (merge c/entity-time-schema c/implicit-schema)
            (if/schema store)))
     (is (= c/e0 (if/init-max-eid store)))
     (is (= c/tx0 (if/max-tx store)))
     (is (if/analyze store nil))
-    (let [a   :a/b
+    (let [aid0 (count c/implicit-schema)
+          a   :a/b
           v   (UUID/randomUUID)
           d   (d/datom c/e0 a v)
-          s   (assoc (if/schema store) a {:db/aid 3})
+          s   (assoc (if/schema store) a {:db/aid aid0})
           b   :b/c
           p1  {:db/valueType :db.type/uuid}
           v1  (UUID/randomUUID)
           d0  (d/datom c/e0 a v1)
           d1  (d/datom c/e0 b v1)
-          s1  (assoc s b (merge p1 {:db/aid 4}))
+          s1  (assoc s b (merge p1 {:db/aid (inc aid0)}))
           c   :c/d
           p2  {:db/valueType :db.type/ref}
           v2  (long (rand c/emax))
           d2  (d/datom c/e0 c v2)
-          s2  (assoc s1 c (merge p2 {:db/aid 5}))
+          s2  (assoc s1 c (merge p2 {:db/aid (+ aid0 2)}))
           dir (if/env-dir (.-lmdb ^Store store))
           t1  (if/last-modified store)]
       (is (= d0 (assoc d :v v1)))
@@ -513,8 +515,9 @@
         (if/close store))
       (let [d     :d/e
             p3    {:db/valueType :db.type/long}
-            s3    (assoc s2 d (merge p3 {:db/aid 6}))
-            s4    (assoc s3 :f/g {:db/aid 7 :db/valueType :db.type/string})
+            s3    (assoc s2 d (merge p3 {:db/aid (+ aid0 3)}))
+            s4    (assoc s3 :f/g {:db/aid (+ aid0 4)
+                                  :db/valueType :db.type/string})
             store (sut/open dir {d p3}
                             {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
         (is (= (+ 6 c/tx0) (if/max-tx store)))
@@ -1126,4 +1129,63 @@
           (is (= 1.0 ^double ratio))))
       (finally
         (if/close store)
+        (u/delete-files dir)))))
+
+(deftest close-waits-for-stale-sampling-work-test
+  (let [dir     (u/tmp-dir (str "sampling-close-race-" (UUID/randomUUID)))
+        store   (sut/open dir
+                          {:a {:db/valueType :db.type/long}}
+                          {:background-sampling? false
+                           :kv-opts {:flags (conj c/default-env-flags :nosync)}})
+        store'  (sut/transfer store (.-lmdb ^Store store))
+        entered (promise)
+        release (promise)
+        holder-result (promise)
+        closer-result (promise)
+        ^ReentrantReadWriteLock sampling-lock (.-sampling-lock ^Store store)
+        holder (Thread.
+                 ^Runnable
+                 (fn []
+                   (let [rlock (.readLock sampling-lock)]
+                     (try
+                       (.lock rlock)
+                       (deliver entered true)
+                       @release
+                       (deliver holder-result :done)
+                       (catch Throwable t
+                         (deliver holder-result t))
+                       (finally
+                         (.unlock rlock))))))
+        closer (Thread.
+                 ^Runnable
+                 (fn []
+                   (try
+                     (if/close store')
+                     (deliver closer-result :done)
+                     (catch Throwable t
+                       (deliver closer-result t)))))]
+    (try
+      (.start holder)
+      (is (= true (deref entered 1000 false)))
+      (.start closer)
+      (Thread/sleep 100)
+      (is (not (realized? closer-result)))
+      (deliver release true)
+      (.join holder 1000)
+      (.join closer 1000)
+      (let [holder-out (deref holder-result 1000 ::timeout)
+            closer-out (deref closer-result 1000 ::timeout)]
+        (when (instance? Throwable holder-out)
+          (throw holder-out))
+        (when (instance? Throwable closer-out)
+          (throw closer-out))
+        (is (= :done holder-out))
+        (is (= :done closer-out)))
+      (is (if/closed? store'))
+      (finally
+        (deliver release true)
+        (.join holder 1000)
+        (.join closer 1000)
+        (when-not (if/closed? store')
+          (if/close store'))
         (u/delete-files dir)))))

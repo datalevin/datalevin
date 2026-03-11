@@ -16,6 +16,7 @@
     :refer [schema opts populated? visit-list-range]]
    [datalevin.index :as idx]
    [datalevin.datom :as d]
+   [datalevin.udf :as udf]
    [datalevin.constants :as c]
    [datalevin.util :as u]
    [datalevin.bits :as b]
@@ -102,6 +103,27 @@
       :db/cardinality (validate-cardinality-change store attr v' v)
       :db/valueType   (validate-value-type-change store attr v' v)
       :db/unique      (validate-uniqueness-change store lmdb attr v' v)
+      :db/embedding
+      (when (not= v' v)
+        (let [low-datom  (d/datom c/e0 attr c/v0)
+              high-datom (d/datom c/emax attr c/vmax)]
+          (when (populated? store :ave low-datom high-datom)
+            (u/raise "Embedding schema changes require an explicit rebuild"
+                     {:attribute attr :key k}))))
+      :db.embedding/domains
+      (when (not= v' v)
+        (let [low-datom  (d/datom c/e0 attr c/v0)
+              high-datom (d/datom c/emax attr c/vmax)]
+          (when (populated? store :ave low-datom high-datom)
+            (u/raise "Embedding schema changes require an explicit rebuild"
+                     {:attribute attr :key k}))))
+      :db.embedding/autoDomain
+      (when (not= v' v)
+        (let [low-datom  (d/datom c/e0 attr c/v0)
+              high-datom (d/datom c/emax attr c/vmax)]
+          (when (populated? store :ave low-datom high-datom)
+            (u/raise "Embedding schema changes require an explicit rebuild"
+                     {:attribute attr :key k}))))
       :pass-through)))
 
 (def ^:private boolean-opts
@@ -671,6 +693,87 @@
 
 (def tuple-props #{:db/tupleAttrs :db/tupleTypes :db/tupleType})
 
+(def ^:private embedding-metric-types
+  #{:cosine :dot-product :euclidean :haversine :divergence :pearson
+    :jaccard :hamming :tanimoto :sorensen :custom})
+
+(defn- validate-embedding-domain-list
+  [a domains]
+  (let [ex-data {:error     :schema/validation
+                 :attribute a
+                 :key       :db.embedding/domains}]
+    (when-not (sequential? domains)
+      (u/raise a " :db.embedding/domains must be a sequential collection"
+               ex-data))
+    (when (empty? domains)
+      (u/raise a " :db.embedding/domains cannot be empty" ex-data))
+    (doseq [domain domains]
+      (when-not (and (string? domain) (not (s/blank? domain)))
+        (u/raise a " :db.embedding/domains entries must be non-blank strings"
+                 (assoc ex-data :value domain))))))
+
+(defn- validate-embedding-domain-config*
+  [where domain config]
+  (when-not (map? config)
+    (u/raise "Embedding domain config must be a map"
+             {:error :store/validation
+              :where where
+              :domain domain
+              :value config}))
+  (when-let [provider (:provider config)]
+    (when-not (keyword? provider)
+      (u/raise "Embedding provider id must be a keyword"
+               {:error :store/validation
+                :where where
+                :domain domain
+                :provider provider})))
+  (when-let [dimensions (:dimensions config)]
+    (when-not (positive-int? dimensions)
+      (u/raise "Embedding dimensions must be a positive integer"
+               {:error :store/validation
+                :where where
+                :domain domain
+                :dimensions dimensions})))
+  (when-let [metric-type (:metric-type config)]
+    (when-not (embedding-metric-types metric-type)
+      (u/raise "Embedding metric type is not supported"
+               {:error :store/validation
+                :where where
+                :domain domain
+                :metric-type metric-type})))
+  (when-let [metadata (:embedding-metadata config)]
+    (when-not (map? metadata)
+      (u/raise "Embedding metadata must be a map"
+               {:error :store/validation
+                :where where
+                :domain domain
+                :metadata metadata}))))
+
+(defn validate-embedding-options
+  [opts]
+  (when-let [embedding-opts (:embedding-opts opts)]
+    (validate-embedding-domain-config* :embedding-opts nil embedding-opts))
+  (when-let [embedding-domains (:embedding-domains opts)]
+    (when-not (map? embedding-domains)
+      (u/raise "Option :embedding-domains expects a map"
+               {:error :store/validation
+                :option :embedding-domains
+                :value embedding-domains}))
+    (doseq [[domain config] embedding-domains]
+      (when-not (and (string? domain) (not (s/blank? domain)))
+        (u/raise "Embedding domain names must be non-blank strings"
+                 {:error :store/validation
+                  :option :embedding-domains
+                  :domain domain}))
+      (validate-embedding-domain-config* :embedding-domains domain config)))
+  (when-let [embedding-providers (:embedding-providers opts)]
+    (when-not (map? embedding-providers)
+      (u/raise "Option :embedding-providers expects a map"
+               {:error :store/validation
+                :option :embedding-providers
+                :value embedding-providers})))
+  opts)
+
 (defn validate-schema
   "Validate full schema structure."
   [schema]
@@ -692,6 +795,22 @@
                          #{:db.cardinality/one :db.cardinality/many})
     (validate-schema-key a :db/fulltext (:db/fulltext kv)
                          #{true false})
+    (validate-schema-key a :db/embedding (:db/embedding kv)
+                         #{true false})
+    (validate-schema-key a :db.embedding/autoDomain
+                         (:db.embedding/autoDomain kv)
+                         #{true false})
+
+    (when (contains? kv :db.embedding/domains)
+      (validate-embedding-domain-list a (:db.embedding/domains kv)))
+
+    (when (and (:db/embedding kv)
+               (not (identical? (:db/valueType kv) :db.type/string)))
+      (u/raise "Bad attribute specification for embedding"
+               {:error     :schema/validation
+                :attribute a
+                :key       :db/embedding
+                :valueType (:db/valueType kv)}))
 
     ;; tuple should have one of tuple-props
     (when (and (identical? :db.type/tuple (:db/valueType kv))
@@ -882,6 +1001,33 @@
     (u/raise "Entity " op " expected to have :db/fn attribute with fn? value"
              {:error :transact/syntax, :operation :db.fn/call, :tx-data entity})))
 
+(defn validate-installed-callable-entity
+  "Validate stored function attributes on an entity map."
+  [entity]
+  (when (and (contains? entity :db/fn) (contains? entity :db/udf))
+    (u/raise "Entity cannot have both :db/fn and :db/udf at " entity
+             {:error :transact/syntax, :tx-data entity}))
+  (when (contains? entity :db/udf)
+    (let [descriptor (udf/descriptor (:db/udf entity))]
+      (when-let [ident (:db/ident entity)]
+        (when-not (= ident (:udf/id descriptor))
+          (u/raise "Installed :db/udf id must match :db/ident at " entity
+                   {:error      :transact/syntax
+                    :tx-data    entity
+                    :db/ident   ident
+                    :descriptor descriptor})))
+      descriptor)))
+
+(defn validate-installed-udf-ident
+  "Validate that an installed descriptor matches the entity ident when known."
+  [ident descriptor at]
+  (when (and ident (not= ident (:udf/id descriptor)))
+    (u/raise "Installed :db/udf id must match :db/ident at " at
+             {:error      :transact/syntax
+              :db/ident   ident
+              :descriptor descriptor
+              :context    at})))
+
 (defn validate-custom-tx-fn-entity
   "Validate that an entity exists for a custom transaction function."
   [ident op entity]
@@ -899,7 +1045,7 @@
 (defn validate-tx-op
   "Validate that the operation is a known transaction operation."
   [op entity]
-  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
+  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
            {:error :transact/syntax, :operation op, :tx-data entity}))
 
 (defn validate-tx-entity-type

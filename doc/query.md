@@ -288,6 +288,65 @@ variable dependencies are considered to reorder these complex clauses to
 optimize performance. Rules are executed last, see [rules](rules.md) for details
 of the rule engine.
 
+## Runtime UDFs in Queries
+
+Datalevin query supports a `udf` function for runtime-resolved user-defined
+functions. Query UDFs are resolved against the runtime registry attached to the
+current DB value.
+
+`udf` accepts:
+
+* an installed ident whose entity stores `:db/udf`
+* an inline descriptor map
+* a registered id keyword when that id is unambiguous in the registry
+
+Query UDF descriptors use `:udf/kind :query-fn`. Predicate UDFs use
+`:udf/kind :predicate`.
+
+```clojure
+(require '[datalevin.core :as d]
+         '[datalevin.udf :as udf])
+
+(def descriptor {:udf/lang :java
+                 :udf/kind :query-fn
+                 :udf/id   :normalize-email})
+
+(def registry
+  (doto (udf/create-registry)
+    (udf/register! descriptor clojure.string/lower-case)))
+
+(def conn
+  (d/create-conn
+    "/tmp/query-udf"
+    {:user/email {:db/valueType :db.type/string}}
+    {:runtime-opts {:udf-registry registry}}))
+
+(d/transact! conn [{:db/ident :normalize-email
+                    :db/udf   descriptor}
+                   {:db/id 1 :user/email "A@B.COM"}])
+
+;; installed ident
+(d/q '[:find ?email .
+       :in $
+       :where
+       [?e :user/email ?raw]
+       [(udf :normalize-email ?raw) ?email]]
+     @conn)
+
+;; inline descriptor
+(d/q '[:find ?email .
+       :in $ ?descriptor
+       :where
+       [?e :user/email ?raw]
+       [(udf ?descriptor ?raw) ?email]]
+     @conn
+     descriptor)
+```
+
+The runtime registry is transient; only `:db/udf` descriptors are persisted.
+Query result caching tracks the registry generation, so updating a registered
+UDF takes effect on subsequent queries.
+
 ## Benchmarks
 
 We conducted several benchmarks to test Datalevin query engine.

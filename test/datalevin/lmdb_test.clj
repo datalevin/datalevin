@@ -1,5 +1,6 @@
 (ns datalevin.lmdb-test
   (:require
+   [datalevin.binding.cpp :as cpp]
    [datalevin.lmdb :as l]
    [datalevin.bits :as b]
    [datalevin.interpret :as i]
@@ -38,6 +39,10 @@
       (finally
         (if/close-kv lmdb)
         (u/delete-files dir)))))
+
+(defn- registered-shutdown-hooks
+  []
+  @(deref #'cpp/shutdown-hooks))
 
 (deftest basic-ops-test
   (let [dir  (u/tmp-dir (str "lmdb-test-" (UUID/randomUUID)))
@@ -782,6 +787,20 @@
         (finally
           (dc/close-db db)
           (u/delete-files dir))))))
+
+(deftest empty-db-close-unregisters-shutdown-hook-test
+  (let [baseline (count (registered-shutdown-hooks))
+        dirs     (repeatedly 8 #(u/tmp-dir (str "empty-db-hook-" (UUID/randomUUID))))]
+    (try
+      (doseq [dir dirs]
+        (let [db (dc/empty-db dir nil {:wal? false})]
+          (dc/close-db db)
+          (u/delete-files dir)))
+      (is (= baseline (count (registered-shutdown-hooks))))
+      (finally
+        (doseq [dir dirs]
+          (when (u/file-exists dir)
+            (u/delete-files dir)))))))
 
 (deftest open-again-resized-test
   (let [dir  (u/tmp-dir (str "again-resize-" (UUID/randomUUID)))

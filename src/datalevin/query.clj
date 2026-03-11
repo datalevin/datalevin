@@ -431,7 +431,7 @@
 (def ^:private tuple-producing-fns
   "Set of function symbols that produce tuples and can benefit from
    knowing which indices are needed."
-  #{'fulltext 'idoc-match 'vec-neighbors})
+  #{'fulltext 'idoc-match 'vec-neighbors 'embedding-neighbors})
 
 (extend-protocol IBinding
   BindIgnore
@@ -3907,29 +3907,32 @@
           all-vars      (concatv find-vars (map :symbol with))
 
           [parsed-q inputs] (plugin-inputs parsed-q inputs)
+          udf-db        (first (filter db/-searchable? inputs))
 
           context
-          (-> (Context. parsed-q [] {} {} [] nil nil nil nil
-                        (volatile! {}) true nil)
-              (resolve-ins inputs)
-              (resolve-redudants)
-              (rules/rewrite)
-              (rewrite-unused-vars)
-              (-q true)
-              (collect all-vars))
+          (binding [built-ins/*udf-db* udf-db]
+            (-> (Context. parsed-q [] {} {} [] nil nil nil nil
+                          (volatile! {}) true nil)
+                (resolve-ins inputs)
+                (resolve-redudants)
+                (rules/rewrite)
+                (rewrite-unused-vars)
+                (-q true)
+                (collect all-vars)))
           result
-          (cond->> (:result-set context)
-            with (mapv #(subvec % 0 result-arity))
+          (binding [built-ins/*udf-db* udf-db]
+            (cond->> (:result-set context)
+              with (mapv #(subvec % 0 result-arity))
 
-            (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
-            (aggregate find-elements context)
+              (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+              (aggregate find-elements context)
 
-            (seq having)
-            (apply-having having find-elements)
+              (seq having)
+              (apply-having having find-elements)
 
-            (some dp/pull? find-elements) (pull find-elements context)
+              (some dp/pull? find-elements) (pull find-elements context)
 
-            true (-post-process find (:qreturn-map parsed-q)))]
+              true (-post-process find (:qreturn-map parsed-q))))]
       (result-explain context result)
       (if-let [order (:qorder parsed-q)]
         (if (instance? FindRel find)
@@ -3942,6 +3945,16 @@
   changes invalidate query result cache."
   [qualified-fns]
   (into #{} (map #(some-> % resolve deref)) qualified-fns))
+
+(defn- query-uses-udf?
+  [parsed-q]
+  (boolean
+    (some #(= 'udf (some-> ^Function % :fn :symbol))
+          (dp/collect #(instance? Function %) (:qwhere parsed-q)))))
+
+(defn- udf-cache-token
+  [inputs]
+  (mapv #(when (db/-searchable? %) (db/udf-cache-token %)) inputs))
 
 (defn- query-cache-deps
   "Extract conservative dependencies for query-result cache invalidation.
@@ -4039,7 +4052,10 @@
                                   resolve-qualified-fns)
                           (dissoc :limit :offset))
             deps      (query-cache-deps parsed-q')
-            k         [:query-result deps parsed-q' (mapv cache-input-token inputs)]]
+            udf-token (when (query-uses-udf? parsed-q')
+                        (udf-cache-token inputs))
+            k         [:query-result deps parsed-q' udf-token
+                       (mapv cache-input-token inputs)]]
         (if-let [cached (db/cache-get store k)]
           cached
           (let [res (q* parsed-q inputs)]

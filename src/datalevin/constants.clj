@@ -94,7 +94,9 @@
                    :db/aid         1}
    :db/updated-at {:db/valueType   :db.type/long
                    :db/cardinality :db.cardinality/one
-                   :db/aid         2}})
+                   :db/aid         2}
+   :db/fn         {:db/aid         3}
+   :db/udf        {:db/aid         4}})
 
 (def ^:no-doc entity-time-schema
   {:db/created-at {:db/valueType   :db.type/long

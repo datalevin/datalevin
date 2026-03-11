@@ -1,8 +1,15 @@
 # Datalevin Vector Indexing and Similarity Search
 
-Datalevin has specialized index for equal-length dense numeric numbers
-(vectors), and supports efficient approximate nearest neighbors search
-on these vectors based on various similarity metrics.
+Datalevin supports two related but distinct similarity-search features:
+
+* `:db.type/vec` stores user-supplied dense numeric vectors and indexes them for
+  nearest-neighbor search.
+* `:db/embedding` indexes string datoms by embedding similarity. Datalevin
+  computes the vectors during transaction processing and queries return the
+  original source datoms.
+
+Both features use approximate nearest-neighbor search on equal-length dense
+numeric vectors.
 
 This functionality is developed on the basis of
 [usearch](https://github.com/unum-cloud/usearch) library, which is an
@@ -10,7 +17,7 @@ implementation of Hierarchical Navigable Small World (HNSW) graph algorithm [1].
 usearch leverages SIMD vector instructions in CPUs and is used in several OLAP
 stores, such as clickhouse, DuckDB, and so on.
 
-With this feature, Datalevin can be used as a vector database to support
+With these features, Datalevin can be used as a vector database to support
 applications such as semantic search, image search, retrieval augmented
 generation (RAG), and so on. This feature is currently available on Linux for
 both x86_64 and arm64 CPUs, and on MacOSX for arm64. Windows support is
@@ -139,6 +146,32 @@ id.
 ;=> ("king" "queen")
 ```
 
+### Standalone Text Embedding Providers
+
+Datalevin also exposes a small embedding-provider API for cases where
+applications want to embed text directly.
+
+```Clojure
+(require '[datalevin.core :as d])
+
+(with-open [provider (d/new-embedding-provider
+                       {:provider :default
+                        :dir      "/tmp/mydb"})]
+  ;; initialize lazily on first use
+  (d/embedding-dimensions provider)
+  ;; stable metadata about the embedding space
+  (d/embedding-metadata provider)
+  ;; embed one or more texts
+  (d/embed-text provider "hello world")
+  (d/embed-texts provider ["hello world" "bonjour le monde"]))
+```
+
+The built-in default provider uses the local llama.cpp embedder bundled in
+`dtlvnative`. If `:model` or `:model-path` is not supplied, Datalevin expects
+the default model `multilingual-e5-small-Q8_0.gguf` under `dir/embed/`, where
+`dir` is the DB root. If the file is missing, Datalevin downloads it from
+Hugging Face on first use.
+
 ### Vector Indexing and Search in Datalog Store
 
 Vectors can be stored in Datalog as attribute values of data type
@@ -191,10 +224,119 @@ In the above example, we destructure the results into three variables,
 
 The search can be specific to an attribute, or specific to a list of domains.
 
+### Embedding Indexing and Search in Datalog Store
+
+Embedding indexing is distinct from `:db.type/vec`. With `:db/embedding`,
+Datalevin keeps the original text datoms as the source of truth and maintains a
+secondary vector index over them. No hidden vector attributes are generated.
+
+An embedding-enabled attribute must be a string attribute:
+
+```Clojure
+{:doc/text {:db/valueType            :db.type/string
+            :db/embedding            true
+            :db.embedding/domains    ["docs"]
+            :db.embedding/autoDomain true}}
+```
+
+Embedding schema keys:
+
+* `:db/embedding` enables embedding indexing for the source attribute.
+* `:db.embedding/domains` adds the attribute to one or more embedding domains.
+* `:db.embedding/autoDomain true` adds an attribute-specific domain derived
+  from the attribute name. This is required for attribute-specific query syntax.
+
+Embedding domains use the same attribute-to-domain naming rule as vector
+domains:
+
+* `:text` -> `"text"`
+* `:doc/text` -> `"doc_text"`
+
+Store options for embedding search are separate from vector options:
+
+```Clojure
+{:embedding-opts
+ {:provider    :default
+  :metric-type :cosine}
+
+ :embedding-domains
+ {"docs" {:provider    :default
+          :metric-type :cosine}}}
+```
+
+`:embedding-opts` gives defaults for embedding domains. `:embedding-domains`
+configures per-domain overrides. `:embedding-providers` is an optional
+runtime-only map from provider ids to either provider instances or provider
+specs; it is not persisted in LMDB.
+
+The built-in default provider is `:default` (also available as `:llama.cpp`).
+It uses the local GGUF model described above and resolves the default model path
+relative to the DB root.
+
+```Clojure
+(let [conn (d/create-conn
+             "/tmp/mydb"
+             {:doc/id   {:db/valueType :db.type/string
+                         :db/unique    :db.unique/identity}
+              :doc/text {:db/valueType            :db.type/string
+                         :db/embedding            true
+                         :db.embedding/domains    ["docs"]
+                         :db.embedding/autoDomain true}
+              :doc/tag  {:db/valueType   :db.type/string
+                         :db/cardinality :db.cardinality/many
+                         :db/embedding   true}}
+             {:embedding-opts {:provider    :default
+                               :metric-type :cosine}})]
+  ;; first use loads the model lazily and downloads it into
+  ;; /tmp/mydb/embed/ if it is not already present
+  (d/transact! conn [{:doc/id   "cat-1"
+                      :doc/text "red cat"
+                      :doc/tag  ["pet cat" "feline friend"]}
+                     {:doc/id   "cat-2"
+                      :doc/text "kitten animal"
+                      :doc/tag  ["small pet"]}
+                     {:doc/id   "dog-1"
+                      :doc/text "friendly dog"
+                      :doc/tag  ["canine pal"]}])
+
+  ;; search an explicit embedding domain by query text
+  (d/q '[:find [?id ...]
+         :in $ ?q
+         :where
+         [(embedding-neighbors $ ?q {:domains ["docs"] :top 2})
+          [[?e _ _]]]
+         [?e :doc/id ?id]]
+       (d/db conn) "cat")
+
+  ;; search the attribute-specific embedding domain
+  (d/q '[:find ?id .
+         :in $ ?q
+         :where
+         [(embedding-neighbors $ :doc/text ?q {:top 1}) [[?e _ _]]]
+         [?e :doc/id ?id]]
+       (d/db conn) "cat"))
+;;=> "cat-1"
+```
+
+`embedding-neighbors` returns source datom tuples in the form of `[e a v]`, or
+`[e a v dist]` when `:display :refs+dists` is used.
+
+Important rules:
+
+* The query input to `embedding-neighbors` is text, not a vector.
+* Domain-based search requires `:domains` in the option map.
+* Attribute-specific search requires `:db.embedding/autoDomain true` on that
+  attribute.
+* If an embedding attribute does not specify `:db.embedding/domains`, it
+  participates in the default embedding domain `"datalevin"`.
+* `:db/embedding` may coexist with `:db/fulltext` on the same attribute.
+* Changing embedding-related schema on a populated attribute is rejected and
+  requires an explicit rebuild workflow.
+
 
 ### Search Configurations
 
-#### Search options
+#### Search options for vector search
 
 `search-vec` and `vec-neighbors` functions support an option map that can be
 passed at run time to customize search:
@@ -206,6 +348,17 @@ passed at run time to customize search:
 * `:vec-filter` is a boolean function that takes `vec-ref` and determine if to
   return it.
 * `:domains` specifies a list of domains to be searched (see below).
+
+#### Search options for embedding search
+
+`embedding-neighbors` supports the same `:top` and `:display` options:
+
+* `:top` is the number of results desired, default is 10
+* `:display` controls the result shape:
+  - `:refs` returns `[e a v]`, the default.
+  - `:refs+dists` returns `[e a v dist]`.
+* `:domains` specifies a list of embedding domains to search when using the
+  domain-based form of `embedding-neighbors`.
 
 #### Vector search domains
 
@@ -237,6 +390,24 @@ the domains an attribute participate in all have the same vector dimensions.
 
 During search, `:domains` can be added to the option map to specify the
 domains to be searched.
+
+#### Embedding domains and providers
+
+Embedding domains are configured separately from vector domains. Each embedding
+domain is backed by its own vector index and is associated with an embedding
+provider and vector-search parameters such as `:metric-type` and
+`:dimensions`.
+
+When opening a Datalog store:
+
+* `:embedding-opts` provides default settings for embedding domains.
+* `:embedding-domains` provides per-domain overrides.
+* `:embedding-providers` supplies runtime-only provider implementations or
+  provider specs.
+
+If a configured embedding domain references a provider that is not available at
+runtime, opening the store fails. If a domain has stored dimensions that do not
+match the runtime provider, opening the store also fails.
 
 ## References
 

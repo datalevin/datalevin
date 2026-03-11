@@ -30,7 +30,7 @@
     TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
-(declare closed? shutdown-transact-async-executor!
+(declare closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
 
 (defn conn?
@@ -41,6 +41,7 @@
   [db]
   {:pre [(db/db? db)]}
   (atom db :meta {:listeners (atom {})
+                  :runtime-opts (db/runtime-opts db)
                   :sync-queue-pending (AtomicLong. 0)
                   :sync-queue-last-enqueue-ms (AtomicLong. 0)}))
 
@@ -58,10 +59,21 @@
 
 (defn close
   [conn]
-  (when (and conn (not (closed? conn)))
-    (when-let [store (.-store ^DB @conn)]
-      (i/close ^Store store))
-    (shutdown-transact-async-executor-if-idle!))
+  (when conn
+    (try
+      (when-not (closed? conn)
+        (when-let [store (.-store ^DB @conn)]
+          (i/close store)))
+      (finally
+        (when (closed? conn)
+          (remove-conn (:dir (meta conn)) conn)
+          (when-let [listeners (:listeners (meta conn))]
+            (when (instance? clojure.lang.IAtom listeners)
+              (reset! listeners {})))
+          (when (instance? clojure.lang.IAtom conn)
+            (reset! conn nil))
+          (alter-meta! conn dissoc :dir :remote-store-opts-cache))
+        (shutdown-transact-async-executor-if-idle!))))
   nil)
 
 (defn closed?
@@ -111,7 +123,7 @@
                                    ~c/+in-tx-overflow-times+
                                    l/resized? (w#))
                                (finally (r/close-transact s#)))))
-                 new-db# (db/new-db s#)]
+                 new-db# (db/carry-runtime-opts (db/new-db s#) db#)]
              (reset! ~orig-conn new-db#)
              (when-not old# (db/enable-cache s#))
              res#))
@@ -126,7 +138,7 @@
                            (vreset! s1# (.-store ^DB (deref conn1#)))
                            res#))
                new-s#  (s/transfer (deref s1#) kv#)
-               new-db# (db/new-db new-s#)]
+               new-db# (db/carry-runtime-opts (db/new-db new-s#) db#)]
            (reset! ~orig-conn new-db#)
            (when-not old# (db/enable-cache new-s#))
            res1#)))))
@@ -164,7 +176,7 @@
                        c/+in-tx-overflow-times+
                        l/resized?
                        (with db tx-data tx-meta))]
-          (reset! conn (:db-after report))
+          (reset! conn (db/carry-runtime-opts (:db-after report) db))
           (assoc report :db-after @conn))
         (finally
           (when-not old
@@ -434,9 +446,20 @@
 
 (defn- add-conn [dir conn] (swap! connections assoc dir conn))
 
+(defn- remove-conn
+  [dir conn]
+  (when dir
+    (swap! connections
+           (fn [m]
+             (if (identical? (get m dir) conn)
+               (dissoc m dir)
+               m))))
+  nil)
+
 (defn- new-conn
   [dir schema opts]
   (let [conn (create-conn dir schema opts)]
+    (alter-meta! conn assoc :dir dir)
     (add-conn dir conn)
     conn))
 
@@ -496,9 +519,11 @@
   ([dir schema]
    (get-conn dir schema nil))
   ([dir schema opts]
-   (if-let [c (get @connections dir)]
-     (if (closed? c) (new-conn dir schema opts) c)
-     (new-conn dir schema opts))))
+   (if (and (map? opts) (contains? opts :runtime-opts))
+     (create-conn dir schema opts)
+     (if-let [c (get @connections dir)]
+       (if (closed? c) (new-conn dir schema opts) c)
+       (new-conn dir schema opts)))))
 
 (defmacro with-conn
   "Evaluate body in the context of an connection to the Datalog database.

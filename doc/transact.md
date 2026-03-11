@@ -163,6 +163,56 @@ store the function in the database, so this is usable in embedded mode, where
 that function is available in user code to call and that function can be a
 regular Clojure function.
 
+For non-Clojure runtimes, Datalevin also supports descriptor-backed UDFs with
+`:db/udf`. In this mode the database stores data describing the function rather
+than executable code. The actual implementation is provided by a transient
+runtime registry when the database is opened.
+
+The minimal descriptor keys are:
+
+* `:udf/lang`
+* `:udf/kind`
+* `:udf/id`
+
+Transaction UDFs use `:udf/kind :tx-fn`.
+
+```clojure
+(require '[datalevin.core :as d]
+         '[datalevin.udf :as udf])
+
+(def descriptor {:udf/lang :java
+                 :udf/kind :tx-fn
+                 :udf/id   :user/bootstrap})
+
+(def registry
+  (doto (udf/create-registry)
+    (udf/register! descriptor
+      (fn [_db name]
+        [{:db/id -1 :user/name name}]))))
+
+(def conn
+  (d/create-conn
+    "/tmp/testdb"
+    {:user/name {:db/valueType :db.type/string
+                 :db/unique    :db.unique/identity}}
+    {:runtime-opts {:udf-registry registry}}))
+
+;; inline descriptor call
+(d/transact! conn [[:db.fn/call descriptor "Ada"]])
+
+;; installed descriptor
+(d/transact! conn [{:db/ident :user/bootstrap
+                    :db/udf   descriptor}])
+
+;; installed transaction UDFs can be called by their :db/ident
+(d/transact! conn [[:user/bootstrap "Bob"]])
+```
+
+In embedded mode, `:db.fn/call` can still take a regular Clojure function. In
+client/server mode, atomic transaction UDFs execute on the server, so the
+server process must have the corresponding runtime registry or resolver
+configured. See [server](server.md).
+
 For usage examples, see tests in `datalevin.test.transact`.
 
 ## Bulk Load Data into Datalog Store

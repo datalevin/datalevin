@@ -18,6 +18,7 @@
    [datalevin.buffer :as bf]
    [datalevin.query :as q]
    [datalevin.db :as db]
+   [datalevin.udf :as udf]
    [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
@@ -492,6 +493,30 @@
     (instance? ILMDB store)  (i/close-kv store)
     :else                    (u/raise "Unknown store" {})))
 
+(declare store-closed?)
+
+(defn- reopen-store
+  [store]
+  (cond
+    (instance? IStore store)
+    (st/open (i/dir store) (i/schema store) (i/opts store))
+
+    (instance? ILMDB store)
+    (l/open-kv (i/env-dir store) (i/env-opts store))
+
+    :else
+    (u/raise "Unknown store" {})))
+
+(defn- closed-store-race?
+  [t store]
+  (or (try
+        (store-closed? store)
+        (catch Throwable _
+          true))
+      (and t
+           (s/includes? (or (ex-message t) "")
+                        "LMDB env is closed"))))
+
 (defn- has-permission?
   [req-act req-obj req-tgt user-permissions]
   (some (fn [{:keys [permission/act permission/obj permission/tgt] :as p}]
@@ -625,8 +650,28 @@
 
 (defn- get-store
   ([^Server server db-name writing?]
-   (some-> (get-in (.-dbs server) [db-name (if writing? :wstore :store)])
-           (#(when-not (store-closed? %) %))))
+   (let [m (get (.-dbs server) db-name)
+         usable-store
+         (fn [store]
+           (when-not
+             (try
+               (cond
+                 (nil? store) true
+                 (instance? IStore store) (i/closed? store)
+                 (instance? ILMDB store) (i/closed-kv? store)
+                 :else true)
+               (catch Throwable _
+                 true))
+             store))
+         runtime-store
+         (fn [dt-db]
+           (when (instance? DB dt-db)
+             (usable-store (.-store ^DB dt-db))))]
+     (if writing?
+       (or (usable-store (:wstore m))
+           (runtime-store (:wdt-db m)))
+       (or (usable-store (:store m))
+           (runtime-store (:dt-db m))))))
   ([server db-name]
    (get-store server db-name false)))
 
@@ -658,6 +703,152 @@
                    next)))
     {:updated? @updated?
      :state @final-v}))
+
+(def ^:dynamic *server-runtime-opts-fn*
+  (fn [_ _ _ _] nil))
+
+(defn- current-runtime-opts
+  [m]
+  (or (:runtime-opts m)
+      (some-> (:dt-db m) db/runtime-opts)
+      (some-> (:wdt-db m) db/runtime-opts)
+      {}))
+
+(defn- resolved-runtime-opts
+  [server db-name store m]
+  (let [current  (current-runtime-opts m)
+        resolved (*server-runtime-opts-fn* server db-name store m)]
+    (cond
+      (and (map? current) (map? resolved))
+      (merge current resolved)
+
+      (map? resolved)
+      resolved
+
+      :else
+      current)))
+
+(defn- attach-runtime-opts
+  [dt-db runtime-opts]
+  (cond-> dt-db
+    (seq runtime-opts) (db/with-runtime-opts runtime-opts)))
+
+(defn- new-runtime-db
+  [store runtime-opts]
+  (attach-runtime-opts (db/new-db store) runtime-opts))
+
+(def ^:private installed-udf-query
+  '[:find ?ident ?descriptor
+    :where
+    [?e :db/ident ?ident]
+    [?e :db/udf ?descriptor]])
+
+(defn- udf-readiness-required?
+  [m]
+  (true? (:ha-require-udf-ready? (current-runtime-opts m))))
+
+(defn- udf-readiness-token
+  [m dt-db]
+  [(db/udf-cache-token dt-db)
+   (long (or (:max-tx dt-db)
+             (some-> (:store m) i/max-tx)
+             0))])
+
+(defn- installed-tx-udfs
+  [dt-db]
+  (keep
+    (fn [[ident descriptor]]
+      (let [descriptor (udf/descriptor descriptor)]
+        (when (= :tx-fn (:udf/kind descriptor))
+          {:db/ident ident
+           :descriptor descriptor})))
+    (d/q installed-udf-query dt-db)))
+
+(defn- compute-udf-readiness
+  [m dt-db]
+  (let [registry (db/udf-registry dt-db)
+        context  {:db        dt-db
+                  :kind      :tx-fn
+                  :embedded? true
+                  :store     (:store m)}
+        missing  (reduce
+                   (fn [acc {:keys [db/ident descriptor]}]
+                     (try
+                       (udf/materialize registry context descriptor)
+                       acc
+                       (catch Throwable t
+                         (conj acc {:db/ident   ident
+                                    :descriptor descriptor
+                                    :error      (or (:error (ex-data t))
+                                                    :udf/not-found)}))))
+                   []
+                   (installed-tx-udfs dt-db))]
+    {:udf-ready? false
+     :udf-missing missing}))
+
+(defn- ensure-udf-readiness-state
+  [m]
+  (if-not (udf-readiness-required? m)
+    m
+    (let [runtime-opts (current-runtime-opts m)
+          dt-db        (or (:dt-db m)
+                           (when-let [store (:store m)]
+                             (new-runtime-db store runtime-opts)))]
+      (if-not dt-db
+        m
+        (let [token (udf-readiness-token m dt-db)]
+          (if (= token (:udf-readiness-token m))
+            (cond-> m
+              (nil? (:dt-db m)) (assoc :dt-db dt-db))
+            (let [{:keys [udf-ready? udf-missing]}
+                  (let [result (compute-udf-readiness m dt-db)]
+                    (if (empty? (:udf-missing result))
+                      {:udf-ready? true :udf-missing []}
+                      result))]
+              (cond-> (assoc m
+                             :udf-ready? udf-ready?
+                             :udf-missing udf-missing
+                             :udf-readiness-token token)
+                (nil? (:dt-db m)) (assoc :dt-db dt-db)))))))))
+
+(defn- udf-write-admission-error
+  [db-name m]
+  (when (and (:ha-authority m)
+             (= :leader (:ha-role m))
+             (udf-readiness-required? m)
+             (false? (:udf-ready? m)))
+    (let [owner-node-id (:ha-authority-owner-node-id m)
+          owner-endpoint (or (get-in m [:ha-authority-lease :leader-endpoint])
+                             (some->> (:ha-members m)
+                                      (filter #(= owner-node-id
+                                                  (:node-id %)))
+                                      first
+                                      :endpoint))
+          ordered-endpoints
+          (into []
+                (comp
+                 (map :endpoint)
+                 (remove nil?)
+                 (remove s/blank?))
+                (sort-by :node-id (:ha-members m)))
+          retry-endpoints
+          (->> (cond-> []
+                 (and (string? owner-endpoint)
+                      (not (s/blank? owner-endpoint)))
+                 (conj owner-endpoint)
+                 :always
+                 (into ordered-endpoints))
+               distinct
+               vec)]
+      {:error                        :ha/write-rejected
+       :reason                       :udf-not-ready
+       :retryable?                   false
+       :db-name                      db-name
+       :ha-role                      (:ha-role m)
+       :ha-retry-endpoints           retry-endpoints
+       :ha-authoritative-leader-endpoint owner-endpoint
+       :ha-authoritative-leader-node-id owner-node-id
+       :udf-missing                  (:udf-missing m)})))
 
 (defn- consensus-ha-opts
   [store]
@@ -895,7 +1086,11 @@
 
 (defn- ha-write-admission-error
   [^Server server message]
-  (dha/ha-write-admission-error (.-dbs server) message))
+  (let [db-name (nth (:args message) 0 nil)
+        m       (when (and db-name (contains? (.-dbs server) db-name))
+                  (update-db server db-name ensure-udf-readiness-state))]
+    (or (and db-name (udf-write-admission-error db-name m))
+        (dha/ha-write-admission-error (.-dbs server) message))))
 
 (defn- ensure-ha-runtime
   [root db-name m store]
@@ -909,12 +1104,60 @@
     (stop-ha-runtime db-name m)))
 
 (defn- add-store
-  [^Server server db-name store]
-  (update-db server db-name
-             #(let [m (cond-> (assoc % :store store)
-                        (instance? IStore store) (assoc :dt-db (db/new-db store)))]
-                (ensure-ha-runtime (.-root server) db-name m store)))
-  (ensure-ha-renew-loop server db-name))
+  ([server db-name store]
+   (add-store server db-name store true))
+  ([^Server server db-name store activate-runtime?]
+   (letfn [(add-store* [store]
+             (let [published-store-v (volatile! store)]
+               (update-db
+                 server db-name
+                 (fn [m]
+                   (let [dt-db ^DB (:dt-db m)
+                         runtime-store
+                         (when (instance? DB dt-db)
+                           (.-store dt-db))
+                         published-store
+                         (if (and (not activate-runtime?)
+                                  (some? runtime-store)
+                                  (not (store-closed? runtime-store))
+                                  (not (identical? runtime-store store)))
+                           runtime-store
+                           store)
+                         _            (vreset! published-store-v
+                                               published-store)
+                         runtime-opts (resolved-runtime-opts
+                                        server db-name published-store m)
+                         next-m       (assoc m
+                                             :store published-store
+                                             :runtime-opts runtime-opts)
+                         next-m       (cond-> next-m
+                                        (and activate-runtime?
+                                             (instance? IStore
+                                                        published-store))
+                                        (assoc :dt-db
+                                               (new-runtime-db
+                                                 published-store
+                                                 runtime-opts)))]
+                     (if activate-runtime?
+                       (ensure-ha-runtime
+                         (.-root server) db-name next-m published-store)
+                       next-m))))
+               (when (and (not (identical? @published-store-v store))
+                          (not (store-closed? store)))
+                 (close-store store))
+               (ensure-ha-renew-loop server db-name)
+               @published-store-v))
+          (attempt-add-store [store retries]
+            (try
+              (add-store* store)
+              (catch Throwable t
+                (if (and (pos? retries)
+                         (closed-store-race? t store))
+                  (do
+                    (Thread/sleep 50)
+                    (attempt-add-store (reopen-store store) (dec retries)))
+                  (throw t)))))]
+     (attempt-add-store store 3))))
 
 (defn- get-db
   ([server db-name]
@@ -1452,6 +1695,11 @@
               :database/type)
       requested-db-type))
 
+(defn- activate-runtime-on-open?
+  [requested-db-type actual-db-type]
+  (not (and (= requested-db-type c/kv-type)
+            (= actual-db-type c/dl-type))))
+
 (defn- reusable-store-for-db-type
   [store schema db-type]
   (case db-type
@@ -1490,7 +1738,7 @@
   "Open a store. NB. stores are left open"
   [^Server server ^SelectionKey skey
    {:keys [db-name schema opts return-db-info? respond?]
-    :or   {respond? true}} db-type]
+    :or   {respond? true}} requested-db-type]
   (wrap-error
     (let [{:keys [client-id]} @(.attachment skey)
           {:keys [username]}  (get-client server client-id)
@@ -1506,7 +1754,10 @@
         (locking (db-open-lock server db-name)
           (let [dir              (db-dir (.-root server) db-name)
                 existing-db-now? (db-exists? server db-name)
-                db-type          (effective-db-type server db-name db-type)
+                db-type          (effective-db-type
+                                   server db-name requested-db-type)
+                activate-runtime? (activate-runtime-on-open?
+                                    requested-db-type db-type)
                 store            (or (some-> (get-store server db-name)
                                              (reusable-store-for-db-type
                                                schema db-type))
@@ -1520,14 +1771,16 @@
                                                 server db-name schema db-type)
                                                (throw e))
                                            (throw e)))))
-                datalog?         (instance? Store store)]
-            (add-store server db-name store)
+                 store            (add-store
+                                    server db-name store activate-runtime?)
+                 datalog?         (instance? Store store)]
             (update-client server client-id
                            #(cond-> %
                               true     (update :stores assoc db-name
                                                {:datalog? datalog?
                                                 :dbis     #{}})
-                              datalog? (update :dt-dbs conj db-name)))
+                              (and datalog? activate-runtime?)
+                              (update :dt-dbs conj db-name)))
             (when-not existing-db-now?
               (transact-new-db sys-conn username db-type db-name)
               (update-client server client-id
@@ -1604,9 +1857,15 @@
             (log/info "Skipping automatic reopen of consensus HA database"
                       {:db-name db-name
                        :root root}))
-          (let [next-m (ensure-ha-runtime root db-name
-                                          (assoc m :store store)
-                                          store)]
+          (let [runtime-opts (resolved-runtime-opts nil db-name store m)
+                next-m (ensure-ha-runtime
+                         root db-name
+                         (cond-> (assoc m
+                                        :store store
+                                        :runtime-opts runtime-opts)
+                           datalog?
+                           (assoc :dt-db (new-runtime-db store runtime-opts)))
+                         store)]
             (.put dbs db-name next-m)))))
     (doseq [db-name engines
             :when   (and (not (get-in dbs [db-name :engine]))
@@ -1628,7 +1887,8 @@
             :let    [m (get dbs db-name {})]]
       (.put dbs db-name
             (assoc m :dt-db
-                   (db/new-db (get-in dbs [db-name :store])))))))
+                   (new-runtime-db (get-in dbs [db-name :store])
+                                   (current-runtime-opts m)))))))
 
 (defn- authenticate
   [^Server server ^SelectionKey skey {:keys [username password]}]
@@ -2272,7 +2532,9 @@
     (d/with db txs {} s?)
     (catch Exception e
       (when (:resized (ex-data e))
-        (let [^DB new-db (db/new-db (get-store server db-name writing?))]
+        (let [^DB new-db (db/carry-runtime-opts
+                           (db/new-db (get-store server db-name writing?))
+                           db)]
           (update-db server db-name
                      #(assoc % (if writing? :wdt-db :dt-db)
                              new-db))))
@@ -2731,7 +2993,9 @@
                 server db-name #(assoc %
                                        :wlmdb wlmdb
                                        :wstore wstore
-                                       :wdt-db (db/new-db wstore)))
+                                       :wdt-db (new-runtime-db
+                                                 wstore
+                                                 (current-runtime-opts %))))
               (write-message skey {:type :command-complete})
               (run-calls runner))))))))
 

@@ -21,6 +21,7 @@
    [datalevin.scan :as scan :refer [visit-list*]]
    [datalevin.search :as s]
    [datalevin.idoc :as idoc]
+   [datalevin.embedding :as emb]
    [datalevin.vector :as v]
    [datalevin.prepare :as prep]
    [datalevin.constants :as c]
@@ -39,11 +40,11 @@
             list-range-some list-range-keep visit-list-range
             max-gt advance-max-gt max-tx
             open-list-dbi open-dbi attrs add-doc remove-doc opts env-opts kv-info swap-attr
-            add-vec remove-vec schema closed? a-size db-name populated?
+            add-vec remove-vec close-vecs vec-closed? schema closed? a-size db-name populated?
             get-env-flags set-env-flags]]
    [clojure.string :as str])
   (:import
-   [java.util List Comparator Collection HashMap UUID]
+   [java.util List Comparator Collection HashMap IdentityHashMap UUID]
    [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap
     ScheduledFuture]
    [java.util.concurrent.locks ReentrantReadWriteLock]
@@ -140,13 +141,19 @@
 
 (defn- init-schema
   [lmdb schema]
-  (when (empty? (load-schema lmdb))
-    (transact-schema lmdb c/implicit-schema))
+  (let [now     (load-schema lmdb)
+        missing (reduce-kv
+                  (fn [acc attr props]
+                    (if (contains? now attr) acc (assoc acc attr props)))
+                  {} c/implicit-schema)]
+    (cond
+      (empty? now)
+      (transact-schema lmdb c/implicit-schema)
+
+      (seq missing)
+      (transact-schema lmdb (update-schema now missing))))
   (when schema
     (transact-schema lmdb (update-schema (load-schema lmdb) schema)))
-  (let [now (load-schema lmdb)]
-    (when-not (now :db/created-at)
-      (transact-schema lmdb (update-schema now c/entity-time-schema))))
   (load-schema lmdb))
 
 (defn- init-attrs [schema]
@@ -416,7 +423,9 @@
       (when (= ^int aid ^int (b/read-buffer bf :int))
         (b/read-buffer (.rewind bf) :avg)))))
 
-(declare insert-datom delete-datom fulltext-index vector-index idoc-index check
+(declare insert-datom delete-datom fulltext-index vector-index embedding-index
+         idoc-index check
+         load-datoms-with-plan! prepare-embedding-plan
          prepare-datoms-kv-plan
          commit-datoms-kv-plan!
          migrate-attr-values transact-opts ->SamplingWork e-sample*
@@ -425,7 +434,9 @@
 (deftype Store [lmdb
                 search-engines
                 vector-indices
+                embedding-indices
                 idoc-indices
+                embedding-providers
                 ^ConcurrentHashMap counts   ; aid -> touched times
                 ^:volatile-mutable opts
                 ^:volatile-mutable schema
@@ -465,6 +476,14 @@
       (.lock wlock)
       (try
         (.stop-sampling this)
+        (doseq [index (vals vector-indices)]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [index (vals embedding-indices)]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [provider (vals embedding-providers)]
+          (emb/close-provider provider))
         (close-kv lmdb)
         (finally
           (.unlock wlock)))))
@@ -570,10 +589,7 @@
     (entries lmdb (if (string? index) index (index->dbi index))))
 
   (load-datoms [this datoms]
-    (locking write-txn
-      (->> (prepare-datoms-kv-plan this datoms)
-           (commit-datoms-kv-plan!
-             lmdb search-engines vector-indices idoc-indices))))
+    (load-datoms-with-plan! this datoms nil))
 
   (fetch [_ datom]
     (mapv #(retrieved->datom lmdb attrs %)
@@ -1096,6 +1112,16 @@
       :g (add-vec index [:g (nth d 0)] (peek d))
       :r (remove-vec index [:g d]))))
 
+(defn embedding-index
+  [embedding-indices em-ds]
+  (doseq [res em-ds
+          :let [[domain op] res
+                index       (embedding-indices domain)]]
+    (case (nth op 0)
+      :a (let [[doc-ref vec-data] (nth op 1)]
+           (add-vec index doc-ref vec-data))
+      :d (remove-vec index (nth op 1)))))
+
 (defn idoc-index
   [idoc-indices id-ds]
   (let [updates (volatile! {})
@@ -1303,9 +1329,120 @@
              (props :db.fulltext/autoDomain) (conj (u/keyword->string attr)))
            op])))
 
+(defn- embedding-attr-domains
+  [attr props]
+  (vec
+    (distinct
+      (cond-> (or (seq (props :db.embedding/domains))
+                  [c/default-domain])
+        (props :db.embedding/autoDomain) (conj (v/attr-domain attr))))))
+
+(defn embedding-domain-config
+  [^Store store domain]
+  (get-in (opts store) [:embedding-domains domain]))
+
+(defn embedding-provider
+  [^Store store domain]
+  (or (get-in (opts store) [:embedding-domain-providers domain])
+      ((.-embedding-providers store) domain)))
+
+(defn embedding-index-by-domain
+  [^Store store domain]
+  ((.-embedding-indices store) domain))
+
+(defn- vector-dim
+  [vec-data]
+  (cond
+    (u/array? vec-data)
+    (java.lang.reflect.Array/getLength vec-data)
+
+    (instance? java.util.List vec-data)
+    (.size ^java.util.List vec-data)
+
+    (sequential? vec-data)
+    (count vec-data)
+
+    :else
+    (u/raise "Embedding provider returned an unsupported vector value"
+             {:vector vec-data})))
+
+(defn- ensure-embedding-vector!
+  [domain expected-dimensions vec-data]
+  (let [dimensions (vector-dim vec-data)]
+    (when (and expected-dimensions
+               (not= (long expected-dimensions) (long dimensions)))
+      (u/raise "Embedding vector dimensions do not match domain configuration"
+               {:domain              domain
+                :expected-dimensions expected-dimensions
+                :actual-dimensions   dimensions}))
+    vec-data))
+
+(defn prepare-embedding-plan
+  [^Store store datoms]
+  (let [schema  (schema store)
+        batches (reduce
+                  (fn [m ^Datom datom]
+                    (let [attr  (.-a datom)
+                          props (schema attr)
+                          v     (.-v datom)]
+                      (if (and props
+                               (props :db/embedding)
+                               (d/datom-added datom)
+                               (string? v))
+                        (reduce
+                          (fn [m domain]
+                            (update m domain conj
+                                    {:datom datom
+                                     :text  v
+                                     :attr  attr
+                                     :ref   [(.-e datom) attr v]
+                                     :kind  :document
+                                     :domain domain}))
+                          m
+                          (embedding-attr-domains attr props))
+                        m)))
+                  {}
+                  datoms)]
+    (when (seq batches)
+      (let [plan (IdentityHashMap.)]
+        (doseq [[domain items] batches
+                :let [provider    (or (embedding-provider store domain)
+                                      (u/raise "Embedding provider is not initialized"
+                                               {:domain domain}))
+                      dimensions (get-in (embedding-domain-config store domain)
+                                         [:dimensions])
+                      vectors    (emb/embedding provider
+                                                (mapv #(dissoc % :datom) items)
+                                                nil)]]
+          (when-not (= (count items) (count vectors))
+            (u/raise "Embedding provider returned the wrong number of vectors"
+                     {:domain  domain
+                      :items   (count items)
+                      :vectors (count vectors)}))
+          (doseq [[item vec-data] (map vector items vectors)]
+            (let [datom      (:datom item)
+                  domain-map (or (.get plan datom)
+                                 (let [m (HashMap.)]
+                                   (.put plan datom m)
+                                   m))]
+              (.put ^HashMap domain-map domain
+                    (ensure-embedding-vector! domain dimensions vec-data)))))
+        plan))))
+
+(defn load-datoms-with-plan!
+  [^Store store datoms embedding-plan]
+  (locking (.-write-txn store)
+    (->> (prepare-datoms-kv-plan store datoms embedding-plan)
+         (commit-datoms-kv-plan!
+           (.-lmdb store)
+           (.-search-engines store)
+           (.-vector-indices store)
+           (.-embedding-indices store)
+           (.-idoc-indices store)))))
+
 (defn- insert-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
-   ^FastList id-ds ^HashMap giants]
+   ^FastList em-ds ^FastList id-ds ^HashMap giants embedding-plan]
   (let [schema (schema store)
         opts   (opts store)
         attr   (.-a d)
@@ -1331,6 +1468,12 @@
     (when (identical? vt :db.type/vec)
       (.add vi-ds [(conjv (props :db.vec/domains) (v/attr-domain attr))
                    (if giant? [:g [max-gt v]] [:a [e aid v]])]))
+    (when (props :db/embedding)
+      (let [doc-ref     (if giant? [:g max-gt] [e aid v])
+            domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
+        (doseq [domain (embedding-attr-domains attr props)]
+          (when-let [vec-data (some-> ^HashMap domain-vecs (.get domain))]
+            (.add em-ds [domain [:a [doc-ref vec-data]]])))))
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (let [op    (if giant?
@@ -1346,7 +1489,7 @@
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
-   ^FastList id-ds ^HashMap giants]
+   ^FastList em-ds ^FastList id-ds ^HashMap giants]
   (let [schema (schema store)
         e      (.-e d)
         attr   (.-a d)
@@ -1372,6 +1515,10 @@
     (when (props :db/fulltext)
       (let [v (str v)]
         (collect-fulltext ft-ds attr props v (if gt [:r gt] [:d [e aid v]]))))
+    (when (props :db/embedding)
+      (let [doc-ref (if gt [:g gt] [e aid v])]
+        (doseq [domain (embedding-attr-domains attr props)]
+          (.add em-ds [domain [:d doc-ref]]))))
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (.add id-ds [domain
@@ -1391,21 +1538,26 @@
 (defn- prepare-datoms-kv-plan
   "Prepare KV write plan for a datom batch.
    This is an extraction step toward sharing DL/KV commit flow."
-  [^Store store datoms]
+  ([^Store store datoms]
+   (prepare-datoms-kv-plan store datoms nil))
+  ([^Store store datoms embedding-plan]
   (let [txs    (FastList. (* 3 (count datoms)))
         ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
         ;; or [:r d gt]
         ft-ds  (FastList.)
         ;; vector, same
         vi-ds  (FastList.)
+        ;; embedding [:a [doc-ref vec]], [:d doc-ref]
+        em-ds  (FastList.)
         ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
         ;; or [:r d [gt v]]
         id-ds  (FastList.)
         giants (HashMap.)]
     (doseq [datom datoms]
       (if (d/datom-added datom)
-        (insert-datom store datom txs ft-ds vi-ds id-ds giants)
-        (delete-datom store datom txs ft-ds vi-ds id-ds giants)))
+        (insert-datom store datom txs ft-ds vi-ds em-ds id-ds giants
+                      embedding-plan)
+        (delete-datom store datom txs ft-ds vi-ds em-ds id-ds giants)))
     (.add txs (lmdb/kv-tx :put c/meta :max-tx
                           (.advance-max-tx store) :attr :long))
     (.add txs (lmdb/kv-tx :put c/meta :last-modified
@@ -1413,14 +1565,16 @@
     {:txs txs
      :ft-ds ft-ds
      :vi-ds vi-ds
-     :id-ds id-ds}))
+     :em-ds em-ds
+     :id-ds id-ds})))
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."
-  [lmdb search-engines vector-indices idoc-indices
-   {:keys [txs ft-ds vi-ds id-ds]}]
+  [lmdb search-engines vector-indices embedding-indices idoc-indices
+   {:keys [txs ft-ds vi-ds em-ds id-ds]}]
   (fulltext-index search-engines ft-ds)
   (vector-index vector-indices vi-ds)
+  (embedding-index embedding-indices em-ds)
   (idoc-index idoc-indices id-ds)
   (transact-kv lmdb txs))
 
@@ -1566,11 +1720,38 @@
     (or opts {})
     legacy-ha-nil-sentinel-keys))
 
+(defn- persistable-provider-spec
+  [spec]
+  (cond-> (or spec {})
+    (map? spec) (dissoc :dir :embed-dir)))
+
+(defn- maybe-persistable-provider-spec
+  [spec]
+  (when spec
+    (persistable-provider-spec spec)))
+
+(defn- persistable-opts
+  [opts]
+  (let [opts (dissoc opts :embedding-providers :embedding-domain-providers)
+        opts (cond-> opts
+               (contains? opts :embedding-opts)
+               (assoc :embedding-opts
+                      (maybe-persistable-provider-spec (:embedding-opts opts)))
+
+               (contains? opts :embedding-domains)
+               (assoc :embedding-domains
+                      (when-let [domains (:embedding-domains opts)]
+                        (into {}
+                              (map (fn [[domain cfg]]
+                                     [domain (persistable-provider-spec cfg)]))
+                              domains))))]
+    (cond-> opts
+    true c/canonicalize-wal-opts
+    true encode-legacy-ha-nil-sentinels)))
+
 (defn- transact-opts
   [lmdb opts]
-  (let [opts (-> opts
-                 c/canonicalize-wal-opts
-                 encode-legacy-ha-nil-sentinels)]
+  (let [opts (persistable-opts opts)]
     (when (true? (:wal? opts))
       (let [flags (or (get-env-flags lmdb) #{})]
         (when (and (not (contains? flags :nosync))
@@ -1692,12 +1873,146 @@
         dms))
     (or vector-domains0 {}) schema))
 
+(def ^:private default-embedding-opts
+  {:provider    :default
+   :metric-type :cosine})
+
+(def ^:private embedding-index-prefix
+  "__embedding__")
+
+(defn- embedding-index-domain
+  [domain]
+  (str embedding-index-prefix "/" domain))
+
+(defn- default-embedding-domain
+  [dms embedding-opts]
+  (if (contains? dms c/default-domain)
+    dms
+    (assoc dms c/default-domain
+           (assoc (merge default-embedding-opts (or embedding-opts {}))
+                  :domain c/default-domain))))
+
+(defn- listed-embedding-domains
+  [dms domains embedding-opts embedding-domains]
+  (reduce
+    (fn [m domain]
+      (if (contains? m domain)
+        m
+        (assoc m domain
+               (assoc (merge default-embedding-opts
+                             (get embedding-domains domain)
+                             embedding-opts)
+                      :domain domain))))
+    dms
+    domains))
+
+(defn- init-embedding-domain-refs
+  [embedding-domains0 schema embedding-opts embedding-domains]
+  (reduce-kv
+    (fn [dms attr
+         {:keys [db/embedding db.embedding/domains db.embedding/autoDomain]}]
+      (if embedding
+        (let [dms (if (seq domains)
+                    (listed-embedding-domains dms domains embedding-opts
+                                              embedding-domains)
+                    (default-embedding-domain dms embedding-opts))]
+          (if autoDomain
+            (listed-embedding-domains dms [(v/attr-domain attr)] embedding-opts
+                                      embedding-domains)
+            dms))
+        dms))
+    (or embedding-domains0 {})
+    schema))
+
+(defn- provider-spec-for-domain
+  [dir runtime-providers domain {:keys [provider] :as domain-opts}]
+  (let [provider-id (or provider :default)
+        runtime     (get runtime-providers provider-id)]
+    (cond
+      (satisfies? emb/IEmbeddingProvider runtime)
+      runtime
+
+      (or (map? runtime) (keyword? runtime))
+      (merge (if (map? runtime) runtime {:provider runtime})
+             domain-opts
+             {:provider provider-id :dir dir})
+
+      runtime
+      (u/raise "Embedding provider registry entry is invalid"
+               {:domain domain
+                :provider provider-id
+                :entry runtime})
+
+      (#{:default :llama.cpp} provider-id)
+      (assoc domain-opts :provider provider-id :dir dir)
+
+      :else
+      (u/raise "Embedding provider is not configured"
+               {:domain domain :provider provider-id}))))
+
+(defn- resolve-embedding-domain
+  [dir runtime-providers [domain domain-opts]]
+  (let [domain-opts                 (merge default-embedding-opts domain-opts)
+        provider-spec               (provider-spec-for-domain dir runtime-providers
+                                                              domain domain-opts)
+        {:keys [dimensions
+                embedding-metadata]} (emb/provider-space provider-spec)
+        provider-dimensions         dimensions
+        stored-dimensions           (:dimensions domain-opts)
+        stored-metadata             (:embedding-metadata domain-opts)
+        dimensions                  (or stored-dimensions provider-dimensions)
+        embedding-metadata          (or stored-metadata embedding-metadata)]
+    (when (and stored-dimensions provider-dimensions
+               (not= (long stored-dimensions) (long provider-dimensions)))
+      (u/raise "Embedding domain dimensions do not match the runtime provider"
+               {:domain              domain
+                :provider            (:provider domain-opts)
+                :stored-dimensions   stored-dimensions
+                :provider-dimensions provider-dimensions}))
+    (when-not dimensions
+      (u/raise "Embedding domain dimensions could not be resolved"
+               {:domain domain :provider (:provider domain-opts)}))
+    [domain
+     (-> domain-opts
+         (assoc :provider (or (:provider domain-opts) :default)
+                :dimensions dimensions
+                :embedding-metadata embedding-metadata))]))
+
+(defn- init-embedding-domains
+  [dir embedding-domains0 schema embedding-opts embedding-domains runtime-providers]
+  (let [domains (init-embedding-domain-refs embedding-domains0 schema
+                                            embedding-opts embedding-domains)]
+    (into {}
+          (map #(resolve-embedding-domain dir runtime-providers %))
+          domains)))
+
+(defn- init-embedding-providers
+  [dir domains runtime-providers]
+  (reduce-kv
+    (fn [m domain domain-opts]
+      (assoc m domain
+             (emb/init-embedding-provider
+               (provider-spec-for-domain dir runtime-providers domain domain-opts))))
+    {}
+    domains))
+
 (defn- init-indices
   [lmdb domains]
   (reduce-kv
     (fn [m domain opts]
       (assoc m domain (v/new-vector-index lmdb opts)))
     {} domains))
+
+(defn- init-embedding-indices
+  [lmdb domains]
+  (reduce-kv
+    (fn [m domain opts]
+      (assoc m domain
+             (v/new-vector-index
+               lmdb
+               (assoc opts :domain (embedding-index-domain domain)))))
+    {}
+    domains))
 
 (defn- init-idoc-domains
   [schema]
@@ -1774,7 +2089,8 @@
    (open dir schema nil))
   ([dir schema opts0]
    (let [opts (propagate-top-level-txlog-opts-to-kv-opts opts0)
-         {:keys [kv-opts search-opts search-domains vector-opts vector-domains]}
+         {:keys [kv-opts search-opts search-domains vector-opts vector-domains
+                 embedding-opts embedding-domains embedding-providers]}
          opts
          dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
          persisted-opts (some-> (load-existing-store-opts dir kv-opts)
@@ -1854,6 +2170,7 @@
                            (str (UUID/randomUUID)))
            opts3     (assoc opts2 :db-identity db-identity)
            _         (vld/validate-ha-options opts3)
+           _         (vld/validate-embedding-options opts3)
            _         (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
                        (prn :storage-open
                             {:dir dir
@@ -1884,23 +2201,40 @@
                                           schema search-opts search-domains)
            v-domains (init-vector-domains (:vector-domains opts3)
                                           schema vector-opts vector-domains)
+           e-domains (init-embedding-domains dir
+                                             (:embedding-domains opts3)
+                                             schema
+                                             embedding-opts
+                                             embedding-domains
+                                             embedding-providers)
            i-domains (init-idoc-domains schema)]
-       (transact-opts lmdb opts3)
-       (->Store lmdb
-                (init-engines lmdb s-domains)
-                (init-indices lmdb v-domains)
-                (init-idoc-indices lmdb i-domains)
-                (ConcurrentHashMap.)
-                opts3
-                schema
-                (schema->rschema schema)
-                (init-attrs schema)
-                (init-max-aid schema)
-                (init-max-gt lmdb)
-                (init-max-tx lmdb)
-                (volatile! nil)
-                (volatile! :storage-mutex)
-                (ReentrantReadWriteLock.))))))
+       (let [opts4       (cond-> opts3
+                           (seq e-domains)
+                           (assoc :embedding-opts (merge default-embedding-opts
+                                                         (or (:embedding-opts opts3)
+                                                             embedding-opts))
+                                  :embedding-domains e-domains))
+             e-providers (init-embedding-providers dir e-domains
+                                                   embedding-providers)]
+         (let [opts4 (assoc opts4 :embedding-domain-providers e-providers)]
+         (transact-opts lmdb opts4)
+         (->Store lmdb
+                  (init-engines lmdb s-domains)
+                  (init-indices lmdb v-domains)
+                  (init-embedding-indices lmdb e-domains)
+                  (init-idoc-indices lmdb i-domains)
+                  e-providers
+                  (ConcurrentHashMap.)
+                  opts4
+                  schema
+                  (schema->rschema schema)
+                  (init-attrs schema)
+                  (init-max-aid schema)
+                  (init-max-gt lmdb)
+                  (init-max-tx lmdb)
+                  (volatile! nil)
+                  (volatile! :storage-mutex)
+                  (ReentrantReadWriteLock.))))))))
 
 (defn- transfer-engines
   [engines lmdb]
@@ -1921,7 +2255,9 @@
   (->Store lmdb
            (transfer-engines (.-search-engines old) lmdb)
            (transfer-indices (.-vector-indices old) lmdb)
+           (transfer-indices (.-embedding-indices old) lmdb)
            (transfer-idoc-indices (.-idoc-indices old) lmdb)
+           (.-embedding-providers old)
            (.-counts old)
            (opts old)
            (schema old)
@@ -1932,7 +2268,10 @@
            (max-tx old)
            (.-scheduled-sampling old)
            (.-write-txn old)
-           (ReentrantReadWriteLock.)))
+           ;; Sampling work may still be queued against an older Store wrapper.
+           ;; Keep close/sampling coordination on a shared lock across wrappers
+           ;; that refer to the same logical store/LMDB lifecycle.
+           (.-sampling-lock old)))
 
 (defn sync-max-gt-floor!
   "Advance an open store's in-memory giant-id cursor to at least `next-gt`.

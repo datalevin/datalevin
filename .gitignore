@@ -26,6 +26,7 @@ benchmarks/JOB-bench/db/data.mdb
 pom.xml
 pom.xml.asc
 *.jar
+!bindings/python/src/datalevin/jars/.gitkeep
 *.class
 */*/.lein-*
 */.lein-*
@@ -75,3 +76,11 @@ jepsen/results/
 .lsp/.cache
 .portal
 output.calva-repl
+bindings/python/.pytest_cache/
+bindings/python/.venv/
+bindings/python/build/
+bindings/python/dist/
+bindings/python/src/*.egg-info/
+bindings/python/src/*.dist-info/
+bindings/python/**/__pycache__/
+bindings/python/**/*.py[cod]

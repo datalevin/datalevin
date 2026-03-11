@@ -9,6 +9,9 @@
 ;;
 (ns datalevin.json-api
   (:require
+   [datalevin.client :as dc]
+   [datalevin.core :as d]
+   [datalevin.interface :as i]
    [datalevin.json-api.shared :as shared]))
 
 (def ^:const json-api-version
@@ -35,6 +38,42 @@
    (shared/rebind! h type new-obj))
   ([session h type new-obj]
    (shared/rebind! session h type new-obj)))
+
+(defn- current-session-state
+  []
+  (or shared/*session-state*
+      (var-get #'shared/default-session-state)))
+
+(defn- close-handle-resource!
+  [{:keys [type obj]}]
+  (case type
+    :conn          (when-not (d/closed? obj)
+                     (d/close obj))
+    :kv            (when-not (d/closed-kv? obj)
+                     (d/close-kv obj))
+    :vec           (when-not (i/vec-closed? obj)
+                     (d/close-vector-index obj))
+    :client        (when-not (dc/disconnected? obj)
+                     (dc/disconnect obj))
+    :search-writer nil
+    :search        nil
+    nil))
+
+(defn- release!
+  ([h]
+   (release! (current-session-state) h))
+  ([session h]
+   (let [handles ^java.util.Map (:handles session)]
+     (when-let [entry (.get handles h)]
+       (shared/unregister! session h)
+       (close-handle-resource! entry))
+     true)))
+
+(defn- unregister!
+  ([h]
+   (shared/unregister! h))
+  ([session h]
+   (shared/unregister! session h)))
 
 (defn- resolve-entry
   ([h]
@@ -85,9 +124,12 @@
 
 (defn ^:no-doc clear-handles!
   ([]
-   (shared/clear-handles!))
+   (clear-handles! (current-session-state)))
   ([session]
-   (shared/clear-handles! session)))
+   (let [handles ^java.util.Map (:handles session)]
+     (doseq [h (vec (.keySet handles))]
+       (release! session h))
+     true)))
 
 (defn- with-limits
   [f]

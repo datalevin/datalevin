@@ -27,6 +27,7 @@
    [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
+   [datalevin.db DB]
    [datalevin.interface IStore ILMDB]
    [java.io File]
    [java.net ConnectException]
@@ -47,6 +48,15 @@
   (let [node-id (:ha-node-id ha-opts)]
     (:endpoint (first (filter #(= node-id (:node-id %))
                               (:ha-members ha-opts))))))
+
+(defn- ha-request-timeout-ms
+  [m max-ms]
+  (let [renew-ms (long (or (:ha-lease-renew-ms m)
+                           c/*ha-lease-renew-ms*))
+        rpc-timeout-ms (long (or (get-in m [:ha-control-plane :rpc-timeout-ms])
+                                 0))
+        budget-ms (max 1000 renew-ms rpc-timeout-ms)]
+    (long (min (long max-ms) budget-ms))))
 
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
@@ -101,23 +111,29 @@
 
 (defn- local-kv-store
   [m]
-  (let [store (:store m)
-        kv-store (cond
-                   (nil? store) nil
-                   :else (or (try
-                               (.-lmdb store)
-                               (catch Throwable _
-                                 nil))
-                             store))]
-    (when-not (try
-                (cond
-                  (nil? kv-store) true
-                  (instance? IStore kv-store) (i/closed? kv-store)
-                  (instance? ILMDB kv-store) (i/closed-kv? kv-store)
-                  :else false)
-                (catch Throwable _
-                  true))
-      kv-store)))
+  (let [dt-db (:dt-db m)
+        candidates (cond-> [(:store m)]
+                     (instance? DB dt-db)
+                     (conj (.-store ^DB dt-db)))]
+    (some
+     (fn [store]
+       (let [kv-store (cond
+                        (nil? store) nil
+                        :else (or (try
+                                    (.-lmdb store)
+                                    (catch Throwable _
+                                      nil))
+                                  store))]
+         (when-not (try
+                     (cond
+                       (nil? kv-store) true
+                       (instance? IStore kv-store) (i/closed? kv-store)
+                       (instance? ILMDB kv-store) (i/closed-kv? kv-store)
+                       :else false)
+                     (catch Throwable _
+                       true))
+           kv-store)))
+     candidates)))
 
 (defn- raw-local-kv-store
   [m]
@@ -581,10 +597,7 @@
       (if-let [uri (ha-endpoint-uri db-name endpoint)]
         (let [client-opts
               {:pool-size 1
-               :time-out (long (max 500
-                                    (min 5000
-                                         (long (or (:ha-lease-renew-ms m)
-                                                   c/*ha-lease-renew-ms*)))))}]
+               :time-out (ha-request-timeout-ms m 5000)}]
           (try
             (with-cached-ha-client
               uri db-name client-opts
@@ -949,10 +962,7 @@
   (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
     (let [client-opts
           {:pool-size 1
-           :time-out (long (max 500
-                                (min 10000
-                                     (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))}]
+           :time-out (ha-request-timeout-ms m 10000)}]
       (with-cached-ha-client
         uri db-name client-opts
         (fn [client]
@@ -1145,10 +1155,7 @@
   (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
     (let [client-opts
           {:pool-size 1
-           :time-out (long (max 500
-                                (min 10000
-                                     (long (or (:ha-lease-renew-ms m)
-                                               c/*ha-lease-renew-ms*)))))}]
+           :time-out (ha-request-timeout-ms m 10000)}]
       (with-cached-ha-client
         uri db-name client-opts
         (fn [client]

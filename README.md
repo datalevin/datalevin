@@ -172,6 +172,9 @@ Datalevin has almost the same Datalog API as
 [Datascript](https://github.com/tonsky/datascript), which in turn has almost the
 same API as Datomic®, please consult the abundant tutorials, guides and learning
 sites available online to learn about the usage of Datomic® flavor of Datalog.
+For descriptor-backed transaction/query UDFs and server-side runtime setup, see
+[Transactions](doc/transact.md), [Query](doc/query.md), and
+[Server](doc/server.md).
 
 Here is a simple code example using Datalevin:
 

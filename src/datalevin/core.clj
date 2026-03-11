@@ -16,6 +16,7 @@
    [datalevin.dump :as dump]
    [datalevin.csv :as csv]
    [datalevin.search :as sc]
+   [datalevin.embedding :as emb]
    [datalevin.vector :as v]
    [datalevin.db :as db]
    [datalevin.datom :as dd]
@@ -2250,6 +2251,56 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
    * `:vec-filter` is a boolean function that takes the `vec-ref` and decides if
      it should be in the results."}
   search-vec i/search-vec)
+
+;; -------------------------------------
+;; embedding
+
+(def ^{:arglists '([provider-spec]
+                   [provider-spec opts])
+       :doc      "Initialize a text embedding provider.
+
+  `provider-spec` may be:
+
+   * an existing provider instance
+   * `:default` or `:llama.cpp`
+   * a map such as
+
+     `{:provider :default
+       :model    \"/path/to/model.gguf\"}`
+
+  The built-in default provider uses the local llama.cpp embedder bundled in
+  `dtlvnative`. `:model` or `:model-path` may point to a GGUF embedding model,
+  but when omitted Datalevin expects the default model at `dir/embed/`, where
+  `:dir` is the DB root, and will download `multilingual-e5-small-Q8_0.gguf`
+  from Hugging Face on first use if it is missing. Optional tuning keys are
+  `:gpu-layers`, `:ctx-size`, `:batch-size`, and `:threads`. Providers also
+  expose stable embedding-space metadata via [[embedding-metadata]].
+
+  The returned provider is `AutoCloseable`; use [[close-embedding-provider]]
+  when finished."}
+  new-embedding-provider emb/init-embedding-provider)
+
+(def ^{:arglists '([provider])
+       :doc      "Return stable metadata describing the embedding space for a provider."}
+  embedding-metadata emb/embedding-metadata)
+
+(def ^{:arglists '([provider])
+       :doc      "Return the embedding dimensions of a provider."}
+  embedding-dimensions emb/embedding-dimensions)
+
+(def ^{:arglists '([provider text]
+                   [provider text opts])
+       :doc      "Embed a single text string and return a float array."}
+  embed-text emb/embed-text)
+
+(def ^{:arglists '([provider texts]
+                   [provider texts opts])
+       :doc      "Embed a batch of text strings and return one float array per input, in order."}
+  embed-texts emb/embed-texts)
+
+(def ^{:arglists '([provider])
+       :doc      "Close an embedding provider and release provider-owned resources. Safe to call more than once."}
+  close-embedding-provider emb/close-provider)
 
 ;; -------------------------------------
 ;; byte buffer
