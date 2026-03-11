@@ -39,7 +39,7 @@
 (def deps-config (edn/read-string (slurp "deps.edn")))
 (def runtime-deps (:deps deps-config))
 (def basis (b/create-basis {:project "deps.edn"}))
-(def python-runtime-excluded-deps
+(def release-runtime-excluded-deps
   '#{babashka/babashka.pods
      nrepl/bencode
      org.babashka/sci
@@ -47,15 +47,21 @@
      org.bouncycastle/bcpkix-jdk15on
      org.bouncycastle/bcprov-jdk15on
      com.alipay.sofa/jraft-core})
-(def python-runtime-source-excludes
+(def release-runtime-source-excludes
   ["pod"
    "datalevin/ha"
    "datalevin/ha.clj"
    "datalevin/interpret.clj"
    "datalevin/main.clj"
    "datalevin/server.clj"])
-(def python-runtime-class-excludes
+(def release-runtime-class-excludes
   ["datalevin/ha"])
+(def python-runtime-excluded-deps
+  release-runtime-excluded-deps)
+(def python-runtime-source-excludes
+  release-runtime-source-excludes)
+(def python-runtime-class-excludes
+  release-runtime-class-excludes)
 (def python-runtime-native-libs
   {"linux-x86_64" 'org.clojars.huahaiy/dtlvnative-linux-x86_64
    "linux-arm64" 'org.clojars.huahaiy/dtlvnative-linux-arm64
@@ -91,8 +97,13 @@
      org.clojars.huahaiy/dtlvnative-linux-arm64
      org.clojars.huahaiy/dtlvnative-linux-x86_64
      org.clojars.huahaiy/dtlvnative-windows-x86_64})
+(defn- dissoc-libs
+  [deps libs]
+  (reduce dissoc deps libs))
 (def java-pom-deps
-  (assoc (apply dissoc runtime-deps bundled-native-libs)
+  (assoc (-> runtime-deps
+             (dissoc-libs release-runtime-excluded-deps)
+             (dissoc-libs bundled-native-libs))
          javacpp-lib
          {:mvn/version "1.5.13"}))
 (def developers
@@ -355,6 +366,9 @@
   ;; Keep the release jar free of embedded Java sources; they go in the
   ;; separate sources jar instead.
   (b/delete {:path (str java-artifact-dir "/java")})
+  ;; Java consumers do not need the CLI, pod entrypoint, or HA/server runtime.
+  (delete-under-root! java-artifact-dir release-runtime-source-excludes)
+  (delete-under-root! java-artifact-dir release-runtime-class-excludes)
   (copy-bundled-native-payloads!)
   (write-java-poms!))
 
@@ -376,6 +390,9 @@
   (b/delete {:path (str java-source-dir "/java")})
   (b/copy-dir {:src-dirs   (existing-dirs ["src/java"])
                :target-dir java-source-dir})
+  ;; Keep the published sources aligned with the trimmed runtime jar.
+  (delete-under-root! java-source-dir release-runtime-source-excludes)
+  (delete-under-root! java-source-dir release-runtime-class-excludes)
   (b/jar {:class-dir java-source-dir
           :jar-file  java-source-jar-file})
   (println "Generated Java sources jar at" java-source-jar-file)
