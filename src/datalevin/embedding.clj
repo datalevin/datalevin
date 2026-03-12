@@ -161,6 +161,64 @@
                {:section section :value value}))))
   metadata)
 
+(def ^:private metadata-missing
+  ::missing)
+
+(defn- compatibility-metadata
+  [metadata]
+  (let [metadata (if (nil? metadata)
+                   {}
+                   (-> metadata
+                       validate-metadata-shape
+                       compact-metadata))]
+    metadata))
+
+(defn- metadata-mismatch
+  [stored runtime path]
+  (cond
+    (map? stored)
+    (cond
+      (not (map? runtime))
+      {:path path
+       :stored stored
+       :runtime runtime
+       :reason :shape}
+
+      :else
+      (some (fn [[k stored-v]]
+              (let [next-path (conj path k)]
+                (if (contains? runtime k)
+                  (metadata-mismatch stored-v (get runtime k) next-path)
+                  {:path next-path
+                   :stored stored-v
+                   :runtime metadata-missing
+                   :reason :missing})))
+            stored))
+
+    (= stored runtime)
+    nil
+
+    :else
+    {:path path
+     :stored stored
+     :runtime runtime
+     :reason :value}))
+
+(defn ensure-compatible-metadata
+  "Ensure stored embedding metadata remains compatible with the runtime provider.
+
+  Metadata is part of the embedding-space contract, so missing or changed
+  fields must be treated as incompatibilities."
+  [stored runtime]
+  (let [stored*  (compatibility-metadata stored)
+        runtime* (compatibility-metadata runtime)]
+    (when-let [mismatch (metadata-mismatch stored* runtime* [])]
+      (raise "Embedding metadata does not match the runtime provider"
+             {:stored-metadata  stored
+              :runtime-metadata runtime
+              :mismatch         mismatch}))
+    stored))
+
 (defn- ensure-provider-spec
   [provider-spec]
   (cond

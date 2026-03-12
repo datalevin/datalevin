@@ -1,0 +1,45 @@
+{
+  "name": "datalevin-node",
+  "version": "0.10.7",
+  "description": "Node.js bindings for Datalevin over the JVM interop bridge",
+  "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/datalevin/datalevin.git",
+    "directory": "bindings/javascript"
+  },
+  "homepage": "https://github.com/datalevin/datalevin/tree/master/bindings/javascript#readme",
+  "bugs": {
+    "url": "https://github.com/datalevin/datalevin/issues"
+  },
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "jars",
+    "LICENSE",
+    "README.md",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "prepack": "node scripts/vendor-runtime.mjs",
+    "test": "node --test",
+    "vendor-runtime": "node scripts/vendor-runtime.mjs"
+  },
+  "keywords": [
+    "datalevin",
+    "datalog",
+    "lmdb",
+    "database",
+    "node"
+  ],
+  "author": "Huahai Yang <huahai.yang@gmail.com>",
+  "license": "EPL-2.0",
+  "dependencies": {
+    "java-bridge": "^2.8.0"
+  }
+}

@@ -32,6 +32,17 @@ final class DatalevinForms {
         return ClojureRuntime.readEdn(queryEdn);
     }
 
+    static Object queryFormInput(Object query) {
+        Objects.requireNonNull(query, "query");
+        if (query instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+        if (query instanceof String s) {
+            return ClojureRuntime.readEdn(s);
+        }
+        return ClojureCodec.runtimeInput(query);
+    }
+
     static Object explainOpts(String optsEdn) {
         return optsEdn == null ? PersistentArrayMap.EMPTY : ClojureRuntime.readEdn(optsEdn);
     }

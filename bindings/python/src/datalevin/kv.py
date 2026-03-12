@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ._convert import to_java, to_python
+from ._convert import to_edn_form, to_java, to_python
 from ._interop import _BINDINGS
 from ._resource import ResourceWrapper
 
@@ -73,7 +73,7 @@ class KV(ResourceWrapper):
             raise ValueError("key_range is required for KV get_range().")
         if v_type is not None and k_type is None:
             raise ValueError("v_type requires k_type for KV get_range().")
-        args = [self.raw_handle(), dbi_name, to_java(key_range)]
+        args = [self.raw_handle(), dbi_name, to_edn_form(key_range)]
         if k_type is not None:
             args.append(_BINDINGS.kv_type(k_type))
             if v_type is not None:

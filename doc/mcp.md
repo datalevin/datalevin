@@ -30,6 +30,18 @@ Enable write tools explicitly when needed:
 dtlv --allow-writes mcp
 ```
 
+## Session Lifecycle
+
+The server follows MCP `2025-06-18` session sequencing:
+
+- the first request in a session must be `initialize`
+- `initialize` must include `protocolVersion`, `capabilities`, and `clientInfo`
+- request methods such as `initialize`, `ping`, `tools/list`, and `tools/call`
+  must include a JSON-RPC request `id`
+- normal requests such as `tools/list` and `tools/call` are only accepted after
+  the client sends `notifications/initialized`
+- JSON-RPC batch requests are rejected
+
 ## Tool Result Shape
 
 `tools/call` replies follow the normal MCP JSON-RPC envelope and return both a
@@ -69,6 +81,9 @@ Current defaults:
 
 - max result items: `200`
 - max serialized response bytes: `524288`
+
+The byte limit is enforced against the full MCP JSON-RPC reply, not just
+`structuredContent`.
 
 When a result is truncated, `structuredContent` includes:
 
@@ -141,23 +156,14 @@ Byte truncation with omission:
   even the preview form would still be too large
 
 When truncation happens, `content[0].text` is no longer a full duplicate of the
-structured payload. It becomes a small summary object instead:
+structured payload. It becomes a small summary instead:
 
-```json
-{
-  "summary": "Result truncated.",
-  "truncations": [
-    {
-      "kind": "items",
-      "path": "result",
-      "limit": 200,
-      "returned": 200,
-      "original": 684
-    }
-  ]
-}
+```text
+Result truncated.
 ```
 
+When an untruncated `structuredContent` payload is still too large to duplicate
+in `content[0].text`, the text block becomes `See structuredContent.` instead.
 This avoids paying the full payload cost twice.
 
 ## Pagination Guidance

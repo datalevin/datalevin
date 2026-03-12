@@ -214,6 +214,30 @@
         (finally
           (io/delete-file (io/file dir) true))))))
 
+(deftest metadata-compatibility-test
+  (testing "provider identity mismatch is rejected"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"Embedding metadata does not match the runtime provider"
+          (sut/ensure-compatible-metadata
+            {:embedding/provider {:id :test
+                                  :model-id "model-a"}
+             :embedding/output   {:dimensions 1}}
+            {:embedding/provider {:id :test
+                                  :model-id "model-b"}
+             :embedding/output   {:dimensions 1}}))))
+  (testing "missing metadata fields are rejected"
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo
+          #"Embedding metadata does not match the runtime provider"
+          (sut/ensure-compatible-metadata
+            {:embedding/provider {:id :test}
+             :embedding/output   {:dimensions 1
+                                  :query-prefix "query: "
+                                  :document-prefix "doc: "}}
+            {:embedding/provider {:id :test}
+             :embedding/output   {:dimensions 1}})))))
+
 (deftest default-model-metadata-test
   (let [dir           (u/tmp-dir (str "embed-meta-" (System/nanoTime)))
         model-path    (str dir u/+separator+ sut/default-model-file)

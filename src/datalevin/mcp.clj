@@ -355,6 +355,11 @@
    "id"      id
    "result"  result})
 
+(defn- valid-request-id?
+  [id]
+  (or (string? id)
+      (number? id)))
+
 (defn- result-collection
   [x]
   (or (vector? x)
@@ -406,6 +411,30 @@
   (-> structured
       (update "meta" #(merge {"truncated" true} (or % {})))
       (update-in ["meta" "truncations"] (fnil conj []) truncation)))
+
+(defn- result-byte-truncation?
+  [truncation]
+  (and (= "bytes" (get truncation "kind"))
+       (= "result" (get truncation "path"))))
+
+(defn- set-result-byte-truncation
+  [structured mode]
+  (let [limit      (:max-response-bytes *mcp-limits*)
+        truncation {"kind"  "bytes"
+                    "path"  "result"
+                    "limit" limit
+                    "mode"  mode}]
+    (-> structured
+        (update "meta" #(merge {"truncated" true} (or % {})))
+        (update-in ["meta" "truncations"]
+                   (fn [truncations]
+                     (let [truncations (vec (or truncations []))]
+                       (if (some result-byte-truncation? truncations)
+                         (mapv #(if (result-byte-truncation? %)
+                                  truncation
+                                  %)
+                               truncations)
+                         (conj truncations truncation))))))))
 
 (defn- fits-byte-limit?
   [value]
@@ -472,26 +501,80 @@
         maybe-truncate-result-bytes)
     structured))
 
+(defn- tool-summary
+  [value summary]
+  (cond-> {"summary" summary}
+    (seq (get-in value ["meta" "truncations"]))
+    (assoc "truncations" (get-in value ["meta" "truncations"]))))
+
 (defn- tool-text
   [value]
   (if (seq (get-in value ["meta" "truncations"]))
     (jc/write-json-ready-string
-      {"summary"     "Result truncated."
-       "truncations" (get-in value ["meta" "truncations"])}
+      (tool-summary value "Result truncated.")
       *mcp-limits*)
     (jc/write-json-ready-string value *mcp-limits*)))
 
+(defn- compact-tool-text
+  [value is-error]
+  (cond
+    is-error "Tool error. See structuredContent."
+    (seq (get-in value ["meta" "truncations"])) "Result truncated."
+    :else "See structuredContent."))
+
+(defn- tool-envelope
+  [structured text is-error]
+  (cond-> {"content"           [{"type" "text"
+                                 "text" text}]
+           "structuredContent" structured}
+    is-error (assoc "isError" true)))
+
+(defn- fit-tool-envelope
+  [structured is-error wrap-fn]
+  (let [full-response (tool-envelope structured (tool-text structured) is-error)]
+    (if (fits-byte-limit? (wrap-fn full-response))
+      full-response
+      (let [compact-response (tool-envelope structured
+                                            (compact-tool-text structured is-error)
+                                            is-error)]
+        (when (fits-byte-limit? (wrap-fn compact-response))
+          compact-response)))))
+
+(defn- preview-tool-structured
+  [structured]
+  (let [current (get structured "result")
+        preview (preview-result current)]
+    (when (not= preview current)
+      (-> structured
+          (assoc "result" preview)
+          (set-result-byte-truncation "preview")))))
+
+(defn- omit-tool-structured
+  [structured]
+  (-> structured
+      (assoc "result" nil)
+      (set-result-byte-truncation "omitted")))
+
 (defn- tool-response
   ([structured]
-   (tool-response structured false))
+   (tool-response structured false identity))
   ([structured is-error]
+   (tool-response structured is-error identity))
+  ([structured is-error wrap-fn]
    (let [structured (if is-error
                       (jc/json-ready structured)
                       (prepare-tool-structured structured))]
-     (cond-> {"content"           [{"type" "text"
-                                    "text" (tool-text structured)}]
-              "structuredContent" structured}
-       is-error (assoc "isError" true)))))
+     (or (fit-tool-envelope structured is-error wrap-fn)
+         (when (and (not is-error) (contains? structured "result"))
+           (or (when-let [previewed (preview-tool-structured structured)]
+                 (fit-tool-envelope previewed false wrap-fn))
+               (fit-tool-envelope (omit-tool-structured structured)
+                                  false
+                                  wrap-fn)))
+         (throw (ex-info "Result exceeds max-response-bytes limit."
+                         {:code  :result-too-large
+                          :kind  :bytes
+                          :limit (:max-response-bytes *mcp-limits*)}))))))
 
 (defn- require-string
   [x field]
@@ -527,6 +610,56 @@
     (throw (ex-info (str field " must be a boolean.")
                     {:code  :invalid-params
                      :field field}))))
+
+(defn- require-present
+  [m field]
+  (if (contains? m field)
+    (get m field)
+    (throw (ex-info (str field " is required.")
+                    {:code  :invalid-params
+                     :field field}))))
+
+(defn- require-request-id
+  [request]
+  (cond
+    (not (contains? request "id"))
+    (throw (ex-info "id is required for requests."
+                    {:code  :invalid-request
+                     :field "id"}))
+
+    (not (valid-request-id? (get request "id")))
+    (throw (ex-info "id must be a string or number."
+                    {:code  :invalid-request
+                     :field "id"}))
+
+    :else
+    (get request "id")))
+
+(defn- require-initialize-params
+  [params]
+  (let [protocol-version (require-string
+                           (require-present params "protocolVersion")
+                           "protocolVersion")
+        capabilities     (require-map
+                           (require-present params "capabilities")
+                           "capabilities")
+        client-info      (require-map
+                           (require-present params "clientInfo")
+                           "clientInfo")
+        client-name      (require-string
+                           (require-present client-info "name")
+                           "clientInfo.name")
+        client-version   (require-string
+                           (require-present client-info "version")
+                           "clientInfo.version")]
+    {"protocolVersion" protocol-version
+     "capabilities"    capabilities
+     "clientInfo"      (cond-> {"name"    client-name
+                                "version" client-version}
+                         (contains? client-info "title")
+                         (assoc "title" (require-string
+                                          (get client-info "title")
+                                          "clientInfo.title")))}))
 
 (defn- keyword-marker-string?
   [x]
@@ -685,6 +818,24 @@
   [state vector-index-id]
   (:vec-handle (vector-index-entry state vector-index-id)))
 
+(defn- dependent-search-index-ids
+  [state kv-id]
+  (->> (get @state :search-indexes)
+       (keep (fn [[search-index-id entry]]
+               (when (= kv-id (get entry "kv"))
+                 search-index-id)))
+       vec))
+
+(defn- dependent-vector-index-ids
+  [state kv-id]
+  (->> (get @state :vector-indexes)
+       (keep (fn [[vector-index-id entry]]
+               (when (= kv-id (get entry "kv"))
+                 vector-index-id)))
+       vec))
+
+(declare close-search-index close-vector-index)
+
 (defn- register-vector-index!
   [state vec-handle kv-id]
   (if-let [vector-index-id (get-in @state [:vector-index-by-handle vec-handle])]
@@ -759,10 +910,16 @@
 (defn- close-kv-store
   [state arguments]
   (let [kv-id     (require-string (get arguments "kv") "kv")
-        kv-handle (kv-handle state kv-id)]
+        kv-handle (kv-handle state kv-id)
+        search-index-ids (dependent-search-index-ids state kv-id)
+        vector-index-ids (dependent-vector-index-ids state kv-id)]
     (shared/exec-request (:session-state @state)
                          {"op"   "close-kv"
                           "args" {"kv" kv-handle}})
+    (doseq [search-index-id search-index-ids]
+      (close-search-index state {"searchIndex" search-index-id}))
+    (doseq [vector-index-id vector-index-ids]
+      (close-vector-index state {"vectorIndex" vector-index-id}))
     (swap! state
            (fn [current]
              (-> current
@@ -1287,119 +1444,171 @@
    "serverInfo"      {"name"    "datalevin"
                        "version" c/version}})
 
+(defn- state-phase
+  [state-map]
+  (or (:phase state-map)
+      (if (:initialized? state-map)
+        :ready
+        :new)))
+
+(defn- session-phase
+  [state]
+  (state-phase @state))
+
+(defn- require-request-phase!
+  [state method]
+  (let [phase (session-phase state)]
+    (case phase
+      :new
+      (when-not (= method "initialize")
+        (throw (ex-info "Requests are not allowed before initialize."
+                        {:code   :invalid-request
+                         :method method
+                         :phase  "uninitialized"})))
+
+      :initializing
+      (cond
+        (= method "initialize")
+        (throw (ex-info "Initialize may only be sent once per session."
+                        {:code   :invalid-request
+                         :method method
+                         :phase  "initializing"}))
+
+        (= method "ping")
+        nil
+
+        :else
+        (throw (ex-info "Requests are not allowed before initialized."
+                        {:code   :invalid-request
+                         :method method
+                         :phase  "initializing"})))
+
+      :ready
+      (when (= method "initialize")
+        (throw (ex-info "Initialize may only be sent once per session."
+                        {:code   :invalid-request
+                         :method method
+                         :phase  "ready"})))
+
+      nil)))
+
 (defn- call-tool
-  [state name arguments]
-  (case name
-    "datalevin_api_info"
-    (let [result (get (shared/exec-request (:session-state @state)
-                                           {"op"   "api-info"
-                                            "args" {}})
-                      "result")]
-      (tool-response {"mcp"       {"protocolVersion" protocol-version
-                                    "transport"       "stdio"
-                                    "allowWrites"     (:allow-writes? @state)}
-                      "datalevin" result}))
+  ([state name arguments]
+   (call-tool state name arguments identity))
+  ([state name arguments wrap-fn]
+   (letfn [(respond [value]
+             (tool-response value false wrap-fn))]
+     (case name
+       "datalevin_api_info"
+       (let [result (get (shared/exec-request (:session-state @state)
+                                              {"op"   "api-info"
+                                               "args" {}})
+                         "result")]
+         (respond {"mcp"       {"protocolVersion" protocol-version
+                                "transport"       "stdio"
+                                "allowWrites"     (:allow-writes? @state)}
+                   "datalevin" result}))
 
-    "datalevin_open_database"
-    (tool-response (open-database state arguments))
+       "datalevin_open_database"
+       (respond (open-database state arguments))
 
-    "datalevin_close_database"
-    (tool-response (close-database state arguments))
+       "datalevin_close_database"
+       (respond (close-database state arguments))
 
-    "datalevin_open_kv"
-    (tool-response (open-kv-store state arguments))
+       "datalevin_open_kv"
+       (respond (open-kv-store state arguments))
 
-    "datalevin_close_kv"
-    (tool-response (close-kv-store state arguments))
+       "datalevin_close_kv"
+       (respond (close-kv-store state arguments))
 
-    "datalevin_open_search_index"
-    (tool-response (open-search-index state arguments))
+       "datalevin_open_search_index"
+       (respond (open-search-index state arguments))
 
-    "datalevin_close_search_index"
-    (tool-response (close-search-index state arguments))
+       "datalevin_close_search_index"
+       (respond (close-search-index state arguments))
 
-    "datalevin_add_document"
-    (tool-response (add-document state arguments))
+       "datalevin_add_document"
+       (respond (add-document state arguments))
 
-    "datalevin_remove_document"
-    (tool-response (remove-document state arguments))
+       "datalevin_remove_document"
+       (respond (remove-document state arguments))
 
-    "datalevin_clear_documents"
-    (tool-response (clear-documents state arguments))
+       "datalevin_clear_documents"
+       (respond (clear-documents state arguments))
 
-    "datalevin_document_indexed"
-    (tool-response (document-indexed state arguments))
+       "datalevin_document_indexed"
+       (respond (document-indexed state arguments))
 
-    "datalevin_document_count"
-    (tool-response (document-count state arguments))
+       "datalevin_document_count"
+       (respond (document-count state arguments))
 
-    "datalevin_search_documents"
-    (tool-response (search-documents state arguments))
+       "datalevin_search_documents"
+       (respond (search-documents state arguments))
 
-    "datalevin_open_vector_index"
-    (tool-response (open-vector-index state arguments))
+       "datalevin_open_vector_index"
+       (respond (open-vector-index state arguments))
 
-    "datalevin_close_vector_index"
-    (tool-response (close-vector-index state arguments))
+       "datalevin_close_vector_index"
+       (respond (close-vector-index state arguments))
 
-    "datalevin_vector_index_info"
-    (tool-response (vector-index-info state arguments))
+       "datalevin_vector_index_info"
+       (respond (vector-index-info state arguments))
 
-    "datalevin_add_vector"
-    (tool-response (add-vector state arguments))
+       "datalevin_add_vector"
+       (respond (add-vector state arguments))
 
-    "datalevin_remove_vector"
-    (tool-response (remove-vector state arguments))
+       "datalevin_remove_vector"
+       (respond (remove-vector state arguments))
 
-    "datalevin_vector_indexed"
-    (tool-response (vector-indexed state arguments))
+       "datalevin_vector_indexed"
+       (respond (vector-indexed state arguments))
 
-    "datalevin_vector_search"
-    (tool-response (search-vector-index state arguments))
+       "datalevin_vector_search"
+       (respond (search-vector-index state arguments))
 
-    "datalevin_kv_get"
-    (tool-response (kv-get state arguments))
+       "datalevin_kv_get"
+       (respond (kv-get state arguments))
 
-    "datalevin_kv_range"
-    (tool-response (kv-range state arguments))
+       "datalevin_kv_range"
+       (respond (kv-range state arguments))
 
-    "datalevin_kv_transact"
-    (tool-response (transact-kv-store state arguments))
+       "datalevin_kv_transact"
+       (respond (transact-kv-store state arguments))
 
-    "datalevin_query"
-    (tool-response (query-database state arguments))
+       "datalevin_query"
+       (respond (query-database state arguments))
 
-    "datalevin_datoms"
-    (tool-response (datoms-database state arguments))
+       "datalevin_datoms"
+       (respond (datoms-database state arguments))
 
-    "datalevin_search_datoms"
-    (tool-response (search-datoms-database state arguments))
+       "datalevin_search_datoms"
+       (respond (search-datoms-database state arguments))
 
-    "datalevin_count_datoms"
-    (tool-response (count-datoms-database state arguments))
+       "datalevin_count_datoms"
+       (respond (count-datoms-database state arguments))
 
-    "datalevin_pull"
-    (tool-response (pull-database state arguments))
+       "datalevin_pull"
+       (respond (pull-database state arguments))
 
-    "datalevin_entity"
-    (tool-response (entity-database state arguments))
+       "datalevin_entity"
+       (respond (entity-database state arguments))
 
-    "datalevin_pull_many"
-    (tool-response (pull-many-database state arguments))
+       "datalevin_pull_many"
+       (respond (pull-many-database state arguments))
 
-    "datalevin_transact"
-    (tool-response (transact-database state arguments))
+       "datalevin_transact"
+       (respond (transact-database state arguments))
 
-    "datalevin_fulltext_datoms"
-    (tool-response (fulltext-datoms-database state arguments))
+       "datalevin_fulltext_datoms"
+       (respond (fulltext-datoms-database state arguments))
 
-    (throw (ex-info (str "Unknown tool: " name)
-                    {:code :unknown-tool
-                     :tool name}))))
+       (throw (ex-info (str "Unknown tool: " name)
+                       {:code :unknown-tool
+                        :tool name}))))))
 
 (defn ^:no-doc handle-request
   [state request]
-  (let [id     (get request "id")
+  (let [id     (require-request-id request)
         method (get request "method")
         params (require-map (get request "params") "params")]
     (when-not (= "2.0" (get request "jsonrpc"))
@@ -1408,12 +1617,15 @@
     (when-not (string? method)
       (throw (ex-info "method must be a string."
                       {:code :invalid-request})))
+    (require-request-phase! state method)
     (case method
       "initialize"
-      (do
+      (let [params (require-initialize-params params)]
         (swap! state assoc
+               :phase :initializing
                :initialized? false
                :client-info (get params "clientInfo")
+               :client-capabilities (get params "capabilities")
                :client-protocol-version (get params "protocolVersion"))
         (jsonrpc-result id (initialize-result)))
 
@@ -1425,9 +1637,10 @@
 
       "tools/call"
       (let [name      (require-string (get params "name") "name")
-            arguments (require-map (get params "arguments") "arguments")]
+            arguments (require-map (get params "arguments") "arguments")
+            wrap-fn   #(jsonrpc-result id %)]
         (try
-          (jsonrpc-result id (call-tool state name arguments))
+          (jsonrpc-result id (call-tool state name arguments wrap-fn))
           (catch clojure.lang.ExceptionInfo e
             (let [data (or (ex-data e) {})]
               (jsonrpc-result
@@ -1436,7 +1649,8 @@
                   {"error"   (or (.getMessage e) (str (class e)))
                    "code"    (str (or (:code data) :tool-error))
                    "details" data}
-                  true))))))
+                  true
+                  wrap-fn))))))
 
       (throw (ex-info (str "Unsupported method: " method)
                       {:code   :method-not-found
@@ -1446,15 +1660,24 @@
   [state message]
   (let [message (require-map message "request")
         method  (get message "method")
-        id      (get message "id")]
+        id      (get message "id")
+        response-id (when (valid-request-id? id) id)]
     (try
       (cond
         (= method "notifications/initialized")
         (do
-          (swap! state assoc :initialized? true)
+          (swap! state
+                 (fn [current]
+                   (if (= :initializing (state-phase current))
+                     (assoc current
+                            :phase :ready
+                            :initialized? true)
+                     current)))
           nil)
 
-        (and (str/starts-with? method "notifications/") (nil? id))
+        (and (string? method)
+             (str/starts-with? method "notifications/")
+             (nil? id))
         nil
 
         :else
@@ -1467,19 +1690,19 @@
                          :method-not-found -32601
                          :parse-error -32700
                          -32000)]
-          (jsonrpc-error id rpc-code (or (.getMessage e) (str (class e))) data)))
+          (jsonrpc-error response-id
+                         rpc-code
+                         (or (.getMessage e) (str (class e)))
+                         data)))
       (catch Throwable t
-        (jsonrpc-error id -32603 (or (.getMessage t) (str (class t))))))))
+        (jsonrpc-error response-id -32603
+                       (or (.getMessage t) (str (class t))))))))
 
 (defn ^:no-doc handle-input
   [state input]
   (if (vector? input)
-    (let [responses (->> input
-                         (map #(handle-message state %))
-                         (remove nil?)
-                         vec)]
-      (when (seq responses)
-        responses))
+    (jsonrpc-error nil -32600 "JSON-RPC batch requests are not supported."
+                   {:code :invalid-request})
     (handle-message state input)))
 
 (defn- read-message
@@ -1502,7 +1725,8 @@
   ([^Reader reader ^Writer writer _opts]
    (let [reader (BufferedReader. reader)
          writer (BufferedWriter. writer)
-         state  (atom {:initialized?  false
+         state  (atom {:phase         :new
+                       :initialized?  false
                        :allow-writes? (true? (:allow-writes _opts))
                        :session-state (shared/new-session-state)})]
      (try

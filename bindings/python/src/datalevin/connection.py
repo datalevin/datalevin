@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ._convert import to_java, to_python
+from ._convert import to_edn_form, to_java, to_python, to_query_input
 from ._interop import _BINDINGS
 from ._resource import ResourceWrapper
 
@@ -10,7 +10,7 @@ from ._resource import ResourceWrapper
 def _edn_form(value):
     if isinstance(value, str):
         return _BINDINGS.read_edn(value)
-    return to_java(value)
+    return to_edn_form(value)
 
 
 class Connection(ResourceWrapper):
@@ -61,13 +61,13 @@ class Connection(ResourceWrapper):
 
     def query(self, query, *inputs):
         db = _BINDINGS.connection_db(self.raw_handle())
-        args = [_edn_form(query), db, *inputs]
+        args = [_edn_form(query), db, *(to_query_input(value) for value in inputs)]
         return to_python(_BINDINGS.core_invoke("q", args))
 
     def explain(self, query, *inputs, opts_edn=None):
         db = _BINDINGS.connection_db(self.raw_handle())
         opts = None if opts_edn is None else _edn_form(opts_edn)
-        args = [opts, _edn_form(query), db, *inputs]
+        args = [opts, _edn_form(query), db, *(to_query_input(value) for value in inputs)]
         return to_python(_BINDINGS.core_invoke("explain", args))
 
     def transact(self, tx_data, tx_meta=None):

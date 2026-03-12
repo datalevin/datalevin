@@ -153,6 +153,18 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Returns a bridge-safe touched entity map for the given entity id or lookup
+     * ref.
+     */
+    public Map<?, ?> entityMap(Object eid) {
+        Object entity = ClojureRuntime.core("entity", db(), DatalevinForms.lookupRefInput(eid));
+        if (entity == null) {
+            return null;
+        }
+        return (Map<?, ?>) ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", entity));
+    }
+
+    /**
      * Pulls one entity using a raw selector value.
      */
     public Map<?, ?> pull(Object selector, Object eid) {
@@ -198,6 +210,13 @@ public final class Connection extends HandleResource {
      */
     public Object query(String query, List<?> inputs) {
         return runQuery(DatalevinForms.queryForm(query), inputs);
+    }
+
+    /**
+     * Runs a query expressed as a raw EDN-like form with positional inputs.
+     */
+    public Object queryForm(Object queryForm, List<?> inputs) {
+        return runQuery(DatalevinForms.queryFormInput(queryForm), inputs);
     }
 
     /**
@@ -362,11 +381,29 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Explains a query expressed as a raw EDN-like form with positional inputs.
+     */
+    public Object explainForm(Object queryForm, List<?> inputs) {
+        return runExplain(DatalevinForms.explainOpts(null),
+                          DatalevinForms.queryFormInput(queryForm),
+                          inputs);
+    }
+
+    /**
      * Explains a query expressed as EDN text using explicit explain options.
      */
     public Object explain(String optsEdn, String query, List<?> inputs) {
         return runExplain(DatalevinForms.explainOpts(optsEdn),
                           DatalevinForms.queryForm(query),
+                          inputs);
+    }
+
+    /**
+     * Explains a raw EDN-like query using explicit explain options.
+     */
+    public Object explainForm(String optsEdn, Object queryForm, List<?> inputs) {
+        return runExplain(DatalevinForms.explainOpts(optsEdn),
+                          DatalevinForms.queryFormInput(queryForm),
                           inputs);
     }
 

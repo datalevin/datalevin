@@ -47,23 +47,24 @@
     (float-array [(float cat) (float dog) (float science)])))
 
 (defn- mock-provider
-  []
-  (reify
-    emb/IEmbeddingProvider
-    (embedding [_ items _opts]
-      (mapv (fn [item]
-              (mock-embedding (if (map? item) (:text item) item)))
-            items))
-    (embedding-metadata [_]
-      provider-metadata)
-    (embedding-dimensions [_]
-      3)
-    (close-provider [_]
-      nil)
+  ([] (mock-provider provider-metadata))
+  ([metadata]
+   (reify
+     emb/IEmbeddingProvider
+     (embedding [_ items _opts]
+       (mapv (fn [item]
+               (mock-embedding (if (map? item) (:text item) item)))
+             items))
+     (embedding-metadata [_]
+       metadata)
+     (embedding-dimensions [_]
+       3)
+     (close-provider [_]
+       nil)
 
-    java.lang.AutoCloseable
-    (close [_]
-      nil)))
+     java.lang.AutoCloseable
+     (close [_]
+       nil))))
 
 (def ^:private provider-opts
   {:embedding-opts      {:provider :test
@@ -204,4 +205,42 @@
                                                           :dimensions 2}}
                               :embedding-providers {:test (mock-provider)}})))
         (finally
+          (u/delete-files dir)))))
+  (testing "persisted metadata must match runtime provider identity"
+    (let [dir (u/tmp-dir (str "embedding-metadata-mismatch-" (UUID/randomUUID)))]
+      (try
+        (let [conn (d/create-conn
+                     dir
+                     embedding-schema
+                     {:embedding-opts      {:provider :test}
+                      :embedding-providers {:test (mock-provider)}})]
+          (d/close conn))
+        (is (thrown-with-msg?
+              Exception
+              #"Embedding metadata does not match the runtime provider"
+              (d/create-conn
+                dir
+                embedding-schema
+                {:embedding-opts      {:provider :test}
+                 :embedding-providers
+                 {:test (mock-provider
+                          (assoc-in provider-metadata
+                                    [:embedding/provider :model-id]
+                                    "test/other-model"))}})))
+        (finally
           (u/delete-files dir))))))
+
+(deftest embedding-schema-mutation-requires-rebuild-test
+  (let [dir  (u/tmp-dir (str "embedding-schema-mutation-" (UUID/randomUUID)))
+        conn (d/create-conn dir embedding-schema provider-opts)]
+    (try
+      (d/transact! conn [{:doc/id "doc-1"
+                          :doc/text "red cat"}])
+      (is (thrown-with-msg?
+            Exception
+            #"Embedding schema changes require an explicit rebuild"
+            (d/update-schema conn
+                             {:doc/text {:db/valueType :db.type/string}})))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))

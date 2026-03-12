@@ -23,6 +23,14 @@ java_artifact_jar() {
         "$local_repo" "$version" "$version"
 }
 
+java_artifact_pom() {
+    local version local_repo
+    version=$(datalevin_version)
+    local_repo=$(datalevin_java_local_repo)
+    printf '%s/org/datalevin/datalevin-java/%s/datalevin-java-%s.pom' \
+        "$local_repo" "$version" "$version"
+}
+
 java_artifact_classpath() {
     local artifact_jar repo_classpath classpath
     artifact_jar=$(java_artifact_jar)
@@ -35,4 +43,22 @@ java_artifact_classpath() {
 
 ensure_java_release_artifacts() {
     (cd "$repo_root" && clojure -T:build install-java)
+}
+
+assert_trimmed_java_artifact() {
+    local artifact_jar artifact_pom trimmed_entry_patterns trimmed_dep_patterns
+    artifact_jar=$(java_artifact_jar)
+    artifact_pom=$(java_artifact_pom)
+    trimmed_entry_patterns='^(pod/|datalevin/main\.clj$|datalevin/server\.clj$|datalevin/interpret\.clj$|datalevin/ha(/|\.clj$))'
+    trimmed_dep_patterns='babashka\.pods|<groupId>nrepl</groupId>|<artifactId>bencode</artifactId>|<groupId>org\.babashka</groupId>|<artifactId>sci</artifactId>|<artifactId>tools\.cli</artifactId>|<groupId>org\.bouncycastle</groupId>|<artifactId>jraft-core</artifactId>'
+
+    if jar tf "$artifact_jar" | grep -Eq "$trimmed_entry_patterns"; then
+        echo "Unexpected trimmed runtime entries found in $artifact_jar" >&2
+        return 1
+    fi
+
+    if grep -Eq "$trimmed_dep_patterns" "$artifact_pom"; then
+        echo "Unexpected trimmed runtime dependencies found in $artifact_pom" >&2
+        return 1
+    fi
 }

@@ -61,6 +61,8 @@ reading
 .cpcache/
 /codox
 .clj-kondo/
+!/resources/.clj-kondo/
+!/resources/.clj-kondo/**
 *.o
 *.a
 native/*.zip

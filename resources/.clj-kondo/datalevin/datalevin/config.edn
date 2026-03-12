@@ -1,0 +1,13 @@
+{:lint-as
+ {datalevin.core/pull             datascript.core/pull
+  datalevin.core/pull-many        datascript.core/pull-many
+  pod.huahaiy.datalevin/pull      datascript.core/pull
+  pod.huahaiy.datalevin/pull-many datascript.core/pull-many}
+ :hooks
+ {:analyze-call
+  {datalevin.core/q            hooks.datalevin/q
+   datalevin.query/q           hooks.datalevin/q
+   datalevin.core/explain      hooks.datalevin/explain
+   datalevin.query/explain     hooks.datalevin/explain
+   pod.huahaiy.datalevin/q     hooks.datalevin/q
+   pod.huahaiy.datalevin/explain hooks.datalevin/explain}}}

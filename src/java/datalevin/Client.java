@@ -49,6 +49,23 @@ public final class Client extends HandleResource {
     }
 
     /**
+     * Opens a database with optional schema/options and optional info output.
+     */
+    public Map<?, ?> openDatabase(String dbName,
+                                  String dbType,
+                                  Map<?, ?> schema,
+                                  Map<?, ?> opts,
+                                  boolean info) {
+        return (Map<?, ?>) ClojureRuntime.client("open-database",
+                                                resource(),
+                                                dbName,
+                                                dbType,
+                                                DatalevinForms.schemaInput(schema),
+                                                DatalevinForms.optionsInput(opts),
+                                                info);
+    }
+
+    /**
      * Opens a database on the remote server.
      */
     public void openDatabase(String dbName, DatabaseType dbType) {
@@ -305,6 +322,23 @@ public final class Client extends HandleResource {
     }
 
     /**
+     * Runs a system query expressed as a raw EDN-like form with positional
+     * arguments.
+     */
+    public Object querySystemForm(Object queryForm, List<?> args) {
+        int argCount = args == null ? 0 : args.size();
+        Object[] request = new Object[argCount + 2];
+        request[0] = resource();
+        request[1] = DatalevinForms.queryFormInput(queryForm);
+        if (args != null) {
+            for (int i = 0; i < args.size(); i++) {
+                request[i + 2] = ClojureCodec.runtimeInput(args.get(i));
+            }
+        }
+        return ClojureRuntime.client("query-system", request);
+    }
+
+    /**
      * Shows connected clients on the remote server.
      */
     public Map<?, ?> showClients() {
@@ -316,6 +350,13 @@ public final class Client extends HandleResource {
      */
     public void disconnectClient(UUID clientId) {
         ClojureRuntime.client("disconnect-client", resource(), clientId);
+    }
+
+    /**
+     * Disconnects another client by id.
+     */
+    public void disconnectClient(String clientId) {
+        disconnectClient(UUID.fromString(clientId));
     }
 
     /**

@@ -23,10 +23,10 @@
    [org.clojure/tools.cli "1.3.250"]
    [org.clojure/test.check "1.1.3"]
    [org.eclipse.collections/eclipse-collections "13.0.0"]
-   [org.clojars.huahaiy/dtlvnative-macosx-arm64 "0.17.1"]
-   [org.clojars.huahaiy/dtlvnative-linux-arm64 "0.17.1"]
-   [org.clojars.huahaiy/dtlvnative-linux-x86_64 "0.17.1"]
-   [org.clojars.huahaiy/dtlvnative-windows-x86_64 "0.17.1"]
+   [org.clojars.huahaiy/dtlvnative-macosx-arm64 "0.17.4"]
+   [org.clojars.huahaiy/dtlvnative-linux-arm64 "0.17.4"]
+   [org.clojars.huahaiy/dtlvnative-linux-x86_64 "0.17.4"]
+   [org.clojars.huahaiy/dtlvnative-windows-x86_64 "0.17.4"]
    [org.roaringbitmap/RoaringBitmap "1.3.0"]
    [com.github.luben/zstd-jni "1.5.7-6"]]
   :dependencies
@@ -94,7 +94,12 @@
                    #"\.md" #"\.txt"
                    #"^java/"
                    #"client_quickstart_check\.clj"]
-  :uberjar-exclusions [#"pod.huahaiy.datalevin-test"]
+  :uberjar-exclusions [#"pod.huahaiy.datalevin-test"
+                       #"^META-INF/maven/.*"
+                       #"^META-INF/leiningen/.*/project\.clj$"
+                       #"^META-INF/leiningen/.*/README(\.[^/]+)?$"
+                       #"^com/caucho/hessian/test/.*"
+                       #"^org/bouncycastle/util/test/.*"]
   :deploy-repositories [["clojars" {:url           "https://repo.clojars.org"
                                     :username      :env/clojars_username
                                     :password      :env/clojars_password

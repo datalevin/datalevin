@@ -25,10 +25,26 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Invokes a Datalevin core function and normalizes the result for bridge
+     * runtimes.
+     */
+    public static Object coreInvokeBridge(String function, List<?> args) {
+        return ClojureCodec.bridgeOutput(coreInvoke(function, args));
+    }
+
+    /**
      * Invokes a Datalevin client function and returns the raw Clojure result.
      */
     public static Object clientInvoke(String function, List<?> args) {
         return ClojureRuntime.client(function, normalizeArgs(args));
+    }
+
+    /**
+     * Invokes a Datalevin client function and normalizes the result for bridge
+     * runtimes.
+     */
+    public static Object clientInvokeBridge(String function, List<?> args) {
+        return ClojureCodec.bridgeOutput(clientInvoke(function, args));
     }
 
     /**
@@ -155,6 +171,28 @@ public final class DatalevinInterop {
      */
     public static Object readEdn(String edn) {
         return ClojureRuntime.readEdn(edn);
+    }
+
+    /**
+     * Returns the current Datalevin/Clojure context class loader.
+     *
+     * <p>Bridge runtimes such as node-java-bridge can use this loader when
+     * proxying dynamically generated Clojure classes back into another
+     * language runtime.
+     */
+    public static ClassLoader currentClassLoader() {
+        return Thread.currentThread().getContextClassLoader();
+    }
+
+    /**
+     * Normalizes JVM results into bridge-safe JDK collections and scalar values.
+     *
+     * <p>This is primarily useful for runtimes such as Node's `java-bridge`
+     * that struggle with opaque Clojure implementation classes nested inside
+     * otherwise ordinary collections.
+     */
+    public static Object bridgeResult(Object value) {
+        return ClojureCodec.bridgeOutput(value);
     }
 
     /**
@@ -322,7 +360,11 @@ public final class DatalevinInterop {
         Object[] normalized = new Object[args.size()];
         int i = 0;
         for (Object arg : args) {
-            normalized[i++] = ClojureCodec.runtimeInput(arg);
+            if (arg instanceof HandleResource handle) {
+                normalized[i++] = ClojureCodec.runtimeInput(handle.handle());
+            } else {
+                normalized[i++] = ClojureCodec.runtimeInput(arg);
+            }
         }
         return normalized;
     }
