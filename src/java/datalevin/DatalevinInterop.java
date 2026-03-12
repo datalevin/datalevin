@@ -158,6 +158,28 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Returns the current Datalevin/Clojure context class loader.
+     *
+     * <p>Bridge runtimes such as node-java-bridge can use this loader when
+     * proxying dynamically generated Clojure classes back into another
+     * language runtime.
+     */
+    public static ClassLoader currentClassLoader() {
+        return Thread.currentThread().getContextClassLoader();
+    }
+
+    /**
+     * Normalizes JVM results into bridge-safe JDK collections and scalar values.
+     *
+     * <p>This is primarily useful for runtimes such as Node's `java-bridge`
+     * that struggle with opaque Clojure implementation classes nested inside
+     * otherwise ordinary collections.
+     */
+    public static Object bridgeResult(Object value) {
+        return ClojureCodec.bridgeOutput(value);
+    }
+
+    /**
      * Normalizes a keyword-like string into a raw Clojure keyword.
      */
     public static Object keyword(String value) {

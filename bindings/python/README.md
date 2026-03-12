@@ -12,14 +12,14 @@ This scaffold uses:
 
 From this repo, the wrapper can run against:
 
-1. `DATALEVIN_JAR=/path/to/datalevin-python-runtime-<version>.jar`
+1. `DATALEVIN_JAR=/path/to/datalevin-runtime-<version>.jar`
 2. a vendored jar under `src/datalevin/jars/`
 3. a repo-local build in `target/`
 
 Typical local flow:
 
 ```bash
-clojure -T:build vendor-python-jar
+clojure -T:build vendor-jar
 cd bindings/python
 python -m venv .venv
 . .venv/bin/activate
@@ -27,9 +27,9 @@ pip install -e '.[dev]'
 pytest
 ```
 
-`vendor-python-jar` now builds a platform-specific runtime jar for the current
-build host by default. To keep the old cross-platform native payloads, pass
-`clojure -T:build vendor-python-jar :native-platform all`.
+`vendor-jar` builds a platform-specific runtime jar for the current build host
+by default. To keep the cross-platform native payloads, pass
+`clojure -T:build vendor-jar :native-platform all`.
 
 Wheel builds do this automatically and produce platform-tagged wheels. The
 supported release path is wheel-only:
@@ -49,4 +49,4 @@ GitHub Actions release workflows are split the same way:
 
 For ad hoc development against a different build, set `DATALEVIN_JAR` to point
 at another embeddable Datalevin runtime jar, preferably
-`target/datalevin-python-runtime-<version>.jar`.
+`target/datalevin-runtime-<version>.jar`.

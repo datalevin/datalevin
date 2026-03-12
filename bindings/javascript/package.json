@@ -1,0 +1,34 @@
+{
+  "name": "datalevin-node",
+  "version": "0.10.7",
+  "description": "Node.js bindings for Datalevin over the JVM interop bridge",
+  "type": "module",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "files": [
+    "src",
+    "jars",
+    "README.md",
+    "scripts"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "scripts": {
+    "test": "node --test",
+    "vendor-runtime": "node scripts/vendor-runtime.mjs"
+  },
+  "keywords": [
+    "datalevin",
+    "datalog",
+    "lmdb",
+    "database",
+    "node"
+  ],
+  "author": "Huahai Yang <huahai.yang@gmail.com>",
+  "license": "EPL-2.0",
+  "dependencies": {
+    "java-bridge": "^2.8.0"
+  }
+}

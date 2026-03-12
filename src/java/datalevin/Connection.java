@@ -201,6 +201,13 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Runs a query expressed as a raw EDN-like form with positional inputs.
+     */
+    public Object queryForm(Object queryForm, List<?> inputs) {
+        return runQuery(DatalevinForms.queryFormInput(queryForm), inputs);
+    }
+
+    /**
      * Runs a typed query with no explicit extra inputs.
      */
     public Object query(DatalogQuery query) {
@@ -362,11 +369,29 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Explains a query expressed as a raw EDN-like form with positional inputs.
+     */
+    public Object explainForm(Object queryForm, List<?> inputs) {
+        return runExplain(DatalevinForms.explainOpts(null),
+                          DatalevinForms.queryFormInput(queryForm),
+                          inputs);
+    }
+
+    /**
      * Explains a query expressed as EDN text using explicit explain options.
      */
     public Object explain(String optsEdn, String query, List<?> inputs) {
         return runExplain(DatalevinForms.explainOpts(optsEdn),
                           DatalevinForms.queryForm(query),
+                          inputs);
+    }
+
+    /**
+     * Explains a raw EDN-like query using explicit explain options.
+     */
+    public Object explainForm(String optsEdn, Object queryForm, List<?> inputs) {
+        return runExplain(DatalevinForms.explainOpts(optsEdn),
+                          DatalevinForms.queryFormInput(queryForm),
                           inputs);
     }
 

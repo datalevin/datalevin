@@ -88,7 +88,7 @@ def _vendor_runtime_jar(native_platform: str) -> None:
     command = [
         "clojure",
         "-T:build",
-        "vendor-python-jar",
+        "vendor-jar",
         ":native-platform",
         native_platform,
     ]

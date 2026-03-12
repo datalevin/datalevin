@@ -17,6 +17,7 @@ DATALEVIN_JVM_ARGS_ENV = "DATALEVIN_JVM_ARGS"
 DATALEVIN_JAVACPP_CACHEDIR_ENV = "DATALEVIN_JAVACPP_CACHEDIR"
 PACKAGE_NAME = "datalevin"
 TARGET_JAR_PATTERNS = (
+    "datalevin-runtime-*.jar",
     "datalevin-python-runtime-*.jar",
     "datalevin-java-*.jar",
 )
