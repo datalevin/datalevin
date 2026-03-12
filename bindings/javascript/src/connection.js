@@ -40,6 +40,9 @@ export class Connection extends ResourceWrapper {
     const normalizedSchema = schemaUpdate === null || schemaUpdate === undefined
       ? null
       : await toJava(schemaUpdate);
+    const normalizedDelAttrs = delAttrs === null || delAttrs === undefined
+      ? null
+      : await toJava([...delAttrs]);
 
     if (renameMap !== null && renameMap !== undefined) {
       return toJsResult(
@@ -47,14 +50,14 @@ export class Connection extends ResourceWrapper {
           this.rawHandle(),
           "updateSchema",
           normalizedSchema,
-          delAttrs === null ? null : [...delAttrs],
+          normalizedDelAttrs,
           await toJava(renameMap)
         )
       );
     }
 
     if (delAttrs !== null && delAttrs !== undefined) {
-      return toJsResult(await callJavaMethod(this.rawHandle(), "updateSchema", normalizedSchema, [...delAttrs], null));
+      return toJsResult(await callJavaMethod(this.rawHandle(), "updateSchema", normalizedSchema, normalizedDelAttrs, null));
     }
 
     return toJsResult(await callJavaMethod(this.rawHandle(), "updateSchema", normalizedSchema));
@@ -69,7 +72,7 @@ export class Connection extends ResourceWrapper {
   }
 
   async entity(eid) {
-    return toJsResult(await callJavaMethod(this.rawHandle(), "entity", await toJava(eid)));
+    return toJsResult(await callJavaMethod(this.rawHandle(), "entityMap", await toJava(eid)));
   }
 
   async pull(selector, eid) {

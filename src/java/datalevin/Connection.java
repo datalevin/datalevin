@@ -153,6 +153,18 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Returns a bridge-safe touched entity map for the given entity id or lookup
+     * ref.
+     */
+    public Map<?, ?> entityMap(Object eid) {
+        Object entity = ClojureRuntime.core("entity", db(), DatalevinForms.lookupRefInput(eid));
+        if (entity == null) {
+            return null;
+        }
+        return (Map<?, ?>) ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", entity));
+    }
+
+    /**
      * Pulls one entity using a raw selector value.
      */
     public Map<?, ?> pull(Object selector, Object eid) {

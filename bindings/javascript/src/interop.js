@@ -2,18 +2,10 @@ import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
 import { callJavaMethod, classes, jvmStarted, startJvm } from "./jvm.js";
 
 async function unwrapInteropHandle(value) {
-  let current = value;
-  if (typeof current?.rawHandle === "function") {
-    current = current.rawHandle();
+  if (typeof value?.rawHandle === "function") {
+    return value.rawHandle();
   }
-  if (
-    current !== null
-    && (typeof current === "object" || typeof current === "function")
-    && (typeof current.handleSync === "function" || typeof current.handle === "function")
-  ) {
-    return callJavaMethod(current, "handle");
-  }
-  return current;
+  return value;
 }
 
 async function normalizeInteropArgs(args = []) {
@@ -42,7 +34,7 @@ class InteropBindings {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
-      "coreInvoke",
+      "coreInvokeBridge",
       functionName,
       await toJava(await normalizeInteropArgs([...(args || [])]))
     );
@@ -52,7 +44,7 @@ class InteropBindings {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
-      "clientInvoke",
+      "clientInvokeBridge",
       functionName,
       await toJava(await normalizeInteropArgs([...(args || [])]))
     );

@@ -43,6 +43,9 @@ def _normalize_native_platform(value: str | None) -> str:
         if any(token in normalized for token in ("aarch64", "arm64")):
             return "macosx-arm64"
 
+    if "freebsd" in normalized and any(token in normalized for token in ("x86_64", "amd64")):
+        return "freebsd-x86_64"
+
     if "win" in normalized and any(token in normalized for token in ("x86_64", "amd64")):
         return "windows-x86_64"
 
@@ -50,6 +53,8 @@ def _normalize_native_platform(value: str | None) -> str:
         "linux_x86_64",
         "linux_arm64",
         "macosx_arm64",
+        "freebsd_x86_64",
+        "freebsd_amd64",
         "windows_x86_64",
     }:
         return normalized.replace("_", "-")
@@ -57,7 +62,8 @@ def _normalize_native_platform(value: str | None) -> str:
     raise DistutilsSetupError(
         f"Unsupported wheel platform '{value}'. "
         "Set DATALEVIN_NATIVE_PLATFORM to one of: "
-        "linux-x86_64, linux-arm64, macosx-arm64, windows-x86_64, all."
+        "linux-x86_64, linux-arm64, macosx-arm64, freebsd-x86_64, "
+        "windows-x86_64, all."
     )
 
 
@@ -75,6 +81,11 @@ def _wheel_platform_tag(native_platform: str, fallback_tag: str | None) -> str:
                 return fallback_tag
         except DistutilsSetupError:
             pass
+    if native_platform == "freebsd-x86_64":
+        raise DistutilsSetupError(
+            "FreeBSD wheel tagging requires a native FreeBSD build or an explicit "
+            "--plat-name freebsd_*_amd64."
+        )
     return WHEEL_PLATFORM_TAGS[native_platform]
 
 
@@ -85,12 +96,13 @@ def _vendor_runtime_jar(native_platform: str) -> None:
             "the runtime jar can be regenerated."
         )
 
+    build_platform = "all" if native_platform == "freebsd-x86_64" else native_platform
     command = [
         "clojure",
         "-T:build",
         "vendor-jar",
         ":native-platform",
-        native_platform,
+        build_platform,
     ]
     try:
         subprocess.run(command, cwd=REPO_ROOT, check=True)

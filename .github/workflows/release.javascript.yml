@@ -1,0 +1,88 @@
+name: JavaScript Release
+
+on:
+  workflow_dispatch:
+  release:
+    types:
+      - created
+
+jobs:
+  build-package:
+    name: Build JavaScript package
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Clojure CLI
+        uses: DeLaGuardo/setup-clojure@13.4
+        with:
+          cli: latest
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: bindings/javascript/package-lock.json
+          registry-url: https://registry.npmjs.org
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-${{ runner.arch }}-clojure-${{ hashFiles('deps.edn', 'build.clj', 'project.clj') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-clojure-
+
+      - name: Build shared runtime jar
+        run: clojure -T:build vendor-jar :native-platform all
+
+      - name: Install JavaScript dependencies
+        working-directory: bindings/javascript
+        run: npm ci
+
+      - name: Run JavaScript tests
+        working-directory: bindings/javascript
+        run: node --test
+
+      - name: Dry-run npm package and enforce size budget
+        working-directory: bindings/javascript
+        env:
+          MAX_PACKAGE_BYTES: "45000000"
+        run: |
+          PACK_JSON="$(npm pack --dry-run --json)"
+          printf '%s\n' "$PACK_JSON"
+          PACKAGE_SIZE="$(printf '%s\n' "$PACK_JSON" | node -e 'const fs = require("node:fs"); const data = JSON.parse(fs.readFileSync(0, "utf8")); console.log(data[0].size);')"
+          if [ "$PACKAGE_SIZE" -gt "$MAX_PACKAGE_BYTES" ]; then
+            echo "npm package size $PACKAGE_SIZE exceeds limit $MAX_PACKAGE_BYTES" >&2
+            exit 1
+          fi
+
+      - name: Create npm package tarball
+        working-directory: bindings/javascript
+        run: npm pack
+
+      - name: Upload npm package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: javascript-package
+          path: bindings/javascript/datalevin-node-*.tgz
+          if-no-files-found: error
+
+      - name: Publish to npm
+        if: github.event_name == 'release'
+        working-directory: bindings/javascript
+        run: npm publish --provenance --access public

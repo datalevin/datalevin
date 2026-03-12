@@ -37,6 +37,10 @@ by default. To keep the cross-platform native payloads, pass:
 clojure -T:build vendor-jar :native-platform all
 ```
 
+`npm run vendor-runtime` vendors the publishable shared runtime jar and defaults
+to `DATALEVIN_NATIVE_PLATFORM=all`. Override that environment variable if you
+want a host-specific vendored jar during development.
+
 For ad hoc development against a different build, set `DATALEVIN_JAR` to point
 at another embeddable Datalevin runtime jar, preferably
 `target/datalevin-runtime-<version>.jar`.
@@ -76,3 +80,5 @@ try {
 - `interop()` is intended for advanced bridge use, but opaque raw database
   values are not exposed in Node. Use the high-level `Connection`, `KV`, and
   `Client` wrappers for normal operations.
+- `.github/workflows/release.javascript.yml` builds, tests, dry-runs the npm
+  package on demand, and publishes tagged releases to npm.

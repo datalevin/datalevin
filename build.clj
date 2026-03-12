@@ -88,6 +88,12 @@
                      "darwin/.*"
                      "freebsd/.*"
                      "aix/.*"]})
+(def runtime-all-zstd-excludes
+  ["linux/(?!amd64/|aarch64/).*"
+   "win/(?!amd64/).*"
+   "darwin/(?!aarch64/).*"
+   "freebsd/(?!amd64/).*"
+   "aix/.*"])
 (def binding-jar-dirs
   [python-jar-dir
    javascript-jar-dir])
@@ -193,7 +199,7 @@
   [native-platform]
   (let [platform (normalize-runtime-native-platform native-platform)]
     (if (= platform :all)
-      []
+      runtime-all-zstd-excludes
       (runtime-zstd-excludes platform))))
 
 (defn clean [_]

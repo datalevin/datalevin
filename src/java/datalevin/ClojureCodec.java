@@ -161,6 +161,16 @@ final class ClojureCodec {
             return result;
         }
 
+        if (value instanceof IPersistentMap persistentMap) {
+            LinkedHashMap<Object, Object> result = new LinkedHashMap<>();
+            for (Object item : persistentMap) {
+                if (item instanceof Map.Entry<?, ?> entry) {
+                    result.put(bridgeOutput(entry.getKey()), bridgeOutput(entry.getValue()));
+                }
+            }
+            return result;
+        }
+
         if (value instanceof Map<?, ?> map) {
             LinkedHashMap<Object, Object> result = new LinkedHashMap<>(map.size());
             for (Map.Entry<?, ?> entry : map.entrySet()) {
