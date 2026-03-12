@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from ._convert import to_python
+from ._convert import to_edn_form, to_python, to_query_input
 from ._interop import _BINDINGS
 from ._resource import ResourceWrapper
 
@@ -10,7 +10,7 @@ from ._resource import ResourceWrapper
 def _query_form(value):
     if isinstance(value, str):
         return _BINDINGS.read_edn(value)
-    return value
+    return to_edn_form(value)
 
 
 class Client(ResourceWrapper):
@@ -132,7 +132,7 @@ class Client(ResourceWrapper):
         return to_python(
             _BINDINGS.client_invoke(
                 "query-system",
-                [self.raw_handle(), _query_form(query), *args],
+                [self.raw_handle(), _query_form(query), *(to_query_input(arg) for arg in args)],
             )
         )
 

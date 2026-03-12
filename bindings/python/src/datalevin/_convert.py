@@ -10,10 +10,11 @@ import uuid as py_uuid
 import jpype
 from jpype.types import JByte, JLong
 
-from ._java import classes, is_java_object
+from ._java import call_java, classes, is_java_object
 
 INT64_MIN = -(2**63)
 INT64_MAX = 2**63 - 1
+FORM_SYMBOL_STRINGS = {"*", "...", ".", "$", "%", "_"}
 
 
 def to_java(value):
@@ -115,3 +116,77 @@ def to_python(value):
         return [to_python(item) for item in value]
 
     return value
+
+
+def to_edn_form(value):
+    """Convert Python form structures into EDN-friendly JVM values."""
+
+    if value is None or is_java_object(value):
+        return value
+
+    raw_handle = getattr(value, "raw_handle", None)
+    if callable(raw_handle):
+        return raw_handle()
+
+    if isinstance(value, str):
+        if value.startswith(":"):
+            return call_java(classes().interop.keyword, value)
+        if value.startswith("?") or value in FORM_SYMBOL_STRINGS:
+            return call_java(classes().interop.symbol, value)
+        return value
+
+    if isinstance(value, Mapping):
+        jmap = classes().linked_hash_map()
+        for key, item in value.items():
+            jmap.put(to_edn_form(key), to_edn_form(item))
+        return jmap
+
+    if isinstance(value, (set, frozenset)):
+        jset = classes().linked_hash_set()
+        for item in value:
+            jset.add(to_edn_form(item))
+        return jset
+
+    if isinstance(value, (list, tuple)):
+        jlist = classes().array_list()
+        for item in value:
+            jlist.add(to_edn_form(item))
+        return jlist
+
+    return to_java(value)
+
+
+def to_query_input(value):
+    """Convert Python query inputs while preserving ordinary string literals."""
+
+    if value is None or is_java_object(value):
+        return value
+
+    raw_handle = getattr(value, "raw_handle", None)
+    if callable(raw_handle):
+        return raw_handle()
+
+    if isinstance(value, str):
+        if value.startswith(":"):
+            return call_java(classes().interop.keyword, value)
+        return value
+
+    if isinstance(value, Mapping):
+        jmap = classes().linked_hash_map()
+        for key, item in value.items():
+            jmap.put(to_query_input(key), to_query_input(item))
+        return jmap
+
+    if isinstance(value, (set, frozenset)):
+        jset = classes().linked_hash_set()
+        for item in value:
+            jset.add(to_query_input(item))
+        return jset
+
+    if isinstance(value, (list, tuple)):
+        jlist = classes().array_list()
+        for item in value:
+            jlist.add(to_query_input(item))
+        return jlist
+
+    return to_java(value)

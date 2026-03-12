@@ -17,7 +17,10 @@ class InteropBindings:
         return call_java(classes().datalevin.apiInfo)
 
     def exec_json_raw(self, request_json: str) -> str:
-        return call_java(classes().json_api.exec, request_json)
+        json_api_exec = getattr(classes().json_api, "exec_", None)
+        if json_api_exec is None:
+            json_api_exec = getattr(classes().json_api, "exec")
+        return str(call_java(json_api_exec, request_json))
 
     def core_invoke(self, function: str, args=None):
         return call_java(classes().interop.coreInvoke, function, to_java(list(args or ())))
