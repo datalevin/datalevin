@@ -17,7 +17,8 @@
   (:import
    [java.util UUID]
    [java.util.concurrent.atomic AtomicBoolean]
-   [datalevin.datom Datom]))
+   [datalevin.datom Datom]
+   [datalevin.storage Store]))
 
 (use-fixtures :each server-fixture)
 
@@ -171,9 +172,10 @@
                        #(assoc %
                                :store primary-store
                                :dt-db runtime-db))
-      (if/close-kv primary-store)
+      (if/close primary-store)
       (is (= runtime-store (#'srv/get-store server db-name)))
-      (is (= runtime-store (#'srv/get-kv-store server db-name)))
+      (is (= (.-lmdb ^Store runtime-store)
+             (#'srv/get-kv-store server db-name)))
       (finally
         (srv/stop server)
         (u/delete-files root)))))
@@ -399,6 +401,12 @@
                  (throw (ex-info "copy cleanup failed" {})))}
               (fn []
                 (if/copy store dest false)))]
+        (let [deadline (+ (System/currentTimeMillis) 5000)]
+          (loop []
+            (when (and (not @cleanup-attempted?)
+                       (< (System/currentTimeMillis) deadline))
+              (Thread/sleep 25)
+              (recur))))
         (is @cleanup-attempted?)
         (is (map? copy-meta))
         (reset! copied-store* (l/open-kv dest))

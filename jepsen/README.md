@@ -16,7 +16,12 @@ The first cut is intentionally narrow:
 
 * local 3-node HA cluster backend
 * append, append-cas, bank, register, giant-values, tx-fn-register,
-  fencing, rejoin-bootstrap, identity-upsert, and index-consistency workloads
+  fencing, rejoin-bootstrap, degraded-rejoin, snapshot-db-identity-rejoin,
+  snapshot-checksum-rejoin, snapshot-manifest-corruption-rejoin,
+  snapshot-copy-corruption-rejoin, witness-topology, membership-drift,
+  membership-drift-live,
+  fencing-retry, udf-readiness,
+  identity-upsert, and index-consistency workloads
 * Datalevin-specific `grant` and `internal` characterization workloads
 * local leader pause, arbitrary-node pause, multi-node pause, leader failover,
   leader partition, asymmetric multi-way graph cuts, heterogeneous per-link
@@ -42,6 +47,17 @@ does not claim full parity with the Datomic Jepsen suite.
   workload that stores oversized payloads and validates exact replay/readback
 * `src/datalevin/jepsen/workload/fencing.clj`: HA admission/fencing workload
   that probes every node directly and fails on split-brain write admission
+* `src/datalevin/jepsen/workload/fencing_retry.clj`: witness-topology HA
+  failover workload that forces fencing-hook retries and failures on the sole
+  surviving candidate, verifies promotion stays blocked with a stable
+  `DTLV_FENCE_OP_ID`, and then confirms recovery after the hook is restored
+  with the full fencing environment contract (`DTLV_DB_NAME`,
+  old-leader identity/endpoint, terms, and `DTLV_FENCE_OP_ID`)
+* `src/datalevin/jepsen/workload/udf_readiness.clj`: HA write-admission
+  workload that installs a tx-UDF descriptor, enables
+  `:ha-require-udf-ready?`, verifies leaders reject writes while the runtime
+  registry is missing the tx function, and then confirms recovery once the
+  registry is populated
 * `src/datalevin/jepsen/workload/register.clj`: linearizable per-key register
   workload using Jepsen's independent register checker
 * `src/datalevin/jepsen/workload/tx_fn_register.clj`: linearizable register
@@ -53,6 +69,37 @@ does not claim full parity with the Datomic Jepsen suite.
 * `src/datalevin/jepsen/workload/rejoin_bootstrap.clj`: follower rejoin
   convergence workload that restarts missing nodes and verifies cluster-wide
   register state after catch-up
+* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: forced WAL-gap rejoin
+  workload that blocks snapshot copy, verifies degraded follower state, and
+  then confirms bootstrap recovery once a valid snapshot source is available
+* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
+  `snapshot-db-identity-rejoin` variant, which corrupts snapshot metadata,
+  verifies the follower rejects the copy, and then confirms recovery from a
+  subsequent valid bootstrap
+* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
+  `snapshot-checksum-rejoin` variant, which injects a checksum-style snapshot
+  copy failure, verifies the follower stays degraded, and then confirms
+  recovery from a subsequent valid bootstrap
+* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
+  `snapshot-manifest-corruption-rejoin` variant, which strips the copied
+  snapshot's applied-LSN metadata, verifies the follower rejects the malformed
+  manifest before install, and then confirms recovery from a subsequent valid
+  bootstrap
+* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
+  `snapshot-copy-corruption-rejoin` variant, which corrupts the copied
+  `data.mdb`, verifies the follower reports snapshot install failure, and then
+  confirms recovery from a subsequent valid bootstrap
+* `src/datalevin/jepsen/workload/witness_topology.clj`: two-data-node plus
+  one non-promotable witness topology workload that verifies write availability
+  across data-leader loss while control quorum remains intact
+* `src/datalevin/jepsen/workload/membership_drift.clj`: follower restart
+  workload that injects drifted HA membership, expects startup rejection via
+  membership-hash mismatch, and then verifies clean recovery after
+  configuration reconciliation
+* `src/datalevin/jepsen/workload/membership_drift.clj`: also exposes the
+  `membership-drift-live` variant, which injects drift directly into the live
+  leader, expects the repaired node to rejoin through follower recovery, and
+  then verifies quorum-visible writes after the cluster settles
 * `src/datalevin/jepsen/workload/grant.clj`: transaction-function workload for
   single-decision grant approval races
 * `src/datalevin/jepsen/workload/internal.clj`: single-threaded internal
@@ -129,6 +176,76 @@ Run the follower rejoin convergence workload:
 ```bash
 cd jepsen
 lein run test --workload rejoin-bootstrap --control-backend sofa-jraft --nemesis rejoin --time-limit 30 --rate 10 --key-count 8
+```
+
+Run the degraded rejoin bootstrap workload:
+
+```bash
+cd jepsen
+lein run test --workload degraded-rejoin --control-backend sofa-jraft --time-limit 30 --rate 5 --key-count 4
+```
+
+Run the snapshot DB-identity rejection workload:
+
+```bash
+cd jepsen
+lein run test --workload snapshot-db-identity-rejoin --control-backend sofa-jraft --time-limit 30 --rate 5 --key-count 4
+```
+
+Run the snapshot checksum rejection workload:
+
+```bash
+cd jepsen
+lein run test --workload snapshot-checksum-rejoin --control-backend sofa-jraft --time-limit 30 --rate 5 --key-count 4
+```
+
+Run the malformed snapshot manifest rejection workload:
+
+```bash
+cd jepsen
+lein run test --workload snapshot-manifest-corruption-rejoin --control-backend sofa-jraft --time-limit 30 --rate 5 --key-count 4
+```
+
+Run the corrupted snapshot copy rejection workload:
+
+```bash
+cd jepsen
+lein run test --workload snapshot-copy-corruption-rejoin --control-backend sofa-jraft --time-limit 30 --rate 5 --key-count 4
+```
+
+Run the witness-topology workload:
+
+```bash
+cd jepsen
+lein run test --workload witness-topology --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the membership-drift rejoin workload:
+
+```bash
+cd jepsen
+lein run test --workload membership-drift --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the live membership-drift recovery workload:
+
+```bash
+cd jepsen
+lein run test --workload membership-drift-live --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the fencing retry/idempotence workload:
+
+```bash
+cd jepsen
+lein run test --workload fencing-retry --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the UDF-readiness HA admission workload:
+
+```bash
+cd jepsen
+lein run test --workload udf-readiness --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
 ```
 
 Run the identity-upsert characterization workload:
@@ -386,8 +503,6 @@ iteration.
 
 The next meaningful increments are:
 
-* stronger forced WAL-gap/snapshot-bootstrap scenarios inside the rejoin path
+* leader-side membership-hash mismatch demotion coverage beyond restart-time rejection
 * full workload characterization under quorum-loss and clock-skew faults
-* JRaft-backed runs as part of the normal matrix
-* Datalevin-specific checkers for fencing and no-split-brain behavior
 * remote multi-host deployment instead of the current single-host harness

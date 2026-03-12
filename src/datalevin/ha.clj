@@ -234,18 +234,27 @@
                                           nil))
                                       0))
               snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
+              payload-lsn (if (= :leader role)
+                            (read-ha-local-payload-lsn kv-store)
+                            0)
               persisted-lsn (read-ha-local-persisted-lsn kv-store)
               ha-lsn (long (max persisted-lsn state-lsn))
-              local-truth (long (max watermark-lsn snapshot-lsn))]
+              follower-floor-lsn (long (max persisted-lsn snapshot-lsn))
+              local-truth (long (if (= :leader role)
+                                  (max watermark-lsn snapshot-lsn payload-lsn)
+                                  (max watermark-lsn snapshot-lsn)))]
           (cond
             (= :leader role)
             (long (max ha-lsn local-truth))
 
-            (pos? local-truth)
-            local-truth
+            (pos? follower-floor-lsn)
+            follower-floor-lsn
 
             (pos? ha-lsn)
             ha-lsn
+
+            (pos? local-truth)
+            local-truth
 
             :else
             0))
@@ -298,18 +307,27 @@
   [m]
   (if (local-kv-store m)
     (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
+          role (:ha-role m)
           kv-store (local-kv-store m)
           persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
           watermark-lsn (read-ha-local-watermark-lsn m)
           snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
-          local-truth (long (max watermark-lsn snapshot-lsn))
-          local-lsn (long (if (= :leader (:ha-role m))
+          payload-lsn (if (= :leader role)
+                        (read-ha-local-payload-lsn kv-store)
+                        0)
+          follower-floor-lsn (long (max persisted-lsn snapshot-lsn))
+          local-truth (long (if (= :leader role)
+                              (max watermark-lsn snapshot-lsn payload-lsn)
+                              (max watermark-lsn snapshot-lsn)))
+          local-lsn (long (if (= :leader role)
                             (max state-lsn persisted-lsn local-truth)
-                            (if (pos? local-truth)
-                              local-truth
-                              (max state-lsn persisted-lsn))))]
+                            (if (pos? follower-floor-lsn)
+                              follower-floor-lsn
+                              (if (pos? local-truth)
+                                local-truth
+                                (max state-lsn persisted-lsn)))))]
       (cond-> (assoc m :ha-local-last-applied-lsn local-lsn)
-        (= :leader (:ha-role m))
+        (= :leader role)
         (assoc :ha-leader-last-applied-lsn local-lsn)))
     m))
 
@@ -577,6 +595,7 @@
                     (i/opts store)
                     {})]
     (assoc (or base-opts {})
+           ::st/raw-persist-open-opts? true
            :db-name db-name
            :db-identity db-identity)))
 
@@ -655,11 +674,21 @@
 (def ^:redef close-ha-snapshot-remote-store!
   i/close-kv)
 
+(defn- safe-fetch-ha-endpoint-watermark-lsn
+  [db-name m endpoint]
+  (try
+    (fetch-ha-endpoint-watermark-lsn db-name m endpoint)
+    (catch Exception e
+      {:reachable? false
+       :reason :endpoint-watermark-fetch-failed
+       :endpoint endpoint
+       :message (ex-message e)})))
+
 (defn ^:redef fetch-leader-watermark-lsn
   [db-name m lease]
   (let [leader-endpoint (:leader-endpoint lease)
         authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        result (fetch-ha-endpoint-watermark-lsn
+        result (safe-fetch-ha-endpoint-watermark-lsn
                 db-name m leader-endpoint)]
     (if (:reachable? result)
       (update result
@@ -685,7 +714,7 @@
                                      (not (s/blank? %))))
                        distinct)]
     (reduce (fn [best endpoint]
-              (let [watermark (fetch-ha-endpoint-watermark-lsn
+              (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                                db-name m endpoint)]
                 (if-not (:reachable? watermark)
                   best
@@ -770,6 +799,17 @@
          distinct
          vec)))
 
+(defn- ha-source-watermark-lsn
+  [leader-endpoint source-endpoint watermark]
+  (when (:reachable? watermark)
+    (let [last-lsn (some-> (:last-applied-lsn watermark) long)
+          txlog-lsn (some-> (or (:txlog-last-applied-lsn watermark)
+                                (:last-applied-lsn watermark))
+                            long)]
+      (if (= source-endpoint leader-endpoint)
+        (or last-lsn txlog-lsn)
+        txlog-lsn))))
+
 (defn- ha-gap-fallback-source-endpoints
   [db-name m lease next-lsn]
   (let [required-lsn (long (max 0 (dec (long next-lsn))))
@@ -791,12 +831,12 @@
                                 (not (s/blank? endpoint))
                                 (not= endpoint local-endpoint)
                                 (not= endpoint leader-endpoint))
-                       (let [watermark (fetch-ha-endpoint-watermark-lsn
+                       (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                                         db-name m endpoint)
-                             raw-last-lsn (when (:reachable? watermark)
-                                            (long (or (:last-applied-lsn
-                                                       watermark)
-                                                      0)))
+                             raw-last-lsn (ha-source-watermark-lsn
+                                           leader-endpoint
+                                           endpoint
+                                           watermark)
                              last-lsn (when (some? raw-last-lsn)
                                         (long (min raw-last-lsn
                                                    leader-safe-lsn)))
@@ -837,17 +877,21 @@
                                                0))
                                      0)))]
     (if (= source-endpoint leader-endpoint)
-      (let [watermark (fetch-ha-endpoint-watermark-lsn
+      (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
-            remote-lsn (when (:reachable? watermark)
-                         (long (or (:last-applied-lsn watermark) 0)))]
+            remote-lsn (ha-source-watermark-lsn
+                        leader-endpoint
+                        source-endpoint
+                        watermark)]
         {:known? true
          :last-applied-lsn (long (max authority-lsn (or remote-lsn 0)))
          :watermark watermark})
-      (let [watermark (fetch-ha-endpoint-watermark-lsn
+      (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
-            raw-last-lsn (when (:reachable? watermark)
-                           (long (or (:last-applied-lsn watermark) 0)))
+            raw-last-lsn (ha-source-watermark-lsn
+                          leader-endpoint
+                          source-endpoint
+                          watermark)
             last-lsn (when (some? raw-last-lsn)
                        (long (min raw-last-lsn leader-safe-lsn)))]
         {:known? (some? last-lsn)
@@ -856,7 +900,7 @@
          :leader-safe-lsn leader-safe-lsn
          :watermark watermark}))))
 
-(defn- fetch-ha-follower-records-with-gap-fallback
+(defn- ^:redef fetch-ha-follower-records-with-gap-fallback
   [db-name m lease next-lsn upto-lsn]
   (let [sources (ha-follower-source-endpoints m lease)]
     (loop [remaining sources
@@ -1000,26 +1044,19 @@
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
   (let [store (:store m)
-        kv-store (local-kv-store m)
+        kv-store (raw-local-kv-store m)
         rows (:rows record)
-        ops (:ops record)]
+        ops (:ops record)
+        replay-rows (cond
+                      (sequential? rows) (vec rows)
+                      (sequential? ops) (vec ops)
+                      :else nil)]
     (when-not kv-store
       (u/raise "Follower txlog replay requires a local KV store"
                {:error :ha/follower-missing-store}))
     (cond
-      (sequential? rows)
-      (let [store (:store m)
-            giant-datoms
-            (into {}
-                  (keep (fn [[op dbi k v kt vt]]
-                          (when (and (= op :put)
-                                     (= dbi c/giants)
-                                     (= kt :id))
-                            [k (if (= vt :raw)
-                                 (idx/decode-giant-datom v)
-                                 v)])))
-                  rows)
-            schema-overrides
+      replay-rows
+      (let [schema-overrides
             (reduce
              (fn [overrides [op dbi attr props]]
                (if (= dbi c/schema)
@@ -1029,71 +1066,7 @@
                    overrides)
                  overrides))
              {}
-             rows)
-            pending-attrs
-            (into {}
-                  (keep (fn [[attr props]]
-                          (when-let [aid (:db/aid props)]
-                            [aid attr])))
-                  schema-overrides)
-            attr-props
-            (fn [aid]
-              (when-let [attr (or (get pending-attrs aid)
-                                  (when (instance? IStore store)
-                                    (get (i/attrs store) aid)))]
-                (merge (when (instance? IStore store)
-                         (get (i/schema store) attr))
-                       (get schema-overrides attr))))
-            normalize-avg
-            (fn normalize-avg [e x]
-              (cond
-                (ha-retrieved-like? x)
-                (let [aid (ha-reflect-field x "a")
-                      props (attr-props aid)
-                      vt (when props
-                           (or (:db/valueType props) :data))
-                      g (or (ha-reflect-field x "g") c/normal)
-                      rv (if (= g c/normal)
-                           (ha-reflect-field x "v")
-                           (or (some-> (get giant-datoms g)
-                                       dd/datom-v)
-                               (some-> (idx/gt->datom kv-store g)
-                                       dd/datom-v)))]
-                  (when-not vt
-                    (u/raise "Follower txlog replay is missing attr value type"
-                             {:error :ha/follower-invalid-record
-                              :aid aid
-                              :record record}))
-                  (b/indexable e aid rv vt (long g)))
-
-                (ha-seq-like? x)
-                (mapv #(normalize-avg e %) x)
-
-                :else
-                x))
-            replay-rows
-            (mapv (fn [[op dbi k v kt vt :as row]]
-                    (cond
-                      (or (= kt :avg)
-                          (= vt :avg))
-                      (let [k' (if (= kt :avg)
-                                 (normalize-avg nil k)
-                                 k)
-                            v' (if (= vt :avg)
-                                 (normalize-avg (when (integer? k)
-                                                  (long k))
-                                                v)
-                                 v)]
-                        (cond-> row
-                          (not= k' k) (assoc 2 k')
-                          (not= v' v) (assoc 3 v')))
-
-                      :else row))
-                  rows)
-            replay-rows
-            (conj replay-rows
-                  [:put c/kv-info c/wal-local-payload-lsn
-                   (long (:lsn record)) :keyword :data])
+             replay-rows)
             replayed-max-gt
             (reduce
              (fn [acc [op dbi k]]
@@ -1106,7 +1079,7 @@
              replay-rows)
             next-state
             (do
-              (transact-ha-follower-local! m replay-rows)
+              (kv/mirror-replayed-txlog-record! kv-store record)
               (when (and (instance? IStore store)
                          (pos? (long replayed-max-gt)))
                 (st/sync-max-gt-floor! store replayed-max-gt))
@@ -1119,7 +1092,41 @@
                          :store (open-ha-store-dbis!
                                  (st/open store-dir nil store-opts))
                          :dt-db nil))
-                m))]
+                m))
+            readback-kv-store (raw-local-kv-store next-state)
+            probe-eid (some->> replay-rows
+                               (keep (fn [[op dbi k]]
+                                       (when (and (= op :put)
+                                                  (= dbi c/eav)
+                                                  (integer? k))
+                                         (long k))))
+                               first)
+            readback
+            (when readback-kv-store
+              {:lsn (long (:lsn record))
+               :payload-lsn (read-ha-local-payload-lsn readback-kv-store)
+               :meta-max-tx (long (or (try
+                                       (i/get-value readback-kv-store
+                                                    c/meta
+                                                    :max-tx
+                                                    :attr
+                                                    :long)
+                                       (catch Throwable _
+                                         nil))
+                                      0))
+               :probe-eid probe-eid
+               :probe-eav-range
+               (when probe-eid
+                 (try
+                   (vec (i/get-range readback-kv-store
+                                     c/eav
+                                     [probe-eid]
+                                     :id
+                                     :avg))
+                   (catch Throwable _
+                     nil)))})]
+        (let [next-state (assoc next-state
+                                :ha-follower-last-apply-readback readback)]
         (when (instance? IStore (:store next-state))
           (when-let [target-max-tx
                      (some->> replay-rows
@@ -1127,23 +1134,14 @@
                                       (when (and (= op :put)
                                                  (= dbi c/meta)
                                                  (= k :max-tx)
-                                                 (integer? v))
+                                          (integer? v))
                                         (long v))))
                               last)]
             (loop [cur (long (i/max-tx (:store next-state)))]
               (when (< cur target-max-tx)
                 (i/advance-max-tx (:store next-state))
                 (recur (long (i/max-tx (:store next-state))))))))
-        next-state)
-
-      (sequential? ops)
-      (do
-        (transact-ha-follower-local!
-         m
-         (conj (vec ops)
-               [:put c/kv-info c/wal-local-payload-lsn
-                (long (:lsn record)) :keyword :data]))
-        m)
+          next-state))
 
       :else
       (u/raise "Follower txlog replay record is missing rows"
@@ -1396,12 +1394,18 @@
               ;; datalog transaction path, so clear any cached query misses
               ;; before publishing a refreshed dt-db view.
               (db/refresh-cache (:store next-m)))
-          local-lsn-after (read-ha-local-last-applied-lsn next-m)
           last-record-lsn (when-let [record (peek records)]
                             (long (:lsn record)))
-          applied-lsn (long (max local-lsn-after
-                                 (or last-record-lsn
-                                     (dec (long next-lsn)))))
+          ;; Empty batches prove only that the chosen source returned no new
+          ;; replicated rows. Advancing to `(dec next-lsn)` here can skip
+          ;; records after a stale or speculative follower cursor.
+          current-local-floor-lsn
+          (long (max 0
+                     (long (or (:ha-local-last-applied-lsn next-m)
+                               (:ha-local-last-applied-lsn m)
+                               0))))
+          applied-lsn (long (or last-record-lsn
+                                current-local-floor-lsn))
           _ (when (seq records)
               (persist-ha-local-applied-lsn! next-m applied-lsn))]
       (try
@@ -1440,6 +1444,10 @@
        :source-order source-order
        :state (-> (assoc next-m
                          :ha-local-last-applied-lsn applied-lsn
+                         :ha-follower-last-batch-records
+                         (when (seq records)
+                           (mapv #(select-keys % [:lsn :rows :ops])
+                                 records))
                          :ha-follower-next-lsn (unchecked-inc applied-lsn)
                          :ha-follower-last-batch-size (count records)
                          :ha-follower-last-sync-ms now-ms
@@ -1576,9 +1584,21 @@
                    :ha-follower-last-error :missing-leader-endpoint
                    :ha-follower-last-error-details {:lease lease}
                    :ha-follower-last-error-ms now-ms)
-            (let [next-lsn (long (max 1
-                                      (unchecked-inc
-                                       (long (ha-local-last-applied-lsn m)))))]
+            (let [local-next-lsn
+                  (long (max 1
+                             (unchecked-inc
+                              (long (ha-local-last-applied-lsn m)))))
+                  tracked-next-lsn
+                  (when (integer? (:ha-follower-next-lsn m))
+                    (long (:ha-follower-next-lsn m)))
+                  ;; Fresh follower stores can expose internal LMDB txlog
+                  ;; watermarks before they have replayed any replicated rows.
+                  ;; Honor the tracked follower cursor when present, but never
+                  ;; allow it to advance past the local floor.
+                  next-lsn
+                  (if (and tracked-next-lsn (pos? tracked-next-lsn))
+                    (long (min tracked-next-lsn local-next-lsn))
+                    local-next-lsn)]
               (try
                 (:state (sync-ha-follower-batch
                          db-name m lease next-lsn now-ms))

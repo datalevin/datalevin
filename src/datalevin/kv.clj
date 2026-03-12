@@ -1900,6 +1900,7 @@
           (txlog-replay-dbi! lmdb dbi-name @info-v))))))
 
 (declare append-payload-lsn-row)
+(declare align-runtime-txlog-payload-floor!)
 
 (defn- replay-avg-row?
   [row]
@@ -2013,6 +2014,34 @@
            row))
        rows))))
 
+(declare with-runtime-txlog-rollback)
+
+(defn ^:no-doc replay-txlog-rows!
+  "Apply txlog payload rows directly to LMDB using the same normalization path
+  as local txlog recovery, but without consuming a new local txlog LSN."
+  [lmdb rows lsn]
+  (let [rows   (vec rows)
+        record {:lsn  (long lsn)
+                :rows rows}]
+    (with-runtime-txlog-rollback
+      lmdb
+      (fn []
+        (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
+        (let [normalized (-> (normalize-txlog-replay-avg-rows lmdb rows record)
+                             vec)]
+          (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
+            (binding [*out* *err*]
+              (prn {:ha-replay-debug true
+                    :lsn (long lsn)
+                    :row-count (count rows)
+                    :normalized-count (count normalized)
+                    :row-types (mapv class rows)
+                    :rows rows
+                    :normalized normalized})))
+          (i/transact-kv
+           lmdb
+           (append-payload-lsn-row normalized (long lsn))))))))
+
 (defn- txlog-replay-record!
   [lmdb state record]
   (let [append-res {:lsn (:lsn record)
@@ -2090,8 +2119,9 @@
           (txlog-recover-on-open! lmdb)
           (ensure-snapshot-bootstrap! lmdb)
           (vswap! info-v assoc :txlog-recovered? true))
+        (align-runtime-txlog-payload-floor! lmdb)
         (start-snapshot-scheduler! lmdb)
-        state))))
+        (or (txlog/state lmdb) state)))))
 
 (defn- ensure-tx-dbi
   [dbi-name tx]
@@ -2239,6 +2269,78 @@
     (or (txlog/state lmdb)
         (ensure-txlog-ready! lmdb))))
 
+(defn- persisted-runtime-floor-lsn
+  [lmdb]
+  (long
+   (max
+    (long (or (try
+                (i/get-value lmdb
+                             c/kv-info
+                             c/wal-local-payload-lsn
+                             :keyword
+                             :data)
+                (catch Throwable _
+                  nil))
+              0))
+    (long (or (try
+                (i/get-value lmdb
+                             c/kv-info
+                             c/wal-snapshot-current-lsn
+                             :keyword
+                             :data)
+                (catch Throwable _
+                  nil))
+              0))
+    (long (or (try
+                (i/get-value lmdb
+                             c/kv-info
+                             c/ha-local-applied-lsn
+                             :keyword
+                             :data)
+                (catch Throwable _
+                  nil))
+              0)))))
+
+(defn- align-runtime-txlog-payload-floor!
+  [lmdb]
+  (with-runtime-txlog-state-guard
+    lmdb
+    (fn []
+      (when-let [info-v (i/kv-info lmdb)]
+        (when-let [state (txlog/state lmdb)]
+          (let [floor-lsn (persisted-runtime-floor-lsn lmdb)
+                target-next-lsn (unchecked-inc floor-lsn)
+                current-next-lsn (long @(:next-lsn state))]
+            (when (> target-next-lsn current-next-lsn)
+              ;; Snapshot-installed followers can restore LMDB payload state
+              ;; ahead of their local txlog files. Align the runtime cursor to
+              ;; the restored payload floor so the next mirrored HA record can
+              ;; append contiguously without inventing placeholder WAL rows.
+              (let [state (if (> floor-lsn
+                                 (long (or (:meta-last-applied-lsn state) 0)))
+                            (let [aligned-state
+                                  (assoc state :meta-last-applied-lsn floor-lsn)]
+                              (vswap! info-v assoc :txlog-state aligned-state)
+                              aligned-state)
+                            state)
+                    sync-manager (:sync-manager state)
+                    now-ms (System/currentTimeMillis)]
+                (vreset! (:next-lsn state) target-next-lsn)
+                (vreset! (:last-appended-lsn sync-manager) floor-lsn)
+                (vreset! (:last-durable-lsn sync-manager) floor-lsn)
+                (vreset! (:last-sync-ms sync-manager)
+                         (long (max now-ms
+                                    (long @(:last-sync-ms sync-manager)))))
+                (vreset! (:unsynced-count sync-manager) 0)
+                (vreset! (:pending-lsn-head sync-manager) 0)
+                (vreset! (:pending-lsn-tail sync-manager) 0)
+                (vreset! (:pending-lsn-size sync-manager) 0)
+                (vreset! (:sync-requested? sync-manager) false)
+                (vreset! (:sync-request-reason sync-manager) nil)
+                (vreset! (:sync-in-progress? sync-manager) false)
+                (vreset! (:healthy? sync-manager) true)
+                (vreset! (:failure sync-manager) nil)))))))))
+
 (def ^:private txlog-retention-backpressure-check-interval-ms
   1000)
 
@@ -2349,6 +2451,67 @@
     (catch Exception e
       (txlog-mark-fatal! state e)
       (throw e))))
+
+(defn ^:no-doc mirror-replayed-txlog-record!
+  "Append a replicated HA record into the local txlog at the same LSN and
+  apply its payload to LMDB. This keeps promoted followers on the same WAL
+  sequence and preserves source records for downstream followers."
+  [lmdb record]
+  (with-runtime-txlog-state-guard
+    lmdb
+    (fn []
+      (let [record-rows (cond
+                          (sequential? (:rows record)) (vec (:rows record))
+                          (sequential? (:ops record)) (vec (:ops record))
+                          :else nil)]
+        (when-not record-rows
+          (raise "Follower replay record is missing payload rows"
+                 {:type :txlog/ha-replay-missing-rows
+                  :record (select-keys record [:lsn :segment-id :offset])}))
+        (if-let [state (txlog-runtime-state lmdb)]
+          (let [record-lsn (long (:lsn record))
+              expected-lsn (long @(:next-lsn state))]
+            (when (> record-lsn expected-lsn)
+              (raise "Follower replay local txn-log cursor does not match record LSN"
+                     {:type :txlog/ha-replay-lsn-mismatch
+                      :expected-lsn expected-lsn
+                      :record-lsn record-lsn}))
+            (if (< record-lsn expected-lsn)
+              {:lsn record-lsn
+               :skipped? true}
+              (do
+                (txlog-prepare-replay-dbis!
+                 lmdb
+                 [(assoc record :rows record-rows)]
+                 (dec record-lsn))
+                (let [normalized-rows
+                      (-> (normalize-txlog-replay-avg-rows lmdb
+                                                           record-rows
+                                                           record)
+                          vec)
+                      append-res (txlog/append-durable! state
+                                                        normalized-rows
+                                                        txlog-append-hooks)]
+                  (when-not (= record-lsn (long (:lsn append-res)))
+                    (raise "Follower replay appended unexpected txn-log LSN"
+                           {:type :txlog/ha-replay-lsn-mismatch
+                            :expected-lsn record-lsn
+                            :actual-lsn (:lsn append-res)}))
+                  (let [marker-entry
+                        (txlog/next-commit-marker-entry
+                         (:commit-marker? state)
+                         (long @(:marker-revision state))
+                         append-res)
+                        rows
+                        (append-payload-lsn-row normalized-rows record-lsn)]
+                    (when marker-entry
+                      (.add ^FastList rows (:row marker-entry)))
+                    (apply-lmdb-after-txlog-append! lmdb state rows)
+                    (txlog/commit-finished! state marker-entry)
+                    (when (:synced? append-res)
+                      (txlog/maybe-publish-meta-best-effort! state append-res))
+                    append-res)))))
+          (replay-txlog-rows! lmdb record-rows (:lsn record)))))))
 
 (defn- transact-with-txlog!
   [lmdb state dbi-name txs k-type v-type]
@@ -3157,9 +3320,14 @@
       (finally
         (close-txlog-state! db))))
   (close-transact-kv [_]
-    (if-let [state (txlog-runtime-state db)]
-      (close-with-txlog! db state)
-      (i/close-transact-kv db)))
+    (with-runtime-txlog-state-guard
+      db
+      (fn []
+        (if (txlog-write-path-enabled? db)
+          (if-let [state (txlog-runtime-state db)]
+            (close-with-txlog! db state)
+            (i/close-transact-kv db))
+          (i/close-transact-kv db)))))
   (closed-kv? [this] (i/closed-kv? db))
   (copy [this a0] (.copy this a0 false))
   (copy [this a0 a1] (txlog-copy-with-backup-pin! this db a0 a1))
@@ -3253,9 +3421,14 @@
   (transact-kv [this a0 a1] (.transact-kv this a0 a1 :data :data))
   (transact-kv [this a0 a1 a2] (.transact-kv this a0 a1 a2 :data))
   (transact-kv [_ a0 a1 a2 a3]
-    (if-let [state (txlog-runtime-state db)]
-      (transact-with-txlog! db state a0 a1 a2 a3)
-      (i/transact-kv db a0 a1 a2 a3)))
+    (with-runtime-txlog-state-guard
+      db
+      (fn []
+        (if (txlog-write-path-enabled? db)
+          (if-let [state (txlog-runtime-state db)]
+            (transact-with-txlog! db state a0 a1 a2 a3)
+            (i/transact-kv db a0 a1 a2 a3))
+          (i/transact-kv db a0 a1 a2 a3)))))
   (val-compressor [this] (i/val-compressor db))
   (visit [this a0 a1 a2] (i/visit db a0 a1 a2))
   (visit [this a0 a1 a2 a3] (i/visit db a0 a1 a2 a3))

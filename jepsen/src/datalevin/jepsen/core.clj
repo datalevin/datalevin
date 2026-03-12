@@ -6,14 +6,19 @@
    [datalevin.jepsen.workload.append :as append]
    [datalevin.jepsen.workload.append-cas :as append-cas]
    [datalevin.jepsen.workload.bank :as bank]
+   [datalevin.jepsen.workload.degraded-rejoin :as degraded-rejoin]
    [datalevin.jepsen.workload.fencing :as fencing]
+   [datalevin.jepsen.workload.fencing-retry :as fencing-retry]
    [datalevin.jepsen.workload.giant-values :as giant-values]
    [datalevin.jepsen.workload.grant :as grant]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
+   [datalevin.jepsen.workload.membership-drift :as membership-drift]
    [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.jepsen.workload.register :as register]
+   [datalevin.jepsen.workload.udf-readiness :as udf-readiness]
+   [datalevin.jepsen.workload.witness-topology :as witness-topology]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [jepsen.checker :as checker]
    [jepsen.checker.timeline :as timeline]
@@ -26,14 +31,24 @@
   {:append append/workload
    :append-cas append-cas/workload
    :bank bank/workload
+   :degraded-rejoin degraded-rejoin/workload
    :fencing fencing/workload
+   :fencing-retry fencing-retry/workload
    :giant-values giant-values/workload
    :grant grant/workload
    :identity-upsert identity-upsert/workload
    :index-consistency index-consistency/workload
    :internal internal/workload
+   :membership-drift membership-drift/workload
+   :membership-drift-live membership-drift/live-workload
    :rejoin-bootstrap rejoin-bootstrap/workload
+   :snapshot-checksum-rejoin degraded-rejoin/checksum-workload
+   :snapshot-copy-corruption-rejoin degraded-rejoin/copy-corruption-workload
+   :snapshot-db-identity-rejoin degraded-rejoin/db-identity-workload
+   :snapshot-manifest-corruption-rejoin degraded-rejoin/manifest-corruption-workload
    :register register/workload
+   :udf-readiness udf-readiness/workload
+   :witness-topology witness-topology/workload
    :tx-fn-register tx-fn-register/workload})
 
 (defn parse-nemesis-spec
@@ -83,9 +98,14 @@
   [opts]
   (let [_              (validate-nemesis-compatibility! opts)
         cluster-id     (str (UUID/randomUUID))
-        nodes          (vec (or (seq (:nodes opts)) local/default-nodes))
         workload-name  (:workload opts)
         workload       ((workloads workload-name) opts)
+        nodes          (vec (or (seq (:nodes workload))
+                                (seq (:nodes opts))
+                                local/default-nodes))
+        control-nodes  (vec (or (seq (:datalevin/control-nodes workload))
+                                (seq (:datalevin/control-nodes opts))
+                                nodes))
         rate           (double (:rate opts))
         time-limit     (:time-limit opts)
         nemesis-faults (:nemesis opts)
@@ -128,6 +148,9 @@
             :db-name (:db-name opts)
             :control-backend (:control-backend opts)
             :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+            :datalevin/server-runtime-opts-fn
+            (:datalevin/server-runtime-opts-fn workload)
+            :datalevin/control-nodes control-nodes
             :ssh ssh-opts
             :datalevin/nemesis-faults nemesis-faults
             :datalevin/cluster-id cluster-id})))

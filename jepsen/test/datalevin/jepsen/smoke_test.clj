@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.smoke-test
   (:require
+   [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
    [datalevin.client :as cl]
    [datalevin.core :as d]
@@ -9,14 +10,19 @@
    [datalevin.jepsen.workload.append :as append]
    [datalevin.jepsen.workload.append-cas :as append-cas]
    [datalevin.jepsen.workload.bank :as bank]
+   [datalevin.jepsen.workload.degraded-rejoin :as degraded-rejoin]
    [datalevin.jepsen.workload.fencing :as fencing]
+   [datalevin.jepsen.workload.fencing-retry :as fencing-retry]
    [datalevin.jepsen.workload.giant-values :as giant-values]
    [datalevin.jepsen.workload.grant :as grant]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
+   [datalevin.jepsen.workload.membership-drift :as membership-drift]
    [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.jepsen.workload.register :as register]
+   [datalevin.jepsen.workload.udf-readiness :as udf-readiness]
+   [datalevin.jepsen.workload.witness-topology :as witness-topology]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
@@ -132,6 +138,64 @@
     (is (some? (:final-generator workload)))
     (is (= bank/schema (:schema workload)))))
 
+(deftest degraded-rejoin-workload-smoke-test
+  (let [workload (degraded-rejoin/workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= degraded-rejoin/schema (:schema workload)))))
+
+(deftest snapshot-db-identity-rejoin-workload-smoke-test
+  (let [workload (degraded-rejoin/db-identity-workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= degraded-rejoin/schema (:schema workload)))))
+
+(deftest snapshot-checksum-rejoin-workload-smoke-test
+  (let [workload (degraded-rejoin/checksum-workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= degraded-rejoin/schema (:schema workload)))))
+
+(deftest snapshot-manifest-corruption-rejoin-workload-smoke-test
+  (let [workload (degraded-rejoin/manifest-corruption-workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= degraded-rejoin/schema (:schema workload)))))
+
+(deftest snapshot-copy-corruption-rejoin-workload-smoke-test
+  (let [workload (degraded-rejoin/copy-corruption-workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= degraded-rejoin/schema (:schema workload)))))
+
+(deftest witness-topology-workload-smoke-test
+  (let [workload (witness-topology/workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= witness-topology/schema (:schema workload)))
+    (is (= ["n1" "n2"] (:nodes workload)))
+    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes workload)))))
+
+(deftest membership-drift-workload-smoke-test
+  (let [workload (membership-drift/workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= membership-drift/schema (:schema workload)))))
+
+(deftest membership-drift-live-workload-smoke-test
+  (let [workload (membership-drift/live-workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= membership-drift/schema (:schema workload)))))
+
 (deftest giant-values-workload-smoke-test
   (let [workload (giant-values/workload {:key-count 4
                                          :nodes ["n1" "n2" "n3"]})]
@@ -155,6 +219,24 @@
     (is (some? (:checker workload)))
     (is (some? (:final-generator workload)))
     (is (= fencing/schema (:schema workload)))))
+
+(deftest fencing-retry-workload-smoke-test
+  (let [workload (fencing-retry/workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= fencing-retry/schema (:schema workload)))
+    (is (= ["n1" "n2"] (:nodes workload)))
+    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes workload)))))
+
+(deftest udf-readiness-workload-smoke-test
+  (let [workload (udf-readiness/workload {:key-count 4})]
+    (is (some? (:client workload)))
+    (is (some? (:generator workload)))
+    (is (some? (:checker workload)))
+    (is (= udf-readiness/schema (:schema workload)))
+    (is (= ["n1" "n2" "n3"] (:nodes workload)))
+    (is (ifn? (:datalevin/server-runtime-opts-fn workload)))))
 
 (deftest internal-workload-smoke-test
   (let [workload (internal/workload {})]
@@ -1187,6 +1269,473 @@
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
+
+(defn- run-degraded-rejoin-exercise!
+  [db-name workload]
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name db-name
+                    :control-backend :sofa-jraft
+                    :nodes ["n1" "n2" "n3"]
+                    :key-count 4
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults []
+                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)}
+        db         (local/db cluster-id)
+        client     (:client workload)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [opened      (client/open! client test-map "n1")
+            _           (client/setup! opened test-map)
+            exercise-op (client/invoke! opened
+                                        test-map
+                                        {:type :invoke
+                                         :f :exercise})]
+        exercise-op)
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(defn- assert-degraded-rejoin-exercise!
+  [exercise-op expected-snapshot-error]
+  (is (= :ok (:type exercise-op))
+      (pr-str exercise-op))
+  (is (true? (get-in exercise-op [:value :recovered?])))
+  (is (true? (get-in exercise-op
+                     [:value :degraded-state :ha-follower-degraded?])))
+  (is (= :wal-gap
+         (get-in exercise-op
+                 [:value :degraded-state :ha-follower-degraded-reason])))
+  (when-let [expected-error-code (:error-code expected-snapshot-error)]
+    (is (some #{expected-error-code}
+              (get-in exercise-op [:value :observed-snapshot-error-codes]))))
+  (when-let [expected-message (:message expected-snapshot-error)]
+    (is (some #(= expected-message (:message %))
+              (get-in exercise-op [:value :observed-snapshot-errors]))))
+  (when-let [required-data-keys (:required-data-keys expected-snapshot-error)]
+    (is (some (fn [snapshot-error]
+                (let [data (or (:data snapshot-error) {})]
+                  (every? #(contains? data %)
+                          required-data-keys)))
+              (get-in exercise-op [:value :observed-snapshot-errors]))))
+  (is (true? (degraded-rejoin/wal-gap-realized?
+              (get-in exercise-op [:value :follower-next-lsn])
+              (get-in exercise-op [:value :source-nodes])
+              (get-in exercise-op [:value :gc-results]))))
+  (is (integer? (get-in exercise-op
+                        [:value
+                         :recovered-state
+                         :ha-follower-last-bootstrap-ms])))
+  (is (string? (get-in exercise-op
+                       [:value
+                        :recovered-state
+                        :ha-follower-bootstrap-source-endpoint])))
+  (is (pos? (long (or (get-in exercise-op
+                              [:value :required-snapshot-lsn])
+                     0))))
+  (is (= {"n1" [9000 10000 3002 3003]
+          "n2" [9000 10000 3002 3003]
+          "n3" [9000 10000 3002 3003]}
+         (into {}
+               (map (fn [[logical-node {:keys [values]}]]
+                      [logical-node values]))
+               (get-in exercise-op [:value :nodes])))))
+
+(deftest degraded-rejoin-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-degraded-rejoin-exercise!
+         "degraded-rejoin-smoke"
+         (degraded-rejoin/workload {:key-count 4
+                                    :nodes ["n1" "n2" "n3"]}))]
+    (assert-degraded-rejoin-exercise!
+     exercise-op
+     {:error-code :ha/follower-snapshot-unavailable})))
+
+(deftest snapshot-db-identity-rejoin-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-degraded-rejoin-exercise!
+         "snapshot-db-identity-rejoin-smoke"
+         (degraded-rejoin/db-identity-workload {:key-count 4
+                                                :nodes ["n1" "n2" "n3"]}))]
+    (assert-degraded-rejoin-exercise!
+     exercise-op
+     {:error-code :ha/follower-snapshot-db-identity-mismatch})))
+
+(deftest snapshot-checksum-rejoin-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-degraded-rejoin-exercise!
+         "snapshot-checksum-rejoin-smoke"
+         (degraded-rejoin/checksum-workload {:key-count 4
+                                             :nodes ["n1" "n2" "n3"]}))]
+    (assert-degraded-rejoin-exercise!
+     exercise-op
+     {:message "Copy checksum mismatch"
+      :required-data-keys #{:expected-checksum
+                            :actual-checksum}})))
+
+(deftest snapshot-manifest-corruption-rejoin-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-degraded-rejoin-exercise!
+         "snapshot-manifest-corruption-rejoin-smoke"
+         (degraded-rejoin/manifest-corruption-workload
+          {:key-count 4
+           :nodes ["n1" "n2" "n3"]}))]
+    (assert-degraded-rejoin-exercise!
+     exercise-op
+     {:error-code :ha/follower-snapshot-missing-last-applied-lsn})))
+
+(deftest snapshot-copy-corruption-rejoin-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-degraded-rejoin-exercise!
+         "snapshot-copy-corruption-rejoin-smoke"
+         (degraded-rejoin/copy-corruption-workload
+          {:key-count 4
+           :nodes ["n1" "n2" "n3"]}))]
+    (assert-degraded-rejoin-exercise!
+     exercise-op
+     {:error-code :ha/follower-snapshot-install-failed})))
+
+(defn- run-membership-drift-exercise!
+  [db-name workload]
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name db-name
+                    :schema (:schema workload)
+                    :control-backend :sofa-jraft
+                    :nodes (vec (or (:nodes workload)
+                                    local/default-nodes))
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults []
+                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                    :datalevin/control-nodes
+                    (:datalevin/control-nodes workload)}
+        db         (local/db cluster-id)
+        client     (:client workload)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [opened      (client/open! client test-map "n1")
+            _           (client/setup! opened test-map)
+            exercise-op (client/invoke! opened
+                                        test-map
+                                        {:type :invoke
+                                         :f :exercise})]
+        exercise-op)
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(defn- assert-membership-drift-exercise!
+  [exercise-op]
+  (is (= :ok (:type exercise-op))
+      (pr-str exercise-op))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-before])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-after])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :drifted-node])))
+  (is (or (= :ha/membership-hash-mismatch
+             (or (get-in exercise-op [:value :restart-error :data :err-data :error])
+                 (get-in exercise-op [:value :restart-error :data :error])))
+          (some-> (get-in exercise-op [:value :restart-error :message])
+                  str/lower-case
+                  (str/includes? "membership hash mismatch"))))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :live-before])))
+  (is (= 2 (count (get-in exercise-op [:value :live-after-failed-restart]))))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :live-after-restart])))
+  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
+  (is (= {"n1" [1000 1001 0 0]
+          "n2" [1000 1001 0 0]
+          "n3" [1000 1001 0 0]}
+         (into {}
+               (map (fn [[logical-node {:keys [values]}]]
+                      [logical-node values]))
+               (get-in exercise-op [:value :nodes])))))
+
+(deftest membership-drift-client-recovers-follower-smoke-test
+  (let [exercise-op
+        (run-membership-drift-exercise!
+         "membership-drift-smoke"
+         (membership-drift/workload {:key-count 4}))]
+    (assert-membership-drift-exercise! exercise-op)))
+
+(defn- assert-membership-drift-live-exercise!
+  [exercise-op]
+  (is (= :ok (:type exercise-op))
+      (pr-str exercise-op))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-before])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-after])))
+  (is (= (get-in exercise-op [:value :leader-before])
+         (get-in exercise-op [:value :drifted-node])))
+  (is (or (= :ha/membership-hash-mismatch
+             (or (get-in exercise-op [:value :drift-error :data :err-data :error])
+                 (get-in exercise-op [:value :drift-error :data :error])))
+          (some-> (get-in exercise-op [:value :drift-error :message])
+                  str/lower-case
+                  (str/includes? "membership hash mismatch"))))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :live-before])))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :live-after-restore])))
+  (is (contains? (set (get-in exercise-op [:value :recovered-nodes]))
+                 (get-in exercise-op [:value :drifted-node])))
+  (is (>= (long (or (get-in exercise-op [:value :recovered-nodes-count]) 0))
+          2))
+  (is (map? (get-in exercise-op [:value :recovered-state])))
+  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
+  (is (= [2000 2001 0 0]
+         (get-in exercise-op
+                 [:value
+                  :nodes
+                  (get-in exercise-op [:value :drifted-node])
+                  :values]))))
+
+(deftest membership-drift-live-client-recovers-leader-smoke-test
+  (let [exercise-op
+        (run-membership-drift-exercise!
+         "membership-drift-live-smoke"
+         (membership-drift/live-workload {:key-count 4}))]
+    (assert-membership-drift-live-exercise! exercise-op)))
+
+(defn- run-witness-topology-exercise!
+  [db-name workload]
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name db-name
+                    :schema (:schema workload)
+                    :control-backend :sofa-jraft
+                    :nodes (:nodes workload)
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults []
+                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                    :datalevin/control-nodes
+                    (:datalevin/control-nodes workload)}
+        db         (local/db cluster-id)
+        client     (:client workload)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [opened      (client/open! client test-map "n1")
+            _           (client/setup! opened test-map)
+            exercise-op (client/invoke! opened
+                                        test-map
+                                        {:type :invoke
+                                         :f :exercise})]
+        exercise-op)
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(defn- assert-witness-topology-exercise!
+  [exercise-op]
+  (is (= :ok (:type exercise-op))
+      (pr-str exercise-op))
+  (is (= ["n1" "n2"]
+         (get-in exercise-op [:value :topology :data-nodes])))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :topology :control-nodes])))
+  (is (= ["n3"]
+         (get-in exercise-op [:value :topology :control-only-node-names])))
+  (is (= 2 (count (get-in exercise-op [:value :topology :ha-members]))))
+  (is (= 2 (count (get-in exercise-op [:value :topology :promotable-voters]))))
+  (is (= 1 (count (get-in exercise-op
+                          [:value :topology :non-promotable-voters]))))
+  (is (= (get-in exercise-op [:value :leader-before])
+         (get-in exercise-op [:value :stopped-node])))
+  (is (not= (get-in exercise-op [:value :leader-before])
+            (get-in exercise-op [:value :leader-after])))
+  (is (= [(get-in exercise-op [:value :leader-after])]
+         (get-in exercise-op [:value :live-after-stop])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :control-leader-before])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :control-leader-after])))
+  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
+  (is (= {(get-in exercise-op [:value :leader-after])
+          [1000 1001 2000 2001]}
+         (into {}
+               (map (fn [[logical-node {:keys [values]}]]
+                      [logical-node values]))
+               (get-in exercise-op [:value :nodes])))))
+
+(deftest witness-topology-client-retains-quorum-smoke-test
+  (let [exercise-op
+        (run-witness-topology-exercise!
+         "witness-topology-smoke"
+         (witness-topology/workload {:key-count 4}))]
+    (assert-witness-topology-exercise! exercise-op)))
+
+(defn- run-fencing-retry-exercise!
+  [db-name workload]
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name db-name
+                    :schema (:schema workload)
+                    :control-backend :sofa-jraft
+                    :nodes (:nodes workload)
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults []
+                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                    :datalevin/control-nodes
+                    (:datalevin/control-nodes workload)}
+        db         (local/db cluster-id)
+        client     (:client workload)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [opened      (client/open! client test-map "n1")
+            _           (client/setup! opened test-map)
+            exercise-op (client/invoke! opened
+                                        test-map
+                                        {:type :invoke
+                                         :f :exercise})]
+        exercise-op)
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(defn- assert-fencing-retry-exercise!
+  [exercise-op]
+  (let [value              (:value exercise-op)
+        success-hook-entry (:success-hook-entry value)]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (= ["n1" "n2"]
+           (get-in value [:topology :data-nodes])))
+    (is (= ["n1" "n2" "n3"]
+           (get-in value [:topology :control-nodes])))
+    (is (= ["n3"]
+           (get-in value [:topology :control-only-node-names])))
+    (is (= 2 (count (get-in value [:topology :promotable-voters]))))
+    (is (= 1 (count (get-in value
+                            [:topology :non-promotable-voters]))))
+    (is (= (:leader-before value)
+           (:stopped-node value)))
+    (is (= (:candidate-node value)
+           (:leader-after value)))
+    (is (not= (:leader-before value)
+              (:leader-after value)))
+    (is (nil? (:leader-during-fencing-failure value)))
+    (is (= :fencing-failed
+           (get-in value [:failed-state :ha-promotion-last-failure])))
+    (is (>= (long (or (get-in value [:failed-retry-group :attempt-count])
+                      0))
+            3))
+    (is (= #{(long (or (:candidate-node-id value) 0))}
+           (get-in value [:failed-retry-group :candidate-node-ids])))
+    (is (= #{"fail"}
+           (get-in value [:failed-retry-group :modes])))
+    (is (= [(:candidate-node value)]
+           (:live-after-stop value)))
+    (is (= (:db-name value)
+           (:db-name success-hook-entry)))
+    (is (= (long (or (:candidate-node-id value) 0))
+           (long (or (:new-leader-node-id success-hook-entry) 0))))
+    (is (= (long (or (:leader-after-id value) 0))
+           (long (or (:new-leader-node-id success-hook-entry) 0))))
+    (is (= (long (or (:stopped-node-id value) 0))
+           (long (or (:old-leader-node-id success-hook-entry) 0))))
+    (is (= (:stopped-node-endpoint value)
+           (:old-leader-endpoint success-hook-entry)))
+    (is (= (str (:db-name value)
+                ":"
+                (:observed-term success-hook-entry)
+                ":"
+                (:candidate-node-id value))
+           (:fence-op-id success-hook-entry)))
+    (is (= (inc (long (or (:observed-term success-hook-entry) -1)))
+           (long (or (:candidate-term success-hook-entry) -1))))
+    (is (= "success"
+           (:mode success-hook-entry)))
+    (is (pos? (long (or (:target-lsn value) 0))))
+    (is (= {(:candidate-node value)
+            [1000 1001 2000 2001]}
+           (into {}
+                 (map (fn [[logical-node {:keys [values]}]]
+                        [logical-node values]))
+                 (:nodes value))))))
+
+(deftest fencing-retry-client-recovers-after-hook-failure-smoke-test
+  (let [exercise-op
+        (run-fencing-retry-exercise!
+         "fencing-retry-smoke"
+         (fencing-retry/workload {:key-count 4}))]
+    (assert-fencing-retry-exercise! exercise-op)))
+
+(defn- run-udf-readiness-exercise!
+  [db-name workload]
+  (let [cluster-id (str (UUID/randomUUID))
+        test-map   {:db-name db-name
+                    :schema (:schema workload)
+                    :control-backend :sofa-jraft
+                    :nodes (:nodes workload)
+                    :verbose false
+                    :datalevin/cluster-id cluster-id
+                    :datalevin/nemesis-faults []
+                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                    :datalevin/server-runtime-opts-fn
+                    (:datalevin/server-runtime-opts-fn workload)}
+        db         (local/db cluster-id)
+        client     (:client workload)]
+    (try
+      (doseq [node (:nodes test-map)]
+        (jdb/setup! db test-map node))
+      (let [opened      (client/open! client test-map "n1")
+            _           (client/setup! opened test-map)
+            exercise-op (client/invoke! opened
+                                        test-map
+                                        {:type :invoke
+                                         :f :exercise})]
+        exercise-op)
+      (finally
+        (doseq [node (:nodes test-map)]
+          (jdb/teardown! db test-map node))))))
+
+(defn- assert-udf-readiness-exercise!
+  [exercise-op]
+  (is (= :ok (:type exercise-op))
+      (pr-str exercise-op))
+  (is (= ["n1" "n2" "n3"]
+         (get-in exercise-op [:value :live-nodes])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-before])))
+  (is (contains? #{"n1" "n2" "n3"}
+                 (get-in exercise-op [:value :leader-after])))
+  (is (= :ha/write-rejected
+         (get-in exercise-op [:value :failed-error :error])))
+  (is (= :udf-not-ready
+         (get-in exercise-op [:value :failed-error :reason])))
+  (is (false? (get-in exercise-op [:value :failed-error :retryable?])))
+  (is (contains? (into #{}
+                       (map :db/ident)
+                       (get-in exercise-op [:value :failed-error :udf-missing]))
+                 :counter/inc))
+  (is (false? (get-in exercise-op [:value :leader-state-before :udf-ready?])))
+  (is (contains? (into #{}
+                       (map :db/ident)
+                       (get-in exercise-op [:value :leader-state-before :udf-missing]))
+                 :counter/inc))
+  (is (true? (get-in exercise-op [:value :leader-state-after :udf-ready?])))
+  (is (= [] (get-in exercise-op [:value :leader-state-after :udf-missing])))
+  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
+  (is (= {"n1" 1 "n2" 1 "n3" 1}
+         (into {}
+               (map (fn [[logical-node {:keys [value]}]]
+                      [logical-node value]))
+               (get-in exercise-op [:value :nodes])))))
+
+(deftest udf-readiness-client-recovers-after-registry-install-smoke-test
+  (let [exercise-op
+        (run-udf-readiness-exercise!
+         "udf-readiness-smoke"
+         (udf-readiness/workload {:key-count 4}))]
+    (assert-udf-readiness-exercise! exercise-op)))
 
 (deftest rejoin-bootstrap-wal-gap-realized-when-source-is-behind-test
   (let [gap? #'rejoin-bootstrap/wal-gap-realized?]
@@ -2326,6 +2875,83 @@
            (:datalevin/nemesis-faults test-map)))
     (is (some? (:nemesis test-map)))
     (is (some? (:generator test-map)))))
+
+(deftest datalevin-test-with-snapshot-manifest-corruption-rejoin-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :snapshot-manifest-corruption-rejoin
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
+
+(deftest datalevin-test-with-snapshot-copy-corruption-rejoin-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :snapshot-copy-corruption-rejoin
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
+
+(deftest datalevin-test-with-witness-topology-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :witness-topology
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (= ["n1" "n2"] (:nodes test-map)))
+    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes test-map)))
+    (is (some? (:generator test-map)))))
+
+(deftest datalevin-test-with-membership-drift-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :membership-drift
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
+
+(deftest datalevin-test-with-membership-drift-live-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :membership-drift-live
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
+
+(deftest datalevin-test-with-fencing-retry-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :fencing-retry
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (= ["n1" "n2"] (:nodes test-map)))
+    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes test-map)))
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
+
+(deftest datalevin-test-with-udf-readiness-smoke-test
+  (let [test-map (core/datalevin-test {:db-name "smoke"
+                                       :control-backend :sofa-jraft
+                                       :workload :udf-readiness
+                                       :rate 1
+                                       :time-limit 5
+                                       :key-count 4})]
+    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
+    (is (ifn? (:datalevin/server-runtime-opts-fn test-map)))
+    (is (some? (:generator test-map)))
+    (is (some? (:checker test-map)))))
 
 (deftest nemesis-partition-net-uses-jepsen-net-test
   (let [dropped      (atom nil)

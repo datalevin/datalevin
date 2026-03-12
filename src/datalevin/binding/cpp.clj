@@ -928,7 +928,8 @@
     (assert (< ^long key-size 512) "Key size cannot be greater than 511 bytes")
     (let [{info-dbis :dbis max-dbis :max-dbs} @info]
       (if (< (count info-dbis) ^long max-dbis)
-        (let [opts     {:key-size       key-size
+        (let [existing-opts (get info-dbis dbi-name)
+              opts     {:key-size       key-size
                         :val-size       val-size
                         :flags          flags
                         :validate-data? validate-data?}
@@ -943,9 +944,10 @@
               db       (DBI. this dbi (new-pools) kp vp kc vc
                              dupsort? counted? validate-data?)]
           (when (not= dbi-name c/kv-info)
-            (vswap! info assoc-in [:dbis dbi-name] opts)
-            (transact-kv this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
-                                        [:keyword :string])]))
+            (when (not= existing-opts opts)
+              (vswap! info assoc-in [:dbis dbi-name] opts)
+              (transact-kv this [(l/kv-tx :put c/kv-info [:dbis dbi-name] opts
+                                          [:keyword :string])])))
           (.put dbis dbi-name db)
           db)
         (u/raise (str "Reached maximal number of DBI: " max-dbis) {}))))

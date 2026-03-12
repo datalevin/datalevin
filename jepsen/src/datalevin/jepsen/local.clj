@@ -78,6 +78,9 @@
 (def ^:private base-report-ha-replica-floor! dha/report-ha-replica-floor!)
 (def ^:private base-fetch-ha-endpoint-snapshot-copy!
   dha/fetch-ha-endpoint-snapshot-copy!)
+(def ^:private base-server-runtime-opts-fn srv/*server-runtime-opts-fn*)
+
+(defonce ^:private server-runtime-opts-overrides (atom {}))
 
 (defn- cluster-entry-for-db-identity
   [db-identity]
@@ -267,6 +270,61 @@
     (kv/set-storage-fault-hook! maybe-apply-storage-fault!)
     true))
 
+(defn- normalize-server-runtime-opts-override
+  [override]
+  (cond
+    (ifn? override) override
+    (map? override) (constantly override)
+    :else nil))
+
+(defn- override-key
+  [root db-name]
+  [root db-name])
+
+(defn- resolved-server-runtime-opts
+  [server db-name store m]
+  (let [root         (some-> ^Server server .-root)
+        override-fn  (get @server-runtime-opts-overrides
+                          (override-key root db-name))
+        base-opts    (base-server-runtime-opts-fn server db-name store m)
+        override-opts (when override-fn
+                        (override-fn server db-name store m))]
+    (cond
+      (and (map? base-opts) (map? override-opts))
+      (merge base-opts override-opts)
+
+      (map? override-opts)
+      override-opts
+
+      :else
+      base-opts)))
+
+(defonce ^:private server-runtime-opts-hook-installed?
+  (do
+    (alter-var-root #'srv/*server-runtime-opts-fn*
+                    (constantly resolved-server-runtime-opts))
+    true))
+
+(defn- install-server-runtime-opts-overrides!
+  [db-name nodes override]
+  (when-let [override-fn (normalize-server-runtime-opts-override override)]
+    (swap! server-runtime-opts-overrides
+           (fn [m]
+             (reduce (fn [acc {:keys [root]}]
+                       (assoc acc (override-key root db-name) override-fn))
+                     m
+                     nodes)))
+    true))
+
+(defn- clear-server-runtime-opts-overrides!
+  [db-name nodes]
+  (swap! server-runtime-opts-overrides
+         (fn [m]
+           (reduce (fn [acc {:keys [root]}]
+                     (dissoc acc (override-key root db-name)))
+                   m
+                   nodes))))
+
 (defn- existing-canonical-path
   [& path-parts]
   (let [^java.io.File file (apply io/file path-parts)]
@@ -374,12 +432,13 @@
 
 (defn- make-nodes
   [work-dir logical-nodes]
-  (let [ports (reserve-ports 6)]
+  (let [node-count (count logical-nodes)
+        ports      (reserve-ports (* 2 node-count))]
     (mapv
      (fn [idx logical-node]
        (let [node-id   (inc idx)
              port      (nth ports idx)
-             peer-port (nth ports (+ 3 idx))]
+             peer-port (nth ports (+ node-count idx))]
          {:logical-node logical-node
           :node-id      node-id
           :port         port
@@ -390,16 +449,20 @@
      (range)
      logical-nodes)))
 
-(defn- promotable-voters
-  [nodes]
-  (mapv (fn [{:keys [node-id peer-id]}]
-          {:peer-id peer-id
-           :ha-node-id node-id
-           :promotable? true})
-        nodes))
+(defn- control-voters
+  [data-nodes control-nodes]
+  (let [promotable-node-ids (set (map :node-id data-nodes))]
+    (mapv (fn [{:keys [node-id peer-id]}]
+            (if (contains? promotable-node-ids node-id)
+              {:peer-id peer-id
+               :ha-node-id node-id
+               :promotable? true}
+              {:peer-id peer-id
+               :promotable? false}))
+          control-nodes)))
 
 (defn- base-ha-opts
-  [nodes group-id db-identity control-backend]
+  [data-nodes control-nodes group-id db-identity control-backend]
   {:wal? true
    :db-identity db-identity
    :ha-mode :consensus-lease
@@ -413,13 +476,13 @@
                      :timeout-ms 1000
                      :retries 0
                      :retry-delay-ms 0}
-   :ha-members (mapv #(select-keys % [:node-id :endpoint]) nodes)
+   :ha-members (mapv #(select-keys % [:node-id :endpoint]) data-nodes)
    :ha-control-plane
    {:backend (if (= :in-memory control-backend)
                :sofa-jraft
                control-backend)
     :group-id group-id
-    :voters (promotable-voters nodes)
+    :voters (control-voters data-nodes control-nodes)
     :rpc-timeout-ms 5000
     :election-timeout-ms 5000
     :operation-timeout-ms 30000}})
@@ -447,11 +510,23 @@
   (u/create-dirs state-dir)
   (spit (clock-skew-state-file state-dir node-id) (str (long skew-ms))))
 
+(defn- merge-ha-opts
+  [base-opts override-opts]
+  (if (map? override-opts)
+    (let [control-plane-override (:ha-control-plane override-opts)]
+      (cond-> (merge base-opts (dissoc override-opts :ha-control-plane))
+        (map? control-plane-override)
+        (update :ha-control-plane merge control-plane-override)))
+    base-opts))
+
 (defn- node-ha-opts
-  [base-opts node]
-  (-> base-opts
-      (assoc :ha-node-id (:node-id node))
-      (assoc-in [:ha-control-plane :local-peer-id] (:peer-id node))))
+  ([base-opts node]
+   (node-ha-opts base-opts node nil))
+  ([base-opts node override-opts]
+   (-> base-opts
+       (assoc :ha-node-id (:node-id node))
+       (assoc-in [:ha-control-plane :local-peer-id] (:peer-id node))
+       (merge-ha-opts override-opts))))
 
 (defn- cluster-setup-timeout-ms
   [base-opts]
@@ -497,6 +572,13 @@
       (srv/stop server)
       (catch Throwable _ nil))))
 
+(defn- safe-stop-authority!
+  [authority]
+  (when authority
+    (try
+      (ctrl/stop-authority! authority)
+      (catch Throwable _ nil))))
+
 (defn- safe-delete-dir!
   [path]
   (when path
@@ -533,6 +615,33 @@
                  (Thread/sleep (long leader-connect-retry-sleep-ms))
                  (recur))
                (throw e)))))))))
+
+(defn- validate-cluster-topology!
+  [data-logical-nodes control-logical-nodes control-backend]
+  (let [data-logical-nodes    (vec data-logical-nodes)
+        control-logical-nodes (vec control-logical-nodes)
+        data-node-set         (set data-logical-nodes)
+        control-node-set      (set control-logical-nodes)]
+    (when (empty? data-logical-nodes)
+      (u/raise "Jepsen cluster requires at least one data node"
+               {:data-nodes data-logical-nodes
+                :control-nodes control-logical-nodes}))
+    (when (not= (count data-logical-nodes) (count data-node-set))
+      (u/raise "Jepsen data nodes must be unique"
+               {:data-nodes data-logical-nodes}))
+    (when (not= (count control-logical-nodes) (count control-node-set))
+      (u/raise "Jepsen control nodes must be unique"
+               {:control-nodes control-logical-nodes}))
+    (when (some #(not (contains? control-node-set %)) data-logical-nodes)
+      (u/raise "Jepsen control nodes must include every data node"
+               {:data-nodes data-logical-nodes
+                :control-nodes control-logical-nodes}))
+    (when (and (> (count control-logical-nodes) (count data-logical-nodes))
+               (not= :sofa-jraft control-backend))
+      (u/raise "Jepsen control-only witness nodes require sofa-jraft"
+               {:control-backend control-backend
+                :data-nodes data-logical-nodes
+                :control-nodes control-logical-nodes}))))
 
 (defn- ^:redef create-conn-with-timeout!
   ([uri schema]
@@ -597,6 +706,37 @@
                 srv/*stop-ha-authority-fn*
                 dha/stop-ha-authority]
     (f)))
+
+(defn- control-authority-opts
+  [work-dir base-opts node]
+  (let [control-plane-opts (:ha-control-plane base-opts)]
+    (cond-> (assoc control-plane-opts :local-peer-id (:peer-id node))
+      (= :sofa-jraft (:backend control-plane-opts))
+      (assoc :raft-dir (str work-dir
+                            u/+separator+
+                            "control-authority-"
+                            (:node-id node))))))
+
+(defn- start-control-authority!
+  [work-dir base-opts node]
+  (let [opts          (control-authority-opts work-dir base-opts node)
+        local-peer-id (:local-peer-id opts)
+        authority     (ctrl/new-authority opts)]
+    (when-let [raft-dir (:raft-dir opts)]
+      (u/create-dirs raft-dir))
+    (PartitionFaults/setCurrentLocalPeerId local-peer-id)
+    (try
+      (ctrl/start-authority! authority)
+      authority
+      (finally
+        (PartitionFaults/clearCurrentLocalPeerId)))))
+
+(defn- authority-diagnostics->control-state
+  [authority-diagnostics]
+  {:ha-control-local-peer-id (:local-peer-id authority-diagnostics)
+   :ha-control-leader-peer-id (:leader-peer-id authority-diagnostics)
+   :ha-control-node-leader? (:node-leader? authority-diagnostics)
+   :ha-control-node-state (some-> (:node-state authority-diagnostics) str)})
 
 (defn- db-state
   [server db-name]
@@ -721,8 +861,86 @@
                            {:cluster-id cluster-id
                             :target-lsn target
                             :timeout-ms timeout-ms
+                           :snapshot snapshot
+                           :previous-snapshot last-snapshot}))))))))
+
+(defn wait-for-nodes-at-least-lsn!
+  ([cluster-id logical-nodes target-lsn]
+   (wait-for-nodes-at-least-lsn! cluster-id logical-nodes target-lsn
+                                 cluster-timeout-ms))
+  ([cluster-id logical-nodes target-lsn timeout-ms]
+   (let [deadline      (+ (now-ms) (long timeout-ms))
+         target        (long target-lsn)
+         logical-nodes (vec logical-nodes)]
+     (loop [last-snapshot nil]
+       (let [snapshot (into {}
+                            (map (fn [logical-node]
+                                   [logical-node
+                                    (node-progress-lsn cluster-id
+                                                       logical-node)]))
+                            logical-nodes)]
+         (cond
+           (every? (fn [[_ lsn]]
+                     (>= (long lsn) target))
+                   snapshot)
+           snapshot
+
+           (< (now-ms) deadline)
+           (do
+             (Thread/sleep 250)
+             (recur snapshot))
+
+           :else
+           (throw (ex-info "Timed out waiting for Jepsen nodes to catch up"
+                           {:cluster-id cluster-id
+                            :logical-nodes logical-nodes
+                            :target-lsn target
+                            :timeout-ms timeout-ms
                             :snapshot snapshot
                             :previous-snapshot last-snapshot}))))))))
+
+(defn wait-for-at-least-nodes-at-least-lsn!
+  ([cluster-id logical-nodes target-lsn required-count]
+   (wait-for-at-least-nodes-at-least-lsn! cluster-id logical-nodes target-lsn
+                                          required-count cluster-timeout-ms))
+  ([cluster-id logical-nodes target-lsn required-count timeout-ms]
+   (let [deadline      (+ (now-ms) (long timeout-ms))
+         target        (long target-lsn)
+         logical-nodes (vec logical-nodes)
+         required-count (long required-count)]
+     (loop [last-snapshot nil]
+       (let [snapshot (into {}
+                            (map (fn [logical-node]
+                                   [logical-node
+                                    (node-progress-lsn cluster-id
+                                                       logical-node)]))
+                            logical-nodes)
+             matching (->> snapshot
+                           (keep (fn [[logical-node lsn]]
+                                   (when (>= (long lsn) target)
+                                     logical-node)))
+                           sort
+                           vec)]
+         (cond
+           (>= (count matching) required-count)
+           {:snapshot snapshot
+            :matched-nodes matching}
+
+           (< (now-ms) deadline)
+           (do
+             (Thread/sleep 250)
+             (recur snapshot))
+
+           :else
+           (throw (ex-info
+                   "Timed out waiting for Jepsen node quorum to catch up"
+                   {:cluster-id cluster-id
+                    :logical-nodes logical-nodes
+                    :target-lsn target
+                    :required-count required-count
+                    :timeout-ms timeout-ms
+                    :snapshot snapshot
+                    :previous-snapshot last-snapshot}))))))))
 
 (defn- probe-write-admission
   [cluster-id logical-node server db-name]
@@ -859,7 +1077,8 @@
    (let [timeout-ms (long timeout-ms)
          deadline   (+ (now-ms) timeout-ms)]
      (loop [last-snapshot nil]
-       (let [{:keys [live-nodes]} (get @clusters cluster-id)
+       (let [{:keys [control-node-names]} (get @clusters cluster-id)
+             control-node-names (or control-node-names [])
              snapshot (into {}
                             (map (fn [logical-node]
                                    (let [state (node-diagnostics cluster-id
@@ -878,8 +1097,8 @@
                                        :node-state (:ha-control-node-state state)
                                        :term (:ha-authority-term state)
                                        :role (:ha-role state)}]))
-                            live-nodes))
-             quorum-size (inc (quot (count live-nodes) 2))
+                            control-node-names))
+             quorum-size (inc (quot (count control-node-names) 2))
              leader-counts (frequencies (keep :leader (vals snapshot)))
              leaders (->> leader-counts
                           (keep (fn [[logical-node count]]
@@ -919,62 +1138,68 @@
 
 (defn node-diagnostics
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-    (when-let [state (db-state (get servers logical-node) db-name)]
+  (let [{:keys [db-name servers control-authorities]} (get @clusters cluster-id)]
+    (if-let [state (db-state (get servers logical-node) db-name)]
       (let [authority-diagnostics
             (when-let [authority (:ha-authority state)]
               (authority-diagnostics-snapshot authority))]
-        {:ha-role (:ha-role state)
-         :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
-         :ha-authority-term (:ha-authority-term state)
-         :ha-control-local-peer-id (:local-peer-id authority-diagnostics)
-         :ha-control-leader-peer-id (:leader-peer-id authority-diagnostics)
-         :ha-control-node-leader? (:node-leader? authority-diagnostics)
-         :ha-control-node-state (some-> (:node-state authority-diagnostics)
-                                        str)
-         :ha-local-last-applied-lsn (:ha-local-last-applied-lsn state)
-         :ha-follower-next-lsn (:ha-follower-next-lsn state)
-         :ha-follower-last-batch-size (:ha-follower-last-batch-size state)
-         :ha-follower-last-sync-ms (:ha-follower-last-sync-ms state)
-         :ha-follower-leader-endpoint (:ha-follower-leader-endpoint state)
-         :ha-follower-source-endpoint (:ha-follower-source-endpoint state)
-         :ha-follower-source-order (:ha-follower-source-order state)
-         :ha-follower-last-bootstrap-ms (:ha-follower-last-bootstrap-ms state)
-         :ha-follower-bootstrap-source-endpoint
-         (:ha-follower-bootstrap-source-endpoint state)
-         :ha-follower-bootstrap-snapshot-last-applied-lsn
-         (:ha-follower-bootstrap-snapshot-last-applied-lsn state)
-         :ha-follower-degraded? (:ha-follower-degraded? state)
-         :ha-follower-degraded-reason (:ha-follower-degraded-reason state)
-         :ha-follower-last-error (:ha-follower-last-error state)
-         :ha-follower-last-error-details
-         (:ha-follower-last-error-details state)
-         :ha-follower-next-sync-not-before-ms
-         (:ha-follower-next-sync-not-before-ms state)
-         :ha-clock-skew-paused? (:ha-clock-skew-paused? state)
-         :ha-clock-skew-last-observed-ms
-         (:ha-clock-skew-last-observed-ms state)
-         :ha-clock-skew-last-result (:ha-clock-skew-last-result state)
-         :ha-lease-until-ms (:ha-lease-until-ms state)
-         :ha-last-authority-refresh-ms
-         (:ha-last-authority-refresh-ms state)
-         :ha-authority-read-ok? (:ha-authority-read-ok? state)
-         :ha-promotion-last-failure
-         (:ha-promotion-last-failure state)
-         :ha-promotion-failure-details
-         (:ha-promotion-failure-details state)
-         :ha-rejoin-promotion-blocked?
-         (:ha-rejoin-promotion-blocked? state)
-         :ha-rejoin-promotion-blocked-until-ms
-         (:ha-rejoin-promotion-blocked-until-ms state)
-         :ha-rejoin-promotion-cleared-ms
-         (:ha-rejoin-promotion-cleared-ms state)
-         :ha-candidate-since-ms (:ha-candidate-since-ms state)
-         :ha-candidate-delay-ms (:ha-candidate-delay-ms state)
-         :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
-                                    logical-node)
-         :jepsen-storage-fault (storage-fault cluster-id logical-node)
-         :ha-effective-local-lsn (effective-local-lsn cluster-id logical-node)}))))
+        (merge
+         {:ha-role (:ha-role state)
+          :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
+          :ha-authority-term (:ha-authority-term state)
+          :udf-ready? (:udf-ready? state)
+          :udf-missing (:udf-missing state)
+          :udf-readiness-token (:udf-readiness-token state)
+          :ha-local-last-applied-lsn (:ha-local-last-applied-lsn state)
+          :ha-follower-next-lsn (:ha-follower-next-lsn state)
+          :ha-follower-last-batch-size (:ha-follower-last-batch-size state)
+          :ha-follower-last-sync-ms (:ha-follower-last-sync-ms state)
+          :ha-follower-leader-endpoint (:ha-follower-leader-endpoint state)
+          :ha-follower-source-endpoint (:ha-follower-source-endpoint state)
+          :ha-follower-source-order (:ha-follower-source-order state)
+          :ha-follower-last-bootstrap-ms (:ha-follower-last-bootstrap-ms state)
+          :ha-follower-bootstrap-source-endpoint
+          (:ha-follower-bootstrap-source-endpoint state)
+          :ha-follower-bootstrap-snapshot-last-applied-lsn
+          (:ha-follower-bootstrap-snapshot-last-applied-lsn state)
+          :ha-follower-degraded? (:ha-follower-degraded? state)
+          :ha-follower-degraded-reason (:ha-follower-degraded-reason state)
+          :ha-follower-last-error (:ha-follower-last-error state)
+          :ha-follower-last-error-details
+          (:ha-follower-last-error-details state)
+          :ha-follower-next-sync-not-before-ms
+          (:ha-follower-next-sync-not-before-ms state)
+          :ha-clock-skew-paused? (:ha-clock-skew-paused? state)
+          :ha-clock-skew-last-observed-ms
+          (:ha-clock-skew-last-observed-ms state)
+          :ha-clock-skew-last-result (:ha-clock-skew-last-result state)
+          :ha-lease-until-ms (:ha-lease-until-ms state)
+          :ha-last-authority-refresh-ms
+          (:ha-last-authority-refresh-ms state)
+          :ha-authority-read-ok? (:ha-authority-read-ok? state)
+          :ha-promotion-last-failure
+          (:ha-promotion-last-failure state)
+          :ha-promotion-failure-details
+          (:ha-promotion-failure-details state)
+          :ha-rejoin-promotion-blocked?
+          (:ha-rejoin-promotion-blocked? state)
+          :ha-rejoin-promotion-blocked-until-ms
+          (:ha-rejoin-promotion-blocked-until-ms state)
+          :ha-rejoin-promotion-cleared-ms
+          (:ha-rejoin-promotion-cleared-ms state)
+          :ha-candidate-since-ms (:ha-candidate-since-ms state)
+          :ha-candidate-delay-ms (:ha-candidate-delay-ms state)
+          :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
+                                     logical-node)
+          :jepsen-storage-fault (storage-fault cluster-id logical-node)
+          :ha-effective-local-lsn (effective-local-lsn cluster-id logical-node)}
+         (authority-diagnostics->control-state authority-diagnostics)))
+      (when-let [authority (get control-authorities logical-node)]
+        (merge
+         {:ha-role :control-only
+          :jepsen-control-only? true}
+         (authority-diagnostics->control-state
+          (authority-diagnostics-snapshot authority)))))))
 
 (defn local-query
   [cluster-id logical-node q & inputs]
@@ -1441,7 +1666,7 @@
     (try
       (f conn)
       (finally
-        (d/close conn)))))
+        (safe-close-conn! conn)))))
 
 (defn open-node-conn!
   [test logical-node schema]
@@ -1476,11 +1701,33 @@
     (try
       (f conn)
       (finally
-        (d/close conn)))))
+        (safe-close-conn! conn)))))
 
 (defn stopped-node-info
   [cluster-id logical-node]
   (get-in @clusters [cluster-id :stopped-node-info logical-node]))
+
+(defn override-node-ha-opts!
+  [cluster-id logical-node override-opts]
+  (locking clusters
+    (when-let [{:keys [node-by-name]} (get @clusters cluster-id)]
+      (when-not (contains? node-by-name logical-node)
+        (u/raise "Cannot override HA opts for unknown Jepsen node"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node}))
+      (swap! clusters assoc-in
+             [cluster-id :node-ha-opt-overrides logical-node]
+             override-opts)
+      override-opts)))
+
+(defn clear-node-ha-opts-override!
+  [cluster-id logical-node]
+  (locking clusters
+    (let [override (get-in @clusters
+                           [cluster-id :node-ha-opt-overrides logical-node])]
+      (swap! clusters update-in [cluster-id :node-ha-opt-overrides]
+             dissoc logical-node)
+      override)))
 
 (defn txlog-retention-state
   [cluster-id logical-node]
@@ -1515,6 +1762,48 @@
       (f kv-store)
       (finally
         (i/close-kv kv-store)))))
+
+(defn assoc-opt-on-node!
+  [cluster-id logical-node k v]
+  (with-node-kv-store
+    cluster-id
+    logical-node
+    (fn [kv-store]
+      (i/assoc-opt kv-store k v))))
+
+(defn assoc-opt-on-node-store!
+  [cluster-id logical-node k v]
+  (let [{:keys [db-name admin-conns]} (get @clusters cluster-id)
+        store (some-> (get admin-conns logical-node)
+                      deref
+                      .-store)]
+    (when-not store
+      (u/raise "Cannot update remote store opt on unavailable Jepsen node"
+               {:cluster-id cluster-id
+                :logical-node logical-node
+                :db-name db-name}))
+    (i/assoc-opt store k v)))
+
+(defn assoc-opt-on-stopped-node-store!
+  [cluster-id logical-node k v]
+  (let [{:keys [db-name node-by-name servers]} (get @clusters cluster-id)
+        node (get node-by-name logical-node)
+        root (:root node)]
+    (when-not node
+      (u/raise "Cannot update local store opt on unknown Jepsen node"
+               {:cluster-id cluster-id
+                :logical-node logical-node
+                :db-name db-name}))
+    (when (get servers logical-node)
+      (u/raise "Cannot update local store opt while Jepsen node is running"
+               {:cluster-id cluster-id
+                :logical-node logical-node
+                :db-name db-name}))
+    (let [store (#'srv/open-store root db-name nil true)]
+      (try
+        (i/assoc-opt store k v)
+        (finally
+          (i/close store))))))
 
 (defn clear-copy-backup-pins-on-node!
   [cluster-id logical-node]
@@ -1649,28 +1938,38 @@
 (defn restart-node!
   [cluster-id logical-node]
   (locking clusters
-    (let [{:keys [db-name schema base-opts node-by-name verbose? control-backend]}
+    (let [{:keys [db-name schema base-opts node-by-name verbose?
+                  control-backend node-ha-opt-overrides]}
           (get @clusters cluster-id)]
       (if (get-in @clusters [cluster-id :servers logical-node])
         true
-        (let [node   (get node-by-name logical-node)
-              server (start-server! node verbose?)
-              conn   (with-control-backend
-                       control-backend
-                       #(open-ha-conn! node
-                                       db-name
-                                       schema
-                                       (node-ha-opts base-opts node)))]
-          (swap! clusters
-                 (fn [clusters*]
-                   (-> clusters*
-                       (assoc-in [cluster-id :servers logical-node] server)
-                       (assoc-in [cluster-id :admin-conns logical-node] conn)
-                       (update-in [cluster-id :stopped-node-info] dissoc logical-node)
-                       (update-in [cluster-id :paused-node-info] dissoc logical-node)
-                       (update-in [cluster-id :paused-nodes] disj logical-node)
-                       (update-in [cluster-id :live-nodes] conj logical-node))))
-          true)))))
+        (let [node     (get node-by-name logical-node)
+              override (get node-ha-opt-overrides logical-node)
+              server   (start-server! node verbose?)]
+          (try
+            (let [conn (with-control-backend
+                         control-backend
+                         #(open-ha-conn! node
+                                         db-name
+                                         nil
+                                         (node-ha-opts base-opts
+                                                       node
+                                                       override)))]
+              (swap! clusters
+                     (fn [clusters*]
+                       (-> clusters*
+                           (assoc-in [cluster-id :servers logical-node] server)
+                           (assoc-in [cluster-id :admin-conns logical-node] conn)
+                           (update-in [cluster-id :stopped-node-info]
+                                      dissoc logical-node)
+                           (update-in [cluster-id :paused-node-info]
+                                      dissoc logical-node)
+                           (update-in [cluster-id :paused-nodes] disj logical-node)
+                           (update-in [cluster-id :live-nodes] conj logical-node))))
+              true)
+            (catch Throwable e
+              (safe-stop-server! server)
+              (throw e))))))))
 
 (defn- pause-server-loop!
   [^Server server]
@@ -1823,12 +2122,29 @@
 
 (defn- init-cluster!
   [cluster-id test]
-  (let [logical-nodes    (vec (or (seq (:nodes test)) default-nodes))
+  (let [data-logical-nodes
+        (vec (or (seq (:nodes test)) default-nodes))
+        control-logical-nodes
+        (vec (or (seq (:datalevin/control-nodes test))
+                 data-logical-nodes))
+        control-backend  (:control-backend test)
+        _                (validate-cluster-topology!
+                          data-logical-nodes
+                          control-logical-nodes
+                          control-backend)
         work-dir         (resolve-work-dir cluster-id test)
-        nodes            (make-nodes work-dir logical-nodes)
+        all-nodes        (make-nodes work-dir control-logical-nodes)
+        data-node-set    (set data-logical-nodes)
+        data-nodes       (->> all-nodes
+                              (filter #(contains? data-node-set
+                                                  (:logical-node %)))
+                              vec)
+        control-only-nodes
+        (->> all-nodes
+             (remove #(contains? data-node-set (:logical-node %)))
+             vec)
         db-name          (:db-name test)
         schema           (:schema test)
-        control-backend  (:control-backend test)
         nemesis-faults   (set (:datalevin/nemesis-faults test))
         clock-skew?      (some #{:clock-skew-pause
                                  :clock-skew-leader-fast
@@ -1840,8 +2156,11 @@
         group-id         (str "datalevin-jepsen-" cluster-id)
         db-identity      (str "db-" (UUID/randomUUID))
         cluster-opts     (or (:datalevin/cluster-opts test) {})
+        server-runtime-opts-override
+        (:datalevin/server-runtime-opts-fn test)
         base-opts        (cond-> (merge (base-ha-opts
-                                          nodes
+                                          data-nodes
+                                          all-nodes
                                           group-id
                                           db-identity
                                           control-backend)
@@ -1852,17 +2171,26 @@
         verbose?         (boolean (:verbose test))
         setup-timeout-ms (cluster-setup-timeout-ms base-opts)
         servers-atom     (atom {})
-        conns-atom       (atom {})]
+        conns-atom       (atom {})
+        authorities-atom (atom {})]
     (try
-      (doseq [{:keys [logical-node peer-id]} nodes]
+      (doseq [{:keys [logical-node peer-id]} all-nodes]
         (PartitionFaults/registerPeer cluster-id logical-node peer-id))
+      (install-server-runtime-opts-overrides!
+       db-name
+       data-nodes
+       server-runtime-opts-override)
       (when clock-skew?
-        (doseq [{:keys [node-id]} nodes]
+        (doseq [{:keys [node-id]} all-nodes]
           (write-clock-skew-ms! clock-skew-dir node-id 0)))
       (with-control-backend
         control-backend
         (fn []
-          (doseq [node nodes]
+          (doseq [node control-only-nodes]
+            (swap! authorities-atom assoc
+                   (:logical-node node)
+                   (start-control-authority! work-dir base-opts node)))
+          (doseq [node data-nodes]
             (swap! servers-atom assoc
                    (:logical-node node)
                    (start-server! node verbose?)))
@@ -1870,7 +2198,7 @@
           ;; a sequential open can deadlock waiting for a quorum that has not
           ;; started its authority yet.
           (doseq [[logical-node conn]
-                  (->> nodes
+                  (->> data-nodes
                        (mapv (fn [node]
                                (future
                                  [(:logical-node node)
@@ -1892,28 +2220,35 @@
                      :base-opts       base-opts
                      :clock-skew-dir  clock-skew-dir
                      :verbose?        verbose?
-                     :nodes           nodes
+                     :nodes           data-nodes
+                     :control-nodes   all-nodes
+                     :data-node-names data-logical-nodes
+                     :control-node-names control-logical-nodes
+                     :control-only-node-names
+                     (vec (map :logical-node control-only-nodes))
                      :node-by-id      (into {}
                                             (map (juxt :node-id :logical-node))
-                                            nodes)
+                                            all-nodes)
                      :node-by-name    (into {}
                                             (map (juxt :logical-node identity))
-                                            nodes)
+                                            all-nodes)
                      :endpoint->node  (into {}
                                             (map (juxt :endpoint :logical-node))
-                                            nodes)
+                                            all-nodes)
                      :peer-id->node   (into {}
                                             (map (juxt :peer-id :logical-node))
-                                            nodes)
+                                            all-nodes)
                      :servers         @servers-atom
+                     :control-authorities @authorities-atom
                      :admin-conns     @conns-atom
-                     :live-nodes      (set logical-nodes)
+                     :live-nodes      (set data-logical-nodes)
                      :network-grudge  (sorted-map)
                      :dropped-links   #{}
                      :link-behaviors  (sorted-map)
                      :network-behavior nil
                      :paused-nodes    #{}
                      :paused-node-info {}
+                     :node-ha-opt-overrides {}
                      :storage-faults  {}
                      :stopped-node-info {}
                      :teardown-nodes  #{}}]
@@ -1923,20 +2258,28 @@
       (catch Throwable e
         (doseq [conn (vals @conns-atom)]
           (safe-close-conn! conn))
+        (doseq [authority (vals @authorities-atom)]
+          (safe-stop-authority! authority))
         (doseq [server (vals @servers-atom)]
           (safe-stop-server! server))
+        (clear-server-runtime-opts-overrides! db-name data-nodes)
         (PartitionFaults/unregisterCluster cluster-id)
         (safe-delete-dir! work-dir)
         (throw e)))))
 
 (defn- teardown-cluster!
   [cluster-id]
-  (when-let [{:keys [admin-conns servers work-dir keep-work-dir?]} (get @clusters cluster-id)]
+  (when-let [{:keys [admin-conns servers control-authorities work-dir
+                     keep-work-dir? db-name nodes]}
+             (get @clusters cluster-id)]
     (heal-network! cluster-id)
     (doseq [conn (vals admin-conns)]
       (safe-close-conn! conn))
+    (doseq [authority (vals control-authorities)]
+      (safe-stop-authority! authority))
     (doseq [server (vals servers)]
       (safe-stop-server! server))
+    (clear-server-runtime-opts-overrides! db-name nodes)
     (PartitionFaults/unregisterCluster cluster-id)
     (swap! clusters dissoc cluster-id)
     (when-not keep-work-dir?

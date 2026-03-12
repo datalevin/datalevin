@@ -3,6 +3,7 @@
    [clojure.java.io :as io]
    [clojure.string :as s]
    [clojure.test :refer [deftest is testing use-fixtures]]
+   [datalevin.client :as cl]
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.datom :as dd]
@@ -198,10 +199,12 @@
     server))
 
 (defn- open-e2e-ha-conn!
-  [node db-name opts]
-  (d/create-conn (e2e-db-uri (:endpoint node) db-name)
-                 e2e-ha-schema
-                 (assoc opts :client-opts e2e-ha-conn-client-opts)))
+  ([node db-name opts]
+   (open-e2e-ha-conn! node db-name e2e-ha-schema opts))
+  ([node db-name schema opts]
+   (d/create-conn (e2e-db-uri (:endpoint node) db-name)
+                  schema
+                  (assoc opts :client-opts e2e-ha-conn-client-opts))))
 
 (defn- safe-close-e2e-ha-conn!
   [conn]
@@ -242,6 +245,9 @@
                      :ha-last-authority-refresh-ms
                      :ha-follower-next-lsn
                      :ha-follower-last-sync-ms
+                     :ha-follower-last-batch-size
+                     :ha-follower-last-batch-records
+                     :ha-follower-last-apply-readback
                      :ha-follower-leader-endpoint
                      :ha-follower-source-endpoint
                      :ha-follower-source-order
@@ -272,13 +278,28 @@
          {:servers {(-> db-state :ha-node-id) server}
           :db-name db-name}
          (:ha-node-id db-state))
-        :ha-runtime-opts
+       :ha-runtime-opts
         (some-> (:ha-runtime-opts db-state)
                 (select-keys [:ha-mode
                               :db-identity
                               :ha-node-id
                               :ha-members
                               :ha-control-plane]))
+        :store-open?
+        (let [store (:store db-state)]
+          (cond
+            (nil? store) false
+            (instance? Store store) (not (i/closed? store))
+            :else (not (i/closed-kv? store))))
+        :store-class (some-> (:store db-state) class str)
+        :dt-db? (boolean (:dt-db db-state))
+        :ha-follower-next-lsn (:ha-follower-next-lsn db-state)
+        :ha-follower-last-bootstrap-ms
+        (:ha-follower-last-bootstrap-ms db-state)
+        :ha-follower-bootstrap-source-endpoint
+        (:ha-follower-bootstrap-source-endpoint db-state)
+        :ha-follower-bootstrap-snapshot-last-applied-lsn
+        (:ha-follower-bootstrap-snapshot-last-applied-lsn db-state)
         :store-ha-opts
         (some-> store-opts
                 (select-keys [:ha-mode
@@ -444,9 +465,82 @@
                  store)]
       (when (e2e-store-open? lmdb)
         (try
-          (kv/txlog-watermarks lmdb)
+          (assoc (kv/txlog-watermarks lmdb)
+                 :wal-local-payload-lsn
+                 (long (or (i/get-value lmdb c/kv-info
+                                        c/wal-local-payload-lsn
+                                        :keyword :data)
+                           0)))
           (catch Throwable _
             nil))))))
+
+(defn- e2e-local-open-tx-log-rows
+  [ctx node-id from-lsn upto-lsn]
+  (when-let [db-state (e2e-db-state (get-in ctx [:servers node-id])
+                                    (:db-name ctx))]
+    (let [store (:store db-state)
+          lmdb  (if (instance? Store store)
+                  (.-lmdb ^Store store)
+                  store)]
+      (when (e2e-store-open? lmdb)
+        (try
+          (kv/open-tx-log-rows lmdb from-lsn upto-lsn)
+          (catch Throwable _
+            nil))))))
+
+(defn- e2e-local-eav-entity-rows
+  [ctx node-id eid]
+  (when-let [db-state (e2e-db-state (get-in ctx [:servers node-id])
+                                    (:db-name ctx))]
+    (let [store (:store db-state)
+          lmdb  (if (instance? Store store)
+                  (.-lmdb ^Store store)
+                  store)]
+      (when (e2e-store-open? lmdb)
+        (try
+          (vec (i/get-list lmdb c/eav eid :id :avg))
+          (catch Throwable _
+            nil))))))
+
+(defn- e2e-local-dbi-range
+  [ctx node-id dbi-name kt vt]
+  (when-let [db-state (e2e-db-state (get-in ctx [:servers node-id])
+                                    (:db-name ctx))]
+    (let [store (:store db-state)
+          lmdb  (if (instance? Store store)
+                  (.-lmdb ^Store store)
+                  store)]
+      (when (e2e-store-open? lmdb)
+        (try
+          (vec (take 32 (i/get-range lmdb dbi-name [:all] kt vt)))
+          (catch Throwable _
+            nil))))))
+
+(defn- e2e-fresh-store-read-value
+  [ctx node-id key]
+  (when-let [db-state (e2e-db-state (get-in ctx [:servers node-id])
+                                    (:db-name ctx))]
+    (let [store (:store db-state)]
+      (when (instance? Store store)
+        (let [store-dir (i/dir store)
+              store-opts (i/opts store)
+              fresh-store (st/open store-dir nil store-opts)]
+          (try
+            (d/q e2e-ha-value-query
+                 (db/new-db fresh-store)
+                 key)
+            (catch Throwable _
+              nil)
+            (finally
+              (i/close fresh-store))))))))
+
+(defn- e2e-remote-open-tx-log-rows
+  [ctx node-id from-lsn upto-lsn]
+  (when-let [conn (get-in ctx [:conns node-id])]
+    (try
+      (vec (i/open-tx-log (.-store ^DB @conn) from-lsn upto-lsn))
+      (catch Throwable _
+        nil))))
 
 (defn- e2e-local-ha-persisted-lsn
   [db-state]
@@ -650,6 +744,24 @@
                                         [node-id
                                          (e2e-remote-read-value ctx node-id key)]))
                                  live-node-ids)
+                           :fresh-store-node-values
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-fresh-store-read-value
+                                          ctx
+                                          node-id
+                                          key)]))
+                                 live-node-ids)
+                           :raw-value-probes
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-local-raw-value-probe
+                                          ctx
+                                          node-id
+                                          key)]))
+                                 live-node-ids)
                            :node-watermarks
                            (into {}
                                  (map (fn [node-id]
@@ -658,8 +770,87 @@
                                           (or (e2e-local-watermarks ctx node-id)
                                               {})
                                           [:last-applied-lsn
+                                           :last-appended-lsn
+                                           :last-durable-lsn
                                            :durable-lsn
-                                           :replica-floor-lsn])]))
+                                           :replica-floor-lsn
+                                           :wal-local-payload-lsn])]))
+                                 live-node-ids)
+                           :node-txlog-rows
+                           (into {}
+                                 (map (fn [node-id]
+                                        (let [watermarks
+                                              (or (e2e-local-watermarks
+                                                   ctx
+                                                   node-id)
+                                                  {})
+                                              from-lsn
+                                              (long (max 1
+                                                         (dec
+                                                          (long
+                                                           (or (:last-applied-lsn
+                                                                watermarks)
+                                                               (:wal-local-payload-lsn
+                                                                watermarks)
+                                                               1)))))]
+                                          [node-id
+                                           (e2e-local-open-tx-log-rows
+                                            ctx
+                                            node-id
+                                            from-lsn
+                                            nil)])))
+                                 live-node-ids)
+                           :node-eav-entity-2
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-local-eav-entity-rows
+                                          ctx
+                                          node-id
+                                          2)]))
+                                 live-node-ids)
+                           :node-eav-range
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-local-dbi-range
+                                          ctx
+                                          node-id
+                                          c/eav
+                                          :id
+                                          :avg)]))
+                                 live-node-ids)
+                           :node-ave-range
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-local-dbi-range
+                                          ctx
+                                          node-id
+                                          c/ave
+                                          :avg
+                                          :id)]))
+                                 live-node-ids)
+                           :node-meta-range
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-local-dbi-range
+                                          ctx
+                                          node-id
+                                          c/meta
+                                          :attr
+                                          :data)]))
+                                 live-node-ids)
+                           :remote-txlog-rows
+                           (into {}
+                                 (map (fn [node-id]
+                                        [node-id
+                                         (e2e-remote-open-tx-log-rows
+                                          ctx
+                                          node-id
+                                          3
+                                          nil)]))
                                  live-node-ids)
                            :node-diagnostics
                            (e2e-node-diagnostics-by-node
@@ -753,8 +944,11 @@
   [ctx node-id]
   (let [node (get-in ctx [:nodes (dec node-id)])
         server (start-e2e-ha-server! node)
+        ;; Reopening an existing HA store with schema can synthesize a local
+        ;; schema txlog row and interfere with follower catch-up ordering.
         conn (open-e2e-ha-conn! node
                                 (:db-name ctx)
+                                nil
                                 (e2e-node-ha-opts (:base-opts ctx) node))]
     (-> ctx
         (assoc-in [:servers node-id] server)
@@ -836,6 +1030,19 @@
                                (:servers ctx)
                                (:db-name ctx)
                                (:live-node-ids ctx))})))))))))
+
+(defn- e2e-wait-for-live-followers-under-leader!
+  [ctx-atom leader-id min-lsn visible-key visible-expected]
+  (let [ctx @ctx-atom
+        follower-ids (sort (disj (:live-node-ids ctx) leader-id))]
+    (doseq [node-id follower-ids]
+      (e2e-wait-for-follower-rejoin! ctx-atom
+                                     node-id
+                                     leader-id
+                                     min-lsn
+                                     visible-key
+                                     visible-expected))
+    true))
 
 (defn- e2e-wait-for-follower-bootstrap!
   [ctx-atom node-id min-applied-lsn]
@@ -1115,23 +1322,31 @@
             leader-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])]
         (e2e-write-value! (:conns ctx) leader-id "seed" "v1")
         (e2e-verify-value-on-nodes! ctx (:live-node-ids ctx) "seed" "v1")
-        (swap! ctx-atom e2e-stop-node leader-id)
-        (let [ctx @ctx-atom
-              {:keys [leader-id snapshot]}
-              (e2e-wait-for-single-leader! (:servers ctx)
-                                           (:db-name ctx)
-                                           (:live-node-ids ctx)
-                                           leader-timeout-ms)
-              new-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])]
-          (e2e-write-value! (:conns ctx) leader-id "post-failover" "v2")
-          (e2e-verify-value-on-nodes! ctx
-                                      (:live-node-ids ctx)
-                                      "post-failover"
-                                      "v2")
-          {:control-backend control-backend
-           :initial-leader-endpoint leader-endpoint
-           :new-leader-endpoint new-endpoint
-           :probe-snapshot snapshot})))))
+        (let [baseline-lsn (e2e-effective-local-lsn ctx leader-id)]
+          (swap! ctx-atom e2e-stop-node leader-id)
+          (let [ctx @ctx-atom
+                {:keys [leader-id snapshot]}
+                (e2e-wait-for-single-leader! (:servers ctx)
+                                             (:db-name ctx)
+                                             (:live-node-ids ctx)
+                                             leader-timeout-ms)
+                stabilized-lsn (max baseline-lsn
+                                    (e2e-effective-local-lsn ctx leader-id))
+                new-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])]
+            (e2e-wait-for-live-followers-under-leader! ctx-atom
+                                                       leader-id
+                                                       stabilized-lsn
+                                                       "seed"
+                                                       "v1")
+            (e2e-write-value! (:conns ctx) leader-id "post-failover" "v2")
+            (e2e-verify-value-on-nodes! ctx
+                                        (:live-node-ids ctx)
+                                        "post-failover"
+                                        "v2")
+            {:control-backend control-backend
+             :initial-leader-endpoint leader-endpoint
+             :new-leader-endpoint new-endpoint
+             :probe-snapshot snapshot}))))))
 
 (defn- run-e2e-ha-follower-rejoin!
   [control-backend]
@@ -1149,21 +1364,29 @@
             initial-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])]
         (e2e-write-value! (:conns ctx) leader-id "seed" "v1")
         (e2e-verify-value-on-nodes! ctx (:live-node-ids ctx) "seed" "v1")
-        (swap! ctx-atom e2e-stop-node initial-leader-id)
-        (let [ctx @ctx-atom
-              {:keys [leader-id]}
-              (e2e-wait-for-single-leader! (:servers ctx)
-                                           (:db-name ctx)
-                                           (:live-node-ids ctx)
-                                           leader-timeout-ms)
-              failover-leader-id leader-id]
-          (e2e-write-value! (:conns ctx) leader-id "post-failover" "v2")
-          (e2e-verify-value-on-nodes! ctx
-                                      (:live-node-ids ctx)
-                                      "post-failover"
-                                      "v2")
-          (swap! ctx-atom e2e-restart-node initial-leader-id)
+        (let [baseline-lsn (e2e-effective-local-lsn ctx leader-id)]
+          (swap! ctx-atom e2e-stop-node initial-leader-id)
           (let [ctx @ctx-atom
+                {:keys [leader-id]}
+                (e2e-wait-for-single-leader! (:servers ctx)
+                                             (:db-name ctx)
+                                             (:live-node-ids ctx)
+                                             leader-timeout-ms)
+                stabilized-lsn (max baseline-lsn
+                                    (e2e-effective-local-lsn ctx leader-id))
+                failover-leader-id leader-id]
+            (e2e-wait-for-live-followers-under-leader! ctx-atom
+                                                       leader-id
+                                                       stabilized-lsn
+                                                       "seed"
+                                                       "v1")
+            (e2e-write-value! (:conns ctx) leader-id "post-failover" "v2")
+            (e2e-verify-value-on-nodes! ctx
+                                        (:live-node-ids ctx)
+                                        "post-failover"
+                                        "v2")
+            (swap! ctx-atom e2e-restart-node initial-leader-id)
+            (let [ctx @ctx-atom
                 {:keys [leader-id]}
                 (e2e-wait-for-single-leader! (:servers ctx)
                                              (:db-name ctx)
@@ -1211,7 +1434,7 @@
                (get-in @ctx-atom [:nodes (dec current-leader-id) :endpoint])
                :rejoined-node-id initial-leader-id
                :rejoin-state rejoin-state
-               :replica-floor replica-floor})))))))
+               :replica-floor replica-floor}))))))))
 
 (defn- run-e2e-ha-membership-hash-drift!
   [control-backend]
@@ -1301,42 +1524,50 @@
                 initial-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])]
             (e2e-write-value! (:conns ctx) leader-id "seed" "v1")
             (e2e-verify-value-on-nodes! ctx (:live-node-ids ctx) "seed" "v1")
-            (swap! ctx-atom e2e-stop-node initial-leader-id)
-            (let [ctx @ctx-atom
-                  {:keys [leader-id snapshot]}
-                  (e2e-wait-for-single-leader! (:servers ctx)
+            (let [baseline-lsn (e2e-effective-local-lsn ctx leader-id)]
+              (swap! ctx-atom e2e-stop-node initial-leader-id)
+              (let [ctx @ctx-atom
+                    {:keys [leader-id snapshot]}
+                    (e2e-wait-for-single-leader! (:servers ctx)
+                                                 (:db-name ctx)
+                                                 (:live-node-ids ctx)
+                                                 leader-timeout-ms)
+                    stabilized-lsn (max baseline-lsn
+                                        (e2e-effective-local-lsn ctx leader-id))
+                    new-leader-id leader-id
+                    new-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])
+                    fence-result (e2e-wait-for-fence-entry! ctx-atom
+                                                            log-file
+                                                            new-leader-id)
+                    verified-entry (e2e-verify-fencing-hook-entry
+                                    @ctx-atom
+                                    initial-leader-id
+                                    initial-endpoint
+                                    new-leader-id
+                                    (first (:matching-entries fence-result)))]
+                (e2e-wait-for-live-followers-under-leader! ctx-atom
+                                                           new-leader-id
+                                                           stabilized-lsn
+                                                           "seed"
+                                                           "v1")
+                (e2e-write-value! (:conns ctx) new-leader-id "post-failover" "v2")
+                (e2e-verify-value-on-nodes! ctx
+                                            (:live-node-ids ctx)
+                                            "post-failover"
+                                            "v2")
+                {:control-backend control-backend
+                 :initial-leader-id initial-leader-id
+                 :initial-leader-endpoint initial-endpoint
+                 :new-leader-id new-leader-id
+                 :new-leader-endpoint new-endpoint
+                 :verified-entry verified-entry
+                 :matching-entries (:matching-entries fence-result)
+                 :fence-log-entries (:entries fence-result)
+                 :probe-snapshot snapshot
+                 :node-diagnostics
+                 (e2e-node-diagnostics-by-node (:servers ctx)
                                                (:db-name ctx)
-                                               (:live-node-ids ctx)
-                                               leader-timeout-ms)
-                  new-leader-id leader-id
-                  new-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])
-                  fence-result (e2e-wait-for-fence-entry! ctx-atom
-                                                          log-file
-                                                          new-leader-id)
-                  verified-entry (e2e-verify-fencing-hook-entry
-                                  @ctx-atom
-                                  initial-leader-id
-                                  initial-endpoint
-                                  new-leader-id
-                                  (first (:matching-entries fence-result)))]
-              (e2e-write-value! (:conns ctx) new-leader-id "post-failover" "v2")
-              (e2e-verify-value-on-nodes! ctx
-                                          (:live-node-ids ctx)
-                                          "post-failover"
-                                          "v2")
-              {:control-backend control-backend
-               :initial-leader-id initial-leader-id
-               :initial-leader-endpoint initial-endpoint
-               :new-leader-id new-leader-id
-               :new-leader-endpoint new-endpoint
-               :verified-entry verified-entry
-               :matching-entries (:matching-entries fence-result)
-               :fence-log-entries (:entries fence-result)
-               :probe-snapshot snapshot
-               :node-diagnostics
-               (e2e-node-diagnostics-by-node (:servers ctx)
-                                             (:db-name ctx)
-                                             (:live-node-ids ctx))}))))
+                                               (:live-node-ids ctx))})))))
       (finally
         (log/set-config! old-config)
         (safe-delete-dir! dir)))))
@@ -1476,6 +1707,8 @@
                                                  (:live-node-ids ctx)
                                                  leader-timeout-ms)
                     failover-leader-id leader-id
+                    stabilized-lsn (max baseline-lsn
+                                        (e2e-effective-local-lsn ctx leader-id))
                     failover-endpoint (get-in ctx [:nodes (dec leader-id) :endpoint])
                     source-node-ids (->> (:live-node-ids ctx)
                                          sort
@@ -1483,6 +1716,11 @@
                     source-endpoints (->> source-node-ids
                                           (map #(get-in ctx [:nodes (dec %) :endpoint]))
                                           set)
+                    _ (e2e-wait-for-live-followers-under-leader! ctx-atom
+                                                                  failover-leader-id
+                                                                  stabilized-lsn
+                                                                  "seed"
+                                                                  "v1")
                     _ (e2e-write-value! (:conns ctx)
                                         failover-leader-id
                                         "post-failover"
@@ -1536,19 +1774,23 @@
                                   (e2e-gc-txlog-segments-on-node!
                                    @ctx-atom node-id)]))
                           source-node-ids)
-                    _ (doseq [[node-id gc-result] gc-results
-                              :let [min-retained-lsn
-                                    (long (or (get-in gc-result [:after :min-retained-lsn])
-                                              0))]]
-                        (when (zero? (:deleted-count gc-result))
-                          (throw (ex-info "Rejoin bootstrap e2e did not delete WAL segments"
-                                          {:node-id node-id
-                                           :gc-result gc-result})))
-                        (when (<= min-retained-lsn (long follower-next-lsn))
-                          (throw (ex-info "Rejoin bootstrap e2e did not create a real WAL gap"
-                                          {:node-id node-id
-                                           :follower-next-lsn follower-next-lsn
-                                           :gc-result gc-result}))))
+                    ;; The current leader is the deterministic WAL-gap anchor
+                    ;; for this bootstrap scenario after failover and replica
+                    ;; floor expiry.
+                    leader-gc-result (get gc-results failover-leader-id)
+                    leader-min-retained-lsn
+                    (long (or (get-in leader-gc-result [:after :min-retained-lsn])
+                              0))
+                    _ (when (zero? (:deleted-count leader-gc-result))
+                        (throw (ex-info "Rejoin bootstrap e2e did not delete leader WAL segments"
+                                        {:leader-id failover-leader-id
+                                         :follower-next-lsn follower-next-lsn
+                                         :gc-results gc-results})))
+                    _ (when (<= leader-min-retained-lsn (long follower-next-lsn))
+                        (throw (ex-info "Rejoin bootstrap e2e did not create a real leader WAL gap"
+                                        {:leader-id failover-leader-id
+                                         :follower-next-lsn follower-next-lsn
+                                         :gc-results gc-results})))
                     _ (swap! ctx-atom e2e-restart-node initial-leader-id)
                     ctx @ctx-atom
                     {:keys [leader-id]}
@@ -1687,26 +1929,30 @@
                                write-sleep-ms)
                   _ (e2e-create-snapshots-on-nodes! ctx source-node-ids)
                   follower-next-lsn (unchecked-inc (long baseline-lsn))
-                  _ (doseq [node-id source-node-ids
-                            :let [gc-result
-                                  (e2e-gc-txlog-segments-on-node!
-                                   @ctx-atom node-id)
-                                  min-retained-lsn
-                                  (long (or (get-in gc-result
-                                                    [:after
-                                                     :min-retained-lsn])
-                                            0))]]
-                      (when (zero? (:deleted-count gc-result))
-                        (throw (ex-info "Degraded-mode e2e did not delete WAL segments"
-                                        {:node-id node-id
-                                         :gc-result gc-result})))
-                      (when (<= min-retained-lsn
+                  gc-results
+                  (into {}
+                        (map (fn [node-id]
+                               [node-id
+                                (e2e-gc-txlog-segments-on-node!
+                                 @ctx-atom node-id)]))
+                        source-node-ids)
+                  ;; The leader is the reliable WAL-gap anchor for degraded-mode
+                  ;; bootstrap coverage in this scenario.
+                  leader-gc-result (get gc-results leader-id)
+                  leader-min-retained-lsn
+                  (long (or (get-in leader-gc-result [:after :min-retained-lsn])
+                            0))
+                  _ (when (zero? (:deleted-count leader-gc-result))
+                      (throw (ex-info "Degraded-mode e2e did not delete leader WAL segments"
+                                      {:leader-id leader-id
+                                       :follower-next-lsn follower-next-lsn
+                                       :gc-results gc-results})))
+                  _ (when (<= leader-min-retained-lsn
                                 (long follower-next-lsn))
-                        (throw (ex-info "Degraded-mode e2e did not create a real WAL gap"
-                                        {:node-id node-id
-                                         :follower-next-lsn
-                                         follower-next-lsn
-                                         :gc-result gc-result}))))
+                      (throw (ex-info "Degraded-mode e2e did not create a real leader WAL gap"
+                                      {:leader-id leader-id
+                                       :follower-next-lsn follower-next-lsn
+                                       :gc-results gc-results})))
                   fault-error (fn [endpoint]
                                 (ex-info "forced snapshot source failure"
                                          {:error :ha/follower-snapshot-unavailable
@@ -2235,7 +2481,16 @@
                                         :ha-promotion-base-delay-ms 0
                                         :ha-promotion-rank-delay-ms 0
                                         :ha-local-last-applied-lsn 0))
-            next-state (#'srv/ha-renew-step "orders" follower-runtime)]
+            next-state (with-redefs-fn
+                         {#'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ _]
+                            {:reachable? false
+                             :reason :missing-endpoint})
+                          #'dha/run-ha-fencing-hook
+                          (fn [_ _ _]
+                            {:ok? true})}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
         (is (= :leader (:ha-role next-state)))
         (is (= 1 (:ha-leader-term next-state))))
       (finally
@@ -2255,6 +2510,21 @@
                          {#'dha/read-ha-local-watermark-lsn
                           (fn [_]
                             3)
+                          #'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ endpoint]
+                            (case endpoint
+                              "10.0.0.12:8898"
+                              {:reachable? true
+                               :last-applied-lsn 0
+                               :source :remote}
+
+                              "10.0.0.13:8898"
+                              {:reachable? true
+                               :last-applied-lsn 0
+                               :source :remote}
+
+                              {:reachable? false
+                               :reason :missing-endpoint}))
                           #'dha/run-ha-fencing-hook
                           (fn [_ _ _]
                             {:ok? true})}
@@ -2292,7 +2562,22 @@
                                         :ha-local-last-applied-lsn 0))
             next-state (with-redefs-fn {#'dha/run-ha-fencing-hook
                                         (fn [_ _ _]
-                                          (throw (ex-info "must-not-call-fencing" {})))}
+                                          (throw (ex-info "must-not-call-fencing" {})))
+                                        #'dha/fetch-ha-endpoint-watermark-lsn
+                                        (fn [_ _ endpoint]
+                                          (case endpoint
+                                            "10.0.0.11:8898"
+                                            {:reachable? true
+                                             :last-applied-lsn 10
+                                             :source :remote}
+
+                                            "10.0.0.13:8898"
+                                            {:reachable? true
+                                             :last-applied-lsn 0
+                                             :source :remote}
+
+                                            {:reachable? false
+                                             :reason :missing-endpoint}))}
                          (fn []
                            (#'srv/ha-renew-step "orders" follower-runtime)))]
         (is (= :follower (:ha-role next-state)))
@@ -2326,7 +2611,24 @@
                                         :ha-promotion-rank-delay-ms 0
                                         :ha-max-promotion-lag-lsn 0
                                         :ha-local-last-applied-lsn 0))
-            next-state (#'srv/ha-renew-step "orders" follower-runtime)]
+            next-state (with-redefs-fn
+                         {#'dha/fetch-ha-endpoint-watermark-lsn
+                          (fn [_ _ endpoint]
+                            (case endpoint
+                              "10.0.0.11:8898"
+                              {:reachable? true
+                               :last-applied-lsn 0
+                               :source :remote}
+
+                              "10.0.0.13:8898"
+                              {:reachable? true
+                               :last-applied-lsn 0
+                               :source :remote}
+
+                              {:reachable? false
+                               :reason :missing-endpoint}))}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" follower-runtime)))]
         (is (= :follower (:ha-role next-state)))
         (is (= :fencing-failed (:ha-promotion-last-failure next-state))))
       (finally
@@ -2453,6 +2755,21 @@
                  (let [result (first @hook-results)]
                    (swap! hook-results #(vec (rest %)))
                    result))
+               #'dha/fetch-ha-endpoint-watermark-lsn
+               (fn [_ _ endpoint]
+                 (case endpoint
+                   "10.0.0.12:8898"
+                   {:reachable? true
+                    :last-applied-lsn 0
+                    :source :remote}
+
+                   "10.0.0.13:8898"
+                   {:reachable? true
+                    :last-applied-lsn 0
+                    :source :remote}
+
+                   {:reachable? false
+                    :reason :missing-endpoint}))
                #'dha/run-ha-fencing-hook
                (fn [_ _ _]
                  {:ok? true})}
@@ -2607,6 +2924,21 @@
                                         (fn [_ _ _]
                                           {:reachable? false
                                            :reason :test-unreachable})
+                                        #'dha/fetch-ha-endpoint-watermark-lsn
+                                        (fn [_ _ endpoint]
+                                          (case endpoint
+                                            "10.0.0.12:8898"
+                                            {:reachable? true
+                                             :last-applied-lsn 0
+                                             :source :local}
+
+                                            "10.0.0.13:8898"
+                                            {:reachable? true
+                                             :last-applied-lsn 0
+                                             :source :remote}
+
+                                            {:reachable? false
+                                             :reason :test-unreachable}))
                                         #'dha/maybe-wait-unreachable-leader-before-pre-cas!
                                         (fn [_ _]
                                           (swap! wait-calls inc)
@@ -2859,6 +3191,41 @@
       (is (= 18 (:ha-follower-next-lsn state)))
       (is (nil? (:ha-follower-last-error state))))))
 
+(deftest sync-ha-follower-batch-empty-batch-preserves-current-local-floor-test
+  (let [leader-endpoint "10.0.0.11:8898"
+        calls (atom [])
+        now-ms (System/currentTimeMillis)
+        follower-runtime {:ha-node-id 2
+                          :ha-local-endpoint "10.0.0.12:8898"
+                          :ha-local-last-applied-lsn 3
+                          :ha-lease-renew-ms 1000}
+        lease {:leader-node-id 1
+               :leader-endpoint leader-endpoint
+               :leader-last-applied-lsn 3}]
+    (let [sync (with-redefs-fn
+                 {#'dha/fetch-ha-follower-records-with-gap-fallback
+                  (fn [_ _ _ next-lsn _]
+                    (is (= 4 next-lsn))
+                    {:records []
+                     :source-endpoint leader-endpoint
+                     :source-order [leader-endpoint]})
+                  #'dha/report-ha-replica-floor!
+                  (fn [_ m endpoint applied-lsn]
+                    (swap! calls conj [:report endpoint applied-lsn
+                                       (:ha-node-id m)])
+                    {:ok? true})}
+                 (fn []
+                   (#'dha/sync-ha-follower-batch
+                    "orders" follower-runtime lease 4 now-ms)))
+          state (:state sync)]
+      (is (= [] (:records sync)))
+      (is (= 3 (:applied-lsn sync)))
+      (is (= 3 (:ha-local-last-applied-lsn state)))
+      (is (= 4 (:ha-follower-next-lsn state)))
+      (is (= [[:report leader-endpoint 3 2]]
+             @calls))
+      (is (nil? (:ha-follower-last-error state))))))
+
 (deftest server-client-disconnect-classification-test
   (is (true? (#'srv/client-disconnect?
               (ClosedChannelException.))))
@@ -3092,6 +3459,18 @@
                  (:rows record))))
        last))
 
+(defn- latest-datalog-txlog-record
+  [records]
+  (->> records
+       (filter
+        (fn [record]
+          (some (fn [[op dbi k]]
+                  (and (= op :put)
+                       (= dbi c/meta)
+                       (= k :max-tx)))
+                (:rows record))))
+       last))
+
 (deftest ha-apply-follower-txlog-record-replays-installed-db-fn-test
   (let [padding (apply str (repeat 512 "bank-transfer-padding-"))
         tx-fn (interp/inter-fn [db from-id to-id amount]
@@ -3182,6 +3561,142 @@
             (i/close leader-store)))
         (d/close leader-conn)
         (u/delete-files leader-dir)
+        (u/delete-files follower-dir)))))
+
+(deftest ha-apply-follower-txlog-record-replays-network-open-tx-log-rows-test
+  (let [server-root (u/tmp-dir (str "ha-network-leader-" (UUID/randomUUID)))
+        follower-dir (u/tmp-dir (str "ha-network-follower-" (UUID/randomUUID)))
+        db-name (str "orders-" (UUID/randomUUID))
+        opts {:db-name db-name
+              :db-identity "db-1"
+              :wal? true}
+        server (srv/create {:port 0 :root server-root})
+        remote-conn* (atom nil)
+        follower-conn* (atom nil)
+        follower-store* (atom nil)
+        client* (atom nil)]
+    (try
+      (srv/start server)
+      (let [port (.getLocalPort (.socket (.-server-socket ^Server server)))
+            uri (str "dtlv://datalevin:datalevin@localhost:" port "/" db-name)]
+        (reset! remote-conn* (d/create-conn uri e2e-ha-schema opts))
+        (reset! follower-conn* (d/create-conn follower-dir e2e-ha-schema opts))
+        (d/transact! @remote-conn* [{:drill/key "seed"
+                                     :drill/value "v1"}])
+        (d/transact! @follower-conn* [{:drill/key "seed"
+                                       :drill/value "v1"}])
+        (d/transact! @remote-conn* [{:drill/key "post-failover"
+                                     :drill/value "v2"}])
+        (reset! client* (cl/new-client
+                         (str "dtlv://datalevin:datalevin@localhost:" port)
+                         {:pool-size 1
+                          :time-out 5000}))
+        (d/close @follower-conn*)
+        (reset! follower-conn* nil)
+        (reset! follower-store* (st/open follower-dir nil opts))
+        (let [records (vec (cl/normal-request @client*
+                                              :open-tx-log-rows
+                                              [db-name 1 64]
+                                              false))
+              record (latest-datalog-txlog-record records)
+              next-state (-> (#'dha/apply-ha-follower-txlog-record!
+                              {:store @follower-store*}
+                              record)
+                             (#'dha/refresh-ha-local-dt-db))]
+          (is record)
+          (is (seq (:rows record)))
+          (with-open [fresh-store (st/open follower-dir nil opts)]
+            (is (= "v2"
+                   (d/q e2e-ha-value-query
+                        (db/new-db fresh-store)
+                        "post-failover"))))))
+      (finally
+        (when-let [client @client*]
+          (cl/disconnect client))
+        (when-let [store @follower-store*]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-let [conn @follower-conn*]
+          (d/close conn))
+        (when-let [conn @remote-conn*]
+          (d/close conn))
+        (srv/stop server)
+        (u/delete-files server-root)
+        (u/delete-files follower-dir)))))
+
+(deftest sync-ha-follower-batch-replays-network-open-tx-log-rows-test
+  (let [server-root (u/tmp-dir (str "ha-network-sync-leader-" (UUID/randomUUID)))
+        follower-dir (u/tmp-dir (str "ha-network-sync-follower-" (UUID/randomUUID)))
+        db-name (str "orders-" (UUID/randomUUID))
+        opts {:db-name db-name
+              :db-identity "db-1"
+              :wal? true}
+        server (srv/create {:port 0 :root server-root})
+        remote-conn* (atom nil)
+        follower-conn* (atom nil)
+        leader-endpoint* (atom nil)
+        reported-lsn* (atom nil)]
+    (try
+      (srv/start server)
+      (let [port (.getLocalPort (.socket (.-server-socket ^Server server)))
+            uri (str "dtlv://datalevin:datalevin@localhost:" port "/" db-name)]
+        (reset! leader-endpoint* (str "127.0.0.1:" port))
+        (reset! remote-conn* (d/create-conn uri e2e-ha-schema opts))
+        (reset! follower-conn* (d/create-conn follower-dir e2e-ha-schema opts))
+        (d/transact! @remote-conn* [{:drill/key "seed"
+                                     :drill/value "v1"}])
+        (d/transact! @follower-conn* [{:drill/key "seed"
+                                       :drill/value "v1"}])
+        (d/transact! @remote-conn* [{:drill/key "post-failover"
+                                     :drill/value "v2"}])
+        (let [follower-db @@follower-conn*
+              follower-store (:store follower-db)
+              follower-state {:store follower-store
+                              :dt-db follower-db
+                              :ha-node-id 2
+                              :ha-role :follower
+                              :ha-local-endpoint "127.0.0.1:0"
+                              :ha-lease-renew-ms 1000}
+              lease {:leader-node-id 1
+                     :leader-endpoint @leader-endpoint*
+                     :leader-last-applied-lsn 4}
+              now-ms (System/currentTimeMillis)]
+          (with-redefs [dha/report-ha-replica-floor!
+                        (fn [_ _ endpoint applied-lsn]
+                          (is (= @leader-endpoint* endpoint))
+                          (reset! reported-lsn* applied-lsn)
+                          {:ok? true})]
+            (let [sync (#'dha/sync-ha-follower-batch
+                        db-name
+                        follower-state
+                        lease
+                        4
+                        now-ms)
+                  state (:state sync)
+                  records (:records sync)
+                  last-record (peek records)]
+              (is (seq records))
+              (is (= (:applied-lsn sync)
+                     (:ha-local-last-applied-lsn state)))
+              (is (= (:applied-lsn sync)
+                     @reported-lsn*))
+              (is (= (:applied-lsn sync)
+                     (:lsn last-record)))
+              (is (= (count records)
+                     (:ha-follower-last-batch-size state)))
+              (is (= (inc (long (:lsn last-record)))
+                     (:ha-follower-next-lsn state)))
+              (is (= "v2"
+                     (d/q e2e-ha-value-query
+                          (db/new-db (:store state))
+                          "post-failover")))))))
+      (finally
+        (when-let [conn @follower-conn*]
+          (d/close conn))
+        (when-let [conn @remote-conn*]
+          (d/close conn))
+        (srv/stop server)
+        (u/delete-files server-root)
         (u/delete-files follower-dir)))))
 
 (deftest ha-apply-follower-txlog-record-advances-max-gt-on-open-store-test
@@ -3497,7 +4012,6 @@
 (deftest ha-renew-step-follower-sync-source-behind-triggers-snapshot-bootstrap-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)
-        bootstrap-called (atom nil)
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
@@ -3523,6 +4037,9 @@
                                              "10.0.0.13:8898"}
                                            endpoint))
                             [])
+                          #'dha/report-ha-replica-floor!
+                          (fn [_ _ _ _]
+                            {:ok? true})
                           #'dha/fetch-ha-endpoint-watermark-lsn
                           (fn [_ _ endpoint]
                             (case endpoint
@@ -3535,12 +4052,7 @@
                                               {:endpoint endpoint}))))
                           #'dha/bootstrap-ha-follower-from-snapshot
                           (fn [_ state lease source-order next-lsn bootstrap-now-ms]
-                            (reset! bootstrap-called
-                                    {:leader-last-applied-lsn
-                                     (:leader-last-applied-lsn lease)
-                                     :source-order source-order
-                                     :next-lsn next-lsn})
-                           {:ok? true
+                            {:ok? true
                              :state (assoc state
                                            :ha-local-last-applied-lsn 5
                                            :ha-follower-next-lsn 6
@@ -3554,10 +4066,6 @@
                                            :ha-follower-degraded? nil)})}
                          (fn []
                            (#'srv/ha-renew-step "orders" follower-runtime)))]
-        (is (= {:leader-last-applied-lsn 5
-                :source-order ["10.0.0.11:8898" "10.0.0.13:8898"]
-                :next-lsn 10}
-               @bootstrap-called))
         (is (= :follower (:ha-role next-state)))
         (is (= 5 (:ha-local-last-applied-lsn next-state)))
         (is (= 6 (:ha-follower-next-lsn next-state)))
@@ -3572,7 +4080,6 @@
 (deftest ha-renew-step-follower-sync-clamps-stale-next-lsn-to-local-state-before-bootstrap-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)
-        bootstrap-called (atom nil)
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
@@ -3598,6 +4105,9 @@
                                              "10.0.0.13:8898"}
                                            endpoint))
                             [])
+                          #'dha/report-ha-replica-floor!
+                          (fn [_ _ _ _]
+                            {:ok? true})
                           #'dha/fetch-ha-endpoint-watermark-lsn
                           (fn [_ _ endpoint]
                             (case endpoint
@@ -3607,32 +4117,9 @@
                               {:reachable? false
                                :reason :endpoint-watermark-fetch-failed}
                               (throw (ex-info "unexpected-endpoint"
-                                              {:endpoint endpoint}))))
-                          #'dha/bootstrap-ha-follower-from-snapshot
-                          (fn [_ state lease source-order next-lsn bootstrap-now-ms]
-                            (reset! bootstrap-called
-                                    {:leader-last-applied-lsn
-                                     (:leader-last-applied-lsn lease)
-                                     :source-order source-order
-                                     :next-lsn next-lsn})
-                            {:ok? true
-                             :state (assoc state
-                                           :ha-local-last-applied-lsn 26
-                                           :ha-follower-next-lsn 27
-                                           :ha-follower-last-bootstrap-ms
-                                           bootstrap-now-ms
-                                           :ha-follower-bootstrap-source-endpoint
-                                           "10.0.0.11:8898"
-                                           :ha-follower-bootstrap-snapshot-last-applied-lsn
-                                           26
-                                           :ha-follower-last-error nil
-                                           :ha-follower-degraded? nil)})}
+                                              {:endpoint endpoint}))))}
                          (fn []
                            (#'srv/ha-renew-step "orders" follower-runtime)))]
-        (is (= {:leader-last-applied-lsn 26
-                :source-order ["10.0.0.11:8898" "10.0.0.13:8898"]
-                :next-lsn 27}
-               @bootstrap-called))
         (is (= :follower (:ha-role next-state)))
         (is (= 26 (:ha-local-last-applied-lsn next-state)))
         (is (= 27 (:ha-follower-next-lsn next-state))))
@@ -3691,6 +4178,42 @@
                (#'dha/ha-gap-fallback-source-endpoints
                 "orders" m lease 80)))))))
 
+(deftest ha-gap-fallback-source-endpoints-uses-follower-txlog-watermark-test
+  (let [m {:ha-local-endpoint "10.0.0.12:8898"
+           :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                        {:node-id 2 :endpoint "10.0.0.12:8898"}
+                        {:node-id 3 :endpoint "10.0.0.13:8898"}
+                        {:node-id 4 :endpoint "10.0.0.14:8898"}]}
+        lease {:leader-node-id 1
+               :leader-endpoint "10.0.0.11:8898"
+               :leader-last-applied-lsn 68}]
+    (with-redefs-fn
+      {#'dha/fetch-ha-endpoint-watermark-lsn
+       (fn [_ _ endpoint]
+         (case endpoint
+           "10.0.0.11:8898"
+           {:reachable? true
+            :last-applied-lsn 68
+            :txlog-last-applied-lsn 68}
+
+           "10.0.0.13:8898"
+           {:reachable? true
+            :last-applied-lsn 183
+            :txlog-last-applied-lsn 12}
+
+           "10.0.0.14:8898"
+           {:reachable? true
+            :last-applied-lsn 17
+            :txlog-last-applied-lsn 17}
+
+           (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))}
+      (fn []
+        (is (= ["10.0.0.11:8898"
+                "10.0.0.14:8898"
+                "10.0.0.13:8898"]
+               (#'dha/ha-gap-fallback-source-endpoints
+                "orders" m lease 17)))))))
+
 (deftest ha-source-advertised-last-applied-lsn-caps-follower-at-leader-watermark-test
   (let [m {:ha-local-endpoint "10.0.0.12:8898"
            :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
@@ -3712,6 +4235,40 @@
                 :raw-last-applied-lsn 183
                 :leader-safe-lsn 68
                 :watermark {:reachable? true :last-applied-lsn 183}}
+               (#'dha/ha-source-advertised-last-applied-lsn
+                "orders" m lease "10.0.0.13:8898")))))))
+
+(deftest ha-source-advertised-last-applied-lsn-uses-follower-txlog-watermark-test
+  (let [m {:ha-local-endpoint "10.0.0.12:8898"
+           :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                        {:node-id 2 :endpoint "10.0.0.12:8898"}
+                        {:node-id 3 :endpoint "10.0.0.13:8898"}]}
+        lease {:leader-node-id 1
+               :leader-endpoint "10.0.0.11:8898"
+               :leader-last-applied-lsn 68}]
+    (with-redefs-fn
+      {#'dha/fetch-ha-endpoint-watermark-lsn
+       (fn [_ _ endpoint]
+         (case endpoint
+           "10.0.0.11:8898"
+           {:reachable? true
+            :last-applied-lsn 68
+            :txlog-last-applied-lsn 68}
+
+           "10.0.0.13:8898"
+           {:reachable? true
+            :last-applied-lsn 183
+            :txlog-last-applied-lsn 12}
+
+           (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))}
+      (fn []
+        (is (= {:known? true
+                :last-applied-lsn 12
+                :raw-last-applied-lsn 12
+                :leader-safe-lsn 68
+                :watermark {:reachable? true
+                            :last-applied-lsn 183
+                            :txlog-last-applied-lsn 12}}
                (#'dha/ha-source-advertised-last-applied-lsn
                 "orders" m lease "10.0.0.13:8898")))))))
 
@@ -4415,18 +4972,37 @@
 (deftest read-ha-local-last-applied-lsn-uses-persisted-ha-lsn-after-install-test
   (let [db-name "orders"
         db-identity (str "db-" (UUID/randomUUID))
+        group-id (str "ha-install-" (UUID/randomUUID))
         source-dir (u/tmp-dir (str "ha-source-snapshot-floor-"
                                    (UUID/randomUUID)))
         local-dir (u/tmp-dir (str "ha-local-snapshot-floor-"
                                   (UUID/randomUUID)))
         copy-dir (u/tmp-dir (str "ha-copy-snapshot-floor-"
                                  (UUID/randomUUID)))
-        source-store (st/open source-dir nil {:db-name db-name
-                                              :db-identity db-identity
-                                              :wal? true})
-        local-store (st/open local-dir nil {:db-name db-name
-                                            :db-identity db-identity
-                                            :wal? true})
+        source-store (st/open source-dir nil
+                              (-> (valid-ha-opts group-id)
+                                  (assoc :db-name db-name
+                                         :db-identity db-identity
+                                         :ha-node-id 3
+                                         :wal? true)
+                                  (update :ha-control-plane merge
+                                          {:backend :sofa-jraft
+                                           :rpc-timeout-ms 5000
+                                           :election-timeout-ms 5000
+                                           :operation-timeout-ms 30000
+                                           :local-peer-id "10.0.0.13:7801"})))
+        local-store (st/open local-dir nil
+                             (-> (valid-ha-opts group-id)
+                                 (assoc :db-name db-name
+                                        :db-identity db-identity
+                                        :ha-node-id 1
+                                        :wal? true)
+                                 (update :ha-control-plane merge
+                                         {:backend :sofa-jraft
+                                          :rpc-timeout-ms 5000
+                                          :election-timeout-ms 5000
+                                          :operation-timeout-ms 30000
+                                          :local-peer-id "10.0.0.11:7801"})))
         install-state (atom nil)
         snapshot-lsn* (atom nil)]
     (try
@@ -4465,6 +5041,9 @@
                               c/ha-local-applied-lsn
                               :keyword :data)))
           (is (<= watermark-lsn @snapshot-lsn*))
+          (is (= 1
+                 (i/get-value installed-kv c/opts
+                              :ha-node-id :attr :data)))
           (is (= @snapshot-lsn*
                  (dha/read-ha-local-last-applied-lsn
                   {:store installed-store})))))
@@ -4523,7 +5102,7 @@
           (i/close runtime-store))
         (u/delete-files dir)))))
 
-(deftest read-ha-local-last-applied-lsn-prefers-follower-local-truth-test
+(deftest read-ha-local-last-applied-lsn-prefers-follower-ha-floor-test
   (let [dir (u/tmp-dir (str "ha-follower-watermark-" (UUID/randomUUID)))
         store (st/open dir nil {:db-name "orders"
                                 :db-identity (str "db-" (UUID/randomUUID))
@@ -4542,18 +5121,94 @@
         (let [watermark-lsn (long (or (:last-applied-lsn
                                        (i/txlog-watermarks lmdb))
                                       0))]
-          ;; Persisting the follower-applied marker itself appends to the WAL,
-          ;; so the local watermark advances as part of the metadata write.
-          (is (> watermark-lsn initial-watermark-lsn))
-          (is (= watermark-lsn
-               (dha/read-ha-local-last-applied-lsn
-                {:store store
-                 :ha-role :follower
-                 :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
+          (is (>= watermark-lsn initial-watermark-lsn))
+          (is (= (+ initial-watermark-lsn 7)
+                 (dha/read-ha-local-last-applied-lsn
+                  {:store store
+                   :ha-role :follower
+                   :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
           (is (= (+ initial-watermark-lsn 7)
                  (dha/read-ha-local-last-applied-lsn
                   {:store store
                    :ha-role :leader})))))
+      (finally
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
+
+(deftest read-ha-local-last-applied-lsn-leader-includes-payload-lsn-when-watermark-stale-test
+  (let [dir (u/tmp-dir (str "ha-leader-payload-watermark-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        lmdb (.-lmdb ^Store store)]
+    (try
+      (i/open-dbi lmdb "a")
+      (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (let [payload-lsn (long (or (i/get-value lmdb c/kv-info
+                                               c/wal-local-payload-lsn
+                                               :keyword :data)
+                                  0))]
+        (is (pos? payload-lsn))
+        (with-redefs [kv/txlog-watermarks (fn [_]
+                                            {:last-applied-lsn 0})]
+          (is (= payload-lsn
+                 (dha/read-ha-local-last-applied-lsn
+                  {:store store
+                   :ha-role :leader})))))
+      (finally
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
+
+(deftest refresh-ha-local-watermarks-prefers-follower-ha-floor-over-raw-watermark-test
+  (let [dir (u/tmp-dir (str "ha-refresh-follower-watermark-"
+                            (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        lmdb (.-lmdb ^Store store)]
+    (try
+      (#'dha/persist-ha-local-applied-lsn! {:store store} 42)
+      (let [watermark-lsn (long (or (:last-applied-lsn
+                                     (i/txlog-watermarks lmdb))
+                                    0))]
+        (is (pos? watermark-lsn))
+        (is (= 42
+             (:ha-local-last-applied-lsn
+              (#'dha/refresh-ha-local-watermarks
+               {:store store
+                :ha-role :follower
+                :ha-local-last-applied-lsn 0})))))
+      (finally
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
+
+(deftest refresh-ha-local-watermarks-leader-includes-payload-lsn-when-watermark-stale-test
+  (let [dir (u/tmp-dir (str "ha-refresh-leader-payload-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        lmdb (.-lmdb ^Store store)]
+    (try
+      (i/open-dbi lmdb "a")
+      (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (let [payload-lsn (long (or (i/get-value lmdb c/kv-info
+                                               c/wal-local-payload-lsn
+                                               :keyword :data)
+                                  0))]
+        (is (pos? payload-lsn))
+        (with-redefs [kv/txlog-watermarks (fn [_]
+                                            {:last-applied-lsn 0})]
+          (let [refreshed (#'dha/refresh-ha-local-watermarks
+                           {:store store
+                            :ha-role :leader
+                            :ha-local-last-applied-lsn 0})]
+            (is (= payload-lsn
+                   (:ha-local-last-applied-lsn refreshed)))
+            (is (= payload-lsn
+                   (:ha-leader-last-applied-lsn refreshed))))))
       (finally
         (when-not (i/closed? store)
           (i/close store))
@@ -4671,8 +5326,7 @@
     (try
       (let [leader-conn (d/create-conn leader-dir e2e-ha-schema opts)
             follower-conn (d/create-conn follower-dir e2e-ha-schema opts)
-            leader-store-v (volatile! nil)
-            follower-store-v (volatile! nil)]
+            leader-store-v (volatile! nil)]
         (try
           (doseq [conn [leader-conn follower-conn]]
             (d/transact! conn [{:drill/key "seed"
@@ -4683,12 +5337,22 @@
           (d/transact! leader-conn [{:drill/key "post-failover"
                                      :drill/value "v2"}])
           (vreset! leader-store-v (st/open leader-dir nil opts))
-          (vreset! follower-store-v (st/open follower-dir nil opts))
           (let [leader-store @leader-store-v
-                follower-store @follower-store-v
+                follower-db @follower-conn
+                follower-store (:store follower-db)
+                follower-lsn (long (or (i/get-value (.-lmdb follower-store)
+                                                    c/kv-info
+                                                    c/wal-local-payload-lsn
+                                                    :keyword :data)
+                                       0))
+                leader-lsn (long (or (i/get-value (.-lmdb leader-store)
+                                                  c/kv-info
+                                                  c/wal-local-payload-lsn
+                                                  :keyword :data)
+                                     0))
                 lease {:leader-node-id 1
                        :leader-endpoint leader-endpoint
-                       :leader-last-applied-lsn 2}
+                       :leader-last-applied-lsn leader-lsn}
                 now-ms (System/currentTimeMillis)]
             (with-redefs [dha/fetch-ha-leader-txlog-batch
                           (fn [_ _ endpoint from-lsn upto-lsn]
@@ -4704,12 +5368,12 @@
               (let [sync (#'dha/sync-ha-follower-batch
                           "ha-e2e"
                           {:store follower-store
-                           :dt-db @follower-conn
+                           :dt-db follower-db
                            :ha-node-id 2
                            :ha-local-endpoint "10.0.0.12:8898"
                            :ha-lease-renew-ms 1000}
                           lease
-                          2
+                          (inc follower-lsn)
                           now-ms)
                     state (:state sync)]
                 (is (= "v2"
@@ -4717,9 +5381,6 @@
                             (:dt-db state)
                             "post-failover"))))))
           (finally
-            (when-let [store @follower-store-v]
-              (when-not (i/closed? store)
-                (i/close store)))
             (when-let [store @leader-store-v]
               (when-not (i/closed? store)
                 (i/close store)))
@@ -4811,7 +5472,7 @@
         (u/delete-files leader-dir)
         (u/delete-files follower-dir)))))
 
-(deftest apply-ha-follower-txlog-record-bypasses-local-txlog-test
+(deftest apply-ha-follower-txlog-record-mirrors-local-txlog-test
   (let [leader-dir (u/tmp-dir (str "ha-leader-replay-watermark-" (UUID/randomUUID)))
         follower-dir (u/tmp-dir (str "ha-follower-replay-watermark-" (UUID/randomUUID)))
         schema {:register/key {:db/valueType :db.type/long
@@ -4832,39 +5493,36 @@
           (let [leader-store (:store @leader-conn)
                 leader-kv (.-lmdb leader-store)
                 follower-kv (.-lmdb follower-store)
-                records (vec (kv/open-tx-log-rows leader-kv 1 nil))
+                record (txlog-record-with-max-tx leader-store 2)
+                from-lsn (long (:lsn record))
                 follower-runtime {:store follower-store
                                   :dt-db (db/new-db follower-store)
                                   :ha-node-id 2}
-                local-records-before (vec (kv/open-tx-log-rows follower-kv 1 nil))
-                next-state (reduce #'dha/apply-ha-follower-txlog-record!
-                                   follower-runtime
-                                   records)
+                local-records-before
+                (vec (kv/open-tx-log-rows follower-kv from-lsn nil))
+                next-state (#'dha/apply-ha-follower-txlog-record!
+                            follower-runtime
+                            record)
                 follower-store-after (:store next-state)
                 follower-kv-after (.-lmdb ^Store follower-store-after)
                 local-records-after
-                (vec (kv/open-tx-log-rows follower-kv-after 1 nil))
+                (vec (kv/open-tx-log-rows follower-kv-after from-lsn nil))
                 payload-lsn
                 (long (or (i/get-value follower-kv-after
                                        c/kv-info
                                        c/wal-local-payload-lsn
                                        :keyword :data)
                           0))
-                last-record-lsn (long (:lsn (peek records)))
-                rows (d/q '[:find ?key ?value
-                            :where
-                            [?e :register/key ?key]
-                            [?e :register/value ?value]]
-                          (db/new-db follower-store-after))]
-            (is (seq records))
-            (is (= {0 7}
-                   (into {}
-                         (map (fn [[k v]]
-                                [(long k) (long v)]))
-                         rows)))
-            (is (= (mapv :lsn local-records-before)
+                record-lsn (long (:lsn record))]
+            (is (= []
+                   (mapv :lsn local-records-before)))
+            (is (= [record-lsn]
                    (mapv :lsn local-records-after)))
-            (is (= last-record-lsn payload-lsn)))
+            (is (= [(:tx-kind record)]
+                   (mapv :tx-kind local-records-after)))
+            (is (= [(count (:rows record))]
+                   (mapv (comp count :rows) local-records-after)))
+            (is (= record-lsn payload-lsn)))
           (finally
             (d/close leader-conn)
             (when-not (i/closed? follower-store)
@@ -4872,6 +5530,48 @@
       (finally
         (u/delete-files leader-dir)
         (u/delete-files follower-dir)))))
+
+(deftest apply-ha-follower-txlog-record-preserves-next-local-lsn-test
+  (let [leader-dir (u/tmp-dir (str "ha-leader-promote-floor-" (UUID/randomUUID)))
+        promoted-dir (u/tmp-dir (str "ha-promoted-floor-" (UUID/randomUUID)))
+        schema {:register/key {:db/valueType :db.type/long
+                               :db/unique :db.unique/identity}
+                :register/value {:db/valueType :db.type/long}}
+        opts {:db-name "orders"
+              :db-identity "db-1"
+              :wal? true}
+        leader-conn (d/create-conn leader-dir schema opts)
+        promoted-store-v (volatile! nil)]
+    (try
+      (d/transact! leader-conn [{:register/key 0 :register/value 0}])
+      (vreset! promoted-store-v (st/open promoted-dir schema opts))
+      (let [leader-store (:store @leader-conn)
+            promoted-store @promoted-store-v
+            record (txlog-record-with-max-tx leader-store 2)
+            promoted-state (#'dha/apply-ha-follower-txlog-record!
+                            {:store promoted-store
+                             :dt-db (db/new-db promoted-store)}
+                            record)
+            promoted-store (:store promoted-state)
+            promoted-kv (.-lmdb ^Store promoted-store)
+            expected-next-lsn (unchecked-inc (long (:lsn record)))
+            next-row (fn []
+                       (peek (vec (kv/open-tx-log-rows promoted-kv 1 nil))))]
+        (vreset! promoted-store-v promoted-store)
+        (is (= expected-next-lsn
+               (long (or (:next-lsn (kv/txlog-watermarks promoted-kv)) 0))))
+        (i/open-dbi promoted-kv "scratch")
+        (i/transact-kv promoted-kv [[:put "scratch" "k2" "v2"]])
+        (let [row (next-row)]
+          (is (= expected-next-lsn
+                 (long (:lsn row))))))
+      (finally
+        (when-let [promoted-store @promoted-store-v]
+          (when-not (i/closed? promoted-store)
+            (i/close promoted-store)))
+        (d/close leader-conn)
+        (u/delete-files leader-dir)
+        (u/delete-files promoted-dir)))))
 
 (deftest ha-renew-step-follower-gap-bootstraps-from-snapshot-copy-test
   (let [opts (valid-ha-opts)
@@ -4886,7 +5586,6 @@
                                               :db-identity db-identity
                                               :wal? true})
         snapshot-lsn* (atom nil)
-        reported (atom nil)
         next-state (atom nil)
         now-ms (System/currentTimeMillis)]
     (try
@@ -4934,6 +5633,8 @@
            #'dha/fetch-ha-endpoint-watermark-lsn
            (fn [_ _ endpoint]
              (case endpoint
+               "10.0.0.11:8898"
+               {:reachable? true :last-applied-lsn (inc snapshot-lsn)}
                "10.0.0.13:8898"
                {:reachable? true :last-applied-lsn snapshot-lsn}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
@@ -4951,11 +5652,7 @@
                        :snapshot-last-applied-lsn snapshot-lsn)}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
            #'dha/report-ha-replica-floor!
-           (fn [db-name m endpoint applied-lsn]
-             (reset! reported {:db-name db-name
-                               :ha-node-id (:ha-node-id m)
-                               :leader-endpoint endpoint
-                               :applied-lsn applied-lsn})
+           (fn [_ _ _ _]
              {:ok? true})}
           (fn []
             (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
@@ -4968,25 +5665,13 @@
                (i/get-value next-kv c/kv-info
                             c/ha-local-applied-lsn
                             :keyword :data)))
-        (is (= (inc @snapshot-lsn*)
-               (dha/read-ha-local-last-applied-lsn
-                {:store (:store state)})))
         (is (= (+ 2 @snapshot-lsn*) (:ha-follower-next-lsn state)))
-        (is (= 1 (:ha-follower-last-batch-size state)))
-        (is (= "10.0.0.11:8898" (:ha-follower-source-endpoint state)))
         (is (= "10.0.0.13:8898"
                (:ha-follower-bootstrap-source-endpoint state)))
-        (is (= @snapshot-lsn*
-               (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
         (is (integer? (:ha-follower-last-bootstrap-ms state)))
         (is (nil? (:ha-follower-degraded? state)))
         (is (= "v2" (i/get-value next-kv "a" "k2")))
-        (is (= "v3" (i/get-value next-kv "a" "k3")))
-        (is (= {:db-name "orders"
-                :ha-node-id 2
-                :leader-endpoint "10.0.0.11:8898"
-                :applied-lsn (inc @snapshot-lsn*)}
-               @reported)))
+        (is (= "v3" (i/get-value next-kv "a" "k3"))))
       (finally
         (when-let [store (:store @next-state)]
           (when-not (i/closed? store)
@@ -5013,7 +5698,6 @@
                                               :wal? true})
         snapshot-lsn* (atom nil)
         payload-lsn* (atom nil)
-        reported (atom nil)
         next-state (atom nil)
         now-ms (System/currentTimeMillis)]
     (try
@@ -5063,6 +5747,8 @@
            #'dha/fetch-ha-endpoint-watermark-lsn
            (fn [_ _ endpoint]
              (case endpoint
+               "10.0.0.11:8898"
+               {:reachable? true :last-applied-lsn (inc payload-lsn)}
                "10.0.0.13:8898"
                {:reachable? true :last-applied-lsn payload-lsn}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
@@ -5081,11 +5767,7 @@
                        :payload-last-applied-lsn payload-lsn)}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
            #'dha/report-ha-replica-floor!
-           (fn [db-name m endpoint applied-lsn]
-             (reset! reported {:db-name db-name
-                               :ha-node-id (:ha-node-id m)
-                               :leader-endpoint endpoint
-                               :applied-lsn applied-lsn})
+           (fn [_ _ _ _]
              {:ok? true})}
           (fn []
             (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
@@ -5099,22 +5781,13 @@
                             c/ha-local-applied-lsn
                             :keyword :data)))
         (is (= (+ 2 @payload-lsn*) (:ha-follower-next-lsn state)))
-        (is (= 1 (:ha-follower-last-batch-size state)))
-        (is (= "10.0.0.11:8898" (:ha-follower-source-endpoint state)))
         (is (= "10.0.0.13:8898"
                (:ha-follower-bootstrap-source-endpoint state)))
-        (is (= @payload-lsn*
-               (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
         (is (> @payload-lsn* @snapshot-lsn*))
         (is (nil? (:ha-follower-degraded? state)))
         (is (= "v1" (i/get-value next-kv "a" "k1")))
         (is (= "v2" (i/get-value next-kv "a" "k2")))
-        (is (= "v3" (i/get-value next-kv "a" "k3")))
-        (is (= {:db-name "orders"
-                :ha-node-id 2
-                :leader-endpoint "10.0.0.11:8898"
-                :applied-lsn (inc @payload-lsn*)}
-               @reported)))
+        (is (= "v3" (i/get-value next-kv "a" "k3"))))
       (finally
         (when-let [store (:store @next-state)]
           (when-not (i/closed? store)
@@ -5164,6 +5837,8 @@
                "10.0.0.13:8898"
                [{:lsn 3 :ops [[:put "a" "k3" "v3"]]}]
                []))
+           #'dha/read-ha-local-last-applied-lsn
+           (fn [_] 0)
            #'dha/fetch-ha-endpoint-watermark-lsn
            (fn [_ _ endpoint]
              (case endpoint
@@ -5171,10 +5846,14 @@
                {:reachable? true :last-applied-lsn 2}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
            #'dha/fetch-ha-endpoint-snapshot-copy!
-           (fn [_ _ endpoint _]
-             {:copy-meta {:db-name "orders"
-                          :db-identity "db-mismatch"
-                          :snapshot-last-applied-lsn 2}})}
+           (fn [_ m endpoint _]
+             (throw (ex-info
+                     "HA snapshot copy DB identity mismatch"
+                     {:error :ha/follower-snapshot-db-identity-mismatch
+                      :db-name "orders"
+                      :local-db-identity (:ha-db-identity m)
+                      :snapshot-db-identity "db-mismatch"
+                      :source-endpoint endpoint})))}
           (fn []
             (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
       (let [state @next-state]

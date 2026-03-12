@@ -2104,11 +2104,7 @@
                          :tempids tempids)
             (seq new-attributes) (assoc :new-attributes new-attributes))))
         (catch Exception e
-          (if (:resized (ex-data e))
-            (throw e)
-            (let [entities (prepare-entities db initial-es tx-time)]
-              (local-transact-tx-data initial-report entities tx-time
-                                      simulated?)))))
+          (throw e)))
       (let [entities (prepare-entities db initial-es tx-time)]
         (local-transact-tx-data initial-report entities tx-time simulated?)))))
 

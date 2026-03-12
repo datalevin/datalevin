@@ -99,26 +99,43 @@
                :txs      :tx-data
                :txs+info :tx-data+db-info
                :load-datoms)
+         req (if (< (count datoms) ^long c/+wire-datom-batch-size+)
+               {:type     t
+                :mode     :request
+                :writing? writing?
+                :args     (if tx?
+                            [db-name datoms simulated?]
+                            [db-name datoms])}
+               {:type     t
+                :mode     :copy-in
+                :writing? writing?
+                :args     (if tx?
+                            [db-name simulated?]
+                            [db-name])})
+         request-fn
+         (fn [retry-client req]
+           (if (= :copy-in (:mode req))
+             (cl/copy-in retry-client req datoms c/+wire-datom-batch-size+)
+             (cl/request retry-client req)))
          {:keys [type message result err-data]
           :as   response}
-         (if (< (count datoms) ^long c/+wire-datom-batch-size+)
-           (cl/request client {:type     t
-                               :mode     :request
-                               :writing? writing?
-                               :args     (if tx?
-                                           [db-name datoms simulated?]
-                                           [db-name datoms])})
-           (cl/copy-in client {:type     t
-                               :mode     :copy-in
-                               :writing? writing?
-                               :args     (if tx?
-                                           [db-name simulated?]
-                                           [db-name])}
-                       datoms c/+wire-datom-batch-size+))]
+         (request-fn client req)]
      (if (= type :error-response)
        (if (:resized err-data)
          (u/raise message err-data)
-         (u/raise "Error loading datoms to server:" message {}))
+         (if (#'cl/retryable-ha-write-reject? err-data)
+           (if-let [retry-context (#'cl/client-retry-context client)]
+             (#'cl/retry-ha-write-request*
+             req
+              message
+              err-data
+              retry-context
+              request-fn
+              cl/disconnect
+              #'cl/new-client-for-endpoint
+              #(#'cl/set-preferred-ha-endpoint! client %))
+             (#'cl/raise-normal-request-error req message err-data nil))
+           (#'cl/raise-normal-request-error req message err-data nil)))
        (if (and tx?
                 (or (contains? response :db-info)
                     (contains? response :new-attributes)))

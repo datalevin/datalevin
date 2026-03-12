@@ -1710,6 +1710,9 @@
    :ha-clock-skew-hook
    :ha-membership-hash])
 
+(def ^:private raw-persist-open-opts-key
+  ::raw-persist-open-opts?)
+
 (defn- encode-legacy-ha-nil-sentinels
   [opts]
   (reduce
@@ -1730,9 +1733,28 @@
   (when spec
     (persistable-provider-spec spec)))
 
+(defn- compact-persisted-kv-opts
+  [opts]
+  (let [opts (or opts {})
+        kv-opts (c/canonicalize-wal-opts (or (:kv-opts opts) {}))
+        compact-kv-opts
+        (into {}
+              (remove (fn [[k v]]
+                        (and (not= k :wal?)
+                             (contains? opts k)
+                             (= v (get opts k)))))
+              kv-opts)]
+    (cond-> (dissoc opts :kv-opts)
+      (contains? opts :kv-opts)
+      (assoc :kv-opts compact-kv-opts))))
+
 (defn- persistable-opts
   [opts]
-  (let [opts (dissoc opts :embedding-providers :embedding-domain-providers)
+  (let [opts (-> opts
+                 compact-persisted-kv-opts
+                 (dissoc :embedding-providers
+                         :embedding-domain-providers
+                         raw-persist-open-opts-key))
         opts (cond-> opts
                (contains? opts :embedding-opts)
                (assoc :embedding-opts
@@ -1749,19 +1771,49 @@
     true c/canonicalize-wal-opts
     true encode-legacy-ha-nil-sentinels)))
 
+(declare load-opts)
+
 (defn- transact-opts
   [lmdb opts]
-  (let [opts (persistable-opts opts)]
-    (when (true? (:wal? opts))
-      (let [flags (or (get-env-flags lmdb) #{})]
-        (when (and (not (contains? flags :nosync))
-                   (not (contains? flags :rdonly)))
-          (set-env-flags lmdb #{:nosync} true))))
-    (transact-kv
-      lmdb (conj (for [[k v] opts]
-                   (lmdb/kv-tx :put c/opts k v :attr :data))
-                 (lmdb/kv-tx :put c/meta :last-modified
-                             (System/currentTimeMillis) :attr :long)))))
+  (let [opts (persistable-opts opts)
+        current (some-> (load-opts lmdb) persistable-opts)]
+    (when (not= current opts)
+      (when (true? (:wal? opts))
+        (let [flags (or (get-env-flags lmdb) #{})]
+          (when (and (not (contains? flags :nosync))
+                     (not (contains? flags :rdonly)))
+            (set-env-flags lmdb #{:nosync} true))))
+      (transact-kv
+        lmdb (conj (for [[k v] opts]
+                     (lmdb/kv-tx :put c/opts k v :attr :data))
+                   (lmdb/kv-tx :put c/meta :last-modified
+                               (System/currentTimeMillis) :attr :long))))))
+
+(defn- raw-lmdb
+  [db]
+  (or (try
+        (.-db db)
+        (catch Throwable _
+          nil))
+      db))
+
+(defn- transact-opts-raw
+  [lmdb opts]
+  (let [opts (persistable-opts opts)
+        current (some-> (load-opts lmdb) persistable-opts)
+        raw-db (raw-lmdb lmdb)]
+    (when (not= current opts)
+      (when (true? (:wal? opts))
+        (let [flags (or (get-env-flags raw-db) #{})]
+          (when (and (not (contains? flags :nosync))
+                     (not (contains? flags :rdonly)))
+            (set-env-flags raw-db #{:nosync} true))))
+      (transact-kv
+        raw-db
+        (conj (for [[k v] opts]
+                (lmdb/kv-tx :put c/opts k v :attr :data))
+              (lmdb/kv-tx :put c/meta :last-modified
+                          (System/currentTimeMillis) :attr :long))))))
 
 (defn- normalize-legacy-ha-nil-sentinels
   [opts]
@@ -2054,6 +2106,15 @@
                         (merge kv-opts txlog-opts)
                         kv-opts)))))
 
+(defn- normalize-ha-open-opts
+  [opts]
+  (cond-> opts
+    (= :consensus-lease (:ha-mode opts))
+    ;; Background sampling performs follower-local metadata writes. In HA mode
+    ;; that extra local write traffic obscures replicated progress and can race
+    ;; with follower replay. Keep it disabled on consensus-lease stores.
+    (assoc :background-sampling? false)))
+
 (defn- txlog-dir-path
   [dir]
   (str dir u/+separator+ "txlog"))
@@ -2088,15 +2149,20 @@
   ([dir schema]
    (open dir schema nil))
   ([dir schema opts0]
-   (let [opts (propagate-top-level-txlog-opts-to-kv-opts opts0)
+   (let [incoming-opts0 opts0
+         opts (propagate-top-level-txlog-opts-to-kv-opts opts0)
+         raw-persist-open-opts? (true? (get opts raw-persist-open-opts-key))
+         opts (dissoc opts raw-persist-open-opts-key)
          {:keys [kv-opts search-opts search-domains vector-opts vector-domains
                  embedding-opts embedding-domains embedding-providers]}
          opts
          dir  (or dir (u/tmp-dir (str "datalevin-" (UUID/randomUUID))))
-         persisted-opts (some-> (load-existing-store-opts dir kv-opts)
-                                propagate-top-level-txlog-opts-to-kv-opts)
+         persisted-opts (load-existing-store-opts dir kv-opts)
          persisted-kv-opts
-         (c/canonicalize-wal-opts (or (:kv-opts persisted-opts) {}))
+         (c/canonicalize-wal-opts
+          (or (:kv-opts (some-> persisted-opts
+                                propagate-top-level-txlog-opts-to-kv-opts))
+              {}))
          new-db? (not (existing-store? dir))
          wal-default-kv-opts (when new-db?
                                {:wal? c/*datalog-wal?*
@@ -2163,8 +2229,13 @@
                         :db-name              (str (UUID/randomUUID))
                         :cache-limit          512}
                        opts0)
-           opts2     (c/canonicalize-wal-opts
-                      (merge opts1 opts))
+           opts2-base (-> (merge opts1 opts)
+                          c/canonicalize-wal-opts
+                          normalize-ha-open-opts)
+           opts2     (if (and (some? persisted-opts)
+                              (empty? (or incoming-opts0 {})))
+                       (propagate-top-level-txlog-opts-to-kv-opts opts2-base)
+                       opts2-base)
            db-identity (or (:db-identity opts2)
                            (:db-name opts2)
                            (str (UUID/randomUUID)))
@@ -2217,7 +2288,9 @@
              e-providers (init-embedding-providers dir e-domains
                                                    embedding-providers)]
          (let [opts4 (assoc opts4 :embedding-domain-providers e-providers)]
-         (transact-opts lmdb opts4)
+         (if raw-persist-open-opts?
+           (transact-opts-raw lmdb opts4)
+           (transact-opts lmdb opts4))
          (->Store lmdb
                   (init-engines lmdb s-domains)
                   (init-indices lmdb v-domains)
