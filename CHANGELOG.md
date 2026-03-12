@@ -22,6 +22,7 @@
   downloaded from HuggingFace on first use.
 - [Datalog] for embedding enabled datoms, `embedding-neighbors` built-in function to
   return `[e, a, v]` based on vector similarity. Details in [doc](doc/vector.md).
+- clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
 
 ## 0.10.7 (2026-03-03)
 
