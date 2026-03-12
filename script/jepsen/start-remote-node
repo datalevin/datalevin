@@ -1,0 +1,9 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+jepsen_dir="$repo_root/jepsen"
+
+cd "$jepsen_dir"
+exec lein run -m datalevin.jepsen.remote-node start "$@"

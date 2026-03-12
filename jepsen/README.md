@@ -56,8 +56,9 @@ does not claim full parity with the Datomic Jepsen suite.
 * `src/datalevin/jepsen/workload/udf_readiness.clj`: HA write-admission
   workload that installs a tx-UDF descriptor, enables
   `:ha-require-udf-ready?`, verifies leaders reject writes while the runtime
-  registry is missing the tx function, and then confirms recovery once the
-  registry is populated
+  registry is missing the tx function, confirms recovery once the registry is
+  populated, and is smoke-tested under leader failover, leader partition, and
+  degraded-network Jepsen runs
 * `src/datalevin/jepsen/workload/register.clj`: linearizable per-key register
   workload using Jepsen's independent register checker
 * `src/datalevin/jepsen/workload/tx_fn_register.clj`: linearizable register
@@ -121,6 +122,61 @@ Run the Jepsen subproject smoke test:
 cd jepsen
 lein test
 ```
+
+Start a local 3-node Jepsen-backed cluster and keep it running for ad hoc HA
+testing:
+
+```bash
+script/jepsen/start-local-cluster --workload append
+```
+
+Use `--keep-work-dir` to preserve the node directories after shutdown, and
+`--print-edn` if you want machine-readable endpoint details.
+
+Bring up a real multi-host Jepsen cluster one node at a time with a shared EDN
+config:
+
+```bash
+script/jepsen/start-remote-node --config jepsen/remote-cluster.example.edn --node n1
+```
+
+Run the same command on each host with its logical node name. Use
+`script/jepsen/stop-remote-node --config ... --node ...` to stop a launcher.
+The config file is shared across every host and should define the workload,
+group identity, data nodes, and any control-only witness nodes.
+
+Standard 3 data-node config:
+
+```edn
+{:db-name "jepsen-remote"
+ :workload :append
+ :group-id "jepsen-remote-group"
+ :db-identity "jepsen-remote-db"
+ :nodes
+ [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
+  {:logical-node "n2" :node-id 2 :endpoint "10.0.0.12:8898" :peer-id "10.0.0.12:15001" :root "/var/tmp/dtlv-jepsen/n2"}
+  {:logical-node "n3" :node-id 3 :endpoint "10.0.0.13:8898" :peer-id "10.0.0.13:15001" :root "/var/tmp/dtlv-jepsen/n3"}]}
+```
+
+Witness-topology or `fencing-retry` config:
+
+```edn
+{:db-name "jepsen-witness"
+ :workload :witness-topology
+ :group-id "jepsen-witness-group"
+ :db-identity "jepsen-witness-db"
+ :nodes
+ [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
+  {:logical-node "n2" :node-id 2 :endpoint "10.0.0.12:8898" :peer-id "10.0.0.12:15001" :root "/var/tmp/dtlv-jepsen/n2"}]
+ :control-nodes
+ [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
+  {:logical-node "n2" :node-id 2 :endpoint "10.0.0.12:8898" :peer-id "10.0.0.12:15001" :root "/var/tmp/dtlv-jepsen/n2"}
+  {:logical-node "n3" :node-id 3 :endpoint "10.0.0.13:8898" :peer-id "10.0.0.13:15001" :root "/var/tmp/dtlv-jepsen/n3" :promotable? false}]}
+```
+
+In the witness case, start `n3` with the same `start-remote-node` command; the
+launcher will detect that it is control-only and run the control authority
+without opening a Datalevin data store.
 
 Run a local append workload:
 
@@ -246,6 +302,27 @@ Run the UDF-readiness HA admission workload:
 ```bash
 cd jepsen
 lein run test --workload udf-readiness --control-backend sofa-jraft --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the UDF-readiness HA admission workload during leader failover:
+
+```bash
+cd jepsen
+lein run test --workload udf-readiness --control-backend sofa-jraft --nemesis failover --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the UDF-readiness HA admission workload during leader partition:
+
+```bash
+cd jepsen
+lein run test --workload udf-readiness --control-backend sofa-jraft --nemesis partition --time-limit 20 --rate 1 --key-count 4
+```
+
+Run the UDF-readiness HA admission workload during degraded network:
+
+```bash
+cd jepsen
+lein run test --workload udf-readiness --control-backend sofa-jraft --nemesis degraded --time-limit 20 --rate 1 --key-count 4
 ```
 
 Run the identity-upsert characterization workload:

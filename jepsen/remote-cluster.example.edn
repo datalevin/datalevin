@@ -1,0 +1,37 @@
+;; Shared Jepsen remote-cluster config.
+;;
+;; Copy this file to every host, then start the matching logical node on each
+;; machine:
+;;
+;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n1
+;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n2
+;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n3
+;;
+;; Each host should use the same file contents. Replace the TEST-NET addresses
+;; and root paths with real hostnames/IPs and writable local directories.
+
+{:db-name "jepsen-remote"
+ :workload :append
+ :group-id "jepsen-remote-group"
+ :db-identity "jepsen-remote-db"
+ :control-backend :sofa-jraft
+ :nodes
+ [{:logical-node "n1"
+   :node-id 1
+   :endpoint "192.0.2.11:8898"
+   :peer-id "192.0.2.11:15001"
+   :root "/var/tmp/dtlv-jepsen/n1"}
+  {:logical-node "n2"
+   :node-id 2
+   :endpoint "192.0.2.12:8898"
+   :peer-id "192.0.2.12:15001"
+   :root "/var/tmp/dtlv-jepsen/n2"}
+  {:logical-node "n3"
+   :node-id 3
+   :endpoint "192.0.2.13:8898"
+   :peer-id "192.0.2.13:15001"
+   :root "/var/tmp/dtlv-jepsen/n3"}]
+
+ ;; Optional workload-specific tuning. These mirror the main Jepsen CLI opts.
+ :workload-opts
+ {:key-count 4}}
