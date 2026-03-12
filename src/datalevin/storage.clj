@@ -1350,6 +1350,20 @@
   [^Store store domain]
   ((.-embedding-indices store) domain))
 
+(declare provider-spec-for-domain)
+
+(def ^:private persisted-embedding-space-keys
+  #{:dimensions :embedding-metadata})
+
+(defn- runtime-provider-space
+  [dir runtime-providers domain domain-opts]
+  (let [provider-spec (provider-spec-for-domain
+                        dir
+                        runtime-providers
+                        domain
+                        (apply dissoc domain-opts persisted-embedding-space-keys))]
+    (emb/provider-space provider-spec)))
+
 (defn- vector-dim
   [vec-data]
   (cond
@@ -1953,15 +1967,15 @@
 (defn- resolve-embedding-domain
   [dir runtime-providers [domain domain-opts]]
   (let [domain-opts                 (merge default-embedding-opts domain-opts)
-        provider-spec               (provider-spec-for-domain dir runtime-providers
-                                                              domain domain-opts)
         {:keys [dimensions
-                embedding-metadata]} (emb/provider-space provider-spec)
+                embedding-metadata]} (runtime-provider-space dir runtime-providers
+                                                             domain domain-opts)
         provider-dimensions         dimensions
+        provider-metadata           embedding-metadata
         stored-dimensions           (:dimensions domain-opts)
         stored-metadata             (:embedding-metadata domain-opts)
         dimensions                  (or stored-dimensions provider-dimensions)
-        embedding-metadata          (or stored-metadata embedding-metadata)]
+        embedding-metadata          (or stored-metadata provider-metadata)]
     (when (and stored-dimensions provider-dimensions
                (not= (long stored-dimensions) (long provider-dimensions)))
       (u/raise "Embedding domain dimensions do not match the runtime provider"
@@ -1969,6 +1983,8 @@
                 :provider            (:provider domain-opts)
                 :stored-dimensions   stored-dimensions
                 :provider-dimensions provider-dimensions}))
+    (when stored-metadata
+      (emb/ensure-compatible-metadata stored-metadata provider-metadata))
     (when-not dimensions
       (u/raise "Embedding domain dimensions could not be resolved"
                {:domain domain :provider (:provider domain-opts)}))

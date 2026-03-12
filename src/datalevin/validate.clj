@@ -94,6 +94,25 @@
           (u/raise "Attribute uniqueness change is inconsistent with data"
                    {:attribute attr}))))))
 
+(def ^:private embedding-schema-keys
+  [:db/embedding :db.embedding/domains :db.embedding/autoDomain])
+
+(defn- populated-attribute?
+  [store attr]
+  (let [low-datom  (d/datom c/e0 attr c/v0)
+        high-datom (d/datom c/emax attr c/vmax)]
+    (populated? store :ave low-datom high-datom)))
+
+(defn- validate-embedding-schema-change
+  [store attr old-props new-props]
+  (when-let [k (some (fn [k]
+                       (when (not= (get old-props k) (get new-props k))
+                         k))
+                     embedding-schema-keys)]
+    (when (populated-attribute? store attr)
+      (u/raise "Embedding schema changes require an explicit rebuild"
+               {:attribute attr :key k}))))
+
 (defn validate-schema-mutation
   "Validate schema attribute changes (cardinality, value type, uniqueness)."
   [store lmdb attr old-props new-props]
@@ -103,28 +122,8 @@
       :db/cardinality (validate-cardinality-change store attr v' v)
       :db/valueType   (validate-value-type-change store attr v' v)
       :db/unique      (validate-uniqueness-change store lmdb attr v' v)
-      :db/embedding
-      (when (not= v' v)
-        (let [low-datom  (d/datom c/e0 attr c/v0)
-              high-datom (d/datom c/emax attr c/vmax)]
-          (when (populated? store :ave low-datom high-datom)
-            (u/raise "Embedding schema changes require an explicit rebuild"
-                     {:attribute attr :key k}))))
-      :db.embedding/domains
-      (when (not= v' v)
-        (let [low-datom  (d/datom c/e0 attr c/v0)
-              high-datom (d/datom c/emax attr c/vmax)]
-          (when (populated? store :ave low-datom high-datom)
-            (u/raise "Embedding schema changes require an explicit rebuild"
-                     {:attribute attr :key k}))))
-      :db.embedding/autoDomain
-      (when (not= v' v)
-        (let [low-datom  (d/datom c/e0 attr c/v0)
-              high-datom (d/datom c/emax attr c/vmax)]
-          (when (populated? store :ave low-datom high-datom)
-            (u/raise "Embedding schema changes require an explicit rebuild"
-                     {:attribute attr :key k}))))
-      :pass-through)))
+      :pass-through))
+  (validate-embedding-schema-change store attr old-props new-props))
 
 (def ^:private boolean-opts
   #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?
