@@ -2,11 +2,121 @@
 
 Python bindings for Datalevin over the JVM interop bridge.
 
-This scaffold uses:
+## Install
 
-- `JPype1` for Python-to-JVM interop
-- `datalevin.DatalevinInterop` as the primary runtime substrate
-- thin Python wrappers for local Datalog, local KV, and remote admin usage
+```bash
+python -m pip install datalevin
+```
+
+Requirements:
+
+- Python 3.10+
+- Java 21+
+
+Published wheels bundle the shared Datalevin runtime jar, so normal usage does
+not require building Datalevin from source.
+
+## Quick Start
+
+```python
+from datalevin import connect
+
+with connect(
+    "/tmp/dtlv-py",
+    schema={
+        ":name": {
+            ":db/valueType": ":db.type/string",
+            ":db/unique": ":db.unique/identity",
+        }
+    },
+) as conn:
+    conn.transact(
+        [
+            {":db/id": -1, ":name": "Ada"},
+            {":db/id": -2, ":name": "Bob"},
+        ]
+    )
+
+    names = conn.query("[:find [?name ...] :where [?e :name ?name]]")
+    ada = conn.pull([":name"], 1)
+
+    print(names)
+    print(ada)
+```
+
+Structured query forms and inputs can also be passed as normal Python lists and
+dictionaries when that is more convenient than EDN strings.
+
+## KV Example
+
+```python
+from datalevin import open_kv
+
+with open_kv("/tmp/dtlv-py-kv") as kv:
+    kv.open_dbi("items")
+    kv.transact(
+        [
+            (":put", 1, "alpha"),
+            (":put", 2, "beta"),
+        ],
+        dbi_name="items",
+        k_type=":long",
+        v_type=":string",
+    )
+
+    print(
+        kv.get_value(
+            "items",
+            2,
+            k_type=":long",
+            v_type=":string",
+            ignore_key=True,
+        )
+    )
+    print(kv.get_range("items", [":all"], k_type=":long", v_type=":string"))
+```
+
+## Remote Client Example
+
+Use `new_client()` for server administration against a running Datalevin server:
+
+```python
+from datalevin import new_client
+
+client = new_client("dtlv://datalevin:datalevin@localhost")
+created = False
+opened = False
+
+try:
+    client.create_database("demo", "datalog")
+    created = True
+    info = client.open_database(
+        "demo",
+        "datalog",
+        schema={
+            ":name": {
+                ":db/valueType": ":db.type/string",
+                ":db/unique": ":db.unique/identity",
+            }
+        },
+        info=True,
+    )
+    opened = True
+
+    print(info)
+    print(client.list_databases())
+finally:
+    if opened:
+        client.close_database("demo")
+    if created:
+        client.drop_database("demo")
+    client.disconnect()
+```
+
+## Notes
+
+- Datalevin values come back as ordinary Python values where possible.
+- `interop()` is available for advanced raw-handle access when you need it.
 
 ## Development
 
@@ -40,8 +150,8 @@ python -m pip wheel --no-build-isolation bindings/python -w dist/
 
 Set `DATALEVIN_NATIVE_PLATFORM` to override the inferred target when building a
 wheel from a different platform tag. Supported values are
-`linux-x86_64`, `linux-arm64`, `macosx-arm64`, `windows-x86_64`, `freebsd-x86_64`,
-and `all`.
+`linux-x86_64`, `linux-arm64`, `macosx-arm64`, `windows-x86_64`,
+`freebsd-x86_64`, and `all`.
 
 FreeBSD amd64 wheel builds should run on a FreeBSD host so the wheel keeps the
 native `freebsd_*_amd64` platform tag. Those builds vendor the shared runtime
