@@ -40,6 +40,16 @@ class InteropBindings {
     );
   }
 
+  async coreInvokeRaw(functionName, args = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "coreInvoke",
+      functionName,
+      await toJava(await normalizeInteropArgs([...(args || [])]))
+    );
+  }
+
   async clientInvoke(functionName, args = null) {
     const cls = await classes();
     return callJavaMethod(
@@ -72,6 +82,11 @@ class InteropBindings {
 
   async connectionClosed(handle) {
     return Boolean(await callJavaMethod(handle, "closed"));
+  }
+
+  async connectionDb(handle) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionDb", handle);
   }
 
   async openKeyValue(dir, opts = null) {
@@ -152,23 +167,23 @@ class InteropBindings {
 
   async createUdfRegistry() {
     const cls = await classes();
-    return callJavaMethod(cls.datalevin, "createUdfRegistry");
+    return callJavaMethod(cls.interop, "createUdfRegistry");
   }
 
   async registerUdf(registry, descriptor, fn) {
     const cls = await classes();
-    return callJavaMethod(cls.datalevin, "registerUdf", registry, await toJava(descriptor), fn);
+    return callJavaMethod(cls.interop, "registerUdf", registry, await toJava(descriptor), fn);
   }
 
   async unregisterUdf(registry, descriptor) {
     const cls = await classes();
-    return callJavaMethod(cls.datalevin, "unregisterUdf", registry, await toJava(descriptor));
+    return callJavaMethod(cls.interop, "unregisterUdf", registry, await toJava(descriptor));
   }
 
   async registeredUdf(registry, descriptor) {
     const cls = await classes();
     return Boolean(
-      await callJavaMethod(cls.datalevin, "registeredUdf", registry, await toJava(descriptor))
+      await callJavaMethod(cls.interop, "registeredUdf", registry, await toJava(descriptor))
     );
   }
 
@@ -210,6 +225,36 @@ class InteropBindings {
     }
     const cls = await classes();
     return callJavaMethod(cls.interop, "kvTxs", await toJava(txs));
+  }
+
+  async kvTxsWithTypes(txs, kType = null, vType = null) {
+    if (txs === null || txs === undefined) {
+      return null;
+    }
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvTxs",
+      await toJava(txs),
+      await toJava(kType),
+      await toJava(vType)
+    );
+  }
+
+  async kvInput(value, type) {
+    if (value === null || value === undefined) {
+      return null;
+    }
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "kvInput", await toJava(value), await toJava(type));
+  }
+
+  async kvRange(range, type) {
+    if (range === null || range === undefined) {
+      return null;
+    }
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "kvRange", await toEdnForm(range), await toJava(type));
   }
 
   async kvType(value) {

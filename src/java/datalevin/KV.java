@@ -974,46 +974,52 @@ public final class KV extends HandleResource {
      * Applies KV transactions with an explicit key type.
      */
     public Object transact(String dbiName, Object txs, String kType) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
         return ClojureRuntime.core("transact-kv",
                                   resource(),
                                   dbiName,
-                                  DatalevinForms.kvTxsInput(txs),
-                                  DatalevinForms.typeInput(kType));
+                                  DatalevinForms.kvTxsInput(txs, normalizedKType, null),
+                                  normalizedKType);
     }
 
     /**
      * Applies KV transactions with an explicit key type.
      */
     public Object transact(String dbiName, Object txs, KVType kType) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
         return ClojureRuntime.core("transact-kv",
                                   resource(),
                                   dbiName,
-                                  DatalevinForms.kvTxsInput(txs),
-                                  DatalevinForms.typeInput(kType));
+                                  DatalevinForms.kvTxsInput(txs, normalizedKType, null),
+                                  normalizedKType);
     }
 
     /**
      * Applies KV transactions with explicit key and value types.
      */
     public Object transact(String dbiName, Object txs, String kType, String vType) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return ClojureRuntime.core("transact-kv",
                                   resource(),
                                   dbiName,
-                                  DatalevinForms.kvTxsInput(txs),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType));
+                                  DatalevinForms.kvTxsInput(txs, normalizedKType, normalizedVType),
+                                  normalizedKType,
+                                  normalizedVType);
     }
 
     /**
      * Applies KV transactions with explicit key and value types.
      */
     public Object transact(String dbiName, Object txs, KVType kType, KVType vType) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return ClojureRuntime.core("transact-kv",
                                   resource(),
                                   dbiName,
-                                  DatalevinForms.kvTxsInput(txs),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType));
+                                  DatalevinForms.kvTxsInput(txs, normalizedKType, normalizedVType),
+                                  normalizedKType,
+                                  normalizedVType);
     }
 
     /**
@@ -1030,12 +1036,14 @@ public final class KV extends HandleResource {
      * Returns the value for {@code key} from the named DBI with explicit types.
      */
     public Object getValue(String dbi, Object key, String kType, String vType, boolean ignoreKey) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return ClojureRuntime.core("get-value",
                                   resource(),
                                   dbi,
-                                  ClojureCodec.runtimeInput(key),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
+                                  DatalevinForms.kvInput(key, normalizedKType),
+                                  normalizedKType,
+                                  normalizedVType,
                                   ignoreKey);
     }
 
@@ -1043,12 +1051,14 @@ public final class KV extends HandleResource {
      * Returns the value for {@code key} from the named DBI with explicit types.
      */
     public Object getValue(String dbi, Object key, KVType kType, KVType vType, boolean ignoreKey) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return ClojureRuntime.core("get-value",
                                   resource(),
                                   dbi,
-                                  ClojureCodec.runtimeInput(key),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
+                                  DatalevinForms.kvInput(key, normalizedKType),
+                                  normalizedKType,
+                                  normalizedVType,
                                   ignoreKey);
     }
 
@@ -1143,10 +1153,12 @@ public final class KV extends HandleResource {
                             String vType,
                             Integer limit,
                             Integer offset) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return page(ResultSupport.sequence(runGetRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange),
-                                                       DatalevinForms.typeInput(kType),
-                                                       DatalevinForms.typeInput(vType))),
+                                                       DatalevinForms.rangeInput(kRange, normalizedKType),
+                                                       normalizedKType,
+                                                       normalizedVType)),
                     limit,
                     offset);
     }
@@ -1172,10 +1184,12 @@ public final class KV extends HandleResource {
                             KVType vType,
                             Integer limit,
                             Integer offset) {
+        Object normalizedKType = DatalevinForms.typeInput(kType);
+        Object normalizedVType = DatalevinForms.typeInput(vType);
         return page(ResultSupport.sequence(runGetRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange),
-                                                       DatalevinForms.typeInput(kType),
-                                                       DatalevinForms.typeInput(vType))),
+                                                       DatalevinForms.rangeInput(kRange, normalizedKType),
+                                                       normalizedKType,
+                                                       normalizedVType)),
                     limit,
                     offset);
     }

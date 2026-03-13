@@ -123,8 +123,19 @@ class RawInterop {
     return _BINDINGS.txData(txData);
   }
 
-  async kvTxs(txs) {
-    return _BINDINGS.kvTxs(txs);
+  async kvTxs(txs, kType = null, vType = null) {
+    if (kType === null && vType === null) {
+      return _BINDINGS.kvTxs(txs);
+    }
+    return _BINDINGS.kvTxsWithTypes(txs, kType, vType);
+  }
+
+  async kvInput(value, type) {
+    return _BINDINGS.kvInput(value, type);
+  }
+
+  async kvRange(range, type) {
+    return _BINDINGS.kvRange(range, type);
   }
 
   async kvType(value) {

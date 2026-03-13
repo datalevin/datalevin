@@ -170,6 +170,9 @@ def test_remote_admin_can_disconnect_other_clients(live_server) -> None:
         admin_client.disconnect_client(other_id)
 
         assert _wait_for(lambda: other_id not in admin_client.show_clients())
+        assert _wait_for(other_client.disconnected)
+        with pytest.raises(RuntimeError):
+            other_client.list_databases()
     finally:
         with suppress(Exception):
             admin_client.close_database(db_name)
