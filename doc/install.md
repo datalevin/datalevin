@@ -24,6 +24,25 @@ If you use [Clojure CLI](https://clojure.org/guides/deps_and_cli) and
 
 This library supports Java 21 and above.
 
+For embedded-only JVM use cases, Datalevin also publishes a trimmed artifact
+that keeps the local APIs and `datalevin.client`, bundles the native Datalevin
+libraries, and excludes the server, HA, CLI, and babashka pod runtime code.
+
+If you use Leiningen:
+
+```Clojure
+[datalevin/datalevin-embedded "0.10.7"]
+```
+
+If you use Clojure CLI:
+
+```Clojure
+{:deps {datalevin/datalevin-embedded {:mvn/version "0.10.7"}}}
+```
+
+See [embedded release notes](embedded-release.md) for the packaging and release
+workflow.
+
 ### Native Dependencies
 
 If the native dependencies of Datalevin are not met, Datalevin may fail to load

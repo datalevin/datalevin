@@ -12,9 +12,12 @@
 (def java-artifact-dir (str java-release-dir "/classes"))
 (def java-source-dir (str java-release-dir "/sources"))
 (def javadoc-dir (str java-release-dir "/javadoc"))
-(def local-repo (str java-release-dir "/m2"))
+(def java-local-repo (str java-release-dir "/m2"))
 (def java-central-dir "target/java-central")
 (def java-central-staging-dir (str java-central-dir "/staging"))
+(def embedded-release-dir "target/embedded-release")
+(def embedded-artifact-dir (str embedded-release-dir "/classes"))
+(def embedded-local-repo (str embedded-release-dir "/m2"))
 (def python-bindings-dir "bindings/python")
 (def javascript-bindings-dir "bindings/javascript")
 (def runtime-dir "target/runtime")
@@ -27,12 +30,15 @@
                           second)
                  "dev"))
 (def java-lib 'org.datalevin/datalevin-java)
+(def embedded-lib 'datalevin/datalevin-embedded)
 (def clojure-runtime-lib 'org.clojure/clojure)
 (def javacpp-lib 'org.bytedeco/javacpp)
 (def java-jar-file (format "target/datalevin-java-%s.jar" version))
 (def java-pom-file (format "target/datalevin-java-%s.pom" version))
 (def java-source-jar-file (format "target/datalevin-java-%s-sources.jar" version))
 (def java-javadoc-jar-file (format "target/datalevin-java-%s-javadoc.jar" version))
+(def embedded-jar-file (format "target/datalevin-embedded-%s.jar" version))
+(def embedded-pom-file (format "target/datalevin-embedded-%s.pom" version))
 (def runtime-jar-file (format "target/datalevin-runtime-%s.jar" version))
 (def java-central-bundle-file
   (format "%s/datalevin-java-%s-central-bundle.zip" java-central-dir version))
@@ -109,12 +115,14 @@
 (defn- dissoc-libs
   [deps libs]
   (reduce dissoc deps libs))
-(def java-pom-deps
+(def release-pom-deps
   (assoc (-> runtime-deps
              (dissoc-libs release-runtime-excluded-deps)
              (dissoc-libs bundled-native-libs))
          javacpp-lib
          {:mvn/version "1.5.13"}))
+(def java-pom-deps release-pom-deps)
+(def embedded-pom-deps release-pom-deps)
 (def developers
   [{:id "huahaiy"
     :name "Huahai Yang"
@@ -214,11 +222,14 @@
 
 (defn clean-java [_]
   (doseq [path [java-release-dir
+                embedded-release-dir
                 java-central-dir
                 java-jar-file
                 java-pom-file
                 java-source-jar-file
                 java-javadoc-jar-file
+                embedded-jar-file
+                embedded-pom-file
                 runtime-dir
                 runtime-jar-file
                 java-central-bundle-file]]
@@ -269,80 +280,107 @@
   {:javadoc-dir javadoc-dir
    :javadoc-jar java-javadoc-jar-file})
 
-(defn- write-java-poms! []
-  (let [pom-dir     (format "%s/META-INF/maven/%s/%s"
-                            java-artifact-dir
-                            (namespace java-lib)
-                            (name java-lib))
-        pom-file    (str pom-dir "/pom.xml")
-        props-file  (str pom-dir "/pom.properties")
-        deps->xml   (fn [[lib dep]]
-                      (when-let [dep-version (:mvn/version dep)]
-                        (str "    <dependency>\n"
-                             "      <groupId>" (namespace lib) "</groupId>\n"
-                             "      <artifactId>" (name lib) "</artifactId>\n"
-                             "      <version>" dep-version "</version>\n"
-                             (when-let [exclusions (:exclusions dep)]
-                               (str "      <exclusions>\n"
-                                    (apply str
-                                           (for [exclusion exclusions]
-                                             (str "        <exclusion>\n"
-                                                  "          <groupId>" (namespace exclusion) "</groupId>\n"
-                                                  "          <artifactId>" (name exclusion) "</artifactId>\n"
-                                                  "        </exclusion>\n")))
-                                    "      </exclusions>\n"))
-                             "    </dependency>\n")))
-        developers->xml
-        (fn [{:keys [id name email]}]
-          (str "    <developer>\n"
-               (when id
-                 (str "      <id>" id "</id>\n"))
-               "      <name>" name "</name>\n"
-               (when email
-                 (str "      <email>" email "</email>\n"))
-               "    </developer>\n"))
-        pom-xml     (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-                         "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n"
-                         "         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
-                         "         xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n"
-                         "  <modelVersion>4.0.0</modelVersion>\n"
-                         "  <groupId>" (namespace java-lib) "</groupId>\n"
-                         "  <artifactId>" (name java-lib) "</artifactId>\n"
-                         "  <version>" version "</version>\n"
-                         "  <packaging>jar</packaging>\n"
-                         "  <name>" (name java-lib) "</name>\n"
-                         "  <description>A simple, fast and versatile Datalog database</description>\n"
-                         "  <url>https://github.com/datalevin/datalevin</url>\n"
-                         "  <licenses>\n"
-                         "    <license>\n"
-                         "      <name>EPL-1.0</name>\n"
-                         "      <url>https://www.eclipse.org/legal/epl-1.0/</url>\n"
-                         "    </license>\n"
-                         "  </licenses>\n"
-                         "  <scm>\n"
-                         "    <url>" (:url scm) "</url>\n"
-                         "    <connection>" (:connection scm) "</connection>\n"
-                         "    <developerConnection>" (:developerConnection scm) "</developerConnection>\n"
-                         "    <tag>" (:tag scm) "</tag>\n"
-                         "  </scm>\n"
-                         "  <developers>\n"
-                         (apply str (map developers->xml developers))
-                         "  </developers>\n"
-                         "  <dependencies>\n"
-                         (->> java-pom-deps
-                              (sort-by (comp str key))
-                              (map deps->xml)
-                              (apply str))
-                         "  </dependencies>\n"
-                         "</project>\n")]
+(defn- dependency->xml [[lib dep]]
+  (when-let [dep-version (:mvn/version dep)]
+    (str "    <dependency>\n"
+         "      <groupId>" (namespace lib) "</groupId>\n"
+         "      <artifactId>" (name lib) "</artifactId>\n"
+         "      <version>" dep-version "</version>\n"
+         (when-let [exclusions (:exclusions dep)]
+           (str "      <exclusions>\n"
+                (apply str
+                       (for [exclusion exclusions]
+                         (str "        <exclusion>\n"
+                              "          <groupId>" (namespace exclusion) "</groupId>\n"
+                              "          <artifactId>" (name exclusion) "</artifactId>\n"
+                              "        </exclusion>\n")))
+                "      </exclusions>\n"))
+         "    </dependency>\n")))
+
+(defn- developer->xml [{:keys [id name email]}]
+  (str "    <developer>\n"
+       (when id
+         (str "      <id>" id "</id>\n"))
+       "      <name>" name "</name>\n"
+       (when email
+         (str "      <email>" email "</email>\n"))
+       "    </developer>\n"))
+
+(defn- pom-xml
+  [lib-sym {:keys [title description deps]}]
+  (str "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+       "<project xmlns=\"http://maven.apache.org/POM/4.0.0\"\n"
+       "         xmlns:xsi=\"http://www.w3.org/2001/XMLSchema-instance\"\n"
+       "         xsi:schemaLocation=\"http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd\">\n"
+       "  <modelVersion>4.0.0</modelVersion>\n"
+       "  <groupId>" (namespace lib-sym) "</groupId>\n"
+       "  <artifactId>" (name lib-sym) "</artifactId>\n"
+       "  <version>" version "</version>\n"
+       "  <packaging>jar</packaging>\n"
+       "  <name>" title "</name>\n"
+       "  <description>" description "</description>\n"
+       "  <url>https://github.com/datalevin/datalevin</url>\n"
+       "  <licenses>\n"
+       "    <license>\n"
+       "      <name>EPL-1.0</name>\n"
+       "      <url>https://www.eclipse.org/legal/epl-1.0/</url>\n"
+       "    </license>\n"
+       "  </licenses>\n"
+       "  <scm>\n"
+       "    <url>" (:url scm) "</url>\n"
+       "    <connection>" (:connection scm) "</connection>\n"
+       "    <developerConnection>" (:developerConnection scm) "</developerConnection>\n"
+       "    <tag>" (:tag scm) "</tag>\n"
+       "  </scm>\n"
+       "  <developers>\n"
+       (apply str (map developer->xml developers))
+       "  </developers>\n"
+       "  <dependencies>\n"
+       (->> deps
+            (sort-by (comp str key))
+            (map dependency->xml)
+            (apply str))
+       "  </dependencies>\n"
+       "</project>\n"))
+
+(defn- write-pom-files!
+  [artifact-dir lib-sym pom-file {:keys [title description deps]}]
+  (let [pom-dir    (format "%s/META-INF/maven/%s/%s"
+                           artifact-dir
+                           (namespace lib-sym)
+                           (name lib-sym))
+        pom-path   (str pom-dir "/pom.xml")
+        props-file (str pom-dir "/pom.properties")
+        pom-xml    (pom-xml lib-sym {:title       title
+                                     :description description
+                                     :deps        deps})]
     (.mkdirs (File. pom-dir))
-    (spit pom-file pom-xml)
+    (spit pom-path pom-xml)
     (spit props-file
-          (str "groupId=" (namespace java-lib) "\n"
-               "artifactId=" (name java-lib) "\n"
+          (str "groupId=" (namespace lib-sym) "\n"
+               "artifactId=" (name lib-sym) "\n"
                "version=" version "\n"))
-    (b/delete {:path java-pom-file})
-    (spit java-pom-file pom-xml)))
+    (b/delete {:path pom-file})
+    (spit pom-file pom-xml)))
+
+(defn- write-java-poms! []
+  (write-pom-files!
+    java-artifact-dir
+    java-lib
+    java-pom-file
+    {:title       (name java-lib)
+     :description "A simple, fast and versatile Datalog database"
+     :deps        java-pom-deps}))
+
+(defn- write-embedded-poms! []
+  (write-pom-files!
+    embedded-artifact-dir
+    embedded-lib
+    embedded-pom-file
+    {:title       (name embedded-lib)
+     :description (str "Embedded-only Datalevin runtime with bundled native "
+                       "libraries and remote client support")
+     :deps        embedded-pom-deps}))
 
 (defn- native-jar-paths []
   (->> (:classpath-roots basis)
@@ -363,23 +401,31 @@
           (io/copy in out))))))
 
 (defn- copy-bundled-native-payloads!
-  []
+  [target-dir]
   (doseq [jar-path (native-jar-paths)]
-    (copy-jar-prefix! jar-path "datalevin/dtlvnative/" java-artifact-dir)))
+    (copy-jar-prefix! jar-path "datalevin/dtlvnative/" target-dir)))
+
+(defn- prep-trimmed-artifact!
+  [target-dir]
+  (compile-java nil)
+  (b/delete {:path target-dir})
+  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
+               :target-dir target-dir})
+  ;; Keep release jars free of embedded Java sources.
+  (b/delete {:path (str target-dir "/java")})
+  ;; Embedded consumers do not need the CLI, pod entrypoint, or HA/server runtime.
+  (delete-under-root! target-dir release-runtime-source-excludes)
+  (delete-under-root! target-dir release-runtime-class-excludes))
 
 (defn- prep-java-artifact! []
-  (compile-java nil)
-  (b/delete {:path java-artifact-dir})
-  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
-               :target-dir java-artifact-dir})
-  ;; Keep the release jar free of embedded Java sources; they go in the
-  ;; separate sources jar instead.
-  (b/delete {:path (str java-artifact-dir "/java")})
-  ;; Java consumers do not need the CLI, pod entrypoint, or HA/server runtime.
-  (delete-under-root! java-artifact-dir release-runtime-source-excludes)
-  (delete-under-root! java-artifact-dir release-runtime-class-excludes)
-  (copy-bundled-native-payloads!)
+  (prep-trimmed-artifact! java-artifact-dir)
+  (copy-bundled-native-payloads! java-artifact-dir)
   (write-java-poms!))
+
+(defn- prep-embedded-artifact! []
+  (prep-trimmed-artifact! embedded-artifact-dir)
+  (copy-bundled-native-payloads! embedded-artifact-dir)
+  (write-embedded-poms!))
 
 (defn java-jar [_]
   (prep-java-artifact!)
@@ -418,7 +464,7 @@
    :javadoc-jar  java-javadoc-jar-file})
 
 (defn- repo-path
-  [lib-sym]
+  [local-repo lib-sym]
   (format "%s/%s/%s/%s"
           local-repo
           (str/replace (namespace lib-sym) "." "/")
@@ -426,24 +472,25 @@
           version))
 
 (defn- metadata-path
-  [lib-sym]
+  [local-repo lib-sym]
   (format "%s/%s/%s/maven-metadata-local.xml"
           local-repo
           (str/replace (namespace lib-sym) "." "/")
           (name lib-sym)))
 
 (defn- install-artifact!
-  [src filename]
+  [local-repo lib-sym src filename]
   (b/copy-file {:src src
-                :target (str (repo-path java-lib) "/" filename)}))
+                :target (str (repo-path local-repo lib-sym) "/" filename)}))
 
-(defn- write-metadata! []
-  (let [artifact-id (name java-lib)
-        group-id    (namespace java-lib)
+(defn- write-metadata!
+  [local-repo lib-sym]
+  (let [artifact-id (name lib-sym)
+        group-id    (namespace lib-sym)
         ts          (.format (java.time.format.DateTimeFormatter/ofPattern
                                "yyyyMMddHHmmss")
                              (java.time.LocalDateTime/now))]
-    (spit (metadata-path java-lib)
+    (spit (metadata-path local-repo lib-sym)
           (str "<metadata>\n"
                "  <groupId>" group-id "</groupId>\n"
                "  <artifactId>" artifact-id "</artifactId>\n"
@@ -458,30 +505,58 @@
 
 (defn install-java [_]
   (java-release nil)
-  (install-artifact! java-jar-file (format "datalevin-java-%s.jar" version))
-  (install-artifact! java-pom-file (format "datalevin-java-%s.pom" version))
-  (install-artifact! java-source-jar-file
+  (install-artifact! java-local-repo
+                     java-lib
+                     java-jar-file
+                     (format "datalevin-java-%s.jar" version))
+  (install-artifact! java-local-repo
+                     java-lib
+                     java-pom-file
+                     (format "datalevin-java-%s.pom" version))
+  (install-artifact! java-local-repo
+                     java-lib
+                     java-source-jar-file
                      (format "datalevin-java-%s-sources.jar" version))
-  (install-artifact! java-javadoc-jar-file
+  (install-artifact! java-local-repo
+                     java-lib
+                     java-javadoc-jar-file
                      (format "datalevin-java-%s-javadoc.jar" version))
-  (write-metadata!)
-  (println "Installed Java release artifacts in" local-repo)
+  (write-metadata! java-local-repo java-lib)
+  (println "Installed Java release artifacts in" java-local-repo)
   {:jar-file    java-jar-file
    :pom-file    java-pom-file
    :source-jar  java-source-jar-file
    :javadoc-jar java-javadoc-jar-file
-   :local-repo  local-repo})
+   :local-repo  java-local-repo})
+
+(defn embedded-jar [_]
+  (prep-embedded-artifact!)
+  (b/jar {:class-dir embedded-artifact-dir
+          :jar-file  embedded-jar-file
+          :manifest  {"Implementation-Title"   "Datalevin Embedded"
+                      "Implementation-Version" version}})
+  (println "Generated Datalevin embedded jar at" embedded-jar-file)
+  {:jar-file embedded-jar-file
+   :pom-file embedded-pom-file})
+
+(defn install-embedded [_]
+  (embedded-jar nil)
+  (install-artifact! embedded-local-repo
+                     embedded-lib
+                     embedded-jar-file
+                     (format "datalevin-embedded-%s.jar" version))
+  (install-artifact! embedded-local-repo
+                     embedded-lib
+                     embedded-pom-file
+                     (format "datalevin-embedded-%s.pom" version))
+  (write-metadata! embedded-local-repo embedded-lib)
+  (println "Installed embedded release artifacts in" embedded-local-repo)
+  {:jar-file   embedded-jar-file
+   :pom-file   embedded-pom-file
+   :local-repo embedded-local-repo})
 
 (defn- prep-runtime-artifact! []
-  (compile-java nil)
-  (b/delete {:path runtime-class-dir})
-  (b/copy-dir {:src-dirs   (existing-dirs ["src" "resources" class-dir])
-               :target-dir runtime-class-dir})
-  ;; Keep the embeddable runtime jar free of Java sources.
-  (b/delete {:path (str runtime-class-dir "/java")})
-  ;; Language bindings do not use the CLI, pod entrypoint, or HA/server runtime.
-  (delete-under-root! runtime-class-dir runtime-source-excludes)
-  (delete-under-root! runtime-class-dir runtime-class-excludes))
+  (prep-trimmed-artifact! runtime-class-dir))
 
 (defn- write-runtime-deps!
   [native-platform]

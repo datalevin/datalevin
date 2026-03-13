@@ -50,6 +50,7 @@
     (update-file "test-jar/deps.edn" old->new)
     (update-file "test-jar/test-uber.sh" old->new)
     (update-file "doc/install.md" old->new)
+    (update-file "doc/embedded-release.md" old->new)
     (update-file "doc/dtlv.md" old->new)
     (update-file "examples/java/README.md" old->new)
     (update-file "src/datalevin/constants.clj" old->new)
@@ -63,6 +64,7 @@
       "test-jar/deps.edn"
       "test-jar/test-uber.sh"
       "doc/install.md"
+      "doc/embedded-release.md"
       "doc/dtlv.md"
       "examples/java/README.md"
       "src/datalevin/constants.clj"

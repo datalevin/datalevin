@@ -111,6 +111,10 @@ As a Clojure library, Datalevin is simple to add as a dependency to your Clojure
 project. There are also several other installation options. Please see details in
 [Installation Documentation](doc/install.md)
 
+For embedded-only JVM consumers, Clojars also publishes
+`datalevin/datalevin-embedded:0.10.7`, which keeps the local APIs and
+`datalevin.client` while trimming the server, HA, CLI, and babashka pod runtime.
+
 ## :birthday: Upgrade
 
 Please read
