@@ -1,13 +1,16 @@
 (ns datalevin.test.core
   (:require
    [clojure.test :as t :refer [is are deftest testing]]
+   [datalevin.client :as cl]
    [datalevin.core :as d]
    [datalevin.entity :as de]
    [taoensso.timbre :as log]
    [datalevin.constants :as c]
    [datalevin.util :as u :refer [defrecord-updatable]]
    [datalevin.server :as srv])
-  (:import [java.util UUID]))
+  (:import
+   [java.net ServerSocket]
+   [java.util UUID]))
 
 (defn wrap-res [f]
   (let [res (f)]
@@ -40,15 +43,22 @@
   (binding [*print-namespace-maps* false]
     (t)))
 
+(defn allocate-port
+  []
+  (with-open [s (ServerSocket. 0)]
+    (.getLocalPort s)))
+
 (defn server-fixture
   [f]
-  (let [dir    (u/tmp-dir (str "server-test-" (UUID/randomUUID)))
+  (let [port   (allocate-port)
+        dir    (u/tmp-dir (str "server-test-" (UUID/randomUUID)))
         server (binding [c/*db-background-sampling?* false]
-                 (srv/create {:port c/default-port
+                 (srv/create {:port port
                               :root dir}))]
     ;; (log/set-min-level! :debug)
     (log/set-min-level! :report)
-    (binding [c/*db-background-sampling?* false]
+    (binding [c/*db-background-sampling?* false
+              cl/*default-port*        port]
       (try
         (srv/start server)
         (f)

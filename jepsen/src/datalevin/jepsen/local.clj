@@ -1,17 +1,21 @@
 (ns datalevin.jepsen.local
   (:require
+   [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]
+   [datalevin.client :as cl]
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as ddb]
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
+   [datalevin.jepsen.remote :as remote]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
    [datalevin.server :as srv]
    [datalevin.util :as u]
+   [jepsen.control :as control]
    [jepsen.db :as db]
    [jepsen.net.proto :as net.proto]
    [taoensso.timbre :as log])
@@ -81,6 +85,21 @@
 (def ^:private base-server-runtime-opts-fn srv/*server-runtime-opts-fn*)
 
 (defonce ^:private server-runtime-opts-overrides (atom {}))
+
+(def ^:private remote-launch-log-file "jepsen-remote-launch.log")
+(def ^:private remote-config-file "jepsen-remote-cluster.edn")
+(def ^:private remote-state-poll-ms 500)
+
+(defn- remote-cluster?
+  [cluster-id]
+  (true? (get-in @clusters [cluster-id :remote?])))
+
+(defn- safe-disconnect-client!
+  [client]
+  (when client
+    (try
+      (cl/disconnect client)
+      (catch Throwable _ nil))))
 
 (defn- cluster-entry-for-db-identity
   [db-identity]
@@ -589,6 +608,140 @@
 (declare create-conn-with-timeout!
          transport-failure?)
 
+(defn- remote-config-path-for-node
+  [node]
+  (str (:root node) u/+separator+ remote-config-file))
+
+(defn- remote-launch-log-path
+  [node]
+  (str (:root node) u/+separator+ remote-launch-log-file))
+
+(defn- remote-pid-file
+  [node]
+  (str (:root node) u/+separator+ "jepsen-remote-node.pid"))
+
+(defn- remote-state-file
+  [node]
+  (str (:root node) u/+separator+ "jepsen-remote-node.edn"))
+
+(defn- remote-node-state*
+  [ssh logical-node node]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (try
+        (some-> (control/exec :cat (remote-state-file node))
+                edn/read-string)
+        (catch Throwable _
+          nil)))))
+
+(defn- wait-for-remote-node-running!
+  [ssh node timeout-ms]
+  (let [deadline (+ (now-ms) (long timeout-ms))]
+    (loop [last-state nil]
+      (let [state (remote-node-state* ssh (:logical-node node) node)
+            status (:status state)]
+        (cond
+          (= :running status)
+          state
+
+          (= :failed status)
+          (u/raise "Remote Jepsen node failed to start"
+                   {:node (:logical-node node)
+                    :state state})
+
+          (< (now-ms) deadline)
+          (do
+            (Thread/sleep (long remote-state-poll-ms))
+            (recur (or state last-state)))
+
+          :else
+          (u/raise "Timed out waiting for remote Jepsen node to start"
+                   {:node (:logical-node node)
+                    :timeout-ms timeout-ms
+                    :last-state last-state}))))))
+
+(defn- upload-remote-config!
+  [ssh node local-config-path]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (control/exec :mkdir :-p (:root node))
+      (control/upload local-config-path (remote-config-path-for-node node)))))
+
+(defn- start-remote-node-launcher!
+  [ssh repo-root node verbose?]
+  (let [command (str "mkdir -p " (control/escape (:root node))
+                     " && nohup script/jepsen/start-remote-node"
+                     " --config " (control/escape (remote-config-path-for-node node))
+                     " --node " (control/escape (:logical-node node))
+                     (when verbose? " --verbose")
+                     " > " (control/escape (remote-launch-log-path node))
+                     " 2>&1 < /dev/null &")]
+    (control/with-ssh ssh
+      (control/on (:logical-node node)
+        (control/cd repo-root
+          (control/exec :bash :-lc command))))))
+
+(defn- stop-remote-node-launcher!
+  [ssh repo-root node]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (control/cd repo-root
+        (control/exec :bash :-lc
+                      (str "script/jepsen/stop-remote-node"
+                           " --config "
+                           (control/escape (remote-config-path-for-node node))
+                           " --node "
+                           (control/escape (:logical-node node))))))))
+
+(defn- signal-remote-node!
+  [ssh node signal]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (control/exec :bash :-lc
+                    (str "kill -" signal " $(cat "
+                         (control/escape (remote-pid-file node))
+                         ")")))))
+
+(defn- remote-admin-client!
+  [cluster-id logical-node]
+  (locking clusters
+    (let [{:keys [node-by-name]} (get @clusters cluster-id)
+          endpoint (get-in node-by-name [logical-node :endpoint])
+          existing (get-in @clusters [cluster-id :remote-admin-clients logical-node])]
+      (cond
+        (nil? endpoint)
+        nil
+
+        (and existing (not (cl/disconnected? existing)))
+        existing
+
+        :else
+        (let [client (cl/new-client (admin-uri endpoint) conn-client-opts)]
+          (swap! clusters assoc-in
+                 [cluster-id :remote-admin-clients logical-node]
+                 client)
+          client)))))
+
+(defn- remote-ha-watermark
+  [cluster-id logical-node]
+  (let [{:keys [db-name]} (get @clusters cluster-id)]
+    (when-let [client (remote-admin-client! cluster-id logical-node)]
+      (try
+        (cl/normal-request client :ha-watermark [db-name] false)
+        (catch Throwable e
+          (when (transport-failure? e)
+            (safe-disconnect-client! client)
+            (swap! clusters assoc-in
+                   [cluster-id :remote-admin-clients logical-node]
+                   nil))
+          (throw e))))))
+
+(defn- close-remote-admin-client!
+  [cluster-id logical-node]
+  (when-let [client (get-in @clusters [cluster-id :remote-admin-clients logical-node])]
+    (safe-disconnect-client! client)
+    (swap! clusters assoc-in [cluster-id :remote-admin-clients logical-node] nil)))
+
 (defn- open-ha-conn!
   ([node db-name schema opts]
    (open-ha-conn! node db-name schema opts cluster-timeout-ms))
@@ -791,44 +944,70 @@
               nil))
           0))))
 
+(defn- remote-node-diagnostics
+  [cluster-id logical-node]
+  (try
+    (when-let [state (remote-ha-watermark cluster-id logical-node)]
+      (let [effective-lsn (long (or (:last-applied-lsn state)
+                                    (:ha-local-last-applied-lsn state)
+                                    0))]
+        (assoc state
+               :jepsen-paused?
+               (contains? (get-in @clusters [cluster-id :paused-nodes])
+                          logical-node)
+               :jepsen-storage-fault (storage-fault cluster-id logical-node)
+               :ha-effective-local-lsn effective-lsn)))
+    (catch Throwable e
+      (if (transport-failure? e)
+        nil
+        (throw e)))))
+
 (defn effective-local-lsn
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-    (if-let [state (db-state (get servers logical-node) db-name)]
-      (let [txlog-lsn     (long (or (:last-applied-lsn
-                                     (local-watermarks
-                                       (get servers logical-node)
-                                       db-name))
-                                    0))
-            snapshot-lsn  (local-snapshot-lsn state)
-            runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
-            persisted-lsn (local-ha-persisted-lsn state)
-            comparable    (long (max runtime-lsn persisted-lsn))
-            local-truth   (long (max txlog-lsn snapshot-lsn))]
-        (if (= :leader (:ha-role state))
-          (long (max local-truth comparable))
-          (if (pos? local-truth)
-            local-truth
-            comparable)))
-      0)))
+  (if (remote-cluster? cluster-id)
+    (long (or (:ha-effective-local-lsn
+               (remote-node-diagnostics cluster-id logical-node))
+              0))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
+      (if-let [state (db-state (get servers logical-node) db-name)]
+        (let [txlog-lsn     (long (or (:last-applied-lsn
+                                       (local-watermarks
+                                        (get servers logical-node)
+                                        db-name))
+                                      0))
+              snapshot-lsn  (local-snapshot-lsn state)
+              runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
+              persisted-lsn (local-ha-persisted-lsn state)
+              comparable    (long (max runtime-lsn persisted-lsn))
+              local-truth   (long (max txlog-lsn snapshot-lsn))]
+          (if (= :leader (:ha-role state))
+            (long (max local-truth comparable))
+            (if (pos? local-truth)
+              local-truth
+              comparable)))
+        0))))
 
 (defn node-progress-lsn
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-    (if-let [state (db-state (get servers logical-node) db-name)]
-      (let [txlog-lsn     (long (or (:last-applied-lsn
-                                     (local-watermarks
-                                      (get servers logical-node)
-                                      db-name))
-                                    0))
-            runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
-            persisted-lsn (local-ha-persisted-lsn state)
-            comparable    (long (max runtime-lsn persisted-lsn))]
-        ;; Snapshot-floor metadata is a historical retention marker, not proof
-        ;; that a live node has replayed newer WAL. Catch-up waits must use the
-        ;; node's actual applied progress so later snapshots cannot regress.
-        (long (max txlog-lsn comparable)))
-      0)))
+  (if (remote-cluster? cluster-id)
+    (long (or (:last-applied-lsn
+               (remote-node-diagnostics cluster-id logical-node))
+              0))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
+      (if-let [state (db-state (get servers logical-node) db-name)]
+        (let [txlog-lsn     (long (or (:last-applied-lsn
+                                       (local-watermarks
+                                        (get servers logical-node)
+                                        db-name))
+                                      0))
+              runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
+              persisted-lsn (local-ha-persisted-lsn state)
+              comparable    (long (max runtime-lsn persisted-lsn))]
+          ;; Snapshot-floor metadata is a historical retention marker, not proof
+          ;; that a live node has replayed newer WAL. Catch-up waits must use the
+          ;; node's actual applied progress so later snapshots cannot regress.
+          (long (max txlog-lsn comparable)))
+        0))))
 
 (defn wait-for-live-nodes-at-least-lsn!
   ([cluster-id target-lsn]
@@ -972,7 +1151,8 @@
           {:status :probe-failed
            :message (ex-message e)})))))
 
-(declare node-diagnostics)
+(declare node-diagnostics
+         with-node-conn)
 
 (defn wait-for-single-leader!
   ([cluster-id]
@@ -982,46 +1162,63 @@
          deadline   (+ (now-ms) timeout-ms)]
      (loop [last-snapshot nil]
        (let [{:keys [db-name live-nodes servers]} (get @clusters cluster-id)
-             snapshot (into {}
-                            (map (fn [logical-node]
-                                   [logical-node
-                                    (probe-write-admission
-                                     cluster-id
-                                     logical-node
-                                     (get servers logical-node)
-                                     db-name)]))
-                            live-nodes)
+             snapshot (if (remote-cluster? cluster-id)
+                        (into {}
+                              (for [logical-node live-nodes
+                                    :let [state (node-diagnostics cluster-id
+                                                                  logical-node)]]
+                                [logical-node
+                                 (cond
+                                   (:jepsen-paused? state)
+                                   {:status :paused}
+
+                                   (nil? state)
+                                   {:status :unavailable}
+
+                                   (= :leader (:ha-role state))
+                                   {:status :leader}
+
+                                   :else
+                                   {:status :follower
+                                    :ha-role (:ha-role state)})]))
+                        (into {}
+                              (for [logical-node live-nodes]
+                                [logical-node
+                                 (probe-write-admission
+                                  cluster-id
+                                  logical-node
+                                  (get servers logical-node)
+                                  db-name)])))
              diagnostics-snapshot
              (into {}
-                   (map (fn [logical-node]
-                          [logical-node
-                           (select-keys
-                            (node-diagnostics cluster-id logical-node)
-                            [:ha-role
-                             :ha-authority-owner-node-id
-                             :ha-authority-term
-                             :ha-control-local-peer-id
-                             :ha-control-leader-peer-id
-                             :ha-control-node-leader?
-                             :ha-control-node-state
-                             :ha-local-last-applied-lsn
-                             :ha-follower-next-lsn
-                             :ha-follower-last-sync-ms
-                             :ha-follower-last-bootstrap-ms
-                             :ha-follower-degraded?
-                             :ha-follower-degraded-reason
-                             :ha-follower-last-error
-                             :ha-follower-last-error-details
-                             :ha-clock-skew-paused?
-                             :ha-clock-skew-last-observed-ms
-                             :ha-clock-skew-last-result
-                             :ha-promotion-last-failure
-                             :ha-promotion-failure-details
-                             :ha-rejoin-promotion-blocked?
-                             :ha-rejoin-promotion-blocked-until-ms
-                             :ha-lease-until-ms
-                             :ha-last-authority-refresh-ms])]))
-                   live-nodes)
+                   (for [logical-node live-nodes]
+                     [logical-node
+                      (select-keys
+                       (node-diagnostics cluster-id logical-node)
+                       [:ha-role
+                        :ha-authority-owner-node-id
+                        :ha-authority-term
+                        :ha-control-local-peer-id
+                        :ha-control-leader-peer-id
+                        :ha-control-node-leader?
+                        :ha-control-node-state
+                        :ha-local-last-applied-lsn
+                        :ha-follower-next-lsn
+                        :ha-follower-last-sync-ms
+                        :ha-follower-last-bootstrap-ms
+                        :ha-follower-degraded?
+                        :ha-follower-degraded-reason
+                        :ha-follower-last-error
+                        :ha-follower-last-error-details
+                        :ha-clock-skew-paused?
+                        :ha-clock-skew-last-observed-ms
+                        :ha-clock-skew-last-result
+                        :ha-promotion-last-failure
+                        :ha-promotion-failure-details
+                        :ha-rejoin-promotion-blocked?
+                        :ha-rejoin-promotion-blocked-until-ms
+                        :ha-lease-until-ms
+                        :ha-last-authority-refresh-ms])]))
              leaders (->> snapshot
                           (keep (fn [[logical-node {:keys [status]}]]
                                   (when (= :leader status) logical-node)))
@@ -1138,81 +1335,94 @@
 
 (defn node-diagnostics
   [cluster-id logical-node]
-  (let [{:keys [db-name servers control-authorities]} (get @clusters cluster-id)]
-    (if-let [state (db-state (get servers logical-node) db-name)]
-      (let [authority-diagnostics
-            (when-let [authority (:ha-authority state)]
-              (authority-diagnostics-snapshot authority))]
-        (merge
-         {:ha-role (:ha-role state)
-          :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
-          :ha-authority-term (:ha-authority-term state)
-          :udf-ready? (:udf-ready? state)
-          :udf-missing (:udf-missing state)
-          :udf-readiness-token (:udf-readiness-token state)
-          :ha-local-last-applied-lsn (:ha-local-last-applied-lsn state)
-          :ha-follower-next-lsn (:ha-follower-next-lsn state)
-          :ha-follower-last-batch-size (:ha-follower-last-batch-size state)
-          :ha-follower-last-sync-ms (:ha-follower-last-sync-ms state)
-          :ha-follower-leader-endpoint (:ha-follower-leader-endpoint state)
-          :ha-follower-source-endpoint (:ha-follower-source-endpoint state)
-          :ha-follower-source-order (:ha-follower-source-order state)
-          :ha-follower-last-bootstrap-ms (:ha-follower-last-bootstrap-ms state)
-          :ha-follower-bootstrap-source-endpoint
-          (:ha-follower-bootstrap-source-endpoint state)
-          :ha-follower-bootstrap-snapshot-last-applied-lsn
-          (:ha-follower-bootstrap-snapshot-last-applied-lsn state)
-          :ha-follower-degraded? (:ha-follower-degraded? state)
-          :ha-follower-degraded-reason (:ha-follower-degraded-reason state)
-          :ha-follower-last-error (:ha-follower-last-error state)
-          :ha-follower-last-error-details
-          (:ha-follower-last-error-details state)
-          :ha-follower-next-sync-not-before-ms
-          (:ha-follower-next-sync-not-before-ms state)
-          :ha-clock-skew-paused? (:ha-clock-skew-paused? state)
-          :ha-clock-skew-last-observed-ms
-          (:ha-clock-skew-last-observed-ms state)
-          :ha-clock-skew-last-result (:ha-clock-skew-last-result state)
-          :ha-lease-until-ms (:ha-lease-until-ms state)
-          :ha-last-authority-refresh-ms
-          (:ha-last-authority-refresh-ms state)
-          :ha-authority-read-ok? (:ha-authority-read-ok? state)
-          :ha-promotion-last-failure
-          (:ha-promotion-last-failure state)
-          :ha-promotion-failure-details
-          (:ha-promotion-failure-details state)
-          :ha-rejoin-promotion-blocked?
-          (:ha-rejoin-promotion-blocked? state)
-          :ha-rejoin-promotion-blocked-until-ms
-          (:ha-rejoin-promotion-blocked-until-ms state)
-          :ha-rejoin-promotion-cleared-ms
-          (:ha-rejoin-promotion-cleared-ms state)
-          :ha-candidate-since-ms (:ha-candidate-since-ms state)
-          :ha-candidate-delay-ms (:ha-candidate-delay-ms state)
-          :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
-                                     logical-node)
-          :jepsen-storage-fault (storage-fault cluster-id logical-node)
-          :ha-effective-local-lsn (effective-local-lsn cluster-id logical-node)}
-         (authority-diagnostics->control-state authority-diagnostics)))
-      (when-let [authority (get control-authorities logical-node)]
-        (merge
-         {:ha-role :control-only
-          :jepsen-control-only? true}
-         (authority-diagnostics->control-state
-          (authority-diagnostics-snapshot authority)))))))
+  (if (remote-cluster? cluster-id)
+    (remote-node-diagnostics cluster-id logical-node)
+    (let [{:keys [db-name servers control-authorities]} (get @clusters cluster-id)]
+      (if-let [state (db-state (get servers logical-node) db-name)]
+        (let [authority-diagnostics
+              (when-let [authority (:ha-authority state)]
+                (authority-diagnostics-snapshot authority))]
+          (merge
+           {:ha-role (:ha-role state)
+            :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
+            :ha-authority-term (:ha-authority-term state)
+            :udf-ready? (:udf-ready? state)
+            :udf-missing (:udf-missing state)
+            :udf-readiness-token (:udf-readiness-token state)
+            :ha-local-last-applied-lsn (:ha-local-last-applied-lsn state)
+            :ha-follower-next-lsn (:ha-follower-next-lsn state)
+            :ha-follower-last-batch-size (:ha-follower-last-batch-size state)
+            :ha-follower-last-sync-ms (:ha-follower-last-sync-ms state)
+            :ha-follower-leader-endpoint (:ha-follower-leader-endpoint state)
+            :ha-follower-source-endpoint (:ha-follower-source-endpoint state)
+            :ha-follower-source-order (:ha-follower-source-order state)
+            :ha-follower-last-bootstrap-ms (:ha-follower-last-bootstrap-ms state)
+            :ha-follower-bootstrap-source-endpoint
+            (:ha-follower-bootstrap-source-endpoint state)
+            :ha-follower-bootstrap-snapshot-last-applied-lsn
+            (:ha-follower-bootstrap-snapshot-last-applied-lsn state)
+            :ha-follower-degraded? (:ha-follower-degraded? state)
+            :ha-follower-degraded-reason (:ha-follower-degraded-reason state)
+            :ha-follower-last-error (:ha-follower-last-error state)
+            :ha-follower-last-error-details
+            (:ha-follower-last-error-details state)
+            :ha-follower-next-sync-not-before-ms
+            (:ha-follower-next-sync-not-before-ms state)
+            :ha-clock-skew-paused? (:ha-clock-skew-paused? state)
+            :ha-clock-skew-last-observed-ms
+            (:ha-clock-skew-last-observed-ms state)
+            :ha-clock-skew-last-result (:ha-clock-skew-last-result state)
+            :ha-lease-until-ms (:ha-lease-until-ms state)
+            :ha-last-authority-refresh-ms
+            (:ha-last-authority-refresh-ms state)
+            :ha-authority-read-ok? (:ha-authority-read-ok? state)
+            :ha-promotion-last-failure
+            (:ha-promotion-last-failure state)
+            :ha-promotion-failure-details
+            (:ha-promotion-failure-details state)
+            :ha-rejoin-promotion-blocked?
+            (:ha-rejoin-promotion-blocked? state)
+            :ha-rejoin-promotion-blocked-until-ms
+            (:ha-rejoin-promotion-blocked-until-ms state)
+            :ha-rejoin-promotion-cleared-ms
+            (:ha-rejoin-promotion-cleared-ms state)
+            :ha-candidate-since-ms (:ha-candidate-since-ms state)
+            :ha-candidate-delay-ms (:ha-candidate-delay-ms state)
+            :jepsen-paused? (contains? (get-in @clusters [cluster-id :paused-nodes])
+                                       logical-node)
+            :jepsen-storage-fault (storage-fault cluster-id logical-node)
+            :ha-effective-local-lsn (effective-local-lsn cluster-id logical-node)}
+           (authority-diagnostics->control-state authority-diagnostics)))
+        (when-let [authority (get control-authorities logical-node)]
+          (merge
+           {:ha-role :control-only
+            :jepsen-control-only? true}
+           (authority-diagnostics->control-state
+            (authority-diagnostics-snapshot authority))))))))
 
 (defn local-query
   [cluster-id logical-node q & inputs]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-    (if-let [state (db-state (get servers logical-node) db-name)]
-      (let [store (:store state)]
-        (if (store-open? store)
-          (try
-            (apply d/q q (ddb/new-db store) inputs)
-            (catch Throwable _
-              ::unavailable))
-          ::unavailable))
-      ::unavailable)))
+  (if (remote-cluster? cluster-id)
+    (try
+      (with-node-conn
+        {:datalevin/cluster-id cluster-id
+         :db-name (:db-name (get @clusters cluster-id))}
+        logical-node
+        nil
+        (fn [conn]
+          (apply d/q q @conn inputs)))
+      (catch Throwable _
+        ::unavailable))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
+      (if-let [state (db-state (get servers logical-node) db-name)]
+        (let [store (:store state)]
+          (if (store-open? store)
+            (try
+              (apply d/q q (ddb/new-db store) inputs)
+              (catch Throwable _
+                ::unavailable))
+            ::unavailable))
+        ::unavailable))))
 
 (defn clock-skew-enabled?
   [cluster-id]
@@ -1911,38 +2121,87 @@
   [cluster-id logical-node]
   (locking clusters
     (when-let [cluster (get @clusters cluster-id)]
-      (let [server   (get-in cluster [:servers logical-node])
-            db-name  (:db-name cluster)
-            db-state (db-state server db-name)
-            stopped-info
-            (when db-state
-              {:stopped-at-ms (now-ms)
-               :ha-role (:ha-role db-state)
-               :effective-local-lsn (effective-local-lsn cluster-id logical-node)
-               :node-diagnostics (node-diagnostics cluster-id logical-node)})]
-        (safe-close-conn! (get-in cluster [:admin-conns logical-node]))
-        (safe-stop-server! (get-in cluster [:servers logical-node]))
-        (swap! clusters
-               (fn [clusters*]
-                 (-> clusters*
-                     (assoc-in [cluster-id :admin-conns logical-node] nil)
-                     (assoc-in [cluster-id :servers logical-node] nil)
-                     (assoc-in [cluster-id :stopped-node-info logical-node]
-                               stopped-info)
-                     (update-in [cluster-id :paused-node-info]
-                                dissoc
-                                logical-node)
-                     (update-in [cluster-id :paused-nodes] disj logical-node)
-                     (update-in [cluster-id :live-nodes] disj logical-node))))))))
+      (if (:remote? cluster)
+        (let [{:keys [node-by-name ssh repo-root]} cluster
+              node         (get node-by-name logical-node)
+              stopped-info {:stopped-at-ms (now-ms)
+                            :ha-role (:ha-role (node-diagnostics
+                                                cluster-id
+                                                logical-node))
+                            :effective-local-lsn
+                            (effective-local-lsn cluster-id logical-node)
+                            :node-diagnostics
+                            (node-diagnostics cluster-id logical-node)}]
+          (close-remote-admin-client! cluster-id logical-node)
+          (stop-remote-node-launcher! ssh repo-root node)
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (assoc-in [cluster-id :remote-admin-clients logical-node]
+                                 nil)
+                       (assoc-in [cluster-id :stopped-node-info logical-node]
+                                 stopped-info)
+                       (update-in [cluster-id :paused-node-info]
+                                  dissoc
+                                  logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)
+                       (update-in [cluster-id :live-nodes] disj logical-node)))))
+        (let [server   (get-in cluster [:servers logical-node])
+              db-name  (:db-name cluster)
+              db-state (db-state server db-name)
+              stopped-info
+              (when db-state
+                {:stopped-at-ms (now-ms)
+                 :ha-role (:ha-role db-state)
+                 :effective-local-lsn (effective-local-lsn cluster-id logical-node)
+                 :node-diagnostics (node-diagnostics cluster-id logical-node)})]
+          (safe-close-conn! (get-in cluster [:admin-conns logical-node]))
+          (safe-stop-server! (get-in cluster [:servers logical-node]))
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (assoc-in [cluster-id :admin-conns logical-node] nil)
+                       (assoc-in [cluster-id :servers logical-node] nil)
+                       (assoc-in [cluster-id :stopped-node-info logical-node]
+                                 stopped-info)
+                       (update-in [cluster-id :paused-node-info]
+                                  dissoc
+                                  logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)
+                       (update-in [cluster-id :live-nodes] disj logical-node)))))))))
 
 (defn restart-node!
   [cluster-id logical-node]
   (locking clusters
-    (let [{:keys [db-name schema base-opts node-by-name verbose?
-                  control-backend node-ha-opt-overrides]}
+    (let [{:keys [db-name base-opts node-by-name verbose?
+                  control-backend node-ha-opt-overrides remote?
+                  ssh repo-root remote-config-path setup-timeout-ms]}
           (get @clusters cluster-id)]
-      (if (get-in @clusters [cluster-id :servers logical-node])
+      (cond
+        (and (not remote?)
+             (get-in @clusters [cluster-id :servers logical-node]))
         true
+
+        remote?
+        (let [node (get node-by-name logical-node)]
+          (upload-remote-config! ssh node remote-config-path)
+          (start-remote-node-launcher! ssh repo-root node verbose?)
+          (wait-for-remote-node-running! ssh
+                                         node
+                                         (or setup-timeout-ms
+                                             cluster-timeout-ms))
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (update-in [cluster-id :stopped-node-info]
+                                  dissoc logical-node)
+                       (update-in [cluster-id :paused-node-info]
+                                  dissoc logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)
+                       (update-in [cluster-id :live-nodes] conj logical-node))))
+          true)
+
+        :else
         (let [node     (get node-by-name logical-node)
               override (get node-ha-opt-overrides logical-node)
               server   (start-server! node verbose?)]
@@ -2023,35 +2282,54 @@
                  {:cluster-id cluster-id
                   :logical-node logical-node}))
       (when-not (contains? (:paused-nodes cluster) logical-node)
-        (let [server   (get-in cluster [:servers logical-node])
-              db-name  (:db-name cluster)
-              db-state (db-state server db-name)
-              conn     (get-in cluster [:admin-conns logical-node])
-              pause-info
-              (when db-state
-                {:paused-at-ms (now-ms)
-                 :ha-role (:ha-role db-state)
-                 :effective-local-lsn (effective-local-lsn cluster-id logical-node)
-                 :node-diagnostics (node-diagnostics cluster-id logical-node)})]
-          ;; Close the harness admin connection before stalling the server loop.
-          ;; Once the node is paused, remote close can block forever waiting on a
-          ;; server that no longer services requests.
-          (safe-close-conn! conn)
-          (when-let [authority (:ha-authority db-state)]
-            (#'srv/stop-ha-renew-loop db-state)
-            (ctrl/stop-authority! authority))
-          (when server
-            ;; Pause emulation keeps the listener bound, so drop live channels
-            ;; before halting the event loop to keep clients from hanging.
-            (disconnect-server-client-channels! server)
-            (pause-server-loop! server))
-          (swap! clusters
-                 (fn [clusters*]
-                   (-> clusters*
-                       (assoc-in [cluster-id :admin-conns logical-node] nil)
-                       (assoc-in [cluster-id :paused-node-info logical-node]
-                                 pause-info)
-                       (update-in [cluster-id :paused-nodes] conj logical-node)))))))
+        (if (:remote? cluster)
+          (let [{:keys [node-by-name ssh]} cluster
+                node       (get node-by-name logical-node)
+                pause-info {:paused-at-ms (now-ms)
+                            :ha-role (:ha-role (node-diagnostics
+                                                cluster-id
+                                                logical-node))
+                            :effective-local-lsn
+                            (effective-local-lsn cluster-id logical-node)
+                            :node-diagnostics
+                            (node-diagnostics cluster-id logical-node)}]
+            (close-remote-admin-client! cluster-id logical-node)
+            (signal-remote-node! ssh node "STOP")
+            (swap! clusters
+                   (fn [clusters*]
+                     (-> clusters*
+                         (assoc-in [cluster-id :paused-node-info logical-node]
+                                   pause-info)
+                         (update-in [cluster-id :paused-nodes] conj logical-node)))))
+          (let [server   (get-in cluster [:servers logical-node])
+                db-name  (:db-name cluster)
+                db-state (db-state server db-name)
+                conn     (get-in cluster [:admin-conns logical-node])
+                pause-info
+                (when db-state
+                  {:paused-at-ms (now-ms)
+                   :ha-role (:ha-role db-state)
+                   :effective-local-lsn (effective-local-lsn cluster-id logical-node)
+                   :node-diagnostics (node-diagnostics cluster-id logical-node)})]
+            ;; Close the harness admin connection before stalling the server loop.
+            ;; Once the node is paused, remote close can block forever waiting on a
+            ;; server that no longer services requests.
+            (safe-close-conn! conn)
+            (when-let [authority (:ha-authority db-state)]
+              (#'srv/stop-ha-renew-loop db-state)
+              (ctrl/stop-authority! authority))
+            (when server
+              ;; Pause emulation keeps the listener bound, so drop live channels
+              ;; before halting the event loop to keep clients from hanging.
+              (disconnect-server-client-channels! server)
+              (pause-server-loop! server))
+            (swap! clusters
+                   (fn [clusters*]
+                     (-> clusters*
+                         (assoc-in [cluster-id :admin-conns logical-node] nil)
+                         (assoc-in [cluster-id :paused-node-info logical-node]
+                                   pause-info)
+                         (update-in [cluster-id :paused-nodes] conj logical-node))))))))
     true))
 
 (defn resume-node!
@@ -2062,30 +2340,41 @@
         (u/raise "Cannot resume unpaused Jepsen node"
                  {:cluster-id cluster-id
                   :logical-node logical-node}))
-      (let [{:keys [db-name node-by-name control-backend]} cluster
-            server   (get-in cluster [:servers logical-node])
-            node     (get node-by-name logical-node)
-            _        (when-not server
-                       (u/raise "Cannot resume missing Jepsen server"
-                                {:cluster-id cluster-id
-                                 :logical-node logical-node}))
-            _        (when-not node
-                       (u/raise "Cannot resume unknown Jepsen node"
-                                {:cluster-id cluster-id
-                                 :logical-node logical-node}))]
-        (srv/start server)
-        (rebuild-node-ha-runtime! control-backend server db-name)
-        ;; The harness admin connection is only used for setup/teardown.
-        ;; Reopening it synchronously here can wedge the nemesis on a node
-        ;; that is still coming back, so leave it nil after resume.
-        (swap! clusters
-               (fn [clusters*]
-                 (-> clusters*
-                     (assoc-in [cluster-id :admin-conns logical-node] nil)
-                     (update-in [cluster-id :paused-node-info]
-                                dissoc
-                                logical-node)
-                     (update-in [cluster-id :paused-nodes] disj logical-node))))))
+      (if (:remote? cluster)
+        (let [{:keys [node-by-name ssh]} cluster
+              node (get node-by-name logical-node)]
+          (signal-remote-node! ssh node "CONT")
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (update-in [cluster-id :paused-node-info]
+                                  dissoc
+                                  logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)))))
+        (let [{:keys [db-name node-by-name control-backend]} cluster
+              server   (get-in cluster [:servers logical-node])
+              node     (get node-by-name logical-node)
+              _        (when-not server
+                         (u/raise "Cannot resume missing Jepsen server"
+                                  {:cluster-id cluster-id
+                                   :logical-node logical-node}))
+              _        (when-not node
+                         (u/raise "Cannot resume unknown Jepsen node"
+                                  {:cluster-id cluster-id
+                                   :logical-node logical-node}))]
+          (srv/start server)
+          (rebuild-node-ha-runtime! control-backend server db-name)
+          ;; The harness admin connection is only used for setup/teardown.
+          ;; Reopening it synchronously here can wedge the nemesis on a node
+          ;; that is still coming back, so leave it nil after resume.
+          (swap! clusters
+                 (fn [clusters*]
+                   (-> clusters*
+                       (assoc-in [cluster-id :admin-conns logical-node] nil)
+                       (update-in [cluster-id :paused-node-info]
+                                  dissoc
+                                  logical-node)
+                       (update-in [cluster-id :paused-nodes] disj logical-node)))))))
     true))
 
 (defn wedge-node-storage!
@@ -2108,6 +2397,13 @@
       (swap! clusters update-in [cluster-id :storage-faults] dissoc logical-node)
       fault)))
 
+(defn- safe-stop-remote-launcher!
+  [ssh repo-root node]
+  (try
+    (stop-remote-node-launcher! ssh repo-root node)
+    (catch Throwable _
+      nil)))
+
 (defn- resolve-work-dir
   [cluster-id test]
   (if-let [base-dir (:work-dir test)]
@@ -2119,6 +2415,93 @@
     (let [dir (u/tmp-dir (str "datalevin-jepsen-" cluster-id "-" (UUID/randomUUID)))]
       (u/create-dirs dir)
       dir)))
+
+(defn- init-remote-cluster!
+  [cluster-id test {:keys [config config-path ssh topology workload]}]
+  (let [data-nodes       (:data-nodes topology)
+        control-nodes    (:control-nodes topology)
+        control-only     (:control-only-nodes topology)
+        _                (when (seq control-only)
+                           (u/raise "Remote Jepsen cluster setup does not support control-only nodes"
+                                    {:cluster-id cluster-id
+                                     :control-only-nodes
+                                     (mapv :logical-node control-only)}))
+        db-name          (:db-name config)
+        schema           (:schema workload)
+        control-backend  (:control-backend config)
+        base-opts        (remote/base-ha-opts config data-nodes control-nodes)
+        setup-timeout-ms (cluster-setup-timeout-ms base-opts)
+        verbose?         (boolean (:verbose test))
+        all-nodes        (vec control-nodes)]
+    (try
+      (doseq [node all-nodes]
+        (upload-remote-config! ssh node config-path))
+      (doseq [node all-nodes]
+        (safe-stop-remote-launcher! ssh (:repo-root config) node))
+      (doseq [node all-nodes]
+        (start-remote-node-launcher! ssh (:repo-root config) node verbose?))
+      (doseq [node all-nodes]
+        (wait-for-remote-node-running! ssh node setup-timeout-ms))
+      (let [cluster {:cluster-id      cluster-id
+                     :remote?         true
+                     :db-name         db-name
+                     :schema          schema
+                     :control-backend control-backend
+                     :base-opts       base-opts
+                     :verbose?        verbose?
+                     :repo-root       (:repo-root config)
+                     :remote-config-path config-path
+                     :setup-timeout-ms setup-timeout-ms
+                     :nodes           data-nodes
+                     :control-nodes   control-nodes
+                     :data-node-names (vec (map :logical-node data-nodes))
+                     :control-node-names (vec (map :logical-node control-nodes))
+                     :control-only-node-names []
+                     :node-by-id      (into {}
+                                            (map (juxt :node-id :logical-node))
+                                            control-nodes)
+                     :node-by-name    (into {}
+                                            (map (juxt :logical-node identity))
+                                            control-nodes)
+                     :endpoint->node  (into {}
+                                            (map (juxt :endpoint :logical-node))
+                                            control-nodes)
+                     :peer-id->node   (into {}
+                                            (map (juxt :peer-id :logical-node))
+                                            control-nodes)
+                     :servers         {}
+                     :control-authorities {}
+                     :admin-conns     {}
+                     :remote-admin-clients {}
+                     :ssh             ssh
+                     :live-nodes      (set (map :logical-node data-nodes))
+                     :network-grudge  (sorted-map)
+                     :dropped-links   #{}
+                     :link-behaviors  (sorted-map)
+                     :network-behavior nil
+                     :paused-nodes    #{}
+                     :paused-node-info {}
+                     :node-ha-opt-overrides {}
+                     :storage-faults  {}
+                     :stopped-node-info {}
+                     :teardown-nodes  #{}}]
+        (swap! clusters assoc cluster-id cluster)
+        (wait-for-single-leader! cluster-id setup-timeout-ms)
+        cluster)
+      (catch Throwable e
+        (doseq [node (reverse all-nodes)]
+          (safe-stop-remote-launcher! ssh (:repo-root config) node))
+        (swap! clusters dissoc cluster-id)
+        (throw e)))))
+
+(defn- teardown-remote-cluster!
+  [cluster-id]
+  (when-let [{:keys [node-by-name ssh repo-root]} (get @clusters cluster-id)]
+    (doseq [logical-node (keys (:remote-admin-clients (get @clusters cluster-id)))]
+      (close-remote-admin-client! cluster-id logical-node))
+    (doseq [node (reverse (vals node-by-name))]
+      (safe-stop-remote-launcher! ssh repo-root node))
+    (swap! clusters dissoc cluster-id)))
 
 (defn- init-cluster!
   [cluster-id test]
@@ -2302,9 +2685,30 @@
             (teardown-cluster! cluster-id)))))
     this))
 
+(defrecord RemoteClusterDB [cluster-id remote-spec]
+  db/DB
+  (setup! [this test _node]
+    (locking clusters
+      (when-not (cluster-state cluster-id)
+        (init-remote-cluster! cluster-id test remote-spec)))
+    this)
+
+  (teardown! [this test node]
+    (locking clusters
+      (when-let [cluster (cluster-state cluster-id)]
+        (let [teardown-nodes (conj (:teardown-nodes cluster) node)]
+          (swap! clusters assoc-in [cluster-id :teardown-nodes] teardown-nodes)
+          (when (= teardown-nodes (set (:nodes test)))
+            (teardown-remote-cluster! cluster-id)))))
+    this))
+
 (defn db
   [cluster-id]
   (->LocalClusterDB cluster-id))
+
+(defn remote-db
+  [cluster-id remote-spec]
+  (->RemoteClusterDB cluster-id remote-spec))
 
 (defn net
   [cluster-id]

@@ -10,95 +10,15 @@
 (ns datalevin.embedding-test
   (:require
    [clojure.java.io :as io]
-   [clojure.string :as s]
    [clojure.test :refer [deftest is testing]]
    [datalevin.embedding :as sut]
-   [datalevin.util :as u])
-  (:import
-   [java.nio.file Files StandardCopyOption]))
-
-(def ^:private default-embed-cache-env
-  "DTLV_TEST_EMBED_CACHE_DIR")
-
-(def ^:private skip-real-embed-test-env
-  "DTLV_SKIP_REAL_EMBED_TEST")
+   [datalevin.embedding-test-support :as test-support]
+   [datalevin.util :as u]))
 
 ;; Integration test usage:
 ;; * DTLV_TEST_EMBED_CACHE_DIR overrides the cache location
 ;; * DTLV_SKIP_REAL_EMBED_TEST=1 skips the real default-model integration test
 ;; * DTLV_TEST_LLAMA_EMBED_MODEL=/path/model.gguf uses an explicit model path
-
-(defn- non-blank-env
-  [name]
-  (let [value (System/getenv name)]
-    (when (and value (not (s/blank? value)))
-      value)))
-
-(defn- truthy-env?
-  [name]
-  (contains? #{"1" "true" "yes" "on"}
-             (some-> (non-blank-env name) s/lower-case)))
-
-(defn- ensure-dir!
-  [path]
-  (.mkdirs (io/file path))
-  path)
-
-(defn- default-embed-cache-dir
-  []
-  (or (non-blank-env default-embed-cache-env)
-      (when-let [xdg-cache-home (non-blank-env "XDG_CACHE_HOME")]
-        (str xdg-cache-home u/+separator+ "datalevin"
-             u/+separator+ "embed"))
-      (str (System/getProperty "user.home")
-           u/+separator+ ".cache"
-           u/+separator+ "datalevin"
-           u/+separator+ "embed")))
-
-(defn- ensure-cached-default-model!
-  []
-  (let [embed-dir  (ensure-dir! (default-embed-cache-dir))
-        model-path (str embed-dir u/+separator+ sut/default-model-file)]
-    (when-not (.exists (io/file model-path))
-      (#'datalevin.embedding/ensure-default-model! {:embed-dir embed-dir}))
-    model-path))
-
-(defn- link-or-copy-file!
-  [source target]
-  (let [target-file (io/file target)]
-    (.mkdirs (.getParentFile target-file))
-    (when-not (.exists target-file)
-      (let [source-path (.toPath (io/file source))
-            target-path (.toPath target-file)]
-        (try
-          (Files/createLink target-path source-path)
-          (catch Exception _
-            (Files/copy source-path target-path
-                        (into-array java.nio.file.CopyOption
-                                    [StandardCopyOption/REPLACE_EXISTING]))))))
-    target))
-
-(defn- install-cached-model-into-db-root!
-  [source-model dir]
-  (let [embed-dir        (str dir u/+separator+ "embed")
-        target-model     (str embed-dir u/+separator+ sut/default-model-file)
-        source-manifest  (str source-model ".edn")
-        target-manifest  (str target-model ".edn")]
-    (link-or-copy-file! source-model target-model)
-    (when (.exists (io/file source-manifest))
-      (link-or-copy-file! source-manifest target-manifest))
-    target-model))
-
-(defn- integration-provider-spec!
-  [dir]
-  (when-not (truthy-env? skip-real-embed-test-env)
-    (if-let [model (non-blank-env "DTLV_TEST_LLAMA_EMBED_MODEL")]
-      {:provider :default
-       :model    model}
-      (do
-        (install-cached-model-into-db-root! (ensure-cached-default-model!) dir)
-        {:provider :default
-         :dir      dir}))))
 
 (deftest helper-dispatch-test
   (let [closed?  (atom false)
@@ -292,7 +212,7 @@
     (let [dir (u/tmp-dir (str "embed-integration-" (System/nanoTime)))]
       (try
         (.mkdirs (io/file dir))
-        (when-let [provider-spec (integration-provider-spec! dir)]
+        (when-let [provider-spec (test-support/integration-provider-spec! dir)]
           (with-open [provider (sut/init-embedding-provider provider-spec)]
             (let [dims  (sut/embedding-dimensions provider)
                   cat-1 (sut/embed-text provider "cat")

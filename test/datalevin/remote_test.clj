@@ -388,32 +388,26 @@
         dest-root          (u/tmp-dir (str "remote-copy-cleanup-failure-"
                                            (UUID/randomUUID)))
         dest               (str dest-root u/+separator+ "copy")
-        cleanup-attempted? (atom false)
-        copied-store*      (atom nil)]
+        cleanup-attempted  (promise)
+        copied-store*      (atom nil)
+        cleanup-fn*        @#'srv/cleanup-copy-tmp-dir-fn*
+        original-cleanup   @cleanup-fn*]
     (try
       (dc/open-dbi store "a")
       (dc/transact-kv store [[:put "a" "hello" "world"]])
-      (let [copy-meta
-            (with-redefs-fn
-              {#'srv/cleanup-copy-tmp-dir!
-               (fn [_]
-                 (reset! cleanup-attempted? true)
-                 (throw (ex-info "copy cleanup failed" {})))}
-              (fn []
-                (if/copy store dest false)))]
-        (let [deadline (+ (System/currentTimeMillis) 5000)]
-          (loop []
-            (when (and (not @cleanup-attempted?)
-                       (< (System/currentTimeMillis) deadline))
-              (Thread/sleep 25)
-              (recur))))
-        (is @cleanup-attempted?)
+      (reset! cleanup-fn*
+              (fn [_]
+                (deliver cleanup-attempted true)
+                (throw (ex-info "copy cleanup failed" {}))))
+      (let [copy-meta (if/copy store dest false)]
+        (is (= true (deref cleanup-attempted 30000 false)))
         (is (map? copy-meta))
         (reset! copied-store* (l/open-kv dest))
         (dc/open-dbi @copied-store* "a")
         (is (= "world"
                (dc/get-value @copied-store* "a" "hello"))))
       (finally
+        (reset! cleanup-fn* original-cleanup)
         (when-let [copied-store @copied-store*]
           (dc/close-kv copied-store))
         (dc/close-kv store)

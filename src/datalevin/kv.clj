@@ -2877,7 +2877,15 @@
          (= (long (min file-bytes
                        (long active-offset)))
             (long (or (:scan-bytes entry) -1)))
-         (and (= file-bytes (long (:file-bytes entry)))
+         (and ;; Active-segment scans can race a stale runtime offset and cache a
+              ;; partial record set for bytes that are already visible on disk.
+              ;; Once that segment closes, do not trust the cached entry unless
+              ;; it covered the full file at cache time.
+              (= (long (or (:scan-bytes entry)
+                           (:file-bytes entry)
+                           -1))
+                 (long (:file-bytes entry)))
+              (= file-bytes (long (:file-bytes entry)))
               (= modified-ms (long (:modified-ms entry)))))))
 
 (defn- txlog-segment-cache-entry

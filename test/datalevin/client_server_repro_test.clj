@@ -4,19 +4,22 @@
    [datalevin.client :as cl]
    [datalevin.constants :as c]
    [datalevin.server :as srv]
+   [datalevin.test.core :as tdc]
    [datalevin.util :as u])
   (:import
    [java.util UUID]))
 
 (defn- with-server
   [f]
-  (let [dir    (u/tmp-dir (str "client-server-repro-" (UUID/randomUUID)))
+  (let [port   (tdc/allocate-port)
+        dir    (u/tmp-dir (str "client-server-repro-" (UUID/randomUUID)))
         server (binding [c/*db-background-sampling?* false]
-                 (srv/create {:port c/default-port
+                 (srv/create {:port port
                               :root dir}))]
     (try
-      (srv/start server)
-      (f server)
+      (binding [cl/*default-port* port]
+        (srv/start server)
+        (f server))
       (finally
         (srv/stop server)
         (u/delete-files dir)

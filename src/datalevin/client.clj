@@ -215,9 +215,12 @@
     (when-let [[_ username password] (re-find #"(.+):(.+)" user-info)]
       {:username username :password password})))
 
+(def ^:dynamic *default-port*
+  c/default-port)
+
 (defn ^:no-doc parse-port
   [^URI uri]
-  (let [p (.getPort uri)] (if (= -1 p) c/default-port p)))
+  (let [p (.getPort uri)] (if (= -1 p) *default-port* p)))
 
 (defn ^:no-doc parse-db
   "Extract the identifier of database from URI. A database is uniquely

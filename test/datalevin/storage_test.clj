@@ -136,6 +136,54 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest closed-txlog-read-reloads-partial-active-segment-cache-test
+  (let [dir       (repo-tmp-dir "storage-closed-txlog-cache-")
+        txlog-dir (str dir java.io.File/separator "txlog")
+        rows-for  (fn [lsn]
+                    [[:put "active" lsn (* 10 lsn) :long :long]])
+        path-for  (fn [segment-id]
+                    (str txlog-dir
+                         java.io.File/separator
+                         (format "segment-%016d.wal" (long segment-id))))
+        write-segment!
+        (fn [segment-id lsns]
+          (with-open [out (io/output-stream (path-for segment-id))]
+            (doseq [lsn lsns]
+              (.write out
+                      ^bytes
+                      (txlog/encode-record
+                       (txlog/encode-commit-row-payload
+                        lsn
+                        (+ 1000 lsn)
+                        (rows-for lsn)))))))]
+    (try
+      (u/create-dirs txlog-dir)
+      (write-segment! 1 [9 10])
+      (write-segment! 2 [11])
+      (write-segment! 3 [12])
+      (let [segment-2-file (io/file (path-for 2))
+            segment-2-path (.getPath ^java.io.File segment-2-file)
+            segment-2-bytes (long (.length ^java.io.File segment-2-file))
+            segment-2-mtime (long (.lastModified ^java.io.File segment-2-file))
+            state {:dir txlog-dir
+                   :txlog-records-cache
+                   (volatile! {2 {:segment-id 2
+                                  :path segment-2-path
+                                  :file-bytes segment-2-bytes
+                                  :modified-ms segment-2-mtime
+                                  :scan-bytes 0
+                                  :min-lsn nil
+                                  :records []}})
+                   :segment-id (volatile! 4)
+                   :segment-offset (volatile! 0)}
+            records (kv/txlog-records state 11)
+            refreshed-entry (get @(:txlog-records-cache state) 2)]
+        (is (= [11 12] (mapv :lsn records)))
+        (is (= [11] (mapv :lsn (:records refreshed-entry))))
+        (is (= segment-2-bytes (long (:scan-bytes refreshed-entry)))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest wal-local-payload-lsn-tracks-successful-apply-test
   (let [dir   (repo-tmp-dir "storage-local-payload-lsn-")
         store (sut/open dir nil {:db-name "local-payload"

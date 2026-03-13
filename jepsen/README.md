@@ -178,6 +178,20 @@ In the witness case, start `n3` with the same `start-remote-node` command; the
 launcher will detect that it is control-only and run the control authority
 without opening a Datalevin data store.
 
+Run Jepsen against an already-launched remote cluster with the same shared
+config:
+
+```bash
+cd jepsen
+lein run test --remote-config remote-cluster.example.edn --nemesis leader-failover --time-limit 30 --rate 10
+```
+
+In remote mode, the workload, db name, HA group identity, node topology, and
+control backend come from the shared EDN config instead of the usual local
+cluster CLI flags. The current remote runner supports the standard data-node
+topologies and transport-level nemeses; witness-only topologies and a few
+local-only fault injectors still use the local harness for now.
+
 Run a local append workload:
 
 ```bash

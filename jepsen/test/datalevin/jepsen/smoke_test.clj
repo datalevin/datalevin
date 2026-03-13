@@ -2,7 +2,6 @@
   (:require
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
-   [datalevin.client :as cl]
    [datalevin.core :as d]
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.local :as local]
@@ -206,109 +205,144 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest append-workload-smoke-test
-  (let [workload (append/workload {:key-count 4
-                                   :min-txn-length 2
-                                   :max-txn-length 3
-                                   :max-writes-per-key 8})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= append/schema (:schema workload)))))
+(defn- assert-workload-shape!
+  [workload {:keys [schema final-generator? nodes control-nodes
+                    cluster-opts? runtime-opts-fn?]}]
+  (is (some? (:client workload)))
+  (is (some? (:generator workload)))
+  (is (some? (:checker workload)))
+  (is (= schema (:schema workload)))
+  (when (some? final-generator?)
+    (is (= final-generator?
+           (some? (:final-generator workload)))))
+  (when (some? nodes)
+    (is (= nodes (:nodes workload))))
+  (when (some? control-nodes)
+    (is (= control-nodes (:datalevin/control-nodes workload))))
+  (when (some? cluster-opts?)
+    (is (= cluster-opts?
+           (map? (:datalevin/cluster-opts workload)))))
+  (when runtime-opts-fn?
+    (is (ifn? (:datalevin/server-runtime-opts-fn workload)))))
 
-(deftest append-cas-workload-smoke-test
-  (let [workload (append-cas/workload {:key-count 4
-                                       :min-txn-length 2
-                                       :max-txn-length 3
-                                       :max-writes-per-key 8})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= append-cas/schema (:schema workload)))))
+(def ^:private workload-construction-cases
+  [{:label :append
+    :builder append/workload
+    :opts {:key-count 4
+           :min-txn-length 2
+           :max-txn-length 3
+           :max-writes-per-key 8}
+    :schema append/schema}
+   {:label :append-cas
+    :builder append-cas/workload
+    :opts {:key-count 4
+           :min-txn-length 2
+           :max-txn-length 3
+           :max-writes-per-key 8}
+    :schema append-cas/schema}
+   {:label :grant
+    :builder grant/workload
+    :opts {:key-count 4}
+    :schema grant/schema
+    :final-generator? true}
+   {:label :bank
+    :builder bank/workload
+    :opts {:key-count 4
+           :account-balance 100
+           :max-transfer 5}
+    :schema bank/schema
+    :final-generator? true}
+   {:label :degraded-rejoin
+    :builder degraded-rejoin/workload
+    :opts {:key-count 4}
+    :schema degraded-rejoin/schema}
+   {:label :snapshot-db-identity-rejoin
+    :builder degraded-rejoin/db-identity-workload
+    :opts {:key-count 4}
+    :schema degraded-rejoin/schema}
+   {:label :snapshot-checksum-rejoin
+    :builder degraded-rejoin/checksum-workload
+    :opts {:key-count 4}
+    :schema degraded-rejoin/schema}
+   {:label :snapshot-manifest-corruption-rejoin
+    :builder degraded-rejoin/manifest-corruption-workload
+    :opts {:key-count 4}
+    :schema degraded-rejoin/schema}
+   {:label :snapshot-copy-corruption-rejoin
+    :builder degraded-rejoin/copy-corruption-workload
+    :opts {:key-count 4}
+    :schema degraded-rejoin/schema}
+   {:label :witness-topology
+    :builder witness-topology/workload
+    :opts {:key-count 4}
+    :schema witness-topology/schema
+    :nodes ["n1" "n2"]
+    :control-nodes ["n1" "n2" "n3"]}
+   {:label :membership-drift
+    :builder membership-drift/workload
+    :opts {:key-count 4}
+    :schema membership-drift/schema}
+   {:label :membership-drift-live
+    :builder membership-drift/live-workload
+    :opts {:key-count 4}
+    :schema membership-drift/schema}
+   {:label :giant-values
+    :builder giant-values/workload
+    :opts {:key-count 4
+           :nodes ["n1" "n2" "n3"]}
+    :schema giant-values/schema}
+   {:label :fencing
+    :builder fencing/workload
+    :opts {}
+    :schema fencing/schema
+    :final-generator? true}
+   {:label :fencing-retry
+    :builder fencing-retry/workload
+    :opts {:key-count 4}
+    :schema fencing-retry/schema
+    :nodes ["n1" "n2"]
+    :control-nodes ["n1" "n2" "n3"]}
+   {:label :udf-readiness
+    :builder udf-readiness/workload
+    :opts {:key-count 4}
+    :schema udf-readiness/schema
+    :nodes ["n1" "n2" "n3"]
+    :runtime-opts-fn? true}
+   {:label :internal
+    :builder internal/workload
+    :opts {}
+    :schema internal/schema}
+   {:label :identity-upsert
+    :builder identity-upsert/workload
+    :opts {}
+    :schema identity-upsert/schema}
+   {:label :index-consistency
+    :builder index-consistency/workload
+    :opts {}
+    :schema index-consistency/schema}
+   {:label :register
+    :builder register/workload
+    :opts {:key-count 4
+           :nodes ["n1" "n2" "n3"]}
+    :schema register/schema}
+   {:label :tx-fn-register
+    :builder tx-fn-register/workload
+    :opts {:key-count 4
+           :nodes ["n1" "n2" "n3"]}
+    :schema tx-fn-register/schema}
+   {:label :rejoin-bootstrap
+    :builder rejoin-bootstrap/workload
+    :opts {:key-count 4
+           :nodes ["n1" "n2" "n3"]}
+    :schema rejoin-bootstrap/schema
+    :final-generator? true
+    :cluster-opts? true}])
 
-(deftest grant-workload-smoke-test
-  (let [workload (grant/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (some? (:final-generator workload)))
-    (is (= grant/schema (:schema workload)))))
-
-(deftest bank-workload-smoke-test
-  (let [workload (bank/workload {:key-count 4
-                                 :account-balance 100
-                                 :max-transfer 5})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (some? (:final-generator workload)))
-    (is (= bank/schema (:schema workload)))))
-
-(deftest degraded-rejoin-workload-smoke-test
-  (let [workload (degraded-rejoin/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= degraded-rejoin/schema (:schema workload)))))
-
-(deftest snapshot-db-identity-rejoin-workload-smoke-test
-  (let [workload (degraded-rejoin/db-identity-workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= degraded-rejoin/schema (:schema workload)))))
-
-(deftest snapshot-checksum-rejoin-workload-smoke-test
-  (let [workload (degraded-rejoin/checksum-workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= degraded-rejoin/schema (:schema workload)))))
-
-(deftest snapshot-manifest-corruption-rejoin-workload-smoke-test
-  (let [workload (degraded-rejoin/manifest-corruption-workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= degraded-rejoin/schema (:schema workload)))))
-
-(deftest snapshot-copy-corruption-rejoin-workload-smoke-test
-  (let [workload (degraded-rejoin/copy-corruption-workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= degraded-rejoin/schema (:schema workload)))))
-
-(deftest witness-topology-workload-smoke-test
-  (let [workload (witness-topology/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= witness-topology/schema (:schema workload)))
-    (is (= ["n1" "n2"] (:nodes workload)))
-    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes workload)))))
-
-(deftest membership-drift-workload-smoke-test
-  (let [workload (membership-drift/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= membership-drift/schema (:schema workload)))))
-
-(deftest membership-drift-live-workload-smoke-test
-  (let [workload (membership-drift/live-workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= membership-drift/schema (:schema workload)))))
-
-(deftest giant-values-workload-smoke-test
-  (let [workload (giant-values/workload {:key-count 4
-                                         :nodes ["n1" "n2" "n3"]})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= giant-values/schema (:schema workload)))))
+(deftest workload-construction-smoke-test
+  (doseq [{:keys [label builder opts] :as expected}
+          workload-construction-cases]
+    (testing (name label)
+      (assert-workload-shape! (builder opts) expected))))
 
 (deftest bank-workload-rejects-too-few-accounts-test
   (is (thrown-with-msg?
@@ -318,38 +352,409 @@
                        :account-balance 100
                        :max-transfer 5}))))
 
-(deftest fencing-workload-smoke-test
-  (let [workload (fencing/workload {})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (some? (:final-generator workload)))
-    (is (= fencing/schema (:schema workload)))))
+(defn- assert-datalevin-test-map!
+  [test-map {:keys [nodes control-backend nemesis-faults control-nodes
+                    networked? runtime-opts-fn?]}]
+  (is (= nodes (:nodes test-map)))
+  (is (= control-backend (:control-backend test-map)))
+  (is (some? (:db test-map)))
+  (is (some? (:client test-map)))
+  (is (some? (:generator test-map)))
+  (is (some? (:checker test-map)))
+  (when (some? nemesis-faults)
+    (is (= nemesis-faults (:datalevin/nemesis-faults test-map))))
+  (when (seq nemesis-faults)
+    (is (some? (:nemesis test-map))))
+  (when (some? control-nodes)
+    (is (= control-nodes (:datalevin/control-nodes test-map))))
+  (when networked?
+    (is (some? (:net test-map))))
+  (when runtime-opts-fn?
+    (is (ifn? (:datalevin/server-runtime-opts-fn test-map)))))
 
-(deftest fencing-retry-workload-smoke-test
-  (let [workload (fencing-retry/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= fencing-retry/schema (:schema workload)))
-    (is (= ["n1" "n2"] (:nodes workload)))
-    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes workload)))))
+(defn- with-temp-remote-config
+  [config f]
+  (let [dir  (u/tmp-dir (str "jepsen-remote-config-" (UUID/randomUUID)))
+        path (str dir u/+separator+ "cluster.edn")]
+    (u/create-dirs dir)
+    (spit path (pr-str config))
+    (try
+      (f path)
+      (finally
+        (u/delete-files dir)))))
 
-(deftest udf-readiness-workload-smoke-test
-  (let [workload (udf-readiness/workload {:key-count 4})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= udf-readiness/schema (:schema workload)))
-    (is (= ["n1" "n2" "n3"] (:nodes workload)))
-    (is (ifn? (:datalevin/server-runtime-opts-fn workload)))))
+(def ^:private datalevin-test-construction-cases
+  [{:label :append
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 2
+           :max-txn-length 3
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :append-cas
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :append-cas
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 2
+           :max-txn-length 3
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :grant
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :grant
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :bank
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :bank
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :account-balance 100
+           :max-transfer 5
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :giant-values
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :giant-values
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :fencing
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :fencing
+           :rate 10
+           :time-limit 5
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :internal
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :internal
+           :rate 10
+           :time-limit 5
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :identity-upsert
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :identity-upsert
+           :rate 10
+           :time-limit 5
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :index-consistency
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :index-consistency
+           :rate 10
+           :time-limit 5
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :register
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :register
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :tx-fn-register
+    :opts {:db-name "smoke"
+           :control-backend :in-memory
+           :workload :tx-fn-register
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :in-memory
+               :nemesis-faults []}}
+   {:label :rejoin-bootstrap
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :rejoin-bootstrap
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :degraded-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :degraded-rejoin
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :snapshot-db-identity-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :snapshot-db-identity-rejoin
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :snapshot-checksum-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :snapshot-checksum-rejoin
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :snapshot-manifest-corruption-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :snapshot-manifest-corruption-rejoin
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :snapshot-copy-corruption-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :snapshot-copy-corruption-rejoin
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :witness-topology
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :witness-topology
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []
+               :control-nodes ["n1" "n2" "n3"]}}
+   {:label :membership-drift
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :membership-drift
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :membership-drift-live
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :membership-drift-live
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :fencing-retry
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :fencing-retry
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []
+               :control-nodes ["n1" "n2" "n3"]}}
+   {:label :udf-readiness
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :udf-readiness
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []
+               :runtime-opts-fn? true}}])
 
-(deftest internal-workload-smoke-test
-  (let [workload (internal/workload {})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= internal/schema (:schema workload)))))
+(deftest datalevin-test-construction-smoke-test
+  (doseq [{:keys [label opts expected]} datalevin-test-construction-cases]
+    (testing (name label)
+      (assert-datalevin-test-map! (core/datalevin-test opts)
+                                  expected))))
+
+(deftest datalevin-test-remote-construction-smoke-test
+  (with-temp-remote-config
+    {:db-name "remote-smoke"
+     :workload :register
+     :group-id "remote-smoke-group"
+     :db-identity "remote-smoke-db"
+     :repo-root "/srv/datalevin"
+     :nodes [{:logical-node "n1"
+              :node-id 1
+              :endpoint "10.0.0.11:8898"
+              :peer-id "10.0.0.11:15001"
+              :root "/var/tmp/dtlv-jepsen/n1"}
+             {:logical-node "n2"
+              :node-id 2
+              :endpoint "10.0.0.12:8898"
+              :peer-id "10.0.0.12:15001"
+              :root "/var/tmp/dtlv-jepsen/n2"}
+             {:logical-node "n3"
+              :node-id 3
+              :endpoint "10.0.0.13:8898"
+              :peer-id "10.0.0.13:15001"
+              :root "/var/tmp/dtlv-jepsen/n3"}]}
+    (fn [config-path]
+      (let [test-map (core/datalevin-test
+                      {:remote-config config-path
+                       :workload :append
+                       :rate 10
+                       :time-limit 5
+                       :nemesis [:leader-failover]})]
+        (assert-datalevin-test-map!
+         test-map
+         {:nodes ["n1" "n2" "n3"]
+          :control-backend :sofa-jraft
+          :nemesis-faults [:leader-failover]
+          :networked? true})
+        (is (= "remote-smoke" (:db-name test-map)))
+        (is (= :register
+               (-> test-map :name (str/split #" ") first keyword)))
+        (is (= config-path (:datalevin/remote-config test-map)))))))
+
+(deftest datalevin-test-remote-rejects-local-only-workload-smoke-test
+  (with-temp-remote-config
+    {:db-name "remote-local-only"
+     :workload :rejoin-bootstrap
+     :group-id "remote-local-only-group"
+     :db-identity "remote-local-only-db"
+     :repo-root "/srv/datalevin"
+     :nodes [{:logical-node "n1"
+              :node-id 1
+              :endpoint "10.0.0.11:8898"
+              :peer-id "10.0.0.11:15001"
+              :root "/var/tmp/dtlv-jepsen/n1"}
+             {:logical-node "n2"
+              :node-id 2
+              :endpoint "10.0.0.12:8898"
+              :peer-id "10.0.0.12:15001"
+              :root "/var/tmp/dtlv-jepsen/n2"}
+             {:logical-node "n3"
+              :node-id 3
+              :endpoint "10.0.0.13:8898"
+              :peer-id "10.0.0.13:15001"
+              :root "/var/tmp/dtlv-jepsen/n3"}]}
+    (fn [config-path]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not yet supported by the remote runner"
+           (core/datalevin-test
+            {:remote-config config-path
+             :rate 10
+             :time-limit 5
+             :nemesis []}))))))
+
+(deftest datalevin-test-remote-rejects-unsupported-nemesis-smoke-test
+  (with-temp-remote-config
+    {:db-name "remote-unsupported-nemesis"
+     :workload :append
+     :group-id "remote-unsupported-group"
+     :db-identity "remote-unsupported-db"
+     :repo-root "/srv/datalevin"
+     :nodes [{:logical-node "n1"
+              :node-id 1
+              :endpoint "10.0.0.11:8898"
+              :peer-id "10.0.0.11:15001"
+              :root "/var/tmp/dtlv-jepsen/n1"}
+             {:logical-node "n2"
+              :node-id 2
+              :endpoint "10.0.0.12:8898"
+              :peer-id "10.0.0.12:15001"
+              :root "/var/tmp/dtlv-jepsen/n2"}
+             {:logical-node "n3"
+              :node-id 3
+              :endpoint "10.0.0.13:8898"
+              :peer-id "10.0.0.13:15001"
+              :root "/var/tmp/dtlv-jepsen/n3"}]}
+    (fn [config-path]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"not yet supported by the remote runner"
+           (core/datalevin-test
+            {:remote-config config-path
+             :rate 10
+             :time-limit 5
+             :nemesis [:leader-disk-full]}))))))
 
 (deftest local-port-reservation-uses-dedicated-server-range-test
   (let [ports (#'local/reserve-ports 6)]
@@ -458,20 +863,6 @@
   (is (true? (local/expected-disruption-write-failure?
               {:datalevin/nemesis-faults [:leader-disk-full]}
               "Request to Datalevin server failed: \"No space left on device\""))))
-
-(deftest identity-upsert-workload-smoke-test
-  (let [workload (identity-upsert/workload {})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= identity-upsert/schema (:schema workload)))))
-
-(deftest index-consistency-workload-smoke-test
-  (let [workload (index-consistency/workload {})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= index-consistency/schema (:schema workload)))))
 
 (deftest append-checker-all-disruption-write-loss-is-valid-test
   (let [checker (:checker (append/workload {:key-count 4
@@ -867,51 +1258,6 @@
         (d/close conn)
         (u/delete-files dir)))))
 
-(deftest register-workload-smoke-test
-  (let [workload (register/workload {:key-count 4
-                                     :nodes ["n1" "n2" "n3"]})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= register/schema (:schema workload)))))
-
-(deftest tx-fn-register-workload-smoke-test
-  (let [workload (tx-fn-register/workload {:key-count 4
-                                           :nodes ["n1" "n2" "n3"]})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (= tx-fn-register/schema (:schema workload)))))
-
-(deftest rejoin-bootstrap-workload-smoke-test
-  (let [workload (rejoin-bootstrap/workload {:key-count 4
-                                             :nodes ["n1" "n2" "n3"]})]
-    (is (some? (:client workload)))
-    (is (some? (:generator workload)))
-    (is (some? (:checker workload)))
-    (is (some? (:final-generator workload)))
-    (is (map? (:datalevin/cluster-opts workload)))
-    (is (= rejoin-bootstrap/schema (:schema workload)))))
-
-(deftest datalevin-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 2
-                                       :max-txn-length 3
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
 (deftest datalevin-test-orders-nemesis-final-before-workload-final-test
   (let [timed-gen          ::timed
         workload-final-gen {:type :invoke :f :converge}
@@ -923,184 +1269,6 @@
     (is (= timed-gen (nth phases 0)))
     (is (= nemesis-final-gen (:gen (nth phases 1))))
     (is (= workload-final-gen (:gen (nth phases 2))))))
-
-(deftest datalevin-append-cas-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :append-cas
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 2
-                                       :max-txn-length 3
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-grant-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :grant
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-bank-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :bank
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :account-balance 100
-                                       :max-transfer 5
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-giant-values-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :giant-values
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-fencing-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :fencing
-                                       :rate 10
-                                       :time-limit 5
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-failover]})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :sofa-jraft (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-internal-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :internal
-                                       :rate 10
-                                       :time-limit 5
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-identity-upsert-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :identity-upsert
-                                       :rate 10
-                                       :time-limit 5
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-index-consistency-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :index-consistency
-                                       :rate 10
-                                       :time-limit 5
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-register-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :register
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-tx-fn-register-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :in-memory
-                                       :workload :tx-fn-register
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis []})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :in-memory (:control-backend test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-rejoin-bootstrap-test-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :rejoin-bootstrap
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:follower-rejoin]})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (= :sofa-jraft (:control-backend test-map)))
-    (is (= [:follower-rejoin] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:db test-map)))
-    (is (some? (:client test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
 
 (deftest append-local-history-failover-checker-smoke-test
   (let [append-checker
@@ -3261,231 +3429,290 @@
                {:failover? false
                 :clock-skew? true})))))
 
-(deftest datalevin-test-with-failover-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-failover]})]
-    (is (= [:leader-failover] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
+(def ^:private datalevin-test-nemesis-wiring-cases
+  [{:label :leader-failover
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-failover]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-failover]
+               :networked? false}}
+   {:label :leader-pause
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-pause]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-pause]
+               :networked? false}}
+   {:label :node-pause
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:node-pause]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:node-pause]
+               :networked? false}}
+   {:label :multi-node-pause
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:multi-node-pause]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:multi-node-pause]
+               :networked? false}}
+   {:label :leader-partition
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-partition]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-partition]
+               :networked? true}}
+   {:label :asymmetric-partition
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:asymmetric-partition]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:asymmetric-partition]
+               :networked? true}}
+   {:label :degraded-network
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:degraded-network]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:degraded-network]
+               :networked? true}}
+   {:label :leader-io-stall
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-io-stall]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-io-stall]
+               :networked? false}}
+   {:label :leader-disk-full
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-disk-full]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-disk-full]
+               :networked? false}}
+   {:label :follower-rejoin
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :rejoin-bootstrap
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:follower-rejoin]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:follower-rejoin]
+               :networked? false}}
+   {:label :quorum-loss
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:quorum-loss]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:quorum-loss]
+               :networked? false}}
+   {:label :clock-skew-pause
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:clock-skew-pause]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:clock-skew-pause]
+               :networked? false}}
+   {:label :clock-skew-mixed
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:clock-skew-mixed]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:clock-skew-mixed]
+               :networked? false}}
+   {:label :clock-skew-failover
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:clock-skew-pause
+                     :leader-failover]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:clock-skew-pause
+                                :leader-failover]
+               :networked? false}}
+   {:label :degraded-rejoin-combo
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :rejoin-bootstrap
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:degraded-network
+                     :follower-rejoin]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:degraded-network
+                                :follower-rejoin]
+               :networked? true}}
+   {:label :udf-readiness-failover
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :udf-readiness
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis [:leader-failover]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-failover]
+               :networked? false
+               :runtime-opts-fn? true}}
+   {:label :udf-readiness-partition
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :udf-readiness
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis [:leader-partition]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-partition]
+               :networked? true
+               :runtime-opts-fn? true}}
+   {:label :udf-readiness-degraded-network
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :udf-readiness
+           :rate 1
+           :time-limit 5
+           :key-count 4
+           :nemesis [:degraded-network]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:degraded-network]
+               :networked? true
+               :runtime-opts-fn? true}}])
 
-(deftest datalevin-test-with-pause-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-pause]})]
-    (is (= [:leader-pause] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-node-pause-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:node-pause]})]
-    (is (= [:node-pause] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-multi-node-pause-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:multi-node-pause]})]
-    (is (= [:multi-node-pause] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-partition-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-partition]})]
-    (is (= [:leader-partition] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:net test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-asymmetric-partition-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:asymmetric-partition]})]
-    (is (= [:asymmetric-partition] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:net test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-degraded-network-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:degraded-network]})]
-    (is (= [:degraded-network] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:net test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-io-stall-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-io-stall]})]
-    (is (= [:leader-io-stall] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-disk-full-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:leader-disk-full]})]
-    (is (= [:leader-disk-full] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-follower-rejoin-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :rejoin-bootstrap
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:follower-rejoin]})]
-    (is (= [:follower-rejoin] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-quorum-loss-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:quorum-loss]})]
-    (is (= [:quorum-loss] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-clock-skew-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:clock-skew-pause]})]
-    (is (= [:clock-skew-pause] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-mixed-clock-skew-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:clock-skew-mixed]})]
-    (is (= [:clock-skew-mixed] (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-clock-skew-failover-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :append
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :min-txn-length 1
-                                       :max-txn-length 1
-                                       :max-writes-per-key 8
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:clock-skew-pause
-                                                 :leader-failover]})]
-    (is (= [:clock-skew-pause :leader-failover]
-           (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
+(deftest datalevin-test-nemesis-wiring-smoke-test
+  (doseq [{:keys [label opts expected]} datalevin-test-nemesis-wiring-cases]
+    (testing (name label)
+      (assert-datalevin-test-map! (core/datalevin-test opts)
+                                  expected))))
 
 (deftest clock-skew-failover-startup-elects-single-leader-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
@@ -3506,145 +3733,6 @@
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
-
-(deftest datalevin-test-with-degraded-rejoin-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :rejoin-bootstrap
-                                       :rate 10
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nodes ["n1" "n2" "n3"]
-                                       :nemesis [:degraded-network
-                                                 :follower-rejoin]})]
-    (is (= [:degraded-network :follower-rejoin]
-           (:datalevin/nemesis-faults test-map)))
-    (is (some? (:nemesis test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-snapshot-manifest-corruption-rejoin-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :snapshot-manifest-corruption-rejoin
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-test-with-snapshot-copy-corruption-rejoin-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :snapshot-copy-corruption-rejoin
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-test-with-witness-topology-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :witness-topology
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (= ["n1" "n2"] (:nodes test-map)))
-    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes test-map)))
-    (is (some? (:generator test-map)))))
-
-(deftest datalevin-test-with-membership-drift-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :membership-drift
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-test-with-membership-drift-live-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :membership-drift-live
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-test-with-fencing-retry-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :fencing-retry
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (= ["n1" "n2"] (:nodes test-map)))
-    (is (= ["n1" "n2" "n3"] (:datalevin/control-nodes test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(deftest datalevin-test-with-udf-readiness-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :udf-readiness
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4})]
-    (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-    (is (ifn? (:datalevin/server-runtime-opts-fn test-map)))
-    (is (some? (:generator test-map)))
-    (is (some? (:checker test-map)))))
-
-(defn- assert-udf-readiness-fault-test-map
-  [test-map expected-faults networked?]
-  (is (= ["n1" "n2" "n3"] (:nodes test-map)))
-  (is (= expected-faults (:datalevin/nemesis-faults test-map)))
-  (is (ifn? (:datalevin/server-runtime-opts-fn test-map)))
-  (is (some? (:nemesis test-map)))
-  (is (some? (:generator test-map)))
-  (is (some? (:checker test-map)))
-  (when networked?
-    (is (some? (:net test-map)))))
-
-(deftest datalevin-test-with-udf-readiness-failover-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :udf-readiness
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nemesis [:leader-failover]})]
-    (assert-udf-readiness-fault-test-map test-map
-                                         [:leader-failover]
-                                         false)))
-
-(deftest datalevin-test-with-udf-readiness-partition-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :udf-readiness
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nemesis [:leader-partition]})]
-    (assert-udf-readiness-fault-test-map test-map
-                                         [:leader-partition]
-                                         true)))
-
-(deftest datalevin-test-with-udf-readiness-degraded-network-smoke-test
-  (let [test-map (core/datalevin-test {:db-name "smoke"
-                                       :control-backend :sofa-jraft
-                                       :workload :udf-readiness
-                                       :rate 1
-                                       :time-limit 5
-                                       :key-count 4
-                                       :nemesis [:degraded-network]})]
-    (assert-udf-readiness-fault-test-map test-map
-                                         [:degraded-network]
-                                         true)))
 
 (deftest nemesis-partition-net-uses-jepsen-net-test
   (let [dropped      (atom nil)

@@ -3,6 +3,7 @@
    [clojure.string :as str]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.nemesis :as datalevin.nemesis]
+   [datalevin.jepsen.remote :as remote]
    [datalevin.jepsen.workload.append :as append]
    [datalevin.jepsen.workload.append-cas :as append-cas]
    [datalevin.jepsen.workload.bank :as bank]
@@ -94,9 +95,125 @@
     workload-final-generator
     (conj (gen/clients workload-final-generator))))
 
+(def ^:private remote-unsupported-workloads
+  #{:degraded-rejoin
+    :membership-drift
+    :membership-drift-live
+    :rejoin-bootstrap
+    :snapshot-checksum-rejoin
+    :snapshot-copy-corruption-rejoin
+    :snapshot-db-identity-rejoin
+    :snapshot-manifest-corruption-rejoin
+    :fencing-retry
+    :witness-topology})
+
+(def ^:private remote-unsupported-nemeses
+  #{:leader-io-stall
+    :leader-disk-full
+    :clock-skew-pause
+    :clock-skew-leader-fast
+    :clock-skew-leader-slow
+    :clock-skew-mixed})
+
+(defn- validate-remote-runner!
+  [config workload-name nemesis-faults topology]
+  (when (contains? remote-unsupported-workloads workload-name)
+    (throw (ex-info
+            "This Jepsen workload is not yet supported by the remote runner"
+            {:workload workload-name
+             :remote-config (:db-name config)})))
+  (when (seq (:control-only-nodes topology))
+    (throw (ex-info
+            "The remote Jepsen runner does not yet support control-only witness nodes"
+            {:workload workload-name
+             :control-nodes (mapv :logical-node (:control-nodes topology))
+             :data-nodes (mapv :logical-node (:data-nodes topology))})))
+  (when-let [fault (first (filter remote-unsupported-nemeses nemesis-faults))]
+    (throw (ex-info
+            "This Jepsen nemesis is not yet supported by the remote runner"
+            {:fault fault
+             :nemesis nemesis-faults
+             :workload workload-name})))
+  (when-not (string? (:repo-root config))
+    (throw (ex-info
+            "Remote Jepsen runner requires :repo-root in the remote config"
+            {:workload workload-name
+             :db-name (:db-name config)}))))
+
+(defn- remote-datalevin-test
+  [opts]
+  (let [cluster-id     (str (UUID/randomUUID))
+        config         (-> (:remote-config opts)
+                           remote/read-config
+                           (remote/validate-config! workloads))
+        workload-name  (:workload config)
+        workload       (remote/config-workload config workloads)
+        topology       (remote/workload-topology config workload)
+        nodes          (vec (or (seq (:nodes workload))
+                                (map :logical-node (:data-nodes topology))))
+        control-nodes  (vec (or (seq (:datalevin/control-nodes workload))
+                                (map :logical-node (:control-nodes topology))))
+        rate           (double (:rate opts))
+        time-limit     (:time-limit opts)
+        nemesis-faults (:nemesis opts)
+        _              (validate-nemesis-compatibility!
+                        (assoc opts :control-backend (:control-backend config)))
+        _              (validate-remote-runner! config
+                                               workload-name
+                                               nemesis-faults
+                                               topology)
+        {:keys [nemesis generator final-generator]}
+        (datalevin.nemesis/nemesis-package {:faults nemesis-faults})
+        workload-final-generator
+        (:final-generator workload)
+        client-gen     (->> (:generator workload)
+                            (gen/stagger (/ rate)))
+        combined-gen   (if generator
+                         (gen/clients client-gen generator)
+                         (gen/clients client-gen))
+        timed-gen      (->> combined-gen
+                            (gen/time-limit time-limit))
+        phases         (compose-generator-phases timed-gen
+                                                workload-final-generator
+                                                final-generator)
+        ssh-opts       (merge {:username "root"
+                               :password "root"
+                               :strict-host-key-checking false}
+                              (:ssh opts))]
+    (merge tests/noop-test
+           opts
+           {:name (str (name workload-name) " remote")
+            :nodes nodes
+            :db (local/remote-db cluster-id
+                                 {:config config
+                                  :config-path (:remote-config opts)
+                                  :ssh ssh-opts
+                                  :topology topology
+                                  :workload workload})
+            :client (:client workload)
+            :nemesis nemesis
+            :checker (checker/compose
+                      {:timeline   (timeline/html)
+                       :exceptions (checker/unhandled-exceptions)
+                       :workload   (:checker workload)})
+            :generator (apply gen/phases phases)
+            :schema (:schema workload)
+            :db-name (:db-name config)
+            :control-backend (:control-backend config)
+            :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+            :datalevin/server-runtime-opts-fn
+            (:datalevin/server-runtime-opts-fn workload)
+            :datalevin/control-nodes control-nodes
+            :ssh ssh-opts
+            :datalevin/nemesis-faults nemesis-faults
+            :datalevin/cluster-id cluster-id
+            :datalevin/remote-config (:remote-config opts)})))
+
 (defn datalevin-test
   [opts]
-  (let [_              (validate-nemesis-compatibility! opts)
+  (if (:remote-config opts)
+    (remote-datalevin-test opts)
+    (let [_              (validate-nemesis-compatibility! opts)
         cluster-id     (str (UUID/randomUUID))
         workload-name  (:workload opts)
         workload       ((workloads workload-name) opts)
@@ -153,4 +270,4 @@
             :datalevin/control-nodes control-nodes
             :ssh ssh-opts
             :datalevin/nemesis-faults nemesis-faults
-            :datalevin/cluster-id cluster-id})))
+            :datalevin/cluster-id cluster-id}))))

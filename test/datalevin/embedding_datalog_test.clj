@@ -13,6 +13,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.core :as d]
    [datalevin.embedding :as emb]
+   [datalevin.embedding-test-support :as test-support]
    [datalevin.util :as u])
   (:import
    [java.util UUID]))
@@ -70,6 +71,44 @@
   {:embedding-opts      {:provider :test
                          :metric-type :cosine}
    :embedding-providers {:test (mock-provider)}})
+
+(def ^:private real-e2e-docs
+  [{:doc/id   "cat-1"
+    :doc/text "A tabby cat naps on the sofa after chasing a feather toy."}
+   {:doc/id   "cat-2"
+    :doc/text "The kitten purrs while sitting in a cardboard box."}
+   {:doc/id   "cat-3"
+    :doc/text "A rescue feline needs food, litter, and a warm home."}
+   {:doc/id   "dog-1"
+    :doc/text "The golden retriever waits by the door for a walk in the park."}
+   {:doc/id   "dog-2"
+    :doc/text "A puppy fetches a tennis ball and wags its tail."}
+   {:doc/id   "dog-3"
+    :doc/text "The dog trainer teaches the canine to sit and stay."}
+   {:doc/id   "space-1"
+    :doc/text "Astronomers study distant galaxies with a large telescope."}
+   {:doc/id   "space-2"
+    :doc/text "The spacecraft entered orbit around Mars and transmitted images."}
+   {:doc/id   "space-3"
+    :doc/text "Rocket engines push the launch vehicle beyond Earths atmosphere."}])
+
+(defn- top-neighbor-id
+  [db query]
+  (d/q '[:find ?id .
+         :in $ ?q
+         :where
+         [(embedding-neighbors $ :doc/text ?q {:top 1}) [[?e _ _]]]
+         [?e :doc/id ?id]]
+       db query))
+
+(defn- top-neighbor-ids
+  [db query top]
+  (d/q '[:find [?id ...]
+         :in $ ?q ?opts
+         :where
+         [(embedding-neighbors $ :doc/text ?q ?opts) [[?e _ _]]]
+         [?e :doc/id ?id]]
+       db query {:top top}))
 
 (deftest embedding-neighbors-fns-test
   (let [dir  (u/tmp-dir (str "embedding-fns-" (UUID/randomUUID)))
@@ -182,6 +221,46 @@
             (d/close conn2))))
       (finally
         (u/delete-files dir)))))
+
+(deftest real-embedding-neighbors-e2e-test
+  (when-not (u/windows?)
+    (let [dir (u/tmp-dir (str "embedding-real-e2e-" (UUID/randomUUID)))]
+      (try
+        (when-let [provider-spec (test-support/integration-provider-spec! dir)]
+          (let [conn (d/create-conn dir
+                                    embedding-schema
+                                    {:embedding-opts
+                                     (assoc provider-spec :metric-type :cosine)})]
+            (try
+              (d/transact! conn real-e2e-docs)
+              (let [db             (d/db conn)
+                    rocket-hits    (top-neighbor-ids
+                                     db
+                                     "rocket launch vehicle and Earth atmosphere"
+                                     3)
+                    telescope-hits (top-neighbor-ids
+                                     db
+                                     "astronomers using a telescope to study galaxies"
+                                     2)]
+                (is (= "cat-2"
+                       (top-neighbor-id db
+                                        "kitten purring in a cardboard box")))
+                (is (= "dog-1"
+                       (top-neighbor-id
+                         db
+                         "golden retriever going for a walk in the park")))
+                (is (= "dog-3"
+                       (top-neighbor-id
+                         db
+                         "dog trainer teaching a canine to stay")))
+                (is (= 3 (count rocket-hits)))
+                (is (every? #(s/starts-with? % "space-") rocket-hits))
+                (is (= 2 (count telescope-hits)))
+                (is (every? #(s/starts-with? % "space-") telescope-hits)))
+              (finally
+                (d/close conn)))))
+        (finally
+          (u/delete-files dir))))))
 
 (deftest embedding-provider-validation-test
   (testing "missing runtime provider"

@@ -24,6 +24,8 @@
    [nil "--db-name NAME" "Database name to create for the workload"
     :default "jepsen-append"]
 
+   [nil "--remote-config PATH" "Run against a real remote Jepsen cluster described by this shared EDN config"]
+
    [nil "--work-dir DIR" "Base work directory for local cluster data"]
 
    [nil "--keep-work-dir" "Keep local cluster work directories after success"]

@@ -2819,9 +2819,16 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error (normal-kv-store-handler list-dbis)))
 
-(defn- ^:redef cleanup-copy-tmp-dir!
+(defn- cleanup-copy-tmp-dir*
   [tf]
   (u/delete-files tf))
+
+(def ^:private ^:redef cleanup-copy-tmp-dir-fn*
+  (atom cleanup-copy-tmp-dir*))
+
+(defn- cleanup-copy-tmp-dir!
+  [tf]
+  (@cleanup-copy-tmp-dir-fn* tf))
 
 (def ^:private ^:redef server-copy-store!
   i/copy)
@@ -3094,7 +3101,57 @@
         :result
         (cond-> {:last-applied-lsn effective-lsn
                  :txlog-last-applied-lsn txlog-lsn
-                 :ha-runtime? (boolean authority)}
+                 :ha-runtime? (boolean authority)
+                 :udf-ready? (:udf-ready? db-state)
+                 :udf-missing (:udf-missing db-state)
+                 :udf-readiness-token (:udf-readiness-token db-state)
+                 :ha-authority-owner-node-id
+                 (:ha-authority-owner-node-id db-state)
+                 :ha-authority-term (:ha-authority-term db-state)
+                 :ha-follower-next-lsn (:ha-follower-next-lsn db-state)
+                 :ha-follower-last-batch-size
+                 (:ha-follower-last-batch-size db-state)
+                 :ha-follower-last-sync-ms (:ha-follower-last-sync-ms db-state)
+                 :ha-follower-leader-endpoint
+                 (:ha-follower-leader-endpoint db-state)
+                 :ha-follower-source-endpoint
+                 (:ha-follower-source-endpoint db-state)
+                 :ha-follower-source-order (:ha-follower-source-order db-state)
+                 :ha-follower-last-bootstrap-ms
+                 (:ha-follower-last-bootstrap-ms db-state)
+                 :ha-follower-bootstrap-source-endpoint
+                 (:ha-follower-bootstrap-source-endpoint db-state)
+                 :ha-follower-bootstrap-snapshot-last-applied-lsn
+                 (:ha-follower-bootstrap-snapshot-last-applied-lsn db-state)
+                 :ha-follower-degraded? (:ha-follower-degraded? db-state)
+                 :ha-follower-degraded-reason
+                 (:ha-follower-degraded-reason db-state)
+                 :ha-follower-last-error (:ha-follower-last-error db-state)
+                 :ha-follower-last-error-details
+                 (:ha-follower-last-error-details db-state)
+                 :ha-follower-next-sync-not-before-ms
+                 (:ha-follower-next-sync-not-before-ms db-state)
+                 :ha-clock-skew-paused? (:ha-clock-skew-paused? db-state)
+                 :ha-clock-skew-last-observed-ms
+                 (:ha-clock-skew-last-observed-ms db-state)
+                 :ha-clock-skew-last-result
+                 (:ha-clock-skew-last-result db-state)
+                 :ha-lease-until-ms (:ha-lease-until-ms db-state)
+                 :ha-last-authority-refresh-ms
+                 (:ha-last-authority-refresh-ms db-state)
+                 :ha-authority-read-ok? (:ha-authority-read-ok? db-state)
+                 :ha-promotion-last-failure
+                 (:ha-promotion-last-failure db-state)
+                 :ha-promotion-failure-details
+                 (:ha-promotion-failure-details db-state)
+                 :ha-rejoin-promotion-blocked?
+                 (:ha-rejoin-promotion-blocked? db-state)
+                 :ha-rejoin-promotion-blocked-until-ms
+                 (:ha-rejoin-promotion-blocked-until-ms db-state)
+                 :ha-rejoin-promotion-cleared-ms
+                 (:ha-rejoin-promotion-cleared-ms db-state)
+                 :ha-candidate-since-ms (:ha-candidate-since-ms db-state)
+                 :ha-candidate-delay-ms (:ha-candidate-delay-ms db-state)}
           (some? runtime-lsn)
           (assoc :ha-local-last-applied-lsn runtime-lsn
                  :ha-role (:ha-role db-state))

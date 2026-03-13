@@ -122,9 +122,11 @@
                       "listOf" "setOf" "mapResult" "listResult" "setResult"}
    Connection       #{"closed" "schema" "updateSchema" "opts" "clear"
                       "maxEid" "datalogIndexCacheLimit" "entid" "entity"
+                      "entityMap"
                       "pull" "pullMany" "query" "queryScalar"
                       "queryCollection" "queryTuple" "queryRelation"
-                      "queryKeyed" "explain" "transact" "exec"}
+                      "queryKeyed" "queryForm"
+                      "explain" "explainForm" "transact" "exec"}
    KV               #{"closed" "dir" "openDbi" "openListDbi" "putListItems"
                       "delListItems" "deleteListItems" "getList" "visitList"
                       "listCount" "inList" "listRange" "listRangeCount"
@@ -142,9 +144,12 @@
                       "createRole" "dropRole" "listRoles" "assignRole"
                       "withdrawRole" "listUserRoles" "grantPermission"
                       "revokePermission" "listRolePermissions"
-                      "listUserPermissions" "querySystem" "showClients"
+                      "listUserPermissions" "querySystem" "querySystemForm"
+                      "showClients"
                       "disconnectClient" "exec"}
-   DatalevinInterop #{"coreInvoke" "clientInvoke" "readEdn"
+   DatalevinInterop #{"coreInvoke" "coreInvokeBridge"
+                      "clientInvoke" "clientInvokeBridge"
+                      "readEdn" "currentClassLoader" "bridgeResult"
                       "createConnection" "getConnection" "closeConnection"
                       "connectionClosed" "connectionDb" "openKeyValue"
                       "closeKeyValue" "keyValueClosed" "newClient"
@@ -759,9 +764,13 @@
                                                       (.put "age" 30)
                                                       (.put "tag" "vip"))))
                                          (java-map "source" "helper-overloads"))
+              query-form      (DatalevinInterop/readEdn
+                               "[:find ?name . :in $ ?target :where [?e :name ?target] [?e :name ?name]]")
               raw-result      (.query c
                                       "[:find ?name . :in $ ?target :where [?e :name ?target] [?e :name ?name]]"
                                       (into-array Object ["Ada"]))
+              form-result     (.queryForm c query-form
+                                          (java.util.ArrayList. ["Ada"]))
               typed-result    (set (.query c all-query))
               typed-varargs   (set (.query c min-query (into-array Object [20])))
               scalar-no-input (.queryScalar c scalar-ground Long)
@@ -775,14 +784,19 @@
                                               (into-array Object [20]))
               keyed-input     (.queryKeyed c keyed-query
                                            (into-array Object [20]))
+              entity-map      (.entityMap c ["name" "Ada"])
               explain-raw     (.explain c
                                         "[:find ?name . :in $ ?target :where [?e :name ?target] [?e :name ?name]]"
                                         (into-array Object ["Ada"]))
+              explain-form    (.explainForm c query-form
+                                            (java.util.ArrayList. ["Ada"]))
               explain-typed   (.explain c all-query)
               explain-input   (.explain c relation-query
                                         (into-array Object [20]))
               explain-opts    (.explain c "{:analyze true}" all-query
                                         (java.util.ArrayList.))
+              explain-form-opts (.explainForm c "{:analyze true}" query-form
+                                              (java.util.ArrayList. ["Ada"]))
               exec-schema     (.exec c "schema" nil)]
           (is (instance? Map report-raw))
           (is (instance? Map report-typed))
@@ -790,6 +804,7 @@
           (is (contains? (set (keys updated)) :home-city))
           (is (not (contains? (set (keys updated)) :nickname)))
           (is (= "Ada" raw-result))
+          (is (= "Ada" form-result))
           (is (= #{"Ada" "Bea" "Cid"} typed-result))
           (is (= #{"Bea" "Cid"} typed-varargs))
           (is (= 42 scalar-no-input))
@@ -802,10 +817,14 @@
           (is (= #{{"name" "Bea" "age" 20}
                    {"name" "Cid" "age" 30}}
                  (into #{} keyed-input)))
+          (is (= "Ada" (mget entity-map :name)))
+          (is (= 10 (mget entity-map :age)))
           (is (instance? Map explain-raw))
+          (is (instance? Map explain-form))
           (is (instance? Map explain-typed))
           (is (instance? Map explain-input))
           (is (instance? Map explain-opts))
+          (is (instance? Map explain-form-opts))
           (is (= ":db.type/string" (get-in exec-schema [":name" ":db/valueType"])))))
 
       (with-open [^Connection shared-map (Datalevin/getConn map-dir schema-map opts)]
@@ -1111,10 +1130,13 @@
             query      (DatalevinInterop/readEdn
                         "[:find [?name ...] :where [?e :name ?name]]")
             names      (set (DatalevinInterop/coreInvoke "q" [query db]))
+            names-bridge (set (DatalevinInterop/coreInvokeBridge "q" [query db]))
             lookup     (DatalevinInterop/lookupRef ["name" "Alice"])
             alice      (DatalevinInterop/coreInvoke
                         "pull"
                         [db (DatalevinInterop/readEdn "[:name :age]") lookup])
+            alice-bridge (DatalevinInterop/bridgeResult alice)
+            loader     (DatalevinInterop/currentClassLoader)
             string-type (DatalevinInterop/kvType ":string")
             kv-txs     (DatalevinInterop/kvTxs
                         [[:put "a" "alpha"]
@@ -1133,8 +1155,12 @@
         (is (instance? Map report))
         (is (= "interop" (mget (mget report :tx-meta) "source")))
         (is (= #{"Alice" "Bob"} names))
+        (is (= #{"Alice" "Bob"} names-bridge))
         (is (= "Alice" (mget alice :name)))
         (is (= 30 (mget alice :age)))
+        (is (= "Alice" (mget alice-bridge :name)))
+        (is (= 30 (mget alice-bridge :age)))
+        (is (= (.getContextClassLoader (Thread/currentThread)) loader))
         (is (= "beta" kv-value))
         (is (= 2 kv-entries))
         (is (= ["items"] (vec (DatalevinInterop/coreInvoke "list-dbis" [kv]))))
@@ -1409,9 +1435,15 @@
                   user-roles (set (.listUserRoles c username))
                   role-perms (.listRolePermissions c role)
                   user-perms (.listUserPermissions c username)
+                  user-query-form
+                  (DatalevinInterop/readEdn
+                   "[:find ?u . :in $ ?u :where [?e :user/name ?u]]")
                   system-users (set (.querySystem c
                                                   "[:find [?u ...] :where [?e :user/name ?u]]"
                                                   (java.util.ArrayList.)))
+                  system-user-form (.querySystemForm c user-query-form
+                                                    (java.util.ArrayList.
+                                                     [username]))
                   clients   (.showClients c)
                   client-info (get clients client-id)
                   open-db-info (get (mget client-info :open-dbs) db-name)
@@ -1429,6 +1461,7 @@
               (is (contains? roles (keyword role)))
               (is (contains? user-roles (keyword role)))
               (is (contains? system-users username))
+              (is (= username system-user-form))
               (is (some (fn [perm]
                           (permission-matches? perm
                                                :datalevin.server/alter
@@ -1520,26 +1553,33 @@
                                            [client role-key alter db-perm target])
           (DatalevinInterop/clientInvoke "open-database"
                                            [client db-name "datalog" nil nil false])
-          (let [dbs        (set (DatalevinInterop/clientInvoke "list-databases" [client]))
+          (let [user-query  (DatalevinInterop/readEdn
+                             "[:find ?u . :in $ ?u :where [?e :user/name ?u]]")
+                dbs        (set (DatalevinInterop/clientInvoke "list-databases" [client]))
                 dbs-in-use (set (DatalevinInterop/clientInvoke "list-databases-in-use" [client]))
                 users      (set (DatalevinInterop/clientInvoke "list-users" [client]))
+                users-bridge (set (DatalevinInterop/clientInvokeBridge
+                                   "list-users"
+                                   [client]))
                 roles      (set (DatalevinInterop/clientInvoke "list-roles" [client]))
                 user-roles (set (DatalevinInterop/clientInvoke "list-user-roles"
                                                                [client username]))
                 user-name  (DatalevinInterop/clientInvoke
                             "query-system"
-                            [client
-                             (DatalevinInterop/readEdn
-                              "[:find ?u . :in $ ?u :where [?e :user/name ?u]]")
-                             username])
+                            [client user-query username])
+                user-name-bridge (DatalevinInterop/clientInvokeBridge
+                                  "query-system"
+                                  [client user-query username])
                 role-perms (DatalevinInterop/clientInvoke "list-role-permissions"
                                                           [client role-key])]
             (is (contains? dbs db-name))
             (is (contains? dbs-in-use db-name))
             (is (contains? users username))
+            (is (contains? users-bridge username))
             (is (contains? roles role-key))
             (is (contains? user-roles role-key))
             (is (= username user-name))
+            (is (= username user-name-bridge))
             (is (some #(permission-matches? % alter db-perm) role-perms))
             (is (false? (DatalevinInterop/clientDisconnected client))))
           (finally
