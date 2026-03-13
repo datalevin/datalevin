@@ -8,8 +8,10 @@
   comes with a Jepsen test suite to validate correctness
   [#252](https://github.com/datalevin/datalevin/issues/252). Details in
   [doc](doc/ha.md).
-- [Lib] Release Datalevin as a Java library to maven central.
-- [Lib] Release Datalevin as a Python library to PyPI.
+- [Lib] Release Datalevin as a Java library
+  `org.datalevin:datalevin-java:<version>` to maven central.
+- [Lib] Release Datalevin as a Python library `datalevin`to PyPI.
+- [Lib] Release Datalevin as a Node.js library `datalevin-node` to npm.
 - [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
 - [MCP] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 - [Datalog] allow to register a `:db/udf` to specify a user defined function.

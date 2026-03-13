@@ -64,14 +64,21 @@ final class DatalevinForms {
     }
 
     static Object rangeInput(List<?> rangeSpec) {
+        return rangeInput(rangeSpec, null);
+    }
+
+    static Object rangeInput(List<?> rangeSpec, Object boundType) {
         Objects.requireNonNull(rangeSpec, "rangeSpec");
         if (rangeSpec.isEmpty()) {
             throw new IllegalArgumentException("rangeSpec must not be empty.");
         }
-        if (rangeSpec instanceof IPersistentCollection && normalizedRangeSpec(rangeSpec)) {
+        Object normalizedType = normalizedKvType(boundType);
+        if (!needsTypedNormalization(normalizedType)
+                && rangeSpec instanceof IPersistentCollection
+                && normalizedRangeSpec(rangeSpec)) {
             return rangeSpec;
         }
-        return rangeInput(rangeSpec.get(0), rangeSpec.subList(1, rangeSpec.size()));
+        return rangeInput(rangeSpec.get(0), rangeSpec.subList(1, rangeSpec.size()), normalizedType);
     }
 
     static Object lookupRefInput(Object value) {
@@ -268,10 +275,17 @@ final class DatalevinForms {
     }
 
     static Object kvTxsInput(Object txs) {
+        return kvTxsInput(txs, null, null);
+    }
+
+    static Object kvTxsInput(Object txs, Object defaultKType, Object defaultVType) {
         if (txs == null) {
             return null;
         }
+        Object normalizedKType = normalizedKvType(defaultKType);
+        Object normalizedVType = normalizedKvType(defaultVType);
         if (txs instanceof Collection<?> collection
+                && !needsTypedKvTxNormalization(collection, normalizedKType, normalizedVType)
                 && txs instanceof IPersistentCollection
                 && normalizedKvTxs(collection)) {
             return txs;
@@ -279,17 +293,21 @@ final class DatalevinForms {
         ArrayList<Object> items = new ArrayList<>();
         if (txs instanceof Collection<?> collection) {
             for (Object item : collection) {
-                items.add(kvTxItemInput(item));
+                items.add(kvTxItemInput(item, normalizedKType, normalizedVType));
             }
             return PersistentVector.create(items);
         }
         if (txs instanceof Object[] array) {
             for (Object item : array) {
-                items.add(kvTxItemInput(item));
+                items.add(kvTxItemInput(item, normalizedKType, normalizedVType));
             }
             return PersistentVector.create(items);
         }
         throw new IllegalArgumentException("KV transaction data must be a collection.");
+    }
+
+    static Object kvInput(Object value, Object type) {
+        return typedKvInput(value, normalizedKvType(type));
     }
 
     private static Object txItemInput(Object item) {
@@ -415,17 +433,37 @@ final class DatalevinForms {
         return false;
     }
 
-    private static Object kvTxItemInput(Object item) {
+    private static Object kvTxItemInput(Object item, Object defaultKType, Object defaultVType) {
         if (item instanceof Collection<?> collection) {
             ArrayList<?> list = collection instanceof List<?> existing
                     ? new ArrayList<>(existing)
                     : new ArrayList<>(collection);
             ArrayList<Object> converted = new ArrayList<>(list.size());
+            String op = list.isEmpty() ? null : extractKeywordString(list.get(0));
+            int keyIndex = defaultKType == null && defaultVType == null ? 2 : 1;
+            int valueIndex = kvDeleteOp(op) ? -1 : keyIndex + 1;
+            int itemKTypeIndex = defaultKType == null && defaultVType == null ? keyIndex + 2 : -1;
+            int itemVTypeIndex = defaultKType == null && defaultVType == null && valueIndex >= 0
+                    ? valueIndex + 2
+                    : -1;
+            Object itemKType = typeAt(list, itemKTypeIndex);
+            Object itemVType = typeAt(list, itemVTypeIndex);
+            Object resolvedKType = itemKType == null ? defaultKType : itemKType;
+            Object resolvedVType = itemVType == null ? defaultVType : itemVType;
             for (int i = 0; i < list.size(); i++) {
                 Object value = list.get(i);
                 if (i == 0) {
-                    String op = extractKeywordString(value);
                     converted.add(op == null ? ClojureCodec.runtimeInput(value) : ClojureCodec.keyword(op));
+                } else if (i == keyIndex) {
+                    converted.add(typedKvInput(value, resolvedKType));
+                } else if (i == valueIndex) {
+                    converted.add(kvListOp(op)
+                                  ? typedKvValuesInput(value, resolvedVType)
+                                  : typedKvInput(value, resolvedVType));
+                } else if (i == itemKTypeIndex) {
+                    converted.add(typeInput(value));
+                } else if (i == itemVTypeIndex) {
+                    converted.add(typeInput(value));
                 } else {
                     converted.add(ClojureCodec.runtimeInput(value));
                 }
@@ -433,9 +471,9 @@ final class DatalevinForms {
             return PersistentVector.create(converted);
         }
         if (item instanceof Object[] array) {
-            return kvTxItemInput(Arrays.asList(array));
+            return kvTxItemInput(Arrays.asList(array), defaultKType, defaultVType);
         }
-        return ClojureCodec.runtimeInput(item);
+        return typedKvInput(item, defaultVType == null ? defaultKType : defaultVType);
     }
 
     private static IPersistentMap keywordMap(Map<?, ?> map, boolean keywordizeColonValues) {
@@ -491,13 +529,171 @@ final class DatalevinForms {
         return ClojureCodec.runtimeInput(value);
     }
 
-    private static Object rangeInput(Object rangeType, List<?> bounds) {
+    private static Object rangeInput(Object rangeType, List<?> bounds, Object boundType) {
         ArrayList<Object> converted = new ArrayList<>(1 + bounds.size());
         converted.add(rangeKeyword(rangeType));
         for (Object bound : bounds) {
-            converted.add(ClojureCodec.runtimeInput(bound));
+            converted.add(typedKvInput(bound, boundType));
         }
         return PersistentVector.create(converted);
+    }
+
+    private static Object normalizedKvType(Object type) {
+        return type == null ? null : typeInput(type);
+    }
+
+    private static boolean needsTypedNormalization(Object type) {
+        if (isBytesType(type)) {
+            return true;
+        }
+        if (type instanceof Collection<?> collection) {
+            for (Object item : collection) {
+                if (needsTypedNormalization(item)) {
+                    return true;
+                }
+            }
+        }
+        if (type instanceof Object[] array) {
+            for (Object item : array) {
+                if (needsTypedNormalization(item)) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private static boolean needsTypedKvTxNormalization(Iterable<?> txs,
+                                                       Object defaultKType,
+                                                       Object defaultVType) {
+        if (needsTypedNormalization(defaultKType) || needsTypedNormalization(defaultVType)) {
+            return true;
+        }
+        for (Object item : txs) {
+            if (kvTxUsesTypedNormalization(item)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static boolean kvTxUsesTypedNormalization(Object item) {
+        List<?> list = toList(item);
+        if (list == null || list.isEmpty()) {
+            return false;
+        }
+        String op = extractKeywordString(list.get(0));
+        if (op == null) {
+            return false;
+        }
+        int keyTypeIndex = kvDeleteOp(op) ? 3 : 4;
+        int valueTypeIndex = kvDeleteOp(op) ? -1 : 5;
+        return needsTypedNormalization(typeAt(list, keyTypeIndex))
+                || needsTypedNormalization(typeAt(list, valueTypeIndex));
+    }
+
+    private static boolean kvDeleteOp(String op) {
+        return ":del".equals(op);
+    }
+
+    private static boolean kvListOp(String op) {
+        return ":put-list".equals(op) || ":del-list".equals(op);
+    }
+
+    private static Object typeAt(List<?> list, int index) {
+        if (index < 0 || index >= list.size()) {
+            return null;
+        }
+        return normalizedKvType(list.get(index));
+    }
+
+    private static List<?> toList(Object value) {
+        if (value instanceof List<?> list) {
+            return list;
+        }
+        if (value instanceof Collection<?> collection) {
+            return new ArrayList<>(collection);
+        }
+        if (value instanceof Object[] array) {
+            return Arrays.asList(array);
+        }
+        return null;
+    }
+
+    private static Object typedKvInput(Object value, Object type) {
+        if (isBytesType(type)) {
+            return bytesInput(value);
+        }
+        List<?> typeList = toList(type);
+        if (typeList != null) {
+            return typedKvTupleInput(value, typeList);
+        }
+        return ClojureCodec.runtimeInput(value);
+    }
+
+    private static Object typedKvTupleInput(Object value, List<?> typeSpec) {
+        List<?> values = toList(value);
+        if (values == null) {
+            return ClojureCodec.runtimeInput(value);
+        }
+        ArrayList<Object> converted = new ArrayList<>(values.size());
+        if (typeSpec.size() == 1) {
+            Object elementType = typeSpec.get(0);
+            for (Object item : values) {
+                converted.add(typedKvInput(item, elementType));
+            }
+            return PersistentVector.create(converted);
+        }
+        for (int i = 0; i < values.size(); i++) {
+            Object elementType = i < typeSpec.size() ? typeSpec.get(i) : null;
+            converted.add(typedKvInput(values.get(i), elementType));
+        }
+        return PersistentVector.create(converted);
+    }
+
+    private static Object typedKvValuesInput(Object value, Object type) {
+        List<?> values = toList(value);
+        if (values == null) {
+            return typedKvInput(value, type);
+        }
+        ArrayList<Object> converted = new ArrayList<>(values.size());
+        for (Object item : values) {
+            converted.add(typedKvInput(item, type));
+        }
+        return PersistentVector.create(converted);
+    }
+
+    private static boolean isBytesType(Object type) {
+        String keyword = extractKeywordString(type);
+        return ":bytes".equals(keyword) || ":db.type/bytes".equals(keyword);
+    }
+
+    private static Object bytesInput(Object value) {
+        if (value == null || value instanceof byte[]) {
+            return value;
+        }
+        if (value instanceof Collection<?> collection) {
+            return bytesInput(collection.toArray());
+        }
+        if (value instanceof Object[] array) {
+            byte[] bytes = new byte[array.length];
+            for (int i = 0; i < array.length; i++) {
+                bytes[i] = byteValue(array[i]);
+            }
+            return bytes;
+        }
+        return ClojureCodec.runtimeInput(value);
+    }
+
+    private static byte byteValue(Object value) {
+        if (value instanceof Number number) {
+            int intValue = number.intValue();
+            if (intValue < -128 || intValue > 255) {
+                throw new IllegalArgumentException("Byte value out of range: " + intValue);
+            }
+            return (byte) intValue;
+        }
+        throw new IllegalArgumentException("Expected byte value, got: " + value);
     }
 
     private static Object keywordFromAttr(Object value) {

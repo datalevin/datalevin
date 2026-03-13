@@ -166,20 +166,62 @@ test(
         [[":put", "a", "alpha"], [":put", "b", "beta"], [":put", "c", "gamma"]],
         { dbiName: "items", kType: ":string", vType: ":string" }
       );
+      await kv.openDbi("blobs");
+      await kv.transact(
+        [[":put", "buf", Buffer.from([0, 1, 2, 255])], [":put", "arr", new Uint8Array([9, 8, 7])]],
+        { dbiName: "blobs", kType: ":string", vType: ":bytes" }
+      );
+      await kv.openDbi("blob-keys");
+      await kv.transact(
+        [
+          [":put", Buffer.from([0, 1]), Buffer.from([7, 8])],
+          [":put", Buffer.from([0, 2]), Buffer.from([9, 10])]
+        ],
+        { dbiName: "blob-keys", kType: ":bytes", vType: ":bytes" }
+      );
       await kv.transact(
         [[":put", "a", 1], [":put", "a", 2], [":put", "b", 3]],
         { dbiName: "list", kType: ":string", vType: ":long" }
       );
 
-      assert.deepEqual((await kv.listDbis()).sort(), ["items", "list"]);
+      assert.deepEqual((await kv.listDbis()).sort(), ["blob-keys", "blobs", "items", "list"]);
       assert.equal(intValue(await kv.entries("items")), 3);
       assert.equal(
         await kv.getValue("items", "b", { kType: ":string", vType: ":string", ignoreKey: true }),
         "beta"
       );
+      const blobFromBuffer = await kv.getValue("blobs", "buf", {
+        kType: ":string",
+        vType: ":bytes",
+        ignoreKey: true
+      });
+      const blobFromUint8 = await kv.getValue("blobs", "arr", {
+        kType: ":string",
+        vType: ":bytes",
+        ignoreKey: true
+      });
+      const blobKeyValue = await kv.getValue("blob-keys", Buffer.from([0, 2]), {
+        kType: ":bytes",
+        vType: ":bytes",
+        ignoreKey: true
+      });
+      const blobKeyRange = await kv.getRange("blob-keys", [":closed", Buffer.from([0, 1]), Buffer.from([0, 2])], {
+        kType: ":bytes",
+        vType: ":bytes"
+      });
       assert.deepEqual(
         await kv.getRange("items", [":all"], { kType: ":string", vType: ":string", limit: 2, offset: 1 }),
         [["b", "beta"], ["c", "gamma"]]
+      );
+      assert.equal(Buffer.isBuffer(blobFromBuffer), true);
+      assert.equal(Buffer.isBuffer(blobFromUint8), true);
+      assert.equal(Buffer.isBuffer(blobKeyValue), true);
+      assert.deepEqual([...blobFromBuffer], [0, 1, 2, 255]);
+      assert.deepEqual([...blobFromUint8], [9, 8, 7]);
+      assert.deepEqual([...blobKeyValue], [9, 10]);
+      assert.deepEqual(
+        blobKeyRange.map(([key, value]) => [[...key], [...value]]),
+        [[[0, 1], [7, 8]], [[0, 2], [9, 10]]]
       );
       assert.deepEqual(
         (await kv.getRange("list", [":all"], { kType: ":string", vType: ":long" }))
@@ -191,7 +233,7 @@ test(
       assert.equal(intValue(await kv.entries("items")), 0);
 
       await kv.dropDbi("items");
-      assert.deepEqual((await kv.listDbis()).sort(), ["list"]);
+      assert.deepEqual((await kv.listDbis()).sort(), ["blob-keys", "blobs", "list"]);
     } finally {
       await kv.close();
     }
@@ -262,6 +304,7 @@ test(
     const kv = await raw.openKeyValue(kvDir);
     try {
       await raw.coreInvoke("open-dbi", [kv, "items"]);
+      await raw.coreInvoke("open-dbi", [kv, "blob-keys"]);
       await raw.coreInvoke("transact-kv", [
         kv,
         "items",
@@ -269,8 +312,19 @@ test(
         await raw.kvType(":string"),
         await raw.kvType(":string")
       ]);
+      await raw.coreInvoke("transact-kv", [
+        kv,
+        "blob-keys",
+        await raw.kvTxs(
+          [[":put", Buffer.from([1]), Buffer.from([9])], [":put", Buffer.from([2]), Buffer.from([8])]],
+          ":bytes",
+          ":bytes"
+        ),
+        await raw.kvType(":bytes"),
+        await raw.kvType(":bytes")
+      ]);
 
-      assert.deepEqual(await toJs(await raw.coreInvoke("list-dbis", [kv])), ["items"]);
+      assert.deepEqual((await toJs(await raw.coreInvoke("list-dbis", [kv]))).sort(), ["blob-keys", "items"]);
       assert.equal(intValue(await toJs(await raw.coreInvoke("entries", [kv, "items"]))), 2);
       assert.deepEqual(
         await toJs(
@@ -283,6 +337,18 @@ test(
           ])
         ),
         [["a", "alpha"], ["b", "beta"]]
+      );
+      assert.deepEqual(
+        (await toJs(
+          await raw.coreInvoke("get-range", [
+            kv,
+            "blob-keys",
+            await raw.kvRange([":closed", Buffer.from([1]), Buffer.from([2])], ":bytes"),
+            await raw.kvType(":bytes"),
+            await raw.kvType(":bytes")
+          ])
+        )).map(([key, value]) => [[...key], [...value]]),
+        [[[1], [9]], [[2], [8]]]
       );
     } finally {
       await raw.closeKeyValue(kv);

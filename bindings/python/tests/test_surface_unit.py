@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import datalevin._jvm as jvm_module
 import datalevin.client as client_module
 import datalevin.connection as connection_module
 import datalevin.kv as kv_module
@@ -19,6 +20,8 @@ class FakeClientBindings:
     def client_invoke(self, function: str, args=None):
         args = list(args or ())
         self.client_calls.append((function, args))
+        if function == "get-id":
+            return f"id:{args[0]}"
         return {"function": function, "args": args}
 
     def close_client(self, handle) -> None:
@@ -98,8 +101,9 @@ def test_client_wrapper_delegates_to_bindings(monkeypatch) -> None:
     monkeypatch.setattr(client_module, "to_query_input", lambda value: ("query-input", value))
 
     client = client_module.Client("HANDLE")
+    other = client_module.Client("OTHER")
 
-    assert client.client_id() == {"function": "get-id", "args": ["HANDLE"]}
+    assert client.client_id() == "id:HANDLE"
 
     assert client.open_database("main", "datalog") is None
     assert fake.client_calls[-1] == ("open-database", ["HANDLE", "main", "datalog"])
@@ -137,6 +141,8 @@ def test_client_wrapper_delegates_to_bindings(monkeypatch) -> None:
     }
 
     assert client.disconnected() is False
+    client.disconnect_client("id:OTHER")
+    assert other.disconnected() is True
     client.disconnect()
     assert client.disconnected() is True
     assert repr(client) == "<Client closed>"
@@ -178,3 +184,13 @@ def test_exec_json_raises_datalevin_error(monkeypatch) -> None:
     assert str(exc_info.value) == "boom"
     assert exc_info.value.type_name == "datalevin.test/error"
     assert exc_info.value.data == {"code": 42}
+
+
+def test_preferred_runtime_jar_prefers_shared_runtime_and_latest_version(tmp_path) -> None:
+    legacy = tmp_path / "datalevin-java-0.10.6.jar"
+    shared_old = tmp_path / "datalevin-runtime-0.10.6.jar"
+    shared_new = tmp_path / "datalevin-runtime-0.10.7.jar"
+    for path in (legacy, shared_old, shared_new):
+        path.write_text("", encoding="utf-8")
+
+    assert jvm_module._preferred_runtime_jar(tmp_path) == shared_new

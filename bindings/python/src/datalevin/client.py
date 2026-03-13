@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from weakref import WeakSet
+
 from ._convert import to_edn_form, to_python, to_query_input
 from ._interop import _BINDINGS
 from ._resource import ResourceWrapper
+
+_LIVE_CLIENTS = WeakSet()
 
 
 def _query_form(value):
@@ -18,15 +22,18 @@ class Client(ResourceWrapper):
 
     def __init__(self, handle) -> None:
         super().__init__(handle, _BINDINGS.close_client, _BINDINGS.client_disconnected, "client")
+        self._client_id = None
+        self._remotely_disconnected = False
+        _LIVE_CLIENTS.add(self)
 
     def disconnect(self) -> None:
         self.close()
 
     def disconnected(self) -> bool:
-        return self.closed()
+        return self._remotely_disconnected or self.closed()
 
     def client_id(self):
-        return to_python(_BINDINGS.client_invoke("get-id", [self.raw_handle()]))
+        return self._resolve_client_id()
 
     def open_database(self, name, db_type, schema=None, opts=None, info=False):
         if info or schema is not None or opts is not None:
@@ -141,3 +148,22 @@ class Client(ResourceWrapper):
 
     def disconnect_client(self, client_id) -> None:
         _BINDINGS.client_invoke("disconnect-client", [self.raw_handle(), client_id])
+        _mark_local_client_disconnected(client_id)
+
+    def _resolve_client_id(self):
+        if self._client_id is None:
+            self._client_id = to_python(_BINDINGS.client_invoke("get-id", [self.raw_handle()]))
+        return self._client_id
+
+    def _mark_remotely_disconnected(self) -> None:
+        self._remotely_disconnected = True
+        self._handle = None
+
+
+def _mark_local_client_disconnected(client_id) -> None:
+    target_id = str(client_id)
+    for client in list(_LIVE_CLIENTS):
+        if client._handle is None:
+            continue
+        if str(client._resolve_client_id()) == target_id:
+            client._mark_remotely_disconnected()

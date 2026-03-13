@@ -122,11 +122,10 @@
                       "listOf" "setOf" "mapResult" "listResult" "setResult"}
    Connection       #{"closed" "schema" "updateSchema" "opts" "clear"
                       "maxEid" "datalogIndexCacheLimit" "entid" "entity"
-                      "entityMap"
-                      "pull" "pullMany" "query" "queryScalar"
-                      "queryCollection" "queryTuple" "queryRelation"
-                      "queryKeyed" "queryForm"
-                      "explain" "explainForm" "transact" "exec"}
+                      "entityMap" "pull" "pullMany" "query" "queryForm"
+                      "queryScalar" "queryCollection" "queryTuple"
+                      "queryRelation" "queryKeyed" "explain" "explainForm"
+                      "transact" "exec"}
    KV               #{"closed" "dir" "openDbi" "openListDbi" "putListItems"
                       "delListItems" "deleteListItems" "getList" "visitList"
                       "listCount" "inList" "listRange" "listRangeCount"
@@ -145,8 +144,7 @@
                       "withdrawRole" "listUserRoles" "grantPermission"
                       "revokePermission" "listRolePermissions"
                       "listUserPermissions" "querySystem" "querySystemForm"
-                      "showClients"
-                      "disconnectClient" "exec"}
+                      "showClients" "disconnectClient" "exec"}
    DatalevinInterop #{"coreInvoke" "coreInvokeBridge"
                       "clientInvoke" "clientInvokeBridge"
                       "readEdn" "currentClassLoader" "bridgeResult"
@@ -157,8 +155,9 @@
                       "symbol" "schema" "options" "udfDescriptor"
                       "createUdfRegistry" "registerUdf" "unregisterUdf"
                       "registeredUdf" "renameMap" "deleteAttrs"
-                      "lookupRef" "txData" "kvTxs" "kvType" "databaseType"
-                      "role" "permissionKeyword" "permissionTarget"}})
+                      "lookupRef" "txData" "kvTxs" "kvInput" "kvRange"
+                      "kvType" "databaseType" "role"
+                      "permissionKeyword" "permissionTarget"}})
 
 (deftest java-friendly-local-api-test
   (let [conn-dir (test-dir "java-friendly-conn")
@@ -1177,6 +1176,7 @@
 (deftest java-interop-helper-coverage-test
   (let [conn-dir   (test-dir "java-interop-helper-conn")
         kv-dir     (test-dir "java-interop-helper-kv")
+        byte-array-class (class (byte-array 0))
         schema-map (java-map "name" (java-map ":db/valueType" ":db.type/string"
                                               ":db/unique" ":db.unique/identity")
                              "age"  (java-map ":db/valueType" ":db.type/long"))
@@ -1201,7 +1201,14 @@
             normalized-delete #{:age}
             normalized-tx     [{:db/id -1 :name "Ada"}]
             normalized-kv-txs [[:put "a" "alpha"]]
-            normalized-kv-type [:string :long]]
+            normalized-kv-type [:string :long]
+            normalized-bytes-tx (DatalevinInterop/kvTxs
+                                 [[:put [1 2] [3 255]]]
+                                 ":bytes"
+                                 ":bytes")
+            normalized-bytes-range (DatalevinInterop/kvRange
+                                    [":closed" [1] [3 255]]
+                                    ":bytes")]
         (is (= :db.type/string (mget (mget raw-schema :name) :db/valueType)))
         (is (= :db.unique/identity (mget (mget raw-schema :name) :db/unique)))
         (is (= :db.type/long (mget (mget raw-schema :age) :db/valueType)))
@@ -1226,7 +1233,11 @@
         (is (identical? normalized-kv-txs
                         (DatalevinInterop/kvTxs normalized-kv-txs)))
         (is (identical? normalized-kv-type
-                        (DatalevinInterop/kvType normalized-kv-type))))
+                        (DatalevinInterop/kvType normalized-kv-type)))
+        (is (instance? byte-array-class (nth (first normalized-bytes-tx) 1)))
+        (is (instance? byte-array-class (nth (first normalized-bytes-tx) 2)))
+        (is (instance? byte-array-class (nth normalized-bytes-range 1)))
+        (is (instance? byte-array-class (nth normalized-bytes-range 2))))
 
       (let [anon (DatalevinInterop/getConnection nil nil nil)]
         (try

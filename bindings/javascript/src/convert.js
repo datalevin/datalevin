@@ -1,4 +1,4 @@
-import { classes, javaBridgeModule } from "./jvm.js";
+import { classes } from "./jvm.js";
 
 const INT64_MIN = -(2n ** 63n);
 const INT64_MAX = 2n ** 63n - 1n;
@@ -10,6 +10,35 @@ function isPlainObject(value) {
   }
   const prototype = Object.getPrototypeOf(value);
   return prototype === Object.prototype || prototype === null;
+}
+
+function toSignedByteValues(value) {
+  return Array.from(new Int8Array(value.buffer, value.byteOffset, value.byteLength));
+}
+
+function toBufferView(value) {
+  if (Buffer.isBuffer(value)) {
+    return value;
+  }
+  return Buffer.from(value.buffer, value.byteOffset, value.byteLength);
+}
+
+function materializeJavaCollection(collection) {
+  if (typeof collection?.toArraySync === "function") {
+    try {
+      const items = collection.toArraySync();
+      return Array.isArray(items) ? items : Array.from(items);
+    } catch {
+      // Fall back to iterator-based traversal when array materialization is unsupported.
+    }
+  }
+
+  const items = [];
+  const iterator = collection.iteratorSync();
+  while (iterator.hasNextSync()) {
+    items.push(iterator.nextSync());
+  }
+  return items;
 }
 
 function instanceOf(value, type) {
@@ -95,11 +124,7 @@ export async function toJava(value) {
   }
 
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    const bridge = await javaBridgeModule();
-    if (typeof bridge.newArray === "function") {
-      return bridge.newArray("byte", Array.from(value));
-    }
-    return Buffer.from(value);
+    return toSignedByteValues(value);
   }
 
   if (value instanceof Map) {
@@ -133,7 +158,7 @@ export async function toJs(value) {
   }
 
   if (Buffer.isBuffer(value) || value instanceof Uint8Array) {
-    return Buffer.from(value);
+    return toBufferView(value);
   }
 
   if (Array.isArray(value)) {
@@ -179,9 +204,7 @@ export async function toJs(value) {
 
   if (instanceOf(value, cls.mapType) || typeof value.entrySetSync === "function") {
     const entries = [];
-    const iterator = value.entrySetSync().iteratorSync();
-    while (iterator.hasNextSync()) {
-      const entry = iterator.nextSync();
+    for (const entry of materializeJavaCollection(value.entrySetSync())) {
       entries.push([await toJs(entry.getKeySync()), await toJs(entry.getValueSync())]);
     }
 
@@ -193,9 +216,8 @@ export async function toJs(value) {
 
   if (instanceOf(value, cls.setType)) {
     const items = [];
-    const iterator = value.iteratorSync();
-    while (iterator.hasNextSync()) {
-      items.push(await toJs(iterator.nextSync()));
+    for (const item of materializeJavaCollection(value)) {
+      items.push(await toJs(item));
     }
     return new Set(items);
   }
@@ -206,9 +228,8 @@ export async function toJs(value) {
     || typeof value.iteratorSync === "function"
   ) {
     const items = [];
-    const iterator = value.iteratorSync();
-    while (iterator.hasNextSync()) {
-      items.push(await toJs(iterator.nextSync()));
+    for (const item of materializeJavaCollection(value)) {
+      items.push(await toJs(item));
     }
     return items;
   }

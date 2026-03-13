@@ -35,6 +35,7 @@ def test_raw_interop_exposes_normalizers_and_kv_calls(tmp_path) -> None:
     kv = raw.open_key_value(str(tmp_path / "kv"))
     try:
         raw.core_invoke("open-dbi", [kv, "items"])
+        raw.core_invoke("open-dbi", [kv, "blob-keys"])
         raw.core_invoke(
             "transact-kv",
             [
@@ -45,7 +46,17 @@ def test_raw_interop_exposes_normalizers_and_kv_calls(tmp_path) -> None:
                 raw.kv_type(":string"),
             ],
         )
-        assert to_python(raw.core_invoke("list-dbis", [kv])) == ["items"]
+        raw.core_invoke(
+            "transact-kv",
+            [
+                kv,
+                "blob-keys",
+                raw.kv_txs([(":put", b"\x01", b"\x09"), (":put", b"\x02", b"\x08")]),
+                raw.kv_type(":bytes"),
+                raw.kv_type(":bytes"),
+            ],
+        )
+        assert sorted(to_python(raw.core_invoke("list-dbis", [kv]))) == ["blob-keys", "items"]
         assert to_python(raw.core_invoke("entries", [kv, "items"])) == 2
         assert to_python(
             raw.core_invoke(
@@ -53,6 +64,24 @@ def test_raw_interop_exposes_normalizers_and_kv_calls(tmp_path) -> None:
                 [kv, "items", raw.read_edn("[:all]"), raw.kv_type(":string"), raw.kv_type(":string")],
             )
         ) == [["a", "alpha"], ["b", "beta"]]
+        assert to_python(
+            raw.core_invoke(
+                "get-value",
+                [kv, "blob-keys", b"\x02", raw.kv_type(":bytes"), raw.kv_type(":bytes"), True],
+            )
+        ) == b"\x08"
+        assert to_python(
+            raw.core_invoke(
+                "get-range",
+                [
+                    kv,
+                    "blob-keys",
+                    [raw.keyword(":closed"), b"\x01", b"\x02"],
+                    raw.kv_type(":bytes"),
+                    raw.kv_type(":bytes"),
+                ],
+            )
+        ) == [[b"\x01", b"\x09"], [b"\x02", b"\x08"]]
     finally:
         raw.close_key_value(kv)
 

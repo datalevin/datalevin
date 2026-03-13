@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.resources as resources
 import os
+import re
 import shlex
 from pathlib import Path
 
@@ -101,7 +102,8 @@ def _vendored_jars() -> list[str]:
     if not jar_root.is_dir():
         return []
 
-    return sorted(str(path) for path in jar_root.iterdir() if path.name.endswith(".jar"))
+    jar = _preferred_runtime_jar(Path(str(jar_root)))
+    return [] if jar is None else [str(jar)]
 
 
 def _repo_local_jars() -> list[str]:
@@ -109,10 +111,23 @@ def _repo_local_jars() -> list[str]:
     target_dir = repo_root / "target"
     if not target_dir.exists():
         return []
-    resolved = []
+    jar = _preferred_runtime_jar(target_dir)
+    return [] if jar is None else [str(jar)]
+
+
+def _preferred_runtime_jar(dir_path: Path) -> Path | None:
     for pattern in TARGET_JAR_PATTERNS:
-        resolved.extend(sorted(str(path) for path in target_dir.glob(pattern)))
-    return resolved
+        matches = sorted(dir_path.glob(pattern), key=_jar_sort_key)
+        if matches:
+            return matches[-1]
+    return None
+
+
+def _jar_sort_key(path: Path):
+    stem = path.stem
+    version = stem.rsplit("-", 1)[-1]
+    parts = re.split(r"([0-9]+)", version)
+    return [int(part) if part.isdigit() else part for part in parts]
 
 
 def _ensure_javacpp_cachedir_arg(jvm_args: list[str]) -> None:

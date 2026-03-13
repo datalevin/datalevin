@@ -314,6 +314,28 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Normalizes KV transaction data with default key and value types.
+     */
+    public static Object kvTxs(Object txs, Object kType, Object vType) {
+        return DatalevinForms.kvTxsInput(txs, kType, vType);
+    }
+
+    /**
+     * Normalizes a typed KV key or value into the raw Clojure form expected by
+     * Datalevin.
+     */
+    public static Object kvInput(Object value, Object type) {
+        return DatalevinForms.kvInput(value, type);
+    }
+
+    /**
+     * Normalizes a KV range form with a typed bound specification.
+     */
+    public static Object kvRange(List<?> range, Object type) {
+        return DatalevinForms.rangeInput(range, type);
+    }
+
+    /**
      * Normalizes a KV type value into the raw Clojure form expected by
      * Datalevin.
      */

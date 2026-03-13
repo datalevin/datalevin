@@ -29,42 +29,31 @@ export class Connection extends ResourceWrapper {
   }
 
   async schema() {
-    return toJsResult(await callJavaMethod(this.rawHandle(), "schema"));
+    return toJsResult(await _BINDINGS.coreInvoke("schema", [this.rawHandle()]));
   }
 
   async opts() {
-    return toJsResult(await callJavaMethod(this.rawHandle(), "opts"));
+    return toJsResult(await _BINDINGS.coreInvoke("opts", [this.rawHandle()]));
   }
 
   async updateSchema(schemaUpdate, { delAttrs = null, renameMap = null } = {}) {
-    const normalizedSchema = schemaUpdate === null || schemaUpdate === undefined
-      ? null
-      : await toJava(schemaUpdate);
-    const normalizedDelAttrs = delAttrs === null || delAttrs === undefined
-      ? null
-      : await toJava([...delAttrs]);
+    const args = [
+      this.rawHandle(),
+      schemaUpdate === null || schemaUpdate === undefined ? null : await _BINDINGS.schema(schemaUpdate)
+    ];
 
     if (renameMap !== null && renameMap !== undefined) {
-      return toJsResult(
-        await callJavaMethod(
-          this.rawHandle(),
-          "updateSchema",
-          normalizedSchema,
-          normalizedDelAttrs,
-          await toJava(renameMap)
-        )
-      );
+      args.push(await _BINDINGS.deleteAttrs(delAttrs));
+      args.push(await _BINDINGS.renameMap(renameMap));
+    } else if (delAttrs !== null && delAttrs !== undefined) {
+      args.push(await _BINDINGS.deleteAttrs(delAttrs));
     }
 
-    if (delAttrs !== null && delAttrs !== undefined) {
-      return toJsResult(await callJavaMethod(this.rawHandle(), "updateSchema", normalizedSchema, normalizedDelAttrs, null));
-    }
-
-    return toJsResult(await callJavaMethod(this.rawHandle(), "updateSchema", normalizedSchema));
+    return toJsResult(await _BINDINGS.coreInvoke("update-schema", args));
   }
 
   async clear() {
-    await callJavaMethod(this.rawHandle(), "clear");
+    await _BINDINGS.coreInvoke("clear", [this.rawHandle()]);
   }
 
   async entid(eid) {
@@ -77,13 +66,15 @@ export class Connection extends ResourceWrapper {
 
   async pull(selector, eid) {
     return toJsResult(
-      await callJavaMethod(this.rawHandle(), "pull", await pullSelector(selector), await toJava(eid))
+      await callJavaMethod(this.rawHandle(), "pull", await pullSelector(selector), await toJava(eid)),
+      { bridge: true }
     );
   }
 
   async pullMany(selector, eids) {
     return toJsResult(
-      await callJavaMethod(this.rawHandle(), "pullMany", await pullSelector(selector), await toJava(eids))
+      await callJavaMethod(this.rawHandle(), "pullMany", await pullSelector(selector), await toJava(eids)),
+      { bridge: true }
     );
   }
 
@@ -94,11 +85,13 @@ export class Connection extends ResourceWrapper {
     }
     if (typeof query === "string") {
       return toJsResult(
-        await callJavaMethod(this.rawHandle(), "query", query, await toJava(normalizedInputs))
+        await callJavaMethod(this.rawHandle(), "query", query, await toJava(normalizedInputs)),
+        { bridge: true }
       );
     }
     return toJsResult(
-      await callJavaMethod(this.rawHandle(), "queryForm", await queryForm(query), await toJava(normalizedInputs))
+      await callJavaMethod(this.rawHandle(), "queryForm", await queryForm(query), await toJava(normalizedInputs)),
+      { bridge: true }
     );
   }
 
@@ -107,7 +100,6 @@ export class Connection extends ResourceWrapper {
     for (const input of inputs) {
       normalizedInputs.push(await toQueryInput(input));
     }
-
     if (optsEdn !== null && optsEdn !== undefined) {
       if (typeof query === "string") {
         return toJsResult(
@@ -117,7 +109,8 @@ export class Connection extends ResourceWrapper {
             optsEdn,
             query,
             await toJava(normalizedInputs)
-          )
+          ),
+          { bridge: true }
         );
       }
       return toJsResult(
@@ -127,25 +120,28 @@ export class Connection extends ResourceWrapper {
           optsEdn,
           await queryForm(query),
           await toJava(normalizedInputs)
-        )
+        ),
+        { bridge: true }
       );
     }
 
     if (typeof query === "string") {
       return toJsResult(
-        await callJavaMethod(this.rawHandle(), "explain", query, await toJava(normalizedInputs))
+        await callJavaMethod(this.rawHandle(), "explain", query, await toJava(normalizedInputs)),
+        { bridge: true }
       );
     }
     return toJsResult(
-      await callJavaMethod(this.rawHandle(), "explainForm", await queryForm(query), await toJava(normalizedInputs))
+      await callJavaMethod(this.rawHandle(), "explainForm", await queryForm(query), await toJava(normalizedInputs)),
+      { bridge: true }
     );
   }
 
   async transact(txData, txMeta = null) {
-    const normalizedTxData = await _BINDINGS.txData(txData);
+    const args = [this.rawHandle(), await _BINDINGS.txData(txData)];
     if (txMeta !== null && txMeta !== undefined) {
-      return toJsResult(await callJavaMethod(this.rawHandle(), "transact", normalizedTxData, await toJava(txMeta)));
+      args.push(await toJava(txMeta));
     }
-    return toJsResult(await callJavaMethod(this.rawHandle(), "transact", normalizedTxData));
+    return toJsResult(await _BINDINGS.coreInvoke("transact!", args));
   }
 }
