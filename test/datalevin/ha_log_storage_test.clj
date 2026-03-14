@@ -29,6 +29,10 @@
   [obj field-name]
   (.get ^java.lang.reflect.Field (private-field (class obj) field-name) obj))
 
+(defn- read-private-static-field
+  [^Class cls field-name]
+  (.get ^java.lang.reflect.Field (private-field cls field-name) nil))
+
 (defn- read-private-long
   [obj field-name]
   (.getLong ^java.lang.reflect.Field (private-field (class obj) field-name) obj))
@@ -87,6 +91,26 @@
        (.getModifiers (private-field LMDBLogStorage "firstLogIndex"))))
   (is (Modifier/isVolatile
        (.getModifiers (private-field LMDBLogStorage "hasLoadedFirstLogIndex")))))
+
+(deftest lmdb-log-storage-long-key-buffer-is-thread-local-test
+  (let [dir (u/tmp-dir (str "ha-log-storage-key-cache-" (UUID/randomUUID)))
+        ^LMDBLogStorage storage (make-log-storage dir)]
+    (try
+      (let [initialized? (.init storage (log-storage-options))
+            ^ThreadLocal key-cache
+            (read-private-static-field LMDBLogStorage "LONG_KEY_BUF_VAL")]
+        (is initialized?)
+        (when initialized?
+          (let [main-thread-buf (.get key-cache)
+                same-thread-buf (.get key-cache)
+                other-thread-buf @(future (.get key-cache))]
+            (is (instance? ThreadLocal key-cache))
+            (is (instance? BufVal main-thread-buf))
+            (is (identical? main-thread-buf same-thread-buf))
+            (is (not (identical? main-thread-buf other-thread-buf))))))
+      (finally
+        (.shutdown storage)
+        (u/delete-files dir)))))
 
 (deftest lmdb-log-storage-get-entry-throws-on-corrupt-bytes-test
   (let [dir (u/tmp-dir (str "ha-log-storage-corrupt-" (UUID/randomUUID)))
