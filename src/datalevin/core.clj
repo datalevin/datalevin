@@ -750,8 +750,10 @@ Only usable for debug output.
    * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
    Default is `datalevin.constants/*ha-max-promotion-lag-lsn*`.
 
-   * `:ha-clock-skew-budget-ms`, maximum tolerated clock skew in milliseconds
-   before auto-failover pauses. Default is
+   * `:ha-clock-skew-budget-ms`, maximum tolerated absolute clock skew in
+   milliseconds before auto-failover pauses. In consensus-lease mode,
+   `2 * :ha-clock-skew-budget-ms` must not exceed
+   `(:ha-lease-timeout-ms - :ha-lease-renew-ms)`. Default is
    `datalevin.constants/*ha-clock-skew-budget-ms*`.
 
    * `:ha-clock-skew-hook`, optional command hook that reports observed clock
@@ -1067,8 +1069,10 @@ Only usable for debug output.
   * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
   * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
   * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
-  * `:ha-clock-skew-budget-ms`, maximum tolerated clock skew before
-   auto-failover pauses.
+  * `:ha-clock-skew-budget-ms`, maximum tolerated absolute clock skew before
+   auto-failover pauses; in consensus-lease mode,
+   `2 * :ha-clock-skew-budget-ms` must not exceed
+   `(:ha-lease-timeout-ms - :ha-lease-renew-ms)`.
   * `:ha-clock-skew-hook`, optional command hook that reports observed clock
    skew in milliseconds on stdout.
   * `:ha-control-plane`, consensus control-plane configuration map required

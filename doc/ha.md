@@ -52,6 +52,9 @@ Out of scope (V2):
 * Node identity: stable positive integer `node-id`
 * Clock skew budget: all HA nodes and control-plane voters require NTP/chrony,
   observed max absolute skew `<100ms`
+* Consensus-lease HA assumes bounded clock error; if clocks diverge enough,
+  two nodes can briefly believe they are leader until the stale lease window
+  closes and the skew hook pauses promotion
 * Write admission is fail-closed and never extends lease locally after renew
   failure
 * Per-write admission uses cached state from successful renew/read loop (no
@@ -116,6 +119,9 @@ Validation rules:
   `ha-lease-renew-ms`, `ha-lease-timeout-ms`,
   `ha-promotion-base-delay-ms`, `ha-promotion-rank-delay-ms`.
 * `ha-lease-timeout-ms >= 2 * ha-lease-renew-ms` (recommend `3x`).
+* `2 * ha-clock-skew-budget-ms <= (ha-lease-timeout-ms - ha-lease-renew-ms)`.
+  The skew hook reports absolute offset from a common time source, so pairwise
+  skew across two nodes can approach `2x` the configured budget.
 * `ha-max-promotion-lag-lsn` is non-negative.
 * Fencing hook shape is valid (`:cmd`, timeout/retry fields).
 * `:group-id`, `:local-peer-id`, and voter `:peer-id` values are unique.
@@ -731,6 +737,9 @@ Debugging a failed local drill:
 * Procedure for repeated fencing failures is required.
 * Procedure for follower-only rejoin is required.
 * Monitor clock skew budget `<100ms`; pause auto-failover when violated.
+* Treat consensus-lease HA as bounded-clock safety, not arbitrary-clock safety;
+  larger pairwise skew can create a brief dual-leader belief window until the
+  lease window closes.
 * Degraded-mode procedure is required when no valid WAL/snapshot source exists.
 
 ## Implementation Phases

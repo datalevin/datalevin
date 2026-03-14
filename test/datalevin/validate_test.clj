@@ -107,6 +107,16 @@
            #"ha-clock-skew-budget-ms must be a positive integer"
            (vld/validate-ha-options opts)))))
 
+  (testing "rejects clock skew budget that exceeds lease safety window"
+    (let [opts (assoc (valid-ha-opts)
+                      :ha-lease-renew-ms 3000
+                      :ha-lease-timeout-ms 7000
+                      :ha-clock-skew-budget-ms 2500)]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"ha-clock-skew-budget-ms is too large for the lease window"
+           (vld/validate-ha-options opts)))))
+
   (testing "rejects malformed clock skew hook"
     (let [opts (assoc (valid-ha-opts)
                       :ha-clock-skew-hook {:cmd []

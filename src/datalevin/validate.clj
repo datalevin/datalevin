@@ -435,8 +435,8 @@
   "Validate consensus-lease HA options as a coherent set.
    Returns `opts` unchanged on success."
   [opts]
-  (let [opts (or opts {})
-        mode (:ha-mode opts)]
+      (let [opts (or opts {})
+            mode (:ha-mode opts)]
     (when (and (some? mode) (not= mode :consensus-lease))
       (u/raise "Option :ha-mode expects nil or :consensus-lease"
                {:error :ha/validation
@@ -449,6 +449,9 @@
             member-id-set (set member-ids)
             renew-ms (:ha-lease-renew-ms opts)
             timeout-ms (:ha-lease-timeout-ms opts)
+            stale-leader-window-ms
+            (when (and (integer? renew-ms) (integer? timeout-ms))
+              (- (long timeout-ms) (long renew-ms)))
             base-delay-ms (:ha-promotion-base-delay-ms opts)
             rank-delay-ms (:ha-promotion-rank-delay-ms opts)
             max-lag-lsn (:ha-max-promotion-lag-lsn opts)
@@ -505,6 +508,19 @@
                    {:error :ha/validation
                     :ha-lease-timeout-ms timeout-ms
                     :ha-lease-renew-ms renew-ms}))
+        (when (or (nil? stale-leader-window-ms)
+                  (< stale-leader-window-ms 0)
+                  (> (unchecked-multiply 2 (long clock-skew-budget-ms))
+                     (long stale-leader-window-ms)))
+          (u/raise
+           (str "Option :ha-clock-skew-budget-ms is too large for the lease window; "
+                "require 2 * :ha-clock-skew-budget-ms <= "
+                "(:ha-lease-timeout-ms - :ha-lease-renew-ms)")
+           {:error :ha/validation
+            :ha-clock-skew-budget-ms clock-skew-budget-ms
+            :ha-lease-timeout-ms timeout-ms
+            :ha-lease-renew-ms renew-ms
+            :stale-leader-window-ms stale-leader-window-ms}))
         (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
         (when (some? (:ha-clock-skew-hook opts))
           (validate-ha-clock-skew-hook-shape (:ha-clock-skew-hook opts)))
