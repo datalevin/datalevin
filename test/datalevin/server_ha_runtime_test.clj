@@ -76,6 +76,30 @@
         (is (= :updated (:marker state)))
         (is (not (identical? initial-state state)))))))
 
+(deftest ha-write-admission-error-refreshes-udf-state-for-tx-data-messages-test
+  (let [db-name "orders"
+        initial-state {:marker :initial}
+        ^Server server (fake-server-with-db-state db-name initial-state)
+        calls (atom [])]
+    (binding [srv/*ensure-udf-readiness-state-fn*
+              (fn [m]
+                (swap! calls conj (:marker m))
+                (assoc m :marker :updated))]
+      (is (nil? (#'srv/ha-write-admission-error
+                 server
+                 {:type :tx-data
+                  :args [db-name [] false]})))
+      (is (= [:initial] @calls))
+      (is (= :updated (:marker (get (.-dbs server) db-name))))
+      (#'srv/update-db server db-name #(assoc % :marker :initial))
+      (reset! calls [])
+      (is (nil? (#'srv/ha-write-admission-error
+                 server
+                 {:type :tx-data+db-info
+                  :args [db-name [] false]})))
+      (is (= [:initial] @calls))
+      (is (= :updated (:marker (get (.-dbs server) db-name)))))))
+
 (deftest add-store-reopens-datalog-store-after-closed-lmdb-race-test
   (let [dir (u/tmp-dir (str "server-add-store-race-" (UUID/randomUUID)))
         server (srv/create {:port 0 :root dir})

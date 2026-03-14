@@ -1039,6 +1039,10 @@
                      (conj (+ (long (:ha-candidate-since-ms m))
                               (long (:ha-candidate-delay-ms m))))
 
+                     (and (= :candidate role)
+                          (integer? (:ha-candidate-pre-cas-wait-until-ms m)))
+                     (conj (long (:ha-candidate-pre-cas-wait-until-ms m)))
+
                      (and (= :follower role)
                           (integer? (:ha-follower-next-sync-not-before-ms m)))
                      (conj (long (:ha-follower-next-sync-not-before-ms m)))
@@ -3280,7 +3284,11 @@
                  :ha-rejoin-promotion-cleared-ms
                  (:ha-rejoin-promotion-cleared-ms db-state)
                  :ha-candidate-since-ms (:ha-candidate-since-ms db-state)
-                 :ha-candidate-delay-ms (:ha-candidate-delay-ms db-state)}
+                 :ha-candidate-delay-ms (:ha-candidate-delay-ms db-state)
+                 :ha-candidate-pre-cas-wait-until-ms
+                 (:ha-candidate-pre-cas-wait-until-ms db-state)
+                 :ha-promotion-wait-before-cas-ms
+                 (:ha-promotion-wait-before-cas-ms db-state)}
           (some? runtime-lsn)
           (assoc :ha-local-last-applied-lsn runtime-lsn
                  :ha-role (:ha-role db-state))

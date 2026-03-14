@@ -88,7 +88,10 @@
   (dissoc m
           :ha-candidate-since-ms
           :ha-candidate-delay-ms
-          :ha-candidate-rank-index))
+          :ha-candidate-rank-index
+          :ha-candidate-pre-cas-wait-until-ms
+          :ha-candidate-pre-cas-observed-version
+          :ha-promotion-wait-before-cas-ms))
 
 (defn- ha-promotion-rank-index
   [m]
@@ -110,6 +113,10 @@
         rank-idx (ha-promotion-rank-index m)]
     (when (integer? rank-idx)
       (+ base-ms (* (long rank-idx) rank-ms)))))
+
+(defn ^:redef ha-now-ms
+  []
+  (System/currentTimeMillis))
 
 (defn- local-kv-store
   [m]
@@ -482,7 +489,7 @@
           (doseq [entry entries]
             (let [entry ^java.util.Map$Entry entry
                   cache-key (.getKey entry)
-                  client    (.getValue entry)]
+                  client (.getValue entry)]
               (when (.remove cache cache-key client)
                 (close-ha-client! client))))
           (when-not (.isEmpty cache)
@@ -545,7 +552,7 @@
                                  :env-dir env-dir
                                  :marker-path marker-path})))
             backup-dir (:backup-dir marker)
-            stage      (:stage marker)]
+            stage (:stage marker)]
         (when-not (and (map? marker)
                        (string? backup-dir)
                        (not (s/blank? backup-dir))
@@ -659,7 +666,7 @@
       (if-not (recover-ha-local-store-dir-if-needed! env-dir)
         store
         (let [schema (i/schema store)
-              opts   (i/opts store)]
+              opts (i/opts store)]
           (when-not (i/closed? store)
             (i/close store))
           (-> (st/open env-dir schema opts)
@@ -667,15 +674,15 @@
 
 (defn- reopen-ha-local-store-if-needed
   [m]
-  (let [store          (:store m)
+  (let [store (:store m)
         recovered-store (recover-ha-local-store-if-needed store)
-        m              (if (identical? recovered-store store)
-                         m
-                         (-> m
-                             (assoc :store recovered-store
-                                    :dt-db nil)
-                             (dissoc :engine :index)
-                             refresh-ha-local-dt-db))]
+        m (if (identical? recovered-store store)
+            m
+            (-> m
+                (assoc :store recovered-store
+                       :dt-db nil)
+                (dissoc :engine :index)
+                refresh-ha-local-dt-db))]
     (if (local-kv-store m)
       m
       (let [store (:store m)]
@@ -1253,13 +1260,13 @@
               {:lsn (long (:lsn record))
                :payload-lsn (read-ha-local-payload-lsn readback-kv-store)
                :meta-max-tx (long (or (try
-                                       (i/get-value readback-kv-store
-                                                    c/meta
-                                                    :max-tx
-                                                    :attr
-                                                    :long)
-                                       (catch Throwable _
-                                         nil))
+                                        (i/get-value readback-kv-store
+                                                     c/meta
+                                                     :max-tx
+                                                     :attr
+                                                     :long)
+                                        (catch Throwable _
+                                          nil))
                                       0))
                :probe-eid probe-eid
                :probe-eav-range
@@ -1274,20 +1281,20 @@
                      nil)))})]
         (let [next-state (assoc next-state
                                 :ha-follower-last-apply-readback readback)]
-        (when (instance? IStore (:store next-state))
-          (when-let [target-max-tx
-                     (some->> replay-rows
-                              (keep (fn [[op dbi k v]]
-                                      (when (and (= op :put)
-                                                 (= dbi c/meta)
-                                                 (= k :max-tx)
-                                          (integer? v))
-                                        (long v))))
-                              last)]
-            (loop [cur (long (i/max-tx (:store next-state)))]
-              (when (< cur target-max-tx)
-                (i/advance-max-tx (:store next-state))
-                (recur (long (i/max-tx (:store next-state))))))))
+          (when (instance? IStore (:store next-state))
+            (when-let [target-max-tx
+                       (some->> replay-rows
+                                (keep (fn [[op dbi k v]]
+                                        (when (and (= op :put)
+                                                   (= dbi c/meta)
+                                                   (= k :max-tx)
+                                                   (integer? v))
+                                          (long v))))
+                                last)]
+              (loop [cur (long (i/max-tx (:store next-state)))]
+                (when (< cur target-max-tx)
+                  (i/advance-max-tx (:store next-state))
+                  (recur (long (i/max-tx (:store next-state))))))))
           next-state))
 
       :else
@@ -1474,7 +1481,7 @@
           ;; Validate that the copied snapshot is openable before swapping paths.
           (let [snapshot-store (st/open snapshot-dir nil open-opts)]
             (try
-                (i/opts snapshot-store)
+              (i/opts snapshot-store)
               (finally
                 (i/close snapshot-store))))
           (close-ha-local-store! m)
@@ -1808,10 +1815,8 @@
         lease-until-ms (long (or (:lease-until-ms lease) 0))
         wait-until-ms (+ lease-until-ms renew-ms)
         now-ms (System/currentTimeMillis)
-        sleep-ms (long (max 0 (- wait-until-ms now-ms)))]
-    (when (pos? sleep-ms)
-      (Thread/sleep sleep-ms))
-    {:slept-ms sleep-ms
+        wait-ms (long (max 0 (- wait-until-ms now-ms)))]
+    {:wait-ms wait-ms
      :wait-until-ms wait-until-ms}))
 
 (defn- pre-cas-lag-input
@@ -2242,7 +2247,10 @@
 
 (defn- maybe-promote-after-authority-observation
   [db-name m authority db-identity obs now-ms]
-  (let [m1 (apply-authority-observation m obs now-ms)
+  (let [m1 (-> (apply-authority-observation m obs now-ms)
+               (dissoc :ha-candidate-pre-cas-wait-until-ms
+                       :ha-candidate-pre-cas-observed-version
+                       :ha-promotion-wait-before-cas-ms))
         lease (:lease obs)
         version (:version obs)
         db-identity-mismatch? (:db-identity-mismatch? obs)
@@ -2271,39 +2279,123 @@
            db-name m1 authority db-identity lease version now-ms lag-input)
           (let [wait-info (maybe-wait-unreachable-leader-before-pre-cas!
                            m1 lease)
-                obs-2 (observe-authority-state m1)
-                now-ms-2 (System/currentTimeMillis)
-                m2 (-> (apply-authority-observation m1 obs-2 now-ms-2)
-                       (assoc :ha-promotion-wait-before-cas-ms
-                              (:slept-ms wait-info)))
-                lease-2 (:lease obs-2)
-                version-2 (:version obs-2)]
-            (cond
-              (:db-identity-mismatch? obs-2)
-              (fail-ha-candidate m2 :db-identity-mismatch
-                                 {:local-db-identity db-identity
-                                  :authority-lease lease-2})
+                wait-ms (long (or (:wait-ms wait-info)
+                                  (:slept-ms wait-info)
+                                  0))]
+            (if (pos? wait-ms)
+              (assoc m1
+                     :ha-candidate-pre-cas-wait-until-ms
+                     (:wait-until-ms wait-info)
+                     :ha-candidate-pre-cas-observed-version version
+                     :ha-promotion-wait-before-cas-ms wait-ms)
+              (let [obs-2 (observe-authority-state m1)
+                    now-ms-2 (System/currentTimeMillis)
+                    m2 (apply-authority-observation m1 obs-2 now-ms-2)
+                    lease-2 (:lease obs-2)
+                    version-2 (:version obs-2)]
+                (cond
+                  (:db-identity-mismatch? obs-2)
+                  (fail-ha-candidate m2 :db-identity-mismatch
+                                     {:local-db-identity db-identity
+                                      :authority-lease lease-2})
 
-              (:membership-mismatch? obs-2)
-              (fail-ha-candidate m2 :membership-hash-mismatch
-                                 {:ha-membership-hash (:ha-membership-hash m2)
-                                  :ha-authority-membership-hash
-                                  (:authority-membership-hash obs-2)})
+                  (:membership-mismatch? obs-2)
+                  (fail-ha-candidate m2 :membership-hash-mismatch
+                                     {:ha-membership-hash
+                                      (:ha-membership-hash m2)
+                                      :ha-authority-membership-hash
+                                      (:authority-membership-hash obs-2)})
 
-              (not (lease/lease-expired? lease-2 now-ms-2))
-              (fail-ha-candidate m2 :lease-not-expired
-                                 {:lease lease-2})
+                  (not (lease/lease-expired? lease-2 now-ms-2))
+                  (fail-ha-candidate m2 :lease-not-expired
+                                     {:lease lease-2})
 
-              :else
-              (finalize-ha-candidate-promotion
+                  :else
+                  (finalize-ha-candidate-promotion
+                   db-name
+                   m2
+                   authority
+                   db-identity
+                   lease-2
+                   version-2
+                   now-ms-2
+                   (pre-cas-lag-input db-name m2 lease-2 now-ms-2)))))))))))
+
+(def ^:private restart-ha-candidate-promotion
+  ::restart-ha-candidate-promotion)
+
+(defn- maybe-resume-ha-candidate-pre-cas-wait
+  [db-name m now-ms]
+  (when-let [wait-until-ms (:ha-candidate-pre-cas-wait-until-ms m)]
+    (let [remaining-ms (long (max 0 (- (long wait-until-ms) (long now-ms))))]
+      (if (pos? remaining-ms)
+        (assoc m :ha-promotion-wait-before-cas-ms remaining-ms)
+        (let [observed-version (:ha-candidate-pre-cas-observed-version m)
+              m1 (dissoc m
+                         :ha-candidate-pre-cas-wait-until-ms
+                         :ha-candidate-pre-cas-observed-version
+                         :ha-promotion-wait-before-cas-ms)
+              obs (observe-authority-state m1)
+              now-ms-2 (System/currentTimeMillis)]
+          (if (= observed-version (:version obs))
+            (maybe-promote-after-authority-observation
+             db-name
+             m1
+             (:ha-authority m1)
+             (:ha-db-identity m1)
+             obs
+             now-ms-2)
+            restart-ha-candidate-promotion))))))
+
+(defn- attempt-ha-candidate-promotion
+  [db-name m now-ms]
+  (let [observed-lease (:ha-authority-lease m)]
+    (cond
+      (or (true? (:ha-db-identity-mismatch? m))
+          (true? (:ha-membership-mismatch? m))
+          (not= (:ha-membership-hash m)
+                (:ha-authority-membership-hash m)))
+      (fail-ha-candidate m :membership-hash-mismatch
+                         {:ha-membership-hash (:ha-membership-hash m)
+                          :ha-authority-membership-hash
+                          (:ha-authority-membership-hash m)})
+
+      (not (lease/lease-expired? observed-lease now-ms))
+      (fail-ha-candidate m :lease-not-expired
+                         {:lease observed-lease})
+
+      (true? (:ha-clock-skew-paused? m))
+      (fail-ha-candidate m :clock-skew-paused
+                         (ha-clock-skew-promotion-failure-details m))
+
+      (false? (:ha-authority-read-ok? m))
+      (fail-ha-candidate m :authority-read-failed
+                         (ha-authority-read-failure-details m))
+
+      :else
+      (let [lag-input-1 (pre-cas-lag-input db-name
+                                           m
+                                           observed-lease
+                                           now-ms)
+            lag-check-1 (ha-promotion-lag-guard
+                         m
+                         (:effective-lease lag-input-1))]
+        (if-not (:ok? lag-check-1)
+          (fail-ha-candidate m :lag-guard-failed
+                             {:phase :pre-fence
+                              :lag lag-check-1
+                              :leader-lag-input lag-input-1})
+          (let [fence-result
+                (run-ha-fencing-hook db-name m observed-lease)]
+            (if-not (:ok? fence-result)
+              (fail-ha-candidate m :fencing-failed fence-result)
+              (maybe-promote-after-authority-observation
                db-name
-               m2
-               authority
-               db-identity
-               lease-2
-               version-2
-               now-ms-2
-               (pre-cas-lag-input db-name m2 lease-2 now-ms-2)))))))))
+               m
+               (:ha-authority m)
+               (:ha-db-identity m)
+               (observe-authority-state m)
+               (System/currentTimeMillis)))))))))
 
 (defn- maybe-promote-ha-candidate
   [db-name m now-ms]
@@ -2315,72 +2407,44 @@
             elapsed-ms (max 0 (- (long now-ms) candidate-since-ms))]
         (if (< elapsed-ms candidate-delay-ms)
           m
-          (let [observed-lease (:ha-authority-lease m)]
+          (let [resume-result (maybe-resume-ha-candidate-pre-cas-wait
+                               db-name m now-ms)]
             (cond
-              (or (true? (:ha-db-identity-mismatch? m))
-                  (true? (:ha-membership-mismatch? m))
-                  (not= (:ha-membership-hash m)
-                        (:ha-authority-membership-hash m)))
-              (fail-ha-candidate m :membership-hash-mismatch
-                                 {:ha-membership-hash (:ha-membership-hash m)
-                                  :ha-authority-membership-hash
-                                  (:ha-authority-membership-hash m)})
+              (map? resume-result)
+              resume-result
 
-              (not (lease/lease-expired? observed-lease now-ms))
-              (fail-ha-candidate m :lease-not-expired
-                                 {:lease observed-lease})
-
-              (true? (:ha-clock-skew-paused? m))
-              (fail-ha-candidate m :clock-skew-paused
-                                 (ha-clock-skew-promotion-failure-details m))
-
-              (false? (:ha-authority-read-ok? m))
-              (fail-ha-candidate m :authority-read-failed
-                                 (ha-authority-read-failure-details m))
+              (= restart-ha-candidate-promotion resume-result)
+              (attempt-ha-candidate-promotion
+               db-name
+               (dissoc m
+                       :ha-candidate-pre-cas-wait-until-ms
+                       :ha-candidate-pre-cas-observed-version
+                       :ha-promotion-wait-before-cas-ms)
+               now-ms)
 
               :else
-              (let [lag-input-1 (pre-cas-lag-input db-name
-                                                   m
-                                                   observed-lease
-                                                   now-ms)
-                    lag-check-1 (ha-promotion-lag-guard
-                                 m
-                                 (:effective-lease lag-input-1))]
-                (if-not (:ok? lag-check-1)
-                  (fail-ha-candidate m :lag-guard-failed
-                                     {:phase :pre-fence
-                                      :lag lag-check-1
-                                      :leader-lag-input lag-input-1})
-                  (let [fence-result
-                        (run-ha-fencing-hook db-name m observed-lease)]
-                    (if-not (:ok? fence-result)
-                      (fail-ha-candidate m :fencing-failed fence-result)
-                      (maybe-promote-after-authority-observation
-                       db-name
-                       m
-                       (:ha-authority m)
-                       (:ha-db-identity m)
-                       (observe-authority-state m)
-                       (System/currentTimeMillis))))))))))
+              (attempt-ha-candidate-promotion db-name m now-ms)))))
       (catch Exception e
         (fail-ha-candidate m :promotion-exception
                            {:message (ex-message e)})))))
 
 (defn- advance-ha-follower-or-candidate
-  [db-name m now-ms]
+  [db-name m]
   (if (contains? #{:follower :candidate} (:ha-role m))
-    (let [m0 (sync-ha-follower-state db-name m now-ms)
-          m1 (maybe-clear-ha-rejoin-promotion-block m0 now-ms)
-          m2 (maybe-enter-ha-candidate m1 now-ms)]
-      (maybe-promote-ha-candidate db-name m2 now-ms))
+    (let [m0 (sync-ha-follower-state db-name m (ha-now-ms))
+          state-now-ms (ha-now-ms)
+          m1 (maybe-clear-ha-rejoin-promotion-block m0 state-now-ms)
+          m2 (maybe-enter-ha-candidate m1 state-now-ms)]
+      (maybe-promote-ha-candidate db-name m2 (ha-now-ms)))
     m))
 
 (defn- read-ha-authority-state
-  [db-name m now-ms]
+  [db-name m]
   (let [authority (:ha-authority m)
         db-identity (:ha-db-identity m)
         {:keys [lease version membership-hash]}
         (ctrl/read-state authority db-identity)
+        now-ms (ha-now-ms)
         authority-membership-hash membership-hash
         db-identity-mismatch?
         (and lease (not= db-identity (:db-identity lease)))
@@ -2418,10 +2482,11 @@
       m1)))
 
 (defn- renew-ha-leader-state
-  [db-name m now-ms]
+  [db-name m]
   (if (not= :leader (:ha-role m))
     m
-    (let [term (:ha-leader-term m)]
+    (let [now-ms (ha-now-ms)
+          term (:ha-leader-term m)]
       (if-not (and (integer? term) (pos? ^long term))
         (demote-ha-leader db-name m :missing-leader-term nil now-ms)
         (let [result (ctrl/renew-lease
@@ -2465,10 +2530,9 @@
   [db-name m]
   (if-not (:ha-authority m)
     m
-    (let [now-ms (System/currentTimeMillis)
-          m0 (refresh-ha-local-watermarks m)
+    (let [m0 (refresh-ha-local-watermarks m)
           m1 (try
-               (read-ha-authority-state db-name m0 now-ms)
+               (read-ha-authority-state db-name m0)
                (catch Exception e
                  (log/warn e "HA read-lease failed"
                            {:db-name db-name})
@@ -2479,16 +2543,17 @@
                          :message (ex-message e)
                          :data (ex-data e)})))
           m2 (try
-               (renew-ha-leader-state db-name m1 now-ms)
+               (renew-ha-leader-state db-name m1)
                (catch Exception e
                  (demote-ha-leader db-name m1
                                    :renew-exception
                                    {:message (ex-message e)}
-                                   now-ms)))
+                                   (ha-now-ms))))
           m3 (refresh-ha-clock-skew-state db-name m2)
-          m4 (advance-ha-follower-or-candidate db-name m3 now-ms)]
-      (-> (maybe-demote-on-refresh-timeout db-name m4 now-ms)
-          (maybe-finish-ha-demotion now-ms)))))
+          m4 (advance-ha-follower-or-candidate db-name m3)
+          end-now-ms (ha-now-ms)]
+      (-> (maybe-demote-on-refresh-timeout db-name m4 end-now-ms)
+          (maybe-finish-ha-demotion end-now-ms)))))
 
 (defn clear-ha-runtime-state
   [m]
@@ -2528,6 +2593,9 @@
           :ha-promotion-last-failure :ha-promotion-failure-details
           :ha-candidate-since-ms :ha-candidate-delay-ms
           :ha-candidate-rank-index
+          :ha-candidate-pre-cas-wait-until-ms
+          :ha-candidate-pre-cas-observed-version
+          :ha-promotion-wait-before-cas-ms
           :ha-rejoin-promotion-blocked?
           :ha-rejoin-promotion-blocked-until-ms
           :ha-rejoin-promotion-cleared-ms
@@ -2540,6 +2608,8 @@
     :del-attr
     :rename-attr
     :load-datoms
+    :tx-data
+    :tx-data+db-info
     :open-transact
     :close-transact
     :abort-transact

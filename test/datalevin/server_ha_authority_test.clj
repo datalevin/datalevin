@@ -270,6 +270,42 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
+(deftest renew-ha-leader-state-uses-current-clock-for-renew-request-test
+  (let [authority (ha/new-in-memory-authority
+                   {:group-id (str "ha-renew-now-" (UUID/randomUUID))})
+        _ (ha/start-authority! authority)
+        acquire (ha/try-acquire-lease
+                 authority
+                 {:db-identity "db-a"
+                  :leader-node-id 2
+                  :leader-endpoint "10.0.0.12:8898"
+                  :lease-renew-ms 500
+                  :lease-timeout-ms 1000
+                  :leader-last-applied-lsn 7
+                  :now-ms 1000
+                  :observed-version 0
+                  :observed-lease nil})
+        leader-state {:ha-authority authority
+                      :ha-db-identity "db-a"
+                      :ha-role :leader
+                      :ha-node-id 2
+                      :ha-local-endpoint "10.0.0.12:8898"
+                      :ha-lease-renew-ms 500
+                      :ha-lease-timeout-ms 1000
+                      :ha-leader-term (:term acquire)
+                      :ha-leader-last-applied-lsn 7
+                      :ha-last-authority-refresh-ms 0}]
+    (try
+      (let [next-state (with-redefs-fn
+                         {#'dha/ha-now-ms (fn [] 1500)}
+                         (fn []
+                           (#'dha/renew-ha-leader-state
+                            "orders" leader-state)))]
+        (is (= 1500 (:ha-last-authority-refresh-ms next-state)))
+        (is (= 2500 (:ha-lease-until-ms next-state))))
+      (finally
+        (ha/stop-authority! authority)))))
+
 (deftest ha-renew-step-demotes-on-renew-term-mismatch-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)
@@ -302,6 +338,30 @@
         (is (= :follower (:ha-role follower-state))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-renew-step-refreshes-time-after-follower-sync-before-candidate-entry-test
+  (let [tick (atom 0)
+        follower-runtime {:ha-role :follower
+                          :ha-authority-lease {:lease-until-ms 1500
+                                               :leader-node-id 2}
+                          :ha-authority-read-ok? true
+                          :ha-membership-hash "hash-a"
+                          :ha-authority-membership-hash "hash-a"
+                          :ha-node-id 2
+                          :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                                       {:node-id 2 :endpoint "10.0.0.12:8898"}]
+                          :ha-promotion-base-delay-ms 10000
+                          :ha-promotion-rank-delay-ms 0}]
+    (with-redefs-fn
+      {#'dha/ha-now-ms
+       (fn []
+         (swap! tick + 1000))}
+      (fn []
+        (let [next-state (#'dha/advance-ha-follower-or-candidate
+                          "orders" follower-runtime)]
+          (is (= :candidate (:ha-role next-state)))
+          (is (= 2000 (:ha-candidate-since-ms next-state)))
+          (is (= 10000 (:ha-candidate-delay-ms next-state))))))))
 
 (deftest ha-renew-step-demotes-on-membership-hash-mismatch-test
   (let [opts (valid-ha-opts)
@@ -808,7 +868,86 @@
                            (#'srv/ha-renew-step "orders" follower-runtime)))]
         (is (= 1 @wait-calls))
         (is (= :leader (:ha-role next-state)))
-        (is (= 0 (:ha-promotion-wait-before-cas-ms next-state))))
+        (is (nil? (:ha-promotion-wait-before-cas-ms next-state))))
+      (finally
+        (#'srv/stop-ha-authority "orders" runtime)))))
+
+(deftest ha-renew-step-candidate-unreachable-leader-resumes-after-wait-without-refencing-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        fence-calls (atom 0)
+        wait-calls (atom 0)]
+    (try
+      (let [authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity (:ha-db-identity runtime)
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn 0
+                :now-ms 1000
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :ha-role :follower
+                                        :ha-promotion-base-delay-ms 0
+                                        :ha-promotion-rank-delay-ms 0
+                                        :ha-max-promotion-lag-lsn 0
+                                        :ha-local-last-applied-lsn 0))
+            wait-until-ms (+ (System/currentTimeMillis) 200)
+            promote-step
+            (fn [state]
+              (#'srv/ha-renew-step "orders" state))
+            next-state
+            (with-redefs-fn
+              {#'dha/run-ha-fencing-hook
+               (fn [_ _ _]
+                 (swap! fence-calls inc)
+                 {:ok? true})
+               #'dha/fetch-leader-watermark-lsn
+               (fn [_ _ _]
+                 {:reachable? false
+                  :reason :test-unreachable})
+               #'dha/fetch-ha-endpoint-watermark-lsn
+               (fn [_ _ endpoint]
+                 (case endpoint
+                   "10.0.0.12:8898"
+                   {:reachable? true
+                    :last-applied-lsn 0
+                    :source :local}
+
+                   "10.0.0.13:8898"
+                   {:reachable? true
+                    :last-applied-lsn 0
+                    :source :remote}
+
+                   {:reachable? false
+                    :reason :test-unreachable}))
+               #'dha/maybe-wait-unreachable-leader-before-pre-cas!
+               (fn [_ _]
+                 (swap! wait-calls inc)
+                 (if (= 1 @wait-calls)
+                   {:wait-ms 200
+                    :wait-until-ms wait-until-ms}
+                   {:wait-ms 0
+                    :wait-until-ms wait-until-ms}))}
+              (fn []
+                (let [waiting-state (promote-step follower-runtime)]
+                  (Thread/sleep 225)
+                  [waiting-state
+                   (promote-step waiting-state)])))]
+        (let [[waiting-state promoted-state] next-state]
+          (is (= 1 @fence-calls))
+          (is (= 2 @wait-calls))
+          (is (= :candidate (:ha-role waiting-state)))
+          (is (= wait-until-ms
+                 (:ha-candidate-pre-cas-wait-until-ms waiting-state)))
+          (is (= 200 (:ha-promotion-wait-before-cas-ms waiting-state)))
+          (is (= :leader (:ha-role promoted-state)))
+          (is (nil? (:ha-candidate-pre-cas-wait-until-ms promoted-state)))
+          (is (nil? (:ha-promotion-wait-before-cas-ms promoted-state)))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
@@ -885,6 +1024,12 @@
             {:ha-role :follower
              :ha-lease-renew-ms 5000
              :ha-follower-next-sync-not-before-ms (+ now-ms 250)}
+            now-ms)))
+    (is (= 250
+           (#'srv/ha-loop-sleep-ms
+            {:ha-role :candidate
+             :ha-lease-renew-ms 5000
+             :ha-candidate-pre-cas-wait-until-ms (+ now-ms 250)}
             now-ms)))
     (is (= 5000
            (#'srv/ha-loop-sleep-ms
