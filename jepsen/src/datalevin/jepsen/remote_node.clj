@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.remote-node
   (:require
+   [clojure.edn :as edn]
    [clojure.pprint :as pp]
    [clojure.string :as str]
    [clojure.tools.cli :refer [parse-opts]]
@@ -150,10 +151,12 @@
 
 (defn- wait-for-open-prereqs!
   [node topology timeout-ms]
-  (let [data-endpoints        (mapv :endpoint (:data-nodes topology))
-        control-only-peer-ids (mapv :peer-id (:control-only-nodes topology))
-        prereq-endpoints      (vec (concat data-endpoints
-                                           control-only-peer-ids))]
+  (let [control-only-peer-ids (mapv :peer-id (:control-only-nodes topology))
+        prereq-endpoints      (vec control-only-peer-ids)]
+    ;; Data nodes need to enter the HA open path promptly so staged launchers
+    ;; can bring peers up one at a time. Waiting for every data endpoint here
+    ;; forces the first node to stall until the rest of the cluster is already
+    ;; listening.
     (when (seq prereq-endpoints)
       (wait-for-endpoints! prereq-endpoints timeout-ms)))
   node)
@@ -242,6 +245,17 @@
       (Files/deleteIfExists (Paths/get path (make-array String 0)))
       (catch Throwable _
         nil))))
+
+(defn- read-state-file*
+  [node]
+  (let [path (state-file node)]
+    (when (and path
+               (Files/exists (Paths/get path (make-array String 0))
+                             (make-array java.nio.file.LinkOption 0)))
+      (try
+        (-> path slurp edn/read-string)
+        (catch Throwable _
+          nil)))))
 
 (defn- process-handle
   [pid]
@@ -544,10 +558,12 @@
                        (some-> pid-path slurp str/trim parse-long))
         result       (if pid
                        (stop-process! pid)
-                       :missing)]
+                       :missing)
+        failed-state? (= :failed (:status (read-state-file* node)))]
     (when (#{:stopped :forced :missing} result)
       (delete-if-exists! pid-path)
-      (delete-if-exists! (state-file node)))
+      (when-not (and (= :missing result) failed-state?)
+        (delete-if-exists! (state-file node))))
     (println
      (pr-str {:node node-name
               :pid pid
