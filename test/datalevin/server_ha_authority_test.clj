@@ -339,6 +339,20 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
+(deftest maybe-finish-ha-demotion-finishes-at-demoted-at-ms-test
+  (let [demoting-state {:ha-role :demoting
+                        :ha-demoted-at-ms 1000}]
+    (is (= :follower
+           (:ha-role (#'dha/maybe-finish-ha-demotion
+                      demoting-state
+                      1000
+                      true))))
+    (is (= :demoting
+           (:ha-role (#'dha/maybe-finish-ha-demotion
+                      demoting-state
+                      1000
+                      false))))))
+
 (deftest ha-renew-step-refreshes-time-after-follower-sync-before-candidate-entry-test
   (let [tick (atom 0)
         follower-runtime {:ha-role :follower
@@ -1036,6 +1050,12 @@
             {:ha-role :candidate
              :ha-lease-renew-ms 5000
              :ha-candidate-pre-cas-wait-until-ms (+ now-ms 250)}
+            now-ms)))
+    (is (= 250
+           (#'srv/ha-loop-sleep-ms
+            {:ha-role :demoting
+             :ha-lease-renew-ms 5000
+             :ha-demoted-at-ms (+ now-ms 250)}
             now-ms)))
     (is (= 5000
            (#'srv/ha-loop-sleep-ms

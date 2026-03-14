@@ -80,7 +80,7 @@
   (if (and started-demoting?
            (= :demoting (:ha-role m))
            (integer? (:ha-demoted-at-ms m))
-           (> (long now-ms) (long (:ha-demoted-at-ms m))))
+           (>= (long now-ms) (long (:ha-demoted-at-ms m))))
     (assoc m :ha-role :follower)
     m))
 

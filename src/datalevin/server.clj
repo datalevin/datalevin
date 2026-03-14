@@ -1049,7 +1049,7 @@
 
                      (and (= :demoting role)
                           (integer? (:ha-demoted-at-ms m)))
-                     (conj (u/long-inc (long (:ha-demoted-at-ms m)))))
+                     (conj (long (:ha-demoted-at-ms m))))
          next-deadline (when (seq deadlines)
                          (long (reduce min (map long deadlines))))
          remaining-ms  (when (some? next-deadline)
