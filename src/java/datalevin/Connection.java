@@ -15,9 +15,6 @@ import java.util.Objects;
  * builders in this package.
  */
 public final class Connection extends HandleResource {
-
-    private volatile Object cachedDb;
-
     Connection(Object conn) {
         super(conn,
               resource -> ClojureRuntime.core("close", resource),
@@ -43,7 +40,6 @@ public final class Connection extends HandleResource {
      * Applies a raw schema update and returns the updated schema.
      */
     public Map<?, ?> updateSchema(Map<?, ?> schemaUpdate) {
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("update-schema",
                                                resource(),
                                                DatalevinForms.schemaInput(schemaUpdate));
@@ -53,7 +49,6 @@ public final class Connection extends HandleResource {
      * Applies a typed schema update and returns the updated schema.
      */
     public Map<?, ?> updateSchema(Schema schemaUpdate) {
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("update-schema",
                                                resource(),
                                                schemaUpdate == null ? null : schemaUpdate.buildForm());
@@ -68,7 +63,6 @@ public final class Connection extends HandleResource {
         Object normalizedSchema = DatalevinForms.schemaInput(schemaUpdate);
         Object normalizedDelAttrs = DatalevinForms.deleteAttrsInput(delAttrs);
         Object normalizedRenameMap = DatalevinForms.renameMapInput(renameMap);
-        invalidateDb();
         if (renameMap != null) {
             return (Map<?, ?>) ClojureRuntime.core("update-schema",
                                                   resource(),
@@ -107,7 +101,6 @@ public final class Connection extends HandleResource {
      * Clears all data from the underlying database.
      */
     public void clear() {
-        invalidateDb();
         ClojureRuntime.core("clear", resource());
     }
 
@@ -130,7 +123,6 @@ public final class Connection extends HandleResource {
      */
     public long datalogIndexCacheLimit(long limit) {
         ClojureRuntime.core("datalog-index-cache-limit", db(), limit);
-        invalidateDb();
         return datalogIndexCacheLimit();
     }
 
@@ -455,7 +447,6 @@ public final class Connection extends HandleResource {
      * Transacts raw transaction data and returns the transaction report.
      */
     public Map<?, ?> transact(Object txData) {
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("transact!",
                                                resource(),
                                                DatalevinForms.txDataInput(txData));
@@ -465,7 +456,6 @@ public final class Connection extends HandleResource {
      * Transacts typed transaction data and returns the transaction report.
      */
     public Map<?, ?> transact(TxData txData) {
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("transact!",
                                                resource(),
                                                txData == null ? null : txData.buildForm());
@@ -478,7 +468,6 @@ public final class Connection extends HandleResource {
         if (txMeta == null) {
             return transact(txData);
         }
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("transact!",
                                               resource(),
                                               DatalevinForms.txDataInput(txData),
@@ -492,7 +481,6 @@ public final class Connection extends HandleResource {
         if (txMeta == null) {
             return transact(txData);
         }
-        invalidateDb();
         return (Map<?, ?>) ClojureRuntime.core("transact!",
                                               resource(),
                                               txData == null ? null : txData.buildForm(),
@@ -507,12 +495,7 @@ public final class Connection extends HandleResource {
     }
 
     private Object db() {
-        Object db = cachedDb;
-        if (db == null) {
-            db = ClojureRuntime.core("db", resource());
-            cachedDb = db;
-        }
-        return db;
+        return ClojureRuntime.core("db", resource());
     }
 
     private Object runQuery(Object queryForm, List<?> inputs) {
@@ -583,7 +566,4 @@ public final class Connection extends HandleResource {
         }
     }
 
-    private void invalidateDb() {
-        cachedDb = null;
-    }
 }

@@ -618,6 +618,32 @@
         (delete-files-retry conn-dir)
         (delete-files-retry kv-dir)))))
 
+(deftest java-connection-shared-wrapper-refresh-test
+  (let [conn-dir (test-dir "java-shared-wrapper-refresh")
+        schema   (doto (Datalevin/schema)
+                   (.attr "name" (doto (Schema/attribute)
+                                   (.valueType Schema$ValueType/STRING))))
+        query    "[:find [?name ...] :where [?e :name ?name]]"
+        inputs   (java.util.ArrayList.)]
+    (try
+      (with-open [^Connection reader (Datalevin/getConn conn-dir schema)
+                  ^Connection writer (Datalevin/getConn conn-dir)]
+        (.transact writer
+                   (doto (Datalevin/tx)
+                     (.entity (doto (Tx/entity -1)
+                                (.put "name" "Alice")))))
+        (is (= ["Alice"]
+               (vec (.query reader query inputs))))
+
+        (.transact writer
+                   (doto (Datalevin/tx)
+                     (.entity (doto (Tx/entity -2)
+                                (.put "name" "Bob")))))
+        (is (= #{"Alice" "Bob"}
+               (set (.query reader query inputs)))))
+      (finally
+        (delete-files-retry conn-dir)))))
+
 (deftest java-friendly-helper-overload-coverage-test
   (let [plain-dir      (test-dir "java-helper-plain-conn")
         map-dir        (test-dir "java-helper-map-conn")
