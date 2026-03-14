@@ -76,8 +76,9 @@
     m))
 
 (defn- maybe-finish-ha-demotion
-  [m now-ms]
-  (if (and (= :demoting (:ha-role m))
+  [m now-ms started-demoting?]
+  (if (and started-demoting?
+           (= :demoting (:ha-role m))
            (integer? (:ha-demoted-at-ms m))
            (> (long now-ms) (long (:ha-demoted-at-ms m))))
     (assoc m :ha-role :follower)
@@ -2530,7 +2531,8 @@
   [db-name m]
   (if-not (:ha-authority m)
     m
-    (let [m0 (refresh-ha-local-watermarks m)
+    (let [started-demoting? (= :demoting (:ha-role m))
+          m0 (refresh-ha-local-watermarks m)
           m1 (try
                (read-ha-authority-state db-name m0)
                (catch Exception e
@@ -2553,7 +2555,7 @@
           m4 (advance-ha-follower-or-candidate db-name m3)
           end-now-ms (ha-now-ms)]
       (-> (maybe-demote-on-refresh-timeout db-name m4 end-now-ms)
-          (maybe-finish-ha-demotion end-now-ms)))))
+          (maybe-finish-ha-demotion end-now-ms started-demoting?)))))
 
 (defn clear-ha-runtime-state
   [m]

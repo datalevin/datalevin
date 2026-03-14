@@ -384,7 +384,13 @@
                                       :ha-membership-hash "bogus-hash"
                                       :ha-leader-term (:term acquire)
                                       :ha-last-authority-refresh-ms now-ms))
-            next-state (#'srv/ha-renew-step "orders" leader-runtime)]
+            tick (atom 1000)
+            next-state (with-redefs-fn
+                         {#'dha/ha-now-ms
+                          (fn []
+                            (swap! tick inc))}
+                         (fn []
+                           (#'srv/ha-renew-step "orders" leader-runtime)))]
         (is (:ok? acquire))
         (is (= :demoting (:ha-role next-state)))
         (is (= :membership-hash-mismatch (:ha-demotion-reason next-state)))

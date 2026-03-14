@@ -57,9 +57,9 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private String groupId;
     private LogEntryEncoder logEntryEncoder;
     private LogEntryDecoder logEntryDecoder;
-    private long firstLogIndex = 1L;
+    private volatile long firstLogIndex = 1L;
     private long mapSizeBytes = MAP_SIZE_BYTES;
-    private boolean hasLoadedFirstLogIndex;
+    private volatile boolean hasLoadedFirstLogIndex;
 
     public LMDBLogStorage(final String path, final RaftOptions raftOptions) {
         this.path = path;
@@ -153,10 +153,10 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 return null;
             }
             return readEntry(index);
-        } catch (final Exception e) {
+        } catch (final RuntimeException e) {
             LOG.error("Fail to get log entry at index {} in data path: {}.",
                 index, this.path, e);
-            return null;
+            throw e;
         } finally {
             this.readLock.unlock();
         }
@@ -421,9 +421,6 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             }
             do {
                 final LogEntry entry = decodeEntry(copyBytes(cursor.val()));
-                if (entry == null) {
-                    return false;
-                }
                 if (!confManager.add(toConfigurationEntry(entry))) {
                     LOG.error("Fail to load configuration entry at path={} index={}.",
                         this.path, entry.getId().getIndex());
@@ -526,7 +523,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private LogEntry decodeEntry(final byte[] bytes) {
         final LogEntry entry = this.logEntryDecoder.decode(bytes);
         if (entry == null) {
-            LOG.error("Bad log entry format in data path: {}.", this.path);
+            throw new IllegalStateException(
+                "Bad log entry format in data path: " + this.path);
         }
         return entry;
     }

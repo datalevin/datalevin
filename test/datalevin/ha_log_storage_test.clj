@@ -7,14 +7,17 @@
    [com.alipay.sofa.jraft.entity EnumOutter$EntryType LogEntry LogId]
    [com.alipay.sofa.jraft.entity.codec.v2 LogEntryV2CodecFactory]
    [com.alipay.sofa.jraft.option LogStorageOptions RaftOptions]
-   [datalevin.cpp Env]
+   [datalevin.cpp BufVal Dbi Env Txn]
    [datalevin.ha LMDBLogStorage]
+   [java.lang.reflect Modifier]
    [java.nio ByteBuffer]
    [java.util UUID]))
 
 (def ^:private default-map-size-bytes (* 64 1024 1024))
 (def ^:private shrunken-map-size-bytes (* 1024 1024))
 (def ^:private entry-payload-bytes (* 2 1024 1024))
+
+(declare log-storage-options make-log-storage make-log-entry)
 
 (defn- private-field
   [^Class cls field-name]
@@ -28,6 +31,60 @@
 (defn- read-private-long
   [obj field-name]
   (.getLong ^java.lang.reflect.Field (private-field (class obj) field-name) obj))
+
+(defn- long-bytes
+  [value]
+  (let [buf (ByteBuffer/allocate Long/BYTES)]
+    (.putLong buf (long value))
+    (.array buf)))
+
+(defn- buf-val
+  [^bytes bytes]
+  (let [buf-val (BufVal. (max 1 (alength bytes)))
+        buf (.inBuf buf-val)]
+    (.clear buf)
+    (.put buf bytes)
+    (.flip buf)
+    (.reset buf-val)
+    buf-val))
+
+(defn- overwrite-log-entry-bytes!
+  [^LMDBLogStorage storage index ^bytes bytes]
+  (let [^Env env (read-private-field storage "env")
+        ^Dbi log-dbi (read-private-field storage "logDbi")
+        txn (Txn/create env)]
+    (try
+      (.put log-dbi txn
+            (buf-val (long-bytes index))
+            (buf-val bytes)
+            0)
+      (.commit txn)
+      (finally
+        (.close txn)))))
+
+(deftest lmdb-log-storage-first-log-index-cache-fields-are-volatile-test
+  (is (Modifier/isVolatile
+       (.getModifiers (private-field LMDBLogStorage "firstLogIndex"))))
+  (is (Modifier/isVolatile
+       (.getModifiers (private-field LMDBLogStorage "hasLoadedFirstLogIndex")))))
+
+(deftest lmdb-log-storage-get-entry-throws-on-corrupt-bytes-test
+  (let [dir (u/tmp-dir (str "ha-log-storage-corrupt-" (UUID/randomUUID)))
+        ^LMDBLogStorage storage (make-log-storage dir)]
+    (try
+      (let [initialized? (.init storage (log-storage-options))]
+        (is initialized?)
+        (when initialized?
+          (is (.appendEntry storage (make-log-entry 1 64)))
+          (overwrite-log-entry-bytes! storage 1 (byte-array [1 2 3 4]))
+          (try
+            (.getEntry storage 1)
+            (is false "Expected corrupt log bytes to throw")
+            (catch IllegalStateException e
+              (is (re-find #"Bad log entry format" (ex-message e)))))))
+      (finally
+        (.shutdown storage)
+        (u/delete-files dir)))))
 
 (defn- log-storage-options
   []

@@ -1651,11 +1651,12 @@
     (let [{:keys [group-id state running-v]} authority]
       (ensure-running! running-v)
       (lease/lease-key group-id db-identity)
-      (let [{:keys [lease version]} (lease-entry @state db-identity)]
+      (let [snapshot @state
+            {:keys [lease version]} (lease-entry snapshot db-identity)]
         {:lease lease
          :version version
-         :membership-hash (:membership-hash @state)
-         :voters (:voters @state)}))
+         :membership-hash (:membership-hash snapshot)
+         :voters (:voters snapshot)}))
 
     (instance? SofaJraftLeaseAuthority authority)
     (let [{:keys [group-id running-v]} authority]

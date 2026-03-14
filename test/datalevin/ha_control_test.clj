@@ -218,6 +218,49 @@
       (is (= ["127.0.0.1:8801" "127.0.0.1:8802" "127.0.0.1:8803"]
              (ctrl/read-voters authority))))))
 
+(deftest in-memory-authority-read-state-uses-single-snapshot-test
+  (let [group-id (unique-group-id)
+        initial-voters [{:peer-id "127.0.0.1:7801"}
+                        {:peer-id "127.0.0.1:7802"}]
+        authority (doto (ctrl/new-in-memory-authority
+                         {:group-id group-id
+                          :voters initial-voters})
+                    (ctrl/start-authority!))
+        _ (ctrl/init-membership-hash! authority "hash-a")
+        acquire (ctrl/try-acquire-lease authority
+                                        {:db-identity db-identity
+                                         :leader-node-id 2
+                                         :leader-endpoint "10.0.0.12:8898"
+                                         :lease-renew-ms 5000
+                                         :lease-timeout-ms 15000
+                                         :leader-last-applied-lsn 42
+                                         :now-ms 1000
+                                         :observed-version 0
+                                         :observed-lease nil})
+        state-atom (:state authority)
+        snapshot @state-atom
+        {:keys [lease version]} (#'ctrl/lease-entry snapshot db-identity)
+        orig-lease-entry @#'ctrl/lease-entry]
+    (is (:ok? acquire))
+    (let [result (with-redefs-fn
+                   {#'ctrl/lease-entry
+                    (fn [current-state current-db-identity]
+                      (let [entry (orig-lease-entry current-state
+                                                    current-db-identity)]
+                        (swap! state-atom
+                               assoc
+                               :membership-hash "hash-b"
+                               :voters ["127.0.0.1:8801"
+                                        "127.0.0.1:8802"])
+                        entry))}
+                   (fn []
+                     (ctrl/read-state authority db-identity)))]
+      (is (= lease (:lease result)))
+      (is (= version (:version result)))
+      (is (= "hash-a" (:membership-hash result)))
+      (is (= ["127.0.0.1:7801" "127.0.0.1:7802"]
+             (:voters result))))))
+
 (deftest in-memory-authority-shares-state-by-group-id-test
   (let [group-id   (unique-group-id)
         authority-a (started-authority group-id)
