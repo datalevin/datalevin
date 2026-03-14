@@ -4,11 +4,12 @@
    [clojure.test :refer [deftest is]]
    [datalevin.constants :as c]
    [datalevin.core :as d]
-   [datalevin.json-api.shared :as shared]
+  [datalevin.json-api.shared :as shared]
    [datalevin.json-convert :as jc]
    [datalevin.main :as main]
    [datalevin.mcp :as sut]
    [datalevin.test.core :as tdc]
+   [datalevin.vector :as v]
    [datalevin.util :as u])
   (:import
    [java.io StringReader StringWriter]
@@ -305,9 +306,23 @@
     (is (= true (get-in both-error ["result" "isError"])))
     (is (= ":invalid-params"
            (get-in both-error ["result" "structuredContent" "code"])))
+    (is (= {"field" "dir|uri"}
+           (get-in both-error ["result" "structuredContent" "details"])))
+    (is (nil? (get-in both-error ["result" "structuredContent" "details"
+                                  ":code"])))
     (is (= true (get-in none-error ["result" "isError"])))
     (is (= ":invalid-params"
-           (get-in none-error ["result" "structuredContent" "code"])))))
+           (get-in none-error ["result" "structuredContent" "code"])))
+    (is (= {"field" "dir|uri"}
+           (get-in none-error ["result" "structuredContent" "details"])))))
+
+(deftest require-vector-coerces-sequentials-test
+  (is (= [1 2 3]
+         (#'sut/require-vector [1 2 3] "items")))
+  (is (= [1 2 3]
+         (#'sut/require-vector '(1 2 3) "items")))
+  (is (= [1 2 3]
+         (#'sut/require-vector (java.util.ArrayList. [1 2 3]) "items"))))
 
 (deftest database-tools-test
   (let [dir    (u/tmp-dir (str "datalevin-mcp-" (UUID/randomUUID)))
@@ -543,7 +558,8 @@
                (get-in close-response ["result" "structuredContent" "closed"])))
         (is (= true (get-in post-close ["result" "isError"])))
         (is (= ":unknown-kv"
-               (get-in post-close ["result" "structuredContent" "code"]))))
+               (get-in post-close ["result" "structuredContent" "code"])))
+        (is (nil? (get-in post-close ["result" "structuredContent" "details"]))))
       (finally
         (shared/clear-handles! (:session-state @state))
         (u/delete-files dir)))))
@@ -1041,6 +1057,11 @@
                                            "opts" {":dimensions" 3}}}})
               vector-id    (get-in open-vector ["result" "structuredContent"
                                                 "vectorIndex"])
+              handles-open (get (shared/exec-request
+                                  (:session-state @state)
+                                  {"op"   "list-handles"
+                                   "args" {}})
+                                "result")
               count-open   (sut/handle-message
                              state
                              {"jsonrpc" "2.0"
@@ -1063,6 +1084,11 @@
                               "method"  "tools/call"
                               "params"  {"name"      "datalevin_close_kv"
                                           "arguments" {"kv" kv-id}}})
+              handles-closed (get (shared/exec-request
+                                    (:session-state @state)
+                                    {"op"   "list-handles"
+                                     "args" {}})
+                                  "result")
               count-closed (sut/handle-message
                              state
                              {"jsonrpc" "2.0"
@@ -1099,8 +1125,10 @@
           (is (= 0
                  (get-in info-open ["result" "structuredContent" "result"
                                     ":size"])))
+          (is (= 3 (count handles-open)))
           (is (= true
                  (get-in close-kv ["result" "structuredContent" "closed"])))
+          (is (= {} handles-closed))
           (is (= true (get-in count-closed ["result" "isError"])))
           (is (= ":unknown-search-index"
                  (get-in count-closed ["result" "structuredContent" "code"])))
@@ -1113,6 +1141,131 @@
           (is (= true (get-in close-vector ["result" "isError"])))
           (is (= ":unknown-vector-index"
                  (get-in close-vector ["result" "structuredContent" "code"]))))
+        (finally
+          (shared/clear-handles! (:session-state @state))
+          (u/delete-files dir))))))
+
+(deftest close-kv-persists-dependent-vector-index-test
+  (if (u/windows?)
+    (is true)
+    (let [dir   (u/tmp-dir (str "datalevin-mcp-kv-vector-persist-"
+                                (UUID/randomUUID)))
+          kv    (d/open-kv dir)
+          _     (d/close-kv kv)
+          state (initialized-state {:allow-writes? true})]
+      (try
+        (binding [v/*submit-async-vec-save* (fn [_] nil)]
+          (let [domain        "close-kv-persist"
+                open-kv-1     (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3991
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_open_kv"
+                                             "arguments" {"dir" dir}}})
+                kv-id-1       (get-in open-kv-1 ["result" "structuredContent"
+                                                 "kv"])
+                open-vector-1 (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3992
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_open_vector_index"
+                                             "arguments"
+                                             {"kv"   kv-id-1
+                                              "opts" {":dimensions" 3
+                                                       ":domain"     domain}}}})
+                vector-id-1   (get-in open-vector-1 ["result"
+                                                     "structuredContent"
+                                                     "vectorIndex"])
+                add-vector    (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3993
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_add_vector"
+                                             "arguments"
+                                             {"vectorIndex" vector-id-1
+                                              "vectorRef"   "v1"
+                                              "vectorData"  [1.0 0.0 0.0]}}})
+                close-kv-1    (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3994
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_close_kv"
+                                             "arguments" {"kv" kv-id-1}}})
+                open-kv-2     (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3995
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_open_kv"
+                                             "arguments" {"dir" dir}}})
+                kv-id-2       (get-in open-kv-2 ["result" "structuredContent"
+                                                 "kv"])
+                open-vector-2 (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3996
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_open_vector_index"
+                                             "arguments"
+                                             {"kv"   kv-id-2
+                                              "opts" {":dimensions" 3
+                                                       ":domain"     domain}}}})
+                vector-id-2   (get-in open-vector-2 ["result"
+                                                     "structuredContent"
+                                                     "vectorIndex"])
+                info-open     (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3997
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_vector_index_info"
+                                             "arguments"
+                                             {"vectorIndex" vector-id-2}}})
+                indexed-open  (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3998
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_vector_indexed"
+                                             "arguments"
+                                             {"vectorIndex" vector-id-2
+                                              "vectorRef"   "v1"}}})
+                search-open   (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      3999
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_vector_search"
+                                             "arguments"
+                                             {"vectorIndex" vector-id-2
+                                              "queryVector" [1.0 0.0 0.0]
+                                              "opts"        {":top" 1}}}})
+                close-kv-2    (sut/handle-message
+                                state
+                                {"jsonrpc" "2.0"
+                                 "id"      4000
+                                 "method"  "tools/call"
+                                 "params"  {"name"      "datalevin_close_kv"
+                                             "arguments" {"kv" kv-id-2}}})]
+            (is (= false (get-in add-vector ["result" "isError"] false)))
+            (is (= true
+                   (get-in close-kv-1 ["result" "structuredContent" "closed"])))
+            (is (= 1
+                   (get-in info-open ["result" "structuredContent" "result"
+                                      ":size"])))
+            (is (= true
+                   (get-in indexed-open ["result" "structuredContent"
+                                         "result"])))
+            (is (= ["v1"]
+                   (get-in search-open ["result" "structuredContent"
+                                        "result"])))
+            (is (= true
+                   (get-in close-kv-2 ["result" "structuredContent"
+                                       "closed"])))))
         (finally
           (shared/clear-handles! (:session-state @state))
           (u/delete-files dir))))))
@@ -1485,6 +1638,34 @@
       (is (= expected-tool-names
              (mapv #(get % "name")
                    (get-in (second responses) ["result" "tools"])))))))
+
+(deftest serve-binds-limit-overrides-test
+  (let [messages [(jc/write-json-ready-string
+                    {"jsonrpc" "2.0"
+                     "id"      1
+                     "method"  "initialize"
+                     "params"  default-initialize-params})
+                  (jc/write-json-ready-string
+                    {"jsonrpc" "2.0"
+                     "method"  "notifications/initialized"
+                     "params"  {}})
+                  (jc/write-json-ready-string
+                    {"jsonrpc" "2.0"
+                     "id"      2
+                     "method"  "tools/call"
+                     "params"  {"name"      "datalevin_api_info"
+                                 "arguments" {}}})]
+        reader   (StringReader. (str (str/join "\n" messages) "\n"))
+        writer   (StringWriter.)]
+    (sut/serve reader writer {:max-response-bytes 500})
+    (let [responses (remove str/blank? (str/split-lines (str writer)))
+          api-line  (second responses)
+          api-info  (jc/read-json-string api-line)]
+      (is (= 2 (count responses)))
+      (is (= 2 (get api-info "id")))
+      (is (= "See structuredContent."
+             (get-in api-info ["result" "content" 0 "text"])))
+      (is (<= (count (.getBytes api-line "UTF-8")) 500)))))
 
 (deftest batch-request-test
   (let [state    (new-state)

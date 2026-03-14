@@ -48,6 +48,14 @@
 (def ^:dynamic *mcp-limits*
   default-mcp-limits)
 
+(def ^:private mcp-limit-keys
+  (keys default-mcp-limits))
+
+(defn- effective-mcp-limits
+  [opts]
+  (merge default-mcp-limits
+         (select-keys opts mcp-limit-keys)))
+
 (def ^:private tool-specs
   {"datalevin_api_info"
    {"name"        "datalevin_api_info"
@@ -576,6 +584,36 @@
                           :kind  :bytes
                           :limit (:max-response-bytes *mcp-limits*)}))))))
 
+(def ^:private public-tool-error-detail-keys
+  {:field "field"
+   :kind  "kind"
+   :limit "limit"})
+
+(defn- public-tool-error-detail-value
+  [value]
+  (cond
+    (keyword? value) (name value)
+    (string? value)  value
+    (number? value)  value
+    (instance? Boolean value) value
+    :else nil))
+
+(defn- public-tool-error-details
+  [data]
+  (into {}
+        (keep (fn [[k out-key]]
+                (when-let [value (public-tool-error-detail-value (get data k))]
+                  [out-key value])))
+        public-tool-error-detail-keys))
+
+(defn- tool-error-structured
+  [^clojure.lang.ExceptionInfo e]
+  (let [data    (or (ex-data e) {})
+        details (public-tool-error-details data)]
+    (cond-> {"error" (or (.getMessage e) (str (class e)))
+             "code"  (str (or (:code data) :tool-error))}
+      (seq details) (assoc "details" details))))
+
 (defn- require-string
   [x field]
   (if (string? x)
@@ -597,8 +635,11 @@
 
 (defn- require-vector
   [x field]
-  (if (vector? x)
-    x
+  (cond
+    (vector? x) x
+    (sequential? x) (vec x)
+    (instance? java.util.List x) (vec x)
+    :else
     (throw (ex-info (str field " must be an array.")
                     {:code  :invalid-params
                      :field field}))))
@@ -913,13 +954,13 @@
         kv-handle (kv-handle state kv-id)
         search-index-ids (dependent-search-index-ids state kv-id)
         vector-index-ids (dependent-vector-index-ids state kv-id)]
-    (shared/exec-request (:session-state @state)
-                         {"op"   "close-kv"
-                          "args" {"kv" kv-handle}})
     (doseq [search-index-id search-index-ids]
       (close-search-index state {"searchIndex" search-index-id}))
     (doseq [vector-index-id vector-index-ids]
       (close-vector-index state {"vectorIndex" vector-index-id}))
+    (shared/exec-request (:session-state @state)
+                         {"op"   "close-kv"
+                          "args" {"kv" kv-handle}})
     (swap! state
            (fn [current]
              (-> current
@@ -1642,15 +1683,12 @@
         (try
           (jsonrpc-result id (call-tool state name arguments wrap-fn))
           (catch clojure.lang.ExceptionInfo e
-            (let [data (or (ex-data e) {})]
-              (jsonrpc-result
-                id
-                (tool-response
-                  {"error"   (or (.getMessage e) (str (class e)))
-                   "code"    (str (or (:code data) :tool-error))
-                   "details" data}
-                  true
-                  wrap-fn))))))
+            (jsonrpc-result
+              id
+              (tool-response
+                (tool-error-structured e)
+                true
+                wrap-fn)))))
 
       (throw (ex-info (str "Unsupported method: " method)
                       {:code   :method-not-found
@@ -1729,19 +1767,20 @@
                        :initialized?  false
                        :allow-writes? (true? (:allow-writes _opts))
                        :session-state (shared/new-session-state)})]
-     (try
-       (loop []
-         (when-let [message (read-message reader)]
-           (when-let [response (handle-input state message)]
-             (write-message! writer response))
-           (recur)))
-       (finally
-         (shared/clear-handles! (:session-state @state)))))))
+     (binding [*mcp-limits* (effective-mcp-limits _opts)]
+       (try
+         (loop []
+           (when-let [message (read-message reader)]
+             (when-let [response (handle-input state message)]
+               (write-message! writer response))
+             (recur)))
+         (finally
+           (shared/clear-handles! (:session-state @state))))))))
 
 (defn run
   ([]
    (run {}))
   ([opts]
-   (serve (InputStreamReader. System/in)
+   (serve (InputStreamReader. System/in "UTF-8")
           (OutputStreamWriter. System/out "UTF-8")
           opts)))
