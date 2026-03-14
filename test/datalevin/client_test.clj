@@ -11,6 +11,7 @@
   (:require
    [clojure.test :refer [deftest is use-fixtures]]
    [datalevin.client :as cl]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.test.core :refer [server-fixture]])
   (:import
@@ -270,11 +271,87 @@
                 (swap! pref-created conj [host port])
                 retry-client))
             (fn [& _]
-              (reset! retried? true)
-              :should-not-run))))
+                (reset! retried? true)
+                :should-not-run))))
     (is (= [["10.0.0.11" 8898]] @pref-created))
     (is (= [{:endpoint "10.0.0.11:8898"}] @pref-disconnected))
     (is (false? @retried?))))
+
+(deftest retry-ha-write-request-reuses-cached-client-and-open-db-test
+  (let [client       (Object.)
+        req          {:type :transact-kv
+                      :args ["orders" [[:put "k" "v"]]]
+                      :writing? true}
+        retry-context {:client client
+                       :host "10.0.0.12"
+                       :port 8898}
+        mk-retry-client
+        (fn [host port]
+          (reify cl/IClient
+            (request [_ _]
+              (throw (ex-info "unexpected request" {:host host :port port})))
+            (copy-in [_ _ _ _] nil)
+            (disconnect [_] nil)
+            (disconnected? [_] false)
+            (get-pool [_] nil)
+            (get-id [_] nil)))
+        created      (atom [])
+        opened       (atom [])
+        disconnected (atom [])
+        retried?     (atom false)]
+    (with-redefs [cl/open-database
+                  (fn
+                    ([retry-client db-name db-type]
+                     (swap! opened conj [retry-client db-name db-type])
+                     nil)
+                    ([retry-client db-name db-type _schema _opts _return-db-info?]
+                     (swap! opened conj [retry-client db-name db-type])
+                     nil))]
+      (is (= :ok
+             (#'cl/retry-ha-write-request*
+              req
+              "HA write admission rejected"
+              (:err-data
+               (ha-write-rejected-response
+                "HA write admission rejected"
+                ["10.0.0.11:8898"]))
+              retry-context
+              (fn [_ _] {:type :command-complete :result :ok})
+              (fn [retry-client]
+                (swap! disconnected conj retry-client))
+              (fn [_ host port]
+                (let [retry-client (mk-retry-client host port)]
+                  (swap! created conj retry-client)
+                  retry-client))
+              #(#'cl/set-preferred-ha-endpoint! client %))))
+      (let [retry-client (first @created)]
+        (is (= [retry-client] @created))
+        (is (= [[retry-client "orders" c/db-store-kv]] @opened))
+        (is (empty? @disconnected))
+        (let [res (#'cl/try-preferred-ha-write-request*
+                   client
+                   req
+                   retry-context
+                   (fn [cached-client _]
+                     {:type :command-complete
+                      :result [:ok cached-client]})
+                   (fn [cached-client]
+                     (swap! disconnected conj cached-client))
+                   (fn [_ host port]
+                     (let [new-client (mk-retry-client host port)]
+                       (swap! created conj new-client)
+                       new-client))
+                   (fn [& _]
+                     (reset! retried? true)
+                     :should-not-run))]
+          (is (= {:handled? true
+                  :result [:ok retry-client]}
+                 res))
+          (is (identical? retry-client (second (:result res)))))
+        (is (= [retry-client] @created))
+        (is (= [[retry-client "orders" c/db-store-kv]] @opened))
+        (is (empty? @disconnected))
+        (is (false? @retried?))))))
 
 (deftest normal-request-non-writing-error-includes-server-payload-test
   (let [client (reify cl/IClient

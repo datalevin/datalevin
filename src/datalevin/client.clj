@@ -35,6 +35,12 @@
 (defonce ^:private ^java.util.Map ha-preferred-endpoints
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defonce ^:private ^java.util.Map ha-retry-clients
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defonce ^:private ^java.util.Map ha-retry-open-targets
+  (Collections/synchronizedMap (WeakHashMap.)))
+
 (defn- conn-wire-opts
   [^SocketChannel ch]
   (or (.get connection-wire-opts ch)
@@ -286,7 +292,7 @@
       (u/raise "Unable to copy in:" e
                {:req req :count (count data)}))))
 
-(declare open-database)
+(declare open-database disconnect-retry-clients!)
 
 (deftype ^:no-doc Client [username password host port pool-size time-out
                           ^:volatile-mutable ^UUID id
@@ -364,7 +370,8 @@
         (send-only conn {:type :disconnect})
         (release-connection pool conn))
       (finally
-        (.remove ha-preferred-endpoints client)))
+        (.remove ha-preferred-endpoints client)
+        (disconnect-retry-clients! client disconnect)))
     (close-pool pool))
 
   (disconnected? [client]
@@ -471,7 +478,8 @@
      :pool-size (.-pool-size ^Client client)
      :time-out  (.-time-out ^Client client)
      :host      (.-host ^Client client)
-     :port      (.-port ^Client client)}))
+     :port      (.-port ^Client client)
+     :client    client}))
 
 (defn- read-preferred-ha-endpoint
   [client]
@@ -503,23 +511,187 @@
     (->Client username password host port pool-size time-out
               client-id pool)))
 
+(def ^:private ha-kv-retry-request-types
+  #{:transact-kv
+    :open-transact-kv
+    :close-transact-kv
+    :abort-transact-kv
+    :open-dbi
+    :clear-dbi
+    :drop-dbi
+    :kv-re-index})
+
+(def ^:private ha-datalog-retry-request-types
+  #{:assoc-opt
+    :set-schema
+    :init-max-eid
+    :del-attr
+    :rename-attr
+    :load-datoms
+    :tx-data
+    :tx-data+db-info
+    :open-transact
+    :close-transact
+    :abort-transact
+    :datalog-re-index})
+
+(def ^:private ha-engine-retry-request-types
+  #{:add-doc
+    :remove-doc
+    :clear-docs
+    :search-re-index})
+
+(defn- request-db-type
+  [req]
+  (or (:db-type req)
+      (let [req-type (:type req)]
+        (cond
+          (contains? ha-kv-retry-request-types req-type)
+          c/db-store-kv
+
+          (contains? ha-datalog-retry-request-types req-type)
+          c/db-store-datalog
+
+          (contains? ha-engine-retry-request-types req-type)
+          "engine"
+
+          :else nil))))
+
+(defn- request-db-target
+  [req]
+  (when-let [db-type (request-db-type req)]
+    (let [db-name (or (:db-name req) (first (:args req)))]
+      (when (string? db-name)
+        [db-name db-type]))))
+
+(defn- ^java.util.Set retry-client-open-target-set
+  [retry-client]
+  (locking ha-retry-open-targets
+    (or (.get ha-retry-open-targets retry-client)
+        (let [targets (Collections/newSetFromMap (ConcurrentHashMap.))]
+          (.put ha-retry-open-targets retry-client targets)
+          targets))))
+
+(defn- clear-retry-client-open-targets!
+  [retry-client]
+  (.remove ha-retry-open-targets retry-client))
+
+(defn- ensure-retry-client-open!
+  [retry-client req]
+  (when (satisfies? IClient retry-client)
+    (when-let [[db-name db-type :as target] (request-db-target req)]
+      (let [targets (retry-client-open-target-set retry-client)]
+        (when (.add targets target)
+          (try
+            (open-database retry-client db-name db-type)
+            (catch Exception e
+              (.remove targets target)
+              (throw e)))))))
+  retry-client)
+
+(defn- ^ConcurrentHashMap retry-client-cache
+  [client]
+  (locking ha-retry-clients
+    (or (.get ha-retry-clients client)
+        (let [cache (ConcurrentHashMap.)]
+          (.put ha-retry-clients client cache)
+          cache))))
+
+(defn- cached-retry-client
+  [client endpoint]
+  (when-let [^ConcurrentHashMap cache (.get ha-retry-clients client)]
+    (.get cache endpoint)))
+
+(defn- cache-retry-client!
+  [client endpoint retry-client]
+  (let [^ConcurrentHashMap cache (retry-client-cache client)]
+    (.put cache endpoint retry-client))
+  retry-client)
+
+(defn- retry-client-disconnected?
+  [retry-client]
+  (and retry-client
+       (satisfies? IClient retry-client)
+       (disconnected? retry-client)))
+
+(defn- safe-disconnect-retry-client!
+  [retry-client disconnect-fn]
+  (when retry-client
+    (clear-retry-client-open-targets! retry-client)
+    (try
+      (disconnect-fn retry-client)
+      (catch Exception _ nil))))
+
+(defn- evict-retry-client!
+  [client endpoint disconnect-fn]
+  (when client
+    (when-let [^ConcurrentHashMap cache (.get ha-retry-clients client)]
+      (when-let [retry-client (.remove cache endpoint)]
+        (safe-disconnect-retry-client! retry-client disconnect-fn)))))
+
+(defn- disconnect-retry-clients!
+  [client disconnect-fn]
+  (when-let [cache (.remove ha-retry-clients client)]
+    (doseq [retry-client (.values ^ConcurrentHashMap cache)]
+      (safe-disconnect-retry-client! retry-client disconnect-fn))
+    (.clear ^ConcurrentHashMap cache)))
+
+(defn- prepare-retry-client
+  [req retry-context host port disconnect-fn new-client-fn]
+  (let [endpoint    (endpoint-key host port)
+        base-client (:client retry-context)]
+    (if base-client
+      (locking (retry-client-cache base-client)
+        (if-let [cached (cached-retry-client base-client endpoint)]
+          (if (retry-client-disconnected? cached)
+            (do
+              (evict-retry-client! base-client endpoint disconnect-fn)
+              (let [retry-client (-> (new-client-fn retry-context host port)
+                                     (ensure-retry-client-open! req))]
+                (cache-retry-client! base-client endpoint retry-client)
+                {:client retry-client
+                 :cached? true
+                 :endpoint endpoint
+                 :base-client base-client}))
+            {:client (ensure-retry-client-open! cached req)
+             :cached? true
+             :endpoint endpoint
+             :base-client base-client})
+          (let [retry-client (-> (new-client-fn retry-context host port)
+                                 (ensure-retry-client-open! req))]
+            (cache-retry-client! base-client endpoint retry-client)
+            {:client retry-client
+             :cached? true
+             :endpoint endpoint
+             :base-client base-client})))
+      {:client (-> (new-client-fn retry-context host port)
+                   (ensure-retry-client-open! req))
+       :cached? false
+       :endpoint endpoint
+       :base-client nil})))
+
 (defn- attempt-ha-endpoint-request
   [req retry-context host port request-fn disconnect-fn new-client-fn]
   (try
-    (let [retry-client (new-client-fn retry-context host port)]
+    (let [{:keys [client cached? endpoint base-client]}
+          (prepare-retry-client
+            req retry-context host port disconnect-fn new-client-fn)]
       (try
         (let [{:keys [type message result err-data]}
-              (request-fn retry-client req)]
+              (request-fn client req)]
           (if (= type :error-response)
             {:kind :error
              :message message
              :err-data err-data}
             {:kind :success
              :result result}))
+        (catch Exception e
+          (when cached?
+            (evict-retry-client! base-client endpoint disconnect-fn))
+          (throw e))
         (finally
-          (try
-            (disconnect-fn retry-client)
-            (catch Exception _ nil)))))
+          (when-not cached?
+            (safe-disconnect-retry-client! client disconnect-fn)))))
     (catch Exception e
       {:kind :exception
        :exception e})))
