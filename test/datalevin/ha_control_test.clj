@@ -2,11 +2,13 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.ha.control :as ctrl]
-   [datalevin.util :as u])
+   [datalevin.util :as u]
+   [taoensso.nippy :as nippy])
   (:import
-   [com.alipay.sofa.jraft Node]
+   [com.alipay.sofa.jraft Node StateMachine Status]
    [java.io File]
    [java.net ServerSocket]
+   [java.nio ByteBuffer]
    [java.util UUID]))
 
 (defn- started-authority
@@ -35,6 +37,59 @@
           (do (Thread/sleep 25)
               (recur))
           false)))))
+
+(defn- command-closure-outcome
+  []
+  (let [result-p (promise)]
+    {:closure  (ctrl/->CommandClosure (volatile! nil) result-p)
+     :result-p result-p}))
+
+(defn- batch-iterator
+  [entries rollback-v]
+  (let [entries (mapv (fn [{:keys [command done]}]
+                        {:data (ByteBuffer/wrap ^bytes (nippy/freeze command))
+                         :done done})
+                      entries)
+        idx-v   (volatile! 0)]
+    (reify com.alipay.sofa.jraft.Iterator
+      (hasNext [_]
+        (< (long @idx-v) (count entries)))
+
+      (next [_]
+        (let [idx  ^long @idx-v
+              data (some-> entries (nth idx nil) :data)]
+          (vreset! idx-v (inc idx))
+          data))
+
+      (remove [_]
+        (throw (UnsupportedOperationException.)))
+
+      (setAutoCommitPerLog [_ _])
+
+      (getData [_]
+        (let [idx (long @idx-v)]
+          (some-> entries (nth idx nil) :data)))
+
+      (getIndex [_]
+        (inc (long @idx-v)))
+
+      (getTerm [_]
+        1)
+
+      (done [_]
+        (let [idx (long @idx-v)]
+          (some-> entries (nth idx nil) :done)))
+
+      (commit [_]
+        false)
+
+      (commitAndSnapshotSync [_ done]
+        (when done
+          (.run done (Status/OK))))
+
+      (setErrorAndRollback [_ ntail status]
+        (vreset! rollback-v {:count ntail
+                             :status status})))))
 
 (defn- started-sofa-authority
   ([group-id local-peer-id voters]
@@ -190,6 +245,50 @@
         mismatch-b  (ctrl/init-membership-hash! authority-b "def456")]
     (is (:ok? init-a))
     (is (= :membership-hash-mismatch (:reason mismatch-b)))))
+
+(deftest sofa-jraft-fsm-batch-failure-is-atomic-test
+  (let [state-atom  (atom {:leases {}
+                           :membership-hash nil
+                           :voters []})
+        ^StateMachine fsm (#'ctrl/new-jraft-fsm state-atom)
+        first       (command-closure-outcome)
+        second      (command-closure-outcome)
+        third       (command-closure-outcome)
+        rollback-v  (volatile! nil)
+        iter        (batch-iterator
+                     [{:command {:op :init-membership-hash
+                                 :membership-hash "abc123"}
+                       :done (:closure first)}
+                      {:command {:op :try-acquire-lease
+                                 :req {:db-identity db-identity
+                                       :leader-node-id 1
+                                       :leader-endpoint "10.0.0.11:8898"
+                                       :lease-renew-ms 1000
+                                       :lease-timeout-ms 3000
+                                       :leader-last-applied-lsn 7
+                                       :now-ms 1000
+                                       :observed-version 0
+                                       :observed-lease nil}}
+                       :done (:closure second)}
+                      {:command {:op :unsupported}
+                       :done (:closure third)}]
+                     rollback-v)]
+    (.onApply fsm iter)
+    (let [outcomes (mapv #(deref % 1000 ::timeout)
+                         [(:result-p first)
+                          (:result-p second)
+                          (:result-p third)])]
+      (is (= {:leases {}
+              :membership-hash nil
+              :voters []}
+             @state-atom))
+      (is (= 2 (:count @rollback-v)))
+      (doseq [outcome outcomes]
+        (is (not= ::timeout outcome))
+        (is (false? (.isOk ^Status (:status outcome))))
+        (is (nil? (:result outcome)))
+        (is (re-find #"HA FSM apply failed"
+                     (.getErrorMsg ^Status (:status outcome))))))))
 
 (deftest sofa-jraft-authority-replicates-and-fails-over-test
   (let [group-id (unique-group-id)

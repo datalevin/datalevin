@@ -10,6 +10,7 @@
 (ns ^:no-doc datalevin.ha
   "Consensus-lease HA runtime helpers shared by server runtime."
   (:require
+   [clojure.edn :as edn]
    [clojure.string :as s]
    [datalevin.bits :as b]
    [datalevin.client :as cl]
@@ -34,7 +35,8 @@
    [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
-   [java.util.concurrent ConcurrentHashMap TimeUnit]))
+   [java.util.concurrent ConcurrentHashMap TimeUnit]
+   [java.util.function BiFunction Function]))
 
 (defn consensus-ha-opts
   [store]
@@ -424,27 +426,37 @@
 
 (defn- cached-ha-client
   [uri db-name client-opts]
-  (let [cache-key (ha-client-cache-key uri client-opts)]
-    (locking ha-client-cache
-      (if-let [client (.get ha-client-cache cache-key)]
-        (if (live-ha-client? client)
-          client
-          (do
-            (close-ha-client! client)
-            (let [new-client (open-ha-client uri db-name client-opts)]
-              (.put ha-client-cache cache-key new-client)
-              new-client)))
-        (let [client (open-ha-client uri db-name client-opts)]
-          (.put ha-client-cache cache-key client)
-          client)))))
+  (let [cache-key (ha-client-cache-key uri client-opts)
+        ^ConcurrentHashMap cache ha-client-cache]
+    (if-let [client (.get cache cache-key)]
+      (if (live-ha-client? client)
+        client
+        (let [stale-client-v (volatile! nil)
+              client (.compute cache cache-key
+                               (reify BiFunction
+                                 (apply [_ _ existing]
+                                   (if (live-ha-client? existing)
+                                     existing
+                                     (do
+                                       (when existing
+                                         (vreset! stale-client-v existing))
+                                       (open-ha-client uri db-name
+                                                       client-opts))))))]
+          (when-let [stale-client @stale-client-v]
+            (when-not (identical? stale-client client)
+              (close-ha-client! stale-client)))
+          client))
+      (.computeIfAbsent cache cache-key
+                        (reify Function
+                          (apply [_ _]
+                            (open-ha-client uri db-name client-opts)))))))
 
 (defn- invalidate-cached-ha-client!
   [uri client-opts client]
-  (let [cache-key (ha-client-cache-key uri client-opts)]
-    (locking ha-client-cache
-      (when (identical? client (.get ha-client-cache cache-key))
-        (.remove ha-client-cache cache-key)
-        (close-ha-client! client)))))
+  (let [cache-key (ha-client-cache-key uri client-opts)
+        ^ConcurrentHashMap cache ha-client-cache]
+    (when (.remove cache cache-key client)
+      (close-ha-client! client))))
 
 (defn- with-cached-ha-client
   [uri db-name client-opts f]
@@ -463,10 +475,18 @@
 
 (defn- clear-ha-client-cache!
   []
-  (locking ha-client-cache
-    (doseq [client (vals (into {} ha-client-cache))]
-      (close-ha-client! client))
-    (.clear ha-client-cache)))
+  (let [^ConcurrentHashMap cache ha-client-cache]
+    (loop []
+      (let [entries (vec (.entrySet cache))]
+        (when (seq entries)
+          (doseq [entry entries]
+            (let [entry ^java.util.Map$Entry entry
+                  cache-key (.getKey entry)
+                  client    (.getValue entry)]
+              (when (.remove cache cache-key client)
+                (close-ha-client! client))))
+          (when-not (.isEmpty cache)
+            (recur)))))))
 
 (defn- ha-endpoint-uri
   [db-name endpoint]
@@ -505,6 +525,110 @@
                     (into-array java.nio.file.CopyOption
                                 [StandardCopyOption/REPLACE_EXISTING]))))))
 
+(def ^:private ha-snapshot-install-marker-suffix
+  ".ha-snapshot-install.edn")
+
+(defn- ha-snapshot-install-marker-path
+  [env-dir]
+  (str env-dir ha-snapshot-install-marker-suffix))
+
+(defn- read-ha-snapshot-install-marker
+  [env-dir]
+  (let [marker-path (ha-snapshot-install-marker-path env-dir)]
+    (when (u/file-exists marker-path)
+      (let [marker (try
+                     (edn/read-string (slurp marker-path))
+                     (catch Exception e
+                       (u/raise "HA snapshot install marker is unreadable"
+                                e
+                                {:error :ha/follower-snapshot-install-marker-invalid
+                                 :env-dir env-dir
+                                 :marker-path marker-path})))
+            backup-dir (:backup-dir marker)
+            stage      (:stage marker)]
+        (when-not (and (map? marker)
+                       (string? backup-dir)
+                       (not (s/blank? backup-dir))
+                       (keyword? stage))
+          (u/raise "HA snapshot install marker is invalid"
+                   {:error :ha/follower-snapshot-install-marker-invalid
+                    :env-dir env-dir
+                    :marker-path marker-path
+                    :marker marker}))
+        (assoc marker :marker-path marker-path)))))
+
+(defn- write-ha-snapshot-install-marker!
+  [env-dir marker]
+  (spit (ha-snapshot-install-marker-path env-dir)
+        (str (pr-str marker) "\n")))
+
+(defn- delete-ha-snapshot-install-marker!
+  [env-dir]
+  (let [marker-path (ha-snapshot-install-marker-path env-dir)]
+    (when (u/file-exists marker-path)
+      (u/delete-files marker-path))))
+
+(defn- restore-ha-snapshot-install-backup!
+  [env-dir backup-dir]
+  (when (u/file-exists env-dir)
+    (u/delete-files env-dir))
+  (move-path! backup-dir env-dir))
+
+(defn- recover-ha-local-snapshot-install!
+  [env-dir]
+  (when-let [{:keys [backup-dir stage] :as marker}
+             (read-ha-snapshot-install-marker env-dir)]
+    (case stage
+      :prepare
+      (cond
+        (u/file-exists backup-dir)
+        (do
+          (log/warn "Recovering HA snapshot install from staged backup"
+                    {:env-dir env-dir
+                     :backup-dir backup-dir
+                     :stage stage})
+          (restore-ha-snapshot-install-backup! env-dir backup-dir)
+          (delete-ha-snapshot-install-marker! env-dir)
+          marker)
+
+        (u/file-exists env-dir)
+        (do
+          (delete-ha-snapshot-install-marker! env-dir)
+          marker)
+
+        :else
+        (u/raise "HA snapshot install marker has no recoverable store"
+                 {:error :ha/follower-snapshot-install-recovery-failed
+                  :env-dir env-dir
+                  :backup-dir backup-dir
+                  :stage stage}))
+
+      :backup-moved
+      (if (u/file-exists backup-dir)
+        (do
+          (log/warn "Recovering HA snapshot install after interrupted backup move"
+                    {:env-dir env-dir
+                     :backup-dir backup-dir
+                     :stage stage})
+          (restore-ha-snapshot-install-backup! env-dir backup-dir)
+          (delete-ha-snapshot-install-marker! env-dir)
+          marker)
+        (u/raise "HA snapshot install backup is missing during recovery"
+                 {:error :ha/follower-snapshot-install-recovery-failed
+                  :env-dir env-dir
+                  :backup-dir backup-dir
+                  :stage stage}))
+
+      (u/raise "HA snapshot install marker has an unsupported stage"
+               {:error :ha/follower-snapshot-install-marker-invalid
+                :env-dir env-dir
+                :marker marker}))))
+
+(defn recover-ha-local-store-dir-if-needed!
+  [env-dir]
+  (when (read-ha-snapshot-install-marker env-dir)
+    (recover-ha-local-snapshot-install! env-dir)))
+
 (defn- close-ha-local-store!
   [m]
   (if-let [dt-db (:dt-db m)]
@@ -527,22 +651,45 @@
 
 (declare open-ha-store-dbis!)
 
+(defn recover-ha-local-store-if-needed
+  [store]
+  (if-not (instance? IStore store)
+    store
+    (let [env-dir (i/dir store)]
+      (if-not (recover-ha-local-store-dir-if-needed! env-dir)
+        store
+        (let [schema (i/schema store)
+              opts   (i/opts store)]
+          (when-not (i/closed? store)
+            (i/close store))
+          (-> (st/open env-dir schema opts)
+              open-ha-store-dbis!))))))
+
 (defn- reopen-ha-local-store-if-needed
   [m]
-  (if (local-kv-store m)
-    m
-    (let [store (:store m)]
-      (if (instance? IStore store)
-        (let [store-dir (i/dir store)
-              store-opts (i/opts store)
-              reopened-store (-> (st/open store-dir nil store-opts)
-                                 open-ha-store-dbis!)]
-          (-> m
-              (assoc :store reopened-store
-                     :dt-db nil)
-              (dissoc :engine :index)
-              refresh-ha-local-dt-db))
-        m))))
+  (let [store          (:store m)
+        recovered-store (recover-ha-local-store-if-needed store)
+        m              (if (identical? recovered-store store)
+                         m
+                         (-> m
+                             (assoc :store recovered-store
+                                    :dt-db nil)
+                             (dissoc :engine :index)
+                             refresh-ha-local-dt-db))]
+    (if (local-kv-store m)
+      m
+      (let [store (:store m)]
+        (if (instance? IStore store)
+          (let [store-dir (i/dir store)
+                store-opts (i/opts store)
+                reopened-store (-> (st/open store-dir nil store-opts)
+                                   open-ha-store-dbis!)]
+            (-> m
+                (assoc :store reopened-store
+                       :dt-db nil)
+                (dissoc :engine :index)
+                refresh-ha-local-dt-db))
+          m)))))
 
 (defn- open-ha-store-dbis!
   [store]
@@ -1316,6 +1463,9 @@
                :message "HA follower snapshot install requires a local store"}}
       (let [env-dir (i/dir store)
             backup-dir (str env-dir ".ha-backup-" (UUID/randomUUID))
+            install-marker {:backup-dir backup-dir
+                            :db-name (some-> store i/db-name)
+                            :created-at-ms (System/currentTimeMillis)}
             open-opts (ha-snapshot-open-opts
                        m
                        (:db-name (i/opts store))
@@ -1324,18 +1474,25 @@
           ;; Validate that the copied snapshot is openable before swapping paths.
           (let [snapshot-store (st/open snapshot-dir nil open-opts)]
             (try
-              (i/opts snapshot-store)
+                (i/opts snapshot-store)
               (finally
                 (i/close snapshot-store))))
           (close-ha-local-store! m)
           (when (u/file-exists backup-dir)
             (u/delete-files backup-dir))
+          (write-ha-snapshot-install-marker!
+           env-dir
+           (assoc install-marker :stage :prepare))
           (move-path! env-dir backup-dir)
+          (write-ha-snapshot-install-marker!
+           env-dir
+           (assoc install-marker :stage :backup-moved))
           (u/create-dirs env-dir)
           (copy-dir-contents! snapshot-dir env-dir)
           (let [new-store (open-ha-store-dbis!
                            (st/open env-dir nil open-opts))
                 new-db (db/new-db new-store)]
+            (delete-ha-snapshot-install-marker! env-dir)
             (when (u/file-exists backup-dir)
               (u/delete-files backup-dir))
             {:ok? true
@@ -1348,10 +1505,7 @@
                        {:db-name (some-> store i/db-name)
                         :env-dir env-dir})
             (try
-              (when (u/file-exists env-dir)
-                (u/delete-files env-dir))
-              (when (u/file-exists backup-dir)
-                (move-path! backup-dir env-dir))
+              (recover-ha-local-snapshot-install! env-dir)
               (let [restored-store (open-ha-store-dbis!
                                     (st/open env-dir nil open-opts))
                     restored-db (db/new-db restored-store)]
@@ -2407,9 +2561,13 @@
     :kv-re-index
     :datalog-re-index})
 
+(defn ha-write-message?
+  [{:keys [type]}]
+  (boolean (ha-write-command-types type)))
+
 (defn ha-write-admission-error
   [dbs {:keys [type args]}]
-  (when (ha-write-command-types type)
+  (when (ha-write-message? {:type type})
     (let [db-name (nth args 0 nil)
           m (and db-name (get dbs db-name))]
       (when (and m (:ha-authority m))

@@ -499,7 +499,9 @@
   [store]
   (cond
     (instance? IStore store)
-    (st/open (i/dir store) (i/schema store) (i/opts store))
+    (let [env-dir (i/dir store)]
+      (dha/recover-ha-local-store-dir-if-needed! env-dir)
+      (st/open env-dir (i/schema store) (i/opts store)))
 
     (instance? ILMDB store)
     (l/open-kv (i/env-dir store) (i/env-opts store))
@@ -689,20 +691,117 @@
 
 (defn- replace-db-state-if-current
   [^Server server db-name expected-state guard-fn new-state]
-  (let [updated? (volatile! false)
+  (let [^ConcurrentHashMap dbs (.-dbs server)
+        present? (volatile! false)
+        updated? (volatile! false)
         final-v  (volatile! nil)]
-    (update-db server db-name
-               (fn [state]
-                 (let [next (if (and (identical? state expected-state)
-                                     (guard-fn state))
-                              (do
-                                (vreset! updated? true)
-                                new-state)
-                              state)]
-                   (vreset! final-v next)
-                   next)))
+    (.computeIfPresent dbs db-name
+                       (reify BiFunction
+                         (apply [_ _ state]
+                           (vreset! present? true)
+                           (let [next (if (and (identical? state expected-state)
+                                               (guard-fn state))
+                                        (do
+                                          (vreset! updated? true)
+                                          new-state)
+                                        state)]
+                             (vreset! final-v next)
+                             next))))
     {:updated? @updated?
-     :state @final-v}))
+     :state (when @present? @final-v)}))
+
+(defn- transform-db-state-when
+  [^Server server db-name guard-fn f]
+  (let [^ConcurrentHashMap dbs (.-dbs server)
+        present? (volatile! false)
+        updated? (volatile! false)
+        final-v  (volatile! nil)]
+    (.computeIfPresent dbs db-name
+                       (reify BiFunction
+                         (apply [_ _ state]
+                           (vreset! present? true)
+                           (let [next (if (guard-fn state)
+                                        (do
+                                          (vreset! updated? true)
+                                          (f state))
+                                        state)]
+                             (vreset! final-v next)
+                             next))))
+    {:updated? @updated?
+     :state (when @present? @final-v)}))
+
+(def ^:private missing-state-value
+  (Object.))
+
+(def ^:private ha-follower-side-effect-keys
+  [:store
+   :dt-db
+   :engine
+   :index
+   :ha-local-last-applied-lsn
+   :ha-follower-last-apply-readback
+   :ha-follower-last-batch-records
+   :ha-follower-next-lsn
+   :ha-follower-last-batch-size
+   :ha-follower-last-sync-ms
+   :ha-follower-leader-endpoint
+   :ha-follower-source-endpoint
+   :ha-follower-source-order
+   :ha-follower-last-bootstrap-ms
+   :ha-follower-bootstrap-source-endpoint
+   :ha-follower-bootstrap-snapshot-last-applied-lsn
+   :ha-follower-sync-backoff-ms
+   :ha-follower-next-sync-not-before-ms
+   :ha-follower-degraded?
+   :ha-follower-degraded-reason
+   :ha-follower-degraded-details
+   :ha-follower-degraded-since-ms
+   :ha-follower-last-error
+   :ha-follower-last-error-details
+   :ha-follower-last-error-ms])
+
+(defn- ha-renew-side-effect-patch
+  [expected-state next-state]
+  (when (= :follower (:ha-role expected-state))
+    (let [patch (reduce
+                 (fn [acc k]
+                   (let [expected-v (get expected-state k missing-state-value)
+                         next-v     (get next-state k missing-state-value)]
+                     (if (= expected-v next-v)
+                       acc
+                       (assoc acc k next-v))))
+                 {}
+                 ha-follower-side-effect-keys)]
+      (when (seq patch)
+        patch))))
+
+(defn- apply-state-patch
+  [state patch]
+  (reduce-kv
+   (fn [acc k v]
+     (if (identical? missing-state-value v)
+       (dissoc acc k)
+       (assoc acc k v)))
+   state
+   patch))
+
+(defn- merge-ha-renew-side-effect-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (= :follower (:ha-role current-state))
+           (= :follower (:ha-role expected-state))
+           (identical? (:ha-renew-loop-running? current-state)
+                       (:ha-renew-loop-running? expected-state))
+           (identical? (:ha-authority current-state)
+                       (:ha-authority expected-state))
+           (= (:ha-node-id current-state)
+              (:ha-node-id expected-state))
+           (= (:ha-db-identity current-state)
+              (:ha-db-identity expected-state))
+           (= (:ha-membership-hash current-state)
+              (:ha-membership-hash expected-state)))
+    (apply-state-patch current-state patch)
+    current-state))
 
 (def ^:dynamic *server-runtime-opts-fn*
   (fn [_ _ _ _] nil))
@@ -811,6 +910,9 @@
                              :udf-readiness-token token)
                 (nil? (:dt-db m)) (assoc :dt-db dt-db)))))))))
 
+(def ^:dynamic *ensure-udf-readiness-state-fn*
+  ensure-udf-readiness-state)
+
 (defn- udf-write-admission-error
   [db-name m]
   (when (and (:ha-authority m)
@@ -915,9 +1017,12 @@
   [db-name m]
   (dha/stop-ha-authority db-name m))
 
+(def ^:dynamic *ha-renew-step-fn*
+  dha/ha-renew-step)
+
 (defn- ha-renew-step
   [db-name m]
-  (dha/ha-renew-step db-name m))
+  (*ha-renew-step-fn* db-name m))
 
 (defn- ha-loop-sleep-ms
   ([m]
@@ -966,19 +1071,33 @@
                   (not (identical? running?
                                    (:ha-renew-loop-running? m))))
             (.set running? false)
-            ;; HA renew steps can perform remote authority and watermark reads.
-            ;; Compute the next state outside `update-db` so peer/internal HA
-            ;; requests can still acquire per-DB state while this loop is in
-            ;; flight, then commit only if the DB entry is still the same
-            ;; generation.
-            (let [next-state (ha-renew-step db-name m)
-                  {:keys [state]}
+            ;; Keep renew work outside `update-db` so HA probes and peer/server
+            ;; operations do not block on control-plane I/O. If a concurrent
+            ;; state update wins the final CAS, merge follower replay side
+            ;; effects back into the current state so applied local progress is
+            ;; not discarded.
+            (let [next-state        (ha-renew-step db-name m)
+                  side-effect-patch (ha-renew-side-effect-patch m next-state)
+                  {:keys [updated? state]}
                   (replace-db-state-if-current
                    server
                    db-name
                    m
                    #(identical? running? (:ha-renew-loop-running? %))
-                   next-state)]
+                   next-state)
+                  state
+                  (if (and (not updated?)
+                           side-effect-patch)
+                    (:state
+                     (transform-db-state-when
+                      server
+                      db-name
+                      #(identical? running? (:ha-renew-loop-running? %))
+                      #(merge-ha-renew-side-effect-patch
+                        %
+                        m
+                        side-effect-patch)))
+                    state)]
               (if (or (nil? state)
                       (nil? (:ha-authority state))
                       (not (identical? running?
@@ -1086,9 +1205,12 @@
 
 (defn- ha-write-admission-error
   [^Server server message]
-  (let [db-name (nth (:args message) 0 nil)
+  (let [write?   (dha/ha-write-message? message)
+        db-name (nth (:args message) 0 nil)
         m       (when (and db-name (contains? (.-dbs server) db-name))
-                  (update-db server db-name ensure-udf-readiness-state))]
+                  (if write?
+                    (update-db server db-name *ensure-udf-readiness-state-fn*)
+                    (get (.-dbs server) db-name)))]
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
 
@@ -1123,6 +1245,9 @@
                                   (not (identical? runtime-store store)))
                            runtime-store
                            store)
+                         published-store
+                         (dha/recover-ha-local-store-if-needed
+                          published-store)
                          _            (vreset! published-store-v
                                                published-store)
                          runtime-opts (resolved-runtime-opts
@@ -1668,7 +1793,9 @@
   [root db-name dbis datalog?]
   (let [dir (db-dir root db-name)]
     (if datalog?
-      (st/open dir)
+      (do
+        (dha/recover-ha-local-store-dir-if-needed! dir)
+        (st/open dir))
       (let [lmdb (l/open-kv dir)]
         (doseq [dbi dbis] (i/open-dbi lmdb dbi))
         lmdb))))
@@ -1763,7 +1890,9 @@
                                                schema db-type))
                                      (try
                                        (case db-type
-                                         :datalog   (st/open dir schema opts)
+                                         :datalog   (do
+                                                      (dha/recover-ha-local-store-dir-if-needed! dir)
+                                                      (st/open dir schema opts))
                                          :key-value (l/open-kv dir opts))
                                        (catch Exception e
                                          (if (multiple-lmdb-open-error? e)

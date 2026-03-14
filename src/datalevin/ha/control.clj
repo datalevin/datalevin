@@ -879,6 +879,20 @@
   (run [_ status]
     (deliver status-p status)))
 
+(defn- run-command-closure!
+  ([^CommandClosure done ^Status status]
+   (.run done status))
+  ([^CommandClosure done result ^Status status]
+   (vreset! (:result-v done) result)
+   (.run done status)))
+
+(defn- fsm-apply-error-status
+  [^Exception e]
+  (Status.
+   (int (.getNumber RaftError/ESTATEMACHINE))
+   (str "HA FSM apply failed: "
+        (.getMessage e))))
+
 (defn- command->byte-buffer
   [cmd]
   (ByteBuffer/wrap ^bytes (nippy/freeze cmd)))
@@ -1223,26 +1237,44 @@
   [state-atom]
   (proxy [StateMachineAdapter] []
     (onApply [^Iterator iter]
-      (try
-        (loop []
-          (when (.hasNext iter)
-            (let [^ByteBuffer data (.getData iter)
-                  done           (.done iter)
-                  cmd            (nippy/thaw (bytebuffer->bytes data))
-                  result         (apply-state-command! state-atom cmd)]
-              (when (instance? CommandClosure done)
-                (vreset! (:result-v done) result)
-                (.run ^CommandClosure done (Status/OK)))
-              (.next iter)
-              (recur))))
-        (catch Exception e
-          (log/error e "HA control JRaft FSM apply failed")
-          (.setErrorAndRollback iter
-                                1
-                                (Status.
-                                 (int (.getNumber RaftError/ESTATEMACHINE))
-                                 (str "HA FSM apply failed: "
-                                      (.getMessage e)))))))
+      ;; Apply the batch against a local state snapshot so callbacks are only
+      ;; resolved after the whole batch commits successfully.
+      (loop [state         @state-atom
+             pending       []
+             applied-count (long 0)]
+        (if (.hasNext iter)
+          (let [^ByteBuffer data (.getData iter)
+                done           (.done iter)
+                step           (try
+                                 (let [cmd (nippy/thaw (bytebuffer->bytes data))
+                                       {:keys [state result]}
+                                       (apply-state-command state cmd)]
+                                   {:state state
+                                    :pending (cond-> pending
+                                               (instance? CommandClosure done)
+                                               (conj [done result]))
+                                    :applied-count (unchecked-inc ^long applied-count)})
+                                 (catch Exception e
+                                   {:error e}))]
+            (if-let [e (:error step)]
+              (let [status (fsm-apply-error-status e)]
+                (log/error e "HA control JRaft FSM apply failed")
+                (doseq [[^CommandClosure pending-done _] pending]
+                  (run-command-closure! pending-done status))
+                (when (instance? CommandClosure done)
+                  (run-command-closure! ^CommandClosure done status))
+                (.setErrorAndRollback iter
+                                      (long (max 1 (long applied-count)))
+                                      status))
+              (do
+                (.next iter)
+                (recur (:state step)
+                       (:pending step)
+                       (long (:applied-count step))))))
+          (do
+            (reset! state-atom state)
+            (doseq [[^CommandClosure done result] pending]
+              (run-command-closure! done result (Status/OK)))))))
 
     (onSnapshotSave [^SnapshotWriter writer done]
       (try

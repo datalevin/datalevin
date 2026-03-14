@@ -36,11 +36,13 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private static final String LOG_DBI_NAME = "datalevin.jraft/log";
     private static final String CONF_DBI_NAME = "datalevin.jraft/conf";
     private static final String META_DBI_NAME = "datalevin.jraft/meta";
+    private static final String DATA_FILE_NAME = "data.mdb";
     private static final byte[] FIRST_LOG_INDEX_KEY =
         "first-log-index".getBytes(StandardCharsets.UTF_8);
     private static final int MAX_DBS = 4;
     private static final int MAX_READERS = 256;
     private static final long MAP_SIZE_BYTES = 64L * 1024L * 1024L;
+    private static final int MAX_MAP_FULL_RETRIES = 6;
 
     private final String path;
     private final boolean sync;
@@ -56,6 +58,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private LogEntryEncoder logEntryEncoder;
     private LogEntryDecoder logEntryDecoder;
     private long firstLogIndex = 1L;
+    private long mapSizeBytes = MAP_SIZE_BYTES;
     private boolean hasLoadedFirstLogIndex;
 
     public LMDBLogStorage(final String path, final RaftOptions raftOptions) {
@@ -178,17 +181,32 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.writeLock.lock();
         try {
             ensureOpen();
-            final Txn txn = Txn.create(this.env);
-            try {
-                for (final LogEntry entry : entries) {
-                    writeEntry(txn, entry);
+            Util.MapFullException lastMapFull = null;
+            for (int attempt = 0; attempt <= MAX_MAP_FULL_RETRIES; attempt++) {
+                final Txn txn = Txn.create(this.env);
+                try {
+                    for (final LogEntry entry : entries) {
+                        writeEntry(txn, entry);
+                    }
+                    txn.commit();
+                    syncEnv();
+                    return entries.size();
+                } catch (final Util.MapFullException e) {
+                    lastMapFull = e;
+                } finally {
+                    txn.close();
                 }
-                txn.commit();
-                syncEnv();
-                return entries.size();
-            } finally {
-                txn.close();
+                if (attempt == MAX_MAP_FULL_RETRIES) {
+                    break;
+                }
+                growMapSizeForAppend(entries, attempt + 1);
             }
+            if (lastMapFull != null) {
+                LOG.error(
+                    "Fail to append {} log entries in data path: {} after {} map resize attempts.",
+                    entries.size(), this.path, MAX_MAP_FULL_RETRIES + 1, lastMapFull);
+            }
+            return 0;
         } catch (final Exception e) {
             LOG.error("Fail to append {} log entries in data path: {}.",
                 entries.size(), this.path, e);
@@ -318,7 +336,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         if (!dir.exists() && !dir.mkdirs()) {
             throw new IllegalStateException("Failed to create log dir " + this.path);
         }
-        this.env = Env.create(this.path, MAP_SIZE_BYTES, MAX_READERS, MAX_DBS, 0);
+        this.mapSizeBytes = resolveInitialMapSize(dir);
+        this.env = Env.create(this.path, this.mapSizeBytes, MAX_READERS, MAX_DBS, 0);
         this.logDbi = Dbi.create(this.env, LOG_DBI_NAME, DTLV.MDB_CREATE);
         this.confDbi = Dbi.create(this.env, CONF_DBI_NAME, DTLV.MDB_CREATE);
         this.metaDbi = Dbi.create(this.env, META_DBI_NAME, DTLV.MDB_CREATE);
@@ -336,7 +355,47 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.metaDbi = null;
         this.env = null;
         this.firstLogIndex = 1L;
+        this.mapSizeBytes = MAP_SIZE_BYTES;
         this.hasLoadedFirstLogIndex = false;
+    }
+
+    private void growMapSizeForAppend(final List<LogEntry> entries, final int attempt) {
+        final long previousSize = this.mapSizeBytes;
+        final long nextSize = nextMapSize(previousSize);
+        if (nextSize <= previousSize) {
+            throw new IllegalStateException("LMDB log storage map size overflow at "
+                + previousSize + " bytes.");
+        }
+        this.env.setMapSize(nextSize);
+        this.mapSizeBytes = nextSize;
+        final long firstIndex = entries.get(0).getId().getIndex();
+        final long lastIndex = entries.get(entries.size() - 1).getId().getIndex();
+        LOG.warn(
+            "LMDB log storage map full, resizing map for append retry. path={}, oldMapSizeBytes={}, newMapSizeBytes={}, attempt={}, firstIndex={}, lastIndex={}, entryCount={}",
+            this.path, previousSize, nextSize, attempt, firstIndex, lastIndex, entries.size());
+    }
+
+    private long resolveInitialMapSize(final File dir) {
+        final File dataFile = new File(dir, DATA_FILE_NAME);
+        if (!dataFile.exists()) {
+            return MAP_SIZE_BYTES;
+        }
+        return roundUpMapSize(Math.max(MAP_SIZE_BYTES, dataFile.length()));
+    }
+
+    private static long nextMapSize(final long currentSize) {
+        if (currentSize > Long.MAX_VALUE / 2L) {
+            return Long.MAX_VALUE;
+        }
+        return currentSize * 2L;
+    }
+
+    private static long roundUpMapSize(final long size) {
+        final long remainder = size % MAP_SIZE_BYTES;
+        if (remainder == 0L) {
+            return size;
+        }
+        return size + (MAP_SIZE_BYTES - remainder);
     }
 
     private void ensureOpen() {
