@@ -232,9 +232,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                     return false;
                 }
                 final long deleteThrough = Math.min(firstIndexKept - 1, currentLast);
-                for (long idx = currentFirst; idx <= deleteThrough; idx++) {
-                    deleteEntry(txn, idx);
-                }
+                deleteRange(txn, this.logDbi, currentFirst, deleteThrough);
+                deleteRange(txn, this.confDbi, currentFirst, deleteThrough);
                 writeMetaLong(txn, FIRST_LOG_INDEX_KEY, firstIndexKept);
                 txn.commit();
                 syncEnv();
@@ -262,9 +261,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             final Txn txn = Txn.create(this.env);
             try {
                 final long deleteFrom = Math.max(currentFirst, lastIndexKept + 1);
-                for (long idx = deleteFrom; idx <= currentLast; idx++) {
-                    deleteEntry(txn, idx);
-                }
+                deleteRange(txn, this.logDbi, deleteFrom, currentLast);
+                deleteRange(txn, this.confDbi, deleteFrom, currentLast);
                 txn.commit();
                 syncEnv();
                 return true;
@@ -457,11 +455,31 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
     }
 
-    private void deleteEntry(final Txn txn, final long index) {
-        final BufVal key = newBufVal(longToBytes(index));
-        this.logDbi.del(txn, key, null);
-        key.reset();
-        this.confDbi.del(txn, key, null);
+    private void deleteRange(final Txn txn, final Dbi dbi,
+                             final long fromIndexInclusive, final long toIndexInclusive) {
+        if (fromIndexInclusive > toIndexInclusive) {
+            return;
+        }
+        final BufVal key = new BufVal(Long.BYTES);
+        final BufVal val = new BufVal(0);
+        Cursor cursor = null;
+        try {
+            cursor = Cursor.create(txn, dbi, key, val);
+            final BufVal start = newBufVal(longToBytes(fromIndexInclusive));
+            if (!cursor.get(start, DTLV.MDB_SET_RANGE)) {
+                return;
+            }
+            while (readCursorKey(cursor) <= toIndexInclusive) {
+                cursor.delete(0);
+                if (!cursor.seek(DTLV.MDB_NEXT)) {
+                    break;
+                }
+            }
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
     }
 
     private void writeMetaLong(final Txn txn, final byte[] keyBytes, final long value) {
@@ -551,6 +569,10 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final byte[] bytes = new byte[buffer.remaining()];
         buffer.get(bytes);
         return bytes;
+    }
+
+    private static long readCursorKey(final Cursor cursor) {
+        return cursor.key().outBuf().duplicate().getLong();
     }
 
     private static byte[] longToBytes(final long value) {

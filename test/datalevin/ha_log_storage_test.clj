@@ -4,10 +4,11 @@
    [datalevin.util :as u])
   (:import
    [com.alipay.sofa.jraft.conf ConfigurationManager]
-   [com.alipay.sofa.jraft.entity EnumOutter$EntryType LogEntry LogId]
+   [com.alipay.sofa.jraft.entity EnumOutter$EntryType LogEntry LogId PeerId]
    [com.alipay.sofa.jraft.entity.codec.v2 LogEntryV2CodecFactory]
    [com.alipay.sofa.jraft.option LogStorageOptions RaftOptions]
-   [datalevin.cpp BufVal Dbi Env Txn]
+   [datalevin.cpp BufVal Cursor Dbi Env Txn]
+   [datalevin.dtlvnative DTLV]
    [datalevin.ha LMDBLogStorage]
    [java.lang.reflect Modifier]
    [java.nio ByteBuffer]
@@ -62,6 +63,25 @@
       (finally
         (.close txn)))))
 
+(defn- dbi-indices
+  [^LMDBLogStorage storage field-name]
+  (let [^Env env (read-private-field storage "env")
+        ^Dbi dbi (read-private-field storage field-name)
+        txn (Txn/createReadOnly env)
+        key (BufVal. Long/BYTES)
+        val (BufVal. 0)
+        cursor (Cursor/create txn dbi key val)]
+    (try
+      (loop [acc []]
+        (if (if (empty? acc)
+              (.seek cursor DTLV/MDB_FIRST)
+              (.seek cursor DTLV/MDB_NEXT))
+          (recur (conj acc (.getLong (.duplicate (.outBuf (.key cursor))))))
+          acc))
+      (finally
+        (.close cursor)
+        (.close txn)))))
+
 (deftest lmdb-log-storage-first-log-index-cache-fields-are-volatile-test
   (is (Modifier/isVolatile
        (.getModifiers (private-field LMDBLogStorage "firstLogIndex"))))
@@ -102,6 +122,42 @@
   (doto (LogEntry. EnumOutter$EntryType/ENTRY_TYPE_DATA)
     (.setId (LogId. index 1))
     (.setData (ByteBuffer/wrap (byte-array payload-size)))))
+
+(defn- make-config-log-entry
+  [index]
+  (doto (LogEntry. EnumOutter$EntryType/ENTRY_TYPE_CONFIGURATION)
+    (.setId (LogId. index 1))
+    (.setPeers [(PeerId. "127.0.0.1" 8081)])))
+
+(deftest lmdb-log-storage-truncate-range-removes-log-and-conf-entries-test
+  (let [dir (u/tmp-dir (str "ha-log-storage-truncate-" (UUID/randomUUID)))
+        ^LMDBLogStorage storage (make-log-storage dir)
+        entries [(make-log-entry 1 16)
+                 (make-config-log-entry 2)
+                 (make-log-entry 3 16)
+                 (make-log-entry 4 16)
+                 (make-config-log-entry 5)
+                 (make-log-entry 6 16)]]
+    (try
+      (let [initialized? (.init storage (log-storage-options))]
+        (is initialized?)
+        (when initialized?
+          (is (= 6 (.appendEntries storage entries)))
+          (is (= [1 2 3 4 5 6] (dbi-indices storage "logDbi")))
+          (is (= [2 5] (dbi-indices storage "confDbi")))
+
+          (is (.truncatePrefix storage 4))
+          (is (= 4 (.getFirstLogIndex storage)))
+          (is (= [4 5 6] (dbi-indices storage "logDbi")))
+          (is (= [5] (dbi-indices storage "confDbi")))
+
+          (is (.truncateSuffix storage 4))
+          (is (= 4 (.getLastLogIndex storage)))
+          (is (= [4] (dbi-indices storage "logDbi")))
+          (is (= [] (dbi-indices storage "confDbi")))))
+      (finally
+        (.shutdown storage)
+        (u/delete-files dir)))))
 
 (deftest lmdb-log-storage-resizes-on-map-full-and-remains-appendable-after-restart-test
   (let [dir     (u/tmp-dir (str "ha-log-storage-" (UUID/randomUUID)))

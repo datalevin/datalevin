@@ -107,6 +107,13 @@ public class Cursor {
     }
 
     /**
+     * Delete the key/data pair to which the cursor refers.
+     */
+    public void delete(int flags) {
+        Util.checkRc(DTLV.mdb_cursor_del(ptr(), flags));
+    }
+
+    /**
      * Renew cursor.
      */
     public Cursor renew(Txn txn) {
