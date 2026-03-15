@@ -9,7 +9,11 @@ public final class DatalevinException extends RuntimeException {
     private final Object data;
 
     DatalevinException(String message, String errorType, Object data) {
-        super(message);
+        this(message, errorType, data, null);
+    }
+
+    DatalevinException(String message, String errorType, Object data, Throwable cause) {
+        super(message, cause);
         this.errorType = errorType;
         this.data = data;
     }

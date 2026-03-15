@@ -364,7 +364,7 @@ final class ClojureRuntime {
                     errorType = String.valueOf(raw);
                 }
             }
-            return new DatalevinException(info.getMessage(), errorType, data);
+            return new DatalevinException(info.getMessage(), errorType, data, info);
         }
         return e;
     }

@@ -64,6 +64,22 @@ public final class KVType {
         return Edn.render(form);
     }
 
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof KVType that)) {
+            return false;
+        }
+        return Objects.equals(form, that.form);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(form);
+    }
+
     Object build() {
         return form;
     }

@@ -108,10 +108,10 @@ public final class RangeSpec {
      * Returns a backward scan variant such as {@code [:closed-back lower upper]}.
      */
     public RangeSpec backward() {
-        if (rangeType.toString().endsWith("-back")) {
+        if (rangeType.getName().endsWith("-back")) {
             return this;
         }
-        return new RangeSpec(ClojureCodec.keyword(rangeType + "-back"), bounds);
+        return new RangeSpec(Keyword.intern(rangeType.getNamespace(), rangeType.getName() + "-back"), bounds);
     }
 
     /**
@@ -128,6 +128,22 @@ public final class RangeSpec {
     @Override
     public String toString() {
         return Edn.render(form);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof RangeSpec that)) {
+            return false;
+        }
+        return Objects.equals(form, that.form);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(form);
     }
 
     private static List<Object> normalizeBounds(List<?> bounds) {

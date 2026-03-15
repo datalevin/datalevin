@@ -36,6 +36,22 @@ public final class Rules {
         return toEdn();
     }
 
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof Rules that)) {
+            return false;
+        }
+        return Objects.equals(buildForm(), that.buildForm());
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(buildForm());
+    }
+
     Object asInput() {
         return buildForm();
     }

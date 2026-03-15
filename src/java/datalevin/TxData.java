@@ -3,6 +3,7 @@ package datalevin;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Builder for Datalevin transaction data.
@@ -92,5 +93,21 @@ public final class TxData {
             cachedForm = DatalevinForms.txDataInput(items);
         }
         return cachedForm;
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof TxData that)) {
+            return false;
+        }
+        return Objects.equals(buildForm(), that.buildForm());
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(buildForm());
     }
 }

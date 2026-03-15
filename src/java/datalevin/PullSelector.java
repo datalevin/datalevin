@@ -8,6 +8,7 @@ import clojure.lang.PersistentVector;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Builder for pull selectors.
@@ -93,6 +94,22 @@ public final class PullSelector {
         return Edn.render(buildForm());
     }
 
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof PullSelector that)) {
+            return false;
+        }
+        return Objects.equals(buildForm(), that.buildForm());
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(buildForm());
+    }
+
     /**
      * Starts an attribute-expression builder.
      */
@@ -154,6 +171,22 @@ public final class PullSelector {
         @Override
         public String toString() {
             return Edn.render(buildForm());
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof Attribute that)) {
+                return false;
+            }
+            return Objects.equals(buildForm(), that.buildForm());
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(buildForm());
         }
 
         private static Object normalizeAttr(Object attr) {

@@ -132,6 +132,22 @@ public final class QueryClause {
         return toEdn();
     }
 
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof QueryClause that)) {
+            return false;
+        }
+        return requiresDb == that.requiresDb && Objects.equals(form, that.form);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(form, requiresDb);
+    }
+
     private static QueryClause bracketedCall(String fn, Object... args) {
         return new QueryClause(vectorForm(callForm(fn, args)), false);
     }

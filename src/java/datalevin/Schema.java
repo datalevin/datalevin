@@ -5,6 +5,7 @@ import clojure.lang.PersistentVector;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.Objects;
 
 /**
  * Builder for Datalevin schema maps.
@@ -52,6 +53,22 @@ public final class Schema {
     @Override
     public String toString() {
         return Edn.render(attributes);
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof Schema that)) {
+            return false;
+        }
+        return Objects.equals(buildForm(), that.buildForm());
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(buildForm());
     }
 
     /**
@@ -290,6 +307,22 @@ public final class Schema {
         @Override
         public String toString() {
             return Edn.render(props);
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof Attribute that)) {
+                return false;
+            }
+            return Objects.equals(buildForm(), that.buildForm());
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(buildForm());
         }
 
         private Attribute keywordProp(String key, String value) {

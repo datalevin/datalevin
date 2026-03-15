@@ -15,10 +15,11 @@
    [datalevin.core :as d]
    [datalevin.json-api :as sut]
    [datalevin.json-api.shared :as shared]
+   [datalevin.json-convert :as jc]
    [datalevin.test.core :as tdc]
    [datalevin.util :as u])
   (:import
-   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData UdfFunction]
+   [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinException DatalevinInterop JSONApi KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData UdfFunction]
    [java.util List Map UUID]
    [java.util.concurrent CountDownLatch TimeUnit]
    [java.util.function BiConsumer BiFunction BiPredicate Consumer]))
@@ -278,13 +279,15 @@
                                                   (.attr "name"))))
               read-count (atom 0)
               read-string* edn/read-string
-              {:keys [names linked selected vip-names alice bob]}
+              {:keys [names linked linked-immutable selected vip-names alice bob]}
               (with-redefs [edn/read-string
                             (fn [& xs]
                               (swap! read-count inc)
                               (apply read-string* xs))]
                 {:names     (set (.query c query empty-inputs))
                  :linked    (set (.query c rule-query empty-inputs))
+                 :linked-immutable
+                 (set (.query c rule-query (List/of)))
                  :selected  (set (.query c or-query empty-inputs))
                  :vip-names (set (.query c vip-query empty-inputs))
                  :alice     (.pull c selector [":name" "Alice"])
@@ -447,6 +450,7 @@
                  (vec (Tx/add -1 "age" 30))))
           (is (= #{"Alice" "Bob" "Charlie"} names))
           (is (= #{"Alice" "Bob"} linked))
+          (is (= #{"Alice" "Bob"} linked-immutable))
           (is (= #{"Alice" "Bob" "Charlie"} selected))
           (is (= #{"Alice"} vip-names))
           (is (= "Alice" (mget alice :name)))
@@ -593,12 +597,17 @@
           (is (= ["b" "beta"] (vec by-rank)))
           (is (= "beta" ranked-value))
           (is (= ["a" "b"] (vec key-range)))
-          (let [range (RangeSpec/open "a" "d")]
-            (is (identical? (.build range) (.build range)))
-            (is (= [:open-back "a" "d"]
-                   (vec (.build (.backward range))))))
+	          (let [range (RangeSpec/open "a" "d")]
+	            (is (identical? (.build range) (.build range)))
+	            (let [backward (.backward range)]
+	              (is (= (Datalevin/kw ":open-back")
+	                     (first (.build backward))))
+	              (is (= [:open-back "a" "d"]
+	                     (vec (.build backward))))))
+	          (is (= "[:closed \"#hashtag\" \"(parenthetical)\"]"
+	                 (str (RangeSpec/closed "#hashtag" "(parenthetical)"))))
 
-          (.sync k)
+	          (.sync k)
           (.clearDbi k "temp")
           (is (zero? (.entries k "temp")))
           (.dropDbi k "temp")
@@ -739,6 +748,113 @@
       (finally
         (.close c)
         (delete-files-retry conn-dir)))))
+
+(deftest java-json-api-direct-bridge-test
+  (let [response (jc/read-json-string (JSONApi/exec "{\"op\":\"api-info\",\"args\":{}}"))]
+    (is (= true (get response "ok")))
+    (is (= (Datalevin/apiInfo) (get response "result")))))
+
+(deftest java-datalevin-exception-preserves-cause-test
+  (let [conn-dir (test-dir "java-exception-cause")
+        conn     (Datalevin/createConn conn-dir)]
+    (try
+      (with-open [^Connection c conn]
+        (let [error (try
+                      (.pull c "[42]" 1)
+                      nil
+                      (catch DatalevinException e
+                        e))]
+          (is (instance? DatalevinException error))
+          (is (instance? clojure.lang.ExceptionInfo (.getCause ^DatalevinException error)))
+          (is (= (.getMessage ^DatalevinException error)
+                 (.getMessage ^clojure.lang.ExceptionInfo (.getCause ^DatalevinException error))))
+          (is (= ":parser/pull" (.getErrorType ^DatalevinException error)))
+          (is (= (.getData ^DatalevinException error)
+                 (.getData ^clojure.lang.ExceptionInfo (.getCause ^DatalevinException error))))))
+      (finally
+        (delete-files-retry conn-dir)))))
+
+(deftest java-value-type-equality-test
+  (letfn [(same-value [a b]
+            (is (= a b))
+            (is (= b a))
+            (is (= (hash a) (hash b)))
+            (is (= ::present (get {a ::present} b)))
+            (is (= 1 (count (set [a b])))))
+          (adult-rules []
+            (-> (Datalevin/rules)
+                (.rule "adult" (into-array String ["?e"]))
+                (.whereDatom (Datalevin/var "e") "age" (Datalevin/var "age"))
+                (.wherePredicate ">=" (into-array Object [(Datalevin/var "age") 18]))
+                (.end)))
+          (adult-query [rules]
+            (doto (Datalevin/query)
+              (.findAll "?name")
+              (.rules rules)
+              (.whereRule "adult" (into-array Object [(Datalevin/var "e")]))
+              (.whereDatom (Datalevin/var "e") "name" (Datalevin/var "name"))))
+          (friend-attr []
+            (doto (PullSelector/attribute "friend")
+              (.limit 1)
+              (.as "best-friend")))
+          (friend-selector []
+            (doto (Datalevin/pull)
+              (.attr "name")
+              (.attr (friend-attr))
+              (.nested "friend" (doto (Datalevin/pull)
+                                  (.attr "name")))))
+          (person-schema []
+            (doto (Datalevin/schema)
+              (.attr "name" (doto (Schema/attribute)
+                              (.valueType Schema$ValueType/STRING)))
+              (.attr "age" (doto (Schema/attribute)
+                             (.valueType Schema$ValueType/LONG)))))
+          (person-entity []
+            (doto (Tx/entity 1)
+              (.put "name" "Alice")
+              (.put "age" 30)))
+          (person-tx []
+            (doto (Datalevin/tx)
+              (.entity (person-entity))
+              (.add 1 "tag" "vip")))]
+    (let [edn-a      (Datalevin/edn "[:name \"Alice\"]")
+          edn-b      (Datalevin/edn "[:name \"Alice\"]")
+          kv-a       (KVType/tuple (into-array KVType [KVType/LONG KVType/STRING]))
+          kv-b       (KVType/tuple (into-array KVType [KVType/LONG KVType/STRING]))
+          range-a    (RangeSpec/closed "a" "z")
+          range-b    (RangeSpec/closed "a" "z")
+          clause-a   (QueryClause/predicate "=" (into-array Object [(Datalevin/var "x") 1]))
+          clause-b   (QueryClause/predicate "=" (into-array Object [(Datalevin/var "x") 1]))
+          rules-a    (adult-rules)
+          rules-b    (adult-rules)
+          query-a    (adult-query rules-a)
+          query-b    (adult-query rules-b)
+          attr-a     (friend-attr)
+          attr-b     (friend-attr)
+          selector-a (friend-selector)
+          selector-b (friend-selector)
+          schema-a   (person-schema)
+          schema-b   (person-schema)
+          entity-a   (person-entity)
+          entity-b   (person-entity)
+          tx-a       (person-tx)
+          tx-b       (person-tx)]
+      (same-value edn-a edn-b)
+      (same-value kv-a kv-b)
+      (same-value range-a range-b)
+      (same-value clause-a clause-b)
+      (same-value rules-a rules-b)
+      (same-value query-a query-b)
+      (same-value attr-a attr-b)
+      (same-value selector-a selector-b)
+      (same-value schema-a schema-b)
+      (same-value entity-a entity-b)
+      (same-value tx-a tx-b)
+      (is (not= range-a (RangeSpec/open "a" "z")))
+      (is (not= query-a
+                (doto (Datalevin/query)
+                  (.findAll "?name")
+                  (.whereDatom (Datalevin/var "e") "name" (Datalevin/var "name"))))))))
 
 (deftest java-friendly-helper-overload-coverage-test
   (let [plain-dir      (test-dir "java-helper-plain-conn")

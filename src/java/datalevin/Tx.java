@@ -4,6 +4,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Arrays;
+import java.util.Objects;
 
 import clojure.lang.PersistentVector;
 
@@ -103,6 +104,22 @@ public final class Tx {
 
         Object buildForm() {
             return firstTxItem(DatalevinForms.txDataInput(List.of(values)));
+        }
+
+        @Override
+        public boolean equals(Object other) {
+            if (this == other) {
+                return true;
+            }
+            if (!(other instanceof Entity that)) {
+                return false;
+            }
+            return Objects.equals(buildForm(), that.buildForm());
+        }
+
+        @Override
+        public int hashCode() {
+            return Objects.hash(buildForm());
         }
     }
 

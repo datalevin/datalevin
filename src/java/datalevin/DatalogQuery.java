@@ -3,6 +3,7 @@ package datalevin;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Objects;
 
 /**
  * Builder for Datalevin Datalog queries.
@@ -246,7 +247,7 @@ public final class DatalogQuery {
         return Edn.render(renderForm());
     }
 
-    List<Object> prepareInputs(Object... inputs) {
+    List<?> prepareInputs(Object... inputs) {
         if (rules == null) {
             return inputs == null || inputs.length == 0 ? List.of() : Arrays.asList(inputs);
         }
@@ -260,14 +261,9 @@ public final class DatalogQuery {
         return prepared;
     }
 
-    List<Object> prepareInputs(List<?> inputs) {
+    List<?> prepareInputs(List<?> inputs) {
         if (rules == null) {
-            if (inputs == null || inputs.isEmpty()) {
-                return List.of();
-            }
-            @SuppressWarnings("unchecked")
-            List<Object> existing = (List<Object>) inputs;
-            return existing;
+            return inputs == null || inputs.isEmpty() ? List.of() : inputs;
         }
         ArrayList<Object> prepared = new ArrayList<>();
         if (inputs != null) {
@@ -280,6 +276,38 @@ public final class DatalogQuery {
     @Override
     public String toString() {
         return toEdn();
+    }
+
+    @Override
+    public boolean equals(Object other) {
+        if (this == other) {
+            return true;
+        }
+        if (!(other instanceof DatalogQuery that)) {
+            return false;
+        }
+        return requiresDb == that.requiresDb
+                && resultShape == that.resultShape
+                && returnMapMode == that.returnMapMode
+                && Objects.equals(find, that.find)
+                && Objects.equals(with, that.with)
+                && Objects.equals(in, that.in)
+                && Objects.equals(where, that.where)
+                && Objects.equals(returnMapFields, that.returnMapFields)
+                && Objects.equals(rules, that.rules);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(find,
+                            with,
+                            in,
+                            where,
+                            returnMapFields,
+                            rules,
+                            resultShape,
+                            returnMapMode,
+                            requiresDb);
     }
 
     private void injectRulesInput(List<Object> prepared) {

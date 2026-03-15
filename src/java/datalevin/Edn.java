@@ -58,9 +58,6 @@ final class Edn {
             if (stringMode == StringMode.RAW) {
                 return s;
             }
-            if (stringMode == StringMode.AUTO_EDN && looksLikeRawEdn(s)) {
-                return s;
-            }
             return quote(s);
         }
 
@@ -122,7 +119,7 @@ final class Edn {
         if (value instanceof EdnLiteral ednLiteral) {
             return ednLiteral.value();
         }
-        if (value instanceof String s && !looksLikeRawEdn(s)) {
+        if (value instanceof String s) {
             return Datalevin.kw(s).toString();
         }
         return render(value);
@@ -141,21 +138,6 @@ final class Edn {
             }
         }
         return builder.append('}').toString();
-    }
-
-    private static boolean looksLikeRawEdn(String value) {
-        return value.startsWith(":")
-                || value.startsWith("?")
-                || value.startsWith("$")
-                || value.startsWith("%")
-                || value.startsWith("_")
-                || value.startsWith("(")
-                || value.startsWith("[")
-                || value.startsWith("{")
-                || value.startsWith("#")
-                || value.startsWith("'")
-                || value.equals("...")
-                || value.equals(".");
     }
 
     private static String quote(String value) {
