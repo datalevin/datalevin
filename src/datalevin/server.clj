@@ -803,6 +803,17 @@
     (apply-state-patch current-state patch)
     current-state))
 
+(defn- persist-ha-renew-side-effects!
+  [expected-state next-state patch]
+  ;; Follower replay mutates local state outside the final server-state CAS.
+  ;; Persist the follower floor before publication so a concurrent role/runtime
+  ;; swap cannot discard durable progress if the merge-back patch is rejected.
+  (when (and patch
+             (= :follower (:ha-role expected-state))
+             (contains? patch :ha-local-last-applied-lsn))
+    (dha/persist-ha-runtime-local-applied-lsn! next-state))
+  next-state)
+
 (def ^:dynamic *server-runtime-opts-fn*
   (fn [_ _ _ _] nil))
 
@@ -1085,6 +1096,8 @@
             ;; not discarded.
             (let [next-state        (ha-renew-step db-name m)
                   side-effect-patch (ha-renew-side-effect-patch m next-state)
+                  _                 (persist-ha-renew-side-effects!
+                                     m next-state side-effect-patch)
                   {:keys [updated? state]}
                   (replace-db-state-if-current
                    server

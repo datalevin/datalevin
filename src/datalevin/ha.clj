@@ -320,7 +320,7 @@
           applied-lsn (long (if (= :leader (:ha-role m))
                               (max persisted-lsn lease-lsn)
                               (max persisted-lsn state-lsn)))]
-      (when (pos? applied-lsn)
+      (when (> applied-lsn persisted-lsn)
         (persist-ha-local-applied-lsn! m applied-lsn))
       applied-lsn)))
 

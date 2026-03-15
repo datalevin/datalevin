@@ -459,3 +459,75 @@
           (future-cancel f))
         (when-let [f @updater-future]
           (future-cancel f))))))
+
+(deftest ha-renew-loop-persists-follower-progress-before-cas-race-test
+  (let [db-name "orders"
+        dir (u/tmp-dir (str "ha-renew-persist-race-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name db-name
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        running? (AtomicBoolean. true)
+        initial-state {:store store
+                       :ha-authority ::authority
+                       :ha-db-identity (:db-identity (i/opts store))
+                       :ha-membership-hash "membership-v1"
+                       :ha-node-id 1
+                       :ha-renew-loop-running? running?
+                       :ha-role :follower
+                       :ha-local-last-applied-lsn 0
+                       :marker :initial}
+        ^Server server (fake-server-with-db-state db-name initial-state)
+        renew-started (promise)
+        allow-renew (promise)
+        renew-future (atom nil)
+        updater-future (atom nil)]
+    (try
+      (.set ^AtomicBoolean (.-running server) true)
+      (binding [srv/*ha-renew-step-fn*
+                (fn [_ m]
+                  (deliver renew-started true)
+                  (deref allow-renew 1000 ::timeout)
+                  (assoc m
+                         :ha-local-last-applied-lsn 7
+                         :ha-follower-next-lsn 8
+                         :ha-follower-last-sync-ms 42
+                         :marker :stale-renew-state))]
+        (reset! renew-future
+                (future (#'srv/run-ha-renew-loop server db-name running?)))
+        (is (true? (deref renew-started 1000 false)))
+        (reset! updater-future
+                (future
+                  (#'srv/update-db server db-name
+                                   #(assoc % :ha-role :leader
+                                           :marker :concurrent-update))))
+        (deliver allow-renew true)
+        (is (not= ::timeout (deref @updater-future 1000 ::timeout)))
+        (let [deadline (+ (System/currentTimeMillis) 1000)]
+          (loop []
+            (let [persisted-lsn
+                  (long (or (i/get-value (.-lmdb ^Store store)
+                                         c/kv-info
+                                         c/ha-local-applied-lsn
+                                         :keyword :data)
+                            0))]
+              (if (or (= 7 persisted-lsn)
+                      (>= (System/currentTimeMillis) deadline))
+                (is (= 7 persisted-lsn))
+                (do
+                  (Thread/sleep 10)
+                  (recur))))))
+        (.set running? false)
+        (let [state (get (.-dbs server) db-name)]
+          (is (= :leader (:ha-role state)))
+          (is (= :concurrent-update (:marker state)))
+          (is (= 7 (dha/read-ha-local-last-applied-lsn state)))))
+      (finally
+        (.set ^AtomicBoolean (.-running server) false)
+        (.set running? false)
+        (when-let [f @renew-future]
+          (future-cancel f))
+        (when-let [f @updater-future]
+          (future-cancel f))
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
