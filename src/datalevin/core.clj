@@ -750,6 +750,10 @@ Only usable for debug output.
    * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
    Default is `datalevin.constants/*ha-max-promotion-lag-lsn*`.
 
+   * `:ha-demotion-drain-ms`, grace period after leader demotion before the
+   node becomes a follower, allowing already-admitted writes to drain.
+   Default is `datalevin.constants/*ha-demotion-drain-ms*`.
+
    * `:ha-clock-skew-budget-ms`, maximum tolerated absolute clock skew in
    milliseconds before auto-failover pauses. In consensus-lease mode,
    `2 * :ha-clock-skew-budget-ms` must not exceed
@@ -757,7 +761,8 @@ Only usable for debug output.
    `datalevin.constants/*ha-clock-skew-budget-ms*`.
 
    * `:ha-clock-skew-hook`, optional command hook that reports observed clock
-   skew in milliseconds on stdout.
+   skew in milliseconds on stdout. The hook runs on follower/candidate renew
+   steps and is skipped for leaders.
 
    * `:ha-control-plane`, consensus control-plane configuration map required
    when `:ha-mode` is `:consensus-lease`.
@@ -1069,12 +1074,15 @@ Only usable for debug output.
   * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
   * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
   * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
+  * `:ha-demotion-drain-ms`, grace period after leader demotion before the
+   node becomes a follower.
   * `:ha-clock-skew-budget-ms`, maximum tolerated absolute clock skew before
    auto-failover pauses; in consensus-lease mode,
    `2 * :ha-clock-skew-budget-ms` must not exceed
    `(:ha-lease-timeout-ms - :ha-lease-renew-ms)`.
   * `:ha-clock-skew-hook`, optional command hook that reports observed clock
-   skew in milliseconds on stdout.
+   skew in milliseconds on stdout. The hook runs on follower/candidate renew
+   steps and is skipped for leaders.
   * `:ha-control-plane`, consensus control-plane configuration map required
    when `:ha-mode` is `:consensus-lease`.
   * `:spill-opts` is the option map that controls the spill-to-disk behavior

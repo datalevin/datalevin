@@ -329,28 +329,37 @@
             demoting-state (#'srv/ha-renew-step "orders" leader-runtime)
             follower-state (#'srv/ha-renew-step "orders"
                                                 (assoc demoting-state
-                                                       :ha-demoted-at-ms
+                                                       :ha-demotion-drain-until-ms
                                                        (dec (System/currentTimeMillis))))]
         (is (:ok? acquire))
         (is (= :demoting (:ha-role demoting-state)))
         (is (= :renew-failed (:ha-demotion-reason demoting-state)))
+        (is (= (+ (long (:ha-demoted-at-ms demoting-state))
+                  (long (:ha-demotion-drain-ms demoting-state)))
+               (:ha-demotion-drain-until-ms demoting-state)))
         (is (nil? (:ha-leader-term demoting-state)))
         (is (= :follower (:ha-role follower-state))))
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
-(deftest maybe-finish-ha-demotion-finishes-at-demoted-at-ms-test
+(deftest maybe-finish-ha-demotion-waits-for-drain-deadline-test
   (let [demoting-state {:ha-role :demoting
-                        :ha-demoted-at-ms 1000}]
+                        :ha-demoted-at-ms 1000
+                        :ha-demotion-drain-until-ms 1250}]
+    (is (= :demoting
+           (:ha-role (#'dha/maybe-finish-ha-demotion
+                      demoting-state
+                      1249
+                      true))))
     (is (= :follower
            (:ha-role (#'dha/maybe-finish-ha-demotion
                       demoting-state
-                      1000
+                      1250
                       true))))
     (is (= :demoting
            (:ha-role (#'dha/maybe-finish-ha-demotion
                       demoting-state
-                      1000
+                      1250
                       false))))))
 
 (deftest ha-renew-step-refreshes-time-after-follower-sync-before-candidate-entry-test
@@ -733,6 +742,41 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
+(deftest refresh-ha-clock-skew-state-leader-skips-hook-test
+  (let [hook-calls (atom 0)
+        leader-runtime {:ha-authority ::authority
+                        :ha-role :leader
+                        :ha-clock-skew-paused? true
+                        :ha-clock-skew-budget-ms 100
+                        :ha-clock-skew-last-check-ms 1234
+                        :ha-clock-skew-last-observed-ms 125
+                        :ha-clock-skew-last-result
+                        {:ok? true
+                         :paused? true
+                         :reason :clock-skew-budget-breached
+                         :budget-ms 100
+                         :clock-skew-ms 125}
+                        :ha-lease-timeout-ms 15000}]
+    (with-redefs-fn
+      {#'dha/run-ha-clock-skew-hook
+       (fn [_ _]
+         (swap! hook-calls inc)
+         {:ok? true
+          :paused? true
+          :reason :clock-skew-budget-breached
+          :budget-ms 100
+          :clock-skew-ms 125})}
+      (fn []
+        (let [next-state (#'dha/refresh-ha-clock-skew-state
+                          "orders" leader-runtime)]
+          (is (zero? @hook-calls))
+          (is (= :leader (:ha-role next-state)))
+          (is (false? (:ha-clock-skew-paused? next-state)))
+          (is (= 1234 (:ha-clock-skew-last-check-ms next-state)))
+          (is (= 125 (:ha-clock-skew-last-observed-ms next-state)))
+          (is (= :clock-skew-budget-breached
+                 (get-in next-state [:ha-clock-skew-last-result :reason]))))))))
+
 (deftest ha-renew-step-candidate-lag-input-uses-reachable-watermark-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)]
@@ -1055,7 +1099,8 @@
            (#'srv/ha-loop-sleep-ms
             {:ha-role :demoting
              :ha-lease-renew-ms 5000
-             :ha-demoted-at-ms (+ now-ms 250)}
+             :ha-demoted-at-ms now-ms
+             :ha-demotion-drain-until-ms (+ now-ms 250)}
             now-ms)))
     (is (= 5000
            (#'srv/ha-loop-sleep-ms

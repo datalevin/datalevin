@@ -63,26 +63,43 @@
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
   (if (= :leader (:ha-role m))
-    (do
+    (let [drain-ms (long (or (:ha-demotion-drain-ms m)
+                             c/*ha-demotion-drain-ms*))]
       (log/warn "Demoting HA leader for DB" db-name
-                {:reason reason :details details})
+                {:reason reason
+                 :details details
+                 :drain-ms drain-ms})
       (-> m
           (assoc :ha-role :demoting
                  :ha-demotion-reason reason
                  :ha-demotion-details details
-                 :ha-demoted-at-ms now-ms)
+                 :ha-demotion-drain-ms drain-ms
+                 :ha-demoted-at-ms now-ms
+                 :ha-demotion-drain-until-ms (+ (long now-ms) drain-ms))
           (dissoc :ha-leader-term
                   :ha-leader-last-applied-lsn)))
     m))
 
+(defn- ha-demotion-deadline-ms
+  [m]
+  (cond
+    (integer? (:ha-demotion-drain-until-ms m))
+    (long (:ha-demotion-drain-until-ms m))
+
+    (integer? (:ha-demoted-at-ms m))
+    (long (:ha-demoted-at-ms m))
+
+    :else nil))
+
 (defn- maybe-finish-ha-demotion
   [m now-ms started-demoting?]
-  (if (and started-demoting?
-           (= :demoting (:ha-role m))
-           (integer? (:ha-demoted-at-ms m))
-           (>= (long now-ms) (long (:ha-demoted-at-ms m))))
-    (assoc m :ha-role :follower)
-    m))
+  (let [deadline-ms (ha-demotion-deadline-ms m)]
+    (if (and started-demoting?
+             (= :demoting (:ha-role m))
+             (integer? deadline-ms)
+             (>= (long now-ms) (long deadline-ms)))
+      (assoc m :ha-role :follower)
+      m)))
 
 (defn- clear-ha-candidate-state
   [m]
@@ -2040,21 +2057,26 @@
   [db-name m]
   (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
                             c/*ha-clock-skew-budget-ms*))
-        result (try
-                 (run-ha-clock-skew-hook db-name m)
-                 (catch Exception e
-                   {:ok? false
-                    :paused? true
-                    :reason :exception
-                    :budget-ms budget-ms
-                    :message (ex-message e)}))
-        now-ms (System/currentTimeMillis)]
-    (assoc m
-           :ha-clock-skew-budget-ms budget-ms
-           :ha-clock-skew-paused? (true? (:paused? result))
-           :ha-clock-skew-last-check-ms now-ms
-           :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
-           :ha-clock-skew-last-result result)))
+        role (:ha-role m)]
+    (if (#{:follower :candidate} role)
+      (let [result (try
+                     (run-ha-clock-skew-hook db-name m)
+                     (catch Exception e
+                       {:ok? false
+                        :paused? true
+                        :reason :exception
+                        :budget-ms budget-ms
+                        :message (ex-message e)}))
+            now-ms (System/currentTimeMillis)]
+        (assoc m
+               :ha-clock-skew-budget-ms budget-ms
+               :ha-clock-skew-paused? (true? (:paused? result))
+               :ha-clock-skew-last-check-ms now-ms
+               :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
+               :ha-clock-skew-last-result result))
+      (assoc m
+             :ha-clock-skew-budget-ms budget-ms
+             :ha-clock-skew-paused? false))))
 
 (defn- ha-clock-skew-promotion-failure-details
   [m]
@@ -2567,7 +2589,8 @@
           :ha-node-id :ha-local-endpoint
           :ha-lease-renew-ms :ha-lease-timeout-ms
           :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
-          :ha-max-promotion-lag-lsn :ha-fencing-hook
+          :ha-max-promotion-lag-lsn :ha-demotion-drain-ms
+          :ha-fencing-hook
           :ha-clock-skew-budget-ms :ha-clock-skew-hook
           :ha-authority-lease :ha-authority-version
           :ha-authority-owner-node-id :ha-authority-term
@@ -2578,6 +2601,7 @@
           :ha-clock-skew-last-check-ms
           :ha-clock-skew-last-observed-ms
           :ha-clock-skew-last-result
+          :ha-demotion-drain-until-ms
           :ha-role :ha-leader-term
           :ha-local-last-applied-lsn
           :ha-follower-next-lsn :ha-follower-last-batch-size
@@ -2774,6 +2798,9 @@
         max-promotion-lag-lsn
         (long (or (:ha-max-promotion-lag-lsn ha-opts)
                   c/*ha-max-promotion-lag-lsn*))
+        demotion-drain-ms
+        (long (or (:ha-demotion-drain-ms ha-opts)
+                  c/*ha-demotion-drain-ms*))
         clock-skew-budget-ms
         (long (or (:ha-clock-skew-budget-ms ha-opts)
                   c/*ha-clock-skew-budget-ms*))
@@ -2845,6 +2872,7 @@
          :ha-promotion-base-delay-ms promotion-base-delay-ms
          :ha-promotion-rank-delay-ms promotion-rank-delay-ms
          :ha-max-promotion-lag-lsn max-promotion-lag-lsn
+         :ha-demotion-drain-ms demotion-drain-ms
          :ha-fencing-hook fencing-hook
          :ha-clock-skew-budget-ms clock-skew-budget-ms
          :ha-clock-skew-hook clock-skew-hook

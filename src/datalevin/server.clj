@@ -969,6 +969,7 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
+   :ha-demotion-drain-ms
    :ha-fencing-hook
    :ha-clock-skew-budget-ms
    :ha-clock-skew-hook
@@ -1048,8 +1049,10 @@
                      (conj (long (:ha-follower-next-sync-not-before-ms m)))
 
                      (and (= :demoting role)
-                          (integer? (:ha-demoted-at-ms m)))
-                     (conj (long (:ha-demoted-at-ms m))))
+                          (or (integer? (:ha-demotion-drain-until-ms m))
+                              (integer? (:ha-demoted-at-ms m))))
+                     (conj (long (or (:ha-demotion-drain-until-ms m)
+                                     (:ha-demoted-at-ms m)))))
          next-deadline (when (seq deadlines)
                          (long (reduce min (map long deadlines))))
          remaining-ms  (when (some? next-deadline)

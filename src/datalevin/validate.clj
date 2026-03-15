@@ -137,7 +137,8 @@
     :wal-group-commit-ms
     :wal-meta-flush-max-txs
     :wal-meta-flush-max-ms
-    :ha-max-promotion-lag-lsn})
+    :ha-max-promotion-lag-lsn
+    :ha-demotion-drain-ms})
 
 (def ^:private positive-int-opts
   #{:wal-commit-wait-ms
@@ -455,6 +456,9 @@
             base-delay-ms (:ha-promotion-base-delay-ms opts)
             rank-delay-ms (:ha-promotion-rank-delay-ms opts)
             max-lag-lsn (:ha-max-promotion-lag-lsn opts)
+            demotion-drain-ms
+            (long (or (:ha-demotion-drain-ms opts)
+                      c/*ha-demotion-drain-ms*))
             clock-skew-budget-ms
             (long (or (:ha-clock-skew-budget-ms opts)
                       c/*ha-clock-skew-budget-ms*))
@@ -498,6 +502,11 @@
                    {:error :ha/validation
                     :option :ha-max-promotion-lag-lsn
                     :value max-lag-lsn}))
+        (when-not (non-negative-int? demotion-drain-ms)
+          (u/raise "Option :ha-demotion-drain-ms must be a non-negative integer"
+                   {:error :ha/validation
+                    :option :ha-demotion-drain-ms
+                    :value demotion-drain-ms}))
         (when-not (positive-int? clock-skew-budget-ms)
           (u/raise "Option :ha-clock-skew-budget-ms must be a positive integer"
                    {:error :ha/validation

@@ -2203,6 +2203,7 @@
                         :ha-promotion-base-delay-ms c/*ha-promotion-base-delay-ms*
                         :ha-promotion-rank-delay-ms c/*ha-promotion-rank-delay-ms*
                         :ha-max-promotion-lag-lsn c/*ha-max-promotion-lag-lsn*
+                        :ha-demotion-drain-ms c/*ha-demotion-drain-ms*
                         :ha-clock-skew-budget-ms c/*ha-clock-skew-budget-ms*
                         :ha-control-plane c/*ha-control-plane*
                         :wal?             c/*datalog-wal?*
@@ -2269,6 +2270,7 @@
                                                            :ha-node-id
                                                            :ha-members
                                                            :ha-control-plane
+                                                           :ha-demotion-drain-ms
                                                            :ha-fencing-hook
                                                            :wal?
                                                            :kv-opts])
@@ -2279,6 +2281,7 @@
                                                   :ha-node-id
                                                   :ha-members
                                                   :ha-control-plane
+                                                  :ha-demotion-drain-ms
                                                   :ha-fencing-hook
                                                   :wal?
                                                   :kv-opts])}))

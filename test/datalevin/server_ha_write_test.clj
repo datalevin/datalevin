@@ -177,7 +177,7 @@
         follower-state (#'srv/ha-renew-step
                         "orders"
                         (assoc demoting-state
-                               :ha-demoted-at-ms
+                               :ha-demotion-drain-until-ms
                                (dec (System/currentTimeMillis))))
         follower-server (fake-server-with-db-state "orders" follower-state)
         follower-err (#'srv/ha-write-admission-error
@@ -185,6 +185,9 @@
                       {:type :transact-kv :args ["orders"]})]
     (is (= :demoting (:ha-role demoting-state)))
     (is (= :renew-failed (:ha-demotion-reason demoting-state)))
+    (is (= (+ (long (:ha-demoted-at-ms demoting-state))
+              (long (:ha-demotion-drain-ms demoting-state)))
+           (:ha-demotion-drain-until-ms demoting-state)))
     (is (= :control-timeout
            (get-in demoting-state [:ha-demotion-details :reason])))
     (is (= :ha/write-rejected (:error demoting-err)))

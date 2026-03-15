@@ -16,6 +16,7 @@
    :ha-promotion-base-delay-ms 300
    :ha-promotion-rank-delay-ms 700
    :ha-max-promotion-lag-lsn 0
+   :ha-demotion-drain-ms 1000
    :ha-clock-skew-budget-ms 100
    :ha-fencing-hook {:cmd ["/usr/local/bin/dtlv-fence"]
                      :timeout-ms 3000
@@ -105,6 +106,13 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
            #"ha-clock-skew-budget-ms must be a positive integer"
+           (vld/validate-ha-options opts)))))
+
+  (testing "rejects negative demotion drain"
+    (let [opts (assoc (valid-ha-opts) :ha-demotion-drain-ms -1)]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"ha-demotion-drain-ms must be a non-negative integer"
            (vld/validate-ha-options opts)))))
 
   (testing "rejects clock skew budget that exceeds lease safety window"

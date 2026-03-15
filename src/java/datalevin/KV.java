@@ -69,37 +69,21 @@ public final class KV extends HandleResource {
      * Adds values to the list associated with {@code key}.
      */
     public void putListItems(String listName, Object key, Object values, String kType, String vType) {
-        ClojureRuntime.core("put-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           ClojureCodec.runtimeInput(values),
-                           DatalevinForms.typeInput(kType),
-                           DatalevinForms.typeInput(vType));
+        putListItemsInternal(listName, key, values, kType, vType);
     }
 
     /**
      * Adds values to the list associated with {@code key}.
      */
     public void putListItems(String listName, Object key, Object values, KVType kType, KVType vType) {
-        ClojureRuntime.core("put-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           ClojureCodec.runtimeInput(values),
-                           DatalevinForms.typeInput(kType),
-                           DatalevinForms.typeInput(vType));
+        putListItemsInternal(listName, key, values, kType, vType);
     }
 
     /**
      * Deletes the entire list associated with {@code key}.
      */
     public void delListItems(String listName, Object key, String kType) {
-        ClojureRuntime.core("del-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           DatalevinForms.typeInput(kType));
+        delListItemsInternal(listName, key, kType);
     }
 
     /**
@@ -113,11 +97,7 @@ public final class KV extends HandleResource {
      * Deletes the entire list associated with {@code key}.
      */
     public void delListItems(String listName, Object key, KVType kType) {
-        ClojureRuntime.core("del-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           DatalevinForms.typeInput(kType));
+        delListItemsInternal(listName, key, kType);
     }
 
     /**
@@ -131,13 +111,7 @@ public final class KV extends HandleResource {
      * Deletes the provided values from the list associated with {@code key}.
      */
     public void delListItems(String listName, Object key, Object values, String kType, String vType) {
-        ClojureRuntime.core("del-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           ClojureCodec.runtimeInput(values),
-                           DatalevinForms.typeInput(kType),
-                           DatalevinForms.typeInput(vType));
+        delListItemsInternal(listName, key, values, kType, vType);
     }
 
     /**
@@ -151,13 +125,7 @@ public final class KV extends HandleResource {
      * Deletes the provided values from the list associated with {@code key}.
      */
     public void delListItems(String listName, Object key, Object values, KVType kType, KVType vType) {
-        ClojureRuntime.core("del-list-items",
-                           resource(),
-                           listName,
-                           ClojureCodec.runtimeInput(key),
-                           ClojureCodec.runtimeInput(values),
-                           DatalevinForms.typeInput(kType),
-                           DatalevinForms.typeInput(vType));
+        delListItemsInternal(listName, key, values, kType, vType);
     }
 
     /**
@@ -171,24 +139,14 @@ public final class KV extends HandleResource {
      * Returns the values in the list associated with {@code key}.
      */
     public List<?> getList(String listName, Object key, String kType, String vType) {
-        return ResultSupport.sequence(ClojureRuntime.core("get-list",
-                                                          resource(),
-                                                          listName,
-                                                          ClojureCodec.runtimeInput(key),
-                                                          DatalevinForms.typeInput(kType),
-                                                          DatalevinForms.typeInput(vType)));
+        return getListInternal(listName, key, kType, vType);
     }
 
     /**
      * Returns the values in the list associated with {@code key}.
      */
     public List<?> getList(String listName, Object key, KVType kType, KVType vType) {
-        return ResultSupport.sequence(ClojureRuntime.core("get-list",
-                                                          resource(),
-                                                          listName,
-                                                          ClojureCodec.runtimeInput(key),
-                                                          DatalevinForms.typeInput(kType),
-                                                          DatalevinForms.typeInput(vType)));
+        return getListInternal(listName, key, kType, vType);
     }
 
     /**
@@ -223,11 +181,7 @@ public final class KV extends HandleResource {
                           Object key,
                           String kType,
                           String vType) {
-        runVisitList(listName,
-                     ClojureFns.consumer(visitor),
-                     ClojureCodec.runtimeInput(key),
-                     DatalevinForms.typeInput(kType),
-                     DatalevinForms.typeInput(vType));
+        visitListInternal(listName, visitor, key, kType, vType);
     }
 
     /**
@@ -238,59 +192,35 @@ public final class KV extends HandleResource {
                           Object key,
                           KVType kType,
                           KVType vType) {
-        runVisitList(listName,
-                     ClojureFns.consumer(visitor),
-                     ClojureCodec.runtimeInput(key),
-                     DatalevinForms.typeInput(kType),
-                     DatalevinForms.typeInput(vType));
+        visitListInternal(listName, visitor, key, kType, vType);
     }
 
     /**
      * Returns the number of items in the list associated with {@code key}.
      */
     public long listCount(String listName, Object key, String kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("list-count",
-                                                         resource(),
-                                                         listName,
-                                                         ClojureCodec.runtimeInput(key),
-                                                         DatalevinForms.typeInput(kType)));
+        return listCountInternal(listName, key, kType);
     }
 
     /**
      * Returns the number of items in the list associated with {@code key}.
      */
     public long listCount(String listName, Object key, KVType kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("list-count",
-                                                         resource(),
-                                                         listName,
-                                                         ClojureCodec.runtimeInput(key),
-                                                         DatalevinForms.typeInput(kType)));
+        return listCountInternal(listName, key, kType);
     }
 
     /**
      * Returns whether {@code value} is in the list associated with {@code key}.
      */
     public boolean inList(String listName, Object key, Object value, String kType, String vType) {
-        return ClojureCodec.javaBoolean(ClojureRuntime.core("in-list?",
-                                                            resource(),
-                                                            listName,
-                                                            ClojureCodec.runtimeInput(key),
-                                                            ClojureCodec.runtimeInput(value),
-                                                            DatalevinForms.typeInput(kType),
-                                                            DatalevinForms.typeInput(vType)));
+        return inListInternal(listName, key, value, kType, vType);
     }
 
     /**
      * Returns whether {@code value} is in the list associated with {@code key}.
      */
     public boolean inList(String listName, Object key, Object value, KVType kType, KVType vType) {
-        return ClojureCodec.javaBoolean(ClojureRuntime.core("in-list?",
-                                                            resource(),
-                                                            listName,
-                                                            ClojureCodec.runtimeInput(key),
-                                                            ClojureCodec.runtimeInput(value),
-                                                            DatalevinForms.typeInput(kType),
-                                                            DatalevinForms.typeInput(vType)));
+        return inListInternal(listName, key, value, kType, vType);
     }
 
     /**
@@ -303,14 +233,7 @@ public final class KV extends HandleResource {
                              String vType,
                              Integer limit,
                              Integer offset) {
-        return page(ResultSupport.sequence(runListRangeOp("list-range",
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType),
-                                                         DatalevinForms.rangeInput(vRange),
-                                                         DatalevinForms.typeInput(vType))),
-                    limit,
-                    offset);
+        return listRangeInternal(listName, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -323,7 +246,7 @@ public final class KV extends HandleResource {
                              String vType,
                              Integer limit,
                              Integer offset) {
-        return listRange(listName, buildRange(kRange), kType, buildRange(vRange), vType, limit, offset);
+        return listRangeInternal(listName, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -336,14 +259,7 @@ public final class KV extends HandleResource {
                              KVType vType,
                              Integer limit,
                              Integer offset) {
-        return page(ResultSupport.sequence(runListRangeOp("list-range",
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType),
-                                                         DatalevinForms.rangeInput(vRange),
-                                                         DatalevinForms.typeInput(vType))),
-                    limit,
-                    offset);
+        return listRangeInternal(listName, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -356,7 +272,7 @@ public final class KV extends HandleResource {
                              KVType vType,
                              Integer limit,
                              Integer offset) {
-        return listRange(listName, buildRange(kRange), kType, buildRange(vRange), vType, limit, offset);
+        return listRangeInternal(listName, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -365,11 +281,7 @@ public final class KV extends HandleResource {
      * <p>This count ignores the value-range boundary.
      */
     public long listRangeCount(String listName, List<?> kRange, String kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("list-range-count",
-                                                         resource(),
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return listRangeCountInternal(listName, kRange, kType);
     }
 
     /**
@@ -378,7 +290,7 @@ public final class KV extends HandleResource {
      * <p>This count ignores the value-range boundary.
      */
     public long listRangeCount(String listName, RangeSpec kRange, String kType) {
-        return listRangeCount(listName, buildRange(kRange), kType);
+        return listRangeCountInternal(listName, kRange, kType);
     }
 
     /**
@@ -387,11 +299,7 @@ public final class KV extends HandleResource {
      * <p>This count ignores the value-range boundary.
      */
     public long listRangeCount(String listName, List<?> kRange, KVType kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("list-range-count",
-                                                         resource(),
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return listRangeCountInternal(listName, kRange, kType);
     }
 
     /**
@@ -400,7 +308,7 @@ public final class KV extends HandleResource {
      * <p>This count ignores the value-range boundary.
      */
     public long listRangeCount(String listName, RangeSpec kRange, KVType kType) {
-        return listRangeCount(listName, buildRange(kRange), kType);
+        return listRangeCountInternal(listName, kRange, kType);
     }
 
     /**
@@ -414,14 +322,7 @@ public final class KV extends HandleResource {
                                    String vType,
                                    Integer limit,
                                    Integer offset) {
-        return runListRangeFilter(listName,
-                                  predicate,
-                                  DatalevinForms.rangeInput(kRange),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.rangeInput(vRange),
-                                  DatalevinForms.typeInput(vType),
-                                  limit,
-                                  offset);
+        return listRangeFilterInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -435,14 +336,7 @@ public final class KV extends HandleResource {
                                    String vType,
                                    Integer limit,
                                    Integer offset) {
-        return listRangeFilter(listName,
-                               predicate,
-                               buildRange(kRange),
-                               kType,
-                               buildRange(vRange),
-                               vType,
-                               limit,
-                               offset);
+        return listRangeFilterInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -456,14 +350,7 @@ public final class KV extends HandleResource {
                                    KVType vType,
                                    Integer limit,
                                    Integer offset) {
-        return runListRangeFilter(listName,
-                                  predicate,
-                                  DatalevinForms.rangeInput(kRange),
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.rangeInput(vRange),
-                                  DatalevinForms.typeInput(vType),
-                                  limit,
-                                  offset);
+        return listRangeFilterInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -477,14 +364,7 @@ public final class KV extends HandleResource {
                                    KVType vType,
                                    Integer limit,
                                    Integer offset) {
-        return listRangeFilter(listName,
-                               predicate,
-                               buildRange(kRange),
-                               kType,
-                               buildRange(vRange),
-                               vType,
-                               limit,
-                               offset);
+        return listRangeFilterInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -498,14 +378,7 @@ public final class KV extends HandleResource {
                                  String vType,
                                  Integer limit,
                                  Integer offset) {
-        return runListRangeKeep(listName,
-                                fn,
-                                DatalevinForms.rangeInput(kRange),
-                                DatalevinForms.typeInput(kType),
-                                DatalevinForms.rangeInput(vRange),
-                                DatalevinForms.typeInput(vType),
-                                limit,
-                                offset);
+        return listRangeKeepInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -519,14 +392,7 @@ public final class KV extends HandleResource {
                                  String vType,
                                  Integer limit,
                                  Integer offset) {
-        return listRangeKeep(listName,
-                             fn,
-                             buildRange(kRange),
-                             kType,
-                             buildRange(vRange),
-                             vType,
-                             limit,
-                             offset);
+        return listRangeKeepInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -540,14 +406,7 @@ public final class KV extends HandleResource {
                                  KVType vType,
                                  Integer limit,
                                  Integer offset) {
-        return runListRangeKeep(listName,
-                                fn,
-                                DatalevinForms.rangeInput(kRange),
-                                DatalevinForms.typeInput(kType),
-                                DatalevinForms.rangeInput(vRange),
-                                DatalevinForms.typeInput(vType),
-                                limit,
-                                offset);
+        return listRangeKeepInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -561,14 +420,7 @@ public final class KV extends HandleResource {
                                  KVType vType,
                                  Integer limit,
                                  Integer offset) {
-        return listRangeKeep(listName,
-                             fn,
-                             buildRange(kRange),
-                             kType,
-                             buildRange(vRange),
-                             vType,
-                             limit,
-                             offset);
+        return listRangeKeepInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
     }
 
     /**
@@ -580,13 +432,7 @@ public final class KV extends HandleResource {
                                 String kType,
                                 List<?> vRange,
                                 String vType) {
-        return runListRangeFnOp("list-range-some",
-                                listName,
-                                ClojureFns.biFunction(fn),
-                                DatalevinForms.rangeInput(kRange),
-                                DatalevinForms.typeInput(kType),
-                                DatalevinForms.rangeInput(vRange),
-                                DatalevinForms.typeInput(vType));
+        return listRangeSomeInternal(listName, fn, kRange, kType, vRange, vType);
     }
 
     /**
@@ -598,7 +444,7 @@ public final class KV extends HandleResource {
                                 String kType,
                                 RangeSpec vRange,
                                 String vType) {
-        return listRangeSome(listName, fn, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeSomeInternal(listName, fn, kRange, kType, vRange, vType);
     }
 
     /**
@@ -610,13 +456,7 @@ public final class KV extends HandleResource {
                                 KVType kType,
                                 List<?> vRange,
                                 KVType vType) {
-        return runListRangeFnOp("list-range-some",
-                                listName,
-                                ClojureFns.biFunction(fn),
-                                DatalevinForms.rangeInput(kRange),
-                                DatalevinForms.typeInput(kType),
-                                DatalevinForms.rangeInput(vRange),
-                                DatalevinForms.typeInput(vType));
+        return listRangeSomeInternal(listName, fn, kRange, kType, vRange, vType);
     }
 
     /**
@@ -628,7 +468,7 @@ public final class KV extends HandleResource {
                                 KVType kType,
                                 RangeSpec vRange,
                                 KVType vType) {
-        return listRangeSome(listName, fn, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeSomeInternal(listName, fn, kRange, kType, vRange, vType);
     }
 
     /**
@@ -640,13 +480,7 @@ public final class KV extends HandleResource {
                                      String kType,
                                      List<?> vRange,
                                      String vType) {
-        return ClojureCodec.javaLong(runListRangeFnOp("list-range-filter-count",
-                                                      listName,
-                                                      ClojureFns.biPredicate(predicate),
-                                                      DatalevinForms.rangeInput(kRange),
-                                                      DatalevinForms.typeInput(kType),
-                                                      DatalevinForms.rangeInput(vRange),
-                                                      DatalevinForms.typeInput(vType)));
+        return listRangeFilterCountInternal(listName, predicate, kRange, kType, vRange, vType);
     }
 
     /**
@@ -658,12 +492,7 @@ public final class KV extends HandleResource {
                                      String kType,
                                      RangeSpec vRange,
                                      String vType) {
-        return listRangeFilterCount(listName,
-                                    predicate,
-                                    buildRange(kRange),
-                                    kType,
-                                    buildRange(vRange),
-                                    vType);
+        return listRangeFilterCountInternal(listName, predicate, kRange, kType, vRange, vType);
     }
 
     /**
@@ -675,13 +504,7 @@ public final class KV extends HandleResource {
                                      KVType kType,
                                      List<?> vRange,
                                      KVType vType) {
-        return ClojureCodec.javaLong(runListRangeFnOp("list-range-filter-count",
-                                                      listName,
-                                                      ClojureFns.biPredicate(predicate),
-                                                      DatalevinForms.rangeInput(kRange),
-                                                      DatalevinForms.typeInput(kType),
-                                                      DatalevinForms.rangeInput(vRange),
-                                                      DatalevinForms.typeInput(vType)));
+        return listRangeFilterCountInternal(listName, predicate, kRange, kType, vRange, vType);
     }
 
     /**
@@ -693,12 +516,7 @@ public final class KV extends HandleResource {
                                      KVType kType,
                                      RangeSpec vRange,
                                      KVType vType) {
-        return listRangeFilterCount(listName,
-                                    predicate,
-                                    buildRange(kRange),
-                                    kType,
-                                    buildRange(vRange),
-                                    vType);
+        return listRangeFilterCountInternal(listName, predicate, kRange, kType, vRange, vType);
     }
 
     /**
@@ -710,13 +528,7 @@ public final class KV extends HandleResource {
                                String kType,
                                List<?> vRange,
                                String vType) {
-        runListRangeFnOp("visit-list-range",
-                         listName,
-                         ClojureFns.biConsumer(visitor),
-                         DatalevinForms.rangeInput(kRange),
-                         DatalevinForms.typeInput(kType),
-                         DatalevinForms.rangeInput(vRange),
-                         DatalevinForms.typeInput(vType));
+        visitListRangeInternal(listName, visitor, kRange, kType, vRange, vType);
     }
 
     /**
@@ -728,7 +540,7 @@ public final class KV extends HandleResource {
                                String kType,
                                RangeSpec vRange,
                                String vType) {
-        visitListRange(listName, visitor, buildRange(kRange), kType, buildRange(vRange), vType);
+        visitListRangeInternal(listName, visitor, kRange, kType, vRange, vType);
     }
 
     /**
@@ -740,13 +552,7 @@ public final class KV extends HandleResource {
                                KVType kType,
                                List<?> vRange,
                                KVType vType) {
-        runListRangeFnOp("visit-list-range",
-                         listName,
-                         ClojureFns.biConsumer(visitor),
-                         DatalevinForms.rangeInput(kRange),
-                         DatalevinForms.typeInput(kType),
-                         DatalevinForms.rangeInput(vRange),
-                         DatalevinForms.typeInput(vType));
+        visitListRangeInternal(listName, visitor, kRange, kType, vRange, vType);
     }
 
     /**
@@ -758,7 +564,7 @@ public final class KV extends HandleResource {
                                KVType kType,
                                RangeSpec vRange,
                                KVType vType) {
-        visitListRange(listName, visitor, buildRange(kRange), kType, buildRange(vRange), vType);
+        visitListRangeInternal(listName, visitor, kRange, kType, vRange, vType);
     }
 
     /**
@@ -769,12 +575,7 @@ public final class KV extends HandleResource {
                                  String kType,
                                  List<?> vRange,
                                  String vType) {
-        return runListRangeOp("list-range-first",
-                              listName,
-                              DatalevinForms.rangeInput(kRange),
-                              DatalevinForms.typeInput(kType),
-                              DatalevinForms.rangeInput(vRange),
-                              DatalevinForms.typeInput(vType));
+        return listRangeFirstInternal(listName, kRange, kType, vRange, vType);
     }
 
     /**
@@ -785,7 +586,7 @@ public final class KV extends HandleResource {
                                  String kType,
                                  RangeSpec vRange,
                                  String vType) {
-        return listRangeFirst(listName, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeFirstInternal(listName, kRange, kType, vRange, vType);
     }
 
     /**
@@ -796,12 +597,7 @@ public final class KV extends HandleResource {
                                  KVType kType,
                                  List<?> vRange,
                                  KVType vType) {
-        return runListRangeOp("list-range-first",
-                              listName,
-                              DatalevinForms.rangeInput(kRange),
-                              DatalevinForms.typeInput(kType),
-                              DatalevinForms.rangeInput(vRange),
-                              DatalevinForms.typeInput(vType));
+        return listRangeFirstInternal(listName, kRange, kType, vRange, vType);
     }
 
     /**
@@ -812,7 +608,7 @@ public final class KV extends HandleResource {
                                  KVType kType,
                                  RangeSpec vRange,
                                  KVType vType) {
-        return listRangeFirst(listName, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeFirstInternal(listName, kRange, kType, vRange, vType);
     }
 
     /**
@@ -824,12 +620,7 @@ public final class KV extends HandleResource {
                                    String kType,
                                    List<?> vRange,
                                    String vType) {
-        return ResultSupport.sequence(runListRangeFirstN(listName,
-                                                         n,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType),
-                                                         DatalevinForms.rangeInput(vRange),
-                                                         DatalevinForms.typeInput(vType)));
+        return listRangeFirstNInternal(listName, n, kRange, kType, vRange, vType);
     }
 
     /**
@@ -841,7 +632,7 @@ public final class KV extends HandleResource {
                                    String kType,
                                    RangeSpec vRange,
                                    String vType) {
-        return listRangeFirstN(listName, n, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeFirstNInternal(listName, n, kRange, kType, vRange, vType);
     }
 
     /**
@@ -853,12 +644,7 @@ public final class KV extends HandleResource {
                                    KVType kType,
                                    List<?> vRange,
                                    KVType vType) {
-        return ResultSupport.sequence(runListRangeFirstN(listName,
-                                                         n,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType),
-                                                         DatalevinForms.rangeInput(vRange),
-                                                         DatalevinForms.typeInput(vType)));
+        return listRangeFirstNInternal(listName, n, kRange, kType, vRange, vType);
     }
 
     /**
@@ -870,43 +656,35 @@ public final class KV extends HandleResource {
                                    KVType kType,
                                    RangeSpec vRange,
                                    KVType vType) {
-        return listRangeFirstN(listName, n, buildRange(kRange), kType, buildRange(vRange), vType);
+        return listRangeFirstNInternal(listName, n, kRange, kType, vRange, vType);
     }
 
     /**
      * Returns the total number of list items in the given key range.
      */
     public long keyRangeListCount(String listName, List<?> kRange, String kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-list-count",
-                                                         resource(),
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return keyRangeListCountInternal(listName, kRange, kType);
     }
 
     /**
      * Returns the total number of list items in the given key range.
      */
     public long keyRangeListCount(String listName, RangeSpec kRange, String kType) {
-        return keyRangeListCount(listName, buildRange(kRange), kType);
+        return keyRangeListCountInternal(listName, kRange, kType);
     }
 
     /**
      * Returns the total number of list items in the given key range.
      */
     public long keyRangeListCount(String listName, List<?> kRange, KVType kType) {
-        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-list-count",
-                                                         resource(),
-                                                         listName,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return keyRangeListCountInternal(listName, kRange, kType);
     }
 
     /**
      * Returns the total number of list items in the given key range.
      */
     public long keyRangeListCount(String listName, RangeSpec kRange, KVType kType) {
-        return keyRangeListCount(listName, buildRange(kRange), kType);
+        return keyRangeListCountInternal(listName, kRange, kType);
     }
 
     /**
@@ -974,52 +752,28 @@ public final class KV extends HandleResource {
      * Applies KV transactions with an explicit key type.
      */
     public Object transact(String dbiName, Object txs, String kType) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        return ClojureRuntime.core("transact-kv",
-                                  resource(),
-                                  dbiName,
-                                  DatalevinForms.kvTxsInput(txs, normalizedKType, null),
-                                  normalizedKType);
+        return transactInternal(dbiName, txs, kType, null);
     }
 
     /**
      * Applies KV transactions with an explicit key type.
      */
     public Object transact(String dbiName, Object txs, KVType kType) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        return ClojureRuntime.core("transact-kv",
-                                  resource(),
-                                  dbiName,
-                                  DatalevinForms.kvTxsInput(txs, normalizedKType, null),
-                                  normalizedKType);
+        return transactInternal(dbiName, txs, kType, null);
     }
 
     /**
      * Applies KV transactions with explicit key and value types.
      */
     public Object transact(String dbiName, Object txs, String kType, String vType) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return ClojureRuntime.core("transact-kv",
-                                  resource(),
-                                  dbiName,
-                                  DatalevinForms.kvTxsInput(txs, normalizedKType, normalizedVType),
-                                  normalizedKType,
-                                  normalizedVType);
+        return transactInternal(dbiName, txs, kType, vType);
     }
 
     /**
      * Applies KV transactions with explicit key and value types.
      */
     public Object transact(String dbiName, Object txs, KVType kType, KVType vType) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return ClojureRuntime.core("transact-kv",
-                                  resource(),
-                                  dbiName,
-                                  DatalevinForms.kvTxsInput(txs, normalizedKType, normalizedVType),
-                                  normalizedKType,
-                                  normalizedVType);
+        return transactInternal(dbiName, txs, kType, vType);
     }
 
     /**
@@ -1036,30 +790,14 @@ public final class KV extends HandleResource {
      * Returns the value for {@code key} from the named DBI with explicit types.
      */
     public Object getValue(String dbi, Object key, String kType, String vType, boolean ignoreKey) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return ClojureRuntime.core("get-value",
-                                  resource(),
-                                  dbi,
-                                  DatalevinForms.kvInput(key, normalizedKType),
-                                  normalizedKType,
-                                  normalizedVType,
-                                  ignoreKey);
+        return getValueInternal(dbi, key, kType, vType, ignoreKey);
     }
 
     /**
      * Returns the value for {@code key} from the named DBI with explicit types.
      */
     public Object getValue(String dbi, Object key, KVType kType, KVType vType, boolean ignoreKey) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return ClojureRuntime.core("get-value",
-                                  resource(),
-                                  dbi,
-                                  DatalevinForms.kvInput(key, normalizedKType),
-                                  normalizedKType,
-                                  normalizedVType,
-                                  ignoreKey);
+        return getValueInternal(dbi, key, kType, vType, ignoreKey);
     }
 
     /**
@@ -1076,22 +814,14 @@ public final class KV extends HandleResource {
      * Returns the sorted rank of {@code key} with an explicit key type.
      */
     public Long getRank(String dbi, Object key, String kType) {
-        return ClojureCodec.javaNullableLong(ClojureRuntime.core("get-rank",
-                                                                 resource(),
-                                                                 dbi,
-                                                                 ClojureCodec.runtimeInput(key),
-                                                                 DatalevinForms.typeInput(kType)));
+        return getRankInternal(dbi, key, kType);
     }
 
     /**
      * Returns the sorted rank of {@code key} with an explicit key type.
      */
     public Long getRank(String dbi, Object key, KVType kType) {
-        return ClojureCodec.javaNullableLong(ClojureRuntime.core("get-rank",
-                                                                 resource(),
-                                                                 dbi,
-                                                                 ClojureCodec.runtimeInput(key),
-                                                                 DatalevinForms.typeInput(kType)));
+        return getRankInternal(dbi, key, kType);
     }
 
     /**
@@ -1105,26 +835,14 @@ public final class KV extends HandleResource {
      * Returns the entry at the given rank with explicit types.
      */
     public Object getByRank(String dbi, long rank, String kType, String vType, boolean ignoreKey) {
-        return ClojureRuntime.core("get-by-rank",
-                                  resource(),
-                                  dbi,
-                                  rank,
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
-                                  ignoreKey);
+        return getByRankInternal(dbi, rank, kType, vType, ignoreKey);
     }
 
     /**
      * Returns the entry at the given rank with explicit types.
      */
     public Object getByRank(String dbi, long rank, KVType kType, KVType vType, boolean ignoreKey) {
-        return ClojureRuntime.core("get-by-rank",
-                                  resource(),
-                                  dbi,
-                                  rank,
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
-                                  ignoreKey);
+        return getByRankInternal(dbi, rank, kType, vType, ignoreKey);
     }
 
     /**
@@ -1153,14 +871,7 @@ public final class KV extends HandleResource {
                             String vType,
                             Integer limit,
                             Integer offset) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return page(ResultSupport.sequence(runGetRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange, normalizedKType),
-                                                       normalizedKType,
-                                                       normalizedVType)),
-                    limit,
-                    offset);
+        return getRangeInternal(dbi, kRange, kType, vType, limit, offset);
     }
 
     /**
@@ -1172,7 +883,7 @@ public final class KV extends HandleResource {
                             String vType,
                             Integer limit,
                             Integer offset) {
-        return getRange(dbi, buildRange(kRange), kType, vType, limit, offset);
+        return getRangeInternal(dbi, kRange, kType, vType, limit, offset);
     }
 
     /**
@@ -1184,14 +895,7 @@ public final class KV extends HandleResource {
                             KVType vType,
                             Integer limit,
                             Integer offset) {
-        Object normalizedKType = DatalevinForms.typeInput(kType);
-        Object normalizedVType = DatalevinForms.typeInput(vType);
-        return page(ResultSupport.sequence(runGetRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange, normalizedKType),
-                                                       normalizedKType,
-                                                       normalizedVType)),
-                    limit,
-                    offset);
+        return getRangeInternal(dbi, kRange, kType, vType, limit, offset);
     }
 
     /**
@@ -1203,165 +907,105 @@ public final class KV extends HandleResource {
                             KVType vType,
                             Integer limit,
                             Integer offset) {
-        return getRange(dbi, buildRange(kRange), kType, vType, limit, offset);
+        return getRangeInternal(dbi, kRange, kType, vType, limit, offset);
     }
 
     /**
      * Returns the key-value entry at the given rank with explicit types.
      */
     public Object getEntryByRank(String dbi, long rank, String kType, String vType) {
-        return ClojureRuntime.core("get-by-rank",
-                                  resource(),
-                                  dbi,
-                                  rank,
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
-                                  false);
+        return getEntryByRankInternal(dbi, rank, kType, vType);
     }
 
     /**
      * Returns the key-value entry at the given rank with explicit types.
      */
     public Object getEntryByRank(String dbi, long rank, KVType kType, KVType vType) {
-        return ClojureRuntime.core("get-by-rank",
-                                  resource(),
-                                  dbi,
-                                  rank,
-                                  DatalevinForms.typeInput(kType),
-                                  DatalevinForms.typeInput(vType),
-                                  false);
+        return getEntryByRankInternal(dbi, rank, kType, vType);
     }
 
     /**
      * Returns keys in the given range.
      */
     public List<?> keyRange(String dbi, List<?> kRange, String kType, Integer limit, Integer offset) {
-        return page(ResultSupport.sequence(runKeyRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange),
-                                                       DatalevinForms.typeInput(kType))),
-                    limit,
-                    offset);
+        return keyRangeInternal(dbi, kRange, kType, limit, offset);
     }
 
     /**
      * Returns keys in the given range.
      */
     public List<?> keyRange(String dbi, RangeSpec kRange, String kType, Integer limit, Integer offset) {
-        return keyRange(dbi, buildRange(kRange), kType, limit, offset);
+        return keyRangeInternal(dbi, kRange, kType, limit, offset);
     }
 
     /**
      * Returns keys in the given range.
      */
     public List<?> keyRange(String dbi, List<?> kRange, KVType kType, Integer limit, Integer offset) {
-        return page(ResultSupport.sequence(runKeyRange(dbi,
-                                                       DatalevinForms.rangeInput(kRange),
-                                                       DatalevinForms.typeInput(kType))),
-                    limit,
-                    offset);
+        return keyRangeInternal(dbi, kRange, kType, limit, offset);
     }
 
     /**
      * Returns keys in the given range.
      */
     public List<?> keyRange(String dbi, RangeSpec kRange, KVType kType, Integer limit, Integer offset) {
-        return keyRange(dbi, buildRange(kRange), kType, limit, offset);
+        return keyRangeInternal(dbi, kRange, kType, limit, offset);
     }
 
     /**
      * Returns the number of keys in the given range.
      */
     public long keyRangeCount(String dbi, List<?> kRange, String kType) {
-        if (kType == null) {
-            return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
-                                                             resource(),
-                                                             dbi,
-                                                             DatalevinForms.rangeInput(kRange)));
-        }
-        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
-                                                         resource(),
-                                                         dbi,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return keyRangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the number of keys in the given range.
      */
     public long keyRangeCount(String dbi, RangeSpec kRange, String kType) {
-        return keyRangeCount(dbi, buildRange(kRange), kType);
+        return keyRangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the number of keys in the given range.
      */
     public long keyRangeCount(String dbi, List<?> kRange, KVType kType) {
-        if (kType == null) {
-            return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
-                                                             resource(),
-                                                             dbi,
-                                                             DatalevinForms.rangeInput(kRange)));
-        }
-        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
-                                                         resource(),
-                                                         dbi,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return keyRangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the number of keys in the given range.
      */
     public long keyRangeCount(String dbi, RangeSpec kRange, KVType kType) {
-        return keyRangeCount(dbi, buildRange(kRange), kType);
+        return keyRangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the approximate number of entries in the given range.
      */
     public long rangeCount(String dbi, List<?> kRange, String kType) {
-        if (kType == null) {
-            return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
-                                                             resource(),
-                                                             dbi,
-                                                             DatalevinForms.rangeInput(kRange)));
-        }
-        return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
-                                                         resource(),
-                                                         dbi,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return rangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the number of entries in the given range.
      */
     public long rangeCount(String dbi, RangeSpec kRange, String kType) {
-        return rangeCount(dbi, buildRange(kRange), kType);
+        return rangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the approximate number of entries in the given range.
      */
     public long rangeCount(String dbi, List<?> kRange, KVType kType) {
-        if (kType == null) {
-            return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
-                                                             resource(),
-                                                             dbi,
-                                                             DatalevinForms.rangeInput(kRange)));
-        }
-        return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
-                                                         resource(),
-                                                         dbi,
-                                                         DatalevinForms.rangeInput(kRange),
-                                                         DatalevinForms.typeInput(kType)));
+        return rangeCountInternal(dbi, kRange, kType);
     }
 
     /**
      * Returns the number of entries in the given range.
      */
     public long rangeCount(String dbi, RangeSpec kRange, KVType kType) {
-        return rangeCount(dbi, buildRange(kRange), kType);
+        return rangeCountInternal(dbi, kRange, kType);
     }
 
     /**
@@ -1387,6 +1031,344 @@ public final class KV extends HandleResource {
 
     private static List<?> buildRange(RangeSpec range) {
         return range == null ? null : range.build();
+    }
+
+    private static Object typeArg(Object type) {
+        return DatalevinForms.typeInput(type);
+    }
+
+    private static Object rangeArg(Object range) {
+        if (range instanceof RangeSpec spec) {
+            return DatalevinForms.rangeInput(spec.build());
+        }
+        return DatalevinForms.rangeInput((List<?>) range);
+    }
+
+    private static Object typedRangeArg(Object range, Object type) {
+        if (range instanceof RangeSpec spec) {
+            return DatalevinForms.rangeInput(spec.build(), type);
+        }
+        return DatalevinForms.rangeInput((List<?>) range, type);
+    }
+
+    private void putListItemsInternal(String listName, Object key, Object values, Object kType, Object vType) {
+        ClojureRuntime.core("put-list-items",
+                           resource(),
+                           listName,
+                           ClojureCodec.runtimeInput(key),
+                           ClojureCodec.runtimeInput(values),
+                           typeArg(kType),
+                           typeArg(vType));
+    }
+
+    private void delListItemsInternal(String listName, Object key, Object kType) {
+        ClojureRuntime.core("del-list-items",
+                           resource(),
+                           listName,
+                           ClojureCodec.runtimeInput(key),
+                           typeArg(kType));
+    }
+
+    private void delListItemsInternal(String listName, Object key, Object values, Object kType, Object vType) {
+        ClojureRuntime.core("del-list-items",
+                           resource(),
+                           listName,
+                           ClojureCodec.runtimeInput(key),
+                           ClojureCodec.runtimeInput(values),
+                           typeArg(kType),
+                           typeArg(vType));
+    }
+
+    private List<?> getListInternal(String listName, Object key, Object kType, Object vType) {
+        return ResultSupport.sequence(ClojureRuntime.core("get-list",
+                                                          resource(),
+                                                          listName,
+                                                          ClojureCodec.runtimeInput(key),
+                                                          typeArg(kType),
+                                                          typeArg(vType)));
+    }
+
+    private void visitListInternal(String listName,
+                                   Consumer<Object> visitor,
+                                   Object key,
+                                   Object kType,
+                                   Object vType) {
+        runVisitList(listName,
+                     ClojureFns.consumer(visitor),
+                     ClojureCodec.runtimeInput(key),
+                     typeArg(kType),
+                     typeArg(vType));
+    }
+
+    private long listCountInternal(String listName, Object key, Object kType) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("list-count",
+                                                         resource(),
+                                                         listName,
+                                                         ClojureCodec.runtimeInput(key),
+                                                         typeArg(kType)));
+    }
+
+    private boolean inListInternal(String listName, Object key, Object value, Object kType, Object vType) {
+        return ClojureCodec.javaBoolean(ClojureRuntime.core("in-list?",
+                                                            resource(),
+                                                            listName,
+                                                            ClojureCodec.runtimeInput(key),
+                                                            ClojureCodec.runtimeInput(value),
+                                                            typeArg(kType),
+                                                            typeArg(vType)));
+    }
+
+    private List<?> listRangeInternal(String listName,
+                                      Object kRange,
+                                      Object kType,
+                                      Object vRange,
+                                      Object vType,
+                                      Integer limit,
+                                      Integer offset) {
+        return page(ResultSupport.sequence(runListRangeOp("list-range",
+                                                         listName,
+                                                         rangeArg(kRange),
+                                                         typeArg(kType),
+                                                         rangeArg(vRange),
+                                                         typeArg(vType))),
+                    limit,
+                    offset);
+    }
+
+    private long listRangeCountInternal(String listName, Object kRange, Object kType) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("list-range-count",
+                                                         resource(),
+                                                         listName,
+                                                         rangeArg(kRange),
+                                                         typeArg(kType)));
+    }
+
+    private List<?> listRangeFilterInternal(String listName,
+                                            BiPredicate<Object, Object> predicate,
+                                            Object kRange,
+                                            Object kType,
+                                            Object vRange,
+                                            Object vType,
+                                            Integer limit,
+                                            Integer offset) {
+        return runListRangeFilter(listName,
+                                  predicate,
+                                  rangeArg(kRange),
+                                  typeArg(kType),
+                                  rangeArg(vRange),
+                                  typeArg(vType),
+                                  limit,
+                                  offset);
+    }
+
+    private List<?> listRangeKeepInternal(String listName,
+                                          BiFunction<Object, Object, ?> fn,
+                                          Object kRange,
+                                          Object kType,
+                                          Object vRange,
+                                          Object vType,
+                                          Integer limit,
+                                          Integer offset) {
+        return runListRangeKeep(listName,
+                                fn,
+                                rangeArg(kRange),
+                                typeArg(kType),
+                                rangeArg(vRange),
+                                typeArg(vType),
+                                limit,
+                                offset);
+    }
+
+    private Object listRangeSomeInternal(String listName,
+                                         BiFunction<Object, Object, ?> fn,
+                                         Object kRange,
+                                         Object kType,
+                                         Object vRange,
+                                         Object vType) {
+        return runListRangeFnOp("list-range-some",
+                                listName,
+                                ClojureFns.biFunction(fn),
+                                rangeArg(kRange),
+                                typeArg(kType),
+                                rangeArg(vRange),
+                                typeArg(vType));
+    }
+
+    private long listRangeFilterCountInternal(String listName,
+                                              BiPredicate<Object, Object> predicate,
+                                              Object kRange,
+                                              Object kType,
+                                              Object vRange,
+                                              Object vType) {
+        return ClojureCodec.javaLong(runListRangeFnOp("list-range-filter-count",
+                                                      listName,
+                                                      ClojureFns.biPredicate(predicate),
+                                                      rangeArg(kRange),
+                                                      typeArg(kType),
+                                                      rangeArg(vRange),
+                                                      typeArg(vType)));
+    }
+
+    private void visitListRangeInternal(String listName,
+                                        BiConsumer<Object, Object> visitor,
+                                        Object kRange,
+                                        Object kType,
+                                        Object vRange,
+                                        Object vType) {
+        runListRangeFnOp("visit-list-range",
+                         listName,
+                         ClojureFns.biConsumer(visitor),
+                         rangeArg(kRange),
+                         typeArg(kType),
+                         rangeArg(vRange),
+                         typeArg(vType));
+    }
+
+    private Object listRangeFirstInternal(String listName,
+                                          Object kRange,
+                                          Object kType,
+                                          Object vRange,
+                                          Object vType) {
+        return runListRangeOp("list-range-first",
+                              listName,
+                              rangeArg(kRange),
+                              typeArg(kType),
+                              rangeArg(vRange),
+                              typeArg(vType));
+    }
+
+    private List<?> listRangeFirstNInternal(String listName,
+                                            long n,
+                                            Object kRange,
+                                            Object kType,
+                                            Object vRange,
+                                            Object vType) {
+        return ResultSupport.sequence(runListRangeFirstN(listName,
+                                                         n,
+                                                         rangeArg(kRange),
+                                                         typeArg(kType),
+                                                         rangeArg(vRange),
+                                                         typeArg(vType)));
+    }
+
+    private long keyRangeListCountInternal(String listName, Object kRange, Object kType) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-list-count",
+                                                         resource(),
+                                                         listName,
+                                                         rangeArg(kRange),
+                                                         typeArg(kType)));
+    }
+
+    private Object transactInternal(String dbiName, Object txs, Object kType, Object vType) {
+        Object normalizedKType = typeArg(kType);
+        Object normalizedVType = typeArg(vType);
+        if (normalizedKType == null && normalizedVType == null) {
+            return ClojureRuntime.core("transact-kv",
+                                      resource(),
+                                      dbiName,
+                                      DatalevinForms.kvTxsInput(txs));
+        }
+        if (normalizedVType == null) {
+            return ClojureRuntime.core("transact-kv",
+                                      resource(),
+                                      dbiName,
+                                      DatalevinForms.kvTxsInput(txs, normalizedKType, null),
+                                      normalizedKType);
+        }
+        return ClojureRuntime.core("transact-kv",
+                                  resource(),
+                                  dbiName,
+                                  DatalevinForms.kvTxsInput(txs, normalizedKType, normalizedVType),
+                                  normalizedKType,
+                                  normalizedVType);
+    }
+
+    private Object getValueInternal(String dbi, Object key, Object kType, Object vType, boolean ignoreKey) {
+        Object normalizedKType = typeArg(kType);
+        Object normalizedVType = typeArg(vType);
+        return ClojureRuntime.core("get-value",
+                                  resource(),
+                                  dbi,
+                                  DatalevinForms.kvInput(key, normalizedKType),
+                                  normalizedKType,
+                                  normalizedVType,
+                                  ignoreKey);
+    }
+
+    private Long getRankInternal(String dbi, Object key, Object kType) {
+        return ClojureCodec.javaNullableLong(ClojureRuntime.core("get-rank",
+                                                                 resource(),
+                                                                 dbi,
+                                                                 ClojureCodec.runtimeInput(key),
+                                                                 typeArg(kType)));
+    }
+
+    private Object getByRankInternal(String dbi, long rank, Object kType, Object vType, boolean ignoreKey) {
+        return ClojureRuntime.core("get-by-rank",
+                                  resource(),
+                                  dbi,
+                                  rank,
+                                  typeArg(kType),
+                                  typeArg(vType),
+                                  ignoreKey);
+    }
+
+    private List<?> getRangeInternal(String dbi,
+                                     Object kRange,
+                                     Object kType,
+                                     Object vType,
+                                     Integer limit,
+                                     Integer offset) {
+        Object normalizedKType = typeArg(kType);
+        Object normalizedVType = typeArg(vType);
+        return page(ResultSupport.sequence(runGetRange(dbi,
+                                                       typedRangeArg(kRange, normalizedKType),
+                                                       normalizedKType,
+                                                       normalizedVType)),
+                    limit,
+                    offset);
+    }
+
+    private Object getEntryByRankInternal(String dbi, long rank, Object kType, Object vType) {
+        return getByRankInternal(dbi, rank, kType, vType, false);
+    }
+
+    private List<?> keyRangeInternal(String dbi, Object kRange, Object kType, Integer limit, Integer offset) {
+        return page(ResultSupport.sequence(runKeyRange(dbi,
+                                                       rangeArg(kRange),
+                                                       typeArg(kType))),
+                    limit,
+                    offset);
+    }
+
+    private long keyRangeCountInternal(String dbi, Object kRange, Object kType) {
+        Object normalizedKType = typeArg(kType);
+        if (normalizedKType == null) {
+            return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
+                                                             resource(),
+                                                             dbi,
+                                                             rangeArg(kRange)));
+        }
+        return ClojureCodec.javaLong(ClojureRuntime.core("key-range-count",
+                                                         resource(),
+                                                         dbi,
+                                                         rangeArg(kRange),
+                                                         normalizedKType));
+    }
+
+    private long rangeCountInternal(String dbi, Object kRange, Object kType) {
+        Object normalizedKType = typeArg(kType);
+        if (normalizedKType == null) {
+            return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
+                                                             resource(),
+                                                             dbi,
+                                                             rangeArg(kRange)));
+        }
+        return ClojureCodec.javaLong(ClojureRuntime.core("range-count",
+                                                         resource(),
+                                                         dbi,
+                                                         rangeArg(kRange),
+                                                         normalizedKType));
     }
 
     private List<?> page(List<?> items, Integer limit, Integer offset) {

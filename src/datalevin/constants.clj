@@ -712,6 +712,10 @@ Set to 0 for strict check-on-every-call behavior."}
   *ha-max-promotion-lag-lsn* 0)
 
 (def ^{:dynamic true
+       :doc     "Default grace period in milliseconds for a demoting leader to drain admitted writes before becoming a follower."}
+  *ha-demotion-drain-ms* 1000)
+
+(def ^{:dynamic true
        :doc     "Default maximum tolerated clock skew in milliseconds before auto-failover pauses."}
   *ha-clock-skew-budget-ms* 100)
 

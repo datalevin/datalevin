@@ -38,6 +38,7 @@
    :ha-promotion-base-delay-ms 100
    :ha-promotion-rank-delay-ms 200
    :ha-max-promotion-lag-lsn 0
+   :ha-demotion-drain-ms 1000
    :ha-clock-skew-budget-ms 1000
    :ha-fencing-hook {:cmd ["/bin/sh" "-c" "exit 0"]
                      :timeout-ms 1000
@@ -70,6 +71,7 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
+   :ha-demotion-drain-ms
    :ha-clock-skew-budget-ms
    :ha-fencing-hook
    :kv-opts])
