@@ -47,6 +47,15 @@ final class JsonBridge {
     }
 
     static Object call(String op, Map<String, ?> args) {
+        return unwrapEnvelope(callJsonApi(op, args));
+    }
+
+    static Object call(Object session, String op, Map<String, ?> args) {
+        Objects.requireNonNull(session, "session");
+        return callJsonApi(session, op, args);
+    }
+
+    private static Object callJsonApi(String op, Map<String, ?> args) {
         Objects.requireNonNull(op, "op");
 
         LinkedHashMap<String, Object> request = new LinkedHashMap<>();
@@ -55,26 +64,39 @@ final class JsonBridge {
 
         try {
             String requestJson = MAPPER.writeValueAsString(encode(request));
-            Object envelope = decode(MAPPER.readValue(JSONApi.exec(requestJson), Object.class));
-            if (!(envelope instanceof Map<?, ?> map)) {
-                throw new IllegalStateException("Datalevin JSON API returned a non-object response.");
-            }
-
-            if (Boolean.TRUE.equals(map.get("ok"))) {
-                return map.get("result");
-            }
-
-            Object message = map.get("error");
-            Object type = map.get("type");
-            Object data = map.get("data");
-            throw new DatalevinException(
-                    message == null ? "Datalevin request failed." : String.valueOf(message),
-                    type == null ? null : String.valueOf(type),
-                    data
-            );
+            return decode(MAPPER.readValue(JSONApi.exec(requestJson), Object.class));
         } catch (JsonProcessingException e) {
             throw new IllegalStateException("Failed to encode/decode Datalevin JSON payload.", e);
         }
+    }
+
+    private static Object callJsonApi(Object session, String op, Map<String, ?> args) {
+        Objects.requireNonNull(op, "op");
+
+        LinkedHashMap<String, Object> request = new LinkedHashMap<>();
+        request.put("op", op);
+        request.put("args", args == null ? Map.of() : args);
+
+        return unwrapEnvelope(decode(ClojureRuntime.jsonApi("exec-request", session, encode(request))));
+    }
+
+    private static Object unwrapEnvelope(Object envelope) {
+        if (!(envelope instanceof Map<?, ?> map)) {
+            throw new IllegalStateException("Datalevin JSON API returned a non-object response.");
+        }
+
+        if (Boolean.TRUE.equals(map.get("ok"))) {
+            return map.get("result");
+        }
+
+        Object message = map.get("error");
+        Object type = map.get("type");
+        Object data = map.get("data");
+        throw new DatalevinException(
+                message == null ? "Datalevin request failed." : String.valueOf(message),
+                type == null ? null : String.valueOf(type),
+                data
+        );
     }
 
     static Object encode(Object value) {

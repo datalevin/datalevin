@@ -12,6 +12,7 @@
    [clojure.edn :as edn]
    [clojure.string :as str]
    [clojure.test :refer [deftest is use-fixtures]]
+   [datalevin.core :as d]
    [datalevin.json-api :as sut]
    [datalevin.json-api.shared :as shared]
    [datalevin.test.core :as tdc]
@@ -19,6 +20,7 @@
   (:import
    [datalevin Client Connection DatabaseType DatalogQuery Datalevin DatalevinInterop KV KVType PermissionAction PermissionObject PullSelector QueryClause RangeSpec Rules Schema Schema$Cardinality Schema$Unique Schema$ValueType Tx TxData UdfFunction]
    [java.util List Map UUID]
+   [java.util.concurrent CountDownLatch TimeUnit]
    [java.util.function BiConsumer BiFunction BiPredicate Consumer]))
 
 (defn- clean-java-api-state
@@ -642,6 +644,100 @@
         (is (= #{"Alice" "Bob"}
                (set (.query reader query inputs)))))
       (finally
+        (delete-files-retry conn-dir)))))
+
+(deftest java-handle-close-race-regression-test
+  (let [conn-dir      (test-dir "java-handle-close-race")
+        ^Connection c (Datalevin/createConn conn-dir)
+        first-entered (CountDownLatch. 1)
+        double-close  (CountDownLatch. 2)
+        release-close (CountDownLatch. 1)
+        calls         (atom 0)
+        real-close    d/close]
+    (try
+      (with-redefs [d/close (fn [resource]
+                              (swap! calls inc)
+                              (.countDown first-entered)
+                              (.countDown double-close)
+                              (.await release-close 1 TimeUnit/SECONDS)
+                              (real-close resource))]
+        (let [close-a (future (.close c))
+              _       (is (.await first-entered 1 TimeUnit/SECONDS))
+              close-b (future (.close c))]
+          (is (false? (.await double-close 1 TimeUnit/SECONDS)))
+          (.countDown release-close)
+          @close-a
+          @close-b))
+      (is (= 1 @calls))
+      (is (.closed c))
+      (finally
+        (delete-files-retry conn-dir)))))
+
+(deftest java-handle-exec-json-concurrency-regression-test
+  (let [conn-dir        (test-dir "java-handle-exec-json-concurrency")
+        ^Connection c   (Datalevin/createConn conn-dir)
+        first-entered   (CountDownLatch. 1)
+        second-entered  (CountDownLatch. 1)
+        release-second  (CountDownLatch. 1)
+        seen            (atom 0)
+        real-exec       sut/exec-request]
+    (try
+      (with-redefs [sut/exec-request
+                    (fn
+                      ([request]
+                       (real-exec request))
+                      ([session request]
+                       (let [n (swap! seen inc)]
+                         (case n
+                           1 (do
+                               (.countDown first-entered)
+                               (real-exec session request))
+                           2 (do
+                               (.countDown second-entered)
+                               (.await release-second 1 TimeUnit/SECONDS)
+                               (real-exec session request))
+                           (real-exec session request)))))]
+        (let [first  (future (.exec c "max-eid" nil))
+              _      (is (.await first-entered 1 TimeUnit/SECONDS))
+              second (future (.exec c "max-eid" nil))
+              _      (is (.await second-entered 1 TimeUnit/SECONDS))]
+          (is (= 0 @first))
+          (is (= ::timeout (deref second 100 ::timeout)))
+          (is (zero? (handle-count)))
+          (.countDown release-second)
+          (is (= 0 @second))
+          (is (zero? (handle-count)))))
+      (finally
+        (.close c)
+        (delete-files-retry conn-dir)))))
+
+(deftest java-handle-exec-json-close-coordination-test
+  (let [conn-dir     (test-dir "java-handle-exec-json-close")
+        ^Connection c (Datalevin/createConn conn-dir)
+        exec-entered (CountDownLatch. 1)
+        release-exec (CountDownLatch. 1)
+        real-exec    sut/exec-request]
+    (try
+      (with-redefs [sut/exec-request
+                    (fn
+                      ([request]
+                       (real-exec request))
+                      ([session request]
+                       (.countDown exec-entered)
+                       (.await release-exec 1 TimeUnit/SECONDS)
+                       (real-exec session request)))]
+        (let [exec-f  (future (.exec c "max-eid" nil))
+              _       (is (.await exec-entered 1 TimeUnit/SECONDS))
+              close-f (future (.close c))]
+          (is (= ::timeout (deref close-f 100 ::timeout)))
+          (is (zero? (handle-count)))
+          (.countDown release-exec)
+          (is (= 0 @exec-f))
+          @close-f
+          (is (.closed c))
+          (is (zero? (handle-count)))))
+      (finally
+        (.close c)
         (delete-files-retry conn-dir)))))
 
 (deftest java-friendly-helper-overload-coverage-test
