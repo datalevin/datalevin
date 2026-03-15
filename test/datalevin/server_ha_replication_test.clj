@@ -2457,6 +2457,7 @@
                                    :keyword :data)
                       0))
             _ (i/transact-kv source-kv [[:put "a" "k2" "v2"]])
+            _ (i/transact-kv source-kv [[:put "a" "k3" "v3"]])
             payload-lsn
             (long (or (:last-applied-lsn (i/txlog-watermarks source-kv)) 0))
             _ (reset! snapshot-lsn* snapshot-lsn)
@@ -2469,7 +2470,7 @@
                 :leader-endpoint "10.0.0.11:8898"
                 :lease-renew-ms (:ha-lease-renew-ms runtime)
                 :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn (inc payload-lsn)
+                :leader-last-applied-lsn payload-lsn
                 :now-ms now-ms
                 :observed-version 0
                 :observed-lease nil})
@@ -2480,20 +2481,29 @@
                                         :ha-local-last-applied-lsn 0))]
         (with-redefs-fn
           {#'dha/fetch-ha-leader-txlog-batch
-           (fn [_ _ endpoint _ _]
+           (fn [_ _ endpoint from-lsn upto-lsn]
              (case endpoint
                "10.0.0.11:8898"
-               [{:lsn (inc payload-lsn)
-                 :ops [[:put "a" "k3" "v3"]]}]
+               ;; Force the initial follower sync to observe a deterministic
+               ;; gap so the renew step exercises snapshot bootstrap before
+               ;; replaying the post-snapshot tail from the leader.
+               (if (= 1 from-lsn)
+                 (vec (kv/open-tx-log-rows source-kv
+                                           (inc snapshot-lsn)
+                                           upto-lsn))
+                 (vec (kv/open-tx-log-rows source-kv from-lsn upto-lsn)))
                "10.0.0.13:8898"
-               [{:lsn (inc payload-lsn)
-                 :ops [[:put "a" "k3" "v3"]]}]
+               (if (= 1 from-lsn)
+                 (vec (kv/open-tx-log-rows source-kv
+                                           (inc snapshot-lsn)
+                                           upto-lsn))
+                 (vec (kv/open-tx-log-rows source-kv from-lsn upto-lsn)))
                []))
            #'dha/fetch-ha-endpoint-watermark-lsn
            (fn [_ _ endpoint]
              (case endpoint
                "10.0.0.11:8898"
-               {:reachable? true :last-applied-lsn (inc payload-lsn)}
+               {:reachable? true :last-applied-lsn payload-lsn}
                "10.0.0.13:8898"
                {:reachable? true :last-applied-lsn payload-lsn}
                (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
@@ -2520,12 +2530,12 @@
             next-kv (.-lmdb (:store state))]
         (i/open-dbi next-kv "a")
         (is (= :follower (:ha-role state)))
-        (is (= (inc @payload-lsn*) (:ha-local-last-applied-lsn state)))
-        (is (= (inc @payload-lsn*)
+        (is (= @payload-lsn* (:ha-local-last-applied-lsn state)))
+        (is (= @payload-lsn*
                (i/get-value next-kv c/kv-info
                             c/ha-local-applied-lsn
                             :keyword :data)))
-        (is (= (+ 2 @payload-lsn*) (:ha-follower-next-lsn state)))
+        (is (= (inc @payload-lsn*) (:ha-follower-next-lsn state)))
         (is (= "10.0.0.13:8898"
                (:ha-follower-bootstrap-source-endpoint state)))
         (is (> @payload-lsn* @snapshot-lsn*))
@@ -2644,6 +2654,10 @@
                  (i/get-value next-kv c/kv-info
                               c/ha-local-applied-lsn
                               :keyword :data)))
+          (is (= @snapshot-lsn*
+                 (i/get-value next-kv c/kv-info
+                              c/wal-local-payload-lsn
+                              :keyword :data)))
           (is (= (inc @snapshot-lsn*) (:ha-follower-next-lsn state)))
           (is (= @snapshot-lsn*
                  (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
@@ -2673,6 +2687,101 @@
         (#'srv/stop-ha-authority "orders" runtime)
         (u/delete-files local-dir)
         (u/delete-files source-dir)))))
+
+(deftest bootstrap-ha-follower-from-snapshot-retries-next-source-from-recovered-store-state-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        local-dir (u/tmp-dir (str "ha-local-bootstrap-retry-" (UUID/randomUUID)))
+        db-identity (:ha-db-identity runtime)
+        local-store (st/open local-dir nil {:db-name "orders"
+                                            :db-identity db-identity
+                                            :wal? true})
+        current-source (atom nil)
+        install-calls (atom [])
+        bootstrap-state (atom nil)
+        now-ms (System/currentTimeMillis)]
+    (try
+      (let [follower-runtime (-> runtime
+                                 (assoc :store local-store
+                                        :ha-role :follower
+                                        :ha-follower-next-lsn 1
+                                        :ha-local-last-applied-lsn 0))
+            lease {:leader-node-id nil
+                   :leader-endpoint nil
+                   :leader-last-applied-lsn 6}
+            bootstrap
+            (with-redefs-fn
+              {#'dha/fetch-ha-endpoint-snapshot-copy!
+               (fn [_ _ endpoint _]
+                 (reset! current-source endpoint)
+                 {:copy-meta {:db-name "orders"
+                              :db-identity db-identity
+                              :snapshot-last-applied-lsn 5}})
+               #'dha/install-ha-local-snapshot!
+               (fn [m _]
+                 (swap! install-calls conj
+                        {:source @current-source
+                         :store-instance? (instance? Store (:store m))
+                         :store-open? (and (instance? Store (:store m))
+                                           (not (i/closed? (:store m))))
+                         :same-store? (identical? local-store (:store m))})
+                 (if (= "10.0.0.11:8898" @current-source)
+                   (do
+                     (when-not (i/closed? local-store)
+                       (i/close local-store))
+                     {:ok? false
+                      :state (assoc m :store nil :dt-db nil)
+                      :error {:error :ha/follower-snapshot-install-failed
+                              :message "first source broke local state"}})
+                   {:ok? true
+                    :state m}))
+               #'dha/read-ha-local-snapshot-current-lsn
+               (fn [_] 5)
+               #'dha/read-ha-local-watermark-lsn
+               (fn [_] 5)
+               #'dha/read-ha-snapshot-payload-lsn
+               (fn [_] 5)
+               #'dha/persist-ha-local-applied-lsn!
+               (fn [_ applied-lsn]
+                 applied-lsn)
+               #'dha/report-ha-replica-floor!
+               (fn [_ _ _ _]
+                 {:ok? true})}
+              (fn []
+                (#'dha/bootstrap-ha-follower-from-snapshot
+                 "orders"
+                 follower-runtime
+                 lease
+                 ["10.0.0.11:8898" "10.0.0.13:8898"]
+                 1
+                 now-ms)))]
+        (reset! bootstrap-state (:state bootstrap))
+        (is (false? (:ok? bootstrap)))
+        (is (= ["10.0.0.11:8898" "10.0.0.13:8898"]
+               (mapv :source @install-calls)))
+        (is (= [true true]
+               (mapv :store-instance? @install-calls)))
+        (is (= [true true]
+               (mapv :store-open? @install-calls)))
+        (is (= [true false]
+               (mapv :same-store? @install-calls)))
+        (is (= "10.0.0.13:8898"
+               (:ha-follower-bootstrap-source-endpoint
+                @bootstrap-state)))
+        (is (= 5
+               (:ha-follower-bootstrap-snapshot-last-applied-lsn
+                @bootstrap-state)))
+        (is (= :ha/follower-missing-leader-endpoint
+               (get-in bootstrap [:errors 1 :error]))))
+      (finally
+        (when-let [store (:store @bootstrap-state)]
+          (when-not (identical? store local-store)
+            (when-not (i/closed? store)
+              (i/close store))))
+        (when-not (i/closed? local-store)
+          (i/close local-store))
+        (#'srv/stop-ha-authority "orders" runtime)
+        (u/delete-files local-dir)))))
 
 (deftest ha-renew-step-follower-gap-snapshot-bootstrap-rejects-db-identity-mismatch-test
   (let [opts (valid-ha-opts)

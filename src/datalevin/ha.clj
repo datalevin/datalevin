@@ -720,6 +720,124 @@
                 refresh-ha-local-dt-db))
           m)))))
 
+(defn- ha-local-store-reopen-info
+  [m]
+  (let [store (:store m)]
+    (when (instance? IStore store)
+      (try
+        {:env-dir (i/dir store)
+         :store-opts (i/opts store)}
+        (catch Throwable _
+          nil)))))
+
+(defn- reopen-ha-local-store-from-info
+  [m {:keys [env-dir store-opts]}]
+  (when (and (string? env-dir)
+             (not (s/blank? env-dir))
+             (map? store-opts))
+    (-> m
+        (assoc :store (-> (st/open env-dir nil store-opts)
+                          open-ha-store-dbis!)
+               :dt-db nil)
+        (dissoc :engine :index)
+        refresh-ha-local-dt-db)))
+
+(defn- normalize-ha-bootstrap-retry-state
+  [candidate-m fallback-m reopen-info]
+  (or (try
+        (let [state (reopen-ha-local-store-if-needed candidate-m)]
+          (when (local-kv-store state)
+            state))
+        (catch Throwable _
+          nil))
+      (try
+        (let [state (reopen-ha-local-store-if-needed fallback-m)]
+          (when (local-kv-store state)
+            state))
+        (catch Throwable _
+          nil))
+      (try
+        ;; Snapshot install can leave only a reopen recipe behind after a
+        ;; failed restore; use it before giving up on the next source.
+        (let [state (reopen-ha-local-store-from-info fallback-m reopen-info)]
+          (when (local-kv-store state)
+            state))
+        (catch Throwable _
+          nil))
+      candidate-m))
+
+(defn- ha-local-contiguous-txlog-tail
+  [kv-store from-lsn upto-lsn]
+  (if (or (nil? kv-store)
+          (> (long from-lsn) (long upto-lsn)))
+    []
+    (loop [expected (long from-lsn)
+           remaining (seq (kv/open-tx-log-rows kv-store from-lsn upto-lsn))
+           acc []]
+      (if-let [record (first remaining)]
+        (let [record-lsn (long (:lsn record))
+              rows (or (:rows record) (:ops record))]
+          (if (and (= record-lsn expected)
+                   (sequential? rows))
+            (recur (unchecked-inc expected)
+                   (next remaining)
+                   (conj acc record))
+            acc))
+        acc))))
+
+(defn- inspect-ha-local-bootstrap-tail
+  [m snapshot-lsn]
+  (if-let [kv-store (raw-local-kv-store m)]
+    (let [candidate-floor-lsn
+          (long (max snapshot-lsn
+                     (read-ha-local-watermark-lsn m)
+                     (read-ha-snapshot-payload-lsn m)))
+          records
+          (ha-local-contiguous-txlog-tail
+           kv-store
+           (unchecked-inc (long snapshot-lsn))
+           candidate-floor-lsn)
+          verified-floor-lsn
+          (long (if (or (= candidate-floor-lsn (long snapshot-lsn))
+                        (seq records))
+                  candidate-floor-lsn
+                  snapshot-lsn))]
+      {:verified-floor-lsn verified-floor-lsn
+       :candidate-floor-lsn candidate-floor-lsn
+       :tail-record-count (count records)})
+    {:verified-floor-lsn (long snapshot-lsn)
+     :candidate-floor-lsn (long snapshot-lsn)
+     :tail-record-count 0}))
+
+(defn- persist-ha-local-bootstrap-floor!
+  [m applied-lsn]
+  (when-let [kv-store (raw-local-kv-store m)]
+    (i/transact-kv kv-store
+                   c/kv-info
+                   [[:put c/wal-local-payload-lsn (long applied-lsn)]
+                    [:put c/ha-local-applied-lsn (long applied-lsn)]]
+                   :keyword
+                   :data))
+  (long applied-lsn))
+
+(defn- reconcile-ha-installed-snapshot-state
+  [m snapshot-lsn]
+  (let [{:keys [verified-floor-lsn] :as replay}
+        (inspect-ha-local-bootstrap-tail m snapshot-lsn)
+        reopen-info (ha-local-store-reopen-info m)
+        clamped? (< (long verified-floor-lsn)
+                    (long (:candidate-floor-lsn replay)))
+        _ (when clamped?
+            (persist-ha-local-bootstrap-floor! m verified-floor-lsn))
+        next-m (if (and clamped? reopen-info)
+                 (do
+                   (close-ha-local-store! m)
+                   (reopen-ha-local-store-from-info m reopen-info))
+                 m)]
+    (assoc replay
+           :installed-lsn (long verified-floor-lsn)
+           :state next-m)))
+
 (defn- open-ha-store-dbis!
   [store]
   (when-let [kv-store (cond
@@ -1658,10 +1776,16 @@
   [db-name m lease source-order next-lsn now-ms]
   (let [required-lsn (long (max 0 (dec (long next-lsn))))]
     (loop [remaining source-order
-           current-m m
+           current-m (normalize-ha-bootstrap-retry-state
+                      m m (ha-local-store-reopen-info m))
+           current-reopen-info (ha-local-store-reopen-info m)
            errors []]
       (if-let [source-endpoint (first remaining)]
-        (let [snapshot-dir (u/tmp-dir (str "ha-snapshot-copy-"
+        (let [current-m (normalize-ha-bootstrap-retry-state
+                         current-m current-m current-reopen-info)
+              current-reopen-info (or (ha-local-store-reopen-info current-m)
+                                      current-reopen-info)
+              snapshot-dir (u/tmp-dir (str "ha-snapshot-copy-"
                                            (UUID/randomUUID)))
               attempt
               (try
@@ -1687,18 +1811,16 @@
                                              (read-ha-local-snapshot-current-lsn
                                               kv-store)
                                              0))))
-                          installed-lsn
-                          (long (max snapshot-lsn
-                                     (read-ha-local-watermark-lsn
-                                      installed-state)
-                                     (read-ha-snapshot-payload-lsn
-                                      installed-state)))
+                          {:keys [state installed-lsn]}
+                          (reconcile-ha-installed-snapshot-state
+                           installed-state
+                           snapshot-lsn)
                           resume-next-lsn (unchecked-inc installed-lsn)
                           _ (persist-ha-local-applied-lsn!
-                             installed-state
+                             state
                              installed-lsn)
                           installed-state
-                          (-> installed-state
+                          (-> state
                               (assoc
                                :ha-local-last-applied-lsn installed-lsn
                                :ha-follower-next-lsn resume-next-lsn
@@ -1750,11 +1872,18 @@
                     (u/delete-files snapshot-dir))))]
           (if (:ok? attempt)
             attempt
-            (recur (rest remaining)
-                   (:state attempt)
-                   (conj errors
-                         (assoc (:error attempt)
-                                :source-endpoint source-endpoint)))))
+            (let [next-m (normalize-ha-bootstrap-retry-state
+                          (:state attempt)
+                          current-m
+                          current-reopen-info)
+                  next-reopen-info (or (ha-local-store-reopen-info next-m)
+                                       current-reopen-info)]
+              (recur (rest remaining)
+                     next-m
+                     next-reopen-info
+                     (conj errors
+                           (assoc (:error attempt)
+                                  :source-endpoint source-endpoint))))))
         {:ok? false
          :state current-m
          :source-order (vec source-order)
