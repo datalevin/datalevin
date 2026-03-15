@@ -358,7 +358,9 @@
   true)
 
 (defn- validate-ha-control-plane-shape
-  [cp]
+  ([cp]
+   (validate-ha-control-plane-shape cp true))
+  ([cp require-local-peer?]
   (when-not (map? cp)
     (u/raise "Option :ha-control-plane expects a map"
              {:error :ha/validation
@@ -374,7 +376,9 @@
              {:error :ha/validation
               :option :ha-control-plane
               :group-id (:group-id cp)}))
-  (validate-peer-id (:local-peer-id cp) :ha-control-plane-local-peer)
+  (when (or require-local-peer?
+            (contains? cp :local-peer-id))
+    (validate-peer-id (:local-peer-id cp) :ha-control-plane-local-peer))
   (doseq [[k v] [[:rpc-timeout-ms (:rpc-timeout-ms cp)]
                  [:election-timeout-ms (:election-timeout-ms cp)]
                  [:operation-timeout-ms (:operation-timeout-ms cp)]]]
@@ -399,6 +403,7 @@
       (validate-ha-voter v idx))
     (let [peer-ids (mapv :peer-id voters)
           local-peer-id (:local-peer-id cp)
+          local-peer-present? (contains? cp :local-peer-id)
           local-count (count (filter #(= local-peer-id %) peer-ids))
           promotable-voters (filter :promotable? voters)
           promotable-node-ids (mapv :ha-node-id promotable-voters)]
@@ -407,19 +412,20 @@
                  {:error :ha/validation
                   :option :ha-control-plane
                   :peer-ids peer-ids}))
-      (when-not (= local-count 1)
-        (u/raise "HA local control-plane peer must appear exactly once in :voters"
-                 {:error :ha/validation
-                  :option :ha-control-plane
-                  :local-peer-id local-peer-id
-                  :matches local-count}))
+      (when (or require-local-peer? local-peer-present?)
+        (when-not (= local-count 1)
+          (u/raise "HA local control-plane peer must appear exactly once in :voters"
+                   {:error :ha/validation
+                    :option :ha-control-plane
+                    :local-peer-id local-peer-id
+                    :matches local-count})))
       (when-not (= (count promotable-node-ids)
                    (count (set promotable-node-ids)))
         (u/raise "Promotable HA voters must map one-to-one by :ha-node-id"
                  {:error :ha/validation
                   :option :ha-control-plane
                   :promotable-node-ids promotable-node-ids}))))
-  cp)
+  cp))
 
 (defn- canonical-ha-membership-payload
   [opts]
@@ -455,12 +461,23 @@
         ^MessageDigest md (MessageDigest/getInstance "SHA-256")]
     (u/hexify (.digest md (.getBytes payload StandardCharsets/UTF_8)))))
 
-(defn validate-ha-options
-  "Validate consensus-lease HA options as a coherent set.
-   Returns `opts` unchanged on success."
+(def ^:private non-persistable-ha-option-keys
+  #{:ha-node-id
+    :ha-client-credentials
+    :ha-fencing-hook
+    :ha-clock-skew-hook})
+
+(def ^:private non-persistable-ha-control-plane-option-keys
+  #{:local-peer-id
+    :raft-dir})
+
+(defn validate-ha-store-opts
+  "Validate the persistable/shared portion of consensus-lease HA options.
+   Accepts node-local HA fields when present in memory, but does not require
+   them to exist."
   [opts]
-      (let [opts (or opts {})
-            mode (:ha-mode opts)]
+  (let [opts (or opts {})
+        mode (:ha-mode opts)]
     (when (and (some? mode) (not= mode :consensus-lease))
       (u/raise "Option :ha-mode expects nil or :consensus-lease"
                {:error :ha/validation
@@ -485,31 +502,22 @@
             clock-skew-budget-ms
             (long (or (:ha-clock-skew-budget-ms opts)
                       c/*ha-clock-skew-budget-ms*))
-            cp (validate-ha-control-plane-shape (:ha-control-plane opts))
+            cp (validate-ha-control-plane-shape (:ha-control-plane opts) false)
             voters (:voters cp)
             local-peer-id (:local-peer-id cp)
-            local-voter (first (filter #(= local-peer-id (:peer-id %)) voters))
+            local-voter (when local-peer-id
+                          (first (filter #(= local-peer-id (:peer-id %))
+                                         voters)))
             promotable-node-id-set (->> voters
                                         (filter :promotable?)
                                         (map :ha-node-id)
                                         set)
             db-identity (:db-identity opts)]
-        (when-not (positive-int? node-id)
-          (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
-                   {:error :ha/validation
-                    :option :ha-node-id
-                    :value node-id}))
         (when-not (non-blank-string? db-identity)
           (u/raise "Option :db-identity must be a non-blank string in consensus mode"
                    {:error :ha/validation
                     :option :db-identity
                     :value db-identity}))
-        (when-not (contains? member-id-set node-id)
-          (u/raise "Option :ha-node-id must exist in :ha-members"
-                   {:error :ha/validation
-                    :option :ha-node-id
-                    :ha-node-id node-id
-                    :ha-members member-ids}))
         (when-not (and (positive-int? renew-ms)
                        (positive-int? timeout-ms)
                        (positive-int? base-delay-ms)
@@ -553,22 +561,13 @@
             :ha-lease-timeout-ms timeout-ms
             :ha-lease-renew-ms renew-ms
             :stale-leader-window-ms stale-leader-window-ms}))
-        (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
+        (when (some? (:ha-fencing-hook opts))
+          (validate-ha-fencing-hook-shape (:ha-fencing-hook opts)))
         (when (some? (:ha-client-credentials opts))
           (validate-ha-client-credentials-shape
            (:ha-client-credentials opts)))
         (when (some? (:ha-clock-skew-hook opts))
           (validate-ha-clock-skew-hook-shape (:ha-clock-skew-hook opts)))
-        (when-not (:promotable? local-voter)
-          (u/raise "Local control-plane voter must be promotable in consensus mode"
-                   {:error :ha/validation
-                    :local-peer-id local-peer-id
-                    :voter local-voter}))
-        (when-not (= node-id (:ha-node-id local-voter))
-          (u/raise "Local control-plane voter :ha-node-id must match :ha-node-id"
-                   {:error :ha/validation
-                    :ha-node-id node-id
-                    :local-voter local-voter}))
         (let [missing (seq (sort (remove promotable-node-id-set member-id-set)))
               extras  (seq (sort (remove member-id-set promotable-node-id-set)))]
           (when (or missing extras)
@@ -578,6 +577,29 @@
                       :extra-promotable-voters extras
                       :ha-members member-ids
                       :promotable-voters (sort promotable-node-id-set)})))
+        (when (some? node-id)
+          (when-not (positive-int? node-id)
+            (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
+                     {:error :ha/validation
+                      :option :ha-node-id
+                      :value node-id}))
+          (when-not (contains? member-id-set node-id)
+            (u/raise "Option :ha-node-id must exist in :ha-members"
+                     {:error :ha/validation
+                      :option :ha-node-id
+                      :ha-node-id node-id
+                      :ha-members member-ids}))
+          (when local-voter
+            (when-not (:promotable? local-voter)
+              (u/raise "Local control-plane voter must be promotable in consensus mode"
+                       {:error :ha/validation
+                        :local-peer-id local-peer-id
+                        :voter local-voter}))
+            (when-not (= node-id (:ha-node-id local-voter))
+              (u/raise "Local control-plane voter :ha-node-id must match :ha-node-id"
+                       {:error :ha/validation
+                        :ha-node-id node-id
+                        :local-voter local-voter}))))
         (when-let [expected (:ha-membership-hash opts)]
           (when-not (non-blank-string? expected)
             (u/raise "Option :ha-membership-hash must be a non-blank string when provided"
@@ -593,11 +615,56 @@
                         :derived derived})))))))
   opts)
 
+(defn validate-ha-options
+  "Validate consensus-lease HA options as a coherent set.
+   Returns `opts` unchanged on success."
+  [opts]
+  (let [opts (validate-ha-store-opts opts)
+        mode (:ha-mode opts)]
+    (when (= mode :consensus-lease)
+      (let [node-id (:ha-node-id opts)
+            members (:ha-members opts)
+            member-ids (mapv :node-id members)
+            member-id-set (set member-ids)
+            cp (validate-ha-control-plane-shape (:ha-control-plane opts))
+            voters (:voters cp)
+            local-peer-id (:local-peer-id cp)
+            local-voter (first (filter #(= local-peer-id (:peer-id %))
+                                       voters))]
+        (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
+        (when-not (positive-int? node-id)
+          (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
+                   {:error :ha/validation
+                    :option :ha-node-id
+                    :value node-id}))
+        (when-not (contains? member-id-set node-id)
+          (u/raise "Option :ha-node-id must exist in :ha-members"
+                   {:error :ha/validation
+                    :option :ha-node-id
+                    :ha-node-id node-id
+                    :ha-members member-ids}))
+        (when-not (:promotable? local-voter)
+          (u/raise "Local control-plane voter must be promotable in consensus mode"
+                   {:error :ha/validation
+                    :local-peer-id local-peer-id
+                    :voter local-voter}))
+        (when-not (= node-id (:ha-node-id local-voter))
+          (u/raise "Local control-plane voter :ha-node-id must match :ha-node-id"
+                   {:error :ha/validation
+                    :ha-node-id node-id
+                    :local-voter local-voter})))))
+  opts)
+
 (defn validate-option-mutation
   "Validate option key/value before commit."
   [k v]
   (let [k (c/canonical-wal-option-key k)]
     (cond
+      (contains? non-persistable-ha-option-keys k)
+      (u/raise (str "Option " k " is node-local HA runtime config and cannot "
+                    "be persisted via assoc-opt")
+               {:option k :value v})
+
       (= k :ha-mode)
       (when-not (or (nil? v) (= :consensus-lease v))
         (u/raise "Option :ha-mode expects nil or :consensus-lease"
@@ -609,19 +676,13 @@
 
       (= k :ha-control-plane)
       (when (some? v)
-        (validate-ha-control-plane-shape v))
-
-      (= k :ha-fencing-hook)
-      (when (some? v)
-        (validate-ha-fencing-hook-shape v))
-
-      (= k :ha-clock-skew-hook)
-      (when (some? v)
-        (validate-ha-clock-skew-hook-shape v))
-
-      (= k :ha-client-credentials)
-      (when (some? v)
-        (validate-ha-client-credentials-shape v))
+        (when-let [local-fields (seq (sort (filter #(contains? v %)
+                                                   non-persistable-ha-control-plane-option-keys)))]
+          (u/raise "Option :ha-control-plane cannot persist node-local fields via assoc-opt"
+                   {:option k
+                    :value v
+                    :local-fields local-fields}))
+        (validate-ha-control-plane-shape v false))
 
       (= k :ha-membership-hash)
       (when-not (or (nil? v) (non-blank-string? v))

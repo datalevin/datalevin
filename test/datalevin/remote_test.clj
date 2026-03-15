@@ -318,7 +318,10 @@
               s3    (assoc s2 d (merge p3 {:db/aid (+ aid0 3)}))
               s4    (assoc s3 :f/g {:db/aid (+ aid0 4)
                                     :db/valueType :db.type/string})
-              store (sut/open dir {d p3})]
+              store (sut/open dir)]
+          ;; Remote schema changes must be explicit writes, not implicit open-time
+          ;; mutations against a reused live store.
+          (if/set-schema store {d p3})
           (is (= s3 (if/schema store)))
           (if/set-schema store {:f/g {:db/valueType :db.type/string}})
           (is (= s4 (if/schema store)))

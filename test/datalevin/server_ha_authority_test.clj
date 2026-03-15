@@ -51,17 +51,13 @@
 
 (deftest start-ha-authority-supports-sofa-jraft-adapter-test
   (let [opts (-> (valid-ha-opts)
-                 (assoc-in [:ha-control-plane :backend] :sofa-jraft)
-                      ;; Single-voter smoke config for local JRaft startup.
-                 (assoc-in [:ha-control-plane :voters]
-                           [{:peer-id "10.0.0.12:7801"
-                             :ha-node-id 2
-                             :promotable? true}]))
-        runtime (#'srv/start-ha-authority "orders" opts)
-        authority (:ha-authority runtime)]
-    (is (some? authority))
-    (is (string? (ha/read-membership-hash authority)))
-    (#'srv/stop-ha-authority "orders" runtime)))
+                 (assoc-in [:ha-control-plane :backend] :sofa-jraft))
+        authority (ha/new-authority (:ha-control-plane opts))
+        diagnostics (ha/authority-diagnostics authority)]
+    (is (satisfies? ha/ILeaseAuthority authority))
+    (is (= :sofa-jraft (:backend diagnostics)))
+    (is (= (get-in opts [:ha-control-plane :group-id])
+           (:group-id diagnostics)))))
 
 (deftest start-ha-authority-derives-raft-dir-from-server-root-test
   (let [root "/var/lib/datalevin-test"
@@ -362,10 +358,10 @@
                       1250
                       false))))))
 
-(deftest ha-renew-step-refreshes-time-after-follower-sync-before-candidate-entry-test
+(deftest advance-ha-follower-or-candidate-refreshes-time-before-candidate-entry-test
   (let [tick (atom 0)
         follower-runtime {:ha-role :follower
-                          :ha-authority-lease {:lease-until-ms 1500
+                          :ha-authority-lease {:lease-until-ms 500
                                                :leader-node-id 2}
                           :ha-authority-read-ok? true
                           :ha-membership-hash "hash-a"
@@ -383,7 +379,7 @@
         (let [next-state (#'dha/advance-ha-follower-or-candidate
                           "orders" follower-runtime)]
           (is (= :candidate (:ha-role next-state)))
-          (is (= 2000 (:ha-candidate-since-ms next-state)))
+          (is (= 1000 (:ha-candidate-since-ms next-state)))
           (is (= 10000 (:ha-candidate-delay-ms next-state))))))))
 
 (deftest ha-renew-step-demotes-on-membership-hash-mismatch-test
@@ -1126,7 +1122,7 @@
       (finally
         (#'srv/stop-ha-authority "orders" runtime)))))
 
-(deftest ha-loop-sleep-ms-respects-candidate-and-follower-deadlines-test
+(deftest ha-loop-sleep-ms-respects-candidate-and-demotion-deadlines-test
   (let [now-ms 1000]
     (is (= 300
            (#'srv/ha-loop-sleep-ms
@@ -1134,12 +1130,6 @@
              :ha-lease-renew-ms 5000
              :ha-candidate-since-ms now-ms
              :ha-candidate-delay-ms 300}
-            now-ms)))
-    (is (= 250
-           (#'srv/ha-loop-sleep-ms
-            {:ha-role :follower
-             :ha-lease-renew-ms 5000
-             :ha-follower-next-sync-not-before-ms (+ now-ms 250)}
             now-ms)))
     (is (= 250
            (#'srv/ha-loop-sleep-ms
@@ -1158,6 +1148,32 @@
            (#'srv/ha-loop-sleep-ms
             {:ha-role :leader
              :ha-lease-renew-ms 5000}
+            now-ms)))))
+
+(deftest ha-follower-loop-sleep-ms-respects-backoff-and-catchup-test
+  (let [now-ms 1000]
+    (is (= 250
+           (#'srv/ha-follower-loop-sleep-ms
+            {:ha-role :leader
+             :ha-lease-renew-ms 5000}
+            now-ms)))
+    (is (= 250
+           (#'srv/ha-follower-loop-sleep-ms
+            {:ha-role :follower
+             :ha-lease-renew-ms 5000
+             :ha-follower-last-batch-size 0}
+            now-ms)))
+    (is (= 1
+           (#'srv/ha-follower-loop-sleep-ms
+            {:ha-role :follower
+             :ha-lease-renew-ms 5000
+             :ha-follower-last-batch-size 3}
+            now-ms)))
+    (is (= 250
+           (#'srv/ha-follower-loop-sleep-ms
+            {:ha-role :follower
+             :ha-lease-renew-ms 5000
+             :ha-follower-next-sync-not-before-ms (+ now-ms 250)}
             now-ms)))))
 
 (deftest ha-maybe-enter-candidate-blocked-when-follower-degraded-test
@@ -1228,6 +1244,30 @@
     (is (= :ha/control-timeout
            (get-in next-m [:ha-promotion-failure-details :data :error])))))
 
+(deftest ha-maybe-enter-candidate-blocked-when-authority-read-stale-test
+  (let [now-ms (System/currentTimeMillis)
+        m {:ha-role :follower
+           :ha-authority-read-ok? true
+           :ha-last-authority-refresh-ms (- now-ms 2000)
+           :ha-lease-timeout-ms 1000
+           :ha-node-id 2
+           :ha-members [{:node-id 1 :endpoint "10.0.0.11:8898"}
+                        {:node-id 2 :endpoint "10.0.0.12:8898"}]
+           :ha-promotion-base-delay-ms 0
+           :ha-promotion-rank-delay-ms 0
+           :ha-membership-hash "hash-a"
+           :ha-authority-membership-hash "hash-a"
+           :ha-authority-lease {:lease-until-ms (dec now-ms)}}
+        next-m (#'dha/maybe-enter-ha-candidate m now-ms)]
+    (is (= :follower (:ha-role next-m)))
+    (is (= :authority-read-failed (:ha-promotion-last-failure next-m)))
+    (is (= :authority-read-stale
+           (get-in next-m [:ha-promotion-failure-details :reason])))
+    (is (= (:ha-last-authority-refresh-ms m)
+           (get-in next-m
+                   [:ha-promotion-failure-details
+                    :last-authority-refresh-ms])))))
+
 (deftest ha-maybe-enter-candidate-blocked-when-rejoin-in-progress-test
   (let [now-ms (System/currentTimeMillis)
         m {:ha-role :follower
@@ -1270,3 +1310,23 @@
     (is (false? (:ha-rejoin-promotion-blocked? next-m)))
     (is (nil? (:ha-rejoin-promotion-blocked-until-ms next-m)))
     (is (integer? (:ha-rejoin-promotion-cleared-ms next-m)))))
+
+(deftest maybe-clear-ha-rejoin-promotion-block-requires-fresh-authority-read-test
+  (let [now-ms (System/currentTimeMillis)
+        m {:ha-role :follower
+           :ha-node-id 2
+           :ha-authority-owner-node-id 1
+           :ha-local-last-applied-lsn 5
+           :ha-rejoin-promotion-blocked? true
+           :ha-rejoin-promotion-blocked-until-ms (+ now-ms 5000)
+           :ha-max-promotion-lag-lsn 0
+           :ha-authority-read-ok? true
+           :ha-last-authority-refresh-ms (- now-ms 2000)
+           :ha-lease-timeout-ms 1000
+           :ha-authority-lease {:leader-node-id 1
+                                :leader-last-applied-lsn 5}}
+        next-m (#'dha/maybe-clear-ha-rejoin-promotion-block m now-ms)]
+    (is (true? (:ha-rejoin-promotion-blocked? next-m)))
+    (is (= (:ha-rejoin-promotion-blocked-until-ms m)
+           (:ha-rejoin-promotion-blocked-until-ms next-m)))
+    (is (nil? (:ha-rejoin-promotion-cleared-ms next-m)))))

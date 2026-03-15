@@ -45,7 +45,7 @@
    [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService Future
-    ConcurrentLinkedQueue ConcurrentHashMap Semaphore TimeUnit]
+    ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]
@@ -519,6 +519,41 @@
            (s/includes? (or (ex-message t) "")
                         "LMDB env is closed"))))
 
+(defn- transient-write-open-race?
+  [t store]
+  (or (closed-store-race? t store)
+      (and t
+           (instance? Store store)
+           (s/includes? (or (ex-message t) "")
+                        "Invalid argument"))))
+
+(declare get-store get-kv-store add-store)
+
+(defn- open-write-txn-with-retry
+  [server db-name]
+  (loop [attempt 0]
+    (let [store (get-store server db-name)
+          kv-store (get-kv-store server db-name)
+          result (locking kv-store
+                   (try
+                     {:ok? true
+                      :store store
+                      :kv-store kv-store
+                      :wlmdb (i/open-transact-kv kv-store)}
+                     (catch Throwable t
+                       {:ok? false
+                        :store store
+                        :error t})))]
+      (if (:ok? result)
+        result
+        (let [t (:error result)]
+          (if (and (zero? attempt)
+                   (transient-write-open-race? t store))
+            (do
+              (add-store server db-name (reopen-store store))
+              (recur (inc attempt)))
+            (throw t)))))))
+
 (defn- has-permission?
   [req-act req-obj req-tgt user-permissions]
   (some (fn [{:keys [permission/act permission/obj permission/tgt] :as p}]
@@ -733,6 +768,13 @@
 (def ^:private missing-state-value
   (Object.))
 
+(def ^:private ha-follower-local-side-effect-keys
+  [:store
+   :dt-db
+   :engine
+   :index
+   :ha-local-last-applied-lsn])
+
 (def ^:private ha-follower-side-effect-keys
   [:store
    :dt-db
@@ -760,20 +802,33 @@
    :ha-follower-last-error-details
    :ha-follower-last-error-ms])
 
-(defn- ha-renew-side-effect-patch
+(defn- state-patch
+  [keys expected-state next-state]
+  (let [patch (reduce
+               (fn [acc k]
+                 (let [expected-v (get expected-state k missing-state-value)
+                       next-v     (get next-state k missing-state-value)]
+                   (if (= expected-v next-v)
+                     acc
+                     (assoc acc k next-v))))
+               {}
+               keys)]
+    (when (seq patch)
+      patch)))
+
+(defn- ha-follower-local-side-effect-patch
   [expected-state next-state]
   (when (= :follower (:ha-role expected-state))
-    (let [patch (reduce
-                 (fn [acc k]
-                   (let [expected-v (get expected-state k missing-state-value)
-                         next-v     (get next-state k missing-state-value)]
-                     (if (= expected-v next-v)
-                       acc
-                       (assoc acc k next-v))))
-                 {}
-                 ha-follower-side-effect-keys)]
-      (when (seq patch)
-        patch))))
+    (state-patch ha-follower-local-side-effect-keys
+                 expected-state
+                 next-state)))
+
+(defn- ha-follower-side-effect-patch
+  [expected-state next-state]
+  (when (= :follower (:ha-role expected-state))
+    (state-patch ha-follower-side-effect-keys
+                 expected-state
+                 next-state)))
 
 (defn- apply-state-patch
   [state patch]
@@ -785,32 +840,54 @@
    state
    patch))
 
-(defn- merge-ha-renew-side-effect-patch
+(defn- same-ha-runtime-state?
+  [current-state expected-state running-key]
+  (and (identical? (get current-state running-key)
+                   (get expected-state running-key))
+       (identical? (:ha-authority current-state)
+                   (:ha-authority expected-state))
+       (= (:ha-node-id current-state)
+          (:ha-node-id expected-state))
+       (= (:ha-db-identity current-state)
+          (:ha-db-identity expected-state))
+       (= (:ha-membership-hash current-state)
+          (:ha-membership-hash expected-state))))
+
+(defn- merge-ha-follower-local-side-effect-patch
   [current-state expected-state patch]
   (if (and patch
-           (= :follower (:ha-role current-state))
-           (= :follower (:ha-role expected-state))
-           (identical? (:ha-renew-loop-running? current-state)
-                       (:ha-renew-loop-running? expected-state))
-           (identical? (:ha-authority current-state)
-                       (:ha-authority expected-state))
-           (= (:ha-node-id current-state)
-              (:ha-node-id expected-state))
-           (= (:ha-db-identity current-state)
-              (:ha-db-identity expected-state))
-           (= (:ha-membership-hash current-state)
-              (:ha-membership-hash expected-state)))
+           (same-ha-runtime-state?
+            current-state
+            expected-state
+            :ha-follower-loop-running?))
     (apply-state-patch current-state patch)
     current-state))
 
-(defn- persist-ha-renew-side-effects!
-  [expected-state next-state patch]
+(defn- merge-ha-follower-side-effect-patch
+  [current-state expected-state local-patch patch]
+  (let [current-state
+        (merge-ha-follower-local-side-effect-patch
+         current-state
+         expected-state
+         local-patch)]
+    (if (and patch
+             (= :follower (:ha-role current-state))
+             (= :follower (:ha-role expected-state))
+             (same-ha-runtime-state?
+              current-state
+              expected-state
+              :ha-follower-loop-running?))
+      (apply-state-patch current-state patch)
+      current-state)))
+
+(defn- persist-ha-follower-side-effects!
+  [expected-state next-state local-patch]
   ;; Follower replay mutates local state outside the final server-state CAS.
   ;; Persist the follower floor before publication so a concurrent role/runtime
   ;; swap cannot discard durable progress if the merge-back patch is rejected.
-  (when (and patch
+  (when (and local-patch
              (= :follower (:ha-role expected-state))
-             (contains? patch :ha-local-last-applied-lsn))
+             (contains? local-patch :ha-local-last-applied-lsn))
     (dha/persist-ha-runtime-local-applied-lsn! next-state))
   next-state)
 
@@ -987,6 +1064,9 @@
    :ha-clock-skew-hook
    :ha-control-plane])
 
+(def ^:private ha-runtime-option-key-set
+  (set ha-runtime-option-keys))
+
 (defn- sanitize-ha-path-segment
   [x]
   (-> x
@@ -1033,9 +1113,16 @@
 (def ^:dynamic *ha-renew-step-fn*
   dha/ha-renew-step)
 
+(def ^:dynamic *ha-follower-sync-step-fn*
+  dha/ha-follower-sync-step)
+
 (defn- ha-renew-step
   [db-name m]
   (*ha-renew-step-fn* db-name m))
+
+(defn- ha-follower-sync-step
+  [db-name m]
+  (*ha-follower-sync-step-fn* db-name m))
 
 (defn- ha-loop-sleep-ms
   ([m]
@@ -1056,10 +1143,6 @@
                           (integer? (:ha-candidate-pre-cas-wait-until-ms m)))
                      (conj (long (:ha-candidate-pre-cas-wait-until-ms m)))
 
-                     (and (= :follower role)
-                          (integer? (:ha-follower-next-sync-not-before-ms m)))
-                     (conj (long (:ha-follower-next-sync-not-before-ms m)))
-
                      (and (= :demoting role)
                           (or (integer? (:ha-demotion-drain-until-ms m))
                               (integer? (:ha-demoted-at-ms m))))
@@ -1075,65 +1158,145 @@
        (cond
          (< (long remaining-ms) 1) 1
          (< (long remaining-ms) renew-ms) (long remaining-ms)
-         :else renew-ms)
+       :else renew-ms)
        renew-ms))))
 
+(defn- ha-follower-loop-sleep-ms
+  ([m]
+   (ha-follower-loop-sleep-ms m (System/currentTimeMillis)))
+  ([m now-ms]
+   (let [renew-ms (long (max 100
+                             (long (or (:ha-lease-renew-ms m)
+                                       c/*ha-lease-renew-ms*))))
+         idle-ms (long (min 250
+                            (max 25 (quot renew-ms 4))))
+         role (:ha-role m)
+         next-sync-not-before-ms
+         (when (integer? (:ha-follower-next-sync-not-before-ms m))
+           (long (:ha-follower-next-sync-not-before-ms m)))
+         batch-size (long (or (:ha-follower-last-batch-size m) 0))]
+     (cond
+       (and (= :follower role)
+            next-sync-not-before-ms)
+       (let [remaining-ms (- next-sync-not-before-ms (long now-ms))]
+         (long (if (<= remaining-ms 0) 1 remaining-ms)))
+
+       (and (= :follower role)
+            (pos? batch-size))
+       1
+
+       :else
+       idle-ms))))
+
+(defn- ha-loop-error-backoff!
+  [^AtomicBoolean running?]
+  (try
+    (Thread/sleep 250)
+    (catch InterruptedException _
+      (.set running? false))))
+
 (defn- run-ha-renew-loop
-  [^Server server db-name ^AtomicBoolean running?]
-  (loop []
-    (when (and (.get running?)
-               (.get ^AtomicBoolean (.-running server)))
-      (try
-        (let [m (get (.-dbs server) db-name)]
-          (if (or (nil? m)
-                  (nil? (:ha-authority m))
-                  (not (identical? running?
-                                   (:ha-renew-loop-running? m))))
-            (.set running? false)
-            ;; Keep renew work outside `update-db` so HA probes and peer/server
-            ;; operations do not block on control-plane I/O. If a concurrent
-            ;; state update wins the final CAS, merge follower replay side
-            ;; effects back into the current state so applied local progress is
-            ;; not discarded.
-            (let [next-state        (ha-renew-step db-name m)
-                  side-effect-patch (ha-renew-side-effect-patch m next-state)
-                  _                 (persist-ha-renew-side-effects!
-                                     m next-state side-effect-patch)
-                  {:keys [updated? state]}
-                  (replace-db-state-if-current
-                   server
-                   db-name
-                   m
-                   #(identical? running? (:ha-renew-loop-running? %))
-                   next-state)
-                  state
-                  (if (and (not updated?)
-                           side-effect-patch)
-                    (:state
-                     (transform-db-state-when
-                      server
-                      db-name
-                      #(identical? running? (:ha-renew-loop-running? %))
-                      #(merge-ha-renew-side-effect-patch
-                        %
-                        m
-                        side-effect-patch)))
-                    state)]
-              (if (or (nil? state)
-                      (nil? (:ha-authority state))
-                      (not (identical? running?
-                                       (:ha-renew-loop-running? state))))
-                (.set running? false)
-                (let [sleep-ms (long (ha-loop-sleep-ms state))]
-                  (try
-                    (Thread/sleep sleep-ms)
-                    (catch InterruptedException _
-                      (.set running? false))))))))
-        (catch Throwable t
-          (log/error t "HA renew loop crashed"
-                     {:db-name db-name})
-          (.set running? false)))
-      (recur))))
+  [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
+  (try
+    (loop []
+      (when (and (.get running?)
+                 (.get ^AtomicBoolean (.-running server)))
+        (try
+          (let [m (get (.-dbs server) db-name)]
+            (if (or (nil? m)
+                    (nil? (:ha-authority m))
+                    (not (identical? running?
+                                     (:ha-renew-loop-running? m))))
+              (.set running? false)
+              ;; Keep renew work outside `update-db` so HA probes and peer/server
+              ;; operations do not block on control-plane I/O.
+              (let [next-state (ha-renew-step db-name m)
+                    {:keys [state]}
+                    (replace-db-state-if-current
+                     server
+                     db-name
+                     m
+                     #(identical? running? (:ha-renew-loop-running? %))
+                     next-state)]
+                (if (or (nil? state)
+                        (nil? (:ha-authority state))
+                        (not (identical? running?
+                                         (:ha-renew-loop-running? state))))
+                  (.set running? false)
+                  (let [sleep-ms (long (ha-loop-sleep-ms state))]
+                    (try
+                      (Thread/sleep sleep-ms)
+                      (catch InterruptedException _
+                        (.set running? false))))))))
+          (catch Throwable t
+            (log/error t "HA renew loop crashed"
+                       {:db-name db-name})
+            (ha-loop-error-backoff! running?)))
+        (recur)))
+    (finally
+      (.countDown stopped-latch))))
+
+(defn- run-ha-follower-sync-loop
+  [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
+  (try
+    (loop []
+      (when (and (.get running?)
+                 (.get ^AtomicBoolean (.-running server)))
+        (try
+          (let [m (get (.-dbs server) db-name)]
+            (if (or (nil? m)
+                    (nil? (:ha-authority m))
+                    (not (identical? running?
+                                     (:ha-follower-loop-running? m))))
+              (.set running? false)
+              ;; Follower replay can block on remote txlog fetch and local apply
+              ;; work. Keep it off the authority renew path so lease reads and
+              ;; promotions are not rate-limited by replication latency.
+              (let [next-state (ha-follower-sync-step db-name m)
+                    local-patch (ha-follower-local-side-effect-patch
+                                 m next-state)
+                    side-effect-patch (ha-follower-side-effect-patch
+                                       m next-state)
+                    _ (persist-ha-follower-side-effects!
+                       m next-state local-patch)
+                    {:keys [updated? state]}
+                    (replace-db-state-if-current
+                     server
+                     db-name
+                     m
+                     #(identical? running? (:ha-follower-loop-running? %))
+                     next-state)
+                    state
+                    (if (and (not updated?)
+                             (or local-patch side-effect-patch))
+                      (:state
+                       (transform-db-state-when
+                        server
+                        db-name
+                        #(identical? running? (:ha-follower-loop-running? %))
+                        #(merge-ha-follower-side-effect-patch
+                          %
+                          m
+                          local-patch
+                          side-effect-patch)))
+                      state)]
+                (if (or (nil? state)
+                        (nil? (:ha-authority state))
+                        (not (identical? running?
+                                         (:ha-follower-loop-running? state))))
+                  (.set running? false)
+                  (let [sleep-ms (long (ha-follower-loop-sleep-ms state))]
+                    (try
+                      (Thread/sleep sleep-ms)
+                      (catch InterruptedException _
+                        (.set running? false))))))))
+          (catch Throwable t
+            (log/error t "HA follower sync loop crashed"
+                       {:db-name db-name})
+            (ha-loop-error-backoff! running?)))
+        (recur)))
+    (finally
+      (.countDown stopped-latch))))
 
 (declare execute)
 
@@ -1141,40 +1304,89 @@
   [^Server server db-name]
   (let [new-running-v (volatile! nil)]
     (update-db server db-name
-               (fn [m]
-                 (if (and m
-                          (:ha-authority m))
-                   (let [running?    (:ha-renew-loop-running? m)
-                         loop-future (:ha-renew-loop-future m)
-                         active?     (and (instance? AtomicBoolean running?)
-                                          (.get ^AtomicBoolean running?)
-                                          (instance? Future loop-future)
-                                          (not (.isDone ^Future loop-future)))]
-                     (if active?
-                       m
-                       (do
-                         (when (instance? AtomicBoolean running?)
-                           (.set ^AtomicBoolean running? false))
-                         (let [new-running? (AtomicBoolean. true)]
-                           (vreset! new-running-v new-running?)
-                           (assoc m
-                                  :ha-renew-loop-running? new-running?
-                                  :ha-renew-loop-future nil)))))
-                   m)))
+      (fn [m]
+        (if (and m
+                 (:ha-authority m))
+          (let [running?    (:ha-renew-loop-running? m)
+                loop-future (:ha-renew-loop-future m)
+                active?     (and (instance? AtomicBoolean running?)
+                                 (.get ^AtomicBoolean running?)
+                                 (instance? Future loop-future)
+                                 (not (.isDone ^Future loop-future)))]
+            (if active?
+              m
+              (do
+                (when (instance? AtomicBoolean running?)
+                  (.set ^AtomicBoolean running? false))
+                (let [new-running?  (AtomicBoolean. true)
+                      stopped-latch (CountDownLatch. 1)]
+                  (vreset! new-running-v new-running?)
+                  (assoc m
+                         :ha-renew-loop-running? new-running?
+                         :ha-renew-loop-stopped-latch stopped-latch
+                         :ha-renew-loop-future nil)))))
+          m)))
     (when-let [running? @new-running-v]
-      (let [future (.submit ^ExecutorService
+      (let [stopped-latch
+            (get-in (.-dbs server) [db-name :ha-renew-loop-stopped-latch])
+            future (.submit ^ExecutorService
                             (.-work-executor server)
                             ^Runnable #(run-ha-renew-loop
                                          server
                                          db-name
-                                         running?))]
+                                         running?
+                                         stopped-latch))]
         (update-db server db-name
-                   (fn [m]
-                     (if (and m
-                              (identical? running?
-                                          (:ha-renew-loop-running? m)))
-                       (assoc m :ha-renew-loop-future future)
-                       m)))))))
+          (fn [m]
+            (if (and m
+                     (identical? running?
+                                 (:ha-renew-loop-running? m)))
+              (assoc m :ha-renew-loop-future future)
+              m)))))))
+
+(defn- ensure-ha-follower-sync-loop
+  [^Server server db-name]
+  (let [new-running-v (volatile! nil)]
+    (update-db server db-name
+      (fn [m]
+        (if (and m
+                 (:ha-authority m))
+          (let [running?    (:ha-follower-loop-running? m)
+                loop-future (:ha-follower-loop-future m)
+                active?     (and (instance? AtomicBoolean running?)
+                                 (.get ^AtomicBoolean running?)
+                                 (instance? Future loop-future)
+                                 (not (.isDone ^Future loop-future)))]
+            (if active?
+              m
+              (do
+                (when (instance? AtomicBoolean running?)
+                  (.set ^AtomicBoolean running? false))
+                (let [new-running?  (AtomicBoolean. true)
+                      stopped-latch (CountDownLatch. 1)]
+                  (vreset! new-running-v new-running?)
+                  (assoc m
+                         :ha-follower-loop-running? new-running?
+                         :ha-follower-loop-stopped-latch stopped-latch
+                         :ha-follower-loop-future nil)))))
+          m)))
+    (when-let [running? @new-running-v]
+      (let [stopped-latch
+            (get-in (.-dbs server) [db-name :ha-follower-loop-stopped-latch])
+            future (.submit ^ExecutorService
+                            (.-work-executor server)
+                            ^Runnable #(run-ha-follower-sync-loop
+                                         server
+                                         db-name
+                                         running?
+                                         stopped-latch))]
+        (update-db server db-name
+          (fn [m]
+            (if (and m
+                     (identical? running?
+                                 (:ha-follower-loop-running? m)))
+              (assoc m :ha-follower-loop-future future)
+              m)))))))
 
 (defn- stop-ha-renew-loop
   [m]
@@ -1182,6 +1394,27 @@
     (.set running? false))
   (when-let [^Future future (:ha-renew-loop-future m)]
     (.cancel future true)))
+
+(defn- stop-ha-follower-sync-loop
+  [m]
+  (when-let [^AtomicBoolean running? (:ha-follower-loop-running? m)]
+    (.set running? false))
+  (when-let [^Future future (:ha-follower-loop-future m)]
+    (.cancel future true)))
+
+(defn- await-ha-loop-stop
+  [loop-label db-name latch]
+  (when (instance? CountDownLatch latch)
+    (try
+      (when-not (.await ^CountDownLatch latch 5 TimeUnit/SECONDS)
+        (log/warn "Timed out waiting for HA loop to stop"
+                  {:db-name db-name
+                   :loop loop-label}))
+      (catch InterruptedException _
+        (.interrupt (Thread/currentThread))
+        (log/warn "Interrupted while waiting for HA loop to stop"
+                  {:db-name db-name
+                   :loop loop-label})))))
 
 (def ^:dynamic *start-ha-authority-fn*
   start-ha-authority)
@@ -1192,25 +1425,63 @@
 (def ^:dynamic *stop-ha-renew-loop-fn*
   stop-ha-renew-loop)
 
+(def ^:dynamic *stop-ha-follower-sync-loop-fn*
+  stop-ha-follower-sync-loop)
+
+(defn- current-ha-runtime-local-opts
+  [m]
+  (dha/merge-ha-runtime-local-opts
+   (dha/effective-ha-runtime-local-opts m)
+   (some-> (current-runtime-opts m)
+           dha/select-ha-runtime-local-opts)))
+
 (defn- resolved-ha-runtime-opts
-  [root db-name store]
-  (when-let [ha-opts (*consensus-ha-opts-fn* store)]
-    (-> (with-default-ha-control-raft-dir root db-name ha-opts)
-        (select-keys ha-runtime-option-keys))))
+  ([root db-name store]
+   (resolved-ha-runtime-opts root db-name store nil nil))
+  ([root db-name store m]
+   (resolved-ha-runtime-opts root db-name store m nil))
+  ([root db-name store m explicit-ha-runtime-opts]
+   (when-let [ha-opts (*consensus-ha-opts-fn* store)]
+     (let [current-ha-runtime-opts
+           (dha/merge-ha-runtime-local-opts
+            (current-ha-runtime-local-opts m)
+            (dha/select-ha-runtime-local-opts explicit-ha-runtime-opts))
+           merged-ha-opts
+           (dha/merge-ha-runtime-local-opts ha-opts
+                                            current-ha-runtime-opts)]
+       (-> (with-default-ha-control-raft-dir root db-name merged-ha-opts)
+           (select-keys ha-runtime-option-keys))))))
+
+(defn- shared-store-lifecycle?
+  [a b]
+  (or (identical? a b)
+      (and (instance? Store a)
+           (instance? Store b)
+           (identical? (.-lmdb ^Store a)
+                       (.-lmdb ^Store b)))))
 
 (defn- stop-ha-runtime
   [db-name m]
-  (*stop-ha-renew-loop-fn* m)
-  (try
-    (dha/persist-ha-runtime-local-applied-lsn! m)
-    (catch Throwable t
-      (log/warn t "Failed to persist HA local applied LSN during shutdown"
-                {:db-name db-name
-                 :ha-node-id (:ha-node-id m)})))
-  (*stop-ha-authority-fn* db-name m)
-  (dissoc (dha/clear-ha-runtime-state m)
-          :ha-runtime-opts
-          :ha-renew-loop-future))
+  (let [runtime-local-opts (current-ha-runtime-local-opts m)]
+    (*stop-ha-renew-loop-fn* m)
+    (*stop-ha-follower-sync-loop-fn* m)
+    (await-ha-loop-stop :renew db-name (:ha-renew-loop-stopped-latch m))
+    (await-ha-loop-stop :follower db-name (:ha-follower-loop-stopped-latch m))
+    (try
+      (dha/persist-ha-runtime-local-applied-lsn! m)
+      (catch Throwable t
+        (log/warn t "Failed to persist HA local applied LSN during shutdown"
+                  {:db-name db-name
+                   :ha-node-id (:ha-node-id m)})))
+    (*stop-ha-authority-fn* db-name m)
+    (cond-> (dissoc (dha/clear-ha-runtime-state m)
+                    :ha-runtime-opts
+                    :ha-renew-loop-future
+                    :ha-renew-loop-stopped-latch
+                    :ha-follower-loop-future
+                    :ha-follower-loop-stopped-latch)
+      (seq runtime-local-opts)
+      (assoc :ha-runtime-local-opts runtime-local-opts))))
 
 (defn- ha-authority-running?
   [authority]
@@ -1236,20 +1507,28 @@
         (dha/ha-write-admission-error (.-dbs server) message))))
 
 (defn- ensure-ha-runtime
-  [root db-name m store]
-  (if-let [ha-opts (resolved-ha-runtime-opts root db-name store)]
-    (if (and (= (:ha-runtime-opts m) ha-opts)
+  ([root db-name m store]
+   (ensure-ha-runtime root db-name m store nil))
+  ([root db-name m store explicit-ha-runtime-opts]
+  (if-let [ha-opts (resolved-ha-runtime-opts
+                    root db-name store m explicit-ha-runtime-opts)]
+    (let [runtime-local-opts (dha/select-ha-runtime-local-opts ha-opts)]
+      (if (and (= (:ha-runtime-opts m) ha-opts)
              (ha-authority-running? (:ha-authority m)))
-      m
-      (-> (stop-ha-runtime db-name m)
-          (merge (*start-ha-authority-fn* db-name ha-opts))
-          (assoc :ha-runtime-opts ha-opts)))
-    (stop-ha-runtime db-name m)))
+        (assoc m :ha-runtime-local-opts runtime-local-opts)
+        (-> (stop-ha-runtime db-name m)
+            (merge (*start-ha-authority-fn* db-name ha-opts))
+            (assoc :ha-runtime-opts ha-opts
+                   :ha-runtime-local-opts runtime-local-opts))))
+    (dissoc (stop-ha-runtime db-name m)
+            :ha-runtime-local-opts))))
 
 (defn- add-store
   ([server db-name store]
-   (add-store server db-name store true))
+   (add-store server db-name store true nil))
   ([^Server server db-name store activate-runtime?]
+   (add-store server db-name store activate-runtime? nil))
+  ([^Server server db-name store activate-runtime? explicit-ha-runtime-opts]
    (letfn [(add-store* [store]
              (let [published-store-v (volatile! store)]
                (update-db
@@ -1269,13 +1548,35 @@
                          published-store
                          (dha/recover-ha-local-store-if-needed
                           published-store)
+                         ha-runtime-opts
+                         (resolved-ha-runtime-opts
+                          (.-root server)
+                          db-name
+                          published-store
+                          m
+                          explicit-ha-runtime-opts)
                          _            (vreset! published-store-v
                                                published-store)
                          runtime-opts (resolved-runtime-opts
                                         server db-name published-store m)
+                         runtime-local-opts
+                         (some-> ha-runtime-opts
+                                 dha/select-ha-runtime-local-opts)
                          next-m       (assoc m
                                              :store published-store
                                              :runtime-opts runtime-opts)
+                         next-m       (cond-> next-m
+                                        (and (not activate-runtime?)
+                                             (some? ha-runtime-opts))
+                                        (assoc :ha-runtime-opts
+                                               ha-runtime-opts
+                                               :ha-runtime-local-opts
+                                               runtime-local-opts)
+
+                                        (and (not activate-runtime?)
+                                             (nil? ha-runtime-opts))
+                                        (dissoc :ha-runtime-opts
+                                                :ha-runtime-local-opts))
                          next-m       (cond-> next-m
                                         (and activate-runtime?
                                              (instance? IStore
@@ -1286,12 +1587,19 @@
                                                  runtime-opts)))]
                      (if activate-runtime?
                        (ensure-ha-runtime
-                         (.-root server) db-name next-m published-store)
+                         (.-root server)
+                         db-name
+                         next-m
+                         published-store
+                         explicit-ha-runtime-opts)
                        next-m))))
-               (when (and (not (identical? @published-store-v store))
+               (when (and (not (shared-store-lifecycle?
+                                @published-store-v
+                                store))
                           (not (store-closed? store)))
                  (close-store store))
                (ensure-ha-renew-loop server db-name)
+               (ensure-ha-follower-sync-loop server db-name)
                @published-store-v))
           (attempt-add-store [store retries]
             (try
@@ -1316,6 +1624,7 @@
   [^Server server db-name]
   (let [m (get (.-dbs server) db-name)]
     (stop-ha-renew-loop m)
+    (stop-ha-follower-sync-loop m)
     (stop-ha-authority db-name m)
     (when-let [store (:store m)]
       (if-let [db (:dt-db m)]
@@ -1826,8 +2135,10 @@
   (cond
     (instance? Store store)
     (when-not (i/closed? store)
-      (when schema
-        (i/set-schema store schema))
+      ;; Opening an already-live store for another client should not mutate the
+      ;; database. Applying `schema` here synthesizes a local schema txlog row,
+      ;; which is especially dangerous on HA followers because it can advance
+      ;; local watermarks without a replicated payload row.
       store)
 
     (some? store)
@@ -1922,7 +2233,7 @@
                                                (throw e))
                                            (throw e)))))
                  store            (add-store
-                                    server db-name store activate-runtime?)
+                                    server db-name store activate-runtime? opts)
                  datalog?         (instance? Store store)]
             (update-client server client-id
                            #(cond-> %
@@ -2597,17 +2908,121 @@
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error (normal-dt-store-handler opts)))
 
+(declare cleanup-assoc-opt-rollback-backup!)
+
+(defn- prepare-assoc-opt-rollback-backup!
+  [^Server server db-name store k]
+  (when (and (instance? Store store)
+             (or (contains? ha-runtime-option-key-set k)
+                 (some? (resolved-ha-runtime-opts (.-root server)
+                                                 db-name
+                                                 store))))
+    (let [current-state (get (.-dbs server) db-name)
+          runtime-ha-opts (resolved-ha-runtime-opts
+                           (.-root server)
+                           db-name
+                           store
+                           current-state)]
+      {:ha-runtime-opts runtime-ha-opts})))
+
+(defn- reject-unsafe-live-ha-option-mutation!
+  [^Server server db-name store k old-opts new-opts]
+  (when (and (= k :ha-members)
+             (not= old-opts new-opts)
+             (instance? Store store)
+             (some? (resolved-ha-runtime-opts
+                     (.-root server)
+                     db-name
+                     store
+                     (get (.-dbs server) db-name))))
+    (u/raise "Option :ha-members cannot be changed via assoc-opt on a live consensus HA database"
+             {:error :ha/unsafe-live-option-mutation
+              :db-name db-name
+              :option k})))
+
+(defn- cleanup-assoc-opt-rollback-backup!
+  [{:keys [backup-root]}]
+  (when (and (string? backup-root)
+             (u/file-exists backup-root))
+    (u/delete-files backup-root)))
+
+(defn- restore-assoc-opt-rollback-backup!
+  [env-dir {:keys [backup-dir]}]
+  (when (and (string? backup-dir)
+             (u/file-exists backup-dir))
+    (when (u/file-exists env-dir)
+      (u/delete-files env-dir))
+    (#'dha/copy-dir-contents! backup-dir env-dir)
+    true))
+
+(defn- rollback-assoc-opt!
+  [^Server server db-name store old-opts k rollback-backup]
+  (when (and (instance? Store store)
+             old-opts
+             (not= old-opts (i/opts store)))
+    (try
+      (let [env-dir (i/dir store)
+            schema (i/schema store)]
+        (#'st/transact-opts (.-lmdb ^Store store) old-opts)
+        (when-not (store-closed? store)
+          (close-store store))
+        (dha/recover-ha-local-store-dir-if-needed! env-dir)
+        (add-store server db-name
+                   (st/open env-dir schema old-opts)
+                   true
+                   (:ha-runtime-opts rollback-backup)))
+      (catch Throwable rollback-t
+        (log/error rollback-t
+                   "Failed to roll back store option mutation"
+                   {:db-name db-name
+                    :option k}))
+      (finally
+        (cleanup-assoc-opt-rollback-backup! rollback-backup)))))
+
+(defn- apply-assoc-opt!
+  [^Server server db-name store writing? k v]
+  (let [old-opts (when (instance? IStore store)
+                   (i/opts store))
+        k' (c/canonical-wal-option-key k)
+        new-opts (when old-opts
+                   (-> old-opts
+                       (dissoc k)
+                       (assoc k' v)))]
+    (if (and old-opts (= old-opts new-opts))
+      old-opts
+      (let [rollback-backup (when-not writing?
+                              (prepare-assoc-opt-rollback-backup!
+                               server db-name store k'))]
+        (try
+          (when-not writing?
+            (reject-unsafe-live-ha-option-mutation!
+             server db-name store k' old-opts new-opts))
+          (let [result (i/assoc-opt store k' v)]
+            ;; For direct mutations, make runtime restart part of the same
+            ;; logical operation as the store option change.
+            (when-not writing?
+              (add-store server db-name store true))
+            result)
+          (catch Throwable t
+            (when-not writing?
+              (rollback-assoc-opt! server
+                                  db-name
+                                  store
+                                  old-opts
+                                  k'
+                                  rollback-backup))
+            (throw t))
+          (finally
+            (when-not writing?
+              (cleanup-assoc-opt-rollback-backup! rollback-backup))))))))
+
 (defn- assoc-opt
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
   (wrap-error
     (let [db-name (nth args 0)
           store   (store server skey db-name writing?)
-          result  (apply i/assoc-opt store (rest args))]
-      ;; Defer HA lifecycle changes for staged write transactions until commit.
-      (when-not writing?
-        (update-db server db-name
-                   #(ensure-ha-runtime (.-root server) db-name % store))
-        (ensure-ha-renew-loop server db-name))
+          [k v]   (rest args)
+          result  (apply-assoc-opt! server db-name store writing? k v)]
       (write-message skey {:type :command-complete
                            :result result}))))
 
@@ -3088,13 +3503,17 @@
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
         (.acquire ^Semaphore (get-lock server db-name))
-        (let [kv-store (get-kv-store server db-name)]
-          (locking kv-store
+        (try
+          (let [{:keys [kv-store wlmdb]}
+                (open-write-txn-with-retry server db-name)]
             (update-db server db-name
-                       #(assoc % :wlmdb (i/open-transact-kv kv-store)))
+                       #(assoc % :wlmdb wlmdb))
             (let [runner (write-txn-runner server db-name kv-store)]
               (write-message skey {:type :command-complete})
-              (run-calls runner))))))))
+              (run-calls runner)))
+          (catch Throwable t
+            (.release ^Semaphore (get-in (.-dbs server) [db-name :lock]))
+            (throw t)))))))
 
 (defn- close-transact-kv
   [^Server server ^SelectionKey skey {:keys [args]}]
@@ -3140,21 +3559,23 @@
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
         (.acquire ^Semaphore (get-lock server db-name))
-        (let [kv-store (get-kv-store server db-name)]
-          (locking kv-store
-            (let [wlmdb  (i/open-transact-kv kv-store)
-                  ostore (get-store server db-name)
-                  wstore (st/transfer ostore wlmdb)
-                  runner (write-txn-runner server db-name kv-store)]
-              (update-db
-                server db-name #(assoc %
-                                       :wlmdb wlmdb
-                                       :wstore wstore
-                                       :wdt-db (new-runtime-db
-                                                 wstore
-                                                 (current-runtime-opts %))))
-              (write-message skey {:type :command-complete})
-              (run-calls runner))))))))
+        (try
+          (let [{:keys [store kv-store wlmdb]}
+                (open-write-txn-with-retry server db-name)
+                wstore (st/transfer store wlmdb)
+                runner (write-txn-runner server db-name kv-store)]
+            (update-db
+              server db-name #(assoc %
+                                     :wlmdb wlmdb
+                                     :wstore wstore
+                                     :wdt-db (new-runtime-db
+                                               wstore
+                                               (current-runtime-opts %))))
+            (write-message skey {:type :command-complete})
+            (run-calls runner))
+          (catch Throwable t
+            (.release ^Semaphore (get-in (.-dbs server) [db-name :lock]))
+            (throw t)))))))
 
 (defn- close-transact
   [^Server server ^SelectionKey skey {:keys [args]}]
@@ -4155,7 +4576,8 @@
                              clients
                              dbs)]
         (doseq [db-name (keys dbs)]
-          (ensure-ha-renew-loop server db-name))
+          (ensure-ha-renew-loop server db-name)
+          (ensure-ha-follower-sync-loop server db-name))
         server))
     (catch Exception e
       (u/raise "Error creating server:" (ex-message e) {}))))

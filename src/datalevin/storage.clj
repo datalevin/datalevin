@@ -463,9 +463,12 @@
           new-opts (-> opts
                        (dissoc k)
                        (assoc k' v))]
-      (vld/validate-ha-options new-opts)
-      (set! opts new-opts)
-      (transact-opts lmdb new-opts)))
+      (vld/validate-ha-store-opts new-opts)
+      (if (= opts new-opts)
+        opts
+        (do
+          (set! opts new-opts)
+          (transact-opts lmdb new-opts)))))
 
   (db-name [_] (:db-name opts))
 
@@ -1724,6 +1727,16 @@
    :ha-clock-skew-hook
    :ha-membership-hash])
 
+(def ^:private non-persistable-ha-option-keys
+  [:ha-node-id
+   :ha-client-credentials
+   :ha-fencing-hook
+   :ha-clock-skew-hook])
+
+(def ^:private non-persistable-ha-control-plane-option-keys
+  [:local-peer-id
+   :raft-dir])
+
 (def ^:private raw-persist-open-opts-key
   ::raw-persist-open-opts?)
 
@@ -1762,10 +1775,28 @@
       (contains? opts :kv-opts)
       (assoc :kv-opts compact-kv-opts))))
 
+(defn- persistable-ha-control-plane-opts
+  [cp]
+  (cond-> (or cp {})
+    (map? cp) (dissoc :local-peer-id :raft-dir)))
+
+(defn- persistable-ha-opts
+  [opts]
+  (let [opts (apply dissoc (or opts {}) non-persistable-ha-option-keys)]
+    (cond-> opts
+      (contains? opts :ha-control-plane)
+      (update :ha-control-plane persistable-ha-control-plane-opts))))
+
+(defn- store-visible-opts
+  [opts]
+  (-> (persistable-ha-opts opts)
+      (dissoc raw-persist-open-opts-key)))
+
 (defn- persistable-opts
   [opts]
   (let [opts (-> opts
                  compact-persisted-kv-opts
+                 persistable-ha-opts
                  (dissoc :embedding-providers
                          :embedding-domain-providers
                          raw-persist-open-opts-key))
@@ -2146,10 +2177,16 @@
     (u/file-exists (txlog-dir-path dir))
     (assoc :wal? true)))
 
+(defn- existing-store-probe-kv-opts
+  [dir kv-opts]
+  (assoc (existing-store-open-kv-opts dir kv-opts)
+         :snapshot-bootstrap-force? false
+         :snapshot-scheduler? false))
+
 (defn- load-existing-store-opts
   [dir kv-opts]
   (when (existing-store? dir)
-    (let [probe (lmdb/open-kv dir (existing-store-open-kv-opts dir kv-opts))]
+    (let [probe (lmdb/open-kv dir (existing-store-probe-kv-opts dir kv-opts))]
       (try
         (open-dbis probe)
         (not-empty (load-opts probe))
@@ -2257,7 +2294,7 @@
                            (:db-name opts2)
                            (str (UUID/randomUUID)))
            opts3     (assoc opts2 :db-identity db-identity)
-           _         (vld/validate-ha-options opts3)
+           _         (vld/validate-ha-store-opts opts3)
            _         (vld/validate-embedding-options opts3)
            _         (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
                        (prn :storage-open
@@ -2306,7 +2343,8 @@
                                   :embedding-domains e-domains))
              e-providers (init-embedding-providers dir e-domains
                                                    embedding-providers)]
-         (let [opts4 (assoc opts4 :embedding-domain-providers e-providers)]
+         (let [opts4 (assoc opts4 :embedding-domain-providers e-providers)
+               store-opts (store-visible-opts opts4)]
          (if raw-persist-open-opts?
            (transact-opts-raw lmdb opts4)
            (transact-opts lmdb opts4))
@@ -2317,7 +2355,7 @@
                   (init-idoc-indices lmdb i-domains)
                   e-providers
                   (ConcurrentHashMap.)
-                  opts4
+                  store-opts
                   schema
                   (schema->rschema schema)
                   (init-attrs schema)
@@ -2363,6 +2401,28 @@
            ;; Sampling work may still be queued against an older Store wrapper.
            ;; Keep close/sampling coordination on a shared lock across wrappers
            ;; that refer to the same logical store/LMDB lifecycle.
+           (.-sampling-lock old)))
+
+(defn with-open-opts
+  "Return a Store wrapper over the same open LMDB state but with different
+  in-memory opts. This does not persist opts back into LMDB."
+  [^Store old new-opts]
+  (->Store (.-lmdb old)
+           (.-search-engines old)
+           (.-vector-indices old)
+           (.-embedding-indices old)
+           (.-idoc-indices old)
+           (.-embedding-providers old)
+           (.-counts old)
+           (store-visible-opts new-opts)
+           (schema old)
+           (rschema old)
+           (attrs old)
+           (max-aid old)
+           (max-gt old)
+           (max-tx old)
+           (.-scheduled-sampling old)
+           (.-write-txn old)
            (.-sampling-lock old)))
 
 (defn sync-max-gt-floor!

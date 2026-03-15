@@ -2290,15 +2290,6 @@
                              :data)
                 (catch Throwable _
                   nil))
-              0))
-    (long (or (try
-                (i/get-value lmdb
-                             c/kv-info
-                             c/ha-local-applied-lsn
-                             :keyword
-                             :data)
-                (catch Throwable _
-                  nil))
               0)))))
 
 (defn- align-runtime-txlog-payload-floor!
@@ -2443,14 +2434,20 @@
 
 (defn- apply-lmdb-after-txlog-append!
   [lmdb state rows]
-  (try
-    (u/repeat-try-catch
-     c/+in-tx-overflow-times+
-     l/resized?
-     (i/transact-kv lmdb rows))
-    (catch Exception e
-      (txlog-mark-fatal! state e)
-      (throw e))))
+  ;; These rows have already been assigned a durable WAL position. Apply them
+  ;; to LMDB without routing back through the live txlog path, otherwise we
+  ;; consume an extra local LSN while materializing the same record.
+  (with-runtime-txlog-rollback
+    lmdb
+    (fn []
+      (try
+        (u/repeat-try-catch
+         c/+in-tx-overflow-times+
+         l/resized?
+         (i/transact-kv lmdb rows))
+        (catch Exception e
+          (txlog-mark-fatal! state e)
+          (throw e))))))
 
 (defn ^:no-doc mirror-replayed-txlog-record!
   "Append a replicated HA record into the local txlog at the same LSN and

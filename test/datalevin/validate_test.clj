@@ -32,6 +32,15 @@
                       :election-timeout-ms 3000
                       :operation-timeout-ms 5000}})
 
+(defn- persisted-ha-store-opts
+  []
+  (-> (valid-ha-opts)
+      (dissoc :ha-node-id
+              :ha-client-credentials
+              :ha-fencing-hook
+              :ha-clock-skew-hook)
+      (update :ha-control-plane dissoc :local-peer-id :raft-dir)))
+
 (deftest derive-ha-membership-hash-deterministic-test
   (let [opts-a (valid-ha-opts)
         opts-b (-> (valid-ha-opts)
@@ -74,6 +83,23 @@
                       {:username "ha-replica"
                        :password "p@ss:word"})]
       (is (= opts (vld/validate-ha-options opts)))))
+
+  (testing "accepts persisted HA store opts without node-local identity"
+    (let [opts (persisted-ha-store-opts)]
+      (is (= opts (vld/validate-ha-store-opts opts)))))
+
+  (testing "rejects missing node-local identity in runtime HA validation"
+    (let [opts (-> (persisted-ha-store-opts)
+                   (assoc :ha-fencing-hook {:cmd ["/usr/local/bin/dtlv-fence"]
+                                            :timeout-ms 3000
+                                            :retries 2
+                                            :retry-delay-ms 1000})
+                   (assoc-in [:ha-control-plane :local-peer-id]
+                             "10.0.0.12:7801"))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"ha-node-id must be a positive integer"
+           (vld/validate-ha-options opts)))))
 
   (testing "rejects unsorted :ha-members"
     (let [opts (assoc (valid-ha-opts)
@@ -152,3 +178,23 @@
            clojure.lang.ExceptionInfo
            #"ha-client-credentials :username must be a non-blank string without ':'"
            (vld/validate-ha-options opts))))))
+
+(deftest validate-option-mutation-rejects-node-local-ha-fields-test
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"node-local HA runtime config"
+       (vld/validate-option-mutation :ha-node-id 2)))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"cannot persist node-local fields"
+       (vld/validate-option-mutation
+        :ha-control-plane
+        {:backend :sofa-jraft
+         :group-id "ha-prod"
+         :local-peer-id "10.0.0.12:7801"
+         :rpc-timeout-ms 2000
+         :election-timeout-ms 3000
+         :operation-timeout-ms 5000
+         :voters [{:peer-id "10.0.0.11:7801" :ha-node-id 1 :promotable? true}
+                  {:peer-id "10.0.0.12:7801" :ha-node-id 2 :promotable? true}
+                  {:peer-id "10.0.0.13:7801" :ha-node-id 3 :promotable? true}]}))))

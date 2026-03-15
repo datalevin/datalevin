@@ -1,6 +1,7 @@
 (ns datalevin.storage-test
   (:require
    [clojure.java.io :as io]
+   [datalevin.lmdb :as l]
    [datalevin.storage :as sut]
    [datalevin.util :as u]
    [datalevin.constants :as c]
@@ -65,7 +66,6 @@
    :db-name
    :db-identity
    :ha-mode
-   :ha-node-id
    :ha-members
    :ha-control-plane
    :ha-lease-renew-ms
@@ -73,11 +73,15 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
-   :ha-client-credentials
    :ha-demotion-drain-ms
    :ha-clock-skew-budget-ms
-   :ha-fencing-hook
    :kv-opts])
+
+(defn- persisted-ha-store-view
+  [opts]
+  (cond-> (select-keys opts persisted-ha-store-opt-keys)
+    (map? (:ha-control-plane opts))
+    (update :ha-control-plane dissoc :local-peer-id :raft-dir)))
 
 (defn- repo-tmp-dir
   [prefix]
@@ -330,20 +334,28 @@
   (let [dir      (repo-tmp-dir "storage-ha-reopen-")
         opts     (valid-ha-store-opts)
         store    (sut/open dir nil opts)
-        expected (select-keys (if/opts store) persisted-ha-store-opt-keys)
+        expected (persisted-ha-store-view (if/opts store))
         normalized-expected
-        (select-keys (#'sut/propagate-top-level-txlog-opts-to-kv-opts
-                      (if/opts store))
-                     persisted-ha-store-opt-keys)
+        (persisted-ha-store-view
+         (#'sut/propagate-top-level-txlog-opts-to-kv-opts
+          (if/opts store)))
         live-persisted
-        (select-keys
-          (#'sut/load-opts (.-lmdb ^Store store))
-          persisted-ha-store-opt-keys)]
+        (persisted-ha-store-view (#'sut/load-opts (.-lmdb ^Store store)))]
     (try
       (is (= expected live-persisted)
           (pr-str {:dir dir
                    :live-persisted live-persisted
                    :store-opts expected}))
+      (is (nil? (:ha-node-id (if/opts store))))
+      (is (nil? (:ha-client-credentials (if/opts store))))
+      (is (nil? (:ha-fencing-hook (if/opts store))))
+      (is (nil? (get-in (if/opts store)
+                        [:ha-control-plane :local-peer-id])))
+      (is (nil? (:ha-node-id (#'sut/load-opts (.-lmdb ^Store store)))))
+      (is (nil? (:ha-client-credentials (#'sut/load-opts (.-lmdb ^Store store)))))
+      (is (nil? (:ha-fencing-hook (#'sut/load-opts (.-lmdb ^Store store)))))
+      (is (nil? (get-in (#'sut/load-opts (.-lmdb ^Store store))
+                        [:ha-control-plane :local-peer-id])))
       (if/close store)
       (let [incoming   (#'sut/propagate-top-level-txlog-opts-to-kv-opts nil)
             persisted  (#'sut/load-existing-store-opts dir (:kv-opts incoming))
@@ -352,40 +364,57 @@
                         :persisted-existing?
                         (#'sut/existing-store? dir)
                         :persisted
-                        (select-keys persisted persisted-ha-store-opt-keys)}]
+                        (persisted-ha-store-view persisted)}]
         (is (= expected
-               (select-keys persisted persisted-ha-store-opt-keys))
+               (persisted-ha-store-view persisted))
             (pr-str debug-info)))
       (let [reopened (sut/open dir nil)
             debug-info {:dir dir
                         :txlog-opts-ops (txlog-opts-ops dir)
                         :persisted
-                        (select-keys
-                          (#'sut/load-existing-store-opts dir nil)
-                          persisted-ha-store-opt-keys)
+                        (persisted-ha-store-view
+                         (#'sut/load-existing-store-opts dir nil))
                         :reopened
-                        (select-keys (if/opts reopened)
-                                     persisted-ha-store-opt-keys)}]
+                        (persisted-ha-store-view (if/opts reopened))}]
         (is (= normalized-expected
-               (select-keys (if/opts reopened)
-                            persisted-ha-store-opt-keys))
+               (persisted-ha-store-view (if/opts reopened)))
             (pr-str debug-info))
+        (is (nil? (:ha-node-id (if/opts reopened))))
+        (is (nil? (get-in (if/opts reopened)
+                          [:ha-control-plane :local-peer-id])))
         (if/close reopened))
       (let [reopened (sut/open dir nil {:wal? true})
             debug-info {:dir dir
                         :txlog-opts-ops (txlog-opts-ops dir)
                         :persisted
-                        (select-keys
-                          (#'sut/load-existing-store-opts dir {:wal? true})
-                          persisted-ha-store-opt-keys)
+                        (persisted-ha-store-view
+                         (#'sut/load-existing-store-opts dir {:wal? true}))
                         :reopened
-                        (select-keys (if/opts reopened)
-                                     persisted-ha-store-opt-keys)}]
+                        (persisted-ha-store-view (if/opts reopened))}]
         (is (= expected
-               (select-keys (if/opts reopened)
-                            persisted-ha-store-opt-keys))
+               (persisted-ha-store-view (if/opts reopened)))
             (pr-str debug-info))
         (if/close reopened))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest load-existing-store-opts-uses-snapshot-inert-probe-test
+  (let [dir           (repo-tmp-dir "storage-ha-probe-")
+        opts          (valid-ha-store-opts)
+        store         (sut/open dir nil opts)
+        original-open l/open-kv
+        captured-opts (atom nil)]
+    (try
+      (if/close store)
+      (with-redefs [l/open-kv
+                    (fn [path kv-opts]
+                      (reset! captured-opts kv-opts)
+                      (original-open path kv-opts))]
+        (is (= (persisted-ha-store-view (if/opts store))
+               (persisted-ha-store-view
+                (#'sut/load-existing-store-opts dir nil)))))
+      (is (false? (:snapshot-bootstrap-force? @captured-opts)))
+      (is (false? (:snapshot-scheduler? @captured-opts)))
       (finally
         (u/delete-files dir)))))
 

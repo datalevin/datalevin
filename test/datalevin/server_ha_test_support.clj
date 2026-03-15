@@ -524,18 +524,22 @@
   (when-let [db-state (e2e-db-state (get-in ctx [:servers node-id])
                                     (:db-name ctx))]
     (let [store (:store db-state)]
-      (when (instance? Store store)
-        (let [store-dir (i/dir store)
-              store-opts (i/opts store)
-              fresh-store (st/open store-dir nil store-opts)]
-          (try
-            (d/q e2e-ha-value-query
-                 (db/new-db fresh-store)
-                 key)
-            (catch Throwable _
-              nil)
-            (finally
-              (i/close fresh-store))))))))
+      (when (and (instance? Store store)
+                 (not (e2e-store-open? store)))
+        (try
+          (let [store-dir (i/dir store)
+                store-opts (i/opts store)
+                fresh-store (st/open store-dir nil store-opts)]
+            (try
+              (d/q e2e-ha-value-query
+                   (db/new-db fresh-store)
+                   key)
+              (catch Throwable _
+                nil)
+              (finally
+                (i/close fresh-store))))
+          (catch Throwable _
+            nil))))))
 
 (defn e2e-remote-open-tx-log-rows
   [ctx node-id from-lsn upto-lsn]
@@ -864,9 +868,43 @@
 
 (defn e2e-write-value!
   [conns leader-id key value]
-  (d/transact! (get conns leader-id)
-               [{:drill/key key
-                 :drill/value value}]))
+  (let [tx-data [{:drill/key key
+                  :drill/value value}]
+        deadline-ms (+ (now-ms) 15000)]
+    (loop [target-node-id leader-id]
+      (let [conn (get conns target-node-id)]
+        (when-not conn
+          (throw (ex-info "Missing E2E HA connection for write target"
+                          {:leader-id leader-id
+                           :target-node-id target-node-id
+                           :key key
+                           :value value})))
+        (let [attempt (try
+                        {:ok? true
+                         :result (d/transact! conn tx-data)}
+                        (catch Throwable e
+                          {:ok? false
+                           :error e}))]
+          (if (:ok? attempt)
+            (:result attempt)
+            (let [e (:error attempt)
+                  data (ex-data e)
+                  err-data (:err-data data)
+                  bad-rslot? (or (s/includes? (or (:server-message data) "")
+                                              "MDB_BAD_RSLOT")
+                                 (s/includes? (or (:cause err-data) "")
+                                              "MDB_BAD_RSLOT"))
+                  retryable? (and (map? err-data)
+                                  (= :ha/write-rejected (:error err-data))
+                                  (true? (:retryable? err-data)))
+                  next-node-id (or (:ha-authoritative-leader-node-id err-data)
+                                   target-node-id)]
+              (if (and (or retryable? bad-rslot?)
+                       (< (now-ms) deadline-ms))
+                (do
+                  (Thread/sleep 250)
+                  (recur next-node-id))
+                (throw e)))))))))
 
 (defmacro with-e2e-control-backend
   [control-backend & body]
@@ -1473,7 +1511,8 @@
                                                         drifted-node-id)]
             (e2e-write-value! (:conns ctx) leader-id "seed" "v1")
             (e2e-verify-value-on-nodes! ctx (:live-node-ids ctx) "seed" "v1")
-            (let [drift-error
+            (let [baseline-lsn (e2e-effective-local-lsn ctx leader-id)
+                  drift-error
                   (try
                     (i/assoc-opt leader-store :ha-members drifted-members)
                     nil
@@ -1491,7 +1530,16 @@
                     (e2e-wait-for-single-leader! (:servers ctx)
                                                  (:db-name ctx)
                                                  (:live-node-ids ctx)
-                                                 leader-timeout-ms)]
+                                                 leader-timeout-ms)
+                    stabilized-lsn (max baseline-lsn
+                                        (e2e-effective-local-lsn ctx
+                                                                 leader-id))]
+                (e2e-wait-for-live-followers-under-leader! ctx-atom
+                                                           leader-id
+                                                           stabilized-lsn
+                                                           "seed"
+                                                           "v1")
+                (let [ctx @ctx-atom]
                 (e2e-write-value! (:conns ctx) leader-id "post-reconcile" "v2")
                 (e2e-verify-value-on-nodes! ctx
                                             (:live-node-ids ctx)
@@ -1505,7 +1553,7 @@
                  :recovered-node-diagnostics
                  (e2e-node-diagnostics-by-node (:servers ctx)
                                                (:db-name ctx)
-                                               (:live-node-ids ctx))})))))
+                                               (:live-node-ids ctx))}))))))
       (finally
         (log/set-config! old-config)))))
 

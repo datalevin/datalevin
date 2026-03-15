@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+version=$(sed -n 's/^(def version "\(.*\)")/\1/p' project.clj | head -n1)
+
+lein clean
+
+clojure -T:build embedded-jar
+lein deploy clojars datalevin/datalevin-embedded "$version" \
+  "target/datalevin-embedded-$version.jar" \
+  "target/datalevin-embedded-$version.pom"

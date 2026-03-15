@@ -96,8 +96,9 @@
   (let [result (run-e2e-ha-membership-hash-drift! :in-memory)]
     (is (= :in-memory (:control-backend result)))
     (is (integer? (:drifted-node-id result)))
-    (is (= :ha/membership-hash-mismatch
-           (get-in result [:drift-error :data :err-data :error])))
+    (is (= :ha/unsafe-live-option-mutation
+           (or (get-in result [:drift-error :data :err-data :error])
+               (get-in result [:drift-error :data :error]))))
     (is (integer? (:recovered-leader-id result)))
     (is (true? (get-in result
                        [:recovered-node-diagnostics

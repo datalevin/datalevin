@@ -75,7 +75,8 @@
                       :observed-version 0
                       :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))
             next-state (with-redefs-fn
@@ -100,7 +101,7 @@
                                      :applied-lsn applied-lsn})
                             {:ok? true})}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (:ok? acquire))
         (is (= [1 2] @applied))
         (is (= :follower (:ha-role next-state)))
@@ -679,19 +680,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 3
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 3
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))
             next-state (with-redefs-fn
@@ -716,7 +718,7 @@
                           #'dha/read-ha-local-last-applied-lsn
                           (fn [_] 0)}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (empty? @applied))
         (is (= :follower (:ha-role next-state)))
         (is (= :sync-failed (:ha-follower-last-error next-state)))
@@ -749,19 +751,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 3
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 3
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))]
         (with-redefs-fn
@@ -783,7 +786,7 @@
                              {:error :ha/follower-snapshot-unavailable
                               :endpoint endpoint})))}
           (fn []
-            (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
+            (reset! next-state (#'srv/ha-follower-sync-step "orders" follower-runtime)))))
       (let [state @next-state
             gap-data (get-in state
                              [:ha-follower-last-error-details
@@ -808,19 +811,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 3
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 3
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))
             step-state
@@ -834,7 +838,7 @@
                  #'dha/read-ha-local-last-applied-lsn
                  (fn [_] 0)}
                 (fn []
-                  (#'srv/ha-renew-step "orders" state))))
+                  (#'srv/ha-follower-sync-step "orders" state))))
             state-1 (step-state follower-runtime)
             state-2 (step-state state-1)]
         (is (= 1 @fetch-calls))
@@ -856,19 +860,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 2
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 2
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))
             next-state (with-redefs-fn
@@ -903,7 +908,7 @@
                                               :applied-lsn applied-lsn})
                             {:ok? true})}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (= ["10.0.0.11:8898" "10.0.0.13:8898"] @calls))
         (is (= :follower (:ha-role next-state)))
         (is (= 2 (:ha-local-last-applied-lsn next-state)))
@@ -926,19 +931,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 5
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 5
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 10
                                         :ha-local-last-applied-lsn 9))
             next-state (with-redefs-fn
@@ -976,7 +982,7 @@
                                            :ha-follower-last-error nil
                                            :ha-follower-degraded? nil)})}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (= :follower (:ha-role next-state)))
         (is (= 5 (:ha-local-last-applied-lsn next-state)))
         (is (= 6 (:ha-follower-next-lsn next-state)))
@@ -994,19 +1000,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 26
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 26
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 99
                                         :ha-local-last-applied-lsn 26))
             next-state (with-redefs-fn
@@ -1030,7 +1037,7 @@
                               (throw (ex-info "unexpected-endpoint"
                                               {:endpoint endpoint}))))}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (= :follower (:ha-role next-state)))
         (is (= 26 (:ha-local-last-applied-lsn next-state)))
         (is (= 27 (:ha-follower-next-lsn next-state))))
@@ -1437,19 +1444,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 2
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 2
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
-                                 (assoc :ha-role :follower
+                                 (assoc :ha-authority-lease (:lease acquire)
+                                        :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))
             next-state (with-redefs-fn
@@ -1490,7 +1498,7 @@
                                               :applied-lsn applied-lsn})
                             {:ok? true})}
                          (fn []
-                           (#'srv/ha-renew-step "orders" follower-runtime)))]
+                           (#'srv/ha-follower-sync-step "orders" follower-runtime)))]
         (is (= ["10.0.0.11:8898" "10.0.0.14:8898"] @calls))
         (is (= :follower (:ha-role next-state)))
         (is (= "10.0.0.14:8898" (:ha-follower-source-endpoint next-state)))
@@ -1747,9 +1755,12 @@
                               c/ha-local-applied-lsn
                               :keyword :data)))
           (is (<= watermark-lsn @snapshot-lsn*))
-          (is (= 1
+          (is (nil?
                  (i/get-value installed-kv c/opts
                               :ha-node-id :attr :data)))
+          (is (nil? (:ha-node-id (i/opts installed-store))))
+          (is (nil? (get-in (i/opts installed-store)
+                            [:ha-control-plane :local-peer-id])))
           (is (= @snapshot-lsn*
                  (dha/read-ha-local-last-applied-lsn
                   {:store installed-store})))))
@@ -1795,8 +1806,9 @@
                         :dt-db nil})))
       (is (instance? Store @recovered-store))
       (is (not (identical? local-store @recovered-store)))
-      (is (= 1
-             (:ha-node-id (i/opts @recovered-store))))
+      (is (= db-identity
+             (:db-identity (i/opts @recovered-store))))
+      (is (nil? (:ha-node-id (i/opts @recovered-store))))
       (finally
         (when-let [store @recovered-store]
           (when-not (i/closed? store)
@@ -1804,6 +1816,104 @@
         (when-not (i/closed? local-store)
           (i/close local-store))
         (u/delete-files local-dir)))))
+
+(deftest reopen-ha-local-store-if-needed-preserves-local-ha-runtime-opts-after-replayed-opts-test
+  (let [db-name "orders"
+        db-identity (str "db-" (UUID/randomUUID))
+        group-id (str "ha-reopen-local-ha-opts-" (UUID/randomUUID))
+        leader-dir (u/tmp-dir (str "ha-reopen-leader-" (UUID/randomUUID)))
+        follower-dir (u/tmp-dir (str "ha-reopen-follower-" (UUID/randomUUID)))
+        leader-opts (-> (valid-ha-opts group-id)
+                        (assoc :db-name db-name
+                               :db-identity db-identity
+                               :ha-node-id 1
+                               :ha-client-credentials
+                               {:username "leader-ha"
+                                :password "secret-1"}
+                               :wal? true)
+                        (update :ha-control-plane merge
+                                {:backend :sofa-jraft
+                                 :rpc-timeout-ms 5000
+                                 :election-timeout-ms 5000
+                                 :operation-timeout-ms 30000
+                                 :local-peer-id "10.0.0.11:7801"}))
+        follower-opts (-> (valid-ha-opts group-id)
+                          (assoc :db-name db-name
+                                 :db-identity db-identity
+                                 :ha-node-id 2
+                                 :ha-client-credentials
+                                 {:username "follower-ha"
+                                  :password "secret-2"}
+                                 :wal? true)
+                          (update :ha-control-plane merge
+                                  {:backend :sofa-jraft
+                                   :rpc-timeout-ms 5000
+                                   :election-timeout-ms 5000
+                                   :operation-timeout-ms 30000
+                                   :local-peer-id "10.0.0.12:7801"}))
+        drifted-members [{:node-id 1 :endpoint "127.0.0.1:29001"}
+                         {:node-id 2 :endpoint "127.0.0.1:8898"}
+                         {:node-id 3 :endpoint "127.0.0.1:8899"}]
+        leader-store (st/open leader-dir nil leader-opts)
+        follower-store-v (volatile! nil)
+        reopened-store (atom nil)]
+    (try
+      (vreset! follower-store-v (st/open follower-dir nil follower-opts))
+      (let [_ (i/assoc-opt leader-store :ha-members drifted-members)
+            record (->> (kv/open-tx-log-rows (.-lmdb leader-store) 1 nil)
+                        (filter (fn [row]
+                                  (some (fn [[op dbi k]]
+                                          (and (= op :put)
+                                               (= dbi c/opts)
+                                               (= k :ha-members)))
+                                        (:rows row))))
+                        last)]
+        (is record)
+        (when record
+          (let [applied-state (#'dha/apply-ha-follower-txlog-record!
+                               {:store @follower-store-v
+                                :dt-db (db/new-db @follower-store-v)
+                                :ha-db-identity db-identity
+                                :ha-runtime-opts follower-opts}
+                               record)]
+            (vreset! follower-store-v (:store applied-state))
+            (is (nil?
+                   (i/get-value (.-lmdb ^Store @follower-store-v)
+                               c/opts
+                                :ha-node-id
+                                :attr
+                                :data)))
+            (is (= follower-opts
+                   (:ha-runtime-opts applied-state)))
+            (is (nil? (:ha-node-id (i/opts @follower-store-v))))
+            (is (nil? (:ha-client-credentials (i/opts @follower-store-v))))
+            (is (nil? (get-in (i/opts @follower-store-v)
+                              [:ha-control-plane :local-peer-id])))
+            (i/close @follower-store-v)
+            (let [reopened-state (#'dha/reopen-ha-local-store-if-needed
+                                  {:store @follower-store-v
+                                   :dt-db nil
+                                   :ha-db-identity db-identity
+                                   :ha-runtime-opts follower-opts})]
+              (reset! reopened-store (:store reopened-state))
+              (is (= follower-opts
+                     (:ha-runtime-opts reopened-state)))
+              (is (nil? (:ha-node-id (i/opts @reopened-store))))
+              (is (nil? (:ha-client-credentials
+                         (i/opts @reopened-store))))
+              (is (nil? (get-in (i/opts @reopened-store)
+                                [:ha-control-plane :local-peer-id])))))))
+      (finally
+        (when-let [store @reopened-store]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-let [store @follower-store-v]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-not (i/closed? leader-store)
+          (i/close leader-store))
+        (u/delete-files follower-dir)
+        (u/delete-files leader-dir)))))
 
 (deftest read-ha-local-last-applied-lsn-falls-back-to-cached-state-when-store-closed-test
   (let [dir (u/tmp-dir (str "ha-closed-store-fallback-" (UUID/randomUUID)))
@@ -1847,7 +1957,7 @@
           (i/close runtime-store))
         (u/delete-files dir)))))
 
-(deftest read-ha-local-last-applied-lsn-prefers-follower-ha-floor-test
+(deftest read-ha-local-last-applied-lsn-clamps-follower-ha-floor-to-local-data-test
   (let [dir (u/tmp-dir (str "ha-follower-watermark-" (UUID/randomUUID)))
         store (st/open dir nil {:db-name "orders"
                                 :db-identity (str "db-" (UUID/randomUUID))
@@ -1867,12 +1977,12 @@
                                        (i/txlog-watermarks lmdb))
                                       0))]
           (is (>= watermark-lsn initial-watermark-lsn))
-          (is (= (+ initial-watermark-lsn 7)
+          (is (= watermark-lsn
                  (dha/read-ha-local-last-applied-lsn
                   {:store store
                    :ha-role :follower
                    :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
-          (is (= (+ initial-watermark-lsn 7)
+          (is (= watermark-lsn
                  (dha/read-ha-local-last-applied-lsn
                   {:store store
                    :ha-role :leader})))))
@@ -1906,7 +2016,89 @@
           (i/close store))
         (u/delete-files dir)))))
 
-(deftest refresh-ha-local-watermarks-prefers-follower-ha-floor-over-raw-watermark-test
+(deftest reopen-store-does-not-align-runtime-txlog-to-stale-ha-floor-test
+  (let [dir (u/tmp-dir (str "ha-reopen-floor-clamp-" (UUID/randomUUID)))
+        db-identity (str "db-" (UUID/randomUUID))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity db-identity
+                                :wal? true})]
+    (try
+      (let [lmdb (.-lmdb ^Store store)]
+        (i/open-dbi lmdb "a")
+        (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
+        (let [payload-lsn (long (or (i/get-value lmdb c/kv-info
+                                                 c/wal-local-payload-lsn
+                                                 :keyword :data)
+                                    0))]
+          (is (pos? payload-lsn))
+          (#'dha/persist-ha-local-applied-lsn!
+           {:store store}
+           (+ payload-lsn 7))
+          (i/close store)
+          (let [reopened-store (st/open dir nil {:db-name "orders"
+                                                 :db-identity db-identity
+                                                 :wal? true})]
+            (try
+              (let [reopened-lmdb (.-lmdb ^Store reopened-store)
+                    watermarks (i/txlog-watermarks reopened-lmdb)]
+                (is (= payload-lsn
+                       (:last-appended-lsn watermarks)))
+                (is (= payload-lsn
+                       (:last-durable-lsn watermarks)))
+                (is (= payload-lsn
+                       (:last-applied-lsn watermarks)))
+                (is (= payload-lsn
+                       (dha/read-ha-local-last-applied-lsn
+                        {:store reopened-store
+                         :ha-role :follower
+                         :ha-local-last-applied-lsn (+ payload-lsn 7)}))))
+              (finally
+                (when-not (i/closed? reopened-store)
+                  (i/close reopened-store)))))))
+      (finally
+        (when (instance? Store store)
+          (when-not (i/closed? store)
+            (i/close store)))
+        (u/delete-files dir)))))
+
+(deftest ha-local-last-applied-lsn-helper-clamps-stale-runtime-floor-to-local-data-test
+  (let [dir (u/tmp-dir (str "ha-helper-floor-clamp-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        lmdb (.-lmdb ^Store store)]
+    (try
+      (i/open-dbi lmdb "a")
+      (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (let [watermark-lsn (long (or (:last-applied-lsn
+                                     (i/txlog-watermarks lmdb))
+                                    0))]
+        (is (pos? watermark-lsn))
+        (#'dha/persist-ha-local-applied-lsn!
+         {:store store}
+         (+ watermark-lsn 11))
+        (is (= watermark-lsn
+               (#'dha/ha-local-last-applied-lsn
+                {:store store
+                 :ha-role :follower
+                 :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
+        (is (= {:ok? false
+                :leader-last-applied-lsn (inc watermark-lsn)
+                :local-last-applied-lsn watermark-lsn
+                :lag-lsn 1
+                :max-lag-lsn 0}
+               (#'dha/ha-promotion-lag-guard
+                {:store store
+                 :ha-role :follower
+                 :ha-max-promotion-lag-lsn 0
+                 :ha-local-last-applied-lsn (+ watermark-lsn 11)}
+                {:leader-last-applied-lsn (inc watermark-lsn)}))))
+      (finally
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
+
+(deftest refresh-ha-local-watermarks-clamps-follower-ha-floor-to-local-data-test
   (let [dir (u/tmp-dir (str "ha-refresh-follower-watermark-"
                             (UUID/randomUUID)))
         store (st/open dir nil {:db-name "orders"
@@ -1919,12 +2111,39 @@
                                      (i/txlog-watermarks lmdb))
                                     0))]
         (is (pos? watermark-lsn))
-        (is (= 42
+        (is (= watermark-lsn
              (:ha-local-last-applied-lsn
               (#'dha/refresh-ha-local-watermarks
                {:store store
                 :ha-role :follower
                 :ha-local-last-applied-lsn 0})))))
+      (finally
+        (when-not (i/closed? store)
+          (i/close store))
+        (u/delete-files dir)))))
+
+(deftest persist-ha-runtime-local-applied-lsn-clamps-stale-runtime-floor-to-local-data-test
+  (let [dir (u/tmp-dir (str "ha-persist-runtime-floor-" (UUID/randomUUID)))
+        store (st/open dir nil {:db-name "orders"
+                                :db-identity (str "db-" (UUID/randomUUID))
+                                :wal? true})
+        lmdb (.-lmdb ^Store store)]
+    (try
+      (i/open-dbi lmdb "a")
+      (i/transact-kv lmdb [[:put "a" "k1" "v1"]])
+      (let [watermark-lsn (long (or (:last-applied-lsn
+                                     (i/txlog-watermarks lmdb))
+                                    0))]
+        (is (pos? watermark-lsn))
+        (is (= watermark-lsn
+               (dha/persist-ha-runtime-local-applied-lsn!
+                {:store store
+                 :ha-role :follower
+                 :ha-local-last-applied-lsn (+ watermark-lsn 11)})))
+        (is (= watermark-lsn
+               (i/get-value lmdb c/kv-info
+                            c/ha-local-applied-lsn
+                            :keyword :data))))
       (finally
         (when-not (i/closed? store)
           (i/close store))
@@ -2348,19 +2567,20 @@
                       0))
             _ (reset! snapshot-lsn* snapshot-lsn)
             authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity db-identity
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn (inc snapshot-lsn)
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity db-identity
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn (inc snapshot-lsn)
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
                                  (assoc :store local-store
+                                        :ha-authority-lease (:lease acquire)
                                         :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))]
@@ -2400,7 +2620,7 @@
            (fn [_ _ _ _]
              {:ok? true})}
           (fn []
-            (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
+            (reset! next-state (#'srv/ha-follower-sync-step "orders" follower-runtime)))))
       (let [state @next-state
             next-kv (.-lmdb (:store state))]
         (i/open-dbi next-kv "a")
@@ -2463,19 +2683,20 @@
             _ (reset! snapshot-lsn* snapshot-lsn)
             _ (reset! payload-lsn* payload-lsn)
             authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity db-identity
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn payload-lsn
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity db-identity
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn payload-lsn
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
                                  (assoc :store local-store
+                                        :ha-authority-lease (:lease acquire)
                                         :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))]
@@ -2525,7 +2746,7 @@
            (fn [_ _ _ _]
              {:ok? true})}
           (fn []
-            (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
+            (reset! next-state (#'srv/ha-follower-sync-step "orders" follower-runtime)))))
       (let [state @next-state
             next-kv (.-lmdb (:store state))]
         (i/open-dbi next-kv "a")
@@ -2629,7 +2850,9 @@
                    (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
                #'dha/fetch-ha-endpoint-snapshot-copy!
                (fn [_ _ endpoint dest-dir]
-                 (is (= "10.0.0.13:8898" endpoint))
+                 (is (contains? #{"10.0.0.11:8898"
+                                  "10.0.0.13:8898"}
+                                endpoint))
                  {:copy-meta
                   (assoc (i/copy source-kv dest-dir false)
                          :db-name "orders"
@@ -2675,6 +2898,132 @@
                  (get-in bootstrap
                          [:errors 0 :data :resume-next-lsn])))
           (is (not= @poisoned-payload-lsn*
+                    (:ha-local-last-applied-lsn state)))))
+      (finally
+        (when-let [store (:store @bootstrap-state)]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-not (i/closed? source-store)
+          (i/close source-store))
+        (when-not (i/closed? local-store)
+          (i/close local-store))
+        (#'srv/stop-ha-authority "orders" runtime)
+        (u/delete-files local-dir)
+        (u/delete-files source-dir)))))
+
+(deftest bootstrap-ha-follower-from-snapshot-does-not-poison-floor-when-copy-persists-stale-local-applied-lsn-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        local-dir (u/tmp-dir (str "ha-local-copy-persisted-floor-" (UUID/randomUUID)))
+        source-dir (u/tmp-dir (str "ha-source-copy-persisted-floor-" (UUID/randomUUID)))
+        db-identity (:ha-db-identity runtime)
+        local-store (st/open local-dir nil {:db-name "orders"
+                                            :db-identity db-identity
+                                            :wal? true})
+        source-store (st/open source-dir nil {:db-name "orders"
+                                              :db-identity db-identity
+                                              :wal? true})
+        snapshot-lsn* (atom nil)
+        poisoned-persisted-lsn* (atom nil)
+        bootstrap-state (atom nil)
+        now-ms (System/currentTimeMillis)]
+    (try
+      (let [local-kv (.-lmdb local-store)
+            source-kv (.-lmdb source-store)
+            _ (i/open-dbi local-kv "a")
+            _ (i/open-dbi source-kv "a")
+            _ (i/transact-kv source-kv [[:put "a" "k1" "v1"]])
+            _ (i/create-snapshot! source-kv)
+            snapshot-lsn
+            (long (or (i/get-value source-kv c/kv-info
+                                   c/wal-snapshot-current-lsn
+                                   :keyword :data)
+                      0))
+            poisoned-persisted-lsn (+ snapshot-lsn 3)
+            _ (i/transact-kv source-kv c/kv-info
+                             [[:put c/ha-local-applied-lsn
+                               poisoned-persisted-lsn]]
+                             :keyword :data)
+            _ (reset! snapshot-lsn* snapshot-lsn)
+            _ (reset! poisoned-persisted-lsn* poisoned-persisted-lsn)
+            authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity db-identity
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn poisoned-persisted-lsn
+                :now-ms now-ms
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :store local-store
+                                        :ha-role :follower
+                                        :ha-follower-next-lsn 1
+                                        :ha-local-last-applied-lsn 0))
+            lease {:leader-node-id 1
+                   :leader-endpoint "10.0.0.11:8898"
+                   :leader-last-applied-lsn poisoned-persisted-lsn}
+            bootstrap
+            (with-redefs-fn
+              {#'dha/fetch-ha-leader-txlog-batch
+               (fn [_ _ endpoint from-lsn _]
+                 (is (contains? #{"10.0.0.11:8898"
+                                  "10.0.0.13:8898"}
+                                endpoint))
+                 (is (= (inc snapshot-lsn) from-lsn))
+                 [])
+               #'dha/fetch-ha-endpoint-watermark-lsn
+               (fn [_ _ endpoint]
+                 (case endpoint
+                   "10.0.0.11:8898"
+                   {:reachable? true
+                    :last-applied-lsn poisoned-persisted-lsn}
+                   "10.0.0.13:8898"
+                   {:reachable? true
+                    :last-applied-lsn poisoned-persisted-lsn}
+                   (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
+               #'dha/fetch-ha-endpoint-snapshot-copy!
+               (fn [_ _ endpoint dest-dir]
+                 (is (= "10.0.0.13:8898" endpoint))
+                 {:copy-meta
+                  (assoc (i/copy source-kv dest-dir false)
+                         :db-name "orders"
+                         :db-identity db-identity
+                         :snapshot-last-applied-lsn snapshot-lsn
+                         :payload-last-applied-lsn snapshot-lsn)})}
+              (fn []
+                (#'dha/bootstrap-ha-follower-from-snapshot
+                 "orders"
+                 follower-runtime
+                 lease
+                 ["10.0.0.13:8898"]
+                 1
+                 now-ms)))]
+        (reset! bootstrap-state (:state bootstrap))
+        (let [state @bootstrap-state
+              next-kv (.-lmdb (:store state))]
+          (i/open-dbi next-kv "a")
+          (is (false? (:ok? bootstrap)))
+          (is (= @snapshot-lsn* (:ha-local-last-applied-lsn state)))
+          (is (= @snapshot-lsn*
+                 (i/get-value next-kv c/kv-info
+                              c/ha-local-applied-lsn
+                              :keyword :data)))
+          (is (= @snapshot-lsn*
+                 (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
+          (is (= @snapshot-lsn*
+                 (get-in bootstrap
+                         [:errors 0 :data :snapshot-last-applied-lsn])))
+          (is (= @snapshot-lsn*
+                 (get-in bootstrap
+                         [:errors 0 :data :installed-last-applied-lsn])))
+          (is (= (inc @snapshot-lsn*)
+                 (:ha-follower-next-lsn state)))
+          (is (= "v1" (i/get-value next-kv "a" "k1")))
+          (is (not= @poisoned-persisted-lsn*
                     (:ha-local-last-applied-lsn state)))))
       (finally
         (when-let [store (:store @bootstrap-state)]
@@ -2795,19 +3144,20 @@
         now-ms (System/currentTimeMillis)]
     (try
       (let [authority (:ha-authority runtime)
-            _ (ha/try-acquire-lease
-               authority
-               {:db-identity (:ha-db-identity runtime)
-                :leader-node-id 1
-                :leader-endpoint "10.0.0.11:8898"
-                :lease-renew-ms (:ha-lease-renew-ms runtime)
-                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
-                :leader-last-applied-lsn 3
-                :now-ms now-ms
-                :observed-version 0
-                :observed-lease nil})
+            acquire (ha/try-acquire-lease
+                     authority
+                     {:db-identity (:ha-db-identity runtime)
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms (:ha-lease-renew-ms runtime)
+                      :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                      :leader-last-applied-lsn 3
+                      :now-ms now-ms
+                      :observed-version 0
+                      :observed-lease nil})
             follower-runtime (-> runtime
                                  (assoc :store local-store
+                                        :ha-authority-lease (:lease acquire)
                                         :ha-role :follower
                                         :ha-follower-next-lsn 1
                                         :ha-local-last-applied-lsn 0))]
@@ -2838,7 +3188,7 @@
                       :snapshot-db-identity "db-mismatch"
                       :source-endpoint endpoint})))}
           (fn []
-            (reset! next-state (#'srv/ha-renew-step "orders" follower-runtime)))))
+            (reset! next-state (#'srv/ha-follower-sync-step "orders" follower-runtime)))))
       (let [state @next-state]
         (is (= :follower (:ha-role state)))
         (is (true? (:ha-follower-degraded? state)))

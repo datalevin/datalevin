@@ -45,6 +45,54 @@
       (when (= :consensus-lease (:ha-mode opts))
         opts))))
 
+(def ^:private ha-runtime-local-option-keys
+  [:ha-node-id
+   :ha-client-credentials
+   :ha-fencing-hook
+   :ha-clock-skew-hook])
+
+(def ^:private ha-runtime-local-control-plane-option-keys
+  [:local-peer-id
+   :raft-dir])
+
+(defn select-ha-runtime-local-opts
+  "Select the node-local HA runtime config from a full HA opts map."
+  [ha-opts]
+  (let [ha-opts (or ha-opts {})
+        local-opts (select-keys ha-opts ha-runtime-local-option-keys)
+        runtime-control-plane (some-> (:ha-control-plane ha-opts)
+                                      (select-keys
+                                       ha-runtime-local-control-plane-option-keys))]
+    (cond-> local-opts
+      (seq runtime-control-plane)
+      (assoc :ha-control-plane runtime-control-plane))))
+
+(defn merge-ha-runtime-local-opts
+  "Merge node-local HA runtime config back onto a store/runtime opts map without
+  changing the shared persisted HA configuration."
+  [store-opts runtime-opts]
+  (let [store-opts            (or store-opts {})
+        runtime-opts          (or runtime-opts {})
+        local-runtime-opts    (select-ha-runtime-local-opts runtime-opts)
+        local-opts            (select-keys local-runtime-opts
+                                           ha-runtime-local-option-keys)
+        runtime-control-plane (:ha-control-plane local-runtime-opts)
+        store-control-plane   (:ha-control-plane store-opts)]
+    (cond-> (merge store-opts local-opts)
+      (seq runtime-control-plane)
+      (assoc :ha-control-plane
+             (merge (or store-control-plane {})
+                    runtime-control-plane)))))
+
+(defn effective-ha-runtime-local-opts
+  "Return the best available node-local HA config from a runtime state map.
+  This survives HA runtime restarts where the active `:ha-runtime-opts` may be
+  temporarily cleared while the preserved local config remains available."
+  [m]
+  (merge-ha-runtime-local-opts
+   (:ha-runtime-local-opts (or m {}))
+   (some-> m :ha-runtime-opts select-ha-runtime-local-opts)))
+
 (defn- local-ha-endpoint
   [ha-opts]
   (let [node-id (:ha-node-id ha-opts)]
@@ -238,7 +286,34 @@
                 nil))
             0)))
 
+(declare read-ha-local-watermark-lsn)
+
+(defn- ha-local-data-lsn-ceiling
+  [m kv-store]
+  (let [role (:ha-role m)
+        watermark-lsn (read-ha-local-watermark-lsn m)
+        snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
+        payload-lsn (if (= :leader role)
+                      (read-ha-local-payload-lsn kv-store)
+                      0)]
+    {:snapshot-lsn snapshot-lsn
+     :watermark-lsn watermark-lsn
+     :payload-lsn payload-lsn
+     :ceiling-lsn (long (if (= :leader role)
+                          (max watermark-lsn snapshot-lsn payload-lsn)
+                          (max watermark-lsn snapshot-lsn)))}))
+
+(defn- ha-clamped-follower-floor-lsn
+  [persisted-lsn snapshot-lsn ceiling-lsn]
+  (let [tracked-lsn (long (max persisted-lsn snapshot-lsn))]
+    (if (pos? ceiling-lsn)
+      (if (pos? tracked-lsn)
+        (long (min ceiling-lsn tracked-lsn))
+        ceiling-lsn)
+      tracked-lsn)))
+
 (declare read-ha-local-last-applied-lsn)
+(declare read-ha-local-watermark-lsn)
 
 (defn ^:redef read-ha-snapshot-payload-lsn
   [m]
@@ -252,39 +327,20 @@
         role (:ha-role m)]
     (try
       (if-let [kv-store (local-kv-store m)]
-        (let [watermark-lsn (long (or (try
-                                        (get (kv/txlog-watermarks kv-store)
-                                             :last-applied-lsn)
-                                        (catch Throwable t
-                                          (when-not (closed-kv-race? t kv-store)
-                                            (throw t))
-                                          nil))
-                                      0))
-              snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
-              payload-lsn (if (= :leader role)
-                            (read-ha-local-payload-lsn kv-store)
-                            0)
+        (let [{:keys [snapshot-lsn ceiling-lsn]}
+              (ha-local-data-lsn-ceiling m kv-store)
               persisted-lsn (read-ha-local-persisted-lsn kv-store)
-              ha-lsn (long (max persisted-lsn state-lsn))
-              follower-floor-lsn (long (max persisted-lsn snapshot-lsn))
-              local-truth (long (if (= :leader role)
-                                  (max watermark-lsn snapshot-lsn payload-lsn)
-                                  (max watermark-lsn snapshot-lsn)))]
+              follower-floor-lsn
+              (ha-clamped-follower-floor-lsn
+               persisted-lsn snapshot-lsn ceiling-lsn)]
           (cond
             (= :leader role)
-            (long (max ha-lsn local-truth))
+            ceiling-lsn
 
-            (pos? follower-floor-lsn)
+            (pos? ceiling-lsn)
             follower-floor-lsn
 
-            (pos? ha-lsn)
-            ha-lsn
-
-            (pos? local-truth)
-            local-truth
-
-            :else
-            0))
+            :else state-lsn))
         state-lsn)
       (catch Throwable e
         (when-not (closed-kv-race? e (local-kv-store m))
@@ -307,7 +363,8 @@
 (defn persist-ha-runtime-local-applied-lsn!
   [m]
   (when-let [kv-store (local-kv-store m)]
-    (let [persisted-lsn (read-ha-local-persisted-lsn kv-store)
+    (let [{:keys [ceiling-lsn]} (ha-local-data-lsn-ceiling m kv-store)
+          persisted-lsn (read-ha-local-persisted-lsn kv-store)
           state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
           lease-lsn (long (or (get-in m
                                       [:ha-authority-lease
@@ -317,18 +374,24 @@
           ;; former leader's raw local txlog watermark here can overstate how
           ;; much replicated history that node actually shares with the current
           ;; leader on rejoin.
-          applied-lsn (long (if (= :leader (:ha-role m))
-                              (max persisted-lsn lease-lsn)
-                              (max persisted-lsn state-lsn)))]
+          target-lsn (long (if (= :leader (:ha-role m))
+                             (max persisted-lsn lease-lsn)
+                             (max persisted-lsn state-lsn)))
+          applied-lsn (long (if (pos? ceiling-lsn)
+                              (min ceiling-lsn target-lsn)
+                              target-lsn))]
       (when (> applied-lsn persisted-lsn)
         (persist-ha-local-applied-lsn! m applied-lsn))
       applied-lsn)))
 
 (defn- ha-local-last-applied-lsn
   [m]
-  (if (integer? (:ha-local-last-applied-lsn m))
-    (long (:ha-local-last-applied-lsn m))
-    (read-ha-local-last-applied-lsn m)))
+  (let [state-lsn (:ha-local-last-applied-lsn m)]
+    (if (local-kv-store m)
+      (read-ha-local-last-applied-lsn m)
+      (if (integer? state-lsn)
+        (long state-lsn)
+        0))))
 
 (defn- refresh-ha-local-watermarks
   [m]
@@ -336,23 +399,15 @@
     (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
           role (:ha-role m)
           kv-store (local-kv-store m)
+          {:keys [snapshot-lsn ceiling-lsn]}
+          (ha-local-data-lsn-ceiling m kv-store)
           persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
-          watermark-lsn (read-ha-local-watermark-lsn m)
-          snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
-          payload-lsn (if (= :leader role)
-                        (read-ha-local-payload-lsn kv-store)
-                        0)
-          follower-floor-lsn (long (max persisted-lsn snapshot-lsn))
-          local-truth (long (if (= :leader role)
-                              (max watermark-lsn snapshot-lsn payload-lsn)
-                              (max watermark-lsn snapshot-lsn)))
           local-lsn (long (if (= :leader role)
-                            (max state-lsn persisted-lsn local-truth)
-                            (if (pos? follower-floor-lsn)
-                              follower-floor-lsn
-                              (if (pos? local-truth)
-                                local-truth
-                                (max state-lsn persisted-lsn)))))]
+                            ceiling-lsn
+                            (if (pos? ceiling-lsn)
+                              (ha-clamped-follower-floor-lsn
+                               persisted-lsn snapshot-lsn ceiling-lsn)
+                              state-lsn)))]
       (cond-> (assoc m :ha-local-last-applied-lsn local-lsn)
         (= :leader role)
         (assoc :ha-leader-last-applied-lsn local-lsn)))
@@ -680,24 +735,43 @@
 
 (declare open-ha-store-dbis!)
 
+(defn- ha-local-store-open-opts
+  [m store]
+  (let [store-opts (if (instance? IStore store)
+                     (or (i/opts store) {})
+                     {})
+        runtime-opts (effective-ha-runtime-local-opts m)
+        db-name (or (:db-name store-opts)
+                    (some-> store i/db-name))
+        db-identity (or (:ha-db-identity m)
+                        (:db-identity store-opts))
+        open-opts (merge-ha-runtime-local-opts store-opts runtime-opts)]
+    (cond-> open-opts
+      db-name (assoc :db-name db-name)
+      db-identity (assoc :db-identity db-identity))))
+
 (defn recover-ha-local-store-if-needed
-  [store]
-  (if-not (instance? IStore store)
-    store
-    (let [env-dir (i/dir store)]
-      (if-not (recover-ha-local-store-dir-if-needed! env-dir)
-        store
-        (let [schema (i/schema store)
-              opts (i/opts store)]
-          (when-not (i/closed? store)
-            (i/close store))
-          (-> (st/open env-dir schema opts)
-              open-ha-store-dbis!))))))
+  ([store]
+   (recover-ha-local-store-if-needed store nil))
+  ([store open-opts]
+   (if-not (instance? IStore store)
+     store
+     (let [env-dir (i/dir store)]
+       (if-not (recover-ha-local-store-dir-if-needed! env-dir)
+         store
+         (let [schema (i/schema store)
+               opts (merge (or (i/opts store) {})
+                           (or open-opts {}))]
+           (when-not (i/closed? store)
+             (i/close store))
+           (-> (st/open env-dir schema opts)
+               open-ha-store-dbis!)))))))
 
 (defn- reopen-ha-local-store-if-needed
   [m]
   (let [store (:store m)
-        recovered-store (recover-ha-local-store-if-needed store)
+        open-opts (ha-local-store-open-opts m store)
+        recovered-store (recover-ha-local-store-if-needed store open-opts)
         m (if (identical? recovered-store store)
             m
             (-> m
@@ -710,7 +784,7 @@
       (let [store (:store m)]
         (if (instance? IStore store)
           (let [store-dir (i/dir store)
-                store-opts (i/opts store)
+                store-opts (ha-local-store-open-opts m store)
                 reopened-store (-> (st/open store-dir nil store-opts)
                                    open-ha-store-dbis!)]
             (-> m
@@ -726,7 +800,7 @@
     (when (instance? IStore store)
       (try
         {:env-dir (i/dir store)
-         :store-opts (i/opts store)}
+         :store-opts (ha-local-store-open-opts m store)}
         (catch Throwable _
           nil)))))
 
@@ -788,8 +862,11 @@
 (defn- inspect-ha-local-bootstrap-tail
   [m snapshot-lsn]
   (if-let [kv-store (raw-local-kv-store m)]
-    (let [candidate-floor-lsn
+    (let [persisted-floor-lsn
+          (read-ha-local-persisted-lsn kv-store)
+          candidate-floor-lsn
           (long (max snapshot-lsn
+                     persisted-floor-lsn
                      (read-ha-local-watermark-lsn m)
                      (read-ha-snapshot-payload-lsn m)))
           records
@@ -803,9 +880,11 @@
                   candidate-floor-lsn
                   snapshot-lsn))]
       {:verified-floor-lsn verified-floor-lsn
+       :persisted-floor-lsn persisted-floor-lsn
        :candidate-floor-lsn candidate-floor-lsn
        :tail-record-count (count records)})
     {:verified-floor-lsn (long snapshot-lsn)
+     :persisted-floor-lsn (long snapshot-lsn)
      :candidate-floor-lsn (long snapshot-lsn)
      :tail-record-count 0}))
 
@@ -885,9 +964,7 @@
 (defn- ha-snapshot-open-opts
   [m db-name db-identity]
   (let [store (:store m)
-        base-opts (if (instance? IStore store)
-                    (i/opts store)
-                    {})]
+        base-opts (ha-local-store-open-opts m store)]
     (assoc (or base-opts {})
            ::st/raw-persist-open-opts? true
            :db-name db-name
@@ -1380,7 +1457,7 @@
               (if (and (instance? IStore store)
                        (seq schema-overrides))
                 (let [store-dir (i/dir store)
-                      store-opts (i/opts store)]
+                      store-opts (ha-local-store-open-opts m store)]
                   (close-ha-local-store! m)
                   (assoc m
                          :store (open-ha-store-dbis!
@@ -2252,10 +2329,30 @@
       (assoc base
              :reason :clock-skew-check-failed))))
 
+(defn- ha-authority-read-fresh?
+  [m now-ms]
+  (let [ok? (true? (:ha-authority-read-ok? m))
+        last-ms (:ha-last-authority-refresh-ms m)
+        timeout-ms (long (or (:ha-lease-timeout-ms m)
+                             c/*ha-lease-timeout-ms*))]
+    (and ok?
+         (or (not (integer? last-ms))
+             (< (- (long now-ms) (long last-ms))
+                timeout-ms)))))
+
 (defn- ha-authority-read-failure-details
-  [m]
-  (or (:ha-authority-read-error m)
-      {:reason :authority-read-failed}))
+  ([m]
+   (ha-authority-read-failure-details m (ha-now-ms)))
+  ([m now-ms]
+   (or (when (and (true? (:ha-authority-read-ok? m))
+                  (integer? (:ha-last-authority-refresh-ms m))
+                  (not (ha-authority-read-fresh? m now-ms)))
+         {:reason :authority-read-stale
+          :last-authority-refresh-ms (:ha-last-authority-refresh-ms m)
+          :timeout-ms (long (or (:ha-lease-timeout-ms m)
+                                c/*ha-lease-timeout-ms*))})
+       (:ha-authority-read-error m)
+       {:reason :authority-read-failed})))
 
 (defn- ha-rejoin-promotion-failure-details
   [m]
@@ -2287,10 +2384,11 @@
                                           :leader-last-applied-lsn])
                                0))
           local-lsn (ha-local-last-applied-lsn m)
+          authority-fresh? (ha-authority-read-fresh? m now-ms)
           lag-lsn (max 0 (- leader-lsn local-lsn))
           lag-ok? (<= lag-lsn
                       (long (or (:ha-max-promotion-lag-lsn m) 0)))
-          synced? (and (true? (:ha-authority-read-ok? m))
+          synced? (and authority-fresh?
                        (integer? owner-node-id)
                        (not= owner-node-id local-node-id)
                        (not (:ha-follower-degraded? m))
@@ -2358,11 +2456,11 @@
            :ha-promotion-failure-details
            (ha-rejoin-promotion-failure-details m))
 
-    (false? (:ha-authority-read-ok? m))
+    (not (ha-authority-read-fresh? m now-ms))
     (assoc m
            :ha-promotion-last-failure :authority-read-failed
            :ha-promotion-failure-details
-           (ha-authority-read-failure-details m))
+           (ha-authority-read-failure-details m now-ms))
 
     :else
     (if-let [delay-ms (ha-promotion-delay-ms m)]
@@ -2610,12 +2708,20 @@
         (fail-ha-candidate m :promotion-exception
                            {:message (ex-message e)})))))
 
+(defn ^:redef ha-follower-sync-step
+  [db-name m]
+  (if-not (:ha-authority m)
+    m
+    (let [m0 (refresh-ha-local-watermarks m)]
+      (if (= :follower (:ha-role m0))
+        (sync-ha-follower-state db-name m0 (ha-now-ms))
+        m0))))
+
 (defn- advance-ha-follower-or-candidate
   [db-name m]
   (if (contains? #{:follower :candidate} (:ha-role m))
-    (let [m0 (sync-ha-follower-state db-name m (ha-now-ms))
-          state-now-ms (ha-now-ms)
-          m1 (maybe-clear-ha-rejoin-promotion-block m0 state-now-ms)
+    (let [state-now-ms (ha-now-ms)
+          m1 (maybe-clear-ha-rejoin-promotion-block m state-now-ms)
           m2 (maybe-enter-ha-candidate m1 state-now-ms)]
       (maybe-promote-ha-candidate db-name m2 (ha-now-ms)))
     m))
@@ -2785,7 +2891,8 @@
           :ha-rejoin-promotion-blocked-until-ms
           :ha-rejoin-promotion-cleared-ms
           :ha-rejoin-started-at-ms
-          :ha-renew-loop-running?))
+          :ha-renew-loop-running?
+          :ha-follower-loop-running?))
 
 (def ^:private ha-write-command-types
   #{:set-schema
@@ -2942,7 +3049,24 @@
 
 (defn start-ha-authority
   [db-name ha-opts]
-  (let [cp (:ha-control-plane ha-opts)
+  (let [validation-opts (cond-> ha-opts
+                          (= :in-memory
+                             (get-in ha-opts [:ha-control-plane :backend]))
+                          (assoc-in [:ha-control-plane :backend]
+                                    :sofa-jraft)
+
+                          (nil? (get-in ha-opts [:ha-control-plane :rpc-timeout-ms]))
+                          (assoc-in [:ha-control-plane :rpc-timeout-ms] 2000)
+
+                          (nil? (get-in ha-opts [:ha-control-plane :election-timeout-ms]))
+                          (assoc-in [:ha-control-plane :election-timeout-ms]
+                                    3000)
+
+                          (nil? (get-in ha-opts [:ha-control-plane :operation-timeout-ms]))
+                          (assoc-in [:ha-control-plane :operation-timeout-ms]
+                                    5000))
+        _ (vld/validate-ha-options validation-opts)
+        cp (:ha-control-plane ha-opts)
         db-identity (:db-identity ha-opts)
         node-id (:ha-node-id ha-opts)
         members (:ha-members ha-opts)
