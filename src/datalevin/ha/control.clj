@@ -552,7 +552,6 @@
 
 (defn- apply-read-state-transition
   [state db-identity]
-  (require-non-blank-string! db-identity :db-identity)
   (let [{:keys [lease version]} (lease-entry state db-identity)]
     {:state state
      :result {:lease lease
@@ -1641,9 +1640,9 @@
 (defn read-state
   "Read the HA control snapshot for db-identity.
 
-  For the SOFAJRaft backend this uses the replicated command path instead of
-  readIndex, because the full DB-server HA startup path can stall in readIndex
-  even when the raft group is otherwise healthy."
+  For the SOFAJRaft backend this uses a linearizable readIndex barrier and then
+  serves the snapshot from the local FSM state, avoiding a replicated command
+  on every steady-state HA renew cycle."
   [authority db-identity]
   (require-non-blank-string! db-identity :db-identity)
   (cond
@@ -1659,11 +1658,16 @@
          :voters (:voters snapshot)}))
 
     (instance? SofaJraftLeaseAuthority authority)
-    (let [{:keys [group-id running-v]} authority]
+    (let [{:keys [group-id running-v fsm-state]} authority]
       (ensure-running! running-v)
       (lease/lease-key group-id db-identity)
-      (submit-command! authority {:op :read-state
-                                  :db-identity db-identity}))
+      (await-linearizable-read! authority)
+      (let [snapshot @fsm-state
+            {:keys [lease version]} (lease-entry snapshot db-identity)]
+        {:lease lease
+         :version version
+         :membership-hash (:membership-hash snapshot)
+         :voters (:voters snapshot)}))
 
     (satisfies? ILeaseAuthority authority)
     (let [{:keys [lease version]} (read-lease authority db-identity)]
@@ -1676,6 +1680,22 @@
     (u/raise "Unsupported HA control authority type"
              {:error :ha/control-unsupported-authority
               :class (some-> authority class .getName)})))
+
+(defn read-state-for-startup
+  "Read the HA control snapshot for db-identity during startup.
+
+  For the SOFAJRaft backend this preserves the replicated command path because
+  the full DB-server HA startup path can stall in readIndex even when the raft
+  group is otherwise healthy."
+  [authority db-identity]
+  (require-non-blank-string! db-identity :db-identity)
+  (if (instance? SofaJraftLeaseAuthority authority)
+    (let [{:keys [group-id running-v]} authority]
+      (ensure-running! running-v)
+      (lease/lease-key group-id db-identity)
+      (submit-command! authority {:op :read-state
+                                  :db-identity db-identity}))
+    (read-state authority db-identity)))
 
 (defn new-in-memory-authority
   "Create an in-memory authority adapter for deterministic tests."

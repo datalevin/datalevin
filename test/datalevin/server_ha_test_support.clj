@@ -84,6 +84,7 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
+   :ha-client-credentials
    :ha-demotion-drain-ms
    :ha-fencing-hook
    :ha-clock-skew-budget-ms
@@ -639,14 +640,14 @@
 
 (defn e2e-parse-fence-log-line
   [line]
-  (let [parts (s/split line #"," 8)
+  (let [parts (s/split line #"," 9)
         [timestamp-ms db-name fence-op-id observed-term candidate-term new-node-id
-         old-node-id old-leader-endpoint]
+         old-node-id old-leader-endpoint fence-shared-op-id]
         (if (= 6 (count parts))
           (let [[ts op observed candidate new-id old-id] parts]
-            [ts nil op observed candidate new-id old-id nil])
+            [ts nil op observed candidate new-id old-id nil nil])
           (into (vec parts)
-                (repeat (max 0 (- 8 (count parts))) nil)))]
+                (repeat (max 0 (- 9 (count parts))) nil)))]
     {:timestamp-ms timestamp-ms
      :db-name db-name
      :fence-op-id fence-op-id
@@ -654,7 +655,8 @@
      :candidate-term candidate-term
      :new-node-id new-node-id
      :old-node-id old-node-id
-     :old-leader-endpoint old-leader-endpoint}))
+     :old-leader-endpoint old-leader-endpoint
+     :fence-shared-op-id fence-shared-op-id}))
 
 (defn e2e-read-fence-log
   [path]
@@ -1293,12 +1295,21 @@
                       (long candidate-term)))
       (throw (ex-info "E2E fencing hook entry recorded unexpected leader term transition"
                       {:entry entry})))
-    (let [expected-fence-op-id (str db-name ":" observed-term ":" new-leader-id)]
+    (let [expected-fence-op-id (str db-name ":" observed-term ":" new-leader-id)
+          expected-fence-shared-op-id (str db-name ":" observed-term)]
       (when-not (= expected-fence-op-id (:fence-op-id entry))
         (throw (ex-info "E2E fencing hook entry recorded unexpected fence op id"
                         {:expected-fence-op-id expected-fence-op-id
                          :entry entry})))
-      (assoc entry :expected-fence-op-id expected-fence-op-id))))
+      (when-not (= expected-fence-shared-op-id
+                   (:fence-shared-op-id entry))
+        (throw (ex-info "E2E fencing hook entry recorded unexpected shared fence op id"
+                        {:expected-fence-shared-op-id
+                         expected-fence-shared-op-id
+                         :entry entry})))
+      (assoc entry
+             :expected-fence-op-id expected-fence-op-id
+             :expected-fence-shared-op-id expected-fence-shared-op-id))))
 
 (defn e2e-drifted-ha-members
   [members target-node-id]

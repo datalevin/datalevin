@@ -110,6 +110,11 @@
   (when-let [^Node node @(:node-v authority)]
     (.isLeader node)))
 
+(defn- authority-last-log-index
+  [authority]
+  (when-let [^Node node @(:node-v authority)]
+    (.getLastLogIndex node)))
+
 (def ^:private db-identity "7a9f1f8d-cf5a-4fd6-a5a0-6db4a74a6f6f")
 
 (deftest canonical-key-derivation-test
@@ -260,6 +265,87 @@
       (is (= "hash-a" (:membership-hash result)))
       (is (= ["127.0.0.1:7801" "127.0.0.1:7802"]
              (:voters result))))))
+
+(deftest sofa-jraft-read-state-does-not-append-raft-log-test
+  (let [group-id (unique-group-id)
+        peer     (str "127.0.0.1:" (reserve-port))
+        voters   [{:peer-id peer
+                   :ha-node-id 1
+                   :promotable? true}]
+        authority (started-sofa-authority
+                   group-id
+                   peer
+                   voters
+                   {:operation-timeout-ms 8000})]
+    (try
+      (is (wait-until #(authority-leader? authority) 10000))
+      (is (:ok? (ctrl/init-membership-hash! authority "abc123")))
+      (let [acquire (ctrl/try-acquire-lease
+                     authority
+                     {:db-identity db-identity
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms 1000
+                      :lease-timeout-ms 3000
+                      :leader-last-applied-lsn 7
+                      :now-ms 1000
+                      :observed-version 0
+                      :observed-lease nil})]
+        (is (:ok? acquire))
+        (let [baseline (authority-last-log-index authority)
+              reads    [(ctrl/read-state authority db-identity)
+                        (ctrl/read-state authority db-identity)
+                        (ctrl/read-state authority db-identity)]
+              after    (authority-last-log-index authority)]
+          (is (= baseline after))
+          (doseq [result reads]
+            (is (= 1 (get-in result [:lease :term])))
+            (is (= (:version acquire) (:version result)))
+            (is (= "abc123" (:membership-hash result)))
+            (is (= [peer] (:voters result))))))
+      (finally
+        (try
+          (ctrl/stop-authority! authority)
+          (catch Exception _))))))
+
+(deftest sofa-jraft-startup-read-state-uses-command-path-test
+  (let [group-id (unique-group-id)
+        peer     (str "127.0.0.1:" (reserve-port))
+        voters   [{:peer-id peer
+                   :ha-node-id 1
+                   :promotable? true}]
+        authority (started-sofa-authority
+                   group-id
+                   peer
+                   voters
+                   {:operation-timeout-ms 8000})]
+    (try
+      (is (wait-until #(authority-leader? authority) 10000))
+      (is (:ok? (ctrl/init-membership-hash! authority "abc123")))
+      (let [acquire (ctrl/try-acquire-lease
+                     authority
+                     {:db-identity db-identity
+                      :leader-node-id 1
+                      :leader-endpoint "10.0.0.11:8898"
+                      :lease-renew-ms 1000
+                      :lease-timeout-ms 3000
+                      :leader-last-applied-lsn 7
+                      :now-ms 1000
+                      :observed-version 0
+                      :observed-lease nil})
+            baseline (authority-last-log-index authority)
+            result   (ctrl/read-state-for-startup authority db-identity)
+            after    (authority-last-log-index authority)]
+        (is (:ok? acquire))
+        (is (< baseline after))
+        (is (= 1 (get-in result [:lease :term])))
+        (is (= (:version acquire) (:version result)))
+        (is (= "abc123" (:membership-hash result)))
+        (is (= [peer] (:voters result))))
+      (finally
+        (try
+          (ctrl/stop-authority! authority)
+          (catch Exception _))))))
 
 (deftest in-memory-authority-shares-state-by-group-id-test
   (let [group-id   (unique-group-id)

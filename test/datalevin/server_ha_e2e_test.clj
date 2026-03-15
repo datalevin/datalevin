@@ -122,7 +122,10 @@
                 (get-in result [:verified-entry :observed-term])
                 ":"
                 (:new-leader-id result))
-           (get-in result [:verified-entry :fence-op-id])))))
+           (get-in result [:verified-entry :fence-op-id])))
+    (is (= (str "ha-e2e:"
+                (get-in result [:verified-entry :observed-term]))
+           (get-in result [:verified-entry :fence-shared-op-id])))))
 
 (deftest ha-e2e-in-memory-three-node-clock-skew-pause-test
   (let [result (run-e2e-ha-clock-skew-pause! :in-memory)]

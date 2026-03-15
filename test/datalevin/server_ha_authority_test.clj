@@ -588,7 +588,8 @@
         log-file (str dir u/+separator+ "fence.log")
         cmd ["/bin/sh" "-c"
              (str "printf '%s\\n' "
-                  "\"$DTLV_FENCE_OP_ID,$DTLV_TERM_CANDIDATE,$DTLV_TERM_OBSERVED\" "
+                  "\"$DTLV_FENCE_OP_ID,$DTLV_FENCE_SHARED_OP_ID,"
+                  "$DTLV_TERM_CANDIDATE,$DTLV_TERM_OBSERVED\" "
                   ">> \"$1\"; "
                   "n=$(wc -l < \"$1\"); "
                   "if [ \"$n\" -lt 3 ]; then exit 7; else exit 0; fi")
@@ -610,12 +611,63 @@
                        s/split-lines)]
         (is (:ok? result))
         (is (= 3 (:attempt result)))
+        (is (= "orders:4" (:fence-shared-op-id result)))
         (is (= 1
                (count (distinct (map #(first (s/split % #","))
                                      calls)))))
+        (is (= 1
+               (count (distinct (map #(second (s/split % #","))
+                                     calls)))))
         (is (= #{"5"}
-               (set (map #(second (s/split % #",")) calls))))
+               (set (map #(nth (s/split % #",") 2) calls))))
         (is (= #{"4"}
+               (set (map #(nth (s/split % #",") 3) calls)))))
+      (finally
+        (try
+          (u/delete-files dir)
+          (catch Exception _))))))
+
+(deftest ha-run-fencing-hook-shared-op-id-stable-across-candidates-test
+  (let [dir (u/tmp-dir (str "ha-fence-hook-shared-" (UUID/randomUUID)))
+        log-file (str dir u/+separator+ "fence.log")
+        cmd ["/bin/sh" "-c"
+             (str "printf '%s\\n' "
+                  "\"$DTLV_NEW_LEADER_NODE_ID,$DTLV_FENCE_OP_ID,"
+                  "$DTLV_FENCE_SHARED_OP_ID\" >> \"$1\"")
+             "fence-hook"
+             log-file]
+        observed-lease {:leader-node-id 1
+                        :leader-endpoint "10.0.0.11:8898"
+                        :term 4}]
+    (try
+      (u/create-dirs dir)
+      (let [fence-opts {:cmd cmd
+                        :timeout-ms 1000
+                        :retries 0
+                        :retry-delay-ms 0}
+            result-1 (#'dha/run-ha-fencing-hook
+                      "orders"
+                      {:ha-node-id 2
+                       :ha-fencing-hook fence-opts}
+                      observed-lease)
+            result-2 (#'dha/run-ha-fencing-hook
+                      "orders"
+                      {:ha-node-id 3
+                       :ha-fencing-hook fence-opts}
+                      observed-lease)
+            calls (->> (slurp log-file)
+                       s/split-lines)]
+        (is (:ok? result-1))
+        (is (:ok? result-2))
+        (is (not= (:fence-op-id result-1)
+                  (:fence-op-id result-2)))
+        (is (= (:fence-shared-op-id result-1)
+               (:fence-shared-op-id result-2)))
+        (is (= #{"2" "3"}
+               (set (map #(first (s/split % #",")) calls))))
+        (is (= #{"orders:4:2" "orders:4:3"}
+               (set (map #(second (s/split % #",")) calls))))
+        (is (= #{"orders:4"}
                (set (map #(nth (s/split % #",") 2) calls)))))
       (finally
         (try

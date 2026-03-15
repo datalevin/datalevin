@@ -218,8 +218,10 @@
 (defn ^:no-doc parse-user-info
   [^URI uri]
   (when-let [user-info (.getUserInfo uri)]
-    (when-let [[_ username password] (re-find #"(.+):(.+)" user-info)]
-      {:username username :password password})))
+    (let [idx (.indexOf user-info ":")]
+      (when (and (pos? idx) (< idx (dec (count user-info))))
+        {:username (subs user-info 0 idx)
+         :password (subs user-info (inc idx))}))))
 
 (def ^:dynamic *default-port*
   c/default-port)

@@ -750,6 +750,16 @@ Only usable for debug output.
    * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
    Default is `datalevin.constants/*ha-max-promotion-lag-lsn*`.
 
+   * `:ha-client-credentials`, optional `{:username ... :password ...}` map
+   used for HA inter-node replication and snapshot-copy requests when server
+   auth is not using the built-in default account.
+
+   * `:ha-fencing-hook`, optional command hook executed locally before
+   candidate promotion. Hooks must tolerate concurrent execution on different
+   candidates that observe the same expired lease; use
+   `DTLV_FENCE_SHARED_OP_ID` to dedupe destructive actions across nodes and
+   `DTLV_FENCE_OP_ID` to dedupe retries on one node.
+
    * `:ha-demotion-drain-ms`, grace period after leader demotion before the
    node becomes a follower, allowing already-admitted writes to drain.
    Default is `datalevin.constants/*ha-demotion-drain-ms*`.
@@ -1074,6 +1084,13 @@ Only usable for debug output.
   * `:ha-promotion-base-delay-ms`, base delay before promotion attempt.
   * `:ha-promotion-rank-delay-ms`, per-rank delay for deterministic promotion.
   * `:ha-max-promotion-lag-lsn`, maximum allowed LSN lag for promotion.
+  * `:ha-client-credentials`, optional `{:username ... :password ...}` map
+   for HA inter-node server authentication when the cluster does not use the
+   built-in default account.
+  * `:ha-fencing-hook`, optional pre-promotion command hook. Hooks must be
+   safe to run concurrently on different candidates for the same observed
+   lease; use `DTLV_FENCE_SHARED_OP_ID` for cross-node dedupe and
+   `DTLV_FENCE_OP_ID` for same-node retries.
   * `:ha-demotion-drain-ms`, grace period after leader demotion before the
    node becomes a follower.
   * `:ha-clock-skew-budget-ms`, maximum tolerated absolute clock skew before

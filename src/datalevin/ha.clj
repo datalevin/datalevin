@@ -31,7 +31,7 @@
    [datalevin.db DB]
    [datalevin.interface IStore ILMDB]
    [java.io File]
-   [java.net ConnectException]
+   [java.net ConnectException URI]
    [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
@@ -513,19 +513,23 @@
           (when-not (.isEmpty cache)
             (recur)))))))
 
+(defn- ha-client-credentials
+  [m]
+  (or (:ha-client-credentials m)
+      {:username c/default-username
+       :password c/default-password}))
+
 (defn- ha-endpoint-uri
-  [db-name endpoint]
+  [db-name endpoint m]
   (when-let [{:keys [host port]} (parse-endpoint endpoint)]
-    (str "dtlv://"
-         c/default-username
-         ":"
-         c/default-password
-         "@"
-         host
-         ":"
-         port
-         "/"
-         db-name)))
+    (let [{:keys [username password]} (ha-client-credentials m)]
+      (str (URI. "dtlv"
+                 (str username ":" password)
+                 host
+                 (int port)
+                 (str "/" db-name)
+                 nil
+                 nil)))))
 
 (defn- copy-dir-contents!
   [src-dir dest-dir]
@@ -785,7 +789,7 @@
        :source :local}
 
       :else
-      (if-let [uri (ha-endpoint-uri db-name endpoint)]
+      (if-let [uri (ha-endpoint-uri db-name endpoint m)]
         (let [client-opts
               {:pool-size 1
                :time-out (ha-request-timeout-ms m 5000)}]
@@ -1175,7 +1179,7 @@
 
 (defn ^:redef fetch-ha-leader-txlog-batch
   [db-name m leader-endpoint from-lsn upto-lsn]
-  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint m)]
     (let [client-opts
           {:pool-size 1
            :time-out (ha-request-timeout-ms m 10000)}]
@@ -1322,7 +1326,7 @@
 
 (defn ^:redef report-ha-replica-floor!
   [db-name m leader-endpoint applied-lsn]
-  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint m)]
     (let [client-opts
           {:pool-size 1
            :time-out (ha-request-timeout-ms m 10000)}]
@@ -1341,7 +1345,7 @@
 
 (defn ^:redef clear-ha-replica-floor!
   [db-name m leader-endpoint]
-  (if-let [uri (ha-endpoint-uri db-name leader-endpoint)]
+  (if-let [uri (ha-endpoint-uri db-name leader-endpoint m)]
     (let [client-opts
           {:pool-size 1
            :time-out (long (max 500
@@ -1399,7 +1403,7 @@
 
 (defn ^:redef fetch-ha-endpoint-snapshot-copy!
   [db-name m endpoint dest-dir]
-  (if-let [uri (ha-endpoint-uri db-name endpoint)]
+  (if-let [uri (ha-endpoint-uri db-name endpoint m)]
     (let [timeout-ms (long (max 1000
                                 (min 60000
                                      (* 4
@@ -1545,7 +1549,13 @@
               (catch Exception restore-e
                 {:ok? false
                  :state (-> m
-                            (dissoc :store :dt-db :engine :index))
+                            ;; Preserve the closed store handle so the next
+                            ;; renew step can recover and reopen from its
+                            ;; original env dir instead of getting stuck with
+                            ;; no local store at all.
+                            (assoc :store store
+                                   :dt-db nil)
+                            (dissoc :engine :index))
                  :error {:error :ha/follower-snapshot-install-restore-failed
                          :message (ex-message e)
                          :data (merge (or (ex-data e) {})
@@ -1665,18 +1675,32 @@
                       install-res
                       (install-ha-local-snapshot! current-m snapshot-dir)]
                   (if (:ok? install-res)
-                    (let [snapshot-lsn (long (or (:payload-last-applied-lsn
-                                                  manifest)
-                                                 (:snapshot-last-applied-lsn
-                                                  manifest)))
-                          resume-next-lsn (unchecked-inc snapshot-lsn)
+                    (let [installed-state (:state install-res)
+                          snapshot-lsn
+                          (long (max 0
+                                     (long (or (:snapshot-last-applied-lsn
+                                                manifest)
+                                               0))
+                                     (long (if-let [kv-store
+                                                    (raw-local-kv-store
+                                                     installed-state)]
+                                             (read-ha-local-snapshot-current-lsn
+                                              kv-store)
+                                             0))))
+                          installed-lsn
+                          (long (max snapshot-lsn
+                                     (read-ha-local-watermark-lsn
+                                      installed-state)
+                                     (read-ha-snapshot-payload-lsn
+                                      installed-state)))
+                          resume-next-lsn (unchecked-inc installed-lsn)
                           _ (persist-ha-local-applied-lsn!
-                             (:state install-res)
-                             snapshot-lsn)
+                             installed-state
+                             installed-lsn)
                           installed-state
-                          (-> (:state install-res)
+                          (-> installed-state
                               (assoc
-                               :ha-local-last-applied-lsn snapshot-lsn
+                               :ha-local-last-applied-lsn installed-lsn
                                :ha-follower-next-lsn resume-next-lsn
                                :ha-follower-last-bootstrap-ms now-ms
                                :ha-follower-bootstrap-source-endpoint
@@ -1707,6 +1731,8 @@
                                           (or (ex-data e) {})
                                           {:snapshot-last-applied-lsn
                                            snapshot-lsn
+                                           :installed-last-applied-lsn
+                                           installed-lsn
                                            :resume-next-lsn
                                            resume-next-lsn})}})))
                     {:ok? false
@@ -1960,6 +1986,7 @@
               candidate-term (lease/next-term observed-lease)
               candidate-id (:ha-node-id m)
               fence-op-id (str db-name ":" observed-term ":" candidate-id)
+              fence-shared-op-id (str db-name ":" observed-term)
               env {"DTLV_DB_NAME" db-name
                    "DTLV_OLD_LEADER_NODE_ID"
                    (str (or (:leader-node-id observed-lease) ""))
@@ -1968,7 +1995,8 @@
                    "DTLV_NEW_LEADER_NODE_ID" (str candidate-id)
                    "DTLV_TERM_CANDIDATE" (str candidate-term)
                    "DTLV_TERM_OBSERVED" (str observed-term)
-                   "DTLV_FENCE_OP_ID" fence-op-id}
+                   "DTLV_FENCE_OP_ID" fence-op-id
+                   "DTLV_FENCE_SHARED_OP_ID" fence-shared-op-id}
               max-attempts (inc (long (or retries 0)))
               timeout-ms (long (or timeout-ms 3000))
               retry-delay-ms (long (or retry-delay-ms 1000))]
@@ -1977,14 +2005,16 @@
               (if (:ok? result)
                 (assoc result
                        :attempt attempt
-                       :fence-op-id fence-op-id)
+                       :fence-op-id fence-op-id
+                       :fence-shared-op-id fence-shared-op-id)
                 (if (< attempt max-attempts)
                   (do
                     (Thread/sleep retry-delay-ms)
                     (recur (u/long-inc attempt)))
                   (assoc result
                          :attempt attempt
-                         :fence-op-id fence-op-id))))))))))
+                         :fence-op-id fence-op-id
+                         :fence-shared-op-id fence-shared-op-id))))))))))
 
 (defn- parse-ha-clock-skew-output
   [output]
@@ -2766,7 +2796,7 @@
   [db-name authority db-identity]
   (try
     (let [{:keys [lease version]}
-          (ctrl/read-state authority db-identity)]
+          (ctrl/read-state-for-startup authority db-identity)]
       {:ok? true
        :lease lease
        :version version
@@ -2872,6 +2902,7 @@
          :ha-promotion-base-delay-ms promotion-base-delay-ms
          :ha-promotion-rank-delay-ms promotion-rank-delay-ms
          :ha-max-promotion-lag-lsn max-promotion-lag-lsn
+         :ha-client-credentials (:ha-client-credentials ha-opts)
          :ha-demotion-drain-ms demotion-drain-ms
          :ha-fencing-hook fencing-hook
          :ha-clock-skew-budget-ms clock-skew-budget-ms

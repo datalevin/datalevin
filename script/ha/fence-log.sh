@@ -7,7 +7,7 @@ exit_code="${2:-0}"
 
 mkdir -p "$(dirname "$log_path")"
 
-printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+printf '%s,%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "$(( $(date +%s) * 1000 ))" \
   "${DTLV_DB_NAME:-}" \
   "${DTLV_FENCE_OP_ID:-}" \
@@ -16,6 +16,7 @@ printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
   "${DTLV_NEW_LEADER_NODE_ID:-}" \
   "${DTLV_OLD_LEADER_NODE_ID:-}" \
   "${DTLV_OLD_LEADER_ENDPOINT:-}" \
+  "${DTLV_FENCE_SHARED_OP_ID:-}" \
   >> "$log_path"
 
 exit "$exit_code"

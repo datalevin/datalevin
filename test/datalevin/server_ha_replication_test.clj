@@ -32,6 +32,27 @@
 
 (use-fixtures :once quiet-server-ha-logs-fixture)
 
+(deftest ha-endpoint-uri-uses-ha-client-credentials-test
+  (let [uri (#'dha/ha-endpoint-uri
+             "orders"
+             "10.0.0.11:8898"
+             {:ha-client-credentials
+              {:username "ha-replica"
+               :password "p@ss:word"}})]
+    (is (= "dtlv://ha-replica:p%40ss:word@10.0.0.11:8898/orders"
+           uri))
+    (is (= {:username "ha-replica"
+            :password "p@ss:word"}
+           (cl/parse-user-info (java.net.URI. uri))))
+    (is (= (str "dtlv://"
+                c/default-username
+                ":"
+                c/default-password
+                "@10.0.0.11:8898/orders")
+           (#'dha/ha-endpoint-uri "orders"
+                                  "10.0.0.11:8898"
+                                  {})))))
+
 (deftest ha-renew-step-follower-syncs-txlog-and-updates-replica-floor-test
   (let [opts (valid-ha-opts)
         runtime (#'srv/start-ha-authority "orders" opts)
@@ -1745,6 +1766,45 @@
         (u/delete-files local-dir)
         (u/delete-files source-dir)))))
 
+(deftest failed-snapshot-install-state-reopens-local-store-on-next-sync-test
+  (let [db-name "orders"
+        db-identity (str "db-" (UUID/randomUUID))
+        group-id (str "ha-install-restore-failure-" (UUID/randomUUID))
+        local-dir (u/tmp-dir (str "ha-local-snapshot-restore-failure-"
+                                  (UUID/randomUUID)))
+        local-store (st/open local-dir nil
+                             (-> (valid-ha-opts group-id)
+                                 (assoc :db-name db-name
+                                        :db-identity db-identity
+                                        :ha-node-id 1
+                                        :wal? true)
+                                 (update :ha-control-plane merge
+                                         {:backend :sofa-jraft
+                                          :rpc-timeout-ms 5000
+                                          :election-timeout-ms 5000
+                                          :operation-timeout-ms 30000
+                                          :local-peer-id "10.0.0.11:7801"})))
+        recovered-store (atom nil)]
+    (try
+      (i/open-dbi (.-lmdb local-store) "a")
+      (i/transact-kv (.-lmdb local-store) [[:put "a" "k1" "v1"]])
+      (i/close local-store)
+      (reset! recovered-store
+              (:store (#'dha/reopen-ha-local-store-if-needed
+                       {:store local-store
+                        :dt-db nil})))
+      (is (instance? Store @recovered-store))
+      (is (not (identical? local-store @recovered-store)))
+      (is (= 1
+             (:ha-node-id (i/opts @recovered-store))))
+      (finally
+        (when-let [store @recovered-store]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-not (i/closed? local-store)
+          (i/close local-store))
+        (u/delete-files local-dir)))))
+
 (deftest read-ha-local-last-applied-lsn-falls-back-to-cached-state-when-store-closed-test
   (let [dir (u/tmp-dir (str "ha-closed-store-fallback-" (UUID/randomUUID)))
         store (st/open dir nil {:db-name "orders"
@@ -2469,12 +2529,141 @@
         (is (= "10.0.0.13:8898"
                (:ha-follower-bootstrap-source-endpoint state)))
         (is (> @payload-lsn* @snapshot-lsn*))
+        (is (= @snapshot-lsn*
+               (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
         (is (nil? (:ha-follower-degraded? state)))
         (is (= "v1" (i/get-value next-kv "a" "k1")))
         (is (= "v2" (i/get-value next-kv "a" "k2")))
         (is (= "v3" (i/get-value next-kv "a" "k3"))))
       (finally
         (when-let [store (:store @next-state)]
+          (when-not (i/closed? store)
+            (i/close store)))
+        (when-not (i/closed? source-store)
+          (i/close source-store))
+        (when-not (i/closed? local-store)
+          (i/close local-store))
+        (#'srv/stop-ha-authority "orders" runtime)
+        (u/delete-files local-dir)
+        (u/delete-files source-dir)))))
+
+(deftest bootstrap-ha-follower-from-snapshot-does-not-poison-floor-when-copy-payload-exceeds-copied-data-test
+  (let [opts (valid-ha-opts)
+        runtime (#'srv/start-ha-authority "orders" opts)
+        local-dir (u/tmp-dir (str "ha-local-copy-floor-" (UUID/randomUUID)))
+        source-dir (u/tmp-dir (str "ha-source-copy-floor-" (UUID/randomUUID)))
+        db-identity (:ha-db-identity runtime)
+        local-store (st/open local-dir nil {:db-name "orders"
+                                            :db-identity db-identity
+                                            :wal? true})
+        source-store (st/open source-dir nil {:db-name "orders"
+                                              :db-identity db-identity
+                                              :wal? true})
+        snapshot-lsn* (atom nil)
+        poisoned-payload-lsn* (atom nil)
+        bootstrap-state (atom nil)
+        now-ms (System/currentTimeMillis)]
+    (try
+      (let [local-kv (.-lmdb local-store)
+            source-kv (.-lmdb source-store)
+            _ (i/open-dbi local-kv "a")
+            _ (i/open-dbi source-kv "a")
+            _ (i/transact-kv source-kv [[:put "a" "k1" "v1"]])
+            _ (i/create-snapshot! source-kv)
+            snapshot-lsn
+            (long (or (i/get-value source-kv c/kv-info
+                                   c/wal-snapshot-current-lsn
+                                   :keyword :data)
+                      0))
+            poisoned-payload-lsn (+ snapshot-lsn 3)
+            _ (reset! snapshot-lsn* snapshot-lsn)
+            _ (reset! poisoned-payload-lsn* poisoned-payload-lsn)
+            authority (:ha-authority runtime)
+            _ (ha/try-acquire-lease
+               authority
+               {:db-identity db-identity
+                :leader-node-id 1
+                :leader-endpoint "10.0.0.11:8898"
+                :lease-renew-ms (:ha-lease-renew-ms runtime)
+                :lease-timeout-ms (:ha-lease-timeout-ms runtime)
+                :leader-last-applied-lsn poisoned-payload-lsn
+                :now-ms now-ms
+                :observed-version 0
+                :observed-lease nil})
+            follower-runtime (-> runtime
+                                 (assoc :store local-store
+                                        :ha-role :follower
+                                        :ha-follower-next-lsn 1
+                                        :ha-local-last-applied-lsn 0))
+            lease {:leader-node-id 1
+                   :leader-endpoint "10.0.0.11:8898"
+                   :leader-last-applied-lsn poisoned-payload-lsn}
+            bootstrap
+            (with-redefs-fn
+              {#'dha/fetch-ha-leader-txlog-batch
+               (fn [_ _ endpoint from-lsn _]
+                 (is (contains? #{"10.0.0.11:8898"
+                                  "10.0.0.13:8898"}
+                                endpoint))
+                 (is (= (inc snapshot-lsn) from-lsn))
+                 [])
+               #'dha/fetch-ha-endpoint-watermark-lsn
+               (fn [_ _ endpoint]
+                 (case endpoint
+                   "10.0.0.11:8898"
+                   {:reachable? true
+                    :last-applied-lsn poisoned-payload-lsn}
+                   "10.0.0.13:8898"
+                   {:reachable? true
+                    :last-applied-lsn poisoned-payload-lsn}
+                   (throw (ex-info "unexpected-endpoint" {:endpoint endpoint}))))
+               #'dha/fetch-ha-endpoint-snapshot-copy!
+               (fn [_ _ endpoint dest-dir]
+                 (is (= "10.0.0.13:8898" endpoint))
+                 {:copy-meta
+                  (assoc (i/copy source-kv dest-dir false)
+                         :db-name "orders"
+                         :db-identity db-identity
+                         :snapshot-last-applied-lsn snapshot-lsn
+                         :payload-last-applied-lsn poisoned-payload-lsn)})}
+              (fn []
+                (#'dha/bootstrap-ha-follower-from-snapshot
+                 "orders"
+                 follower-runtime
+                 lease
+                 ["10.0.0.13:8898"]
+                 1
+                 now-ms)))]
+        (reset! bootstrap-state (:state bootstrap))
+        (let [state @bootstrap-state
+              next-kv (.-lmdb (:store state))]
+          (i/open-dbi next-kv "a")
+          (is (false? (:ok? bootstrap)))
+          (is (= @snapshot-lsn* (:ha-local-last-applied-lsn state)))
+          (is (= @snapshot-lsn*
+                 (i/get-value next-kv c/kv-info
+                              c/ha-local-applied-lsn
+                              :keyword :data)))
+          (is (= (inc @snapshot-lsn*) (:ha-follower-next-lsn state)))
+          (is (= @snapshot-lsn*
+                 (:ha-follower-bootstrap-snapshot-last-applied-lsn state)))
+          (is (= "10.0.0.13:8898"
+                 (:ha-follower-bootstrap-source-endpoint state)))
+          (is (= "v1" (i/get-value next-kv "a" "k1")))
+          (is (nil? (i/get-value next-kv "a" "k2")))
+          (is (= @snapshot-lsn*
+                 (get-in bootstrap
+                         [:errors 0 :data :snapshot-last-applied-lsn])))
+          (is (= @snapshot-lsn*
+                 (get-in bootstrap
+                         [:errors 0 :data :installed-last-applied-lsn])))
+          (is (= (inc @snapshot-lsn*)
+                 (get-in bootstrap
+                         [:errors 0 :data :resume-next-lsn])))
+          (is (not= @poisoned-payload-lsn*
+                    (:ha-local-last-applied-lsn state)))))
+      (finally
+        (when-let [store (:store @bootstrap-state)]
           (when-not (i/closed? store)
             (i/close store)))
         (when-not (i/closed? source-store)

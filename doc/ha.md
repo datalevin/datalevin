@@ -86,6 +86,10 @@ All HA options are per database. Membership is fixed and shared by operators.
  ;; Must be fully caught up before promotion.
  :ha-max-promotion-lag-lsn 0
 
+ :ha-client-credentials
+ {:username "ha-replica"
+  :password "secret"}
+
  :ha-fencing-hook
  {:cmd ["/usr/local/bin/dtlv-fence"]
   :timeout-ms 3000
@@ -123,11 +127,18 @@ Validation rules:
   The skew hook reports absolute offset from a common time source, so pairwise
   skew across two nodes can approach `2x` the configured budget.
 * `ha-max-promotion-lag-lsn` is non-negative.
+* Optional `:ha-client-credentials` must include non-blank `:username` and
+  `:password`; `:username` must not contain `:`.
 * Fencing hook shape is valid (`:cmd`, timeout/retry fields).
 * `:group-id`, `:local-peer-id`, and voter `:peer-id` values are unique.
 * Local peer appears exactly once in voter list.
 * `:peer-id` format is `host:port`; port is valid integer range.
 * Control-plane voter set is quorum-capable.
+
+If the server cluster does not use the built-in `datalevin/datalevin` account,
+configure `:ha-client-credentials` on every node so follower snapshot copy,
+replica-floor updates, watermark probes, and WAL fetches authenticate with the
+same credentials as normal client traffic.
 * Every promotable `ha-node-id` maps to exactly one promotable voter.
 * Witness voters may be unmapped to `ha-members` and are always
   non-promotable.
@@ -318,19 +329,31 @@ Input:
   * `DTLV_NEW_LEADER_NODE_ID`
   * `DTLV_TERM_CANDIDATE`
   * `DTLV_TERM_OBSERVED`
-  * `DTLV_FENCE_OP_ID` (`db-name + observed-term + candidate-node-id`)
+  * `DTLV_FENCE_OP_ID` (`db-name + observed-term + candidate-node-id`; stable
+    across retries on one candidate)
+  * `DTLV_FENCE_SHARED_OP_ID` (`db-name + observed-term`; shared by every
+    candidate fencing the same observed lease)
 
 Execution:
 
 * Timeout: `:timeout-ms`
 * Retry: `:retries` with `:retry-delay-ms`
-* Retries/replays with the same `DTLV_FENCE_OP_ID` must be idempotent
+* Multiple candidates can execute the hook concurrently before the final
+  authority re-observation and lease CAS resolve a single winner.
+* Retries/replays with the same `DTLV_FENCE_OP_ID` must be idempotent.
+* Destructive fencing must also be idempotent across nodes for the same
+  `DTLV_FENCE_SHARED_OP_ID`; `DTLV_FENCE_OP_ID` alone is not sufficient for
+  cross-candidate dedupe.
+* If the external fencing backend cannot provide that guarantee directly,
+  wrap it in an intent/confirm or equivalent two-phase protocol keyed by
+  `DTLV_FENCE_SHARED_OP_ID`.
 
 Result:
 
 * Exit `0`: fencing succeeded, promotion may continue
 * Non-zero/timeout/unimplemented hook: promotion aborted
-* CAS loss after successful fencing leaves node in follower role
+* CAS loss after successful fencing leaves node in follower role even though
+  the fencing action already ran
 
 ## Failure Behavior
 
@@ -409,15 +432,18 @@ Rollback:
 1. Ensure the configured hook command path exists and is executable on every
    promotable node.
 2. Confirm the hook can tolerate replay with the same `DTLV_FENCE_OP_ID` and
-   treats repeated calls as idempotent.
+   concurrent execution on different candidates sharing the same
+   `DTLV_FENCE_SHARED_OP_ID`.
 3. Run `script/ha/fencing-hook-verify` before staging or production cutover to
    confirm the promotion path exports `DTLV_DB_NAME`,
    `DTLV_OLD_LEADER_NODE_ID`, `DTLV_OLD_LEADER_ENDPOINT`,
    `DTLV_NEW_LEADER_NODE_ID`, `DTLV_TERM_OBSERVED`,
-   `DTLV_TERM_CANDIDATE`, and `DTLV_FENCE_OP_ID`.
+   `DTLV_TERM_CANDIDATE`, `DTLV_FENCE_OP_ID`, and
+   `DTLV_FENCE_SHARED_OP_ID`.
 4. Verify the recorded `DTLV_FENCE_OP_ID` matches
-   `db-name:observed-term:candidate-node-id` before enabling automatic
-   promotion.
+   `db-name:observed-term:candidate-node-id` and
+   `DTLV_FENCE_SHARED_OP_ID` matches `db-name:observed-term` before enabling
+   automatic promotion.
 
 ### Repeated fencing failures
 
@@ -426,7 +452,7 @@ Rollback:
 2. Remove the affected node from promotion eligibility or stop it while the
    hook is repaired.
 3. Verify hook command path, timeout, retry budget, and idempotent handling of
-   `DTLV_FENCE_OP_ID`.
+   both `DTLV_FENCE_OP_ID` and `DTLV_FENCE_SHARED_OP_ID`.
 4. Confirm the hook succeeds in the target environment before re-enabling
    promotion.
 5. Reintroduce the node only after a normal follower catch-up cycle completes.
@@ -478,7 +504,8 @@ Rollback:
    `DTLV_FENCE_OP_ID`.
 6. Run a fencing-hook-verify drill and confirm the deployed hook executes with
    populated `DTLV_DB_NAME`, leader identity, endpoint, term, and
-   `DTLV_FENCE_OP_ID` metadata before promotion.
+   `DTLV_FENCE_OP_ID` plus `DTLV_FENCE_SHARED_OP_ID` metadata before
+   promotion.
 7. Run a follower-only rejoin drill and confirm the restarted former leader
    rejoins as follower, catches up, and refreshes its replica floor on the
    active leader.
@@ -615,7 +642,7 @@ Fencing-hook-verify drill:
   `Scenario: fencing-hook-verify`
   `verified-entry:` with populated `:db-name`, `:old-node-id`,
   `:old-leader-endpoint`, `:new-node-id`, `:observed-term`,
-  `:candidate-term`, and `:fence-op-id`
+  `:candidate-term`, `:fence-op-id`, and `:fence-shared-op-id`
 * Purpose:
   confirm the real hook command path executes during promotion and receives the
   full fencing environment contract needed for deployment-time integration.
@@ -761,7 +788,8 @@ Required tests include:
 * lag guard block/allow behavior and pre-CAS re-check
 * fencing hook failure blocks promotion
 * successful fencing hook execution exports DB name, leader identity,
-  endpoint, terms, and fence-op-id contract before promotion
+  endpoint, terms, and per-candidate/shared fence-op-id contract before
+  promotion
 * write admission rejects follower/stale-term writes
 * write admission rejects owner-node mismatch (`owner != local ha-node-id`)
 * leader demotion on renew failure or owner/term loss
@@ -771,6 +799,8 @@ Required tests include:
 * quorum loss blocks promotion and unsafe writes
 * membership-hash mismatch blocks promotion/startup and demotes active leader
 * fencing hook retries with same `DTLV_FENCE_OP_ID` are idempotent
+* fencing hook contract exposes `DTLV_FENCE_SHARED_OP_ID` for cross-candidate
+  fencing dedupe
 * witness voter topology remains non-promotable and still quorum-capable
 * retention remains safe while replica floors stay fresh
 * WAL gap recovery triggers snapshot/bootstrap path

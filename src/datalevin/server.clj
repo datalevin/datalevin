@@ -980,6 +980,7 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
+   :ha-client-credentials
    :ha-demotion-drain-ms
    :ha-fencing-hook
    :ha-clock-skew-budget-ms

@@ -32,6 +32,13 @@
   []
   (cl/->Client "user" "pw" "10.0.0.12" 8898 1 1000 nil nil))
 
+(deftest parse-user-info-preserves-colons-in-password-test
+  (is (= {:username "ha-replica"
+          :password "p@ss:word"}
+         (cl/parse-user-info
+          (java.net.URI.
+           "dtlv://ha-replica:p%40ss:word@localhost:8898/orders")))))
+
 (deftest normal-request-reopen-works-with-single-connection-pool-test
   (let [db-name (str "reopen-pool-" (UUID/randomUUID))
         uri     (str "dtlv://datalevin:datalevin@localhost/" db-name)

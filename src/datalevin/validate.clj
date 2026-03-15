@@ -304,6 +304,29 @@
   (validate-ha-command-hook-shape
     :ha-clock-skew-hook "clock skew" hook))
 
+(defn- validate-ha-client-credentials-shape
+  [credentials]
+  (when-not (map? credentials)
+    (u/raise "Option :ha-client-credentials expects a map"
+             {:error :ha/validation
+              :option :ha-client-credentials
+              :value credentials}))
+  (let [username (:username credentials)
+        password (:password credentials)]
+    (when-not (and (non-blank-string? username)
+                   (not (s/includes? username ":")))
+      (u/raise
+       "Option :ha-client-credentials :username must be a non-blank string without ':'"
+       {:error :ha/validation
+        :option :ha-client-credentials
+        :credentials credentials}))
+    (when-not (non-blank-string? password)
+      (u/raise "Option :ha-client-credentials :password must be a non-blank string"
+               {:error :ha/validation
+                :option :ha-client-credentials
+                :credentials credentials})))
+  true)
+
 (defn- validate-ha-voter
   [v idx]
   (when-not (map? v)
@@ -531,6 +554,9 @@
             :ha-lease-renew-ms renew-ms
             :stale-leader-window-ms stale-leader-window-ms}))
         (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
+        (when (some? (:ha-client-credentials opts))
+          (validate-ha-client-credentials-shape
+           (:ha-client-credentials opts)))
         (when (some? (:ha-clock-skew-hook opts))
           (validate-ha-clock-skew-hook-shape (:ha-clock-skew-hook opts)))
         (when-not (:promotable? local-voter)
@@ -592,6 +618,10 @@
       (= k :ha-clock-skew-hook)
       (when (some? v)
         (validate-ha-clock-skew-hook-shape v))
+
+      (= k :ha-client-credentials)
+      (when (some? v)
+        (validate-ha-client-credentials-shape v))
 
       (= k :ha-membership-hash)
       (when-not (or (nil? v) (non-blank-string? v))

@@ -65,7 +65,14 @@
                                :ha-node-id 2
                                :promotable? true}
                               {:peer-id "10.0.0.13:7801"
-                               :promotable? false}]))]
+                              :promotable? false}]))]
+      (is (= opts (vld/validate-ha-options opts)))))
+
+  (testing "accepts valid HA client credentials"
+    (let [opts (assoc (valid-ha-opts)
+                      :ha-client-credentials
+                      {:username "ha-replica"
+                       :password "p@ss:word"})]
       (is (= opts (vld/validate-ha-options opts)))))
 
   (testing "rejects unsorted :ha-members"
@@ -134,4 +141,14 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo
            #"clock skew hook :cmd must be a non-empty vector"
+           (vld/validate-ha-options opts)))))
+
+  (testing "rejects malformed HA client credentials"
+    (let [opts (assoc (valid-ha-opts)
+                      :ha-client-credentials
+                      {:username "bad:user"
+                       :password ""})]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"ha-client-credentials :username must be a non-blank string without ':'"
            (vld/validate-ha-options opts))))))

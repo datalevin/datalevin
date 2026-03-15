@@ -293,7 +293,10 @@
   (let [root "/srv/dtlv"
         db-name "orders"
         old-ha-opts (valid-ha-opts "ha-restart")
-        new-ha-opts (assoc old-ha-opts :ha-clock-skew-budget-ms 250)
+        new-ha-opts (assoc old-ha-opts
+                           :ha-client-credentials
+                           {:username "ha-replica"
+                            :password "secret"})
         old-m {:ha-authority ::old-authority
                :ha-runtime-opts (resolved-ha-runtime-opts
                                  root db-name old-ha-opts)
