@@ -692,7 +692,7 @@
   [this ^ThreadLocal tl-reader]
   (when-not (.isVirtual (Thread/currentThread))
     (when-let [^Rtx rtx (.get tl-reader)]
-      (when (<= ^long (.max-val-size this)
+      (when (<= (long (max-val-size this))
                 ^int (.capacity ^ByteBuffer (l/val-bf rtx)))
         (try
           (.renew rtx)
@@ -707,7 +707,8 @@
 
 (defn- fresh-reader-rtx
   [this ^Env env ^ThreadLocal tl-reader]
-  (let [rtx (Rtx. this
+  (let [max-val-size* (long (max-val-size this))
+        rtx (Rtx. this
                   (Txn/createReadOnly env)
                   (volatile! 1)
                   (new-bufval c/+max-key-size+)
@@ -717,7 +718,7 @@
                   (new-bufval c/+max-key-size+)
                   (new-bufval c/+max-key-size+)
                   (bf/allocate-buffer c/+max-key-size+)
-                  (bf/allocate-buffer (.max-val-size this))
+                  (bf/allocate-buffer max-val-size*)
                   (volatile! false))]
     (.set tl-reader rtx)
     rtx))

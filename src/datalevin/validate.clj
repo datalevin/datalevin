@@ -549,7 +549,7 @@
                     :ha-lease-timeout-ms timeout-ms
                     :ha-lease-renew-ms renew-ms}))
         (when (or (nil? stale-leader-window-ms)
-                  (< stale-leader-window-ms 0)
+                  (< (long stale-leader-window-ms) 0)
                   (> (unchecked-multiply 2 (long clock-skew-budget-ms))
                      (long stale-leader-window-ms)))
           (u/raise

@@ -1853,11 +1853,7 @@
 
 (defn- raw-lmdb
   [db]
-  (or (try
-        (.-db db)
-        (catch Throwable _
-          nil))
-      db))
+  db)
 
 (defn- transact-opts-raw
   [lmdb opts]

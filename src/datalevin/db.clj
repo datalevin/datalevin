@@ -106,6 +106,12 @@
 
 (defrecord TxReport [db-before db-after tx-data tempids tx-meta])
 
+(defrecord PreparedBlindTx
+  [schema-epoch
+   opts-epoch
+   auto-entity-time?
+   entities])
+
 ;; (defmethod print-method TxReport [^TxReport rp, ^java.io.Writer w]
 ;;   (binding [*out* w]
 ;;     (pr {:datoms-transacted (count (:tx-data rp))})))
@@ -2097,6 +2103,143 @@
         (comp (mapcat expand-transactable-entity)
            (map aat)))
       entities)))
+
+(def ^:private blind-write-unsupported
+  ::blind-write-unsupported)
+
+(defn- blind-write-attr-supported?
+  [db attr props]
+  (and props
+       (keyword? attr)
+       (not (contains? #{:db/id :db/created-at :db/updated-at} attr))
+       (not= "db" (namespace attr))
+       (not (reverse-ref? attr))
+       (not (ref? db attr))
+       (not (-is-attr? db attr :db/unique))
+       (not (tuple-attr? db attr))
+       (not (tuple-type? db attr))
+       (not (tuple-types? db attr))
+       (not (tuple-source? db attr))))
+
+(defn- blind-write-values
+  [db attr value]
+  (let [values (maybe-wrap-multival db attr value)]
+    (if (and (multi-value? db attr value)
+             (not (and (coll? values) (not (map? values)))))
+      blind-write-unsupported
+      (reduce
+        (fn [acc v]
+          (cond
+            (identical? acc blind-write-unsupported)
+            blind-write-unsupported
+
+            (or (map? v)
+                (datom? v)
+                (and (coll? v)
+                     (not (bytes? v))))
+            blind-write-unsupported
+
+            :else
+            (conj acc v)))
+        []
+        values))))
+
+(defn- prepare-blind-write-entity
+  [^DB db entity]
+  (let [store (.-store db)
+        entity-id (or (:db/id entity) (auto-tempid))]
+    (when (or (nil? (:db/id entity))
+              (tempid? (:db/id entity)))
+      (let [prepared
+            (reduce-kv
+              (fn [acc attr raw-value]
+                (if (or (identical? acc blind-write-unsupported)
+                        (identical? attr :db/id))
+                  acc
+                  (let [props ((schema store) attr)]
+                    (if-not (blind-write-attr-supported? db attr props)
+                      blind-write-unsupported
+                      (let [values (blind-write-values db attr raw-value)]
+                        (if (identical? values blind-write-unsupported)
+                          blind-write-unsupported
+                          (reduce
+                            (fn [pairs v]
+                              (vld/validate-attr attr entity)
+                              (vld/validate-val v entity)
+                              (conj pairs [attr (correct-value store attr v)]))
+                            acc
+                            values)))))))
+              []
+              entity)]
+        (when-not (identical? prepared blind-write-unsupported)
+          {:tempid entity-id
+           :attrs  prepared})))))
+
+(defn ^:no-doc prepare-blind-local-tx
+  [^DB db initial-es]
+  (let [store (.-store db)
+        auto-entity-time? (boolean (:auto-entity-time? (opts store)))
+        entities
+        (reduce
+          (fn [acc entity]
+            (if (map? entity)
+              (if-let [prepared (prepare-blind-write-entity db entity)]
+                (let [attrs (:attrs prepared)]
+                  (if (or (seq attrs) auto-entity-time?)
+                    (conj acc prepared)
+                    acc))
+                (reduced nil))
+              (reduced nil)))
+          []
+          initial-es)]
+    (when (and entities (seq entities))
+      (->PreparedBlindTx (schema store)
+                         (opts store)
+                         auto-entity-time?
+                         entities))))
+
+(defn ^:no-doc blind-local-tx-valid?
+  [^DB db ^PreparedBlindTx prepared]
+  (let [store (.-store db)]
+    (and (identical? (:schema-epoch prepared) (schema store))
+         (identical? (:opts-epoch prepared) (opts store)))))
+
+(defn ^:no-doc stamp-blind-local-tx
+  [^DB db ^PreparedBlindTx prepared tx-meta]
+  (let [tx-id              (inc (long (:max-tx db)))
+        tx-time            (System/currentTimeMillis)
+        auto-entity-time?  (:auto-entity-time? prepared)
+        entities           (:entities prepared)
+        [tx-data tempids max-eid]
+        (reduce
+          (fn [[tx-data tempids next-eid] {:keys [tempid attrs]}]
+            (let [^long next-eid next-eid
+                  eid         (unchecked-inc next-eid)
+                  tx-data     (cond-> tx-data
+                                true
+                                (conj (datom eid :db/created-at tx-time tx-id))
+
+                                auto-entity-time?
+                                (conj (datom eid :db/updated-at tx-time tx-id)))
+                  tx-data     (reduce
+                                (fn [acc [attr value]]
+                                  (conj acc (datom eid attr value tx-id)))
+                                tx-data
+                                attrs)
+                  tempids     (cond-> tempids
+                                (and tempid (not (auto-tempid? tempid)))
+                                (assoc tempid eid))]
+              [tx-data tempids eid]))
+          [[] {} (long (:max-eid db))]
+          entities)
+        tempids            (assoc tempids :db/current-tx tx-id)
+        info               {:max-eid max-eid
+                            :max-tx  tx-id}
+        db-after           (-> db
+                               (assoc :max-eid max-eid)
+                               (assoc :max-tx tx-id))
+        report             (->TxReport db db-after tx-data tempids tx-meta)]
+    [report info]))
 
 (defn transact-tx-data
   [initial-report initial-es simulated?]

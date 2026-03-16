@@ -178,13 +178,52 @@
                        (with db tx-data tx-meta))]
           (reset! conn (db/carry-runtime-opts (:db-after report) db))
           (assoc report :db-after @conn))
-        (finally
-          (when-not old
-            (db/enable-cache (.-store ^DB @conn))))))))
+          (finally
+            (when-not old
+              (db/enable-cache (.-store ^DB @conn))))))))
+
+(defn- direct-local-blind-transact!
+  [conn prepared tx-meta]
+  (locking conn
+    (let [db    ^DB (deref conn)
+          store ^Store (.-store db)]
+      (when (db/blind-local-tx-valid? db prepared)
+        (let [old (db/cache-disabled? store)]
+          (db/disable-cache store)
+          (try
+            (let [kv            (.-lmdb store)
+                  prepared-store (volatile! nil)
+                  [report info]
+                  (l/with-transaction-kv [kv1 kv]
+                    (let [store1 ^Store (s/transfer store kv1)
+                          db1    ^DB    (db/transfer db store1)]
+                      (vreset! prepared-store store1)
+                      (let [[report info] (db/stamp-blind-local-tx
+                                            db1 prepared tx-meta)]
+                        (db/commit-prepared-tx-data! db1 (:tx-data report))
+                        [report info])))
+                  new-store      ^Store (s/transfer ^Store @prepared-store kv)
+                  new-info       (assoc info :last-modified
+                                        (long (or (i/last-modified new-store)
+                                                  0)))
+                  new-db         (db/carry-runtime-opts
+                                   (db/new-db new-store new-info)
+                                   db)]
+              (reset! conn new-db)
+              (assoc report :db-after @conn))
+            (finally
+              (when-not old
+                (db/enable-cache (.-store ^DB @conn))))))))))
+
+(defn- maybe-direct-local-blind-transact!
+  [conn tx-data tx-meta]
+  (when-let [prepared (db/prepare-blind-local-tx ^DB @conn tx-data)]
+    (direct-local-blind-transact! conn prepared tx-meta)))
 
 (defn- -transact! [conn tx-data tx-meta]
   (if (local-direct-transact-eligible? conn)
-    (direct-local-transact! conn tx-data tx-meta)
+    (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
+        (direct-local-transact! conn tx-data tx-meta))
     (let [report (with-transaction [c conn]
                    (assert (conn? c))
                    (with @c tx-data tx-meta))]
@@ -309,7 +348,7 @@
   (let [now-ms (System/currentTimeMillis)
         ^AtomicLong last-enqueue-ms (sync-queue-last-enqueue-ms-counter conn)]
     (if (< (- now-ms (.get last-enqueue-ms))
-           wal-idle-direct-cooldown-ms)
+           (long wal-idle-direct-cooldown-ms))
       [false nil]
       (let [^AtomicLong pending (sync-queue-pending-counter conn)]
         (if (.compareAndSet pending 0 1)

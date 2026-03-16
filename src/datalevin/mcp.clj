@@ -399,7 +399,9 @@
   (let [{:keys [preview-items preview-map-entries preview-chars]} *mcp-limits*]
     (cond
       (string? x)
-      (if (and preview-chars (> (count x) preview-chars))
+      (if (and preview-chars
+               (> (long (count x))
+                  (long preview-chars)))
         (str (subs x 0 preview-chars) "...")
         x)
 
@@ -469,7 +471,7 @@
     (if (and limit
              (result-collection result)
              size
-             (> size limit))
+             (> (long size) (long limit)))
       (-> structured
           (assoc "result" (take-result-items result limit))
           (add-truncation {"kind"     "items"
@@ -1753,7 +1755,8 @@
 
 (defn- write-message!
   [^BufferedWriter writer message]
-  (.write writer (jc/write-json-ready-string message))
+  (let [^String payload (jc/write-json-ready-string message)]
+    (.write writer payload))
   (.write writer "\n")
   (.flush writer))
 

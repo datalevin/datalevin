@@ -1178,7 +1178,7 @@
      (cond
        (and (= :follower role)
             next-sync-not-before-ms)
-       (let [remaining-ms (- next-sync-not-before-ms (long now-ms))]
+       (let [remaining-ms (- (long next-sync-not-before-ms) (long now-ms))]
          (long (if (<= remaining-ms 0) 1 remaining-ms)))
 
        (and (= :follower role)
@@ -1601,7 +1601,7 @@
                (ensure-ha-renew-loop server db-name)
                (ensure-ha-follower-sync-loop server db-name)
                @published-store-v))
-          (attempt-add-store [store retries]
+          (attempt-add-store [store ^long retries]
             (try
               (add-store* store)
               (catch Throwable t
@@ -1609,7 +1609,8 @@
                          (closed-store-race? t store))
                   (do
                     (Thread/sleep 50)
-                    (attempt-add-store (reopen-store store) (dec retries)))
+                    (attempt-add-store (reopen-store store)
+                                       (unchecked-dec retries)))
                   (throw t)))))]
      (attempt-add-store store 3))))
 

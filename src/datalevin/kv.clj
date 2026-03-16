@@ -2299,7 +2299,7 @@
     (fn []
       (when-let [info-v (i/kv-info lmdb)]
         (when-let [state (txlog/state lmdb)]
-          (let [floor-lsn (persisted-runtime-floor-lsn lmdb)
+          (let [floor-lsn (long (persisted-runtime-floor-lsn lmdb))
                 target-next-lsn (unchecked-inc floor-lsn)
                 current-next-lsn (long @(:next-lsn state))]
             (when (> target-next-lsn current-next-lsn)
@@ -2871,7 +2871,7 @@
   (and entry
        (= path (:path entry))
        (if (and active-segment? (some? active-offset))
-         (= (long (min file-bytes
+         (= (long (min (long file-bytes)
                        (long active-offset)))
             (long (or (:scan-bytes entry) -1)))
          (and ;; Active-segment scans can race a stale runtime offset and cache a

@@ -61,12 +61,14 @@
   (or *session-state* default-session-state))
 
 (defn- session-handles
+  ^ConcurrentHashMap
   ([] (session-handles (current-session-state)))
-  ([session] (:handles session)))
+  ([session] ^ConcurrentHashMap (:handles session)))
 
 (defn- session-reverse-handles
+  ^IdentityHashMap
   ([] (session-reverse-handles (current-session-state)))
-  ([session] (:reverse-handles session)))
+  ([session] ^IdentityHashMap (:reverse-handles session)))
 
 (defn- gen-handle
   [prefix]
@@ -88,8 +90,8 @@
   ([prefix type obj]
    (register! (current-session-state) prefix type obj))
   ([session prefix type obj]
-   (let [handles         (session-handles session)
-         reverse-handles (session-reverse-handles session)]
+   (let [^ConcurrentHashMap handles         (session-handles session)
+         ^IdentityHashMap   reverse-handles (session-reverse-handles session)]
      (locking reverse-handles
        (if-let [h (.get ^IdentityHashMap reverse-handles obj)]
          h
@@ -102,8 +104,8 @@
   ([h type new-obj]
    (rebind! (current-session-state) h type new-obj))
   ([session h type new-obj]
-   (let [handles         (session-handles session)
-         reverse-handles (session-reverse-handles session)]
+   (let [^ConcurrentHashMap handles         (session-handles session)
+         ^IdentityHashMap   reverse-handles (session-reverse-handles session)]
      (locking reverse-handles
        (when-let [{:keys [obj]} (.get handles h)]
          (.remove ^IdentityHashMap reverse-handles obj))
@@ -135,8 +137,8 @@
   ([h]
    (release! (current-session-state) h))
   ([session h]
-   (let [handles         (session-handles session)
-         reverse-handles (session-reverse-handles session)]
+   (let [^ConcurrentHashMap handles         (session-handles session)
+         ^IdentityHashMap   reverse-handles (session-reverse-handles session)]
      (when-let [{:keys [type obj]} (.remove handles h)]
        (locking reverse-handles
          (.remove ^IdentityHashMap reverse-handles obj))
@@ -154,8 +156,8 @@
   ([h]
    (unregister! (current-session-state) h))
   ([session h]
-   (let [handles         (session-handles session)
-         reverse-handles (session-reverse-handles session)]
+   (let [^ConcurrentHashMap handles         (session-handles session)
+         ^IdentityHashMap   reverse-handles (session-reverse-handles session)]
      (when-let [{:keys [obj]} (.remove handles h)]
        (locking reverse-handles
          (.remove ^IdentityHashMap reverse-handles obj)))
@@ -164,8 +166,8 @@
 (defn ^:no-doc clear-handles!
   ([] (clear-handles! (current-session-state)))
   ([session]
-   (let [handles         (session-handles session)
-         reverse-handles (session-reverse-handles session)]
+   (let [^ConcurrentHashMap handles         (session-handles session)
+         ^IdentityHashMap   reverse-handles (session-reverse-handles session)]
      (doseq [h (vec (.keySet handles))]
        (release! session h))
      (locking reverse-handles
@@ -195,16 +197,18 @@
   [json-result]
   (let [limit (:max-result-items *json-api-limits*)]
     (when limit
-      (loop [stack (list json-result)
-             seen  0]
+      (let [limit (long limit)]
+        (loop [stack (list json-result)
+               seen (long 0)]
         (when-let [x (first stack)]
-          (let [seen' (+ seen (count-direct-items x))]
+            (let [seen' (unchecked-add (long seen)
+                                       (long (count-direct-items x)))]
             (when (> seen' limit)
               (throw (ex-info "Result exceeds max-result-items limit."
                               {:code  :result-too-large
                                :kind  :items
                                :limit limit})))
-            (recur (concat (nested-items x) (rest stack)) seen')))))
+              (recur (concat (nested-items x) (rest stack)) seen'))))))
     json-result))
 
 (defn- api-info

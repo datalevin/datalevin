@@ -30,6 +30,7 @@
   (:import
    [datalevin.db DB]
    [datalevin.interface IStore ILMDB]
+   [datalevin.storage Store]
    [java.io File]
    [java.net ConnectException URI]
    [java.nio.channels ClosedChannelException]
@@ -107,6 +108,32 @@
                                  0))
         budget-ms (max 1000 renew-ms rpc-timeout-ms)]
     (long (min (long max-ms) budget-ms))))
+
+(defn- long-max2 ^long
+  [a b]
+  (let [a (long a)
+        b (long b)]
+    (if (> a b) a b)))
+
+(defn- long-max3 ^long
+  [a b c]
+  (long-max2 a (long-max2 b c)))
+
+(defn- long-max4 ^long
+  [a b c d]
+  (long-max2 (long-max2 a b) (long-max2 c d)))
+
+(defn- long-min2 ^long
+  [a b]
+  (let [a (long a)
+        b (long b)]
+    (if (< a b) a b)))
+
+(defn- nonnegative-long-diff ^long
+  [a b]
+  (let [a (long a)
+        b (long b)]
+    (if (> a b) (- a b) 0)))
 
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
@@ -194,11 +221,9 @@
      (fn [store]
        (let [kv-store (cond
                         (nil? store) nil
-                        :else (or (try
-                                    (.-lmdb store)
-                                    (catch Throwable _
-                                      nil))
-                                  store))]
+                        (instance? Store store) (.-lmdb ^Store store)
+                        (instance? ILMDB store) store
+                        :else nil)]
          (when-not (try
                      (cond
                        (nil? kv-store) true
@@ -300,15 +325,15 @@
      :watermark-lsn watermark-lsn
      :payload-lsn payload-lsn
      :ceiling-lsn (long (if (= :leader role)
-                          (max watermark-lsn snapshot-lsn payload-lsn)
-                          (max watermark-lsn snapshot-lsn)))}))
+                          (long-max3 watermark-lsn snapshot-lsn payload-lsn)
+                          (long-max2 watermark-lsn snapshot-lsn)))}))
 
 (defn- ha-clamped-follower-floor-lsn
   [persisted-lsn snapshot-lsn ceiling-lsn]
-  (let [tracked-lsn (long (max persisted-lsn snapshot-lsn))]
-    (if (pos? ceiling-lsn)
+  (let [tracked-lsn (long-max2 persisted-lsn snapshot-lsn)]
+    (if (pos? (long ceiling-lsn))
       (if (pos? tracked-lsn)
-        (long (min ceiling-lsn tracked-lsn))
+        (long-min2 ceiling-lsn tracked-lsn)
         ceiling-lsn)
       tracked-lsn)))
 
@@ -337,7 +362,7 @@
             (= :leader role)
             ceiling-lsn
 
-            (pos? ceiling-lsn)
+            (pos? (long ceiling-lsn))
             follower-floor-lsn
 
             :else state-lsn))
@@ -364,7 +389,7 @@
   [m]
   (when-let [kv-store (local-kv-store m)]
     (let [{:keys [ceiling-lsn]} (ha-local-data-lsn-ceiling m kv-store)
-          persisted-lsn (read-ha-local-persisted-lsn kv-store)
+          persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
           state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
           lease-lsn (long (or (get-in m
                                       [:ha-authority-lease
@@ -375,10 +400,10 @@
           ;; much replicated history that node actually shares with the current
           ;; leader on rejoin.
           target-lsn (long (if (= :leader (:ha-role m))
-                             (max persisted-lsn lease-lsn)
-                             (max persisted-lsn state-lsn)))
-          applied-lsn (long (if (pos? ceiling-lsn)
-                              (min ceiling-lsn target-lsn)
+                             (long-max2 persisted-lsn lease-lsn)
+                             (long-max2 persisted-lsn state-lsn)))
+          applied-lsn (long (if (pos? (long ceiling-lsn))
+                              (long-min2 ceiling-lsn target-lsn)
                               target-lsn))]
       (when (> applied-lsn persisted-lsn)
         (persist-ha-local-applied-lsn! m applied-lsn))
@@ -404,7 +429,7 @@
           persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
           local-lsn (long (if (= :leader role)
                             ceiling-lsn
-                            (if (pos? ceiling-lsn)
+                            (if (pos? (long ceiling-lsn))
                               (ha-clamped-follower-floor-lsn
                                persisted-lsn snapshot-lsn ceiling-lsn)
                               state-lsn)))]
@@ -427,17 +452,15 @@
 (defn- ha-promotion-lag-guard
   [m lease]
   (let [leader-last-applied-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        tracked-local-lsn (ha-local-last-applied-lsn m)
+        tracked-local-lsn (long (ha-local-last-applied-lsn m))
         bootstrap-watermark-lsn
         (when (and (bootstrap-empty-lease? lease)
-                   (zero? tracked-local-lsn))
+                   (zero? (long tracked-local-lsn)))
           (read-ha-local-watermark-lsn m))
-        local-last-applied-lsn (long (max tracked-local-lsn
-                                          (long (or bootstrap-watermark-lsn
-                                                    0))))
-        lag-lsn (max 0
-                     (- leader-last-applied-lsn
-                        local-last-applied-lsn))
+        local-last-applied-lsn (long-max2 tracked-local-lsn
+                                          (or bootstrap-watermark-lsn 0))
+        lag-lsn (nonnegative-long-diff leader-last-applied-lsn
+                                       local-last-applied-lsn)
         max-lag-lsn (long (or (:ha-max-promotion-lag-lsn m) 0))]
     {:ok? (<= lag-lsn max-lag-lsn)
      :leader-last-applied-lsn leader-last-applied-lsn
@@ -448,7 +471,7 @@
 (defn- bootstrap-empty-lease?
   [lease]
   (and (or (nil? lease) (nil? (:leader-node-id lease)))
-       (zero? (lease/observed-term lease))))
+       (zero? (long (lease/observed-term lease)))))
 
 (def ^:private endpoint-pattern
   #"^(.+):([0-9]+)$")
@@ -865,10 +888,10 @@
     (let [persisted-floor-lsn
           (read-ha-local-persisted-lsn kv-store)
           candidate-floor-lsn
-          (long (max snapshot-lsn
+          (long-max4 snapshot-lsn
                      persisted-floor-lsn
                      (read-ha-local-watermark-lsn m)
-                     (read-ha-snapshot-payload-lsn m)))
+                     (read-ha-snapshot-payload-lsn m))
           records
           (ha-local-contiguous-txlog-tail
            kv-store
@@ -920,11 +943,8 @@
 (defn- open-ha-store-dbis!
   [store]
   (when-let [kv-store (cond
-                        (instance? IStore store)
-                        (try
-                          (.-lmdb store)
-                          (catch Throwable _
-                            nil))
+                        (instance? Store store)
+                        (.-lmdb ^Store store)
 
                         (instance? ILMDB store)
                         store
@@ -1118,17 +1138,17 @@
 
 (defn- next-ha-follower-sync-backoff-ms
   [m]
-  (let [renew-ms (long (max 100
-                            (long (or (:ha-lease-renew-ms m)
-                                      c/*ha-lease-renew-ms*))))
-        base-ms (long (max 250 (quot renew-ms 2)))
+  (let [renew-ms (long-max2 100
+                            (or (:ha-lease-renew-ms m)
+                                c/*ha-lease-renew-ms*))
+        base-ms (long-max2 250 (quot renew-ms 2))
         prev-ms (long (or (:ha-follower-sync-backoff-ms m) 0))
-        max-ms (long (max ha-follower-max-sync-backoff-ms
-                          (* 6 renew-ms)))
+        max-ms (long-max2 ha-follower-max-sync-backoff-ms
+                          (unchecked-multiply (long 6) renew-ms))
         candidate (if (pos? prev-ms)
-                    (* 2 prev-ms)
+                    (unchecked-multiply (long 2) prev-ms)
                     base-ms)]
-    (long (min max-ms candidate))))
+    (long-min2 max-ms candidate)))
 
 (defn- ha-follower-gap-error?
   [e]
@@ -1186,12 +1206,12 @@
   (let [required-lsn (long (max 0 (dec (long next-lsn))))
         leader-watermark (fetch-leader-watermark-lsn db-name m lease)
         authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        leader-safe-lsn (long (max authority-lsn
+        leader-safe-lsn (long-max2 authority-lsn
                                    (if (:reachable? leader-watermark)
                                      (long (or (:last-applied-lsn
                                                 leader-watermark)
                                                0))
-                                     0)))
+                                     0))
         local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
         followers
@@ -1209,10 +1229,11 @@
                                            endpoint
                                            watermark)
                              last-lsn (when (some? raw-last-lsn)
-                                        (long (min raw-last-lsn
-                                                   leader-safe-lsn)))
+                                        (long-min2 raw-last-lsn
+                                                   leader-safe-lsn))
                              eligible? (and (some? last-lsn)
-                                            (>= last-lsn required-lsn))]
+                                            (>= (long last-lsn)
+                                                required-lsn))]
                          {:endpoint endpoint
                           :node-id node-id
                           :last-applied-lsn last-lsn
@@ -1241,12 +1262,12 @@
   (let [leader-endpoint (ha-leader-endpoint m lease)
         authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
         leader-watermark (fetch-leader-watermark-lsn db-name m lease)
-        leader-safe-lsn (long (max authority-lsn
+        leader-safe-lsn (long-max2 authority-lsn
                                    (if (:reachable? leader-watermark)
                                      (long (or (:last-applied-lsn
                                                 leader-watermark)
                                                0))
-                                     0)))]
+                                     0))]
     (if (= source-endpoint leader-endpoint)
       (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
@@ -1255,7 +1276,7 @@
                         source-endpoint
                         watermark)]
         {:known? true
-         :last-applied-lsn (long (max authority-lsn (or remote-lsn 0)))
+         :last-applied-lsn (long-max2 authority-lsn (or remote-lsn 0))
          :watermark watermark})
       (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
@@ -1264,7 +1285,7 @@
                           source-endpoint
                           watermark)
             last-lsn (when (some? raw-last-lsn)
-                       (long (min raw-last-lsn leader-safe-lsn)))]
+                       (long-min2 raw-last-lsn leader-safe-lsn))]
         {:known? (some? last-lsn)
          :last-applied-lsn last-lsn
          :raw-last-applied-lsn raw-last-lsn
@@ -1440,11 +1461,11 @@
              replay-rows)
             replayed-max-gt
             (reduce
-             (fn [acc [op dbi k]]
+             (fn [^long acc [op dbi k]]
                (if (and (= op :put)
                         (= dbi c/giants)
                         (integer? k))
-                 (max acc (unchecked-inc (long k)))
+                 (long-max2 acc (unchecked-inc (long k)))
                  acc))
              0
              replay-rows)
@@ -1508,10 +1529,11 @@
                                                    (integer? v))
                                           (long v))))
                                 last)]
-              (loop [cur (long (i/max-tx (:store next-state)))]
-                (when (< cur target-max-tx)
-                  (i/advance-max-tx (:store next-state))
-                  (recur (long (i/max-tx (:store next-state))))))))
+              (let [target-max-tx (long target-max-tx)]
+                (loop [cur (long (i/max-tx (:store next-state)))]
+                  (when (< cur target-max-tx)
+                    (i/advance-max-tx (:store next-state))
+                    (recur (long (i/max-tx (:store next-state)))))))))
           next-state))
 
       :else
@@ -1662,8 +1684,8 @@
                               (long snapshot-last-lsn))
           payload-last-lsn (when (integer? payload-last-lsn)
                              (long payload-last-lsn))
-          install-last-lsn (long (max (or payload-last-lsn 0)
-                                      (or snapshot-last-lsn 0)))]
+          install-last-lsn (long-max2 (or payload-last-lsn 0)
+                                      (or snapshot-last-lsn 0))]
       (when (< install-last-lsn (long required-lsn))
         (u/raise "HA snapshot copy payload is older than the required follower floor"
                  {:error :ha/follower-snapshot-too-stale
@@ -1892,7 +1914,7 @@
                           (reconcile-ha-installed-snapshot-state
                            installed-state
                            snapshot-lsn)
-                          resume-next-lsn (unchecked-inc installed-lsn)
+                          resume-next-lsn (unchecked-inc (long installed-lsn))
                           _ (persist-ha-local-applied-lsn!
                              state
                              installed-lsn)
@@ -2007,8 +2029,9 @@
                   ;; Honor the tracked follower cursor when present, but never
                   ;; allow it to advance past the local floor.
                   next-lsn
-                  (if (and tracked-next-lsn (pos? tracked-next-lsn))
-                    (long (min tracked-next-lsn local-next-lsn))
+                  (if (and tracked-next-lsn
+                           (pos? (long tracked-next-lsn)))
+                    (long-min2 tracked-next-lsn local-next-lsn)
                     local-next-lsn)]
               (try
                 (:state (sync-ha-follower-batch
@@ -2092,12 +2115,12 @@
           (and lease-expired?
                reachable?
                (< leader-lsn authority-lsn))
-          (long (max leader-lsn
+          (long-max2 leader-lsn
                      (or reachable-member-lsn
-                         (ha-local-last-applied-lsn m))))
+                         (ha-local-last-applied-lsn m)))
 
           reachable?
-          (max authority-lsn leader-lsn)
+          (long-max2 authority-lsn leader-lsn)
 
           :else
           (long (or reachable-member-lsn
@@ -2385,7 +2408,7 @@
                                0))
           local-lsn (ha-local-last-applied-lsn m)
           authority-fresh? (ha-authority-read-fresh? m now-ms)
-          lag-lsn (max 0 (- leader-lsn local-lsn))
+          lag-lsn (nonnegative-long-diff leader-lsn local-lsn)
           lag-ok? (<= lag-lsn
                       (long (or (:ha-max-promotion-lag-lsn m) 0)))
           synced? (and authority-fresh?

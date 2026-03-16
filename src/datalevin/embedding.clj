@@ -261,7 +261,7 @@
 (defn- infer-artifact-format
   [name]
   (when-let [idx (s/last-index-of name ".")]
-    (keyword (s/lower-case (subs name (inc idx))))))
+    (keyword (s/lower-case (subs name (unchecked-inc-int (int idx)))))))
 
 (defn- infer-quantization
   [name]
@@ -399,12 +399,15 @@
         suffix ".tmp"
         tmp    (Files/createTempFile tmp-dir prefix suffix
                                      (make-array FileAttribute 0))
-        client (create-http-client)
-        req    (-> (HttpRequest/newBuilder (URI/create url))
-                   (.header "User-Agent" "Datalevin")
-                   (.header "Accept" "application/octet-stream")
-                   (.GET)
-                   (.build))]
+        ^HttpClient client (create-http-client)
+        ^HttpRequest req   (-> (HttpRequest/newBuilder (URI/create url))
+                               (.header "User-Agent" "Datalevin")
+                               (.header "Accept" "application/octet-stream")
+                               (.GET)
+                               (.build))
+        ^"[Ljava.nio.file.CopyOption;" copy-opts
+        (into-array java.nio.file.CopyOption
+                    [StandardCopyOption/REPLACE_EXISTING])]
     (try
       (let [^HttpResponse resp (.send client req (HttpResponse$BodyHandlers/ofInputStream))
             status             (.statusCode resp)]
@@ -412,9 +415,7 @@
           (raise "Failed to download embedding model"
                  {:url url :status status :target target-path}))
         (with-open [^InputStream in (.body resp)]
-          (Files/copy in tmp
-                      (into-array java.nio.file.CopyOption
-                                  [StandardCopyOption/REPLACE_EXISTING])))
+          (Files/copy in ^Path tmp copy-opts))
         (move-file! tmp target)
         target-path)
       (catch clojure.lang.ExceptionInfo e
@@ -521,7 +522,7 @@
             :embedding-metadata metadata}
 
            :else
-           (with-open [provider (init-embedding-provider spec)]
+           (with-open [^AutoCloseable provider (init-embedding-provider spec)]
              {:dimensions         (embedding-dimensions provider)
               :embedding-metadata (embedding-metadata provider)})))))))
 
