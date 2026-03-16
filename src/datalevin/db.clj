@@ -143,19 +143,21 @@
   ([store]
    (refresh-cache store (last-modified store)))
   ([store target]
-   (.put ^ConcurrentHashMap caches (dir store)
-         (LRUCache. (:cache-limit (opts store)) target))
-   (mark-remote-cache-check! store)))
+   (let [target (long (or target 0))]
+     (.put ^ConcurrentHashMap caches (dir store)
+           (LRUCache. (:cache-limit (opts store)) target))
+     (mark-remote-cache-check! store))))
 
 (defn- ensure-cache
   [store target]
-  (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
-    (if (< ^long (.target cache) ^long target)
-      (refresh-cache store target)
-      (do
-        (.setTarget cache target)
-        (mark-remote-cache-check! store)))
-    (refresh-cache store target)))
+  (let [target (long (or target 0))]
+    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+      (if (< ^long (.target cache) ^long target)
+        (refresh-cache store target)
+        (do
+          (.setTarget cache target)
+          (mark-remote-cache-check! store)))
+      (refresh-cache store target))))
 
 (defn cache-disabled?
   [store]
@@ -701,7 +703,7 @@
     (let [store  (.-store ^DB x)
           cache  (.get ^ConcurrentHashMap caches (dir store))]
       (when (should-check-remote-cache? store cache)
-        (let [target (last-modified store)]
+        (let [target (long (or (last-modified store) 0))]
           (mark-remote-cache-check! store)
           (when (or (nil? cache)
                     (< ^long (.target ^LRUCache cache) ^long target))
@@ -2037,6 +2039,19 @@
           tempids           (into {} (butlast tempids))]
       [tx-data tempids max-eid nil])))
 
+(defn- resolved-remote-db-info
+  [store db db-info max-eid simulated?]
+  {:max-eid       (or max-eid
+                      (:max-eid db-info)
+                      (:max-eid db)
+                      (when-not simulated? (init-max-eid store)))
+   :max-tx        (or (:max-tx db-info)
+                      (when-not simulated? (max-tx store))
+                      (:max-tx db))
+   :last-modified (or (:last-modified db-info)
+                      (when-not simulated? (last-modified store))
+                      0)})
+
 ;; HACK to avoid circular dependency
 (def de-entity? (delay (resolve 'datalevin.entity/entity?)))
 (def de-entity->txs (delay (resolve 'datalevin.entity/->txs)))
@@ -2090,26 +2105,27 @@
         tx-time (System/currentTimeMillis)]
     (if (instance? datalevin.remote.DatalogStore store)
       (try
-        (let [res                                    (r/tx-data store initial-es simulated?)
+        (let [txs                                    (sequence
+                                                      (mapcat
+                                                        expand-transactable-entity)
+                                                      initial-es)
+              res                                    (r/tx-data store txs simulated?)
               db-info                                (when (map? res) (:db-info res))
               res                                    (if db-info (dissoc res :db-info) res)
               [tx-data tempids max-eid new-attributes] (remote-tx-result res)]
-          (when-not simulated?
-            (invalidate-cache store tx-data
-                              (if db-info
-                                (:last-modified db-info)
-                                (last-modified store))))
-          (let [info (when db-info
-                       (assoc db-info :max-eid max-eid))]
-          (cond-> (assoc initial-report
-                         :db-after (-> (carry-runtime-opts (new-db store info) db)
-                                       (assoc :max-eid max-eid)
+          (let [info (resolved-remote-db-info
+                       store db (or db-info {}) max-eid simulated?)]
+            (when-not simulated?
+              (invalidate-cache store tx-data (:last-modified info)))
+            (cond-> (assoc initial-report
+                           :db-after (-> (carry-runtime-opts (new-db store info) db)
+                                         (assoc :max-eid (:max-eid info))
                                        (#(if simulated?
                                            (update % :max-tx u/long-inc)
                                            %)))
-                         :tx-data tx-data
-                         :tempids tempids)
-            (seq new-attributes) (assoc :new-attributes new-attributes))))
+                           :tx-data tx-data
+                           :tempids tempids)
+              (seq new-attributes) (assoc :new-attributes new-attributes))))
         (catch Exception e
           (throw e)))
       (let [entities (prepare-entities db initial-es tx-time)]

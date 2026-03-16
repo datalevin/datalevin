@@ -661,10 +661,12 @@
         (let [^objects reports (object-array n)]
           (try
             (binding [*sync-queue-worker?* true]
-              ;; Prepare reports first (no write txn open), then persist all
-              ;; prepared tx-data in one explicit write txn.
-              (prepare-sync-queued-batch-reports! conn requests reports)
-              (commit-sync-queued-batch-reports! conn reports))
+              ;; Batch preparation allocates concrete entids/tx ids. Keep it
+              ;; under the same connection lock as commit so concurrent direct
+              ;; writes cannot advance the shared snapshot mid-batch.
+              (locking conn
+                (prepare-sync-queued-batch-reports! conn requests reports)
+                (commit-sync-queued-batch-reports! conn reports)))
             (let [db-after @conn]
               (dotimes [i n]
                 (deliver-sync-queued-success!

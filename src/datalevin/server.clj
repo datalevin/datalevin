@@ -2135,10 +2135,11 @@
   (cond
     (instance? Store store)
     (when-not (i/closed? store)
-      ;; Opening an already-live store for another client should not mutate the
-      ;; database. Applying `schema` here synthesizes a local schema txlog row,
-      ;; which is especially dangerous on HA followers because it can advance
-      ;; local watermarks without a replicated payload row.
+      ;; Preserve the legacy remote open-with-schema behavior for plain stores,
+      ;; but never synthesize follower-local schema rows on HA databases.
+      (when (and schema
+                 (nil? (:ha-mode (i/opts store))))
+        (i/set-schema store schema))
       store)
 
     (some? store)
@@ -4429,14 +4430,32 @@
   [^Server server f]
   (.execute ^Executor (.-work-executor server) f))
 
+(def ^:private idempotent-withtxn-control-types
+  #{:close-transact
+    :abort-transact
+    :close-transact-kv
+    :abort-transact-kv})
+
 (defn- handle-writing
   [^Server server ^SelectionKey skey {:keys [args] :as message}]
   (try
     (let [db-name  (nth args 0)
+          type     (:type message)
           kv-store (get-kv-store server db-name)
           runner   (get-in (.-dbs server) [db-name :runner])]
-      (new-message runner skey message)
-      (locking kv-store (.notify kv-store)))
+      (cond
+        runner
+        (do
+          (new-message runner skey message)
+          (locking kv-store (.notify kv-store)))
+
+        (idempotent-withtxn-control-types type)
+        (write-message skey {:type :command-complete})
+
+        :else
+        (u/raise "No active with-transaction runner"
+                 {:db-name db-name
+                  :type    type})))
     (catch Exception e
       ;; (stt/print-stack-trace e)
       (error-response skey (str "Error Handling with-transaction message:"

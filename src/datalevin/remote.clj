@@ -1173,6 +1173,16 @@
     (cl/normal-request client :kv-re-index [db-name opts])
     db))
 
+(defn ->KVStore
+  ([uri db-name client write-txn writing?]
+   (KVStore. uri db-name client write-txn writing?
+             false (AtomicBoolean. false)))
+  ([uri db-name client write-txn writing? owns-client?]
+   (KVStore. uri db-name client write-txn writing?
+             owns-client? (AtomicBoolean. false)))
+  ([uri db-name client write-txn writing? owns-client? closed?]
+   (KVStore. uri db-name client write-txn writing? owns-client? closed?)))
+
 (defn open-kv
   "Open a remote kv store."
   ([uri-str]

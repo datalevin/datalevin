@@ -139,6 +139,22 @@
                      res))))
           schema)))
 
+(defn- effective-schema-update
+  [old schema]
+  (into {}
+        (map (fn [[attr props]]
+               [attr (if-let [old-props (old attr)]
+                       (assoc props :db/aid (old-props :db/aid))
+                       props)]))
+        schema))
+
+(defn- schema-update-required?
+  [old schema]
+  (boolean
+    (some (fn [[attr props]]
+            (not= (old attr) props))
+          (effective-schema-update old schema))))
+
 (defn- init-schema
   [lmdb schema]
   (let [now     (load-schema lmdb)
@@ -524,10 +540,11 @@
                             (not (identical? new-vt :data)))]
       ;; Re-encode stored values before persisting schema change.
       (migrate-attr-values this attr new-vt))
-    (set! schema (init-schema lmdb new-schema))
-    (set! rschema (schema->rschema schema))
-    (set! attrs (init-attrs schema))
-    (set! max-aid (init-max-aid schema))
+    (when (schema-update-required? schema new-schema)
+      (set! schema (init-schema lmdb new-schema))
+      (set! rschema (schema->rschema schema))
+      (set! attrs (init-attrs schema))
+      (set! max-aid (init-max-aid schema)))
     schema)
 
   (attrs [_] attrs)
