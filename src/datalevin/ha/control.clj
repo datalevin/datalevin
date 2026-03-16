@@ -596,6 +596,7 @@
 (def ^:private default-snapshot-interval-secs 300)
 (def ^:private max-read-index-attempt-timeout-ms 500)
 (def ^:private max-command-attempt-timeout-ms 5000)
+(def ^:private initial-command-retry-delay-ms 20)
 (def ^:private read-retryable-errors
   #{RaftError/EAGAIN
     RaftError/EBUSY
@@ -627,6 +628,29 @@
              (min (long remaining)
                   (long (or rpc-timeout-ms max-command-attempt-timeout-ms))
                   (long max-command-attempt-timeout-ms)))))
+
+(defn- command-retry-delay-ms
+  [attempt remaining rpc-timeout-ms]
+  (let [attempt (max 0 (int attempt))
+        cap-ms  (long (max 1
+                           (min (long remaining)
+                                (long (or rpc-timeout-ms
+                                          max-command-attempt-timeout-ms)))))
+        delay-ms (loop [delay-ms (long initial-command-retry-delay-ms)
+                        attempt  attempt]
+                   (if (or (zero? attempt)
+                           (>= delay-ms cap-ms))
+                     delay-ms
+                     (recur (long (min cap-ms
+                                       (* 2 delay-ms)))
+                            (dec attempt))))]
+    (if (> delay-ms cap-ms)
+      cap-ms
+      delay-ms)))
+
+(defn- ^:redef sleep-command-retry!
+  [attempt remaining rpc-timeout-ms]
+  (Thread/sleep (command-retry-delay-ms attempt remaining rpc-timeout-ms)))
 
 (defn- single-voter-authority?
   [{:keys [voters]}]
@@ -896,7 +920,7 @@
   [cmd]
   (ByteBuffer/wrap ^bytes (nippy/freeze cmd)))
 
-(defn- apply-local-command-once!
+(defn- ^:redef apply-local-command-once!
   [^Node node cmd timeout-ms]
   (let [result-p (promise)
         closure  (->CommandClosure (volatile! nil) result-p)
@@ -1162,7 +1186,7 @@
                 (:result local-res)
 
                 (#{:not-leader :timeout} (:error local-res))
-                (do (Thread/sleep 20)
+                (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                     (recur (inc attempt)))
 
                 :else
@@ -1195,11 +1219,11 @@
                                  ::invoke-failed))]
                 (cond
                   (= ::invoke-failed response)
-                  (do (Thread/sleep 20)
+                  (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                       (recur (inc attempt)))
 
                   (not (instance? RpcRequests$ErrorResponse response))
-                  (do (Thread/sleep 20)
+                  (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                       (recur (inc attempt)))
 
                   :else
@@ -1213,7 +1237,7 @@
                     (cond
                       (not= forward-response-code
                             (.getErrorCode response-msg))
-                      (do (Thread/sleep 20)
+                      (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                           (recur (inc attempt)))
 
                       (:ok? payload)
@@ -1221,7 +1245,7 @@
 
                       (contains? #{:not-leader :apply-timeout :node-unavailable}
                                  (:error payload))
-                      (do (Thread/sleep 20)
+                      (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                           (recur (inc attempt)))
 
                       :else
@@ -1229,7 +1253,7 @@
                                {:error :ha/control-forward-failed
                                 :attempt attempt
                                 :payload payload})))))
-              (do (Thread/sleep 20)
+              (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
                   (recur (inc attempt))))))))))
 
 (defn- new-jraft-fsm
