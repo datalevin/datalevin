@@ -830,6 +830,24 @@
                  expected-state
                  next-state)))
 
+(def ^:private ha-renew-merge-excluded-keys
+  (into #{:ha-leader-last-applied-lsn
+          :ha-renew-loop-running?
+          :ha-renew-loop-future
+          :ha-follower-loop-running?
+          :ha-follower-loop-future}
+        ha-follower-side-effect-keys))
+
+(defn- ha-renew-state-patch
+  [expected-state next-state]
+  (let [patch-keys (->> (concat (keys expected-state)
+                                (keys next-state))
+                        distinct
+                        (remove ha-renew-merge-excluded-keys))]
+    (state-patch patch-keys
+                 expected-state
+                 next-state)))
+
 (defn- apply-state-patch
   [state patch]
   (reduce-kv
@@ -879,6 +897,16 @@
               :ha-follower-loop-running?))
       (apply-state-patch current-state patch)
       current-state)))
+
+(defn- merge-ha-renew-state-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (same-ha-runtime-state?
+            current-state
+            expected-state
+            :ha-renew-loop-running?))
+    (apply-state-patch current-state patch)
+    current-state))
 
 (defn- persist-ha-follower-side-effects!
   [expected-state next-state local-patch]
@@ -1211,13 +1239,26 @@
               ;; Keep renew work outside `update-db` so HA probes and peer/server
               ;; operations do not block on control-plane I/O.
               (let [next-state (ha-renew-step db-name m)
-                    {:keys [state]}
+                    renew-patch (ha-renew-state-patch m next-state)
+                    {:keys [updated? state]}
                     (replace-db-state-if-current
                      server
                      db-name
                      m
                      #(identical? running? (:ha-renew-loop-running? %))
-                     next-state)]
+                     next-state)
+                    state
+                    (if (and (not updated?) renew-patch)
+                      (:state
+                       (transform-db-state-when
+                        server
+                        db-name
+                        #(identical? running? (:ha-renew-loop-running? %))
+                        #(merge-ha-renew-state-patch
+                          %
+                          m
+                          renew-patch)))
+                      state)]
                 (if (or (nil? state)
                         (nil? (:ha-authority state))
                         (not (identical? running?

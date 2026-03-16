@@ -3,6 +3,7 @@
          org.clojure/clojure                           {:mvn/version "1.12.4"}
          babashka/babashka.pods                        {:mvn/version "0.2.0"}
          com.cognitect/transit-clj                     {:mvn/version "1.0.333"}
+         com.github.clj-easy/graal-build-time          {:mvn/version "1.0.5"}
          com.taoensso/nippy                            {:mvn/version "3.6.0"}
          com.github.luben/zstd-jni                     {:mvn/version "1.5.7-6"}
          com.taoensso/timbre                           {:mvn/version "6.5.0"}

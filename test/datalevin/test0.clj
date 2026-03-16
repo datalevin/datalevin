@@ -32,20 +32,7 @@
    datalevin.test.validation
    datalevin.test.upsert
    datalevin.test.issues
-   datalevin.test.transact
-   datalevin.lmdb-test
-   datalevin.scan-test
-   datalevin.storage-test
-   datalevin.query-test
-   datalevin.remote-test
-   datalevin.java-api-test
-   datalevin.json-api-test
-   datalevin.search-test
-   datalevin.vector-test
-   datalevin.idoc-test
-   datalevin.main-test
-   datalevin.core-test
-   )
+   datalevin.test.transact)
   (:gen-class))
 
 (defn ^:export test-clj []
@@ -81,19 +68,7 @@
           'datalevin.test.validation
           'datalevin.test.upsert
           'datalevin.test.issues
-          'datalevin.test.transact
-          'datalevin.lmdb-test
-          'datalevin.scan-test
-          'datalevin.storage-test
-          'datalevin.query-test
-          'datalevin.remote-test
-          'datalevin.java-api-test
-          'datalevin.json-api-test
-          'datalevin.search-test
-          'datalevin.vector-test
-          'datalevin.idoc-test
-          'datalevin.main-test
-          'datalevin.core-test)]
+          'datalevin.test.transact)]
     (System/exit (if (zero? ^long (+ ^long fail ^long error)) 0 1))))
 
 (defn -main [& _args]

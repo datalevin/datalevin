@@ -452,12 +452,15 @@
   [^ByteBuffer bf ^long x]
   (.putInt bf (unchecked-int (bit-and x 0xffffffff))))
 
+(defn- big-endian-buffer!
+  ^ByteBuffer [^ByteBuffer bf]
+  (.order bf ByteOrder/BIG_ENDIAN))
+
 (def ^:private ^ThreadLocal tl-record-header-buffer
   (ThreadLocal/withInitial
    (reify java.util.function.Supplier
      (get [_]
-       (doto (ByteBuffer/allocate record-header-size)
-         (.order ByteOrder/BIG_ENDIAN))))))
+       (big-endian-buffer! (ByteBuffer/allocate record-header-size))))))
 
 (def ^:private ^ThreadLocal tl-record-write-buffers
   (ThreadLocal/withInitial
@@ -557,8 +560,8 @@
          checksum  (record-body-checksum body)
          total-len (+ record-header-size (long body-len))
          record    (byte-array (int total-len))
-         header-bf (doto (ByteBuffer/wrap record 0 record-header-size)
-                     (.order ByteOrder/BIG_ENDIAN))]
+         header-bf (big-endian-buffer!
+                     (ByteBuffer/wrap record 0 record-header-size))]
      (write-record-header! header-bf body-len (boolean compressed?) checksum)
      (when (pos? (long body-len))
        (System/arraycopy body 0 record record-header-size (int body-len)))
@@ -596,8 +599,7 @@
 
 (defn- decode-header-bytes
   [^bytes header-bytes offset]
-  (let [header (doto (ByteBuffer/wrap header-bytes)
-                 (.order ByteOrder/BIG_ENDIAN))]
+  (let [header (big-endian-buffer! (ByteBuffer/wrap header-bytes))]
     (decode-header-buffer header offset)))
 
 (defn- read-fully-at!
@@ -712,8 +714,7 @@
                                               (long (max 0
                                                          (long max-offset)))))
                                    (long file-size))
-             ^ByteBuffer read-bf (doto (bf/get-array-buffer 8192)
-                                   (.order ByteOrder/BIG_ENDIAN))]
+             ^ByteBuffer read-bf (big-endian-buffer! (bf/get-array-buffer 8192))]
          (try
            (loop [offset  0
                   records (when collect-records? [])]
@@ -2116,8 +2117,7 @@
          segment-id 0
          segment-offset 0
          updated-ms 0}}]
-  (let [payload (doto (ByteBuffer/allocate meta-slot-payload-size)
-                  (.order ByteOrder/BIG_ENDIAN))]
+  (let [payload (big-endian-buffer! (ByteBuffer/allocate meta-slot-payload-size))]
     (.put payload ^bytes meta-magic-bytes)
     (.put payload (byte meta-format-major))
     (.put payload (byte 0x00))
@@ -2130,8 +2130,7 @@
     (.putLong payload (long segment-offset))
     (.putLong payload (long updated-ms))
     (let [^bytes payload-bytes (.array payload)
-          slot (doto (ByteBuffer/allocate meta-slot-size)
-                 (.order ByteOrder/BIG_ENDIAN))]
+          slot (big-endian-buffer! (ByteBuffer/allocate meta-slot-size))]
       (.put slot payload-bytes)
       (put-u32 slot (crc32c payload-bytes))
       (.array slot))))
@@ -2142,16 +2141,16 @@
     (raise "Invalid txn-log meta slot size"
            {:size (alength slot-bytes) :expected meta-slot-size}))
   (let [payload (Arrays/copyOfRange slot-bytes 0 meta-slot-payload-size)
-        checksum-buf (doto (ByteBuffer/wrap slot-bytes
-                                            meta-slot-payload-size
-                                            4)
-                       (.order ByteOrder/BIG_ENDIAN))
+        checksum-buf (big-endian-buffer!
+                       (ByteBuffer/wrap slot-bytes
+                                        meta-slot-payload-size
+                                        4))
         expected-check (long (read-int-unsigned checksum-buf))
         actual-check (long (bit-and 0xffffffff (long (crc32c payload))))]
     (when-not (= expected-check actual-check)
       (raise "Txn-log meta slot checksum mismatch"
              {:expected expected-check :actual actual-check}))
-    (let [bf (doto (ByteBuffer/wrap payload) (.order ByteOrder/BIG_ENDIAN))
+    (let [bf (big-endian-buffer! (ByteBuffer/wrap payload))
           magic (byte-array 4)]
       (.get bf magic)
       (when-not (Arrays/equals magic ^bytes meta-magic-bytes)
@@ -2318,8 +2317,8 @@
          txlog-record-offset 0
          txlog-record-crc 0
          updated-ms 0}}]
-  (let [payload (doto (ByteBuffer/allocate commit-marker-slot-payload-size)
-                  (.order ByteOrder/BIG_ENDIAN))]
+  (let [payload (big-endian-buffer!
+                  (ByteBuffer/allocate commit-marker-slot-payload-size))]
     (.put payload ^bytes commit-marker-magic-bytes)
     (.put payload (byte commit-marker-format-major))
     (.put payload (byte 0x00))
@@ -2331,8 +2330,8 @@
     (put-u32 payload (long txlog-record-crc))
     (.putLong payload (long updated-ms))
     (let [^bytes payload-bytes (.array payload)
-          slot (doto (ByteBuffer/allocate commit-marker-slot-size)
-                 (.order ByteOrder/BIG_ENDIAN))]
+          slot (big-endian-buffer!
+                 (ByteBuffer/allocate commit-marker-slot-size))]
       (.put slot payload-bytes)
       (put-u32 slot (crc32c payload-bytes))
       (.array slot))))
@@ -2344,16 +2343,16 @@
            {:size (alength slot-bytes)
             :expected commit-marker-slot-size}))
   (let [payload (Arrays/copyOfRange slot-bytes 0 commit-marker-slot-payload-size)
-        checksum-buf (doto (ByteBuffer/wrap slot-bytes
-                                            commit-marker-slot-payload-size
-                                            4)
-                       (.order ByteOrder/BIG_ENDIAN))
+        checksum-buf (big-endian-buffer!
+                       (ByteBuffer/wrap slot-bytes
+                                        commit-marker-slot-payload-size
+                                        4))
         expected-check (long (read-int-unsigned checksum-buf))
         actual-check (long (bit-and 0xffffffff (long (crc32c payload))))]
     (when-not (= expected-check actual-check)
       (raise "Txn-log commit marker slot checksum mismatch"
              {:expected expected-check :actual actual-check}))
-    (let [bf (doto (ByteBuffer/wrap payload) (.order ByteOrder/BIG_ENDIAN))
+    (let [bf (big-endian-buffer! (ByteBuffer/wrap payload))
           magic (byte-array 4)]
       (.get bf magic)
       (when-not (Arrays/equals magic ^bytes commit-marker-magic-bytes)
@@ -2538,7 +2537,7 @@
 
 (defn- bb-put-byte!
   ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl v]
-  (let [bf (ensure-room! bf tl 1)]
+  (let [^ByteBuffer bf (ensure-room! bf tl 1)]
     (.put bf (byte v))
     bf))
 
@@ -2547,7 +2546,7 @@
   (when (or (neg? v) (> v 0xffff))
     (raise "Txn-log u16 field out of range"
            {:value v :type :txlog/corrupt}))
-  (let [bf (ensure-room! bf tl Short/BYTES)]
+  (let [^ByteBuffer bf (ensure-room! bf tl Short/BYTES)]
     (.putShort bf (short v))
     bf))
 
@@ -2556,27 +2555,27 @@
   (when (or (neg? v) (> v 0xffffffff))
     (raise "Txn-log u32 field out of range"
            {:value v :type :txlog/corrupt}))
-  (let [bf (ensure-room! bf tl Integer/BYTES)]
+  (let [^ByteBuffer bf (ensure-room! bf tl Integer/BYTES)]
     (.putInt bf (unchecked-int v))
     bf))
 
 (defn- bb-put-long!
   ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^long v]
-  (let [bf (ensure-room! bf tl Long/BYTES)]
+  (let [^ByteBuffer bf (ensure-room! bf tl Long/BYTES)]
     (.putLong bf v)
     bf))
 
 (defn- bb-put-bytes!
   ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^bytes bs]
   (let [len (alength bs)
-        bf (ensure-room! bf tl len)]
+        ^ByteBuffer bf (ensure-room! bf tl len)]
     (.put bf bs 0 len)
     bf))
 
 (defn- bb-put-buffer!
   ^ByteBuffer [^ByteBuffer bf ^ThreadLocal tl ^ByteBuffer src]
   (let [len (.remaining src)
-        bf (ensure-room! bf tl len)]
+        ^ByteBuffer bf (ensure-room! bf tl len)]
     (.put bf (.array src) (.position src) len)
     bf))
 
@@ -2774,20 +2773,20 @@
         k-len (.remaining k-bf)]
     (case op
       :put
-      (let [bf1 (-> bf
-                    (bb-put-byte! tl (int op-kv-put))
-                    (bb-put-u16! tl dbi-len)
-                    (bb-put-bytes! tl dbi-bs)
-                    (bb-write-type! tl k-type)
-                    (bb-put-u16! tl k-len))
+      (let [^ByteBuffer bf1 (-> bf
+                                (bb-put-byte! tl (int op-kv-put))
+                                (bb-put-u16! tl dbi-len)
+                                (bb-put-bytes! tl dbi-bs)
+                                (bb-write-type! tl k-type)
+                                (bb-put-u16! tl k-len))
             k-offset (.position bf1)
-            bf2 (bb-put-buffer! bf1 tl k-bf)
+            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
             v-type (or vt :data)
             ^ByteBuffer v-bf (encode-to-buf v v-type)
             v-len (.remaining v-bf)
-            bf3 (-> bf2
-                    (bb-write-type! tl v-type)
-                    (bb-put-u32! tl v-len))
+            ^ByteBuffer bf3 (-> bf2
+                                (bb-write-type! tl v-type)
+                                (bb-put-u32! tl v-len))
             v-offset (.position bf3)
             bf' (-> bf3
                     (bb-put-buffer! tl v-bf)
@@ -2795,12 +2794,12 @@
         bf')
 
       :del
-      (let [bf1 (-> bf
-                    (bb-put-byte! tl (int op-kv-del))
-                    (bb-put-u16! tl dbi-len)
-                    (bb-put-bytes! tl dbi-bs)
-                    (bb-write-type! tl k-type)
-                    (bb-put-u16! tl k-len))
+      (let [^ByteBuffer bf1 (-> bf
+                                (bb-put-byte! tl (int op-kv-del))
+                                (bb-put-u16! tl dbi-len)
+                                (bb-put-bytes! tl dbi-bs)
+                                (bb-write-type! tl k-type)
+                                (bb-put-u16! tl k-len))
             k-offset (.position bf1)
             bf' (-> bf1
                     (bb-put-buffer! tl k-bf)
@@ -2808,14 +2807,14 @@
         bf')
 
       :put-list
-      (let [bf1 (-> bf
-                    (bb-put-byte! tl (int op-kv-put-list))
-                    (bb-put-u16! tl dbi-len)
-                    (bb-put-bytes! tl dbi-bs)
-                    (bb-write-type! tl k-type)
-                    (bb-put-u16! tl k-len))
+      (let [^ByteBuffer bf1 (-> bf
+                                (bb-put-byte! tl (int op-kv-put-list))
+                                (bb-put-u16! tl dbi-len)
+                                (bb-put-bytes! tl dbi-bs)
+                                (bb-write-type! tl k-type)
+                                (bb-put-u16! tl k-len))
             k-offset (.position bf1)
-            bf2 (bb-put-buffer! bf1 tl k-bf)
+            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
             v-type (or vt :data)
             ;; Keep list payload as :data for compact, fast decode.
             ^ByteBuffer v-bf (encode-to-buf v :data)
@@ -2828,14 +2827,14 @@
         bf')
 
       :del-list
-      (let [bf1 (-> bf
-                    (bb-put-byte! tl (int op-kv-del-list))
-                    (bb-put-u16! tl dbi-len)
-                    (bb-put-bytes! tl dbi-bs)
-                    (bb-write-type! tl k-type)
-                    (bb-put-u16! tl k-len))
+      (let [^ByteBuffer bf1 (-> bf
+                                (bb-put-byte! tl (int op-kv-del-list))
+                                (bb-put-u16! tl dbi-len)
+                                (bb-put-bytes! tl dbi-bs)
+                                (bb-write-type! tl k-type)
+                                (bb-put-u16! tl k-len))
             k-offset (.position bf1)
-            bf2 (bb-put-buffer! bf1 tl k-bf)
+            ^ByteBuffer bf2 (bb-put-buffer! bf1 tl k-bf)
             v-type (or vt :data)
             ;; Keep list payload as :data for compact, fast decode.
             ^ByteBuffer v-bf (encode-to-buf v :data)
