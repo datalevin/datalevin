@@ -434,7 +434,7 @@ Rollback:
 2. Confirm the hook can tolerate replay with the same `DTLV_FENCE_OP_ID` and
    concurrent execution on different candidates sharing the same
    `DTLV_FENCE_SHARED_OP_ID`.
-3. Run `script/ha/fencing-hook-verify` before staging or production cutover to
+3. Run `../dtlvtest/script/ha/fencing-hook-verify` before staging or production cutover to
    confirm the promotion path exports `DTLV_DB_NAME`,
    `DTLV_OLD_LEADER_NODE_ID`, `DTLV_OLD_LEADER_ENDPOINT`,
    `DTLV_NEW_LEADER_NODE_ID`, `DTLV_TERM_OBSERVED`,
@@ -519,15 +519,15 @@ Rollback:
 
 For fast local rehearsal, use:
 
-* `script/ha/failover`
-* `script/ha/follower-rejoin`
-* `script/ha/rejoin-bootstrap`
-* `script/ha/membership-hash-drift`
-* `script/ha/fencing-hook-verify`
-* `script/ha/clock-skew-pause`
-* `script/ha/degraded-mode-no-valid-source`
-* `script/ha/wal-gap`
-* `script/ha/fencing-failure`
+* `../dtlvtest/script/ha/failover`
+* `../dtlvtest/script/ha/follower-rejoin`
+* `../dtlvtest/script/ha/rejoin-bootstrap`
+* `../dtlvtest/script/ha/membership-hash-drift`
+* `../dtlvtest/script/ha/fencing-hook-verify`
+* `../dtlvtest/script/ha/clock-skew-pause`
+* `../dtlvtest/script/ha/degraded-mode-no-valid-source`
+* `../dtlvtest/script/ha/wal-gap`
+* `../dtlvtest/script/ha/fencing-failure`
 
 These scripts start a disposable 3-node localhost cluster under a temporary
 work directory, provision a HA Datalog store on each node, and exercise the current
@@ -538,8 +538,8 @@ The Datalevin-specific Jepsen scaffold for that next layer lives under
 
 Additional local control-plane drills are available through the shared harness:
 
-* `clojure -M:dev script/ha/drill.clj witness-topology --control-backend sofa-jraft`
-* `clojure -M:dev script/ha/drill.clj control-quorum-loss --control-backend sofa-jraft`
+* `clojure -M:dev ../dtlvtest/script/ha/drill.clj witness-topology --control-backend sofa-jraft`
+* `clojure -M:dev ../dtlvtest/script/ha/drill.clj control-quorum-loss --control-backend sofa-jraft`
 
 These two scenarios exercise standalone JRaft authorities rather than a full
 DB cluster. They validate quorum behavior directly and keep the focus on
@@ -556,7 +556,7 @@ Requirements:
 
 * Run from the repository root.
 * Use the dev alias so the drill harness can load local namespaces:
-  `clojure -M:dev script/ha/drill.clj --help`
+  `clojure -M:dev ../dtlvtest/script/ha/drill.clj --help`
 * Localhost ports starting at `19001` must be free unless you override
   `--port-base`.
 
@@ -570,7 +570,7 @@ Common options:
 
 Failover drill:
 
-* Command: `script/ha/failover`
+* Command: `../dtlvtest/script/ha/failover`
 * Expected success signals:
   `Seed write replicated across all three nodes`
   `Post-failover leader:`
@@ -582,7 +582,7 @@ Failover drill:
 
 Follower-rejoin drill:
 
-* Command: `script/ha/follower-rejoin`
+* Command: `../dtlvtest/script/ha/follower-rejoin`
 * Expected success signals:
   `Stopping leader for follower-only rejoin:`
   `Failover leader:`
@@ -600,7 +600,7 @@ Follower-rejoin drill:
 
 Rejoin-bootstrap drill:
 
-* Command: `script/ha/rejoin-bootstrap`
+* Command: `../dtlvtest/script/ha/rejoin-bootstrap`
 * Expected success signals:
   `Stopping leader to force rejoin bootstrap:`
   `Forced WAL GC on surviving nodes for rejoin bootstrap:`
@@ -618,7 +618,7 @@ Rejoin-bootstrap drill:
 
 Membership-hash-drift drill:
 
-* Command: `script/ha/membership-hash-drift`
+* Command: `../dtlvtest/script/ha/membership-hash-drift`
 * Expected success signals:
   `Rejected membership-drift update on leader:`
   `Restored authoritative members on node:`
@@ -635,7 +635,7 @@ Membership-hash-drift drill:
 
 Fencing-hook-verify drill:
 
-* Command: `script/ha/fencing-hook-verify`
+* Command: `../dtlvtest/script/ha/fencing-hook-verify`
 * Expected success signals:
   `Stopping leader to verify fencing hook contract:`
   `Verified fencing hook contract on promoted node:`
@@ -653,7 +653,7 @@ Fencing-hook-verify drill:
 
 Clock-skew-pause drill:
 
-* Command: `script/ha/clock-skew-pause`
+* Command: `../dtlvtest/script/ha/clock-skew-pause`
 * Expected success signals:
   `Configured follower clock skew breach; stopping leader`
   `Clock-skew pause blocked automatic failover on followers:`
@@ -672,7 +672,7 @@ Clock-skew-pause drill:
 
 Degraded-mode-no-valid-source drill:
 
-* Command: `script/ha/degraded-mode-no-valid-source`
+* Command: `../dtlvtest/script/ha/degraded-mode-no-valid-source`
 * Expected success signals:
   `Restarted follower with no valid snapshot source:`
   `Follower entered degraded mode:`
@@ -690,7 +690,7 @@ Degraded-mode-no-valid-source drill:
 
 WAL-gap drill:
 
-* Command: `script/ha/wal-gap`
+* Command: `../dtlvtest/script/ha/wal-gap`
 * Expected success signals:
   `Created baseline snapshot at LSN:`
   `Forced WAL GC on leader:`
@@ -707,7 +707,7 @@ WAL-gap drill:
 
 Fencing-failure drill:
 
-* Command: `script/ha/fencing-failure`
+* Command: `../dtlvtest/script/ha/fencing-failure`
 * Expected success signals:
   `Updated follower fencing hooks to fail; stopping current leader`
   `Scenario: fencing-failure`
@@ -720,7 +720,7 @@ Fencing-failure drill:
 Witness-topology drill:
 
 * Command:
-  `clojure -M:dev script/ha/drill.clj witness-topology --control-backend sofa-jraft`
+  `clojure -M:dev ../dtlvtest/script/ha/drill.clj witness-topology --control-backend sofa-jraft`
 * Expected success signals:
   `Initial control-plane leader:`
   `Stopped promotable voter: 2`
@@ -733,7 +733,7 @@ Witness-topology drill:
 Control-quorum-loss drill:
 
 * Command:
-  `clojure -M:dev script/ha/drill.clj control-quorum-loss --control-backend sofa-jraft`
+  `clojure -M:dev ../dtlvtest/script/ha/drill.clj control-quorum-loss --control-backend sofa-jraft`
 * Expected success signals:
   `Initial control-plane leader:`
   `Scenario: control-quorum-loss`

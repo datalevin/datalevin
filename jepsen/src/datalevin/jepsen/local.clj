@@ -510,6 +510,10 @@
   []
   (or (existing-canonical-path "." "script" "ha" "clock-skew-file.sh")
       (existing-canonical-path ".." "script" "ha" "clock-skew-file.sh")
+      (existing-canonical-path ".." "dtlvtest" "script" "ha"
+                               "clock-skew-file.sh")
+      (existing-canonical-path ".." ".." "dtlvtest" "script" "ha"
+                               "clock-skew-file.sh")
       (u/raise "Unable to locate Jepsen clock skew hook script"
                {:script "clock-skew-file.sh"})))
 

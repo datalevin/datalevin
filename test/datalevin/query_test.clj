@@ -950,3 +950,35 @@
            ["Alan Rickman" #inst "1946-02-21T00:00:00.000-00:00"]))
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-issue-358-boolean-false-query
+  (let [dir              (u/tmp-dir (str "query-issue-358-" (UUID/randomUUID)))
+        schema           {:item/id   {:db/valueType :db.type/string
+                                      :db/unique    :db.unique/identity}
+                          :item/flag {:db/valueType :db.type/boolean}}
+        false-query      '[:find ?id
+                           :where
+                           [?e :item/id ?id]
+                           [?e :item/flag false]]
+        input-flag-query '[:find ?id
+                           :in $ ?flag
+                           :where
+                           [?e :item/id ?id]
+                           [?e :item/flag ?flag]]
+        true-query       '[:find ?id
+                           :where
+                           [?e :item/id ?id]
+                           [?e :item/flag true]]
+        conn             (d/get-conn dir schema)]
+    (try
+      (d/transact! conn [{:item/id "a" :item/flag false}
+                         {:item/id "b" :item/flag false}])
+      (let [eid-a (ffirst (d/q '[:find ?e :where [?e :item/id "a"]]
+                               (d/db conn)))]
+        (d/transact! conn [[:db/add eid-a :item/flag true]])
+        (is (= #{["b"]} (d/q false-query (d/db conn))))
+        (is (= #{["b"]} (d/q input-flag-query (d/db conn) false)))
+        (is (= #{["a"]} (d/q true-query (d/db conn)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))

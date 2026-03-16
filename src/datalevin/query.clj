@@ -130,8 +130,9 @@
   (-sample [_ db _]
     (let [get-v? (< 1 (count vars))]
       (cond
-        val   (db/-sample-init-tuples-list
-                db attr mcount [[[:closed val] [:closed val]]] nil false)
+        (some? val)
+        (db/-sample-init-tuples-list
+          db attr mcount [[[:closed val] [:closed val]]] nil false)
         range (db/-sample-init-tuples-list db attr mcount range pred get-v?)
         :else (cond-> (db/-e-sample db attr)
                 get-v?
@@ -529,7 +530,12 @@
                 (get tuple idx)))))))))
 
 (defn substitute-constants [context pattern]
-  (mapv #(or (substitute-constant context %) %) pattern))
+  (mapv (fn [pattern-el]
+          (if (qu/binding-var? pattern-el)
+            (let [substituted (substitute-constant context pattern-el)]
+              (if (nil? substituted) pattern-el substituted))
+            pattern-el))
+        pattern))
 
 (defn- compute-rels-bound-values
   "Compute bound values for a variable from context relations."
@@ -1816,7 +1822,7 @@
   [e (reduce (fn [m pattern]
                (let [attr   (second pattern)
                      clause (map->Clause {:attr attr})]
-                 (if-let [v (qu/get-v pattern)]
+                 (if-some [v (qu/get-v pattern)]
                    (if (qu/free-var? v)
                      (update m :free conjv (assoc clause :var v))
                      (update m :bound conjv (assoc clause :val v)))
@@ -2455,7 +2461,7 @@
                               :vars (cond-> [e]
                                       (not no-var?) (conj var))
                               :range range)
-               val     (assoc :val val)
+               (some? val) (assoc :val val)
                know-e? (assoc :know-e? true)
                true    (#(let [vars (:vars %)]
                            (assoc % :cols (if (= 1 (count vars))

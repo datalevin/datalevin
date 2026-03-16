@@ -780,7 +780,14 @@
 (defn transfer
   [^DB old store]
   (carry-runtime-opts
-    (DB. store (.-max-eid old) (.-max-tx old) (.-eavt old) (.-avet old)
+    ;; eavt/avet are mutable transaction-local overlays, not durable indexes.
+    ;; A transferred DB view must get fresh caches so local write transactions
+    ;; do not leak in-memory datoms across connection/transaction wrappers.
+    (DB. store
+         (.-max-eid old)
+         (.-max-tx old)
+         (TreeSortedSet. ^Comparator d/cmp-datoms-eavt)
+         (TreeSortedSet. ^Comparator d/cmp-datoms-avet)
          (.-pull-patterns old))
     old))
 
