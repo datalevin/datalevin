@@ -112,7 +112,7 @@ project. There are also several other installation options. Please see details i
 [Installation Documentation](doc/install.md)
 
 For embedded-only JVM consumers, Clojars also publishes
-`datalevin/datalevin-embedded:0.10.7`, which keeps the local APIs and
+`org.datalevin/datalevin-embedded:0.10.7`, which keeps the local APIs and
 `datalevin.client` while trimming the server, HA, CLI, and babashka pod runtime.
 
 ## :birthday: Upgrade

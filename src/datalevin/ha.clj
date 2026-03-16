@@ -311,6 +311,9 @@
                 nil))
             0)))
 
+(def ^:private ha-local-watermark-snapshot-key
+  ::ha-local-watermark-snapshot)
+
 (declare read-ha-local-watermark-lsn)
 
 (defn- ha-local-data-lsn-ceiling
@@ -340,6 +343,65 @@
 (declare read-ha-local-last-applied-lsn)
 (declare read-ha-local-watermark-lsn)
 
+(defn- read-ha-local-watermark-lsn*
+  [kv-store]
+  (long (or (try
+              (get (kv/txlog-watermarks kv-store) :last-applied-lsn)
+              (catch Throwable t
+                (when-not (closed-kv-race? t kv-store)
+                  (throw t))
+                nil))
+            0)))
+
+(defn- ^:redef fresh-ha-local-watermark-snapshot
+  [m kv-store]
+  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
+        role (:ha-role m)
+        watermark-lsn (read-ha-local-watermark-lsn* kv-store)
+        snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
+        payload-lsn (if (= :leader role)
+                      (read-ha-local-payload-lsn kv-store)
+                      0)
+        persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
+        ceiling-lsn (long (if (= :leader role)
+                            (long-max3 watermark-lsn
+                                       snapshot-lsn
+                                       payload-lsn)
+                            (long-max2 watermark-lsn
+                                       snapshot-lsn)))
+        follower-floor-lsn
+        (ha-clamped-follower-floor-lsn
+         persisted-lsn snapshot-lsn ceiling-lsn)
+        local-last-applied-lsn
+        (long (if (= :leader role)
+                ceiling-lsn
+                (if (pos? (long ceiling-lsn))
+                  follower-floor-lsn
+                  state-lsn)))]
+    {:role role
+     :kv-store kv-store
+     :state-lsn state-lsn
+     :watermark-lsn watermark-lsn
+     :snapshot-lsn snapshot-lsn
+     :payload-lsn payload-lsn
+     :persisted-lsn persisted-lsn
+     :ceiling-lsn ceiling-lsn
+     :follower-floor-lsn follower-floor-lsn
+     :local-last-applied-lsn local-last-applied-lsn}))
+
+(defn- cached-ha-local-watermark-snapshot
+  [m kv-store]
+  (let [snapshot (get m ha-local-watermark-snapshot-key)]
+    (when (and (map? snapshot)
+               (= (:role snapshot) (:ha-role m))
+               (identical? (:kv-store snapshot) kv-store))
+      snapshot)))
+
+(defn- ha-local-watermark-snapshot
+  [m kv-store]
+  (or (cached-ha-local-watermark-snapshot m kv-store)
+      (fresh-ha-local-watermark-snapshot m kv-store)))
+
 (defn ^:redef read-ha-snapshot-payload-lsn
   [m]
   (if-let [kv-store (local-kv-store m)]
@@ -348,24 +410,11 @@
 
 (defn ^:redef read-ha-local-last-applied-lsn
   [m]
-  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-        role (:ha-role m)]
+  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
     (try
       (if-let [kv-store (local-kv-store m)]
-        (let [{:keys [snapshot-lsn ceiling-lsn]}
-              (ha-local-data-lsn-ceiling m kv-store)
-              persisted-lsn (read-ha-local-persisted-lsn kv-store)
-              follower-floor-lsn
-              (ha-clamped-follower-floor-lsn
-               persisted-lsn snapshot-lsn ceiling-lsn)]
-          (cond
-            (= :leader role)
-            ceiling-lsn
-
-            (pos? (long ceiling-lsn))
-            follower-floor-lsn
-
-            :else state-lsn))
+        (:local-last-applied-lsn
+         (ha-local-watermark-snapshot m kv-store))
         state-lsn)
       (catch Throwable e
         (when-not (closed-kv-race? e (local-kv-store m))
@@ -376,13 +425,9 @@
 (defn- ^:redef read-ha-local-watermark-lsn
   [m]
   (if-let [kv-store (local-kv-store m)]
-    (long (or (try
-                (get (kv/txlog-watermarks kv-store) :last-applied-lsn)
-                (catch Throwable t
-                  (when-not (closed-kv-race? t kv-store)
-                    (throw t))
-                  nil))
-              0))
+    (if-let [snapshot (cached-ha-local-watermark-snapshot m kv-store)]
+      (long (:watermark-lsn snapshot))
+      (read-ha-local-watermark-lsn* kv-store))
     0))
 
 (defn persist-ha-runtime-local-applied-lsn!
@@ -420,22 +465,14 @@
 
 (defn- refresh-ha-local-watermarks
   [m]
-  (if (local-kv-store m)
-    (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-          role (:ha-role m)
-          kv-store (local-kv-store m)
-          {:keys [snapshot-lsn ceiling-lsn]}
-          (ha-local-data-lsn-ceiling m kv-store)
-          persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
-          local-lsn (long (if (= :leader role)
-                            ceiling-lsn
-                            (if (pos? (long ceiling-lsn))
-                              (ha-clamped-follower-floor-lsn
-                               persisted-lsn snapshot-lsn ceiling-lsn)
-                              state-lsn)))]
-      (cond-> (assoc m :ha-local-last-applied-lsn local-lsn)
+  (if-let [kv-store (local-kv-store m)]
+    (let [{:keys [role local-last-applied-lsn] :as snapshot}
+          (ha-local-watermark-snapshot m kv-store)]
+      (cond-> (assoc m
+                     ha-local-watermark-snapshot-key snapshot
+                     :ha-local-last-applied-lsn local-last-applied-lsn)
         (= :leader role)
-        (assoc :ha-leader-last-applied-lsn local-lsn)))
+        (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
     m))
 
 (defn- transact-ha-follower-local!
@@ -2736,9 +2773,11 @@
   (if-not (:ha-authority m)
     m
     (let [m0 (refresh-ha-local-watermarks m)]
-      (if (= :follower (:ha-role m0))
-        (sync-ha-follower-state db-name m0 (ha-now-ms))
-        m0))))
+      (cond-> (if (= :follower (:ha-role m0))
+                (sync-ha-follower-state db-name m0 (ha-now-ms))
+                m0)
+        :always
+        (dissoc ha-local-watermark-snapshot-key)))))
 
 (defn- advance-ha-follower-or-candidate
   [db-name m]
@@ -2865,11 +2904,13 @@
           m4 (advance-ha-follower-or-candidate db-name m3)
           end-now-ms (ha-now-ms)]
       (-> (maybe-demote-on-refresh-timeout db-name m4 end-now-ms)
-          (maybe-finish-ha-demotion end-now-ms started-demoting?)))))
+          (maybe-finish-ha-demotion end-now-ms started-demoting?)
+          (dissoc ha-local-watermark-snapshot-key)))))
 
 (defn clear-ha-runtime-state
   [m]
   (dissoc m
+          ha-local-watermark-snapshot-key
           :ha-authority :ha-db-identity :ha-membership-hash
           :ha-authority-membership-hash
           :ha-db-identity-mismatch? :ha-membership-mismatch?

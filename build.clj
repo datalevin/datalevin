@@ -30,7 +30,7 @@
                           second)
                  "dev"))
 (def java-lib 'org.datalevin/datalevin-java)
-(def embedded-lib 'datalevin/datalevin-embedded)
+(def embedded-lib 'org.datalevin/datalevin-embedded)
 (def clojure-runtime-lib 'org.clojure/clojure)
 (def javacpp-lib 'org.bytedeco/javacpp)
 (def java-jar-file (format "target/datalevin-java-%s.jar" version))
@@ -48,7 +48,6 @@
 (def release-runtime-excluded-deps
   '#{babashka/babashka.pods
      nrepl/bencode
-     org.babashka/sci
      org.clojure/tools.cli
      org.bouncycastle/bcpkix-jdk15on
      org.bouncycastle/bcprov-jdk15on
@@ -57,8 +56,8 @@
   ["pod"
    "datalevin/ha"
    "datalevin/ha.clj"
-   "datalevin/interpret.clj"
    "datalevin/main.clj"
+   "datalevin/mcp.clj"
    "datalevin/server.clj"])
 (def release-runtime-class-excludes
   ["datalevin/ha"])

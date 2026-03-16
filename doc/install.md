@@ -31,13 +31,13 @@ libraries, and excludes the server, HA, CLI, and babashka pod runtime code.
 If you use Leiningen:
 
 ```Clojure
-[datalevin/datalevin-embedded "0.10.7"]
+[org.datalevin/datalevin-embedded "0.10.7"]
 ```
 
 If you use Clojure CLI:
 
 ```Clojure
-{:deps {datalevin/datalevin-embedded {:mvn/version "0.10.7"}}}
+{:deps {org.datalevin/datalevin-embedded {:mvn/version "0.10.7"}}}
 ```
 
 See [embedded release notes](embedded-release.md) for the packaging and release

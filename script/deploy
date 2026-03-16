@@ -11,6 +11,6 @@ lein clean
 lein with-profile core-release deploy clojars
 
 clojure -T:build embedded-jar
-lein deploy clojars datalevin/datalevin-embedded "$version" \
+lein deploy clojars org.datalevin/datalevin-embedded "$version" \
   "target/datalevin-embedded-$version.jar" \
   "target/datalevin-embedded-$version.pom"
