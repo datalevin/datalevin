@@ -36,7 +36,8 @@
    [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
-   [java.util.concurrent ConcurrentHashMap TimeUnit]
+   [java.util.concurrent ConcurrentHashMap ExecutorService Executors Future
+    TimeUnit]
    [java.util.function BiFunction Function]))
 
 (defn consensus-ha-opts
@@ -1112,6 +1113,26 @@
        :endpoint endpoint
        :message (ex-message e)})))
 
+(defn- ha-parallel-mapv
+  [f coll]
+  (let [items (vec coll)
+        n (count items)]
+    (cond
+      (zero? n)
+      []
+
+      (= 1 n)
+      [(f (first items))]
+
+      :else
+      (let [^ExecutorService executor (Executors/newFixedThreadPool n)]
+        (try
+          (->> (.invokeAll executor
+                           (mapv (fn [item] #(f item)) items))
+               (mapv #(.get ^Future %)))
+          (finally
+            (.shutdown executor)))))))
+
 (defn ^:redef fetch-leader-watermark-lsn
   [db-name m lease]
   (let [leader-endpoint (:leader-endpoint lease)
@@ -1140,35 +1161,41 @@
                                (map :endpoint (:ha-members m)))
                        (filter #(and (string? %)
                                      (not (s/blank? %))))
-                       distinct)]
-    (reduce (fn [best endpoint]
-              (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                               db-name m endpoint)]
-                (if-not (:reachable? watermark)
-                  best
-                  (let [last-applied-lsn
-                        (long (or (:last-applied-lsn watermark) 0))
-                        candidate {:endpoint endpoint
-                                   :last-applied-lsn last-applied-lsn
-                                   :watermark watermark}]
-                    (cond
-                      (nil? best)
-                      candidate
+                       distinct
+                       vec)
+        watermarks (ha-parallel-mapv
+                    (fn [endpoint]
+                      {:endpoint endpoint
+                       :watermark
+                       (safe-fetch-ha-endpoint-watermark-lsn
+                        db-name m endpoint)})
+                    endpoints)]
+    (reduce (fn [best {:keys [endpoint watermark]}]
+              (if-not (:reachable? watermark)
+                best
+                (let [last-applied-lsn
+                      (long (or (:last-applied-lsn watermark) 0))
+                      candidate {:endpoint endpoint
+                                 :last-applied-lsn last-applied-lsn
+                                 :watermark watermark}]
+                  (cond
+                    (nil? best)
+                    candidate
 
-                      (> last-applied-lsn
-                         (long (:last-applied-lsn best)))
-                      candidate
+                    (> last-applied-lsn
+                       (long (:last-applied-lsn best)))
+                    candidate
 
-                      (and (= last-applied-lsn
-                              (long (:last-applied-lsn best)))
-                           (= endpoint local-endpoint)
-                           (not= endpoint (:endpoint best)))
-                      candidate
+                    (and (= last-applied-lsn
+                            (long (:last-applied-lsn best)))
+                         (= endpoint local-endpoint)
+                         (not= endpoint (:endpoint best)))
+                    candidate
 
-                      :else
-                      best)))))
+                    :else
+                    best))))
             nil
-            endpoints)))
+            watermarks)))
 
 (def ^:private ha-follower-max-batch-records 256)
 (def ^:private ha-follower-max-sync-backoff-ms 30000)
@@ -1251,32 +1278,37 @@
                                      0))
         local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
-        followers
+        follower-members
         (->> (:ha-members m)
              (sort-by :node-id)
-             (keep (fn [{:keys [endpoint node-id]}]
-                     (when (and (string? endpoint)
-                                (not (s/blank? endpoint))
-                                (not= endpoint local-endpoint)
-                                (not= endpoint leader-endpoint))
-                       (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                                        db-name m endpoint)
-                             raw-last-lsn (ha-source-watermark-lsn
-                                           leader-endpoint
-                                           endpoint
-                                           watermark)
-                             last-lsn (when (some? raw-last-lsn)
-                                        (long-min2 raw-last-lsn
-                                                   leader-safe-lsn))
-                             eligible? (and (some? last-lsn)
-                                            (>= (long last-lsn)
-                                                required-lsn))]
-                         {:endpoint endpoint
-                          :node-id node-id
-                          :last-applied-lsn last-lsn
-                          :raw-last-applied-lsn raw-last-lsn
-                          :leader-safe-lsn leader-safe-lsn
-                          :eligible? eligible?})))))
+             (filter (fn [{:keys [endpoint]}]
+                       (and (string? endpoint)
+                            (not (s/blank? endpoint))
+                            (not= endpoint local-endpoint)
+                            (not= endpoint leader-endpoint))))
+             vec)
+        followers
+        (ha-parallel-mapv
+         (fn [{:keys [endpoint node-id]}]
+           (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
+                            db-name m endpoint)
+                 raw-last-lsn (ha-source-watermark-lsn
+                               leader-endpoint
+                               endpoint
+                               watermark)
+                 last-lsn (when (some? raw-last-lsn)
+                            (long-min2 raw-last-lsn
+                                       leader-safe-lsn))
+                 eligible? (and (some? last-lsn)
+                                (>= (long last-lsn)
+                                    required-lsn))]
+             {:endpoint endpoint
+              :node-id node-id
+              :last-applied-lsn last-lsn
+              :raw-last-applied-lsn raw-last-lsn
+              :leader-safe-lsn leader-safe-lsn
+              :eligible? eligible?}))
+         follower-members)
         eligible-followers
         (sort-by (juxt (comp - :last-applied-lsn) :node-id)
                  (filter :eligible? followers))
