@@ -38,7 +38,8 @@
    [java.util UUID]
    [java.util.concurrent ConcurrentHashMap ExecutorService Executors Future
     TimeUnit]
-   [java.util.function BiFunction Function]))
+   [java.util.concurrent.atomic AtomicLong]
+   [java.util.function BiFunction]))
 
 (defn consensus-ha-opts
   [store]
@@ -538,14 +539,42 @@
           (cl/disconnect client)
           (catch Throwable _ nil))))))
 
+(def ^:dynamic *ha-client-cache-max-size* 256)
+
+(def ^:dynamic *ha-client-cache-ttl-ms* (* 5 60 1000))
+
+(def ^:dynamic *ha-client-cache-prune-interval-ms* 10000)
+
 (defonce ^:private ^ConcurrentHashMap ha-client-cache
   (ConcurrentHashMap.))
+
+(defonce ^:private ^AtomicLong ha-client-cache-last-prune-ms
+  (AtomicLong. 0))
 
 (defn- ha-client-cache-key
   [uri client-opts]
   [uri
    (long (or (:pool-size client-opts) 1))
    (long (or (:time-out client-opts) c/default-connection-timeout))])
+
+(defn- ha-client-cache-entry
+  [client now-ms]
+  {:client client
+   :last-used-ms (AtomicLong. (long now-ms))})
+
+(defn- ha-client-cache-entry-client
+  [entry]
+  (:client entry))
+
+(defn- ha-client-cache-entry-last-used-ms ^long
+  [entry]
+  (long (.get ^AtomicLong (:last-used-ms entry))))
+
+(defn- touch-ha-client-cache-entry!
+  [entry now-ms]
+  (when-let [^AtomicLong last-used-ms (:last-used-ms entry)]
+    (.set last-used-ms (long now-ms)))
+  entry)
 
 (defn- ^:redef live-ha-client?
   [client]
@@ -554,6 +583,66 @@
          (not (cl/disconnected? client))
          (catch Throwable _
            false))))
+
+(defn- reusable-ha-client-cache-entry?
+  [entry now-ms]
+  (and entry
+       (live-ha-client? (ha-client-cache-entry-client entry))
+       (<= (nonnegative-long-diff now-ms
+                                  (ha-client-cache-entry-last-used-ms entry))
+           (long *ha-client-cache-ttl-ms*))))
+
+(defn- close-ha-client-cache-entry!
+  [entry]
+  (close-ha-client! (ha-client-cache-entry-client entry)))
+
+(defn- prune-ha-client-cache!
+  [now-ms protected-entry]
+  (let [^ConcurrentHashMap cache ha-client-cache
+        max-size (max 0 (long *ha-client-cache-max-size*))
+        entries (vec (.entrySet cache))
+        annotated
+        (mapv
+         (fn [entry]
+           (let [entry ^java.util.Map$Entry entry
+                 cache-entry (.getValue entry)]
+             {:cache-key (.getKey entry)
+              :cache-entry cache-entry
+              :last-used-ms (ha-client-cache-entry-last-used-ms cache-entry)
+              :protected? (identical? cache-entry protected-entry)
+              :reusable? (reusable-ha-client-cache-entry? cache-entry now-ms)}))
+         entries)
+        stale-victims (filterv #(and (not (:protected? %))
+                                     (not (:reusable? %)))
+                              annotated)
+        live-entries (filterv :reusable? annotated)
+        overflow-count (max 0 (- (count live-entries) max-size))
+        overflow-victims
+        (if (pos? overflow-count)
+          (->> live-entries
+               (remove :protected?)
+               (sort-by (juxt :last-used-ms :cache-key))
+               (take overflow-count)
+               vec)
+          [])]
+    (doseq [{:keys [cache-key cache-entry]}
+            (into stale-victims overflow-victims)]
+      (when (.remove cache cache-key cache-entry)
+        (close-ha-client-cache-entry! cache-entry)))
+    (.set ha-client-cache-last-prune-ms (long now-ms))))
+
+(defn- maybe-prune-ha-client-cache!
+  ([now-ms]
+   (maybe-prune-ha-client-cache! now-ms nil))
+  ([now-ms protected-entry]
+   (let [^ConcurrentHashMap cache ha-client-cache
+         max-size (max 0 (long *ha-client-cache-max-size*))
+         prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))]
+     (when (or (> (.size cache) max-size)
+               (>= (nonnegative-long-diff now-ms
+                                          (.get ha-client-cache-last-prune-ms))
+                   prune-interval-ms))
+       (prune-ha-client-cache! now-ms protected-entry)))))
 
 (defn- ^:redef open-ha-client
   [uri db-name client-opts]
@@ -569,35 +658,46 @@
   [uri db-name client-opts]
   (let [cache-key (ha-client-cache-key uri client-opts)
         ^ConcurrentHashMap cache ha-client-cache]
-    (if-let [client (.get cache cache-key)]
-      (if (live-ha-client? client)
-        client
-        (let [stale-client-v (volatile! nil)
-              client (.compute cache cache-key
-                               (reify BiFunction
-                                 (apply [_ _ existing]
-                                   (if (live-ha-client? existing)
-                                     existing
-                                     (do
-                                       (when existing
-                                         (vreset! stale-client-v existing))
-                                       (open-ha-client uri db-name
-                                                       client-opts))))))]
-          (when-let [stale-client @stale-client-v]
-            (when-not (identical? stale-client client)
-              (close-ha-client! stale-client)))
-          client))
-      (.computeIfAbsent cache cache-key
-                        (reify Function
-                          (apply [_ _]
-                            (open-ha-client uri db-name client-opts)))))))
+    (maybe-prune-ha-client-cache! (ha-now-ms))
+    (let [stale-entry-v (volatile! nil)
+          cache-entry (.compute cache cache-key
+                                (reify BiFunction
+                                  (apply [_ _ existing]
+                                    (let [now-ms (ha-now-ms)]
+                                      (if (reusable-ha-client-cache-entry?
+                                           existing now-ms)
+                                        (touch-ha-client-cache-entry! existing
+                                                                      now-ms)
+                                        (do
+                                          (when existing
+                                            (vreset! stale-entry-v existing))
+                                          (ha-client-cache-entry
+                                           (open-ha-client uri db-name
+                                                           client-opts)
+                                           now-ms)))))))]
+      (when-let [stale-entry @stale-entry-v]
+        (when-not (identical? stale-entry cache-entry)
+          (close-ha-client-cache-entry! stale-entry)))
+      (maybe-prune-ha-client-cache! (ha-now-ms) cache-entry)
+      (ha-client-cache-entry-client cache-entry))))
 
 (defn- invalidate-cached-ha-client!
   [uri client-opts client]
   (let [cache-key (ha-client-cache-key uri client-opts)
-        ^ConcurrentHashMap cache ha-client-cache]
-    (when (.remove cache cache-key client)
-      (close-ha-client! client))))
+        ^ConcurrentHashMap cache ha-client-cache
+        stale-entry-v (volatile! nil)]
+    (.compute cache cache-key
+              (reify BiFunction
+                (apply [_ _ existing]
+                  (if (and existing
+                           (identical? client
+                                       (ha-client-cache-entry-client existing)))
+                    (do
+                      (vreset! stale-entry-v existing)
+                      nil)
+                    existing))))
+    (when-let [stale-entry @stale-entry-v]
+      (close-ha-client-cache-entry! stale-entry))))
 
 (defn- with-cached-ha-client
   [uri db-name client-opts f]
@@ -623,11 +723,12 @@
           (doseq [entry entries]
             (let [entry ^java.util.Map$Entry entry
                   cache-key (.getKey entry)
-                  client (.getValue entry)]
-              (when (.remove cache cache-key client)
-                (close-ha-client! client))))
+                  cache-entry (.getValue entry)]
+              (when (.remove cache cache-key cache-entry)
+                (close-ha-client-cache-entry! cache-entry))))
           (when-not (.isEmpty cache)
-            (recur)))))))
+            (recur)))))
+    (.set ha-client-cache-last-prune-ms 0)))
 
 (defn- ha-client-credentials
   [m]
