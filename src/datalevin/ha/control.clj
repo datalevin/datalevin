@@ -97,6 +97,16 @@
                         (assoc m group-id state))))
              group-id))))
 
+(defn reset-in-memory-groups!
+  "Clear all shared in-memory authority state.
+
+  This is intended for test fixtures so separate tests can safely reuse
+  deterministic in-memory group IDs without inheriting leases or membership
+  from earlier tests."
+  []
+  (reset! in-memory-groups {})
+  nil)
+
 (defn- non-blank-string?
   [x]
   (and (string? x) (not (s/blank? x))))
