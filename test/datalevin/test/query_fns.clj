@@ -541,6 +541,15 @@
                   :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]
                 db [:and {:phrase "little lamb"} "fleece"])
            #{[2 :text "Mary had a little lamb whose fleece was red as fire."]}))
+    (let [scores (into {}
+                       (d/q '[:find ?e ?score
+                              :in $ ?q
+                              :where [(fulltext $ ?q {:display :refs+scores})
+                                      [[?e ?a ?v ?score]]]]
+                            db "red fox"))]
+      (is (= #{1 2} (set (keys scores))))
+      (is (every? number? (vals scores)))
+      (is (> (scores 1) (scores 2))))
     (d/close-db db)
     (u/delete-files dir)))
 

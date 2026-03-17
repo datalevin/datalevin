@@ -2097,9 +2097,11 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
 
 `opts` map may have these keys:
 
-  * `:display` can be one of `:refs` (default), `:offsets`, `:texts`,
-    or `:texts+offsets`.
+  * `:display` can be one of `:refs` (default), `:refs+scores`,
+    `:offsets`, `:texts`, or `:texts+offsets`.
     - `:refs` returns a lazy sequence of `doc-ref` ordered by relevance.
+    - `:refs+scores` returns a lazy sequence of `[doc-ref score]`
+      ordered by relevance.
     - `:offsets` returns a lazy sequence of
       `[doc-ref [term1 [offset ...]] [term2 [...]] ...]`,
       ordered by relevance, if search engine option `:index-position?`

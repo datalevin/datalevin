@@ -195,6 +195,7 @@
 (defn- fulltext-doc-ref+extras
   [display result]
   (case display
+    :refs+scores   [(nth result 0) [(nth result 1)]]
     :texts         [(nth result 0) [(nth result 1)]]
     :offsets       [(nth result 0) [(nth result 1)]]
     :texts+offsets [(nth result 0) [(nth result 1) (nth result 2)]]
@@ -250,6 +251,7 @@
   See [[datalevin.core.search]].
 
   Additional values are returned when `:display` is set in the options:
+  * `:refs+scores` returns `[e a v score]`
   * `:texts` returns `[e a v text]`
   * `:offsets` returns `[e a v offsets]`
   * `:texts+offsets` returns `[e a v text offsets]`
@@ -269,6 +271,11 @@
   * Domain specific search:
 
     `[(fulltext $ \"red\" {:domains [\"color\"]} [[?e ?a ?v]])]`
+
+  * Search with scores:
+
+    `[(fulltext $ \"red\" {:display :refs+scores})
+      [[?e ?a ?v ?score]]]`
 
   * Search with text and offsets:
 

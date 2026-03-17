@@ -515,6 +515,11 @@
     (pd/add-doc engine 3 (docs 3))
 
     (is (= [1 2] (pd/search engine "red")))
+    (let [results (vec (pd/search engine "red" {:display :refs+scores}))]
+      (is (= [1 2] (mapv first results)))
+      (is (every? number? (map second results)))
+      (is (> (second (first results))
+             (second (second results)))))
     (is (= [[1 [["red" [10 39]]]] [2 [["red" [40]]]]]
            (pd/search engine "red" {:display :offsets})))
     (pd/close-kv lmdb)

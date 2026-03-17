@@ -69,7 +69,7 @@ public class Txn {
 
     public void close() {
         if (state == RELEASED) return;
-        if (state == READY) DTLV.mdb_txn_abort(ptr);
+        if (state == READY || state == RESET) DTLV.mdb_txn_abort(ptr);
         state = RELEASED;
     }
 

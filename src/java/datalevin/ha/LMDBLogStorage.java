@@ -24,6 +24,7 @@ import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.List;
+import java.util.function.BiFunction;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import org.slf4j.Logger;
@@ -68,6 +69,9 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private volatile long firstLogIndex = 1L;
     private long mapSizeBytes = MAP_SIZE_BYTES;
     private volatile boolean hasLoadedFirstLogIndex;
+    private volatile long readStateVersion = 1L;
+    private final ThreadLocal<ReadTxnState> readTxnState =
+        ThreadLocal.withInitial(ReadTxnState::new);
 
     public LMDBLogStorage(final String path, final RaftOptions raftOptions) {
         this.path = path;
@@ -126,17 +130,19 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             if (this.hasLoadedFirstLogIndex) {
                 return this.firstLogIndex;
             }
-            final Long persisted = readMetaLong(FIRST_LOG_INDEX_KEY);
-            if (persisted != null) {
-                setFirstLogIndex(persisted);
-                return persisted;
-            }
-            final Long first = getBoundaryIndex(this.logDbi, DTLV.MDB_FIRST);
-            if (first != null) {
-                setFirstLogIndex(first);
-                return first;
-            }
-            return 1L;
+            return withReadTxn((txn, state) -> {
+                final Long persisted = readMetaLong(txn, FIRST_LOG_INDEX_KEY);
+                if (persisted != null) {
+                    setFirstLogIndex(persisted);
+                    return persisted;
+                }
+                final Long first = getBoundaryIndex(txn, this.logDbi, DTLV.MDB_FIRST);
+                if (first != null) {
+                    setFirstLogIndex(first);
+                    return first;
+                }
+                return 1L;
+            });
         } finally {
             this.readLock.unlock();
         }
@@ -146,7 +152,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     public long getLastLogIndex() {
         this.readLock.lock();
         try {
-            final Long last = getBoundaryIndex(this.logDbi, DTLV.MDB_LAST);
+            final Long last = withReadTxn(
+                (txn, state) -> getBoundaryIndex(txn, this.logDbi, DTLV.MDB_LAST));
             return last == null ? 0L : last;
         } finally {
             this.readLock.unlock();
@@ -172,8 +179,27 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     @Override
     public long getTerm(final long index) {
-        final LogEntry entry = getEntry(index);
-        return entry == null ? 0L : entry.getId().getTerm();
+        this.readLock.lock();
+        try {
+            if (this.hasLoadedFirstLogIndex && index < this.firstLogIndex) {
+                return 0L;
+            }
+            final long readVersion = this.readStateVersion;
+            final ReadTxnState state = this.readTxnState.get();
+            if (state.hasCachedTerm(index, readVersion)) {
+                return state.getCachedTerm();
+            }
+            final LogEntry entry = withReadTxn((txn, readState) -> readEntry(txn, index));
+            final long term = entry == null ? 0L : entry.getId().getTerm();
+            state.cacheTerm(index, term, readVersion);
+            return term;
+        } catch (final RuntimeException e) {
+            LOG.error("Fail to get log term at index {} in data path: {}.",
+                index, this.path, e);
+            throw e;
+        } finally {
+            this.readLock.unlock();
+        }
     }
 
     @Override
@@ -198,6 +224,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                     }
                     txn.commit();
                     syncEnv();
+                    advanceReadStateVersion();
                     return entries.size();
                 } catch (final Util.MapFullException e) {
                     lastMapFull = e;
@@ -246,6 +273,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 txn.commit();
                 syncEnv();
                 setFirstLogIndex(firstIndexKept);
+                advanceReadStateVersion();
                 return true;
             } finally {
                 txn.close();
@@ -273,6 +301,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 deleteRange(txn, this.confDbi, deleteFrom, currentLast);
                 txn.commit();
                 syncEnv();
+                advanceReadStateVersion();
                 return true;
             } finally {
                 txn.close();
@@ -312,6 +341,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 txn.commit();
                 syncEnv();
                 setFirstLogIndex(nextLogIndex);
+                advanceReadStateVersion();
                 return true;
             } finally {
                 txn.close();
@@ -349,9 +379,11 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.metaDbi = Dbi.create(this.env, META_DBI_NAME, DTLV.MDB_CREATE);
         this.firstLogIndex = 1L;
         this.hasLoadedFirstLogIndex = false;
+        advanceReadStateVersion();
     }
 
     private void closeEnv() {
+        closeCurrentThreadReadTxnState();
         closeQuietly(this.logDbi);
         closeQuietly(this.confDbi);
         closeQuietly(this.metaDbi);
@@ -363,6 +395,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.firstLogIndex = 1L;
         this.mapSizeBytes = MAP_SIZE_BYTES;
         this.hasLoadedFirstLogIndex = false;
+        advanceReadStateVersion();
     }
 
     private void growMapSizeForAppend(final List<LogEntry> entries, final int attempt) {
@@ -443,14 +476,17 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private LogEntry readEntry(final long index) {
-        ensureOpen();
-        final Txn txn = Txn.createReadOnly(this.env);
-        try {
-            final byte[] bytes = getBytes(txn, this.logDbi, longKeyBufVal(index));
-            return bytes == null ? null : decodeEntry(bytes);
-        } finally {
-            txn.close();
-        }
+        return withReadTxn((txn, state) -> {
+            final LogEntry entry = readEntry(txn, index);
+            final long term = entry == null ? 0L : entry.getId().getTerm();
+            state.cacheTerm(index, term, this.readStateVersion);
+            return entry;
+        });
+    }
+
+    private LogEntry readEntry(final Txn txn, final long index) {
+        final byte[] bytes = getBytes(txn, this.logDbi, longKeyBufVal(index));
+        return bytes == null ? null : decodeEntry(bytes);
     }
 
     private void writeEntry(final Txn txn, final LogEntry entry) {
@@ -495,22 +531,22 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private Long readMetaLong(final byte[] keyBytes) {
-        ensureOpen();
-        final Txn txn = Txn.createReadOnly(this.env);
-        try {
-            final byte[] bytes = getBytes(txn, this.metaDbi, keyBytes);
-            if (bytes == null) {
-                return null;
-            }
-            return ByteBuffer.wrap(bytes).getLong();
-        } finally {
-            txn.close();
+        return withReadTxn((txn, state) -> readMetaLong(txn, keyBytes));
+    }
+
+    private Long readMetaLong(final Txn txn, final byte[] keyBytes) {
+        final byte[] bytes = getBytes(txn, this.metaDbi, keyBytes);
+        if (bytes == null) {
+            return null;
         }
+        return ByteBuffer.wrap(bytes).getLong();
     }
 
     private Long getBoundaryIndex(final Dbi dbi, final int op) {
-        ensureOpen();
-        final Txn txn = Txn.createReadOnly(this.env);
+        return withReadTxn((txn, state) -> getBoundaryIndex(txn, dbi, op));
+    }
+
+    private Long getBoundaryIndex(final Txn txn, final Dbi dbi, final int op) {
         final BufVal key = cursorKeyBufVal();
         final BufVal val = emptyValBufVal();
         Cursor cursor = null;
@@ -524,8 +560,31 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             if (cursor != null) {
                 cursor.close();
             }
-            txn.close();
         }
+    }
+
+    private <T> T withReadTxn(final BiFunction<Txn, ReadTxnState, T> reader) {
+        ensureOpen();
+        final long readVersion = this.readStateVersion;
+        final ReadTxnState state = this.readTxnState.get();
+        state.prepare(this.env, readVersion);
+        final Txn txn = state.acquire();
+        try {
+            return reader.apply(txn, state);
+        } finally {
+            state.release();
+        }
+    }
+
+    private void advanceReadStateVersion() {
+        this.readStateVersion++;
+        closeCurrentThreadReadTxnState();
+    }
+
+    private void closeCurrentThreadReadTxnState() {
+        final ReadTxnState state = this.readTxnState.get();
+        state.closeTxn();
+        this.readTxnState.remove();
     }
 
     private byte[] getBytes(final Txn txn, final Dbi dbi, final byte[] keyBytes) {
@@ -618,6 +677,67 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final byte[] bytes = new byte[Long.BYTES];
         ByteBuffer.wrap(bytes).putLong(value);
         return bytes;
+    }
+
+    private static final class ReadTxnState {
+        private Env env;
+        private Txn txn;
+        private boolean txnReset;
+        private long version = Long.MIN_VALUE;
+        private long cachedTermIndex = Long.MIN_VALUE;
+        private long cachedTerm;
+
+        private void prepare(final Env env, final long version) {
+            if (this.env != env) {
+                closeTxn();
+                this.env = env;
+            }
+            if (this.version != version) {
+                this.version = version;
+                this.cachedTermIndex = Long.MIN_VALUE;
+                this.cachedTerm = 0L;
+            }
+        }
+
+        private Txn acquire() {
+            if (this.txn == null) {
+                this.txn = Txn.createReadOnly(this.env);
+                this.txnReset = false;
+            } else if (this.txnReset) {
+                this.txn.renew();
+                this.txnReset = false;
+            }
+            return this.txn;
+        }
+
+        private void release() {
+            if (this.txn != null && !this.txnReset) {
+                this.txn.reset();
+                this.txnReset = true;
+            }
+        }
+
+        private boolean hasCachedTerm(final long index, final long version) {
+            return this.version == version && this.cachedTermIndex == index;
+        }
+
+        private long getCachedTerm() {
+            return this.cachedTerm;
+        }
+
+        private void cacheTerm(final long index, final long term, final long version) {
+            this.version = version;
+            this.cachedTermIndex = index;
+            this.cachedTerm = term;
+        }
+
+        private void closeTxn() {
+            if (this.txn != null) {
+                this.txn.close();
+                this.txn = null;
+                this.txnReset = false;
+            }
+        }
     }
 
     private static BufVal newBufVal(final byte[] bytes) {

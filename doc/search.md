@@ -77,6 +77,10 @@ involves only a few functions: `new-search-engine`, `add-doc`, `remove-doc`, and
 (d/search engine "red")
 ;=> (1 2)
 
+;; ask for the ranking scores as well
+(d/search engine "red" {:display :refs+scores})
+;; => returns [doc-ref score] pairs ordered by relevance
+
 ;; search syntax supports arbitrary boolean expression and phrases
 (d/search engine [:and {:phrase "little lamb"} "fleece"])
 ;=> (2)
@@ -105,6 +109,7 @@ as `search`), and returns a sequence of matching datom tuples ordered by
 relevance to the query. By default (`:display :refs`), each tuple is `[e a v]`
 for easy destructuring. With other `:display` values, `fulltext` returns:
 
+* `:refs+scores` as `[e a v score]`
 * `:texts` as `[e a v text]`
 * `:offsets` as `[e a v offsets]`
 * `:texts+offsets` as `[e a v text offsets]`
@@ -151,6 +156,14 @@ In the above example, we destructure the results into three variables,
 When `:display` is not `:refs`, destructure extra values in the result tuple:
 
 ```Clojure
+;; include score
+(d/q '[:find ?e ?a ?v ?score
+       :in $ ?q
+       :where [(fulltext $ ?q {:top 1 :display :refs+scores})
+               [[?e ?a ?v ?score]]]]
+     db
+     "red fox")
+
 ;; include document text
 (d/q '[:find ?e ?a ?v ?text
        :in $ ?q
@@ -203,11 +216,13 @@ is 2,
 is 45,
 * `:display` specifies how results are displayed, could be one of these:
    - `:refs` only returns `doc-ref`, the default.
+   - `:refs+scores` returns `[doc-ref score]`.
    - `:texts` add the raw text of the documents to the results.
    - `:offsets` add the offsets of the matched tokens to the results.
    - `:texts+offsets` add both texts and offsets to results.
-  In Datalog `fulltext`, these map to tuple shapes `[e a v]`, `[e a v text]`,
-  `[e a v offsets]`, and `[e a v text offsets]`.
+  In Datalog `fulltext`, these map to tuple shapes `[e a v]`,
+  `[e a v score]`, `[e a v text]`, `[e a v offsets]`, and
+  `[e a v text offsets]`.
 * `:doc-filter` is a boolean function that takes `doc-ref` and determine if to
   return the document.
 * `:domains` specifies a list of domains to be searched (see below).

@@ -965,6 +965,11 @@
   (when-let [doc-ref ((.-docs engine) doc-id)]
     (when (doc-filter doc-ref) doc-ref)))
 
+(defn- add-score
+  [^SearchEngine engine doc-filter [score doc-id :as result]]
+  (when-let [doc-ref (get-doc-ref engine doc-filter result)]
+    [doc-ref score]))
+
 (defn- add-offsets
   [^SearchEngine engine doc-filter terms [_ doc-id :as result]]
   (when-let [doc-ref (get-doc-ref engine doc-filter result)]
@@ -1007,6 +1012,8 @@
     :texts         (comp (map #(add-rawtext engine doc-filter %))
                          (remove nil?))
     :offsets       (comp (map #(add-offsets engine doc-filter tms %))
+                         (remove nil?))
+    :refs+scores   (comp (map #(add-score engine doc-filter %))
                          (remove nil?))
     :refs          (comp (map #(get-doc-ref engine doc-filter %))
                          (remove nil?))))
