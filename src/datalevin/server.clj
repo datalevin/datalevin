@@ -1212,7 +1212,7 @@
 
        (and (= :follower role)
             (pos? batch-size))
-       1
+       0
 
        :else
        idle-ms))))
@@ -1328,10 +1328,12 @@
                                          (:ha-follower-loop-running? state))))
                   (.set running? false)
                   (let [sleep-ms (long (ha-follower-loop-sleep-ms state))]
-                    (try
-                      (Thread/sleep sleep-ms)
-                      (catch InterruptedException _
-                        (.set running? false))))))))
+                    (if (pos? sleep-ms)
+                      (try
+                        (Thread/sleep sleep-ms)
+                        (catch InterruptedException _
+                          (.set running? false)))
+                      (Thread/yield)))))))
           (catch Throwable t
             (log/error t "HA follower sync loop crashed"
                        {:db-name db-name})
@@ -1539,28 +1541,6 @@
 
 (declare db-write-admission-lock)
 
-(defn- refresh-ha-write-admission-state
-  [^Server server db-name m]
-  (if (and (:ha-authority m)
-           (= :leader (:ha-role m)))
-    (let [next-state  (dha/refresh-ha-authority-state db-name m)
-          state-patch (ha-renew-state-patch m next-state)
-          {:keys [updated? state]}
-          (replace-db-state-if-current server
-                                       db-name
-                                       m
-                                       (constantly true)
-                                       next-state)]
-      (if (and (not updated?) state-patch)
-        (:state
-         (transform-db-state-when
-          server
-          db-name
-          #(same-ha-runtime-state? % m :ha-renew-loop-running?)
-          #(merge-ha-renew-state-patch % m state-patch)))
-        state))
-    m))
-
 (defn- ha-write-admission-error
   [^Server server message]
   (let [write?  (dha/ha-write-message? message)
@@ -1569,9 +1549,7 @@
                   (if write?
                     (update-db server db-name *ensure-udf-readiness-state-fn*)
                     (get (.-dbs server) db-name)))
-        m       (if (and write? db-name m0)
-                  (refresh-ha-write-admission-state server db-name m0)
-                  m0)]
+        m       m0]
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
 

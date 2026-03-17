@@ -269,7 +269,6 @@
        :now-ms now-ms
        :observed-version observed-version
        :observed-lease observed-lease})
-    (lease/lease-key group-id db-identity)
     (apply-state-command!
      state
      (stamp-lease-command
@@ -297,7 +296,6 @@
        :lease-renew-ms lease-renew-ms
        :lease-timeout-ms lease-timeout-ms
        :now-ms now-ms})
-    (lease/lease-key group-id db-identity)
     (apply-state-command!
      state
      (stamp-lease-command

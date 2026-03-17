@@ -571,11 +571,11 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             return;
         }
 
-        final List<LogEntry> survivors =
-            readEntriesInRange(txn, this.logDbi, keepFrom, keepTo);
+        final List<RawLogRecord> survivors =
+            readRawEntriesInRange(txn, this.logDbi, keepFrom, keepTo);
         Util.checkRc(DTLV.mdb_drop(txn.get(), this.logDbi.get(), 0));
-        for (final LogEntry entry : survivors) {
-            writeLogEntry(txn, entry);
+        for (final RawLogRecord survivor : survivors) {
+            writeRawLogEntry(txn, survivor.index, survivor.encodedBytes);
         }
     }
 
@@ -594,13 +594,13 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             && survivorCount <= MAX_REBUILD_SURVIVOR_ENTRIES;
     }
 
-    private List<LogEntry> readEntriesInRange(final Txn txn, final Dbi dbi,
-                                              final long fromIndexInclusive,
-                                              final long toIndexInclusive) {
+    private List<RawLogRecord> readRawEntriesInRange(final Txn txn, final Dbi dbi,
+                                                     final long fromIndexInclusive,
+                                                     final long toIndexInclusive) {
         if (fromIndexInclusive > toIndexInclusive) {
             return Collections.emptyList();
         }
-        final ArrayList<LogEntry> entries =
+        final ArrayList<RawLogRecord> entries =
             new ArrayList<>((int) Math.min(toIndexInclusive - fromIndexInclusive + 1L, 1024L));
         final BufVal key = cursorKeyBufVal();
         final BufVal val = emptyValBufVal();
@@ -615,7 +615,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 if (readCursorKey(cursor) > toIndexInclusive) {
                     break;
                 }
-                entries.add(decodeEntry(cursor.val()));
+                entries.add(new RawLogRecord(readCursorKey(cursor),
+                    copyBytes(cursor.val())));
             } while (cursor.seek(DTLV.MDB_NEXT));
             return entries;
         } finally {
@@ -720,6 +721,10 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final BufVal key = longKeyBufVal(entry.getId().getIndex());
         final BufVal val = byteValBufVal(this.logEntryEncoder.encode(entry));
         putBytes(txn, this.logDbi, key, val);
+    }
+
+    private void writeRawLogEntry(final Txn txn, final long index, final byte[] encodedBytes) {
+        putBytes(txn, this.logDbi, longKeyBufVal(index), encodedBytes);
     }
 
     private LogEntry decodeEntry(final BufVal bufVal) {
@@ -843,6 +848,16 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final BufVal bufVal = EMPTY_VAL_BUF_VAL.get();
         bufVal.reset();
         return bufVal;
+    }
+
+    private static final class RawLogRecord {
+        private final long index;
+        private final byte[] encodedBytes;
+
+        private RawLogRecord(final long index, final byte[] encodedBytes) {
+            this.index = index;
+            this.encodedBytes = encodedBytes;
+        }
     }
 
     private static final class ReadTxnState {
