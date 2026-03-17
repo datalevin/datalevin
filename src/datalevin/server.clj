@@ -1536,14 +1536,39 @@
         true))
     false))
 
+(defn- refresh-ha-write-admission-state
+  [^Server server db-name m]
+  (if (and (:ha-authority m)
+           (= :leader (:ha-role m)))
+    (let [next-state  (dha/refresh-ha-authority-state db-name m)
+          state-patch (ha-renew-state-patch m next-state)
+          {:keys [updated? state]}
+          (replace-db-state-if-current server
+                                       db-name
+                                       m
+                                       (constantly true)
+                                       next-state)]
+      (if (and (not updated?) state-patch)
+        (:state
+         (transform-db-state-when
+          server
+          db-name
+          #(same-ha-runtime-state? % m :ha-renew-loop-running?)
+          #(merge-ha-renew-state-patch % m state-patch)))
+        state))
+    m))
+
 (defn- ha-write-admission-error
   [^Server server message]
-  (let [write?   (dha/ha-write-message? message)
+  (let [write?  (dha/ha-write-message? message)
         db-name (nth (:args message) 0 nil)
-        m       (when (and db-name (contains? (.-dbs server) db-name))
+        m0      (when (and db-name (contains? (.-dbs server) db-name))
                   (if write?
                     (update-db server db-name *ensure-udf-readiness-state-fn*)
-                    (get (.-dbs server) db-name)))]
+                    (get (.-dbs server) db-name)))
+        m       (if (and write? db-name m0)
+                  (refresh-ha-write-admission-state server db-name m0)
+                  m0)]
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
 

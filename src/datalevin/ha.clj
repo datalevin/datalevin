@@ -1534,7 +1534,15 @@
                      :gap-error {:source-endpoint source-endpoint
                                  :message (ex-message e)
                                  :data (ex-data e)}}
-                    (throw e))))]
+                    (if reordered?
+                      {:ok? false
+                       :gap-error {:source-endpoint source-endpoint
+                                   :message (ex-message e)
+                                   :data (assoc (or (ex-data e) {})
+                                                :error
+                                                (or (:error (ex-data e))
+                                                    :ha/txlog-source-unavailable))}}
+                      (throw e)))))]
           (cond
             (:ok? attempt)
             (:value attempt)
@@ -2338,6 +2346,18 @@
              :ha-membership-mismatch? membership-mismatch?
              :ha-last-authority-refresh-ms now-ms)))
 
+(defn- authority-read-error
+  [e]
+  {:reason :authority-read-failed
+   :message (ex-message e)
+   :data (ex-data e)})
+
+(defn- apply-authority-read-failure
+  [m error]
+  (assoc m
+         :ha-authority-read-ok? false
+         :ha-authority-read-error error))
+
 (defn- run-command-with-timeout
   [cmd env timeout-ms]
   (try
@@ -2921,48 +2941,43 @@
       (maybe-promote-ha-candidate db-name m2 (ha-now-ms)))
     m))
 
-(defn- read-ha-authority-state
+(defn refresh-ha-authority-state
   [db-name m]
-  (let [authority (:ha-authority m)
-        db-identity (:ha-db-identity m)
-        {:keys [lease version membership-hash]}
-        (ctrl/read-state authority db-identity)
-        now-ms (ha-now-ms)
-        authority-membership-hash membership-hash
-        db-identity-mismatch?
-        (and lease (not= db-identity (:db-identity lease)))
-        membership-mismatch?
-        (and authority-membership-hash
-             (not= authority-membership-hash (:ha-membership-hash m)))
-        m1 (-> m
-               (assoc :ha-authority-lease lease
-                      :ha-authority-version version
-                      :ha-authority-owner-node-id (:leader-node-id lease)
-                      :ha-authority-term (:term lease)
-                      :ha-lease-until-ms (:lease-until-ms lease)
-                      :ha-authority-membership-hash authority-membership-hash
-                      :ha-db-identity-mismatch? db-identity-mismatch?
-                      :ha-membership-mismatch? membership-mismatch?
-                      :ha-authority-read-ok? true
-                      :ha-authority-read-error nil
-                      :ha-last-authority-refresh-ms now-ms))]
-    (cond
-      (and db-identity-mismatch? (= :leader (:ha-role m1)))
-      (demote-ha-leader db-name m1
-                        :db-identity-mismatch
-                        {:local-db-identity db-identity
-                         :authority-lease lease}
-                        now-ms)
+  (if-not (:ha-authority m)
+    m
+    (try
+      (let [db-identity (:ha-db-identity m)
+            now-ms (ha-now-ms)
+            observation (observe-authority-state m)
+            {:keys [lease authority-membership-hash
+                    db-identity-mismatch? membership-mismatch?]}
+            observation
+            m1 (-> m
+                   (apply-authority-observation observation now-ms)
+                   (assoc :ha-authority-read-ok? true
+                          :ha-authority-read-error nil))]
+        (cond
+          (and db-identity-mismatch? (= :leader (:ha-role m1)))
+          (demote-ha-leader db-name m1
+                            :db-identity-mismatch
+                            {:local-db-identity db-identity
+                             :authority-lease lease}
+                            now-ms)
 
-      (and membership-mismatch? (= :leader (:ha-role m1)))
-      (demote-ha-leader db-name m1
-                        :membership-hash-mismatch
-                        {:local-membership-hash (:ha-membership-hash m1)
-                         :authority-membership-hash authority-membership-hash}
-                        now-ms)
+          (and membership-mismatch? (= :leader (:ha-role m1)))
+          (demote-ha-leader db-name m1
+                            :membership-hash-mismatch
+                            {:local-membership-hash (:ha-membership-hash m1)
+                             :authority-membership-hash
+                             authority-membership-hash}
+                            now-ms)
 
-      :else
-      m1)))
+          :else
+          m1))
+      (catch Exception e
+        (log/warn e "HA read-lease failed"
+                  {:db-name db-name})
+        (apply-authority-read-failure m (authority-read-error e))))))
 
 (defn- renew-ha-leader-state
   [db-name m]
@@ -3015,17 +3030,7 @@
     m
     (let [started-demoting? (= :demoting (:ha-role m))
           m0 (refresh-ha-local-watermarks m)
-          m1 (try
-               (read-ha-authority-state db-name m0)
-               (catch Exception e
-                 (log/warn e "HA read-lease failed"
-                           {:db-name db-name})
-                 (assoc m0
-                        :ha-authority-read-ok? false
-                        :ha-authority-read-error
-                        {:reason :authority-read-failed
-                         :message (ex-message e)
-                         :data (ex-data e)})))
+          m1 (refresh-ha-authority-state db-name m0)
           m2 (try
                (renew-ha-leader-state db-name m1)
                (catch Exception e
@@ -3161,6 +3166,9 @@
                :ha-retry-endpoints retry-endpoints
                :ha-authoritative-leader-endpoint owner-endpoint
                :ha-authoritative-leader-node-id owner-node-id}
+              authority-read-failure
+              (when-not (ha-authority-read-fresh? m now-ms)
+                (ha-authority-read-failure-details m now-ms))
               db-id-mismatch? (true? (:ha-db-identity-mismatch? m))
               membership-mismatch? (true? (:ha-membership-mismatch? m))
               lease-until-ms (:ha-lease-until-ms m)
@@ -3179,6 +3187,14 @@
                    {:error :ha/write-rejected
                     :reason :not-leader
                     :ha-role role
+                    :retryable? true})
+
+            authority-read-failure
+            (merge common-meta
+                   authority-read-failure
+                   {:error :ha/write-rejected
+                    :reason (:reason authority-read-failure)
+                    :ha-authority-read-error authority-read-failure
                     :retryable? true})
 
             db-id-mismatch?

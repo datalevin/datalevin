@@ -45,6 +45,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private static final int MAX_MAP_FULL_RETRIES = 6;
     private static final ThreadLocal<BufVal> LONG_KEY_BUF_VAL =
         ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
+    private static final ThreadLocal<BufVal> CURSOR_KEY_BUF_VAL =
+        ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
+    private static final ThreadLocal<BufVal> BYTE_KEY_BUF_VAL =
+        ThreadLocal.withInitial(() -> new BufVal(1));
+    private static final ThreadLocal<BufVal> EMPTY_VAL_BUF_VAL =
+        ThreadLocal.withInitial(() -> new BufVal(0));
 
     private final String path;
     private final boolean sync;
@@ -411,8 +417,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private boolean loadConfigurationEntries(final ConfigurationManager confManager) {
         final Txn txn = Txn.createReadOnly(this.env);
-        final BufVal key = new BufVal(Long.BYTES);
-        final BufVal val = new BufVal(0);
+        final BufVal key = cursorKeyBufVal();
+        final BufVal val = emptyValBufVal();
         Cursor cursor = null;
         try {
             cursor = Cursor.create(txn, this.confDbi, key, val);
@@ -462,8 +468,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         if (fromIndexInclusive > toIndexInclusive) {
             return;
         }
-        final BufVal key = new BufVal(Long.BYTES);
-        final BufVal val = new BufVal(0);
+        final BufVal key = cursorKeyBufVal();
+        final BufVal val = emptyValBufVal();
         Cursor cursor = null;
         try {
             cursor = Cursor.create(txn, dbi, key, val);
@@ -505,8 +511,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private Long getBoundaryIndex(final Dbi dbi, final int op) {
         ensureOpen();
         final Txn txn = Txn.createReadOnly(this.env);
-        final BufVal key = new BufVal(Long.BYTES);
-        final BufVal val = new BufVal(0);
+        final BufVal key = cursorKeyBufVal();
+        final BufVal val = emptyValBufVal();
         Cursor cursor = null;
         try {
             cursor = Cursor.create(txn, dbi, key, val);
@@ -523,23 +529,23 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private byte[] getBytes(final Txn txn, final Dbi dbi, final byte[] keyBytes) {
-        final BufVal key = newBufVal(keyBytes);
+        final BufVal key = byteKeyBufVal(keyBytes);
         return getBytes(txn, dbi, key);
     }
 
     private byte[] getBytes(final Txn txn, final Dbi dbi, final BufVal key) {
-        final BufVal val = new BufVal(0);
+        final BufVal val = emptyValBufVal();
         final int rc = DTLV.mdb_get(txn.get(), dbi.get(), key.ptr(), val.ptr());
-        Util.checkRc(rc);
         if (rc == DTLV.MDB_NOTFOUND) {
             return null;
         }
+        Util.checkRc(rc);
         return copyBytes(val);
     }
 
     private void putBytes(final Txn txn, final Dbi dbi,
                           final byte[] keyBytes, final byte[] valBytes) {
-        final BufVal key = newBufVal(keyBytes);
+        final BufVal key = byteKeyBufVal(keyBytes);
         putBytes(txn, dbi, key, valBytes);
     }
 
@@ -596,6 +602,18 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         return bufVal;
     }
 
+    private static BufVal cursorKeyBufVal() {
+        final BufVal bufVal = CURSOR_KEY_BUF_VAL.get();
+        bufVal.reset();
+        return bufVal;
+    }
+
+    private static BufVal emptyValBufVal() {
+        final BufVal bufVal = EMPTY_VAL_BUF_VAL.get();
+        bufVal.reset();
+        return bufVal;
+    }
+
     private static byte[] longToBytes(final long value) {
         final byte[] bytes = new byte[Long.BYTES];
         ByteBuffer.wrap(bytes).putLong(value);
@@ -604,6 +622,21 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private static BufVal newBufVal(final byte[] bytes) {
         final BufVal bufVal = new BufVal(Math.max(1, bytes.length));
+        final ByteBuffer buffer = bufVal.inBuf();
+        buffer.clear();
+        buffer.put(bytes);
+        buffer.flip();
+        bufVal.ptr().mv_size(bytes.length);
+        return bufVal;
+    }
+
+    private static BufVal byteKeyBufVal(final byte[] bytes) {
+        final int size = Math.max(1, bytes.length);
+        BufVal bufVal = BYTE_KEY_BUF_VAL.get();
+        if (bufVal.inBuf().capacity() < size) {
+            bufVal = new BufVal(size);
+            BYTE_KEY_BUF_VAL.set(bufVal);
+        }
         final ByteBuffer buffer = bufVal.inBuf();
         buffer.clear();
         buffer.put(bytes);
