@@ -1250,6 +1250,10 @@
       (= endpoint local-endpoint)
       {:reachable? true
        :last-applied-lsn (ha-local-last-applied-lsn m)
+       :ha-authority-owner-node-id (:ha-authority-owner-node-id m)
+       :ha-authority-term (:ha-authority-term m)
+       :ha-role (:ha-role m)
+       :ha-runtime? (boolean (:ha-authority m))
        :source :local}
 
       :else
@@ -1285,6 +1289,10 @@
                              0))
                    :ha-local-last-applied-lsn
                    (some-> (:ha-local-last-applied-lsn watermarks) long)
+                   :ha-authority-owner-node-id
+                   (some-> (:ha-authority-owner-node-id watermarks) long)
+                   :ha-authority-term
+                   (some-> (:ha-authority-term watermarks) long)
                    :ha-role (:ha-role watermarks)
                    :ha-runtime? (:ha-runtime? watermarks)
                    :ha-control-node-leader?
@@ -1450,7 +1458,9 @@
   [e]
   (contains? #{:ha/txlog-gap
                :ha/txlog-source-behind
+               :ha/txlog-source-authority-mismatch
                :ha/txlog-non-contiguous
+               :ha/txlog-record-invalid-term
                :ha/txlog-gap-unresolved}
              (:error (ex-data e))))
 
@@ -1497,6 +1507,79 @@
         (or last-lsn txlog-lsn)
         txlog-lsn))))
 
+(defn- ha-source-authority-check
+  [lease source-endpoint watermark]
+  (let [leader-endpoint (:leader-endpoint lease)
+        leader-node-id (:leader-node-id lease)
+        lease-term (:term lease)]
+    (cond
+      (= source-endpoint leader-endpoint)
+      {:ok? true}
+
+      (not (:reachable? watermark))
+      {:ok? false
+       :reason :source-watermark-unreachable
+       :watermark watermark}
+
+      (not (:ha-runtime? watermark))
+      {:ok? false
+       :reason :source-not-ha-runtime
+       :watermark watermark}
+
+      (not (integer? leader-node-id))
+      {:ok? false
+       :reason :lease-missing-leader-node-id
+       :leader-node-id leader-node-id}
+
+      (not (integer? lease-term))
+      {:ok? false
+       :reason :lease-missing-term
+       :lease-term lease-term}
+
+      (not (integer? (:ha-authority-owner-node-id watermark)))
+      {:ok? false
+       :reason :source-missing-authority-owner-node-id
+       :watermark watermark}
+
+      (not (integer? (:ha-authority-term watermark)))
+      {:ok? false
+       :reason :source-missing-authority-term
+       :watermark watermark}
+
+      (not= (long leader-node-id)
+            (long (:ha-authority-owner-node-id watermark)))
+      {:ok? false
+       :reason :source-authority-owner-mismatch
+       :leader-node-id (long leader-node-id)
+       :source-authority-owner-node-id
+       (long (:ha-authority-owner-node-id watermark))
+       :watermark watermark}
+
+      (not= (long lease-term)
+            (long (:ha-authority-term watermark)))
+      {:ok? false
+       :reason :source-authority-term-mismatch
+       :lease-term (long lease-term)
+       :source-authority-term (long (:ha-authority-term watermark))
+       :watermark watermark}
+
+      :else
+      {:ok? true
+       :watermark watermark})))
+
+(defn- assert-ha-source-authority!
+  [lease source-endpoint watermark]
+  (let [check (ha-source-authority-check lease source-endpoint watermark)]
+    (when-not (:ok? check)
+      (u/raise "Follower txlog replay source is not aligned with current authority"
+               {:error :ha/txlog-source-authority-mismatch
+                :source-endpoint source-endpoint
+                :leader-endpoint (:leader-endpoint lease)
+                :leader-node-id (:leader-node-id lease)
+                :lease-term (:term lease)
+                :source-check (dissoc check :ok?)
+                :watermark watermark}))))
+
 (defn- ha-gap-fallback-source-endpoints
   [db-name m lease next-lsn]
   (let [required-lsn (long (max 0 (dec (long next-lsn))))
@@ -1523,6 +1606,8 @@
          (fn [{:keys [endpoint node-id]}]
            (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                             db-name m endpoint)
+                 authority-check (ha-source-authority-check
+                                  lease endpoint watermark)
                  raw-last-lsn (ha-source-watermark-lsn
                                leader-endpoint
                                endpoint
@@ -1530,11 +1615,14 @@
                  last-lsn (when (some? raw-last-lsn)
                             (long-min2 raw-last-lsn
                                        leader-safe-lsn))
-                 eligible? (and (some? last-lsn)
+                 eligible? (and (:ok? authority-check)
+                                (some? last-lsn)
                                 (>= (long last-lsn)
                                     required-lsn))]
              {:endpoint endpoint
               :node-id node-id
+              :authority-ok? (:ok? authority-check)
+              :authority-check authority-check
               :last-applied-lsn last-lsn
               :raw-last-applied-lsn raw-last-lsn
               :leader-safe-lsn leader-safe-lsn
@@ -1544,7 +1632,8 @@
         (sort-by (juxt (comp - :last-applied-lsn) :node-id)
                  (filter :eligible? followers))
         unknown-followers
-        (sort-by :node-id (remove :eligible? followers))]
+        (sort-by :node-id
+                 (filter :authority-ok? (remove :eligible? followers)))]
     (->> (concat (when (and (string? leader-endpoint)
                             (not (s/blank? leader-endpoint))
                             (not= leader-endpoint local-endpoint))
@@ -1556,6 +1645,7 @@
 
 (declare fetch-ha-leader-txlog-batch)
 (declare assert-contiguous-lsn!)
+(declare assert-ha-follower-record-terms!)
 
 (defn- ha-source-advertised-last-applied-lsn
   [db-name m lease source-endpoint]
@@ -1594,7 +1684,8 @@
 
 (defn- ^:redef fetch-ha-follower-records-with-gap-fallback
   [db-name m lease next-lsn upto-lsn]
-  (let [sources (ha-follower-source-endpoints m lease)]
+  (let [sources (ha-follower-source-endpoints m lease)
+        leader-endpoint (ha-leader-endpoint m lease)]
     (loop [remaining sources
            source-order sources
            reordered? false
@@ -1602,7 +1693,14 @@
       (if-let [source-endpoint (first remaining)]
         (let [attempt
               (try
-                (let [records (vec (or (fetch-ha-leader-txlog-batch
+                (let [leader-source? (= source-endpoint leader-endpoint)
+                      source-watermark (when-not leader-source?
+                                         (safe-fetch-ha-endpoint-watermark-lsn
+                                          db-name m source-endpoint))
+                      _ (when source-watermark
+                          (assert-ha-source-authority!
+                           lease source-endpoint source-watermark))
+                      records (vec (or (fetch-ha-leader-txlog-batch
                                         db-name
                                         m
                                         source-endpoint
@@ -1612,6 +1710,8 @@
                   (if (seq records)
                     (do
                       (assert-contiguous-lsn! next-lsn records)
+                      (assert-ha-follower-record-terms!
+                       lease source-endpoint records)
                       {:ok? true
                        :value {:source-endpoint source-endpoint
                                :records records
@@ -1747,6 +1847,57 @@
                         :actual-lsn actual}))
             (recur actual (rest rs))))))))
 
+(defn- assert-ha-follower-record-terms!
+  [lease source-endpoint records]
+  (when-let [lease-term (some-> (:term lease) long)]
+    (reduce
+     (fn [prev-term record]
+       (if-let [record-term (some-> (:ha-term record) long)]
+         (do
+           (when-not (pos? record-term)
+             (u/raise "Follower txlog replay record has invalid HA term"
+                      {:error :ha/txlog-record-invalid-term
+                       :source-endpoint source-endpoint
+                       :lease-term lease-term
+                       :record-lsn (:lsn record)
+                       :record-term record-term}))
+           (when (> record-term lease-term)
+             (u/raise "Follower txlog replay record term is ahead of current lease"
+                      {:error :ha/txlog-record-invalid-term
+                       :source-endpoint source-endpoint
+                       :lease-term lease-term
+                       :record-lsn (:lsn record)
+                       :record-term record-term}))
+           (when (and prev-term
+                      (< record-term prev-term))
+             (u/raise "Follower txlog replay record terms regressed within batch"
+                      {:error :ha/txlog-record-invalid-term
+                       :source-endpoint source-endpoint
+                       :lease-term lease-term
+                       :previous-record-term prev-term
+                       :record-lsn (:lsn record)
+                       :record-term record-term}))
+           record-term)
+         prev-term))
+     nil
+     records)))
+
+(defn- assert-ha-follower-record-term!
+  [m record]
+  (when-let [record-term (some-> (:ha-term record) long)]
+    (when-not (pos? record-term)
+      (u/raise "Follower txlog replay record has invalid HA term"
+               {:error :ha/txlog-record-invalid-term
+                :record-lsn (:lsn record)
+                :record-term record-term}))
+    (when-let [authority-term (some-> (:ha-authority-term m) long)]
+      (when (> record-term authority-term)
+        (u/raise "Follower txlog replay record term is ahead of current authority"
+                 {:error :ha/txlog-record-invalid-term
+                  :record-lsn (:lsn record)
+                  :record-term record-term
+                  :authority-term authority-term})))))
+
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
   (let [store (:store m)
@@ -1760,6 +1911,7 @@
     (when-not kv-store
       (u/raise "Follower txlog replay requires a local KV store"
                {:error :ha/follower-missing-store}))
+    (assert-ha-follower-record-term! m record)
     (cond
       replay-rows
       (let [schema-overrides

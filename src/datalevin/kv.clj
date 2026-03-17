@@ -2486,9 +2486,11 @@
                                                            record-rows
                                                            record)
                           vec)
-                      append-res (txlog/append-durable! state
-                                                        normalized-rows
-                                                        txlog-append-hooks)]
+                      append-res (binding [txlog/*commit-payload-ha-term*
+                                           (some-> (:ha-term record) long)]
+                                   (txlog/append-durable! state
+                                                          normalized-rows
+                                                          txlog-append-hooks))]
                   (when-not (= record-lsn (long (:lsn append-res)))
                     (raise "Follower replay appended unexpected txn-log LSN"
                            {:type :txlog/ha-replay-lsn-mismatch
@@ -2842,16 +2844,19 @@
         tx-time (long (or (:tx-time payload)
                           (:ts payload)
                           0))
+        ha-term (some-> (:ha-term payload) long)
         rows (vec (or (:ops payload) []))
         tx-kind (txlog/classify-record-kind rows)]
-    {:lsn lsn
-     :tx-kind tx-kind
-     :tx-time tx-time
-     :rows rows
-     :segment-id (long segment-id)
-     :offset (long (:offset record))
-     :checksum (long (:checksum record))
-     :path path}))
+    (cond-> {:lsn lsn
+             :tx-kind tx-kind
+             :tx-time tx-time
+             :rows rows
+             :segment-id (long segment-id)
+             :offset (long (:offset record))
+             :checksum (long (:checksum record))
+             :path path}
+      (some? ha-term)
+      (assoc :ha-term ha-term))))
 
 (defn- txlog-segment-records
   [state segment]

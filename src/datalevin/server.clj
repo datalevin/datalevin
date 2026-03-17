@@ -25,6 +25,7 @@
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
    [datalevin.search :as sc]
+   [datalevin.txlog :as txlog]
    [datalevin.vector :as v]
    [datalevin.kv :as kv]
    [datalevin.built-ins :as dbq]
@@ -4488,16 +4489,29 @@
 
 ;; END message handlers
 
+(defn- current-ha-txlog-term
+  [^Server server db-name]
+  (when-let [db-state (and db-name (get (.-dbs server) db-name))]
+    (let [authority-term (:ha-authority-term db-state)]
+      (when (and (:ha-authority db-state)
+                 (= :leader (:ha-role db-state))
+                 (integer? authority-term)
+                 (pos? ^long authority-term))
+        (long authority-term)))))
+
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
   (let [type (:type message)
+        db-name (nth (:args message) 0 nil)
+        ha-txlog-term (current-ha-txlog-term server db-name)
         precheck-only? (contains? #{:open-transact :open-transact-kv} type)
         {:keys [ok? error]}
         (with-ha-write-admission
           server
           message
           #(when-not precheck-only?
-             (message-cases skey type)))]
+             (binding [txlog/*commit-payload-ha-term* ha-txlog-term]
+               (message-cases skey type))))]
     (cond
       (not ok?)
       (error-response skey "HA write admission rejected" error)

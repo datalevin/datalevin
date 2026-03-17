@@ -59,6 +59,10 @@
 (def ^:const commit-marker-format-major 1)
 (def ^:private commit-marker-magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x43) (byte 0x4d)])) ; DLCM
+(def ^:private commit-payload-ha-term-flag 0x01)
+
+(def ^:dynamic *commit-payload-ha-term*
+  nil)
 
 (def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 (def ^:private segment-prealloc-mode-values #{:native :none})
@@ -202,16 +206,19 @@
       (let [tx-time (long (or (:tx-time payload)
                               (:ts payload)
                               0))
+            ha-term (some-> (:ha-term payload) long)
             rows    (vec (or (:ops payload) []))
             tx-kind (classify-record-kind rows)]
-        {:lsn lsn
-         :tx-kind tx-kind
-         :tx-time tx-time
-         :rows rows
-         :segment-id segment-id
-         :offset (long (:offset record))
-         :checksum (long (:checksum record))
-         :path path}))
+        (cond-> {:lsn lsn
+                 :tx-kind tx-kind
+                 :tx-time tx-time
+                 :rows rows
+                 :segment-id segment-id
+                 :offset (long (:offset record))
+                 :checksum (long (:checksum record))
+                 :path path}
+          (some? ha-term)
+          (assoc :ha-term ha-term))))
     (catch Exception e
       (raise "Malformed txn-log payload"
              e
@@ -3014,6 +3021,11 @@
   (let [^FastList rowsv (ensure-fast-list rows)
         row-count (long (.size rowsv))
         parallel-rows? (use-parallel-row-encoding? row-count)
+        ha-term (when (some? *commit-payload-ha-term*)
+                  (long *commit-payload-ha-term*))
+        flags (int (if (some? ha-term)
+                     commit-payload-ha-term-flag
+                     0))
         ^ThreadLocal tl tl-commit-body-buffer
         ^ByteBuffer bf0 (.clear ^ByteBuffer (.get tl))
         ^HashMap dbi-cache (when-not parallel-rows?
@@ -3022,10 +3034,12 @@
         ^ByteBuffer bf1 (-> bf0
                             (bb-put-bytes! tl commit-payload-magic-bytes)
                             (bb-put-byte! tl commit-payload-format-major)
-                            (bb-put-byte! tl 0)
+                            (bb-put-byte! tl flags)
                             (bb-put-u16! tl 0)
                             (bb-put-long! tl (long lsn))
                             (bb-put-long! tl (long tx-time))
+                            (cond-> (some? ha-term)
+                              (bb-put-long! tl ha-term))
                             (bb-put-u32! tl row-count))
         ^ByteBuffer bfN (if parallel-rows?
                           (append-parallel-kv-row-bytes! bf1
@@ -3066,10 +3080,12 @@
   (let [bf (ByteBuffer/wrap body)
         ^bytes magic (bb-get-bytes bf 4 {:field :magic})
         major (bb-get-u8 bf {:field :major})
-        _flags (bb-get-u8 bf {:field :flags})
+        flags (bb-get-u8 bf {:field :flags})
         _reserved (bb-get-u16 bf {:field :reserved})
         lsn (bb-get-long bf {:field :lsn})
         tx-time (bb-get-long bf {:field :tx-time})
+        ha-term (when (pos? (bit-and flags commit-payload-ha-term-flag))
+                  (bb-get-long bf {:field :ha-term}))
         op-count (bb-get-u32 bf {:field :op-count})]
     (when-not (Arrays/equals magic ^bytes commit-payload-magic-bytes)
       (raise "Invalid txn-log payload magic"
@@ -3088,9 +3104,11 @@
                 (if (< i ^long op-count)
                   (recur (unchecked-inc-int i) (conj acc (decode-kv-row bf)))
                   acc))]
-      {:lsn lsn
-       :ts tx-time
-       :ops ops})))
+      (cond-> {:lsn lsn
+               :ts tx-time
+               :ops ops}
+        (some? ha-term)
+        (assoc :ha-term (long ha-term))))))
 
 (defn prepare-commit-rows
   [commit-state append-info rows]
