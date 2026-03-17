@@ -494,25 +494,41 @@
              {:error :ha/follower-missing-store})))
 
 (declare bootstrap-empty-lease?)
+(declare fresh-ha-promotion-local-last-applied-lsn)
 
 (defn- ha-promotion-lag-guard
-  [m lease]
-  (let [leader-last-applied-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        tracked-local-lsn (long (ha-local-last-applied-lsn m))
-        bootstrap-watermark-lsn
-        (when (and (bootstrap-empty-lease? lease)
-                   (zero? (long tracked-local-lsn)))
-          (read-ha-local-watermark-lsn m))
-        local-last-applied-lsn (long-max2 tracked-local-lsn
-                                          (or bootstrap-watermark-lsn 0))
+  ([m lease]
+   (ha-promotion-lag-guard m lease
+                           (fresh-ha-promotion-local-last-applied-lsn
+                            m lease)))
+  ([m lease local-last-applied-lsn]
+   (let [leader-last-applied-lsn (long (or (:leader-last-applied-lsn lease) 0))
+         local-last-applied-lsn (long (or local-last-applied-lsn 0))
         lag-lsn (nonnegative-long-diff leader-last-applied-lsn
                                        local-last-applied-lsn)
         max-lag-lsn (long (or (:ha-max-promotion-lag-lsn m) 0))]
-    {:ok? (<= lag-lsn max-lag-lsn)
-     :leader-last-applied-lsn leader-last-applied-lsn
-     :local-last-applied-lsn local-last-applied-lsn
-     :lag-lsn lag-lsn
-     :max-lag-lsn max-lag-lsn}))
+     {:ok? (<= lag-lsn max-lag-lsn)
+      :leader-last-applied-lsn leader-last-applied-lsn
+      :local-last-applied-lsn local-last-applied-lsn
+      :lag-lsn lag-lsn
+      :max-lag-lsn max-lag-lsn})))
+
+(defn- fresh-ha-promotion-local-last-applied-lsn
+  [m lease]
+  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
+    (try
+      (if-let [kv-store (local-kv-store m)]
+        (:local-last-applied-lsn
+         (fresh-ha-local-watermark-snapshot m kv-store))
+        (if (and (bootstrap-empty-lease? lease)
+                 (zero? state-lsn))
+          (long-max2 state-lsn (read-ha-local-watermark-lsn m))
+          state-lsn))
+      (catch Throwable e
+        (when-not (closed-kv-race? e (local-kv-store m))
+          (log/warn e "Unable to read fresh local txlog watermarks for HA promotion lag guard"
+                    {:db-name (some-> (:store m) i/opts :db-name)}))
+        state-lsn))))
 
 (defn- bootstrap-empty-lease?
   [lease]
@@ -2603,6 +2619,8 @@
   [db-name m lease now-ms]
   (let [authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
         lease-expired? (lease/lease-expired? lease now-ms)
+        local-last-applied-lsn (fresh-ha-promotion-local-last-applied-lsn
+                                m lease)
         leader-watermark (fetch-leader-watermark-lsn db-name m lease)
         reachable? (true? (:reachable? leader-watermark))
         leader-lsn (if reachable?
@@ -2617,22 +2635,23 @@
         reachable-member-lsn
         (when reachable-member-watermark
           (long (or (:last-applied-lsn reachable-member-watermark) 0)))
+        max-local-member-lsn
+        (long-max2 (or reachable-member-lsn 0)
+                   local-last-applied-lsn)
         effective-lsn
         (cond
           (and lease-expired?
                reachable?
                (< leader-lsn authority-lsn))
-          (long-max2 leader-lsn
-                     (or reachable-member-lsn
-                         (ha-local-last-applied-lsn m)))
+          (long-max2 leader-lsn max-local-member-lsn)
 
           reachable?
-          (long-max2 authority-lsn leader-lsn)
+          (long-max3 authority-lsn leader-lsn max-local-member-lsn)
 
           :else
-          (long (or reachable-member-lsn
-                    (ha-local-last-applied-lsn m))))]
+          max-local-member-lsn)]
     {:effective-lease (assoc lease :leader-last-applied-lsn effective-lsn)
+     :local-last-applied-lsn local-last-applied-lsn
      :lease-expired? lease-expired?
      :leader-endpoint-reachable? reachable?
      :authority-last-applied-lsn authority-lsn
@@ -3102,7 +3121,9 @@
     (fail-ha-candidate m :lease-not-expired
                        {:lease lease})
     (let [lag-check
-          (ha-promotion-lag-guard m (:effective-lease lag-input))]
+          (ha-promotion-lag-guard m
+                                  (:effective-lease lag-input)
+                                  (:local-last-applied-lsn lag-input))]
       (if-not (:ok? lag-check)
         (fail-ha-candidate m :lag-guard-failed
                            {:phase :pre-cas
@@ -3221,7 +3242,8 @@
                                            now-ms)
             lag-check-1 (ha-promotion-lag-guard
                          m
-                         (:effective-lease lag-input-1))]
+                         (:effective-lease lag-input-1)
+                         (:local-last-applied-lsn lag-input-1))]
         (if-not (:ok? lag-check-1)
           (fail-ha-candidate m :lag-guard-failed
                              {:phase :pre-fence
