@@ -2681,6 +2681,14 @@
       (f))
     (f)))
 
+(defn- with-write-txn-lock-before-runtime-txlog-state
+  [lmdb f]
+  (let [tx-v (l/write-txn lmdb)]
+    (if (Thread/holdsLock tx-v)
+      (with-runtime-txlog-state-guard lmdb f)
+      (locking tx-v
+        (with-runtime-txlog-state-guard lmdb f)))))
+
 (defn- with-runtime-txlog-rollback
   [lmdb f]
   (with-runtime-txlog-state-guard
@@ -3325,7 +3333,7 @@
       (finally
         (close-txlog-state! db))))
   (close-transact-kv [_]
-    (with-runtime-txlog-state-guard
+    (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
         (if (txlog-write-path-enabled? db)
@@ -3426,7 +3434,7 @@
   (transact-kv [this a0 a1] (.transact-kv this a0 a1 :data :data))
   (transact-kv [this a0 a1 a2] (.transact-kv this a0 a1 a2 :data))
   (transact-kv [_ a0 a1 a2 a3]
-    (with-runtime-txlog-state-guard
+    (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
         (if (txlog-write-path-enabled? db)

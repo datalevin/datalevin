@@ -3022,9 +3022,16 @@
           :else
           m1))
       (catch Exception e
-        (log/warn e "HA read-lease failed"
-                  {:db-name db-name})
-        (apply-authority-read-failure m (authority-read-error e))))))
+        (let [error (authority-read-error e)
+              failed-m (apply-authority-read-failure m error)
+              now-ms (ha-now-ms)]
+          (log/warn e "HA read-lease failed"
+                    {:db-name db-name
+                     :ha-role (:ha-role m)
+                     :demoting? (= :leader (:ha-role m))})
+          (if (= :leader (:ha-role failed-m))
+            (demote-ha-leader db-name failed-m :authority-read-failed error now-ms)
+            failed-m))))))
 
 (defn- renew-ha-leader-state
   [db-name m]
