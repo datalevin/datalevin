@@ -299,6 +299,16 @@
   (validate-ha-command-hook-shape
     :ha-fencing-hook "fencing" hook))
 
+(defn- validate-ha-fencing-hook-required
+  [hook]
+  (when-not (some? hook)
+    (u/raise
+      "Consensus HA requires :ha-fencing-hook at startup; failover is disabled without it"
+      {:error :ha/missing-fencing-hook
+       :option :ha-fencing-hook
+       :value hook}))
+  hook)
+
 (defn- validate-ha-clock-skew-hook-shape
   [hook]
   (validate-ha-command-hook-shape
@@ -631,7 +641,9 @@
             local-peer-id (:local-peer-id cp)
             local-voter (first (filter #(= local-peer-id (:peer-id %))
                                        voters))]
-        (validate-ha-fencing-hook-shape (:ha-fencing-hook opts))
+        (validate-ha-fencing-hook-shape
+          (validate-ha-fencing-hook-required
+            (:ha-fencing-hook opts)))
         (when-not (positive-int? node-id)
           (u/raise "Option :ha-node-id must be a positive integer in consensus mode"
                    {:error :ha/validation
