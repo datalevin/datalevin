@@ -37,7 +37,7 @@
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
    [java.util.concurrent ConcurrentHashMap ExecutorService Executors Future
-    TimeUnit]
+    ThreadFactory TimeUnit]
    [java.util.concurrent.atomic AtomicLong]
    [java.util.function BiFunction]))
 
@@ -1214,6 +1214,31 @@
        :endpoint endpoint
        :message (ex-message e)})))
 
+(def ^:private ha-probe-max-threads
+  (-> (.availableProcessors (Runtime/getRuntime))
+      (* 2)
+      (max 4)
+      (min 16)))
+
+(def ^:private ha-probe-thread-seq
+  (AtomicLong. 0))
+
+(defn- new-ha-probe-thread-factory
+  []
+  (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
+    (reify ThreadFactory
+      (newThread [_ runnable]
+        (doto (.newThread delegate runnable)
+          (.setName
+           (str "datalevin-ha-probe-"
+                (.incrementAndGet ha-probe-thread-seq)))
+          (.setDaemon true))))))
+
+(defonce ^:private ^ExecutorService ha-probe-executor
+  (Executors/newFixedThreadPool
+   (int ha-probe-max-threads)
+   (new-ha-probe-thread-factory)))
+
 (defn- ha-parallel-mapv
   [f coll]
   (let [items (vec coll)
@@ -1226,13 +1251,9 @@
       [(f (first items))]
 
       :else
-      (let [^ExecutorService executor (Executors/newFixedThreadPool n)]
-        (try
-          (->> (.invokeAll executor
-                           (mapv (fn [item] #(f item)) items))
-               (mapv #(.get ^Future %)))
-          (finally
-            (.shutdown executor)))))))
+      (->> (.invokeAll ha-probe-executor
+                       (mapv (fn [item] #(f item)) items))
+           (mapv #(.get ^Future %))))))
 
 (defn ^:redef fetch-leader-watermark-lsn
   [db-name m lease]
