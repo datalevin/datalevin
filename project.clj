@@ -1,4 +1,4 @@
-(def version "0.10.9")
+(def version "0.10.10")
 
 (defproject datalevin version
   :description "A simple, fast and versatile Datalog database"
@@ -23,10 +23,10 @@
    [org.clojure/tools.cli "1.3.250"]
    [org.clojure/test.check "1.1.3"]
    [org.eclipse.collections/eclipse-collections "13.0.0"]
-   [org.clojars.huahaiy/dtlvnative-macosx-arm64 "0.17.5"]
-   [org.clojars.huahaiy/dtlvnative-linux-arm64 "0.17.5"]
-   [org.clojars.huahaiy/dtlvnative-linux-x86_64 "0.17.5"]
-   [org.clojars.huahaiy/dtlvnative-windows-x86_64 "0.17.5"]
+   [org.clojars.huahaiy/dtlvnative-macosx-arm64 "0.17.6"]
+   [org.clojars.huahaiy/dtlvnative-linux-arm64 "0.17.6"]
+   [org.clojars.huahaiy/dtlvnative-linux-x86_64 "0.17.6"]
+   [org.clojars.huahaiy/dtlvnative-windows-x86_64 "0.17.6"]
    [org.roaringbitmap/RoaringBitmap "1.3.0"]
    [com.github.luben/zstd-jni "1.5.7-6"]]
   :dependencies
