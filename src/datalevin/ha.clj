@@ -1485,7 +1485,9 @@
                       {:ok? true
                        :value {:source-endpoint source-endpoint
                                :records records
-                               :source-order source-order}})
+                               :source-order source-order
+                               :source-last-applied-lsn-known? false
+                               :source-last-applied-lsn nil}})
                     (let [{:keys [known? last-applied-lsn]}
                           (ha-source-advertised-last-applied-lsn
                            db-name m lease source-endpoint)]
@@ -1527,7 +1529,11 @@
                         {:ok? true
                          :value {:source-endpoint source-endpoint
                                  :records records
-                                 :source-order source-order}}))))
+                                 :source-order source-order
+                                 :source-last-applied-lsn-known? known?
+                                 :source-last-applied-lsn
+                                 (when known?
+                                   (long (or last-applied-lsn 0)))}}))))
                 (catch Exception e
                   (if (ha-follower-gap-error? e)
                     {:ok? false
@@ -1968,7 +1974,9 @@
                 :lease lease}))
     (let [upto-lsn (long (+ (long next-lsn)
                             (dec (long ha-follower-max-batch-records))))
-          {:keys [records source-endpoint source-order]}
+          {:keys [records source-endpoint source-order
+                  source-last-applied-lsn-known?
+                  source-last-applied-lsn]}
           (fetch-ha-follower-records-with-gap-fallback
            db-name m lease next-lsn upto-lsn)
           next-m (reduce apply-ha-follower-txlog-record! m records)
@@ -1981,8 +1989,9 @@
           last-record-lsn (when-let [record (peek records)]
                             (long (:lsn record)))
           ;; Empty batches prove only that the chosen source returned no new
-          ;; replicated rows. Advancing to `(dec next-lsn)` here can skip
-          ;; records after a stale or speculative follower cursor.
+          ;; replicated rows. Preserve the tracked replay cursor only when the
+          ;; source explicitly advertised that it is caught up through
+          ;; `(dec next-lsn)`; otherwise fall back to the local floor.
           current-local-floor-lsn
           (long (max 0
                      (long (or (:ha-local-last-applied-lsn next-m)
@@ -1990,6 +1999,25 @@
                                0))))
           applied-lsn (long (or last-record-lsn
                                 current-local-floor-lsn))
+          next-fetch-lsn
+          (long
+           (if (seq records)
+             (unchecked-inc applied-lsn)
+             (let [leader-last-applied-lsn
+                   (long (or (:leader-last-applied-lsn lease) 0))
+                   empty-batch-proven-cursor?
+                   (and (true? source-last-applied-lsn-known?)
+                        (= (long (or source-last-applied-lsn 0))
+                           (long (max 0 (dec (long next-lsn))))))
+                   preserve-tracked-cursor?
+                   (and empty-batch-proven-cursor?
+                        (> (long next-lsn)
+                           (long (unchecked-inc current-local-floor-lsn)))
+                        (> leader-last-applied-lsn
+                           current-local-floor-lsn))]
+               (if preserve-tracked-cursor?
+                 (long next-lsn)
+                 (unchecked-inc applied-lsn)))))
           _ (when (seq records)
               (persist-ha-local-applied-lsn! next-m applied-lsn))]
       (try
@@ -2032,7 +2060,7 @@
                          (when (seq records)
                            (mapv #(select-keys % [:lsn :rows :ops])
                                  records))
-                         :ha-follower-next-lsn (unchecked-inc applied-lsn)
+                         :ha-follower-next-lsn next-fetch-lsn
                          :ha-follower-last-batch-size (count records)
                          :ha-follower-last-sync-ms now-ms
                          :ha-follower-leader-endpoint leader-endpoint
@@ -2199,17 +2227,36 @@
                   (long (max 1
                              (unchecked-inc
                               (long (ha-local-last-applied-lsn m)))))
+                  local-last-applied-lsn
+                  (long (max 0
+                             (dec local-next-lsn)))
+                  leader-last-applied-lsn
+                  (long (or (:leader-last-applied-lsn lease)
+                            0))
                   tracked-next-lsn
                   (when (integer? (:ha-follower-next-lsn m))
                     (long (:ha-follower-next-lsn m)))
                   ;; Fresh follower stores can expose internal LMDB txlog
                   ;; watermarks before they have replayed any replicated rows.
-                  ;; Honor the tracked follower cursor when present, but never
-                  ;; allow it to advance past the local floor.
+                  ;; Honor the tracked follower cursor when the local watermark
+                  ;; floor is behind the leader, such as after snapshot install
+                  ;; resets. Otherwise clamp speculative cursors to the local
+                  ;; floor.
                   next-lsn
-                  (if (and tracked-next-lsn
-                           (pos? (long tracked-next-lsn)))
+                  (cond
+                    (and tracked-next-lsn
+                         (pos? (long tracked-next-lsn))
+                         (> (long tracked-next-lsn)
+                            local-next-lsn)
+                         (> leader-last-applied-lsn
+                            local-last-applied-lsn))
+                    tracked-next-lsn
+
+                    (and tracked-next-lsn
+                         (pos? (long tracked-next-lsn)))
                     (long-min2 tracked-next-lsn local-next-lsn)
+
+                    :else
                     local-next-lsn)]
               (try
                 (:state (sync-ha-follower-batch

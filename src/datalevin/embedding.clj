@@ -66,6 +66,7 @@
    {:dimensions      default-model-dimensions
     :pooling         :mean
     :normalize?      true
+    :max-tokens      512
     :query-prefix    "query: "
     :document-prefix "passage: "}
    :embedding/artifact

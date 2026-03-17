@@ -170,7 +170,9 @@ The built-in default provider uses the local llama.cpp embedder bundled in
 `dtlvnative`. If `:model` or `:model-path` is not supplied, Datalevin expects
 the default model `multilingual-e5-small-Q8_0.gguf` under `dir/embed/`, where
 `dir` is the DB root. If the file is missing, Datalevin downloads it from
-Hugging Face on first use.
+Hugging Face on first use. The default model (`intfloat/multilingual-e5-small`)
+produces 384-dimensional vectors and supports a maximum input of 512 tokens.
+Text longer than 512 tokens is truncated by the model.
 
 ### Vector Indexing and Search in Datalog Store
 
