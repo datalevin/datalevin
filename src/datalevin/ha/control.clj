@@ -79,6 +79,10 @@
    :membership-hash nil
    :voters []})
 
+(defn ^:redef control-now-ms
+  []
+  (System/currentTimeMillis))
+
 (defonce ^:private in-memory-groups
   (atom {}))
 
@@ -164,6 +168,43 @@
   (require-positive-int! lease-timeout-ms :lease-timeout-ms)
   (require-integer! now-ms :now-ms))
 
+(defn- validate-clock-skew-budget!
+  [clock-skew-budget-ms where]
+  (when (some? clock-skew-budget-ms)
+    (require-positive-int! clock-skew-budget-ms where))
+  clock-skew-budget-ms)
+
+(defn- authority-clock-skew-result
+  [now-ms authority-now-ms clock-skew-budget-ms]
+  (when (some? clock-skew-budget-ms)
+    (let [authority-now-ms (do
+                             (require-integer! authority-now-ms
+                                               :authority-now-ms)
+                             (long authority-now-ms))
+          clock-skew-budget-ms
+          (long (validate-clock-skew-budget!
+                 clock-skew-budget-ms
+                 :clock-skew-budget-ms))
+          clock-skew-ms
+          (Math/abs (long (- (long now-ms) authority-now-ms)))]
+      (when (> clock-skew-ms clock-skew-budget-ms)
+        {:ok? false
+         :reason :clock-skew-exceeded
+         :now-ms (long now-ms)
+         :authority-now-ms authority-now-ms
+         :clock-skew-ms clock-skew-ms
+         :clock-skew-budget-ms clock-skew-budget-ms}))))
+
+(defn- stamp-lease-command
+  [cmd clock-skew-budget-ms]
+  (cond-> cmd
+    (contains? #{:try-acquire-lease :renew-lease} (:op cmd))
+    (assoc :authority-now-ms (long (control-now-ms))
+           :clock-skew-budget-ms
+           (some-> clock-skew-budget-ms
+                   (validate-clock-skew-budget! :clock-skew-budget-ms)
+                   long))))
+
 (defn- lease-entry
   [state db-identity]
   (get-in state [:leases db-identity] {:lease nil :version 0}))
@@ -178,7 +219,10 @@
     (u/raise "HA lease authority is not started"
              {:error :ha/control-not-started})))
 
-(defrecord InMemoryLeaseAuthority [group-id state running-v initial-voters]
+(declare apply-state-command!)
+
+(defrecord InMemoryLeaseAuthority [group-id state running-v initial-voters
+                                   clock-skew-budget-ms]
   ILeaseAuthority
   (start-authority! [this]
     (when (seq initial-voters)
@@ -216,68 +260,20 @@
        :observed-version observed-version
        :observed-lease observed-lease})
     (lease/lease-key group-id db-identity)
-    (let [result-v (volatile! nil)]
-      (swap! state
-             (fn [s]
-               (let [{:keys [lease version]} (lease-entry s db-identity)
-                     observed-version (long (or observed-version 0))
-                     current-version (long version)]
-                 (cond
-                   (not= observed-version current-version)
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :cas-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (and (some? observed-lease) (not= observed-lease lease))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :observed-lease-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (and lease (not= db-identity (:db-identity lease)))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :db-identity-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (and lease (not (lease/lease-expired? lease now-ms)))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :lease-not-expired
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   :else
-                   (let [observed (or observed-lease lease)
-                         new-term (lease/next-term observed)
-                         new-lease (lease/new-lease-record
-                                     {:db-identity db-identity
-                                      :leader-node-id leader-node-id
-                                      :leader-endpoint leader-endpoint
-                                      :term new-term
-                                      :lease-renew-ms lease-renew-ms
-                                      :lease-timeout-ms lease-timeout-ms
-                                      :now-ms now-ms
-                                      :leader-last-applied-lsn
-                                      leader-last-applied-lsn})
-                         new-version (inc current-version)]
-                     (vreset! result-v
-                              {:ok? true
-                               :lease new-lease
-                               :version new-version
-                               :term new-term})
-                     (assoc-in s [:leases db-identity]
-                               {:lease new-lease
-                                :version new-version}))))))
-      @result-v))
+    (apply-state-command!
+     state
+     (stamp-lease-command
+      {:op :try-acquire-lease
+       :req {:db-identity db-identity
+             :leader-node-id leader-node-id
+             :leader-endpoint leader-endpoint
+             :lease-renew-ms lease-renew-ms
+             :lease-timeout-ms lease-timeout-ms
+             :leader-last-applied-lsn leader-last-applied-lsn
+             :now-ms now-ms
+             :observed-version observed-version
+             :observed-lease observed-lease}}
+      clock-skew-budget-ms)))
 
   (renew-lease [_ {:keys [db-identity leader-node-id leader-endpoint
                           term lease-renew-ms lease-timeout-ms
@@ -292,72 +288,19 @@
        :lease-timeout-ms lease-timeout-ms
        :now-ms now-ms})
     (lease/lease-key group-id db-identity)
-    (let [result-v (volatile! nil)]
-      (swap! state
-             (fn [s]
-               (let [{:keys [lease version]} (lease-entry s db-identity)
-                     current-version (long version)]
-                 (cond
-                   (nil? lease)
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :missing-lease
-                                 :version current-version})
-                       s)
-
-                   (not= db-identity (:db-identity lease))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :db-identity-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (lease/lease-expired? lease now-ms)
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :lease-expired
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (not= leader-node-id (:leader-node-id lease))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :owner-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   (not= term (:term lease))
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :term-mismatch
-                                 :lease lease
-                                 :version current-version})
-                       s)
-
-                   :else
-                   (let [new-lease (lease/new-lease-record
-                                     {:db-identity db-identity
-                                      :leader-node-id leader-node-id
-                                      :leader-endpoint leader-endpoint
-                                      :term term
-                                      :lease-renew-ms lease-renew-ms
-                                      :lease-timeout-ms lease-timeout-ms
-                                      :now-ms now-ms
-                                      :leader-last-applied-lsn
-                                      leader-last-applied-lsn})
-                         new-version (inc current-version)]
-                     (vreset! result-v
-                              {:ok? true
-                               :lease new-lease
-                               :version new-version
-                               :term term})
-                     (assoc-in s [:leases db-identity]
-                               {:lease new-lease
-                                :version new-version}))))))
-      @result-v))
+    (apply-state-command!
+     state
+     (stamp-lease-command
+      {:op :renew-lease
+       :req {:db-identity db-identity
+             :leader-node-id leader-node-id
+             :leader-endpoint leader-endpoint
+             :term term
+             :lease-renew-ms lease-renew-ms
+             :lease-timeout-ms lease-timeout-ms
+             :leader-last-applied-lsn leader-last-applied-lsn
+             :now-ms now-ms}}
+      clock-skew-budget-ms)))
 
   (read-membership-hash [_]
     (ensure-running! running-v)
@@ -410,12 +353,24 @@
   [state {:keys [db-identity leader-node-id leader-endpoint
                  lease-renew-ms lease-timeout-ms
                  leader-last-applied-lsn now-ms
-                 observed-version observed-lease] :as req}]
+                 observed-version observed-lease] :as req}
+   authority-now-ms
+   clock-skew-budget-ms]
   (validate-acquire-request! req)
-  (let [{:keys [lease version]} (lease-entry state db-identity)
+  (let [skew-result (authority-clock-skew-result
+                     now-ms
+                     authority-now-ms
+                     clock-skew-budget-ms)
+        {:keys [lease version]} (lease-entry state db-identity)
         observed-version (long (or observed-version 0))
         current-version (long version)]
     (cond
+      skew-result
+      {:state state
+       :result (assoc skew-result
+                      :lease lease
+                      :version current-version)}
+
       (not= observed-version current-version)
       {:state state
        :result {:ok? false
@@ -468,11 +423,23 @@
 (defn- apply-renew-transition
   [state {:keys [db-identity leader-node-id leader-endpoint
                  term lease-renew-ms lease-timeout-ms
-                 leader-last-applied-lsn now-ms] :as req}]
+                 leader-last-applied-lsn now-ms] :as req}
+   authority-now-ms
+   clock-skew-budget-ms]
   (validate-renew-request! req)
-  (let [{:keys [lease version]} (lease-entry state db-identity)
+  (let [skew-result (authority-clock-skew-result
+                     now-ms
+                     authority-now-ms
+                     clock-skew-budget-ms)
+        {:keys [lease version]} (lease-entry state db-identity)
         current-version (long version)]
     (cond
+      skew-result
+      {:state state
+       :result (assoc skew-result
+                      :lease lease
+                      :version current-version)}
+
       (nil? lease)
       {:state state
        :result {:ok? false
@@ -560,10 +527,18 @@
               :voters (:voters state)}}))
 
 (defn- apply-state-command
-  [state {:keys [op] :as cmd}]
+  [state {:keys [op authority-now-ms clock-skew-budget-ms] :as cmd}]
   (case op
-    :try-acquire-lease   (apply-try-acquire-transition state (:req cmd))
-    :renew-lease         (apply-renew-transition state (:req cmd))
+    :try-acquire-lease   (apply-try-acquire-transition
+                          state
+                          (:req cmd)
+                          authority-now-ms
+                          clock-skew-budget-ms)
+    :renew-lease         (apply-renew-transition
+                          state
+                          (:req cmd)
+                          authority-now-ms
+                          clock-skew-budget-ms)
     :init-membership-hash (apply-init-membership-hash-transition
                            state (:membership-hash cmd))
     :read-state          (apply-read-state-transition state (:db-identity cmd))
@@ -1176,7 +1151,10 @@
         (let [{:keys [^Node node ^RpcClient rpc-client]}
               (running-runtime! authority)]
           (if (.isLeader node)
-            (let [local-timeout (command-attempt-timeout-ms
+            (let [cmd (stamp-lease-command
+                       cmd
+                       (:clock-skew-budget-ms authority))
+                  local-timeout (command-attempt-timeout-ms
                                  remaining
                                  rpc-timeout-ms)
                   local-res (apply-local-command-once!
@@ -1332,6 +1310,7 @@
 (defrecord SofaJraftLeaseAuthority [group-id local-peer-id voters
                                     rpc-timeout-ms election-timeout-ms
                                     operation-timeout-ms raft-dir
+                                    clock-skew-budget-ms
                                     fsm-state node-v group-service-v
                                     rpc-client-v running-v]
   ILeaseAuthority
@@ -1598,11 +1577,13 @@
   (try
     (cond
       (instance? InMemoryLeaseAuthority authority)
-      (let [{:keys [group-id state running-v initial-voters]} authority
+      (let [{:keys [group-id state running-v initial-voters
+                    clock-skew-budget-ms]} authority
             snapshot @state]
         {:backend :in-memory
          :group-id group-id
          :running? (running? running-v)
+         :clock-skew-budget-ms clock-skew-budget-ms
          :initial-voters initial-voters
          :voters (:voters snapshot)
          :membership-hash (:membership-hash snapshot)
@@ -1611,7 +1592,8 @@
       (instance? SofaJraftLeaseAuthority authority)
       (let [{:keys [group-id local-peer-id voters
                     rpc-timeout-ms election-timeout-ms
-                    operation-timeout-ms fsm-state node-v
+                    operation-timeout-ms clock-skew-budget-ms
+                    fsm-state node-v
                     running-v]} authority
             snapshot @fsm-state
             ^Node node @node-v
@@ -1636,6 +1618,7 @@
          :rpc-timeout-ms rpc-timeout-ms
          :election-timeout-ms election-timeout-ms
          :operation-timeout-ms operation-timeout-ms
+         :clock-skew-budget-ms clock-skew-budget-ms
          :fsm-voters (:voters snapshot)
          :fsm-membership-hash (:membership-hash snapshot)
          :fsm-lease-count (count (:leases snapshot))
@@ -1723,7 +1706,7 @@
 
 (defn new-in-memory-authority
   "Create an in-memory authority adapter for deterministic tests."
-  [{:keys [group-id voters]}]
+  [{:keys [group-id voters clock-skew-budget-ms]}]
   (lease/membership-hash-key group-id)
   (let [initial-voters (if (seq voters)
                          (validated-peer-ids! voters :ha-control-plane-voters)
@@ -1731,20 +1714,28 @@
     (->InMemoryLeaseAuthority group-id
                               (group-state group-id)
                               (volatile! false)
-                              initial-voters)))
+                              initial-voters
+                              (some-> clock-skew-budget-ms
+                                      (validate-clock-skew-budget!
+                                       :clock-skew-budget-ms)
+                                      long))))
 
 (defn new-sofa-jraft-authority
   "Create the SOFAJRaft-backed distributed lease authority."
   [{:keys [group-id local-peer-id voters rpc-timeout-ms
            election-timeout-ms operation-timeout-ms
-           raft-dir]}]
+           raft-dir clock-skew-budget-ms]}]
   (lease/membership-hash-key group-id)
   (let [rpc-timeout-ms       (long (or rpc-timeout-ms
                                        default-rpc-timeout-ms))
         election-timeout-ms  (long (or election-timeout-ms
                                        default-election-timeout-ms))
         operation-timeout-ms (long (or operation-timeout-ms
-                                       default-operation-timeout-ms))]
+                                       default-operation-timeout-ms))
+        clock-skew-budget-ms
+        (some-> clock-skew-budget-ms
+                (validate-clock-skew-budget! :clock-skew-budget-ms)
+                long)]
     (->SofaJraftLeaseAuthority group-id
                                local-peer-id
                                voters
@@ -1752,6 +1743,7 @@
                                election-timeout-ms
                                operation-timeout-ms
                                raft-dir
+                               clock-skew-budget-ms
                                (atom (blank-state))
                                (volatile! nil)
                                (volatile! nil)

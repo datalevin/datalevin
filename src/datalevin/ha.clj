@@ -3279,7 +3279,6 @@
                           (assoc-in [:ha-control-plane :operation-timeout-ms]
                                     5000))
         _ (vld/validate-ha-options validation-opts)
-        cp (:ha-control-plane ha-opts)
         db-identity (:db-identity ha-opts)
         node-id (:ha-node-id ha-opts)
         members (:ha-members ha-opts)
@@ -3300,6 +3299,8 @@
         clock-skew-budget-ms
         (long (or (:ha-clock-skew-budget-ms ha-opts)
                   c/*ha-clock-skew-budget-ms*))
+        cp (assoc (:ha-control-plane ha-opts)
+                  :clock-skew-budget-ms clock-skew-budget-ms)
         fencing-hook (:ha-fencing-hook ha-opts)
         clock-skew-hook (:ha-clock-skew-hook ha-opts)
         local-endpoint (local-ha-endpoint ha-opts)
