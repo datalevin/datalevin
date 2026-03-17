@@ -3,15 +3,24 @@ package datalevin.ha;
 import com.alipay.sofa.jraft.conf.Configuration;
 import com.alipay.sofa.jraft.conf.ConfigurationEntry;
 import com.alipay.sofa.jraft.conf.ConfigurationManager;
+import com.alipay.sofa.jraft.JRaftUtils;
 import com.alipay.sofa.jraft.entity.EnumOutter.EntryType;
 import com.alipay.sofa.jraft.entity.LogEntry;
 import com.alipay.sofa.jraft.entity.LogId;
+import com.alipay.sofa.jraft.entity.PeerId;
 import com.alipay.sofa.jraft.entity.codec.LogEntryDecoder;
 import com.alipay.sofa.jraft.entity.codec.LogEntryEncoder;
+import com.alipay.sofa.jraft.entity.codec.v2.LogEntryV2CodecFactory;
+import com.alipay.sofa.jraft.entity.codec.v2.LogOutter;
+import com.alipay.sofa.jraft.entity.codec.v2.V2Decoder;
 import com.alipay.sofa.jraft.option.LogStorageOptions;
 import com.alipay.sofa.jraft.option.RaftOptions;
 import com.alipay.sofa.jraft.storage.LogStorage;
+import com.alipay.sofa.jraft.util.AsciiStringUtil;
 import com.alipay.sofa.jraft.util.Describer;
+import com.google.protobuf.ByteString;
+import com.google.protobuf.InvalidProtocolBufferException;
+import com.google.protobuf.ZeroByteStringHelper;
 import datalevin.cpp.BufVal;
 import datalevin.cpp.Cursor;
 import datalevin.cpp.Dbi;
@@ -22,6 +31,7 @@ import datalevin.dtlvnative.DTLV;
 import java.io.File;
 import java.nio.ByteBuffer;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.function.BiFunction;
@@ -50,8 +60,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
     private static final ThreadLocal<BufVal> BYTE_KEY_BUF_VAL =
         ThreadLocal.withInitial(() -> new BufVal(1));
+    private static final ThreadLocal<BufVal> BYTE_VAL_BUF_VAL =
+        ThreadLocal.withInitial(() -> new BufVal(1));
     private static final ThreadLocal<BufVal> EMPTY_VAL_BUF_VAL =
         ThreadLocal.withInitial(() -> new BufVal(0));
+    private static final ThreadLocal<BufVal> LONG_VAL_BUF_VAL =
+        ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
 
     private final String path;
     private final boolean sync;
@@ -459,7 +473,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 return true;
             }
             do {
-                final LogEntry entry = decodeEntry(copyBytes(cursor.val()));
+                final LogEntry entry = decodeEntry(cursor.val());
                 if (!confManager.add(toConfigurationEntry(entry))) {
                     LOG.error("Fail to load configuration entry at path={} index={}.",
                         this.path, entry.getId().getIndex());
@@ -485,7 +499,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private LogEntry readEntry(final Txn txn, final long index) {
-        final byte[] bytes = getBytes(txn, this.logDbi, longKeyBufVal(index));
+        final BufVal bytes = getBufVal(txn, this.logDbi, longKeyBufVal(index));
         return bytes == null ? null : decodeEntry(bytes);
     }
 
@@ -493,9 +507,10 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final long index = entry.getId().getIndex();
         final BufVal key = longKeyBufVal(index);
         final byte[] entryBytes = this.logEntryEncoder.encode(entry);
-        putBytes(txn, this.logDbi, key, entryBytes);
+        final BufVal val = byteValBufVal(entryBytes);
+        putBytes(txn, this.logDbi, key, val);
         if (entry.getType() == EntryType.ENTRY_TYPE_CONFIGURATION) {
-            putBytes(txn, this.confDbi, key, entryBytes);
+            putBytes(txn, this.confDbi, key, val);
         }
     }
 
@@ -527,7 +542,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private void writeMetaLong(final Txn txn, final byte[] keyBytes, final long value) {
-        putBytes(txn, this.metaDbi, keyBytes, longToBytes(value));
+        putBytes(txn, this.metaDbi, byteKeyBufVal(keyBytes), longValBufVal(value));
     }
 
     private Long readMetaLong(final byte[] keyBytes) {
@@ -535,11 +550,15 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private Long readMetaLong(final Txn txn, final byte[] keyBytes) {
-        final byte[] bytes = getBytes(txn, this.metaDbi, keyBytes);
+        final BufVal bytes = getBufVal(txn, this.metaDbi, byteKeyBufVal(keyBytes));
         if (bytes == null) {
             return null;
         }
-        return ByteBuffer.wrap(bytes).getLong();
+        final ByteBuffer buffer = bytes.outBuf();
+        if (buffer.remaining() != Long.BYTES) {
+            throw new IllegalStateException("Bad long metadata value in data path: " + this.path);
+        }
+        return buffer.getLong();
     }
 
     private Long getBoundaryIndex(final Dbi dbi, final int op) {
@@ -587,31 +606,67 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.readTxnState.remove();
     }
 
-    private byte[] getBytes(final Txn txn, final Dbi dbi, final byte[] keyBytes) {
-        final BufVal key = byteKeyBufVal(keyBytes);
-        return getBytes(txn, dbi, key);
-    }
-
-    private byte[] getBytes(final Txn txn, final Dbi dbi, final BufVal key) {
+    private BufVal getBufVal(final Txn txn, final Dbi dbi, final BufVal key) {
         final BufVal val = emptyValBufVal();
         final int rc = DTLV.mdb_get(txn.get(), dbi.get(), key.ptr(), val.ptr());
         if (rc == DTLV.MDB_NOTFOUND) {
             return null;
         }
         Util.checkRc(rc);
-        return copyBytes(val);
+        return val;
     }
 
     private void putBytes(final Txn txn, final Dbi dbi,
                           final byte[] keyBytes, final byte[] valBytes) {
-        final BufVal key = byteKeyBufVal(keyBytes);
-        putBytes(txn, dbi, key, valBytes);
+        putBytes(txn, dbi, byteKeyBufVal(keyBytes), byteValBufVal(valBytes));
     }
 
     private void putBytes(final Txn txn, final Dbi dbi,
                           final BufVal key, final byte[] valBytes) {
-        final BufVal val = newBufVal(valBytes);
+        final BufVal val = byteValBufVal(valBytes);
+        putBytes(txn, dbi, key, val);
+    }
+
+    private void putBytes(final Txn txn, final Dbi dbi,
+                          final BufVal key, final BufVal val) {
         dbi.put(txn, key, val, 0);
+    }
+
+    private LogEntry decodeEntry(final BufVal bufVal) {
+        if (this.logEntryDecoder instanceof V2Decoder) {
+            final LogEntry entry = decodeV2Entry(bufVal.outBuf());
+            if (entry != null) {
+                return entry;
+            }
+        }
+        return decodeEntry(copyBytes(bufVal));
+    }
+
+    private LogEntry decodeV2Entry(final ByteBuffer encoded) {
+        final int start = encoded.position();
+        if (encoded.remaining() < LogEntryV2CodecFactory.HEADER_SIZE) {
+            return null;
+        }
+        for (int i = 0; i < LogEntryV2CodecFactory.MAGIC_BYTES.length; i++) {
+            if (encoded.get(start + i) != LogEntryV2CodecFactory.MAGIC_BYTES[i]) {
+                return null;
+            }
+        }
+        int payloadStart = start + LogEntryV2CodecFactory.MAGIC_BYTES.length;
+        if (encoded.get(payloadStart++) != 1) {
+            return null;
+        }
+        payloadStart += LogEntryV2CodecFactory.RESERVED.length;
+        final ByteBuffer payload = encoded.duplicate();
+        payload.position(payloadStart);
+        try {
+            final LogOutter.PBLogEntry pbEntry =
+                LogOutter.PBLogEntry.parseFrom(ZeroByteStringHelper.wrap(payload.slice()));
+            return toLogEntry(pbEntry);
+        } catch (final InvalidProtocolBufferException e) {
+            LOG.error("Fail to decode pb log entry", e);
+            return null;
+        }
     }
 
     private LogEntry decodeEntry(final byte[] bytes) {
@@ -621,6 +676,33 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 "Bad log entry format in data path: " + this.path);
         }
         return entry;
+    }
+
+    private static LogEntry toLogEntry(final LogOutter.PBLogEntry entry) {
+        final LogEntry logEntry = new LogEntry();
+        logEntry.setType(entry.getType());
+        logEntry.getId().setIndex(entry.getIndex());
+        logEntry.getId().setTerm(entry.getTerm());
+        if (entry.hasChecksum()) {
+            logEntry.setChecksum(entry.getChecksum());
+        }
+        if (entry.getPeersCount() > 0) {
+            logEntry.setPeers(toPeerIds(entry.getPeersList()));
+        }
+        if (entry.getOldPeersCount() > 0) {
+            logEntry.setOldPeers(toPeerIds(entry.getOldPeersList()));
+        }
+        if (entry.getLearnersCount() > 0) {
+            logEntry.setLearners(toPeerIds(entry.getLearnersList()));
+        }
+        if (entry.getOldLearnersCount() > 0) {
+            logEntry.setOldLearners(toPeerIds(entry.getOldLearnersList()));
+        }
+        final ByteString data = entry.getData();
+        if (!data.isEmpty()) {
+            logEntry.setData(ByteBuffer.wrap(ZeroByteStringHelper.getByteArray(data)));
+        }
+        return logEntry;
     }
 
     private ConfigurationEntry toConfigurationEntry(final LogEntry entry) {
@@ -671,12 +753,6 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         final BufVal bufVal = EMPTY_VAL_BUF_VAL.get();
         bufVal.reset();
         return bufVal;
-    }
-
-    private static byte[] longToBytes(final long value) {
-        final byte[] bytes = new byte[Long.BYTES];
-        ByteBuffer.wrap(bytes).putLong(value);
-        return bytes;
     }
 
     private static final class ReadTxnState {
@@ -740,16 +816,6 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
     }
 
-    private static BufVal newBufVal(final byte[] bytes) {
-        final BufVal bufVal = new BufVal(Math.max(1, bytes.length));
-        final ByteBuffer buffer = bufVal.inBuf();
-        buffer.clear();
-        buffer.put(bytes);
-        buffer.flip();
-        bufVal.ptr().mv_size(bytes.length);
-        return bufVal;
-    }
-
     private static BufVal byteKeyBufVal(final byte[] bytes) {
         final int size = Math.max(1, bytes.length);
         BufVal bufVal = BYTE_KEY_BUF_VAL.get();
@@ -763,6 +829,39 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         buffer.flip();
         bufVal.ptr().mv_size(bytes.length);
         return bufVal;
+    }
+
+    private static BufVal byteValBufVal(final byte[] bytes) {
+        final int size = Math.max(1, bytes.length);
+        BufVal bufVal = BYTE_VAL_BUF_VAL.get();
+        if (bufVal.inBuf().capacity() < size) {
+            bufVal = new BufVal(size);
+            BYTE_VAL_BUF_VAL.set(bufVal);
+        }
+        final ByteBuffer buffer = bufVal.inBuf();
+        buffer.clear();
+        buffer.put(bytes);
+        buffer.flip();
+        bufVal.ptr().mv_size(bytes.length);
+        return bufVal;
+    }
+
+    private static BufVal longValBufVal(final long value) {
+        final BufVal bufVal = LONG_VAL_BUF_VAL.get();
+        final ByteBuffer buffer = bufVal.inBuf();
+        buffer.clear();
+        buffer.putLong(value);
+        buffer.flip();
+        bufVal.ptr().mv_size(Long.BYTES);
+        return bufVal;
+    }
+
+    private static List<PeerId> toPeerIds(final List<ByteString> encodedPeers) {
+        final List<PeerId> peers = new ArrayList<>(encodedPeers.size());
+        for (final ByteString encodedPeer : encodedPeers) {
+            peers.add(JRaftUtils.getPeerId(AsciiStringUtil.unsafeDecode(encodedPeer)));
+        }
+        return peers;
     }
 
     private static void closeQuietly(final Dbi dbi) {

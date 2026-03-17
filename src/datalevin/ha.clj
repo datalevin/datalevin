@@ -36,10 +36,10 @@
    [java.nio.channels ClosedChannelException]
    [java.nio.file Files Paths StandardCopyOption]
    [java.util UUID]
-   [java.util.concurrent ConcurrentHashMap ExecutorService Executors Future
-    ThreadFactory TimeUnit]
-   [java.util.concurrent.atomic AtomicLong]
-   [java.util.function BiFunction]))
+   [java.util.concurrent CompletableFuture CompletionException ConcurrentHashMap
+    ExecutionException ExecutorService Executors Future ThreadFactory TimeUnit]
+   [java.util.concurrent.atomic AtomicBoolean AtomicLong]
+   [java.util.function BiConsumer BiFunction]))
 
 (defn consensus-ha-opts
   [store]
@@ -551,6 +551,30 @@
 (defonce ^:private ^AtomicLong ha-client-cache-last-prune-ms
   (AtomicLong. 0))
 
+(def ^:private ha-client-cache-prune-thread-seq
+  (AtomicLong. 0))
+
+(defonce ^:private ^AtomicBoolean ha-client-cache-prune-scheduled?
+  (AtomicBoolean. false))
+
+(defonce ^:private ^AtomicLong ha-client-cache-prune-generation
+  (AtomicLong. 0))
+
+(defn- new-ha-client-cache-prune-thread-factory
+  []
+  (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
+    (reify ThreadFactory
+      (newThread [_ runnable]
+        (doto (.newThread delegate runnable)
+          (.setName
+           (str "datalevin-ha-client-cache-prune-"
+                (.incrementAndGet ha-client-cache-prune-thread-seq)))
+          (.setDaemon true))))))
+
+(defonce ^:private ^ExecutorService ha-client-cache-prune-executor
+  (Executors/newSingleThreadExecutor
+   (new-ha-client-cache-prune-thread-factory)))
+
 (defn- ha-client-cache-key
   [uri client-opts]
   [uri
@@ -558,13 +582,25 @@
    (long (or (:time-out client-opts) c/default-connection-timeout))])
 
 (defn- ha-client-cache-entry
-  [client now-ms]
-  {:client client
+  [future now-ms]
+  {:future future
    :last-used-ms (AtomicLong. (long now-ms))})
+
+(defn- pending-ha-client-cache-entry?
+  [entry]
+  (and entry
+       (let [^CompletableFuture future (:future entry)]
+         (not (.isDone future)))))
 
 (defn- ha-client-cache-entry-client
   [entry]
-  (:client entry))
+  (when entry
+    (let [^CompletableFuture future (:future entry)]
+      (when (.isDone future)
+        (try
+          (.getNow future nil)
+          (catch CompletionException _
+            nil))))))
 
 (defn- ha-client-cache-entry-last-used-ms ^long
   [entry]
@@ -587,16 +623,27 @@
 (defn- reusable-ha-client-cache-entry?
   [entry now-ms]
   (and entry
-       (live-ha-client? (ha-client-cache-entry-client entry))
-       (<= (nonnegative-long-diff now-ms
-                                  (ha-client-cache-entry-last-used-ms entry))
-           (long *ha-client-cache-ttl-ms*))))
+       (if (pending-ha-client-cache-entry? entry)
+         true
+         (and (live-ha-client? (ha-client-cache-entry-client entry))
+              (<= (nonnegative-long-diff now-ms
+                                         (ha-client-cache-entry-last-used-ms entry))
+                  (long *ha-client-cache-ttl-ms*))))))
 
 (defn- close-ha-client-cache-entry!
   [entry]
-  (close-ha-client! (ha-client-cache-entry-client entry)))
+  (let [client (ha-client-cache-entry-client entry)]
+    (if client
+      (close-ha-client! client)
+      (when-let [^CompletableFuture future (:future entry)]
+        (when (pending-ha-client-cache-entry? entry)
+          (.whenComplete future
+                         (reify BiConsumer
+                           (accept [_ opened-client _]
+                             (when opened-client
+                               (close-ha-client! opened-client))))))))))
 
-(defn- prune-ha-client-cache!
+(defn- ^:redef prune-ha-client-cache!
   [now-ms protected-entry]
   (let [^ConcurrentHashMap cache ha-client-cache
         max-size (max 0 (long *ha-client-cache-max-size*))
@@ -609,6 +656,7 @@
              {:cache-key (.getKey entry)
               :cache-entry cache-entry
               :last-used-ms (ha-client-cache-entry-last-used-ms cache-entry)
+              :pending? (pending-ha-client-cache-entry? cache-entry)
               :protected? (identical? cache-entry protected-entry)
               :reusable? (reusable-ha-client-cache-entry? cache-entry now-ms)}))
          entries)
@@ -620,6 +668,7 @@
         overflow-victims
         (if (pos? overflow-count)
           (->> live-entries
+               (remove :pending?)
                (remove :protected?)
                (sort-by (juxt :last-used-ms :cache-key))
                (take overflow-count)
@@ -628,21 +677,50 @@
     (doseq [{:keys [cache-key cache-entry]}
             (into stale-victims overflow-victims)]
       (when (.remove cache cache-key cache-entry)
-        (close-ha-client-cache-entry! cache-entry)))
-    (.set ha-client-cache-last-prune-ms (long now-ms))))
+        (close-ha-client-cache-entry! cache-entry)))))
+
+(defn- ha-client-cache-prune-due?
+  [now-ms]
+  (let [^ConcurrentHashMap cache ha-client-cache
+        max-size (max 0 (long *ha-client-cache-max-size*))
+        prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))]
+    (or (> (.size cache) max-size)
+        (>= (nonnegative-long-diff now-ms
+                                   (.get ha-client-cache-last-prune-ms))
+            prune-interval-ms))))
+
+(defn- schedule-ha-client-cache-prune!
+  [protected-entry]
+  (let [generation (.get ha-client-cache-prune-generation)]
+    (when (.compareAndSet ha-client-cache-prune-scheduled? false true)
+      (try
+        (.submit
+         ha-client-cache-prune-executor
+         ^Runnable
+         (fn []
+           (try
+             (when (= generation (.get ha-client-cache-prune-generation))
+               (let [now-ms (ha-now-ms)]
+                 (prune-ha-client-cache! now-ms protected-entry)
+                 (when (= generation (.get ha-client-cache-prune-generation))
+                   (.set ha-client-cache-last-prune-ms (long now-ms)))))
+             (catch Throwable e
+               (log/warn e "Failed to prune HA client cache"))
+             (finally
+               (.set ha-client-cache-prune-scheduled? false)
+               (when (and (= generation (.get ha-client-cache-prune-generation))
+                          (ha-client-cache-prune-due? (ha-now-ms)))
+                 (schedule-ha-client-cache-prune! nil))))))
+        (catch Throwable e
+          (.set ha-client-cache-prune-scheduled? false)
+          (log/warn e "Failed to schedule HA client cache pruning"))))))
 
 (defn- maybe-prune-ha-client-cache!
   ([now-ms]
    (maybe-prune-ha-client-cache! now-ms nil))
   ([now-ms protected-entry]
-   (let [^ConcurrentHashMap cache ha-client-cache
-         max-size (max 0 (long *ha-client-cache-max-size*))
-         prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))]
-     (when (or (> (.size cache) max-size)
-               (>= (nonnegative-long-diff now-ms
-                                          (.get ha-client-cache-last-prune-ms))
-                   prune-interval-ms))
-       (prune-ha-client-cache! now-ms protected-entry)))))
+   (when (ha-client-cache-prune-due? now-ms)
+     (schedule-ha-client-cache-prune! protected-entry))))
 
 (defn- ^:redef open-ha-client
   [uri db-name client-opts]
@@ -654,12 +732,25 @@
   [client type args writing?]
   (cl/normal-request client type args writing?))
 
+(defn- ^:redef await-ha-client-cache-entry-client!
+  [entry]
+  (let [^CompletableFuture future (:future entry)]
+    (try
+      (.get future)
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.interrupt (Thread/currentThread))
+        (throw e)))))
+
 (defn- cached-ha-client
   [uri db-name client-opts]
   (let [cache-key (ha-client-cache-key uri client-opts)
         ^ConcurrentHashMap cache ha-client-cache]
     (maybe-prune-ha-client-cache! (ha-now-ms))
-    (let [stale-entry-v (volatile! nil)
+    (let [pending-entry (ha-client-cache-entry (CompletableFuture.)
+                                               (ha-now-ms))
+          stale-entry-v (volatile! nil)
           cache-entry (.compute cache cache-key
                                 (reify BiFunction
                                   (apply [_ _ existing]
@@ -671,15 +762,25 @@
                                         (do
                                           (when existing
                                             (vreset! stale-entry-v existing))
-                                          (ha-client-cache-entry
-                                           (open-ha-client uri db-name
-                                                           client-opts)
-                                           now-ms)))))))]
+                                          (touch-ha-client-cache-entry!
+                                           pending-entry now-ms)))))))
+          installer? (identical? cache-entry pending-entry)]
       (when-let [stale-entry @stale-entry-v]
         (when-not (identical? stale-entry cache-entry)
           (close-ha-client-cache-entry! stale-entry)))
-      (maybe-prune-ha-client-cache! (ha-now-ms) cache-entry)
-      (ha-client-cache-entry-client cache-entry))))
+      (let [client (if installer?
+                     (let [^CompletableFuture future (:future pending-entry)]
+                       (try
+                         (let [client (open-ha-client uri db-name client-opts)]
+                           (.complete future client)
+                           client)
+                         (catch Throwable e
+                           (.remove cache cache-key pending-entry)
+                           (.completeExceptionally future e)
+                           (throw e))))
+                     (await-ha-client-cache-entry-client! cache-entry))]
+        (maybe-prune-ha-client-cache! (ha-now-ms) cache-entry)
+        client))))
 
 (defn- invalidate-cached-ha-client!
   [uri client-opts client]
@@ -717,6 +818,8 @@
 (defn- clear-ha-client-cache!
   []
   (let [^ConcurrentHashMap cache ha-client-cache]
+    (.incrementAndGet ha-client-cache-prune-generation)
+    (.set ha-client-cache-prune-scheduled? false)
     (loop []
       (let [entries (vec (.entrySet cache))]
         (when (seq entries)
