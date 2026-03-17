@@ -112,7 +112,7 @@ project. There are also several other installation options. Please see details i
 [Installation Documentation](doc/install.md)
 
 For embedded-only JVM consumers, Clojars also publishes
-`org.datalevin/datalevin-embedded:0.10.8`, which keeps the local APIs and
+`org.datalevin/datalevin-embedded:0.10.9`, which keeps the local APIs and
 `datalevin.client` while trimming the server, HA, CLI, and babashka pod runtime.
 
 ## :birthday: Upgrade
@@ -141,7 +141,7 @@ The Java API lives in package `datalevin` and starts from
 Java results may contain raw Clojure runtime classes such as
 `clojure.lang.Keyword` and persistent collections. That is intentional.
 
-The Java release artifact is `org.datalevin:datalevin-java:0.10.8`. It bundles
+The Java release artifact is `org.datalevin:datalevin-java:0.10.9`. It bundles
 the Datalevin runtime payload, including the native Datalevin libraries, so
 Java consumers only need Maven Central enabled. See
 [`examples/java/README.md`](examples/java/README.md) for Maven and Gradle
