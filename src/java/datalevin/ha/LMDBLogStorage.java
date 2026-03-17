@@ -54,6 +54,9 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private static final int MAX_READERS = 256;
     private static final long MAP_SIZE_BYTES = 64L * 1024L * 1024L;
     private static final int MAX_MAP_FULL_RETRIES = 6;
+    // Rebuilding the log DBI materializes all survivors in memory before reinsert.
+    // Keep that fast path bounded and fall back to cursor deletes for larger survivor sets.
+    private static final long MAX_REBUILD_SURVIVOR_ENTRIES = 65536L;
     private static final ThreadLocal<BufVal> LONG_KEY_BUF_VAL =
         ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
     private static final ThreadLocal<BufVal> CURSOR_KEY_BUF_VAL =
@@ -281,7 +284,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                     return false;
                 }
                 final long deleteThrough = Math.min(firstIndexKept - 1, currentLast);
-                deleteRange(txn, this.logDbi, currentFirst, deleteThrough);
+                truncateLogRange(txn, currentFirst, currentLast, currentFirst, deleteThrough);
                 deleteRange(txn, this.confDbi, currentFirst, deleteThrough);
                 writeMetaLong(txn, FIRST_LOG_INDEX_KEY, firstIndexKept);
                 txn.commit();
@@ -311,7 +314,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             final Txn txn = Txn.create(this.env);
             try {
                 final long deleteFrom = Math.max(currentFirst, lastIndexKept + 1);
-                deleteRange(txn, this.logDbi, deleteFrom, currentLast);
+                truncateLogRange(txn, currentFirst, currentLast, deleteFrom, currentLast);
                 deleteRange(txn, this.confDbi, deleteFrom, currentLast);
                 txn.commit();
                 syncEnv();
@@ -541,6 +544,87 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
     }
 
+    private void truncateLogRange(final Txn txn,
+                                  final long currentFirst,
+                                  final long currentLast,
+                                  final long deleteFromInclusive,
+                                  final long deleteToInclusive) {
+        if (deleteFromInclusive > deleteToInclusive) {
+            return;
+        }
+        if (!shouldRebuildLogDbi(currentFirst, currentLast,
+            deleteFromInclusive, deleteToInclusive)) {
+            deleteRange(txn, this.logDbi, deleteFromInclusive, deleteToInclusive);
+            return;
+        }
+
+        final long keepFrom;
+        final long keepTo;
+        if (deleteFromInclusive == currentFirst) {
+            keepFrom = deleteToInclusive + 1L;
+            keepTo = currentLast;
+        } else if (deleteToInclusive == currentLast) {
+            keepFrom = currentFirst;
+            keepTo = deleteFromInclusive - 1L;
+        } else {
+            deleteRange(txn, this.logDbi, deleteFromInclusive, deleteToInclusive);
+            return;
+        }
+
+        final List<LogEntry> survivors =
+            readEntriesInRange(txn, this.logDbi, keepFrom, keepTo);
+        Util.checkRc(DTLV.mdb_drop(txn.get(), this.logDbi.get(), 0));
+        for (final LogEntry entry : survivors) {
+            writeLogEntry(txn, entry);
+        }
+    }
+
+    private boolean shouldRebuildLogDbi(final long currentFirst,
+                                        final long currentLast,
+                                        final long deleteFromInclusive,
+                                        final long deleteToInclusive) {
+        if (currentLast < currentFirst || deleteFromInclusive > deleteToInclusive) {
+            return false;
+        }
+        final long totalEntries = currentLast - currentFirst + 1L;
+        final long deleteCount = deleteToInclusive - deleteFromInclusive + 1L;
+        final long survivorCount = totalEntries - deleteCount;
+        return totalEntries > 0L && deleteCount > 0L
+            && deleteCount > survivorCount
+            && survivorCount <= MAX_REBUILD_SURVIVOR_ENTRIES;
+    }
+
+    private List<LogEntry> readEntriesInRange(final Txn txn, final Dbi dbi,
+                                              final long fromIndexInclusive,
+                                              final long toIndexInclusive) {
+        if (fromIndexInclusive > toIndexInclusive) {
+            return Collections.emptyList();
+        }
+        final ArrayList<LogEntry> entries =
+            new ArrayList<>((int) Math.min(toIndexInclusive - fromIndexInclusive + 1L, 1024L));
+        final BufVal key = cursorKeyBufVal();
+        final BufVal val = emptyValBufVal();
+        Cursor cursor = null;
+        try {
+            cursor = Cursor.create(txn, dbi, key, val);
+            final BufVal start = longKeyBufVal(fromIndexInclusive);
+            if (!cursor.get(start, DTLV.MDB_SET_RANGE)) {
+                return entries;
+            }
+            do {
+                if (readCursorKey(cursor) > toIndexInclusive) {
+                    break;
+                }
+                entries.add(decodeEntry(cursor.val()));
+            } while (cursor.seek(DTLV.MDB_NEXT));
+            return entries;
+        } finally {
+            if (cursor != null) {
+                cursor.close();
+            }
+        }
+    }
+
     private void writeMetaLong(final Txn txn, final byte[] keyBytes, final long value) {
         putBytes(txn, this.metaDbi, byteKeyBufVal(keyBytes), longValBufVal(value));
     }
@@ -630,6 +714,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private void putBytes(final Txn txn, final Dbi dbi,
                           final BufVal key, final BufVal val) {
         dbi.put(txn, key, val, 0);
+    }
+
+    private void writeLogEntry(final Txn txn, final LogEntry entry) {
+        final BufVal key = longKeyBufVal(entry.getId().getIndex());
+        final BufVal val = byteValBufVal(this.logEntryEncoder.encode(entry));
+        putBytes(txn, this.logDbi, key, val);
     }
 
     private LogEntry decodeEntry(final BufVal bufVal) {

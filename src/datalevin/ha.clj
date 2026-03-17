@@ -102,6 +102,13 @@
     (:endpoint (first (filter #(= node-id (:node-id %))
                               (:ha-members ha-opts))))))
 
+(defn- ordered-ha-members
+  [m]
+  (or (:ha-members-sorted m)
+      (some->> (:ha-members m)
+               (sort-by :node-id)
+               vec)))
+
 (defn- ha-request-timeout-ms
   [m max-ms]
   (let [renew-ms (long (or (:ha-lease-renew-ms m)
@@ -191,7 +198,7 @@
 (defn- ha-promotion-rank-index
   [m]
   (let [node-id (:ha-node-id m)
-        members (sort-by :node-id (:ha-members m))]
+        members (ordered-ha-members m)]
     (first
      (keep-indexed
       (fn [idx member]
@@ -1459,7 +1466,7 @@
   [m lease]
   (let [local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
-        ordered-members (sort-by :node-id (:ha-members m))
+        ordered-members (ordered-ha-members m)
         fallback-endpoints
         (into []
               (comp
@@ -1504,8 +1511,7 @@
         local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
         follower-members
-        (->> (:ha-members m)
-             (sort-by :node-id)
+        (->> (ordered-ha-members m)
              (filter (fn [{:keys [endpoint]}]
                        (and (string? endpoint)
                             (not (s/blank? endpoint))
@@ -2484,38 +2490,72 @@
      reachable-member-lsn
      :reachable-member-watermark reachable-member-watermark}))
 
-(defn- observe-authority-state
+(defn- authority-observation-from-state
+  [m]
+  {:lease (:ha-authority-lease m)
+   :version (:ha-authority-version m)
+   :authority-now-ms (:ha-authority-now-ms m)
+   :lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
+   :authority-membership-hash (:ha-authority-membership-hash m)
+   :db-identity-mismatch? (true? (:ha-db-identity-mismatch? m))
+   :membership-mismatch? (true? (:ha-membership-mismatch? m))
+   :observed-at-ms (:ha-last-authority-refresh-ms m)})
+
+(defn- authority-lease-local-deadline-ms
+  [lease authority-now-ms local-start-ms]
+  (when (and (integer? authority-now-ms)
+             (integer? local-start-ms))
+    (let [lease-until-ms (:lease-until-ms lease)]
+      (when (integer? lease-until-ms)
+        (+ (long local-start-ms)
+           (max 0
+                (- (long lease-until-ms)
+                   (long authority-now-ms))))))))
+
+(defn ^:redef observe-authority-state
   [m]
   (let [authority (:ha-authority m)
         db-identity (:ha-db-identity m)
-        {:keys [lease version membership-hash]}
+        local-start-ms (ha-now-ms)
+        {:keys [lease version membership-hash authority-now-ms]}
         (ctrl/read-state authority db-identity)
         authority-membership-hash membership-hash
         db-identity-mismatch?
         (and lease (not= db-identity (:db-identity lease)))
         membership-mismatch?
         (and authority-membership-hash
-             (not= authority-membership-hash (:ha-membership-hash m)))]
+             (not= authority-membership-hash (:ha-membership-hash m)))
+        observed-at-ms (ha-now-ms)]
     {:lease lease
      :version version
+     :authority-now-ms authority-now-ms
+     :lease-local-deadline-ms
+     (authority-lease-local-deadline-ms
+      lease authority-now-ms local-start-ms)
      :authority-membership-hash authority-membership-hash
      :db-identity-mismatch? db-identity-mismatch?
-     :membership-mismatch? membership-mismatch?}))
+     :membership-mismatch? membership-mismatch?
+     :observed-at-ms observed-at-ms}))
 
 (defn- apply-authority-observation
-  [m {:keys [lease version authority-membership-hash
-             db-identity-mismatch? membership-mismatch?]}
+  [m {:keys [lease version authority-now-ms lease-local-deadline-ms
+             authority-membership-hash
+             db-identity-mismatch? membership-mismatch?
+             observed-at-ms]}
    now-ms]
+  (let [refresh-ms (or observed-at-ms now-ms)]
   (-> m
       (assoc :ha-authority-lease lease
              :ha-authority-version version
+             :ha-authority-now-ms authority-now-ms
+             :ha-lease-local-deadline-ms lease-local-deadline-ms
              :ha-authority-owner-node-id (:leader-node-id lease)
              :ha-authority-term (:term lease)
              :ha-lease-until-ms (:lease-until-ms lease)
              :ha-authority-membership-hash authority-membership-hash
              :ha-db-identity-mismatch? db-identity-mismatch?
              :ha-membership-mismatch? membership-mismatch?
-             :ha-last-authority-refresh-ms now-ms)))
+             :ha-last-authority-refresh-ms refresh-ms))))
 
 (defn- authority-read-error
   [e]
@@ -2724,6 +2764,16 @@
              (< (- (long now-ms) (long last-ms))
                 timeout-ms)))))
 
+(defn- current-authority-observation
+  [m now-ms]
+  (when (ha-authority-read-fresh? m now-ms)
+    (authority-observation-from-state m)))
+
+(defn- promotion-authority-observation
+  [m now-ms]
+  (or (current-authority-observation m now-ms)
+      (observe-authority-state m)))
+
 (defn- ha-authority-read-failure-details
   ([m]
    (ha-authority-read-failure-details m (ha-now-ms)))
@@ -2858,7 +2908,8 @@
 
 (defn- try-promote-with-cas
   [m authority db-identity lease version now-ms lag-check]
-  (let [acquire
+  (let [local-start-ms now-ms
+        acquire
         (ctrl/try-acquire-lease
          authority
          {:db-identity db-identity
@@ -2867,21 +2918,26 @@
           :lease-renew-ms (:ha-lease-renew-ms m)
           :lease-timeout-ms (:ha-lease-timeout-ms m)
           :leader-last-applied-lsn (:local-last-applied-lsn lag-check)
-          :now-ms now-ms
+          :now-ms local-start-ms
           :observed-version version
           :observed-lease lease})]
     (if (:ok? acquire)
-      (let [{:keys [lease version term]} acquire]
+      (let [{:keys [lease version term authority-now-ms]} acquire
+            observed-at-ms (ha-now-ms)]
         (-> m
             clear-ha-candidate-state
             (assoc :ha-role :leader
                    :ha-leader-term term
                    :ha-authority-lease lease
                    :ha-authority-version version
+                   :ha-authority-now-ms authority-now-ms
+                   :ha-lease-local-deadline-ms
+                   (authority-lease-local-deadline-ms
+                    lease authority-now-ms local-start-ms)
                    :ha-authority-owner-node-id (:leader-node-id lease)
                    :ha-authority-term (:term lease)
                    :ha-lease-until-ms (:lease-until-ms lease)
-                   :ha-last-authority-refresh-ms now-ms
+                   :ha-last-authority-refresh-ms observed-at-ms
                    :ha-db-identity-mismatch? false
                    :ha-membership-mismatch? false
                    :ha-promotion-last-failure nil
@@ -2952,38 +3008,8 @@
                      (:wait-until-ms wait-info)
                      :ha-candidate-pre-cas-observed-version version
                      :ha-promotion-wait-before-cas-ms wait-ms)
-              (let [obs-2 (observe-authority-state m1)
-                    now-ms-2 (System/currentTimeMillis)
-                    m2 (apply-authority-observation m1 obs-2 now-ms-2)
-                    lease-2 (:lease obs-2)
-                    version-2 (:version obs-2)]
-                (cond
-                  (:db-identity-mismatch? obs-2)
-                  (fail-ha-candidate m2 :db-identity-mismatch
-                                     {:local-db-identity db-identity
-                                      :authority-lease lease-2})
-
-                  (:membership-mismatch? obs-2)
-                  (fail-ha-candidate m2 :membership-hash-mismatch
-                                     {:ha-membership-hash
-                                      (:ha-membership-hash m2)
-                                      :ha-authority-membership-hash
-                                      (:authority-membership-hash obs-2)})
-
-                  (not (lease/lease-expired? lease-2 now-ms-2))
-                  (fail-ha-candidate m2 :lease-not-expired
-                                     {:lease lease-2})
-
-                  :else
-                  (finalize-ha-candidate-promotion
-                   db-name
-                   m2
-                   authority
-                   db-identity
-                   lease-2
-                   version-2
-                   now-ms-2
-                   (pre-cas-lag-input db-name m2 lease-2 now-ms-2)))))))))))
+              (finalize-ha-candidate-promotion
+               db-name m1 authority db-identity lease version now-ms lag-input))))))))
 
 (def ^:private restart-ha-candidate-promotion
   ::restart-ha-candidate-promotion)
@@ -2995,19 +3021,19 @@
       (if (pos? remaining-ms)
         (assoc m :ha-promotion-wait-before-cas-ms remaining-ms)
         (let [observed-version (:ha-candidate-pre-cas-observed-version m)
+              current-obs (promotion-authority-observation m now-ms)
               m1 (dissoc m
                          :ha-candidate-pre-cas-wait-until-ms
                          :ha-candidate-pre-cas-observed-version
                          :ha-promotion-wait-before-cas-ms)
-              obs (observe-authority-state m1)
               now-ms-2 (System/currentTimeMillis)]
-          (if (= observed-version (:version obs))
+          (if (= observed-version (:version current-obs))
             (maybe-promote-after-authority-observation
              db-name
              m1
              (:ha-authority m1)
              (:ha-db-identity m1)
-             obs
+             current-obs
              now-ms-2)
             restart-ha-candidate-promotion))))))
 
@@ -3058,7 +3084,9 @@
                m
                (:ha-authority m)
                (:ha-db-identity m)
-               (observe-authority-state m)
+               (promotion-authority-observation
+                m
+                (System/currentTimeMillis))
                (System/currentTimeMillis)))))))))
 
 (defn- maybe-promote-ha-candidate
@@ -3161,10 +3189,10 @@
   [db-name m]
   (if (not= :leader (:ha-role m))
     m
-    (let [now-ms (ha-now-ms)
+    (let [local-start-ms (ha-now-ms)
           term (:ha-leader-term m)]
       (if-not (and (integer? term) (pos? ^long term))
-        (demote-ha-leader db-name m :missing-leader-term nil now-ms)
+        (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
         (let [result (ctrl/renew-lease
                       (:ha-authority m)
                       {:db-identity (:ha-db-identity m)
@@ -3174,20 +3202,25 @@
                        :lease-renew-ms (:ha-lease-renew-ms m)
                        :lease-timeout-ms (:ha-lease-timeout-ms m)
                        :leader-last-applied-lsn (long (or (:ha-leader-last-applied-lsn m) 0))
-                       :now-ms now-ms})]
+                       :now-ms local-start-ms})]
           (if (:ok? result)
-            (let [{:keys [lease version]} result]
+            (let [{:keys [lease version authority-now-ms]} result
+                  observed-at-ms (ha-now-ms)]
               (-> m
                   (assoc :ha-authority-lease lease
                          :ha-authority-version version
+                         :ha-authority-now-ms authority-now-ms
+                         :ha-lease-local-deadline-ms
+                         (authority-lease-local-deadline-ms
+                          lease authority-now-ms local-start-ms)
                          :ha-authority-owner-node-id (:leader-node-id lease)
                          :ha-authority-term (:term lease)
                          :ha-lease-until-ms (:lease-until-ms lease)
-                         :ha-last-authority-refresh-ms now-ms)))
+                         :ha-last-authority-refresh-ms observed-at-ms)))
             (demote-ha-leader db-name m
                               :renew-failed
                               {:reason (:reason result)}
-                              now-ms)))))))
+                              (ha-now-ms))))))))
 
 (defn- maybe-demote-on-refresh-timeout
   [db-name m now-ms]
@@ -3230,7 +3263,7 @@
           :ha-authority :ha-db-identity :ha-membership-hash
           :ha-authority-membership-hash
           :ha-db-identity-mismatch? :ha-membership-mismatch?
-          :ha-members
+          :ha-members :ha-members-sorted
           :ha-node-id :ha-local-endpoint
           :ha-lease-renew-ms :ha-lease-timeout-ms
           :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
@@ -3238,8 +3271,10 @@
           :ha-fencing-hook
           :ha-clock-skew-budget-ms :ha-clock-skew-hook
           :ha-authority-lease :ha-authority-version
+          :ha-authority-now-ms
           :ha-authority-owner-node-id :ha-authority-term
-          :ha-lease-until-ms :ha-last-authority-refresh-ms
+          :ha-lease-until-ms :ha-lease-local-deadline-ms
+          :ha-last-authority-refresh-ms
           :ha-authority-read-ok?
           :ha-authority-read-error
           :ha-clock-skew-paused?
@@ -3313,7 +3348,7 @@
     (let [db-name (nth args 0 nil)
           m (and db-name (get dbs db-name))]
       (when (and m (:ha-authority m))
-        (let [now-ms (System/currentTimeMillis)
+        (let [now-ms (ha-now-ms)
               role (:ha-role m)
               local-node-id (:ha-node-id m)
               owner-node-id (:ha-authority-owner-node-id m)
@@ -3329,7 +3364,7 @@
                      (map :endpoint)
                      (remove nil?)
                      (remove s/blank?))
-                    (sort-by :node-id (:ha-members m)))
+                    (ordered-ha-members m))
               retry-endpoints
               (->> (cond-> []
                      (and (string? owner-endpoint)
@@ -3350,6 +3385,7 @@
               db-id-mismatch? (true? (:ha-db-identity-mismatch? m))
               membership-mismatch? (true? (:ha-membership-mismatch? m))
               lease-until-ms (:ha-lease-until-ms m)
+              lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
               leader-term (:ha-leader-term m)
               authority-term (:ha-authority-term m)]
           (cond
@@ -3398,12 +3434,17 @@
                     :ha-authority-owner-node-id owner-node-id
                     :retryable? true})
 
-            (or (nil? lease-until-ms)
-                (>= (long now-ms) (long lease-until-ms)))
+            (or (and (integer? lease-local-deadline-ms)
+                     (>= (long now-ms) (long lease-local-deadline-ms)))
+                (and (not (integer? lease-local-deadline-ms))
+                     (or (nil? lease-until-ms)
+                         (>= (long now-ms) (long lease-until-ms)))))
             (merge common-meta
                    {:error :ha/write-rejected
                     :reason :lease-expired
                     :lease-until-ms lease-until-ms
+                    :lease-local-deadline-ms lease-local-deadline-ms
+                    :ha-authority-now-ms (:ha-authority-now-ms m)
                     :now-ms now-ms
                     :retryable? true})
 
@@ -3460,6 +3501,7 @@
         db-identity (:db-identity ha-opts)
         node-id (:ha-node-id ha-opts)
         members (:ha-members ha-opts)
+        ordered-members (some->> members (sort-by :node-id) vec)
         renew-ms (:ha-lease-renew-ms ha-opts)
         timeout-ms (:ha-lease-timeout-ms ha-opts)
         promotion-base-delay-ms
@@ -3540,6 +3582,7 @@
          :ha-db-identity-mismatch? false
          :ha-membership-mismatch? false
          :ha-members members
+         :ha-members-sorted ordered-members
          :ha-node-id node-id
          :ha-local-endpoint local-endpoint
          :ha-lease-renew-ms renew-ms

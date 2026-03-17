@@ -1536,6 +1536,8 @@
         true))
     false))
 
+(declare db-write-admission-lock)
+
 (defn- refresh-ha-write-admission-state
   [^Server server db-name m]
   (if (and (:ha-authority m)
@@ -1571,6 +1573,21 @@
                   m0)]
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
+
+(defn- with-ha-write-admission
+  [^Server server message f]
+  (let [write?  (dha/ha-write-message? message)
+        db-name (nth (:args message) 0 nil)
+        dbs     (.-dbs server)]
+    (if (and write? db-name (.containsKey ^ConcurrentHashMap dbs db-name))
+      (locking (db-write-admission-lock server db-name)
+        (if-let [err (ha-write-admission-error server message)]
+          {:ok? false
+           :error err}
+          {:ok? true
+           :result (f)}))
+      {:ok? true
+       :result (f)})))
 
 (defn- ensure-ha-runtime
   ([root db-name m store]
@@ -2259,6 +2276,16 @@
                  (let [lock (or (:open-lock m) (Object.))]
                    (vreset! lock-v lock)
                    (assoc m :open-lock lock))))
+    @lock-v))
+
+(defn- db-write-admission-lock
+  [^Server server db-name]
+  (let [lock-v (volatile! nil)]
+    (update-db server db-name
+               (fn [m]
+                 (let [lock (or (:ha-write-admission-lock m) (Object.))]
+                   (vreset! lock-v lock)
+                   (assoc m :ha-write-admission-lock lock))))
     @lock-v))
 
 (defn- open-server-store
@@ -4461,6 +4488,23 @@
 
 ;; END message handlers
 
+(defn- dispatch-message-with-ha-write-admission
+  [^Server server ^SelectionKey skey message]
+  (let [type (:type message)
+        precheck-only? (contains? #{:open-transact :open-transact-kv} type)
+        {:keys [ok? error]}
+        (with-ha-write-admission
+          server
+          message
+          #(when-not precheck-only?
+             (message-cases skey type)))]
+    (cond
+      (not ok?)
+      (error-response skey "HA write admission rejected" error)
+
+      precheck-only?
+      (message-cases skey type))))
+
 (defprotocol IRunner
   "Ensure calls within `with-transaction-kv` run in the same thread that
   runs `open-transact-kv`, otherwise LMDB will deadlock"
@@ -4480,9 +4524,9 @@
     (locking kv-store
       (loop []
         (.wait ^Object kv-store)
-        (let [{:keys [type] :as message} @msg
-              skey                       @sk]
-          (message-cases skey type))
+        (let [message @msg
+              skey    @sk]
+          (dispatch-message-with-ha-write-admission server skey message))
         (when @running? (recur))))))
 
 (defn- write-txn-runner
@@ -4541,15 +4585,13 @@
   [^Server server ^SelectionKey skey fmt msg ]
   (try
     (let [wire-opts                       (:wire-opts @(.attachment skey))
-          {:keys [type writing?] :as message}
+          {:keys [writing?] :as message}
           (p/read-value fmt msg wire-opts)]
       (log/debug "Message received:" (dissoc message :password :args))
       (set-last-active server skey)
-      (if-let [err (ha-write-admission-error server message)]
-        (error-response skey "HA write admission rejected" err)
-        (if writing?
-          (handle-writing server skey message)
-          (message-cases skey type))))
+      (if writing?
+        (handle-writing server skey message)
+        (dispatch-message-with-ha-write-admission server skey message)))
     (catch Exception e
       ;; (stt/print-stack-trace e)
       (log/error "Error Handling message:" e))))

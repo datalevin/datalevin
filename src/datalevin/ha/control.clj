@@ -371,6 +371,7 @@
                      now-ms
                      authority-now-ms
                      clock-skew-budget-ms)
+        effective-now-ms (long (or authority-now-ms now-ms))
         {:keys [lease version]} (lease-entry state db-identity)
         observed-version (long (or observed-version 0))
         current-version (long version)]
@@ -378,6 +379,7 @@
       skew-result
       {:state state
        :result (assoc skew-result
+                      :authority-now-ms authority-now-ms
                       :lease lease
                       :version current-version)}
 
@@ -385,6 +387,7 @@
       {:state state
        :result {:ok? false
                 :reason :cas-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -392,6 +395,7 @@
       {:state state
        :result {:ok? false
                 :reason :observed-lease-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -399,13 +403,15 @@
       {:state state
        :result {:ok? false
                 :reason :db-identity-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
-      (and lease (not (lease/lease-expired? lease now-ms)))
+      (and lease (not (lease/lease-expired? lease effective-now-ms)))
       {:state state
        :result {:ok? false
                 :reason :lease-not-expired
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -419,7 +425,7 @@
                           :term new-term
                           :lease-renew-ms lease-renew-ms
                           :lease-timeout-ms lease-timeout-ms
-                          :now-ms now-ms
+                          :now-ms effective-now-ms
                           :leader-last-applied-lsn leader-last-applied-lsn})
             new-version (inc current-version)]
         {:state (assoc-in state [:leases db-identity]
@@ -428,7 +434,8 @@
          :result {:ok? true
                   :lease new-lease
                   :version new-version
-                  :term new-term}}))))
+                  :term new-term
+                  :authority-now-ms authority-now-ms}}))))
 
 (defn- apply-renew-transition
   [state {:keys [db-identity leader-node-id leader-endpoint
@@ -441,12 +448,14 @@
                      now-ms
                      authority-now-ms
                      clock-skew-budget-ms)
+        effective-now-ms (long (or authority-now-ms now-ms))
         {:keys [lease version]} (lease-entry state db-identity)
         current-version (long version)]
     (cond
       skew-result
       {:state state
        :result (assoc skew-result
+                      :authority-now-ms authority-now-ms
                       :lease lease
                       :version current-version)}
 
@@ -454,19 +463,22 @@
       {:state state
        :result {:ok? false
                 :reason :missing-lease
+                :authority-now-ms authority-now-ms
                 :version current-version}}
 
       (not= db-identity (:db-identity lease))
       {:state state
        :result {:ok? false
                 :reason :db-identity-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
-      (lease/lease-expired? lease now-ms)
+      (lease/lease-expired? lease effective-now-ms)
       {:state state
        :result {:ok? false
                 :reason :lease-expired
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -474,6 +486,7 @@
       {:state state
        :result {:ok? false
                 :reason :owner-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -481,6 +494,7 @@
       {:state state
        :result {:ok? false
                 :reason :term-mismatch
+                :authority-now-ms authority-now-ms
                 :lease lease
                 :version current-version}}
 
@@ -492,7 +506,7 @@
                           :term term
                           :lease-renew-ms lease-renew-ms
                           :lease-timeout-ms lease-timeout-ms
-                          :now-ms now-ms
+                          :now-ms effective-now-ms
                           :leader-last-applied-lsn leader-last-applied-lsn})
             new-version (inc current-version)]
         {:state (assoc-in state [:leases db-identity]
@@ -501,7 +515,8 @@
          :result {:ok? true
                   :lease new-lease
                   :version new-version
-                  :term term}}))))
+                  :term term
+                  :authority-now-ms authority-now-ms}}))))
 
 (defn- apply-init-membership-hash-transition
   [state membership-hash]
@@ -533,6 +548,7 @@
     {:state state
      :result {:lease lease
               :version version
+              :authority-now-ms (long (control-now-ms))
               :membership-hash (:membership-hash state)
               :voters (:voters state)}}))
 
@@ -1667,12 +1683,13 @@
     (let [{:keys [group-id state running-v]} authority]
       (ensure-running! running-v)
       (lease/lease-key group-id db-identity)
-      (let [snapshot @state
-            {:keys [lease version]} (lease-entry snapshot db-identity)]
-        {:lease lease
-         :version version
-         :membership-hash (:membership-hash snapshot)
-         :voters (:voters snapshot)}))
+    (let [snapshot @state
+          {:keys [lease version]} (lease-entry snapshot db-identity)]
+      {:lease lease
+       :version version
+       :authority-now-ms (long (control-now-ms))
+       :membership-hash (:membership-hash snapshot)
+       :voters (:voters snapshot)}))
 
     (instance? SofaJraftLeaseAuthority authority)
     (let [{:keys [group-id running-v fsm-state]} authority]
@@ -1683,6 +1700,7 @@
             {:keys [lease version]} (lease-entry snapshot db-identity)]
         {:lease lease
          :version version
+         :authority-now-ms (long (control-now-ms))
          :membership-hash (:membership-hash snapshot)
          :voters (:voters snapshot)}))
 
