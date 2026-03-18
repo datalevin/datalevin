@@ -35,6 +35,12 @@
   (close-provider [this]
     "Release provider-owned resources. Must be idempotent."))
 
+(defprotocol ITokenCounter
+  (token-count* [this item opts]
+    "Return the token count for a single input item.")
+  (truncate-item* [this item max-tokens opts]
+    "Truncate a single input item so it fits within `max-tokens`."))
+
 (def ^:private built-in-provider-ids
   #{:default :llama.cpp})
 
@@ -100,15 +106,19 @@
     (raise "Embedding items must be strings or maps with string :text"
            {:item item})))
 
+(defn- item-kind-prefix
+  [metadata item]
+  (when (map? item)
+    (let [output (:embedding/output metadata)]
+      (case (or (:kind item) (:usage item))
+        :query    (:query-prefix output)
+        :document (:document-prefix output)
+        nil))))
+
 (defn- shaped-item-text
   [metadata item]
   (let [text   (ensure-item-text item)
-        output (:embedding/output metadata)
-        prefix (when (map? item)
-                 (case (or (:kind item) (:usage item))
-                   :query    (:query-prefix output)
-                   :document (:document-prefix output)
-                   nil))]
+        prefix (item-kind-prefix metadata item)]
     (if (and (string? prefix) (not (s/blank? prefix)))
       (str prefix text)
       text)))
@@ -118,6 +128,37 @@
   (when-not (satisfies? IEmbeddingProvider provider)
     (raise "Expected an embedding provider"
            {:input provider})))
+
+(defn- ensure-token-counter
+  [provider]
+  (when-not (satisfies? ITokenCounter provider)
+    (raise "Embedding provider does not support token counting"
+           {:provider provider})))
+
+(defn- ensure-max-tokens
+  [max-tokens]
+  (when-not (integer? max-tokens)
+    (raise "max-tokens must be an integer"
+           {:max-tokens max-tokens}))
+  (when (neg? (long max-tokens))
+    (raise "max-tokens must be non-negative"
+           {:max-tokens max-tokens}))
+  (long max-tokens))
+
+(defn- truncate-item-result
+  [item prefix truncated]
+  (let [text (if (and (string? prefix) (not (s/blank? prefix)))
+               (do
+                 (when-not (s/starts-with? truncated prefix)
+                   (raise "Unable to preserve embedding item prefix within token budget"
+                          {:item item
+                           :prefix prefix
+                           :truncated truncated}))
+                 (subs truncated (count prefix)))
+               truncated)]
+    (if (map? item)
+      (assoc item :text text)
+      text)))
 
 (defn- remove-nil-vals
   [m]
@@ -356,6 +397,16 @@
   (close-provider [_]
     (.close embedder))
 
+  ITokenCounter
+  (token-count* [_ item _opts]
+    (.tokenCount embedder ^String (shaped-item-text metadata item)))
+  (truncate-item* [_ item max-tokens _opts]
+    (let [prefix    (item-kind-prefix metadata item)
+          truncated (.truncateText embedder
+                                   ^String (shaped-item-text metadata item)
+                                   (int (ensure-max-tokens max-tokens)))]
+      (truncate-item-result item prefix truncated)))
+
   AutoCloseable
   (close [_]
     (.close embedder)))
@@ -554,6 +605,12 @@
           (when-let [provider @provider*]
             (close-provider provider))))
 
+      ITokenCounter
+      (token-count* [_ item opts]
+        (token-count* (ensure!) item opts))
+      (truncate-item* [_ item max-tokens opts]
+        (truncate-item* (ensure!) item max-tokens opts))
+
       AutoCloseable
       (close [this]
         (close-provider this)))))
@@ -616,3 +673,44 @@
                  :else (raise "Texts must be a string or a sequential collection"
                               {:texts texts}))]
      (embedding provider texts opts))))
+
+(defn token-count
+  "Return the token count for a single input item."
+  ([provider item]
+   (token-count provider item nil))
+  ([provider item opts]
+   (ensure-token-counter provider)
+   (token-count* provider item opts)))
+
+(defn token-counts
+  "Return one token count per input item, in order."
+  ([provider items]
+   (token-counts provider items nil))
+  ([provider items opts]
+   (ensure-token-counter provider)
+   (let [items (cond
+                 (nil? items) []
+                 (string? items) [items]
+                 (or (sequential? items)
+                     (instance? java.util.List items)) items
+                 :else (raise "Items must be a string or a sequential collection"
+                              {:items items}))]
+     (mapv #(token-count* provider % opts) items))))
+
+(defn truncate-item
+  "Truncate a single embedding input item so it fits within `max-tokens`."
+  ([provider item max-tokens]
+   (truncate-item provider item max-tokens nil))
+  ([provider item max-tokens opts]
+   (ensure-token-counter provider)
+   (truncate-item* provider item (ensure-max-tokens max-tokens) opts)))
+
+(defn truncate-text
+  "Truncate a single text string so it fits within `max-tokens`."
+  ([provider text max-tokens]
+   (truncate-text provider text max-tokens nil))
+  ([provider text max-tokens opts]
+   (when-not (string? text)
+     (raise "Text must be a string"
+            {:text text}))
+   (truncate-item provider text max-tokens opts)))

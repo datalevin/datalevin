@@ -575,6 +575,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
         final List<RawLogRecord> survivors =
             readRawEntriesInRange(txn, this.logDbi, keepFrom, keepTo);
+        // Only logDbi is rebuilt here. confDbi survivors remain in place and the
+        // truncate callers separately delete only the removed configuration range.
         Util.checkRc(DTLV.mdb_drop(txn.get(), this.logDbi.get(), 0));
         for (final RawLogRecord survivor : survivors) {
             writeRawLogEntry(txn, survivor.index, survivor.encodedBytes);
@@ -726,12 +728,6 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private void putBytes(final Txn txn, final Dbi dbi,
                           final BufVal key, final BufVal val) {
         dbi.put(txn, key, val, 0);
-    }
-
-    private void writeLogEntry(final Txn txn, final LogEntry entry) {
-        final BufVal key = longKeyBufVal(entry.getId().getIndex());
-        final BufVal val = byteValBufVal(this.logEntryEncoder.encode(entry));
-        putBytes(txn, this.logDbi, key, val);
     }
 
     private void writeRawLogEntry(final Txn txn, final long index, final byte[] encodedBytes) {

@@ -2329,6 +2329,26 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
        :doc      "Embed a batch of text strings and return one float array per input, in order."}
   embed-texts emb/embed-texts)
 
+(def ^{:arglists '([provider item]
+                   [provider item opts])
+       :doc      "Return the token count for a single embedding input item."}
+  token-count emb/token-count)
+
+(def ^{:arglists '([provider items]
+                   [provider items opts])
+       :doc      "Return one token count per embedding input item, in order."}
+  token-counts emb/token-counts)
+
+(def ^{:arglists '([provider item max-tokens]
+                   [provider item max-tokens opts])
+       :doc      "Truncate a single embedding input item so it fits within `max-tokens`."}
+  truncate-item emb/truncate-item)
+
+(def ^{:arglists '([provider text max-tokens]
+                   [provider text max-tokens opts])
+       :doc      "Truncate a single text string so it fits within `max-tokens`."}
+  truncate-text emb/truncate-text)
+
 (def ^{:arglists '([provider])
        :doc      "Close an embedding provider and release provider-owned resources. Safe to call more than once."}
   close-embedding-provider emb/close-provider)
