@@ -214,6 +214,13 @@
 
     :else nil))
 
+(defn- ha-demotion-draining?
+  [m now-ms]
+  (let [deadline-ms (ha-demotion-deadline-ms m)]
+    (or (= :demoting (:ha-role m))
+        (and (integer? deadline-ms)
+             (< (long now-ms) (long deadline-ms))))))
+
 (defn- maybe-finish-ha-demotion
   [m now-ms started-demoting?]
   (let [deadline-ms (ha-demotion-deadline-ms m)]
@@ -3681,12 +3688,13 @@
 
 (defn- advance-ha-follower-or-candidate
   [db-name m]
-  (if (contains? #{:follower :candidate} (:ha-role m))
-    (let [state-now-ms (ha-now-ms)
-          m1 (maybe-clear-ha-rejoin-promotion-block m state-now-ms)
-          m2 (maybe-enter-ha-candidate m1 state-now-ms)]
-      (maybe-promote-ha-candidate db-name m2 (ha-now-ms)))
-    m))
+  (let [state-now-ms (ha-now-ms)]
+    (if (or (ha-demotion-draining? m state-now-ms)
+            (not (contains? #{:follower :candidate} (:ha-role m))))
+      m
+      (let [m1 (maybe-clear-ha-rejoin-promotion-block m state-now-ms)
+            m2 (maybe-enter-ha-candidate m1 state-now-ms)]
+        (maybe-promote-ha-candidate db-name m2 (ha-now-ms))))))
 
 (defn refresh-ha-authority-state
   [db-name m]

@@ -86,26 +86,60 @@
 (defonce ^:private in-memory-groups
   (atom {}))
 
+(defonce ^:private in-memory-group-scope-seq
+  (atom 0))
+
+(def ^:dynamic *in-memory-group-scope*
+  :global)
+
+(defn fresh-in-memory-group-scope
+  "Allocate a fresh in-memory authority scope token.
+
+  Authorities created under different scope tokens do not share the same
+  backing group-state atoms even when they reuse the same group-id."
+  []
+  (keyword "datalevin.ha.control.scope"
+           (str (swap! in-memory-group-scope-seq inc))))
+
 (defn- group-state
-  [group-id]
-  (or (get @in-memory-groups group-id)
+  ([group-id]
+   (group-state *in-memory-group-scope* group-id))
+  ([scope-id group-id]
+   (or (get-in @in-memory-groups [scope-id group-id])
       (let [state (atom (blank-state))]
-        (get (swap! in-memory-groups
-                    (fn [m]
-                      (if (contains? m group-id)
-                        m
-                        (assoc m group-id state))))
-             group-id))))
+        (get-in (swap! in-memory-groups
+                       (fn [m]
+                         (if (contains? (get m scope-id {}) group-id)
+                           m
+                           (assoc-in m [scope-id group-id] state))))
+                [scope-id group-id])))))
 
 (defn reset-in-memory-groups!
-  "Clear all shared in-memory authority state.
+  "Clear shared in-memory authority state for one scope.
 
   This is intended for test fixtures so separate tests can safely reuse
   deterministic in-memory group IDs without inheriting leases or membership
-  from earlier tests."
+  from earlier tests. When called with no argument it clears the current
+  `*in-memory-group-scope*` only."
+  ([] (reset-in-memory-groups! *in-memory-group-scope*))
+  ([scope-id]
+   (swap! in-memory-groups dissoc scope-id)
+   nil))
+
+(defn with-fresh-in-memory-group-scope
+  "Run `f` with a fresh isolated in-memory authority scope."
+  [f]
+  (let [scope-id (fresh-in-memory-group-scope)]
+    (binding [*in-memory-group-scope* scope-id]
+      (try
+        (f)
+        (finally
+          (reset-in-memory-groups! scope-id))))))
+
+(defn current-in-memory-group-scope
+  "Return the current in-memory authority scope token."
   []
-  (reset! in-memory-groups {})
-  nil)
+  *in-memory-group-scope*)
 
 (defn- non-blank-string?
   [x]
@@ -1745,13 +1779,14 @@
 
 (defn new-in-memory-authority
   "Create an in-memory authority adapter for deterministic tests."
-  [{:keys [group-id voters clock-skew-budget-ms]}]
+  [{:keys [group-id voters clock-skew-budget-ms scope-id]}]
   (lease/membership-hash-key group-id)
   (let [initial-voters (if (seq voters)
                          (validated-peer-ids! voters :ha-control-plane-voters)
-                         [])]
+                         [])
+        scope-id (or scope-id *in-memory-group-scope*)]
     (->InMemoryLeaseAuthority group-id
-                              (group-state group-id)
+                              (group-state scope-id group-id)
                               (volatile! false)
                               initial-voters
                               (some-> clock-skew-budget-ms

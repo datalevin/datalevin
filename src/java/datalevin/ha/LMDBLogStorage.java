@@ -34,6 +34,8 @@ import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiFunction;
 import java.util.concurrent.locks.Lock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
@@ -86,9 +88,15 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private volatile long firstLogIndex = 1L;
     private long mapSizeBytes = MAP_SIZE_BYTES;
     private volatile boolean hasLoadedFirstLogIndex;
-    private volatile long readStateVersion = 1L;
+    private final AtomicLong readStateVersion = new AtomicLong(1L);
+    private final ConcurrentHashMap<Thread, ReadTxnState> readTxnStates =
+        new ConcurrentHashMap<>();
     private final ThreadLocal<ReadTxnState> readTxnState =
-        ThreadLocal.withInitial(ReadTxnState::new);
+        ThreadLocal.withInitial(() -> {
+            final ReadTxnState state = new ReadTxnState();
+            this.readTxnStates.put(Thread.currentThread(), state);
+            return state;
+        });
 
     public LMDBLogStorage(final String path, final RaftOptions raftOptions) {
         this.path = path;
@@ -201,7 +209,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             if (this.hasLoadedFirstLogIndex && index < this.firstLogIndex) {
                 return 0L;
             }
-            final long readVersion = this.readStateVersion;
+            final long readVersion = this.readStateVersion.get();
             final ReadTxnState state = this.readTxnState.get();
             if (state.hasCachedTerm(index, readVersion)) {
                 return state.getCachedTerm();
@@ -401,7 +409,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private void closeEnv() {
-        closeCurrentThreadReadTxnState();
+        closeAllReadTxnStates();
         clearCurrentThreadReusableBufVals();
         closeQuietly(this.logDbi);
         closeQuietly(this.confDbi);
@@ -498,7 +506,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         return withReadTxn((txn, state) -> {
             final LogEntry entry = readEntry(txn, index);
             final long term = entry == null ? 0L : entry.getId().getTerm();
-            state.cacheTerm(index, term, this.readStateVersion);
+            state.cacheTerm(index, term, this.readStateVersion.get());
             return entry;
         });
     }
@@ -673,8 +681,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private <T> T withReadTxn(final BiFunction<Txn, ReadTxnState, T> reader) {
         ensureOpen();
-        final long readVersion = this.readStateVersion;
-        final ReadTxnState state = this.readTxnState.get();
+        final long readVersion = this.readStateVersion.get();
+        final ReadTxnState state = currentReadTxnState();
         state.prepare(this.env, readVersion);
         final Txn txn = state.acquire();
         try {
@@ -685,14 +693,29 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private void advanceReadStateVersion() {
-        this.readStateVersion++;
+        this.readStateVersion.incrementAndGet();
         closeCurrentThreadReadTxnState();
     }
 
     private void closeCurrentThreadReadTxnState() {
         final ReadTxnState state = this.readTxnState.get();
         state.closeTxn();
+        this.readTxnStates.remove(Thread.currentThread(), state);
         this.readTxnState.remove();
+    }
+
+    private void closeAllReadTxnStates() {
+        for (final ReadTxnState state : this.readTxnStates.values()) {
+            state.closeTxn();
+        }
+        this.readTxnStates.clear();
+        this.readTxnState.remove();
+    }
+
+    private ReadTxnState currentReadTxnState() {
+        final ReadTxnState state = this.readTxnState.get();
+        this.readTxnStates.putIfAbsent(Thread.currentThread(), state);
+        return state;
     }
 
     private void clearCurrentThreadReusableBufVals() {
