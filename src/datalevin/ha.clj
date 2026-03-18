@@ -1917,8 +1917,16 @@
                         leader-endpoint
                         source-endpoint
                         watermark)]
-        {:known? true
-         :last-applied-lsn (long-max2 authority-lsn (or remote-lsn 0))
+        {:known? (or (some? remote-lsn)
+                     (pos? authority-lsn))
+         ;; Use the source's fresh watermark when we have it. The cached lease
+         ;; observation can be ahead of what the leader currently serves during
+         ;; follower catch-up, and treating that stale authority LSN as
+         ;; authoritative turns speculative cursor overshoot into a false gap.
+         :last-applied-lsn (when (or (some? remote-lsn)
+                                     (pos? authority-lsn))
+                             (long (or remote-lsn authority-lsn)))
+         :authority-last-applied-lsn authority-lsn
          :watermark watermark})
       (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                        db-name m source-endpoint)
@@ -1972,25 +1980,51 @@
                                :source-last-applied-lsn nil}})
                     (let [{:keys [known? last-applied-lsn]}
                           (ha-source-advertised-last-applied-lsn
-                           db-name m lease source-endpoint)]
+                           db-name m lease source-endpoint)
+                          source-last-applied-lsn
+                          (long (or last-applied-lsn 0))
+                          local-last-applied-lsn
+                          (long (max 0
+                                     (long (or (:ha-local-last-applied-lsn m)
+                                               0))))
+                          speculative-cursor?
+                          (> (long next-lsn)
+                             (unchecked-inc local-last-applied-lsn))]
                       (cond
                         (and known?
-                             (< (long (or last-applied-lsn 0))
+                             (< source-last-applied-lsn
                                 (long (max 0
                                            (dec (long next-lsn))))))
-                        {:ok? false
-                         :gap-error
-                         {:source-endpoint source-endpoint
-                          :message
-                          "Follower txlog replay source is behind local cursor"
-                          :data {:error :ha/txlog-source-behind
-                                 :expected-lsn (long next-lsn)
-                                 :actual-lsn nil
-                                 :source-last-applied-lsn
-                                 (long (or last-applied-lsn 0))}}}
+                        (if (and speculative-cursor?
+                                 (>= source-last-applied-lsn
+                                     local-last-applied-lsn))
+                          ;; The tracked replay cursor got ahead of what the
+                          ;; chosen source can currently prove, but the source
+                          ;; is still caught up through the follower's
+                          ;; authoritative local floor. Treat this as a stale
+                          ;; speculative cursor so the caller clamps back to
+                          ;; `(inc local-last-applied-lsn)` instead of
+                          ;; triggering snapshot bootstrap.
+                          {:ok? true
+                           :value {:source-endpoint source-endpoint
+                                   :records records
+                                   :source-order source-order
+                                   :source-last-applied-lsn-known? true
+                                   :source-last-applied-lsn
+                                   source-last-applied-lsn}}
+                          {:ok? false
+                           :gap-error
+                           {:source-endpoint source-endpoint
+                            :message
+                            "Follower txlog replay source is behind local cursor"
+                            :data {:error :ha/txlog-source-behind
+                                   :expected-lsn (long next-lsn)
+                                   :actual-lsn nil
+                                   :source-last-applied-lsn
+                                   source-last-applied-lsn}}})
 
                         (and known?
-                             (>= (long (or last-applied-lsn 0))
+                             (>= source-last-applied-lsn
                                  (long next-lsn)))
                         {:ok? false
                          :gap-error
@@ -2001,7 +2035,7 @@
                                  :expected-lsn (long next-lsn)
                                  :actual-lsn nil
                                  :source-last-applied-lsn
-                                 (long (or last-applied-lsn 0))}}}
+                                 source-last-applied-lsn}}}
 
                         reordered?
                         {:ok? false
