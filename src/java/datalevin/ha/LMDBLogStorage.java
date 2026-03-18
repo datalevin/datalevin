@@ -25,6 +25,8 @@ import datalevin.cpp.BufVal;
 import datalevin.cpp.Cursor;
 import datalevin.cpp.Dbi;
 import datalevin.cpp.Env;
+import datalevin.cpp.Info;
+import datalevin.cpp.Stat;
 import datalevin.cpp.Txn;
 import datalevin.cpp.Util;
 import datalevin.dtlvnative.DTLV;
@@ -56,9 +58,11 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private static final int MAX_READERS = 256;
     private static final long MAP_SIZE_BYTES = 64L * 1024L * 1024L;
     private static final int MAX_MAP_FULL_RETRIES = 6;
+    private static final long MIN_APPEND_MAP_HEADROOM_BYTES = 4L * 1024L * 1024L;
     // Rebuilding the log DBI materializes all survivors in memory before reinsert.
     // Keep that fast path bounded and fall back to cursor deletes for larger survivor sets.
     private static final long MAX_REBUILD_SURVIVOR_ENTRIES = 65536L;
+    private static final long MAX_REBUILD_SURVIVOR_BYTES = 16L * 1024L * 1024L;
 
     private final String path;
     private final boolean sync;
@@ -230,16 +234,16 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         this.writeLock.lock();
         try {
             ensureOpen();
+            final List<EncodedLogEntry> encodedEntries = prepareAppendEntries(entries);
+            ensureMapCapacityForAppend(encodedEntries);
             Util.MapFullException lastMapFull = null;
             for (int attempt = 0; attempt <= MAX_MAP_FULL_RETRIES; attempt++) {
                 final Txn txn = Txn.create(this.env);
                 try {
-                    for (final LogEntry entry : entries) {
-                        writeEntry(txn, entry);
-                    }
+                    writeEncodedEntries(txn, encodedEntries);
                     txn.commit();
                     advanceReadStateVersion();
-                    return entries.size();
+                    return encodedEntries.size();
                 } catch (final Util.MapFullException e) {
                     lastMapFull = e;
                 } finally {
@@ -248,12 +252,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 if (attempt == MAX_MAP_FULL_RETRIES) {
                     break;
                 }
-                growMapSizeForAppend(entries, attempt + 1);
+                growMapSizeForAppend(encodedEntries, attempt + 1);
             }
             if (lastMapFull != null) {
                 LOG.error(
                     "Fail to append {} log entries in data path: {} after {} map resize attempts.",
-                    entries.size(), this.path, MAX_MAP_FULL_RETRIES + 1, lastMapFull);
+                    encodedEntries.size(), this.path, MAX_MAP_FULL_RETRIES + 1, lastMapFull);
             }
             return 0;
         } catch (final Exception e) {
@@ -415,8 +419,9 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         advanceReadStateVersion();
     }
 
-    private void growMapSizeForAppend(final List<LogEntry> entries, final int attempt) {
-        final long previousSize = this.mapSizeBytes;
+    private void growMapSizeForAppend(final List<EncodedLogEntry> entries, final int attempt) {
+        final long previousSize = currentMapUsage().mapSizeBytes;
+        this.mapSizeBytes = previousSize;
         final long nextSize = nextMapSize(previousSize);
         if (nextSize <= previousSize) {
             throw new IllegalStateException("LMDB log storage map size overflow at "
@@ -424,11 +429,32 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
         this.env.setMapSize(nextSize);
         this.mapSizeBytes = nextSize;
-        final long firstIndex = entries.get(0).getId().getIndex();
-        final long lastIndex = entries.get(entries.size() - 1).getId().getIndex();
+        final long firstIndex = entries.get(0).index;
+        final long lastIndex = entries.get(entries.size() - 1).index;
         LOG.warn(
             "LMDB log storage map full, resizing map for append retry. path={}, oldMapSizeBytes={}, newMapSizeBytes={}, attempt={}, firstIndex={}, lastIndex={}, entryCount={}",
             this.path, previousSize, nextSize, attempt, firstIndex, lastIndex, entries.size());
+    }
+
+    private void ensureMapCapacityForAppend(final List<EncodedLogEntry> entries) {
+        final long estimatedAppendBytes = estimateAppendBytes(entries);
+        if (estimatedAppendBytes <= 0L) {
+            return;
+        }
+        final MapUsage usage = currentMapUsage();
+        this.mapSizeBytes = usage.mapSizeBytes;
+        final long targetSize = roundUpMapSize(Math.max(MAP_SIZE_BYTES,
+            Math.addExact(usage.usedBytes,
+                Math.addExact(estimatedAppendBytes,
+                    appendMapHeadroomBytes(estimatedAppendBytes)))));
+        if (targetSize <= usage.mapSizeBytes) {
+            return;
+        }
+        this.env.setMapSize(targetSize);
+        this.mapSizeBytes = targetSize;
+        LOG.info(
+            "Pre-sized LMDB log storage map for append. path={}, oldMapSizeBytes={}, newMapSizeBytes={}, estimatedAppendBytes={}, entryCount={}",
+            this.path, usage.mapSizeBytes, targetSize, estimatedAppendBytes, entries.size());
     }
 
     private long resolveInitialMapSize(final File dir) {
@@ -444,6 +470,10 @@ public final class LMDBLogStorage implements LogStorage, Describer {
             return Long.MAX_VALUE;
         }
         return currentSize * 2L;
+    }
+
+    private static long appendMapHeadroomBytes(final long estimatedAppendBytes) {
+        return Math.max(MIN_APPEND_MAP_HEADROOM_BYTES, estimatedAppendBytes);
     }
 
     private static long roundUpMapSize(final long size) {
@@ -517,6 +547,17 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
     }
 
+    private void writeEncodedEntries(final Txn txn, final List<EncodedLogEntry> entries) {
+        for (final EncodedLogEntry entry : entries) {
+            final BufVal key = longKeyBufVal(entry.index);
+            final BufVal val = byteValBufVal(entry.encodedBytes);
+            putBytes(txn, this.logDbi, key, val);
+            if (entry.configuration) {
+                putBytes(txn, this.confDbi, key, val);
+            }
+        }
+    }
+
     private void deleteRange(final Txn txn, final Dbi dbi,
                              final long fromIndexInclusive, final long toIndexInclusive) {
         if (fromIndexInclusive > toIndexInclusive) {
@@ -572,7 +613,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
 
         final List<RawLogRecord> survivors =
-            readRawEntriesInRange(txn, this.logDbi, keepFrom, keepTo);
+            readRawEntriesInRange(txn, this.logDbi, keepFrom, keepTo,
+                MAX_REBUILD_SURVIVOR_BYTES);
+        if (survivors == null) {
+            deleteRange(txn, this.logDbi, deleteFromInclusive, deleteToInclusive);
+            return;
+        }
         // Only logDbi is rebuilt here. confDbi survivors remain in place and the
         // truncate callers separately delete only the removed configuration range.
         Util.checkRc(DTLV.mdb_drop(txn.get(), this.logDbi.get(), 0));
@@ -598,12 +644,14 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private List<RawLogRecord> readRawEntriesInRange(final Txn txn, final Dbi dbi,
                                                      final long fromIndexInclusive,
-                                                     final long toIndexInclusive) {
+                                                     final long toIndexInclusive,
+                                                     final long maxTotalBytes) {
         if (fromIndexInclusive > toIndexInclusive) {
             return Collections.emptyList();
         }
         final ArrayList<RawLogRecord> entries =
             new ArrayList<>((int) Math.min(toIndexInclusive - fromIndexInclusive + 1L, 1024L));
+        long totalBytes = 0L;
         final BufVal key = cursorKeyBufVal();
         final BufVal val = emptyValBufVal();
         Cursor cursor = null;
@@ -617,8 +665,12 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 if (readCursorKey(cursor) > toIndexInclusive) {
                     break;
                 }
-                entries.add(new RawLogRecord(readCursorKey(cursor),
-                    copyBytes(cursor.val())));
+                final byte[] encodedBytes = copyBytes(cursor.val());
+                totalBytes += encodedBytes.length;
+                if (totalBytes > maxTotalBytes) {
+                    return null;
+                }
+                entries.add(new RawLogRecord(readCursorKey(cursor), encodedBytes));
             } while (cursor.seek(DTLV.MDB_NEXT));
             return entries;
         } finally {
@@ -665,6 +717,49 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         } finally {
             if (cursor != null) {
                 cursor.close();
+            }
+        }
+    }
+
+    private List<EncodedLogEntry> prepareAppendEntries(final List<LogEntry> entries) {
+        final ArrayList<EncodedLogEntry> encoded = new ArrayList<>(entries.size());
+        for (final LogEntry entry : entries) {
+            encoded.add(new EncodedLogEntry(entry.getId().getIndex(),
+                this.logEntryEncoder.encode(entry),
+                entry.getType() == EntryType.ENTRY_TYPE_CONFIGURATION));
+        }
+        return encoded;
+    }
+
+    private long estimateAppendBytes(final List<EncodedLogEntry> entries) {
+        long totalBytes = 0L;
+        for (final EncodedLogEntry entry : entries) {
+            final long perDbiBytes = Long.BYTES + (long) entry.encodedBytes.length;
+            totalBytes = Math.addExact(totalBytes, perDbiBytes);
+            if (entry.configuration) {
+                totalBytes = Math.addExact(totalBytes, perDbiBytes);
+            }
+        }
+        return totalBytes;
+    }
+
+    private MapUsage currentMapUsage() {
+        Info info = null;
+        Stat stat = null;
+        try {
+            info = Info.create(this.env);
+            stat = Stat.create(this.env);
+            final long mapSizeBytes = info.get().me_mapsize();
+            final long usedPages = info.get().me_last_pgno() + 1L;
+            final long usedBytes =
+                usedPages <= 0L ? 0L : Math.multiplyExact(usedPages, (long) stat.get().ms_psize());
+            return new MapUsage(mapSizeBytes, usedBytes);
+        } finally {
+            if (stat != null) {
+                stat.close();
+            }
+            if (info != null) {
+                info.close();
             }
         }
     }
@@ -880,6 +975,29 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         private RawLogRecord(final long index, final byte[] encodedBytes) {
             this.index = index;
             this.encodedBytes = encodedBytes;
+        }
+    }
+
+    private static final class EncodedLogEntry {
+        private final long index;
+        private final byte[] encodedBytes;
+        private final boolean configuration;
+
+        private EncodedLogEntry(final long index, final byte[] encodedBytes,
+                                final boolean configuration) {
+            this.index = index;
+            this.encodedBytes = encodedBytes;
+            this.configuration = configuration;
+        }
+    }
+
+    private static final class MapUsage {
+        private final long mapSizeBytes;
+        private final long usedBytes;
+
+        private MapUsage(final long mapSizeBytes, final long usedBytes) {
+            this.mapSizeBytes = mapSizeBytes;
+            this.usedBytes = usedBytes;
         }
     }
 
