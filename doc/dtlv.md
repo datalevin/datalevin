@@ -8,7 +8,7 @@ server.
 
 $ dtlv help
 
-  Datalevin (version: 0.10.10)
+  Datalevin (version: 0.10.11)
 
 Usage: dtlv [options] [command] [arguments]
 
@@ -53,7 +53,7 @@ will initiate an interactive console (REPL).
 ```console
 $ dtlv
 
-  Datalevin (version: 0.10.10)
+  Datalevin (version: 0.10.11)
 
   Type (help) to see available functions. Some Clojure core functions are also available.
   Type (exit) to exit.

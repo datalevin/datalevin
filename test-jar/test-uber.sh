@@ -8,7 +8,7 @@ echo $jvm_version
 
 cd "$(dirname "$0")"
 
-uberjar=../target/datalevin-0.10.10-standalone.jar
+uberjar=../target/datalevin-0.10.11-standalone.jar
 
 if jar tf "$uberjar" | grep -Eq '^(META-INF/maven/|META-INF/leiningen/.*/project\.clj$|META-INF/leiningen/.*/README(\.[^/]+)?$|com/caucho/hessian/test/|org/bouncycastle/util/test/)'; then
     echo "Unexpected third-party metadata or test payload found in $uberjar" >&2

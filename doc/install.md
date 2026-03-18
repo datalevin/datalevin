@@ -12,14 +12,14 @@ If you use [Leiningen](https://leiningen.org/) build tool, add this to the
 `:dependencies` section of your `project.clj` file:
 
 ```Clojure
-[datalevin "0.10.10"]
+[datalevin "0.10.11"]
 ```
 
 If you use [Clojure CLI](https://clojure.org/guides/deps_and_cli) and
 `deps.edn`, declare the dependency like so:
 
 ```Clojure
-{:deps {datalevin/datalevin {:mvn/version "0.10.10"}}}
+{:deps {datalevin/datalevin {:mvn/version "0.10.11"}}}
 ```
 
 This library supports Java 21 and above.
@@ -31,13 +31,13 @@ libraries, and excludes the server, HA, CLI, and babashka pod runtime code.
 If you use Leiningen:
 
 ```Clojure
-[org.datalevin/datalevin-embedded "0.10.10"]
+[org.datalevin/datalevin-embedded "0.10.11"]
 ```
 
 If you use Clojure CLI:
 
 ```Clojure
-{:deps {org.datalevin/datalevin-embedded {:mvn/version "0.10.10"}}}
+{:deps {org.datalevin/datalevin-embedded {:mvn/version "0.10.11"}}}
 ```
 
 See [embedded release notes](embedded-release.md) for the packaging and release
@@ -168,13 +168,13 @@ See [README on Docker hub](https://hub.docker.com/r/huahaiy/datalevin) for usage
 
 Or download the executable binary from github:
 
-* [MacOS](https://github.com/datalevin/datalevin/releases/download/0.10.10/dtlv-0.10.10-macos-14-aarch64.zip)
+* [MacOS](https://github.com/datalevin/datalevin/releases/download/0.10.11/dtlv-0.10.11-macos-14-aarch64.zip)
   on arm64 (AARCH64)
-* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.10/dtlv-0.10.10-ubuntu-22.04-amd64.zip)
+* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.11/dtlv-0.10.11-ubuntu-22.04-amd64.zip)
   on x86_64 (AMD64)
-* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.10/dtlv-0.10.10-ubuntu-24.04-arm-aarch64.zip)
+* [Linux](https://github.com/datalevin/datalevin/releases/download/0.10.11/dtlv-0.10.11-ubuntu-24.04-arm-aarch64.zip)
   on arm64 (AARCH64)
-* [Windows](https://github.com/datalevin/datalevin/releases/download/0.10.10/dtlv-0.10.10-windows-amd64.zip)
+* [Windows](https://github.com/datalevin/datalevin/releases/download/0.10.11/dtlv-0.10.11-windows-amd64.zip)
   on x86-64 (AMD64)
 
 Unzip to get a `dtlv` executable, put it on your path.
@@ -184,19 +184,19 @@ You may want to launch `dtlv` in `rlwrap` to get a better REPL experience.
 ### Uberjar
 
 A JVM
-[uberjar](https://github.com/datalevin/datalevin/releases/download/0.10.10/datalevin-0.10.10-standalone.jar)
+[uberjar](https://github.com/datalevin/datalevin/releases/download/0.10.11/datalevin-0.10.11-standalone.jar)
 is downloadable to use as the command line tool. It is useful when one wants to
 run a Datalevin server and needs the efficiency of JVM's JIT, as GraalVM native
 image is not as efficient as Hotspot JVM for long running programs, or when a
 pre-built native version is not available for your platform. For example:
 
 ```console
-java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -jar datalevin-0.10.10-standalone.jar
+java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -jar datalevin-0.10.11-standalone.jar
 ```
 This will start the Datalevin REPL.
 
 ```console
-java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -jar datalevin-0.10.10-standalone.jar serv -r /tmp/test-server
+java --add-opens=java.base/java.nio=ALL-UNNAMED --add-opens=java.base/sun.nio.ch=ALL-UNNAMED -jar datalevin-0.10.11-standalone.jar serv -r /tmp/test-server
 ```
 Will run the Datalevin server on default port 8898, with root data path at
 `/tmp/test-server`.
@@ -214,7 +214,7 @@ registry](https://github.com/babashka/pod-registry) within a Babashka script
 #!/usr/bin/env bb
 
 (require '[babashka.pods :as pods])
-(pods/load-pod 'huahaiy/datalevin "0.10.10")
+(pods/load-pod 'huahaiy/datalevin "0.10.11")
 
 ```
 
