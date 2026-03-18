@@ -3208,8 +3208,13 @@
   [db-name m]
   (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
                             c/*ha-clock-skew-budget-ms*))
-        role (:ha-role m)]
-    (if (#{:follower :candidate} role)
+        role (:ha-role m)
+        clock-skew-hook (:ha-clock-skew-hook m)
+        hook-configured?
+        (let [cmd (:cmd clock-skew-hook)]
+          (and (vector? cmd) (seq cmd)))]
+    (if (or (#{:follower :candidate} role)
+            (and (= :leader role) hook-configured?))
       (let [result (try
                      (run-ha-clock-skew-hook db-name m)
                      (catch Exception e
@@ -3218,13 +3223,21 @@
                         :reason :exception
                         :budget-ms budget-ms
                         :message (ex-message e)}))
-            now-ms (System/currentTimeMillis)]
-        (assoc m
-               :ha-clock-skew-budget-ms budget-ms
-               :ha-clock-skew-paused? (true? (:paused? result))
-               :ha-clock-skew-last-check-ms now-ms
-               :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
-               :ha-clock-skew-last-result result))
+            now-ms (System/currentTimeMillis)
+            next-m (assoc m
+                          :ha-clock-skew-budget-ms budget-ms
+                          :ha-clock-skew-paused? (true? (:paused? result))
+                          :ha-clock-skew-last-check-ms now-ms
+                          :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
+                          :ha-clock-skew-last-result result)]
+        (if (and (= :leader role)
+                 (true? (:paused? result)))
+          (demote-ha-leader db-name next-m
+                            :clock-skew-paused
+                            {:budget-ms budget-ms
+                             :clock-skew-result result}
+                            now-ms)
+          next-m))
       (assoc m
              :ha-clock-skew-budget-ms budget-ms
              :ha-clock-skew-paused? false))))
@@ -3921,6 +3934,18 @@
                    {:error :ha/write-rejected
                     :reason :not-leader
                     :ha-role role
+                    :retryable? true})
+
+            (true? (:ha-clock-skew-paused? m))
+            (merge common-meta
+                   {:error :ha/write-rejected
+                    :reason :clock-skew-paused
+                    :ha-clock-skew-last-result
+                    (:ha-clock-skew-last-result m)
+                    :ha-clock-skew-last-check-ms
+                    (:ha-clock-skew-last-check-ms m)
+                    :ha-clock-skew-last-observed-ms
+                    (:ha-clock-skew-last-observed-ms m)
                     :retryable? true})
 
             authority-read-failure
