@@ -20,6 +20,7 @@
    [datalevin.db :as db]
    [datalevin.udf :as udf]
    [datalevin.lmdb :as l]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.protocol :as p]
    [datalevin.storage :as st]
    [datalevin.ha :as dha]
@@ -1554,6 +1555,16 @@
         m       m0]
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
+
+(defn- ha-write-commit-admission!
+  [^Server server message]
+  (when-let [err (ha-write-admission-error server message)]
+    (u/raise "HA write admission rejected" err)))
+
+(defn- ha-write-commit-check-fn
+  [^Server server message]
+  (fn [_]
+    (ha-write-commit-admission! server message)))
 
 (defn- with-ha-write-admission
   [^Server server message f]
@@ -3601,11 +3612,13 @@
       (wrap-permission
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
-        (i/close-transact-kv kv-store)
-        (halt-run (get-in dbs [db-name :runner]))
-        (update-db server db-name #(dissoc % :runner :wlmdb))
-        (write-message skey {:type :command-complete})
-        (.release ^Semaphore (get-in dbs [db-name :lock]))))))
+        (try
+          (i/close-transact-kv kv-store)
+          (write-message skey {:type :command-complete})
+          (finally
+            (halt-run (get-in dbs [db-name :runner]))
+            (update-db server db-name #(dissoc % :runner :wlmdb))
+            (.release ^Semaphore (get-in dbs [db-name :lock]))))))))
 
 (defn- abort-transact-kv
   [^Server server ^SelectionKey skey {:keys [args writing?]}]
@@ -3663,16 +3676,18 @@
       (wrap-permission
           ::alter ::database (db-eid sys-conn db-name)
           "Don't have permission to alter the database"
-        (i/close-transact-kv kv-store)
-        (halt-run (get-in dbs [db-name :runner]))
-        (add-store
-          server db-name
-          (st/transfer (get-in dbs [db-name :wstore]) kv-store))
-        (update-db
-          server db-name
-          #(dissoc % :wlmdb :wstore :wdt-db :runner))
-        (write-message skey {:type :command-complete})
-        (.release ^Semaphore (get-in dbs [db-name :lock]))))))
+        (try
+          (i/close-transact-kv kv-store)
+          (add-store
+            server db-name
+            (st/transfer (get-in dbs [db-name :wstore]) kv-store))
+          (write-message skey {:type :command-complete})
+          (finally
+            (halt-run (get-in dbs [db-name :runner]))
+            (update-db
+              server db-name
+              #(dissoc % :wlmdb :wstore :wdt-db :runner))
+            (.release ^Semaphore (get-in dbs [db-name :lock]))))))))
 
 (defn- abort-transact
   [^Server server ^SelectionKey skey {:keys [args]}]
@@ -4490,7 +4505,9 @@
           server
           message
           #(when-not precheck-only?
-             (binding [txlog/*commit-payload-ha-term* ha-txlog-term]
+             (binding [txlog/*commit-payload-ha-term* ha-txlog-term
+                       cpp/*before-write-commit-fn*
+                       (ha-write-commit-check-fn server message)]
                (message-cases skey type))))]
     (cond
       (not ok?)

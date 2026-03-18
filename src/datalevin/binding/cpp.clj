@@ -68,6 +68,14 @@
       (raise "Unable to read VERSION file"
              {:msg (.getMessage e)}))))
 
+(def ^:dynamic *before-write-commit-fn*
+  nil)
+
+(defn- run-before-write-commit!
+  [context]
+  (when-let [f *before-write-commit-fn*]
+    (f context)))
+
 (defprotocol IPool
   (pool-add [_ x])
   (pool-take [_]))
@@ -1078,6 +1086,7 @@
           (if aborted?
             (.close txn)
             (try
+              (run-before-write-commit! {:operation :close-transact-kv})
               (.commit txn)
               (catch Util$MapFullException _
                 (.close txn)
@@ -1087,8 +1096,10 @@
               (catch Exception e
                 (.close txn)
                 (vreset! write-txn nil)
-                (raise "Fail to commit read/write transaction in LMDB: "
-                       e {}))))
+                (if (= :ha/write-rejected (:error (ex-data e)))
+                  (throw e)
+                  (raise "Fail to commit read/write transaction in LMDB: "
+                         e {})))))
           (vreset! write-txn nil)
           (.close txn)
           (if aborted? :aborted :committed)))
@@ -1130,7 +1141,10 @@
                     (transact* [[:put c/kv-info :max-val-size (:max-val-size @info)]]
                                dbis txn)
                     (vswap! info assoc :max-val-size-changed? false))
-                  (when one-shot? (.commit txn))
+                  (when one-shot?
+                    (run-before-write-commit! {:operation :transact-kv
+                                               :dbi-name dbi-name})
+                    (.commit txn))
                   :transacted
                   (catch Util$MapFullException _
                     (.close txn)
@@ -1141,7 +1155,9 @@
                           (raise "DB resized" {:resized true}))))
                   (catch Exception e
                     (when one-shot? (.close txn))
-                    (raise "Fail to transact to LMDB: " e {})))))]
+                    (if (= :ha/write-rejected (:error (ex-data e)))
+                      (throw e)
+                      (raise "Fail to transact to LMDB: " e {}))))))]
         (if (Thread/holdsLock write-txn)
           (do-transact nil)
           (locking write-txn
