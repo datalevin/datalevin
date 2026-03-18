@@ -120,6 +120,40 @@
         budget-ms (max 1000 renew-ms rpc-timeout-ms)]
     (long (min (long max-ms) budget-ms))))
 
+(defn- ha-lease-local-remaining-ms
+  [m now-ms now-nanos]
+  (cond
+    (integer? (:ha-lease-local-deadline-nanos m))
+    (max 0
+         (.toMillis TimeUnit/NANOSECONDS
+                    (max 0
+                         (- (long (:ha-lease-local-deadline-nanos m))
+                            (long now-nanos)))))
+
+    (integer? (:ha-lease-local-deadline-ms m))
+    (max 0
+         (- (long (:ha-lease-local-deadline-ms m))
+            (long now-ms)))
+
+    (integer? (:ha-lease-until-ms m))
+    (max 0
+         (- (long (:ha-lease-until-ms m))
+            (long now-ms)))
+
+    :else
+    nil))
+
+(defn- ha-renew-timeout-ms
+  [m now-ms now-nanos]
+  (let [lease-timeout-ms (long (or (:ha-lease-timeout-ms m)
+                                   c/*ha-lease-timeout-ms*))
+        request-timeout-ms (ha-request-timeout-ms m lease-timeout-ms)
+        remaining-ms (ha-lease-local-remaining-ms m now-ms now-nanos)]
+    (long (max 1
+               (if (integer? remaining-ms)
+                 (min request-timeout-ms (long remaining-ms))
+                 request-timeout-ms)))))
+
 (defn- long-max2 ^long
   [a b]
   (let [a (long a)
@@ -3619,6 +3653,10 @@
     m
     (let [local-start-ms (ha-now-ms)
           local-start-nanos (ha-now-nanos)
+          renew-timeout-ms (ha-renew-timeout-ms
+                            m
+                            local-start-ms
+                            local-start-nanos)
           term (:ha-leader-term m)]
       (if-not (and (integer? term) (pos? ^long term))
         (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
@@ -3631,7 +3669,8 @@
                        :lease-renew-ms (:ha-lease-renew-ms m)
                        :lease-timeout-ms (:ha-lease-timeout-ms m)
                        :leader-last-applied-lsn (long (or (:ha-leader-last-applied-lsn m) 0))
-                       :now-ms local-start-ms})]
+                       :now-ms local-start-ms
+                       :timeout-ms renew-timeout-ms})]
           (if (:ok? result)
             (let [{:keys [lease version authority-now-ms]} result
                   observed-at-ms (ha-now-ms)]

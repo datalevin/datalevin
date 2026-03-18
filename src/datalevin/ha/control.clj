@@ -651,6 +651,14 @@
   [attempt remaining rpc-timeout-ms]
   (Thread/sleep (command-retry-delay-ms attempt remaining rpc-timeout-ms)))
 
+(defn- command-operation-timeout-ms
+  [operation-timeout-ms timeout-ms]
+  (when (some? timeout-ms)
+    (require-positive-int! timeout-ms :timeout-ms))
+  (long (max 1
+             (min (long operation-timeout-ms)
+                  (long (or timeout-ms operation-timeout-ms))))))
+
 (defn- single-voter-authority?
   [{:keys [voters]}]
   (= 1 (count voters)))
@@ -1163,8 +1171,12 @@
       forward-interest)))
 
 (defn- submit-command!
-  [{:keys [rpc-timeout-ms operation-timeout-ms] :as authority} cmd]
-  (let [deadline (+ (System/currentTimeMillis) (long operation-timeout-ms))]
+  [{:keys [rpc-timeout-ms operation-timeout-ms] :as authority}
+   {:keys [timeout-ms] :as cmd}]
+  (let [deadline (+ (System/currentTimeMillis)
+                    (command-operation-timeout-ms
+                     operation-timeout-ms
+                     timeout-ms))]
     (loop [attempt 0]
       (let [remaining (- deadline (System/currentTimeMillis))]
         (when (<= remaining 0)
@@ -1474,6 +1486,7 @@
     (ensure-running! running-v)
     (lease/lease-key group-id (:db-identity req))
     (submit-command! this {:op :renew-lease
+                           :timeout-ms (:timeout-ms req)
                            :req req}))
 
   (read-membership-hash [this]
