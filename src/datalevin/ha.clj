@@ -627,6 +627,8 @@
 
 (def ^:dynamic *ha-client-cache-access-bucket-ms* 1000)
 
+(def ^:dynamic *ha-client-cache-max-access-records* nil)
+
 (defonce ^:private ^ConcurrentHashMap ha-client-cache
   (ConcurrentHashMap.))
 
@@ -638,6 +640,9 @@
 
 (defonce ^:private ^ConcurrentLinkedDeque ha-client-cache-access-order
   (ConcurrentLinkedDeque.))
+
+(defonce ^:private ^AtomicLong ha-client-cache-access-order-size
+  (AtomicLong. 0))
 
 (def ^:private ha-client-cache-prune-thread-seq
   (AtomicLong. 0))
@@ -673,26 +678,61 @@
   []
   (.incrementAndGet ha-client-cache-access-seq))
 
+(def ^:private ha-client-cache-default-max-access-records-per-entry 8)
+
+(def ^:private ha-client-cache-min-max-access-records 1024)
+
+(defn- ha-client-cache-max-access-records ^long
+  []
+  (long
+   (or *ha-client-cache-max-access-records*
+       (long-max2
+        ha-client-cache-min-max-access-records
+        (* (long-max2 1 (long *ha-client-cache-max-size*))
+           ha-client-cache-default-max-access-records-per-entry)))))
+
+(defn- ha-client-cache-access-order-full?
+  []
+  (>= (.get ha-client-cache-access-order-size)
+      (ha-client-cache-max-access-records)))
+
+(defn- enqueue-ha-client-cache-access-record!
+  [record]
+  (.addLast ha-client-cache-access-order record)
+  (.incrementAndGet ha-client-cache-access-order-size)
+  record)
+
+(defn- prepend-ha-client-cache-access-record!
+  [record]
+  (.addFirst ha-client-cache-access-order record)
+  (.incrementAndGet ha-client-cache-access-order-size)
+  record)
+
+(defn- poll-ha-client-cache-access-record!
+  []
+  (when-let [record (.pollFirst ha-client-cache-access-order)]
+    (.decrementAndGet ha-client-cache-access-order-size)
+    record))
+
 (defn- ha-client-cache-entry-access-id ^long
   [entry]
   (long (.get ^AtomicLong (:access-id entry))))
 
 (defn- record-ha-client-cache-access!
   [cache-key entry now-ms]
-  (let [access-id (next-ha-client-cache-access-id!)]
-    (.set ^AtomicLong (:last-used-ms entry) (long now-ms))
-    (.set ^AtomicLong (:access-id entry) access-id)
-    (.addLast ha-client-cache-access-order [cache-key access-id])
-    entry))
+  (.set ^AtomicLong (:last-used-ms entry) (long now-ms))
+  (when (or (zero? (ha-client-cache-entry-access-id entry))
+            (not (ha-client-cache-access-order-full?)))
+    (let [access-id (next-ha-client-cache-access-id!)]
+      (.set ^AtomicLong (:access-id entry) access-id)
+      (enqueue-ha-client-cache-access-record! [cache-key access-id])))
+  entry)
 
 (defn- ha-client-cache-entry
-  [cache-key future now-ms]
-  (record-ha-client-cache-access!
-   cache-key
-   {:future future
-    :last-used-ms (AtomicLong. 0)
-    :access-id (AtomicLong. 0)}
-   now-ms))
+  [_cache-key future _now-ms]
+  {:future future
+   :last-used-ms (AtomicLong. 0)
+   :access-id (AtomicLong. 0)})
 
 (defn- pending-ha-client-cache-entry?
   [entry]
@@ -776,7 +816,7 @@
 (defn- restore-ha-client-cache-access-records!
   [records]
   (doseq [record (rseq (vec records))]
-    (.addFirst ha-client-cache-access-order record)))
+    (prepend-ha-client-cache-access-record! record)))
 
 (defn- current-ha-client-cache-access-record?
   [entry access-id]
@@ -788,7 +828,7 @@
   (let [^ConcurrentHashMap cache ha-client-cache]
     (loop [deferred []]
       (if-let [[cache-key access-id :as record]
-               (.pollFirst ha-client-cache-access-order)]
+               (poll-ha-client-cache-access-record!)]
         (let [entry (.get cache cache-key)]
           (cond
             (nil? entry)
@@ -819,7 +859,7 @@
     (loop [deferred []]
       (if (> (.size cache) max-size)
         (if-let [[cache-key access-id :as record]
-                 (.pollFirst ha-client-cache-access-order)]
+                 (poll-ha-client-cache-access-record!)]
           (let [entry (.get cache cache-key)]
             (cond
               (nil? entry)
@@ -849,8 +889,11 @@
   [now-ms]
   (let [^ConcurrentHashMap cache ha-client-cache
         max-size (max 0 (long *ha-client-cache-max-size*))
-        prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))]
+        prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))
+        access-order-size (.get ha-client-cache-access-order-size)]
     (or (> (.size cache) max-size)
+        (>= access-order-size
+            (ha-client-cache-max-access-records))
         (>= (nonnegative-long-diff now-ms
                                    (.get ha-client-cache-last-prune-ms))
             prune-interval-ms))))
@@ -990,6 +1033,7 @@
     (.set ha-client-cache-prune-scheduled? false)
     (.set ha-client-cache-access-seq 0)
     (.clear ha-client-cache-access-order)
+    (.set ha-client-cache-access-order-size 0)
     (loop []
       (let [entries (vec (.entrySet cache))]
         (when (seq entries)
@@ -1654,11 +1698,13 @@
 
 (defn- estimate-ha-follower-record-bytes
   [record]
-  (let [payload (select-keys record [:lsn :ha-term :rows :ops])]
-    (try
-      (alength ^bytes (b/serialize payload))
-      (catch Throwable _
-        (long (count (pr-str payload)))))))
+  (if-let [payload-bytes (some-> (:payload-bytes record) long)]
+    (long-max2 1 payload-bytes)
+    (let [payload (select-keys record [:lsn :ha-term :rows :ops])]
+      (try
+        (alength ^bytes (b/serialize payload))
+        (catch Throwable _
+          (long (count (pr-str payload))))))))
 
 (defn- estimate-ha-follower-batch-bytes
   [records]
@@ -3621,28 +3667,16 @@
                          (ha-authority-read-failure-details m))
 
       :else
-      (let [lag-input-1 (pre-cas-lag-input db-name
-                                           m
-                                           observed-lease
-                                           now-ms)
-            lag-check-1 (ha-promotion-lag-guard
-                         m
-                         (:effective-lease lag-input-1)
-                         (:local-last-applied-lsn lag-input-1))]
-        (if-not (:ok? lag-check-1)
-          (fail-ha-candidate m :lag-guard-failed
-                             {:phase :pre-fence
-                              :lag lag-check-1
-                              :leader-lag-input lag-input-1})
-          (maybe-promote-after-authority-observation
-           db-name
-           m
-           (:ha-authority m)
-           (:ha-db-identity m)
-           (promotion-authority-observation
-            m
-            (System/currentTimeMillis))
-           (System/currentTimeMillis)))))))
+      (let [promotion-now-ms (System/currentTimeMillis)]
+        (maybe-promote-after-authority-observation
+         db-name
+         m
+         (:ha-authority m)
+         (:ha-db-identity m)
+         (promotion-authority-observation
+          m
+          promotion-now-ms)
+         promotion-now-ms)))))
 
 (defn- maybe-promote-ha-candidate
   [db-name m now-ms]

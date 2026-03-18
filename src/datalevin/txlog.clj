@@ -194,7 +194,8 @@
 (defn- decode-scanned-record-entry
   [^long segment-id ^String path record]
   (try
-    (let [payload (decode-commit-row-payload ^bytes (:body record))
+    (let [^bytes body (:body record)
+          payload (decode-commit-row-payload body)
           lsn     (long (or (:lsn payload) 0))]
       (when-not (pos? lsn)
         (raise "Txn-log payload missing valid positive LSN"
@@ -208,11 +209,15 @@
                               0))
             ha-term (some-> (:ha-term payload) long)
             rows    (vec (or (:ops payload) []))
-            tx-kind (classify-record-kind rows)]
+            tx-kind (classify-record-kind rows)
+            payload-bytes (long (or (:body-len record)
+                                    (some-> body alength)
+                                    0))]
         (cond-> {:lsn lsn
                  :tx-kind tx-kind
                  :tx-time tx-time
                  :rows rows
+                 :payload-bytes payload-bytes
                  :segment-id segment-id
                  :offset (long (:offset record))
                  :checksum (long (:checksum record))

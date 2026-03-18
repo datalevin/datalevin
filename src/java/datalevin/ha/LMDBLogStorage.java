@@ -59,18 +59,6 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     // Rebuilding the log DBI materializes all survivors in memory before reinsert.
     // Keep that fast path bounded and fall back to cursor deletes for larger survivor sets.
     private static final long MAX_REBUILD_SURVIVOR_ENTRIES = 65536L;
-    private final ThreadLocal<BufVal> LONG_KEY_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
-    private final ThreadLocal<BufVal> CURSOR_KEY_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
-    private final ThreadLocal<BufVal> BYTE_KEY_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(1));
-    private final ThreadLocal<BufVal> BYTE_VAL_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(1));
-    private final ThreadLocal<BufVal> EMPTY_VAL_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(0));
-    private final ThreadLocal<BufVal> LONG_VAL_BUF_VAL =
-        ThreadLocal.withInitial(() -> new BufVal(Long.BYTES));
 
     private final String path;
     private final boolean sync;
@@ -89,6 +77,8 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     private long mapSizeBytes = MAP_SIZE_BYTES;
     private volatile boolean hasLoadedFirstLogIndex;
     private final AtomicLong readStateVersion = new AtomicLong(1L);
+    private final ConcurrentHashMap<Thread, ReusableBufVals> reusableBufVals =
+        new ConcurrentHashMap<>();
     private final ConcurrentHashMap<Thread, ReadTxnState> readTxnStates =
         new ConcurrentHashMap<>();
     private final ThreadLocal<ReadTxnState> readTxnState =
@@ -410,7 +400,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private void closeEnv() {
         closeAllReadTxnStates();
-        clearCurrentThreadReusableBufVals();
+        clearReusableBufVals();
         closeQuietly(this.logDbi);
         closeQuietly(this.confDbi);
         closeQuietly(this.metaDbi);
@@ -718,13 +708,22 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         return state;
     }
 
-    private void clearCurrentThreadReusableBufVals() {
-        this.LONG_KEY_BUF_VAL.remove();
-        this.CURSOR_KEY_BUF_VAL.remove();
-        this.BYTE_KEY_BUF_VAL.remove();
-        this.BYTE_VAL_BUF_VAL.remove();
-        this.EMPTY_VAL_BUF_VAL.remove();
-        this.LONG_VAL_BUF_VAL.remove();
+    private ReusableBufVals currentReusableBufVals() {
+        final Thread thread = Thread.currentThread();
+        ReusableBufVals bufVals = this.reusableBufVals.get(thread);
+        if (bufVals != null) {
+            return bufVals;
+        }
+        final ReusableBufVals created = new ReusableBufVals();
+        final ReusableBufVals raced = this.reusableBufVals.putIfAbsent(thread, created);
+        return raced == null ? created : raced;
+    }
+
+    private void clearReusableBufVals() {
+        for (final ReusableBufVals bufVals : this.reusableBufVals.values()) {
+            bufVals.close();
+        }
+        this.reusableBufVals.clear();
     }
 
     private BufVal getBufVal(final Txn txn, final Dbi dbi, final BufVal key) {
@@ -853,7 +852,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private BufVal longKeyBufVal(final long value) {
-        final BufVal bufVal = LONG_KEY_BUF_VAL.get();
+        final BufVal bufVal = currentReusableBufVals().longKeyBufVal;
         final ByteBuffer buffer = bufVal.inBuf();
         buffer.clear();
         buffer.putLong(value);
@@ -863,13 +862,13 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private BufVal cursorKeyBufVal() {
-        final BufVal bufVal = CURSOR_KEY_BUF_VAL.get();
+        final BufVal bufVal = currentReusableBufVals().cursorKeyBufVal;
         bufVal.reset();
         return bufVal;
     }
 
     private BufVal emptyValBufVal() {
-        final BufVal bufVal = EMPTY_VAL_BUF_VAL.get();
+        final BufVal bufVal = currentReusableBufVals().emptyValBufVal;
         bufVal.reset();
         return bufVal;
     }
@@ -945,12 +944,36 @@ public final class LMDBLogStorage implements LogStorage, Describer {
         }
     }
 
+    private static final class ReusableBufVals implements AutoCloseable {
+        private final BufVal longKeyBufVal = new BufVal(Long.BYTES);
+        private final BufVal cursorKeyBufVal = new BufVal(Long.BYTES);
+        private BufVal byteKeyBufVal = new BufVal(1);
+        private BufVal byteValBufVal = new BufVal(1);
+        private final BufVal emptyValBufVal = new BufVal(0);
+        private final BufVal longValBufVal = new BufVal(Long.BYTES);
+
+        @Override
+        public void close() {
+            closeQuietly(this.longKeyBufVal);
+            closeQuietly(this.cursorKeyBufVal);
+            closeQuietly(this.byteKeyBufVal);
+            closeQuietly(this.byteValBufVal);
+            closeQuietly(this.emptyValBufVal);
+            closeQuietly(this.longValBufVal);
+            this.byteKeyBufVal = null;
+            this.byteValBufVal = null;
+        }
+    }
+
     private BufVal byteKeyBufVal(final byte[] bytes) {
         final int size = Math.max(1, bytes.length);
-        BufVal bufVal = BYTE_KEY_BUF_VAL.get();
+        final ReusableBufVals reusable = currentReusableBufVals();
+        BufVal bufVal = reusable.byteKeyBufVal;
         if (bufVal.inBuf().capacity() < size) {
+            final BufVal oldBufVal = bufVal;
             bufVal = new BufVal(size);
-            BYTE_KEY_BUF_VAL.set(bufVal);
+            reusable.byteKeyBufVal = bufVal;
+            closeQuietly(oldBufVal);
         }
         final ByteBuffer buffer = bufVal.inBuf();
         buffer.clear();
@@ -962,10 +985,13 @@ public final class LMDBLogStorage implements LogStorage, Describer {
 
     private BufVal byteValBufVal(final byte[] bytes) {
         final int size = Math.max(1, bytes.length);
-        BufVal bufVal = BYTE_VAL_BUF_VAL.get();
+        final ReusableBufVals reusable = currentReusableBufVals();
+        BufVal bufVal = reusable.byteValBufVal;
         if (bufVal.inBuf().capacity() < size) {
+            final BufVal oldBufVal = bufVal;
             bufVal = new BufVal(size);
-            BYTE_VAL_BUF_VAL.set(bufVal);
+            reusable.byteValBufVal = bufVal;
+            closeQuietly(oldBufVal);
         }
         final ByteBuffer buffer = bufVal.inBuf();
         buffer.clear();
@@ -976,7 +1002,7 @@ public final class LMDBLogStorage implements LogStorage, Describer {
     }
 
     private BufVal longValBufVal(final long value) {
-        final BufVal bufVal = LONG_VAL_BUF_VAL.get();
+        final BufVal bufVal = currentReusableBufVals().longValBufVal;
         final ByteBuffer buffer = bufVal.inBuf();
         buffer.clear();
         buffer.putLong(value);
@@ -999,6 +1025,16 @@ public final class LMDBLogStorage implements LogStorage, Describer {
                 dbi.close();
             } catch (final Exception e) {
                 LOG.warn("Failed to close LMDB dbi.", e);
+            }
+        }
+    }
+
+    private static void closeQuietly(final BufVal bufVal) {
+        if (bufVal != null) {
+            try {
+                bufVal.close();
+            } catch (final Exception e) {
+                LOG.warn("Failed to close LMDB buffer value.", e);
             }
         }
     }

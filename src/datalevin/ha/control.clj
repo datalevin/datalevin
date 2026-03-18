@@ -263,6 +263,15 @@
     (u/raise "HA lease authority is not started"
              {:error :ha/control-not-started})))
 
+(defn- commit-state-transition!
+  [state-atom transition-fn]
+  (loop []
+    (let [old-state @state-atom
+          {:keys [state result]} (transition-fn old-state)]
+      (if (compare-and-set! state-atom old-state state)
+        result
+        (recur)))))
+
 (declare apply-state-command!)
 
 (defrecord InMemoryLeaseAuthority [group-id state running-v initial-voters
@@ -352,33 +361,29 @@
     (ensure-running! running-v)
     (require-non-blank-string! membership-hash :membership-hash)
     (lease/membership-hash-key group-id)
-    (let [result-v (volatile! nil)]
-      (swap! state
-             (fn [s]
-               (let [existing (:membership-hash s)]
-                 (cond
-                   (nil? existing)
-                   (do (vreset! result-v
-                                {:ok? true
-                                 :initialized? true
-                                 :membership-hash membership-hash})
-                       (assoc s :membership-hash membership-hash))
+    (commit-state-transition!
+     state
+     (fn [s]
+       (let [existing (:membership-hash s)]
+         (cond
+           (nil? existing)
+           {:state (assoc s :membership-hash membership-hash)
+            :result {:ok? true
+                     :initialized? true
+                     :membership-hash membership-hash}}
 
-                   (= existing membership-hash)
-                   (do (vreset! result-v
-                                {:ok? true
-                                 :initialized? false
-                                 :membership-hash existing})
-                       s)
+           (= existing membership-hash)
+           {:state s
+            :result {:ok? true
+                     :initialized? false
+                     :membership-hash existing}}
 
-                   :else
-                   (do (vreset! result-v
-                                {:ok? false
-                                 :reason :membership-hash-mismatch
-                                 :membership-hash existing
-                                 :expected membership-hash})
-                       s)))))
-      @result-v))
+           :else
+           {:state s
+            :result {:ok? false
+                     :reason :membership-hash-mismatch
+                     :membership-hash existing
+                     :expected membership-hash}})))))
 
   (read-voters [_]
     (ensure-running! running-v)
@@ -606,13 +611,9 @@
 
 (defn- apply-state-command!
   [state-atom cmd]
-  (let [result-v (volatile! nil)]
-    (swap! state-atom
-           (fn [s]
-             (let [{:keys [state result]} (apply-state-command s cmd)]
-               (vreset! result-v result)
-               state)))
-    @result-v))
+  (commit-state-transition!
+   state-atom
+   #(apply-state-command % cmd)))
 
 (defonce ^:private protobuf-loaded?
   (delay (do (ProtobufMsgFactory/load) true)))

@@ -16,7 +16,7 @@ import java.nio.*;
  * This is the primary method of getting data in/out of LMDB.
  */
 @SuppressWarnings("removal")
-public class BufVal {
+public class BufVal implements AutoCloseable {
 
     static final int STRUCT_FIELD_OFFSET_DATA = BYTES;
     static final int STRUCT_FIELD_OFFSET_SIZE = 0;
@@ -170,6 +170,28 @@ public class BufVal {
      */
     public DTLV.MDB_val ptr() {
         return (DTLV.MDB_val)ptr;
+    }
+
+    /**
+     * Release the owned MDB_val struct and input direct buffer.
+     * The output view buffer is not explicitly cleaned because, on the fast path,
+     * it is rebound to LMDB-owned memory via Unsafe address mutation.
+     */
+    @Override
+    public void close() {
+        final DTLV.MDB_val localPtr = this.ptr;
+        final ByteBuffer localInBuf = this.inBuf;
+
+        this.ptr = null;
+        this.data = null;
+        this.inBuf = null;
+        this.outBuf = null;
+        this.inAddr = 0L;
+
+        if (localPtr != null) {
+            localPtr.close();
+        }
+        UnsafeAccess.clean(localInBuf);
     }
 
 }
