@@ -1190,6 +1190,10 @@
       m)))
 
 (declare open-ha-store-dbis!)
+(def ^:private ha-local-store-reopen-info-key
+  ::ha-local-store-reopen-info)
+(declare ha-local-store-reopen-info)
+(declare reopen-ha-local-store-from-info)
 
 (defn- ha-local-store-open-opts
   [m store]
@@ -1233,34 +1237,40 @@
             (-> m
                 (assoc :store recovered-store
                        :dt-db nil)
-                (dissoc :engine :index)
+                (dissoc :engine :index
+                        ha-local-store-reopen-info-key)
                 refresh-ha-local-dt-db))]
     (if (local-kv-store m)
       m
-      (let [store (:store m)]
-        (if (instance? IStore store)
-          (let [store-dir (i/dir store)
-                store-opts (ha-local-store-open-opts m store)
-                reopened-store (-> (st/open store-dir nil store-opts)
-                                   open-ha-store-dbis!)]
-            (-> m
-                (assoc :store reopened-store
-                       :dt-db nil)
-                (dissoc :engine :index)
-                refresh-ha-local-dt-db))
-          m)))))
+      (if-let [reopen-info (ha-local-store-reopen-info m)]
+        (try
+          (reopen-ha-local-store-from-info m reopen-info)
+          (catch Throwable e
+            (u/raise "HA local store reopen failed"
+                     {:error :ha/follower-local-store-reopen-failed
+                      :env-dir (:env-dir reopen-info)
+                      :reopen-info reopen-info
+                      :message (ex-message e)
+                      :data (ex-data e)
+                      :state (-> m
+                                 (assoc ha-local-store-reopen-info-key
+                                        reopen-info
+                                        :dt-db nil)
+                                 (dissoc :engine :index))})))
+        m))))
 
 (defn- ha-local-store-reopen-info
   [m]
-  (let [store (:store m)]
-    (when (instance? IStore store)
-      (try
-        {:env-dir (i/dir store)
-         :store-opts (ha-local-store-open-opts m store)}
-        (catch Throwable _
-          nil)))))
+  (or (get m ha-local-store-reopen-info-key)
+      (let [store (:store m)]
+        (when (instance? IStore store)
+          (try
+            {:env-dir (i/dir store)
+             :store-opts (ha-local-store-open-opts m store)}
+            (catch Throwable _
+              nil))))))
 
-(defn- reopen-ha-local-store-from-info
+(defn- ^:redef reopen-ha-local-store-from-info
   [m {:keys [env-dir store-opts]}]
   (when (and (string? env-dir)
              (not (s/blank? env-dir))
@@ -1269,7 +1279,8 @@
         (assoc :store (-> (st/open env-dir nil store-opts)
                           open-ha-store-dbis!)
                :dt-db nil)
-        (dissoc :engine :index)
+        (dissoc :engine :index
+                ha-local-store-reopen-info-key)
         refresh-ha-local-dt-db)))
 
 (defn- normalize-ha-bootstrap-retry-state
@@ -2184,13 +2195,23 @@
                 (st/sync-max-gt-floor! store replayed-max-gt))
               (if (and (instance? IStore store)
                        (seq schema-overrides))
-                (let [store-dir (i/dir store)
-                      store-opts (ha-local-store-open-opts m store)]
+                (let [reopen-info (ha-local-store-reopen-info m)]
                   (close-ha-local-store! m)
-                  (assoc m
-                         :store (open-ha-store-dbis!
-                                 (st/open store-dir nil store-opts))
-                         :dt-db nil))
+                  (try
+                    (reopen-ha-local-store-from-info m reopen-info)
+                    (catch Throwable e
+                      (u/raise
+                       "HA follower schema replay failed to reopen local store"
+                       {:error :ha/follower-schema-reopen-failed
+                        :record-lsn (:lsn record)
+                        :reopen-info reopen-info
+                        :message (ex-message e)
+                       :data (ex-data e)
+                       :state (-> m
+                                  (assoc ha-local-store-reopen-info-key
+                                          reopen-info
+                                          :dt-db nil)
+                                   (dissoc :engine :index))}))))
                 m))
             readback-kv-store (raw-local-kv-store next-state)
             probe-eid (some->> replay-rows
@@ -2754,52 +2775,62 @@
                    :ha-follower-last-error :missing-leader-endpoint
                    :ha-follower-last-error-details {:lease lease}
                    :ha-follower-last-error-ms now-ms)
-            (let [local-next-lsn
-                  (long (max 1
-                             (unchecked-inc
-                              (long (ha-local-last-applied-lsn m)))))
-                  local-last-applied-lsn
-                  (long (max 0
-                             (dec local-next-lsn)))
-                  leader-last-applied-lsn
-                  (long (or (:leader-last-applied-lsn lease)
-                            0))
-                  tracked-next-lsn
-                  (when (integer? (:ha-follower-next-lsn m))
-                    (long (:ha-follower-next-lsn m)))
-                  ;; Fresh follower stores can expose internal LMDB txlog
-                  ;; watermarks before they have replayed any replicated rows.
-                  ;; Honor the tracked follower cursor when the local watermark
-                  ;; floor is behind the leader, such as after snapshot install
-                  ;; resets. Otherwise clamp speculative cursors to the local
-                  ;; floor.
-                  next-lsn
-                  (cond
-                    (and tracked-next-lsn
-                         (pos? (long tracked-next-lsn))
-                         (> (long tracked-next-lsn)
-                            local-next-lsn)
-                         (> leader-last-applied-lsn
-                            local-last-applied-lsn))
+            (try
+              (let [m (reopen-ha-local-store-if-needed m)
+                    local-next-lsn
+                    (long (max 1
+                               (unchecked-inc
+                                (long (ha-local-last-applied-lsn m)))))
+                    local-last-applied-lsn
+                    (long (max 0
+                               (dec local-next-lsn)))
+                    leader-last-applied-lsn
+                    (long (or (:leader-last-applied-lsn lease)
+                              0))
                     tracked-next-lsn
+                    (when (integer? (:ha-follower-next-lsn m))
+                      (long (:ha-follower-next-lsn m)))
+                    ;; Fresh follower stores can expose internal LMDB txlog
+                    ;; watermarks before they have replayed any replicated rows.
+                    ;; Honor the tracked follower cursor when the local watermark
+                    ;; floor is behind the leader, such as after snapshot install
+                    ;; resets. Otherwise clamp speculative cursors to the local
+                    ;; floor.
+                    next-lsn
+                    (cond
+                      (and tracked-next-lsn
+                           (pos? (long tracked-next-lsn))
+                           (> (long tracked-next-lsn)
+                              local-next-lsn)
+                           (> leader-last-applied-lsn
+                              local-last-applied-lsn))
+                      tracked-next-lsn
 
-                    (and tracked-next-lsn
-                         (pos? (long tracked-next-lsn)))
-                    (long-min2 tracked-next-lsn local-next-lsn)
+                      (and tracked-next-lsn
+                           (pos? (long tracked-next-lsn)))
+                      (long-min2 tracked-next-lsn local-next-lsn)
 
-                    :else
-                    local-next-lsn)]
-              (try
+                      :else
+                      local-next-lsn)]
                 (:state (sync-ha-follower-batch
-                         db-name m lease next-lsn now-ms))
-                (catch Exception e
+                         db-name m lease next-lsn now-ms)))
+              (catch Exception e
+                (let [error-state (or (:state (ex-data e)) m)
+                      fallback-next-lsn
+                      (long (max 1
+                                 (unchecked-inc
+                                  (long
+                                   (ha-local-last-applied-lsn
+                                    error-state)))))]
                   (if (ha-follower-gap-error? e)
                     (let [source-order (vec (or (:source-order (ex-data e))
                                                 (ha-gap-fallback-source-endpoints
-                                                 db-name m lease next-lsn)))
+                                                 db-name error-state lease
+                                                 fallback-next-lsn)))
                           bootstrap (bootstrap-ha-follower-from-snapshot
-                                     db-name m lease source-order
-                                     next-lsn now-ms)]
+                                     db-name error-state lease source-order
+                                     fallback-next-lsn
+                                     now-ms)]
                       (if (:ok? bootstrap)
                         (:state bootstrap)
                         (let [details {:message
@@ -2828,15 +2859,18 @@
                                    :data (ex-data e)
                                    :leader-endpoint leader-endpoint
                                    :source-order
-                                   (ha-follower-source-endpoints m lease)}
-                          backoff-ms (next-ha-follower-sync-backoff-ms m)]
-                      (assoc m
+                                   (ha-follower-source-endpoints error-state
+                                                                 lease)}
+                          backoff-ms (next-ha-follower-sync-backoff-ms
+                                      error-state)]
+                      (assoc error-state
                              :ha-follower-last-error :sync-failed
                              :ha-follower-last-error-details details
                              :ha-follower-last-error-ms now-ms
                              :ha-follower-sync-backoff-ms backoff-ms
                              :ha-follower-next-sync-not-before-ms
-                             (+ (long now-ms) (long backoff-ms))))))))))))))
+                             (+ (long now-ms)
+                                (long backoff-ms))))))))))))))
 
 (defn ^:redef maybe-wait-unreachable-leader-before-pre-cas!
   [m lease]
