@@ -295,6 +295,28 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest test-issue-359-vector-value-passed-to-udf
+  (let [dir  (u/tmp-dir (str "test-issue-359-" (UUID/randomUUID)))
+        conn (d/get-conn dir)
+        seen (atom ::unset)
+        pred (fn [coord]
+               (reset! seen coord)
+               (= coord [1 2 4]))]
+    (try
+      (d/transact! conn [{:db/id -1 :at/coord [1 2 4]}])
+      (is (= [{:db/id 1 :at/coord [1 2 4]}]
+             (d/q '[:find [(pull ?e [*]) ...]
+                    :in $ ?coord-in-range
+                    :where
+                    [?e :at/coord ?coord]
+                    [(?coord-in-range ?coord)]]
+                  @conn
+                  pred)))
+      (is (= [1 2 4] @seen))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-built-in-get
   (is (= (d/q '[:find ?m ?m-value
                 :in [[?k ?m] ...] ?m-key
