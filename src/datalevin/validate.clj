@@ -159,7 +159,9 @@
     :ha-lease-timeout-ms
     :ha-promotion-base-delay-ms
     :ha-promotion-rank-delay-ms
-    :ha-clock-skew-budget-ms})
+    :ha-clock-skew-budget-ms
+    :ha-follower-max-batch-records
+    :ha-follower-target-batch-bytes})
 
 (def ^:private keyword-enum-opts
   {:wal-durability-profile #{:strict :relaxed :extra}
@@ -512,6 +514,12 @@
             clock-skew-budget-ms
             (long (or (:ha-clock-skew-budget-ms opts)
                       c/*ha-clock-skew-budget-ms*))
+            follower-max-batch-records
+            (long (or (:ha-follower-max-batch-records opts)
+                      c/*ha-follower-max-batch-records*))
+            follower-target-batch-bytes
+            (long (or (:ha-follower-target-batch-bytes opts)
+                      c/*ha-follower-target-batch-bytes*))
             cp (validate-ha-control-plane-shape (:ha-control-plane opts) false)
             voters (:voters cp)
             local-peer-id (:local-peer-id cp)
@@ -553,6 +561,16 @@
                    {:error :ha/validation
                     :option :ha-clock-skew-budget-ms
                     :value clock-skew-budget-ms}))
+        (when-not (positive-int? follower-max-batch-records)
+          (u/raise "Option :ha-follower-max-batch-records must be a positive integer"
+                   {:error :ha/validation
+                    :option :ha-follower-max-batch-records
+                    :value follower-max-batch-records}))
+        (when-not (positive-int? follower-target-batch-bytes)
+          (u/raise "Option :ha-follower-target-batch-bytes must be a positive integer"
+                   {:error :ha/validation
+                    :option :ha-follower-target-batch-bytes
+                    :value follower-target-batch-bytes}))
         (when (< (long timeout-ms) (unchecked-multiply 2 (long renew-ms)))
           (u/raise "Option :ha-lease-timeout-ms must be >= 2 * :ha-lease-renew-ms"
                    {:error :ha/validation

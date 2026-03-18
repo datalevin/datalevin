@@ -29,12 +29,13 @@
    [taoensso.timbre :as log])
   (:import
    [datalevin.db DB]
+   [datalevin.io PosixFsync]
    [datalevin.interface IStore ILMDB]
    [datalevin.storage Store]
    [java.io File]
    [java.net ConnectException URI]
-   [java.nio.channels ClosedChannelException]
-   [java.nio.file Files Paths StandardCopyOption]
+   [java.nio.channels ClosedChannelException FileChannel]
+   [java.nio.file Files Paths StandardCopyOption StandardOpenOption]
    [java.util UUID]
    [java.util.concurrent CompletableFuture CompletionException ConcurrentHashMap
     ConcurrentLinkedDeque ExecutionException ExecutorService Executors Future
@@ -965,6 +966,34 @@
                  nil
                  nil)))))
 
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  ha-sync-read-open-options
+  (into-array StandardOpenOption [StandardOpenOption/READ]))
+
+(defn- fsync-ha-snapshot-path!
+  [path]
+  (with-open [^FileChannel ch (FileChannel/open
+                               (Paths/get path (into-array String []))
+                               ha-sync-read-open-options)]
+    (PosixFsync/fsync ch)))
+
+(defn- sync-ha-snapshot-dir-tree!
+  [dir]
+  (doseq [^File f (sort-by #(.getName ^File %)
+                           (or (u/list-files dir) []))]
+    (if (.isDirectory f)
+      (sync-ha-snapshot-dir-tree! (.getPath f))
+      (fsync-ha-snapshot-path! (.getPath f))))
+  (fsync-ha-snapshot-path! dir))
+
+(defn ^:redef sync-ha-snapshot-install-target!
+  [env-dir]
+  (when (u/file-exists env-dir)
+    (sync-ha-snapshot-dir-tree! env-dir)
+    (when-let [^File parent (.getParentFile (File. env-dir))]
+      (when (.exists parent)
+        (fsync-ha-snapshot-path! (.getPath parent))))))
+
 (defn- copy-dir-contents!
   [src-dir dest-dir]
   (u/create-dirs dest-dir)
@@ -1544,7 +1573,64 @@
             nil
             watermarks)))
 
-(def ^:private ha-follower-max-batch-records 256)
+(defn- ha-follower-max-batch-records
+  [m]
+  (long (or (:ha-follower-max-batch-records m)
+            c/*ha-follower-max-batch-records*)))
+
+(defn- ha-follower-target-batch-bytes
+  [m]
+  (long (or (:ha-follower-target-batch-bytes m)
+            c/*ha-follower-target-batch-bytes*)))
+
+(def ^:private ha-follower-adaptive-batch-assumed-record-bytes 4096)
+(def ^:private ha-follower-adaptive-batch-sample-limit 16)
+
+(defn- estimate-ha-follower-record-bytes
+  [record]
+  (let [payload (select-keys record [:lsn :ha-term :rows :ops])]
+    (try
+      (alength ^bytes (b/serialize payload))
+      (catch Throwable _
+        (long (count (pr-str payload)))))))
+
+(defn- estimate-ha-follower-batch-bytes
+  [records]
+  (when (seq records)
+    (let [sample (vec (take ha-follower-adaptive-batch-sample-limit records))
+          sample-count (count sample)]
+      (when (pos? sample-count)
+        (let [sample-bytes (reduce
+                            (fn [^long total record]
+                              (+ total
+                                 (long (max 1
+                                            (estimate-ha-follower-record-bytes
+                                             record)))))
+                            0
+                            sample)
+              avg-record-bytes (long-max2 1
+                                          (long (Math/ceil
+                                                 (/ (double sample-bytes)
+                                                    (double sample-count)))))]
+          (long (* avg-record-bytes (long (count records)))))))))
+
+(defn- ha-follower-request-batch-records
+  [m]
+  (let [max-records (long-max2 1 (ha-follower-max-batch-records m))
+        target-bytes (long-max2 1 (ha-follower-target-batch-bytes m))
+        last-batch-size (long (or (:ha-follower-last-batch-size m) 0))
+        last-batch-bytes (long (or (:ha-follower-last-batch-estimated-bytes m)
+                                   0))
+        avg-record-bytes (if (and (pos? last-batch-size)
+                                  (pos? last-batch-bytes))
+                           (long-max2 1
+                                      (long (Math/ceil
+                                             (/ (double last-batch-bytes)
+                                                (double last-batch-size)))))
+                           ha-follower-adaptive-batch-assumed-record-bytes)
+        target-records (long-max2 1 (quot target-bytes avg-record-bytes))]
+    (long-min2 max-records target-records)))
+
 (def ^:private ha-follower-max-sync-backoff-ms 30000)
 
 (defn- next-ha-follower-sync-backoff-ms
@@ -2308,6 +2394,7 @@
            (assoc install-marker :stage :backup-moved))
           (u/create-dirs env-dir)
           (copy-dir-contents! snapshot-dir env-dir)
+          (sync-ha-snapshot-install-target! env-dir)
           (let [new-store (open-ha-store-dbis!
                            (st/open env-dir nil open-opts))
                 new-db (db/new-db new-store)]
@@ -2356,13 +2443,14 @@
   [db-name m lease next-lsn now-ms]
   (let [m (reopen-ha-local-store-if-needed m)
         leader-endpoint (ha-leader-endpoint m lease)
-        local-node-id (:ha-node-id m)]
+        local-node-id (:ha-node-id m)
+        requested-batch-records (ha-follower-request-batch-records m)]
     (when (or (nil? leader-endpoint) (s/blank? leader-endpoint))
       (u/raise "HA follower is missing leader endpoint for txlog sync"
                {:error :ha/follower-missing-leader-endpoint
                 :lease lease}))
     (let [upto-lsn (long (+ (long next-lsn)
-                            (dec (long ha-follower-max-batch-records))))
+                            (dec requested-batch-records)))
           {:keys [records source-endpoint source-order
                   source-last-applied-lsn-known?
                   source-last-applied-lsn]}
@@ -2407,6 +2495,7 @@
                (if preserve-tracked-cursor?
                  (long next-lsn)
                  (unchecked-inc applied-lsn)))))
+          batch-estimated-bytes (estimate-ha-follower-batch-bytes records)
           _ (when (seq records)
               (persist-ha-local-applied-lsn! next-m applied-lsn))]
       (try
@@ -2445,10 +2534,15 @@
        :source-order source-order
        :state (-> (assoc next-m
                          :ha-local-last-applied-lsn applied-lsn
+                         :ha-follower-requested-batch-records
+                         requested-batch-records
                          :ha-follower-last-batch-records
                          (when (seq records)
                            (mapv #(select-keys % [:lsn :rows :ops])
                                  records))
+                         :ha-follower-last-batch-estimated-bytes
+                         (or batch-estimated-bytes
+                             (:ha-follower-last-batch-estimated-bytes m))
                          :ha-follower-next-lsn next-fetch-lsn
                          :ha-follower-last-batch-size (count records)
                          :ha-follower-last-sync-ms now-ms
@@ -3533,6 +3627,8 @@
           :ha-lease-renew-ms :ha-lease-timeout-ms
           :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
           :ha-max-promotion-lag-lsn :ha-demotion-drain-ms
+          :ha-follower-max-batch-records
+          :ha-follower-target-batch-bytes
           :ha-fencing-hook
           :ha-clock-skew-budget-ms :ha-clock-skew-hook
           :ha-authority-lease :ha-authority-version
@@ -3550,6 +3646,8 @@
           :ha-role :ha-leader-term
           :ha-local-last-applied-lsn
           :ha-follower-next-lsn :ha-follower-last-batch-size
+          :ha-follower-last-batch-estimated-bytes
+          :ha-follower-requested-batch-records
           :ha-follower-last-sync-ms :ha-follower-leader-endpoint
           :ha-follower-source-endpoint :ha-follower-source-order
           :ha-follower-last-bootstrap-ms
@@ -3784,6 +3882,12 @@
         clock-skew-budget-ms
         (long (or (:ha-clock-skew-budget-ms ha-opts)
                   c/*ha-clock-skew-budget-ms*))
+        follower-max-batch-records
+        (long (or (:ha-follower-max-batch-records ha-opts)
+                  c/*ha-follower-max-batch-records*))
+        follower-target-batch-bytes
+        (long (or (:ha-follower-target-batch-bytes ha-opts)
+                  c/*ha-follower-target-batch-bytes*))
         cp (assoc (:ha-control-plane ha-opts)
                   :clock-skew-budget-ms clock-skew-budget-ms)
         fencing-hook (:ha-fencing-hook ha-opts)
@@ -3857,6 +3961,8 @@
          :ha-max-promotion-lag-lsn max-promotion-lag-lsn
          :ha-client-credentials (:ha-client-credentials ha-opts)
          :ha-demotion-drain-ms demotion-drain-ms
+         :ha-follower-max-batch-records follower-max-batch-records
+         :ha-follower-target-batch-bytes follower-target-batch-bytes
          :ha-fencing-hook fencing-hook
          :ha-clock-skew-budget-ms clock-skew-budget-ms
          :ha-clock-skew-hook clock-skew-hook

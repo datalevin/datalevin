@@ -21,13 +21,19 @@
   persist in DB.
 - [Datalog] allow `:db/embedding true` property for string attributes, which
   will use an embedding provider to embed the texts into vectors and index them.
-  A trimmed-down build of llama.cppA is included as the default embedding
-  provider. The default embedding model `multilingual-e5-small-Q8_0.gguf` is
-  downloaded from HuggingFace on first use.
+  A trimmed-down build of llama.cpp is included as the default embedding
+  provider. A default embedding model `multilingual-e5-small-Q8_0.gguf` is
+  downloaded from HuggingFace on first use. This small model is sufficient for
+  text snippets embedding. For large and complex text passages, user should supply
+  a larger model in GGUF format.
 - [Datalog] for embedding enabled datoms, `embedding-neighbors` built-in function to
   return `[e, a, v]` based on vector similarity. Details in [doc](doc/vector.md).
 - [Search] `:display :refs+scores` to also show relevance score.
 - clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
+
+### Fixed
+- [Datalog] Handle `false` value correctly in query
+  [#358](https://github.com/datalevin/datalevin/issues/358)
 
 ## 0.10.7 (2026-03-03)
 

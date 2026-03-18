@@ -1086,6 +1086,8 @@
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn
+   :ha-follower-max-batch-records
+   :ha-follower-target-batch-bytes
    :ha-client-credentials
    :ha-demotion-drain-ms
    :ha-fencing-hook
