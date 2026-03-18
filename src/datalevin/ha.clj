@@ -2925,6 +2925,12 @@
          :ha-authority-read-ok? false
          :ha-authority-read-error error))
 
+(defn- apply-authority-read-success
+  [m]
+  (assoc m
+         :ha-authority-read-ok? true
+         :ha-authority-read-error nil))
+
 (defn- run-command-with-timeout
   [cmd env timeout-ms]
   (try
@@ -3512,8 +3518,7 @@
             observation
             m1 (-> m
                    (apply-authority-observation observation now-ms)
-                   (assoc :ha-authority-read-ok? true
-                          :ha-authority-read-error nil))]
+                   apply-authority-read-success)]
         (cond
           (and db-identity-mismatch? (= :leader (:ha-role m1)))
           (demote-ha-leader db-name m1
@@ -3534,15 +3539,11 @@
           m1))
       (catch Exception e
         (let [error (authority-read-error e)
-              failed-m (apply-authority-read-failure m error)
-              now-ms (ha-now-ms)]
+              failed-m (apply-authority-read-failure m error)]
           (log/warn e "HA read-lease failed"
                     {:db-name db-name
-                     :ha-role (:ha-role m)
-                     :demoting? (= :leader (:ha-role m))})
-          (if (= :leader (:ha-role failed-m))
-            (demote-ha-leader db-name failed-m :authority-read-failed error now-ms)
-            failed-m))))))
+                     :ha-role (:ha-role m)})
+          failed-m)))))
 
 (defn- renew-ha-leader-state
   [db-name m]
@@ -3566,6 +3567,7 @@
             (let [{:keys [lease version authority-now-ms]} result
                   observed-at-ms (ha-now-ms)]
               (-> m
+                  apply-authority-read-success
                   (assoc :ha-authority-lease lease
                          :ha-authority-version version
                          :ha-authority-now-ms authority-now-ms
