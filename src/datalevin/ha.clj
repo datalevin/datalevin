@@ -232,6 +232,10 @@
   []
   (System/currentTimeMillis))
 
+(defn ^:redef ha-now-nanos
+  []
+  (System/nanoTime))
+
 (defn- local-kv-store
   [m]
   (let [dt-db (:dt-db m)
@@ -2862,6 +2866,7 @@
    :version (:ha-authority-version m)
    :authority-now-ms (:ha-authority-now-ms m)
    :lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
+   :lease-local-deadline-nanos (:ha-lease-local-deadline-nanos m)
    :authority-membership-hash (:ha-authority-membership-hash m)
    :db-identity-mismatch? (true? (:ha-db-identity-mismatch? m))
    :membership-mismatch? (true? (:ha-membership-mismatch? m))
@@ -2878,11 +2883,24 @@
                 (- (long lease-until-ms)
                    (long authority-now-ms))))))))
 
+(defn- authority-lease-local-deadline-nanos
+  [lease authority-now-ms local-start-nanos]
+  (when (and (integer? authority-now-ms)
+             (integer? local-start-nanos))
+    (let [lease-until-ms (:lease-until-ms lease)]
+      (when (integer? lease-until-ms)
+        (+ (long local-start-nanos)
+           (.toNanos TimeUnit/MILLISECONDS
+                     (max 0
+                          (- (long lease-until-ms)
+                             (long authority-now-ms)))))))))
+
 (defn ^:redef observe-authority-state
   [m]
   (let [authority (:ha-authority m)
         db-identity (:ha-db-identity m)
         local-start-ms (ha-now-ms)
+        local-start-nanos (ha-now-nanos)
         {:keys [lease version membership-hash authority-now-ms]}
         (ctrl/read-state authority db-identity)
         authority-membership-hash membership-hash
@@ -2898,13 +2916,17 @@
      :lease-local-deadline-ms
      (authority-lease-local-deadline-ms
       lease authority-now-ms local-start-ms)
+     :lease-local-deadline-nanos
+     (authority-lease-local-deadline-nanos
+      lease authority-now-ms local-start-nanos)
      :authority-membership-hash authority-membership-hash
      :db-identity-mismatch? db-identity-mismatch?
      :membership-mismatch? membership-mismatch?
      :observed-at-ms observed-at-ms}))
 
 (defn- apply-authority-observation
-  [m {:keys [lease version authority-now-ms lease-local-deadline-ms
+  [m {:keys [lease version authority-now-ms
+             lease-local-deadline-ms lease-local-deadline-nanos
              authority-membership-hash
              db-identity-mismatch? membership-mismatch?
              observed-at-ms]}
@@ -2915,6 +2937,7 @@
              :ha-authority-version version
              :ha-authority-now-ms authority-now-ms
              :ha-lease-local-deadline-ms lease-local-deadline-ms
+             :ha-lease-local-deadline-nanos lease-local-deadline-nanos
              :ha-authority-owner-node-id (:leader-node-id lease)
              :ha-authority-term (:term lease)
              :ha-lease-until-ms (:lease-until-ms lease)
@@ -3309,6 +3332,7 @@
 (defn- try-promote-with-cas
   [db-name m authority db-identity observed-lease version now-ms lag-check]
   (let [local-start-ms now-ms
+        local-start-nanos (ha-now-nanos)
         acquire
         (ctrl/try-acquire-lease
          authority
@@ -3336,6 +3360,9 @@
                    :ha-lease-local-deadline-ms
                    (authority-lease-local-deadline-ms
                     acquired-lease authority-now-ms local-start-ms)
+                   :ha-lease-local-deadline-nanos
+                   (authority-lease-local-deadline-nanos
+                    acquired-lease authority-now-ms local-start-nanos)
                    :ha-authority-owner-node-id (:leader-node-id acquired-lease)
                    :ha-authority-term (:term acquired-lease)
                    :ha-lease-until-ms (:lease-until-ms acquired-lease)
@@ -3591,6 +3618,7 @@
   (if (not= :leader (:ha-role m))
     m
     (let [local-start-ms (ha-now-ms)
+          local-start-nanos (ha-now-nanos)
           term (:ha-leader-term m)]
       (if-not (and (integer? term) (pos? ^long term))
         (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
@@ -3615,6 +3643,9 @@
                          :ha-lease-local-deadline-ms
                          (authority-lease-local-deadline-ms
                           lease authority-now-ms local-start-ms)
+                         :ha-lease-local-deadline-nanos
+                         (authority-lease-local-deadline-nanos
+                          lease authority-now-ms local-start-nanos)
                          :ha-authority-owner-node-id (:leader-node-id lease)
                          :ha-authority-term (:term lease)
                          :ha-lease-until-ms (:lease-until-ms lease)
@@ -3678,7 +3709,9 @@
           :ha-authority-lease :ha-authority-version
           :ha-authority-now-ms
           :ha-authority-owner-node-id :ha-authority-term
-          :ha-lease-until-ms :ha-lease-local-deadline-ms
+          :ha-lease-until-ms
+          :ha-lease-local-deadline-ms
+          :ha-lease-local-deadline-nanos
           :ha-last-authority-refresh-ms
           :ha-authority-read-ok?
           :ha-authority-read-error
@@ -3796,8 +3829,10 @@
               membership-mismatch? (true? (:ha-membership-mismatch? m))
               lease-until-ms (:ha-lease-until-ms m)
               lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
+              lease-local-deadline-nanos (:ha-lease-local-deadline-nanos m)
               leader-term (:ha-leader-term m)
               authority-term (:ha-authority-term m)
+              now-nanos (ha-now-nanos)
               leader-fencing-pending? (true? (:ha-leader-fencing-pending? m))
               leader-fencing-error (:ha-leader-fencing-last-error m)]
           (cond
@@ -3853,9 +3888,14 @@
                     :ha-authority-owner-node-id owner-node-id
                     :retryable? true})
 
-            (or (and (integer? lease-local-deadline-ms)
+            (or (and (integer? lease-local-deadline-nanos)
+                     (>= (long now-nanos)
+                         (long lease-local-deadline-nanos)))
+                (and (not (integer? lease-local-deadline-nanos))
+                     (integer? lease-local-deadline-ms)
                      (>= (long now-ms) (long lease-local-deadline-ms)))
-                (and (not (integer? lease-local-deadline-ms))
+                (and (not (integer? lease-local-deadline-nanos))
+                     (not (integer? lease-local-deadline-ms))
                      (or (nil? lease-until-ms)
                          (>= (long now-ms) (long lease-until-ms)))))
             (merge common-meta
@@ -3863,8 +3903,10 @@
                     :reason :lease-expired
                     :lease-until-ms lease-until-ms
                     :lease-local-deadline-ms lease-local-deadline-ms
+                    :lease-local-deadline-nanos lease-local-deadline-nanos
                     :ha-authority-now-ms (:ha-authority-now-ms m)
                     :now-ms now-ms
+                    :now-nanos now-nanos
                     :retryable? true})
 
             (or (nil? leader-term)
