@@ -1558,6 +1558,16 @@
 
 (defn- ha-write-commit-admission!
   [^Server server message]
+  (let [db-name (nth (:args message) 0 nil)]
+    (when db-name
+      (update-db
+        server
+        db-name
+        (fn [m]
+          (if (and (= :leader (:ha-role m))
+                   (satisfies? ctrl/ILeaseAuthority (:ha-authority m)))
+            (dha/refresh-ha-authority-state db-name m)
+            m)))))
   (when-let [err (ha-write-admission-error server message)]
     (u/raise "HA write admission rejected" err)))
 
