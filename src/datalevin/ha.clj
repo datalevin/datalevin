@@ -163,7 +163,10 @@
                  :ha-demoted-at-ms now-ms
                  :ha-demotion-drain-until-ms (+ (long now-ms) drain-ms))
           (dissoc :ha-leader-term
-                  :ha-leader-last-applied-lsn)))
+                  :ha-leader-last-applied-lsn
+                  :ha-leader-fencing-pending?
+                  :ha-leader-fencing-observed-lease
+                  :ha-leader-fencing-last-error)))
     m))
 
 (defn- ha-demotion-deadline-ms
@@ -196,6 +199,13 @@
           :ha-candidate-pre-cas-wait-until-ms
           :ha-candidate-pre-cas-observed-version
           :ha-promotion-wait-before-cas-ms))
+
+(defn- clear-ha-leader-fencing-state
+  [m]
+  (dissoc m
+          :ha-leader-fencing-pending?
+          :ha-leader-fencing-observed-lease
+          :ha-leader-fencing-last-error))
 
 (defn- ha-promotion-rank-index
   [m]
@@ -3008,6 +3018,34 @@
                          :fence-op-id fence-op-id
                          :fence-shared-op-id fence-shared-op-id))))))))))
 
+(defn- maybe-complete-ha-leader-fencing
+  [m db-name]
+  (let [observed-lease (:ha-leader-fencing-observed-lease m)]
+    (if-not (and (= :leader (:ha-role m))
+                 (true? (:ha-leader-fencing-pending? m)))
+      m
+      (let [fence-result (try
+                           (run-ha-fencing-hook db-name m observed-lease)
+                           (catch Exception e
+                             {:ok? false
+                              :reason :exception
+                              :message (ex-message e)
+                              :data (ex-data e)}))]
+        (if (:ok? fence-result)
+          (-> m
+              clear-ha-leader-fencing-state
+              (assoc :ha-leader-fencing-pending? false
+                     :ha-leader-fencing-last-error nil))
+          (do
+            (log/warn "HA leader fencing incomplete"
+                      {:db-name db-name
+                       :ha-node-id (:ha-node-id m)
+                       :ha-authority-term (:ha-authority-term m)
+                       :fence-result fence-result})
+            (assoc m
+                   :ha-leader-fencing-pending? true
+                   :ha-leader-fencing-last-error fence-result)))))))
+
 (defn- parse-ha-clock-skew-output
   [output]
   (let [trimmed (some-> output s/trim)]
@@ -3269,7 +3307,7 @@
                           :ha-members (:ha-members m)}))))
 
 (defn- try-promote-with-cas
-  [m authority db-identity lease version now-ms lag-check]
+  [db-name m authority db-identity observed-lease version now-ms lag-check]
   (let [local-start-ms now-ms
         acquire
         (ctrl/try-acquire-lease
@@ -3282,28 +3320,34 @@
           :leader-last-applied-lsn (:local-last-applied-lsn lag-check)
           :now-ms local-start-ms
           :observed-version version
-          :observed-lease lease})]
+          :observed-lease observed-lease})]
     (if (:ok? acquire)
-      (let [{:keys [lease version term authority-now-ms]} acquire
+      (let [{acquired-lease :lease
+             acquired-version :version
+             :keys [term authority-now-ms]} acquire
             observed-at-ms (ha-now-ms)]
         (-> m
             clear-ha-candidate-state
             (assoc :ha-role :leader
                    :ha-leader-term term
-                   :ha-authority-lease lease
-                   :ha-authority-version version
+                   :ha-authority-lease acquired-lease
+                   :ha-authority-version acquired-version
                    :ha-authority-now-ms authority-now-ms
                    :ha-lease-local-deadline-ms
                    (authority-lease-local-deadline-ms
-                    lease authority-now-ms local-start-ms)
-                   :ha-authority-owner-node-id (:leader-node-id lease)
-                   :ha-authority-term (:term lease)
-                   :ha-lease-until-ms (:lease-until-ms lease)
+                    acquired-lease authority-now-ms local-start-ms)
+                   :ha-authority-owner-node-id (:leader-node-id acquired-lease)
+                   :ha-authority-term (:term acquired-lease)
+                   :ha-lease-until-ms (:lease-until-ms acquired-lease)
                    :ha-last-authority-refresh-ms observed-at-ms
                    :ha-db-identity-mismatch? false
                    :ha-membership-mismatch? false
                    :ha-promotion-last-failure nil
-                   :ha-promotion-failure-details nil)))
+                   :ha-promotion-failure-details nil
+                   :ha-leader-fencing-pending? true
+                   :ha-leader-fencing-observed-lease observed-lease
+                   :ha-leader-fencing-last-error nil)
+            (maybe-complete-ha-leader-fencing db-name)))
       (fail-ha-candidate m :lease-cas-failed {:acquire acquire}))))
 
 (defn- finalize-ha-candidate-promotion
@@ -3321,6 +3365,7 @@
                             :lag lag-check
                             :leader-lag-input lag-input})
         (try-promote-with-cas
+         db-name
          m
          authority
          db-identity
@@ -3440,19 +3485,15 @@
                              {:phase :pre-fence
                               :lag lag-check-1
                               :leader-lag-input lag-input-1})
-          (let [fence-result
-                (run-ha-fencing-hook db-name m observed-lease)]
-            (if-not (:ok? fence-result)
-              (fail-ha-candidate m :fencing-failed fence-result)
-              (maybe-promote-after-authority-observation
-               db-name
-               m
-               (:ha-authority m)
-               (:ha-db-identity m)
-               (promotion-authority-observation
-                m
-                (System/currentTimeMillis))
-               (System/currentTimeMillis)))))))))
+          (maybe-promote-after-authority-observation
+           db-name
+           m
+           (:ha-authority m)
+           (:ha-db-identity m)
+           (promotion-authority-observation
+            m
+            (System/currentTimeMillis))
+           (System/currentTimeMillis)))))))
 
 (defn- maybe-promote-ha-candidate
   [db-name m now-ms]
@@ -3577,7 +3618,8 @@
                          :ha-authority-owner-node-id (:leader-node-id lease)
                          :ha-authority-term (:term lease)
                          :ha-lease-until-ms (:lease-until-ms lease)
-                         :ha-last-authority-refresh-ms observed-at-ms)))
+                         :ha-last-authority-refresh-ms observed-at-ms)
+                  (maybe-complete-ha-leader-fencing db-name)))
             (demote-ha-leader db-name m
                               :renew-failed
                               {:reason (:reason result)}
@@ -3646,6 +3688,9 @@
           :ha-clock-skew-last-result
           :ha-demotion-drain-until-ms
           :ha-role :ha-leader-term
+          :ha-leader-fencing-pending?
+          :ha-leader-fencing-observed-lease
+          :ha-leader-fencing-last-error
           :ha-local-last-applied-lsn
           :ha-follower-next-lsn :ha-follower-last-batch-size
           :ha-follower-last-batch-estimated-bytes
@@ -3752,7 +3797,9 @@
               lease-until-ms (:ha-lease-until-ms m)
               lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
               leader-term (:ha-leader-term m)
-              authority-term (:ha-authority-term m)]
+              authority-term (:ha-authority-term m)
+              leader-fencing-pending? (true? (:ha-leader-fencing-pending? m))
+              leader-fencing-error (:ha-leader-fencing-last-error m)]
           (cond
             (= role :demoting)
             (merge common-meta
@@ -3774,6 +3821,13 @@
                    {:error :ha/write-rejected
                     :reason (:reason authority-read-failure)
                     :ha-authority-read-error authority-read-failure
+                    :retryable? true})
+
+            leader-fencing-pending?
+            (merge common-meta
+                   {:error :ha/write-rejected
+                    :reason :fencing-pending
+                    :ha-fencing-error leader-fencing-error
                     :retryable? true})
 
             db-id-mismatch?
@@ -3980,6 +4034,8 @@
          :ha-authority-read-ok? (:ok? startup-read)
          :ha-authority-read-error error
          :ha-last-authority-refresh-ms now-ms
+         :ha-leader-fencing-pending? false
+         :ha-leader-fencing-last-error nil
          :ha-rejoin-promotion-blocked? rejoin-promotion-blocked?
          :ha-rejoin-promotion-blocked-until-ms
          rejoin-promotion-blocked-until-ms

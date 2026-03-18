@@ -15,7 +15,7 @@ In scope:
 * Per-database leader lease and term in Raft based consensus control plane
 * Read-only replica catch-up over existing Datalevin client/server transport
 * Automatic promotion based on deterministic membership order
-* Mandatory fencing hook before promotion
+* Mandatory fencing hook before leader write admission
 * Write admission fencing-token checks
 
 Out of scope (V2):
@@ -260,25 +260,26 @@ Snapshot/bootstrap protocol:
 2. Verify authoritative membership hash matches local derived hash.
 3. After delay, perform lag guard:
    `leader-last-applied-lsn - local-last-applied-lsn <= ha-max-promotion-lag-lsn`.
-4. Execute fencing hook unless bootstrap acquisition from empty lease
-   (`term=0`, no owner).
-5. Re-check lag guard immediately before CAS using fresh authoritative lease
+4. Re-check lag guard immediately before CAS using fresh authoritative lease
    read; if leader endpoint is reachable, fetch fresh `txlog-watermarks` and use
    `max(authoritative-lease-lsn, leader-watermark-lsn)` as guard input unless
    the lease is already expired and the old owner reports a lower watermark, in
    which case use the highest currently reachable member watermark instead.
-6. If leader endpoint is unreachable, delay CAS by at least one additional renew
+5. If leader endpoint is unreachable, delay CAS by at least one additional renew
    interval beyond lease expiry before final guard re-check.
-7. Attempt authoritative lease CAS acquisition.
-8. On CAS loss, return immediately to `:follower`.
+6. Attempt authoritative lease CAS acquisition.
+7. On CAS loss, return immediately to `:follower`.
+8. On CAS success, execute the fencing hook unless bootstrap acquisition came
+   from an empty lease (`term=0`, no owner). Write admission stays blocked until
+   fencing succeeds.
 
 Promotion safety chain is strict:
 
 * membership-hash check
 * lag guard
-* fencing hook
 * lag guard re-check
 * authoritative lease CAS
+* fencing hook on the CAS winner before writes
 
 ### Leader renew and write admission
 
@@ -309,7 +310,8 @@ Promotion safety chain is strict:
 
 Two safety layers are required:
 
-1. External fence action via hook before promotion.
+1. External fence action via hook on the CAS winner before leader write
+   admission.
 2. Fencing-token write admission (`term` must match local authoritative leader
    term).
 
@@ -317,7 +319,8 @@ If guard fails, write is rejected with explicit not-leader/fenced error.
 
 ## Fencing Hook Contract
 
-The promoting node executes the hook locally before lease takeover.
+The CAS-winning node executes the hook locally after lease takeover and before
+leader write admission.
 
 Input:
 
@@ -338,22 +341,16 @@ Execution:
 
 * Timeout: `:timeout-ms`
 * Retry: `:retries` with `:retry-delay-ms`
-* Multiple candidates can execute the hook concurrently before the final
-  authority re-observation and lease CAS resolve a single winner.
 * Retries/replays with the same `DTLV_FENCE_OP_ID` must be idempotent.
-* Destructive fencing must also be idempotent across nodes for the same
-  `DTLV_FENCE_SHARED_OP_ID`; `DTLV_FENCE_OP_ID` alone is not sufficient for
-  cross-candidate dedupe.
-* If the external fencing backend cannot provide that guarantee directly,
-  wrap it in an intent/confirm or equivalent two-phase protocol keyed by
-  `DTLV_FENCE_SHARED_OP_ID`.
+* Destructive fencing should remain idempotent for the same
+  `DTLV_FENCE_SHARED_OP_ID` so retries cannot double-apply the same old-leader
+  fence action.
 
 Result:
 
 * Exit `0`: fencing succeeded, promotion may continue
-* Non-zero/timeout/unimplemented hook: promotion aborted
-* CAS loss after successful fencing leaves node in follower role even though
-  the fencing action already ran
+* Non-zero/timeout/unimplemented hook: the new leader keeps renewing its lease
+  but write admission remains blocked until fencing succeeds
 
 ## Failure Behavior
 
