@@ -210,6 +210,23 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a local llama.cpp text generator using native defaults.
+     */
+    public static LlamaGenerator newLlamaGenerator(String modelPath) {
+        return new LlamaGenerator(modelPath);
+    }
+
+    /**
+     * Creates a local llama.cpp text generator with explicit tuning options.
+     */
+    public static LlamaGenerator newLlamaGenerator(String modelPath,
+                                                   int gpuLayers,
+                                                   int ctxSize,
+                                                   int threads) {
+        return new LlamaGenerator(modelPath, gpuLayers, ctxSize, threads);
+    }
+
+    /**
      * Creates a typed Datalog query builder.
      */
     public static DatalogQuery query() {

@@ -17,6 +17,7 @@
    [datalevin.csv :as csv]
    [datalevin.search :as sc]
    [datalevin.embedding :as emb]
+   [datalevin.llm :as llm]
    [datalevin.vector :as v]
    [datalevin.db :as db]
    [datalevin.datom :as dd]
@@ -2351,6 +2352,58 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
 (def ^{:arglists '([provider])
        :doc      "Close an embedding provider and release provider-owned resources. Safe to call more than once."}
   close-embedding-provider emb/close-provider)
+
+;; -------------------------------------
+;; llm
+
+(def ^{:arglists '([provider-spec]
+                   [provider-spec opts])
+       :doc      "Initialize a local LLM provider.
+
+  `provider-spec` may be:
+
+   * an existing provider instance
+   * `:llama.cpp`
+   * a map such as
+
+     `{:provider :llama.cpp
+       :model    \"/path/to/model.gguf\"}`
+
+  The built-in llama.cpp provider is backed by `dtlvnative`. Unlike embeddings,
+  Datalevin does not bundle or download a default generation model, so `:model`
+  or `:model-path` is required. Optional tuning keys are `:gpu-layers`,
+  `:ctx-size`, and `:threads`.
+
+  The returned provider is `AutoCloseable`; use [[close-llm-provider]] when
+  finished."}
+  new-llm-provider llm/init-llm-provider)
+
+(def ^{:arglists '([provider])
+       :doc      "Return stable metadata describing the configured llm provider."}
+  llm-metadata llm/llm-metadata)
+
+(def ^{:arglists '([provider])
+       :doc      "Return the model context size for an llm provider."}
+  llm-context-size llm/llm-context-size)
+
+(def ^{:arglists '([provider prompt max-tokens]
+                   [provider prompt max-tokens opts])
+       :doc      "Generate completion text for a single prompt."}
+  generate-text llm/generate-text)
+
+(def ^{:arglists '([provider text max-tokens]
+                   [provider text max-tokens opts])
+       :doc      "Summarize a single input string."}
+  summarize-text llm/summarize-text)
+
+(def ^{:arglists '([provider text]
+                   [provider text opts])
+       :doc      "Return the token count for a single llm input string."}
+  llm-token-count llm/llm-token-count)
+
+(def ^{:arglists '([provider])
+       :doc      "Close an llm provider and release provider-owned resources. Safe to call more than once."}
+  close-llm-provider llm/close-llm-provider)
 
 ;; -------------------------------------
 ;; byte buffer
