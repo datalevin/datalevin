@@ -312,7 +312,7 @@
   [kv-store]
   (try
     (cond
-      (nil? kv-store) false
+      (nil? kv-store) true
       (instance? IStore kv-store) (i/closed? kv-store)
       (instance? ILMDB kv-store) (i/closed-kv? kv-store)
       :else false)
@@ -2356,6 +2356,14 @@
                {:error :ha/follower-invalid-record
                 :record record}))))
 
+(def ^:dynamic *ha-follower-apply-record-fn* nil)
+
+(defn- ha-follower-stale-state-error?
+  [e]
+  (= :ha/follower-stale-state
+     (or (:error (ex-data e))
+         (:type (ex-data e)))))
+
 (defn ^:redef report-ha-replica-floor!
   [db-name m leader-endpoint applied-lsn]
   (if-let [uri (ha-endpoint-uri db-name leader-endpoint m)]
@@ -2563,37 +2571,44 @@
                                :dt-db new-db)
                         (dissoc :engine :index))})
           (catch Exception e
-            (log/error e "HA follower snapshot install failed"
-                       {:db-name (some-> store i/db-name)
-                        :env-dir env-dir})
-            (try
-              (recover-ha-local-snapshot-install! env-dir)
-              (let [restored-store (open-ha-store-dbis!
-                                    (st/open env-dir nil open-opts))
-                    restored-db (db/new-db restored-store)]
-                {:ok? false
-                 :state (-> m
-                            (assoc :store restored-store
-                                   :dt-db restored-db)
-                            (dissoc :engine :index))
-                 :error {:error :ha/follower-snapshot-install-failed
-                         :message (ex-message e)
-                         :data (ex-data e)}})
-              (catch Exception restore-e
-                {:ok? false
-                 :state (-> m
-                            ;; Preserve the closed store handle so the next
-                            ;; renew step can recover and reopen from its
-                            ;; original env dir instead of getting stuck with
-                            ;; no local store at all.
-                            (assoc :store store
-                                   :dt-db nil)
-                            (dissoc :engine :index))
-                 :error {:error :ha/follower-snapshot-install-restore-failed
-                         :message (ex-message e)
-                         :data (merge (or (ex-data e) {})
-                                      {:restore-message (ex-message restore-e)
-                                       :restore-data (ex-data restore-e)})}}))))))))
+            (let [log-context {:db-name (some-> store i/db-name)
+                               :env-dir env-dir}]
+              (try
+                (recover-ha-local-snapshot-install! env-dir)
+                (log/warn e
+                          "HA follower snapshot install failed; restored local store"
+                          log-context)
+                (let [restored-store (open-ha-store-dbis!
+                                      (st/open env-dir nil open-opts))
+                      restored-db (db/new-db restored-store)]
+                  {:ok? false
+                   :state (-> m
+                              (assoc :store restored-store
+                                     :dt-db restored-db)
+                              (dissoc :engine :index))
+                   :error {:error :ha/follower-snapshot-install-failed
+                           :message (ex-message e)
+                           :data (ex-data e)}})
+                (catch Exception restore-e
+                  (log/error restore-e
+                             "HA follower snapshot install restore failed"
+                             (merge log-context
+                                    {:install-message (ex-message e)
+                                     :install-data (ex-data e)}))
+                  {:ok? false
+                   :state (-> m
+                              ;; Preserve the closed store handle so the next
+                              ;; renew step can recover and reopen from its
+                              ;; original env dir instead of getting stuck with
+                              ;; no local store at all.
+                              (assoc :store store
+                                     :dt-db nil)
+                              (dissoc :engine :index))
+                   :error {:error :ha/follower-snapshot-install-restore-failed
+                           :message (ex-message e)
+                           :data (merge (or (ex-data e) {})
+                                        {:restore-message (ex-message restore-e)
+                                         :restore-data (ex-data restore-e)})}})))))))))
 
 (defn- sync-ha-follower-batch
   [db-name m lease next-lsn now-ms]
@@ -2612,7 +2627,9 @@
                   source-last-applied-lsn]}
           (fetch-ha-follower-records-with-gap-fallback
            db-name m lease next-lsn upto-lsn)
-          next-m (reduce apply-ha-follower-txlog-record! m records)
+          apply-record-fn (or *ha-follower-apply-record-fn*
+                              apply-ha-follower-txlog-record!)
+          next-m (reduce apply-record-fn m records)
           _ (when (and (seq records)
                        (instance? IStore (:store next-m)))
               ;; Follower replay writes raw KV rows and bypasses the normal
@@ -2909,7 +2926,11 @@
                                   (long
                                    (ha-local-last-applied-lsn
                                     error-state)))))]
-                  (if (ha-follower-gap-error? e)
+                  (cond
+                    (ha-follower-stale-state-error? e)
+                    error-state
+
+                    (ha-follower-gap-error? e)
                     (let [source-order (vec (or (:source-order (ex-data e))
                                                 (ha-gap-fallback-source-endpoints
                                                  db-name error-state lease
@@ -2942,6 +2963,8 @@
                                      now-ms)
                                  :ha-follower-sync-backoff-ms nil
                                  :ha-follower-next-sync-not-before-ms nil))))
+
+                    :else
                     (let [details {:message (ex-message e)
                                    :data (ex-data e)
                                    :leader-endpoint leader-endpoint

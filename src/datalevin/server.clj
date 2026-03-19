@@ -681,11 +681,15 @@
                    [(l/kv-tx :put session-dbi client-id session :uuid :data)])
     (.put ^Map (.-clients server) client-id session)))
 
-(declare store-closed?)
+(declare get-store store-closed?)
 
 (defn- get-stores
   [^Server server]
-  (into {} (map (fn [[db-name m]] [db-name (:store m)]) (.-dbs server))))
+  (into {}
+        (keep (fn [[db-name _]]
+                (when-let [store (get-store server db-name)]
+                  [db-name store])))
+        (.-dbs server)))
 
 (defn- get-store
   ([^Server server db-name writing?]
@@ -1156,6 +1160,32 @@
   [db-name m]
   (*ha-follower-sync-step-fn* db-name m))
 
+(declare get-lock db-write-admission-lock)
+
+(defn- ha-follower-apply-record-with-guard
+  [^Server server db-name expected-state record]
+  (let [^Semaphore lock (get-lock server db-name)]
+    (.acquire lock)
+    (try
+      (locking (db-write-admission-lock server db-name)
+        (let [current-state (get (.-dbs server) db-name)]
+          (if (and current-state
+                   (= :follower (:ha-role current-state))
+                   (same-ha-runtime-state?
+                    current-state
+                    expected-state
+                    :ha-follower-loop-running?))
+            (dha/apply-ha-follower-txlog-record! expected-state record)
+            (u/raise "HA follower replay aborted because follower state changed"
+                     {:error :ha/follower-stale-state
+                      :db-name db-name
+                      :record-lsn (:lsn record)
+                      :state current-state
+                      :current-role (:ha-role current-state)
+                      :expected-role (:ha-role expected-state)}))))
+      (finally
+        (.release lock)))))
+
 (defn- ha-loop-sleep-ms
   ([m]
    (ha-loop-sleep-ms m (System/currentTimeMillis)))
@@ -1297,7 +1327,14 @@
               ;; Follower replay can block on remote txlog fetch and local apply
               ;; work. Keep it off the authority renew path so lease reads and
               ;; promotions are not rate-limited by replication latency.
-              (let [next-state (ha-follower-sync-step db-name m)
+              (let [next-state (binding [dha/*ha-follower-apply-record-fn*
+                                         (fn [state record]
+                                           (ha-follower-apply-record-with-guard
+                                            server
+                                            db-name
+                                            state
+                                            record))]
+                                 (ha-follower-sync-step db-name m))
                     local-patch (ha-follower-local-side-effect-patch
                                  m next-state)
                     side-effect-patch (ha-follower-side-effect-patch
@@ -2090,6 +2127,7 @@
 (defn- store-closed?
   [store]
   (cond
+    (nil? store)             true
     (instance? IStore store) (i/closed? store)
     (instance? ILMDB store)  (i/closed-kv? store)
     :else                    (u/raise "Unknown store type" {})))
