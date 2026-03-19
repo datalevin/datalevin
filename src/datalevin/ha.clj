@@ -1885,120 +1885,143 @@
                 :source-check (dissoc check :ok?)
                 :watermark watermark}))))
 
+(declare ha-leader-safe-lsn)
+
 (defn- ha-gap-fallback-source-endpoints
-  [db-name m lease next-lsn]
-  (let [required-lsn (long (max 0 (dec (long next-lsn))))
-        leader-watermark (fetch-leader-watermark-lsn db-name m lease)
-        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        leader-safe-lsn (long-max2 authority-lsn
-                                   (if (:reachable? leader-watermark)
-                                     (long (or (:last-applied-lsn
-                                                leader-watermark)
-                                               0))
-                                     0))
-        local-endpoint (:ha-local-endpoint m)
-        leader-endpoint (ha-leader-endpoint m lease)
-        follower-members
-        (->> (ordered-ha-members m)
-             (filter (fn [{:keys [endpoint]}]
-                       (and (string? endpoint)
-                            (not (s/blank? endpoint))
-                            (not= endpoint local-endpoint)
-                            (not= endpoint leader-endpoint))))
-             vec)
-        followers
-        (ha-parallel-mapv
-         (fn [{:keys [endpoint node-id]}]
-           (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                            db-name m endpoint)
-                 authority-check (ha-source-authority-check
-                                  lease endpoint watermark)
-                 raw-last-lsn (ha-source-watermark-lsn
-                               leader-endpoint
-                               endpoint
-                               watermark)
-                 last-lsn (when (some? raw-last-lsn)
-                            (long-min2 raw-last-lsn
-                                       leader-safe-lsn))
-                 eligible? (and (:ok? authority-check)
-                                (some? last-lsn)
-                                (>= (long last-lsn)
-                                    required-lsn))]
-             {:endpoint endpoint
-              :node-id node-id
-              :authority-ok? (:ok? authority-check)
-              :authority-check authority-check
-              :last-applied-lsn last-lsn
-              :raw-last-applied-lsn raw-last-lsn
-              :leader-safe-lsn leader-safe-lsn
-              :eligible? eligible?}))
-         follower-members)
-        eligible-followers
-        (sort-by (juxt (comp - :last-applied-lsn) :node-id)
-                 (filter :eligible? followers))
-        unknown-followers
-        (sort-by :node-id
-                 (filter :authority-ok? (remove :eligible? followers)))]
-    (->> (concat (when (and (string? leader-endpoint)
-                            (not (s/blank? leader-endpoint))
-                            (not= leader-endpoint local-endpoint))
-                   [leader-endpoint])
-                 (map :endpoint eligible-followers)
-                 (map :endpoint unknown-followers))
-         distinct
-         vec)))
+  ([db-name m lease next-lsn]
+   (ha-gap-fallback-source-endpoints
+    db-name
+    m
+    lease
+    next-lsn
+    (fetch-leader-watermark-lsn db-name m lease)))
+  ([db-name m lease next-lsn leader-watermark]
+   (let [required-lsn (long (max 0 (dec (long next-lsn))))
+         leader-safe-lsn (ha-leader-safe-lsn lease leader-watermark)
+         local-endpoint (:ha-local-endpoint m)
+         leader-endpoint (ha-leader-endpoint m lease)
+         follower-members
+         (->> (ordered-ha-members m)
+              (filter (fn [{:keys [endpoint]}]
+                        (and (string? endpoint)
+                             (not (s/blank? endpoint))
+                             (not= endpoint local-endpoint)
+                             (not= endpoint leader-endpoint))))
+              vec)
+         followers
+         (ha-parallel-mapv
+          (fn [{:keys [endpoint node-id]}]
+            (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
+                             db-name m endpoint)
+                  authority-check (ha-source-authority-check
+                                   lease endpoint watermark)
+                  raw-last-lsn (ha-source-watermark-lsn
+                                leader-endpoint
+                                endpoint
+                                watermark)
+                  last-lsn (when (some? raw-last-lsn)
+                             (long-min2 raw-last-lsn
+                                        leader-safe-lsn))
+                  eligible? (and (:ok? authority-check)
+                                 (some? last-lsn)
+                                 (>= (long last-lsn)
+                                     required-lsn))]
+              {:endpoint endpoint
+               :node-id node-id
+               :authority-ok? (:ok? authority-check)
+               :authority-check authority-check
+               :last-applied-lsn last-lsn
+               :raw-last-applied-lsn raw-last-lsn
+               :leader-safe-lsn leader-safe-lsn
+               :eligible? eligible?}))
+          follower-members)
+         eligible-followers
+         (sort-by (juxt (comp - :last-applied-lsn) :node-id)
+                  (filter :eligible? followers))
+         unknown-followers
+         (sort-by :node-id
+                  (filter :authority-ok? (remove :eligible? followers)))]
+     (->> (concat (when (and (string? leader-endpoint)
+                             (not (s/blank? leader-endpoint))
+                             (not= leader-endpoint local-endpoint))
+                    [leader-endpoint])
+                  (map :endpoint eligible-followers)
+                  (map :endpoint unknown-followers))
+          distinct
+          vec))))
 
 (declare fetch-ha-leader-txlog-batch)
 (declare assert-contiguous-lsn!)
 (declare assert-ha-follower-record-terms!)
 
+(defn- ha-leader-safe-lsn
+  [lease leader-watermark]
+  (let [authority-lsn (long (or (:leader-last-applied-lsn lease) 0))]
+    (long-max2 authority-lsn
+               (if (:reachable? leader-watermark)
+                 (long (or (:last-applied-lsn leader-watermark) 0))
+                 0))))
+
 (defn- ha-source-advertised-last-applied-lsn
-  [db-name m lease source-endpoint]
-  (let [leader-endpoint (ha-leader-endpoint m lease)
-        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        leader-watermark (fetch-leader-watermark-lsn db-name m lease)
-        leader-safe-lsn (long-max2 authority-lsn
-                                   (if (:reachable? leader-watermark)
-                                     (long (or (:last-applied-lsn
-                                                leader-watermark)
-                                               0))
-                                     0))]
-    (if (= source-endpoint leader-endpoint)
-      (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                       db-name m source-endpoint)
-            remote-lsn (ha-source-watermark-lsn
-                        leader-endpoint
-                        source-endpoint
-                        watermark)]
-        {:known? (or (some? remote-lsn)
-                     (pos? authority-lsn))
-         ;; Use the source's fresh watermark when we have it. The cached lease
-         ;; observation can be ahead of what the leader currently serves during
-         ;; follower catch-up, and treating that stale authority LSN as
-         ;; authoritative turns speculative cursor overshoot into a false gap.
-         :last-applied-lsn (when (or (some? remote-lsn)
-                                     (pos? authority-lsn))
-                             (long (or remote-lsn authority-lsn)))
-         :authority-last-applied-lsn authority-lsn
-         :watermark watermark})
-      (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                       db-name m source-endpoint)
-            raw-last-lsn (ha-source-watermark-lsn
-                          leader-endpoint
-                          source-endpoint
-                          watermark)
-            last-lsn (when (some? raw-last-lsn)
-                       (long-min2 raw-last-lsn leader-safe-lsn))]
-        {:known? (some? last-lsn)
-         :last-applied-lsn last-lsn
-         :raw-last-applied-lsn raw-last-lsn
-         :leader-safe-lsn leader-safe-lsn
-         :watermark watermark}))))
+  ([db-name m lease source-endpoint]
+   (ha-source-advertised-last-applied-lsn
+    db-name
+    m
+    lease
+    source-endpoint
+    (fetch-leader-watermark-lsn db-name m lease)
+    nil))
+  ([db-name m lease source-endpoint leader-watermark]
+   (ha-source-advertised-last-applied-lsn
+    db-name
+    m
+    lease
+    source-endpoint
+    leader-watermark
+    nil))
+  ([db-name m lease source-endpoint leader-watermark source-watermark]
+   (let [leader-endpoint (ha-leader-endpoint m lease)
+         authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
+         leader-safe-lsn (ha-leader-safe-lsn lease leader-watermark)
+         watermark (or source-watermark
+                       (if (= source-endpoint leader-endpoint)
+                         leader-watermark
+                         (safe-fetch-ha-endpoint-watermark-lsn
+                          db-name m source-endpoint)))]
+     (if (= source-endpoint leader-endpoint)
+       (let [remote-lsn (ha-source-watermark-lsn
+                         leader-endpoint
+                         source-endpoint
+                         watermark)]
+         {:known? (or (some? remote-lsn)
+                      (pos? authority-lsn))
+          ;; Use the source's fresh watermark when we have it. The cached lease
+          ;; observation can be ahead of what the leader currently serves during
+          ;; follower catch-up, and treating that stale authority LSN as
+          ;; authoritative turns speculative cursor overshoot into a false gap.
+          :last-applied-lsn (when (or (some? remote-lsn)
+                                      (pos? authority-lsn))
+                              (long (or remote-lsn authority-lsn)))
+          :authority-last-applied-lsn authority-lsn
+          :watermark watermark})
+       (let [raw-last-lsn (ha-source-watermark-lsn
+                           leader-endpoint
+                           source-endpoint
+                           watermark)
+             last-lsn (when (some? raw-last-lsn)
+                        (long-min2 raw-last-lsn leader-safe-lsn))]
+         {:known? (some? last-lsn)
+          :last-applied-lsn last-lsn
+          :raw-last-applied-lsn raw-last-lsn
+          :leader-safe-lsn leader-safe-lsn
+          :watermark watermark})))))
 
 (defn- ^:redef fetch-ha-follower-records-with-gap-fallback
   [db-name m lease next-lsn upto-lsn]
   (let [sources (ha-follower-source-endpoints m lease)
-        leader-endpoint (ha-leader-endpoint m lease)]
+        leader-endpoint (ha-leader-endpoint m lease)
+        leader-watermark* (delay (fetch-leader-watermark-lsn
+                                  db-name m lease))]
     (loop [remaining sources
            source-order sources
            reordered? false
@@ -2033,7 +2056,12 @@
                                :source-last-applied-lsn nil}})
                     (let [{:keys [known? last-applied-lsn]}
                           (ha-source-advertised-last-applied-lsn
-                           db-name m lease source-endpoint)
+                           db-name
+                           m
+                           lease
+                           source-endpoint
+                           @leader-watermark*
+                           source-watermark)
                           source-last-applied-lsn
                           (long (or last-applied-lsn 0))
                           local-last-applied-lsn
@@ -2129,7 +2157,11 @@
             (let [remaining' (if reordered?
                                (rest remaining)
                                (->> (ha-gap-fallback-source-endpoints
-                                     db-name m lease next-lsn)
+                                     db-name
+                                     m
+                                     lease
+                                     next-lsn
+                                     @leader-watermark*)
                                     (remove #{source-endpoint})
                                     vec))
                   source-order' (if reordered?
