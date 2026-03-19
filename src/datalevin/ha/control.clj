@@ -663,28 +663,30 @@
                   (long (or rpc-timeout-ms max-command-attempt-timeout-ms))
                   (long max-command-attempt-timeout-ms)))))
 
-(defn- command-retry-delay-ms
+(defn- command-retry-delay-ms ^long
   [attempt remaining rpc-timeout-ms]
-  (let [attempt (max 0 (int attempt))
-        cap-ms  (long (max 1
-                           (min (long remaining)
-                                (long (or rpc-timeout-ms
-                                          max-command-attempt-timeout-ms)))))
-        delay-ms (loop [delay-ms (long initial-command-retry-delay-ms)
-                        attempt  attempt]
+  (let [attempt      (max 0 (int attempt))
+        cap-ms       (long (max 1
+                                (min (long remaining)
+                                     (long (or rpc-timeout-ms
+                                               max-command-attempt-timeout-ms)))))
+        delay-ms     (loop [delay-ms (long initial-command-retry-delay-ms)
+                            attempt  attempt]
                    (if (or (zero? attempt)
                            (>= delay-ms cap-ms))
                      delay-ms
-                     (recur (long (min cap-ms
-                                       (* 2 delay-ms)))
-                            (dec attempt))))]
-    (if (> delay-ms cap-ms)
+                     (let [doubled-delay (* 2 delay-ms)]
+                       (recur (if (< doubled-delay cap-ms)
+                                doubled-delay
+                                cap-ms)
+                              (dec attempt)))))]
+    (if (> (long delay-ms) cap-ms)
       cap-ms
-      delay-ms)))
+      (long delay-ms))))
 
 (defn- ^:redef sleep-command-retry!
   [attempt remaining rpc-timeout-ms]
-  (Thread/sleep (command-retry-delay-ms attempt remaining rpc-timeout-ms)))
+  (Thread/sleep (long (command-retry-delay-ms attempt remaining rpc-timeout-ms))))
 
 (defn- command-operation-timeout-ms
   [operation-timeout-ms timeout-ms]
@@ -1208,12 +1210,12 @@
 (defn- submit-command!
   [{:keys [rpc-timeout-ms operation-timeout-ms] :as authority}
    {:keys [timeout-ms] :as cmd}]
-  (let [deadline (+ (System/currentTimeMillis)
-                    (command-operation-timeout-ms
-                     operation-timeout-ms
-                     timeout-ms))]
+  (let [deadline (+ (long (System/currentTimeMillis))
+                    (long (command-operation-timeout-ms
+                           operation-timeout-ms
+                           timeout-ms)))]
     (loop [attempt 0]
-      (let [remaining (- deadline (System/currentTimeMillis))]
+      (let [remaining (- deadline (long (System/currentTimeMillis)))]
         (when (<= remaining 0)
           (u/raise "HA control command timed out"
                    {:error :ha/control-timeout
@@ -1249,8 +1251,13 @@
               (let [request (control-message forward-request-code
                                              {:tag forward-request-tag
                                               :command cmd})
-                    invoke-timeout (long (max 1 (min remaining
-                                                     (long rpc-timeout-ms))))
+                    invoke-timeout
+                    (let [rpc-timeout (long (or rpc-timeout-ms
+                                                max-command-attempt-timeout-ms))
+                          cap         (if (< remaining rpc-timeout)
+                                        remaining
+                                        rpc-timeout)]
+                      (if (> cap 1) cap 1))
                     response (try
                                (.invokeSync rpc-client
                                             (.getEndpoint leader)

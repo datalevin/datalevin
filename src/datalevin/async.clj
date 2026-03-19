@@ -44,10 +44,10 @@
                     ])
 
 (def ^:private async-backlog-factor
-  64)
+  1024)
 
 (def ^:private async-min-backlog
-  256)
+  4098)
 
 (defn- async-backlog-capacity
   ([] (async-backlog-capacity (.availableProcessors (Runtime/getRuntime))))

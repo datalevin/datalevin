@@ -108,7 +108,7 @@
     spec))
 
 (defn- llm-provider-metadata
-  [spec model-path context-size]
+  [spec ^String model-path context-size]
   (compact-map
     {:llm/provider
      {:kind :local
@@ -121,7 +121,7 @@
         :threads      (:threads spec)})
      :llm/artifact
      {:format :gguf
-      :file   (.getName (File. model-path))
+      :file   (.getName (java.io.File. ^String model-path))
       :path   model-path}}))
 
 (deftype LlamaCppProvider [^LlamaGenerator generator provider-spec metadata]
@@ -147,7 +147,7 @@
 
 (defn- create-llama-provider
   [spec]
-  (let [model      (or (:model spec) (:model-path spec))
+  (let [^String model (or (:model spec) (:model-path spec))
         gpu-layers (int (or (:gpu-layers spec) 0))
         ctx-size   (int (or (:ctx-size spec) 0))
         threads    (int (or (:threads spec) 0))

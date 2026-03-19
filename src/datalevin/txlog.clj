@@ -3089,7 +3089,8 @@
         _reserved (bb-get-u16 bf {:field :reserved})
         lsn (bb-get-long bf {:field :lsn})
         tx-time (bb-get-long bf {:field :tx-time})
-        ha-term (when (pos? (bit-and flags commit-payload-ha-term-flag))
+        ha-term (when (pos? (long (bit-and (long flags)
+                                           (long commit-payload-ha-term-flag))))
                   (bb-get-long bf {:field :ha-term}))
         op-count (bb-get-u32 bf {:field :op-count})]
     (when-not (Arrays/equals magic ^bytes commit-payload-magic-bytes)

@@ -4,31 +4,38 @@
 ### Added
 - [Server] Read only replicas and high availability with auto roll-over and
   promotion (Raft consensus based)
-  [#72](https://github.com/datalevin/datalevin/issues/72). This implementation
-  comes with a Jepsen test suite to validate correctness
+  [#72](https://github.com/datalevin/datalevin/issues/72). This HA
+  implementation comes with a Jepsen test suite to validate correctness
   [#252](https://github.com/datalevin/datalevin/issues/252). Details in
   [doc](doc/ha.md).
-- [Lib] Release Datalevin as a Java library
-  `org.datalevin:datalevin-java:<version>` to maven central.
-- [Lib] Release Datalevin as a Python library `datalevin`to PyPI.
-- [Lib] Release Datalevin as a Node.js library `datalevin-node` to npm.
-- [Lib] Release a trimmed embedded-only jar
-  `org.datalevin/datalevin-embedded:<version>` to Clojars.
 - [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
-- [MCP] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
-- [Datalog] allow to register a `:db/udf` to specify a user defined function.
-  This is cross language, resolves in runtime environment and does not
-  persist in DB.
-- [Datalog] allow `:db/embedding true` property for string attributes, which
-  will use an embedding provider to embed the texts into vectors and index them.
-  A trimmed-down build of llama.cpp is included as the default embedding
-  provider. A default embedding model `multilingual-e5-small-Q8_0.gguf` is
-  downloaded from HuggingFace on first use. This small model is sufficient for
-  text snippets embedding. For large and complex text passages, user should supply
-  a larger model in GGUF format.
-- [Datalog] for embedding enabled datoms, `embedding-neighbors` built-in function to
+- [Lib] Release a trimmed down embedded use only jar
+  `org.datalevin/datalevin-embedded:<version>` to Clojars. This jar does not
+  contains code for server/HA/pod and related dependencies.
+- [Lib] Release Datalevin as a Java library
+  `org.datalevin:datalevin-java:<version>` to maven central, for embedded use.
+- [Lib] Release Datalevin as a Python library `datalevin`to PyPI, for embedded
+  use.
+- [Lib] Release Datalevin as a Node.js library `datalevin-node` to npm, for
+  embedded use.
+- [AI] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
+- [AI] Built-in trimmed down llama.cpp that supports CPU only inference for text
+  embedding and summarization. Models need to be downloaded separately.
+- [Datalog] Allow `:db/embedding true` property for string attributes, which
+  will use an embedding model to embed the texts into vectors and index them.
+  A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
+  HuggingFace on first use. This small 384 dimensions model is sufficient for
+  short text snippets embedding. For large and complex text passages, user
+  should download a larger model in GGUF format.
+- [Datalog] For embedding enabled datoms, `embedding-neighbors` built-in function to
   return `[e, a, v]` based on vector similarity. Details in [doc](doc/vector.md).
-- [Search] `:display :refs+scores` to also show relevance score.
+- [Datalog] Allow to register a `:db/udf` to specify a user defined function.
+  This feature is language agnostic, resolving in runtime environment and does
+  not persist in DB. So a UDF function can be written in Java, Python or
+  Javascript.
+- [Search] `:display :refs+scores` to show relevance score.
+- [Async] A semaphore to limit the number of async jobs in backlog. Will
+  block if the backlog is full (min of 4098 and 1024 * cores).
 - clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
 
 ### Fixed

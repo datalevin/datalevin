@@ -143,16 +143,19 @@
     :else
     nil))
 
-(defn- ha-renew-timeout-ms
+(defn- ha-renew-timeout-ms ^long
   [m now-ms now-nanos]
   (let [lease-timeout-ms (long (or (:ha-lease-timeout-ms m)
                                    c/*ha-lease-timeout-ms*))
-        request-timeout-ms (ha-request-timeout-ms m lease-timeout-ms)
+        request-timeout-ms (long (ha-request-timeout-ms m lease-timeout-ms))
         remaining-ms (ha-lease-local-remaining-ms m now-ms now-nanos)]
-    (long (max 1
-               (if (integer? remaining-ms)
-                 (min request-timeout-ms (long remaining-ms))
-                 request-timeout-ms)))))
+    (let [timeout-ms (long (if (integer? remaining-ms)
+                             (let [remaining-ms (long remaining-ms)]
+                               (if (< remaining-ms request-timeout-ms)
+                                 remaining-ms
+                                 request-timeout-ms))
+                             request-timeout-ms))]
+      (if (< timeout-ms 1) 1 timeout-ms))))
 
 (defn- long-max2 ^long
   [a b]
@@ -644,7 +647,7 @@
 (defonce ^:private ^AtomicLong ha-client-cache-access-order-size
   (AtomicLong. 0))
 
-(def ^:private ha-client-cache-prune-thread-seq
+(def ^:private ^AtomicLong ha-client-cache-prune-thread-seq
   (AtomicLong. 0))
 
 (defonce ^:private ^AtomicBoolean ha-client-cache-prune-scheduled?
@@ -664,7 +667,8 @@
             (str "datalevin-ha-client-cache-prune"
                  (when label (str "-" label))
                  "-"
-                 (.incrementAndGet ha-client-cache-prune-thread-seq)))
+                 (.incrementAndGet ^AtomicLong
+                                   ha-client-cache-prune-thread-seq)))
            (.setDaemon true)))))))
 
 (defonce ^:private ^ExecutorService ha-client-cache-prune-executor
@@ -747,8 +751,8 @@
    (or *ha-client-cache-max-access-records*
        (long-max2
         ha-client-cache-min-max-access-records
-        (* (long-max2 1 (long *ha-client-cache-max-size*))
-           ha-client-cache-default-max-access-records-per-entry)))))
+        (long (* (long-max2 1 (long *ha-client-cache-max-size*))
+                 (long ha-client-cache-default-max-access-records-per-entry)))))))
 
 (defn- ha-client-cache-access-order-full?
   ([]
@@ -1240,10 +1244,10 @@
   (fsync-ha-snapshot-path! dir))
 
 (defn ^:redef sync-ha-snapshot-install-target!
-  [env-dir]
+  [^String env-dir]
   (when (u/file-exists env-dir)
     (sync-ha-snapshot-dir-tree! env-dir)
-    (when-let [^File parent (.getParentFile (File. env-dir))]
+    (when-let [^File parent (.getParentFile (java.io.File. ^String env-dir))]
       (when (.exists parent)
         (fsync-ha-snapshot-path! (.getPath parent))))))
 
@@ -1738,7 +1742,7 @@
       (max 4)
       (min 16)))
 
-(def ^:private ha-probe-thread-seq
+(def ^:private ^AtomicLong ha-probe-thread-seq
   (AtomicLong. 0))
 
 (defn- new-ha-probe-thread-factory
@@ -1752,7 +1756,7 @@
             (str "datalevin-ha-probe"
                  (when label (str "-" label))
                  "-"
-                 (.incrementAndGet ha-probe-thread-seq)))
+                 (.incrementAndGet ^AtomicLong ha-probe-thread-seq)))
            (.setDaemon true)))))))
 
 (defonce ^:private ^ExecutorService ha-probe-executor
@@ -1875,27 +1879,27 @@
 (def ^:private ha-follower-adaptive-batch-value-overhead-bytes 16)
 (def ^:private ha-follower-adaptive-batch-record-overhead-bytes 32)
 
-(defn- estimate-ha-follower-value-bytes
+(defn- estimate-ha-follower-value-bytes ^long
   [value]
   (cond
     (nil? value)
     1
 
     (string? value)
-    (+ 16 (* 2 (count value)))
+    (+ 16 (* 2 (long (count value))))
 
     (keyword? value)
-    (let [name-len (count (name value))
-          ns-len (if-let [ns (namespace value)]
-                   (count ns)
-                   0)]
+    (let [name-len (long (count (name value)))
+          ns-len   (if-let [ns (namespace value)]
+                     (long (count ns))
+                     0)]
       (+ 24 (* 2 (+ name-len ns-len))))
 
     (symbol? value)
-    (let [name-len (count (name value))
-          ns-len (if-let [ns (namespace value)]
-                   (count ns)
-                   0)]
+    (let [name-len (long (count (name value)))
+          ns-len   (if-let [ns (namespace value)]
+                     (long (count ns))
+                     0)]
       (+ 24 (* 2 (+ name-len ns-len))))
 
     (number? value)
@@ -1943,15 +1947,15 @@
             value)
 
     :else
-    ha-follower-adaptive-batch-value-overhead-bytes))
+    (long ha-follower-adaptive-batch-value-overhead-bytes)))
 
-(defn- estimate-ha-follower-record-bytes
+(defn- estimate-ha-follower-record-bytes ^long
   [record]
   (if-let [payload-bytes (some-> (:payload-bytes record) long)]
     (long-max2 1 payload-bytes)
     (long-max2
      1
-     (+ ha-follower-adaptive-batch-record-overhead-bytes
+     (+ (long ha-follower-adaptive-batch-record-overhead-bytes)
         (long (estimate-ha-follower-value-bytes (:lsn record)))
         (long (estimate-ha-follower-value-bytes (:ha-term record)))
         (long (estimate-ha-follower-value-bytes (:rows record)))
@@ -1966,15 +1970,16 @@
         (let [sample-bytes (reduce
                             (fn [^long total record]
                               (+ total
-                                 (long (max 1
+                                 (long-max2 1
                                             (estimate-ha-follower-record-bytes
-                                             record)))))
+                                             record))))
                             0
                             sample)
-              avg-record-bytes (long-max2 1
-                                          (long (Math/ceil
-                                                 (/ (double sample-bytes)
-                                                    (double sample-count)))))]
+              avg-record-bytes (long-max2
+                                1
+                                (long (Math/ceil
+                                       (/ (double sample-bytes)
+                                          (double sample-count)))))]
           (long (* avg-record-bytes (long (count records)))))))))
 
 (defn- summarize-ha-follower-batch-record
@@ -1998,8 +2003,10 @@
                                       (long (Math/ceil
                                              (/ (double last-batch-bytes)
                                                 (double last-batch-size)))))
-                           ha-follower-adaptive-batch-assumed-record-bytes)
-        target-records (long-max2 1 (quot target-bytes avg-record-bytes))]
+                           (long ha-follower-adaptive-batch-assumed-record-bytes))
+        target-records (long-max2 1
+                                  (quot (long target-bytes)
+                                        avg-record-bytes))]
     (long-min2 max-records target-records)))
 
 (def ^:private ha-follower-max-sync-backoff-ms 30000)
@@ -2480,54 +2487,58 @@
 
 (defn- assert-ha-follower-record-terms!
   [lease source-endpoint records]
-  (when-let [lease-term (some-> (:term lease) long)]
-    (reduce
-     (fn [prev-term record]
-       (if-let [record-term (some-> (:ha-term record) long)]
-         (do
-           (when-not (pos? record-term)
-             (u/raise "Follower txlog replay record has invalid HA term"
-                      {:error :ha/txlog-record-invalid-term
-                       :source-endpoint source-endpoint
-                       :lease-term lease-term
-                       :record-lsn (:lsn record)
-                       :record-term record-term}))
-           (when (> record-term lease-term)
-             (u/raise "Follower txlog replay record term is ahead of current lease"
-                      {:error :ha/txlog-record-invalid-term
-                       :source-endpoint source-endpoint
-                       :lease-term lease-term
-                       :record-lsn (:lsn record)
-                       :record-term record-term}))
-           (when (and prev-term
-                      (< record-term prev-term))
-             (u/raise "Follower txlog replay record terms regressed within batch"
-                      {:error :ha/txlog-record-invalid-term
-                       :source-endpoint source-endpoint
-                       :lease-term lease-term
-                       :previous-record-term prev-term
-                       :record-lsn (:lsn record)
-                       :record-term record-term}))
-           record-term)
-         prev-term))
-     nil
-     records)))
+  (when-some [lease-term* (:term lease)]
+    (let [lease-term (long lease-term*)]
+      (reduce
+       (fn [prev-term record]
+         (if-some [record-term* (:ha-term record)]
+           (let [record-term (long record-term*)]
+             (do
+               (when-not (pos? record-term)
+                 (u/raise "Follower txlog replay record has invalid HA term"
+                          {:error :ha/txlog-record-invalid-term
+                           :source-endpoint source-endpoint
+                           :lease-term lease-term
+                           :record-lsn (:lsn record)
+                           :record-term record-term}))
+               (when (> record-term lease-term)
+                 (u/raise "Follower txlog replay record term is ahead of current lease"
+                          {:error :ha/txlog-record-invalid-term
+                           :source-endpoint source-endpoint
+                           :lease-term lease-term
+                           :record-lsn (:lsn record)
+                           :record-term record-term}))
+               (when (and prev-term
+                          (< record-term (long prev-term)))
+                 (u/raise "Follower txlog replay record terms regressed within batch"
+                          {:error :ha/txlog-record-invalid-term
+                           :source-endpoint source-endpoint
+                           :lease-term lease-term
+                           :previous-record-term prev-term
+                           :record-lsn (:lsn record)
+                           :record-term record-term}))
+               record-term))
+           prev-term))
+       nil
+       records))))
 
 (defn- assert-ha-follower-record-term!
   [m record]
-  (when-let [record-term (some-> (:ha-term record) long)]
-    (when-not (pos? record-term)
-      (u/raise "Follower txlog replay record has invalid HA term"
-               {:error :ha/txlog-record-invalid-term
-                :record-lsn (:lsn record)
-                :record-term record-term}))
-    (when-let [authority-term (some-> (:ha-authority-term m) long)]
-      (when (> record-term authority-term)
-        (u/raise "Follower txlog replay record term is ahead of current authority"
+  (when-some [record-term* (:ha-term record)]
+    (let [record-term (long record-term*)]
+      (when-not (pos? record-term)
+        (u/raise "Follower txlog replay record has invalid HA term"
                  {:error :ha/txlog-record-invalid-term
                   :record-lsn (:lsn record)
-                  :record-term record-term
-                  :authority-term authority-term})))))
+                  :record-term record-term}))
+      (when-some [authority-term* (:ha-authority-term m)]
+        (let [authority-term (long authority-term*)]
+          (when (> record-term authority-term)
+            (u/raise "Follower txlog replay record term is ahead of current authority"
+                     {:error :ha/txlog-record-invalid-term
+                      :record-lsn (:lsn record)
+                      :record-term record-term
+                      :authority-term authority-term})))))))
 
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
@@ -2907,7 +2918,7 @@
   (let [m (reopen-ha-local-store-if-needed m)
         leader-endpoint (ha-leader-endpoint m lease)
         local-node-id (:ha-node-id m)
-        requested-batch-records (ha-follower-request-batch-records m)]
+        requested-batch-records (long (ha-follower-request-batch-records m))]
     (when (or (nil? leader-endpoint) (s/blank? leader-endpoint))
       (u/raise "HA follower is missing leader endpoint for txlog sync"
                {:error :ha/follower-missing-leader-endpoint
