@@ -1250,6 +1250,14 @@
        :else
        idle-ms))))
 
+(defn- sleep-ha-loop!
+  [^AtomicBoolean running? sleep-ms]
+  (when (pos? (long sleep-ms))
+    (try
+      (Thread/sleep (long sleep-ms))
+      (catch InterruptedException _
+        (.set running? false)))))
+
 (defn- ha-loop-error-backoff!
   [^AtomicBoolean running?]
   (try
@@ -1298,11 +1306,7 @@
                         (not (identical? running?
                                          (:ha-renew-loop-running? state))))
                   (.set running? false)
-                  (let [sleep-ms (long (ha-loop-sleep-ms state))]
-                    (try
-                      (Thread/sleep sleep-ms)
-                      (catch InterruptedException _
-                        (.set running? false))))))))
+                  (sleep-ha-loop! running? (ha-loop-sleep-ms state))))))
           (catch Throwable t
             (log/error t "HA renew loop crashed"
                        {:db-name db-name})
@@ -1367,13 +1371,8 @@
                         (not (identical? running?
                                          (:ha-follower-loop-running? state))))
                   (.set running? false)
-                  (let [sleep-ms (long (ha-follower-loop-sleep-ms state))]
-                    (if (pos? sleep-ms)
-                      (try
-                        (Thread/sleep sleep-ms)
-                        (catch InterruptedException _
-                          (.set running? false)))
-                      (Thread/yield)))))))
+                  (sleep-ha-loop! running?
+                                  (ha-follower-loop-sleep-ms state))))))
           (catch Throwable t
             (log/error t "HA follower sync loop crashed"
                        {:db-name db-name})
