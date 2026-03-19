@@ -654,19 +654,75 @@
   (AtomicLong. 0))
 
 (defn- new-ha-client-cache-prune-thread-factory
-  []
-  (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
-    (reify ThreadFactory
-      (newThread [_ runnable]
-        (doto (.newThread delegate runnable)
-          (.setName
-           (str "datalevin-ha-client-cache-prune-"
-                (.incrementAndGet ha-client-cache-prune-thread-seq)))
-          (.setDaemon true))))))
+  ([] (new-ha-client-cache-prune-thread-factory nil))
+  ([label]
+   (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
+     (reify ThreadFactory
+       (newThread [_ runnable]
+         (doto (.newThread delegate runnable)
+           (.setName
+            (str "datalevin-ha-client-cache-prune"
+                 (when label (str "-" label))
+                 "-"
+                 (.incrementAndGet ha-client-cache-prune-thread-seq)))
+           (.setDaemon true)))))))
 
 (defonce ^:private ^ExecutorService ha-client-cache-prune-executor
   (Executors/newSingleThreadExecutor
    (new-ha-client-cache-prune-thread-factory)))
+
+(defonce ^:private default-ha-client-cache-state
+  {:cache ha-client-cache
+   :last-prune-ms ha-client-cache-last-prune-ms
+   :access-seq ha-client-cache-access-seq
+   :access-order ha-client-cache-access-order
+   :access-order-size ha-client-cache-access-order-size
+   :prune-scheduled? ha-client-cache-prune-scheduled?
+   :prune-generation ha-client-cache-prune-generation
+   :prune-executor ha-client-cache-prune-executor})
+
+(def ^:dynamic *ha-client-cache-state* nil)
+
+(defn- ha-thread-label
+  [db-name]
+  (when (some? db-name)
+    (let [label (-> (str db-name)
+                    (s/replace #"[^A-Za-z0-9._-]+" "-")
+                    (s/replace #"(^-+|-+$)" ""))]
+      (when-not (s/blank? label)
+        label))))
+
+(defn- new-ha-client-cache-state
+  [db-name]
+  {:cache (ConcurrentHashMap.)
+   :last-prune-ms (AtomicLong. 0)
+   :access-seq (AtomicLong. 0)
+   :access-order (ConcurrentLinkedDeque.)
+   :access-order-size (AtomicLong. 0)
+   :prune-scheduled? (AtomicBoolean. false)
+   :prune-generation (AtomicLong. 0)
+   :prune-executor
+   (Executors/newSingleThreadExecutor
+    (new-ha-client-cache-prune-thread-factory
+     (ha-thread-label db-name)))})
+
+(defn- ha-client-cache-state
+  ([] (or *ha-client-cache-state*
+          default-ha-client-cache-state))
+  ([m-or-state]
+   (cond
+     (nil? m-or-state)
+     (or *ha-client-cache-state*
+         default-ha-client-cache-state)
+
+     (and (map? m-or-state)
+          (contains? m-or-state :cache)
+          (contains? m-or-state :prune-executor))
+     m-or-state
+
+     :else
+     (or (:ha-client-cache-state m-or-state)
+         default-ha-client-cache-state))))
 
 (defn- ha-client-cache-key
   [uri client-opts]
@@ -675,8 +731,11 @@
    (long (or (:time-out client-opts) c/default-connection-timeout))])
 
 (defn- next-ha-client-cache-access-id! ^long
-  []
-  (.incrementAndGet ha-client-cache-access-seq))
+  ([]
+   (next-ha-client-cache-access-id! nil))
+  ([m-or-state]
+   (.incrementAndGet ^AtomicLong (:access-seq
+                                  (ha-client-cache-state m-or-state)))))
 
 (def ^:private ha-client-cache-default-max-access-records-per-entry 8)
 
@@ -692,41 +751,61 @@
            ha-client-cache-default-max-access-records-per-entry)))))
 
 (defn- ha-client-cache-access-order-full?
-  []
-  (>= (.get ha-client-cache-access-order-size)
-      (ha-client-cache-max-access-records)))
+  ([]
+   (ha-client-cache-access-order-full? nil))
+  ([m-or-state]
+   (>= (.get ^AtomicLong (:access-order-size
+                          (ha-client-cache-state m-or-state)))
+       (ha-client-cache-max-access-records))))
 
 (defn- enqueue-ha-client-cache-access-record!
-  [record]
-  (.addLast ha-client-cache-access-order record)
-  (.incrementAndGet ha-client-cache-access-order-size)
-  record)
+  ([record]
+   (enqueue-ha-client-cache-access-record! nil record))
+  ([m-or-state record]
+   (.addLast ^ConcurrentLinkedDeque (:access-order
+                                     (ha-client-cache-state m-or-state))
+             record)
+   (.incrementAndGet ^AtomicLong (:access-order-size
+                                  (ha-client-cache-state m-or-state)))
+   record))
 
 (defn- prepend-ha-client-cache-access-record!
-  [record]
-  (.addFirst ha-client-cache-access-order record)
-  (.incrementAndGet ha-client-cache-access-order-size)
-  record)
+  ([record]
+   (prepend-ha-client-cache-access-record! nil record))
+  ([m-or-state record]
+   (.addFirst ^ConcurrentLinkedDeque (:access-order
+                                      (ha-client-cache-state m-or-state))
+              record)
+   (.incrementAndGet ^AtomicLong (:access-order-size
+                                  (ha-client-cache-state m-or-state)))
+   record))
 
 (defn- poll-ha-client-cache-access-record!
-  []
-  (when-let [record (.pollFirst ha-client-cache-access-order)]
-    (.decrementAndGet ha-client-cache-access-order-size)
-    record))
+  ([]
+   (poll-ha-client-cache-access-record! nil))
+  ([m-or-state]
+   (let [cache-state (ha-client-cache-state m-or-state)]
+     (when-let [record (.pollFirst ^ConcurrentLinkedDeque
+                                   (:access-order cache-state))]
+       (.decrementAndGet ^AtomicLong (:access-order-size cache-state))
+       record))))
 
 (defn- ha-client-cache-entry-access-id ^long
   [entry]
   (long (.get ^AtomicLong (:access-id entry))))
 
 (defn- record-ha-client-cache-access!
-  [cache-key entry now-ms]
-  (.set ^AtomicLong (:last-used-ms entry) (long now-ms))
-  (when (or (zero? (ha-client-cache-entry-access-id entry))
-            (not (ha-client-cache-access-order-full?)))
-    (let [access-id (next-ha-client-cache-access-id!)]
-      (.set ^AtomicLong (:access-id entry) access-id)
-      (enqueue-ha-client-cache-access-record! [cache-key access-id])))
-  entry)
+  ([cache-key entry now-ms]
+   (record-ha-client-cache-access! nil cache-key entry now-ms))
+  ([m-or-state cache-key entry now-ms]
+   (.set ^AtomicLong (:last-used-ms entry) (long now-ms))
+   (when (or (zero? (ha-client-cache-entry-access-id entry))
+             (not (ha-client-cache-access-order-full? m-or-state)))
+     (let [access-id (next-ha-client-cache-access-id! m-or-state)]
+       (.set ^AtomicLong (:access-id entry) access-id)
+       (enqueue-ha-client-cache-access-record! m-or-state
+                                               [cache-key access-id])))
+   entry))
 
 (defn- ha-client-cache-entry
   [_cache-key future _now-ms]
@@ -755,18 +834,20 @@
   (long (.get ^AtomicLong (:last-used-ms entry))))
 
 (defn- touch-ha-client-cache-entry!
-  [cache-key entry now-ms]
-  (when entry
-    (let [^AtomicLong last-used-ms (:last-used-ms entry)
-          previous-ms (.get last-used-ms)
-          bucket-ms (max 0 (long *ha-client-cache-access-bucket-ms*))]
-      (.set last-used-ms (long now-ms))
-      (when (or (zero? (ha-client-cache-entry-access-id entry))
-                (zero? bucket-ms)
-                (>= (nonnegative-long-diff now-ms previous-ms)
-                    bucket-ms))
-        (record-ha-client-cache-access! cache-key entry now-ms))))
-  entry)
+  ([cache-key entry now-ms]
+   (touch-ha-client-cache-entry! nil cache-key entry now-ms))
+  ([m-or-state cache-key entry now-ms]
+   (when entry
+     (let [^AtomicLong last-used-ms (:last-used-ms entry)
+           previous-ms (.get last-used-ms)
+           bucket-ms (max 0 (long *ha-client-cache-access-bucket-ms*))]
+       (.set last-used-ms (long now-ms))
+       (when (or (zero? (ha-client-cache-entry-access-id entry))
+                 (zero? bucket-ms)
+                 (>= (nonnegative-long-diff now-ms previous-ms)
+                     bucket-ms))
+         (record-ha-client-cache-access! m-or-state cache-key entry now-ms))))
+   entry))
 
 (defn- ^:redef live-ha-client?
   [client]
@@ -814,9 +895,11 @@
           (long *ha-client-cache-ttl-ms*))))
 
 (defn- restore-ha-client-cache-access-records!
-  [records]
-  (doseq [record (rseq (vec records))]
-    (prepend-ha-client-cache-access-record! record)))
+  ([records]
+   (restore-ha-client-cache-access-records! nil records))
+  ([m-or-state records]
+   (doseq [record (rseq (vec records))]
+     (prepend-ha-client-cache-access-record! m-or-state record))))
 
 (defn- current-ha-client-cache-access-record?
   [entry access-id]
@@ -824,11 +907,14 @@
      (ha-client-cache-entry-access-id entry)))
 
 (defn- prune-expired-ha-client-cache-entries!
-  [now-ms protected-entry]
-  (let [^ConcurrentHashMap cache ha-client-cache]
+  ([now-ms protected-entry]
+   (prune-expired-ha-client-cache-entries! nil now-ms protected-entry))
+  ([m-or-state now-ms protected-entry]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         ^ConcurrentHashMap cache (:cache cache-state)]
     (loop [deferred []]
       (if-let [[cache-key access-id :as record]
-               (poll-ha-client-cache-access-record!)]
+               (poll-ha-client-cache-access-record! cache-state)]
         (let [entry (.get cache cache-key)]
           (cond
             (nil? entry)
@@ -849,17 +935,21 @@
               (recur deferred))
 
             :else
-            (restore-ha-client-cache-access-records! (conj deferred record))))
-        (restore-ha-client-cache-access-records! deferred)))))
+            (restore-ha-client-cache-access-records! cache-state
+                                                     (conj deferred record))))
+        (restore-ha-client-cache-access-records! cache-state deferred))))))
 
 (defn- prune-overflow-ha-client-cache-entries!
-  [protected-entry]
-  (let [^ConcurrentHashMap cache ha-client-cache
-        max-size (max 0 (long *ha-client-cache-max-size*))]
+  ([protected-entry]
+   (prune-overflow-ha-client-cache-entries! nil protected-entry))
+  ([m-or-state protected-entry]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         ^ConcurrentHashMap cache (:cache cache-state)
+         max-size (max 0 (long *ha-client-cache-max-size*))]
     (loop [deferred []]
       (if (> (.size cache) max-size)
         (if-let [[cache-key access-id :as record]
-                 (poll-ha-client-cache-access-record!)]
+                 (poll-ha-client-cache-access-record! cache-state)]
           (let [entry (.get cache cache-key)]
             (cond
               (nil? entry)
@@ -877,59 +967,79 @@
                 (when (.remove cache cache-key entry)
                   (close-ha-client-cache-entry! entry))
                 (recur deferred))))
-          (restore-ha-client-cache-access-records! deferred))
-        (restore-ha-client-cache-access-records! deferred)))))
+          (restore-ha-client-cache-access-records! cache-state deferred))
+        (restore-ha-client-cache-access-records! cache-state deferred))))))
 
 (defn- ^:redef prune-ha-client-cache!
-  [now-ms protected-entry]
-  (prune-expired-ha-client-cache-entries! now-ms protected-entry)
-  (prune-overflow-ha-client-cache-entries! protected-entry))
+  ([now-ms protected-entry]
+   (prune-ha-client-cache! nil now-ms protected-entry))
+  ([m-or-state now-ms protected-entry]
+   (prune-expired-ha-client-cache-entries! m-or-state now-ms protected-entry)
+   (prune-overflow-ha-client-cache-entries! m-or-state protected-entry)))
 
 (defn- ha-client-cache-prune-due?
-  [now-ms]
-  (let [^ConcurrentHashMap cache ha-client-cache
-        max-size (max 0 (long *ha-client-cache-max-size*))
-        prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))
-        access-order-size (.get ha-client-cache-access-order-size)]
-    (or (> (.size cache) max-size)
-        (>= access-order-size
-            (ha-client-cache-max-access-records))
-        (>= (nonnegative-long-diff now-ms
-                                   (.get ha-client-cache-last-prune-ms))
-            prune-interval-ms))))
+  ([now-ms]
+   (ha-client-cache-prune-due? nil now-ms))
+  ([m-or-state now-ms]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         ^ConcurrentHashMap cache (:cache cache-state)
+         max-size (max 0 (long *ha-client-cache-max-size*))
+         prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))
+         access-order-size (.get ^AtomicLong (:access-order-size cache-state))]
+     (or (> (.size cache) max-size)
+         (>= access-order-size
+             (ha-client-cache-max-access-records))
+         (>= (nonnegative-long-diff now-ms
+                                    (.get ^AtomicLong
+                                          (:last-prune-ms cache-state)))
+             prune-interval-ms)))))
 
 (defn- schedule-ha-client-cache-prune!
-  [protected-entry]
-  (let [generation (.get ha-client-cache-prune-generation)]
-    (when (.compareAndSet ha-client-cache-prune-scheduled? false true)
-      (try
-        (.submit
-         ha-client-cache-prune-executor
-         ^Runnable
-         (fn []
-           (try
-             (when (= generation (.get ha-client-cache-prune-generation))
-               (let [now-ms (ha-now-ms)]
-                 (prune-ha-client-cache! now-ms protected-entry)
-                 (when (= generation (.get ha-client-cache-prune-generation))
-                   (.set ha-client-cache-last-prune-ms (long now-ms)))))
-             (catch Throwable e
-               (log/warn e "Failed to prune HA client cache"))
-             (finally
-               (.set ha-client-cache-prune-scheduled? false)
-               (when (and (= generation (.get ha-client-cache-prune-generation))
-                          (ha-client-cache-prune-due? (ha-now-ms)))
-                 (schedule-ha-client-cache-prune! nil))))))
-        (catch Throwable e
-          (.set ha-client-cache-prune-scheduled? false)
-          (log/warn e "Failed to schedule HA client cache pruning"))))))
+  ([protected-entry]
+   (schedule-ha-client-cache-prune! nil protected-entry))
+  ([m-or-state protected-entry]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         generation (.get ^AtomicLong (:prune-generation cache-state))]
+     (when (.compareAndSet ^AtomicBoolean (:prune-scheduled? cache-state)
+                           false true)
+       (try
+         (.submit
+          ^ExecutorService (:prune-executor cache-state)
+          ^Runnable
+          (fn []
+            (try
+              (when (= generation
+                       (.get ^AtomicLong (:prune-generation cache-state)))
+                (let [now-ms (ha-now-ms)]
+                  (binding [*ha-client-cache-state* cache-state]
+                    (prune-ha-client-cache! now-ms protected-entry))
+                  (when (= generation
+                           (.get ^AtomicLong
+                                 (:prune-generation cache-state)))
+                    (.set ^AtomicLong (:last-prune-ms cache-state)
+                          (long now-ms)))))
+              (catch Throwable e
+                (log/warn e "Failed to prune HA client cache"))
+              (finally
+                (.set ^AtomicBoolean (:prune-scheduled? cache-state) false)
+                (when (and (= generation
+                              (.get ^AtomicLong
+                                    (:prune-generation cache-state)))
+                           (ha-client-cache-prune-due? cache-state
+                                                       (ha-now-ms)))
+                  (schedule-ha-client-cache-prune! cache-state nil))))))
+         (catch Throwable e
+           (.set ^AtomicBoolean (:prune-scheduled? cache-state) false)
+           (log/warn e "Failed to schedule HA client cache pruning")))))))
 
 (defn- maybe-prune-ha-client-cache!
   ([now-ms]
-   (maybe-prune-ha-client-cache! now-ms nil))
+   (maybe-prune-ha-client-cache! nil now-ms nil))
   ([now-ms protected-entry]
-   (when (ha-client-cache-prune-due? now-ms)
-     (schedule-ha-client-cache-prune! protected-entry))))
+   (maybe-prune-ha-client-cache! nil now-ms protected-entry))
+  ([m-or-state now-ms protected-entry]
+   (when (ha-client-cache-prune-due? m-or-state now-ms)
+     (schedule-ha-client-cache-prune! m-or-state protected-entry))))
 
 (defn- ^:redef open-ha-client
   [uri db-name client-opts]
@@ -953,72 +1063,80 @@
         (throw e)))))
 
 (defn- cached-ha-client
-  [uri db-name client-opts]
-  (let [cache-key (ha-client-cache-key uri client-opts)
-        ^ConcurrentHashMap cache ha-client-cache]
-    (maybe-prune-ha-client-cache! (ha-now-ms))
-    (let [pending-entry (ha-client-cache-entry cache-key
-                                               (CompletableFuture.)
-                                               (ha-now-ms))
-          stale-entry-v (volatile! nil)
-          cache-entry (.compute cache cache-key
-                                (reify BiFunction
-                                  (apply [_ _ existing]
-                                    (let [now-ms (ha-now-ms)]
-                                      (if (reusable-ha-client-cache-entry?
-                                           existing now-ms)
-                                        (touch-ha-client-cache-entry! cache-key
-                                                                      existing
-                                                                      now-ms)
-                                        (do
-                                          (when existing
-                                            (vreset! stale-entry-v existing))
-                                          (touch-ha-client-cache-entry! cache-key
-                                           pending-entry now-ms)))))))
-          installer? (identical? cache-entry pending-entry)]
-      (when-let [stale-entry @stale-entry-v]
-        (when-not (identical? stale-entry cache-entry)
-          (close-ha-client-cache-entry! stale-entry)))
-      (let [client (if installer?
-                     (let [^CompletableFuture future (:future pending-entry)]
-                       (try
-                         (let [client (open-ha-client uri db-name client-opts)]
-                           (.complete future client)
-                           client)
-                         (catch Throwable e
-                           (.remove cache cache-key pending-entry)
-                           (.completeExceptionally future e)
-                           (throw e))))
-                     (await-ha-client-cache-entry-client! cache-entry))]
-        (maybe-prune-ha-client-cache! (ha-now-ms) cache-entry)
-        client))))
+  ([uri db-name client-opts]
+   (cached-ha-client nil uri db-name client-opts))
+  ([m-or-state uri db-name client-opts]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         cache-key (ha-client-cache-key uri client-opts)
+         ^ConcurrentHashMap cache (:cache cache-state)]
+     (maybe-prune-ha-client-cache! cache-state (ha-now-ms) nil)
+     (let [pending-entry (ha-client-cache-entry cache-key
+                                                (CompletableFuture.)
+                                                (ha-now-ms))
+           stale-entry-v (volatile! nil)
+           cache-entry (.compute cache cache-key
+                                 (reify BiFunction
+                                   (apply [_ _ existing]
+                                     (let [now-ms (ha-now-ms)]
+                                       (if (reusable-ha-client-cache-entry?
+                                            existing now-ms)
+                                         (touch-ha-client-cache-entry!
+                                          cache-state cache-key existing now-ms)
+                                         (do
+                                           (when existing
+                                             (vreset! stale-entry-v existing))
+                                           (touch-ha-client-cache-entry!
+                                            cache-state cache-key
+                                            pending-entry now-ms)))))))
+           installer? (identical? cache-entry pending-entry)]
+       (when-let [stale-entry @stale-entry-v]
+         (when-not (identical? stale-entry cache-entry)
+           (close-ha-client-cache-entry! stale-entry)))
+       (let [client (if installer?
+                      (let [^CompletableFuture future (:future pending-entry)]
+                        (try
+                          (let [client (open-ha-client uri db-name client-opts)]
+                            (.complete future client)
+                            client)
+                          (catch Throwable e
+                            (.remove cache cache-key pending-entry)
+                            (.completeExceptionally future e)
+                            (throw e))))
+                      (await-ha-client-cache-entry-client! cache-entry))]
+         (maybe-prune-ha-client-cache! cache-state (ha-now-ms) cache-entry)
+         client)))))
 
 (defn- invalidate-cached-ha-client!
-  [uri client-opts client]
-  (let [cache-key (ha-client-cache-key uri client-opts)
-        ^ConcurrentHashMap cache ha-client-cache
-        stale-entry-v (volatile! nil)]
-    (.compute cache cache-key
-              (reify BiFunction
-                (apply [_ _ existing]
-                  (if (and existing
-                           (identical? client
-                                       (ha-client-cache-entry-client existing)))
-                    (do
-                      (vreset! stale-entry-v existing)
-                      nil)
-                    existing))))
-    (when-let [stale-entry @stale-entry-v]
-      (close-ha-client-cache-entry! stale-entry))))
+  ([uri client-opts client]
+   (invalidate-cached-ha-client! nil uri client-opts client))
+  ([m-or-state uri client-opts client]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         cache-key (ha-client-cache-key uri client-opts)
+         ^ConcurrentHashMap cache (:cache cache-state)
+         stale-entry-v (volatile! nil)]
+     (.compute cache cache-key
+               (reify BiFunction
+                 (apply [_ _ existing]
+                   (if (and existing
+                            (identical? client
+                                        (ha-client-cache-entry-client existing)))
+                     (do
+                       (vreset! stale-entry-v existing)
+                       nil)
+                     existing))))
+     (when-let [stale-entry @stale-entry-v]
+       (close-ha-client-cache-entry! stale-entry)))))
 
 (defn- with-cached-ha-client
-  [uri db-name client-opts f]
-  (let [client (cached-ha-client uri db-name client-opts)]
-    (try
-      (f client)
-      (catch Exception e
-        (invalidate-cached-ha-client! uri client-opts client)
-        (throw e)))))
+  ([uri db-name client-opts f]
+   (with-cached-ha-client nil uri db-name client-opts f))
+  ([m-or-state uri db-name client-opts f]
+   (let [client (cached-ha-client m-or-state uri db-name client-opts)]
+     (try
+       (f client)
+       (catch Exception e
+         (invalidate-cached-ha-client! m-or-state uri client-opts client)
+         (throw e))))))
 
 (defn- unknown-ha-watermark-command?
   [e]
@@ -1027,25 +1145,61 @@
         (s/includes? message "Unknown message type :ha-watermark"))))
 
 (defn- clear-ha-client-cache!
-  []
-  (let [^ConcurrentHashMap cache ha-client-cache]
-    (.incrementAndGet ha-client-cache-prune-generation)
-    (.set ha-client-cache-prune-scheduled? false)
-    (.set ha-client-cache-access-seq 0)
-    (.clear ha-client-cache-access-order)
-    (.set ha-client-cache-access-order-size 0)
-    (loop []
-      (let [entries (vec (.entrySet cache))]
-        (when (seq entries)
-          (doseq [entry entries]
-            (let [entry ^java.util.Map$Entry entry
-                  cache-key (.getKey entry)
-                  cache-entry (.getValue entry)]
-              (when (.remove cache cache-key cache-entry)
-                (close-ha-client-cache-entry! cache-entry))))
-          (when-not (.isEmpty cache)
-            (recur)))))
-    (.set ha-client-cache-last-prune-ms 0)))
+  ([]
+   (clear-ha-client-cache! nil))
+  ([m-or-state]
+   (let [cache-state (ha-client-cache-state m-or-state)
+         ^ConcurrentHashMap cache (:cache cache-state)]
+     (.incrementAndGet ^AtomicLong (:prune-generation cache-state))
+     (.set ^AtomicBoolean (:prune-scheduled? cache-state) false)
+     (.set ^AtomicLong (:access-seq cache-state) 0)
+     (.clear ^ConcurrentLinkedDeque (:access-order cache-state))
+     (.set ^AtomicLong (:access-order-size cache-state) 0)
+     (loop []
+       (let [entries (vec (.entrySet cache))]
+         (when (seq entries)
+           (doseq [entry entries]
+             (let [entry ^java.util.Map$Entry entry
+                   cache-key (.getKey entry)
+                   cache-entry (.getValue entry)]
+               (when (.remove cache cache-key cache-entry)
+                 (close-ha-client-cache-entry! cache-entry))))
+           (when-not (.isEmpty cache)
+             (recur)))))
+     (.set ^AtomicLong (:last-prune-ms cache-state) 0))))
+
+(defn- shutdown-ha-executor!
+  [^ExecutorService executor description context]
+  (when executor
+    (try
+      (.shutdown executor)
+      (when-not (.awaitTermination executor 100 TimeUnit/MILLISECONDS)
+        (.shutdownNow executor))
+      (catch InterruptedException e
+        (.interrupt (Thread/currentThread))
+        (.shutdownNow executor)
+        (log/warn e (str "Interrupted while stopping " description) context))
+      (catch Throwable e
+        (log/warn e (str "Failed to stop " description) context)))))
+
+(defn- stop-ha-client-cache-state!
+  [db-name cache-state]
+  (when (and cache-state
+             (not (identical? cache-state default-ha-client-cache-state)))
+    (clear-ha-client-cache! cache-state)
+    (shutdown-ha-executor! (:prune-executor cache-state)
+                           "HA client cache prune executor"
+                           {:db-name db-name})))
+
+(declare ha-probe-executor)
+
+(defn- stop-ha-probe-executor!
+  [db-name executor]
+  (when (and executor
+             (not (identical? executor ha-probe-executor)))
+    (shutdown-ha-executor! executor
+                           "HA probe executor"
+                           {:db-name db-name})))
 
 (defn- ha-client-credentials
   [m]
@@ -1509,7 +1663,7 @@
                :time-out (ha-request-timeout-ms m 5000)}]
           (try
             (with-cached-ha-client
-              uri db-name client-opts
+              m uri db-name client-opts
               (fn [client]
                 (let [watermarks
                       (try
@@ -1588,36 +1742,52 @@
   (AtomicLong. 0))
 
 (defn- new-ha-probe-thread-factory
-  []
-  (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
-    (reify ThreadFactory
-      (newThread [_ runnable]
-        (doto (.newThread delegate runnable)
-          (.setName
-           (str "datalevin-ha-probe-"
-                (.incrementAndGet ha-probe-thread-seq)))
-          (.setDaemon true))))))
+  ([] (new-ha-probe-thread-factory nil))
+  ([label]
+   (let [^ThreadFactory delegate (Executors/defaultThreadFactory)]
+     (reify ThreadFactory
+       (newThread [_ runnable]
+         (doto (.newThread delegate runnable)
+           (.setName
+            (str "datalevin-ha-probe"
+                 (when label (str "-" label))
+                 "-"
+                 (.incrementAndGet ha-probe-thread-seq)))
+           (.setDaemon true)))))))
 
 (defonce ^:private ^ExecutorService ha-probe-executor
   (Executors/newFixedThreadPool
    (int ha-probe-max-threads)
    (new-ha-probe-thread-factory)))
 
+(defn- new-ha-probe-executor
+  [db-name]
+  (Executors/newFixedThreadPool
+   (int ha-probe-max-threads)
+   (new-ha-probe-thread-factory (ha-thread-label db-name))))
+
+(defn- ha-probe-executor-for
+  [m]
+  (or (:ha-probe-executor m)
+      ha-probe-executor))
+
 (defn- ha-parallel-mapv
-  [f coll]
-  (let [items (vec coll)
-        n (count items)]
-    (cond
-      (zero? n)
-      []
+  ([f coll]
+   (ha-parallel-mapv nil f coll))
+  ([m f coll]
+   (let [items (vec coll)
+         n (count items)]
+     (cond
+       (zero? n)
+       []
 
-      (= 1 n)
-      [(f (first items))]
+       (= 1 n)
+       [(f (first items))]
 
-      :else
-      (->> (.invokeAll ha-probe-executor
-                       (mapv (fn [item] #(f item)) items))
-           (mapv #(.get ^Future %))))))
+       :else
+       (->> (.invokeAll ^ExecutorService (ha-probe-executor-for m)
+                        (mapv (fn [item] #(f item)) items))
+            (mapv #(.get ^Future %)))))))
 
 (defn ^:redef fetch-leader-watermark-lsn
   [db-name m lease]
@@ -1652,6 +1822,7 @@
                         distinct
                         vec)
          watermarks (ha-parallel-mapv
+                     m
                      (fn [endpoint]
                        {:endpoint endpoint
                         :watermark
@@ -1699,16 +1870,92 @@
 
 (def ^:private ha-follower-adaptive-batch-assumed-record-bytes 4096)
 (def ^:private ha-follower-adaptive-batch-sample-limit 16)
+(def ^:private ha-follower-adaptive-batch-byte-array-class
+  (class (byte-array 0)))
+(def ^:private ha-follower-adaptive-batch-value-overhead-bytes 16)
+(def ^:private ha-follower-adaptive-batch-record-overhead-bytes 32)
+
+(defn- estimate-ha-follower-value-bytes
+  [value]
+  (cond
+    (nil? value)
+    1
+
+    (string? value)
+    (+ 16 (* 2 (count value)))
+
+    (keyword? value)
+    (let [name-len (count (name value))
+          ns-len (if-let [ns (namespace value)]
+                   (count ns)
+                   0)]
+      (+ 24 (* 2 (+ name-len ns-len))))
+
+    (symbol? value)
+    (let [name-len (count (name value))
+          ns-len (if-let [ns (namespace value)]
+                   (count ns)
+                   0)]
+      (+ 24 (* 2 (+ name-len ns-len))))
+
+    (number? value)
+    8
+
+    (boolean? value)
+    1
+
+    (char? value)
+    2
+
+    (instance? java.util.UUID value)
+    16
+
+    (instance? ha-follower-adaptive-batch-byte-array-class value)
+    (alength ^bytes value)
+
+    (instance? java.nio.ByteBuffer value)
+    (.remaining ^java.nio.ByteBuffer value)
+
+    (map? value)
+    (reduce-kv (fn [^long total k v]
+                 (+ total
+                    (long (estimate-ha-follower-value-bytes k))
+                    (long (estimate-ha-follower-value-bytes v))))
+               32
+               value)
+
+    (vector? value)
+    (reduce (fn [^long total item]
+              (+ total (long (estimate-ha-follower-value-bytes item))))
+            16
+            value)
+
+    (sequential? value)
+    (reduce (fn [^long total item]
+              (+ total (long (estimate-ha-follower-value-bytes item))))
+            16
+            value)
+
+    (coll? value)
+    (reduce (fn [^long total item]
+              (+ total (long (estimate-ha-follower-value-bytes item))))
+            16
+            value)
+
+    :else
+    ha-follower-adaptive-batch-value-overhead-bytes))
 
 (defn- estimate-ha-follower-record-bytes
   [record]
   (if-let [payload-bytes (some-> (:payload-bytes record) long)]
     (long-max2 1 payload-bytes)
-    (let [payload (select-keys record [:lsn :ha-term :rows :ops])]
-      (try
-        (alength ^bytes (b/serialize payload))
-        (catch Throwable _
-          (long (count (pr-str payload))))))))
+    (long-max2
+     1
+     (+ ha-follower-adaptive-batch-record-overhead-bytes
+        (long (estimate-ha-follower-value-bytes (:lsn record)))
+        (long (estimate-ha-follower-value-bytes (:ha-term record)))
+        (long (estimate-ha-follower-value-bytes (:rows record)))
+        (long (estimate-ha-follower-value-bytes (:ops record)))))))
 
 (defn- estimate-ha-follower-batch-bytes
   [records]
@@ -1922,6 +2169,7 @@
               vec)
          followers
          (ha-parallel-mapv
+          m
           (fn [{:keys [endpoint node-id]}]
             (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
                              db-name m endpoint)
@@ -2197,7 +2445,7 @@
           {:pool-size 1
            :time-out (ha-request-timeout-ms m 10000)}]
       (with-cached-ha-client
-        uri db-name client-opts
+        m uri db-name client-opts
         (fn [client]
           (ha-client-request
            client
@@ -2415,7 +2663,7 @@
           {:pool-size 1
            :time-out (ha-request-timeout-ms m 10000)}]
       (with-cached-ha-client
-        uri db-name client-opts
+        m uri db-name client-opts
         (fn [client]
           (ha-client-request
            client
@@ -2437,7 +2685,7 @@
                                      (long (or (:ha-lease-renew-ms m)
                                                c/*ha-lease-renew-ms*)))))}]
       (with-cached-ha-client
-        uri db-name client-opts
+        m uri db-name client-opts
         (fn [client]
           (ha-client-request
            client
@@ -3534,18 +3782,18 @@
               (:ha-authority-membership-hash m)))
     m
 
+    (true? (:ha-clock-skew-paused? m))
+    (assoc m
+           :ha-promotion-last-failure :clock-skew-paused
+           :ha-promotion-failure-details
+           (ha-clock-skew-promotion-failure-details m))
+
     (true? (:ha-follower-degraded? m))
     (assoc m
            :ha-promotion-last-failure :follower-degraded
            :ha-promotion-failure-details
            {:reason (:ha-follower-degraded-reason m)
             :details (:ha-follower-degraded-details m)})
-
-    (true? (:ha-clock-skew-paused? m))
-    (assoc m
-           :ha-promotion-last-failure :clock-skew-paused
-           :ha-promotion-failure-details
-           (ha-clock-skew-promotion-failure-details m))
 
     (true? (:ha-rejoin-promotion-blocked? m))
     (assoc m
@@ -3949,6 +4197,7 @@
           :ha-last-authority-refresh-ms
           :ha-authority-read-ok?
           :ha-authority-read-error
+          :ha-client-cache-state
           :ha-clock-skew-paused?
           :ha-clock-skew-last-check-ms
           :ha-clock-skew-last-observed-ms
@@ -3983,6 +4232,7 @@
           :ha-rejoin-promotion-blocked-until-ms
           :ha-rejoin-promotion-cleared-ms
           :ha-rejoin-started-at-ms
+          :ha-probe-executor
           :ha-renew-loop-running?
           :ha-follower-loop-running?))
 
@@ -4239,6 +4489,8 @@
         fencing-hook (:ha-fencing-hook ha-opts)
         clock-skew-hook (:ha-clock-skew-hook ha-opts)
         local-endpoint (local-ha-endpoint ha-opts)
+        client-cache-state (new-ha-client-cache-state db-name)
+        probe-executor (new-ha-probe-executor db-name)
         authority (ctrl/new-authority cp)]
     (try
       (ctrl/start-authority! authority)
@@ -4307,6 +4559,7 @@
                  :ha-authority-membership-hash (:membership-hash init-result)
                  :ha-db-identity-mismatch? false
                  :ha-membership-mismatch? false
+                 :ha-client-cache-state client-cache-state
                  :ha-members members
                  :ha-members-sorted ordered-members
                  :ha-node-id node-id
@@ -4340,6 +4593,7 @@
                  :ha-last-authority-refresh-ms observed-at-ms
                  :ha-leader-fencing-pending? false
                  :ha-leader-fencing-last-error nil
+                 :ha-probe-executor probe-executor
                  :ha-rejoin-promotion-blocked? rejoin-promotion-blocked?
                  :ha-rejoin-promotion-blocked-until-ms
                  rejoin-promotion-blocked-until-ms
@@ -4356,12 +4610,18 @@
           (catch Exception stop-e
             (log/warn stop-e "Failed to stop HA authority after startup failure"
                       {:db-name db-name})))
+        (stop-ha-client-cache-state! db-name client-cache-state)
+        (stop-ha-probe-executor! db-name probe-executor)
         (throw e)))))
 
 (defn stop-ha-authority
   [db-name m]
-  (when-let [authority (:ha-authority m)]
-    (try
-      (ctrl/stop-authority! authority)
-      (catch Exception e
-        (log/warn e "Failed to stop HA authority" {:db-name db-name})))))
+  (try
+    (when-let [authority (:ha-authority m)]
+      (try
+        (ctrl/stop-authority! authority)
+        (catch Exception e
+          (log/warn e "Failed to stop HA authority" {:db-name db-name}))))
+    (finally
+      (stop-ha-client-cache-state! db-name (:ha-client-cache-state m))
+      (stop-ha-probe-executor! db-name (:ha-probe-executor m)))))

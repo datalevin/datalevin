@@ -309,6 +309,27 @@
         (dc/shutdown-transact-async-executor!)
         (d/close conn)))))
 
+(deftest test-transact-async-callback-exception-does-not-stall-result
+  (let [conn (d/create-conn nil
+                            {:k {:db/valueType :db.type/long}}
+                            {:wal? true
+                             :wal-durability-profile :strict
+                             :kv-opts {:inmemory? true}})
+        fut  (d/transact-async conn
+                               [{:db/id 1 :k 1}]
+                               nil
+                               (fn [_]
+                                 (throw (ex-info "callback failed" {}))))]
+    (try
+      (is (not= ::timeout (deref fut 2000 ::timeout)))
+      (is (= 1
+             (d/q '[:find (count ?e) .
+                    :where [?e :k]]
+                  (d/db conn))))
+      (finally
+        (dc/shutdown-transact-async-executor!)
+        (d/close conn)))))
+
 (defn- wait-until
   [pred timeout-ms]
   (let [^long timeout-ms timeout-ms]

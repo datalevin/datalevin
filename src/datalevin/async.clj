@@ -10,11 +10,14 @@
 (ns ^:no-doc datalevin.async
   "Asynchronous work mechanism that does adaptive batch processing - the higher
   the load, the bigger the batch"
+  (:require
+   [taoensso.timbre :as log])
   (:import
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors ExecutorService LinkedBlockingQueue
     ConcurrentLinkedQueue ConcurrentHashMap Callable TimeUnit
-    ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy]
+    ThreadPoolExecutor ArrayBlockingQueue ThreadPoolExecutor$CallerRunsPolicy
+    Semaphore]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defprotocol IAsyncWork
@@ -40,11 +43,46 @@
                     ^FastList stage ; for combining work
                     ])
 
+(def ^:private async-backlog-factor
+  64)
+
+(def ^:private async-min-backlog
+  256)
+
+(defn- async-backlog-capacity
+  ([] (async-backlog-capacity (.availableProcessors (Runtime/getRuntime))))
+  ([^long threads]
+   (long
+     (Math/max (long async-min-backlog)
+               (long (* (long async-backlog-factor) threads))))))
+
 (defn- do-work*
   [work]
   (try [:ok (do-work work)]
-       (catch Exception e
+       (catch Throwable e
          [:err e])))
+
+(defn ^:no-doc new-backlog-semaphore
+  []
+  ;; Bound queued work so overloaded producers block instead of letting
+  ;; promises/work items accumulate until the process runs out of heap.
+  (Semaphore. (int (async-backlog-capacity)) true))
+
+(defn- run-callback!
+  [cb payload]
+  (when cb
+    (try
+      (cb payload)
+      (catch Throwable e
+        (log/warn e "Async callback failed")))))
+
+(defn- finalize-work-item!
+  [^WorkItem item res ^Semaphore backlog]
+  (try
+    (when-let [p (.-promise item)]
+      (deliver p res))
+    (finally
+      (.release backlog))))
 
 (deftype AsyncResult [p]
   clojure.lang.IDeref
@@ -66,21 +104,20 @@
   (isRealized [_] (realized? p)))
 
 (defn- individual-work
-  [^ConcurrentLinkedQueue items]
+  [^ConcurrentLinkedQueue items ^Semaphore backlog]
   (loop []
     (when (.peek items)
       (let [^WorkItem item (.poll items)
             res            (do-work* (.-work item))
             [status payload] res
             cb             (.-cb item)]
-        (when (and cb (identical? status :ok))
-          (cb payload))
-        (when-let [p (.-promise item)]
-          (deliver p res)))
+        (finalize-work-item! item res backlog)
+        (when (identical? status :ok)
+          (run-callback! cb payload)))
       (recur))))
 
 (defn- combined-work
-  [cmb ^ConcurrentLinkedQueue items ^FastList stage]
+  [cmb ^ConcurrentLinkedQueue items ^FastList stage ^Semaphore backlog]
   (.clear stage)
   (loop []
     (when (.peek items)
@@ -90,22 +127,20 @@
   (let [res              (do-work* (cmb (mapv #(.-work ^WorkItem %) stage)))
         [status payload] res]
     (dotimes [i (.size stage)]
-      (let [^WorkItem item (.get stage i)
-            cb             (.-cb item)]
-        (when (and cb (identical? status :ok))
-          (cb payload))
-        (when-let [p (.-promise item)]
-          (deliver p res))))))
+      (finalize-work-item! ^WorkItem (.get stage i) res backlog))
+    (when (identical? status :ok)
+      (dotimes [i (.size stage)]
+        (run-callback! (.-cb ^WorkItem (.get stage i)) payload)))))
 
 (defn- event-handler
-  [^ConcurrentHashMap work-queues k]
+  [^ConcurrentHashMap work-queues k ^Semaphore backlog]
   (let [^WorkQueue wq                (.get work-queues k)
         ^ConcurrentLinkedQueue items (.-items wq)
         first-work                   (.-fw wq)]
     (locking items
       (if-let [cmb (combine first-work)]
-        (combined-work cmb items (.-stage wq))
-        (individual-work items)))))
+        (combined-work cmb items (.-stage wq) backlog)
+        (individual-work items backlog)))))
 
 (defn- new-workqueue
   [work]
@@ -116,18 +151,24 @@
 (defn- enqueue-work!
   [^ConcurrentHashMap work-queues
    ^LinkedBlockingQueue event-queue
+   ^Semaphore backlog
    work
    p
    cb]
   (let [k  (work-key work)]
     (assert (keyword? k) "work-key should return a keyword")
     (assert (or (nil? cb) (ifn? cb)) "callback should be nil or a function")
-    (.putIfAbsent work-queues k (new-workqueue work))
-    (let [item                     (->WorkItem work p cb)
-          ^WorkQueue wq            (.get work-queues k)
-          ^ConcurrentLinkedQueue q (.-items wq)]
-      (.offer q item)
-      (.offer event-queue k))))
+    (.acquire backlog)
+    (try
+      (.putIfAbsent work-queues k (new-workqueue work))
+      (let [item                     (->WorkItem work p cb)
+            ^WorkQueue wq            (.get work-queues k)
+            ^ConcurrentLinkedQueue q (.-items wq)]
+        (.offer q item)
+        (.offer event-queue k))
+      (catch Throwable e
+        (.release backlog)
+        (throw e)))))
 
 (defprotocol IAsyncExecutor
   (start [_] "Start the async event loop")
@@ -139,7 +180,8 @@
                         ^ExecutorService workers
                         ^LinkedBlockingQueue event-queue
                         ^ConcurrentHashMap work-queues ; work-key -> WorkQueue
-                        ^AtomicBoolean running]
+                        ^AtomicBoolean running
+                        ^Semaphore backlog]
   IAsyncExecutor
   (start [_]
     (letfn [(event-loop []
@@ -148,7 +190,7 @@
                   (when-not (.contains event-queue k) ; do nothing when busy
                     (when (.get running)
                       (.submit workers
-                               ^Callable #(event-handler work-queues k)))))
+                               ^Callable #(event-handler work-queues k backlog)))))
                 (recur)))
             (init []
               (try (event-loop)
@@ -170,7 +212,7 @@
   (exec [_ work]
     (let [p  (promise)
           cb (callback work)]
-      (enqueue-work! work-queues event-queue work p cb)
+      (enqueue-work! work-queues event-queue backlog work p cb)
       (->AsyncResult p))))
 
 (defn- async-worker-pool
@@ -187,7 +229,8 @@
                    (async-worker-pool)
                    (LinkedBlockingQueue.)
                    (ConcurrentHashMap.)
-                   (AtomicBoolean. false)))
+                   (AtomicBoolean. false)
+                   (new-backlog-semaphore)))
 
 (defonce executor-atom (atom nil))
 
@@ -214,7 +257,7 @@
   (if (instance? AsyncExecutor executor)
     (let [^AsyncExecutor e executor
           cb             (callback work)]
-      (enqueue-work! (.-work-queues e) (.-event-queue e) work nil cb)
+      (enqueue-work! (.-work-queues e) (.-event-queue e) (.-backlog e) work nil cb)
       nil)
     (do
       (exec executor work)

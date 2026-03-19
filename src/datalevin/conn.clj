@@ -513,7 +513,8 @@
                                     workers
                                     (LinkedBlockingQueue.)
                                     (ConcurrentHashMap.)
-                                    (AtomicBoolean. false))]
+                                    (AtomicBoolean. false)
+                                    (a/new-backlog-semaphore))]
     (a/start executor)
     executor))
 
