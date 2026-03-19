@@ -1641,47 +1641,51 @@
         (assoc :reason :leader-watermark-fetch-failed)))))
 
 (defn- highest-reachable-ha-member-watermark
-  [db-name m]
-  (let [local-endpoint (:ha-local-endpoint m)
-        endpoints (->> (concat [local-endpoint]
-                               (map :endpoint (:ha-members m)))
-                       (filter #(and (string? %)
-                                     (not (s/blank? %))))
-                       distinct
-                       vec)
-        watermarks (ha-parallel-mapv
-                    (fn [endpoint]
-                      {:endpoint endpoint
-                       :watermark
-                       (safe-fetch-ha-endpoint-watermark-lsn
-                        db-name m endpoint)})
-                    endpoints)]
-    (reduce (fn [best {:keys [endpoint watermark]}]
-              (if-not (:reachable? watermark)
-                best
-                (let [last-applied-lsn
-                      (long (or (:last-applied-lsn watermark) 0))
-                      candidate {:endpoint endpoint
-                                 :last-applied-lsn last-applied-lsn
-                                 :watermark watermark}]
-                  (cond
-                    (nil? best)
-                    candidate
+  ([db-name m]
+   (highest-reachable-ha-member-watermark db-name m {}))
+  ([db-name m prefetched-watermarks]
+   (let [local-endpoint (:ha-local-endpoint m)
+         endpoints (->> (concat [local-endpoint]
+                                (map :endpoint (:ha-members m)))
+                        (filter #(and (string? %)
+                                      (not (s/blank? %))))
+                        distinct
+                        vec)
+         watermarks (ha-parallel-mapv
+                     (fn [endpoint]
+                       {:endpoint endpoint
+                        :watermark
+                        (if (contains? prefetched-watermarks endpoint)
+                          (get prefetched-watermarks endpoint)
+                          (safe-fetch-ha-endpoint-watermark-lsn
+                           db-name m endpoint))})
+                     endpoints)]
+     (reduce (fn [best {:keys [endpoint watermark]}]
+               (if-not (:reachable? watermark)
+                 best
+                 (let [last-applied-lsn
+                       (long (or (:last-applied-lsn watermark) 0))
+                       candidate {:endpoint endpoint
+                                  :last-applied-lsn last-applied-lsn
+                                  :watermark watermark}]
+                   (cond
+                     (nil? best)
+                     candidate
 
-                    (> last-applied-lsn
-                       (long (:last-applied-lsn best)))
-                    candidate
+                     (> last-applied-lsn
+                        (long (:last-applied-lsn best)))
+                     candidate
 
-                    (and (= last-applied-lsn
-                            (long (:last-applied-lsn best)))
-                         (= endpoint local-endpoint)
-                         (not= endpoint (:endpoint best)))
-                    candidate
+                     (and (= last-applied-lsn
+                             (long (:last-applied-lsn best)))
+                          (= endpoint local-endpoint)
+                          (not= endpoint (:endpoint best)))
+                     candidate
 
-                    :else
-                    best))))
-            nil
-            watermarks)))
+                     :else
+                     best))))
+             nil
+             watermarks))))
 
 (defn- ha-follower-max-batch-records
   [m]
@@ -1725,6 +1729,14 @@
                                                  (/ (double sample-bytes)
                                                     (double sample-count)))))]
           (long (* avg-record-bytes (long (count records)))))))))
+
+(defn- summarize-ha-follower-batch-record
+  [record]
+  (cond-> {:lsn (long (:lsn record))
+           :row-count (count (:rows record))
+           :op-count (count (:ops record))}
+    (some? (:payload-bytes record))
+    (assoc :payload-bytes (long (:payload-bytes record)))))
 
 (defn- ha-follower-request-batch-records
   [m]
@@ -2743,7 +2755,7 @@
                          requested-batch-records
                          :ha-follower-last-batch-records
                          (when (seq records)
-                           (mapv #(select-keys % [:lsn :rows :ops])
+                           (mapv summarize-ha-follower-batch-record
                                  records))
                          :ha-follower-last-batch-estimated-bytes
                          (or batch-estimated-bytes
@@ -3040,7 +3052,12 @@
         (when (or (not reachable?)
                   (and lease-expired?
                        (< leader-lsn authority-lsn)))
-          (highest-reachable-ha-member-watermark db-name m))
+          (highest-reachable-ha-member-watermark
+           db-name
+           m
+           (cond-> {}
+             (string? (:leader-endpoint lease))
+             (assoc (:leader-endpoint lease) leader-watermark))))
         reachable-member-lsn
         (when reachable-member-watermark
           (long (or (:last-applied-lsn reachable-member-watermark) 0)))
