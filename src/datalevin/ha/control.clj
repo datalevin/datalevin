@@ -1044,7 +1044,7 @@
     {:node node
      :rpc-client rpc-client}))
 
-(declare authority-diagnostics)
+(declare authority-diagnostics submit-command!)
 
 (defn- await-linearizable-read!
   [{:keys [operation-timeout-ms] :as authority}]
@@ -1094,6 +1094,15 @@
                            {:error :ha/control-read-failed
                             :status (status-data ^Status status)
                             :authority (authority-diagnostics authority)}))))))))))
+
+(defn ^:redef await-read-state-barrier!
+  [authority]
+  (await-linearizable-read! authority))
+
+(defn ^:redef submit-read-state-command!
+  [authority db-identity]
+  (submit-command! authority {:op :read-state
+                              :db-identity db-identity}))
 
 (defn- forward-request-processor
   [authority]
@@ -1728,7 +1737,9 @@
 
   For the SOFAJRaft backend this uses a linearizable readIndex barrier and then
   serves the snapshot from the local FSM state, avoiding a replicated command
-  on every steady-state HA renew cycle."
+  on every steady-state HA renew cycle. If readIndex itself times out, fall
+  back to the replicated command path so renew/startup callers do not stall on
+  a hot-path control read."
   [authority db-identity]
   (require-non-blank-string! db-identity :db-identity)
   (cond
@@ -1748,14 +1759,25 @@
     (let [{:keys [group-id running-v fsm-state]} authority]
       (ensure-running! running-v)
       (lease/lease-key group-id db-identity)
-      (await-linearizable-read! authority)
-      (let [snapshot @fsm-state
-            {:keys [lease version]} (lease-entry snapshot db-identity)]
-        {:lease lease
-         :version version
-         :authority-now-ms (long (control-now-ms))
-         :membership-hash (:membership-hash snapshot)
-         :voters (:voters snapshot)}))
+      (try
+        (await-read-state-barrier! authority)
+        (let [snapshot @fsm-state
+              {:keys [lease version]} (lease-entry snapshot db-identity)]
+          {:lease lease
+           :version version
+           :authority-now-ms (long (control-now-ms))
+           :membership-hash (:membership-hash snapshot)
+           :voters (:voters snapshot)})
+        (catch clojure.lang.ExceptionInfo e
+          (let [{:keys [error where]} (ex-data e)]
+            (if (and (= :ha/control-timeout error)
+                     (= :read-index where))
+              (do
+                (log/warn e "HA control readIndex timed out; falling back to replicated read-state command"
+                          {:group-id group-id
+                           :db-identity db-identity})
+                (submit-read-state-command! authority db-identity))
+              (throw e))))))
 
     (satisfies? ILeaseAuthority authority)
     (let [{:keys [lease version]} (read-lease authority db-identity)]
@@ -1781,8 +1803,7 @@
     (let [{:keys [group-id running-v]} authority]
       (ensure-running! running-v)
       (lease/lease-key group-id db-identity)
-      (submit-command! authority {:op :read-state
-                                  :db-identity db-identity}))
+      (submit-read-state-command! authority db-identity))
     (read-state authority db-identity)))
 
 (defn new-in-memory-authority
