@@ -48,6 +48,19 @@
        (require-non-blank-string group-id :group-id)
        membership-hash-suffix))
 
+(defn validate-lease-key!
+  "Validate the canonical lease-key inputs without constructing the key."
+  [group-id db-identity]
+  (require-non-blank-string group-id :group-id)
+  (require-non-blank-string db-identity :db-identity)
+  nil)
+
+(defn validate-membership-hash-key!
+  "Validate the canonical membership-hash-key inputs without constructing the key."
+  [group-id]
+  (require-non-blank-string group-id :group-id)
+  nil)
+
 (defn observed-term
   "Get observed authoritative term from a lease record, defaulting to 0."
   [observed-lease]

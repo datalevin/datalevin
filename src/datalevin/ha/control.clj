@@ -293,7 +293,7 @@
 
   (read-lease [this db-identity]
     (ensure-running! running-v)
-    (lease/lease-key group-id db-identity)
+    (lease/validate-lease-key! group-id db-identity)
     (let [{:keys [lease version]} (lease-entry @state db-identity)]
       {:lease lease
        :version version}))
@@ -360,7 +360,7 @@
   (init-membership-hash! [_ membership-hash]
     (ensure-running! running-v)
     (require-non-blank-string! membership-hash :membership-hash)
-    (lease/membership-hash-key group-id)
+    (lease/validate-membership-hash-key! group-id)
     (commit-state-transition!
      state
      (fn [s]
@@ -1219,12 +1219,14 @@
 (defn- submit-command!
   [{:keys [rpc-timeout-ms operation-timeout-ms] :as authority}
    {:keys [timeout-ms] :as cmd}]
-  (let [deadline (+ (long (System/currentTimeMillis))
+  (let [start-ms (long (System/currentTimeMillis))
+        deadline (+ start-ms
                     (long (command-operation-timeout-ms
                            operation-timeout-ms
                            timeout-ms)))]
-    (loop [attempt 0]
-      (let [remaining (- deadline (long (System/currentTimeMillis)))]
+    (loop [attempt 0
+           now-ms  start-ms]
+      (let [remaining (- deadline now-ms)]
         (when (<= remaining 0)
           (u/raise "HA control command timed out"
                    {:error :ha/control-timeout
@@ -1247,7 +1249,8 @@
 
                 (#{:not-leader :timeout} (:error local-res))
                 (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                    (recur (inc attempt)))
+                    (recur (inc attempt)
+                           (long (System/currentTimeMillis))))
 
                 :else
                 (u/raise "HA control local apply failed"
@@ -1285,11 +1288,13 @@
                 (cond
                   (= ::invoke-failed response)
                   (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                      (recur (inc attempt)))
+                      (recur (inc attempt)
+                             (long (System/currentTimeMillis))))
 
                   (not (instance? RpcRequests$ErrorResponse response))
                   (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                      (recur (inc attempt)))
+                      (recur (inc attempt)
+                             (long (System/currentTimeMillis))))
 
                   :else
                   (let [^RpcRequests$ErrorResponse response-msg response
@@ -1303,7 +1308,8 @@
                       (not= forward-response-code
                             (.getErrorCode response-msg))
                       (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                          (recur (inc attempt)))
+                          (recur (inc attempt)
+                                 (long (System/currentTimeMillis))))
 
                       (:ok? payload)
                       (:result payload)
@@ -1311,7 +1317,8 @@
                       (contains? #{:not-leader :apply-timeout :node-unavailable}
                                  (:error payload))
                       (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                          (recur (inc attempt)))
+                          (recur (inc attempt)
+                                 (long (System/currentTimeMillis))))
 
                       :else
                       (u/raise "HA control forward response failed"
@@ -1319,7 +1326,8 @@
                                 :attempt attempt
                                 :payload payload})))))
               (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
-                  (recur (inc attempt))))))))))
+                  (recur (inc attempt)
+                         (long (System/currentTimeMillis)))))))))))
 
 (defn- new-jraft-fsm
   [state-atom]
@@ -1521,7 +1529,7 @@
   (read-lease [this db-identity]
     (ensure-running! running-v)
     (require-non-blank-string! db-identity :db-identity)
-    (lease/lease-key group-id db-identity)
+    (lease/validate-lease-key! group-id db-identity)
     (await-linearizable-read! this)
     (let [{:keys [lease version]} (lease-entry @fsm-state db-identity)]
       {:lease lease
@@ -1529,26 +1537,26 @@
 
   (try-acquire-lease [this req]
     (ensure-running! running-v)
-    (lease/lease-key group-id (:db-identity req))
+    (lease/validate-lease-key! group-id (:db-identity req))
     (submit-command! this {:op :try-acquire-lease
                            :req req}))
 
   (renew-lease [this req]
     (ensure-running! running-v)
-    (lease/lease-key group-id (:db-identity req))
+    (lease/validate-lease-key! group-id (:db-identity req))
     (submit-command! this {:op :renew-lease
                            :timeout-ms (:timeout-ms req)
                            :req req}))
 
   (read-membership-hash [this]
     (ensure-running! running-v)
-    (lease/membership-hash-key group-id)
+    (lease/validate-membership-hash-key! group-id)
     (await-linearizable-read! this)
     (:membership-hash @fsm-state))
 
   (init-membership-hash! [this membership-hash]
     (ensure-running! running-v)
-    (lease/membership-hash-key group-id)
+    (lease/validate-membership-hash-key! group-id)
     (submit-command! this {:op :init-membership-hash
                            :membership-hash membership-hash}))
 
@@ -1746,7 +1754,7 @@
     (instance? InMemoryLeaseAuthority authority)
     (let [{:keys [group-id state running-v]} authority]
       (ensure-running! running-v)
-      (lease/lease-key group-id db-identity)
+      (lease/validate-lease-key! group-id db-identity)
     (let [snapshot @state
           {:keys [lease version]} (lease-entry snapshot db-identity)]
       {:lease lease
@@ -1758,7 +1766,7 @@
     (instance? SofaJraftLeaseAuthority authority)
     (let [{:keys [group-id running-v fsm-state]} authority]
       (ensure-running! running-v)
-      (lease/lease-key group-id db-identity)
+      (lease/validate-lease-key! group-id db-identity)
       (try
         (await-read-state-barrier! authority)
         (let [snapshot @fsm-state
@@ -1802,14 +1810,14 @@
   (if (instance? SofaJraftLeaseAuthority authority)
     (let [{:keys [group-id running-v]} authority]
       (ensure-running! running-v)
-      (lease/lease-key group-id db-identity)
+      (lease/validate-lease-key! group-id db-identity)
       (submit-read-state-command! authority db-identity))
     (read-state authority db-identity)))
 
 (defn new-in-memory-authority
   "Create an in-memory authority adapter for deterministic tests."
   [{:keys [group-id voters clock-skew-budget-ms scope-id]}]
-  (lease/membership-hash-key group-id)
+  (lease/validate-membership-hash-key! group-id)
   (let [initial-voters (if (seq voters)
                          (validated-peer-ids! voters :ha-control-plane-voters)
                          [])
@@ -1828,7 +1836,7 @@
   [{:keys [group-id local-peer-id voters rpc-timeout-ms
            election-timeout-ms operation-timeout-ms
            raft-dir clock-skew-budget-ms]}]
-  (lease/membership-hash-key group-id)
+  (lease/validate-membership-hash-key! group-id)
   (let [rpc-timeout-ms       (long (or rpc-timeout-ms
                                        default-rpc-timeout-ms))
         election-timeout-ms  (long (or election-timeout-ms
