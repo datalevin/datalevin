@@ -83,6 +83,33 @@
   []
   (System/currentTimeMillis))
 
+(def ^:dynamic *in-memory-cas-timeout-ms*
+  5000)
+
+(def ^:private max-in-memory-cas-backoff-ms
+  10)
+
+(defn ^:redef in-memory-cas-now-ms
+  []
+  (System/currentTimeMillis))
+
+(defn ^:redef commit-state-compare-and-set!
+  [state-atom old-state new-state]
+  (compare-and-set! state-atom old-state new-state))
+
+(defn- in-memory-cas-backoff-ms ^long
+  [attempt]
+  (let [attempt (max 0 (int attempt))
+        delay-ms (bit-shift-left 1 (min attempt 3))
+        max-backoff-ms (long max-in-memory-cas-backoff-ms)]
+    (if (> (long delay-ms) max-backoff-ms)
+      max-backoff-ms
+      (long delay-ms))))
+
+(defn ^:redef sleep-in-memory-cas-retry!
+  [attempt]
+  (Thread/sleep (long (in-memory-cas-backoff-ms attempt))))
+
 (defonce ^:private in-memory-groups
   (atom {}))
 
@@ -249,6 +276,15 @@
                    (validate-clock-skew-budget! :clock-skew-budget-ms)
                    long))))
 
+(defn ^:redef authoritative-command
+  [authority cmd]
+  (stamp-lease-command cmd (:clock-skew-budget-ms authority)))
+
+(defn- require-authority-now-ms
+  [authority-now-ms]
+  (require-integer! authority-now-ms :authority-now-ms)
+  (long authority-now-ms))
+
 (defn- lease-entry
   [state db-identity]
   (get-in state [:leases db-identity] {:lease nil :version 0}))
@@ -265,12 +301,20 @@
 
 (defn- commit-state-transition!
   [state-atom transition-fn]
-  (loop []
+  (let [timeout-ms (long (max 1 (long *in-memory-cas-timeout-ms*)))
+        deadline   (+ (long (in-memory-cas-now-ms)) timeout-ms)]
+    (loop [attempt 0]
     (let [old-state @state-atom
           {:keys [state result]} (transition-fn old-state)]
-      (if (compare-and-set! state-atom old-state state)
+      (if (commit-state-compare-and-set! state-atom old-state state)
         result
-        (recur)))))
+        (let [attempt (unchecked-inc-int attempt)]
+          (when (>= (long (in-memory-cas-now-ms)) deadline)
+            (u/raise "HA in-memory control CAS contention timed out"
+                     {:error :ha/control-cas-timeout
+                      :attempt attempt}))
+          (sleep-in-memory-cas-retry! (dec attempt))
+          (recur attempt)))))))
 
 (declare apply-state-command!)
 
@@ -404,11 +448,12 @@
    authority-now-ms
    clock-skew-budget-ms]
   (validate-acquire-request! req)
-  (let [skew-result (authority-clock-skew-result
+  (let [authority-now-ms (require-authority-now-ms authority-now-ms)
+        skew-result (authority-clock-skew-result
                      now-ms
                      authority-now-ms
                      clock-skew-budget-ms)
-        effective-now-ms (long (or authority-now-ms now-ms))
+        effective-now-ms authority-now-ms
         {:keys [lease version]} (lease-entry state db-identity)
         observed-version (long (or observed-version 0))
         current-version (long version)]
@@ -481,11 +526,12 @@
    authority-now-ms
    clock-skew-budget-ms]
   (validate-renew-request! req)
-  (let [skew-result (authority-clock-skew-result
+  (let [authority-now-ms (require-authority-now-ms authority-now-ms)
+        skew-result (authority-clock-skew-result
                      now-ms
                      authority-now-ms
                      clock-skew-budget-ms)
-        effective-now-ms (long (or authority-now-ms now-ms))
+        effective-now-ms authority-now-ms
         {:keys [lease version]} (lease-entry state db-identity)
         current-version (long version)]
     (cond
@@ -1044,6 +1090,10 @@
     {:node node
      :rpc-client rpc-client}))
 
+(defn- authority-fsm-snapshot
+  [{:keys [fsm-state]}]
+  (some-> fsm-state deref))
+
 (declare authority-diagnostics submit-command!)
 
 (defn- await-linearizable-read!
@@ -1064,8 +1114,19 @@
                 invoked?   (try
                              (.readIndex node (byte-array 0)
                                          (proxy [ReadIndexClosure] []
-                                           (run [^Status status _index _request-ctx]
-                                             (deliver status-p status))))
+                                           (run
+                                             ([^Status status]
+                                              (deliver status-p
+                                                       {:status status
+                                                        :snapshot
+                                                        (authority-fsm-snapshot
+                                                         authority)}))
+                                             ([^Status status _index _request-ctx]
+                                              (deliver status-p
+                                                       {:status status
+                                                        :snapshot
+                                                        (authority-fsm-snapshot
+                                                         authority)})))))
                              true
                              (catch Exception e
                                (log/warn e "HA control readIndex invocation failed")
@@ -1073,17 +1134,18 @@
             (if-not invoked?
               (do (Thread/sleep 20)
                   (recur (inc attempt)))
-              (let [status (deref status-p timeout-ms ::timeout)]
+              (let [result (deref status-p timeout-ms ::timeout)
+                    status (:status result)]
                 (cond
-                  (= ::timeout status)
+                  (= ::timeout result)
                   (if (and (single-voter-authority? authority)
                            (.isLeader node))
-                    true
+                    (authority-fsm-snapshot authority)
                     (do (Thread/sleep 20)
                         (recur (inc attempt))))
 
                   (.isOk ^Status status)
-                  true
+                  (:snapshot result)
 
                   (retryable-read-status? ^Status status)
                   (do (Thread/sleep 20)
@@ -1096,6 +1158,10 @@
                             :authority (authority-diagnostics authority)}))))))))))
 
 (defn ^:redef await-read-state-barrier!
+  [authority]
+  (await-linearizable-read! authority))
+
+(defn ^:redef linearizable-read-snapshot!
   [authority]
   (await-linearizable-read! authority))
 
@@ -1133,7 +1199,9 @@
                                          :apply-command))]
                             (case op
                               :apply-command
-                              (let [cmd (:command payload)
+                              (let [cmd (authoritative-command
+                                         authority
+                                         (:command payload))
                                     res (apply-local-command-once!
                                          node cmd
                                          (:operation-timeout-ms authority))]
@@ -1235,9 +1303,7 @@
         (let [{:keys [^Node node ^RpcClient rpc-client]}
               (running-runtime! authority)]
           (if (.isLeader node)
-            (let [cmd (stamp-lease-command
-                       cmd
-                       (:clock-skew-budget-ms authority))
+            (let [cmd (authoritative-command authority cmd)
                   local-timeout (command-attempt-timeout-ms
                                  remaining
                                  rpc-timeout-ms)
@@ -1333,11 +1399,9 @@
   [state-atom]
   (proxy [StateMachineAdapter] []
     (onApply [^Iterator iter]
-      ;; Apply the batch against a local state snapshot so callbacks are only
-      ;; resolved after the whole batch commits successfully.
-      (loop [state         @state-atom
-             pending       []
-             applied-count (long 0)]
+      ;; Apply and commit each log entry in order so the authoritative state
+      ;; and closure outcomes track JRaft's committed-prefix semantics.
+      (loop [state @state-atom]
         (if (.hasNext iter)
           (let [^ByteBuffer data (.getData iter)
                 done           (.done iter)
@@ -1346,31 +1410,23 @@
                                        {:keys [state result]}
                                        (apply-state-command state cmd)]
                                    {:state state
-                                    :pending (cond-> pending
-                                               (instance? CommandClosure done)
-                                               (conj [done result]))
-                                    :applied-count (unchecked-inc ^long applied-count)})
+                                    :result result})
                                  (catch Exception e
                                    {:error e}))]
             (if-let [e (:error step)]
               (let [status (fsm-apply-error-status e)]
                 (log/error e "HA control JRaft FSM apply failed")
-                (doseq [[^CommandClosure pending-done _] pending]
-                  (run-command-closure! pending-done status))
-                (when (instance? CommandClosure done)
-                  (run-command-closure! ^CommandClosure done status))
-                (.setErrorAndRollback iter
-                                      (long (max 1 (long applied-count)))
-                                      status))
+                (.setErrorAndRollback iter 1 status))
               (do
+                (reset! state-atom (:state step))
+                (.commit iter)
+                (when (instance? CommandClosure done)
+                  (run-command-closure! done
+                                        (:result step)
+                                        (Status/OK)))
                 (.next iter)
-                (recur (:state step)
-                       (:pending step)
-                       (long (:applied-count step))))))
-          (do
-            (reset! state-atom state)
-            (doseq [[^CommandClosure done result] pending]
-              (run-command-closure! done result (Status/OK)))))))
+                (recur (:state step)))))
+          nil)))
 
     (onSnapshotSave [^SnapshotWriter writer done]
       (try
@@ -1530,8 +1586,9 @@
     (ensure-running! running-v)
     (require-non-blank-string! db-identity :db-identity)
     (lease/validate-lease-key! group-id db-identity)
-    (await-linearizable-read! this)
-    (let [{:keys [lease version]} (lease-entry @fsm-state db-identity)]
+    (let [snapshot (or (linearizable-read-snapshot! this)
+                       (authority-fsm-snapshot this))
+          {:keys [lease version]} (lease-entry snapshot db-identity)]
       {:lease lease
        :version version}))
 
@@ -1551,8 +1608,8 @@
   (read-membership-hash [this]
     (ensure-running! running-v)
     (lease/validate-membership-hash-key! group-id)
-    (await-linearizable-read! this)
-    (:membership-hash @fsm-state))
+    (:membership-hash (or (linearizable-read-snapshot! this)
+                          (authority-fsm-snapshot this))))
 
   (init-membership-hash! [this membership-hash]
     (ensure-running! running-v)
@@ -1768,8 +1825,8 @@
       (ensure-running! running-v)
       (lease/validate-lease-key! group-id db-identity)
       (try
-        (await-read-state-barrier! authority)
-        (let [snapshot @fsm-state
+        (let [snapshot (or (await-read-state-barrier! authority)
+                           @fsm-state)
               {:keys [lease version]} (lease-entry snapshot db-identity)]
           {:lease lease
            :version version

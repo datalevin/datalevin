@@ -19,6 +19,7 @@
    [datalevin.ha.client-cache :as cache]
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.lease :as lease]
+   [datalevin.ha.snapshot :as snap]
    [datalevin.index :as idx]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
@@ -657,180 +658,28 @@
                  nil
                  nil)))))
 
-(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
-  ha-sync-read-open-options
-  (into-array StandardOpenOption [StandardOpenOption/READ]))
-
-(defn- fsync-ha-snapshot-path!
-  [path]
-  (with-open [^FileChannel ch (FileChannel/open
-                               (Paths/get path (into-array String []))
-                               ha-sync-read-open-options)]
-    (PosixFsync/fsync ch)))
-
-(defn- sync-ha-snapshot-dir-tree!
-  [dir]
-  (doseq [^File f (sort-by #(.getName ^File %)
-                           (or (u/list-files dir) []))]
-    (if (.isDirectory f)
-      (sync-ha-snapshot-dir-tree! (.getPath f))
-      (fsync-ha-snapshot-path! (.getPath f))))
-  (fsync-ha-snapshot-path! dir))
-
-(defn ^:redef sync-ha-snapshot-install-target!
-  [^String env-dir]
-  (when (u/file-exists env-dir)
-    (sync-ha-snapshot-dir-tree! env-dir)
-    (when-let [^File parent (.getParentFile (java.io.File. ^String env-dir))]
-      (when (.exists parent)
-        (fsync-ha-snapshot-path! (.getPath parent))))))
-
-(defn- copy-dir-contents!
-  [src-dir dest-dir]
-  (u/create-dirs dest-dir)
-  (doseq [^File f (or (u/list-files src-dir) [])]
-    (let [dst (str dest-dir u/+separator+ (.getName f))]
-      (if (.isDirectory f)
-        (copy-dir-contents! (.getPath f) dst)
-        (u/copy-file (.getPath f) dst)))))
-
-(defn- move-path!
-  [src dst]
-  (let [src-path (Paths/get src (into-array String []))
-        dst-path (Paths/get dst (into-array String []))
-        opts (into-array java.nio.file.CopyOption
-                         [StandardCopyOption/REPLACE_EXISTING
-                          StandardCopyOption/ATOMIC_MOVE])]
-    (try
-      (Files/move src-path dst-path opts)
-      (catch Exception _
-        (Files/move src-path dst-path
-                    (into-array java.nio.file.CopyOption
-                                [StandardCopyOption/REPLACE_EXISTING]))))))
-
-(def ^:private ha-snapshot-install-marker-suffix
-  ".ha-snapshot-install.edn")
-
-(defn- ha-snapshot-install-marker-path
-  [env-dir]
-  (str env-dir ha-snapshot-install-marker-suffix))
-
-(defn- read-ha-snapshot-install-marker
-  [env-dir]
-  (let [marker-path (ha-snapshot-install-marker-path env-dir)]
-    (when (u/file-exists marker-path)
-      (let [marker (try
-                     (edn/read-string (slurp marker-path))
-                     (catch Exception e
-                       (u/raise "HA snapshot install marker is unreadable"
-                                e
-                                {:error :ha/follower-snapshot-install-marker-invalid
-                                 :env-dir env-dir
-                                 :marker-path marker-path})))
-            backup-dir (:backup-dir marker)
-            stage (:stage marker)]
-        (when-not (and (map? marker)
-                       (string? backup-dir)
-                       (not (s/blank? backup-dir))
-                       (keyword? stage))
-          (u/raise "HA snapshot install marker is invalid"
-                   {:error :ha/follower-snapshot-install-marker-invalid
-                    :env-dir env-dir
-                    :marker-path marker-path
-                    :marker marker}))
-        (assoc marker :marker-path marker-path)))))
-
-(defn- write-ha-snapshot-install-marker!
-  [env-dir marker]
-  (spit (ha-snapshot-install-marker-path env-dir)
-        (str (pr-str marker) "\n")))
-
-(defn- delete-ha-snapshot-install-marker!
-  [env-dir]
-  (let [marker-path (ha-snapshot-install-marker-path env-dir)]
-    (when (u/file-exists marker-path)
-      (u/delete-files marker-path))))
-
-(defn- restore-ha-snapshot-install-backup!
-  [env-dir backup-dir]
-  (when (u/file-exists env-dir)
-    (u/delete-files env-dir))
-  (move-path! backup-dir env-dir))
-
-(defn- recover-ha-local-snapshot-install!
-  [env-dir]
-  (when-let [{:keys [backup-dir stage] :as marker}
-             (read-ha-snapshot-install-marker env-dir)]
-    (case stage
-      :prepare
-      (cond
-        (u/file-exists backup-dir)
-        (do
-          (log/warn "Recovering HA snapshot install from staged backup"
-                    {:env-dir env-dir
-                     :backup-dir backup-dir
-                     :stage stage})
-          (restore-ha-snapshot-install-backup! env-dir backup-dir)
-          (delete-ha-snapshot-install-marker! env-dir)
-          marker)
-
-        (u/file-exists env-dir)
-        (do
-          (delete-ha-snapshot-install-marker! env-dir)
-          marker)
-
-        :else
-        (u/raise "HA snapshot install marker has no recoverable store"
-                 {:error :ha/follower-snapshot-install-recovery-failed
-                  :env-dir env-dir
-                  :backup-dir backup-dir
-                  :stage stage}))
-
-      :backup-moved
-      (if (u/file-exists backup-dir)
-        (do
-          (log/warn "Recovering HA snapshot install after interrupted backup move"
-                    {:env-dir env-dir
-                     :backup-dir backup-dir
-                     :stage stage})
-          (restore-ha-snapshot-install-backup! env-dir backup-dir)
-          (delete-ha-snapshot-install-marker! env-dir)
-          marker)
-        (u/raise "HA snapshot install backup is missing during recovery"
-                 {:error :ha/follower-snapshot-install-recovery-failed
-                  :env-dir env-dir
-                  :backup-dir backup-dir
-                  :stage stage}))
-
-      (u/raise "HA snapshot install marker has an unsupported stage"
-               {:error :ha/follower-snapshot-install-marker-invalid
-                :env-dir env-dir
-                :marker marker}))))
-
-(defn recover-ha-local-store-dir-if-needed!
-  [env-dir]
-  (when (read-ha-snapshot-install-marker env-dir)
-    (recover-ha-local-snapshot-install! env-dir)))
-
-(defn- close-ha-local-store!
-  [m]
-  (if-let [dt-db (:dt-db m)]
-    (db/close-db dt-db)
-    (when-let [store (:store m)]
-      (cond
-        (instance? IStore store) (i/close store)
-        (instance? ILMDB store) (i/close-kv store)
-        :else nil))))
-
-(defn- refresh-ha-local-dt-db
-  [m]
-  (let [store (:store m)]
-    (if (instance? IStore store)
-      (let [info {:max-eid (i/init-max-eid store)
-                  :max-tx (long (i/max-tx store))
-                  :last-modified (long (i/last-modified store))}]
-        (assoc m :dt-db (db/new-db store info)))
-      m)))
+(def ^:private fsync-ha-snapshot-path! snap/fsync-ha-snapshot-path!)
+(def ^:private sync-ha-snapshot-dir-tree! snap/sync-ha-snapshot-dir-tree!)
+(def ^:redef sync-ha-snapshot-install-target!
+  snap/sync-ha-snapshot-install-target!)
+(def ^:private copy-dir-contents! snap/copy-dir-contents!)
+(def ^:private move-path! snap/move-path!)
+(def ^:private ha-snapshot-install-marker-path
+  snap/ha-snapshot-install-marker-path)
+(def ^:private read-ha-snapshot-install-marker
+  snap/read-ha-snapshot-install-marker)
+(def ^:private write-ha-snapshot-install-marker!
+  snap/write-ha-snapshot-install-marker!)
+(def ^:private delete-ha-snapshot-install-marker!
+  snap/delete-ha-snapshot-install-marker!)
+(def ^:private restore-ha-snapshot-install-backup!
+  snap/restore-ha-snapshot-install-backup!)
+(def ^:private recover-ha-local-snapshot-install!
+  snap/recover-ha-local-snapshot-install!)
+(def recover-ha-local-store-dir-if-needed!
+  snap/recover-ha-local-store-dir-if-needed!)
+(def ^:private close-ha-local-store! snap/close-ha-local-store!)
+(def ^:private refresh-ha-local-dt-db snap/refresh-ha-local-dt-db)
 
 (declare open-ha-store-dbis!)
 (def ^:private ha-local-store-reopen-info-key
@@ -1027,46 +876,11 @@
            :installed-lsn (long verified-floor-lsn)
            :state next-m)))
 
-(defn- open-ha-store-dbis!
-  [store]
-  (when-let [kv-store (cond
-                        (instance? Store store)
-                        (.-lmdb ^Store store)
-
-                        (instance? ILMDB store)
-                        store
-
-                        :else nil)]
-    (doseq [dbi-name (or (i/list-dbis kv-store) [])]
-      (let [dbi-opts (try
-                       (i/dbi-opts kv-store dbi-name)
-                       (catch Exception _
-                         nil))]
-        (if (map? dbi-opts)
-          (i/open-dbi kv-store dbi-name dbi-opts)
-          (i/open-dbi kv-store dbi-name)))))
-  store)
-
-(defn- ha-class-name
-  [x]
-  (some-> x class .getName))
-
-(defn- ha-retrieved-like?
-  [x]
-  (= "datalevin.bits.Retrieved" (ha-class-name x)))
-
-(defn- ha-reflect-field
-  [x field-name]
-  (when x
-    (let [^Class cls (class x)
-          field (.getDeclaredField cls field-name)]
-      (.setAccessible field true)
-      (.get field x))))
-
-(defn- ha-seq-like?
-  [x]
-  (or (sequential? x)
-      (instance? java.util.List x)))
+(def ^:private open-ha-store-dbis! snap/open-ha-store-dbis!)
+(def ^:private ha-class-name snap/ha-class-name)
+(def ^:private ha-retrieved-like? snap/ha-retrieved-like?)
+(def ^:private ha-reflect-field snap/ha-reflect-field)
+(def ^:private ha-seq-like? snap/ha-seq-like?)
 
 (defn- ha-snapshot-open-opts
   [m db-name db-identity]
