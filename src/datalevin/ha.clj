@@ -10,17 +10,13 @@
 (ns ^:no-doc datalevin.ha
   "Consensus-lease HA runtime helpers shared by server runtime."
   (:require
-   [clojure.edn :as edn]
    [clojure.string :as s]
-   [datalevin.bits :as b]
    [datalevin.constants :as c]
-   [datalevin.datom :as dd]
    [datalevin.db :as db]
    [datalevin.ha.client-cache :as cache]
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.lease :as lease]
    [datalevin.ha.snapshot :as snap]
-   [datalevin.index :as idx]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
@@ -30,13 +26,10 @@
    [taoensso.timbre :as log])
   (:import
    [datalevin.db DB]
-   [datalevin.io PosixFsync]
    [datalevin.interface IStore ILMDB]
    [datalevin.storage Store]
-   [java.io File]
    [java.net ConnectException URI]
-   [java.nio.channels ClosedChannelException FileChannel]
-   [java.nio.file Files Paths StandardCopyOption StandardOpenOption]
+   [java.nio.channels ClosedChannelException]
    [java.util UUID]
    [java.util.concurrent ExecutorService Executors Future ThreadFactory
     TimeUnit]
@@ -144,17 +137,17 @@
 
 (defn- ha-renew-timeout-ms ^long
   [m now-ms now-nanos]
-  (let [lease-timeout-ms (long (or (:ha-lease-timeout-ms m)
-                                   c/*ha-lease-timeout-ms*))
+  (let [lease-timeout-ms   (long (or (:ha-lease-timeout-ms m)
+                                     c/*ha-lease-timeout-ms*))
         request-timeout-ms (long (ha-request-timeout-ms m lease-timeout-ms))
-        remaining-ms (ha-lease-local-remaining-ms m now-ms now-nanos)]
-    (let [timeout-ms (long (if (integer? remaining-ms)
-                             (let [remaining-ms (long remaining-ms)]
-                               (if (< remaining-ms request-timeout-ms)
-                                 remaining-ms
-                                 request-timeout-ms))
-                             request-timeout-ms))]
-      (if (< timeout-ms 1) 1 timeout-ms))))
+        remaining-ms       (ha-lease-local-remaining-ms m now-ms now-nanos)
+        timeout-ms         (long (if (integer? remaining-ms)
+                                   (let [remaining-ms (long remaining-ms)]
+                                     (if (< remaining-ms request-timeout-ms)
+                                       remaining-ms
+                                       request-timeout-ms))
+                                   request-timeout-ms))]
+    (if (< timeout-ms 1) 1 timeout-ms)))
 
 (defn- long-max2 ^long
   [a b]
@@ -543,15 +536,6 @@
         (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
     m))
 
-(defn- transact-ha-follower-local!
-  [m rows]
-  (if-let [kv-store (local-kv-store m)]
-    (#'kv/with-runtime-txlog-rollback
-     kv-store
-     #(i/transact-kv kv-store rows))
-    (u/raise "Follower txlog replay requires a local KV store"
-             {:error :ha/follower-missing-store})))
-
 (declare bootstrap-empty-lease?)
 (declare fresh-ha-promotion-local-last-applied-lsn)
 
@@ -658,22 +642,14 @@
                  nil
                  nil)))))
 
-(def ^:private fsync-ha-snapshot-path! snap/fsync-ha-snapshot-path!)
-(def ^:private sync-ha-snapshot-dir-tree! snap/sync-ha-snapshot-dir-tree!)
 (def ^:redef sync-ha-snapshot-install-target!
   snap/sync-ha-snapshot-install-target!)
 (def ^:private copy-dir-contents! snap/copy-dir-contents!)
 (def ^:private move-path! snap/move-path!)
-(def ^:private ha-snapshot-install-marker-path
-  snap/ha-snapshot-install-marker-path)
-(def ^:private read-ha-snapshot-install-marker
-  snap/read-ha-snapshot-install-marker)
 (def ^:private write-ha-snapshot-install-marker!
   snap/write-ha-snapshot-install-marker!)
 (def ^:private delete-ha-snapshot-install-marker!
   snap/delete-ha-snapshot-install-marker!)
-(def ^:private restore-ha-snapshot-install-backup!
-  snap/restore-ha-snapshot-install-backup!)
 (def ^:private recover-ha-local-snapshot-install!
   snap/recover-ha-local-snapshot-install!)
 (def recover-ha-local-store-dir-if-needed!
@@ -877,10 +853,6 @@
            :state next-m)))
 
 (def ^:private open-ha-store-dbis! snap/open-ha-store-dbis!)
-(def ^:private ha-class-name snap/ha-class-name)
-(def ^:private ha-retrieved-like? snap/ha-retrieved-like?)
-(def ^:private ha-reflect-field snap/ha-reflect-field)
-(def ^:private ha-seq-like? snap/ha-seq-like?)
 
 (defn- ha-snapshot-open-opts
   [m db-name db-identity]
@@ -1738,37 +1710,41 @@
   (when-some [lease-term* (:term lease)]
     (let [lease-term (long lease-term*)]
       (reduce
-       (fn [prev-term record]
-         (if-some [record-term* (:ha-term record)]
-           (let [record-term (long record-term*)]
-             (do
-               (when-not (pos? record-term)
-                 (u/raise "Follower txlog replay record has invalid HA term"
-                          {:error :ha/txlog-record-invalid-term
-                           :source-endpoint source-endpoint
-                           :lease-term lease-term
-                           :record-lsn (:lsn record)
-                           :record-term record-term}))
-               (when (> record-term lease-term)
-                 (u/raise "Follower txlog replay record term is ahead of current lease"
-                          {:error :ha/txlog-record-invalid-term
-                           :source-endpoint source-endpoint
-                           :lease-term lease-term
-                           :record-lsn (:lsn record)
-                           :record-term record-term}))
-               (when (and prev-term
-                          (< record-term (long prev-term)))
-                 (u/raise "Follower txlog replay record terms regressed within batch"
-                          {:error :ha/txlog-record-invalid-term
-                           :source-endpoint source-endpoint
-                           :lease-term lease-term
-                           :previous-record-term prev-term
-                           :record-lsn (:lsn record)
-                           :record-term record-term}))
-               record-term))
-           prev-term))
-       nil
-       records))))
+        (fn [prev-term record]
+          (if-some [record-term* (:ha-term record)]
+            (let [record-term (long record-term*)]
+              (when-not (pos? record-term)
+                (u/raise "Follower txlog replay record has invalid HA term"
+                         {:error           :ha/txlog-record-invalid-term
+                          :source-endpoint source-endpoint
+                          :lease-term      lease-term
+                          :record-lsn      (:lsn record)
+                          :record-term     record-term}))
+              ;; Catch-up can legitimately span multiple committed leadership
+              ;; terms after failover, so older record terms remain valid here.
+              ;; Source freshness is enforced separately via
+              ;; `assert-ha-source-authority!`; the per-record guard only
+              ;; rejects future terms and regressions within a contiguous batch.
+              (when (> record-term lease-term)
+                (u/raise "Follower txlog replay record term is ahead of current lease"
+                         {:error           :ha/txlog-record-invalid-term
+                          :source-endpoint source-endpoint
+                          :lease-term      lease-term
+                          :record-lsn      (:lsn record)
+                          :record-term     record-term}))
+              (when (and prev-term
+                         (< record-term (long prev-term)))
+                (u/raise "Follower txlog replay record terms regressed within batch"
+                         {:error                :ha/txlog-record-invalid-term
+                          :source-endpoint      source-endpoint
+                          :lease-term           lease-term
+                          :previous-record-term prev-term
+                          :record-lsn           (:lsn record)
+                          :record-term          record-term}))
+              record-term)
+            prev-term))
+        nil
+        records))))
 
 (defn- assert-ha-follower-record-term!
   [m record]
@@ -1781,6 +1757,9 @@
                   :record-term record-term}))
       (when-some [authority-term* (:ha-authority-term m)]
         (let [authority-term (long authority-term*)]
+          ;; Single-record apply shares the same rule as batch validation:
+          ;; historical committed records may trail the current authority term,
+          ;; but replay must never advance into a future term.
           (when (> record-term authority-term)
             (u/raise "Follower txlog replay record term is ahead of current authority"
                      {:error :ha/txlog-record-invalid-term
@@ -1790,14 +1769,14 @@
 
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
-  (let [store (:store m)
-        kv-store (raw-local-kv-store m)
-        rows (:rows record)
-        ops (:ops record)
+  (let [store       (:store m)
+        kv-store    (raw-local-kv-store m)
+        rows        (:rows record)
+        ops         (:ops record)
         replay-rows (cond
                       (sequential? rows) (vec rows)
-                      (sequential? ops) (vec ops)
-                      :else nil)]
+                      (sequential? ops)  (vec ops)
+                      :else              nil)]
     (when-not kv-store
       (u/raise "Follower txlog replay requires a local KV store"
                {:error :ha/follower-missing-store}))
@@ -1806,25 +1785,25 @@
       replay-rows
       (let [schema-overrides
             (reduce
-             (fn [overrides [op dbi attr props]]
-               (if (= dbi c/schema)
-                 (case op
-                   :put (assoc overrides attr props)
-                   :del (dissoc overrides attr)
-                   overrides)
-                 overrides))
-             {}
-             replay-rows)
+              (fn [overrides [op dbi attr props]]
+                (if (= dbi c/schema)
+                  (case op
+                    :put (assoc overrides attr props)
+                    :del (dissoc overrides attr)
+                    overrides)
+                  overrides))
+              {}
+              replay-rows)
             replayed-max-gt
             (reduce
-             (fn [^long acc [op dbi k]]
-               (if (and (= op :put)
-                        (= dbi c/giants)
-                        (integer? k))
-                 (long-max2 acc (unchecked-inc (long k)))
-                 acc))
-             0
-             replay-rows)
+              (fn [^long acc [op dbi k]]
+                (if (and (= op :put)
+                         (= dbi c/giants)
+                         (integer? k))
+                  (long-max2 acc (unchecked-inc (long k)))
+                  acc))
+              0
+              replay-rows)
             next-state
             (do
               (kv/mirror-replayed-txlog-record! kv-store record)
@@ -1839,29 +1818,29 @@
                     (reopen-ha-local-store-from-info m reopen-info)
                     (catch Throwable e
                       (u/raise
-                       "HA follower schema replay failed to reopen local store"
-                       {:error :ha/follower-schema-reopen-failed
-                        :record-lsn (:lsn record)
-                        :reopen-info reopen-info
-                        :message (ex-message e)
-                       :data (ex-data e)
-                       :state (-> m
-                                  (assoc ha-local-store-reopen-info-key
-                                          reopen-info
-                                          :dt-db nil)
-                                   (dissoc :engine :index))}))))
+                        "HA follower schema replay failed to reopen local store"
+                        {:error       :ha/follower-schema-reopen-failed
+                         :record-lsn  (:lsn record)
+                         :reopen-info reopen-info
+                         :message     (ex-message e)
+                         :data        (ex-data e)
+                         :state       (-> m
+                                          (assoc ha-local-store-reopen-info-key
+                                                 reopen-info
+                                                 :dt-db nil)
+                                          (dissoc :engine :index))}))))
                 m))
             readback-kv-store (raw-local-kv-store next-state)
-            probe-eid (some->> replay-rows
-                               (keep (fn [[op dbi k]]
-                                       (when (and (= op :put)
-                                                  (= dbi c/eav)
-                                                  (integer? k))
-                                         (long k))))
-                               first)
+            probe-eid         (some->> replay-rows
+                                       (keep (fn [[op dbi k]]
+                                               (when (and (= op :put)
+                                                          (= dbi c/eav)
+                                                          (integer? k))
+                                                 (long k))))
+                                       first)
             readback
             (when readback-kv-store
-              {:lsn (long (:lsn record))
+              {:lsn         (long (:lsn record))
                :payload-lsn (read-ha-local-payload-lsn readback-kv-store)
                :meta-max-tx (long (or (try
                                         (i/get-value readback-kv-store
@@ -1872,7 +1851,7 @@
                                         (catch Throwable _
                                           nil))
                                       0))
-               :probe-eid probe-eid
+               :probe-eid   probe-eid
                :probe-eav-range
                (when probe-eid
                  (try
@@ -1882,29 +1861,29 @@
                                      :id
                                      :avg))
                    (catch Throwable _
-                     nil)))})]
-        (let [next-state (assoc next-state
-                                :ha-follower-last-apply-readback readback)]
-          (when (instance? IStore (:store next-state))
-            (when-let [target-max-tx
-                       (some->> replay-rows
-                                (keep (fn [[op dbi k v]]
-                                        (when (and (= op :put)
-                                                   (= dbi c/meta)
-                                                   (= k :max-tx)
-                                                   (integer? v))
-                                          (long v))))
-                                last)]
-              (let [target-max-tx (long target-max-tx)]
-                (loop [cur (long (i/max-tx (:store next-state)))]
-                  (when (< cur target-max-tx)
-                    (i/advance-max-tx (:store next-state))
-                    (recur (long (i/max-tx (:store next-state)))))))))
-          next-state))
+                     nil)))})
+            next-state        (assoc next-state
+                                     :ha-follower-last-apply-readback readback)]
+        (when (instance? IStore (:store next-state))
+          (when-let [target-max-tx
+                     (some->> replay-rows
+                              (keep (fn [[op dbi k v]]
+                                      (when (and (= op :put)
+                                                 (= dbi c/meta)
+                                                 (= k :max-tx)
+                                                 (integer? v))
+                                        (long v))))
+                              last)]
+            (let [target-max-tx (long target-max-tx)]
+              (loop [cur (long (i/max-tx (:store next-state)))]
+                (when (< cur target-max-tx)
+                  (i/advance-max-tx (:store next-state))
+                  (recur (long (i/max-tx (:store next-state)))))))))
+        next-state)
 
       :else
       (u/raise "Follower txlog replay record is missing rows"
-               {:error :ha/follower-invalid-record
+               {:error  :ha/follower-invalid-record
                 :record record}))))
 
 (def ^:dynamic *ha-follower-apply-record-fn* nil)

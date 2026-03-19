@@ -139,7 +139,8 @@
         :after (dissoc after :gc-target-segments)})
      (i/gc-txlog-segments! db retain-floor-lsn))))
 
-(declare with-runtime-txlog-state-guard)
+(declare with-runtime-txlog-state-guard
+         with-write-txn-lock-before-runtime-txlog-state)
 
 (defn- txlog-retention-state-local
   [db]
@@ -2454,7 +2455,10 @@
   apply its payload to LMDB. This keeps promoted followers on the same WAL
   sequence and preserves source records for downstream followers."
   [lmdb record]
-  (with-runtime-txlog-state-guard
+  ;; Replay mutates both the runtime txlog metadata and LMDB itself. Keep the
+  ;; same lock order as close/transact paths so follower replay cannot deadlock
+  ;; with concurrent write-txn close on the same store.
+  (with-write-txn-lock-before-runtime-txlog-state
     lmdb
     (fn []
       (let [record-rows (cond
@@ -2693,7 +2697,10 @@
 
 (defn- with-runtime-txlog-rollback
   [lmdb f]
-  (with-runtime-txlog-state-guard
+  ;; This helper eventually routes through LMDB write APIs. Acquire the write
+  ;; transaction lock before the runtime txlog metadata guard so all write-capable
+  ;; paths use a consistent lock order.
+  (with-write-txn-lock-before-runtime-txlog-state
     lmdb
     (fn []
       (if-let [info-v (i/kv-info lmdb)]
@@ -2739,7 +2746,9 @@
 
 (defn- update-kv-info-map-plan!
   [lmdb k plan-f]
-  (with-runtime-txlog-state-guard
+  ;; Floor-provider bookkeeping writes through the wrapped LMDB path, so it must
+  ;; share the same tx-v -> kv-info lock order as normal transaction close.
+  (with-write-txn-lock-before-runtime-txlog-state
     lmdb
     (fn []
       (let [res (plan-f (kv-info-map-value lmdb k))]
@@ -3247,7 +3256,10 @@
       (txlog/enabled-state db)))
 
   (create-snapshot! [_]
-    (with-runtime-txlog-state-guard
+    ;; Snapshot creation updates backup-pin floor metadata before copying the
+    ;; environment, so it participates in the same write-capable lock ordering
+    ;; as replica-floor bookkeeping and transaction close.
+    (with-write-txn-lock-before-runtime-txlog-state
       db
       (fn []
         (if (txlog-write-path-enabled? db)
