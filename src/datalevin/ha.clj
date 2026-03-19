@@ -4121,11 +4121,12 @@
 (defn- startup-read-ha-authority-state
   [db-name authority db-identity]
   (try
-    (let [{:keys [lease version]}
+    (let [{:keys [lease version authority-now-ms]}
           (ctrl/read-state-for-startup authority db-identity)]
       {:ok? true
        :lease lease
        :version version
+       :authority-now-ms authority-now-ms
        :error nil})
     (catch Exception e
       (log/warn e "HA startup read-lease failed; deferring to renew loop"
@@ -4133,6 +4134,7 @@
       {:ok? false
        :lease nil
        :version nil
+       :authority-now-ms nil
        :error {:reason :startup-authority-read-failed
                :message (ex-message e)
                :data (ex-data e)}})))
@@ -4200,32 +4202,43 @@
                  {:error :ha/missing-local-endpoint
                   :db-name db-name
                   :ha-node-id node-id}))
-      (let [now-ms (System/currentTimeMillis)
+      (let [local-start-ms (ha-now-ms)
+            local-start-nanos (ha-now-nanos)
             derived-hash (vld/derive-ha-membership-hash ha-opts)
             init-result (ctrl/init-membership-hash! authority derived-hash)
             startup-read
             (startup-read-ha-authority-state db-name authority db-identity)
-            {:keys [lease version error]} startup-read
+            observed-at-ms (ha-now-ms)
+            {:keys [lease version authority-now-ms error]} startup-read
             _ (when (and lease (not= db-identity (:db-identity lease)))
                 (u/raise "HA lease db identity mismatch at startup"
                          {:error :ha/db-identity-mismatch
                           :db-name db-name
                           :local-db-identity db-identity
                           :authority-lease lease}))
+            lease-local-deadline-ms
+            (authority-lease-local-deadline-ms
+             lease authority-now-ms local-start-ms)
+            lease-local-deadline-nanos
+            (authority-lease-local-deadline-nanos
+             lease authority-now-ms local-start-nanos)
             local-authority-owner? (and lease
                                         (= node-id (:leader-node-id lease))
-                                        (not (lease/lease-expired? lease now-ms))
+                                        (not (lease/lease-expired?
+                                              lease
+                                              observed-at-ms))
                                         (= db-identity (:db-identity lease)))
             rejoin-promotion-blocked?
             (and lease
                  (integer? (:leader-node-id lease))
                  (not= node-id (:leader-node-id lease))
-                 (not (lease/lease-expired? lease now-ms))
+                 (not (lease/lease-expired? lease observed-at-ms))
                  (= db-identity (:db-identity lease)))
             rejoin-promotion-blocked-until-ms
             (when rejoin-promotion-blocked?
-              (long (max (+ (long now-ms) (long renew-ms))
-                         (+ (long (or (:lease-until-ms lease) now-ms))
+              (long (max (+ (long observed-at-ms) (long renew-ms))
+                         (+ (long (or (:lease-until-ms lease)
+                                      observed-at-ms))
                             (long renew-ms)))))]
         (when-not (:ok? init-result)
           (u/raise "HA membership hash mismatch with authoritative control plane"
@@ -4234,53 +4247,60 @@
                     :derived-hash derived-hash
                     :authority init-result}))
         (when local-authority-owner?
-          (log/info "HA startup is rejoining as follower despite local authority ownership"
+          (log/info "HA startup resumed local authority ownership as leader"
                     {:db-name db-name
                      :ha-node-id node-id
                      :term (:term lease)
                      :lease-until-ms (:lease-until-ms lease)}))
-        {:ha-authority authority
-         :ha-db-identity db-identity
-         :ha-membership-hash derived-hash
-         :ha-authority-membership-hash (:membership-hash init-result)
-         :ha-db-identity-mismatch? false
-         :ha-membership-mismatch? false
-         :ha-members members
-         :ha-members-sorted ordered-members
-         :ha-node-id node-id
-         :ha-local-endpoint local-endpoint
-         :ha-lease-renew-ms renew-ms
-         :ha-lease-timeout-ms timeout-ms
-         :ha-promotion-base-delay-ms promotion-base-delay-ms
-         :ha-promotion-rank-delay-ms promotion-rank-delay-ms
-         :ha-max-promotion-lag-lsn max-promotion-lag-lsn
-         :ha-client-credentials (:ha-client-credentials ha-opts)
-         :ha-demotion-drain-ms demotion-drain-ms
-         :ha-follower-max-batch-records follower-max-batch-records
-         :ha-follower-target-batch-bytes follower-target-batch-bytes
-         :ha-fencing-hook fencing-hook
-         :ha-clock-skew-budget-ms clock-skew-budget-ms
-         :ha-clock-skew-hook clock-skew-hook
-         :ha-clock-skew-paused? false
-         :ha-clock-skew-last-check-ms nil
-         :ha-clock-skew-last-observed-ms nil
-         :ha-clock-skew-last-result nil
-         :ha-authority-lease lease
-         :ha-authority-version version
-         :ha-authority-owner-node-id (:leader-node-id lease)
-         :ha-authority-term (:term lease)
-         :ha-lease-until-ms (:lease-until-ms lease)
-         :ha-authority-read-ok? (:ok? startup-read)
-         :ha-authority-read-error error
-         :ha-last-authority-refresh-ms now-ms
-         :ha-leader-fencing-pending? false
-         :ha-leader-fencing-last-error nil
-         :ha-rejoin-promotion-blocked? rejoin-promotion-blocked?
-         :ha-rejoin-promotion-blocked-until-ms
-         rejoin-promotion-blocked-until-ms
-         :ha-rejoin-started-at-ms (when rejoin-promotion-blocked? now-ms)
-         :ha-role :follower
-         :ha-leader-term nil})
+        (cond-> {:ha-authority authority
+                 :ha-db-identity db-identity
+                 :ha-membership-hash derived-hash
+                 :ha-authority-membership-hash (:membership-hash init-result)
+                 :ha-db-identity-mismatch? false
+                 :ha-membership-mismatch? false
+                 :ha-members members
+                 :ha-members-sorted ordered-members
+                 :ha-node-id node-id
+                 :ha-local-endpoint local-endpoint
+                 :ha-lease-renew-ms renew-ms
+                 :ha-lease-timeout-ms timeout-ms
+                 :ha-promotion-base-delay-ms promotion-base-delay-ms
+                 :ha-promotion-rank-delay-ms promotion-rank-delay-ms
+                 :ha-max-promotion-lag-lsn max-promotion-lag-lsn
+                 :ha-client-credentials (:ha-client-credentials ha-opts)
+                 :ha-demotion-drain-ms demotion-drain-ms
+                 :ha-follower-max-batch-records follower-max-batch-records
+                 :ha-follower-target-batch-bytes follower-target-batch-bytes
+                 :ha-fencing-hook fencing-hook
+                 :ha-clock-skew-budget-ms clock-skew-budget-ms
+                 :ha-clock-skew-hook clock-skew-hook
+                 :ha-clock-skew-paused? false
+                 :ha-clock-skew-last-check-ms nil
+                 :ha-clock-skew-last-observed-ms nil
+                 :ha-clock-skew-last-result nil
+                 :ha-authority-lease lease
+                 :ha-authority-version version
+                 :ha-authority-now-ms authority-now-ms
+                 :ha-authority-owner-node-id (:leader-node-id lease)
+                 :ha-authority-term (:term lease)
+                 :ha-lease-until-ms (:lease-until-ms lease)
+                 :ha-lease-local-deadline-ms lease-local-deadline-ms
+                 :ha-lease-local-deadline-nanos lease-local-deadline-nanos
+                 :ha-authority-read-ok? (:ok? startup-read)
+                 :ha-authority-read-error error
+                 :ha-last-authority-refresh-ms observed-at-ms
+                 :ha-leader-fencing-pending? false
+                 :ha-leader-fencing-last-error nil
+                 :ha-rejoin-promotion-blocked? rejoin-promotion-blocked?
+                 :ha-rejoin-promotion-blocked-until-ms
+                 rejoin-promotion-blocked-until-ms
+                 :ha-rejoin-started-at-ms
+                 (when rejoin-promotion-blocked? observed-at-ms)
+                 :ha-role :follower
+                 :ha-leader-term nil}
+          local-authority-owner?
+          (assoc :ha-role :leader
+                 :ha-leader-term (:term lease))))
       (catch Exception e
         (try
           (ctrl/stop-authority! authority)
