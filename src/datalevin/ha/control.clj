@@ -1802,9 +1802,10 @@
 
   For the SOFAJRaft backend this uses a linearizable readIndex barrier and then
   serves the snapshot from the local FSM state, avoiding a replicated command
-  on every steady-state HA renew cycle. If readIndex itself times out, fall
-  back to the replicated command path so renew/startup callers do not stall on
-  a hot-path control read."
+  on every steady-state HA renew cycle. If readIndex itself times out, surface
+  that failure to the caller instead of falling back to a replicated command.
+  The startup path uses read-state-for-startup when it explicitly wants the
+  slower command-based read."
   [authority db-identity]
   (require-non-blank-string! db-identity :db-identity)
   (cond
@@ -1824,25 +1825,14 @@
     (let [{:keys [group-id running-v fsm-state]} authority]
       (ensure-running! running-v)
       (lease/validate-lease-key! group-id db-identity)
-      (try
-        (let [snapshot (or (await-read-state-barrier! authority)
-                           @fsm-state)
-              {:keys [lease version]} (lease-entry snapshot db-identity)]
-          {:lease lease
-           :version version
-           :authority-now-ms (long (control-now-ms))
-           :membership-hash (:membership-hash snapshot)
-           :voters (:voters snapshot)})
-        (catch clojure.lang.ExceptionInfo e
-          (let [{:keys [error where]} (ex-data e)]
-            (if (and (= :ha/control-timeout error)
-                     (= :read-index where))
-              (do
-                (log/warn e "HA control readIndex timed out; falling back to replicated read-state command"
-                          {:group-id group-id
-                           :db-identity db-identity})
-                (submit-read-state-command! authority db-identity))
-              (throw e))))))
+      (let [snapshot (or (await-read-state-barrier! authority)
+                         @fsm-state)
+            {:keys [lease version]} (lease-entry snapshot db-identity)]
+        {:lease lease
+         :version version
+         :authority-now-ms (long (control-now-ms))
+         :membership-hash (:membership-hash snapshot)
+         :voters (:voters snapshot)}))
 
     (satisfies? ILeaseAuthority authority)
     (let [{:keys [lease version]} (read-lease authority db-identity)]
