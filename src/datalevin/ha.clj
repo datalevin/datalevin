@@ -31,8 +31,8 @@
    [java.net ConnectException URI]
    [java.nio.channels ClosedChannelException]
    [java.util UUID]
-   [java.util.concurrent ExecutorService Executors Future ThreadFactory
-    TimeUnit]
+   [java.util.concurrent Callable ExecutorCompletionService
+    ExecutorService Executors Future ThreadFactory TimeUnit]
    [java.util.concurrent.atomic AtomicLong]))
 
 (defn consensus-ha-opts
@@ -1011,9 +1011,45 @@
        [(f (first items))]
 
        :else
-       (->> (.invokeAll ^ExecutorService (ha-probe-executor-for m)
-                        (mapv (fn [item] #(f item)) items))
-            (mapv #(.get ^Future %)))))))
+       (let [^ExecutorService executor (ha-probe-executor-for m)
+             ^ExecutorCompletionService completion
+             (ExecutorCompletionService. executor)
+             results (object-array n)]
+         (doseq [[idx item] (map-indexed vector items)]
+           (.submit completion
+                    ^Callable
+                    (reify Callable
+                      (call [_]
+                        (try
+                          {:index idx
+                           :value (f item)}
+                          (catch Throwable e
+                            {:index idx
+                             :item item
+                             :error e}))))))
+         (loop [remaining n
+                failures []]
+           (if (zero? remaining)
+             (if-let [{:keys [index item error]} (first failures)]
+               (throw (ex-info "HA parallel probe task failed"
+                               {:error :ha/parallel-probe-failed
+                                :index index
+                                :item item
+                                :failure-count (count failures)}
+                               error))
+               (mapv identity results))
+             (let [{:keys [index value item error]}
+                   (.get ^Future (.take completion))]
+               (if error
+                 (recur (unchecked-dec remaining)
+                        (conj failures
+                              {:index index
+                               :item item
+                               :error error}))
+                 (do
+                   (aset results (int index) value)
+                   (recur (unchecked-dec remaining)
+                          failures)))))))))))
 
 (defn- normalize-leader-watermark-result
   [lease result]
@@ -1537,6 +1573,47 @@
 
 (declare ha-leader-safe-lsn)
 
+(defn- ha-gap-fallback-follower-probe
+  [db-name m lease leader-endpoint leader-safe-lsn required-lsn
+   {:keys [endpoint node-id]}]
+  (try
+    (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
+                     db-name m endpoint)
+          authority-check (ha-source-authority-check
+                           lease endpoint watermark)
+          raw-last-lsn (ha-source-watermark-lsn
+                        leader-endpoint
+                        endpoint
+                        watermark)
+          last-lsn (when (some? raw-last-lsn)
+                     (long-min2 raw-last-lsn
+                                leader-safe-lsn))
+          eligible? (and (:ok? authority-check)
+                         (some? last-lsn)
+                         (not (neg? (Long/compare
+                                     (long last-lsn)
+                                     (long required-lsn)))))]
+      {:endpoint endpoint
+       :node-id node-id
+       :authority-ok? (:ok? authority-check)
+       :authority-check authority-check
+       :last-applied-lsn last-lsn
+       :raw-last-applied-lsn raw-last-lsn
+       :leader-safe-lsn leader-safe-lsn
+       :eligible? eligible?})
+    (catch Throwable e
+      {:endpoint endpoint
+       :node-id node-id
+       :authority-ok? false
+       :authority-check {:ok? false
+                         :reason :probe-exception
+                         :message (ex-message e)
+                         :data (ex-data e)}
+       :last-applied-lsn nil
+       :raw-last-applied-lsn nil
+       :leader-safe-lsn leader-safe-lsn
+       :eligible? false})))
+
 (defn- ha-gap-fallback-source-endpoints
   ([db-name m lease next-lsn]
    (ha-gap-fallback-source-endpoints
@@ -1561,30 +1638,10 @@
          followers
          (ha-parallel-mapv
           m
-          (fn [{:keys [endpoint node-id]}]
-            (let [watermark (safe-fetch-ha-endpoint-watermark-lsn
-                             db-name m endpoint)
-                  authority-check (ha-source-authority-check
-                                   lease endpoint watermark)
-                  raw-last-lsn (ha-source-watermark-lsn
-                                leader-endpoint
-                                endpoint
-                                watermark)
-                  last-lsn (when (some? raw-last-lsn)
-                             (long-min2 raw-last-lsn
-                                        leader-safe-lsn))
-                  eligible? (and (:ok? authority-check)
-                                 (some? last-lsn)
-                                 (>= (long last-lsn)
-                                     required-lsn))]
-              {:endpoint endpoint
-               :node-id node-id
-               :authority-ok? (:ok? authority-check)
-               :authority-check authority-check
-               :last-applied-lsn last-lsn
-               :raw-last-applied-lsn raw-last-lsn
-               :leader-safe-lsn leader-safe-lsn
-               :eligible? eligible?}))
+          (fn [member]
+            (ha-gap-fallback-follower-probe
+             db-name m lease leader-endpoint leader-safe-lsn required-lsn
+             member))
           follower-members)
          eligible-followers
          (sort-by (juxt (comp - :last-applied-lsn) :node-id)
@@ -2812,21 +2869,26 @@
                           (- (long lease-until-ms)
                              (long authority-now-ms)))))))))
 
-(defn ^:redef observe-authority-state
-  [m]
-  (let [authority (:ha-authority m)
+(defn- control-result-authority-observation?
+  [result]
+  (and (map? result)
+       (contains? result :version)
+       (contains? result :authority-now-ms)))
+
+(defn- control-result-authority-observation
+  [m local-start-ms local-start-nanos
+   {:keys [lease version authority-now-ms observed-at-ms] :as result}]
+  (let [authority-membership-hash
+        (if (contains? result :membership-hash)
+          (:membership-hash result)
+          (:ha-authority-membership-hash m))
         db-identity (:ha-db-identity m)
-        local-start-ms (ha-now-ms)
-        local-start-nanos (ha-now-nanos)
-        {:keys [lease version membership-hash authority-now-ms]}
-        (ctrl/read-state authority db-identity)
-        authority-membership-hash membership-hash
         db-identity-mismatch?
         (and lease (not= db-identity (:db-identity lease)))
         membership-mismatch?
         (and authority-membership-hash
              (not= authority-membership-hash (:ha-membership-hash m)))
-        observed-at-ms (ha-now-ms)]
+        observed-at-ms (or observed-at-ms (ha-now-ms))]
     {:lease lease
      :version version
      :authority-now-ms authority-now-ms
@@ -2840,6 +2902,19 @@
      :db-identity-mismatch? db-identity-mismatch?
      :membership-mismatch? membership-mismatch?
      :observed-at-ms observed-at-ms}))
+
+(defn ^:redef observe-authority-state
+  [m]
+  (let [authority (:ha-authority m)
+        db-identity (:ha-db-identity m)
+        local-start-ms (ha-now-ms)
+        local-start-nanos (ha-now-nanos)
+        result (ctrl/read-state authority db-identity)]
+    (control-result-authority-observation
+     m
+     local-start-ms
+     local-start-nanos
+     result)))
 
 (defn- apply-authority-observation
   [m {:keys [lease version authority-now-ms
@@ -3564,30 +3639,70 @@
                        :leader-last-applied-lsn (long (or (:ha-leader-last-applied-lsn m) 0))
                        :now-ms local-start-ms
                        :timeout-ms renew-timeout-ms})]
-          (if (:ok? result)
-            (let [{:keys [lease version authority-now-ms]} result
-                  observed-at-ms (ha-now-ms)]
-              (-> m
-                  apply-authority-read-success
-                  (assoc :ha-authority-lease lease
-                         :ha-authority-version version
-                         :ha-authority-now-ms authority-now-ms
-                         :ha-leader-term (:term lease)
-                         :ha-lease-local-deadline-ms
-                         (authority-lease-local-deadline-ms
-                          lease authority-now-ms local-start-ms)
-                         :ha-lease-local-deadline-nanos
-                         (authority-lease-local-deadline-nanos
-                          lease authority-now-ms local-start-nanos)
-                         :ha-authority-owner-node-id (:leader-node-id lease)
-                         :ha-authority-term (:term lease)
-                         :ha-lease-until-ms (:lease-until-ms lease)
-                         :ha-last-authority-refresh-ms observed-at-ms)
-                  (maybe-complete-ha-leader-fencing db-name)))
-            (demote-ha-leader db-name m
-                              :renew-failed
-                              {:reason (:reason result)}
-                              (ha-now-ms))))))))
+          (if (control-result-authority-observation? result)
+            (let [observation
+                  (control-result-authority-observation
+                   m
+                   local-start-ms
+                   local-start-nanos
+                   result)
+                  {:keys [lease authority-membership-hash
+                          db-identity-mismatch? membership-mismatch?]}
+                  observation
+                  now-ms (ha-now-ms)
+                  observed-m (-> m
+                                 (apply-authority-observation observation
+                                                              now-ms)
+                                 apply-authority-read-success)]
+              (cond
+                db-identity-mismatch?
+                (demote-ha-leader db-name observed-m
+                                  :db-identity-mismatch
+                                  {:local-db-identity (:ha-db-identity m)
+                                   :authority-lease lease}
+                                  now-ms)
+
+                membership-mismatch?
+                (demote-ha-leader db-name observed-m
+                                  :membership-hash-mismatch
+                                  {:local-membership-hash
+                                   (:ha-membership-hash observed-m)
+                                   :authority-membership-hash
+                                   authority-membership-hash}
+                                  now-ms)
+
+                (:ok? result)
+                (maybe-complete-ha-leader-fencing observed-m db-name)
+
+                :else
+                (demote-ha-leader db-name observed-m
+                                  :renew-failed
+                                  {:reason (:reason result)}
+                                  now-ms)))
+            (if (:ok? result)
+              (let [{:keys [lease version authority-now-ms]} result
+                    observed-at-ms (ha-now-ms)]
+                (-> m
+                    apply-authority-read-success
+                    (assoc :ha-authority-lease lease
+                           :ha-authority-version version
+                           :ha-authority-now-ms authority-now-ms
+                           :ha-leader-term (:term lease)
+                           :ha-lease-local-deadline-ms
+                           (authority-lease-local-deadline-ms
+                            lease authority-now-ms local-start-ms)
+                           :ha-lease-local-deadline-nanos
+                           (authority-lease-local-deadline-nanos
+                            lease authority-now-ms local-start-nanos)
+                           :ha-authority-owner-node-id (:leader-node-id lease)
+                           :ha-authority-term (:term lease)
+                           :ha-lease-until-ms (:lease-until-ms lease)
+                           :ha-last-authority-refresh-ms observed-at-ms)
+                    (maybe-complete-ha-leader-fencing db-name)))
+              (demote-ha-leader db-name m
+                                :renew-failed
+                                {:reason (:reason result)}
+                                (ha-now-ms)))))))))
 
 (defn- maybe-demote-on-refresh-timeout
   [db-name m now-ms]
@@ -3608,18 +3723,19 @@
     m
     (let [started-demoting? (= :demoting (:ha-role m))
           m0 (refresh-ha-local-watermarks m)
-          m1 (refresh-ha-authority-state db-name m0)
-          m2 (try
-               (renew-ha-leader-state db-name m1)
-               (catch Exception e
-                 (demote-ha-leader db-name m1
-                                   :renew-exception
-                                   {:message (ex-message e)}
-                                   (ha-now-ms))))
-          m3 (refresh-ha-clock-skew-state db-name m2)
-          m4 (advance-ha-follower-or-candidate db-name m3)
+          m1 (if (= :leader (:ha-role m0))
+               (try
+                 (renew-ha-leader-state db-name m0)
+                 (catch Exception e
+                   (demote-ha-leader db-name m0
+                                     :renew-exception
+                                     {:message (ex-message e)}
+                                     (ha-now-ms))))
+               (refresh-ha-authority-state db-name m0))
+          m2 (refresh-ha-clock-skew-state db-name m1)
+          m3 (advance-ha-follower-or-candidate db-name m2)
           end-now-ms (ha-now-ms)]
-      (-> (maybe-demote-on-refresh-timeout db-name m4 end-now-ms)
+      (-> (maybe-demote-on-refresh-timeout db-name m3 end-now-ms)
           (maybe-finish-ha-demotion end-now-ms started-demoting?)
           (dissoc ha-local-watermark-snapshot-key)))))
 

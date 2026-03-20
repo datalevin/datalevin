@@ -22,18 +22,25 @@
    [datalevin.storage Store]
    [java.io File]
    [java.nio.channels FileChannel]
-   [java.nio.file Files Paths StandardCopyOption StandardOpenOption]))
+   [java.nio.file AtomicMoveNotSupportedException Files Paths
+    StandardCopyOption StandardOpenOption]))
 
 (def ^"[Ljava.nio.file.StandardOpenOption;"
   ha-sync-read-open-options
   (into-array StandardOpenOption [StandardOpenOption/READ]))
 
-(defn fsync-ha-snapshot-path!
+(defn ^:redef fsync-ha-snapshot-path!
   [path]
   (with-open [^FileChannel ch (FileChannel/open
                                (Paths/get path (into-array String []))
                                ha-sync-read-open-options)]
     (PosixFsync/fsync ch)))
+
+(defn- fsync-ha-snapshot-parent-dir!
+  [^String path]
+  (when-let [^File parent (.getParentFile (File. path))]
+    (when (.exists parent)
+      (fsync-ha-snapshot-path! (.getPath parent)))))
 
 (defn sync-ha-snapshot-dir-tree!
   [dir]
@@ -48,9 +55,7 @@
   [^String env-dir]
   (when (u/file-exists env-dir)
     (sync-ha-snapshot-dir-tree! env-dir)
-    (when-let [^File parent (.getParentFile (java.io.File. ^String env-dir))]
-      (when (.exists parent)
-        (fsync-ha-snapshot-path! (.getPath parent))))))
+    (fsync-ha-snapshot-parent-dir! env-dir)))
 
 (defn copy-dir-contents!
   [src-dir dest-dir]
@@ -61,19 +66,25 @@
         (copy-dir-contents! (.getPath f) dst)
         (u/copy-file (.getPath f) dst)))))
 
+(defn ^:redef atomic-move-replace-existing-paths!
+  [src-path dst-path]
+  (Files/move src-path dst-path
+              (into-array java.nio.file.CopyOption
+                          [StandardCopyOption/REPLACE_EXISTING
+                           StandardCopyOption/ATOMIC_MOVE])))
+
 (defn move-path!
   [src dst]
   (let [src-path (Paths/get src (into-array String []))
-        dst-path (Paths/get dst (into-array String []))
-        opts (into-array java.nio.file.CopyOption
-                         [StandardCopyOption/REPLACE_EXISTING
-                          StandardCopyOption/ATOMIC_MOVE])]
+        dst-path (Paths/get dst (into-array String []))]
     (try
-      (Files/move src-path dst-path opts)
-      (catch Exception _
-        (Files/move src-path dst-path
-                    (into-array java.nio.file.CopyOption
-                                [StandardCopyOption/REPLACE_EXISTING]))))))
+      (atomic-move-replace-existing-paths! src-path dst-path)
+      (catch AtomicMoveNotSupportedException e
+        (u/raise "HA snapshot install requires atomic path moves"
+                 e
+                 {:error :ha/follower-snapshot-atomic-move-unsupported
+                  :src src
+                  :dst dst})))))
 
 (def ^:private ha-snapshot-install-marker-suffix
   ".ha-snapshot-install.edn")
@@ -113,14 +124,18 @@
 
 (defn write-ha-snapshot-install-marker!
   [env-dir marker]
-  (spit (ha-snapshot-install-marker-path env-dir)
-        (str (pr-str marker) "\n")))
+  (let [marker-path (ha-snapshot-install-marker-path env-dir)]
+    (spit marker-path
+          (str (pr-str marker) "\n"))
+    (fsync-ha-snapshot-path! marker-path)
+    (fsync-ha-snapshot-parent-dir! marker-path)))
 
 (defn delete-ha-snapshot-install-marker!
   [env-dir]
   (let [marker-path (ha-snapshot-install-marker-path env-dir)]
     (when (u/file-exists marker-path)
-      (u/delete-files marker-path))))
+      (u/delete-files marker-path)
+      (fsync-ha-snapshot-parent-dir! marker-path))))
 
 (defn- delete-ha-snapshot-install-stage-dir!
   [{:keys [stage-dir]}]

@@ -30,7 +30,8 @@
    [datalevin.ha LMDBJRaftServiceFactory]
    [java.io File]
    [java.nio ByteBuffer]
-   [java.nio.file Files Paths StandardCopyOption]
+   [java.nio.file AtomicMoveNotSupportedException Files Paths
+    StandardCopyOption]
    [java.util Base64]))
 
 (defprotocol ILeaseAuthority
@@ -635,19 +636,30 @@
               :membership-hash (:membership-hash state)
               :voters (:voters state)}}))
 
+(defn- attach-state-snapshot-to-result
+  [{:keys [state result] :as transition}]
+  (if (map? result)
+    (assoc transition
+           :result (assoc result
+                          :membership-hash (:membership-hash state)
+                          :voters (:voters state)))
+    transition))
+
 (defn- apply-state-command
   [state {:keys [op authority-now-ms clock-skew-budget-ms] :as cmd}]
   (case op
-    :try-acquire-lease   (apply-try-acquire-transition
-                          state
-                          (:req cmd)
-                          authority-now-ms
-                          clock-skew-budget-ms)
-    :renew-lease         (apply-renew-transition
-                          state
-                          (:req cmd)
-                          authority-now-ms
-                          clock-skew-budget-ms)
+    :try-acquire-lease   (attach-state-snapshot-to-result
+                          (apply-try-acquire-transition
+                           state
+                           (:req cmd)
+                           authority-now-ms
+                           clock-skew-budget-ms))
+    :renew-lease         (attach-state-snapshot-to-result
+                          (apply-renew-transition
+                           state
+                           (:req cmd)
+                           authority-now-ms
+                           clock-skew-budget-ms))
     :init-membership-hash (apply-init-membership-hash-transition
                            state (:membership-hash cmd))
     :read-state          (apply-read-state-transition state (:db-identity cmd))
@@ -849,23 +861,27 @@
        :membership-hash membership-hash
        :voters (vec (sort peer-ids))})))
 
+(defn ^:redef atomic-move-replace-existing-paths!
+  [from-path to-path]
+  (Files/move from-path
+              to-path
+              ^"[Ljava.nio.file.CopyOption;"
+              (into-array java.nio.file.CopyOption
+                          [StandardCopyOption/REPLACE_EXISTING
+                           StandardCopyOption/ATOMIC_MOVE])))
+
 (defn- move-replace-existing!
   [^String from ^String to]
   (let [from-path (Paths/get from (make-array String 0))
         to-path   (Paths/get to (make-array String 0))]
     (try
-      (Files/move from-path
-                  to-path
-                  ^"[Ljava.nio.file.CopyOption;"
-                  (into-array java.nio.file.CopyOption
-                              [StandardCopyOption/REPLACE_EXISTING
-                               StandardCopyOption/ATOMIC_MOVE]))
-      (catch Exception _
-        (Files/move from-path
-                    to-path
-                    ^"[Ljava.nio.file.CopyOption;"
-                    (into-array java.nio.file.CopyOption
-                                [StandardCopyOption/REPLACE_EXISTING]))))))
+      (atomic-move-replace-existing-paths! from-path to-path)
+      (catch AtomicMoveNotSupportedException e
+        (u/raise "HA control snapshot save requires atomic file replacement"
+                 e
+                 {:error :ha/control-snapshot-atomic-move-unsupported
+                  :from from
+                  :to to})))))
 
 (defn- snapshot-state-file
   [snapshot-root]
