@@ -1,0 +1,430 @@
+;;
+;; Copyright (c) Huahai Yang. All rights reserved.
+;; The use and distribution terms for this software are covered by the
+;; Eclipse Public License 2.0 (https://opensource.org/license/epl-2.0)
+;; which can be found in the file LICENSE at the root of this distribution.
+;; By using this software in any fashion, you are agreeing to be bound by
+;; the terms of this license.
+;; You must not remove this notice, or any other, from this software.
+;;
+(ns ^:no-doc datalevin.server.ha-runtime
+  "HA runtime/state helpers extracted from datalevin.server."
+  (:require
+   [clojure.string :as s]
+   [datalevin.constants :as c]
+   [datalevin.ha :as dha]
+   [datalevin.ha.control :as ctrl]
+   [datalevin.util :as u]
+   [taoensso.timbre :as log])
+  (:import
+   [java.util.concurrent CountDownLatch TimeUnit]
+   [java.util.concurrent.atomic AtomicBoolean]
+   [datalevin.storage Store]))
+
+(def missing-state-value
+  (Object.))
+
+(def ha-follower-local-side-effect-keys
+  [:store
+   :dt-db
+   :engine
+   :index
+   :ha-local-last-applied-lsn])
+
+(def ha-follower-side-effect-keys
+  [:store
+   :dt-db
+   :engine
+   :index
+   :ha-local-last-applied-lsn
+   :ha-local-persisted-lsn
+   :ha-local-last-persisted-applied-ms
+   :ha-follower-last-apply-readback
+   :ha-follower-last-batch-records
+   :ha-follower-batches-since-persist
+   :ha-follower-next-lsn
+   :ha-follower-last-batch-size
+   :ha-follower-last-sync-ms
+   :ha-follower-leader-endpoint
+   :ha-follower-source-endpoint
+   :ha-follower-source-order
+   :ha-follower-last-bootstrap-ms
+   :ha-follower-bootstrap-source-endpoint
+   :ha-follower-bootstrap-snapshot-last-applied-lsn
+   :ha-follower-sync-backoff-ms
+   :ha-follower-next-sync-not-before-ms
+   :ha-follower-degraded?
+   :ha-follower-degraded-reason
+   :ha-follower-degraded-details
+   :ha-follower-degraded-since-ms
+   :ha-follower-last-error
+   :ha-follower-last-error-details
+   :ha-follower-last-error-ms])
+
+(defn state-patch
+  [keys expected-state next-state]
+  (let [patch (reduce
+               (fn [acc k]
+                 (let [expected-v (get expected-state k missing-state-value)
+                       next-v     (get next-state k missing-state-value)]
+                   (if (= expected-v next-v)
+                     acc
+                     (assoc acc k next-v))))
+               {}
+               keys)]
+    (when (seq patch)
+      patch)))
+
+(defn ha-follower-local-side-effect-patch
+  [expected-state next-state]
+  (when (= :follower (:ha-role expected-state))
+    (state-patch ha-follower-local-side-effect-keys
+                 expected-state
+                 next-state)))
+
+(defn ha-follower-side-effect-patch
+  [expected-state next-state]
+  (when (= :follower (:ha-role expected-state))
+    (state-patch ha-follower-side-effect-keys
+                 expected-state
+                 next-state)))
+
+(def ha-renew-merge-excluded-keys
+  (into #{:ha-leader-last-applied-lsn
+          :ha-renew-loop-running?
+          :ha-renew-loop-future
+          :ha-follower-loop-running?
+          :ha-follower-loop-future}
+        ha-follower-side-effect-keys))
+
+(defn ha-renew-state-patch
+  [expected-state next-state]
+  (let [patch-keys (->> (concat (keys expected-state)
+                                (keys next-state))
+                        distinct
+                        (remove ha-renew-merge-excluded-keys))]
+    (state-patch patch-keys
+                 expected-state
+                 next-state)))
+
+(defn apply-state-patch
+  [state patch]
+  (reduce-kv
+   (fn [acc k v]
+     (if (identical? missing-state-value v)
+       (dissoc acc k)
+       (assoc acc k v)))
+   state
+   patch))
+
+(defn same-ha-runtime-state?
+  [current-state expected-state running-key]
+  (and (identical? (get current-state running-key)
+                   (get expected-state running-key))
+       (identical? (:ha-authority current-state)
+                   (:ha-authority expected-state))
+       (= (:ha-node-id current-state)
+          (:ha-node-id expected-state))
+       (= (:ha-db-identity current-state)
+          (:ha-db-identity expected-state))
+       (= (:ha-membership-hash current-state)
+          (:ha-membership-hash expected-state))))
+
+(defn merge-ha-follower-local-side-effect-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (same-ha-runtime-state?
+            current-state
+            expected-state
+            :ha-follower-loop-running?))
+    (apply-state-patch current-state patch)
+    current-state))
+
+(defn merge-ha-follower-side-effect-patch
+  [current-state expected-state local-patch patch]
+  (let [current-state
+        (merge-ha-follower-local-side-effect-patch
+         current-state
+         expected-state
+         local-patch)]
+    (if (and patch
+             (= :follower (:ha-role current-state))
+             (= :follower (:ha-role expected-state))
+             (same-ha-runtime-state?
+              current-state
+              expected-state
+              :ha-follower-loop-running?))
+      (apply-state-patch current-state patch)
+      current-state)))
+
+(defn merge-ha-renew-state-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (same-ha-runtime-state?
+            current-state
+            expected-state
+            :ha-renew-loop-running?))
+    (apply-state-patch current-state patch)
+    current-state))
+
+(defn persist-ha-follower-side-effects!
+  [expected-state next-state local-patch]
+  ;; Follower replay now throttles `:ha/local-applied-lsn` persistence inside
+  ;; the HA sync step and relies on txlog watermarks for crash recovery between
+  ;; flushes. Keep the server-side publication hook free of extra per-batch KV
+  ;; writes so catch-up can amortize those tiny updates.
+  next-state)
+
+(defn consensus-ha-opts
+  [store]
+  (dha/consensus-ha-opts store))
+
+(def ha-runtime-option-keys
+  [:ha-mode
+   :db-identity
+   :ha-node-id
+   :ha-members
+   :ha-lease-renew-ms
+   :ha-lease-timeout-ms
+   :ha-write-admission-lease-margin-ms
+   :ha-promotion-base-delay-ms
+   :ha-promotion-rank-delay-ms
+   :ha-max-promotion-lag-lsn
+   :ha-follower-max-batch-records
+   :ha-follower-target-batch-bytes
+   :ha-follower-persist-every-batches
+   :ha-follower-persist-interval-ms
+   :ha-client-credentials
+   :ha-demotion-drain-ms
+   :ha-fencing-hook
+   :ha-clock-skew-budget-ms
+   :ha-clock-skew-hook
+   :ha-control-plane])
+
+(def ha-runtime-option-key-set
+  (set ha-runtime-option-keys))
+
+(defn sanitize-ha-path-segment
+  [x]
+  (-> x
+      str
+      (s/replace #"[^A-Za-z0-9._-]" "_")))
+
+(defn default-ha-control-raft-dir
+  [root db-name ha-opts]
+  (let [cp            (:ha-control-plane ha-opts)
+        group-id      (sanitize-ha-path-segment (:group-id cp))
+        local-peer-id (sanitize-ha-path-segment (:local-peer-id cp))
+        db-segment    (u/hexify-string db-name)]
+    (str root
+         u/+separator+
+         "ha-control"
+         u/+separator+
+         group-id
+         u/+separator+
+         local-peer-id
+         u/+separator+
+         db-segment)))
+
+(defn with-default-ha-control-raft-dir
+  [root db-name ha-opts]
+  (if (and (= :sofa-jraft (get-in ha-opts [:ha-control-plane :backend]))
+           (nil? (get-in ha-opts [:ha-control-plane :raft-dir])))
+    (assoc-in ha-opts
+              [:ha-control-plane :raft-dir]
+              (default-ha-control-raft-dir root db-name ha-opts))
+    ha-opts))
+
+(defn start-ha-authority
+  ([db-name ha-opts]
+   (dha/start-ha-authority db-name ha-opts))
+  ([db-name root ha-opts]
+   (dha/start-ha-authority
+    db-name
+    (with-default-ha-control-raft-dir root db-name ha-opts))))
+
+(defn stop-ha-authority
+  [db-name m]
+  (dha/stop-ha-authority db-name m))
+
+(defn ha-loop-sleep-ms
+  ([m]
+   (ha-loop-sleep-ms m (System/currentTimeMillis)))
+  ([m now-ms]
+   (let [renew-ms  (long (max 100
+                              (long (or (:ha-lease-renew-ms m)
+                                        c/*ha-lease-renew-ms*))))
+         role      (:ha-role m)
+         deadlines (cond-> []
+                     (and (= :candidate role)
+                          (integer? (:ha-candidate-since-ms m))
+                          (integer? (:ha-candidate-delay-ms m)))
+                     (conj (+ (long (:ha-candidate-since-ms m))
+                              (long (:ha-candidate-delay-ms m))))
+
+                     (and (= :candidate role)
+                          (integer? (:ha-candidate-pre-cas-wait-until-ms m)))
+                     (conj (long (:ha-candidate-pre-cas-wait-until-ms m)))
+
+                     (and (= :demoting role)
+                          (or (integer? (:ha-demotion-drain-until-ms m))
+                              (integer? (:ha-demoted-at-ms m))))
+                     (conj (long (or (:ha-demotion-drain-until-ms m)
+                                     (:ha-demoted-at-ms m)))))
+         next-deadline (when (seq deadlines)
+                         (long (reduce min (map long deadlines))))
+         remaining-ms  (when (some? next-deadline)
+                         (let [delta (- (long next-deadline)
+                                        (long now-ms))]
+                           (long (if (neg? delta) 0 delta))))]
+     (if (some? remaining-ms)
+       (cond
+         (< (long remaining-ms) 1) 1
+         (< (long remaining-ms) renew-ms) (long remaining-ms)
+         :else renew-ms)
+       renew-ms))))
+
+(defn ha-follower-loop-sleep-ms
+  ([m]
+   (ha-follower-loop-sleep-ms m (System/currentTimeMillis)))
+  ([m now-ms]
+   (let [renew-ms (long (max 100
+                             (long (or (:ha-lease-renew-ms m)
+                                       c/*ha-lease-renew-ms*))))
+         idle-ms  (long (min 250
+                             (max 25 (quot renew-ms 4))))
+         role     (:ha-role m)
+         next-sync-not-before-ms
+         (when (integer? (:ha-follower-next-sync-not-before-ms m))
+           (long (:ha-follower-next-sync-not-before-ms m)))
+         batch-size (long (or (:ha-follower-last-batch-size m) 0))]
+     (cond
+       (and (= :follower role)
+            next-sync-not-before-ms)
+       (let [remaining-ms (- (long next-sync-not-before-ms) (long now-ms))]
+         (long (if (<= remaining-ms 0) 1 remaining-ms)))
+
+       (and (= :follower role)
+            (pos? batch-size))
+       0
+
+       :else
+       idle-ms))))
+
+(defn sleep-ha-loop!
+  [^AtomicBoolean running? sleep-ms]
+  (when (pos? (long sleep-ms))
+    (try
+      (Thread/sleep (long sleep-ms))
+      (catch InterruptedException _
+        (.set running? false)))))
+
+(defn ha-loop-error-backoff!
+  [^AtomicBoolean running?]
+  (try
+    (Thread/sleep 250)
+    (catch InterruptedException _
+      (.set running? false))))
+
+(defn await-ha-loop-stop
+  [loop-label db-name latch]
+  (when (instance? CountDownLatch latch)
+    (try
+      (when-not (.await ^CountDownLatch latch 5 TimeUnit/SECONDS)
+        (log/warn "Timed out waiting for HA loop to stop"
+                  {:db-name db-name
+                   :loop loop-label}))
+      (catch InterruptedException _
+        (.interrupt (Thread/currentThread))
+        (log/warn "Interrupted while waiting for HA loop to stop"
+                  {:db-name db-name
+                   :loop loop-label})))))
+
+(defn current-ha-runtime-local-opts
+  [m current-runtime-opts-fn]
+  (dha/merge-ha-runtime-local-opts
+   (dha/effective-ha-runtime-local-opts m)
+   (some-> (current-runtime-opts-fn m)
+           dha/select-ha-runtime-local-opts)))
+
+(defn resolved-ha-runtime-opts
+  [root db-name store m explicit-ha-runtime-opts
+   {:keys [consensus-ha-opts-fn current-runtime-opts-fn]}]
+  (when-let [ha-opts (consensus-ha-opts-fn store)]
+    (let [current-ha-runtime-opts
+          (dha/merge-ha-runtime-local-opts
+           (current-ha-runtime-local-opts m current-runtime-opts-fn)
+           (dha/select-ha-runtime-local-opts explicit-ha-runtime-opts))
+          merged-ha-opts
+          (dha/merge-ha-runtime-local-opts ha-opts
+                                           current-ha-runtime-opts)]
+      (-> (with-default-ha-control-raft-dir root db-name merged-ha-opts)
+          (select-keys ha-runtime-option-keys)))))
+
+(defn shared-store-lifecycle?
+  [a b]
+  (or (identical? a b)
+      (and (instance? Store a)
+           (instance? Store b)
+           (identical? (.-lmdb ^Store a)
+                       (.-lmdb ^Store b)))))
+
+(defn ha-authority-running?
+  [authority]
+  (if authority
+    (let [diagnostics (try
+                        (ctrl/authority-diagnostics authority)
+                        (catch Throwable _
+                          nil))]
+      (if (contains? diagnostics :running?)
+        (true? (:running? diagnostics))
+        true))
+    false))
+
+(defn stop-ha-runtime
+  [db-name m
+   {:keys [current-runtime-opts-fn
+           stop-ha-renew-loop-fn
+           stop-ha-follower-sync-loop-fn
+           await-ha-loop-stop-fn
+           stop-ha-authority-fn]}]
+  (let [runtime-local-opts
+        (current-ha-runtime-local-opts m current-runtime-opts-fn)]
+    (stop-ha-renew-loop-fn m)
+    (stop-ha-follower-sync-loop-fn m)
+    (await-ha-loop-stop-fn :renew db-name (:ha-renew-loop-stopped-latch m))
+    (await-ha-loop-stop-fn :follower db-name
+                           (:ha-follower-loop-stopped-latch m))
+    (try
+      (dha/persist-ha-runtime-local-applied-lsn! m)
+      (catch Throwable t
+        (log/warn t "Failed to persist HA local applied LSN during shutdown"
+                  {:db-name db-name
+                   :ha-node-id (:ha-node-id m)})))
+    (stop-ha-authority-fn db-name m)
+    (cond-> (dissoc (dha/clear-ha-runtime-state m)
+                    :ha-runtime-opts
+                    :ha-renew-loop-future
+                    :ha-renew-loop-stopped-latch
+                    :ha-follower-loop-future
+                    :ha-follower-loop-stopped-latch)
+      (seq runtime-local-opts)
+      (assoc :ha-runtime-local-opts runtime-local-opts))))
+
+(defn ensure-ha-runtime
+  [root db-name m store explicit-ha-runtime-opts
+   {:keys [resolved-ha-runtime-opts-fn
+           start-ha-authority-fn
+           stop-ha-runtime-fn]}]
+  (if-let [ha-opts (resolved-ha-runtime-opts-fn
+                    root db-name store m explicit-ha-runtime-opts)]
+    (let [runtime-local-opts (dha/select-ha-runtime-local-opts ha-opts)]
+      (if (and (= (:ha-runtime-opts m) ha-opts)
+               (ha-authority-running? (:ha-authority m)))
+        (assoc m :ha-runtime-local-opts runtime-local-opts)
+        (-> (stop-ha-runtime-fn db-name m)
+            (merge (start-ha-authority-fn db-name ha-opts))
+            (assoc :ha-runtime-opts ha-opts
+                   :ha-runtime-local-opts runtime-local-opts))))
+    (dissoc (stop-ha-runtime-fn db-name m)
+            :ha-runtime-local-opts)))

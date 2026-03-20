@@ -25,6 +25,8 @@
    [datalevin.storage :as st]
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
+   [datalevin.server.auth :as auth]
+   [datalevin.server.ha-runtime :as hrt]
    [datalevin.search :as sc]
    [datalevin.txlog :as txlog]
    [datalevin.vector :as v]
@@ -36,13 +38,12 @@
    [clojure.stacktrace :as stt]
    [clojure.string :as s])
   (:import
-   [java.nio.charset StandardCharsets]
    [java.nio ByteBuffer BufferOverflowException]
    [java.nio.file Files Paths OpenOption]
    [java.nio.channels ClosedChannelException Selector SelectionKey
     ServerSocketChannel SocketChannel]
    [java.net InetSocketAddress]
-   [java.security SecureRandom MessageDigest]
+   [java.security MessageDigest]
    [java.util Iterator UUID Map]
    [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
@@ -51,9 +52,7 @@
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
-   [datalevin.interface ILMDB IStore]
-   [org.bouncycastle.crypto.generators Argon2BytesGenerator]
-   [org.bouncycastle.crypto.params Argon2Parameters Argon2Parameters$Builder]))
+   [datalevin.interface ILMDB IStore]))
 
 (defprotocol IServer
   (start [srv] "Start the server")
@@ -61,433 +60,52 @@
 
 ;; system db management
 
-(def server-schema
-  (merge c/implicit-schema
-         c/entity-time-schema
-         {:user/name    {:db/doc       "User name, must be unique"
-                         :db/unique    :db.unique/identity
-                         :db/valueType :db.type/string}
-          :user/pw-hash {:db/doc       "Hash of password"
-                         :db/valueType :db.type/string}
-          :user/pw-salt {:db/doc       "Salt of password"
-                         :db/valueType :db.type/bytes}
+(def server-schema auth/server-schema)
 
-          :database/name {:db/doc       "Database name, must be unique"
-                          :db/unique    :db.unique/identity
-                          :db/valueType :db.type/string}
-          :database/type {:db/doc       "Database type, :datalog or :key-value"
-                          :db/valueType :db.type/keyword}
+(def permission-actions auth/permission-actions)
 
-          :role/key {:db/doc       "Role name, a keyword, must be unique"
-                     :db/valueType :db.type/keyword
-                     :db/unique    :db.unique/identity}
+(def permission-objects auth/permission-objects)
 
-          :permission/act {:db/doc       "Securable action: ::view, ::alter,
-                                          ::create, or ::control"
-                           :db/valueType :db.type/keyword}
-          :permission/obj {:db/doc       "Securable object type: ::database,
-                                          ::user, ::role, or ::server"
-                           :db/valueType :db.type/keyword}
-          :permission/tgt {:db/doc       "Securable target, an entity id"
-                           :db/valueType :db.type/ref}
+(def salt auth/salt)
 
-          :user-role/user {:db/doc       "User part of a user role assignment"
-                           :db/valueType :db.type/ref}
-          :user-role/role {:db/doc       "Role part of a user role assignment"
-                           :db/valueType :db.type/ref}
+(def password-hashing auth/password-hashing)
 
-          :role-perm/role {:db/doc       "Role part of a role permission grant"
-                           :db/valueType :db.type/ref}
-          :role-perm/perm {:db/doc       "Permission part of a permission grant"
-                           :db/valueType :db.type/ref}}))
+(def password-matches? auth/password-matches?)
 
-;; permission securable actions
-(derive ::alter ::view)
-(derive ::create ::alter)
-(derive ::control ::create)
-
-(def permission-actions #{::view ::alter ::create ::control})
-
-;; permission securable object types
-(derive ::server ::database)
-(derive ::server ::user)
-(derive ::server ::role)
-
-(def permission-objects #{::database ::user ::role ::server})
-
-(defn salt
-  "generate a 16 byte salt"
-  []
-  (let [bs (byte-array 16)]
-    (.nextBytes (SecureRandom.) bs)
-    bs))
-
-(defn password-hashing
-  "hashing password using argon2id algorithm, see
-  https://github.com/p-h-c/phc-winner-argon2"
-  ([password salt]
-   (password-hashing password salt nil))
-  ([^String password ^bytes salt
-    {:keys [ops-limit mem-limit out-length parallelism]
-     ;; these defaults are secure, as it takes about 0.5 second to hash
-     :or   {ops-limit   4
-            mem-limit   131072
-            out-length  32
-            parallelism 1}}]
-   (let [builder (doto (Argon2Parameters$Builder. Argon2Parameters/ARGON2_id)
-                   (.withVersion Argon2Parameters/ARGON2_VERSION_13)
-                   (.withIterations ops-limit)
-                   (.withMemoryAsKB mem-limit)
-                   (.withParallelism parallelism)
-                   (.withSalt salt))
-         gen     (doto (Argon2BytesGenerator.)
-                   (.init (.build builder)))
-         out-bs  (byte-array out-length)
-         in-bs   (.getBytes password StandardCharsets/UTF_8)]
-     (.generateBytes gen in-bs out-bs (int 0) (int out-length))
-     (b/encode-base64 out-bs))))
-
-(defn password-matches?
-  [in-password password-hash salt]
-  (= password-hash (password-hashing in-password salt)))
-
-(defn- pull-user
-  [sys-conn username]
-  {:pre [(d/conn? sys-conn)]}
-  (try
-    (d/pull @sys-conn '[*] [:user/name username])
-    (catch Exception _
-      nil)))
-
-(defn- query-user
-  [sys-conn username]
-  {:pre [(d/conn? sys-conn)]}
-  (d/q '[:find ?u .
-         :in $ ?uname
-         :where
-         [?u :user/name ?uname]]
-       @sys-conn username))
-
-(defn- pull-db
-  [sys-conn db-name]
-  {:pre [(d/conn? sys-conn)]}
-  (try
-    (d/pull @sys-conn '[*] [:database/name db-name])
-    (catch Exception _
-      nil)))
-
-(defn- query-role
-  [sys-conn role-key]
-  {:pre [(d/conn? sys-conn)]}
-  (d/q '[:find ?r .
-         :in $ ?rk
-         :where
-         [?r :role/key ?rk]]
-       @sys-conn role-key))
-
-(defn- user-eid [sys-conn username] (query-user sys-conn username))
-
-(defn- db-eid [sys-conn db-name] (:db/id (pull-db sys-conn db-name)))
-
-(defn- role-eid [sys-conn role-key] (query-role sys-conn role-key))
-
-(defn- eid->username
-  [sys-conn eid]
-  (:user/name (d/pull @sys-conn [:user/name] eid)))
-
-(defn- eid->db-name
-  [sys-conn eid]
-  (:database/name (d/pull @sys-conn [:database/name] eid)))
-
-(defn- eid->role-key
-  [sys-conn eid]
-  (:role/key (d/pull @sys-conn [:role/key] eid)))
-
-(defn- query-users [sys-conn]
-  (d/q '[:find [?uname ...]
-         :where
-         [?u :user/name ?uname]]
-       @sys-conn))
-
-(defn- user-roles
-  [sys-conn username]
-  (d/q '[:find [?rk ...]
-         :in $ ?uname
-         :where
-         [?u :user/name ?uname]
-         [?ur :user-role/user ?u]
-         [?ur :user-role/role ?r]
-         [?r :role/key ?rk]]
-       @sys-conn username))
-
-(defn- query-roles [sys-conn]
-  (d/q '[:find [?rk ...]
-         :where
-         [?r :role/key ?rk]]
-       @sys-conn))
-
-(defn- perm-tgt-eid
-  [sys-conn perm-obj perm-tgt]
-  (case perm-obj
-    ::database (db-eid sys-conn perm-tgt)
-    ::user     (user-eid sys-conn perm-tgt)
-    ::role     (role-eid sys-conn perm-tgt)
-    ::server   nil))
-
-(defn- perm-tgt-name
-  [sys-conn perm-obj perm-tgt]
-  (case perm-obj
-    ::database (eid->db-name sys-conn perm-tgt)
-    ::user     (eid->username sys-conn perm-tgt)
-    ::role     (eid->role-key sys-conn perm-tgt)
-    ::server   nil))
-
-(defn- user-permissions
-  ([sys-conn username ]
-   (mapv first
-         (d/q '[:find (pull ?p [:permission/act :permission/obj :permission/tgt])
-                :in $ ?uname
-                :where
-                [?u :user/name ?uname]
-                [?ur :user-role/user ?u]
-                [?ur :user-role/role ?r]
-                [?rp :role-perm/role ?r]
-                [?rp :role-perm/perm ?p]]
-              @sys-conn username))))
-
-(defn- role-permissions
-  [sys-conn role-key]
-  (mapv first
-        (d/q '[:find (pull ?p [:permission/act :permission/obj :permission/tgt])
-               :in $ ?rk
-               :where
-               [?r :role/key ?rk]
-               [?rp :role-perm/role ?r]
-               [?rp :role-perm/perm ?p]]
-             @sys-conn role-key)))
-
-(defn- user-role-eid
-  [sys-conn uid rid]
-  (when (and uid rid)
-    (d/q '[:find ?ur .
-           :in $ ?u ?r
-           :where
-           [?ur :user-role/user ?u]
-           [?ur :user-role/role ?r]]
-         @sys-conn uid rid)))
-
-(defn- permission-eid
-  ([sys-conn perm-tgt]
-   (when perm-tgt
-     (d/q '[:find [?p ...]
-            :in $ ?tgt
-            :where
-            [?p :permission/tgt ?tgt]]
-          @sys-conn perm-tgt)))
-  ([sys-conn perm-act perm-obj perm-tgt]
-   (if perm-tgt
-     (d/q '[:find ?p .
-            :in $ ?act ?obj ?tgt
-            :where
-            [?p :permission/act ?act]
-            [?p :permission/obj ?obj]
-            [?p :permission/tgt ?tgt]]
-          @sys-conn perm-act perm-obj perm-tgt)
-     (d/q '[:find ?p .
-            :in $ ?act ?obj
-            :where
-            [?p :permission/act ?act]
-            [?p :permission/obj ?obj]
-            (not [?p :permission/tgt ?tgt])]
-          @sys-conn perm-act perm-obj))))
-
-(defn- role-permission-eid
-  [sys-conn rid pid]
-  (when (and rid pid)
-    (d/q '[:find ?rp .
-           :in $ ?r ?p
-           :where
-           [?rp :role-perm/role ?r]
-           [?rp :role-perm/perm ?p]]
-         @sys-conn rid pid)))
-
-(defn- query-databases
-  [sys-conn]
-  (d/q '[:find [?dname ...]
-         :where
-         [?d :database/name ?dname]]
-       @sys-conn))
-
-;; each user is a role, similar to postgres
-(defn- user-role-key [username] (keyword "datalevin.role" username))
-
-(defn- user-role-key?
-  ([sys-conn role-key]
-   (user-role-key? sys-conn role-key nil))
-  ([sys-conn role-key username]
-   (let [ns (namespace role-key)
-         n  (name role-key)]
-     (and (= ns "datalevin.role")  (query-user sys-conn n)
-          (if username (= n username) true)))))
-
-(defn- transact-new-user
-  [sys-conn username password]
-  (if (query-user sys-conn username)
-    (u/raise "User already exits" {:username username})
-    (let [s (salt)]
-      (d/transact! sys-conn [{:db/id        -1
-                              :user/name    username
-                              :user/pw-hash (password-hashing password s)
-                              :user/pw-salt s}
-                             {:db/id    -2
-                              :role/key (user-role-key username)}
-                             {:db/id          -3
-                              :user-role/user -1
-                              :user-role/role -2}
-                             {:db/id          -4
-                              :permission/act ::alter
-                              :permission/obj ::user
-                              :permission/tgt -1}
-                             {:db/id          -5
-                              :role-perm/perm -4
-                              :role-perm/role -2}
-                             {:db/id          -6
-                              :permission/act ::view
-                              :permission/obj ::role
-                              :permission/tgt -2}
-                             {:db/id          -7
-                              :role-perm/perm -6
-                              :role-perm/role -2}]))))
-
-(defn- transact-new-password
-  [sys-conn username password]
-  (let [s (salt)]
-    (d/transact! sys-conn [{:user/name    username
-                            :user/pw-hash (password-hashing password s)
-                            :user/pw-salt s}])))
-
-(defn- transact-drop-user
-  [sys-conn uid username]
-  (let [rid    (role-eid sys-conn (user-role-key username))
-        urid   (user-role-eid sys-conn uid rid)
-        pids   (permission-eid sys-conn uid)
-        p-txs  (mapv (fn [pid] [:db/retractEntity pid]) pids)
-        rpids  (mapv #(role-permission-eid sys-conn rid %) pids)
-        rp-txs (mapv (fn [rpid] [:db/retractEntity rpid]) rpids)]
-    (d/transact! sys-conn (u/concatv rp-txs p-txs
-                                     [[:db/retractEntity urid]
-                                      [:db/retractEntity rid]
-                                      [:db/retractEntity uid]]))))
-
-(defn- transact-new-role
-  [sys-conn role-key]
-  (if (query-role sys-conn role-key)
-    (u/raise "Role already exits" {:role-key role-key})
-    (d/transact! sys-conn [{:db/id    -1
-                            :role/key role-key}
-                           {:db/id          -2
-                            :permission/act ::view
-                            :permission/obj ::role
-                            :permission/tgt -1}
-                           {:db/id          -3
-                            :role-perm/perm -2
-                            :role-perm/role -1}])))
-
-(defn- transact-drop-role
-  [sys-conn rid]
-  (let [ur-txs (mapv (fn [urid] [:db/retractEntity urid])
-                     (d/q '[:find [?ur ...]
-                            :in $ ?rid
-                            :where
-                            [?ur :user-role/role ?rid]]
-                          @sys-conn rid))
-        pids   (permission-eid sys-conn rid)
-        p-txs  (mapv (fn [pid] [:db/retractEntity pid]) pids)
-        rpids  (mapv #(role-permission-eid sys-conn rid %) pids)
-        rp-txs (mapv (fn [rpid] [:db/retractEntity rpid]) rpids)]
-    (d/transact! sys-conn (u/concatv rp-txs p-txs ur-txs
-                                     [[:db/retractEntity rid]]))))
-
-(defn- transact-user-role
-  [sys-conn rid username]
-  (if-let [uid (user-eid sys-conn username)]
-    (d/transact! sys-conn [{:user-role/user uid :user-role/role rid}])
-    (u/raise "User does not exist." {:username username})))
-
-(defn- transact-withdraw-role
-  [sys-conn rid username]
-  (if-let [uid (user-eid sys-conn username)]
-    (when-let [urid (user-role-eid sys-conn uid rid)]
-      (d/transact! sys-conn [[:db/retractEntity urid]]))
-    (u/raise "User does not exist." {:username username})))
-
-(defn- transact-role-permission
-  [sys-conn rid perm-act perm-obj perm-tgt]
-  (if perm-tgt
-    (if-let [tid (perm-tgt-eid sys-conn perm-obj perm-tgt)]
-      (if-let [pid (permission-eid sys-conn perm-act perm-obj tid)]
-        (d/transact! sys-conn [{:role-perm/perm pid :role-perm/role rid}])
-        (d/transact! sys-conn [{:db/id          -1
-                                :permission/act perm-act
-                                :permission/obj perm-obj
-                                :permission/tgt tid}
-                               {:db/id          -2
-                                :role-perm/perm -1
-                                :role-perm/role rid}]))
-      (u/raise "Permission target does not exist." {}))
-    (d/transact! sys-conn [{:db/id          -1
-                            :permission/act perm-act
-                            :permission/obj perm-obj}
-                           {:db/id          -2
-                            :role-perm/perm -1
-                            :role-perm/role rid}])))
-
-(defn- transact-revoke-permission
-  [sys-conn rid perm-act perm-obj perm-tgt]
-  (if perm-tgt
-    (if-let [tid (perm-tgt-eid sys-conn perm-obj perm-tgt)]
-      (if-let [pid (permission-eid sys-conn perm-act perm-obj tid)]
-        (when-let [rpid (role-permission-eid sys-conn rid pid)]
-          (d/transact! sys-conn [[:db/retractEntity rpid]]))
-        (u/raise "Permission does not exist." {}))
-      (u/raise "Permission target does not exist." {}))
-    (if-let [pid (permission-eid sys-conn perm-act perm-obj nil)]
-      (when-let [rpid (role-permission-eid sys-conn rid pid)]
-        (d/transact! sys-conn [[:db/retractEntity rpid]]))
-      (u/raise "Permission does not exist." {}))))
-
-(defn- transact-new-db
-  [sys-conn username db-type db-name]
-  (d/transact! sys-conn
-               [{:db/id         -1
-                 :database/type db-type
-                 :database/name db-name}
-                {:db/id          -2
-                 :permission/act ::create
-                 :permission/obj ::database
-                 :permission/tgt -1}
-                {:db/id          -3
-                 :role-perm/perm -2
-                 :role-perm/role [:role/key (user-role-key username)]}]))
-
-(defn- transact-drop-db
-  [sys-conn did]
-  (let [pids     (d/q '[:find [?p ...]
-                        :in $ ?did
-                        :where
-                        [?p :permission/tgt ?did]]
-                      @sys-conn did)
-        pids-txs (mapv (fn [pid] [:db/retractEntity pid]) pids)
-        rpids    (mapcat (fn [pid]
-                           (d/q '[:find [?rp ...]
-                                  :in $ ?pid
-                                  :where
-                                  [?rp :role-perm/perm ?pid]]
-                                @sys-conn pid))
-                         pids)
-        rp-txs   (mapv (fn [rpid] [:db/retractEntity rpid]) rpids)]
-    (d/transact! sys-conn (u/concatv rp-txs pids-txs
-                                     [[:db/retractEntity did]]))))
+(def ^:private pull-user auth/pull-user)
+(def ^:private query-user auth/query-user)
+(def ^:private pull-db auth/pull-db)
+(def ^:private query-role auth/query-role)
+(def ^:private user-eid auth/user-eid)
+(def ^:private db-eid auth/db-eid)
+(def ^:private role-eid auth/role-eid)
+(def ^:private eid->username auth/eid->username)
+(def ^:private eid->db-name auth/eid->db-name)
+(def ^:private eid->role-key auth/eid->role-key)
+(def ^:private query-users auth/query-users)
+(def ^:private user-roles auth/user-roles)
+(def ^:private query-roles auth/query-roles)
+(def ^:private perm-tgt-eid auth/perm-tgt-eid)
+(def ^:private perm-tgt-name auth/perm-tgt-name)
+(def ^:private user-permissions auth/user-permissions)
+(def ^:private role-permissions auth/role-permissions)
+(def ^:private user-role-eid auth/user-role-eid)
+(def ^:private permission-eid auth/permission-eid)
+(def ^:private role-permission-eid auth/role-permission-eid)
+(def ^:private query-databases auth/query-databases)
+(def ^:private user-role-key auth/user-role-key)
+(def ^:private user-role-key? auth/user-role-key?)
+(def ^:private transact-new-user auth/transact-new-user)
+(def ^:private transact-new-password auth/transact-new-password)
+(def ^:private transact-drop-user auth/transact-drop-user)
+(def ^:private transact-new-role auth/transact-new-role)
+(def ^:private transact-drop-role auth/transact-drop-role)
+(def ^:private transact-user-role auth/transact-user-role)
+(def ^:private transact-withdraw-role auth/transact-withdraw-role)
+(def ^:private transact-role-permission auth/transact-role-permission)
+(def ^:private transact-revoke-permission auth/transact-revoke-permission)
+(def ^:private transact-new-db auth/transact-new-db)
+(def ^:private transact-drop-db auth/transact-drop-db)
 
 (defn- close-store
   [store]
@@ -557,15 +175,7 @@
               (recur (inc attempt)))
             (throw t)))))))
 
-(defn- has-permission?
-  [req-act req-obj req-tgt user-permissions]
-  (some (fn [{:keys [permission/act permission/obj permission/tgt] :as p}]
-          (and (isa? act req-act)
-               (isa? obj req-obj)
-               (if req-tgt
-                 (if tgt (= req-tgt (tgt :db/id)) true)
-                 (if tgt false true))))
-        user-permissions))
+(def ^:private has-permission? auth/has-permission?)
 
 (defmacro wrap-permission
   [req-act req-obj req-tgt message & body]
@@ -772,159 +382,29 @@
     {:updated? @updated?
      :state (when @present? @final-v)}))
 
-(def ^:private missing-state-value
-  (Object.))
-
+(def ^:private missing-state-value hrt/missing-state-value)
 (def ^:private ha-follower-local-side-effect-keys
-  [:store
-   :dt-db
-   :engine
-   :index
-   :ha-local-last-applied-lsn])
-
+  hrt/ha-follower-local-side-effect-keys)
 (def ^:private ha-follower-side-effect-keys
-  [:store
-   :dt-db
-   :engine
-   :index
-   :ha-local-last-applied-lsn
-   :ha-local-persisted-lsn
-   :ha-local-last-persisted-applied-ms
-   :ha-follower-last-apply-readback
-   :ha-follower-last-batch-records
-   :ha-follower-batches-since-persist
-   :ha-follower-next-lsn
-   :ha-follower-last-batch-size
-   :ha-follower-last-sync-ms
-   :ha-follower-leader-endpoint
-   :ha-follower-source-endpoint
-   :ha-follower-source-order
-   :ha-follower-last-bootstrap-ms
-   :ha-follower-bootstrap-source-endpoint
-   :ha-follower-bootstrap-snapshot-last-applied-lsn
-   :ha-follower-sync-backoff-ms
-   :ha-follower-next-sync-not-before-ms
-   :ha-follower-degraded?
-   :ha-follower-degraded-reason
-   :ha-follower-degraded-details
-   :ha-follower-degraded-since-ms
-   :ha-follower-last-error
-   :ha-follower-last-error-details
-   :ha-follower-last-error-ms])
-
-(defn- state-patch
-  [keys expected-state next-state]
-  (let [patch (reduce
-               (fn [acc k]
-                 (let [expected-v (get expected-state k missing-state-value)
-                       next-v     (get next-state k missing-state-value)]
-                   (if (= expected-v next-v)
-                     acc
-                     (assoc acc k next-v))))
-               {}
-               keys)]
-    (when (seq patch)
-      patch)))
-
-(defn- ha-follower-local-side-effect-patch
-  [expected-state next-state]
-  (when (= :follower (:ha-role expected-state))
-    (state-patch ha-follower-local-side-effect-keys
-                 expected-state
-                 next-state)))
-
-(defn- ha-follower-side-effect-patch
-  [expected-state next-state]
-  (when (= :follower (:ha-role expected-state))
-    (state-patch ha-follower-side-effect-keys
-                 expected-state
-                 next-state)))
-
+  hrt/ha-follower-side-effect-keys)
+(def ^:private state-patch hrt/state-patch)
+(def ^:private ha-follower-local-side-effect-patch
+  hrt/ha-follower-local-side-effect-patch)
+(def ^:private ha-follower-side-effect-patch
+  hrt/ha-follower-side-effect-patch)
 (def ^:private ha-renew-merge-excluded-keys
-  (into #{:ha-leader-last-applied-lsn
-          :ha-renew-loop-running?
-          :ha-renew-loop-future
-          :ha-follower-loop-running?
-          :ha-follower-loop-future}
-        ha-follower-side-effect-keys))
-
-(defn- ha-renew-state-patch
-  [expected-state next-state]
-  (let [patch-keys (->> (concat (keys expected-state)
-                                (keys next-state))
-                        distinct
-                        (remove ha-renew-merge-excluded-keys))]
-    (state-patch patch-keys
-                 expected-state
-                 next-state)))
-
-(defn- apply-state-patch
-  [state patch]
-  (reduce-kv
-   (fn [acc k v]
-     (if (identical? missing-state-value v)
-       (dissoc acc k)
-       (assoc acc k v)))
-   state
-   patch))
-
-(defn- same-ha-runtime-state?
-  [current-state expected-state running-key]
-  (and (identical? (get current-state running-key)
-                   (get expected-state running-key))
-       (identical? (:ha-authority current-state)
-                   (:ha-authority expected-state))
-       (= (:ha-node-id current-state)
-          (:ha-node-id expected-state))
-       (= (:ha-db-identity current-state)
-          (:ha-db-identity expected-state))
-       (= (:ha-membership-hash current-state)
-          (:ha-membership-hash expected-state))))
-
-(defn- merge-ha-follower-local-side-effect-patch
-  [current-state expected-state patch]
-  (if (and patch
-           (same-ha-runtime-state?
-            current-state
-            expected-state
-            :ha-follower-loop-running?))
-    (apply-state-patch current-state patch)
-    current-state))
-
-(defn- merge-ha-follower-side-effect-patch
-  [current-state expected-state local-patch patch]
-  (let [current-state
-        (merge-ha-follower-local-side-effect-patch
-         current-state
-         expected-state
-         local-patch)]
-    (if (and patch
-             (= :follower (:ha-role current-state))
-             (= :follower (:ha-role expected-state))
-             (same-ha-runtime-state?
-              current-state
-              expected-state
-              :ha-follower-loop-running?))
-      (apply-state-patch current-state patch)
-      current-state)))
-
-(defn- merge-ha-renew-state-patch
-  [current-state expected-state patch]
-  (if (and patch
-           (same-ha-runtime-state?
-            current-state
-            expected-state
-            :ha-renew-loop-running?))
-    (apply-state-patch current-state patch)
-    current-state))
-
-(defn- persist-ha-follower-side-effects!
-  [expected-state next-state local-patch]
-  ;; Follower replay now throttles `:ha/local-applied-lsn` persistence inside
-  ;; the HA sync step and relies on txlog watermarks for crash recovery between
-  ;; flushes. Keep the server-side publication hook free of extra per-batch KV
-  ;; writes so catch-up can amortize those tiny updates.
-  next-state)
+  hrt/ha-renew-merge-excluded-keys)
+(def ^:private ha-renew-state-patch hrt/ha-renew-state-patch)
+(def ^:private apply-state-patch hrt/apply-state-patch)
+(def ^:private same-ha-runtime-state? hrt/same-ha-runtime-state?)
+(def ^:private merge-ha-follower-local-side-effect-patch
+  hrt/merge-ha-follower-local-side-effect-patch)
+(def ^:private merge-ha-follower-side-effect-patch
+  hrt/merge-ha-follower-side-effect-patch)
+(def ^:private merge-ha-renew-state-patch
+  hrt/merge-ha-renew-state-patch)
+(def ^:private persist-ha-follower-side-effects!
+  hrt/persist-ha-follower-side-effects!)
 
 (def ^:dynamic *server-runtime-opts-fn*
   (fn [_ _ _ _] nil))
@@ -1075,80 +555,19 @@
        :ha-authoritative-leader-node-id owner-node-id
        :udf-missing                  (:udf-missing m)})))
 
-(defn- consensus-ha-opts
-  [store]
-  (dha/consensus-ha-opts store))
+(def consensus-ha-opts hrt/consensus-ha-opts)
 
 (def ^:dynamic *consensus-ha-opts-fn*
   consensus-ha-opts)
 
-(def ^:private ha-runtime-option-keys
-  [:ha-mode
-   :db-identity
-   :ha-node-id
-   :ha-members
-   :ha-lease-renew-ms
-   :ha-lease-timeout-ms
-   :ha-write-admission-lease-margin-ms
-   :ha-promotion-base-delay-ms
-   :ha-promotion-rank-delay-ms
-   :ha-max-promotion-lag-lsn
-   :ha-follower-max-batch-records
-   :ha-follower-target-batch-bytes
-   :ha-follower-persist-every-batches
-   :ha-follower-persist-interval-ms
-   :ha-client-credentials
-   :ha-demotion-drain-ms
-   :ha-fencing-hook
-   :ha-clock-skew-budget-ms
-   :ha-clock-skew-hook
-   :ha-control-plane])
-
-(def ^:private ha-runtime-option-key-set
-  (set ha-runtime-option-keys))
-
-(defn- sanitize-ha-path-segment
-  [x]
-  (-> x
-      str
-      (s/replace #"[^A-Za-z0-9._-]" "_")))
-
-(defn- default-ha-control-raft-dir
-  [root db-name ha-opts]
-  (let [cp           (:ha-control-plane ha-opts)
-        group-id     (sanitize-ha-path-segment (:group-id cp))
-        local-peer-id (sanitize-ha-path-segment (:local-peer-id cp))
-        db-segment   (u/hexify-string db-name)]
-    (str root
-         u/+separator+
-         "ha-control"
-         u/+separator+
-         group-id
-         u/+separator+
-         local-peer-id
-         u/+separator+
-         db-segment)))
-
-(defn- with-default-ha-control-raft-dir
-  [root db-name ha-opts]
-  (if (and (= :sofa-jraft (get-in ha-opts [:ha-control-plane :backend]))
-           (nil? (get-in ha-opts [:ha-control-plane :raft-dir])))
-    (assoc-in ha-opts
-              [:ha-control-plane :raft-dir]
-              (default-ha-control-raft-dir root db-name ha-opts))
-    ha-opts))
-
-(defn- start-ha-authority
-  ([db-name ha-opts]
-   (dha/start-ha-authority db-name ha-opts))
-  ([db-name root ha-opts]
-   (dha/start-ha-authority
-    db-name
-    (with-default-ha-control-raft-dir root db-name ha-opts))))
-
-(defn- stop-ha-authority
-  [db-name m]
-  (dha/stop-ha-authority db-name m))
+(def ^:private ha-runtime-option-keys hrt/ha-runtime-option-keys)
+(def ^:private ha-runtime-option-key-set hrt/ha-runtime-option-key-set)
+(def ^:private sanitize-ha-path-segment hrt/sanitize-ha-path-segment)
+(def ^:private default-ha-control-raft-dir hrt/default-ha-control-raft-dir)
+(def ^:private with-default-ha-control-raft-dir
+  hrt/with-default-ha-control-raft-dir)
+(def ^:private start-ha-authority hrt/start-ha-authority)
+(def ^:private stop-ha-authority hrt/stop-ha-authority)
 
 (def ^:dynamic *ha-renew-step-fn*
   dha/ha-renew-step)
@@ -1190,84 +609,10 @@
       (finally
         (.release lock)))))
 
-(defn- ha-loop-sleep-ms
-  ([m]
-   (ha-loop-sleep-ms m (System/currentTimeMillis)))
-  ([m now-ms]
-   (let [renew-ms  (long (max 100
-                              (long (or (:ha-lease-renew-ms m)
-                                        c/*ha-lease-renew-ms*))))
-         role      (:ha-role m)
-         deadlines (cond-> []
-                     (and (= :candidate role)
-                          (integer? (:ha-candidate-since-ms m))
-                          (integer? (:ha-candidate-delay-ms m)))
-                     (conj (+ (long (:ha-candidate-since-ms m))
-                              (long (:ha-candidate-delay-ms m))))
-
-                     (and (= :candidate role)
-                          (integer? (:ha-candidate-pre-cas-wait-until-ms m)))
-                     (conj (long (:ha-candidate-pre-cas-wait-until-ms m)))
-
-                     (and (= :demoting role)
-                          (or (integer? (:ha-demotion-drain-until-ms m))
-                              (integer? (:ha-demoted-at-ms m))))
-                     (conj (long (or (:ha-demotion-drain-until-ms m)
-                                     (:ha-demoted-at-ms m)))))
-         next-deadline (when (seq deadlines)
-                         (long (reduce min (map long deadlines))))
-         remaining-ms  (when (some? next-deadline)
-                         (let [delta (- (long next-deadline)
-                                        (long now-ms))]
-                           (long (if (neg? delta) 0 delta))))]
-     (if (some? remaining-ms)
-       (cond
-         (< (long remaining-ms) 1) 1
-         (< (long remaining-ms) renew-ms) (long remaining-ms)
-       :else renew-ms)
-       renew-ms))))
-
-(defn- ha-follower-loop-sleep-ms
-  ([m]
-   (ha-follower-loop-sleep-ms m (System/currentTimeMillis)))
-  ([m now-ms]
-   (let [renew-ms (long (max 100
-                             (long (or (:ha-lease-renew-ms m)
-                                       c/*ha-lease-renew-ms*))))
-         idle-ms (long (min 250
-                            (max 25 (quot renew-ms 4))))
-         role (:ha-role m)
-         next-sync-not-before-ms
-         (when (integer? (:ha-follower-next-sync-not-before-ms m))
-           (long (:ha-follower-next-sync-not-before-ms m)))
-         batch-size (long (or (:ha-follower-last-batch-size m) 0))]
-     (cond
-       (and (= :follower role)
-            next-sync-not-before-ms)
-       (let [remaining-ms (- (long next-sync-not-before-ms) (long now-ms))]
-         (long (if (<= remaining-ms 0) 1 remaining-ms)))
-
-       (and (= :follower role)
-            (pos? batch-size))
-       0
-
-       :else
-       idle-ms))))
-
-(defn- sleep-ha-loop!
-  [^AtomicBoolean running? sleep-ms]
-  (when (pos? (long sleep-ms))
-    (try
-      (Thread/sleep (long sleep-ms))
-      (catch InterruptedException _
-        (.set running? false)))))
-
-(defn- ha-loop-error-backoff!
-  [^AtomicBoolean running?]
-  (try
-    (Thread/sleep 250)
-    (catch InterruptedException _
-      (.set running? false))))
+(def ^:private ha-loop-sleep-ms hrt/ha-loop-sleep-ms)
+(def ^:private ha-follower-loop-sleep-ms hrt/ha-follower-loop-sleep-ms)
+(def ^:private sleep-ha-loop! hrt/sleep-ha-loop!)
+(def ^:private ha-loop-error-backoff! hrt/ha-loop-error-backoff!)
 
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
@@ -1495,19 +840,7 @@
   (when-let [^Future future (:ha-follower-loop-future m)]
     (.cancel future true)))
 
-(defn- await-ha-loop-stop
-  [loop-label db-name latch]
-  (when (instance? CountDownLatch latch)
-    (try
-      (when-not (.await ^CountDownLatch latch 5 TimeUnit/SECONDS)
-        (log/warn "Timed out waiting for HA loop to stop"
-                  {:db-name db-name
-                   :loop loop-label}))
-      (catch InterruptedException _
-        (.interrupt (Thread/currentThread))
-        (log/warn "Interrupted while waiting for HA loop to stop"
-                  {:db-name db-name
-                   :loop loop-label})))))
+(def ^:private await-ha-loop-stop hrt/await-ha-loop-stop)
 
 (def ^:dynamic *start-ha-authority-fn*
   start-ha-authority)
@@ -1523,10 +856,7 @@
 
 (defn- current-ha-runtime-local-opts
   [m]
-  (dha/merge-ha-runtime-local-opts
-   (dha/effective-ha-runtime-local-opts m)
-   (some-> (current-runtime-opts m)
-           dha/select-ha-runtime-local-opts)))
+  (hrt/current-ha-runtime-local-opts m current-runtime-opts))
 
 (defn- resolved-ha-runtime-opts
   ([root db-name store]
@@ -1534,59 +864,25 @@
   ([root db-name store m]
    (resolved-ha-runtime-opts root db-name store m nil))
   ([root db-name store m explicit-ha-runtime-opts]
-   (when-let [ha-opts (*consensus-ha-opts-fn* store)]
-     (let [current-ha-runtime-opts
-           (dha/merge-ha-runtime-local-opts
-            (current-ha-runtime-local-opts m)
-            (dha/select-ha-runtime-local-opts explicit-ha-runtime-opts))
-           merged-ha-opts
-           (dha/merge-ha-runtime-local-opts ha-opts
-                                            current-ha-runtime-opts)]
-       (-> (with-default-ha-control-raft-dir root db-name merged-ha-opts)
-           (select-keys ha-runtime-option-keys))))))
+   (hrt/resolved-ha-runtime-opts
+    root db-name store m explicit-ha-runtime-opts
+    {:consensus-ha-opts-fn *consensus-ha-opts-fn*
+     :current-runtime-opts-fn current-runtime-opts})))
 
-(defn- shared-store-lifecycle?
-  [a b]
-  (or (identical? a b)
-      (and (instance? Store a)
-           (instance? Store b)
-           (identical? (.-lmdb ^Store a)
-                       (.-lmdb ^Store b)))))
+(def ^:private shared-store-lifecycle? hrt/shared-store-lifecycle?)
 
 (defn- stop-ha-runtime
   [db-name m]
-  (let [runtime-local-opts (current-ha-runtime-local-opts m)]
-    (*stop-ha-renew-loop-fn* m)
-    (*stop-ha-follower-sync-loop-fn* m)
-    (await-ha-loop-stop :renew db-name (:ha-renew-loop-stopped-latch m))
-    (await-ha-loop-stop :follower db-name (:ha-follower-loop-stopped-latch m))
-    (try
-      (dha/persist-ha-runtime-local-applied-lsn! m)
-      (catch Throwable t
-        (log/warn t "Failed to persist HA local applied LSN during shutdown"
-                  {:db-name db-name
-                   :ha-node-id (:ha-node-id m)})))
-    (*stop-ha-authority-fn* db-name m)
-    (cond-> (dissoc (dha/clear-ha-runtime-state m)
-                    :ha-runtime-opts
-                    :ha-renew-loop-future
-                    :ha-renew-loop-stopped-latch
-                    :ha-follower-loop-future
-                    :ha-follower-loop-stopped-latch)
-      (seq runtime-local-opts)
-      (assoc :ha-runtime-local-opts runtime-local-opts))))
+  (hrt/stop-ha-runtime
+   db-name
+   m
+   {:current-runtime-opts-fn current-runtime-opts
+    :stop-ha-renew-loop-fn *stop-ha-renew-loop-fn*
+    :stop-ha-follower-sync-loop-fn *stop-ha-follower-sync-loop-fn*
+    :await-ha-loop-stop-fn await-ha-loop-stop
+    :stop-ha-authority-fn *stop-ha-authority-fn*}))
 
-(defn- ha-authority-running?
-  [authority]
-  (if authority
-    (let [diagnostics (try
-                        (ctrl/authority-diagnostics authority)
-                        (catch Throwable _
-                          nil))]
-      (if (contains? diagnostics :running?)
-        (true? (:running? diagnostics))
-        true))
-    false))
+(def ^:private ha-authority-running? hrt/ha-authority-running?)
 
 (declare db-write-admission-lock)
 
@@ -1641,18 +937,15 @@
   ([root db-name m store]
    (ensure-ha-runtime root db-name m store nil))
   ([root db-name m store explicit-ha-runtime-opts]
-  (if-let [ha-opts (resolved-ha-runtime-opts
-                    root db-name store m explicit-ha-runtime-opts)]
-    (let [runtime-local-opts (dha/select-ha-runtime-local-opts ha-opts)]
-      (if (and (= (:ha-runtime-opts m) ha-opts)
-             (ha-authority-running? (:ha-authority m)))
-        (assoc m :ha-runtime-local-opts runtime-local-opts)
-        (-> (stop-ha-runtime db-name m)
-            (merge (*start-ha-authority-fn* db-name ha-opts))
-            (assoc :ha-runtime-opts ha-opts
-                   :ha-runtime-local-opts runtime-local-opts))))
-    (dissoc (stop-ha-runtime db-name m)
-            :ha-runtime-local-opts))))
+   (hrt/ensure-ha-runtime
+    root
+    db-name
+    m
+    store
+    explicit-ha-runtime-opts
+    {:resolved-ha-runtime-opts-fn resolved-ha-runtime-opts
+     :start-ha-authority-fn *start-ha-authority-fn*
+     :stop-ha-runtime-fn stop-ha-runtime})))
 
 (defn- add-store
   ([server db-name store]
