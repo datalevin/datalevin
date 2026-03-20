@@ -269,6 +269,11 @@
 
 (defn- stamp-lease-command
   [cmd clock-skew-budget-ms]
+  ;; For JRaft-backed authorities this timestamp must be fixed by the leader
+  ;; before the command is appended to the replicated log. Restamping inside
+  ;; FSM apply would make different peers derive different lease records based
+  ;; on their local clocks. The tradeoff is intentionally conservative: the
+  ;; effective lease duration is shortened by Raft commit latency.
   (cond-> cmd
     (contains? #{:try-acquire-lease :renew-lease} (:op cmd))
     (assoc :authority-now-ms (long (control-now-ms))
@@ -647,6 +652,9 @@
 
 (defn- apply-state-command
   [state {:keys [op authority-now-ms clock-skew-budget-ms] :as cmd}]
+  ;; Lease transitions consume the leader-stamped :authority-now-ms carried in
+  ;; the replicated command so every peer applies the same authoritative lease
+  ;; state. This is why the lease start time cannot be moved to local FSM apply.
   (case op
     :try-acquire-lease   (attach-state-snapshot-to-result
                           (apply-try-acquire-transition

@@ -1766,13 +1766,16 @@
                                         upto-lsn)
                                        []))]
                   (if (seq records)
-                    (do
-                      (assert-contiguous-lsn! next-lsn records)
-                      (assert-ha-follower-record-terms!
-                       lease source-endpoint records)
+                    (let [last-record-term
+                          (do
+                            (assert-contiguous-lsn! next-lsn records)
+                            (assert-ha-follower-record-terms!
+                             lease source-endpoint records
+                             (:ha-follower-last-applied-term m)))]
                       {:ok? true
                        :value {:source-endpoint source-endpoint
                                :records records
+                               :last-record-term last-record-term
                                :source-order source-order
                                :source-order-dynamic? reordered?
                                :source-last-applied-lsn-known? false
@@ -1945,45 +1948,49 @@
             (recur actual (rest rs))))))))
 
 (defn- assert-ha-follower-record-terms!
-  [lease source-endpoint records]
-  (when-some [lease-term* (:term lease)]
-    (let [lease-term (long lease-term*)]
-      (reduce
-        (fn [prev-term record]
-          (if-some [record-term* (:ha-term record)]
-            (let [record-term (long record-term*)]
-              (when-not (pos? record-term)
-                (u/raise "Follower txlog replay record has invalid HA term"
-                         {:error           :ha/txlog-record-invalid-term
-                          :source-endpoint source-endpoint
-                          :lease-term      lease-term
-                          :record-lsn      (:lsn record)
-                          :record-term     record-term}))
-              ;; Catch-up can legitimately span multiple committed leadership
-              ;; terms after failover, so older record terms remain valid here.
-              ;; Source freshness is enforced separately via
-              ;; `assert-ha-source-authority!`; the per-record guard only
-              ;; rejects future terms and regressions within a contiguous batch.
-              (when (> record-term lease-term)
-                (u/raise "Follower txlog replay record term is ahead of current lease"
-                         {:error           :ha/txlog-record-invalid-term
-                          :source-endpoint source-endpoint
-                          :lease-term      lease-term
-                          :record-lsn      (:lsn record)
-                          :record-term     record-term}))
-              (when (and prev-term
-                         (< record-term (long prev-term)))
-                (u/raise "Follower txlog replay record terms regressed within batch"
-                         {:error                :ha/txlog-record-invalid-term
-                          :source-endpoint      source-endpoint
-                          :lease-term           lease-term
-                          :previous-record-term prev-term
-                          :record-lsn           (:lsn record)
-                          :record-term          record-term}))
-              record-term)
-            prev-term))
-        nil
-        records))))
+  ([lease source-endpoint records]
+   (assert-ha-follower-record-terms! lease source-endpoint records nil))
+  ([lease source-endpoint records last-applied-term]
+   (when-some [lease-term* (:term lease)]
+     (let [lease-term (long lease-term*)
+           last-applied-term (some-> last-applied-term long)]
+       (reduce
+         (fn [prev-term record]
+           (if-some [record-term* (:ha-term record)]
+             (let [record-term (long record-term*)]
+               (when-not (pos? record-term)
+                 (u/raise "Follower txlog replay record has invalid HA term"
+                          {:error           :ha/txlog-record-invalid-term
+                           :source-endpoint source-endpoint
+                           :lease-term      lease-term
+                           :record-lsn      (:lsn record)
+                           :record-term     record-term}))
+               ;; Catch-up can legitimately span multiple committed leadership
+               ;; terms after failover, so older record terms remain valid
+               ;; until the follower has actually replayed past them. Once the
+               ;; local committed prefix has advanced through a later term,
+               ;; later batches must not fall back below that term even if the
+               ;; sync source changes.
+               (when (> record-term lease-term)
+                 (u/raise "Follower txlog replay record term is ahead of current lease"
+                          {:error           :ha/txlog-record-invalid-term
+                           :source-endpoint source-endpoint
+                           :lease-term      lease-term
+                           :record-lsn      (:lsn record)
+                           :record-term     record-term}))
+               (when (and prev-term
+                          (< record-term (long prev-term)))
+                 (u/raise "Follower txlog replay record terms regressed"
+                          {:error                :ha/txlog-record-invalid-term
+                           :source-endpoint      source-endpoint
+                           :lease-term           lease-term
+                           :previous-record-term prev-term
+                           :record-lsn           (:lsn record)
+                           :record-term          record-term}))
+               record-term)
+             prev-term))
+         last-applied-term
+         records)))))
 
 (defn- assert-ha-follower-record-term!
   [m record]
@@ -2399,7 +2406,7 @@
                 :lease lease}))
     (let [upto-lsn (long (+ (long next-lsn)
                             (dec requested-batch-records)))
-          {:keys [records source-endpoint source-order
+          {:keys [records last-record-term source-endpoint source-order
                   source-order-dynamic?
                   source-last-applied-lsn-known?
                   source-last-applied-lsn]}
@@ -2485,6 +2492,9 @@
        :source-order source-order
        :state (-> (assoc next-m
                          :ha-local-last-applied-lsn applied-lsn
+                         :ha-follower-last-applied-term
+                         (or last-record-term
+                             (:ha-follower-last-applied-term m))
                          :ha-follower-requested-batch-records
                          requested-batch-records
                          :ha-follower-last-batch-records
@@ -2566,6 +2576,7 @@
                           (-> state
                               (assoc
                                :ha-local-last-applied-lsn installed-lsn
+                               :ha-follower-last-applied-term nil
                                :ha-follower-next-lsn resume-next-lsn
                                :ha-follower-last-bootstrap-ms now-ms
                                :ha-follower-bootstrap-source-endpoint
@@ -3789,6 +3800,7 @@
           :ha-leader-fencing-observed-lease
           :ha-leader-fencing-last-error
           :ha-local-last-applied-lsn
+          :ha-follower-last-applied-term
           :ha-follower-next-lsn :ha-follower-last-batch-size
           :ha-follower-last-batch-estimated-bytes
           :ha-follower-requested-batch-records
