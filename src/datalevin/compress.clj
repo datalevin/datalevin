@@ -135,10 +135,11 @@
   (let [dbis  (list-dbis db)
         lists (map #(do (open-dbi db %) (list-dbi? db %)) dbis)
         sizes (map #(entries db %) dbis)
-        total ^long (reduce + 0 sizes)]
-    (when (< ^long c/*compress-sample-size* total)
+        sample-size ^long (long c/*compress-sample-size*)
+        total ^long (long (reduce + 0 sizes))]
+    (when (< sample-size total)
       (let [freqs (init-key-freqs)
-            ratio (/ ^long c/*compress-sample-size* total)]
+            ratio (/ (double sample-size) (double total))]
         (mapv (fn [dbi size lst?]
                 (if lst?
                   (sample-list db dbi size ratio freqs)
@@ -153,10 +154,11 @@
   (let [dbis  (filter #(when-not (list-dbi? db %) (open-dbi db %) %)
                       (list-dbis db))
         sizes (map #(entries db %) dbis)
-        total ^long (reduce + 0 sizes)]
-    (when (< ^long c/*compress-sample-size* total)
+        sample-size ^long (long c/*compress-sample-size*)
+        total ^long (long (reduce + 0 sizes))]
+    (when (< sample-size total)
       (let [valbytes (FastList.)
-            ratio    (/ ^long c/*compress-sample-size* total)]
+            ratio    (/ (double sample-size) (double total))]
         (mapv (fn [dbi size]
                 (sample-values db dbi size ratio valbytes))
               dbis sizes)

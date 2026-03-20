@@ -788,8 +788,11 @@
    :engine
    :index
    :ha-local-last-applied-lsn
+   :ha-local-persisted-lsn
+   :ha-local-last-persisted-applied-ms
    :ha-follower-last-apply-readback
    :ha-follower-last-batch-records
+   :ha-follower-batches-since-persist
    :ha-follower-next-lsn
    :ha-follower-last-batch-size
    :ha-follower-last-sync-ms
@@ -917,13 +920,10 @@
 
 (defn- persist-ha-follower-side-effects!
   [expected-state next-state local-patch]
-  ;; Follower replay mutates local state outside the final server-state CAS.
-  ;; Persist the follower floor before publication so a concurrent role/runtime
-  ;; swap cannot discard durable progress if the merge-back patch is rejected.
-  (when (and local-patch
-             (= :follower (:ha-role expected-state))
-             (contains? local-patch :ha-local-last-applied-lsn))
-    (dha/persist-ha-runtime-local-applied-lsn! next-state))
+  ;; Follower replay now throttles `:ha/local-applied-lsn` persistence inside
+  ;; the HA sync step and relies on txlog watermarks for crash recovery between
+  ;; flushes. Keep the server-side publication hook free of extra per-batch KV
+  ;; writes so catch-up can amortize those tiny updates.
   next-state)
 
 (def ^:dynamic *server-runtime-opts-fn*
@@ -1095,6 +1095,8 @@
    :ha-max-promotion-lag-lsn
    :ha-follower-max-batch-records
    :ha-follower-target-batch-bytes
+   :ha-follower-persist-every-batches
+   :ha-follower-persist-interval-ms
    :ha-client-credentials
    :ha-demotion-drain-ms
    :ha-fencing-hook

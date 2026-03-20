@@ -13,11 +13,12 @@
    [clojure.string :as s]
    [datalevin.client :as cl]
    [datalevin.constants :as c]
+   [datalevin.ha.util :as hu]
    [taoensso.timbre :as log])
   (:import
    [datalevin.utl LRUCache]
    [java.util.concurrent CompletableFuture CompletionException ConcurrentHashMap
-    ExecutionException ExecutorService Executors ThreadFactory TimeUnit]
+    ExecutionException ExecutorService Executors ThreadFactory]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]
    [java.util.function BiConsumer BiFunction]))
 
@@ -25,17 +26,9 @@
   []
   (System/currentTimeMillis))
 
-(defn- long-max2 ^long
-  [a b]
-  (let [a (long a)
-        b (long b)]
-    (if (> a b) a b)))
+(def ^:private long-max2 hu/long-max2)
 
-(defn- nonnegative-long-diff ^long
-  [a b]
-  (let [a (long a)
-        b (long b)]
-    (if (> a b) (- a b) 0)))
+(def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
 
 (defn ^:redef close-ha-client!
   [client]
@@ -115,14 +108,7 @@
 
 (def ^:dynamic *ha-client-cache-state* nil)
 
-(defn- ha-thread-label
-  [db-name]
-  (when (some? db-name)
-    (let [label (-> (str db-name)
-                    (s/replace #"[^A-Za-z0-9._-]+" "-")
-                    (s/replace #"(^-+|-+$)" ""))]
-      (when-not (s/blank? label)
-        label))))
+(def ^:private ha-thread-label hu/ha-thread-label)
 
 (defn new-ha-client-cache-state
   [db-name]
@@ -501,19 +487,7 @@
              (recur)))))
      (.set ^AtomicLong (:last-prune-ms cache-state) 0))))
 
-(defn shutdown-ha-executor!
-  [^ExecutorService executor description context]
-  (when executor
-    (try
-      (.shutdown executor)
-      (when-not (.awaitTermination executor 100 TimeUnit/MILLISECONDS)
-        (.shutdownNow executor))
-      (catch InterruptedException e
-        (.interrupt (Thread/currentThread))
-        (.shutdownNow executor)
-        (log/warn e (str "Interrupted while stopping " description) context))
-      (catch Throwable e
-        (log/warn e (str "Failed to stop " description) context)))))
+(def shutdown-ha-executor! hu/shutdown-ha-executor!)
 
 (defn stop-ha-client-cache-state!
   [db-name cache-state]

@@ -17,6 +17,7 @@
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.lease :as lease]
    [datalevin.ha.snapshot :as snap]
+   [datalevin.ha.util :as hu]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
@@ -161,11 +162,7 @@
                                    request-timeout-ms))]
     (if (< timeout-ms 1) 1 timeout-ms)))
 
-(defn- long-max2 ^long
-  [a b]
-  (let [a (long a)
-        b (long b)]
-    (if (> a b) a b)))
+(def ^:private long-max2 hu/long-max2)
 
 (defn- long-max3 ^long
   [a b c]
@@ -181,11 +178,7 @@
         b (long b)]
     (if (< a b) a b)))
 
-(defn- nonnegative-long-diff ^long
-  [a b]
-  (let [a (long a)
-        b (long b)]
-    (if (> a b) (- a b) 0)))
+(def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
 
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
@@ -347,7 +340,7 @@
                 nil))
             0)))
 
-(defn- persist-ha-local-applied-lsn!
+(defn- ^:redef persist-ha-local-applied-lsn!
   [m applied-lsn]
   (when-let [kv-store (raw-local-kv-store m)]
     (try
@@ -358,6 +351,66 @@
         (when-not (closed-kv-race? t kv-store)
           (throw t)))))
   applied-lsn)
+
+(defn- ha-follower-persist-every-batches
+  [m]
+  (long-max2 1
+             (long (or (:ha-follower-persist-every-batches m)
+                       c/*ha-follower-persist-every-batches*))))
+
+(defn- ha-follower-persist-interval-ms
+  [m]
+  (max 0
+       (long (or (:ha-follower-persist-interval-ms m)
+                 c/*ha-follower-persist-interval-ms*))))
+
+(defn- seed-ha-local-persist-tracking
+  [m now-ms]
+  (if (integer? (:ha-local-persisted-lsn m))
+    m
+    (assoc m
+           :ha-local-persisted-lsn
+           (long (if-let [kv-store (local-kv-store m)]
+                   (read-ha-local-persisted-lsn kv-store)
+                   0))
+           :ha-local-last-persisted-applied-ms (long now-ms)
+           :ha-follower-batches-since-persist 0)))
+
+(defn- note-ha-local-applied-lsn-persisted
+  [m applied-lsn now-ms]
+  (assoc m
+         :ha-local-persisted-lsn (long applied-lsn)
+         :ha-local-last-persisted-applied-ms (long now-ms)
+         :ha-follower-batches-since-persist 0))
+
+(defn- maybe-persist-ha-follower-local-applied-lsn
+  [m applied-lsn now-ms]
+  (let [tracked-m (seed-ha-local-persist-tracking m now-ms)
+        persisted-lsn (long (or (:ha-local-persisted-lsn tracked-m) 0))
+        next-batch-count
+        (long (inc (long (or (:ha-follower-batches-since-persist tracked-m)
+                             0))))
+        persist-interval-ms (ha-follower-persist-interval-ms tracked-m)
+        last-persisted-ms
+        (long (or (:ha-local-last-persisted-applied-ms tracked-m)
+                  now-ms))
+        elapsed-ms (nonnegative-long-diff now-ms last-persisted-ms)
+        persist-every-batches (ha-follower-persist-every-batches tracked-m)
+        interval-elapsed?
+        (and (pos? (long persist-interval-ms))
+             (>= (long elapsed-ms)
+                 (long persist-interval-ms)))
+        batch-threshold-reached?
+        (>= (long next-batch-count)
+            (long persist-every-batches))]
+    (if (and (> (long applied-lsn) persisted-lsn)
+             (or interval-elapsed?
+                 batch-threshold-reached?))
+      (do
+        (persist-ha-local-applied-lsn! tracked-m applied-lsn)
+        (note-ha-local-applied-lsn-persisted
+         tracked-m applied-lsn now-ms))
+      (assoc tracked-m :ha-follower-batches-since-persist next-batch-count))))
 
 (defn- read-ha-local-snapshot-current-lsn
   [kv-store]
@@ -606,19 +659,7 @@
 
 (declare ha-probe-executor)
 
-(defn- shutdown-ha-executor!
-  [^ExecutorService executor description context]
-  (when executor
-    (try
-      (.shutdown executor)
-      (when-not (.awaitTermination executor 100 TimeUnit/MILLISECONDS)
-        (.shutdownNow executor))
-      (catch InterruptedException e
-        (.interrupt (Thread/currentThread))
-        (.shutdownNow executor)
-        (log/warn e (str "Interrupted while stopping " description) context))
-      (catch Throwable e
-        (log/warn e (str "Failed to stop " description) context)))))
+(def ^:private shutdown-ha-executor! hu/shutdown-ha-executor!)
 
 (defn- stop-ha-probe-executor!
   [db-name executor]
@@ -628,14 +669,7 @@
                            "HA probe executor"
                            {:db-name db-name})))
 
-(defn- ha-thread-label
-  [db-name]
-  (when (some? db-name)
-    (let [label (-> (str db-name)
-                    (s/replace #"[^A-Za-z0-9._-]+" "-")
-                    (s/replace #"(^-+|-+$)" ""))]
-      (when-not (s/blank? label)
-        label))))
+(def ^:private ha-thread-label hu/ha-thread-label)
 
 (defn- ha-client-credentials
   [m]
@@ -2581,8 +2615,10 @@
                  (long next-lsn)
                  (unchecked-inc applied-lsn)))))
           batch-estimated-bytes (estimate-ha-follower-batch-bytes records)
-          _ (when (seq records)
-              (persist-ha-local-applied-lsn! next-m applied-lsn))]
+          next-m (if (seq records)
+                   (maybe-persist-ha-follower-local-applied-lsn
+                    next-m applied-lsn now-ms)
+                   next-m)]
       (try
         (try
           (report-ha-replica-floor!
@@ -2703,7 +2739,11 @@
                           (-> state
                               (assoc
                                :ha-local-last-applied-lsn installed-lsn
+                               :ha-local-persisted-lsn installed-lsn
+                               :ha-local-last-persisted-applied-ms
+                               (long now-ms)
                                :ha-follower-last-applied-term nil
+                               :ha-follower-batches-since-persist 0
                                :ha-follower-next-lsn resume-next-lsn
                                :ha-follower-last-bootstrap-ms now-ms
                                :ha-follower-bootstrap-source-endpoint
@@ -3898,71 +3938,121 @@
           (maybe-finish-ha-demotion end-now-ms started-demoting?)
           (dissoc ha-local-watermark-snapshot-key)))))
 
+(def ^:private ha-runtime-config-clear-keys
+  [:ha-authority
+   :ha-db-identity
+   :ha-membership-hash
+   :ha-authority-membership-hash
+   :ha-db-identity-mismatch?
+   :ha-membership-mismatch?
+   :ha-members
+   :ha-members-sorted
+   :ha-node-id
+   :ha-local-endpoint
+   :ha-lease-renew-ms
+   :ha-lease-timeout-ms
+   :ha-write-admission-lease-margin-ms
+   :ha-promotion-base-delay-ms
+   :ha-promotion-rank-delay-ms
+   :ha-max-promotion-lag-lsn
+   :ha-demotion-drain-ms
+   :ha-follower-max-batch-records
+   :ha-follower-target-batch-bytes
+   :ha-follower-persist-every-batches
+   :ha-follower-persist-interval-ms
+   :ha-fencing-hook
+   :ha-clock-skew-budget-ms
+   :ha-clock-skew-hook
+   :ha-client-cache-state
+   :ha-probe-executor])
+
+(def ^:private ha-authority-observation-clear-keys
+  [:ha-authority-lease
+   :ha-authority-version
+   :ha-authority-now-ms
+   :ha-authority-owner-node-id
+   :ha-authority-term
+   :ha-lease-until-ms
+   :ha-lease-local-deadline-ms
+   :ha-lease-local-deadline-nanos
+   :ha-last-authority-refresh-ms
+   :ha-authority-read-ok?
+   :ha-authority-read-error])
+
+(def ^:private ha-clock-skew-clear-keys
+  [:ha-clock-skew-paused?
+   :ha-clock-skew-last-check-ms
+   :ha-clock-skew-last-observed-ms
+   :ha-clock-skew-last-result])
+
+(def ^:private ha-leader-state-clear-keys
+  [:ha-role
+   :ha-leader-term
+   :ha-leader-fencing-pending?
+   :ha-leader-fencing-observed-lease
+   :ha-leader-fencing-last-error
+   :ha-demotion-drain-until-ms])
+
+(def ^:private ha-follower-state-clear-keys
+  [:ha-local-last-applied-lsn
+   :ha-local-persisted-lsn
+   :ha-local-last-persisted-applied-ms
+   :ha-follower-last-applied-term
+   :ha-follower-batches-since-persist
+   :ha-follower-next-lsn
+   :ha-follower-last-batch-size
+   :ha-follower-last-batch-estimated-bytes
+   :ha-follower-requested-batch-records
+   :ha-follower-last-sync-ms
+   :ha-follower-leader-endpoint
+   :ha-follower-source-endpoint
+   :ha-follower-source-order
+   :ha-follower-last-bootstrap-ms
+   :ha-follower-bootstrap-source-endpoint
+   :ha-follower-bootstrap-snapshot-last-applied-lsn
+   :ha-follower-sync-backoff-ms
+   :ha-follower-next-sync-not-before-ms
+   :ha-follower-degraded?
+   :ha-follower-degraded-reason
+   :ha-follower-degraded-details
+   :ha-follower-degraded-since-ms
+   :ha-follower-last-error
+   :ha-follower-last-error-details
+   :ha-follower-last-error-ms])
+
+(def ^:private ha-promotion-state-clear-keys
+  [:ha-promotion-last-failure
+   :ha-promotion-failure-details
+   :ha-candidate-since-ms
+   :ha-candidate-delay-ms
+   :ha-candidate-rank-index
+   :ha-candidate-pre-cas-wait-until-ms
+   :ha-candidate-pre-cas-observed-version
+   :ha-promotion-wait-before-cas-ms
+   :ha-rejoin-promotion-blocked?
+   :ha-rejoin-promotion-blocked-until-ms
+   :ha-rejoin-promotion-cleared-ms
+   :ha-rejoin-started-at-ms])
+
+(def ^:private ha-runtime-loop-clear-keys
+  [:ha-renew-loop-running?
+   :ha-follower-loop-running?])
+
+(def ^:private ha-runtime-clear-keys
+  (vec
+   (concat
+    [ha-local-watermark-snapshot-key]
+    ha-runtime-config-clear-keys
+    ha-authority-observation-clear-keys
+    ha-clock-skew-clear-keys
+    ha-leader-state-clear-keys
+    ha-follower-state-clear-keys
+    ha-promotion-state-clear-keys
+    ha-runtime-loop-clear-keys)))
+
 (defn clear-ha-runtime-state
   [m]
-  (dissoc m
-          ha-local-watermark-snapshot-key
-          :ha-authority :ha-db-identity :ha-membership-hash
-          :ha-authority-membership-hash
-          :ha-db-identity-mismatch? :ha-membership-mismatch?
-          :ha-members :ha-members-sorted
-          :ha-node-id :ha-local-endpoint
-          :ha-lease-renew-ms :ha-lease-timeout-ms
-          :ha-write-admission-lease-margin-ms
-          :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
-          :ha-max-promotion-lag-lsn :ha-demotion-drain-ms
-          :ha-follower-max-batch-records
-          :ha-follower-target-batch-bytes
-          :ha-fencing-hook
-          :ha-clock-skew-budget-ms :ha-clock-skew-hook
-          :ha-authority-lease :ha-authority-version
-          :ha-authority-now-ms
-          :ha-authority-owner-node-id :ha-authority-term
-          :ha-lease-until-ms
-          :ha-lease-local-deadline-ms
-          :ha-lease-local-deadline-nanos
-          :ha-last-authority-refresh-ms
-          :ha-authority-read-ok?
-          :ha-authority-read-error
-          :ha-client-cache-state
-          :ha-clock-skew-paused?
-          :ha-clock-skew-last-check-ms
-          :ha-clock-skew-last-observed-ms
-          :ha-clock-skew-last-result
-          :ha-demotion-drain-until-ms
-          :ha-role :ha-leader-term
-          :ha-leader-fencing-pending?
-          :ha-leader-fencing-observed-lease
-          :ha-leader-fencing-last-error
-          :ha-local-last-applied-lsn
-          :ha-follower-last-applied-term
-          :ha-follower-next-lsn :ha-follower-last-batch-size
-          :ha-follower-last-batch-estimated-bytes
-          :ha-follower-requested-batch-records
-          :ha-follower-last-sync-ms :ha-follower-leader-endpoint
-          :ha-follower-source-endpoint :ha-follower-source-order
-          :ha-follower-last-bootstrap-ms
-          :ha-follower-bootstrap-source-endpoint
-          :ha-follower-bootstrap-snapshot-last-applied-lsn
-          :ha-follower-sync-backoff-ms
-          :ha-follower-next-sync-not-before-ms
-          :ha-follower-degraded? :ha-follower-degraded-reason
-          :ha-follower-degraded-details :ha-follower-degraded-since-ms
-          :ha-follower-last-error :ha-follower-last-error-details
-          :ha-follower-last-error-ms
-          :ha-promotion-last-failure :ha-promotion-failure-details
-          :ha-candidate-since-ms :ha-candidate-delay-ms
-          :ha-candidate-rank-index
-          :ha-candidate-pre-cas-wait-until-ms
-          :ha-candidate-pre-cas-observed-version
-          :ha-promotion-wait-before-cas-ms
-          :ha-rejoin-promotion-blocked?
-          :ha-rejoin-promotion-blocked-until-ms
-          :ha-rejoin-promotion-cleared-ms
-          :ha-rejoin-started-at-ms
-          :ha-probe-executor
-          :ha-renew-loop-running?
-          :ha-follower-loop-running?))
+  (apply dissoc m ha-runtime-clear-keys))
 
 (def ^:private ha-write-command-types
   #{:set-schema
@@ -4222,6 +4312,14 @@
         follower-target-batch-bytes
         (long (or (:ha-follower-target-batch-bytes ha-opts)
                   c/*ha-follower-target-batch-bytes*))
+        follower-persist-every-batches
+        (long-max2 1
+                   (long (or (:ha-follower-persist-every-batches ha-opts)
+                             c/*ha-follower-persist-every-batches*)))
+        follower-persist-interval-ms
+        (max 0
+             (long (or (:ha-follower-persist-interval-ms ha-opts)
+                       c/*ha-follower-persist-interval-ms*)))
         cp (assoc (:ha-control-plane ha-opts)
                   :clock-skew-budget-ms clock-skew-budget-ms)
         fencing-hook (:ha-fencing-hook ha-opts)
@@ -4315,6 +4413,10 @@
                  :ha-demotion-drain-ms demotion-drain-ms
                  :ha-follower-max-batch-records follower-max-batch-records
                  :ha-follower-target-batch-bytes follower-target-batch-bytes
+                 :ha-follower-persist-every-batches
+                 follower-persist-every-batches
+                 :ha-follower-persist-interval-ms
+                 follower-persist-interval-ms
                  :ha-fencing-hook fencing-hook
                  :ha-clock-skew-budget-ms clock-skew-budget-ms
                  :ha-clock-skew-hook clock-skew-hook

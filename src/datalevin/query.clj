@@ -2204,19 +2204,19 @@
         pa   (peek args)]
     (case f
       <  (cond
-           (zero? i)  (add-range m [[:closed c/v0] [:open pa]])
+           (== 0 i)   (add-range m [[:closed c/v0] [:open pa]])
            (= i ac-1) (add-range m [[:open fa] [:closed c/vmax]])
            :else      (add-range m [[:open fa] [:open pa]]))
       <= (cond
-           (zero? i)  (add-range m [[:closed c/v0] [:closed pa]])
+           (== 0 i)   (add-range m [[:closed c/v0] [:closed pa]])
            (= i ac-1) (add-range m [[:closed fa] [:closed c/vmax]])
            :else      (add-range m [[:closed fa] [:closed pa]]))
       >  (cond
-           (zero? i)  (add-range m [[:open pa] [:closed c/vmax]])
+           (== 0 i)   (add-range m [[:open pa] [:closed c/vmax]])
            (= i ac-1) (add-range m [[:closed c/v0] [:open fa]])
            :else      (add-range m [[:open pa] [:open fa]]))
       >= (cond
-           (zero? i)  (add-range m [[:closed pa] [:closed c/vmax]])
+           (== 0 i)   (add-range m [[:closed pa] [:closed c/vmax]])
            (= i ac-1) (add-range m [[:closed c/v0] [:closed fa]])
            :else      (add-range m [[:closed pa] [:closed fa]])))))
 

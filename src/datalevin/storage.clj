@@ -355,8 +355,8 @@
     (if ts
       (.addAll out (r/prod-tuples (r/single-tuples tuple) ts))
       (let [vs (object-array na)
-            fa (aget aids 0)
-            la (aget aids (dec ^long na))]
+            fa ^int (aget aids 0)
+            la ^int (aget aids (dec ^long na))]
         (dotimes [i na] (aset vs i (FastList.)))
         (loop [next? (lmdb/seek-key iter te :id)
                gi    0
@@ -366,9 +366,9 @@
             (let [vb ^ByteBuffer (lmdb/next-val iter)
                   a  ^int (b/read-buffer vb :int)]
               (cond
-                (< a ^int fa)
+                (neg? (Integer/compare a fa))
                 (recur (lmdb/has-next-val iter) gi pa false)
-                (<= a ^int la)
+                (not (pos? (Integer/compare a la)))
                 (let [gi (if (== pa ^int a)
                            gi
                            (if in? (inc gi) gi))

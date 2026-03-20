@@ -732,6 +732,14 @@ Set to 0 for strict check-on-every-call behavior."}
   *ha-follower-target-batch-bytes* 1048576)
 
 (def ^{:dynamic true
+       :doc     "Default minimum number of follower replication batches between persisted local-applied-LSN writes."}
+  *ha-follower-persist-every-batches* 32)
+
+(def ^{:dynamic true
+       :doc     "Default maximum interval in milliseconds between persisted local-applied-LSN writes during follower catch-up."}
+  *ha-follower-persist-interval-ms* 1000)
+
+(def ^{:dynamic true
        :doc     "Default consensus control-plane config map. Nil requires explicit configuration when HA is enabled."}
   *ha-control-plane* nil)
 
