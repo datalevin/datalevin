@@ -1088,6 +1088,7 @@
    :ha-members
    :ha-lease-renew-ms
    :ha-lease-timeout-ms
+   :ha-write-admission-lease-margin-ms
    :ha-promotion-base-delay-ms
    :ha-promotion-rank-delay-ms
    :ha-max-promotion-lag-lsn

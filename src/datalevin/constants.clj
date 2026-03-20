@@ -700,6 +700,10 @@ Set to 0 for strict check-on-every-call behavior."}
   *ha-lease-timeout-ms* 15000)
 
 (def ^{:dynamic true
+       :doc     "Default safety margin in milliseconds subtracted from the local lease deadline during HA write admission."}
+  *ha-write-admission-lease-margin-ms* 100)
+
+(def ^{:dynamic true
        :doc     "Default base delay in milliseconds before candidate promotion attempt."}
   *ha-promotion-base-delay-ms* 300)
 

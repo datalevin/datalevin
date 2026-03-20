@@ -135,6 +135,18 @@
     :else
     nil))
 
+(defn- ha-write-admission-lease-margin-ms
+  [m]
+  (long (max 0
+             (long (or (:ha-write-admission-lease-margin-ms m)
+                       c/*ha-write-admission-lease-margin-ms*
+                       0)))))
+
+(defn- ha-write-admission-lease-margin-nanos
+  [m]
+  (.toNanos TimeUnit/MILLISECONDS
+            (ha-write-admission-lease-margin-ms m)))
+
 (defn- ha-renew-timeout-ms ^long
   [m now-ms now-nanos]
   (let [lease-timeout-ms   (long (or (:ha-lease-timeout-ms m)
@@ -3750,6 +3762,7 @@
           :ha-members :ha-members-sorted
           :ha-node-id :ha-local-endpoint
           :ha-lease-renew-ms :ha-lease-timeout-ms
+          :ha-write-admission-lease-margin-ms
           :ha-promotion-base-delay-ms :ha-promotion-rank-delay-ms
           :ha-max-promotion-lag-lsn :ha-demotion-drain-ms
           :ha-follower-max-batch-records
@@ -3882,6 +3895,10 @@
               lease-until-ms (:ha-lease-until-ms m)
               lease-local-deadline-ms (:ha-lease-local-deadline-ms m)
               lease-local-deadline-nanos (:ha-lease-local-deadline-nanos m)
+              lease-admission-margin-ms
+              (ha-write-admission-lease-margin-ms m)
+              lease-admission-margin-nanos
+              (ha-write-admission-lease-margin-nanos m)
               leader-term (:ha-leader-term m)
               authority-term (:ha-authority-term m)
               now-nanos (ha-now-nanos)
@@ -3953,21 +3970,27 @@
                     :retryable? true})
 
             (or (and (integer? lease-local-deadline-nanos)
-                     (>= (long now-nanos)
+                     (>= (+ (long now-nanos)
+                            (long lease-admission-margin-nanos))
                          (long lease-local-deadline-nanos)))
                 (and (not (integer? lease-local-deadline-nanos))
                      (integer? lease-local-deadline-ms)
-                     (>= (long now-ms) (long lease-local-deadline-ms)))
+                     (>= (+ (long now-ms)
+                            (long lease-admission-margin-ms))
+                         (long lease-local-deadline-ms)))
                 (and (not (integer? lease-local-deadline-nanos))
                      (not (integer? lease-local-deadline-ms))
                      (or (nil? lease-until-ms)
-                         (>= (long now-ms) (long lease-until-ms)))))
+                         (>= (+ (long now-ms)
+                                (long lease-admission-margin-ms))
+                             (long lease-until-ms)))))
             (merge common-meta
                    {:error :ha/write-rejected
                     :reason :lease-expired
                     :lease-until-ms lease-until-ms
                     :lease-local-deadline-ms lease-local-deadline-ms
                     :lease-local-deadline-nanos lease-local-deadline-nanos
+                    :lease-admission-margin-ms lease-admission-margin-ms
                     :ha-authority-now-ms (:ha-authority-now-ms m)
                     :now-ms now-ms
                     :now-nanos now-nanos
@@ -4134,6 +4157,10 @@
                  :ha-local-endpoint local-endpoint
                  :ha-lease-renew-ms renew-ms
                  :ha-lease-timeout-ms timeout-ms
+                 :ha-write-admission-lease-margin-ms
+                 (long (or (:ha-write-admission-lease-margin-ms ha-opts)
+                           c/*ha-write-admission-lease-margin-ms*
+                           0))
                  :ha-promotion-base-delay-ms promotion-base-delay-ms
                  :ha-promotion-rank-delay-ms promotion-rank-delay-ms
                  :ha-max-promotion-lag-lsn max-promotion-lag-lsn
