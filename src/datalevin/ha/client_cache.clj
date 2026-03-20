@@ -18,7 +18,7 @@
   (:import
    [datalevin.utl LRUCache]
    [java.util.concurrent CompletableFuture CompletionException ConcurrentHashMap
-    ExecutionException ExecutorService Executors ThreadFactory]
+    ExecutionException ExecutorService Executors ForkJoinPool ThreadFactory]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]
    [java.util.function BiConsumer BiFunction]))
 
@@ -94,9 +94,8 @@
                                    ha-client-cache-prune-thread-seq)))
            (.setDaemon true)))))))
 
-(defonce ^:private ^ExecutorService ha-client-cache-prune-executor
-  (Executors/newSingleThreadExecutor
-   (new-ha-client-cache-prune-thread-factory)))
+(def ^:private ^ExecutorService default-ha-client-cache-prune-executor
+  (ForkJoinPool/commonPool))
 
 (defonce ^:private default-ha-client-cache-state
   {:cache ha-client-cache
@@ -104,7 +103,7 @@
    :lru ha-client-cache-lru
    :prune-scheduled? ha-client-cache-prune-scheduled?
    :prune-generation ha-client-cache-prune-generation
-   :prune-executor ha-client-cache-prune-executor})
+   :prune-executor default-ha-client-cache-prune-executor})
 
 (def ^:dynamic *ha-client-cache-state* nil)
 
@@ -494,6 +493,8 @@
   (when (and cache-state
              (not (identical? cache-state default-ha-client-cache-state)))
     (clear-ha-client-cache! cache-state)
-    (shutdown-ha-executor! (:prune-executor cache-state)
-                           "HA client cache prune executor"
-                           {:db-name db-name})))
+    (when-not (identical? (:prune-executor cache-state)
+                          default-ha-client-cache-prune-executor)
+      (shutdown-ha-executor! (:prune-executor cache-state)
+                             "HA client cache prune executor"
+                             {:db-name db-name}))))

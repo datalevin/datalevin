@@ -33,7 +33,7 @@
    [java.nio.channels ClosedChannelException]
    [java.util UUID]
    [java.util.concurrent Callable ExecutorCompletionService
-    ExecutorService Executors Future ThreadFactory TimeUnit]
+    ExecutorService Executors ForkJoinPool Future ThreadFactory TimeUnit]
    [java.util.concurrent.atomic AtomicLong]))
 
 (defn consensus-ha-opts
@@ -657,14 +657,14 @@
                  (<= 1 (long port) 65535))
         {:host host :port (long port)}))))
 
-(declare ha-probe-executor)
+(declare default-ha-probe-executor)
 
 (def ^:private shutdown-ha-executor! hu/shutdown-ha-executor!)
 
 (defn- stop-ha-probe-executor!
   [db-name executor]
   (when (and executor
-             (not (identical? executor ha-probe-executor)))
+             (not (identical? executor default-ha-probe-executor)))
     (shutdown-ha-executor! executor
                            "HA probe executor"
                            {:db-name db-name})))
@@ -1030,10 +1030,8 @@
                  (.incrementAndGet ^AtomicLong ha-probe-thread-seq)))
            (.setDaemon true)))))))
 
-(defonce ^:private ^ExecutorService ha-probe-executor
-  (Executors/newFixedThreadPool
-   (int ha-probe-max-threads)
-   (new-ha-probe-thread-factory)))
+(def ^:private ^ExecutorService default-ha-probe-executor
+  (ForkJoinPool/commonPool))
 
 (defn- new-ha-probe-executor
   [db-name]
@@ -1044,7 +1042,7 @@
 (defn- ha-probe-executor-for
   [m]
   (or (:ha-probe-executor m)
-      ha-probe-executor))
+      default-ha-probe-executor))
 
 (defn ^:redef ha-probe-round-timeout-ms
   [m]
