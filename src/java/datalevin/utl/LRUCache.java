@@ -67,6 +67,12 @@ public class LRUCache {
         }
     }
 
+    public List<Object> orderedKeys() {
+        synchronized(map) {
+            return new ArrayList<Object>(map.keySet());
+        }
+    }
+
     public void clear() {
         map.clear();
     }

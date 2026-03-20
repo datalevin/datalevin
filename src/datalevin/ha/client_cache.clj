@@ -13,12 +13,11 @@
    [clojure.string :as s]
    [datalevin.client :as cl]
    [datalevin.constants :as c]
-   [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
+   [datalevin.utl LRUCache]
    [java.util.concurrent CompletableFuture CompletionException ConcurrentHashMap
-    ConcurrentLinkedDeque ExecutionException ExecutorService Executors
-    ThreadFactory TimeUnit]
+    ExecutionException ExecutorService Executors ThreadFactory TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]
    [java.util.function BiConsumer BiFunction]))
 
@@ -62,20 +61,21 @@
 
 (def ^:dynamic *ha-client-cache-max-access-records* nil)
 
+(defn- ha-client-cache-lru-capacity ^long
+  []
+  (long-max2
+   1
+   (long-max2 (long *ha-client-cache-max-size*)
+              (long (or *ha-client-cache-max-access-records* 0)))))
+
 (defonce ^:private ^ConcurrentHashMap ha-client-cache
   (ConcurrentHashMap.))
 
 (defonce ^:private ^AtomicLong ha-client-cache-last-prune-ms
   (AtomicLong. 0))
 
-(defonce ^:private ^AtomicLong ha-client-cache-access-seq
-  (AtomicLong. 0))
-
-(defonce ^:private ^ConcurrentLinkedDeque ha-client-cache-access-order
-  (ConcurrentLinkedDeque.))
-
-(defonce ^:private ^AtomicLong ha-client-cache-access-order-size
-  (AtomicLong. 0))
+(defonce ^:private ^LRUCache ha-client-cache-lru
+  (LRUCache. (int (ha-client-cache-lru-capacity))))
 
 (def ^:private ^AtomicLong ha-client-cache-prune-thread-seq
   (AtomicLong. 0))
@@ -108,9 +108,7 @@
 (defonce ^:private default-ha-client-cache-state
   {:cache ha-client-cache
    :last-prune-ms ha-client-cache-last-prune-ms
-   :access-seq ha-client-cache-access-seq
-   :access-order ha-client-cache-access-order
-   :access-order-size ha-client-cache-access-order-size
+   :lru ha-client-cache-lru
    :prune-scheduled? ha-client-cache-prune-scheduled?
    :prune-generation ha-client-cache-prune-generation
    :prune-executor ha-client-cache-prune-executor})
@@ -130,9 +128,7 @@
   [db-name]
   {:cache (ConcurrentHashMap.)
    :last-prune-ms (AtomicLong. 0)
-   :access-seq (AtomicLong. 0)
-   :access-order (ConcurrentLinkedDeque.)
-   :access-order-size (AtomicLong. 0)
+   :lru (LRUCache. (int (ha-client-cache-lru-capacity)))
    :prune-scheduled? (AtomicBoolean. false)
    :prune-generation (AtomicLong. 0)
    :prune-executor
@@ -164,88 +160,16 @@
    (long (or (:pool-size client-opts) 1))
    (long (or (:time-out client-opts) c/default-connection-timeout))])
 
-(defn- next-ha-client-cache-access-id! ^long
+(defn- ha-client-cache-ordered-keys
   ([]
-   (next-ha-client-cache-access-id! nil))
+   (ha-client-cache-ordered-keys nil))
   ([m-or-state]
-   (.incrementAndGet ^AtomicLong (:access-seq
-                                  (ha-client-cache-state m-or-state)))))
-
-(def ^:private ha-client-cache-default-max-access-records-per-entry 8)
-
-(def ^:private ha-client-cache-min-max-access-records 1024)
-
-(defn- ha-client-cache-max-access-records ^long
-  []
-  (long
-   (or *ha-client-cache-max-access-records*
-       (long-max2
-        ha-client-cache-min-max-access-records
-        (long (* (long-max2 1 (long *ha-client-cache-max-size*))
-                 (long ha-client-cache-default-max-access-records-per-entry)))))))
-
-(defn- ha-client-cache-access-order-full?
-  ([]
-   (ha-client-cache-access-order-full? nil))
-  ([m-or-state]
-   (>= (.get ^AtomicLong (:access-order-size
-                          (ha-client-cache-state m-or-state)))
-       (ha-client-cache-max-access-records))))
-
-(defn- enqueue-ha-client-cache-access-record!
-  ([record]
-   (enqueue-ha-client-cache-access-record! nil record))
-  ([m-or-state record]
-   (.addLast ^ConcurrentLinkedDeque (:access-order
-                                     (ha-client-cache-state m-or-state))
-             record)
-   (.incrementAndGet ^AtomicLong (:access-order-size
-                                  (ha-client-cache-state m-or-state)))
-   record))
-
-(defn- prepend-ha-client-cache-access-record!
-  ([record]
-   (prepend-ha-client-cache-access-record! nil record))
-  ([m-or-state record]
-   (.addFirst ^ConcurrentLinkedDeque (:access-order
-                                      (ha-client-cache-state m-or-state))
-              record)
-   (.incrementAndGet ^AtomicLong (:access-order-size
-                                  (ha-client-cache-state m-or-state)))
-   record))
-
-(defn- poll-ha-client-cache-access-record!
-  ([]
-   (poll-ha-client-cache-access-record! nil))
-  ([m-or-state]
-   (let [cache-state (ha-client-cache-state m-or-state)]
-     (when-let [record (.pollFirst ^ConcurrentLinkedDeque
-                                   (:access-order cache-state))]
-       (.decrementAndGet ^AtomicLong (:access-order-size cache-state))
-       record))))
-
-(defn- ha-client-cache-entry-access-id ^long
-  [entry]
-  (long (.get ^AtomicLong (:access-id entry))))
-
-(defn- record-ha-client-cache-access!
-  ([cache-key entry now-ms]
-   (record-ha-client-cache-access! nil cache-key entry now-ms))
-  ([m-or-state cache-key entry now-ms]
-   (.set ^AtomicLong (:last-used-ms entry) (long now-ms))
-   (when (or (zero? (ha-client-cache-entry-access-id entry))
-             (not (ha-client-cache-access-order-full? m-or-state)))
-     (let [access-id (next-ha-client-cache-access-id! m-or-state)]
-       (.set ^AtomicLong (:access-id entry) access-id)
-       (enqueue-ha-client-cache-access-record! m-or-state
-                                               [cache-key access-id])))
-   entry))
+   (.orderedKeys ^LRUCache (:lru (ha-client-cache-state m-or-state)))))
 
 (defn- ha-client-cache-entry
   [_cache-key future _now-ms]
   {:future future
-   :last-used-ms (AtomicLong. 0)
-   :access-id (AtomicLong. 0)})
+   :last-used-ms (AtomicLong. 0)})
 
 (defn- pending-ha-client-cache-entry?
   [entry]
@@ -276,11 +200,12 @@
            previous-ms (.get last-used-ms)
            bucket-ms (max 0 (long *ha-client-cache-access-bucket-ms*))]
        (.set last-used-ms (long now-ms))
-       (when (or (zero? (ha-client-cache-entry-access-id entry))
+       (when (or (zero? previous-ms)
                  (zero? bucket-ms)
                  (>= (nonnegative-long-diff now-ms previous-ms)
                      bucket-ms))
-         (record-ha-client-cache-access! m-or-state cache-key entry now-ms))))
+         (.put ^LRUCache (:lru (ha-client-cache-state m-or-state))
+               cache-key entry))))
    entry))
 
 (defn- ^:redef live-ha-client?
@@ -328,50 +253,31 @@
                                  (ha-client-cache-entry-last-used-ms entry))
           (long *ha-client-cache-ttl-ms*))))
 
-(defn- restore-ha-client-cache-access-records!
-  ([records]
-   (restore-ha-client-cache-access-records! nil records))
-  ([m-or-state records]
-   (doseq [record (rseq (vec records))]
-     (prepend-ha-client-cache-access-record! m-or-state record))))
-
-(defn- current-ha-client-cache-access-record?
-  [entry access-id]
-  (= (long access-id)
-     (ha-client-cache-entry-access-id entry)))
-
 (defn- prune-expired-ha-client-cache-entries!
   ([now-ms protected-entry]
    (prune-expired-ha-client-cache-entries! nil now-ms protected-entry))
   ([m-or-state now-ms protected-entry]
    (let [cache-state (ha-client-cache-state m-or-state)
-         ^ConcurrentHashMap cache (:cache cache-state)]
-     (loop [deferred []]
-       (if-let [[cache-key access-id :as record]
-                (poll-ha-client-cache-access-record! cache-state)]
-         (let [entry (.get cache cache-key)]
-           (cond
-             (nil? entry)
-             (recur deferred)
+         ^ConcurrentHashMap cache (:cache cache-state)
+         ^LRUCache lru (:lru cache-state)]
+     (doseq [cache-key (ha-client-cache-ordered-keys cache-state)]
+       (let [entry (.get cache cache-key)]
+         (cond
+           (nil? entry)
+           (.remove lru cache-key)
 
-             (not (current-ha-client-cache-access-record? entry access-id))
-             (recur deferred)
+           (or (identical? entry protected-entry)
+               (pending-ha-client-cache-entry? entry))
+           nil
 
-             (or (identical? entry protected-entry)
-                 (pending-ha-client-cache-entry? entry))
-             (recur (conj deferred record))
+           (or (failed-ha-client-cache-entry? entry)
+               (expired-ha-client-cache-entry? entry now-ms))
+           (when (.remove cache cache-key entry)
+             (.remove lru cache-key)
+             (close-ha-client-cache-entry! entry))
 
-             (or (failed-ha-client-cache-entry? entry)
-                 (expired-ha-client-cache-entry? entry now-ms))
-             (do
-               (when (.remove cache cache-key entry)
-                 (close-ha-client-cache-entry! entry))
-               (recur deferred))
-
-             :else
-             (restore-ha-client-cache-access-records! cache-state
-                                                      (conj deferred record))))
-         (restore-ha-client-cache-access-records! cache-state deferred))))))
+           :else
+           nil))))))
 
 (defn- prune-overflow-ha-client-cache-entries!
   ([protected-entry]
@@ -379,30 +285,25 @@
   ([m-or-state protected-entry]
    (let [cache-state (ha-client-cache-state m-or-state)
          ^ConcurrentHashMap cache (:cache cache-state)
+         ^LRUCache lru (:lru cache-state)
          max-size (max 0 (long *ha-client-cache-max-size*))]
-     (loop [deferred []]
-       (if (> (.size cache) max-size)
-         (if-let [[cache-key access-id :as record]
-                  (poll-ha-client-cache-access-record! cache-state)]
-           (let [entry (.get cache cache-key)]
-             (cond
-               (nil? entry)
-               (recur deferred)
+     (loop [[cache-key & remaining] (seq (ha-client-cache-ordered-keys
+                                          cache-state))]
+       (when (and (> (.size cache) max-size) cache-key)
+         (let [entry (.get cache cache-key)]
+           (cond
+             (nil? entry)
+             (.remove lru cache-key)
 
-               (not (current-ha-client-cache-access-record? entry access-id))
-               (recur deferred)
+             (or (identical? entry protected-entry)
+                 (pending-ha-client-cache-entry? entry))
+             nil
 
-               (or (identical? entry protected-entry)
-                   (pending-ha-client-cache-entry? entry))
-               (recur (conj deferred record))
-
-               :else
-               (do
-                 (when (.remove cache cache-key entry)
-                   (close-ha-client-cache-entry! entry))
-                 (recur deferred))))
-           (restore-ha-client-cache-access-records! cache-state deferred))
-         (restore-ha-client-cache-access-records! cache-state deferred))))))
+             :else
+             (when (.remove cache cache-key entry)
+               (.remove lru cache-key)
+               (close-ha-client-cache-entry! entry))))
+         (recur remaining))))))
 
 (defn ^:redef prune-ha-client-cache!
   ([now-ms protected-entry]
@@ -418,11 +319,8 @@
    (let [cache-state (ha-client-cache-state m-or-state)
          ^ConcurrentHashMap cache (:cache cache-state)
          max-size (max 0 (long *ha-client-cache-max-size*))
-         prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))
-         access-order-size (.get ^AtomicLong (:access-order-size cache-state))]
+         prune-interval-ms (max 0 (long *ha-client-cache-prune-interval-ms*))]
      (or (> (.size cache) max-size)
-         (>= access-order-size
-             (ha-client-cache-max-access-records))
          (>= (nonnegative-long-diff now-ms
                                     (.get ^AtomicLong
                                           (:last-prune-ms cache-state)))
@@ -529,11 +427,13 @@
        (let [client (if installer?
                       (let [^CompletableFuture future (:future pending-entry)]
                         (try
-                          (let [client (open-ha-client uri db-name client-opts)]
+                      (let [client (open-ha-client uri db-name client-opts)]
                             (.complete future client)
                             client)
                           (catch Throwable e
                             (.remove cache cache-key pending-entry)
+                            (.remove ^LRUCache (:lru cache-state)
+                                     cache-key)
                             (.completeExceptionally future e)
                             (throw e))))
                       (await-ha-client-cache-entry-client! cache-entry))]
@@ -559,6 +459,7 @@
                        nil)
                      existing))))
      (when-let [stale-entry @stale-entry-v]
+       (.remove ^LRUCache (:lru cache-state) cache-key)
        (close-ha-client-cache-entry! stale-entry)))))
 
 (defn with-cached-ha-client
@@ -586,9 +487,7 @@
          ^ConcurrentHashMap cache (:cache cache-state)]
      (.incrementAndGet ^AtomicLong (:prune-generation cache-state))
      (.set ^AtomicBoolean (:prune-scheduled? cache-state) false)
-     (.set ^AtomicLong (:access-seq cache-state) 0)
-     (.clear ^ConcurrentLinkedDeque (:access-order cache-state))
-     (.set ^AtomicLong (:access-order-size cache-state) 0)
+     (.clear ^LRUCache (:lru cache-state))
      (loop []
        (let [entries (vec (.entrySet cache))]
          (when (seq entries)
