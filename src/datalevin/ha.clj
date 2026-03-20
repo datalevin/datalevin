@@ -1265,7 +1265,7 @@
                first
                :endpoint)))
 
-(defn- ha-follower-source-endpoints
+(defn- ha-default-follower-source-endpoints
   [m lease]
   (let [local-endpoint (:ha-local-endpoint m)
         leader-endpoint (ha-leader-endpoint m lease)
@@ -1288,6 +1288,41 @@
            (into fallback-endpoints))
          distinct
          vec)))
+
+(defn- reuse-ha-follower-source-order?
+  [m]
+  (and (true? (:ha-follower-source-order-dynamic? m))
+       (vector? (:ha-follower-source-order m))
+       (= (:ha-follower-source-order-authority-version m)
+          (:ha-authority-version m))))
+
+(defn- ha-follower-source-endpoints
+  [m lease]
+  (let [default-sources (ha-default-follower-source-endpoints m lease)]
+    (if-not (reuse-ha-follower-source-order? m)
+      default-sources
+      (let [leader-endpoint (ha-leader-endpoint m lease)
+            valid-endpoints (set default-sources)
+            cached-tail
+            (->> (:ha-follower-source-order m)
+                 (filter valid-endpoints)
+                 (remove #(= % leader-endpoint))
+                 distinct
+                 vec)
+            merged
+            (->> (concat
+                  (when (and (string? leader-endpoint)
+                             (not (s/blank? leader-endpoint))
+                             (valid-endpoints leader-endpoint))
+                    [leader-endpoint])
+                  cached-tail
+                  (remove (set cached-tail) default-sources))
+                 (filter valid-endpoints)
+                 distinct
+                 vec)]
+        (if (seq merged)
+          merged
+          default-sources)))))
 
 (defn- ha-source-watermark-lsn
   [leader-endpoint source-endpoint watermark]
@@ -1509,11 +1544,12 @@
   [db-name m lease next-lsn upto-lsn]
   (let [sources (ha-follower-source-endpoints m lease)
         leader-endpoint (ha-leader-endpoint m lease)
+        cached-source-order? (reuse-ha-follower-source-order? m)
         leader-watermark* (delay (fetch-leader-watermark-lsn
                                   db-name m lease))]
     (loop [remaining sources
            source-order sources
-           reordered? false
+           reordered? cached-source-order?
            gap-errors []]
       (if-let [source-endpoint (first remaining)]
         (let [attempt
@@ -1541,6 +1577,7 @@
                        :value {:source-endpoint source-endpoint
                                :records records
                                :source-order source-order
+                               :source-order-dynamic? reordered?
                                :source-last-applied-lsn-known? false
                                :source-last-applied-lsn nil}})
                     (let [{:keys [known? last-applied-lsn]}
@@ -1579,6 +1616,7 @@
                            :value {:source-endpoint source-endpoint
                                    :records records
                                    :source-order source-order
+                                   :source-order-dynamic? reordered?
                                    :source-last-applied-lsn-known? true
                                    :source-last-applied-lsn
                                    source-last-applied-lsn}}
@@ -1616,6 +1654,7 @@
                          :value {:source-endpoint source-endpoint
                                  :records records
                                  :source-order source-order
+                                 :source-order-dynamic? reordered?
                                  :source-last-applied-lsn-known? known?
                                  :source-last-applied-lsn
                                  (when known?
@@ -1665,6 +1704,7 @@
                   :expected-lsn next-lsn
                   :upto-lsn upto-lsn
                   :source-order source-order
+                  :source-order-dynamic? reordered?
                   :gap-errors gap-errors})))))
 
 (defn ^:redef fetch-ha-leader-txlog-batch
@@ -2163,6 +2203,7 @@
     (let [upto-lsn (long (+ (long next-lsn)
                             (dec requested-batch-records)))
           {:keys [records source-endpoint source-order
+                  source-order-dynamic?
                   source-last-applied-lsn-known?
                   source-last-applied-lsn]}
           (fetch-ha-follower-records-with-gap-fallback
@@ -2262,6 +2303,10 @@
                          :ha-follower-leader-endpoint leader-endpoint
                          :ha-follower-source-endpoint source-endpoint
                          :ha-follower-source-order source-order
+                         :ha-follower-source-order-dynamic?
+                         source-order-dynamic?
+                         :ha-follower-source-order-authority-version
+                         (:ha-authority-version next-m)
                          :ha-follower-sync-backoff-ms nil
                          :ha-follower-next-sync-not-before-ms nil
                          :ha-follower-degraded? nil
@@ -2475,6 +2520,10 @@
                                                 (ha-gap-fallback-source-endpoints
                                                  db-name error-state lease
                                                  fallback-next-lsn)))
+                          source-order-dynamic?
+                          (if (contains? (ex-data e) :source-order-dynamic?)
+                            (true? (:source-order-dynamic? (ex-data e)))
+                            true)
                           bootstrap (bootstrap-ha-follower-from-snapshot
                                      db-name error-state lease source-order
                                      fallback-next-lsn
@@ -2485,12 +2534,17 @@
                                        "Follower txlog gap unresolved and snapshot bootstrap failed"
                                        :data
                                        {:error :ha/follower-snapshot-bootstrap-failed
-                                        :gap-error {:message (ex-message e)
-                                                    :data (ex-data e)}
+                                       :gap-error {:message (ex-message e)
+                                                   :data (ex-data e)}
                                         :snapshot-errors (:errors bootstrap)}
                                        :leader-endpoint leader-endpoint
                                        :source-order source-order}]
                           (assoc (:state bootstrap)
+                                 :ha-follower-source-order source-order
+                                 :ha-follower-source-order-dynamic?
+                                 source-order-dynamic?
+                                 :ha-follower-source-order-authority-version
+                                 (:ha-authority-version error-state)
                                  :ha-follower-last-error :sync-failed
                                  :ha-follower-last-error-details details
                                  :ha-follower-last-error-ms now-ms
