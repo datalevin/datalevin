@@ -2654,20 +2654,29 @@
              db-identity-mismatch? membership-mismatch?
              observed-at-ms]}
    now-ms]
-  (let [refresh-ms (or observed-at-ms now-ms)]
-  (-> m
-      (assoc :ha-authority-lease lease
-             :ha-authority-version version
-             :ha-authority-now-ms authority-now-ms
-             :ha-lease-local-deadline-ms lease-local-deadline-ms
-             :ha-lease-local-deadline-nanos lease-local-deadline-nanos
-             :ha-authority-owner-node-id (:leader-node-id lease)
-             :ha-authority-term (:term lease)
-             :ha-lease-until-ms (:lease-until-ms lease)
-             :ha-authority-membership-hash authority-membership-hash
-             :ha-db-identity-mismatch? db-identity-mismatch?
-             :ha-membership-mismatch? membership-mismatch?
-             :ha-last-authority-refresh-ms refresh-ms))))
+  (let [refresh-ms (or observed-at-ms now-ms)
+        observed-term (:term lease)
+        observed-owner-node-id (:leader-node-id lease)]
+    (cond-> (assoc m
+                   :ha-authority-lease lease
+                   :ha-authority-version version
+                   :ha-authority-now-ms authority-now-ms
+                   :ha-lease-local-deadline-ms lease-local-deadline-ms
+                   :ha-lease-local-deadline-nanos lease-local-deadline-nanos
+                   :ha-authority-owner-node-id observed-owner-node-id
+                   :ha-authority-term observed-term
+                   :ha-lease-until-ms (:lease-until-ms lease)
+                   :ha-authority-membership-hash authority-membership-hash
+                   :ha-db-identity-mismatch? db-identity-mismatch?
+                   :ha-membership-mismatch? membership-mismatch?
+                   :ha-last-authority-refresh-ms refresh-ms)
+      (and (= :leader (:ha-role m))
+           (= (:ha-node-id m) observed-owner-node-id)
+           (integer? observed-term)
+           (or (not (integer? (:ha-leader-term m)))
+               (<= (long (:ha-leader-term m))
+                   (long observed-term))))
+      (assoc :ha-leader-term (long observed-term)))))
 
 (defn- authority-read-error
   [e]
@@ -3369,6 +3378,7 @@
                   (assoc :ha-authority-lease lease
                          :ha-authority-version version
                          :ha-authority-now-ms authority-now-ms
+                         :ha-leader-term (:term lease)
                          :ha-lease-local-deadline-ms
                          (authority-lease-local-deadline-ms
                           lease authority-now-ms local-start-ms)
@@ -3652,9 +3662,9 @@
                     :now-nanos now-nanos
                     :retryable? true})
 
-            (or (nil? leader-term)
-                (nil? authority-term)
-                (not= leader-term authority-term))
+            (or (not (integer? leader-term))
+                (not (integer? authority-term))
+                (> (long leader-term) (long authority-term)))
             (merge common-meta
                    {:error :ha/write-rejected
                     :reason :term-mismatch
