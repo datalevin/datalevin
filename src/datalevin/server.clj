@@ -23,6 +23,7 @@
    [datalevin.storage :as st]
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
+   [datalevin.ha.replication :as drep]
    [datalevin.server.auth :as auth]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha-runtime :as hrt]
@@ -594,7 +595,7 @@
                     current-state
                     expected-state
                     :ha-follower-loop-running?))
-            (dha/apply-ha-follower-txlog-record! expected-state record)
+            (drep/apply-ha-follower-txlog-record! expected-state record)
             (u/raise "HA follower replay aborted because follower state changed"
                      {:error :ha/follower-stale-state
                       :db-name db-name
@@ -676,14 +677,14 @@
               ;; Follower replay can block on remote txlog fetch and local apply
               ;; work. Keep it off the authority renew path so lease reads and
               ;; promotions are not rate-limited by replication latency.
-              (let [next-state (binding [dha/*ha-follower-apply-record-fn*
+              (let [next-state (binding [drep/*ha-follower-apply-record-fn*
                                          (fn [state record]
                                            (ha-follower-apply-record-with-guard
                                             server
                                             db-name
                                             state
                                             record))
-                                         dha/*ha-with-local-store-swap-fn*
+                                         drep/*ha-with-local-store-swap-fn*
                                          (fn [f]
                                            (with-db-runtime-store-swap
                                              server
@@ -1280,7 +1281,7 @@
         payload-lsn
         (when kv-store
           (try
-            (long (dha/read-ha-snapshot-payload-lsn {:store store}))
+            (long (drep/read-ha-snapshot-payload-lsn {:store store}))
             (catch Exception _
               0)))
         db-identity (or (:db-identity store-opts)

@@ -81,6 +81,11 @@
         (nil? lease-until-ms)
         (>= (long now-ms) (long lease-until-ms)))))
 
+(defn bootstrap-empty-lease?
+  [lease]
+  (and (or (nil? lease) (nil? (:leader-node-id lease)))
+       (zero? (observed-term lease))))
+
 (defn new-lease-record
   "Create a canonical authoritative lease record."
   [{:keys [db-identity leader-node-id leader-endpoint term lease-renew-ms
