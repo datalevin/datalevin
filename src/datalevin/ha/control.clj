@@ -322,6 +322,14 @@
           (sleep-in-memory-cas-retry! (dec attempt))
           (recur attempt)))))))
 
+(defn ^:redef in-memory-linearizable-state-snapshot!
+  [state-atom]
+  (commit-state-transition!
+   state-atom
+   (fn [snapshot]
+     {:state snapshot
+      :result snapshot})))
+
 (declare apply-state-command!)
 
 (defrecord InMemoryLeaseAuthority [group-id state running-v initial-voters
@@ -344,7 +352,9 @@
   (read-lease [this db-identity]
     (ensure-running! running-v)
     (lease/validate-lease-key! group-id db-identity)
-    (let [{:keys [lease version]} (lease-entry @state db-identity)]
+    (let [{:keys [lease version]}
+          (lease-entry (in-memory-linearizable-state-snapshot! state)
+                       db-identity)]
       {:lease lease
        :version version}))
 
@@ -405,7 +415,7 @@
 
   (read-membership-hash [_]
     (ensure-running! running-v)
-    (:membership-hash @state))
+    (:membership-hash (in-memory-linearizable-state-snapshot! state)))
 
   (init-membership-hash! [_ membership-hash]
     (ensure-running! running-v)
@@ -437,7 +447,7 @@
 
   (read-voters [_]
     (ensure-running! running-v)
-    (vec (:voters @state)))
+    (vec (:voters (in-memory-linearizable-state-snapshot! state))))
 
   (replace-voters! [_ voters]
     (ensure-running! running-v)
@@ -1837,7 +1847,7 @@
     (let [{:keys [group-id state running-v]} authority]
       (ensure-running! running-v)
       (lease/validate-lease-key! group-id db-identity)
-    (let [snapshot @state
+    (let [snapshot (in-memory-linearizable-state-snapshot! state)
           {:keys [lease version]} (lease-entry snapshot db-identity)]
       {:lease lease
        :version version
