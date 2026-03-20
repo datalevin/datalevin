@@ -1015,12 +1015,10 @@
                         (mapv (fn [item] #(f item)) items))
             (mapv #(.get ^Future %)))))))
 
-(defn ^:redef fetch-leader-watermark-lsn
-  [db-name m lease]
+(defn- normalize-leader-watermark-result
+  [lease result]
   (let [leader-endpoint (:leader-endpoint lease)
-        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        result (safe-fetch-ha-endpoint-watermark-lsn
-                db-name m leader-endpoint)]
+        authority-lsn (long (or (:leader-last-applied-lsn lease) 0))]
     (if (:reachable? result)
       (update result
               :last-applied-lsn
@@ -1036,53 +1034,85 @@
         (= :endpoint-watermark-fetch-failed (:reason result))
         (assoc :reason :leader-watermark-fetch-failed)))))
 
+(defn ^:redef fetch-leader-watermark-lsn
+  [db-name m lease]
+  (let [leader-endpoint (:leader-endpoint lease)
+        result (safe-fetch-ha-endpoint-watermark-lsn
+                db-name m leader-endpoint)]
+    (normalize-leader-watermark-result lease result)))
+
+(defn- ha-member-watermark-endpoints
+  ([m]
+   (ha-member-watermark-endpoints m nil))
+  ([m extra-endpoints]
+   (->> (concat [(:ha-local-endpoint m)]
+                extra-endpoints
+                (map :endpoint (:ha-members m)))
+        (filter #(and (string? %)
+                      (not (s/blank? %))))
+        distinct
+        vec)))
+
+(defn- ha-member-watermarks
+  ([db-name m]
+   (ha-member-watermarks db-name m nil {}))
+  ([db-name m extra-endpoints]
+   (ha-member-watermarks db-name m extra-endpoints {}))
+  ([db-name m extra-endpoints prefetched-watermarks]
+   (let [endpoints (ha-member-watermark-endpoints m extra-endpoints)]
+     (into {}
+           (ha-parallel-mapv
+            m
+            (fn [endpoint]
+              [endpoint
+               (if (contains? prefetched-watermarks endpoint)
+                 (get prefetched-watermarks endpoint)
+                 (safe-fetch-ha-endpoint-watermark-lsn
+                  db-name m endpoint))])
+            endpoints)))))
+
+(defn- highest-reachable-ha-member-watermark*
+  [m watermarks]
+  (let [local-endpoint (:ha-local-endpoint m)]
+    (reduce-kv
+     (fn [best endpoint watermark]
+       (if-not (:reachable? watermark)
+         best
+         (let [last-applied-lsn
+               (long (or (:last-applied-lsn watermark) 0))
+               candidate {:endpoint endpoint
+                          :last-applied-lsn last-applied-lsn
+                          :watermark watermark}]
+           (cond
+             (nil? best)
+             candidate
+
+             (> last-applied-lsn
+                (long (:last-applied-lsn best)))
+             candidate
+
+             (and (= last-applied-lsn
+                     (long (:last-applied-lsn best)))
+                  (= endpoint local-endpoint)
+                  (not= endpoint (:endpoint best)))
+             candidate
+
+             :else
+             best))))
+     nil
+     watermarks)))
+
 (defn- highest-reachable-ha-member-watermark
   ([db-name m]
    (highest-reachable-ha-member-watermark db-name m {}))
   ([db-name m prefetched-watermarks]
-   (let [local-endpoint (:ha-local-endpoint m)
-         endpoints (->> (concat [local-endpoint]
-                                (map :endpoint (:ha-members m)))
-                        (filter #(and (string? %)
-                                      (not (s/blank? %))))
-                        distinct
-                        vec)
-         watermarks (ha-parallel-mapv
-                     m
-                     (fn [endpoint]
-                       {:endpoint endpoint
-                        :watermark
-                        (if (contains? prefetched-watermarks endpoint)
-                          (get prefetched-watermarks endpoint)
-                          (safe-fetch-ha-endpoint-watermark-lsn
-                           db-name m endpoint))})
-                     endpoints)]
-     (reduce (fn [best {:keys [endpoint watermark]}]
-               (if-not (:reachable? watermark)
-                 best
-                 (let [last-applied-lsn
-                       (long (or (:last-applied-lsn watermark) 0))
-                       candidate {:endpoint endpoint
-                                  :last-applied-lsn last-applied-lsn
-                                  :watermark watermark}]
-                   (cond
-                     (nil? best)
-                     candidate
-
-                     (> last-applied-lsn
-                        (long (:last-applied-lsn best)))
-                     candidate
-
-                     (and (= last-applied-lsn
-                             (long (:last-applied-lsn best)))
-                          (= endpoint local-endpoint)
-                          (not= endpoint (:endpoint best)))
-                     candidate
-
-                     :else
-                     best))))
-             nil
-             watermarks))))
+   (highest-reachable-ha-member-watermark*
+    m
+    (ha-member-watermarks
+     db-name
+     m
+     (keys prefetched-watermarks)
+     prefetched-watermarks))))
 
 (defn- ha-follower-max-batch-records
   [m]
@@ -1096,13 +1126,118 @@
 
 (def ^:private ha-follower-adaptive-batch-assumed-record-bytes 4096)
 (def ^:private ha-follower-adaptive-batch-sample-limit 16)
+(def ^:private ha-follower-adaptive-batch-value-max-depth 3)
+(def ^:private ha-follower-adaptive-batch-value-sample-limit 8)
 (def ^:private ha-follower-adaptive-batch-byte-array-class
   (class (byte-array 0)))
 (def ^:private ha-follower-adaptive-batch-value-overhead-bytes 16)
 (def ^:private ha-follower-adaptive-batch-record-overhead-bytes 32)
 
-(defn- estimate-ha-follower-value-bytes ^long
+(declare estimate-ha-follower-value-bytes*)
+
+(defn- estimate-ha-follower-truncated-map-bytes ^long
   [value]
+  (let [entry-count (if (counted? value)
+                      (long (count value))
+                      1)]
+    (long (+ 32
+             (* 2
+                (long ha-follower-adaptive-batch-value-overhead-bytes)
+                entry-count)))))
+
+(defn- estimate-ha-follower-truncated-coll-bytes ^long
+  [value]
+  (let [item-count (if (counted? value)
+                     (long (count value))
+                     1)]
+    (long (+ 16
+             (* (long ha-follower-adaptive-batch-value-overhead-bytes)
+                item-count)))))
+
+(defn- extrapolate-ha-follower-sampled-bytes ^long
+  [^long base-bytes ^long sample-bytes ^long sampled-count ^long total-count]
+  (let [limit (long ha-follower-adaptive-batch-value-sample-limit)
+        avg-item-bytes (if (pos? sampled-count)
+                         (long-max2
+                          1
+                          (long (Math/ceil
+                                 (/ (double (- sample-bytes base-bytes))
+                                    (double sampled-count)))))
+                         (long ha-follower-adaptive-batch-value-overhead-bytes))
+        known-total? (not= total-count -1)]
+    (cond
+      (and known-total? (> total-count sampled-count))
+      (let [remaining-count (unchecked-subtract total-count sampled-count)]
+        (long (+ sample-bytes
+                 (* avg-item-bytes remaining-count))))
+
+      (and (not known-total?)
+           (= sampled-count limit))
+      (long (+ sample-bytes avg-item-bytes))
+
+      :else
+      sample-bytes)))
+
+(defn- estimate-ha-follower-map-bytes ^long
+  [value ^long remaining-depth]
+  (if (<= remaining-depth 0)
+    (estimate-ha-follower-truncated-map-bytes value)
+    (let [limit (long ha-follower-adaptive-batch-value-sample-limit)
+          next-depth (unchecked-dec remaining-depth)
+          total-count (long (if (counted? value)
+                              (count value)
+                              -1))]
+      (loop [entries (seq value)
+             sampled-count (long 0)
+             sample-bytes (long 32)]
+        (if (and (< sampled-count limit)
+                 (seq entries))
+          (let [entry (first entries)
+                key-bytes (estimate-ha-follower-value-bytes*
+                           (key entry)
+                           next-depth)
+                val-bytes (estimate-ha-follower-value-bytes*
+                           (val entry)
+                           next-depth)]
+            (recur (rest entries)
+                   (unchecked-inc sampled-count)
+                   (+ sample-bytes
+                      (long key-bytes)
+                      (long val-bytes))))
+          (extrapolate-ha-follower-sampled-bytes
+           32
+           sample-bytes
+           sampled-count
+           total-count))))))
+
+(defn- estimate-ha-follower-coll-bytes ^long
+  [value ^long remaining-depth]
+  (if (<= remaining-depth 0)
+    (estimate-ha-follower-truncated-coll-bytes value)
+    (let [limit (long ha-follower-adaptive-batch-value-sample-limit)
+          next-depth (unchecked-dec remaining-depth)
+          total-count (long (if (counted? value)
+                              (count value)
+                              -1))]
+      (loop [items (seq value)
+             sampled-count (long 0)
+             sample-bytes (long 16)]
+        (if (and (< sampled-count limit)
+                 (seq items))
+          (let [^long item-bytes (estimate-ha-follower-value-bytes*
+                                  (first items)
+                                  next-depth)]
+            (recur (rest items)
+                   (unchecked-inc sampled-count)
+                   (+ sample-bytes item-bytes)))
+          (extrapolate-ha-follower-sampled-bytes
+           16
+           sample-bytes
+           sampled-count
+           total-count))))))
+
+(defn- estimate-ha-follower-value-bytes* ^long
+  [value ^long remaining-depth]
   (cond
     (nil? value)
     1
@@ -1143,33 +1278,25 @@
     (.remaining ^java.nio.ByteBuffer value)
 
     (map? value)
-    (reduce-kv (fn [^long total k v]
-                 (+ total
-                    (long (estimate-ha-follower-value-bytes k))
-                    (long (estimate-ha-follower-value-bytes v))))
-               32
-               value)
+    (estimate-ha-follower-map-bytes value remaining-depth)
 
     (vector? value)
-    (reduce (fn [^long total item]
-              (+ total (long (estimate-ha-follower-value-bytes item))))
-            16
-            value)
+    (estimate-ha-follower-coll-bytes value remaining-depth)
 
     (sequential? value)
-    (reduce (fn [^long total item]
-              (+ total (long (estimate-ha-follower-value-bytes item))))
-            16
-            value)
+    (estimate-ha-follower-coll-bytes value remaining-depth)
 
     (coll? value)
-    (reduce (fn [^long total item]
-              (+ total (long (estimate-ha-follower-value-bytes item))))
-            16
-            value)
+    (estimate-ha-follower-coll-bytes value remaining-depth)
 
     :else
     (long ha-follower-adaptive-batch-value-overhead-bytes)))
+
+(defn- estimate-ha-follower-value-bytes ^long
+  [value]
+  (estimate-ha-follower-value-bytes*
+   value
+   (long ha-follower-adaptive-batch-value-max-depth)))
 
 (defn- estimate-ha-follower-record-bytes ^long
   [record]
@@ -2592,22 +2719,35 @@
         lease-expired? (lease/lease-expired? lease now-ms)
         local-last-applied-lsn (fresh-ha-promotion-local-last-applied-lsn
                                 m lease)
-        leader-watermark (fetch-leader-watermark-lsn db-name m lease)
+        member-watermarks
+        (when lease-expired?
+          (ha-member-watermarks db-name m [(:leader-endpoint lease)]))
+        leader-watermark
+        (if member-watermarks
+          (normalize-leader-watermark-result
+           lease
+           (get member-watermarks
+                (:leader-endpoint lease)
+                {:reachable? false
+                 :reason :missing-endpoint}))
+          (fetch-leader-watermark-lsn db-name m lease))
         reachable? (true? (:reachable? leader-watermark))
         leader-lsn (if reachable?
                      (long (or (:last-applied-lsn leader-watermark)
                                authority-lsn))
                      0)
         reachable-member-watermark
-        (when (or (not reachable?)
+        (when (or member-watermarks
+                  (not reachable?)
                   (and lease-expired?
                        (< leader-lsn authority-lsn)))
           (highest-reachable-ha-member-watermark
            db-name
            m
-           (cond-> {}
-             (string? (:leader-endpoint lease))
-             (assoc (:leader-endpoint lease) leader-watermark))))
+           (or member-watermarks
+               (cond-> {}
+                 (string? (:leader-endpoint lease))
+                 (assoc (:leader-endpoint lease) leader-watermark)))))
         reachable-member-lsn
         (when reachable-member-watermark
           (long (or (:last-applied-lsn reachable-member-watermark) 0)))

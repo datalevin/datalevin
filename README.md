@@ -74,8 +74,8 @@ asynchronous transaction, Datalevin can also handle [write intensive
 workload](benchmarks/write-bench).
 
 Datalevin can store large document (< 2 GiB) and automatically build index by
-paths for JSON, EDN and Markdown documents, so it can be used as a document
-database, similar to MongoDB or PostgreSQL JSONB column.
+paths for JSON, EDN and Markdown [documents](doc/idoc.md), so it can be used as
+a document database, similar to MongoDB or PostgreSQL JSONB column.
 
 Datalevin supports [vector database](doc/vector.md) features by integrating an
 efficient SIMD accelerated vector indexing and search
@@ -83,12 +83,18 @@ efficient SIMD accelerated vector indexing and search
 full-text search engine](doc/search.md) that has
 [competitive](benchmarks/search-bench) search performance.
 
+Datalevin is also AI-native. It ships with a built-in local
+[MCP server](doc/mcp.md) and an in-db embedding service backed by local
+`llama.cpp`, so AI clients can query Datalevin over MCP while applications keep
+embedding generation and search in the same database runtime.
+
 Datalevin can be used as a fast key-value store for
 [EDN](https://en.wikipedia.org/wiki/Extensible_Data_Notation) data. The native
 EDN data capability of Datalevin should be beneficial for Clojure programs.
 
-Datalevin can be used as a library, embedded in applications to manage state,
-e.g. used like SQLite; or it can run in a networked
+Datalevin can be used as a library, embedded in applications written in Java,
+Python, Node.js or Clojure, to manage state, e.g. used like SQLite; or it can
+run in a networked
 [client/server](https://github.com/datalevin/datalevin/blob/master/doc/server.md)
 mode (default port is 8898) with full-fledged role-based access control (RBAC)
 on the server, e.g. used like PostgreSQL; or it can be used as a [babashka
@@ -126,48 +132,6 @@ versions.
 ## :tada: Usage
 
 Datalevin is aimed to be a versatile database.
-
-### Use from Java
-
-The Java API lives in package `datalevin` and starts from
-`datalevin.Datalevin`.
-
-- Use `Connection` for local Datalog databases.
-- Use `KV` for local key-value stores.
-- Use `Client` for remote server administration.
-- Use `DatalevinInterop` for raw-handle bridge use cases such as JPype or
-  node-java-bridge.
-
-Java results may contain raw Clojure runtime classes such as
-`clojure.lang.Keyword` and persistent collections. That is intentional.
-
-The Java release artifact is `org.datalevin:datalevin-java:0.10.12`. It bundles
-the Datalevin runtime payload, including the native Datalevin libraries, so
-Java consumers only need Maven Central enabled. See
-[`examples/java/README.md`](examples/java/README.md) for Maven and Gradle
-snippets and runnable examples, and [`doc/java-release.md`](doc/java-release.md)
-for the Maven Central publishing procedure:
-
-- `DatalogQuickStart.java`
-- `KVQuickStart.java`
-- `ClientQuickStart.java`
-- `InteropQuickStart.java`
-
-### Use as an MCP server
-
-Datalevin also ships a local MCP server entrypoint:
-
-```console
-dtlv mcp
-```
-
-Use `dtlv --allow-writes mcp` to enable write tools.
-
-The MCP integration target is generic: any MCP-compliant client that can launch
-a local `stdio` server, especially custom AI-powered applications.
-
-See [MCP server documentation](doc/mcp.md) for the transport model, tool
-surface, and large-response truncation metadata.
 
 ### Use as a Datalog store
 
@@ -312,7 +276,9 @@ for EDN data.
 
 ;; Close key value db
 (d/close-kv db)
+
 ```
+
 ## :green_book: Documentation
 
 Please refer to the [API
