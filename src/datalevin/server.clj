@@ -48,6 +48,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService Future
     ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit]
+   [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
    [datalevin.interface ILMDB IStore]
@@ -1161,7 +1162,7 @@
   [db-name m]
   (*ha-follower-sync-step-fn* db-name m))
 
-(declare get-lock db-write-admission-lock)
+(declare get-lock db-write-admission-lock with-db-runtime-store-swap)
 
 (defn- ha-follower-apply-record-with-guard
   [^Server server db-name expected-state record]
@@ -1338,7 +1339,13 @@
                                             server
                                             db-name
                                             state
-                                            record))]
+                                            record))
+                                         dha/*ha-with-local-store-swap-fn*
+                                         (fn [f]
+                                           (with-db-runtime-store-swap
+                                             server
+                                             db-name
+                                             f))]
                                  (ha-follower-sync-step db-name m))
                     local-patch (ha-follower-local-side-effect-patch
                                  m next-state)
@@ -3619,6 +3626,43 @@
             (update-db server db-name #(assoc % :lock lock))
             lock)))))
 
+(defn- get-runtime-access-lock
+  [^Server server db-name]
+  (let [dbs (.-dbs server)]
+    (locking dbs
+      (or (get-in dbs [db-name :runtime-access-lock])
+          (let [lock (ReentrantReadWriteLock. true)]
+            (update-db server db-name #(assoc % :runtime-access-lock lock))
+            lock)))))
+
+(defn- with-db-runtime-read-access
+  [^Server server message f]
+  (let [db-name (nth (:args message) 0 nil)
+        dbs (.-dbs server)]
+    (if (and db-name (.containsKey ^ConcurrentHashMap dbs db-name))
+      (let [^ReentrantReadWriteLock lock
+            (get-runtime-access-lock server db-name)
+            read-lock (.readLock lock)]
+        (.lock read-lock)
+        (try
+          (f)
+          (finally
+            (.unlock read-lock))))
+      (f))))
+
+(defn- with-db-runtime-store-swap
+  [^Server server db-name f]
+  (if db-name
+    (let [^ReentrantReadWriteLock lock
+          (get-runtime-access-lock server db-name)
+          write-lock (.writeLock lock)]
+      (.lock write-lock)
+      (try
+        (f)
+        (finally
+          (.unlock write-lock))))
+    (f)))
+
 (defn- get-kv-store
   [server db-name]
   (let [s (get-store server db-name)]
@@ -4650,7 +4694,10 @@
       (set-last-active server skey)
       (if writing?
         (handle-writing server skey message)
-        (dispatch-message-with-ha-write-admission server skey message)))
+        (with-db-runtime-read-access
+          server
+          message
+          #(dispatch-message-with-ha-write-admission server skey message))))
     (catch Exception e
       ;; (stt/print-stack-trace e)
       (log/error "Error Handling message:" e))))

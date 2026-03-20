@@ -677,6 +677,7 @@
   ::ha-local-store-reopen-info)
 (declare ha-local-store-reopen-info)
 (declare reopen-ha-local-store-from-info)
+(declare with-ha-local-store-swap)
 
 (defn- ha-local-store-open-opts
   [m store]
@@ -859,9 +860,10 @@
         _ (when clamped?
             (persist-ha-local-bootstrap-floor! m verified-floor-lsn))
         next-m (if (and clamped? reopen-info)
-                 (do
-                   (close-ha-local-store! m)
-                   (reopen-ha-local-store-from-info m reopen-info))
+                 (with-ha-local-store-swap
+                   #(do
+                      (close-ha-local-store! m)
+                      (reopen-ha-local-store-from-info m reopen-info)))
                  m)]
     (assoc replay
            :installed-lsn (long verified-floor-lsn)
@@ -2059,23 +2061,25 @@
               (if (and (instance? IStore store)
                        (seq schema-overrides))
                 (let [reopen-info (ha-local-store-reopen-info m)]
-                  (close-ha-local-store! m)
-                  (try
-                    (reopen-ha-local-store-from-info m reopen-info)
-                    (catch Throwable e
-                      (u/raise
-                        "HA follower schema replay failed to reopen local store"
-                        {:error       :ha/follower-schema-reopen-failed
-                         :record-lsn  (:lsn record)
-                         :reopen-info reopen-info
-                         :message     (ex-message e)
-                         :data        (ex-data e)
-                         :state       (-> m
-                                          (assoc ha-local-store-reopen-info-key
-                                                 reopen-info
-                                                 :dt-db nil)
-                                          (dissoc :engine :index))}))))
-                m))
+                  (with-ha-local-store-swap
+                    (fn []
+                      (close-ha-local-store! m)
+                      (try
+                        (reopen-ha-local-store-from-info m reopen-info)
+                        (catch Throwable e
+                          (u/raise
+                           "HA follower schema replay failed to reopen local store"
+                           {:error       :ha/follower-schema-reopen-failed
+                            :record-lsn  (:lsn record)
+                            :reopen-info reopen-info
+                            :message     (ex-message e)
+                            :data        (ex-data e)
+                            :state       (-> m
+                                             (assoc ha-local-store-reopen-info-key
+                                                    reopen-info
+                                                    :dt-db nil)
+                                             (dissoc :engine :index))}))))))
+                 m))
             readback-kv-store (raw-local-kv-store next-state)
             probe-eid         (some->> replay-rows
                                        (keep (fn [[op dbi k]]
@@ -2317,82 +2321,84 @@
                        m
                        (:db-name (i/opts store))
                        (:ha-db-identity m))]
-        (try
-          ;; Validate that the copied snapshot is openable before swapping paths.
-          (let [snapshot-store (st/open snapshot-dir nil open-opts)]
+        ;; Validate that the copied snapshot is openable before swapping paths.
+        (let [snapshot-store (st/open snapshot-dir nil open-opts)]
+          (try
+            (i/opts snapshot-store)
+            (finally
+              (i/close snapshot-store))))
+        (with-ha-local-store-swap
+          (fn []
             (try
-              (i/opts snapshot-store)
-              (finally
-                (i/close snapshot-store))))
-          (close-ha-local-store! m)
-          (when (u/file-exists backup-dir)
-            (u/delete-files backup-dir))
-          (when (u/file-exists stage-dir)
-            (u/delete-files stage-dir))
-          (write-ha-snapshot-install-marker!
-           env-dir
-           (assoc install-marker :stage :backup-moving))
-          (move-path! env-dir backup-dir)
-          (write-ha-snapshot-install-marker!
-           env-dir
-           (assoc install-marker :stage :backup-moved))
-          (copy-dir-contents! snapshot-dir stage-dir)
-          (sync-ha-snapshot-install-target! stage-dir)
-          (write-ha-snapshot-install-marker!
-           env-dir
-           (assoc install-marker :stage :snapshot-staged))
-          (move-path! stage-dir env-dir)
-          (sync-ha-snapshot-install-target! env-dir)
-          (let [new-store (open-ha-store-dbis!
-                           (st/open env-dir nil open-opts))
-                new-db (db/new-db new-store)]
-            (delete-ha-snapshot-install-marker! env-dir)
-            (when (u/file-exists backup-dir)
-              (u/delete-files backup-dir))
-            {:ok? true
-             :state (-> m
-                        (assoc :store new-store
-                               :dt-db new-db)
-                        (dissoc :engine :index))})
-          (catch Exception e
-            (let [log-context {:db-name (some-> store i/db-name)
-                               :env-dir env-dir}]
-              (try
-                (recover-ha-local-snapshot-install! env-dir)
-                (log/warn e
-                          "HA follower snapshot install failed; restored local store"
-                          log-context)
-                (let [restored-store (open-ha-store-dbis!
-                                      (st/open env-dir nil open-opts))
-                      restored-db (db/new-db restored-store)]
-                  {:ok? false
-                   :state (-> m
-                              (assoc :store restored-store
-                                     :dt-db restored-db)
-                              (dissoc :engine :index))
-                   :error {:error :ha/follower-snapshot-install-failed
-                           :message (ex-message e)
-                           :data (ex-data e)}})
-                (catch Exception restore-e
-                  (log/error restore-e
-                             "HA follower snapshot install restore failed"
-                             (merge log-context
-                                    {:install-message (ex-message e)
-                                     :install-data (ex-data e)}))
-                  {:ok? false
-                   :state (-> m
-                              ;; Preserve the closed store handle so the next
-                              ;; renew step can recover and reopen from its
-                              ;; original env dir instead of getting stuck with
-                              ;; no local store at all.
-                              (assoc :store store
-                                     :dt-db nil)
-                              (dissoc :engine :index))
-                   :error {:error :ha/follower-snapshot-install-restore-failed
-                           :message (ex-message e)
-                           :data (merge (or (ex-data e) {})
-                                        {:restore-message (ex-message restore-e)
-                                         :restore-data (ex-data restore-e)})}})))))))))
+              (close-ha-local-store! m)
+              (when (u/file-exists backup-dir)
+                (u/delete-files backup-dir))
+              (when (u/file-exists stage-dir)
+                (u/delete-files stage-dir))
+              (write-ha-snapshot-install-marker!
+               env-dir
+               (assoc install-marker :stage :backup-moving))
+              (move-path! env-dir backup-dir)
+              (write-ha-snapshot-install-marker!
+               env-dir
+               (assoc install-marker :stage :backup-moved))
+              (copy-dir-contents! snapshot-dir stage-dir)
+              (sync-ha-snapshot-install-target! stage-dir)
+              (write-ha-snapshot-install-marker!
+               env-dir
+               (assoc install-marker :stage :snapshot-staged))
+              (move-path! stage-dir env-dir)
+              (sync-ha-snapshot-install-target! env-dir)
+              (let [new-store (open-ha-store-dbis!
+                               (st/open env-dir nil open-opts))
+                    new-db (db/new-db new-store)]
+                (delete-ha-snapshot-install-marker! env-dir)
+                (when (u/file-exists backup-dir)
+                  (u/delete-files backup-dir))
+                {:ok? true
+                 :state (-> m
+                            (assoc :store new-store
+                                   :dt-db new-db)
+                            (dissoc :engine :index))})
+              (catch Exception e
+                (let [log-context {:db-name (some-> store i/db-name)
+                                   :env-dir env-dir}]
+                  (try
+                    (recover-ha-local-snapshot-install! env-dir)
+                    (log/warn e
+                              "HA follower snapshot install failed; restored local store"
+                              log-context)
+                    (let [restored-store (open-ha-store-dbis!
+                                          (st/open env-dir nil open-opts))
+                          restored-db (db/new-db restored-store)]
+                      {:ok? false
+                       :state (-> m
+                                  (assoc :store restored-store
+                                         :dt-db restored-db)
+                                  (dissoc :engine :index))
+                       :error {:error :ha/follower-snapshot-install-failed
+                               :message (ex-message e)
+                               :data (ex-data e)}})
+                    (catch Exception restore-e
+                      (log/error restore-e
+                                 "HA follower snapshot install restore failed"
+                                 (merge log-context
+                                        {:install-message (ex-message e)
+                                         :install-data (ex-data e)}))
+                      {:ok? false
+                       :state (-> m
+                                  ;; Preserve the closed store handle so the next
+                                  ;; renew step can recover and reopen from its
+                                  ;; original env dir instead of getting stuck with
+                                  ;; no local store at all.
+                                  (assoc :store store
+                                         :dt-db nil)
+                                  (dissoc :engine :index))
+                       :error {:error :ha/follower-snapshot-install-restore-failed
+                               :message (ex-message e)
+                               :data (merge (or (ex-data e) {})
+                                            {:restore-message (ex-message restore-e)
+                                             :restore-data (ex-data restore-e)})}})))))))))))
 
 (defn- sync-ha-follower-batch
   [db-name m lease next-lsn now-ms]
@@ -3197,6 +3203,14 @@
       (assoc m
              :ha-clock-skew-budget-ms budget-ms
              :ha-clock-skew-paused? false))))
+
+(def ^:dynamic *ha-with-local-store-swap-fn*
+  (fn [f]
+    (f)))
+
+(defn- with-ha-local-store-swap
+  [f]
+  (*ha-with-local-store-swap-fn* f))
 
 (defn- ha-clock-skew-promotion-failure-details
   [m]
