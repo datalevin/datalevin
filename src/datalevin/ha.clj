@@ -644,6 +644,8 @@
 
 (def ^:redef sync-ha-snapshot-install-target!
   snap/sync-ha-snapshot-install-target!)
+(def ha-snapshot-install-marker-path
+  snap/ha-snapshot-install-marker-path)
 (def ^:private copy-dir-contents! snap/copy-dir-contents!)
 (def ^:private move-path! snap/move-path!)
 (def ^:private write-ha-snapshot-install-marker!
@@ -2062,7 +2064,9 @@
                :message "HA follower snapshot install requires a local store"}}
       (let [env-dir (i/dir store)
             backup-dir (str env-dir ".ha-backup-" (UUID/randomUUID))
+            stage-dir (str env-dir ".ha-install-" (UUID/randomUUID))
             install-marker {:backup-dir backup-dir
+                            :stage-dir stage-dir
                             :db-name (some-> store i/db-name)
                             :created-at-ms (System/currentTimeMillis)}
             open-opts (ha-snapshot-open-opts
@@ -2079,15 +2083,21 @@
           (close-ha-local-store! m)
           (when (u/file-exists backup-dir)
             (u/delete-files backup-dir))
+          (when (u/file-exists stage-dir)
+            (u/delete-files stage-dir))
           (write-ha-snapshot-install-marker!
            env-dir
-           (assoc install-marker :stage :prepare))
+           (assoc install-marker :stage :backup-moving))
           (move-path! env-dir backup-dir)
           (write-ha-snapshot-install-marker!
            env-dir
            (assoc install-marker :stage :backup-moved))
-          (u/create-dirs env-dir)
-          (copy-dir-contents! snapshot-dir env-dir)
+          (copy-dir-contents! snapshot-dir stage-dir)
+          (sync-ha-snapshot-install-target! stage-dir)
+          (write-ha-snapshot-install-marker!
+           env-dir
+           (assoc install-marker :stage :snapshot-staged))
+          (move-path! stage-dir env-dir)
           (sync-ha-snapshot-install-target! env-dir)
           (let [new-store (open-ha-store-dbis!
                            (st/open env-dir nil open-opts))

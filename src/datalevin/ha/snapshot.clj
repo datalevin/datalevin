@@ -95,10 +95,14 @@
                                  :env-dir env-dir
                                  :marker-path marker-path})))
             backup-dir (:backup-dir marker)
-            stage (:stage marker)]
+            stage (:stage marker)
+            stage-dir (:stage-dir marker)]
         (when-not (and (map? marker)
                        (string? backup-dir)
                        (not (s/blank? backup-dir))
+                       (or (nil? stage-dir)
+                           (and (string? stage-dir)
+                                (not (s/blank? stage-dir))))
                        (keyword? stage))
           (u/raise "HA snapshot install marker is invalid"
                    {:error :ha/follower-snapshot-install-marker-invalid
@@ -118,11 +122,36 @@
     (when (u/file-exists marker-path)
       (u/delete-files marker-path))))
 
+(defn- delete-ha-snapshot-install-stage-dir!
+  [{:keys [stage-dir]}]
+  (when (and (string? stage-dir)
+             (not (s/blank? stage-dir))
+             (u/file-exists stage-dir))
+    (u/delete-files stage-dir)))
+
 (defn restore-ha-snapshot-install-backup!
   [env-dir backup-dir]
   (when (u/file-exists env-dir)
     (u/delete-files env-dir))
   (move-path! backup-dir env-dir))
+
+(defn- recover-ha-snapshot-install-from-backup!
+  [env-dir {:keys [backup-dir stage] :as marker} log-message]
+  (if (u/file-exists backup-dir)
+    (do
+      (log/warn log-message
+                {:env-dir env-dir
+                 :backup-dir backup-dir
+                 :stage stage})
+      (delete-ha-snapshot-install-stage-dir! marker)
+      (restore-ha-snapshot-install-backup! env-dir backup-dir)
+      (delete-ha-snapshot-install-marker! env-dir)
+      marker)
+    (u/raise "HA snapshot install backup is missing during recovery"
+             {:error :ha/follower-snapshot-install-recovery-failed
+              :env-dir env-dir
+              :backup-dir backup-dir
+              :stage stage})))
 
 (defn recover-ha-local-snapshot-install!
   [env-dir]
@@ -137,12 +166,40 @@
                     {:env-dir env-dir
                      :backup-dir backup-dir
                      :stage stage})
+          (delete-ha-snapshot-install-stage-dir! marker)
           (restore-ha-snapshot-install-backup! env-dir backup-dir)
           (delete-ha-snapshot-install-marker! env-dir)
           marker)
 
         (u/file-exists env-dir)
         (do
+          (delete-ha-snapshot-install-stage-dir! marker)
+          (delete-ha-snapshot-install-marker! env-dir)
+          marker)
+
+        :else
+        (u/raise "HA snapshot install marker has no recoverable store"
+                 {:error :ha/follower-snapshot-install-recovery-failed
+                  :env-dir env-dir
+                  :backup-dir backup-dir
+                  :stage stage}))
+
+      :backup-moving
+      (cond
+        (u/file-exists backup-dir)
+        (do
+          (log/warn "Recovering HA snapshot install while backup move was in progress"
+                    {:env-dir env-dir
+                     :backup-dir backup-dir
+                     :stage stage})
+          (delete-ha-snapshot-install-stage-dir! marker)
+          (restore-ha-snapshot-install-backup! env-dir backup-dir)
+          (delete-ha-snapshot-install-marker! env-dir)
+          marker)
+
+        (u/file-exists env-dir)
+        (do
+          (delete-ha-snapshot-install-stage-dir! marker)
           (delete-ha-snapshot-install-marker! env-dir)
           marker)
 
@@ -154,20 +211,16 @@
                   :stage stage}))
 
       :backup-moved
-      (if (u/file-exists backup-dir)
-        (do
-          (log/warn "Recovering HA snapshot install after interrupted backup move"
-                    {:env-dir env-dir
-                     :backup-dir backup-dir
-                     :stage stage})
-          (restore-ha-snapshot-install-backup! env-dir backup-dir)
-          (delete-ha-snapshot-install-marker! env-dir)
-          marker)
-        (u/raise "HA snapshot install backup is missing during recovery"
-                 {:error :ha/follower-snapshot-install-recovery-failed
-                  :env-dir env-dir
-                  :backup-dir backup-dir
-                  :stage stage}))
+      (recover-ha-snapshot-install-from-backup!
+       env-dir
+       marker
+       "Recovering HA snapshot install after interrupted store swap")
+
+      :snapshot-staged
+      (recover-ha-snapshot-install-from-backup!
+       env-dir
+       marker
+       "Recovering HA snapshot install after interrupted staged snapshot")
 
       (u/raise "HA snapshot install marker has an unsupported stage"
                {:error :ha/follower-snapshot-install-marker-invalid

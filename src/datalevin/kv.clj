@@ -2676,18 +2676,18 @@
        (get info :wal-backup-pin-floor-lsn))
    :wal-backup-pin-floor-lsn))
 
-(defn- kv-info-map-value
+(defn- ^:redef kv-info-map-value
   [lmdb k]
   (txlog/parse-floor-provider-map (kv-info-value lmdb k) k))
 
-(defn- with-runtime-txlog-state-guard
+(defn- ^:redef with-runtime-txlog-state-guard
   [lmdb f]
   (if-let [info-v (i/kv-info lmdb)]
     (locking info-v
       (f))
     (f)))
 
-(defn- with-write-txn-lock-before-runtime-txlog-state
+(defn- ^:redef with-write-txn-lock-before-runtime-txlog-state
   [lmdb f]
   (let [tx-v (l/write-txn lmdb)]
     (if (Thread/holdsLock tx-v)
@@ -2735,7 +2735,7 @@
             (f)))
         (f)))))
 
-(defn- write-kv-info-map!
+(defn- ^:redef write-kv-info-map!
   [lmdb k m]
   (with-runtime-txlog-rollback
     lmdb
