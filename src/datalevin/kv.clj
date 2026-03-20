@@ -2855,7 +2855,10 @@
                           0))
         ha-term (some-> (:ha-term payload) long)
         rows (vec (or (:ops payload) []))
-        tx-kind (txlog/classify-record-kind rows)]
+        tx-kind (txlog/classify-record-kind rows)
+        payload-bytes (long (or (:body-len record)
+                                (some-> ^bytes (:body record) alength)
+                                0))]
     (cond-> {:lsn lsn
              :tx-kind tx-kind
              :tx-time tx-time
@@ -2864,6 +2867,9 @@
              :offset (long (:offset record))
              :checksum (long (:checksum record))
              :path path}
+      (pos? payload-bytes)
+      (assoc :payload-bytes payload-bytes)
+
       (some? ha-term)
       (assoc :ha-term ha-term))))
 

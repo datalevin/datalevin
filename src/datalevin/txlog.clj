@@ -2026,6 +2026,14 @@
                     true))
          (mapv transform-record))))
 
+(defn- attach-open-record-payload-bytes
+  [record]
+  (let [payload-bytes (or (:payload-bytes record)
+                          (:body-len record))]
+    (cond-> (dissoc record :path :body-len)
+      (some? payload-bytes)
+      (assoc :payload-bytes (long payload-bytes)))))
+
 (defn select-open-records
   [records from-lsn upto-lsn]
   (select-open-records*
@@ -2034,8 +2042,9 @@
    upto-lsn
    (fn [{:keys [rows] :as r}]
      (-> r
-         (dissoc :rows :path)
-         (assoc :ops rows)))))
+         (dissoc :rows)
+         (assoc :ops rows)
+         (attach-open-record-payload-bytes)))))
 
 (defn select-open-record-rows
   [records from-lsn upto-lsn]
@@ -2043,7 +2052,7 @@
    records
    from-lsn
    upto-lsn
-   #(dissoc % :path)))
+   attach-open-record-payload-bytes))
 
 (defn retention-floors
   [{:keys [snapshot-state
