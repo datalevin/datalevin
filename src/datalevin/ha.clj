@@ -272,6 +272,14 @@
   []
   (System/nanoTime))
 
+(defn- closed-kv-message-race?
+  [t]
+  (and t
+       (s/includes? (or (ex-message t) "")
+                    "LMDB env is closed")))
+
+(declare closed-kv-store?)
+
 (defn- local-kv-store
   [m]
   (let [dt-db (:dt-db m)
@@ -285,14 +293,7 @@
                         (instance? Store store) (.-lmdb ^Store store)
                         (instance? ILMDB store) store
                         :else nil)]
-         (when-not (try
-                     (cond
-                       (nil? kv-store) true
-                       (instance? IStore kv-store) (i/closed? kv-store)
-                       (instance? ILMDB kv-store) (i/closed-kv? kv-store)
-                       :else false)
-                     (catch Throwable _
-                       true))
+         (when-not (closed-kv-store? kv-store)
            kv-store)))
      candidates)))
 
@@ -311,15 +312,15 @@
       (instance? IStore kv-store) (i/closed? kv-store)
       (instance? ILMDB kv-store) (i/closed-kv? kv-store)
       :else false)
-    (catch Throwable _
-      true)))
+    (catch Exception e
+      (if (closed-kv-message-race? e)
+        true
+        (throw e)))))
 
 (defn- closed-kv-race?
   [t kv-store]
   (or (closed-kv-store? kv-store)
-      (and t
-           (s/includes? (or (ex-message t) "")
-                        "LMDB env is closed"))))
+      (closed-kv-message-race? t)))
 
 (defn- read-ha-local-persisted-lsn
   [kv-store]
