@@ -1680,6 +1680,7 @@
                                      (long required-lsn)))))]
       {:endpoint endpoint
        :node-id node-id
+       :watermark watermark
        :authority-ok? (:ok? authority-check)
        :authority-check authority-check
        :last-applied-lsn last-lsn
@@ -1689,6 +1690,7 @@
     (catch Throwable e
       {:endpoint endpoint
        :node-id node-id
+       :watermark nil
        :authority-ok? false
        :authority-check {:ok? false
                          :reason :probe-exception
@@ -1703,6 +1705,7 @@
   [leader-safe-lsn {:keys [endpoint node-id]}]
   {:endpoint endpoint
    :node-id node-id
+   :watermark nil
    :authority-ok? false
    :authority-check {:ok? false
                      :reason :probe-timeout}
@@ -1711,9 +1714,9 @@
    :leader-safe-lsn leader-safe-lsn
    :eligible? false})
 
-(defn- ha-gap-fallback-source-endpoints
+(defn- ha-gap-fallback-source-selection
   ([db-name m lease next-lsn]
-   (ha-gap-fallback-source-endpoints
+   (ha-gap-fallback-source-selection
     db-name
     m
     lease
@@ -1747,15 +1750,34 @@
                   (filter :eligible? followers))
          unknown-followers
          (sort-by :node-id
-                  (filter :authority-ok? (remove :eligible? followers)))]
-     (->> (concat (when (and (string? leader-endpoint)
-                             (not (s/blank? leader-endpoint))
-                             (not= leader-endpoint local-endpoint))
-                    [leader-endpoint])
-                  (map :endpoint eligible-followers)
-                  (map :endpoint unknown-followers))
-          distinct
-          vec))))
+                  (filter :authority-ok? (remove :eligible? followers)))
+         source-endpoints
+         (->> (concat (when (and (string? leader-endpoint)
+                                 (not (s/blank? leader-endpoint))
+                                 (not= leader-endpoint local-endpoint))
+                        [leader-endpoint])
+                      (map :endpoint eligible-followers)
+                      (map :endpoint unknown-followers))
+              distinct
+              vec)
+         source-watermarks
+         (->> followers
+              (filter :authority-ok?)
+              (keep (fn [{:keys [endpoint watermark]}]
+                      (when (some? watermark)
+                        [endpoint watermark])))
+              (into {}))]
+     {:source-endpoints source-endpoints
+      :source-watermarks source-watermarks})))
+
+(defn- ha-gap-fallback-source-endpoints
+  ([db-name m lease next-lsn]
+   (:source-endpoints
+    (ha-gap-fallback-source-selection db-name m lease next-lsn)))
+  ([db-name m lease next-lsn leader-watermark]
+   (:source-endpoints
+    (ha-gap-fallback-source-selection
+     db-name m lease next-lsn leader-watermark))))
 
 (declare fetch-ha-leader-txlog-batch)
 (declare assert-contiguous-lsn!)
@@ -1833,14 +1855,17 @@
     (loop [remaining sources
            source-order sources
            reordered? cached-source-order?
+           source-watermarks {}
            gap-errors []]
       (if-let [source-endpoint (first remaining)]
         (let [attempt
               (try
                 (let [leader-source? (= source-endpoint leader-endpoint)
                       source-watermark (when-not leader-source?
-                                         (safe-fetch-ha-endpoint-watermark-lsn
-                                          db-name m source-endpoint))
+                                         (or (get source-watermarks
+                                                  source-endpoint)
+                                             (safe-fetch-ha-endpoint-watermark-lsn
+                                              db-name m source-endpoint)))
                       _ (when source-watermark
                           (assert-ha-source-authority!
                            lease source-endpoint source-watermark))
@@ -1965,17 +1990,25 @@
             (:value attempt)
 
             (:skip? attempt)
-            (recur (rest remaining) source-order reordered? gap-errors)
+            (recur (rest remaining)
+                   source-order
+                   reordered?
+                   source-watermarks
+                   gap-errors)
 
             :else
-            (let [remaining' (if reordered?
+            (let [{fallback-sources :source-endpoints
+                   prefetched-source-watermarks :source-watermarks}
+                  (when-not reordered?
+                    (ha-gap-fallback-source-selection
+                     db-name
+                     m
+                     lease
+                     next-lsn
+                     @leader-watermark*))
+                  remaining' (if reordered?
                                (rest remaining)
-                               (->> (ha-gap-fallback-source-endpoints
-                                     db-name
-                                     m
-                                     lease
-                                     next-lsn
-                                     @leader-watermark*)
+                               (->> fallback-sources
                                     (remove #{source-endpoint})
                                     vec))
                   source-order' (if reordered?
@@ -1984,6 +2017,10 @@
               (recur remaining'
                      source-order'
                      true
+                     (if reordered?
+                       source-watermarks
+                       (merge source-watermarks
+                              prefetched-source-watermarks))
                      (conj gap-errors (:gap-error attempt))))))
         (u/raise "Follower txlog replay gap unresolved across deterministic sources"
                  {:error :ha/txlog-gap-unresolved
