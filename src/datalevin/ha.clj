@@ -594,9 +594,10 @@
                        :ha-node-id (:ha-node-id m)
                        :ha-authority-term (:ha-authority-term m)
                        :fence-result fence-result})
-            (assoc m
-                   :ha-leader-fencing-pending? true
-                   :ha-leader-fencing-last-error fence-result)))))))
+            (demote-ha-leader db-name m
+                              :fencing-incomplete
+                              {:fence-result fence-result}
+                              (ha-now-ms))))))))
 
 (defn- parse-ha-clock-skew-output
   [output]
@@ -1158,94 +1159,108 @@
                      :ha-role (:ha-role m)})
           failed-m)))))
 
+(defn- finish-ha-leader-renew
+  [db-name m result local-start-ms local-start-nanos]
+  (if (control-result-authority-observation? result)
+    (let [observation
+          (control-result-authority-observation
+           m
+           local-start-ms
+           local-start-nanos
+           result)
+          {:keys [lease authority-membership-hash
+                  db-identity-mismatch? membership-mismatch?]}
+          observation
+          now-ms (ha-now-ms)
+          observed-m (-> m
+                         (apply-authority-observation observation now-ms)
+                         apply-authority-read-success)]
+      (cond
+        db-identity-mismatch?
+        (demote-ha-leader db-name observed-m
+                          :db-identity-mismatch
+                          {:local-db-identity (:ha-db-identity m)
+                           :authority-lease lease}
+                          now-ms)
+
+        membership-mismatch?
+        (demote-ha-leader db-name observed-m
+                          :membership-hash-mismatch
+                          {:local-membership-hash
+                           (:ha-membership-hash observed-m)
+                           :authority-membership-hash
+                           authority-membership-hash}
+                          now-ms)
+
+        (:ok? result)
+        (maybe-complete-ha-leader-fencing observed-m db-name)
+
+        :else
+        (demote-ha-leader db-name observed-m
+                          :renew-failed
+                          {:reason (:reason result)}
+                          now-ms)))
+    (if (:ok? result)
+      (let [{:keys [lease version authority-now-ms]} result
+            observed-at-ms (ha-now-ms)]
+        (-> m
+            apply-authority-read-success
+            (assoc :ha-authority-lease lease
+                   :ha-authority-version version
+                   :ha-authority-now-ms authority-now-ms
+                   :ha-leader-term (:term lease)
+                   :ha-lease-local-deadline-ms
+                   (authority-lease-local-deadline-ms
+                    lease authority-now-ms local-start-ms)
+                   :ha-lease-local-deadline-nanos
+                   (authority-lease-local-deadline-nanos
+                    lease authority-now-ms local-start-nanos)
+                   :ha-authority-owner-node-id (:leader-node-id lease)
+                   :ha-authority-term (:term lease)
+                   :ha-lease-until-ms (:lease-until-ms lease)
+                   :ha-last-authority-refresh-ms observed-at-ms)
+            (maybe-complete-ha-leader-fencing db-name)))
+      (demote-ha-leader db-name m
+                        :renew-failed
+                        {:reason (:reason result)}
+                        (ha-now-ms)))))
+
 (defn- renew-ha-leader-state
   [db-name m]
   (if (not= :leader (:ha-role m))
     m
-    (let [local-start-ms (ha-now-ms)
-          local-start-nanos (ha-now-nanos)
-          renew-timeout-ms (ha-renew-timeout-ms
-                            m
-                            local-start-ms
-                            local-start-nanos)
-          term (:ha-leader-term m)]
-      (if-not (and (integer? term) (pos? ^long term))
-        (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
-        (let [result (ctrl/renew-lease
-                      (:ha-authority m)
-                      {:db-identity (:ha-db-identity m)
-                       :leader-node-id (:ha-node-id m)
-                       :leader-endpoint (:ha-local-endpoint m)
-                       :term term
-                       :lease-renew-ms (:ha-lease-renew-ms m)
-                       :lease-timeout-ms (:ha-lease-timeout-ms m)
-                       :leader-last-applied-lsn (long (or (:ha-leader-last-applied-lsn m) 0))
-                       :now-ms local-start-ms
-                       :timeout-ms renew-timeout-ms})]
-          (if (control-result-authority-observation? result)
-            (let [observation
-                  (control-result-authority-observation
-                   m
-                   local-start-ms
-                   local-start-nanos
-                   result)
-                  {:keys [lease authority-membership-hash
-                          db-identity-mismatch? membership-mismatch?]}
-                  observation
-                  now-ms (ha-now-ms)
-                  observed-m (-> m
-                                 (apply-authority-observation observation
-                                                              now-ms)
-                                 apply-authority-read-success)]
-              (cond
-                db-identity-mismatch?
-                (demote-ha-leader db-name observed-m
-                                  :db-identity-mismatch
-                                  {:local-db-identity (:ha-db-identity m)
-                                   :authority-lease lease}
-                                  now-ms)
-
-                membership-mismatch?
-                (demote-ha-leader db-name observed-m
-                                  :membership-hash-mismatch
-                                  {:local-membership-hash
-                                   (:ha-membership-hash observed-m)
-                                   :authority-membership-hash
-                                   authority-membership-hash}
-                                  now-ms)
-
-                (:ok? result)
-                (maybe-complete-ha-leader-fencing observed-m db-name)
-
-                :else
-                (demote-ha-leader db-name observed-m
-                                  :renew-failed
-                                  {:reason (:reason result)}
-                                  now-ms)))
-            (if (:ok? result)
-              (let [{:keys [lease version authority-now-ms]} result
-                    observed-at-ms (ha-now-ms)]
-                (-> m
-                    apply-authority-read-success
-                    (assoc :ha-authority-lease lease
-                           :ha-authority-version version
-                           :ha-authority-now-ms authority-now-ms
-                           :ha-leader-term (:term lease)
-                           :ha-lease-local-deadline-ms
-                           (authority-lease-local-deadline-ms
-                            lease authority-now-ms local-start-ms)
-                           :ha-lease-local-deadline-nanos
-                           (authority-lease-local-deadline-nanos
-                            lease authority-now-ms local-start-nanos)
-                           :ha-authority-owner-node-id (:leader-node-id lease)
-                           :ha-authority-term (:term lease)
-                           :ha-lease-until-ms (:lease-until-ms lease)
-                           :ha-last-authority-refresh-ms observed-at-ms)
-                    (maybe-complete-ha-leader-fencing db-name)))
-              (demote-ha-leader db-name m
-                                :renew-failed
-                                {:reason (:reason result)}
-                                (ha-now-ms)))))))))
+    (let [m (if (true? (:ha-leader-fencing-pending? m))
+              (maybe-complete-ha-leader-fencing m db-name)
+              m)]
+      (if (not= :leader (:ha-role m))
+        m
+        (let [local-start-ms (ha-now-ms)
+              local-start-nanos (ha-now-nanos)
+              renew-timeout-ms (ha-renew-timeout-ms
+                                m
+                                local-start-ms
+                                local-start-nanos)
+              term (:ha-leader-term m)]
+          (if-not (and (integer? term) (pos? ^long term))
+            (demote-ha-leader db-name m :missing-leader-term nil local-start-ms)
+            (let [result (ctrl/renew-lease
+                          (:ha-authority m)
+                          {:db-identity (:ha-db-identity m)
+                           :leader-node-id (:ha-node-id m)
+                           :leader-endpoint (:ha-local-endpoint m)
+                           :term term
+                           :lease-renew-ms (:ha-lease-renew-ms m)
+                           :lease-timeout-ms (:ha-lease-timeout-ms m)
+                           :leader-last-applied-lsn
+                           (long (or (:ha-leader-last-applied-lsn m) 0))
+                           :now-ms local-start-ms
+                           :timeout-ms renew-timeout-ms})]
+              (finish-ha-leader-renew
+               db-name
+               m
+               result
+               local-start-ms
+               local-start-nanos))))))))
 
 (defn- maybe-demote-on-refresh-timeout
   [db-name m now-ms]
