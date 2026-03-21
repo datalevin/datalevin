@@ -568,40 +568,82 @@
   [item coll]
   (second (u/some-indexed #(= item %) coll)))
 
+(defn- trailing-run-count
+  [chunk]
+  (if (seq chunk)
+    (let [last-k (first (peek chunk))]
+      (loop [i (dec (count chunk))
+             n 0]
+        (if (and (>= i 0) (= last-k (first (nth chunk i))))
+          (recur (dec i) (unchecked-inc n))
+          n)))
+    0))
+
 (defn- remote-range-seq*
-  [fetch-first-n get-range dbi-name k-range k-type v-type ignore-key? opts]
+  [fetch-first-n dbi-name k-range k-type v-type ignore-key? opts]
   (let [batch-size (max 1 (long (or (:batch-size opts) 100)))
-        request-n  (inc batch-size)
-        fetch      (fn [{:keys [k-range resume]}]
-                     (let [raw     (vec (fetch-first-n dbi-name request-n k-range
-                                                       k-type v-type))
-                           tail    (if resume
-                                     (if-some [idx (find-index resume raw)]
-                                       (let [idx* (long idx)]
-                                         (subvec raw (int (unchecked-inc idx*))))
-                                       ;; Dense duplicate-key ranges (e.g. dupsort/list DBI)
-                                       ;; may not include `resume` in a small page. Fall back
-                                       ;; to one eager range request to preserve correctness.
-                                       (let [all (vec (get-range dbi-name k-range
-                                                                 k-type v-type))]
-                                         (if-some [idx2 (find-index resume all)]
-                                           (let [idx2* (long idx2)]
-                                             (subvec all (int (unchecked-inc idx2*))))
-                                           [])))
-                                     raw)
-                           chunk   (if (> (count tail) batch-size)
-                                     (subvec tail 0 batch-size)
-                                     tail)
-                           batch   (mapv #(project-range-item % ignore-key? v-type)
-                                         chunk)
-                           more?   (> (count tail) batch-size)
-                           next-k  (when more?
-                                     (first (peek chunk)))]
-                       {:batch      batch
-                        :next-state (when next-k
-                                      {:k-range (advance-k-range k-range next-k)
-                                       :resume  (peek chunk)})}))
-        init-state {:k-range k-range :resume nil}]
+        fetch      (fn [{:keys [k-range resume resume-run-count]}]
+                     (loop [request-n (unchecked-inc
+                                       (unchecked-add batch-size
+                                                      (long resume-run-count)))]
+                       (let [raw       (vec (fetch-first-n dbi-name request-n
+                                                           k-range k-type v-type))
+                             raw-count (count raw)]
+                         (if resume
+                           (if-some [idx (find-index resume raw)]
+                             (let [idx*       (long idx)
+                                   tail-count (- raw-count
+                                                 (unchecked-inc idx*))]
+                               (if (and (= raw-count request-n)
+                                        (<= tail-count batch-size))
+                                 ;; The current page still ends inside the
+                                 ;; duplicate-key run anchored at `resume`.
+                                 ;; Grow the bounded fetch and retry instead
+                                 ;; of materializing the entire remaining range.
+                                 (recur (unchecked-add request-n batch-size))
+                                 (let [tail    (subvec raw
+                                                       (int (unchecked-inc idx*)))
+                                       chunk   (if (> tail-count batch-size)
+                                                 (subvec tail 0 batch-size)
+                                                 tail)
+                                       prefix  (subvec raw 0
+                                                       (int (unchecked-add
+                                                              (unchecked-inc idx*)
+                                                              (count chunk))))
+                                       batch   (mapv
+                                                 #(project-range-item %
+                                                                     ignore-key?
+                                                                     v-type)
+                                                 chunk)
+                                       more?   (> tail-count batch-size)
+                                       next-k  (when more? (first (peek chunk)))]
+                                   {:batch      batch
+                                    :next-state (when next-k
+                                                  {:k-range          (advance-k-range
+                                                                       k-range
+                                                                       next-k)
+                                                   :resume           (peek chunk)
+                                                   :resume-run-count (trailing-run-count
+                                                                       prefix)})})))
+                             (if (= raw-count request-n)
+                               (recur (unchecked-add request-n batch-size))
+                               {:batch [] :next-state nil}))
+                           (let [chunk  (if (> raw-count batch-size)
+                                          (subvec raw 0 batch-size)
+                                          raw)
+                                 batch  (mapv #(project-range-item % ignore-key?
+                                                                   v-type)
+                                              chunk)
+                                 more?  (> raw-count batch-size)
+                                 next-k (when more? (first (peek chunk)))]
+                             {:batch      batch
+                              :next-state (when next-k
+                                            {:k-range          (advance-k-range
+                                                                 k-range next-k)
+                                             :resume           (peek chunk)
+                                             :resume-run-count (trailing-run-count
+                                                                 chunk)})})))))
+        init-state {:k-range k-range :resume nil :resume-run-count 0}]
     (reify
       Seqable
       (seq [_]
@@ -965,11 +1007,6 @@
                 [db-name [[:get-first-n dbi-name n k-range k-type v-type false]]]
                 writing?)]
           res))
-      (fn [dbi-name k-range k-type v-type]
-        (cl/normal-request
-          client :get-range
-          [db-name dbi-name k-range k-type v-type false]
-          writing?))
       dbi-name k-range k-type v-type ignore-key? opts))
 
   (range-count [db dbi-name k-range]

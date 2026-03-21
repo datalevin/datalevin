@@ -128,7 +128,11 @@
      ssl))
   ([ks vs]
    (let [ssl (sparse-arraylist)]
-     (dorun (map #(set ssl %1 %2) ks vs))
+     (loop [ks (seq ks)
+            vs (seq vs)]
+       (when (and ks vs)
+         (set ssl (first ks) (first vs))
+         (recur (next ks) (next vs))))
      ssl)) )
 
 (defmethod print-method SparseIntArrayList

@@ -556,6 +556,14 @@
        :ha-authoritative-leader-node-id owner-node-id
        :udf-missing                  (:udf-missing m)})))
 
+(def ^:private udf-admission-exempt-write-types
+  #{:txlog-update-snapshot-floor!
+    :txlog-clear-snapshot-floor!
+    :txlog-update-replica-floor!
+    :txlog-clear-replica-floor!
+    :txlog-pin-backup-floor!
+    :txlog-unpin-backup-floor!})
+
 (def consensus-ha-opts hrt/consensus-ha-opts)
 
 (def ^:dynamic *consensus-ha-opts-fn*
@@ -584,7 +592,10 @@
   [db-name m]
   (*ha-follower-sync-step-fn* db-name m))
 
-(declare get-lock db-write-admission-lock with-db-runtime-store-swap)
+(declare get-lock
+         db-write-admission-lock
+         with-db-runtime-store-read-access
+         with-db-runtime-store-swap)
 
 (defn- ha-follower-apply-record-with-guard
   [^Server server db-name expected-state record]
@@ -706,7 +717,13 @@
               (.set running? false)
               ;; Keep renew work outside `update-db` so HA probes and peer/server
               ;; operations do not block on control-plane I/O.
-              (let [next-state (ha-renew-step db-name m)
+              (let [next-state (binding [drep/*ha-with-local-store-read-fn*
+                                         (fn [f]
+                                           (with-db-runtime-store-read-access
+                                             server
+                                             db-name
+                                             f))]
+                                 (ha-renew-step db-name m))
                     state (publish-ha-renew-state!
                            server
                            db-name
@@ -753,6 +770,12 @@
                                          drep/*ha-with-local-store-swap-fn*
                                          (fn [f]
                                            (with-db-runtime-store-swap
+                                             server
+                                             db-name
+                                             f))
+                                         drep/*ha-with-local-store-read-fn*
+                                         (fn [f]
+                                           (with-db-runtime-store-read-access
                                              server
                                              db-name
                                              f))]
@@ -958,7 +981,10 @@
                     (update-db server db-name *ensure-udf-readiness-state-fn*)
                     (get (.-dbs server) db-name)))
         m       m0]
-    (or (and db-name (udf-write-admission-error db-name m))
+    (or (and db-name
+             (not (contains? udf-admission-exempt-write-types
+                             (:type message)))
+             (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
 
 (defn- leader-authority-state?
@@ -2014,10 +2040,9 @@
             (update-db server db-name #(assoc % :runtime-access-lock lock))
             lock)))))
 
-(defn- with-db-runtime-read-access
-  [^Server server message f]
-  (let [db-name (nth (:args message) 0 nil)
-        dbs     (.-dbs server)]
+(defn- with-db-runtime-store-read-access
+  [^Server server db-name f]
+  (let [dbs (.-dbs server)]
     (if (and db-name (.containsKey ^ConcurrentHashMap dbs db-name))
       (let [^ReentrantReadWriteLock lock (get-runtime-access-lock server db-name)
             read-lock                    (.readLock lock)]
@@ -2027,6 +2052,10 @@
           (finally
             (.unlock read-lock))))
       (f))))
+
+(defn- with-db-runtime-read-access
+  [^Server server message f]
+  (with-db-runtime-store-read-access server (nth (:args message) 0 nil) f))
 
 (defn- with-db-runtime-store-swap
   [^Server server db-name f]

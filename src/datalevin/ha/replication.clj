@@ -252,6 +252,7 @@
 
 (declare read-ha-local-last-applied-lsn)
 (declare read-ha-local-watermark-lsn)
+(declare with-ha-local-store-read)
 
 (defn- read-ha-local-watermark-lsn*
   [kv-store]
@@ -314,55 +315,59 @@
 
 (defn ^:redef read-ha-snapshot-payload-lsn
   [m]
-  (if-let [kv-store (local-kv-store m)]
-    (read-ha-local-payload-lsn kv-store)
-    0))
+  (with-ha-local-store-read
+    #(if-let [kv-store (local-kv-store m)]
+       (read-ha-local-payload-lsn kv-store)
+       0)))
 
 (defn ^:redef read-ha-local-last-applied-lsn
   [m]
-  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
-    (try
-      (if-let [kv-store (local-kv-store m)]
-        (:local-last-applied-lsn
-         (ha-local-watermark-snapshot m kv-store))
-        state-lsn)
-      (catch Throwable e
-        (when-not (closed-kv-race? e (local-kv-store m))
-          (log/warn e "Unable to read local txlog watermarks for HA lag guard"
-                    {:db-name (some-> (:store m) i/opts :db-name)}))
-        state-lsn))))
+  (with-ha-local-store-read
+    #(let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
+       (try
+         (if-let [kv-store (local-kv-store m)]
+           (:local-last-applied-lsn
+            (ha-local-watermark-snapshot m kv-store))
+           state-lsn)
+         (catch Throwable e
+           (when-not (closed-kv-race? e (local-kv-store m))
+             (log/warn e "Unable to read local txlog watermarks for HA lag guard"
+                       {:db-name (some-> (:store m) i/opts :db-name)}))
+           state-lsn)))))
 
 (defn- ^:redef read-ha-local-watermark-lsn
   [m]
-  (if-let [kv-store (local-kv-store m)]
-    (if-let [snapshot (cached-ha-local-watermark-snapshot m kv-store)]
-      (long (:watermark-lsn snapshot))
-      (read-ha-local-watermark-lsn* kv-store))
-    0))
+  (with-ha-local-store-read
+    #(if-let [kv-store (local-kv-store m)]
+       (if-let [snapshot (cached-ha-local-watermark-snapshot m kv-store)]
+         (long (:watermark-lsn snapshot))
+         (read-ha-local-watermark-lsn* kv-store))
+       0)))
 
 (defn persist-ha-runtime-local-applied-lsn!
   [m]
-  (when-let [kv-store (local-kv-store m)]
-    (let [{:keys [ceiling-lsn]} (ha-local-data-lsn-ceiling m kv-store)
-          persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
-          state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-          lease-lsn (long (or (get-in m
-                                      [:ha-authority-lease
-                                       :leader-last-applied-lsn])
-                              0))
-          ;; `:ha/local-applied-lsn` is follower replay state. Persisting a
-          ;; former leader's raw local txlog watermark here can overstate how
-          ;; much replicated history that node actually shares with the current
-          ;; leader on rejoin.
-          target-lsn (long (if (= :leader (:ha-role m))
-                             (long-max2 persisted-lsn lease-lsn)
-                             (long-max2 persisted-lsn state-lsn)))
-          applied-lsn (long (if (pos? (long ceiling-lsn))
-                              (long-min2 ceiling-lsn target-lsn)
-                              target-lsn))]
-      (when (> applied-lsn persisted-lsn)
-        (persist-ha-local-applied-lsn! m applied-lsn))
-      applied-lsn)))
+  (with-ha-local-store-read
+    #(when-let [kv-store (local-kv-store m)]
+       (let [{:keys [ceiling-lsn]} (ha-local-data-lsn-ceiling m kv-store)
+             persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
+             state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
+             lease-lsn (long (or (get-in m
+                                         [:ha-authority-lease
+                                          :leader-last-applied-lsn])
+                                 0))
+             ;; `:ha/local-applied-lsn` is follower replay state. Persisting a
+             ;; former leader's raw local txlog watermark here can overstate how
+             ;; much replicated history that node actually shares with the current
+             ;; leader on rejoin.
+             target-lsn (long (if (= :leader (:ha-role m))
+                                (long-max2 persisted-lsn lease-lsn)
+                                (long-max2 persisted-lsn state-lsn)))
+             applied-lsn (long (if (pos? (long ceiling-lsn))
+                                 (long-min2 ceiling-lsn target-lsn)
+                                 target-lsn))]
+         (when (> applied-lsn persisted-lsn)
+           (persist-ha-local-applied-lsn! m applied-lsn))
+         applied-lsn))))
 
 (defn- ha-local-last-applied-lsn
   [m]
@@ -375,15 +380,16 @@
 
 (defn- refresh-ha-local-watermarks
   [m]
-  (if-let [kv-store (local-kv-store m)]
-    (let [{:keys [role local-last-applied-lsn] :as snapshot}
-          (ha-local-watermark-snapshot m kv-store)]
-      (cond-> (assoc m
-                     ha-local-watermark-snapshot-key snapshot
-                     :ha-local-last-applied-lsn local-last-applied-lsn)
-        (= :leader role)
-        (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
-    m))
+  (with-ha-local-store-read
+    #(if-let [kv-store (local-kv-store m)]
+       (let [{:keys [role local-last-applied-lsn] :as snapshot}
+             (ha-local-watermark-snapshot m kv-store)]
+         (cond-> (assoc m
+                        ha-local-watermark-snapshot-key snapshot
+                        :ha-local-last-applied-lsn local-last-applied-lsn)
+           (= :leader role)
+           (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
+       m)))
 
 (declare fresh-ha-promotion-local-last-applied-lsn)
 
@@ -406,20 +412,21 @@
 
 (defn- fresh-ha-promotion-local-last-applied-lsn
   [m lease]
-  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
-    (try
-      (if-let [kv-store (local-kv-store m)]
-        (:local-last-applied-lsn
-         (fresh-ha-local-watermark-snapshot m kv-store))
-        (if (and (bootstrap-empty-lease? lease)
-                 (zero? state-lsn))
-          (long-max2 state-lsn (read-ha-local-watermark-lsn m))
-          state-lsn))
-      (catch Throwable e
-        (when-not (closed-kv-race? e (local-kv-store m))
-          (log/warn e "Unable to read fresh local txlog watermarks for HA promotion lag guard"
-                    {:db-name (some-> (:store m) i/opts :db-name)}))
-        state-lsn))))
+  (with-ha-local-store-read
+    #(let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
+       (try
+         (if-let [kv-store (local-kv-store m)]
+           (:local-last-applied-lsn
+            (fresh-ha-local-watermark-snapshot m kv-store))
+           (if (and (bootstrap-empty-lease? lease)
+                    (zero? state-lsn))
+             (long-max2 state-lsn (read-ha-local-watermark-lsn m))
+             state-lsn))
+         (catch Throwable e
+           (when-not (closed-kv-race? e (local-kv-store m))
+             (log/warn e "Unable to read fresh local txlog watermarks for HA promotion lag guard"
+                       {:db-name (some-> (:store m) i/opts :db-name)}))
+           state-lsn)))))
 
 (def ^:private endpoint-pattern
   #"^(.+):([0-9]+)$")
@@ -493,6 +500,14 @@
 (defn- with-ha-local-store-swap
   [f]
   (*ha-with-local-store-swap-fn* f))
+
+(def ^:dynamic *ha-with-local-store-read-fn*
+  (fn [f]
+    (f)))
+
+(defn- with-ha-local-store-read
+  [f]
+  (*ha-with-local-store-read-fn* f))
 
 (defn- ha-local-store-open-opts
   [m store]
