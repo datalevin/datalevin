@@ -154,43 +154,43 @@
 (def recover-ha-local-store-dir-if-needed!
   snap/recover-ha-local-store-dir-if-needed!)
 (def recover-ha-local-store-if-needed
-  @#'repl/recover-ha-local-store-if-needed)
+  #'repl/recover-ha-local-store-if-needed)
 (def ^:private close-ha-local-store! snap/close-ha-local-store!)
 (def ^:private refresh-ha-local-dt-db snap/refresh-ha-local-dt-db)
 
-(def ^:private closed-kv-store? @#'repl/closed-kv-store?)
-(def ^:private read-ha-local-persisted-lsn @#'repl/read-ha-local-persisted-lsn)
-(def ^:redef persist-ha-local-applied-lsn! @#'repl/persist-ha-local-applied-lsn!)
+(def ^:private closed-kv-store? #'repl/closed-kv-store?)
+(def ^:private read-ha-local-persisted-lsn #'repl/read-ha-local-persisted-lsn)
+(def ^:redef persist-ha-local-applied-lsn! #'repl/persist-ha-local-applied-lsn!)
 (def ^:redef fresh-ha-local-watermark-snapshot
-  @#'repl/fresh-ha-local-watermark-snapshot)
-(def ^:redef read-ha-snapshot-payload-lsn @#'repl/read-ha-snapshot-payload-lsn)
-(def ^:redef read-ha-local-last-applied-lsn @#'repl/read-ha-local-last-applied-lsn)
-(def ^:private read-ha-local-watermark-lsn @#'repl/read-ha-local-watermark-lsn)
+  #'repl/fresh-ha-local-watermark-snapshot)
+(def ^:redef read-ha-snapshot-payload-lsn #'repl/read-ha-snapshot-payload-lsn)
+(def ^:redef read-ha-local-last-applied-lsn #'repl/read-ha-local-last-applied-lsn)
+(def ^:private read-ha-local-watermark-lsn #'repl/read-ha-local-watermark-lsn)
 (def persist-ha-runtime-local-applied-lsn!
-  @#'repl/persist-ha-runtime-local-applied-lsn!)
-(def ^:private ha-local-last-applied-lsn @#'repl/ha-local-last-applied-lsn)
-(def ^:private refresh-ha-local-watermarks @#'repl/refresh-ha-local-watermarks)
-(def ^:private raw-local-kv-store @#'repl/raw-local-kv-store)
+  #'repl/persist-ha-runtime-local-applied-lsn!)
+(def ^:private ha-local-last-applied-lsn #'repl/ha-local-last-applied-lsn)
+(def ^:private refresh-ha-local-watermarks #'repl/refresh-ha-local-watermarks)
+(def ^:private raw-local-kv-store #'repl/raw-local-kv-store)
 (def ^:private reopen-ha-local-store-if-needed
-  @#'repl/reopen-ha-local-store-if-needed)
-(def ^:private ha-local-store-reopen-info @#'repl/ha-local-store-reopen-info)
+  #'repl/reopen-ha-local-store-if-needed)
+(def ^:private ha-local-store-reopen-info #'repl/ha-local-store-reopen-info)
 (def ^:redef reopen-ha-local-store-from-info
-  @#'repl/reopen-ha-local-store-from-info)
-(def ^:private ha-promotion-lag-guard @#'repl/ha-promotion-lag-guard)
+  #'repl/reopen-ha-local-store-from-info)
+(def ^:private ha-promotion-lag-guard #'repl/ha-promotion-lag-guard)
 (def ^:private fresh-ha-promotion-local-last-applied-lsn
-  @#'repl/fresh-ha-promotion-local-last-applied-lsn)
+  #'repl/fresh-ha-promotion-local-last-applied-lsn)
 (def ^:private bootstrap-empty-lease? lease/bootstrap-empty-lease?)
 (def ^:redef fetch-ha-endpoint-watermark-lsn
-  @#'repl/fetch-ha-endpoint-watermark-lsn)
-(def ^:redef fetch-leader-watermark-lsn @#'repl/fetch-leader-watermark-lsn)
+  #'repl/fetch-ha-endpoint-watermark-lsn)
+(def ^:redef fetch-leader-watermark-lsn #'repl/fetch-leader-watermark-lsn)
 (def ^:private highest-reachable-ha-member-watermark
-  @#'repl/highest-reachable-ha-member-watermark)
-(def ^:private ha-member-watermarks @#'repl/ha-member-watermarks)
+  #'repl/highest-reachable-ha-member-watermark)
+(def ^:private ha-member-watermarks #'repl/ha-member-watermarks)
 (def ^:private normalize-leader-watermark-result
-  @#'repl/normalize-leader-watermark-result)
-(def ^:private sync-ha-follower-state @#'repl/sync-ha-follower-state)
-(def ^:private new-ha-probe-executor @#'repl/new-ha-probe-executor)
-(def ^:private stop-ha-probe-executor! @#'repl/stop-ha-probe-executor!)
+  #'repl/normalize-leader-watermark-result)
+(def ^:private sync-ha-follower-state #'repl/sync-ha-follower-state)
+(def ^:private new-ha-probe-executor #'repl/new-ha-probe-executor)
+(def ^:private stop-ha-probe-executor! #'repl/stop-ha-probe-executor!)
 
 (defn- demote-ha-leader
   [db-name m reason details now-ms]
@@ -300,22 +300,31 @@
      :wait-until-ms wait-until-ms}))
 
 (defn- pre-cas-lag-input
-  [db-name m lease now-ms]
+  ([db-name m lease now-ms]
+   (pre-cas-lag-input db-name m lease now-ms nil))
+  ([db-name m lease now-ms prefetched-leader-watermark]
   (let [authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
         lease-expired? (ha-lease-expired-for-promotion? m lease now-ms)
         local-last-applied-lsn (fresh-ha-promotion-local-last-applied-lsn
                                 m lease)
         member-watermarks
-        (when lease-expired?
+        (when (and lease-expired?
+                   (nil? prefetched-leader-watermark))
           (ha-member-watermarks db-name m [(:leader-endpoint lease)]))
         leader-watermark
-        (if member-watermarks
+        (cond
+          member-watermarks
           (normalize-leader-watermark-result
            lease
            (get member-watermarks
                 (:leader-endpoint lease)
                 {:reachable? false
                  :reason :missing-endpoint}))
+
+          prefetched-leader-watermark
+          prefetched-leader-watermark
+
+          :else
           (fetch-leader-watermark-lsn db-name m lease))
         reachable? (true? (:reachable? leader-watermark))
         leader-lsn (if reachable?
@@ -361,7 +370,7 @@
      :leader-watermark leader-watermark
      :reachable-member-last-applied-lsn
      reachable-member-lsn
-     :reachable-member-watermark reachable-member-watermark}))
+     :reachable-member-watermark reachable-member-watermark})))
 
 (defn- authority-observation-from-state
   [m]
@@ -985,11 +994,16 @@
                          {:lease lease})
 
       :else
-      (let [lag-input (pre-cas-lag-input db-name m1 lease now-ms)
-            reachable? (:leader-endpoint-reachable? lag-input)]
-        (if (or reachable? (bootstrap-empty-lease? lease))
-          (finalize-ha-candidate-promotion
-           db-name m1 authority db-identity lease version now-ms lag-input)
+      (let [bootstrap-empty? (bootstrap-empty-lease? lease)
+            leader-watermark (when-not bootstrap-empty?
+                               (fetch-leader-watermark-lsn db-name m1 lease))
+            reachable? (or bootstrap-empty?
+                           (true? (:reachable? leader-watermark)))]
+        (if reachable?
+          (let [lag-input (pre-cas-lag-input db-name m1 lease now-ms
+                                             leader-watermark)]
+            (finalize-ha-candidate-promotion
+             db-name m1 authority db-identity lease version now-ms lag-input))
           (let [wait-info (maybe-wait-unreachable-leader-before-pre-cas!
                            m1 lease)
                 wait-ms (long (or (:wait-ms wait-info)
@@ -1001,8 +1015,11 @@
                      (:wait-until-ms wait-info)
                      :ha-candidate-pre-cas-observed-version version
                      :ha-promotion-wait-before-cas-ms wait-ms)
-              (finalize-ha-candidate-promotion
-               db-name m1 authority db-identity lease version now-ms lag-input))))))))
+              (let [lag-input (pre-cas-lag-input db-name m1 lease now-ms
+                                                 leader-watermark)]
+                (finalize-ha-candidate-promotion
+                 db-name m1 authority db-identity lease version now-ms
+                 lag-input)))))))))
 
 (def ^:private restart-ha-candidate-promotion
   ::restart-ha-candidate-promotion)
@@ -1565,6 +1582,10 @@
                     :ha-authority-owner-node-id owner-node-id
                     :retryable? true})
 
+            ;; Admission keys off the translated authoritative lease expiry,
+            ;; not renew cadence. A delayed renew loop does not extend this
+            ;; deadline; stale control observations are handled separately by
+            ;; `ha-authority-read-fresh?` above.
             (or (and (integer? lease-local-deadline-nanos)
                      (>= (+ (long now-nanos)
                             (long lease-admission-margin-nanos))

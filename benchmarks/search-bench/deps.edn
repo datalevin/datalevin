@@ -3,7 +3,7 @@
          com.cognitect/transit-clj                     {:mvn/version "1.0.333"}
          com.fasterxml.jackson.core/jackson-core       {:mvn/version "2.17.0"}
          com.fasterxml.jackson.core/jackson-databind   {:mvn/version "2.17.0"}
-         com.taoensso/nippy                            {:mvn/version "3.6.0"}
+         org.clojars.huahaiy/nippy                     {:mvn/version "3.6.2"}
          datalevin/datalevin                           {:local/root "../.."}
          org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.1"}
          org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.1"}

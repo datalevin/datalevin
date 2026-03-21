@@ -921,12 +921,14 @@
         db-name (nth (:args message) 0 nil)
         dbs     (.-dbs server)]
     (if (and write? db-name (.containsKey ^ConcurrentHashMap dbs db-name))
-      (locking (db-write-admission-lock server db-name)
-        (if-let [err (ha-write-admission-error server message)]
-          {:ok? false
-           :error err}
-          {:ok? true
-           :result (f)}))
+      ;; This request-time gate is a cached-state fast path only. The
+      ;; authoritative HA check runs again at commit, so one-shot writes do
+      ;; not need to serialize through the per-DB admission lock here.
+      (if-let [err (ha-write-admission-error server message)]
+        {:ok? false
+         :error err}
+        {:ok? true
+         :result (f)})
       {:ok? true
        :result (f)})))
 

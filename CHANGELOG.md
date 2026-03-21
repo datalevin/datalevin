@@ -20,7 +20,7 @@
   embedded use.
 - [AI] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 - [AI] Built-in trimmed down llama.cpp that supports CPU only inference for text
-  embedding and summarization. Models need to be downloaded separately.
+  embedding and generation. Models need to be downloaded separately.
 - [Datalog] Allow `:db/embedding true` property for string attributes, which
   will use an embedding model to embed the texts into vectors and index them.
   A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
@@ -41,6 +41,11 @@
 ### Fixed
 - [Datalog] Handle `false` value correctly in query
   [#358](https://github.com/datalevin/datalevin/issues/358)
+
+### Improved
+- Nippy uses `ByteBuffer` internals [PR to
+  nippy](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
+  speedup.
 
 ## 0.10.7 (2026-03-03)
 

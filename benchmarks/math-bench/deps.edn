@@ -6,7 +6,7 @@
          com.cognitect/transit-clj                     {:mvn/version "1.0.333"}
          com.github.luben/zstd-jni                     {:mvn/version "1.5.7-6"}
          metosin/jsonista                              {:mvn/version "0.3.13"}
-         com.taoensso/nippy                            {:mvn/version "3.6.0"}
+         org.clojars.huahaiy/nippy                     {:mvn/version "3.6.2"}
          me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.10"}
          org.clojure/clojure                           {:mvn/version "1.12.4"}
          org.roaringbitmap/RoaringBitmap               {:mvn/version "1.3.0"}

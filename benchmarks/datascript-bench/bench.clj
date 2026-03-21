@@ -81,7 +81,7 @@
              (str "{:paths [\"src\"]"
                   ":deps {datalevin/datalevin {:local/root \"../..\"}
                   org.clojure/clojure   {:mvn/version \"1.12.3\"}
-                  com.taoensso/nippy    {:mvn/version \"3.6.0\"}
+                  org.clojars.huahaiy/nippy {:mvn/version \"3.6.2\"}
                   com.github.luben/zstd-jni {:mvn/version \"1.5.7-6\"}
                   com.cognitect/transit-clj {:mvn/version \"1.0.333\"}
                   me.lemire.integercompression/JavaFastPFOR {:mvn/version \"0.3.8\"}

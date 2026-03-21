@@ -2,7 +2,7 @@
  :deps  {datalevin/datalevin                           {:local/root "../.."}
          org.clojure/clojure                           {:mvn/version "1.12.4"}
          com.cognitect/transit-clj                     {:mvn/version "1.0.333"}
-         com.taoensso/nippy                            {:mvn/version "3.6.0"}
+         org.clojars.huahaiy/nippy                     {:mvn/version "3.6.2"}
          me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.10"}
          org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.1"}
          org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.1"}
