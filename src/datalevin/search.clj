@@ -650,6 +650,7 @@
     (.empty docs)
     (.empty terms)
     (.clear norms)
+    (.clear ^LRUCache cache)
     (clear-dbi lmdb terms-dbi)
     (clear-dbi lmdb docs-dbi)
     (clear-dbi lmdb positions-dbi)
@@ -826,6 +827,21 @@
     (get-value (.-lmdb engine) (.-terms-dbi engine) term
                :string :term-info)))
 
+(defn- query-term-info
+  [^SearchEngine engine term]
+  (wrap-cache
+    engine [:query-term-info term]
+    (when-let [[id mw ^SparseIntArrayList sl] (get-term-info engine term)]
+      (let [indices (.-indices sl)]
+        [id
+         mw
+         (if (instance? FastRankRoaringBitmap indices)
+           sl
+           (sl/->SparseIntArrayList
+             (doto (FastRankRoaringBitmap.)
+               (.or ^RoaringBitmap indices))
+             (.-items sl)))]))))
+
 (defn- term-id->term-info
   [^SearchEngine engine term-id]
   (when-let [term ((.-terms engine) term-id)]
@@ -881,6 +897,7 @@
                               (sl/remove sl doc-id)]
                              :string :term-info))
           (.remove cache [:get-term-info term])
+          (.remove cache [:query-term-info term])
           (.remove cache [:get-pos-info doc-id term-id])))
       (.add txs (l/kv-tx :del positions-dbi [doc-id term-id] :int-int)))
     (.add txs (l/kv-tx :del (.-docs-dbi engine) doc-ref :data))
@@ -924,6 +941,7 @@
 
             term-info
             [tid (add-max-weight mw tf unique) (sl/set sl doc-id tf)]]
+        (.remove ^LRUCache (.-cache engine) [:query-term-info term])
         (.add txs (l/kv-tx :put terms-dbi term term-info :string :term-info))
         (if index-position?
           (let [pos-info [(.toArray positions) (.toArray offsets)]]
@@ -943,12 +961,8 @@
         (comp
           (map (fn [[term freq]]
                  (when-let [[id mw ^SparseIntArrayList sl]
-                            (get-term-info engine term)]
-                   (let [df (sl/size sl)
-                         sl (sl/->SparseIntArrayList
-                              (doto (FastRankRoaringBitmap.)
-                                (.or ^RoaringBitmap (.-indices sl)))
-                              (.-items sl))]
+                            (query-term-info engine term)]
+                   (let [df (sl/size sl)]
                      {:df df
                       :id id
                       :mw mw
