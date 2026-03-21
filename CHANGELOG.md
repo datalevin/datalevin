@@ -16,8 +16,12 @@
   `org.datalevin:datalevin-java:<version>` to maven central, for embedded use.
 - [Lib] Release Datalevin as a Python library `datalevin`to PyPI, for embedded
   use.
-- [Lib] Release Datalevin as a Node.js library `datalevin-node` to npm, for
-  embedded use.
+- [Lib] Release Datalevin as a Javascript Node.js library `datalevin-node` to
+  npm, for embedded use.
+- [Datalog] Allow to register a `:db/udf` to specify a user defined function.
+  This feature is language agnostic, resolving in runtime environment and does
+  not persist in DB. So a UDF function can be written in Java, Python or
+  Javascript, in addition to Clojure.
 - [AI] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 - [AI] Built-in trimmed down llama.cpp that supports CPU only inference for text
   embedding and generation. Models need to be downloaded separately.
@@ -29,10 +33,6 @@
   should download a larger model in GGUF format.
 - [Datalog] For embedding enabled datoms, `embedding-neighbors` built-in function to
   return `[e, a, v]` based on vector similarity. Details in [doc](doc/vector.md).
-- [Datalog] Allow to register a `:db/udf` to specify a user defined function.
-  This feature is language agnostic, resolving in runtime environment and does
-  not persist in DB. So a UDF function can be written in Java, Python or
-  Javascript.
 - [Search] `:display :refs+scores` to show relevance score.
 - [Async] A semaphore to limit the number of async jobs in backlog. Will
   block if the backlog is full (min of 4098 and 1024 * cores).
@@ -46,6 +46,7 @@
 - Nippy uses `ByteBuffer` internals [PR to
   nippy](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
   speedup.
+- [Search] Reduce query/update/delete memory allocation.
 
 ## 0.10.7 (2026-03-03)
 

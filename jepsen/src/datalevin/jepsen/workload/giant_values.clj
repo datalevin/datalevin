@@ -27,7 +27,7 @@
     [?e :giant/payload ?payload]])
 
 (def ^:private giant-state-query
-  '[:find ?version ?payload
+  '[:find ?e ?version ?payload
     :in $ ?key
     :where
     [?e :giant/key ?key]
@@ -74,7 +74,7 @@
 
 (defn- giant-state
   [db payload-bytes k]
-  (if-some [[version payload] (first (d/q giant-state-query db (long k)))]
+  (if-some [[_ version payload] (first (d/q giant-state-query db (long k)))]
     (let [version        (some-> version long)
           expected       (when (some? version)
                            (payload-for k version payload-bytes))
@@ -193,8 +193,14 @@
 
 (defn- write-giant!
   [conn payload-bytes k version]
-  (let [version (long version)]
-    (d/transact! conn [(giant-entity k version payload-bytes)])
+  (let [k       (long k)
+        version (long version)]
+    (if-some [[entid _ _] (first (d/q giant-state-query @conn k))]
+      (d/transact! conn [{:db/id entid
+                          :giant/key k
+                          :giant/version version
+                          :giant/payload (payload-for k version payload-bytes)}])
+      (d/transact! conn [(giant-entity k version payload-bytes)]))
     ;; Linearizability should reflect the requested write value, not a later
     ;; overlapping state observed by an immediate readback.
     {:version        version
@@ -207,21 +213,22 @@
         new-value (long new-value)
         payload   (payload-for k new-value payload-bytes)
         db        @conn
-        current   (giant-state db payload-bytes k)]
-    (if (= (:version current) expected)
-      (do
-        (d/transact! conn [[:db/cas
-                            [:giant/key (long k)]
-                            :giant/version
-                            expected
-                            new-value]
-                           [:db/add
-                            [:giant/key (long k)]
-                            :giant/payload
-                            payload]])
-        {:version        new-value
-         :payload-valid? true
-         :payload-bytes  (long payload-bytes)})
+        current-row (first (d/q giant-state-query db (long k)))]
+    (if-some [[entid current-version _] current-row]
+      (if (= (long current-version) expected)
+        (do
+          (d/transact! conn [[:db/cas entid
+                              :giant/version
+                              expected
+                              new-value]
+                             [:db/add
+                              entid
+                              :giant/payload
+                              payload]])
+          {:version        new-value
+           :payload-valid? true
+           :payload-bytes  (long payload-bytes)})
+        ::cas-failed)
       ::cas-failed)))
 
 (defn- execute-op!

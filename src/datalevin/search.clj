@@ -22,8 +22,7 @@
    [datalevin.bits :as b]
    [taoensso.nippy :as nippy]
    [clojure.set :as set]
-   [clojure.string :as s]
-   [clojure.walk :as walk])
+   [clojure.string :as s])
   (:import
    [datalevin.utl PriorityQueue GrowingIntArray]
    [datalevin.sparselist SparseIntArrayList]
@@ -122,8 +121,12 @@
 
 (defn- get-ws
   [tids qterms k]
-  (let [m (IntDoubleHashMap.)]
-    (dorun (map (fn [tid qterm] (.put m tid (qterm k))) tids qterms))
+  (let [m   (IntDoubleHashMap.)
+        cnt (count tids)]
+    (loop [i 0]
+      (when (< i cnt)
+        (.put m (nth tids i) ((nth qterms i) k))
+        (recur (unchecked-inc-int i))))
     m))
 
 (defn- get-mxs [tids wqs mws]
@@ -500,97 +503,165 @@
     (keyword? query) query
     :else            (raise "Invalid search query" {:query query})))
 
-(defn- required-terms*
-  [expr pos?]
+(defn- required-clause-product
+  [clauses clauses2]
+  (persistent!
+    (reduce
+      (fn [acc clause]
+        (reduce (fn [acc clause2]
+                  (conj! acc (set/union clause clause2)))
+                acc clauses2))
+      (transient [])
+      clauses)))
+
+(defn- collect-required-clauses
+  [expr pos? tokens]
   (cond
-    (string? expr)  (if pos? [#{expr}] [#{}])
+    (string? expr)
+    (do
+      (conj! tokens expr)
+      (if pos? [#{expr}] [#{}]))
+
     (keyword? expr) [#{}]
+
     :else
     (let [[op & args] expr]
       (case op
-        :not (required-terms* (first args) (not pos?))
+        :not (collect-required-clauses (first args) (not pos?) tokens)
         :and (if pos?
                (reduce (fn [clauses arg]
-                         (for [clause  clauses
-                               clause2 (required-terms* arg true)]
-                           (set/union clause clause2)))
-                       [#{}] args)
-               (mapcat #(required-terms* % false) args))
+                         (required-clause-product
+                           clauses
+                           (collect-required-clauses arg true tokens)))
+                       [#{}]
+                       args)
+               (persistent!
+                 (reduce (fn [acc arg]
+                           (reduce conj! acc
+                                   (collect-required-clauses arg false
+                                                             tokens)))
+                         (transient [])
+                         args)))
         :or  (if pos?
-               (mapcat #(required-terms* % true) args)
+               (persistent!
+                 (reduce (fn [acc arg]
+                           (reduce conj! acc
+                                   (collect-required-clauses arg true tokens)))
+                         (transient [])
+                         args))
                (reduce (fn [clauses arg]
-                         (for [clause  clauses
-                               clause2 (required-terms* arg false)]
-                           (set/union clause clause2)))
-                       [#{}] args))))))
+                         (required-clause-product
+                           clauses
+                           (collect-required-clauses arg false tokens)))
+                       [#{}]
+                       args))))))
 
 (defn required-terms
   "Given a boolean expression of terms, select terms that are required.
    Do not compute excluded terms, as it is complicated and expensive,
    opt to remove thoses docs with bitmap ops"
-  [{:keys [query] :as context}]
-  (assoc context :req (apply set/union (required-terms* query true))))
-
-(defn- collect-tokens
   [{:keys [query phrases] :as context}]
-  (let [tokens (volatile! [])]
-    (walk/postwalk
-      (fn [e]
-        (if (string? e)
-          (vswap! tokens conj e)
-          e))
-      query)
-    (assoc context :tokens (into @tokens cat (:fbd phrases)))))
+  (let [tokens      (transient [])
+        req-clauses (collect-required-clauses query true tokens)
+        req         (reduce set/union #{} req-clauses)
+        tokens      (reduce (fn [acc phrase]
+                              (reduce conj! acc phrase))
+                            tokens
+                            (:fbd phrases))]
+    (assoc context
+           :req req
+           :tokens (persistent! tokens))))
 
-(defn- to-bms
-  [m args]
-  (let [to-bm (fn [e]
-                (cond
-                  (string? e)           (if-let [bm (m e)] bm (RoaringBitmap.))
-                  (identical? e :empty) (RoaringBitmap.)
-                  :else                 e))
-        bms   (into [] (map to-bm) args)]
-    (when (seq bms) (into-array RoaringBitmap bms))))
+(defn- clone-bm
+  [^RoaringBitmap bm]
+  (doto (RoaringBitmap.) (.or bm)))
 
-(defn- operate-bms
-  [op ^AtomicInteger max-doc ^"[Lorg.roaringbitmap.RoaringBitmap;" bms]
-  (when bms
-    (case op
-      :not (RoaringBitmap/flip ^RoaringBitmap (aget bms 0)
-                               0 (u/long-inc (.get max-doc)))
-      :and (FastAggregation/and bms)
-      :or  (FastAggregation/or bms))))
+(defn- term-bm
+  [tmid bms term]
+  (if-let [tid (tmid term)]
+    (bms tid)
+    (RoaringBitmap.)))
 
 (defn- boolean-bm
-  [tms bms max-doc query]
-  (let [m (zipmap tms bms)]
-    (if (string? query)
-      (m query)
-      (walk/postwalk
-        (fn [e]
-          (if (vector? e)
-            (let [[op & args] e]
-              (operate-bms op max-doc (to-bms m args)))
-            e))
-        query))))
+  [tmid bms max-doc query]
+  (cond
+    (string? query)
+    (term-bm tmid bms query)
+
+    (identical? query :empty)
+    (RoaringBitmap.)
+
+    :else
+    (let [op        (nth query 0)
+          first-arg (nth query 1)]
+      (case op
+        :not
+        (RoaringBitmap/flip ^RoaringBitmap (boolean-bm tmid bms max-doc
+                                                       first-arg)
+                            0 (u/long-inc (.get max-doc)))
+
+        :and
+        (let [^RoaringBitmap acc
+              (if (string? first-arg)
+                (clone-bm (term-bm tmid bms first-arg))
+                (boolean-bm tmid bms max-doc first-arg))
+              cnt (count query)]
+          (loop [i 2]
+            (if (< i cnt)
+              (let [^RoaringBitmap bm (boolean-bm tmid bms max-doc
+                                                  (nth query i))]
+                (.and acc bm)
+                (recur (unchecked-inc-int i)))
+              acc)))
+
+        :or
+        (let [^RoaringBitmap acc
+              (if (string? first-arg)
+                (clone-bm (term-bm tmid bms first-arg))
+                (boolean-bm tmid bms max-doc first-arg))
+              cnt (count query)]
+          (loop [i 2]
+            (if (< i cnt)
+              (let [^RoaringBitmap bm (boolean-bm tmid bms max-doc
+                                                  (nth query i))]
+                (.or acc bm)
+                (recur (unchecked-inc-int i)))
+              acc)))))))
 
 (defn- setup-env
   [{:keys [qterms req max-doc query] :as context}]
-  (let [tids (mapv :id qterms)
-        sls  (mapv :sl qterms)
-        tms  (mapv :tm qterms)
-        wqs  (get-ws tids qterms :wq)
-        bms  (mapv #(.-indices ^SparseIntArrayList %) sls)
-        tmid (zipmap tms tids)]
-    (assoc context
-           :wqs wqs
-           :tmid tmid
-           :tids (into [] (filter (set (mapv tmid req))) tids)
-           :bms (zipmap tids bms)
-           :sls (zipmap tids sls)
-           :tms (zipmap tids tms)
-           :mxs (get-mxs tids wqs (get-ws tids qterms :mw))
-           :bbm (boolean-bm tms bms max-doc query))))
+  (let [wqs (IntDoubleHashMap.)
+        mxs (IntDoubleHashMap.)]
+    (loop [qterms qterms
+           tids  (transient [])
+           rtids (transient [])
+           tmid  (transient {})
+           bms   (transient {})
+           sls   (transient {})
+           tms   (transient {})]
+      (if-let [{:keys [id mw sl tm wq]} (first qterms)]
+        (let [bm (.-indices ^SparseIntArrayList sl)]
+          (.put wqs id wq)
+          (.put mxs id (* ^double wq ^double mw))
+          (recur (next qterms)
+                 (conj! tids id)
+                 (if (req tm) (conj! rtids id) rtids)
+                 (assoc! tmid tm id)
+                 (assoc! bms id bm)
+                 (assoc! sls id sl)
+                 (assoc! tms id tm)))
+        (let [tids (persistent! tids)
+              tmid (persistent! tmid)
+              bms  (persistent! bms)]
+          (assoc context
+                 :wqs wqs
+                 :tmid tmid
+                 :tids (persistent! rtids)
+                 :bms bms
+                 :sls (persistent! sls)
+                 :tms (persistent! tms)
+                 :mxs mxs
+                 :bbm (boolean-bm tmid bms max-doc query)))))))
 
 (defn- all-docs
   [{:keys [bbm phrases] :as context} top]
@@ -687,7 +758,6 @@
     (when-let [context (some-> {:engine this :max-doc max-doc}
                                (parse-query query-analyzer query)
                                required-terms
-                               collect-tokens
                                hydrate-query
                                setup-env)]
       (let [{:keys [tms req]} context
@@ -724,74 +794,105 @@
           (u/raise "Unable to re-index search. " e {:dir (env-dir lmdb)})))
       (u/raise "Can only re-index search when :include-text? is true" {}))))
 
-(defn- collect-phrases
+(defn- phrase-stats-empty
   [query]
-  (let [phrases (volatile! #{})]
-    (walk/postwalk
-      (fn [e]
-        (if (:phrase e)
-          (vswap! phrases conj e)
-          e))
-      query)
-    @phrases))
+  {:query query
+   :all #{}
+   :possible #{}
+   :always #{}})
 
-(defn- required-phrases
-  [expr pos?]
+(defn- merge-phrase-stats
+  [children always-op]
+  (if-let [child (first children)]
+    (loop [children (next children)
+           all      (:all child)
+           possible (:possible child)
+           always   (:always child)]
+      (if-let [child (first children)]
+        (recur (next children)
+               (set/union all (:all child))
+               (set/union possible (:possible child))
+               (always-op always (:always child)))
+        {:all all
+         :possible possible
+         :always always}))
+    {:all #{}
+     :possible #{}
+     :always #{}}))
+
+(defn- phrase-tokens
+  [query-analyzer ^HashMap cache ^String phrase]
+  (or (.get cache phrase)
+      (let [tokens (to-tokens query-analyzer phrase)]
+        (.put cache phrase tokens)
+        tokens)))
+
+(defn- analyze-phrase-query
+  [query-analyzer ^HashMap phrase-cache pos? query]
   (cond
-    (string? expr) [#{}]
-    (:phrase expr) (if pos? [#{expr}] [#{}])
-    (:term expr)   [#{}]
-    (map? expr)    (raise "Invalid search query" {:map expr})
-    :else
-    (let [[op & args] expr]
-      (case op
-        :not (required-phrases (first args) (not pos?))
-        :and (if pos?
-               (reduce (fn [clauses arg]
-                         (for [clause  clauses
-                               clause2 (required-phrases arg true)]
-                           (set/union clause clause2)))
-                       [#{}] args)
-               (mapcat #(required-phrases % false) args))
-        :or  (if pos?
-               (mapcat #(required-phrases % true) args)
-               (reduce (fn [clauses arg]
-                         (for [clause  clauses
-                               clause2 (required-phrases arg false)]
-                           (set/union clause clause2)))
-                       [#{}] args))))))
+    (string? query)  (phrase-stats-empty query)
+    (keyword? query) (phrase-stats-empty query)
+    (map? query)
+    (cond
+      (:phrase query)
+      (let [tokens (phrase-tokens query-analyzer phrase-cache (:phrase query))
+            match  #{tokens}
+            empty  #{}]
+        {:query    (if pos? (vec (cons :and tokens)) :empty)
+         :all      match
+         :possible (if pos? match empty)
+         :always   (if pos? match empty)})
 
-(defn- convert-phrase
-  "convert positive phrase to [:and tokens], negative phrase to :empty"
-  [{:keys [phrase]} analyzer phrases status]
-  (let [tokens (to-tokens analyzer phrase)]
-    (case status
-      :opt (vec (cons :and tokens))
-      :req (do (vswap! phrases update :req conjs tokens)
-               (vec (cons :and tokens)))
-      :fbd (do (vswap! phrases update :fbd conjs tokens)
-               :empty))))
+      (:term query)
+      (phrase-stats-empty (:term query))
+
+      :else
+      (raise "Invalid search query" {:map query}))
+
+    (vector? query)
+    (let [[op & args] query]
+      (if (and (seq args) (operators op))
+        (let [child-pos? (if (= op :not) (not pos?) pos?)
+              children   (mapv #(analyze-phrase-query query-analyzer
+                                                      phrase-cache
+                                                      child-pos?
+                                                      %)
+                               args)
+              rewritten  (vec (cons op (mapv :query children)))]
+          (case op
+            :not
+            (let [stats (merge-phrase-stats children set/union)
+                  first-child (first children)]
+              {:query    rewritten
+               :all      (:all stats)
+               :possible (:possible first-child)
+               :always   (:always first-child)})
+
+            :and
+            (assoc (merge-phrase-stats children (if pos? set/union
+                                                    set/intersection))
+                   :query rewritten)
+
+            :or
+            (assoc (merge-phrase-stats children (if pos? set/intersection
+                                                    set/union))
+                   :query rewritten)))
+        (raise "Invalid search query" {:op op})))
+
+    :else
+    (raise "Invalid search query" {:query query})))
 
 (defn- handle-maps
   [position? phrases analyzer query]
-  (let [all (collect-phrases query)]
+  (let [{:keys [query all possible always]}
+        (analyze-phrase-query analyzer (HashMap.) true query)]
     (if (seq all)
       (if (not position?)
         (raise "Phrase search requires :index-position? true" {})
-        (let [found (required-phrases query true)
-              opt   (apply set/union found)
-              fbd   (set/difference all opt)
-              req   (apply set/intersection found)
-              opt   (set/difference opt req)]
-          (walk/postwalk
-            (fn [e]
-              (cond
-                (opt e)   (convert-phrase e analyzer phrases :opt)
-                (req e)   (convert-phrase e analyzer phrases :req)
-                (fbd e)   (convert-phrase e analyzer phrases :fbd)
-                (:term e) (:term e)
-                :else     e))
-            query)))
+        (let [fbd (set/difference all possible)]
+          (when (seq always) (vswap! phrases assoc :req always))
+          (when (seq fbd) (vswap! phrases assoc :fbd fbd))
+          query))
       query)))
 
 (defn- parse-query

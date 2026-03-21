@@ -28,6 +28,13 @@
     [?e :txreg/key ?key]
     [?e :txreg/version ?version]
     [?e :txreg/payload ?payload]])
+(def ^:private txreg-state-query
+  '[:find ?e ?version ?payload
+    :in $ ?key
+    :where
+    [?e :txreg/key ?key]
+    [?e :txreg/version ?version]
+    [?e :txreg/payload ?payload]])
 (def ^:private tx-fn-query
   '[:find ?ident ?fn
     :in $ [?ident ...]
@@ -58,13 +65,18 @@
 
 (defn- make-txreg-write
   []
-  (let [padding tx-fn-padding]
+  (let [padding      tx-fn-padding
+        entid-query '[:find ?e .
+                      :in $ ?k
+                      :where
+                      [?e :txreg/key ?k]]]
     (i/inter-fn [db k version payload]
       (let [_       padding
             k       (long k)
-            version (long version)]
-        (if-some [ent (d/entity db [:txreg/key k])]
-          [{:db/id         (:db/id ent)
+            version (long version)
+            entid   (d/q entid-query db k)]
+        (if (some? entid)
+          [{:db/id         entid
             :txreg/version version
             :txreg/payload payload}]
           [{:db/id         (str "txreg-" k)
@@ -74,15 +86,20 @@
 
 (defn- make-txreg-cas
   []
-  (let [padding tx-fn-padding]
+  (let [padding      tx-fn-padding
+        version-query '[:find ?e ?version
+                        :in $ ?k
+                        :where
+                        [?e :txreg/key ?k]
+                        [?e :txreg/version ?version]]]
     (i/inter-fn [db k expected new-value payload]
       (let [_         padding
             k         (long k)
             expected  (long expected)
             new-value (long new-value)]
-        (if-some [ent (d/entity db [:txreg/key k])]
-          (if (= expected (long (:txreg/version ent)))
-            [{:db/id         (:db/id ent)
+        (if-some [[entid current-version] (first (d/q version-query db k))]
+          (if (= expected (long current-version))
+            [{:db/id         entid
               :txreg/version new-value
               :txreg/payload payload}]
             [])
@@ -117,9 +134,8 @@
 
 (defn- txreg-state
   [db payload-bytes k]
-  (if-some [ent (d/entity db [:txreg/key (long k)])]
-    (let [version        (some-> (:txreg/version ent) long)
-          payload        (:txreg/payload ent)
+  (if-some [[_ version payload] (first (d/q txreg-state-query db (long k)))]
+    (let [version        (some-> version long)
           expected       (when (some? version)
                            (payload-for k version payload-bytes))
           payload-valid? (and (string? payload)

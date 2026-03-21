@@ -82,6 +82,18 @@
       (nil? @conn)
       (i/closed? ^Store (.-store ^DB @conn))))
 
+(defn- active-conn-structural?
+  "Cheap transaction-path check that avoids remote cache refreshes.
+
+  `conn?` may call `last-modified` on remote stores to refresh caches, which
+  adds an extra round-trip and can stall writes while HA leadership is
+  converging. Transaction internals only need to know that the connection
+  still derefs to a DB value."
+  [conn]
+  (and (instance? clojure.lang.IDeref conn)
+       (let [db @conn]
+         (instance? DB db))))
+
 (defmacro with-transaction
   "Evaluate body within the context of a single new read/write transaction,
   ensuring atomicity of Datalog database operations. Works with synchronous
@@ -225,7 +237,7 @@
     (or (maybe-direct-local-blind-transact! conn tx-data tx-meta)
         (direct-local-transact! conn tx-data tx-meta))
     (let [report (with-transaction [c conn]
-                   (assert (conn? c))
+                   (assert (active-conn-structural? c))
                    (with @c tx-data tx-meta))]
       (assoc report :db-after @conn))))
 
@@ -675,7 +687,7 @@
   [conn ^objects reports]
   (let [n (alength ^objects reports)]
     (with-transaction [c conn]
-      (assert (conn? c))
+      (assert (active-conn-structural? c))
       (dotimes [i n]
         (let [^TxReport report (aget reports i)]
           (db/commit-prepared-tx-data! @c (:tx-data report)))))))

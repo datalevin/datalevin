@@ -12,26 +12,29 @@
    :bank/balance {:db/valueType :db.type/long}})
 
 (def ^:private transfer-balance
-  (i/inter-fn [db from-id to-id amount]
-              (let [from-id (long from-id)
-                    to-id (long to-id)
-                    amount (long amount)]
-                (if (= from-id to-id)
-                  []
-                  (let [from-ent (d/entity db [:bank/id from-id])
-                        to-ent (d/entity db [:bank/id to-id])
-                        from-bal (:bank/balance from-ent)
-                        to-bal (:bank/balance to-ent)]
-                    (if (and from-ent
-                             to-ent
-                             (integer? from-bal)
-                             (integer? to-bal)
-                             (not (neg? amount))
-                             (>= (long from-bal) amount))
-                      [{:db/id (:db/id from-ent)
-                        :bank/balance (- (long from-bal) amount)}
-                       {:db/id (:db/id to-ent)
-                        :bank/balance (+ (long to-bal) amount)}]
+  (let [account-query '[:find ?e ?balance
+                       :in $ ?account-id
+                       :where
+                       [?e :bank/id ?account-id]
+                       [?e :bank/balance ?balance]]]
+    (i/inter-fn [db from-id to-id amount]
+                  (let [from-id (long from-id)
+                      to-id (long to-id)
+                      amount (long amount)]
+                  (if (= from-id to-id)
+                    []
+                    (if-some [[from-entid from-bal] (first (d/q account-query db from-id))]
+                      (if-some [[to-entid to-bal] (first (d/q account-query db to-id))]
+                        (if (and (integer? from-bal)
+                                 (integer? to-bal)
+                                 (not (neg? amount))
+                                 (>= (long from-bal) amount))
+                          [{:db/id from-entid
+                            :bank/balance (- (long from-bal) amount)}
+                           {:db/id to-entid
+                            :bank/balance (+ (long to-bal) amount)}]
+                          [])
+                        [])
                       []))))))
 
 (def ^:private tx-fn-entities
@@ -50,12 +53,19 @@
     :where
     [?e :bank/id ?account-id]
     [?e :bank/balance ?balance]])
+(def ^:private account-balance-query
+  '[:find ?balance
+    :in $ ?account-id
+    :where
+    [?e :bank/id ?account-id]
+    [?e :bank/balance ?balance]])
 
 (defn- account-balance
   [db account-id]
-  (some-> (d/entity db [:bank/id (long account-id)])
-          :bank/balance
-          long))
+  (some->> (d/q account-balance-query db (long account-id))
+           first
+           first
+           long))
 
 (defn- all-balances
   [db account-count]

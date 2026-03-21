@@ -251,7 +251,8 @@
     (log/info "Datalevin server shuts down.")))
 
 (defn- get-client [^Server server client-id]
-  (get (.-clients server) client-id))
+  (when client-id
+    (get (.-clients server) client-id)))
 
 (defn- add-client
   [^Server server ip client-id username]
@@ -1218,6 +1219,10 @@
                                          c/+buffer-size+)
                              :write-bf (bf/allocate-buffer
                                          c/+buffer-size+)
+                             ;; Preserve client message order per connection.
+                             ;; Authentication/session setup must not race
+                             ;; with subsequent requests like :open.
+                             :message-lock (Object.)
                              :wire-opts (p/default-wire-opts)})))))
 
 (defn- copy-in
@@ -2229,17 +2234,29 @@
 (defn- handle-message
   [^Server server ^SelectionKey skey fmt msg ]
   (try
-    (let [wire-opts                       (:wire-opts @(.attachment skey))
-          {:keys [writing?] :as message}
-          (p/read-value fmt msg wire-opts)]
-      (log/debug "Message received:" (dissoc message :password :args))
-      (set-last-active server skey)
-      (if writing?
-        (handle-writing server skey message)
-        (with-db-runtime-read-access
-          server
+    (let [state (.attachment skey)
+          {:keys [message-lock]} @state
           message
-          #(dispatch-message-with-ha-write-admission server skey message))))
+          (locking message-lock
+            (let [wire-opts (:wire-opts @state)
+                  {:keys [type] :as message}
+                  (p/read-value fmt msg wire-opts)]
+              (if (= type :set-client-id)
+                (do
+                  (log/debug "Message received:" (dissoc message :password :args))
+                  (dispatch-message server skey message)
+                  ::handled)
+                message)))]
+      (when-not (= ::handled message)
+        (let [{:keys [writing?]} message]
+          (log/debug "Message received:" (dissoc message :password :args))
+          (set-last-active server skey)
+          (if writing?
+            (handle-writing server skey message)
+            (with-db-runtime-read-access
+              server
+              message
+              #(dispatch-message-with-ha-write-admission server skey message))))))
     (catch Exception e
       ;; (stt/print-stack-trace e)
       (log/error "Error Handling message:" e))))
@@ -2248,7 +2265,8 @@
   [^Server server ^SelectionKey skey]
   (try
     (let [state                         (.attachment skey)
-          {:keys [^ByteBuffer read-bf]} @state
+          {:keys [^ByteBuffer read-bf
+                  message-lock]}        @state
           capacity                      (.capacity read-bf)
           ^SocketChannel ch             (.channel skey)
           ^int readn                    (p/read-ch ch read-bf)]
@@ -2262,8 +2280,7 @@
                        (p/extract-message
                          read-bf
                          (fn [fmt msg]
-                           (execute
-                             server #(handle-message server skey fmt msg)))))
+                           (execute server #(handle-message server skey fmt msg)))))
         (= readn 0)  :continue
         (= readn -1) (.close ch)))
     (catch java.io.IOException e
