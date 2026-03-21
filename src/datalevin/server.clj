@@ -1582,23 +1582,21 @@
 
 (defn- db-open-lock
   [^Server server db-name]
-  (let [lock-v (volatile! nil)]
-    (update-db server db-name
-               (fn [m]
-                 (let [lock (or (:open-lock m) (Object.))]
-                   (vreset! lock-v lock)
-                   (assoc m :open-lock lock))))
-    @lock-v))
+  (let [dbs (.-dbs server)]
+    (locking dbs
+      (or (get-in dbs [db-name :open-lock])
+          (let [lock (Object.)]
+            (update-db server db-name #(assoc % :open-lock lock))
+            lock)))))
 
 (defn- db-write-admission-lock
   [^Server server db-name]
-  (let [lock-v (volatile! nil)]
-    (update-db server db-name
-               (fn [m]
-                 (let [lock (or (:ha-write-admission-lock m) (Object.))]
-                   (vreset! lock-v lock)
-                   (assoc m :ha-write-admission-lock lock))))
-    @lock-v))
+  (let [dbs (.-dbs server)]
+    (locking dbs
+      (or (get-in dbs [db-name :ha-write-admission-lock])
+          (let [lock (Object.)]
+            (update-db server db-name #(assoc % :ha-write-admission-lock lock))
+            lock)))))
 
 (defn- open-server-store
   "Open a store. NB. stores are left open"
