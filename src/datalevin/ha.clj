@@ -95,6 +95,23 @@
   (.toNanos TimeUnit/MILLISECONDS
             (ha-write-admission-lease-margin-ms m)))
 
+(defn- ha-clock-skew-budget-ms ^long
+  [m]
+  (long (max 0
+             (long (or (:ha-clock-skew-budget-ms m)
+                       c/*ha-clock-skew-budget-ms*
+                       0)))))
+
+(defn- ha-lease-expired-for-promotion?
+  [m lease now-ms]
+  (let [lease-until-ms (:lease-until-ms lease)]
+    (or (nil? lease)
+        (nil? lease-until-ms)
+        (let [lease-until-ms (long lease-until-ms)
+              skew-budget-ms (ha-clock-skew-budget-ms m)]
+          (>= (long now-ms)
+              (long (unchecked-add lease-until-ms skew-budget-ms)))))))
+
 (defn- ha-renew-timeout-ms ^long
   [m now-ms now-nanos]
   (let [lease-timeout-ms   (long (or (:ha-lease-timeout-ms m)
@@ -285,7 +302,7 @@
 (defn- pre-cas-lag-input
   [db-name m lease now-ms]
   (let [authority-lsn (long (or (:leader-last-applied-lsn lease) 0))
-        lease-expired? (lease/lease-expired? lease now-ms)
+        lease-expired? (ha-lease-expired-for-promotion? m lease now-ms)
         local-last-applied-lsn (fresh-ha-promotion-local-last-applied-lsn
                                 m lease)
         member-watermarks
@@ -810,7 +827,10 @@
     m
 
     (and (= :candidate (:ha-role m))
-         (not (lease/lease-expired? (:ha-authority-lease m) now-ms)))
+         (not (ha-lease-expired-for-promotion?
+               m
+               (:ha-authority-lease m)
+               now-ms)))
     (-> m
         clear-ha-candidate-state
         (assoc :ha-role :follower))
@@ -818,7 +838,10 @@
     (not= :follower (:ha-role m))
     m
 
-    (not (lease/lease-expired? (:ha-authority-lease m) now-ms))
+    (not (ha-lease-expired-for-promotion?
+          m
+          (:ha-authority-lease m)
+          now-ms))
     m
 
     (or (true? (:ha-db-identity-mismatch? m))
@@ -912,7 +935,7 @@
 
 (defn- finalize-ha-candidate-promotion
   [db-name m authority db-identity lease version now-ms lag-input]
-  (if-not (lease/lease-expired? lease now-ms)
+  (if-not (ha-lease-expired-for-promotion? m lease now-ms)
     (fail-ha-candidate m :lease-not-expired
                        {:lease lease})
     (let [lag-check
@@ -956,7 +979,7 @@
                           :ha-authority-membership-hash
                           (:authority-membership-hash obs)})
 
-      (not (lease/lease-expired? lease now-ms))
+      (not (ha-lease-expired-for-promotion? m1 lease now-ms))
       (fail-ha-candidate m1 :lease-not-expired
                          {:lease lease})
 
@@ -1019,7 +1042,7 @@
                           :ha-authority-membership-hash
                           (:ha-authority-membership-hash m)})
 
-      (not (lease/lease-expired? observed-lease now-ms))
+      (not (ha-lease-expired-for-promotion? m observed-lease now-ms))
       (fail-ha-candidate m :lease-not-expired
                          {:lease observed-lease})
 
@@ -1682,7 +1705,9 @@
              lease authority-now-ms local-start-nanos)
             local-authority-owner? (and lease
                                         (= node-id (:leader-node-id lease))
-                                        (not (lease/lease-expired?
+                                        (not (ha-lease-expired-for-promotion?
+                                              {:ha-clock-skew-budget-ms
+                                               clock-skew-budget-ms}
                                               lease
                                               observed-at-ms))
                                         (= db-identity (:db-identity lease)))
@@ -1690,7 +1715,10 @@
             (and lease
                  (integer? (:leader-node-id lease))
                  (not= node-id (:leader-node-id lease))
-                 (not (lease/lease-expired? lease observed-at-ms))
+                 (not (ha-lease-expired-for-promotion?
+                       {:ha-clock-skew-budget-ms clock-skew-budget-ms}
+                       lease
+                       observed-at-ms))
                  (= db-identity (:db-identity lease)))
             rejoin-promotion-blocked-until-ms
             (when rejoin-promotion-blocked?
