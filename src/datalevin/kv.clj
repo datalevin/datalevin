@@ -1383,7 +1383,9 @@
   (let [retryable?
         (loop [e ex]
           (when e
-            (if (l/resized? e)
+            (if (or (l/resized? e)
+                    (= :ha/write-rejected
+                       (:error (ex-data ^Throwable e))))
               true
               (recur (.getCause ^Throwable e)))))]
     (when (and (not retryable?) (:fatal-error state))

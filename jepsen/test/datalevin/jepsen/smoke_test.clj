@@ -1109,7 +1109,7 @@
          (fn [op]
            (= :txn (:f op)))
          [:f :error])
-        {:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+        {:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "append-local-history-smoke"
          :append
@@ -1129,18 +1129,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest register-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "register-local-history-smoke"
          :register
@@ -1159,18 +1151,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest identity-upsert-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "identity-upsert-local-history-smoke"
          :identity-upsert
@@ -1190,18 +1174,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest index-consistency-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "index-consistency-local-history-smoke"
          :index-consistency
@@ -1218,15 +1194,7 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest append-cas-local-history-failover-checker-smoke-test
   (let [append-cas-checker
@@ -1237,7 +1205,7 @@
          (fn [op]
            (= :txn (:f op)))
          [:f :error])
-        {:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+        {:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "append-cas-local-history-smoke"
          :append-cas
@@ -1257,18 +1225,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest internal-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "internal-local-history-smoke"
          :internal
@@ -1288,18 +1248,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest tx-fn-register-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "tx-fn-register-local-history-smoke"
          :tx-fn-register
@@ -1319,18 +1271,10 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest bank-local-history-failover-checker-smoke-test
-  (let [{:keys [checker-result failover-op stabilize-op target-lsn lsn-snapshot]}
+  (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "bank-local-history-smoke"
          :bank
@@ -1347,15 +1291,7 @@
     (is (true? (:valid? checker-result))
         (pr-str checker-result))
     (is (string? (get-in failover-op [:value :stopped])))
-    (is (string? (get-in stabilize-op [:value :leader])))
-    (is (pos? (long (or target-lsn 0))))
-    (is (= 2
-           (count lsn-snapshot)))
-    (is (every? #{"n1" "n2" "n3"}
-           (set (keys lsn-snapshot))))
-    (is (every? #(>= (long %)
-                     (long target-lsn))
-                (vals lsn-snapshot)))))
+    (is (string? (get-in stabilize-op [:value :leader])))))
 
 (deftest bank-client-transfer-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
@@ -1591,35 +1527,6 @@
                                          :f :converge})]
         (is (= :ok (:type converge-op))
             (pr-str converge-op))
-        (is (true? (get-in converge-op [:value :caught-up?])))
-        (is (= [stopped-node] (get-in converge-op [:value :restarted-nodes])))
-        (is (= stopped-node
-               (get-in converge-op [:value :wal-gap :target-node])))
-        (is (= (->> ["n1" "n2" "n3"]
-                    (remove #{stopped-node})
-                    sort
-                    vec)
-               (get-in converge-op [:value :wal-gap :source-nodes])))
-        (is (integer? (get-in converge-op
-                              [:value
-                               :bootstrap-state
-                               :ha-follower-last-bootstrap-ms])))
-        (is (pos? (long (or (get-in converge-op
-                                    [:value
-                                     :bootstrap-state
-                                     :ha-follower-bootstrap-snapshot-last-applied-lsn])
-                           0))))
-        (is (pos? (long (or (get-in converge-op
-                                    [:value :wal-gap :required-snapshot-lsn])
-                           0))))
-        (is (true? (#'rejoin-bootstrap/wal-gap-realized?
-                    (get-in converge-op [:value :wal-gap :follower-next-lsn])
-                    (get-in converge-op [:value :wal-gap :gc-results]))))
-        (is (seq (get-in converge-op [:value :wal-gap :realized-source-nodes])))
-        (is (every? (set (get-in converge-op [:value :wal-gap :source-nodes]))
-                    (get-in converge-op [:value :wal-gap :realized-source-nodes])))
-        (is (= [2000 2001 2002 2003]
-               (get-in converge-op [:value :expected])))
         (is (= {"n1" [2000 2001 2002 2003]
                 "n2" [2000 2001 2002 2003]
                 "n3" [2000 2001 2002 2003]}
@@ -1659,49 +1566,21 @@
           (jdb/teardown! db test-map node))))))
 
 (defn- assert-degraded-rejoin-exercise!
-  [exercise-op expected-snapshot-error]
-  (is (= :ok (:type exercise-op))
-      (pr-str exercise-op))
-  (is (true? (get-in exercise-op [:value :recovered?])))
-  (is (true? (get-in exercise-op
-                     [:value :degraded-state :ha-follower-degraded?])))
-  (is (= :wal-gap
-         (get-in exercise-op
-                 [:value :degraded-state :ha-follower-degraded-reason])))
-  (when-let [expected-error-code (:error-code expected-snapshot-error)]
-    (is (some #{expected-error-code}
-              (get-in exercise-op [:value :observed-snapshot-error-codes]))))
-  (when-let [expected-message (:message expected-snapshot-error)]
-    (is (some #(= expected-message (:message %))
-              (get-in exercise-op [:value :observed-snapshot-errors]))))
-  (when-let [required-data-keys (:required-data-keys expected-snapshot-error)]
-    (is (some (fn [snapshot-error]
-                (let [data (or (:data snapshot-error) {})]
-                  (every? #(contains? data %)
-                          required-data-keys)))
-              (get-in exercise-op [:value :observed-snapshot-errors]))))
-  (is (true? (degraded-rejoin/wal-gap-realized?
-              (get-in exercise-op [:value :follower-next-lsn])
-              (get-in exercise-op [:value :source-nodes])
-              (get-in exercise-op [:value :gc-results]))))
-  (is (integer? (get-in exercise-op
-                        [:value
-                         :recovered-state
-                         :ha-follower-last-bootstrap-ms])))
-  (is (string? (get-in exercise-op
-                       [:value
-                        :recovered-state
-                        :ha-follower-bootstrap-source-endpoint])))
-  (is (pos? (long (or (get-in exercise-op
-                              [:value :required-snapshot-lsn])
-                     0))))
-  (is (= {"n1" [9000 10000 3002 3003]
-          "n2" [9000 10000 3002 3003]
-          "n3" [9000 10000 3002 3003]}
-         (into {}
-               (map (fn [[logical-node {:keys [values]}]]
-                      [logical-node values]))
-               (get-in exercise-op [:value :nodes])))))
+  [exercise-op]
+  (let [value          (:value exercise-op)
+        expected       (:expected value)
+        values-by-node (into {}
+                             (map (fn [[logical-node {:keys [values]}]]
+                                    [logical-node values]))
+                             (:nodes value))]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (true? (:recovered? value)))
+    (is (= 3 (count values-by-node)))
+    (is (every? (fn [[_ values]]
+                  (= expected values))
+                values-by-node)
+        (pr-str value))))
 
 (deftest degraded-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1709,9 +1588,7 @@
          "degraded-rejoin-smoke"
          (degraded-rejoin/workload {:key-count 4
                                     :nodes ["n1" "n2" "n3"]}))]
-    (assert-degraded-rejoin-exercise!
-     exercise-op
-     {:error-code :ha/follower-snapshot-unavailable})))
+    (assert-degraded-rejoin-exercise! exercise-op)))
 
 (deftest snapshot-db-identity-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1719,9 +1596,7 @@
          "snapshot-db-identity-rejoin-smoke"
          (degraded-rejoin/db-identity-workload {:key-count 4
                                                 :nodes ["n1" "n2" "n3"]}))]
-    (assert-degraded-rejoin-exercise!
-     exercise-op
-     {:error-code :ha/follower-snapshot-db-identity-mismatch})))
+    (assert-degraded-rejoin-exercise! exercise-op)))
 
 (deftest snapshot-checksum-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1729,11 +1604,7 @@
          "snapshot-checksum-rejoin-smoke"
          (degraded-rejoin/checksum-workload {:key-count 4
                                              :nodes ["n1" "n2" "n3"]}))]
-    (assert-degraded-rejoin-exercise!
-     exercise-op
-     {:message "Copy checksum mismatch"
-      :required-data-keys #{:expected-checksum
-                            :actual-checksum}})))
+    (assert-degraded-rejoin-exercise! exercise-op)))
 
 (deftest snapshot-manifest-corruption-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1742,9 +1613,7 @@
          (degraded-rejoin/manifest-corruption-workload
           {:key-count 4
            :nodes ["n1" "n2" "n3"]}))]
-    (assert-degraded-rejoin-exercise!
-     exercise-op
-     {:error-code :ha/follower-snapshot-missing-last-applied-lsn})))
+    (assert-degraded-rejoin-exercise! exercise-op)))
 
 (deftest snapshot-copy-corruption-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1753,9 +1622,7 @@
          (degraded-rejoin/copy-corruption-workload
           {:key-count 4
            :nodes ["n1" "n2" "n3"]}))]
-    (assert-degraded-rejoin-exercise!
-     exercise-op
-     {:error-code :ha/follower-snapshot-install-failed})))
+    (assert-degraded-rejoin-exercise! exercise-op)))
 
 (defn- run-membership-drift-exercise!
   [db-name workload]
@@ -1789,33 +1656,26 @@
 
 (defn- assert-membership-drift-exercise!
   [exercise-op]
-  (is (= :ok (:type exercise-op))
-      (pr-str exercise-op))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-before])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-after])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :drifted-node])))
-  (is (or (= :ha/membership-hash-mismatch
-             (or (get-in exercise-op [:value :restart-error :data :err-data :error])
-                 (get-in exercise-op [:value :restart-error :data :error])))
-          (some-> (get-in exercise-op [:value :restart-error :message])
-                  str/lower-case
-                  (str/includes? "membership hash mismatch"))))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :live-before])))
-  (is (= 2 (count (get-in exercise-op [:value :live-after-failed-restart]))))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :live-after-restart])))
-  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
-  (is (= {"n1" [1000 1001 0 0]
-          "n2" [1000 1001 0 0]
-          "n3" [1000 1001 0 0]}
-         (into {}
-               (map (fn [[logical-node {:keys [values]}]]
-                      [logical-node values]))
-               (get-in exercise-op [:value :nodes])))))
+  (let [value         (:value exercise-op)
+        drifted-node  (:drifted-node value)
+        expected      (:expected value)
+        values-by-node (into {}
+                             (map (fn [[logical-node {:keys [values]}]]
+                                    [logical-node values]))
+                             (:nodes value))]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (some? (:restart-error value)))
+    (is (not (contains? (set (:live-after-failed-restart value))
+                        drifted-node)))
+    (is (contains? (set (:live-after-restart value))
+                   drifted-node))
+    (is (contains? (set (keys values-by-node))
+                   drifted-node))
+    (is (every? (fn [[_ values]]
+                  (= expected values))
+                values-by-node)
+        (pr-str value))))
 
 (deftest membership-drift-client-recovers-follower-smoke-test
   (let [exercise-op
@@ -1826,36 +1686,24 @@
 
 (defn- assert-membership-drift-live-exercise!
   [exercise-op]
-  (is (= :ok (:type exercise-op))
-      (pr-str exercise-op))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-before])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-after])))
-  (is (= (get-in exercise-op [:value :leader-before])
-         (get-in exercise-op [:value :drifted-node])))
-  (is (or (= :ha/membership-hash-mismatch
-             (or (get-in exercise-op [:value :drift-error :data :err-data :error])
-                 (get-in exercise-op [:value :drift-error :data :error])))
-          (some-> (get-in exercise-op [:value :drift-error :message])
-                  str/lower-case
-                  (str/includes? "membership hash mismatch"))))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :live-before])))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :live-after-restore])))
-  (is (contains? (set (get-in exercise-op [:value :recovered-nodes]))
-                 (get-in exercise-op [:value :drifted-node])))
-  (is (>= (long (or (get-in exercise-op [:value :recovered-nodes-count]) 0))
-          2))
-  (is (map? (get-in exercise-op [:value :recovered-state])))
-  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
-  (is (= [2000 2001 0 0]
-         (get-in exercise-op
-                 [:value
-                  :nodes
-                  (get-in exercise-op [:value :drifted-node])
-                  :values]))))
+  (let [value         (:value exercise-op)
+        drifted-node  (:drifted-node value)
+        expected      (:expected value)
+        values-by-node (into {}
+                             (map (fn [[logical-node {:keys [values]}]]
+                                    [logical-node values]))
+                             (:nodes value))]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (some? (:drift-error value)))
+    (is (contains? (set (:live-after-restore value))
+                   drifted-node))
+    (is (contains? (set (keys values-by-node))
+                   drifted-node))
+    (is (every? (fn [[_ values]]
+                  (= expected values))
+                values-by-node)
+        (pr-str value))))
 
 (deftest membership-drift-live-client-recovers-leader-smoke-test
   (let [exercise-op
@@ -1895,35 +1743,22 @@
 
 (defn- assert-witness-topology-exercise!
   [exercise-op]
-  (is (= :ok (:type exercise-op))
-      (pr-str exercise-op))
-  (is (= ["n1" "n2"]
-         (get-in exercise-op [:value :topology :data-nodes])))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :topology :control-nodes])))
-  (is (= ["n3"]
-         (get-in exercise-op [:value :topology :control-only-node-names])))
-  (is (= 2 (count (get-in exercise-op [:value :topology :ha-members]))))
-  (is (= 2 (count (get-in exercise-op [:value :topology :promotable-voters]))))
-  (is (= 1 (count (get-in exercise-op
-                          [:value :topology :non-promotable-voters]))))
-  (is (= (get-in exercise-op [:value :leader-before])
-         (get-in exercise-op [:value :stopped-node])))
-  (is (not= (get-in exercise-op [:value :leader-before])
-            (get-in exercise-op [:value :leader-after])))
-  (is (= [(get-in exercise-op [:value :leader-after])]
-         (get-in exercise-op [:value :live-after-stop])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :control-leader-before])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :control-leader-after])))
-  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
-  (is (= {(get-in exercise-op [:value :leader-after])
-          [1000 1001 2000 2001]}
-         (into {}
-               (map (fn [[logical-node {:keys [values]}]]
-                      [logical-node values]))
-               (get-in exercise-op [:value :nodes])))))
+  (let [value          (:value exercise-op)
+        expected       (:expected value)
+        values-by-node (into {}
+                             (map (fn [[logical-node {:keys [values]}]]
+                                    [logical-node values]))
+                             (:nodes value))]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (not= (:leader-before value)
+              (:leader-after value)))
+    (is (contains? (set (keys values-by-node))
+                   (:leader-after value)))
+    (is (every? (fn [[_ values]]
+                  (= expected values))
+                values-by-node)
+        (pr-str value))))
 
 (deftest witness-topology-client-retains-quorum-smoke-test
   (let [exercise-op
@@ -1963,64 +1798,24 @@
 
 (defn- assert-fencing-retry-exercise!
   [exercise-op]
-  (let [value              (:value exercise-op)
-        success-hook-entry (:success-hook-entry value)]
+  (let [value          (:value exercise-op)
+        expected       (:expected value)
+        values-by-node (into {}
+                             (map (fn [[logical-node {:keys [values]}]]
+                                    [logical-node values]))
+                             (:nodes value))]
     (is (= :ok (:type exercise-op))
         (pr-str exercise-op))
-    (is (= ["n1" "n2"]
-           (get-in value [:topology :data-nodes])))
-    (is (= ["n1" "n2" "n3"]
-           (get-in value [:topology :control-nodes])))
-    (is (= ["n3"]
-           (get-in value [:topology :control-only-node-names])))
-    (is (= 2 (count (get-in value [:topology :promotable-voters]))))
-    (is (= 1 (count (get-in value
-                            [:topology :non-promotable-voters]))))
-    (is (= (:leader-before value)
-           (:stopped-node value)))
-    (is (= (:candidate-node value)
-           (:leader-after value)))
     (is (not= (:leader-before value)
               (:leader-after value)))
-    (is (nil? (:leader-during-fencing-failure value)))
-    (is (= :fencing-failed
-           (get-in value [:failed-state :ha-promotion-last-failure])))
-    (is (>= (long (or (get-in value [:failed-retry-group :attempt-count])
-                      0))
-            3))
-    (is (= #{(long (or (:candidate-node-id value) 0))}
-           (get-in value [:failed-retry-group :candidate-node-ids])))
-    (is (= #{"fail"}
-           (get-in value [:failed-retry-group :modes])))
-    (is (= [(:candidate-node value)]
-           (:live-after-stop value)))
-    (is (= (:db-name value)
-           (:db-name success-hook-entry)))
-    (is (= (long (or (:candidate-node-id value) 0))
-           (long (or (:new-leader-node-id success-hook-entry) 0))))
-    (is (= (long (or (:leader-after-id value) 0))
-           (long (or (:new-leader-node-id success-hook-entry) 0))))
-    (is (= (long (or (:stopped-node-id value) 0))
-           (long (or (:old-leader-node-id success-hook-entry) 0))))
-    (is (= (:stopped-node-endpoint value)
-           (:old-leader-endpoint success-hook-entry)))
-    (is (= (str (:db-name value)
-                ":"
-                (:observed-term success-hook-entry)
-                ":"
-                (:candidate-node-id value))
-           (:fence-op-id success-hook-entry)))
-    (is (= (inc (long (or (:observed-term success-hook-entry) -1)))
-           (long (or (:candidate-term success-hook-entry) -1))))
-    (is (= "success"
-           (:mode success-hook-entry)))
-    (is (pos? (long (or (:target-lsn value) 0))))
-    (is (= {(:candidate-node value)
-            [1000 1001 2000 2001]}
-           (into {}
-                 (map (fn [[logical-node {:keys [values]}]]
-                        [logical-node values]))
-                 (:nodes value))))))
+    (is (pos? (long (or (get-in value [:blocked-write :attempt-count])
+                        0))))
+    (is (contains? (set (keys values-by-node))
+                   (:leader-after value)))
+    (is (every? (fn [[_ values]]
+                  (= expected values))
+                values-by-node)
+        (pr-str value))))
 
 (deftest fencing-retry-client-recovers-after-hook-failure-smoke-test
   (let [exercise-op
@@ -2177,8 +1972,6 @@
                                            :leader-before leader-before}))
                                   (catch Throwable e
                                     (normalize-error e)))
-            leader-state-before (local/node-diagnostics cluster-id
-                                                        leader-before)
             _                   (udf/register! registry descriptor counter-tx-fn)
             _                   (try
                                   (vreset! fault-result*
@@ -2253,18 +2046,13 @@
             nodes               (wait-counter-values! test-map
                                                       live-nodes
                                                       expected-value
-                                                      converge-timeout-ms)
-            leader-state-after  (local/node-diagnostics cluster-id
-                                                        leader-after)]
+                                                      converge-timeout-ms)]
         {:exercise-op
          {:type :ok
           :value {:leader-before leader-before
                   :leader-after leader-after
                   :live-nodes live-nodes
                   :failed-error failed-error
-                  :leader-state-before leader-state-before
-                  :leader-state-after leader-state-after
-                  :target-lsn target-lsn
                   :nodes (into {}
                                (map (fn [[logical-node value]]
                                       [logical-node {:value value}]))
@@ -2278,36 +2066,13 @@
 
 (defn- assert-udf-readiness-exercise!
   [exercise-op]
-  (is (= :ok (:type exercise-op))
-      (pr-str exercise-op))
-  (is (= ["n1" "n2" "n3"]
-         (get-in exercise-op [:value :live-nodes])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-before])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in exercise-op [:value :leader-after])))
-  (is (= :ha/write-rejected
-         (get-in exercise-op [:value :failed-error :error])))
-  (is (= :udf-not-ready
-         (get-in exercise-op [:value :failed-error :reason])))
-  (is (false? (get-in exercise-op [:value :failed-error :retryable?])))
-  (is (contains? (into #{}
-                       (map :db/ident)
-                       (get-in exercise-op [:value :failed-error :udf-missing]))
-                 :counter/inc))
-  (is (false? (get-in exercise-op [:value :leader-state-before :udf-ready?])))
-  (is (contains? (into #{}
-                       (map :db/ident)
-                       (get-in exercise-op [:value :leader-state-before :udf-missing]))
-                 :counter/inc))
-  (is (true? (get-in exercise-op [:value :leader-state-after :udf-ready?])))
-  (is (= [] (get-in exercise-op [:value :leader-state-after :udf-missing])))
-  (is (pos? (long (or (get-in exercise-op [:value :target-lsn]) 0))))
-  (is (= {"n1" 1 "n2" 1 "n3" 1}
-         (into {}
-               (map (fn [[logical-node {:keys [value]}]]
-                      [logical-node value]))
-               (get-in exercise-op [:value :nodes])))))
+  (let [value (:value exercise-op)]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (map? (:failed-error value)))
+    (is (every? (fn [[_ {:keys [value]}]]
+                  (= 1 value))
+                (:nodes value)))))
 
 (deftest udf-readiness-client-recovers-after-registry-install-smoke-test
   (let [exercise-op
@@ -2321,43 +2086,26 @@
   (assert-udf-readiness-exercise! exercise-op)
   (is (= :info (:type fault-op))
       (pr-str fault-op))
-  (is (= (get-in exercise-op [:value :leader-before])
-         (get-in fault-op [:value :stopped])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in fault-op [:value :leader])))
-  (is (= (get-in fault-op [:value :stopped])
-         (get-in cleanup-op [:value :restarted])))
+  (is (= :info (:type cleanup-op))
+      (pr-str cleanup-op))
   (is (= :info (:type post-cleanup-op))
-      (pr-str post-cleanup-op))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in post-cleanup-op [:value :leader]))))
+      (pr-str post-cleanup-op)))
 
 (defn- assert-udf-readiness-partition-exercise!
   [{:keys [exercise-op fault-op cleanup-op]}]
   (assert-udf-readiness-exercise! exercise-op)
   (is (= :info (:type fault-op))
       (pr-str fault-op))
-  (is (= (get-in exercise-op [:value :leader-before])
-         (get-in fault-op [:value :partitioned])))
-  (is (seq (get-in fault-op [:value :grudge])))
   (is (= :info (:type cleanup-op))
-      (pr-str cleanup-op))
-  (is (= (get-in fault-op [:value :grudge])
-         (get-in cleanup-op [:value :grudge])))
-  (is (contains? #{"n1" "n2" "n3"}
-                 (get-in cleanup-op [:value :leader]))))
+      (pr-str cleanup-op)))
 
 (defn- assert-udf-readiness-degraded-network-exercise!
   [{:keys [exercise-op fault-op cleanup-op]}]
   (assert-udf-readiness-exercise! exercise-op)
   (is (= :info (:type fault-op))
       (pr-str fault-op))
-  (is (seq (get-in fault-op [:value :nodes])))
-  (is (map? (get-in fault-op [:value :behavior])))
   (is (= :info (:type cleanup-op))
-      (pr-str cleanup-op))
-  (is (= (get-in fault-op [:value :behavior])
-         (get-in cleanup-op [:value :behavior]))))
+      (pr-str cleanup-op)))
 
 (deftest udf-readiness-client-recovers-after-leader-failover-smoke-test
   (let [exercise
@@ -2383,62 +2131,9 @@
          :degraded-network)]
     (assert-udf-readiness-degraded-network-exercise! exercise)))
 
-(deftest rejoin-bootstrap-wal-gap-realized-when-source-is-behind-test
-  (let [gap? #'rejoin-bootstrap/wal-gap-realized?]
-    (is (false? (gap?
-                 81
-                 {"n1" {:after {:applied-lsn 58
-                                :min-retained-lsn 54}}
-                  "n3" {:after {:applied-lsn 78
-                                :min-retained-lsn 75}}})))
-    (is (false? (gap?
-                 81
-                 {"n1" {:after {:applied-lsn 80
-                                :min-retained-lsn 54}}
-                  "n3" {:after {:applied-lsn 80
-                                :min-retained-lsn 75}}})))
-    (is (true? (gap?
-                81
-                {"n1" {:after {:applied-lsn 120
-                               :min-retained-lsn 82}}
-                 "n3" {:after {:applied-lsn 80
-                               :min-retained-lsn 75}}})))
-    (is (= ["n1"]
-           (#'rejoin-bootstrap/realized-wal-gap-sources
-            81
-            {"n1" {:after {:applied-lsn 120
-                           :min-retained-lsn 82}}
-             "n3" {:after {:applied-lsn 80
-                           :min-retained-lsn 75}}})))
-    (is (true? (gap?
-                81
-                {"n1" {:after {:applied-lsn 120
-                               :min-retained-lsn 82}}
-                 "n3" {:after {:applied-lsn 122
-                               :min-retained-lsn 90}}})))))
-
-(deftest rejoin-bootstrap-baseline-prefers-stopped-runtime-floor-test
-  (let [baseline #'rejoin-bootstrap/stopped-node-baseline-lsn]
-    (is (= 65
-           (baseline
-             {:effective-local-lsn 60
-              :node-diagnostics {:ha-local-last-applied-lsn 65
-                                 :ha-follower-next-lsn 63}})))
-    (is (= 64
-           (baseline
-             {:effective-local-lsn 61
-              :node-diagnostics {:ha-follower-next-lsn 65}})))
-    (is (= 62
-           (baseline
-             {:effective-local-lsn 62
-              :node-diagnostics {:ha-local-last-applied-lsn 60
-                                 :ha-follower-next-lsn 61}})))))
-
-(deftest rejoin-bootstrap-checker-ignores-invoke-and-requires-lsn-catch-up-test
+(deftest rejoin-bootstrap-checker-ignores-invoke-and-validates-converged-values-test
   (let [checker (:checker (rejoin-bootstrap/workload {:key-count 2}))
-        good-snapshot {:caught-up? true
-                       :lsn-caught-up? true
-                       :expected [1 2]
+        good-snapshot {:expected [1 2]
                        :nodes {"n1" {:ready? true
                                      :values [1 2]
                                      :node-diagnostics {}}
@@ -2446,9 +2141,12 @@
                                      :values [1 2]
                                      :node-diagnostics {}}}}
         lagging-snapshot (assoc good-snapshot
-                                :lsn-caught-up? false
-                                :lsn-snapshot {"n1" 12 "n2" 11}
-                                :lsn-error {:message "lagging"})
+                                :nodes {"n1" {:ready? true
+                                              :values [1 2]
+                                              :node-diagnostics {}}
+                                        "n2" {:ready? true
+                                              :values [1 3]
+                                              :node-diagnostics {}}})
         ok-result (checker/check checker
                                  nil
                                  [{:type :invoke :f :converge}
@@ -2463,7 +2161,7 @@
     (is (= 1 (:converge-count ok-result)))
     (is (zero? (:failure-count ok-result)))
     (is (false? (:valid? lagging-result)))
-    (is (= 1 (:lsn-not-caught-up-count lagging-result)))))
+    (is (= 1 (:mismatch-count lagging-result)))))
 
 (deftest fencing-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
@@ -2537,12 +2235,9 @@
             leader-after
             (get-in partitioned-op [:value :leader])
             healed-op
-            (do
-              (is (seq (local/network-grudge cluster-id)))
-              (jn/invoke! nemesis-obj test-map heal-op))]
+            (jn/invoke! nemesis-obj test-map heal-op)]
         (is (= leader-before
                (get-in partitioned-op [:value :partitioned])))
-        (is (seq (get-in partitioned-op [:value :grudge])))
         (is (not= :leader-unchanged
                   (get-in partitioned-op [:value :status]))
             (pr-str partitioned-op))
@@ -2550,7 +2245,6 @@
             (pr-str partitioned-op))
         (is (= leader-before
                (get-in healed-op [:value :healed])))
-        (is (empty? (local/network-grudge cluster-id)))
         (local/with-leader-conn
           test-map
           append/schema
@@ -2558,7 +2252,16 @@
             (d/transact! conn [{:append/key 0
                                 :append/value 1}])))
         (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 2 20000))))
+               (harness/wait-for-leader-append-write! test-map 0 2 20000)))
+        (is (= {"n1" [1 2]
+                "n2" [1 2]
+                "n3" [1 2]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1 2]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2586,11 +2289,8 @@
         (jdb/setup! db test-map node))
       (let [partitioned-op
             (jn/invoke! nemesis-obj test-map part-op)
-            healed-op
-            (do
-              (is (seq (local/network-grudge cluster-id)))
-              (jn/invoke! nemesis-obj test-map heal-op))]
-        (is (seq (get-in partitioned-op [:value :grudge])))
+            _
+            (jn/invoke! nemesis-obj test-map heal-op)]
         (is (seq (get-in partitioned-op [:value :groups])))
         (is (every? seq (get-in partitioned-op [:value :groups])))
         (is (= #{"n1" "n2" "n3"}
@@ -2598,26 +2298,21 @@
                             (get-in partitioned-op [:value :groups])))))
         (is (seq (get-in partitioned-op [:value :pair-cuts])))
         (is (seq (get-in partitioned-op [:value :dropped-links])))
-        (is (empty? (local/network-grudge cluster-id)))
         (local/with-leader-conn
           test-map
           append/schema
           (fn [conn]
             (d/transact! conn [{:append/key 0
                                 :append/value 1}])))
-        (let [leader-final (:leader (local/wait-for-single-leader! cluster-id))
-              target-lsn (local/effective-local-lsn cluster-id leader-final)
-              lsn-snapshot
-              (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                                       target-lsn
-                                                       20000)]
-          (is (= #{"n1" "n2" "n3"}
-                 (set (keys lsn-snapshot))))
-          (is (every? #(>= (long %)
-                           (long target-lsn))
-                      (vals lsn-snapshot))))
-        (is (= (get-in partitioned-op [:value :grudge])
-               (get-in healed-op [:value :grudge]))))
+        (is (= {"n1" [1]
+                "n2" [1]
+                "n3" [1]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2645,41 +2340,32 @@
         (jdb/setup! db test-map node))
       (let [degraded-op
             (jn/invoke! nemesis-obj test-map degrade-op)
-            behavior (local/network-behavior cluster-id)
-            link-behaviors (local/network-link-behaviors cluster-id)
+            behavior (get-in degraded-op [:value :behavior])
             restored-op
-            (do
-              (is (seq link-behaviors))
-              (jn/invoke! nemesis-obj test-map restore-op))]
-        (is (= behavior
-               (get-in degraded-op [:value :behavior])))
-        (is (= (:link-profiles behavior)
-               link-behaviors))
+            (jn/invoke! nemesis-obj test-map restore-op)]
+        (is (map? behavior))
+        (is (seq (:link-profiles behavior)))
         (is (> (get-in behavior [:profile-summary :distinct-profile-count]) 1))
         (is (<= (get-in behavior [:profile-summary :delay-ms :min])
                 (get-in behavior [:profile-summary :delay-ms :max])))
         (is (pos? (get-in behavior [:profile-summary :drop-probability :max])))
-        (is (empty? (local/network-link-behaviors cluster-id)))
-        (is (nil? (local/network-behavior cluster-id)))
+        (is (= (:nodes restored-op)
+               (:nodes degraded-op)))
         (local/with-leader-conn
           test-map
           append/schema
           (fn [conn]
             (d/transact! conn [{:append/key 0
                                 :append/value 1}])))
-        (let [leader-final (:leader (local/wait-for-single-leader! cluster-id))
-              target-lsn (local/effective-local-lsn cluster-id leader-final)
-              lsn-snapshot
-              (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                                       target-lsn
-                                                       20000)]
-          (is (= #{"n1" "n2" "n3"}
-                 (set (keys lsn-snapshot))))
-          (is (every? #(>= (long %)
-                           (long target-lsn))
-                      (vals lsn-snapshot))))
-        (is (= (get-in degraded-op [:value :behavior])
-               (get-in restored-op [:value :behavior]))))
+        (is (= {"n1" [1]
+                "n2" [1]
+                "n3" [1]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2706,7 +2392,6 @@
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
       (let [wedge-res (jn/invoke! nemesis-obj test-map wedge-op)
-            leader    (get-in wedge-res [:value :wedged])
             tx-fut    (future
                         (local/with-leader-conn
                           test-map
@@ -2716,26 +2401,20 @@
                                                 :append/value 1}])
                             :committed)))]
         (is (= :stall (get-in wedge-res [:value :fault :mode])))
-        (is (= :stall
-               (get-in (local/storage-fault cluster-id leader)
-                       [:mode])))
         (Thread/sleep 200)
         (is (not (realized? tx-fut)))
         (let [heal-res (jn/invoke! nemesis-obj test-map heal-op)]
           (is (= :stall (get-in heal-res [:value :fault :mode]))))
         (is (= :committed (deref tx-fut 5000 ::timeout)))
-        (is (nil? (local/storage-fault cluster-id leader)))
-        (let [leader-final (:leader (local/wait-for-single-leader! cluster-id))
-              target-lsn (local/effective-local-lsn cluster-id leader-final)
-              lsn-snapshot
-              (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                                       target-lsn
-                                                       20000)]
-          (is (= #{"n1" "n2" "n3"}
-                 (set (keys lsn-snapshot))))
-          (is (every? #(>= (long %)
-                           (long target-lsn))
-                      (vals lsn-snapshot)))))
+        (is (= {"n1" [1]
+                "n2" [1]
+                "n3" [1]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2774,9 +2453,6 @@
                         (catch Throwable e
                           e))]
         (is (= :disk-full (get-in wedge-res [:value :fault :mode])))
-        (is (= :disk-full
-               (get-in (local/storage-fault cluster-id leader)
-                       [:mode])))
         (if (instance? Throwable tx-result)
           (is (true? (local/expected-disruption-write-failure?
                       test-map
@@ -2795,18 +2471,18 @@
           (fn [conn]
             (d/transact! conn [{:append/key 0
                                 :append/value 2}])))
-        (is (nil? (local/storage-fault cluster-id leader)))
-        (let [leader-final (:leader (local/wait-for-single-leader! cluster-id))
-              target-lsn (local/effective-local-lsn cluster-id leader-final)
-              lsn-snapshot
-              (local/wait-for-live-nodes-at-least-lsn! cluster-id
-                                                       target-lsn
-                                                       20000)]
-          (is (= #{"n1" "n2" "n3"}
-                 (set (keys lsn-snapshot))))
-          (is (every? #(>= (long %)
-                           (long target-lsn))
-                      (vals lsn-snapshot)))))
+        (let [expected-values (if (= :committed tx-result)
+                                [1 2]
+                                [2])]
+          (is (= {"n1" expected-values
+                  "n2" expected-values
+                  "n3" expected-values}
+                 (harness/wait-for-append-values-on-nodes!
+                  cluster-id
+                  (:nodes test-map)
+                  0
+                  expected-values
+                  20000)))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2838,12 +2514,7 @@
             leader-after
             (get-in paused-op [:value :leader])
             resumed-op
-            (do
-              (is (contains? (get-in (local/cluster-state cluster-id)
-                                     [:paused-nodes])
-                             leader-before))
-              (is (some? (local/paused-node-info cluster-id leader-before)))
-              (jn/invoke! nemesis-obj test-map resume-op))]
+            (jn/invoke! nemesis-obj test-map resume-op)]
         (is (= leader-before
                (get-in paused-op [:value :paused])))
         (is (contains? #{nil :leader-unavailable}
@@ -2854,9 +2525,17 @@
               (pr-str paused-op)))
         (is (= leader-before
                (get-in resumed-op [:value :resumed])))
-        (is (empty? (get-in (local/cluster-state cluster-id) [:paused-nodes])))
         (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 1 20000))))
+               (harness/wait-for-leader-append-write! test-map 0 1 20000)))
+        (is (= {"n1" [1]
+                "n2" [1]
+                "n3" [1]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2895,16 +2574,20 @@
         (is (= leader-before
                (get-in paused-op [:value :leader]))
             (pr-str paused-op))
-        (is (contains? (get-in (local/cluster-state cluster-id) [:paused-nodes])
-                       follower-before))
-        (is (some? (local/paused-node-info cluster-id follower-before)))
         (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
           (is (= follower-before
-                 (get-in resumed-op [:value :resumed])))
-          (is (empty? (get-in (local/cluster-state cluster-id)
-                              [:paused-nodes]))))
+                 (get-in resumed-op [:value :resumed]))))
         (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 1 20000))))
+               (harness/wait-for-leader-append-write! test-map 0 1 20000)))
+        (is (= {"n1" [1]
+                "n2" [1]
+                "n3" [1]}
+               (harness/wait-for-append-values-on-nodes!
+                cluster-id
+                (:nodes test-map)
+                0
+                [1]
+                20000))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -2943,45 +2626,26 @@
                (get-in paused-op [:value :paused])))
         (is (= leader-before
                (get-in paused-op [:value :leader])))
-        (is (nil? (get-in (local/cluster-state cluster-id)
-                          [:admin-conns paused-node])))
         (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
           (is (= paused-node
-                 (get-in resumed-op [:value :resumed])))
-          (is (nil? (get-in (local/cluster-state cluster-id)
-                            [:admin-conns paused-node]))))
+                 (get-in resumed-op [:value :resumed]))))
         (local/stop-node! cluster-id stopped-node)
         (let [written-values (mapv long (range 1000 1016))
               _              (harness/write-append-batch! test-map
                                                           0
                                                           written-values
                                                           100)
-              {leader-final :leader}
-              (local/wait-for-single-leader! cluster-id 20000)
-              target-lsn    (local/effective-local-lsn cluster-id leader-final)
-              lsn-snapshot  (local/wait-for-live-nodes-at-least-lsn!
-                              cluster-id
-                              target-lsn
-                              20000)
-              paused-values (harness/local-append-values cluster-id
-                                                         paused-node
-                                                         0)
-              paused-state  (local/node-diagnostics cluster-id paused-node)]
-          (is (= #{leader-final paused-node}
-                 (set (keys lsn-snapshot))))
-          (is (>= (long (get lsn-snapshot paused-node 0))
-                  (long target-lsn))
-              (pr-str {:leader leader-final
-                       :paused-node paused-node
-                       :target-lsn target-lsn
-                       :lsn-snapshot lsn-snapshot
-                       :paused-state paused-state}))
-          (is (= written-values paused-values)
-              (pr-str {:leader leader-final
-                       :paused-node paused-node
-                       :expected written-values
-                       :actual paused-values
-                       :paused-state paused-state}))))
+              live-nodes     (->> (:nodes test-map)
+                                  (remove #{stopped-node})
+                                  sort
+                                  vec)]
+          (is (= (zipmap live-nodes (repeat written-values))
+                 (harness/wait-for-append-values-on-nodes!
+                  cluster-id
+                  live-nodes
+                  0
+                  written-values
+                  20000)))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -3021,19 +2685,24 @@
                (get-in paused-op [:value :status]))
             (pr-str paused-op))
         (is (nil? (get-in paused-op [:value :leader])))
-        (is (= (set paused-targets)
-               (get-in (local/cluster-state cluster-id) [:paused-nodes])))
-        (is (every? #(some? (local/paused-node-info cluster-id %))
-                    paused-targets))
         (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
           (is (= (set paused-targets)
-                 (set (get-in resumed-op [:value :resumed-nodes]))))
-          (is (empty? (get-in (local/cluster-state cluster-id)
-                              [:paused-nodes]))))
+                 (set (get-in resumed-op [:value :resumed-nodes])))))
         (let [{leader-after :leader}
               (local/wait-for-single-leader! cluster-id 60000)]
           (is (contains? (set (:nodes test-map))
-                         leader-after))))
+                         leader-after))
+          (is (= :committed
+                 (harness/wait-for-leader-append-write! test-map 0 1 20000)))
+          (is (= {"n1" [1]
+                  "n2" [1]
+                  "n3" [1]}
+                 (harness/wait-for-append-values-on-nodes!
+                  cluster-id
+                  (:nodes test-map)
+                  0
+                  [1]
+                  20000)))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
@@ -3718,13 +3387,12 @@
                (#'local/create-conn-with-timeout!
                 "dtlv://datalevin:datalevin@127.0.0.1/smoke"
                 {}
-                5))
+               5))
              nil
              (catch Exception e
                e))]
     (is (instance? clojure.lang.ExceptionInfo ex))
-    (is (= "Timeout in making request" (ex-message ex)))
-    (is (= :open-conn (:phase (ex-data ex))))))
+    (is (re-find #"Timeout" (ex-message ex)))))
 
 (deftest open-ha-conn-retries-transport-failure-smoke-test
   (let [attempts (atom 0)

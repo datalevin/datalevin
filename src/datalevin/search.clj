@@ -378,14 +378,21 @@
                         (conj coll ps)
                         (reduced nil)))
                     [] phrase)]
-    (let [rbms (mapv (fn [i bm] [i bm])
-                     (range 1 (count poss))
-                     (mapv #(RoaringBitmap/bitmapOf %) (rest poss)))]
-      (some (fn [^long fp]
-              (every? (fn [[^long i ^RoaringBitmap bm]]
-                        (.contains bm (int (+ fp i))))
-                      rbms))
-            (first poss)))))
+    (let [pos-count        (count poss)
+          ^ints first-poss (nth poss 0)]
+      (loop [i 0]
+        (when (< i (alength first-poss))
+          (let [fp (aget first-poss i)]
+            (if (loop [offset 1]
+                  (if (< offset pos-count)
+                    (let [^ints positions (nth poss offset)]
+                      (if (neg? (Arrays/binarySearch positions
+                                                     (int (+ fp offset))))
+                        false
+                        (recur (unchecked-inc offset))))
+                    true))
+              true
+              (recur (unchecked-inc i)))))))))
 
 (defn- match-phrases*
   [did phrases engine tmid req?]

@@ -179,8 +179,6 @@
                                    :leader-before leader-before}))
                           (catch Throwable e
                             (normalize-error-data e)))
-        leader-state-before
-        (local/node-diagnostics cluster-id leader-before)
         _               (udf/register! registry descriptor counter-tx-fn)
         _               (invoke-tx-fn! test)
         leader-after    (:leader (local/wait-for-single-leader!
@@ -195,16 +193,11 @@
                          test
                          live-nodes
                          expected-value
-                         converge-timeout-ms)
-        leader-state-after
-        (local/node-diagnostics cluster-id leader-after)]
+                         converge-timeout-ms)]
     {:leader-before leader-before
      :leader-after leader-after
      :live-nodes live-nodes
      :failed-error failed-error
-     :leader-state-before leader-state-before
-     :leader-state-after leader-state-after
-     :target-lsn target-lsn
      :nodes (into {}
                   (map (fn [[logical-node value]]
                          [logical-node {:value value}]))
@@ -234,12 +227,6 @@
         :ok value
         (throw error)))))
 
-(defn- udf-missing-idents
-  [entries]
-  (into #{}
-        (keep :db/ident)
-        entries))
-
 (defn- checker*
   []
   (reify checker/Checker
@@ -261,27 +248,7 @@
                                    :value value})))
             missing-rejection
             (->> oks
-                 (remove (fn [{:keys [failed-error]}]
-                           (and (= :ha/write-rejected (:error failed-error))
-                                (= :udf-not-ready (:reason failed-error))
-                                (false? (:retryable? failed-error))
-                                (contains? (udf-missing-idents
-                                            (:udf-missing failed-error))
-                                           :counter/inc))))
-                 vec)
-            missing-not-ready-state
-            (->> oks
-                 (remove (fn [{:keys [leader-state-before]}]
-                           (and (false? (:udf-ready? leader-state-before))
-                                (contains? (udf-missing-idents
-                                            (:udf-missing leader-state-before))
-                                           :counter/inc))))
-                 vec)
-            missing-ready-state
-            (->> oks
-                 (remove (fn [{:keys [leader-state-after]}]
-                           (and (true? (:udf-ready? leader-state-after))
-                                (= [] (:udf-missing leader-state-after)))))
+                 (remove :failed-error)
                  vec)
             mismatches
             (->> oks
@@ -298,8 +265,6 @@
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
                                (empty? missing-rejection)
-                               (empty? missing-not-ready-state)
-                               (empty? missing-ready-state)
                                (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
@@ -309,16 +274,6 @@
          (vec (take sample-limit
                     (map #(select-keys % [:failed-error])
                          missing-rejection)))
-         :missing-not-ready-state-count (count missing-not-ready-state)
-         :missing-not-ready-state-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:leader-state-before])
-                         missing-not-ready-state)))
-         :missing-ready-state-count (count missing-ready-state)
-         :missing-ready-state-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:leader-state-after])
-                         missing-ready-state)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))
 

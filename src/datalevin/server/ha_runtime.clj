@@ -107,6 +107,15 @@
                  expected-state
                  next-state)))
 
+(defn ha-authority-refresh-state-patch
+  [expected-state next-state]
+  (let [patch-keys (->> (concat (keys expected-state)
+                                (keys next-state))
+                        distinct)]
+    (state-patch patch-keys
+                 expected-state
+                 next-state)))
+
 (defn apply-state-patch
   [state patch]
   (reduce-kv
@@ -117,11 +126,9 @@
    state
    patch))
 
-(defn same-ha-runtime-state?
-  [current-state expected-state running-key]
-  (and (identical? (get current-state running-key)
-                   (get expected-state running-key))
-       (identical? (:ha-authority current-state)
+(defn same-ha-runtime-context?
+  [current-state expected-state]
+  (and (identical? (:ha-authority current-state)
                    (:ha-authority expected-state))
        (= (:ha-node-id current-state)
           (:ha-node-id expected-state))
@@ -129,6 +136,12 @@
           (:ha-db-identity expected-state))
        (= (:ha-membership-hash current-state)
           (:ha-membership-hash expected-state))))
+
+(defn same-ha-runtime-state?
+  [current-state expected-state running-key]
+  (and (identical? (get current-state running-key)
+                   (get expected-state running-key))
+       (same-ha-runtime-context? current-state expected-state)))
 
 (defn merge-ha-follower-local-side-effect-patch
   [current-state expected-state patch]
@@ -160,6 +173,29 @@
 (defn merge-ha-renew-state-patch
   [current-state expected-state patch]
   (if (and patch
+           (same-ha-runtime-state?
+            current-state
+            expected-state
+            :ha-renew-loop-running?))
+    (apply-state-patch current-state patch)
+    current-state))
+
+(defn merge-ha-renew-promotion-state-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (same-ha-runtime-context?
+            current-state
+            expected-state))
+    (apply-state-patch current-state patch)
+    current-state))
+
+(defn merge-ha-authority-refresh-state-patch
+  [current-state expected-state patch]
+  (if (and patch
+           (= :leader (:ha-role current-state))
+           (= :leader (:ha-role expected-state))
+           (satisfies? ctrl/ILeaseAuthority
+                       (:ha-authority current-state))
            (same-ha-runtime-state?
             current-state
             expected-state

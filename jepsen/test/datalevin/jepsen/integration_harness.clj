@@ -80,6 +80,35 @@
            sort
            vec))))
 
+(defn wait-for-append-values-on-nodes!
+  [cluster-id logical-nodes key expected-values timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))
+        nodes    (vec logical-nodes)
+        expected (->> expected-values
+                      (map long)
+                      vec)]
+    (loop [last-values nil]
+      (let [observed (into {}
+                           (map (fn [logical-node]
+                                  [logical-node
+                                   (local-append-values cluster-id
+                                                        logical-node
+                                                        key)]))
+                           nodes)]
+        (if (every? (fn [[_ values]] (= expected values)) observed)
+          observed
+          (if (< (System/currentTimeMillis) deadline)
+            (do
+              (Thread/sleep 250)
+              (recur observed))
+            (throw (ex-info "Timed out waiting for append values on nodes"
+                            {:cluster-id cluster-id
+                             :logical-nodes nodes
+                             :key key
+                             :expected-values expected
+                             :timeout-ms timeout-ms
+                             :last-values last-values}))))))))
+
 (defn- invoke-history-op!
   [opened-client test process-id op]
   (let [invoke-op     (assoc op
@@ -153,12 +182,10 @@
             leader-after   (:leader (local/wait-for-single-leader!
                                      cluster-id
                                      local-history-convergence-timeout-ms))
-            target-lsn     (local/effective-local-lsn
+            _              (local/wait-for-live-nodes-at-least-lsn!
                             cluster-id
-                            leader-after)
-            lsn-snapshot   (local/wait-for-live-nodes-at-least-lsn!
-                            cluster-id
-                            target-lsn
+                            (local/effective-local-lsn cluster-id
+                                                       leader-after)
                             local-history-convergence-timeout-ms)
             checker-result (with-redefs [elle.viz/plot-analysis!
                                          (fn [& _] nil)]
@@ -172,9 +199,7 @@
          :leader-before leader-before
          :leader-after leader-after
          :failover-op failover-op
-         :stabilize-op stabilize-op
-         :target-lsn target-lsn
-         :lsn-snapshot lsn-snapshot})
+         :stabilize-op stabilize-op})
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))

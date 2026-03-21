@@ -184,6 +184,19 @@
 (def ^:redef fetch-ha-endpoint-watermark-lsn
   #'repl/fetch-ha-endpoint-watermark-lsn)
 (def ^:redef fetch-leader-watermark-lsn #'repl/fetch-leader-watermark-lsn)
+(def ^:redef open-ha-snapshot-remote-store!
+  #'repl/open-ha-snapshot-remote-store!)
+(def ^:redef copy-ha-remote-store!
+  #'repl/copy-ha-remote-store!)
+(def ^:redef unpin-ha-remote-store-backup-floor!
+  #'repl/unpin-ha-remote-store-backup-floor!)
+(def ^:redef close-ha-snapshot-remote-store!
+  #'repl/close-ha-snapshot-remote-store!)
+(def ^:redef fetch-ha-leader-txlog-batch #'repl/fetch-ha-leader-txlog-batch)
+(def ^:redef report-ha-replica-floor! #'repl/report-ha-replica-floor!)
+(def ^:redef clear-ha-replica-floor! #'repl/clear-ha-replica-floor!)
+(def ^:redef fetch-ha-endpoint-snapshot-copy!
+  #'repl/fetch-ha-endpoint-snapshot-copy!)
 (def ^:private highest-reachable-ha-member-watermark
   #'repl/highest-reachable-ha-member-watermark)
 (def ^:private ha-member-watermarks #'repl/ha-member-watermarks)
@@ -581,6 +594,43 @@
                          :fence-op-id fence-op-id
                          :fence-shared-op-id fence-shared-op-id))))))))))
 
+(defn- release-ha-leader-lease!
+  [db-name m]
+  (let [authority (:ha-authority m)
+        db-identity (:ha-db-identity m)
+        leader-node-id (:ha-node-id m)
+        term (:ha-authority-term m)]
+    (cond
+      (not (satisfies? ctrl/ILeaseAuthority authority))
+      {:ok? false
+       :reason :authority-unavailable}
+
+      (not (integer? leader-node-id))
+      {:ok? false
+       :reason :invalid-leader-node-id
+       :leader-node-id leader-node-id}
+
+      (not (integer? term))
+      {:ok? false
+       :reason :invalid-term
+       :term term}
+
+      :else
+      (try
+        (ctrl/release-lease authority
+                            {:db-identity db-identity
+                             :leader-node-id (long leader-node-id)
+                             :term (long term)})
+        (catch Exception e
+          {:ok? false
+           :reason :exception
+           :message (ex-message e)
+           :data (ex-data e)
+           :db-name db-name
+           :db-identity db-identity
+           :leader-node-id leader-node-id
+           :term term})))))
+
 (defn- maybe-complete-ha-leader-fencing
   [m db-name]
   (let [observed-lease (:ha-leader-fencing-observed-lease m)]
@@ -604,10 +654,19 @@
                        :ha-node-id (:ha-node-id m)
                        :ha-authority-term (:ha-authority-term m)
                        :fence-result fence-result})
-            (demote-ha-leader db-name m
-                              :fencing-incomplete
-                              {:fence-result fence-result}
-                              (ha-now-ms))))))))
+            (let [lease-release (release-ha-leader-lease! db-name m)]
+              (when-not (and (:ok? lease-release)
+                             (true? (:released? lease-release)))
+                (log/warn "HA leader fencing failure could not release authoritative lease"
+                          {:db-name db-name
+                           :ha-node-id (:ha-node-id m)
+                           :ha-authority-term (:ha-authority-term m)
+                           :lease-release lease-release}))
+              (demote-ha-leader db-name m
+                                :fencing-incomplete
+                                {:fence-result fence-result
+                                 :lease-release lease-release}
+                                (ha-now-ms)))))))))
 
 (defn- parse-ha-clock-skew-output
   [output]
@@ -671,48 +730,167 @@
                 (do
                   (Thread/sleep retry-delay-ms)
                   (recur (u/long-inc attempt)))
-                (assoc parsed
-                       :attempt attempt
-                       :budget-ms budget-ms
-                       :paused? true)))))))))
+                  (assoc parsed
+                         :attempt attempt
+                         :budget-ms budget-ms
+                         :paused? true)))))))))
+
+(defn- ha-clock-skew-hook-configured?
+  [m]
+  (let [cmd (get-in m [:ha-clock-skew-hook :cmd])]
+    (and (vector? cmd) (seq cmd))))
+
+(defn- ha-clock-skew-check-fresh?
+  [m now-ms]
+  (or (not (ha-clock-skew-hook-configured? m))
+      (when-let [last-check-ms
+                 (when (integer? (:ha-clock-skew-last-check-ms m))
+                   (long (:ha-clock-skew-last-check-ms m)))]
+        (<= (nonnegative-long-diff (long now-ms) last-check-ms)
+            (long (max 100
+                       (long (or (:ha-lease-renew-ms m)
+                                 c/*ha-lease-renew-ms*))))))))
+
+(defn- ha-clock-skew-promotion-block-reason
+  [m now-ms]
+  (cond
+    (true? (:ha-clock-skew-paused? m))
+    :clock-skew-paused
+
+    (and (ha-clock-skew-hook-configured? m)
+         (not (ha-clock-skew-check-fresh? m now-ms))
+         (true? (:ha-clock-skew-refresh-pending? m)))
+    :clock-skew-check-pending
+
+    (and (ha-clock-skew-hook-configured? m)
+         (not (ha-clock-skew-check-fresh? m now-ms)))
+    :clock-skew-check-stale))
+
+(defn- run-ha-clock-skew-hook-safe
+  [db-name m budget-ms]
+  (try
+    (run-ha-clock-skew-hook db-name m)
+    (catch Exception e
+      {:ok? false
+       :paused? true
+       :reason :exception
+       :budget-ms budget-ms
+       :message (ex-message e)
+       :data (ex-data e)})))
+
+(defn- submit-ha-clock-skew-refresh
+  [db-name m budget-ms]
+  (let [task (reify Callable
+               (call [_]
+                 (run-ha-clock-skew-hook-safe db-name m budget-ms)))
+        executor (:ha-probe-executor m)]
+    (try
+      (cond
+        (instance? ExecutorService executor)
+        (.submit ^ExecutorService executor ^Callable task)
+
+        :else
+        (future-call #(.call ^Callable task)))
+      (catch Exception e
+        (log/warn e "Failed to submit HA clock skew refresh"
+                  {:db-name db-name
+                   :ha-node-id (:ha-node-id m)})
+        nil))))
+
+(defn- apply-ha-clock-skew-result
+  [m budget-ms result]
+  (assoc m
+         :ha-clock-skew-budget-ms budget-ms
+         :ha-clock-skew-refresh-future nil
+         :ha-clock-skew-refresh-pending? false
+         :ha-clock-skew-paused? (true? (:paused? result))
+         :ha-clock-skew-last-check-ms (ha-now-ms)
+         :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
+         :ha-clock-skew-last-result result))
+
+(defn- realize-ha-clock-skew-refresh
+  [m budget-ms]
+  (let [refresh-future (:ha-clock-skew-refresh-future m)]
+    (cond
+      (and (instance? Future refresh-future)
+           (.isDone ^Future refresh-future))
+      (let [result (try
+                     (.get ^Future refresh-future)
+                     (catch Exception e
+                       {:ok? false
+                        :paused? true
+                        :reason :exception
+                        :budget-ms budget-ms
+                        :message (ex-message e)
+                        :data (ex-data e)}))]
+        (apply-ha-clock-skew-result m budget-ms result))
+
+      (instance? Future refresh-future)
+      (assoc m
+             :ha-clock-skew-budget-ms budget-ms
+             :ha-clock-skew-refresh-pending? true)
+
+      :else
+      (assoc m
+             :ha-clock-skew-budget-ms budget-ms
+             :ha-clock-skew-refresh-pending? false))))
 
 (defn- refresh-ha-clock-skew-state
   [db-name m]
   (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
                             c/*ha-clock-skew-budget-ms*))
         role (:ha-role m)
-        clock-skew-hook (:ha-clock-skew-hook m)
-        hook-configured?
-        (let [cmd (:cmd clock-skew-hook)]
-          (and (vector? cmd) (seq cmd)))]
-    (if (or (#{:follower :candidate} role)
-            (and (= :leader role) hook-configured?))
-      (let [result (try
-                     (run-ha-clock-skew-hook db-name m)
-                     (catch Exception e
-                       {:ok? false
-                        :paused? true
-                        :reason :exception
-                        :budget-ms budget-ms
-                        :message (ex-message e)}))
-            now-ms (System/currentTimeMillis)
-            next-m (assoc m
-                          :ha-clock-skew-budget-ms budget-ms
-                          :ha-clock-skew-paused? (true? (:paused? result))
-                          :ha-clock-skew-last-check-ms now-ms
-                          :ha-clock-skew-last-observed-ms (:clock-skew-ms result)
-                          :ha-clock-skew-last-result result)]
-        (if (and (= :leader role)
-                 (true? (:paused? result)))
+        hook-configured? (ha-clock-skew-hook-configured? m)
+        applicable? (or (#{:follower :candidate} role)
+                        (and (= :leader role) hook-configured?))]
+    (cond
+      (not applicable?)
+      (assoc m
+             :ha-clock-skew-budget-ms budget-ms
+             :ha-clock-skew-refresh-future nil
+             :ha-clock-skew-refresh-pending? false
+             :ha-clock-skew-paused? false)
+
+      (not hook-configured?)
+      (apply-ha-clock-skew-result
+       m
+       budget-ms
+       {:ok? true
+        :skipped? true
+        :paused? false
+        :reason :clock-skew-hook-unconfigured
+        :budget-ms budget-ms})
+
+      :else
+      (let [next-m (realize-ha-clock-skew-refresh m budget-ms)
+            result (:ha-clock-skew-last-result next-m)]
+        (cond
+          (and (= :leader role)
+               (true? (:ha-clock-skew-paused? next-m)))
           (demote-ha-leader db-name next-m
                             :clock-skew-paused
                             {:budget-ms budget-ms
                              :clock-skew-result result}
-                            now-ms)
-          next-m))
-      (assoc m
-             :ha-clock-skew-budget-ms budget-ms
-             :ha-clock-skew-paused? false))))
+                            (ha-now-ms))
+
+          (instance? Future (:ha-clock-skew-refresh-future next-m))
+          next-m
+
+          :else
+          (let [refresh-future
+                (submit-ha-clock-skew-refresh db-name next-m budget-ms)]
+            (cond-> (assoc next-m
+                           :ha-clock-skew-refresh-future refresh-future
+                           :ha-clock-skew-refresh-pending?
+                           (boolean refresh-future))
+              (and (boolean refresh-future)
+                   (not (integer? (:ha-clock-skew-last-check-ms next-m))))
+              (assoc :ha-clock-skew-last-result
+                     {:ok? false
+                      :pending? true
+                      :paused? false
+                      :reason :clock-skew-check-pending
+                      :budget-ms budget-ms}))))))))
 
 (def ^:dynamic *ha-with-local-store-swap-fn*
   (fn [f]
@@ -723,17 +901,38 @@
   (*ha-with-local-store-swap-fn* f))
 
 (defn- ha-clock-skew-promotion-failure-details
-  [m]
+  [m now-ms]
   (let [budget-ms (long (or (:ha-clock-skew-budget-ms m)
                             c/*ha-clock-skew-budget-ms*))
         result (:ha-clock-skew-last-result m)
+        reason (ha-clock-skew-promotion-block-reason m now-ms)
         base {:budget-ms budget-ms
               :last-check-ms (:ha-clock-skew-last-check-ms m)
               :check result}]
-    (if (= :clock-skew-budget-breached (:reason result))
+    (cond
+      (= :clock-skew-paused reason)
+      (if (= :clock-skew-budget-breached (:reason result))
+        (assoc base
+               :reason :clock-skew-budget-breached
+               :clock-skew-ms (:clock-skew-ms result))
+        (assoc base
+               :reason (or (:reason result)
+                           :clock-skew-check-failed)))
+
+      (= :clock-skew-check-pending reason)
       (assoc base
-             :reason :clock-skew-budget-breached
-             :clock-skew-ms (:clock-skew-ms result))
+             :reason :clock-skew-check-pending)
+
+      (= :clock-skew-check-stale reason)
+      (assoc base
+             :reason :clock-skew-check-stale
+             :age-ms
+             (when (integer? (:ha-clock-skew-last-check-ms m))
+               (nonnegative-long-diff
+                (long now-ms)
+                (long (:ha-clock-skew-last-check-ms m)))))
+
+      :else
       (assoc base
              :reason :clock-skew-check-failed))))
 
@@ -831,6 +1030,17 @@
              :ha-promotion-last-failure reason
              :ha-promotion-failure-details details)))
 
+(defn- ha-follower-degraded-blocks-promotion?
+  [m now-ms]
+  (and (true? (:ha-follower-degraded? m))
+       (let [lag-check (ha-promotion-lag-guard
+                        m
+                        (:ha-authority-lease m)
+                        (ha-local-last-applied-lsn m))]
+         (or (not= :wal-gap (:ha-follower-degraded-reason m))
+             (not (ha-authority-read-fresh? m now-ms))
+             (not (:ok? lag-check))))))
+
 (defn- maybe-enter-ha-candidate
   [m now-ms]
   (cond
@@ -861,13 +1071,14 @@
               (:ha-authority-membership-hash m)))
     m
 
-    (true? (:ha-clock-skew-paused? m))
-    (assoc m
-           :ha-promotion-last-failure :clock-skew-paused
-           :ha-promotion-failure-details
-           (ha-clock-skew-promotion-failure-details m))
+    (ha-clock-skew-promotion-block-reason m now-ms)
+    (let [reason (ha-clock-skew-promotion-block-reason m now-ms)]
+      (assoc m
+             :ha-promotion-last-failure reason
+             :ha-promotion-failure-details
+             (ha-clock-skew-promotion-failure-details m now-ms)))
 
-    (true? (:ha-follower-degraded? m))
+    (ha-follower-degraded-blocks-promotion? m now-ms)
     (assoc m
            :ha-promotion-last-failure :follower-degraded
            :ha-promotion-failure-details
@@ -1065,9 +1276,12 @@
       (fail-ha-candidate m :lease-not-expired
                          {:lease observed-lease})
 
-      (true? (:ha-clock-skew-paused? m))
-      (fail-ha-candidate m :clock-skew-paused
-                         (ha-clock-skew-promotion-failure-details m))
+      (ha-clock-skew-promotion-block-reason m now-ms)
+      (let [reason (ha-clock-skew-promotion-block-reason m now-ms)]
+        (fail-ha-candidate m reason
+                           (ha-clock-skew-promotion-failure-details
+                            m
+                            now-ms)))
 
       (false? (:ha-authority-read-ok? m))
       (fail-ha-candidate m :authority-read-failed
@@ -1358,6 +1572,8 @@
 
 (def ^:private ha-clock-skew-clear-keys
   [:ha-clock-skew-paused?
+   :ha-clock-skew-refresh-future
+   :ha-clock-skew-refresh-pending?
    :ha-clock-skew-last-check-ms
    :ha-clock-skew-last-observed-ms
    :ha-clock-skew-last-result])
@@ -1807,6 +2023,8 @@
                  :ha-clock-skew-budget-ms clock-skew-budget-ms
                  :ha-clock-skew-hook clock-skew-hook
                  :ha-clock-skew-paused? false
+                 :ha-clock-skew-refresh-future nil
+                 :ha-clock-skew-refresh-pending? false
                  :ha-clock-skew-last-check-ms nil
                  :ha-clock-skew-last-observed-ms nil
                  :ha-clock-skew-last-result nil

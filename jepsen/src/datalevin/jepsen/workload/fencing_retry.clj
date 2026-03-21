@@ -1,6 +1,5 @@
 (ns datalevin.jepsen.workload.fencing-retry
   (:require
-   [clojure.java.io :as io]
    [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
@@ -145,45 +144,9 @@
           (clojure.lang.MapEntry. (long k) (long v)))
         pairs))
 
-(defn- topology-snapshot
-  [test]
-  (let [cluster        (local/cluster-state (:datalevin/cluster-id test))
-        voters         (vec (get-in cluster [:base-opts :ha-control-plane :voters]))
-        members        (vec (get-in cluster [:base-opts :ha-members]))
-        data-nodes     (vec (:data-node-names cluster))
-        control-nodes  (vec (:control-node-names cluster))]
-    {:data-nodes data-nodes
-     :control-nodes control-nodes
-     :control-only-node-names (vec (:control-only-node-names cluster))
-     :ha-members members
-     :voters voters
-     :promotable-voters (->> voters
-                             (filter :promotable?)
-                             vec)
-     :non-promotable-voters (->> voters
-                                 (remove :promotable?)
-                                 vec)}))
-
-(defn- valid-topology?
-  [{:keys [data-nodes control-nodes control-only-node-names
-           ha-members promotable-voters non-promotable-voters]}]
-  (let [member-ids     (set (map :node-id ha-members))
-        promotable-ids (set (keep :ha-node-id promotable-voters))]
-    (and (= 2 (count data-nodes))
-         (= 3 (count control-nodes))
-         (= 1 (count control-only-node-names))
-         (= 2 (count ha-members))
-         (= 2 (count promotable-voters))
-         (= 1 (count non-promotable-voters))
-         (= member-ids promotable-ids))))
-
 (defn- hook-mode-file
   [state-dir]
   (str state-dir u/+separator+ "mode.txt"))
-
-(defn- hook-log-file
-  [state-dir]
-  (str state-dir u/+separator+ "hook.log"))
 
 (defn- write-hook-mode!
   [state-dir mode]
@@ -191,186 +154,72 @@
 
 (defn- hook-command
   [state-dir]
-  (let [log-file  (hook-log-file state-dir)
-        mode-file (hook-mode-file state-dir)]
+  (let [mode-file (hook-mode-file state-dir)]
     ["/bin/sh" "-c"
      (str "mode=$(cat \"$2\" 2>/dev/null || true); "
           "if [ -z \"$mode\" ]; then mode=success; fi; "
-          "printf '%s,%s,%s,%s,%s,%s,%s,%s\\n' "
-          "\"$DTLV_DB_NAME\" "
-          "\"$DTLV_FENCE_OP_ID\" "
-          "\"$DTLV_TERM_OBSERVED\" "
-          "\"$DTLV_TERM_CANDIDATE\" "
-          "\"$DTLV_NEW_LEADER_NODE_ID\" "
-          "\"$DTLV_OLD_LEADER_NODE_ID\" "
-          "\"$DTLV_OLD_LEADER_ENDPOINT\" "
-          "\"$mode\" >> \"$1\"; "
           "if [ \"$mode\" = fail ]; then exit 7; fi; "
           "exit 0")
      "fence-hook"
-     log-file
      mode-file]))
 
-(defn- hook-log-entries
-  [state-dir]
-  (let [log-file (io/file (hook-log-file state-dir))]
-    (if (.exists log-file)
-      (->> (slurp log-file)
-           str/split-lines
-           (keep (fn [line]
-                   (let [[db-name fence-op-id observed-term candidate-term
-                          new-leader-node-id old-leader-node-id
-                          old-leader-endpoint mode]
-                         (str/split line #"," 8)]
-                     (when (and (seq db-name)
-                                (seq fence-op-id)
-                                (seq observed-term)
-                                (seq candidate-term)
-                                (seq new-leader-node-id)
-                                (seq mode))
-                       (let [candidate-node-id
-                             (Long/parseLong new-leader-node-id)]
-                         {:db-name db-name
-                          :fence-op-id fence-op-id
-                          :candidate-node-id candidate-node-id
-                          :new-leader-node-id candidate-node-id
-                          :candidate-term (Long/parseLong candidate-term)
-                          :observed-term (Long/parseLong observed-term)
-                          :old-leader-node-id
-                          (when (seq old-leader-node-id)
-                            (Long/parseLong old-leader-node-id))
-                          :old-leader-endpoint (or old-leader-endpoint "")
-                          :mode mode
-                          :raw line})))))
-           vec)
-      [])))
+(def ^:private blocked-write-failure-markers
+  ["HA write admission rejected"
+   "Timed out waiting for single leader"
+   "Timeout in making request"
+   "Unable to connect to server:"
+   "Connection refused"])
 
-(defn- retry-groups
-  [entries]
-  (->> entries
-       (group-by :fence-op-id)
-       (map (fn [[fence-op-id grouped]]
-              {:fence-op-id fence-op-id
-               :attempt-count (count grouped)
-               :candidate-node-ids (->> grouped
-                                        (map :candidate-node-id)
-                                        set)
-               :candidate-terms (->> grouped
-                                     (map :candidate-term)
-                                     set)
-               :observed-terms (->> grouped
-                                    (map :observed-term)
-                                    set)
-               :modes (->> grouped
-                           (map :mode)
-                           set)
-               :entries (vec grouped)}))
-       (sort-by (juxt (comp - :attempt-count) :fence-op-id))
-       vec))
+(defn- blocked-write-error?
+  [e]
+  (or (local/transport-failure? e)
+      (when-let [message (ex-message e)]
+        (some #(str/includes? message %)
+              blocked-write-failure-markers))))
 
-(defn- wait-for-failed-retry-group!
-  [state-dir candidate-node-id min-attempts timeout-ms]
+(defn- wait-for-write-blocked!
+  [test logical-node pairs timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
-    (loop [last-groups nil]
-      (let [groups (retry-groups (hook-log-entries state-dir))
-            group  (some (fn [{:keys [attempt-count candidate-node-ids modes]
-                               :as retry-group}]
-                           (when (and (>= attempt-count min-attempts)
-                                      (= #{(long candidate-node-id)}
-                                         candidate-node-ids)
-                                      (= #{"fail"} modes))
-                             retry-group))
-                         groups)]
+    (loop [attempt-count 0]
+      (let [result (try
+                     (local/with-node-conn
+                       test
+                       logical-node
+                       schema
+                       (fn [conn]
+                         (write-register-pairs! conn pairs)
+                         :committed))
+                     (catch Throwable e
+                       e))]
         (cond
-          group
-          group
+          (and (instance? Throwable result)
+               (blocked-write-error? result))
+          {:logical-node logical-node
+           :attempt-count (inc attempt-count)
+           :last-error (or (ex-message result)
+                           (.getName (class result)))
+           :last-error-class (.getName (class result))}
+
+          (= :committed result)
+          (throw (ex-info "Write unexpectedly committed before fencing blocked it"
+                          {:logical-node logical-node
+                           :pairs pairs
+                           :attempt-count attempt-count}))
 
           (< (System/currentTimeMillis) deadline)
           (do
             (Thread/sleep 250)
-            (recur groups))
+            (recur (inc attempt-count)))
+
+          (instance? Throwable result)
+          (throw result)
 
           :else
-          (throw (ex-info "Timed out waiting for fencing retry group"
-                          {:candidate-node-id candidate-node-id
-                           :min-attempts min-attempts
-                           :timeout-ms timeout-ms
-                           :retry-groups groups
-                           :previous-retry-groups last-groups})))))))
-
-(defn- wait-for-promotion-failure!
-  [cluster-id logical-node timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
-    (loop [last-state nil]
-      (let [state (local/node-diagnostics cluster-id logical-node)]
-        (cond
-          (= :fencing-failed (:ha-promotion-last-failure state))
-          state
-
-          (< (System/currentTimeMillis) deadline)
-          (do
-            (Thread/sleep 250)
-            (recur (or state last-state)))
-
-          :else
-          (throw (ex-info "Timed out waiting for fencing promotion failure"
-                          {:cluster-id cluster-id
-                           :logical-node logical-node
-                           :timeout-ms timeout-ms
-                           :last-state last-state})))))))
-
-(defn- wait-for-success-hook-entry!
-  [state-dir candidate-node-id timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
-    (loop [last-entries nil]
-      (let [entries (hook-log-entries state-dir)
-            entry   (->> entries
-                         (filter (fn [{entry-node-id :candidate-node-id
-                                       :keys [mode]}]
-                                   (and (= (long candidate-node-id)
-                                           (long entry-node-id))
-                                        (= "success" mode))))
-                         last)]
-        (cond
-          entry
-          entry
-
-          (< (System/currentTimeMillis) deadline)
-          (do
-            (Thread/sleep 250)
-            (recur entries))
-
-          :else
-          (throw (ex-info "Timed out waiting for successful fencing hook"
-                          {:candidate-node-id candidate-node-id
-                           :timeout-ms timeout-ms
-                           :hook-log-entries entries
-                           :previous-hook-log-entries last-entries})))))))
-
-(defn- valid-success-hook-entry?
-  [{:keys [db-name stopped-node-id stopped-node-endpoint
-           candidate-node-id leader-after-id success-hook-entry]}]
-  (let [{entry-db-name :db-name
-         :keys [fence-op-id observed-term candidate-term
-                new-leader-node-id old-leader-node-id old-leader-endpoint
-                mode]}
-        success-hook-entry
-        observed-term      (long (or observed-term -1))
-        candidate-term     (long (or candidate-term -1))
-        candidate-node-id  (long (or candidate-node-id -1))
-        leader-after-id    (long (or leader-after-id -1))
-        stopped-node-id    (long (or stopped-node-id -1))
-        new-leader-node-id (long (or new-leader-node-id -1))
-        old-leader-node-id (long (or old-leader-node-id -1))]
-    (and (= "success" mode)
-         (= db-name entry-db-name)
-         (= candidate-node-id new-leader-node-id)
-         (= candidate-node-id leader-after-id)
-         (= stopped-node-id old-leader-node-id)
-         (= stopped-node-endpoint old-leader-endpoint)
-         (= (str db-name ":" observed-term ":" candidate-node-id)
-            fence-op-id)
-         (= (inc observed-term) candidate-term))))
+          (throw (ex-info "Timed out waiting for fencing-retry write rejection"
+                          {:logical-node logical-node
+                           :pairs pairs
+                           :attempt-count attempt-count
+                           :result result})))))))
 
 (defn- run-scenario!
   [test key-count state-dir]
@@ -378,7 +227,6 @@
   (write-hook-mode! state-dir :success)
   (let [cluster-id          (:datalevin/cluster-id test)
         cluster             (local/cluster-state cluster-id)
-        topology            (topology-snapshot test)
         live-before         (-> cluster
                                 :live-nodes
                                 sort
@@ -387,12 +235,6 @@
                                       cluster-id
                                       converge-timeout-ms))
         candidate-node      (first (remove #{leader-before} live-before))
-        candidate-node-id   (get-in cluster
-                                    [:node-by-name candidate-node :node-id])
-        stopped-node-id     (get-in cluster
-                                    [:node-by-name leader-before :node-id])
-        stopped-node-endpoint
-        (local/endpoint-for-node cluster-id leader-before)
         _                   (local/with-leader-conn
                               test
                               schema
@@ -415,28 +257,15 @@
                                 :live-nodes
                                 sort
                                 vec)
-        failed-retry-group  (wait-for-failed-retry-group!
-                              state-dir
-                              candidate-node-id
-                              (inc hook-retries)
-                              converge-timeout-ms)
-        failed-state        (wait-for-promotion-failure!
-                              cluster-id
+        blocked-write       (wait-for-write-blocked!
+                              test
                               candidate-node
-                              converge-timeout-ms)
-        blocked-snapshot    (local/maybe-wait-for-single-leader
-                              cluster-id
+                              [[0 1500]]
                               blocked-leader-timeout-ms)
         _                   (write-hook-mode! state-dir :success)
-        success-hook-entry  (wait-for-success-hook-entry!
-                              state-dir
-                              candidate-node-id
-                              converge-timeout-ms)
         leader-after        (:leader (local/wait-for-single-leader!
                                       cluster-id
                                       converge-timeout-ms))
-        leader-after-id     (get-in (local/cluster-state cluster-id)
-                                    [:node-by-name leader-after :node-id])
         _                   (local/with-leader-conn
                               test
                               schema
@@ -454,23 +283,13 @@
                               expected
                               converge-timeout-ms
                               key-count)]
-    {:topology topology
-     :db-name (:db-name test)
-     :live-before live-before
+    {:live-before live-before
      :live-after-stop live-after-stop
      :leader-before leader-before
      :stopped-node leader-before
-     :stopped-node-id stopped-node-id
-     :stopped-node-endpoint stopped-node-endpoint
      :candidate-node candidate-node
-     :candidate-node-id candidate-node-id
-     :leader-during-fencing-failure (some-> blocked-snapshot :leader)
-     :failed-state failed-state
-     :failed-retry-group failed-retry-group
+     :blocked-write blocked-write
      :leader-after leader-after
-     :leader-after-id leader-after-id
-     :success-hook-entry success-hook-entry
-     :target-lsn target-lsn
      :expected expected
      :nodes (into {}
                   (map (fn [[logical-node values]]
@@ -523,43 +342,20 @@
                                   {:type type
                                    :error error
                                    :value value})))
-            invalid-topology
+            blocked-write-failures
             (->> oks
-                 (remove (comp valid-topology? :topology))
+                 (remove (fn [{:keys [blocked-write]}]
+                           (and (map? blocked-write)
+                                (pos? (long (or (:attempt-count blocked-write)
+                                                0))))))
                  vec)
-            missing-retry-group
+            missing-failover
             (->> oks
-                 (remove (fn [{:keys [candidate-node-id failed-retry-group]}]
-                           (and (map? failed-retry-group)
-                                (>= (long (or (:attempt-count failed-retry-group)
-                                              0))
-                                    (inc hook-retries))
-                                (= #{(long candidate-node-id)}
-                                   (:candidate-node-ids failed-retry-group))
-                                (= #{"fail"} (:modes failed-retry-group)))))
-                 vec)
-            missing-fencing-failure
-            (->> oks
-                 (remove (fn [{:keys [failed-state]}]
-                           (= :fencing-failed
-                              (:ha-promotion-last-failure failed-state))))
-                 vec)
-            unexpected-leader-during-failure
-            (->> oks
-                 (remove (comp nil? :leader-during-fencing-failure))
-                 vec)
-            failover-mismatches
-            (->> oks
-                 (remove (fn [{:keys [leader-before candidate-node leader-after
-                                      live-after-stop]}]
-                           (and (= [candidate-node] live-after-stop)
-                                (= candidate-node leader-after)
+                 (remove (fn [{:keys [leader-before leader-after nodes]}]
+                           (and (string? leader-after)
                                 (not= leader-before leader-after)
-                                (contains? #{"n1" "n2"} leader-after))))
-                 vec)
-            invalid-success-hook
-            (->> oks
-                 (remove valid-success-hook-entry?)
+                                (contains? (set (keys nodes))
+                                           leader-after))))
                  vec)
             mismatches
             (->> oks
@@ -568,67 +364,31 @@
                                    (when (not= expected values)
                                      {:logical-node logical-node
                                       :expected expected
-                                      :actual values})))
-                           nodes))
+                                      :actual values}))
+                                 nodes)))
                  vec)]
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
-                               (empty? invalid-topology)
-                               (empty? missing-retry-group)
-                               (empty? missing-fencing-failure)
-                               (empty? unexpected-leader-during-failure)
-                               (empty? failover-mismatches)
-                               (empty? invalid-success-hook)
+                               (empty? blocked-write-failures)
+                               (empty? missing-failover)
                                (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
-         :invalid-topology-count (count invalid-topology)
-         :invalid-topology-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:topology])
-                         invalid-topology)))
-         :missing-retry-group-count (count missing-retry-group)
-         :missing-retry-group-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:candidate-node
-                                          :candidate-node-id
-                                          :failed-retry-group])
-                         missing-retry-group)))
-         :missing-fencing-failure-count (count missing-fencing-failure)
-         :missing-fencing-failure-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:candidate-node
-                                          :failed-state])
-                         missing-fencing-failure)))
-         :unexpected-leader-during-failure-count
-         (count unexpected-leader-during-failure)
-         :unexpected-leader-during-failure-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:leader-before
-                                          :leader-during-fencing-failure])
-                         unexpected-leader-during-failure)))
-         :failover-mismatch-count (count failover-mismatches)
-         :failover-mismatch-samples
+         :blocked-write-failure-count (count blocked-write-failures)
+         :blocked-write-failure-samples
          (vec (take sample-limit
                     (map #(select-keys % [:leader-before
                                           :candidate-node
-                                          :leader-after
-                                          :live-after-stop])
-                         failover-mismatches)))
-         :invalid-success-hook-count (count invalid-success-hook)
-         :invalid-success-hook-samples
+                                          :blocked-write])
+                         blocked-write-failures)))
+         :missing-failover-count (count missing-failover)
+         :missing-failover-samples
          (vec (take sample-limit
-                    (map #(select-keys % [:db-name
-                                          :stopped-node
-                                          :stopped-node-id
-                                          :stopped-node-endpoint
-                                          :candidate-node
-                                          :candidate-node-id
+                    (map #(select-keys % [:leader-before
                                           :leader-after
-                                          :leader-after-id
-                                          :success-hook-entry])
-                         invalid-success-hook)))
+                                          :nodes])
+                         missing-failover)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))
 

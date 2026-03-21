@@ -393,6 +393,7 @@
   hrt/ha-renew-merge-excluded-keys)
 (def ^:private ha-renew-state-patch hrt/ha-renew-state-patch)
 (def ^:private apply-state-patch hrt/apply-state-patch)
+(def ^:private same-ha-runtime-context? hrt/same-ha-runtime-context?)
 (def ^:private same-ha-runtime-state? hrt/same-ha-runtime-state?)
 (def ^:private merge-ha-follower-local-side-effect-patch
   hrt/merge-ha-follower-local-side-effect-patch)
@@ -400,6 +401,8 @@
   hrt/merge-ha-follower-side-effect-patch)
 (def ^:private merge-ha-renew-state-patch
   hrt/merge-ha-renew-state-patch)
+(def ^:private merge-ha-renew-promotion-state-patch
+  hrt/merge-ha-renew-promotion-state-patch)
 (def ^:private persist-ha-follower-side-effects!
   hrt/persist-ha-follower-side-effects!)
 
@@ -606,10 +609,86 @@
       (finally
         (.release lock)))))
 
+(defn- with-ha-follower-replay-quiesced
+  [^Server server db-name f]
+  (let [^Semaphore lock (get-lock server db-name)]
+    (.acquire lock)
+    (try
+      (locking (db-write-admission-lock server db-name)
+        (f))
+      (finally
+        (.release lock)))))
+
 (def ^:private ha-loop-sleep-ms hrt/ha-loop-sleep-ms)
 (def ^:private ha-follower-loop-sleep-ms hrt/ha-follower-loop-sleep-ms)
 (def ^:private sleep-ha-loop! hrt/sleep-ha-loop!)
 (def ^:private ha-loop-error-backoff! hrt/ha-loop-error-backoff!)
+
+(defn- ha-renew-promotion-result?
+  [expected-state next-state]
+  (and (not (contains? #{:leader :demoting} (:ha-role expected-state)))
+       (contains? #{:leader :demoting} (:ha-role next-state))
+       (= (:ha-node-id next-state)
+          (:ha-authority-owner-node-id next-state))))
+
+(defn- publish-ha-renew-state!
+  [^Server server db-name expected-state next-state ^AtomicBoolean running?]
+  (let [renew-patch (ha-renew-state-patch expected-state next-state)
+        promotion-result? (ha-renew-promotion-result? expected-state next-state)
+        publish!
+        (fn []
+          (let [{:keys [updated? state]}
+                (replace-db-state-if-current
+                 server
+                 db-name
+                 expected-state
+                 #(identical? running? (:ha-renew-loop-running? %))
+                 next-state)
+                state
+                (if (and (not updated?) renew-patch)
+                  (:state
+                   (transform-db-state-when
+                    server
+                    db-name
+                    #(identical? running? (:ha-renew-loop-running? %))
+                    #(merge-ha-renew-state-patch
+                      %
+                      expected-state
+                      renew-patch)))
+                  state)
+                state
+                (if (and promotion-result?
+                         renew-patch
+                         (or (nil? state)
+                             (not (contains? #{:leader :demoting}
+                                             (:ha-role state)))))
+                  (:state
+                   (transform-db-state-when
+                    server
+                    db-name
+                    #(same-ha-runtime-context? % expected-state)
+                    #(merge-ha-renew-promotion-state-patch
+                      %
+                      expected-state
+                      renew-patch)))
+                  state)]
+            (when (and promotion-result?
+                       (or (nil? state)
+                           (not (contains? #{:leader :demoting}
+                                           (:ha-role state)))))
+              (log/warn "HA renew promotion could not publish local leader state"
+                        {:db-name db-name
+                         :expected-role (:ha-role expected-state)
+                         :next-role (:ha-role next-state)
+                         :state-role (:ha-role state)}))
+            state))]
+    (if (and promotion-result?
+             (= :follower (:ha-role expected-state)))
+      ;; Followers and leaders share the same underlying store handle. Serialize
+      ;; follower replay and follower->leader publication so replay cannot keep
+      ;; mutating the store after local promotion publishes.
+      (with-ha-follower-replay-quiesced server db-name publish!)
+      (publish!))))
 
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
@@ -627,26 +706,12 @@
               ;; Keep renew work outside `update-db` so HA probes and peer/server
               ;; operations do not block on control-plane I/O.
               (let [next-state (ha-renew-step db-name m)
-                    renew-patch (ha-renew-state-patch m next-state)
-                    {:keys [updated? state]}
-                    (replace-db-state-if-current
-                     server
-                     db-name
-                     m
-                     #(identical? running? (:ha-renew-loop-running? %))
-                     next-state)
-                    state
-                    (if (and (not updated?) renew-patch)
-                      (:state
-                       (transform-db-state-when
-                        server
-                        db-name
-                        #(identical? running? (:ha-renew-loop-running? %))
-                        #(merge-ha-renew-state-patch
-                          %
-                          m
-                          renew-patch)))
-                      state)]
+                    state (publish-ha-renew-state!
+                           server
+                           db-name
+                           m
+                           next-state
+                           running?)]
                 (if (or (nil? state)
                         (nil? (:ha-authority state))
                         (not (identical? running?
@@ -895,18 +960,49 @@
     (or (and db-name (udf-write-admission-error db-name m))
         (dha/ha-write-admission-error (.-dbs server) message))))
 
+(defn- leader-authority-state?
+  [m]
+  (and (= :leader (:ha-role m))
+       (satisfies? ctrl/ILeaseAuthority (:ha-authority m))))
+
+(defn- refresh-ha-write-commit-state!
+  [^Server server db-name]
+  (let [m (get (.-dbs server) db-name)]
+    (if-not (leader-authority-state? m)
+      m
+      (let [next-state (dha/refresh-ha-authority-state db-name m)
+            refresh-patch (hrt/ha-authority-refresh-state-patch
+                           m
+                           next-state)
+            {:keys [updated? state]}
+            (replace-db-state-if-current
+             server
+             db-name
+             m
+             leader-authority-state?
+             next-state)]
+        (if (or updated?
+                (nil? refresh-patch))
+          state
+          (:state
+           (transform-db-state-when
+            server
+            db-name
+            #(and (leader-authority-state? %)
+                  (hrt/same-ha-runtime-state?
+                   %
+                   m
+                   :ha-renew-loop-running?))
+            #(hrt/merge-ha-authority-refresh-state-patch
+              %
+              m
+              refresh-patch))))))))
+
 (defn- ha-write-commit-admission!
   [^Server server message]
   (let [db-name (nth (:args message) 0 nil)]
     (when db-name
-      (update-db
-        server
-        db-name
-        (fn [m]
-          (if (and (= :leader (:ha-role m))
-                   (satisfies? ctrl/ILeaseAuthority (:ha-authority m)))
-            (dha/refresh-ha-authority-state db-name m)
-            m)))))
+      (refresh-ha-write-commit-state! server db-name)))
   (when-let [err (ha-write-admission-error server message)]
     (u/raise "HA write admission rejected" err)))
 

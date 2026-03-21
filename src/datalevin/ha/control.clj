@@ -43,6 +43,8 @@
     "CAS lease acquisition attempt using observed lease/version.")
   (renew-lease [this req]
     "Owner + term guarded lease renew.")
+  (release-lease [this req]
+    "Owner + term guarded lease release.")
   (read-membership-hash [this]
     "Read authoritative membership hash (nil when unset).")
   (init-membership-hash! [this membership-hash]
@@ -240,6 +242,12 @@
   (require-positive-int! lease-timeout-ms :lease-timeout-ms)
   (require-integer! now-ms :now-ms))
 
+(defn- validate-release-request!
+  [{:keys [db-identity leader-node-id term]}]
+  (require-non-blank-string! db-identity :db-identity)
+  (require-positive-int! leader-node-id :leader-node-id)
+  (require-positive-int! term :term))
+
 (defn- validate-clock-skew-budget!
   [clock-skew-budget-ms where]
   (when (some? clock-skew-budget-ms)
@@ -412,6 +420,16 @@
              :leader-last-applied-lsn leader-last-applied-lsn
              :now-ms now-ms}}
       clock-skew-budget-ms)))
+
+  (release-lease [_ {:keys [db-identity leader-node-id term] :as req}]
+    (ensure-running! running-v)
+    (validate-release-request! req)
+    (apply-state-command!
+     state
+     {:op :release-lease
+      :req {:db-identity db-identity
+            :leader-node-id leader-node-id
+            :term term}}))
 
   (read-membership-hash [_]
     (ensure-running! running-v)
@@ -617,6 +635,50 @@
                   :term term
                   :authority-now-ms authority-now-ms}}))))
 
+(defn- apply-release-transition
+  [state {:keys [db-identity leader-node-id term] :as req}]
+  (validate-release-request! req)
+  (let [{:keys [lease version]} (lease-entry state db-identity)
+        current-version (long version)]
+    (cond
+      (nil? lease)
+      {:state state
+       :result {:ok? true
+                :released? false
+                :reason :missing-lease
+                :version current-version}}
+
+      (not= db-identity (:db-identity lease))
+      {:state state
+       :result {:ok? false
+                :reason :db-identity-mismatch
+                :lease lease
+                :version current-version}}
+
+      (not= leader-node-id (:leader-node-id lease))
+      {:state state
+       :result {:ok? false
+                :reason :owner-mismatch
+                :lease lease
+                :version current-version}}
+
+      (not= term (:term lease))
+      {:state state
+       :result {:ok? false
+                :reason :term-mismatch
+                :lease lease
+                :version current-version}}
+
+      :else
+      (let [new-version (inc current-version)]
+        {:state (assoc-in state [:leases db-identity]
+                          {:lease nil
+                           :version new-version})
+         :result {:ok? true
+                  :released? true
+                  :lease nil
+                  :version new-version}}))))
+
 (defn- apply-init-membership-hash-transition
   [state membership-hash]
   (require-non-blank-string! membership-hash :membership-hash)
@@ -678,6 +740,10 @@
                            (:req cmd)
                            authority-now-ms
                            clock-skew-budget-ms))
+    :release-lease       (attach-state-snapshot-to-result
+                          (apply-release-transition
+                           state
+                           (:req cmd)))
     :init-membership-hash (apply-init-membership-hash-transition
                            state (:membership-hash cmd))
     :read-state          (apply-read-state-transition state (:db-identity cmd))
@@ -1447,6 +1513,8 @@
             (if-let [e (:error step)]
               (let [status (fsm-apply-error-status e)]
                 (log/error e "HA control JRaft FSM apply failed")
+                (when (instance? CommandClosure done)
+                  (run-command-closure! done status))
                 (.setErrorAndRollback iter 1 status))
               (do
                 (reset! state-atom (:state step))
@@ -1633,6 +1701,12 @@
     (lease/validate-lease-key! group-id (:db-identity req))
     (submit-command! this {:op :renew-lease
                            :timeout-ms (:timeout-ms req)
+                           :req req}))
+
+  (release-lease [this req]
+    (ensure-running! running-v)
+    (lease/validate-lease-key! group-id (:db-identity req))
+    (submit-command! this {:op :release-lease
                            :req req}))
 
   (read-membership-hash [this]

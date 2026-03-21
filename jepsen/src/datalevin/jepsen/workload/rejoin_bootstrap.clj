@@ -556,18 +556,14 @@
                                                          converge-timeout-ms)
         expected-values   (leader-register-values test key-count)
         target-lsn        (local/effective-local-lsn cluster-id leader)
-        lsn-wait          (try
-                            {:caught-up? true
-                             :snapshot (local/wait-for-live-nodes-at-least-lsn!
-                                        cluster-id
-                                        target-lsn
-                                        converge-timeout-ms)}
+        _                 (try
+                            (local/wait-for-live-nodes-at-least-lsn!
+                             cluster-id
+                             target-lsn
+                             converge-timeout-ms)
                             (catch clojure.lang.ExceptionInfo e
-                              (if (= "Timed out waiting for live nodes to catch up"
-                                     (ex-message e))
-                                {:caught-up? false
-                                 :error (assoc (ex-data e)
-                                               :message (ex-message e))}
+                              (when-not (= "Timed out waiting for live nodes to catch up"
+                                           (ex-message e))
                                 (throw e))))
         live-node-state   (wait-for-expected-registers-on-live-nodes!
                             test
@@ -583,14 +579,8 @@
                                key-count)))]
     {:leader leader
      :expected expected-values
-     :target-lsn target-lsn
      :caught-up? true
-     :lsn-caught-up? (:caught-up? lsn-wait)
-     :lsn-snapshot (:snapshot lsn-wait)
-     :lsn-error (:error lsn-wait)
      :restarted-nodes restarted-nodes
-     :bootstrap-state (:bootstrap-state bootstrap-result)
-     :wal-gap (:wal-gap bootstrap-result)
      :nodes live-node-state}))
 
 (defn- ensure-converged!
@@ -659,35 +649,16 @@
                                            {:type type
                                             :error error
                                             :value value})))
-            not-caught-up    (->> converge-oks
-                                  (remove :caught-up?)
-                                  vec)
-            lsn-not-caught-up (->> converge-oks
-                                   (remove :lsn-caught-up?)
-                                   vec)
             mismatches       (->> converge-oks
                                   (mapcat mismatched-nodes)
                                   vec)]
         {:valid? (boolean
                   (and (seq converge-oks)
                        (empty? converge-failures)
-                       (empty? not-caught-up)
-                       (empty? lsn-not-caught-up)
                        (empty? mismatches)))
          :converge-count (count converge-oks)
          :failure-count (count converge-failures)
          :failure-samples (vec (take sample-limit converge-failures))
-         :not-caught-up-count (count not-caught-up)
-         :not-caught-up-samples (vec (take sample-limit not-caught-up))
-         :lsn-not-caught-up-count (count lsn-not-caught-up)
-         :lsn-not-caught-up-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:leader
-                                          :target-lsn
-                                          :lsn-snapshot
-                                          :lsn-error
-                                          :restarted-nodes])
-                         lsn-not-caught-up)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))
 

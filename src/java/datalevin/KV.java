@@ -1125,12 +1125,32 @@ public final class KV extends HandleResource {
                                       Object vType,
                                       Integer limit,
                                       Integer offset) {
+        if (limit != null && limit <= 0) {
+            return List.of();
+        }
+        Object normalizedKRange = rangeArg(kRange);
+        Object normalizedKType = typeArg(kType);
+        Object normalizedVRange = rangeArg(vRange);
+        Object normalizedVType = typeArg(vType);
+        if (useBoundedPage(limit, offset)) {
+            ArrayList<Object> results = new ArrayList<>(initialPageCapacity(limit));
+            runListRangeFnOp("visit-list-range",
+                             listName,
+                             ClojureFns.pagedEntries(normalizedOffset(offset),
+                                                     normalizedLimit(limit),
+                                                     results),
+                             normalizedKRange,
+                             normalizedKType,
+                             normalizedVRange,
+                             normalizedVType);
+            return results;
+        }
         return page(ResultSupport.sequence(runListRangeOp("list-range",
                                                          listName,
-                                                         rangeArg(kRange),
-                                                         typeArg(kType),
-                                                         rangeArg(vRange),
-                                                         typeArg(vType))),
+                                                         normalizedKRange,
+                                                         normalizedKType,
+                                                         normalizedVRange,
+                                                         normalizedVType)),
                     limit,
                     offset);
     }
@@ -1319,10 +1339,25 @@ public final class KV extends HandleResource {
                                      Object vType,
                                      Integer limit,
                                      Integer offset) {
+        if (limit != null && limit <= 0) {
+            return List.of();
+        }
         Object normalizedKType = typeArg(kType);
         Object normalizedVType = typeArg(vType);
+        Object normalizedKRange = typedRangeArg(kRange, normalizedKType);
+        if (useBoundedPage(limit, offset)) {
+            ArrayList<Object> results = new ArrayList<>(initialPageCapacity(limit));
+            runVisitRange(dbi,
+                          ClojureFns.pagedEntries(normalizedOffset(offset),
+                                                  normalizedLimit(limit),
+                                                  results),
+                          normalizedKRange,
+                          normalizedKType,
+                          normalizedVType);
+            return results;
+        }
         return page(ResultSupport.sequence(runGetRange(dbi,
-                                                       typedRangeArg(kRange, normalizedKType),
+                                                       normalizedKRange,
                                                        normalizedKType,
                                                        normalizedVType)),
                     limit,
@@ -1334,9 +1369,24 @@ public final class KV extends HandleResource {
     }
 
     private List<?> keyRangeInternal(String dbi, Object kRange, Object kType, Integer limit, Integer offset) {
+        if (limit != null && limit <= 0) {
+            return List.of();
+        }
+        Object normalizedKRange = rangeArg(kRange);
+        Object normalizedKType = typeArg(kType);
+        if (useBoundedPage(limit, offset)) {
+            ArrayList<Object> results = new ArrayList<>(initialPageCapacity(limit));
+            runVisitKeyRange(dbi,
+                             ClojureFns.pagedValues(normalizedOffset(offset),
+                                                    normalizedLimit(limit),
+                                                    results),
+                             normalizedKRange,
+                             normalizedKType);
+            return results;
+        }
         return page(ResultSupport.sequence(runKeyRange(dbi,
-                                                       rangeArg(kRange),
-                                                       typeArg(kType))),
+                                                       normalizedKRange,
+                                                       normalizedKType)),
                     limit,
                     offset);
     }
@@ -1388,6 +1438,21 @@ public final class KV extends HandleResource {
 
     private void runVisitList(String listName, Object visitor, Object key, Object kType, Object vType) {
         ClojureRuntime.core("visit-list", resource(), listName, visitor, key, kType, vType, false);
+    }
+
+    private void runVisitRange(String dbi,
+                               Object visitor,
+                               Object kRange,
+                               Object kType,
+                               Object vType) {
+        ClojureRuntime.core("visit", resource(), dbi, visitor, kRange, kType, vType, false);
+    }
+
+    private void runVisitKeyRange(String dbi,
+                                  Object visitor,
+                                  Object kRange,
+                                  Object kType) {
+        ClojureRuntime.core("visit-key-range", resource(), dbi, visitor, kRange, kType, false);
     }
 
     private Object runListRangeOp(String op,

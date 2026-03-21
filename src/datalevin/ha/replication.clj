@@ -183,6 +183,9 @@
         batch-threshold-reached?
         (>= (long next-batch-count)
             (long persist-every-batches))]
+    ;; `:ha/local-applied-lsn` is a conservative follower floor used for
+    ;; promotion/rejoin decisions. The exact replayed payload watermark is
+    ;; tracked separately via `:wal/local-payload-lsn`.
     (if (and (> (long applied-lsn) persisted-lsn)
              (or interval-elapsed?
                  batch-threshold-reached?))
@@ -2003,6 +2006,26 @@
                       :record-term record-term
                       :authority-term authority-term})))))))
 
+(defn- advance-store-max-tx-to-target!
+  ([store target-max-tx]
+   (advance-store-max-tx-to-target!
+    #(long (i/max-tx store))
+    #(i/advance-max-tx store)
+    target-max-tx))
+  ([read-max-tx! advance-max-tx! target-max-tx]
+   (let [target-max-tx (long target-max-tx)]
+     (loop [cur (long (read-max-tx!))]
+       (when (< cur target-max-tx)
+         (advance-max-tx!)
+         (let [next-cur (long (read-max-tx!))]
+           (when (<= next-cur cur)
+             (u/raise "HA follower max-tx sync failed to make progress"
+                      {:error :ha/follower-max-tx-stalled
+                       :current-max-tx cur
+                       :next-max-tx next-cur
+                       :target-max-tx target-max-tx}))
+           (recur next-cur)))))))
+
 (defn ^:redef apply-ha-follower-txlog-record!
   [m record]
   (let [store       (:store m)
@@ -2112,11 +2135,9 @@
                                                  (integer? v))
                                         (long v))))
                               last)]
-            (let [target-max-tx (long target-max-tx)]
-              (loop [cur (long (i/max-tx (:store next-state)))]
-                (when (< cur target-max-tx)
-                  (i/advance-max-tx (:store next-state))
-                  (recur (long (i/max-tx (:store next-state)))))))))
+            (advance-store-max-tx-to-target!
+             (:store next-state)
+             (long target-max-tx))))
         next-state)
 
       :else

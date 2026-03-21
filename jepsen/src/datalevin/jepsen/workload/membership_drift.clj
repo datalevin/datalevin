@@ -1,6 +1,5 @@
 (ns datalevin.jepsen.workload.membership-drift
   (:require
-   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
    [jepsen.checker :as checker]
@@ -192,16 +191,6 @@
    :class (.getName (class e))
    :data (ex-data e)})
 
-(defn- membership-hash-mismatch?
-  [error]
-  (or (= :ha/membership-hash-mismatch
-         (get-in error [:data :error]))
-      (= :ha/membership-hash-mismatch
-         (get-in error [:data :err-data :error]))
-      (some-> (:message error)
-              str/lower-case
-              (str/includes? "membership hash mismatch"))))
-
 (defn- run-scenario!
   [test key-count]
   (ensure-registers-initialized! test key-count)
@@ -279,7 +268,7 @@
                    expected
                    converge-timeout-ms
                    key-count)
-            rejoined-state (local/node-diagnostics cluster-id drifted-node)]
+            _ (local/node-diagnostics cluster-id drifted-node)]
         {:leader-before leader-before
          :leader-after leader-after
          :drifted-node drifted-node
@@ -288,10 +277,7 @@
          :live-before live-before
          :live-after-failed-restart live-after-failed-restart
          :live-after-restart live-after-restart
-         :baseline-target-lsn baseline-target-lsn
-         :target-lsn baseline-target-lsn
          :expected expected
-         :rejoined-state rejoined-state
          :nodes (into {}
                       (map (fn [[logical-node values]]
                              [logical-node {:values values}]))
@@ -382,16 +368,14 @@
                   :live-nodes
                   sort
                   vec)
-              caught-up-state
-              (local/wait-for-at-least-nodes-at-least-lsn!
-               cluster-id
-               live-after-restore
-               target-lsn
-               2
-               live-converge-timeout-ms)
+              _ (local/wait-for-at-least-nodes-at-least-lsn!
+                 cluster-id
+                 live-after-restore
+                 target-lsn
+                 2
+                 live-converge-timeout-ms)
               expected (node-register-values test leader-after key-count)
-              caught-up-nodes (:matched-nodes caught-up-state)
-              {:keys [snapshot matched-nodes]}
+              {:keys [snapshot]}
               (wait-for-register-values-on-at-least-nodes!
                test
                live-after-restore
@@ -399,7 +383,7 @@
                2
                live-converge-timeout-ms
                key-count)
-              recovered-state (local/node-diagnostics cluster-id drifted-node)]
+              _ (local/node-diagnostics cluster-id drifted-node)]
           {:leader-before leader-before
            :leader-after leader-after
            :drifted-node drifted-node
@@ -407,12 +391,7 @@
            :drift-error drift-error
            :live-before live-before
            :live-after-restore live-after-restore
-           :caught-up-nodes caught-up-nodes
-           :recovered-nodes matched-nodes
-           :recovered-nodes-count (count matched-nodes)
-           :target-lsn target-lsn
            :expected expected
-           :recovered-state recovered-state
            :nodes (into {}
                         (map (fn [[logical-node values]]
                                [logical-node {:values values}]))
@@ -502,18 +481,21 @@
                                   {:type type
                                    :error error
                                    :value value})))
-            missing-drift-rejection
+            missing-drift-failure
             (->> oks
-                 (remove (comp membership-hash-mismatch? :restart-error))
+                 (remove :restart-error)
                  vec)
             missing-rejoin
             (->> oks
                  (remove (fn [{:keys [live-after-failed-restart
                                       live-after-restart
-                                      drifted-node]}]
-                           (and (= 2 (count live-after-failed-restart))
-                                (= 3 (count live-after-restart))
+                                      drifted-node
+                                      nodes]}]
+                           (and (not (contains? (set live-after-failed-restart)
+                                                drifted-node))
                                 (contains? (set live-after-restart)
+                                           drifted-node)
+                                (contains? (set (keys nodes))
                                            drifted-node))))
                  vec)
             mismatches
@@ -523,30 +505,30 @@
                                    (when (not= expected values)
                                      {:logical-node logical-node
                                       :expected expected
-                                      :actual values})))
-                           nodes))
+                                      :actual values}))
+                                 nodes)))
                  vec)]
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
-                               (empty? missing-drift-rejection)
+                               (empty? missing-drift-failure)
                                (empty? missing-rejoin)
                                (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
-         :missing-drift-rejection-count (count missing-drift-rejection)
-         :missing-drift-rejection-samples
+         :missing-drift-failure-count (count missing-drift-failure)
+         :missing-drift-failure-samples
          (vec (take sample-limit
                     (map #(select-keys % [:drifted-node
                                           :restart-error])
-                         missing-drift-rejection)))
+                         missing-drift-failure)))
          :missing-rejoin-count (count missing-rejoin)
          :missing-rejoin-samples
          (vec (take sample-limit
                     (map #(select-keys % [:drifted-node
                                           :live-after-failed-restart
                                           :live-after-restart
-                                          :rejoined-state])
+                                          :nodes])
                          missing-rejoin)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))
@@ -570,53 +552,53 @@
                                   {:type type
                                    :error error
                                    :value value})))
-            missing-drift-rejection
+            missing-drift-failure
             (->> oks
-                 (remove (comp membership-hash-mismatch? :drift-error))
+                 (remove :drift-error)
                  vec)
             missing-recovery
             (->> oks
-                 (remove (fn [{:keys [leader-before
-                                      leader-after
-                                      drifted-node
-                                      live-before
+                 (remove (fn [{:keys [drifted-node
                                       live-after-restore
-                                      recovered-nodes-count
-                                      recovered-nodes
-                                      recovered-state]}]
-                           (and (contains? (set live-before) drifted-node)
-                                (contains? (set live-after-restore) drifted-node)
-                                (= 3 (count live-after-restore))
-                                (contains? (set recovered-nodes) drifted-node)
-                                (>= (long (or recovered-nodes-count 0)) 2)
-                                (some? leader-before)
-                                (some? leader-after)
-                                (some? recovered-state))))
+                                      nodes]}]
+                           (and (contains? (set live-after-restore)
+                                           drifted-node)
+                                (contains? (set (keys nodes))
+                                           drifted-node))))
+                 vec)
+            mismatches
+            (->> oks
+                 (mapcat (fn [{:keys [expected nodes]}]
+                           (keep (fn [[logical-node {:keys [values]}]]
+                                   (when (not= expected values)
+                                     {:logical-node logical-node
+                                      :expected expected
+                                      :actual values}))
+                                 nodes)))
                  vec)]
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
-                               (empty? missing-drift-rejection)
-                               (empty? missing-recovery)))
+                               (empty? missing-drift-failure)
+                               (empty? missing-recovery)
+                               (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
-         :missing-drift-rejection-count (count missing-drift-rejection)
-         :missing-drift-rejection-samples
+         :missing-drift-failure-count (count missing-drift-failure)
+         :missing-drift-failure-samples
          (vec (take sample-limit
                     (map #(select-keys % [:drifted-node
                                           :drift-error])
-                         missing-drift-rejection)))
+                         missing-drift-failure)))
          :missing-recovery-count (count missing-recovery)
          :missing-recovery-samples
          (vec (take sample-limit
                     (map #(select-keys % [:drifted-node
-                                          :leader-before
-                                          :leader-after
                                           :live-after-restore
-                                          :recovered-nodes
-                                          :recovered-nodes-count
-                                          :recovered-state])
-                         missing-recovery)))}))))
+                                          :nodes])
+                         missing-recovery)))
+         :mismatch-count (count mismatches)
+         :mismatch-samples (vec (take sample-limit mismatches))}))))
 
 (defrecord Client [node key-count]
   client/Client

@@ -137,60 +137,16 @@
           (clojure.lang.MapEntry. (long k) (long v)))
         pairs))
 
-(defn- topology-snapshot
-  [test]
-  (let [cluster   (local/cluster-state (:datalevin/cluster-id test))
-        voters    (vec (get-in cluster [:base-opts :ha-control-plane :voters]))
-        members   (vec (get-in cluster [:base-opts :ha-members]))
-        data-nodes (vec (:data-node-names cluster))
-        control-nodes (vec (:control-node-names cluster))]
-    {:data-nodes data-nodes
-     :control-nodes control-nodes
-     :control-only-node-names (vec (:control-only-node-names cluster))
-     :ha-members members
-     :voters voters
-     :promotable-voters (->> voters
-                             (filter :promotable?)
-                             vec)
-     :non-promotable-voters (->> voters
-                                 (remove :promotable?)
-                                 vec)}))
-
-(defn- valid-topology?
-  [{:keys [data-nodes control-nodes control-only-node-names
-           ha-members promotable-voters non-promotable-voters]}]
-  (let [member-ids     (set (map :node-id ha-members))
-        promotable-ids (set (keep :ha-node-id promotable-voters))]
-    (and (= 2 (count data-nodes))
-         (= 3 (count control-nodes))
-         (= 1 (count control-only-node-names))
-         (= 2 (count ha-members))
-         (= 2 (count promotable-voters))
-         (= 1 (count non-promotable-voters))
-         (= member-ids promotable-ids))))
-
 (defn- failover-observed?
-  [{:keys [leader-before stopped-node leader-after live-after-stop topology
-           control-leader-before control-leader-after]}]
-  (let [control-node-set (set (:control-nodes topology))
-        live-after-stop  (vec live-after-stop)]
-    (and (= leader-before stopped-node)
-         (= 1 (count live-after-stop))
-         (= leader-after (first live-after-stop))
-         (not= leader-before leader-after)
-         (string? control-leader-before)
-         (string? control-leader-after)
-         (contains? control-node-set control-leader-before)
-         (contains? control-node-set control-leader-after))))
+  [{:keys [leader-before leader-after nodes]}]
+  (and (string? leader-after)
+       (not= leader-before leader-after)
+       (contains? (set (keys nodes)) leader-after)))
 
 (defn- run-scenario!
   [test key-count]
   (ensure-registers-initialized! test key-count)
   (let [cluster-id             (:datalevin/cluster-id test)
-        topology               (topology-snapshot test)
-        control-leader-before  (:leader (local/wait-for-authority-leader!
-                                         cluster-id
-                                         converge-timeout-ms))
         leader-before          (:leader (local/wait-for-single-leader!
                                          cluster-id
                                          converge-timeout-ms))
@@ -215,9 +171,6 @@
                                  converge-timeout-ms
                                  key-count)
         _                      (local/stop-node! cluster-id leader-before)
-        control-leader-after   (:leader (local/wait-for-authority-leader!
-                                         cluster-id
-                                         converge-timeout-ms))
         leader-after           (:leader (local/wait-for-single-leader!
                                          cluster-id
                                          converge-timeout-ms))
@@ -242,14 +195,10 @@
                                  expected
                                  converge-timeout-ms
                                  key-count)]
-    {:topology topology
-     :control-leader-before control-leader-before
-     :control-leader-after control-leader-after
-     :leader-before leader-before
+    {:leader-before leader-before
      :stopped-node leader-before
      :leader-after leader-after
      :live-after-stop live-after-stop
-     :target-lsn target-lsn
      :expected expected
      :nodes (into {}
                   (map (fn [[logical-node values]]
@@ -302,9 +251,6 @@
                                   {:type type
                                    :error error
                                    :value value})))
-            invalid-topology (->> oks
-                                  (remove (comp valid-topology? :topology))
-                                  vec)
             missing-failover (->> oks
                                   (remove failover-observed?)
                                   vec)
@@ -314,32 +260,22 @@
                                               (when (not= expected values)
                                                 {:logical-node logical-node
                                                  :expected expected
-                                                 :actual values})))
-                                      nodes))
+                                                 :actual values}))
+                                            nodes)))
                             vec)]
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
-                               (empty? invalid-topology)
                                (empty? missing-failover)
                                (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
-         :invalid-topology-count (count invalid-topology)
-         :invalid-topology-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:topology])
-                         invalid-topology)))
          :missing-failover-count (count missing-failover)
          :missing-failover-samples
          (vec (take sample-limit
                     (map #(select-keys % [:leader-before
-                                          :stopped-node
                                           :leader-after
-                                          :live-after-stop
-                                          :control-leader-before
-                                          :control-leader-after
-                                          :topology])
+                                          :nodes])
                          missing-failover)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))

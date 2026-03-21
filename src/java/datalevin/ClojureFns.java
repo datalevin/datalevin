@@ -82,8 +82,8 @@ final class ClojureFns {
                            List<Object> results) {
         return new BoundedCollector(offset, limit, results) {
             @Override
-            Object collect(Object key, Object value) {
-                return predicate.test(key, value) ? Arrays.asList(key, value) : null;
+            public Object invoke(Object key, Object value) {
+                return maybeAdd(predicate.test(key, value) ? Arrays.asList(key, value) : null);
             }
         };
     }
@@ -94,9 +94,31 @@ final class ClojureFns {
                          List<Object> results) {
         return new BoundedCollector(offset, limit, results) {
             @Override
-            Object collect(Object key, Object value) {
+            public Object invoke(Object key, Object value) {
                 Object result = fn.apply(key, value);
-                return result == null ? null : ClojureCodec.runtimeInput(result);
+                return maybeAdd(result == null ? null : ClojureCodec.runtimeInput(result));
+            }
+        };
+    }
+
+    static AFn pagedValues(int offset,
+                           int limit,
+                           List<Object> results) {
+        return new BoundedCollector(offset, limit, results) {
+            @Override
+            public Object invoke(Object value) {
+                return maybeAdd(value);
+            }
+        };
+    }
+
+    static AFn pagedEntries(int offset,
+                            int limit,
+                            List<Object> results) {
+        return new BoundedCollector(offset, limit, results) {
+            @Override
+            public Object invoke(Object key, Object value) {
+                return maybeAdd(Arrays.asList(key, value));
             }
         };
     }
@@ -114,9 +136,7 @@ final class ClojureFns {
             this.results = results;
         }
 
-        @Override
-        public Object invoke(Object key, Object value) {
-            Object result = collect(key, value);
+        final Object maybeAdd(Object result) {
             if (result == null) {
                 return null;
             }
@@ -127,8 +147,6 @@ final class ClojureFns {
             results.add(result);
             return results.size() >= limit ? TERMINATE_VISIT : null;
         }
-
-        abstract Object collect(Object key, Object value);
     }
 
     private static boolean isTxFnDescriptor(Object descriptor) {

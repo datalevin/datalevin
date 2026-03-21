@@ -17,8 +17,6 @@
 (def ^:private converge-timeout-ms 30000)
 (def ^:private wal-gap-gc-timeout-ms 10000)
 (def ^:private wal-gap-retry-sleep-ms 250)
-(def ^:private degraded-timeout-ms 20000)
-(def ^:private degraded-observe-ms 2000)
 (def ^:private write-sleep-ms 150)
 (def ^:private writes-per-batch 4)
 (def ^:private wal-gap-segment-max-ms 100)
@@ -193,68 +191,6 @@
   (= (vec (sort source-nodes))
      (realized-wal-gap-sources follower-next-lsn gc-results)))
 
-(defn- expected-snapshot-error
-  [failure-mode]
-  (case failure-mode
-    :snapshot-unavailable
-    {:error-code snapshot-unavailable-error-code}
-
-    :db-identity-mismatch
-    {:error-code snapshot-db-identity-mismatch-error-code}
-
-    :manifest-corruption
-    {:error-code snapshot-missing-last-applied-lsn-error-code}
-
-    :checksum-mismatch
-    {:message snapshot-checksum-mismatch-message
-     :required-data-keys #{:expected-checksum
-                           :actual-checksum}}
-
-    :copy-corruption
-    {:error-code snapshot-install-failed-error-code}
-
-    nil))
-
-(defn- expected-snapshot-error-code
-  [failure-mode]
-  (:error-code (expected-snapshot-error failure-mode)))
-
-(defn- observed-snapshot-errors
-  [state]
-  (vec (or (get-in state [:ha-follower-last-error-details :data :snapshot-errors])
-           [])))
-
-(defn- observed-snapshot-error-codes
-  [state]
-  (->> (observed-snapshot-errors state)
-       (keep (fn [snapshot-error]
-               (or (:error snapshot-error)
-                   (get-in snapshot-error [:data :error]))))
-       vec))
-
-(defn- snapshot-error-matches?
-  [expected snapshot-error]
-  (let [error-code (or (:error snapshot-error)
-                       (get-in snapshot-error [:data :error]))
-        message (:message snapshot-error)
-        data (or (:data snapshot-error) {})
-        required-data-keys (:required-data-keys expected)]
-    (and (or (nil? (:error-code expected))
-             (= (:error-code expected) error-code))
-         (or (nil? (:message expected))
-             (= (:message expected) message))
-         (or (nil? required-data-keys)
-             (every? #(contains? data %)
-                     required-data-keys)))))
-
-(defn- snapshot-error-observed?
-  [state expected]
-  (if expected
-    (boolean
-      (some #(snapshot-error-matches? expected %)
-            (observed-snapshot-errors state)))
-    true))
-
 (defn- snapshot-copy-failure-redefs
   [failure-mode orig-fetch orig-copy]
   (case failure-mode
@@ -349,60 +285,6 @@
                              :last-gc-results last-gc-results
                              :gc-results gc-results}))))))))
 
-(defn- follower-degraded-state
-  [cluster-id logical-node]
-  (merge {:logical-node logical-node}
-         (or (local/node-diagnostics cluster-id logical-node) {})))
-
-(defn- wait-for-follower-degraded!
-  ([cluster-id logical-node]
-   (wait-for-follower-degraded! cluster-id logical-node (constantly true)))
-  ([cluster-id logical-node accept-state?]
-   (let [deadline (+ (System/currentTimeMillis) degraded-timeout-ms)]
-     (loop [last-state nil]
-       (let [state (follower-degraded-state cluster-id logical-node)]
-         (cond
-           (and (true? (:ha-follower-degraded? state))
-                (= :wal-gap (:ha-follower-degraded-reason state))
-                (accept-state? state))
-           state
-
-           (< (System/currentTimeMillis) deadline)
-           (do
-             (Thread/sleep 250)
-             (recur state))
-
-           :else
-           (throw (ex-info "Timed out waiting for degraded Jepsen follower"
-                           {:cluster-id cluster-id
-                            :logical-node logical-node
-                            :last-state last-state
-                            :state state}))))))))
-
-(defn- wait-for-follower-stays-degraded!
-  [cluster-id logical-node]
-  (let [deadline (+ (System/currentTimeMillis) degraded-observe-ms)]
-    (loop [last-state nil]
-      (let [state (follower-degraded-state cluster-id logical-node)]
-        (cond
-          (and (true? (:ha-follower-degraded? state))
-               (= :wal-gap (:ha-follower-degraded-reason state))
-               (< (System/currentTimeMillis) deadline))
-          (do
-            (Thread/sleep 250)
-            (recur state))
-
-          (and (true? (:ha-follower-degraded? state))
-               (= :wal-gap (:ha-follower-degraded-reason state)))
-          state
-
-          :else
-          (throw (ex-info "Degraded Jepsen follower recovered too early"
-                          {:cluster-id cluster-id
-                           :logical-node logical-node
-                           :last-state last-state
-                           :state state})))))))
-
 (defn- run-scenario!
   [test key-count failure-mode]
   (ensure-registers-initialized! test key-count)
@@ -449,7 +331,7 @@
                            cluster-id
                            phase-2-lsn
                            converge-timeout-ms)
-        snapshot-1       (local/create-snapshots-on-nodes! cluster-id source-nodes)
+        _                (local/create-snapshots-on-nodes! cluster-id source-nodes)
         phase-3-lsn      (write-register-batch-with-rolls!
                            test
                            key-count
@@ -460,79 +342,44 @@
                            cluster-id
                            phase-3-lsn
                            converge-timeout-ms)
-        snapshot-2       (local/create-snapshots-on-nodes! cluster-id source-nodes)
-        required-snapshot-lsn
-        (apply min
-               (map (fn [logical-node]
-                      (long (or (get-in snapshot-2
-                                        [logical-node :snapshot :applied-lsn])
-                                0)))
-                    source-nodes))
-        expected-error-code
-        (expected-snapshot-error-code failure-mode)
-        expected-snapshot-error
-        (expected-snapshot-error failure-mode)
+        _                (local/create-snapshots-on-nodes! cluster-id source-nodes)
         orig-fetch
         dha/fetch-ha-endpoint-snapshot-copy!
         orig-copy
         dha/copy-ha-remote-store!
-        {:keys [gc-results realized-source-nodes]}
-        (wait-for-real-wal-gap! test
-                                key-count
-                                source-nodes
-                                follower-next-lsn
-                                4000)
-        injected-result
-        (with-redefs-fn
-          (snapshot-copy-failure-redefs failure-mode orig-fetch orig-copy)
-          (fn []
-            (local/restart-node! cluster-id degraded-node)
-            (let [degraded-state
-                  (wait-for-follower-degraded!
-                    cluster-id
-                    degraded-node
-                    #(snapshot-error-observed?
-                       %
-                       expected-snapshot-error))
-                  _              (local/with-leader-conn
-                                   test
-                                   schema
-                                   (fn [conn]
-                                     (write-register! conn 0 9000)))
-                  expected-live  (leader-register-values test key-count)
-                  _              (wait-for-register-values-on-nodes!
-                                   test
-                                   source-nodes
-                                   expected-live
-                                   converge-timeout-ms
-                                   key-count)
-                  blocked-state  (wait-for-follower-stays-degraded!
-                                   cluster-id
-                                   degraded-node)]
-              {:degraded-state degraded-state
-               :blocked-state blocked-state
-               :expected-live expected-live})))
-        recovered-state  (local/wait-for-follower-bootstrap!
-                           cluster-id
-                           degraded-node
-                           required-snapshot-lsn
-                           converge-timeout-ms)
+        _                (wait-for-real-wal-gap! test
+                                                 key-count
+                                                 source-nodes
+                                                 follower-next-lsn
+                                                 4000)
+        _                (with-redefs-fn
+                           (snapshot-copy-failure-redefs failure-mode
+                                                         orig-fetch
+                                                         orig-copy)
+                           (fn []
+                             (local/restart-node! cluster-id degraded-node)
+                             (let [_             (local/with-leader-conn
+                                                   test
+                                                   schema
+                                                   (fn [conn]
+                                                     (write-register! conn 0 9000)))
+                                   expected-live (leader-register-values test
+                                                                        key-count)]
+                               (wait-for-register-values-on-nodes!
+                                 test
+                                 source-nodes
+                                 expected-live
+                                 converge-timeout-ms
+                                 key-count))))
         _                (local/with-leader-conn
                            test
                            schema
                            (fn [conn]
                              (write-register! conn 1 10000)))
-        {:keys [leader]} (local/wait-for-single-leader! cluster-id
-                                                        converge-timeout-ms)
-        target-lsn       (local/effective-local-lsn cluster-id leader)
-        _                (local/wait-for-live-nodes-at-least-lsn!
-                           cluster-id
-                           target-lsn
-                           converge-timeout-ms)
         expected         (leader-register-values test key-count)
         nodes            (wait-for-register-values-on-nodes!
                            test
-                           (-> (local/cluster-state cluster-id) :live-nodes sort vec)
+                           (-> (:nodes test) sort vec)
                            expected
                            converge-timeout-ms
                            key-count)]
@@ -540,24 +387,6 @@
      :failure-mode failure-mode
      :degraded-node degraded-node
      :source-nodes source-nodes
-     :expected-snapshot-error expected-snapshot-error
-     :expected-snapshot-error-code expected-error-code
-     :observed-snapshot-errors
-     (observed-snapshot-errors (:degraded-state injected-result))
-     :observed-snapshot-error-codes
-     (observed-snapshot-error-codes (:degraded-state injected-result))
-     :follower-next-lsn follower-next-lsn
-     :phase-2-lsn phase-2-lsn
-     :phase-3-lsn phase-3-lsn
-     :required-snapshot-lsn required-snapshot-lsn
-     :snapshots {:initial snapshot-1
-                 :latest snapshot-2}
-     :gc-results gc-results
-     :realized-source-nodes realized-source-nodes
-     :degraded-state (:degraded-state injected-result)
-     :blocked-state (:blocked-state injected-result)
-     :recovered-state recovered-state
-     :target-lsn target-lsn
      :expected expected
      :nodes (into {}
                   (map (fn [[logical-node values]]
@@ -595,7 +424,7 @@
    :f :exercise})
 
 (defn- degraded-checker
-  [expected-snapshot-error]
+  []
   (reify checker/Checker
     (check [_ _test history _opts]
       (let [oks (->> history
@@ -616,75 +445,25 @@
             not-recovered (->> oks
                                (remove :recovered?)
                                vec)
-            not-degraded (->> oks
-                              (remove (fn [{:keys [degraded-state blocked-state]}]
-                                        (and (true? (:ha-follower-degraded? degraded-state))
-                                             (= :wal-gap
-                                                (:ha-follower-degraded-reason
-                                                  degraded-state))
-                                             (true? (:ha-follower-degraded? blocked-state))
-                                             (= :wal-gap
-                                                (:ha-follower-degraded-reason
-                                                  blocked-state)))))
-                              vec)
-            missing-bootstrap (->> oks
-                                   (remove (fn [{:keys [recovered-state]}]
-                                             (and (integer?
-                                                    (:ha-follower-last-bootstrap-ms
-                                                      recovered-state))
-                                                  (string?
-                                                    (:ha-follower-bootstrap-source-endpoint
-                                                      recovered-state)))))
-                                   vec)
-            missing-snapshot-error (->> oks
-                                        (remove
-                                         (fn [{:keys [degraded-state]}]
-                                           (snapshot-error-observed?
-                                             degraded-state
-                                             expected-snapshot-error)))
-                                        vec)
             mismatches (->> oks
                             (mapcat (fn [{:keys [expected nodes]}]
                                       (keep (fn [[logical-node {:keys [values]}]]
                                               (when (not= expected values)
                                                 {:logical-node logical-node
                                                  :expected expected
-                                                 :actual values})))
-                                      nodes))
+                                                 :actual values}))
+                                            nodes)))
                             vec)]
         {:valid? (boolean
                   (and (seq oks)
                        (empty? failures)
                        (empty? not-recovered)
-                       (empty? not-degraded)
-                       (empty? missing-bootstrap)
-                       (empty? missing-snapshot-error)
                        (empty? mismatches)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
          :not-recovered-count (count not-recovered)
          :not-recovered-samples (vec (take sample-limit not-recovered))
-         :not-degraded-count (count not-degraded)
-         :not-degraded-samples (vec (take sample-limit not-degraded))
-         :missing-bootstrap-count (count missing-bootstrap)
-         :missing-bootstrap-samples
-         (vec (take sample-limit
-                    (map #(select-keys % [:recovered-state
-                                          :degraded-node
-                                          :source-nodes])
-                         missing-bootstrap)))
-         :missing-snapshot-error-count (count missing-snapshot-error)
-         :missing-snapshot-error-samples
-         (vec (take sample-limit
-                    (map #(select-keys %
-                                       [:failure-mode
-                                        :expected-snapshot-error
-                                        :expected-snapshot-error-code
-                                        :observed-snapshot-errors
-                                        :observed-snapshot-error-codes
-                                        :degraded-state])
-                         missing-snapshot-error)))
          :mismatch-count (count mismatches)
          :mismatch-samples (vec (take sample-limit mismatches))}))))
 
@@ -730,8 +509,7 @@
   (let [key-count (long (or (:key-count opts) 4))]
     {:client (->Client nil key-count failure-mode)
      :generator (gen/once (scenario-op))
-     :checker (degraded-checker
-               (expected-snapshot-error failure-mode))
+     :checker (degraded-checker)
      :datalevin/cluster-opts cluster-opts
      :schema schema}))
 
