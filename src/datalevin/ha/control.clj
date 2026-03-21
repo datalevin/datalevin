@@ -1172,11 +1172,8 @@
                     status (:status result)]
                 (cond
                   (= ::timeout result)
-                  (if (and (single-voter-authority? authority)
-                           (.isLeader node))
-                    (authority-fsm-snapshot authority)
-                    (do (Thread/sleep 20)
-                        (recur (inc attempt))))
+                  (do (Thread/sleep 20)
+                      (recur (inc attempt)))
 
                   (.isOk ^Status status)
                   (:snapshot result)
@@ -1620,8 +1617,7 @@
     (ensure-running! running-v)
     (require-non-blank-string! db-identity :db-identity)
     (lease/validate-lease-key! group-id db-identity)
-    (let [snapshot (or (linearizable-read-snapshot! this)
-                       (authority-fsm-snapshot this))
+    (let [snapshot (linearizable-read-snapshot! this)
           {:keys [lease version]} (lease-entry snapshot db-identity)]
       {:lease lease
        :version version}))
@@ -1642,8 +1638,7 @@
   (read-membership-hash [this]
     (ensure-running! running-v)
     (lease/validate-membership-hash-key! group-id)
-    (:membership-hash (or (linearizable-read-snapshot! this)
-                          (authority-fsm-snapshot this))))
+    (:membership-hash (linearizable-read-snapshot! this)))
 
   (init-membership-hash! [this membership-hash]
     (ensure-running! running-v)
@@ -1856,11 +1851,10 @@
        :voters (:voters snapshot)}))
 
     (instance? SofaJraftLeaseAuthority authority)
-    (let [{:keys [group-id running-v fsm-state]} authority]
+    (let [{:keys [group-id running-v]} authority]
       (ensure-running! running-v)
       (lease/validate-lease-key! group-id db-identity)
-      (let [snapshot (or (await-read-state-barrier! authority)
-                         @fsm-state)
+      (let [snapshot (await-read-state-barrier! authority)
             {:keys [lease version]} (lease-entry snapshot db-identity)]
         {:lease lease
          :version version
