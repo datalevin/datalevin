@@ -717,7 +717,9 @@
               (.set running? false)
               ;; Keep renew work outside `update-db` so HA probes and peer/server
               ;; operations do not block on control-plane I/O.
-              (let [next-state (binding [drep/*ha-with-local-store-read-fn*
+              (let [next-state (binding [drep/*ha-current-state-fn*
+                                         #(get (.-dbs server) db-name)
+                                         drep/*ha-with-local-store-read-fn*
                                          (fn [f]
                                            (with-db-runtime-store-read-access
                                              server
@@ -760,7 +762,9 @@
               ;; Follower replay can block on remote txlog fetch and local apply
               ;; work. Keep it off the authority renew path so lease reads and
               ;; promotions are not rate-limited by replication latency.
-              (let [next-state (binding [drep/*ha-follower-apply-record-fn*
+              (let [next-state (binding [drep/*ha-current-state-fn*
+                                         #(get (.-dbs server) db-name)
+                                         drep/*ha-follower-apply-record-fn*
                                          (fn [state record]
                                            (ha-follower-apply-record-with-guard
                                             server
@@ -981,7 +985,8 @@
                     (update-db server db-name *ensure-udf-readiness-state-fn*)
                     (get (.-dbs server) db-name)))
         m       m0]
-    (or (and db-name
+    (or (and write?
+             db-name
              (not (contains? udf-admission-exempt-write-types
                              (:type message)))
              (udf-write-admission-error db-name m))
@@ -2092,6 +2097,7 @@
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
   (let [type (:type message)
+        write? (dha/ha-write-message? message)
         db-name (nth (:args message) 0 nil)
         ha-txlog-term (current-ha-txlog-term server db-name)
         precheck-only? (contains? #{:open-transact :open-transact-kv} type)
@@ -2099,11 +2105,18 @@
         (with-ha-write-admission
           server
           message
-          #(when-not precheck-only?
+          #(cond
+             precheck-only?
+             nil
+
+             write?
              (binding [txlog/*commit-payload-ha-term* ha-txlog-term
                        cpp/*before-write-commit-fn*
                        (ha-write-commit-check-fn server message)]
-               (dispatch-message server skey message))))]
+               (dispatch-message server skey message))
+
+             :else
+             (dispatch-message server skey message)))]
     (cond
       (not ok?)
       (error-response skey "HA write admission rejected" error)
@@ -2195,6 +2208,7 @@
    :update-client update-client
    :update-db update-db
    :vector-index vector-index
+   :with-db-runtime-store-read-access with-db-runtime-store-read-access
    :write-message write-message
    :write-txn-runner write-txn-runner
    :clients (fn [^Server server] (.-clients server))})

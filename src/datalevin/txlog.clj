@@ -208,7 +208,11 @@
                               (:ts payload)
                               0))
             ha-term (some-> (:ha-term payload) long)
-            rows    (vec (or (:ops payload) []))
+            rows    (let [ops (:ops payload)]
+                      (cond
+                        (vector? ops) ops
+                        (nil? ops) []
+                        :else (vec ops)))
             tx-kind (classify-record-kind rows)
             payload-bytes (long (or (:body-len record)
                                     (some-> body alength)

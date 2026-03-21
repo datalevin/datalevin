@@ -1880,7 +1880,9 @@
          :fsm-lease-count (count (:leases snapshot))
          :node-available? (some? node)
          :node-leader? (when node (.isLeader node))
-         :node-state (when node (safe-node-value #(.getNodeState node)))
+         :node-state (when node
+                       (safe-node-value
+                         #(some-> (.getNodeState node) str)))
          :last-log-index (when node (safe-node-value #(.getLastLogIndex node)))
          :last-committed-index (when node
                                  (safe-node-value

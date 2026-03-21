@@ -499,22 +499,31 @@
 
 (defn resolve-ins
   [context values]
-  (reduce
-    (fn resolve-in [context [binding value]]
-      (cond
-        (and (instance? BindScalar binding)
-             (instance? SrcVar (:variable binding)))
-        (update context :sources assoc (get-in binding [:variable :symbol]) value)
+  (loop [context  context
+         bindings (seq (get-in context [:parsed-q :qin]))
+         values   (seq values)]
+    (if-some [binding (first bindings)]
+      (let [value (when values (first values))
+            context
+            (cond
+              (and (instance? BindScalar binding)
+                   (instance? SrcVar (:variable binding)))
+              (update context :sources assoc (get-in binding [:variable :symbol])
+                      value)
 
-        (and (instance? BindScalar binding)
-             (instance? RulesVar (:variable binding)))
-        (let [parsed (rules/parse-rules value)]
-          (assoc context
-                 :rules parsed
-                 :rules-deps (rules/dependency-graph parsed)))
+              (and (instance? BindScalar binding)
+                   (instance? RulesVar (:variable binding)))
+              (let [parsed (rules/parse-rules value)]
+                (assoc context
+                       :rules parsed
+                       :rules-deps (rules/dependency-graph parsed)))
 
-        :else (update context :rels conj (in->rel binding value))))
-    context (zipmap (get-in context [:parsed-q :qin]) values)))
+              :else
+              (update context :rels conj (in->rel binding value)))]
+        (recur context
+               (next bindings)
+               (when values (next values))))
+      context)))
 
 (defn- rel-with-attr [context sym]
   (some #(when ((:attrs %) sym) %) (:rels context)))

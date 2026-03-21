@@ -65,22 +65,48 @@
 
 (declare closed-kv-store?)
 
+(def ^:dynamic *ha-current-state-fn*
+  (fn []
+    nil))
+
+(defn- current-ha-state
+  [m]
+  (let [current-m (try
+                    (*ha-current-state-fn*)
+                    (catch Throwable _
+                      nil))]
+    (if (map? current-m)
+      current-m
+      m)))
+
+(defn- kv-store-candidates
+  [m]
+  (let [current-m (current-ha-state m)
+        current-dt-db (:dt-db current-m)
+        stale-dt-db   (:dt-db m)]
+    (distinct
+      (remove nil?
+              (concat
+                [(:store current-m)
+                 (when (instance? DB current-dt-db)
+                   (.-store ^DB current-dt-db))]
+                (when-not (identical? current-m m)
+                  [(:store m)
+                   (when (instance? DB stale-dt-db)
+                     (.-store ^DB stale-dt-db))]))))))
+
 (defn- local-kv-store
   [m]
-  (let [dt-db (:dt-db m)
-        candidates (cond-> [(:store m)]
-                     (instance? DB dt-db)
-                     (conj (.-store ^DB dt-db)))]
-    (some
-     (fn [store]
-       (let [kv-store (cond
-                        (nil? store) nil
-                        (instance? Store store) (.-lmdb ^Store store)
-                        (instance? ILMDB store) store
-                        :else nil)]
-         (when-not (closed-kv-store? kv-store)
-           kv-store)))
-     candidates)))
+  (some
+    (fn [store]
+      (let [kv-store (cond
+                       (nil? store) nil
+                       (instance? Store store) (.-lmdb ^Store store)
+                       (instance? ILMDB store) store
+                       :else nil)]
+        (when-not (closed-kv-store? kv-store)
+          kv-store)))
+    (kv-store-candidates m)))
 
 (defn- raw-local-kv-store
   [m]
@@ -223,6 +249,19 @@
 
 (def ^:private ha-local-watermark-snapshot-key
   ::ha-local-watermark-snapshot)
+
+(def ^:private ha-local-store-transient-state-keys
+  [ha-local-watermark-snapshot-key
+   :wdt-db
+   :wlmdb
+   :wstore
+   :runner
+   :engine
+   :index])
+
+(defn- clear-ha-local-store-transient-state
+  [m]
+  (apply dissoc m ha-local-store-transient-state-keys))
 
 (declare read-ha-local-watermark-lsn)
 
@@ -381,15 +420,21 @@
 (defn- refresh-ha-local-watermarks
   [m]
   (with-ha-local-store-read
-    #(if-let [kv-store (local-kv-store m)]
-       (let [{:keys [role local-last-applied-lsn] :as snapshot}
-             (ha-local-watermark-snapshot m kv-store)]
-         (cond-> (assoc m
-                        ha-local-watermark-snapshot-key snapshot
-                        :ha-local-last-applied-lsn local-last-applied-lsn)
-           (= :leader role)
-           (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
-       m)))
+    #(try
+       (if-let [kv-store (local-kv-store m)]
+         (let [{:keys [role local-last-applied-lsn] :as snapshot}
+               (ha-local-watermark-snapshot m kv-store)]
+           (cond-> (assoc m
+                          ha-local-watermark-snapshot-key snapshot
+                          :ha-local-last-applied-lsn local-last-applied-lsn)
+             (= :leader role)
+             (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
+         m)
+       (catch Throwable e
+         (when-not (closed-kv-race? e (local-kv-store m))
+           (log/warn e "Unable to refresh local txlog watermarks for HA renew"
+                     {:db-name (some-> (:store m) i/opts :db-name)}))
+         m))))
 
 (declare fresh-ha-promotion-local-last-applied-lsn)
 
@@ -549,10 +594,10 @@
         m (if (identical? recovered-store store)
             m
             (-> m
+                clear-ha-local-store-transient-state
                 (assoc :store recovered-store
                        :dt-db nil)
-                (dissoc :engine :index
-                        ha-local-store-reopen-info-key)
+                (dissoc ha-local-store-reopen-info-key)
                 refresh-ha-local-dt-db))]
     (if (local-kv-store m)
       m
@@ -575,14 +620,20 @@
 
 (defn- ha-local-store-reopen-info
   [m]
-  (or (get m ha-local-store-reopen-info-key)
-      (let [store (:store m)]
+  (let [current-m (current-ha-state m)
+        candidates (if (identical? current-m m)
+                     [m]
+                     [current-m m])]
+    (or (some #(get % ha-local-store-reopen-info-key) candidates)
+        (some (fn [state]
+                (let [store (:store state)]
         (when (instance? IStore store)
           (try
             {:env-dir (i/dir store)
-             :store-opts (ha-local-store-open-opts m store)}
-            (catch Throwable _
-              nil))))))
+             :store-opts (ha-local-store-open-opts state store)}
+                      (catch Throwable _
+                        nil)))))
+              candidates))))
 
 (defn- ^:redef reopen-ha-local-store-from-info
   [m {:keys [env-dir store-opts]}]
@@ -590,11 +641,11 @@
              (not (s/blank? env-dir))
              (map? store-opts))
     (-> m
+        clear-ha-local-store-transient-state
         (assoc :store (-> (st/open env-dir nil store-opts)
                           open-ha-store-dbis!)
                :dt-db nil)
-        (dissoc :engine :index
-                ha-local-store-reopen-info-key)
+        (dissoc ha-local-store-reopen-info-key)
         refresh-ha-local-dt-db)))
 
 (defn- normalize-ha-bootstrap-retry-state
@@ -2381,9 +2432,9 @@
                   (u/delete-files backup-dir))
                 {:ok? true
                  :state (-> m
+                            clear-ha-local-store-transient-state
                             (assoc :store new-store
-                                   :dt-db new-db)
-                            (dissoc :engine :index))})
+                                   :dt-db new-db))})
               (catch Exception e
                 (let [log-context {:db-name (some-> store i/db-name)
                                    :env-dir env-dir}]
@@ -2397,9 +2448,9 @@
                           restored-db (db/new-db restored-store)]
                       {:ok? false
                        :state (-> m
+                                  clear-ha-local-store-transient-state
                                   (assoc :store restored-store
-                                         :dt-db restored-db)
-                                  (dissoc :engine :index))
+                                         :dt-db restored-db))
                        :error {:error :ha/follower-snapshot-install-failed
                                :message (ex-message e)
                                :data (ex-data e)}})
@@ -2415,9 +2466,9 @@
                                   ;; renew step can recover and reopen from its
                                   ;; original env dir instead of getting stuck with
                                   ;; no local store at all.
+                                  clear-ha-local-store-transient-state
                                   (assoc :store store
-                                         :dt-db nil)
-                                  (dissoc :engine :index))
+                                         :dt-db nil))
                        :error {:error :ha/follower-snapshot-install-restore-failed
                                :message (ex-message e)
                                :data (merge (or (ex-data e) {})

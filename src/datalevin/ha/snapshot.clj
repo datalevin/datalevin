@@ -286,15 +286,36 @@
   (when (read-ha-snapshot-install-marker env-dir)
     (recover-ha-local-snapshot-install! env-dir)))
 
+(defn- close-best-effort!
+  [f x]
+  (when x
+    (try
+      (f x)
+      (catch Throwable _
+        nil))))
+
 (defn close-ha-local-store!
   [m]
-  (if-let [dt-db (:dt-db m)]
-    (db/close-db dt-db)
-    (when-let [store (:store m)]
+  ;; HA store swaps must also retire write-side wrappers that share the same
+  ;; LMDB env; leaving them live can poison subsequent reader creation after a
+  ;; snapshot install or local reopen.
+  (close-best-effort! db/close-db (:wdt-db m))
+  (close-best-effort!
+    (fn [store]
       (cond
         (instance? IStore store) (i/close store)
         (instance? ILMDB store) (i/close-kv store)
-        :else nil))))
+        :else nil))
+    (:wstore m))
+  (close-best-effort! i/close-kv (:wlmdb m))
+  (close-best-effort! db/close-db (:dt-db m))
+  (close-best-effort!
+    (fn [store]
+      (cond
+        (instance? IStore store) (i/close store)
+        (instance? ILMDB store) (i/close-kv store)
+        :else nil))
+    (:store m)))
 
 (defn refresh-ha-local-dt-db
   [m]

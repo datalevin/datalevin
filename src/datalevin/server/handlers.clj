@@ -85,6 +85,12 @@
   [deps skey result]
   ((:write-message deps) skey {:type :command-complete :result result}))
 
+(defn- with-runtime-store-read-access
+  [deps server db-name f]
+  (if-let [with-read-access (:with-db-runtime-store-read-access deps)]
+    (with-read-access server db-name f)
+    (f)))
+
 (defn- with-best-effort-db-transaction-slot
   [deps server db-name f]
   (let [^Semaphore lock ((:get-lock deps) server db-name)]
@@ -97,6 +103,42 @@
        :skipped? true
        :reason :write-transaction-open
        :db-name db-name})))
+
+(defn- transient-runtime-store-error?
+  [e]
+  (boolean
+    (some
+      (fn [cause]
+        (let [message (or (ex-message cause) "")
+              data    (or (ex-data cause) {})
+              err-data (or (:err-data data) {})
+              cause-msg (or (:cause data) (:cause err-data) "")]
+          (or (s/includes? message
+                           "Please do not open multiple LMDB connections")
+              (s/includes? message "LMDB env is closed")
+              (s/includes? message "Invalid argument")
+              (and (string? cause-msg)
+                   (s/includes? cause-msg "Invalid argument")))))
+      (take-while some? (iterate ex-cause e)))))
+
+(defn- with-transient-runtime-store-retry
+  [f]
+  (loop [attempt 0]
+    (let [outcome (try
+                    {:ok? true
+                     :value (f)}
+                    (catch Throwable e
+                      {:ok? false
+                       :error e}))]
+      (if (:ok? outcome)
+        (:value outcome)
+        (let [e (:error outcome)]
+          (if (and (zero? attempt)
+                   (transient-runtime-store-error? e))
+            (do
+              (Thread/sleep 25)
+              (recur 1))
+            (throw e)))))))
 
 (defn- write-or-copy-result!
   [deps skey data]
@@ -892,20 +934,33 @@
     deps
     skey
     #(let [[db-name compact?] args
-           source-store       (kv-store deps server skey db-name writing?)
            started-ms         (System/currentTimeMillis)
            copy-backup-pin    (atom nil)
+           source-store-v     (volatile! nil)
            tf                 (u/tmp-dir (str "copy-" (UUID/randomUUID)))
            path               (Paths/get (str tf u/+separator+ c/data-file-name)
                                          (into-array String []))]
        (try
-         (binding [kv/*wal-copy-backup-pin-observer*
-                   (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
-                     (reset! copy-backup-pin
-                             {:pin-id pin-id
-                              :floor-lsn pin-floor-lsn
-                              :expires-ms pin-expires-ms}))]
-           ((:server-copy-store! deps) source-store tf compact?))
+         (with-transient-runtime-store-retry
+           (fn []
+             (let [source-store (kv-store deps server skey db-name writing?)]
+               (vreset! source-store-v source-store)
+               (reset! copy-backup-pin nil)
+               (try
+                 (binding [kv/*wal-copy-backup-pin-observer*
+                           (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
+                             (reset! copy-backup-pin
+                                     {:pin-id pin-id
+                                      :floor-lsn pin-floor-lsn
+                                      :expires-ms pin-expires-ms}))]
+                   ((:server-copy-store! deps) source-store tf compact?))
+                 (catch Throwable e
+                   (when (transient-runtime-store-error? e)
+                     (try
+                       ((:cleanup-copy-tmp-dir! deps) tf)
+                       (catch Throwable _ nil))
+                     (u/create-dirs tf))
+                   (throw e))))))
          (let [completed-ms (System/currentTimeMillis)
                copied-store ((:open-server-copied-store! deps) tf nil nil)]
            (try
@@ -924,7 +979,7 @@
                  ((:close-server-copied-store! deps) copied-store)))))
          (finally
            (best-effort-unpin-server-copy-backup-floor!
-            deps db-name source-store @copy-backup-pin)
+            deps db-name @source-store-v @copy-backup-pin)
            (try
              ((:cleanup-copy-tmp-dir! deps) tf)
              (catch Throwable e
@@ -1152,9 +1207,16 @@
     skey
     #(let [db-name          (nth args 0)
            kv-store         (kv-store deps server skey db-name writing?)
-           txlog-watermarks (kv/txlog-watermarks kv-store)
            db-state         (db-state deps server db-name)
            authority        (:ha-authority db-state)
+           txlog-watermarks (try
+                              (with-transient-runtime-store-retry
+                                (fn []
+                                  (kv/txlog-watermarks kv-store)))
+                              (catch Throwable e
+                                (when-not (transient-runtime-store-error? e)
+                                  (throw e))
+                                nil))
            authority-diag   (when authority
                               (try
                                 (ctrl/authority-diagnostics authority)
@@ -1162,8 +1224,17 @@
                                   nil)))
            txlog-lsn        (long (or (:last-applied-lsn txlog-watermarks) 0))
            runtime-lsn      (when authority
-                              (long (dha/read-ha-local-last-applied-lsn
-                                     db-state)))
+                              (try
+                                (long (with-transient-runtime-store-retry
+                                        (fn []
+                                          (dha/read-ha-local-last-applied-lsn
+                                            db-state))))
+                                (catch Throwable e
+                                  (when-not (transient-runtime-store-error? e)
+                                    (throw e))
+                                  (long (or (:ha-local-last-applied-lsn
+                                             db-state)
+                                            0)))))
            effective-lsn    (long (or runtime-lsn txlog-lsn))]
        (write-result!
          deps
@@ -1295,8 +1366,7 @@
     skey
     #(let [db-name               (nth args 0)
            snapshot-lsn          (nth args 1)
-           previous-snapshot-lsn (nth args 2 nil)
-           kv-store              ((:get-kv-store deps) server db-name)]
+           previous-snapshot-lsn (nth args 2 nil)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
@@ -1304,22 +1374,36 @@
            (write-result!
              deps
              skey
-             (kv/txlog-update-snapshot-floor!
-              kv-store snapshot-lsn previous-snapshot-lsn)))))))
+             (with-runtime-store-read-access
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-update-snapshot-floor!
+                  ((:get-kv-store deps) server db-name)
+                  snapshot-lsn
+                  previous-snapshot-lsn)))))))))
 
 (defn txlog-clear-snapshot-floor!
   [deps server skey {:keys [args]}]
   (with-error
     deps
     skey
-    #(let [db-name  (nth args 0)
-           kv-store ((:get-kv-store deps) server db-name)]
+    #(let [db-name (nth args 0)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
          (fn []
            (write-result!
-             deps skey (kv/txlog-clear-snapshot-floor! kv-store)))))))
+             deps
+             skey
+             (with-runtime-store-read-access
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-clear-snapshot-floor!
+                  ((:get-kv-store deps) server db-name))))))))))
 
 (defn txlog-update-replica-floor!
   [deps server skey {:keys [args]}]
@@ -1328,8 +1412,7 @@
     skey
     #(let [db-name     (nth args 0)
            replica-id  (nth args 1)
-           applied-lsn (nth args 2)
-           kv-store    ((:get-kv-store deps) server db-name)]
+           applied-lsn (nth args 2)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
@@ -1337,13 +1420,20 @@
            (write-result!
              deps
              skey
-             (with-best-effort-db-transaction-slot
+             (with-runtime-store-read-access
                deps
                server
                db-name
                (fn []
-                 (kv/txlog-update-replica-floor!
-                  kv-store replica-id applied-lsn)))))))))
+                 (with-best-effort-db-transaction-slot
+                   deps
+                   server
+                   db-name
+                   (fn []
+                     (kv/txlog-update-replica-floor!
+                      ((:get-kv-store deps) server db-name)
+                      replica-id
+                      applied-lsn)))))))))))
 
 (defn txlog-clear-replica-floor!
   [deps server skey {:keys [args]}]
@@ -1351,8 +1441,7 @@
     deps
     skey
     #(let [db-name    (nth args 0)
-           replica-id (nth args 1)
-           kv-store   ((:get-kv-store deps) server db-name)]
+           replica-id (nth args 1)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
@@ -1360,12 +1449,19 @@
            (write-result!
              deps
              skey
-             (with-best-effort-db-transaction-slot
+             (with-runtime-store-read-access
                deps
                server
                db-name
                (fn []
-                 (kv/txlog-clear-replica-floor! kv-store replica-id)))))))))
+                 (with-best-effort-db-transaction-slot
+                   deps
+                   server
+                   db-name
+                   (fn []
+                     (kv/txlog-clear-replica-floor!
+                      ((:get-kv-store deps) server db-name)
+                      replica-id)))))))))))
 
 (defn txlog-pin-backup-floor!
   [deps server skey {:keys [args]}]
@@ -1375,8 +1471,7 @@
     #(let [db-name    (nth args 0)
            pin-id     (nth args 1)
            floor-lsn  (nth args 2)
-           expires-ms (nth args 3 nil)
-           kv-store   ((:get-kv-store deps) server db-name)]
+           expires-ms (nth args 3 nil)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
@@ -1384,17 +1479,24 @@
            (write-result!
              deps
              skey
-             (kv/txlog-pin-backup-floor!
-              kv-store pin-id floor-lsn expires-ms)))))))
+             (with-runtime-store-read-access
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-pin-backup-floor!
+                  ((:get-kv-store deps) server db-name)
+                  pin-id
+                  floor-lsn
+                  expires-ms)))))))))
 
 (defn txlog-unpin-backup-floor!
   [deps server skey {:keys [args]}]
   (with-error
     deps
     skey
-    #(let [db-name  (nth args 0)
-           pin-id   (nth args 1)
-           kv-store ((:get-kv-store deps) server db-name)]
+    #(let [db-name (nth args 0)
+           pin-id  (nth args 1)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
@@ -1402,7 +1504,14 @@
            (write-result!
              deps
              skey
-             (kv/txlog-unpin-backup-floor! kv-store pin-id)))))))
+             (with-runtime-store-read-access
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-unpin-backup-floor!
+                  ((:get-kv-store deps) server db-name)
+                  pin-id)))))))))
 
 (defn transact-kv
   [deps server skey {:keys [mode args writing?]}]

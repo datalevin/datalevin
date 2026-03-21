@@ -73,6 +73,17 @@
        (every? #(contains? b %) (keys a))
        (every? #(contains? a %) (keys b))))
 
+(defn- attrs-tuple-length
+  ^long [attrs]
+  (loop [entries (seq attrs)
+         max-idx (long -1)]
+    (if entries
+      (let [[_ idx] (first entries)
+            idx     (long idx)]
+        (recur (next entries)
+               (if (> idx max-idx) idx max-idx)))
+      (unchecked-inc max-idx))))
+
 (defn- sum-rel*
   [attrs-a ^List tuples-a attrs-b ^List tuples-b]
   (let [n            (count attrs-b)
@@ -84,7 +95,7 @@
                            (aset idxs-b i (int idx-b))
                            (aset idxs-a i (int (attrs-a sym)))
                            (recur (unchecked-inc i) (next entries)))))
-        tlen         (->> (vals attrs-a) ^long (apply max) u/long-inc)
+        tlen         (attrs-tuple-length attrs-a)
         size-a       (.size tuples-a)
         size-b       (.size tuples-b)]
     (if (< 0 size-b)
@@ -196,12 +207,12 @@
              ^ints idxs-b   (int-array n)
              ^ints idxs-a   (int-array n)
              _              (loop [i 0, entries (seq attrs-b)]
-                              (when entries
+                             (when entries
                                 (let [[sym idx-b] (first entries)]
                                   (aset idxs-b i (int idx-b))
                                   (aset idxs-a i (int (attrs-a sym)))
                                   (recur (unchecked-inc i) (next entries)))))
-             tlen           (->> (vals attrs-a) ^long (apply max) u/long-inc)
+             tlen           (attrs-tuple-length attrs-a)
              ^List tuples-a tuples-a
              ^List tuples-b tuples-b
              la             (.size tuples-a)

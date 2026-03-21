@@ -1352,6 +1352,18 @@
         (.add out v))
       out)))
 
+(defn- rows-vector
+  [rows]
+  (cond
+    (vector? rows)
+    rows
+
+    (nil? rows)
+    []
+
+    :else
+    (vec rows)))
+
 (defn- ensure-pending-fast-list!
   ^FastList [info-v]
   (let [pending (:txlog-pending-ops @info-v)]
@@ -2023,15 +2035,15 @@
   "Apply txlog payload rows directly to LMDB using the same normalization path
   as local txlog recovery, but without consuming a new local txlog LSN."
   [lmdb rows lsn]
-  (let [rows   (vec rows)
+  (let [rows   (rows-vector rows)
         record {:lsn  (long lsn)
                 :rows rows}]
     (with-runtime-txlog-rollback
       lmdb
       (fn []
         (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
-        (let [normalized (-> (normalize-txlog-replay-avg-rows lmdb rows record)
-                             vec)]
+        (let [normalized (rows-vector
+                          (normalize-txlog-replay-avg-rows lmdb rows record))]
           (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
             (binding [*out* *err*]
               (prn {:ha-replay-debug true
@@ -2464,7 +2476,9 @@
     lmdb
     (fn []
       (let [record-rows (cond
+                          (vector? (:rows record)) (:rows record)
                           (sequential? (:rows record)) (vec (:rows record))
+                          (vector? (:ops record)) (:ops record)
                           (sequential? (:ops record)) (vec (:ops record))
                           :else nil)]
         (when-not record-rows
@@ -2488,10 +2502,10 @@
                  [(assoc record :rows record-rows)]
                  (dec record-lsn))
                 (let [normalized-rows
-                      (-> (normalize-txlog-replay-avg-rows lmdb
-                                                           record-rows
-                                                           record)
-                          vec)
+                      (rows-vector
+                       (normalize-txlog-replay-avg-rows lmdb
+                                                        record-rows
+                                                        record))
                       append-res (binding [txlog/*commit-payload-ha-term*
                                            (some-> (:ha-term record) long)]
                                    (txlog/append-durable! state
@@ -2856,7 +2870,7 @@
                           (:ts payload)
                           0))
         ha-term (some-> (:ha-term payload) long)
-        rows (vec (or (:ops payload) []))
+        rows (rows-vector (:ops payload))
         tx-kind (txlog/classify-record-kind rows)
         payload-bytes (long (or (:body-len record)
                                 (some-> ^bytes (:body record) alength)

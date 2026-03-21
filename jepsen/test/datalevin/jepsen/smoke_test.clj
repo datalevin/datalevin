@@ -1527,13 +1527,16 @@
                                          :f :converge})]
         (is (= :ok (:type converge-op))
             (pr-str converge-op))
-        (is (= {"n1" [2000 2001 2002 2003]
-                "n2" [2000 2001 2002 2003]
-                "n3" [2000 2001 2002 2003]}
-               (into {}
-                     (map (fn [[logical-node {:keys [values]}]]
-                            [logical-node values]))
-                     (get-in converge-op [:value :nodes])))))
+        (let [expected-values (get-in converge-op [:value :expected])]
+          (is (vector? expected-values)
+              (pr-str converge-op))
+          (is (= {"n1" expected-values
+                  "n2" expected-values
+                  "n3" expected-values}
+                 (into {}
+                       (map (fn [[logical-node {:keys [values]}]]
+                              [logical-node values]))
+                       (get-in converge-op [:value :nodes]))))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
