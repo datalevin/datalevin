@@ -73,15 +73,27 @@
 
 (defn- del-max-weight
   [^SparseIntArrayList sl doc-id mw tf norm]
-  (let [w (/ ^double (tf* tf) ^short norm)]
-    (if (= mw w)
+  (let [norm-factor (double ^short norm)
+        w           (/ ^double (tf* tf) norm-factor)]
+    (if (<= ^double mw w)
       (if (= (sl/size sl) 1)
         0.0
-        (apply max (sequence (map #(/ (if (= doc-id %)
-                                        0.0
-                                        ^double (tf* (sl/get sl %)))
-                                      ^short norm))
-                             (.-indices sl))))
+        (let [indices ^RoaringBitmap (.-indices sl)
+              items   ^GrowingIntArray (.-items sl)
+              doc-id  (int doc-id)]
+          (loop [max-w 0.0
+                 item-idx 0
+                 ^PeekableIntIterator iter (.getIntIterator indices)]
+            (if (.hasNext iter)
+              (let [did (.next iter)
+                    tf' (.get items item-idx)]
+                (recur (if (= doc-id did)
+                         max-w
+                         (let [candidate-w (/ ^double (tf* tf') norm-factor)]
+                           (if (< max-w candidate-w) candidate-w max-w)))
+                       (unchecked-inc-int item-idx)
+                       iter))
+              max-w))))
       mw)))
 
 (defn- priority-queue
