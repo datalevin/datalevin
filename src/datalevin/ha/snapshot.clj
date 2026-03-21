@@ -23,7 +23,8 @@
    [java.io File]
    [java.nio.channels FileChannel]
    [java.nio.file AtomicMoveNotSupportedException Files Paths
-    StandardCopyOption StandardOpenOption]))
+    StandardCopyOption StandardOpenOption]
+   [java.util UUID]))
 
 (def ^"[Ljava.nio.file.StandardOpenOption;"
   ha-sync-read-open-options
@@ -144,15 +145,41 @@
              (u/file-exists stage-dir))
     (u/delete-files stage-dir)))
 
+(defn- ha-snapshot-install-displaced-path
+  [env-dir]
+  (str env-dir ".ha-restore-displaced-" (UUID/randomUUID)))
+
 (defn restore-ha-snapshot-install-backup!
   [env-dir backup-dir]
-  (when (u/file-exists env-dir)
-    (u/delete-files env-dir))
-  (move-path! backup-dir env-dir))
+  (let [displaced-dir
+        (when (u/file-exists env-dir)
+          (let [displaced-dir (ha-snapshot-install-displaced-path env-dir)]
+            (move-path! env-dir displaced-dir)
+            displaced-dir))]
+    (try
+      (move-path! backup-dir env-dir)
+      (when (and displaced-dir
+                 (u/file-exists displaced-dir))
+        (u/delete-files displaced-dir))
+      (catch Exception e
+        (when (and displaced-dir
+                   (u/file-exists displaced-dir)
+                   (not (u/file-exists env-dir))
+                   (u/file-exists backup-dir))
+          (try
+            (move-path! displaced-dir env-dir)
+            (catch Exception rollback-e
+              (log/error rollback-e
+                         "HA snapshot install restore failed to roll back displaced store"
+                         {:env-dir env-dir
+                          :backup-dir backup-dir
+                          :displaced-dir displaced-dir}))))
+        (throw e)))))
 
 (defn- recover-ha-snapshot-install-from-backup!
   [env-dir {:keys [backup-dir stage] :as marker} log-message]
-  (if (u/file-exists backup-dir)
+  (cond
+    (u/file-exists backup-dir)
     (do
       (log/warn log-message
                 {:env-dir env-dir
@@ -162,6 +189,18 @@
       (restore-ha-snapshot-install-backup! env-dir backup-dir)
       (delete-ha-snapshot-install-marker! env-dir)
       marker)
+
+    (u/file-exists env-dir)
+    (do
+      (log/warn "Completing HA snapshot install recovery after backup was already restored"
+                {:env-dir env-dir
+                 :backup-dir backup-dir
+                 :stage stage})
+      (delete-ha-snapshot-install-stage-dir! marker)
+      (delete-ha-snapshot-install-marker! env-dir)
+      marker)
+
+    :else
     (u/raise "HA snapshot install backup is missing during recovery"
              {:error :ha/follower-snapshot-install-recovery-failed
               :env-dir env-dir

@@ -28,7 +28,8 @@
    [taoensso.timbre :as log])
   (:import
    [java.nio.file Paths]
-   [java.util UUID]))
+   [java.util UUID]
+   [java.util.concurrent Semaphore]))
 
 (def ^:private view-act :datalevin.server/view)
 (def ^:private alter-act :datalevin.server/alter)
@@ -83,6 +84,19 @@
 (defn- write-result!
   [deps skey result]
   ((:write-message deps) skey {:type :command-complete :result result}))
+
+(defn- with-best-effort-db-transaction-slot
+  [deps server db-name f]
+  (let [^Semaphore lock ((:get-lock deps) server db-name)]
+    (if (.tryAcquire lock)
+      (try
+        (f)
+        (finally
+          (.release lock)))
+      {:ok? false
+       :skipped? true
+       :reason :write-transaction-open
+       :db-name db-name})))
 
 (defn- write-or-copy-result!
   [deps skey data]
@@ -1323,8 +1337,13 @@
            (write-result!
              deps
              skey
-             (kv/txlog-update-replica-floor!
-              kv-store replica-id applied-lsn)))))))
+             (with-best-effort-db-transaction-slot
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-update-replica-floor!
+                  kv-store replica-id applied-lsn)))))))))
 
 (defn txlog-clear-replica-floor!
   [deps server skey {:keys [args]}]
@@ -1341,7 +1360,12 @@
            (write-result!
              deps
              skey
-             (kv/txlog-clear-replica-floor! kv-store replica-id)))))))
+             (with-best-effort-db-transaction-slot
+               deps
+               server
+               db-name
+               (fn []
+                 (kv/txlog-clear-replica-floor! kv-store replica-id)))))))))
 
 (defn txlog-pin-backup-floor!
   [deps server skey {:keys [args]}]

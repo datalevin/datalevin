@@ -827,13 +827,32 @@
              (long (or (:ha-probe-round-timeout-ms m)
                        (ha-request-timeout-ms m 1000))))))
 
+(deftype ^:private HaParallelProbeTask [^int index
+                                        item
+                                        ^clojure.lang.IFn f
+                                        values
+                                        errors]
+  Callable
+  (call [_]
+    (let [^objects values values
+          ^objects errors  errors
+          idx              (int index)]
+      (try
+        (aset values idx (f item))
+        (Integer/valueOf idx)
+        (catch Throwable t
+          (aset errors idx t)
+          (Integer/valueOf idx))))))
+
 (defn- ha-parallel-mapv
   ([f coll]
    (ha-parallel-mapv nil f coll))
   ([m f coll]
    (ha-parallel-mapv m f coll nil))
   ([m f coll timeout-value-fn]
-   (let [items (vec coll)
+   (let [items (if (vector? coll)
+                 coll
+                 (vec coll))
          n (count items)]
      (cond
        (zero? n)
@@ -846,100 +865,139 @@
        (let [^ExecutorService executor (ha-probe-executor-for m)
              ^ExecutorCompletionService completion
              (ExecutorCompletionService. executor)
-             results (object-array n)
+             ^objects results (object-array n)
+             ^objects values (object-array n)
+             ^objects errors (object-array n)
+             ^objects futures (object-array n)
+             completed (boolean-array n)
              timeout-ms (long (ha-probe-round-timeout-ms m))
-             pending
-             (into {}
-                   (map-indexed
-                    (fn [idx item]
-                      [idx
-                       {:item item
-                        :future
-                        (.submit completion
-                                 ^Callable
-                                 (reify Callable
-                                   (call [_]
-                                     (try
-                                       {:index idx
-                                        :value (f item)}
-                                       (catch Throwable e
-                                         {:index idx
-                                          :item item
-                                          :error e})))))}])
-                    items))
              deadline-nanos
              (unchecked-add (long (ha-now-nanos))
                             (unchecked-multiply
                              (long 1000000)
                              (long timeout-ms)))]
-         (letfn [(finish [failures]
-                   (if-let [{:keys [index item error]} (first failures)]
-                     (throw (ex-info "HA parallel probe task failed"
-                                     {:error :ha/parallel-probe-failed
-                                      :index index
-                                      :item item
-                                      :failure-count (count failures)}
-                                     error))
-                     (mapv identity results)))
-                 (record-completion [pending failures ^Future completed]
-                   (let [{:keys [index value item error]} (.get completed)]
-                     (if-not (contains? pending index)
-                       [pending failures]
-                       (let [pending (dissoc pending index)]
-                         (if error
-                           [pending
-                            (conj failures
-                                  {:index index
-                                   :item item
-                                   :error error})]
-                           (do
-                             (aset results (int index) value)
-                             [pending failures]))))))
-                 (drain-ready [pending failures]
-                   (loop [pending pending
-                          failures failures]
-                     (if-let [completed (.poll completion)]
-                       (let [[pending failures]
-                             (record-completion pending failures completed)]
-                         (recur pending failures))
-                       [pending failures])))]
-           (loop [pending pending
-                  failures []]
-             (if (empty? pending)
-               (finish failures)
-               (let [remaining-nanos
-                     (unchecked-subtract
-                      (long deadline-nanos)
-                      (long (ha-now-nanos)))
-                     completed
-                     (when (pos? remaining-nanos)
-                       (.poll completion
-                              (long (max 1
-                                         (quot remaining-nanos
-                                               1000000)))
-                              TimeUnit/MILLISECONDS))]
-                 (if completed
-                   (let [[pending failures]
-                         (record-completion pending failures completed)]
-                     (recur pending failures))
-                   (let [[pending failures] (drain-ready pending failures)]
-                     (if (empty? pending)
-                       (finish failures)
+         (dotimes [idx n]
+           (aset futures idx
+                 (.submit completion
+                          ^Callable
+                          (HaParallelProbeTask.
+                           (int idx)
+                           (nth items idx)
+                           f
+                           values
+                           errors))))
+         (letfn [(finish [^long first-failure]
+                   (if (neg? first-failure)
+                     (loop [idx 0
+                            acc (transient [])]
+                       (if (< idx n)
+                         (recur (unchecked-inc-int idx)
+                                (conj! acc (aget results idx)))
+                         (persistent! acc)))
+                     (let [index (int first-failure)
+                           item (nth items index)
+                           error (aget errors index)
+                           failure-count
+                           (loop [idx 0
+                                  count (long 0)]
+                             (if (< idx n)
+                               (recur (unchecked-inc-int idx)
+                                      (if (and (aget completed idx)
+                                               (some? (aget errors idx)))
+                                        (unchecked-inc count)
+                                        count))
+                               count))]
+                       (throw
+                        (ex-info "HA parallel probe task failed"
+                                 {:error :ha/parallel-probe-failed
+                                  :index index
+                                  :item item
+                                  :failure-count failure-count}
+                                 error)))))
+                 (record-completion [^long remaining
+                                     ^long first-failure
+                                     ^Future completed-future]
+                   (let [idx (int ^Integer (.get completed-future))]
+                     (if (aget completed idx)
+                       [remaining first-failure]
                        (do
-                         (doseq [[_ {:keys [^Future future]}] pending]
-                           (.cancel future true))
-                         (if timeout-value-fn
-                           (do
-                             (doseq [[idx {:keys [item]}] pending]
-                               (aset results (int idx)
-                                     (timeout-value-fn item)))
-                             (finish failures))
-                           (throw (ex-info "HA parallel probe timed out"
-                                           {:error :ha/parallel-probe-timeout
-                                            :timeout-ms timeout-ms
-                                            :pending-count (count pending)
-                                            :items (mapv :item
-                                                         (vals pending))}))))))))))))))))
+                         (aset completed idx true)
+                         (when-not (some? (aget errors idx))
+                           (aset results idx (aget values idx)))
+                         [(unchecked-dec remaining)
+                          (if (and (neg? first-failure)
+                                   (some? (aget errors idx)))
+                            (long idx)
+                            first-failure)]))))
+                 (drain-ready [^long remaining ^long first-failure]
+                   (loop [remaining remaining
+                          first-failure first-failure]
+                     (if-let [completed-future (.poll completion)]
+                       (let [[remaining first-failure]
+                             (record-completion
+                              remaining
+                              first-failure
+                              completed-future)]
+                         (recur remaining first-failure))
+                       [remaining first-failure])))
+                 (timeout-items []
+                   (loop [idx 0
+                          acc (transient [])]
+                     (if (< idx n)
+                       (recur (unchecked-inc-int idx)
+                              (if (aget completed idx)
+                                acc
+                                (conj! acc (nth items idx))))
+                       (persistent! acc))))
+                 (assign-timeout-results! []
+                   (dotimes [idx n]
+                     (when-not (aget completed idx)
+                       (aset results idx
+                             (timeout-value-fn (nth items idx))))))
+                 (cancel-pending! []
+                   (dotimes [idx n]
+                     (when-not (aget completed idx)
+                       (when-let [^Future future (aget futures idx)]
+                         (.cancel future true)))))]
+           (loop [remaining (long n)
+                  first-failure (long -1)]
+             (let [remaining (long remaining)]
+               (if (zero? remaining)
+                 (finish first-failure)
+                 (let [remaining-nanos
+                       (unchecked-subtract
+                        (long deadline-nanos)
+                        (long (ha-now-nanos)))
+                       completed-future
+                       (when (pos? remaining-nanos)
+                         (.poll completion
+                                (long (max 1
+                                           (quot remaining-nanos
+                                                 1000000)))
+                                TimeUnit/MILLISECONDS))]
+                   (if completed-future
+                     (let [[remaining first-failure]
+                           (record-completion
+                            remaining
+                            first-failure
+                            completed-future)]
+                       (recur remaining first-failure))
+                     (let [[remaining first-failure]
+                           (drain-ready remaining first-failure)
+                           remaining (long remaining)]
+                       (if (zero? remaining)
+                         (finish first-failure)
+                         (do
+                           (cancel-pending!)
+                           (if timeout-value-fn
+                             (do
+                               (assign-timeout-results!)
+                               (finish first-failure))
+                             (throw (ex-info "HA parallel probe timed out"
+                                             {:error :ha/parallel-probe-timeout
+                                              :timeout-ms timeout-ms
+                                              :pending-count remaining
+                                              :items (timeout-items)})))))))))))))))))
 
 (defn- normalize-leader-watermark-result
   [lease result]
