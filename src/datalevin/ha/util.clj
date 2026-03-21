@@ -36,6 +36,15 @@
         b (long b)]
     (if (< a b) a b)))
 
+(defn saturated-long-add ^long
+  [a b]
+  (let [a (long a)
+        b (long b)]
+    (try
+      (Math/addExact a b)
+      (catch ArithmeticException _
+        (if (neg? a) Long/MIN_VALUE Long/MAX_VALUE)))))
+
 (defn nonnegative-long-diff ^long
   [a b]
   (let [a (long a)

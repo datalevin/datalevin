@@ -110,7 +110,8 @@
         (let [lease-until-ms (long lease-until-ms)
               skew-budget-ms (ha-clock-skew-budget-ms m)]
           (>= (long now-ms)
-              (long (unchecked-add lease-until-ms skew-budget-ms)))))))
+              (hu/saturated-long-add lease-until-ms
+                                     skew-budget-ms))))))
 
 (defn- ha-renew-timeout-ms ^long
   [m now-ms now-nanos]

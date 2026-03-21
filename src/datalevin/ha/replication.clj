@@ -47,6 +47,7 @@
 (def ^:private long-max3 hu/long-max3)
 (def ^:private long-max4 hu/long-max4)
 (def ^:private long-min2 hu/long-min2)
+(def ^:private saturated-long-add hu/saturated-long-add)
 (def ^:private nonnegative-long-diff hu/nonnegative-long-diff)
 (def ^:private ordered-ha-members hu/ordered-ha-members)
 (def ^:private shutdown-ha-executor! hu/shutdown-ha-executor!)
@@ -872,10 +873,9 @@
              completed (boolean-array n)
              timeout-ms (long (ha-probe-round-timeout-ms m))
              deadline-nanos
-             (unchecked-add (long (ha-now-nanos))
-                            (unchecked-multiply
-                             (long 1000000)
-                             (long timeout-ms)))]
+             (saturated-long-add
+              (long (ha-now-nanos))
+              (.toNanos TimeUnit/MILLISECONDS timeout-ms))]
          (dotimes [idx n]
            (aset futures idx
                  (.submit completion
