@@ -40,6 +40,8 @@
 (def ^:private user-obj :datalevin.server/user)
 (def ^:private role-obj :datalevin.server/role)
 (def ^:private server-obj :datalevin.server/server)
+(def ^:private transient-runtime-store-max-attempts 8)
+(def ^:private transient-runtime-store-retry-sleep-ms 25)
 
 (defn- with-error
   [deps skey f]
@@ -133,11 +135,12 @@
       (if (:ok? outcome)
         (:value outcome)
         (let [e (:error outcome)]
-          (if (and (zero? attempt)
+          (if (and (< attempt transient-runtime-store-max-attempts)
                    (transient-runtime-store-error? e))
             (do
-              (Thread/sleep 25)
-              (recur 1))
+              (Thread/sleep (long (* transient-runtime-store-retry-sleep-ms
+                                     (inc attempt))))
+              (recur (inc attempt)))
             (throw e)))))))
 
 (defn- write-or-copy-result!

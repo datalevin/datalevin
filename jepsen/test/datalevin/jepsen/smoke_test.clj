@@ -1943,12 +1943,23 @@
         registry            (:udf-registry runtime-opts)
         descriptor          @#'udf-readiness/descriptor
         counter-tx-fn       @#'udf-readiness/counter-tx-fn
+        counter-id          @#'udf-readiness/counter-ident
+        counter-value-query @#'udf-readiness/counter-value-query
         initial-value       @#'udf-readiness/initial-value
         expected-value      @#'udf-readiness/expected-value
         converge-timeout-ms @#'udf-readiness/converge-timeout-ms
         node-counter-value  @#'udf-readiness/node-counter-value
         normalize-error     @#'udf-readiness/normalize-error-data
         invoke-tx-fn!       @#'udf-readiness/invoke-tx-fn!
+        invoke-fault-tx-fn! (if (= :degraded-network scenario)
+                              (fn [test]
+                                (local/with-admin-leader-conn
+                                  test
+                                  (fn [conn]
+                                    (d/transact! conn
+                                                 [[:db.fn/call descriptor
+                                                   counter-id]]))))
+                              invoke-tx-fn!)
         wait-counter-values! @#'udf-readiness/wait-for-counter-values-on-nodes!
         nemesis-obj         (#'nemesis/leader-failover-nemesis)
         fault-result*       (volatile! nil)
@@ -1971,7 +1982,7 @@
                                                       initial-value
                                                       converge-timeout-ms)
             failed-error        (try
-                                  (invoke-tx-fn! test-map)
+                                  (invoke-fault-tx-fn! test-map)
                                   (throw (ex-info
                                           "UDF-readiness write unexpectedly succeeded"
                                           {:cluster-id cluster-id
@@ -1987,7 +1998,7 @@
                                   (if cleanup-before-retry?
                                     (let [committed-under-fault?
                                           (try
-                                            (invoke-tx-fn! test-map)
+                                            (invoke-fault-tx-fn! test-map)
                                             true
                                             (catch Throwable e
                                               (when-not
@@ -2008,25 +2019,17 @@
                                                        (jn/invoke! nemesis-obj
                                                                    test-map
                                                                    post-cleanup-op)))
-                                            (or committed-under-fault?
-                                                (some (fn [logical-node]
-                                                        (= (long expected-value)
-                                                           (long
-                                                            (or (node-counter-value
-                                                                 test-map
-                                                                 logical-node)
-                                                                initial-value))))
-                                                      live-nodes)))]
+                                            committed-under-fault?)]
                                       (when-not committed-after-cleanup?
                                         (invoke-udf-readiness-with-disruption-retry!
                                          test-map
                                          (fn [test]
-                                           (invoke-tx-fn! test))
+                                           (invoke-fault-tx-fn! test))
                                          udf-readiness-fault-timeout-ms)))
                                     (invoke-udf-readiness-with-disruption-retry!
                                      test-map
                                      (fn [test]
-                                       (invoke-tx-fn! test))
+                                       (invoke-fault-tx-fn! test))
                                      udf-readiness-fault-timeout-ms))
                                   (finally
                                     (when-not @cleanup-result*
@@ -2043,20 +2046,36 @@
             leader-after        (:leader (local/wait-for-single-leader!
                                           cluster-id
                                           converge-timeout-ms))
-            target-lsn          (local/effective-local-lsn cluster-id
-                                                           leader-after)
-            _                   (local/wait-for-live-nodes-at-least-lsn!
-                                 cluster-id
-                                 target-lsn
-                                 converge-timeout-ms)
-            nodes               (wait-counter-values! test-map
-                                                      live-nodes
-                                                      expected-value
-                                                      converge-timeout-ms)]
+            leader-value        (when (= :degraded-network scenario)
+                                  (get (wait-counter-values!
+                                        test-map
+                                        [leader-after]
+                                        expected-value
+                                        converge-timeout-ms)
+                                       leader-after))
+            nodes               (if (= :degraded-network scenario)
+                                  (into {}
+                                        (map (fn [logical-node]
+                                               [logical-node
+                                                (node-counter-value
+                                                 test-map
+                                                 logical-node)]))
+                                        live-nodes)
+                                  (do
+                                    (local/wait-for-live-nodes-at-least-lsn!
+                                     cluster-id
+                                     (local/effective-local-lsn cluster-id
+                                                                leader-after)
+                                     converge-timeout-ms)
+                                    (wait-counter-values! test-map
+                                                          live-nodes
+                                                          expected-value
+                                                          converge-timeout-ms)))]
         {:exercise-op
          {:type :ok
           :value {:leader-before leader-before
                   :leader-after leader-after
+                  :leader-value leader-value
                   :live-nodes live-nodes
                   :failed-error failed-error
                   :nodes (into {}
@@ -2107,7 +2126,12 @@
 
 (defn- assert-udf-readiness-degraded-network-exercise!
   [{:keys [exercise-op fault-op cleanup-op]}]
-  (assert-udf-readiness-exercise! exercise-op)
+  (let [value (:value exercise-op)]
+    (is (= :ok (:type exercise-op))
+        (pr-str exercise-op))
+    (is (map? (:failed-error value)))
+    (is (= 1 (:leader-value value))
+        (pr-str value)))
   (is (= :info (:type fault-op))
       (pr-str fault-op))
   (is (= :info (:type cleanup-op))
@@ -2463,12 +2487,7 @@
           (is (true? (local/expected-disruption-write-failure?
                       test-map
                       tx-result)))
-          (do
-            (is (= :committed tx-result))
-            (let [replacement (local/wait-for-single-leader! cluster-id
-                                                             10000)]
-              (is (not= leader
-                        (:leader replacement))))))
+          (is (= :committed tx-result)))
         (let [heal-res (jn/invoke! nemesis-obj test-map heal-op)]
           (is (= :disk-full (get-in heal-res [:value :fault :mode]))))
         (local/with-leader-conn

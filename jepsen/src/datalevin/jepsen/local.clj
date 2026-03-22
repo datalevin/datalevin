@@ -1918,6 +1918,22 @@
       (finally
         (safe-close-conn! conn)))))
 
+(defn with-admin-node-conn
+  [test logical-node f]
+  (let [cluster-id (:datalevin/cluster-id test)
+        conn       (get-in @clusters [cluster-id :admin-conns logical-node])]
+    (when (d/closed? conn)
+      (u/raise "Jepsen admin connection unavailable"
+               {:cluster-id cluster-id
+                :logical-node logical-node}))
+    (f conn)))
+
+(defn with-admin-leader-conn
+  [test f]
+  (let [cluster-id (:datalevin/cluster-id test)
+        leader     (:leader (wait-for-single-leader! cluster-id))]
+    (with-admin-node-conn test leader f)))
+
 (defn stopped-node-info
   [cluster-id logical-node]
   (get-in @clusters [cluster-id :stopped-node-info logical-node]))

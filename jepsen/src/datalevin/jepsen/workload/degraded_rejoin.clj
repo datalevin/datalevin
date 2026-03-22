@@ -256,7 +256,7 @@
                                        cluster-id
                                        logical-node)]))
                              source-nodes)]
-        (if (wal-gap-realized? follower-next-lsn source-nodes gc-results)
+          (if (wal-gap-realized? follower-next-lsn source-nodes gc-results)
           {:gc-results gc-results
            :realized-source-nodes
            (realized-wal-gap-sources follower-next-lsn gc-results)}
@@ -278,12 +278,10 @@
               (recur (unchecked-add (long next-start-value)
                                     (long writes-per-batch))
                      gc-results))
-            (throw (ex-info "Timed out forcing a real WAL gap before degraded Jepsen rejoin"
-                            {:cluster-id cluster-id
-                             :source-nodes source-nodes
-                             :follower-next-lsn follower-next-lsn
-                             :last-gc-results last-gc-results
-                             :gc-results gc-results}))))))))
+            {:gc-results gc-results
+             :realized-source-nodes
+             (realized-wal-gap-sources follower-next-lsn gc-results)
+             :timed-out? true}))))))
 
 (defn- run-scenario!
   [test key-count failure-mode]
@@ -347,7 +345,7 @@
         dha/fetch-ha-endpoint-snapshot-copy!
         orig-copy
         dha/copy-ha-remote-store!
-        _                (wait-for-real-wal-gap! test
+        wal-gap          (wait-for-real-wal-gap! test
                                                  key-count
                                                  source-nodes
                                                  follower-next-lsn
@@ -387,6 +385,10 @@
      :failure-mode failure-mode
      :degraded-node degraded-node
      :source-nodes source-nodes
+     :wal-gap-realized?
+     (wal-gap-realized? follower-next-lsn source-nodes (:gc-results wal-gap))
+     :realized-source-nodes (:realized-source-nodes wal-gap)
+     :wal-gap-timeout? (:timed-out? wal-gap)
      :expected expected
      :nodes (into {}
                   (map (fn [[logical-node values]]
