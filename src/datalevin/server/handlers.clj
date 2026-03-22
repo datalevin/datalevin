@@ -940,27 +940,45 @@
            tf                 (u/tmp-dir (str "copy-" (UUID/randomUUID)))
            path               (Paths/get (str tf u/+separator+ c/data-file-name)
                                          (into-array String []))]
-       (try
-         (with-transient-runtime-store-retry
-           (fn []
-             (let [source-store (kv-store deps server skey db-name writing?)]
-               (vreset! source-store-v source-store)
-               (reset! copy-backup-pin nil)
-               (try
+       (letfn [(cleanup-copy-dir! []
+                 (try
+                   ((:cleanup-copy-tmp-dir! deps) tf)
+                   (catch Throwable _ nil))
+                 (u/create-dirs tf))
+               (copy-store! [source-store backup-pin-enabled?]
+                 (reset! copy-backup-pin nil)
                  (binding [kv/*wal-copy-backup-pin-observer*
-                           (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
-                             (reset! copy-backup-pin
-                                     {:pin-id pin-id
-                                      :floor-lsn pin-floor-lsn
-                                      :expires-ms pin-expires-ms}))]
-                   ((:server-copy-store! deps) source-store tf compact?))
-                 (catch Throwable e
-                   (when (transient-runtime-store-error? e)
-                     (try
-                       ((:cleanup-copy-tmp-dir! deps) tf)
-                       (catch Throwable _ nil))
-                     (u/create-dirs tf))
-                   (throw e))))))
+                           (when backup-pin-enabled?
+                             (fn [{:keys [pin-id pin-floor-lsn pin-expires-ms]}]
+                               (reset! copy-backup-pin
+                                       {:pin-id pin-id
+                                        :floor-lsn pin-floor-lsn
+                                        :expires-ms pin-expires-ms})))
+                           kv/*wal-copy-backup-pin-enabled?*
+                           backup-pin-enabled?]
+                   ((:server-copy-store! deps) source-store tf compact?)))]
+       (try
+         (with-runtime-store-read-access
+           deps
+           server
+           db-name
+           (fn []
+             ;; Snapshot copy must not race a runtime store swap/reopen.
+             (with-transient-runtime-store-retry
+               (fn []
+                 (let [source-store (kv-store deps server skey db-name writing?)]
+                   (vreset! source-store-v source-store)
+                   (try
+                     (copy-store! source-store true)
+                     (catch Throwable e
+                       (when (transient-runtime-store-error? e)
+                         (cleanup-copy-dir!)
+                         (log/debug
+                           e
+                           "Retrying server copy without WAL backup pin after transient source-store race"
+                           {:db-name db-name})
+                         (copy-store! source-store false))
+                       (throw e))))))))
          (let [completed-ms (System/currentTimeMillis)
                copied-store ((:open-server-copied-store! deps) tf nil nil)]
            (try
@@ -985,7 +1003,7 @@
              (catch Throwable e
                (log/warn e
                          "Unable to delete temporary copy directory"
-                         {:path (str tf)}))))))))
+                         {:path (str tf)})))))))))
 
 (defn- run-batch-kv-call
   [kv-store call]

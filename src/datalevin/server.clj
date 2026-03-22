@@ -118,11 +118,23 @@
   (cond
     (instance? IStore store)
     (let [env-dir (i/dir store)]
+      (when-not (store-closed? store)
+        (try
+          (close-store store)
+          (catch Throwable _
+            nil)))
       (dha/recover-ha-local-store-dir-if-needed! env-dir)
       (st/open env-dir (i/schema store) (i/opts store)))
 
     (instance? ILMDB store)
-    (l/open-kv (i/env-dir store) (i/env-opts store))
+    (let [env-dir (i/env-dir store)
+          env-opts (i/env-opts store)]
+      (when-not (store-closed? store)
+        (try
+          (close-store store)
+          (catch Throwable _
+            nil)))
+      (l/open-kv env-dir env-opts))
 
     :else
     (u/raise "Unknown store" {})))

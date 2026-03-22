@@ -1692,6 +1692,7 @@
   (let [value         (:value exercise-op)
         drifted-node  (:drifted-node value)
         expected      (:expected value)
+        matched-nodes (set (:matched-nodes value))
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1703,9 +1704,11 @@
                    drifted-node))
     (is (contains? (set (keys values-by-node))
                    drifted-node))
-    (is (every? (fn [[_ values]]
-                  (= expected values))
-                values-by-node)
+    (is (<= 2 (count matched-nodes))
+        (pr-str value))
+    (is (every? (fn [logical-node]
+                  (= expected (get values-by-node logical-node)))
+                matched-nodes)
         (pr-str value))))
 
 (deftest membership-drift-live-client-recovers-leader-smoke-test

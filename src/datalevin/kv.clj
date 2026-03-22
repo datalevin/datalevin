@@ -3015,19 +3015,18 @@
                                           collected)]
                          (if (and (some? min-lsn)
                                   (<= (long min-lsn) from))
-                           (->> collected' (mapcat identity) vec)
+                           (mapcat identity collected')
                            (recur (next remaining) collected')))
-                       (->> collected (mapcat identity) vec)))
-                   (->> segments
-                        (mapcat #(-> (txlog-segment-records-entry
-                                      state
-                                      %
-                                      cache-v)
-                                     :records))
-                        vec))]
+                       (mapcat identity collected)))
+                   (mapcat #(-> (txlog-segment-records-entry
+                                 state
+                                 %
+                                 cache-v)
+                                :records)
+                           segments))]
      (loop [prev nil
-            [record & more] records]
-       (when record
+            records (seq records)]
+       (when-let [record (first records)]
          (let [lsn (:lsn record)]
            (when (or (not (pos? ^long lsn))
                      (and prev (not= lsn (inc ^long prev))))
@@ -3036,7 +3035,7 @@
                      :previous-lsn prev
                      :lsn lsn
                      :record record}))
-           (recur lsn more))))
+           (recur lsn (next records)))))
      records)))
 
 (defn- local-dir?

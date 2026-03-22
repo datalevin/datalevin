@@ -216,18 +216,25 @@
      (.toArray ~'lst ^"[Ldatalevin.search.Candidate;"
                (make-array Candidate (.size ~'lst)))))
 
+(defn- prefix-union-bm
+  ^RoaringBitmap [^"[Lorg.roaringbitmap.RoaringBitmap;" rbms ^long z]
+  (let [limit    (min (alength rbms) (int z))
+        union-bm ^RoaringBitmap (.clone ^RoaringBitmap (aget rbms 0))]
+    (loop [i (int 1)]
+      (if (< i limit)
+        (do
+          (.or union-bm ^RoaringBitmap (aget rbms i))
+          (recur (unchecked-inc-int i)))
+        union-bm))))
+
 (defn- first-candidates
-  [{:keys [sls bms tids bbm]} ^RoaringBitmap result tao n]
-  (let [z          (inc (- ^long n ^long tao))
-        union-tids (set (take z tids))
-        union-bms  (->> (select-keys bms union-tids)
-                        vals
-                        (into-array RoaringBitmap))
-        union-bm   (FastAggregation/or
-                     ^"[Lorg.roaringbitmap.RoaringBitmap;" union-bms)]
+  [{:keys [tids rbms rsls bbm]} ^RoaringBitmap result tao n]
+  (let [z        (inc (- ^long n ^long tao))
+        union-bm (prefix-union-bm rbms z)]
     (candidate-array
-      (doseq [tid tids]
-        (let [bm   ^FastRankRoaringBitmap (bms tid)
+      (dotimes [i (count tids)]
+        (let [tid  (nth tids i)
+              bm   ^FastRankRoaringBitmap (aget rbms i)
               bm'  (let [iter-bm (.clone bm)]
                      (doto ^FastRankRoaringBitmap iter-bm
                        (.and ^RoaringBitmap bbm)
@@ -235,7 +242,7 @@
                        (.andNot result)))
               iter (.getIntIterator ^FastRankRoaringBitmap bm')]
           (when (.hasNext ^PeekableIntIterator iter)
-            (.add lst (Candidate. tid (sls tid) iter))))))))
+            (.add lst (Candidate. tid (nth rsls i) iter))))))))
 
 (defn- next-candidates
   [did ^"[Ldatalevin.search.Candidate;" candidates]
@@ -633,32 +640,33 @@
   (let [wqs (IntDoubleHashMap.)
         mxs (IntDoubleHashMap.)]
     (loop [qterms qterms
-           tids  (transient [])
            rtids (transient [])
+           rbms  (transient [])
+           rsls  (transient [])
            tmid  (transient {})
            bms   (transient {})
-           sls   (transient {})
            tms   (transient {})]
       (if-let [{:keys [id mw sl tm wq]} (first qterms)]
-        (let [bm (.-indices ^SparseIntArrayList sl)]
+        (let [bm        (.-indices ^SparseIntArrayList sl)
+              required? (req tm)]
           (.put wqs id wq)
           (.put mxs id (* ^double wq ^double mw))
           (recur (next qterms)
-                 (conj! tids id)
-                 (if (req tm) (conj! rtids id) rtids)
+                 (if required? (conj! rtids id) rtids)
+                 (if required? (conj! rbms bm) rbms)
+                 (if required? (conj! rsls sl) rsls)
                  (assoc! tmid tm id)
                  (assoc! bms id bm)
-                 (assoc! sls id sl)
                  (assoc! tms id tm)))
-        (let [tids (persistent! tids)
-              tmid (persistent! tmid)
+        (let [tmid (persistent! tmid)
               bms  (persistent! bms)]
           (assoc context
                  :wqs wqs
                  :tmid tmid
                  :tids (persistent! rtids)
+                 :rbms (into-array RoaringBitmap (persistent! rbms))
+                 :rsls (persistent! rsls)
                  :bms bms
-                 :sls (persistent! sls)
                  :tms (persistent! tms)
                  :mxs mxs
                  :bbm (boolean-bm tmid bms max-doc query)))))))

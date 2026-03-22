@@ -810,11 +810,12 @@
          timed-out? (atom false)
          result-f   (future
                       (try
-                        (let [conn (d/create-conn uri
-                                                  schema
-                                                  (assoc opts
-                                                         :client-opts
-                                                         conn-client-opts))]
+                        (let [create-conn (var-get #'d/create-conn)
+                              conn (create-conn uri
+                                                schema
+                                                (assoc opts
+                                                       :client-opts
+                                                       conn-client-opts))]
                           (if @timed-out?
                             (do
                               (safe-close-conn! conn)
@@ -1143,8 +1144,8 @@
 
       :else
       (try
-        (if-let [err (#'srv/ha-write-admission-error
-                      server
+        (if-let [err (dha/ha-write-admission-error
+                      (.-dbs ^Server server)
                       {:type :open-dbi
                        :args [db-name "__jepsen_probe" nil]})]
           {:status :rejected

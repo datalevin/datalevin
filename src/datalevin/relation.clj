@@ -84,6 +84,28 @@
                (if (> idx max-idx) idx max-idx)))
       (unchecked-inc max-idx))))
 
+(defn- attrs-numbered?
+  [attrs]
+  (loop [entries (seq attrs)]
+    (if entries
+      (let [[_ idx] (first entries)]
+        (and (number? idx)
+             (recur (next entries))))
+      true)))
+
+(defn- renumber-attrs
+  [attrs]
+  (persistent!
+    (loop [entries (seq attrs)
+           idx     0
+           acc     (transient {})]
+      (if entries
+        (let [[sym _] (first entries)]
+          (recur (next entries)
+                 (unchecked-inc-int idx)
+                 (assoc! acc sym idx)))
+        acc))))
+
 (defn- sum-rel*
   [attrs-a ^List tuples-a attrs-b ^List tuples-b]
   (let [n            (count attrs-b)
@@ -135,11 +157,11 @@
          "Can’t sum relations with different attrs: " attrs-a " and " attrs-b
          {:error :query/where})
 
-       (every? number? (vals attrs-a))
+       (attrs-numbered? attrs-a)
        (sum-rel* attrs-a tuples-a attrs-b tuples-b)
 
        :else
-       (let [number-attrs (zipmap (keys attrs-a) (range))
+       (let [number-attrs (renumber-attrs attrs-a)
              size-a       (.size ^List tuples-a)
              size-b       (.size ^List tuples-b)]
          (-> (sum-rel* number-attrs (FastList. (+ size-a size-b))
@@ -202,7 +224,7 @@
          "Can’t sum relations with different attrs: " attrs-a " and " attrs-b
          {:error :query/where})
 
-       (every? number? (vals attrs-a))
+       (attrs-numbered? attrs-a)
        (let [n              (count attrs-b)
              ^ints idxs-b   (int-array n)
              ^ints idxs-a   (int-array n)

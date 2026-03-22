@@ -564,6 +564,20 @@
     (if (= v-type :ignore) true (second item))
     item))
 
+(defn- range-page
+  [page]
+  (if (vector? page) page (vec page)))
+
+(defn- project-range-batch
+  [chunk ignore-key? v-type]
+  (if ignore-key?
+    (persistent!
+      (reduce (fn [acc item]
+                (conj! acc (project-range-item item true v-type)))
+              (transient [])
+              chunk))
+    chunk))
+
 (defn- find-index
   [item coll]
   (second (u/some-indexed #(= item %) coll)))
@@ -586,8 +600,9 @@
                      (loop [request-n (unchecked-inc
                                        (unchecked-add batch-size
                                                       (long resume-run-count)))]
-                       (let [raw       (vec (fetch-first-n dbi-name request-n
-                                                           k-range k-type v-type))
+                       (let [raw       (range-page
+                                         (fetch-first-n dbi-name request-n
+                                                        k-range k-type v-type))
                              raw-count (count raw)]
                          (if resume
                            (if-some [idx (find-index resume raw)]
@@ -610,11 +625,8 @@
                                                        (int (unchecked-add
                                                               (unchecked-inc idx*)
                                                               (count chunk))))
-                                       batch   (mapv
-                                                 #(project-range-item %
-                                                                     ignore-key?
-                                                                     v-type)
-                                                 chunk)
+                                       batch   (project-range-batch
+                                                 chunk ignore-key? v-type)
                                        more?   (> tail-count batch-size)
                                        next-k  (when more? (first (peek chunk)))]
                                    {:batch      batch
@@ -631,9 +643,8 @@
                            (let [chunk  (if (> raw-count batch-size)
                                           (subvec raw 0 batch-size)
                                           raw)
-                                 batch  (mapv #(project-range-item % ignore-key?
-                                                                   v-type)
-                                              chunk)
+                                 batch  (project-range-batch chunk ignore-key?
+                                                             v-type)
                                  more?  (> raw-count batch-size)
                                  next-k (when more? (first (peek chunk)))]
                              {:batch      batch

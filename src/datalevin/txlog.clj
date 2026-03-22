@@ -2023,12 +2023,20 @@
              {:type :txlog/invalid-range
               :from-lsn from
               :upto-lsn upto}))
-    (->> records
-         (filter #(>= (long (:lsn %)) from))
-         (filter #(if upto
-                    (<= (long (:lsn %)) (long upto))
-                    true))
-         (mapv transform-record))))
+    (persistent!
+      (reduce (fn [acc record]
+                (let [lsn (long (:lsn record))]
+                  (cond
+                    (< lsn from)
+                    acc
+
+                    (and upto (> lsn upto))
+                    (reduced acc)
+
+                    :else
+                    (conj! acc (transform-record record)))))
+              (transient [])
+              records))))
 
 (defn- attach-open-record-payload-bytes
   [record]

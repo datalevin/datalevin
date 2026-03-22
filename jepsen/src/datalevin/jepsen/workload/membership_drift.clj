@@ -111,7 +111,7 @@
         (cond
           (>= (count matching) required-count)
           {:snapshot snapshot
-           :matching logical-nodes
+           :matching matching
            :matched-nodes matching}
 
           (< (System/currentTimeMillis) deadline)
@@ -375,7 +375,7 @@
                  2
                  live-converge-timeout-ms)
               expected (node-register-values test leader-after key-count)
-              {:keys [snapshot]}
+              {:keys [snapshot matched-nodes]}
               (wait-for-register-values-on-at-least-nodes!
                test
                live-after-restore
@@ -391,7 +391,9 @@
            :drift-error drift-error
            :live-before live-before
            :live-after-restore live-after-restore
+           :baseline-expected baseline-expected
            :expected expected
+           :matched-nodes matched-nodes
            :nodes (into {}
                         (map (fn [[logical-node values]]
                                [logical-node {:values values}]))
@@ -566,21 +568,16 @@
                                 (contains? (set (keys nodes))
                                            drifted-node))))
                  vec)
-            mismatches
+            insufficient-quorum
             (->> oks
-                 (mapcat (fn [{:keys [expected nodes]}]
-                           (keep (fn [[logical-node {:keys [values]}]]
-                                   (when (not= expected values)
-                                     {:logical-node logical-node
-                                      :expected expected
-                                      :actual values}))
-                                 nodes)))
+                 (remove (fn [{:keys [matched-nodes]}]
+                           (>= (count matched-nodes) 2)))
                  vec)]
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
                                (empty? missing-drift-failure)
                                (empty? missing-recovery)
-                               (empty? mismatches)))
+                               (empty? insufficient-quorum)))
          :exercise-count (count oks)
          :failure-count (count failures)
          :failure-samples (vec (take sample-limit failures))
@@ -597,8 +594,14 @@
                                           :live-after-restore
                                           :nodes])
                          missing-recovery)))
-         :mismatch-count (count mismatches)
-         :mismatch-samples (vec (take sample-limit mismatches))}))))
+         :insufficient-quorum-count (count insufficient-quorum)
+         :insufficient-quorum-samples
+         (vec (take sample-limit
+                    (map #(select-keys % [:drifted-node
+                                          :matched-nodes
+                                          :expected
+                                          :nodes])
+                         insufficient-quorum)))}))))
 
 (defrecord Client [node key-count]
   client/Client

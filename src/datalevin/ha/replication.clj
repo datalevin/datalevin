@@ -641,6 +641,13 @@
              (not (s/blank? env-dir))
              (map? store-opts))
     (-> m
+        ;; A saved reopen recipe can be applied after partial snapshot install
+        ;; recovery while the previous store handle is still present in state.
+        ;; Always retire that handle first; otherwise we can leak multiple LMDB
+        ;; connections to the same env and poison later copy/watermark reads.
+        ((fn [state]
+           (close-ha-local-store! state)
+           state))
         clear-ha-local-store-transient-state
         (assoc :store (-> (st/open env-dir nil store-opts)
                           open-ha-store-dbis!)
@@ -665,7 +672,9 @@
       (try
         ;; Snapshot install can leave only a reopen recipe behind after a
         ;; failed restore; use it before giving up on the next source.
-        (let [state (reopen-ha-local-store-from-info fallback-m reopen-info)]
+        (let [state (with-ha-local-store-swap
+                      #(reopen-ha-local-store-from-info fallback-m
+                                                        reopen-info))]
           (when (local-kv-store state)
             state))
         (catch Throwable _
