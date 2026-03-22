@@ -1890,9 +1890,11 @@
     :fault-op {:type :info
                :process :nemesis
                :f :degrade-network}
-    :cleanup-op {:type :info
+   :cleanup-op {:type :info
                  :process :nemesis
                  :f :restore-network}}})
+
+(declare udf-readiness-retryable-error?)
 
 (defn- invoke-udf-readiness-with-disruption-retry!
   [test invoke-fn timeout-ms]
@@ -1904,13 +1906,21 @@
                        {:error e}))]
         (if-let [e (:error result)]
           (if (and (< (System/currentTimeMillis) deadline)
-                   (or (local/transport-failure? e)
-                       (local/expected-disruption-write-failure? test e)))
+                   (udf-readiness-retryable-error? test e))
             (do
               (Thread/sleep 250)
               (recur))
             (throw e))
           (:value result))))))
+
+(defn- udf-readiness-retryable-error?
+  [test e]
+  (let [data     (or (ex-data e) {})
+        err-data (or (:err-data data) data)]
+    (or (local/transport-failure? e)
+        (local/expected-disruption-write-failure? test e)
+        (and (= :ha/write-rejected (:error err-data))
+             (= :udf-not-ready (:reason err-data))))))
 
 (defn- run-udf-readiness-fault-exercise!
   [db-name workload scenario]
@@ -2002,10 +2012,9 @@
                                             true
                                             (catch Throwable e
                                               (when-not
-                                               (or (local/transport-failure? e)
-                                                   (local/expected-disruption-write-failure?
-                                                    test-map
-                                                    e))
+                                               (udf-readiness-retryable-error?
+                                                test-map
+                                                e)
                                                 (throw e))
                                               false))
                                           committed-after-cleanup?
@@ -2019,7 +2028,27 @@
                                                        (jn/invoke! nemesis-obj
                                                                    test-map
                                                                    post-cleanup-op)))
-                                            committed-under-fault?)]
+                                            (if-not committed-under-fault?
+                                              false
+                                              (try
+                                                (let [leader-after-cleanup
+                                                      (:leader
+                                                       (local/wait-for-single-leader!
+                                                        cluster-id
+                                                        (long (min converge-timeout-ms
+                                                                   5000))))
+                                                      leader-visible-value
+                                                      (get (wait-counter-values!
+                                                            test-map
+                                                            [leader-after-cleanup]
+                                                            expected-value
+                                                            (long (min converge-timeout-ms
+                                                                       5000)))
+                                                           leader-after-cleanup)]
+                                                  (= (long expected-value)
+                                                     (long leader-visible-value)))
+                                                (catch Throwable _
+                                                  false))))]
                                       (when-not committed-after-cleanup?
                                         (invoke-udf-readiness-with-disruption-retry!
                                          test-map

@@ -143,6 +143,19 @@
               (recur (inc attempt)))
             (throw e)))))))
 
+(defn- with-transient-runtime-store-skip
+  [db-name op f]
+  (try
+    (with-transient-runtime-store-retry f)
+    (catch Throwable e
+      (if (transient-runtime-store-error? e)
+        {:ok? false
+         :skipped? true
+         :reason :transient-runtime-store
+         :operation op
+         :db-name db-name}
+        (throw e)))))
+
 (defn- write-or-copy-result!
   [deps skey data]
   (if (coll? data)
@@ -1446,15 +1459,19 @@
                server
                db-name
                (fn []
-                 (with-best-effort-db-transaction-slot
-                   deps
-                   server
+                 (with-transient-runtime-store-skip
                    db-name
+                   :txlog-update-replica-floor!
                    (fn []
-                     (kv/txlog-update-replica-floor!
-                      ((:get-kv-store deps) server db-name)
-                      replica-id
-                      applied-lsn)))))))))))
+                     (with-best-effort-db-transaction-slot
+                       deps
+                       server
+                       db-name
+                       (fn []
+                         (kv/txlog-update-replica-floor!
+                          ((:get-kv-store deps) server db-name)
+                          replica-id
+                          applied-lsn)))))))))))))
 
 (defn txlog-clear-replica-floor!
   [deps server skey {:keys [args]}]
@@ -1475,14 +1492,18 @@
                server
                db-name
                (fn []
-                 (with-best-effort-db-transaction-slot
-                   deps
-                   server
+                 (with-transient-runtime-store-skip
                    db-name
+                   :txlog-clear-replica-floor!
                    (fn []
-                     (kv/txlog-clear-replica-floor!
-                      ((:get-kv-store deps) server db-name)
-                      replica-id)))))))))))
+                     (with-best-effort-db-transaction-slot
+                       deps
+                       server
+                       db-name
+                       (fn []
+                         (kv/txlog-clear-replica-floor!
+                          ((:get-kv-store deps) server db-name)
+                          replica-id)))))))))))))
 
 (defn txlog-pin-backup-floor!
   [deps server skey {:keys [args]}]
