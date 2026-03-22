@@ -1678,32 +1678,33 @@
                      (map vector vars (range idx (+ idx (count vars))))))))))
 
 (defn -aggregate
-  [find-elements context tuples]
-  (let [var->idx    (build-var->idx find-elements)
-        first-tuple (first tuples)]
-    (loop [elements  find-elements
-           tuple-idx 0
-           result    []]
-      (if (empty? elements)
-        result
-        (let [elem     (first elements)
-              num-vars (count (dp/-find-vars elem))]
-          (cond
-            (dp/find-expr? elem)
-            (recur (rest elements)
-                   (+ tuple-idx num-vars)
-                   (conj result (eval-find-expr elem context tuples var->idx)))
+  ([find-elements context tuples]
+   (-aggregate find-elements context tuples (build-var->idx find-elements)))
+  ([find-elements context tuples var->idx]
+   (let [first-tuple (first tuples)]
+     (loop [elements  find-elements
+            tuple-idx 0
+            result    []]
+       (if (empty? elements)
+         result
+         (let [elem     (first elements)
+               num-vars (count (dp/-find-vars elem))]
+           (cond
+             (dp/find-expr? elem)
+             (recur (rest elements)
+                    (+ tuple-idx num-vars)
+                    (conj result (eval-find-expr elem context tuples var->idx)))
 
-            (dp/aggregate? elem)
-            (recur (rest elements)
-                   (inc tuple-idx)
-                   (conj result
-                         (compute-aggregate elem context tuples tuple-idx)))
+             (dp/aggregate? elem)
+             (recur (rest elements)
+                    (inc tuple-idx)
+                    (conj result
+                          (compute-aggregate elem context tuples tuple-idx)))
 
-            :else
-            (recur (rest elements)
-                   (inc tuple-idx)
-                   (conj result (nth first-tuple tuple-idx)))))))))
+             :else
+             (recur (rest elements)
+                    (inc tuple-idx)
+                    (conj result (nth first-tuple tuple-idx))))))))))
 
 (defn- groupable-elem?
   "Check if an element should be used for grouping
@@ -1711,13 +1712,44 @@
   [elem]
   (not (or (dp/aggregate? elem) (dp/find-expr? elem))))
 
+(defn- group-key
+  [tuple ^ints group-idxs]
+  (let [n (alength group-idxs)]
+    (cond
+      (zero? n)
+      nil
+
+      (= 1 n)
+      (nth tuple (aget group-idxs 0))
+
+      :else
+      (persistent!
+       (loop [i   (int 0)
+              key (transient [])]
+         (if (< i n)
+           (recur (unchecked-inc-int i)
+                  (conj! key (nth tuple (aget group-idxs i))))
+           key))))))
+
+(defn- group-tuples
+  [resultset ^ints group-idxs]
+  (if (zero? (alength group-idxs))
+    (when (seq resultset)
+      (list resultset))
+    (let [groups (transient {})]
+      (doseq [tuple resultset]
+        (let [key (group-key tuple group-idxs)]
+          (if-let [bucket (get groups key)]
+            (.add ^FastList bucket tuple)
+            (assoc! groups key (doto (FastList.) (.add tuple))))))
+      (vals (persistent! groups)))))
+
 (defn aggregate
   [find-elements context resultset]
-  (let [group-idxs (u/idxs-of groupable-elem? find-elements)
-        group-fn   (fn [tuple] (map #(nth tuple %) group-idxs))
-        grouped    (group-by group-fn resultset)]
-    (for [[_ tuples] grouped]
-      (-aggregate find-elements context tuples))))
+  (let [^ints group-idxs (int-array (u/idxs-of groupable-elem? find-elements))
+        var->idx         (build-var->idx find-elements)]
+    (map #(-aggregate find-elements context % var->idx)
+         (group-tuples resultset group-idxs))))
 
 (defn- find-aggregate-idx
   "Find the index of an aggregate in find-elements by matching structure."

@@ -1158,7 +1158,7 @@
 (declare node-diagnostics
          with-node-conn)
 
-(defn wait-for-single-leader!
+(defn ^:redef wait-for-single-leader!
   ([cluster-id]
    (wait-for-single-leader! cluster-id cluster-timeout-ms))
   ([cluster-id timeout-ms]
@@ -1247,7 +1247,7 @@
              (throw (ex-info "Timed out waiting for single leader"
                              data)))))))))
 
-(defn maybe-wait-for-single-leader
+(defn ^:redef maybe-wait-for-single-leader
   ([cluster-id]
    (maybe-wait-for-single-leader cluster-id cluster-timeout-ms))
   ([cluster-id timeout-ms]
@@ -1259,7 +1259,7 @@
            (throw e))
          nil)))))
 
-(defn cluster-state
+(defn ^:redef cluster-state
   [cluster-id]
   (get @clusters cluster-id))
 
@@ -1271,7 +1271,7 @@
   [cluster-id peer-id]
   (get-in @clusters [cluster-id :peer-id->node peer-id]))
 
-(defn wait-for-authority-leader!
+(defn ^:redef wait-for-authority-leader!
   ([cluster-id]
    (wait-for-authority-leader! cluster-id cluster-timeout-ms))
   ([cluster-id timeout-ms]
@@ -1325,7 +1325,7 @@
                             :authority-snapshot snapshot
                             :previous-snapshot last-snapshot}))))))))
 
-(defn maybe-wait-for-authority-leader
+(defn ^:redef maybe-wait-for-authority-leader
   ([cluster-id]
    (maybe-wait-for-authority-leader cluster-id cluster-timeout-ms))
   ([cluster-id timeout-ms]
@@ -1428,16 +1428,16 @@
             ::unavailable))
         ::unavailable))))
 
-(defn clock-skew-enabled?
+(defn ^:redef clock-skew-enabled?
   [cluster-id]
   (boolean (get-in @clusters [cluster-id :clock-skew-dir])))
 
-(defn clock-skew-budget-ms
+(defn ^:redef clock-skew-budget-ms
   [cluster-id]
   (long (or (get-in @clusters [cluster-id :base-opts :ha-clock-skew-budget-ms])
             c/*ha-clock-skew-budget-ms*)))
 
-(defn set-node-clock-skew!
+(defn ^:redef set-node-clock-skew!
   [cluster-id logical-node skew-ms]
   (when-let [{:keys [clock-skew-dir node-by-name]} (get @clusters cluster-id)]
     (when-let [node (get node-by-name logical-node)]
@@ -2121,7 +2121,7 @@
                             :min-snapshot-lsn min-snapshot-lsn
                             :last-state last-state}))))))))
 
-(defn stop-node!
+(defn ^:redef stop-node!
   [cluster-id logical-node]
   (locking clusters
     (when-let [cluster (get @clusters cluster-id)]
@@ -2271,13 +2271,14 @@
        (#'srv/update-db
         server
         db-name
-        (fn [m]
+       (fn [m]
           (if-let [store (:store m)]
             (#'srv/ensure-ha-runtime (.-root server) db-name m store)
             m)))
-       (#'srv/ensure-ha-renew-loop server db-name))))
+       (#'srv/ensure-ha-renew-loop server db-name)
+       (#'srv/ensure-ha-follower-sync-loop server db-name))))
 
-(defn pause-node!
+(defn ^:redef pause-node!
   [cluster-id logical-node]
   (locking clusters
     (when-let [cluster (get @clusters cluster-id)]
