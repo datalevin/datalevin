@@ -1093,77 +1093,97 @@
    (add-store server db-name store activate-runtime? nil))
   ([^Server server db-name store activate-runtime? explicit-ha-runtime-opts]
    (letfn [(add-store* [store]
-             (let [published-store-v (volatile! store)]
-               (update-db
-                 server db-name
-                 (fn [m]
-                   (let [dt-db ^DB (:dt-db m)
-                         runtime-store
-                         (when (instance? DB dt-db)
-                           (.-store dt-db))
-                         published-store
-                         (if (and (not activate-runtime?)
-                                  (some? runtime-store)
-                                  (not (store-closed? runtime-store))
-                                  (not (identical? runtime-store store)))
+             (let [published-store-v (volatile! store)
+                   close-unpublished-store!
+                   (fn []
+                     (let [published-store @published-store-v]
+                       (when (and (some? published-store)
+                                  (not (shared-store-lifecycle?
+                                         published-store
+                                         store))
+                                  (not (store-closed? published-store)))
+                         (close-store published-store))
+                       (when (and (some? store)
+                                  (not (identical? published-store store))
+                                  (not (shared-store-lifecycle?
+                                         store
+                                         published-store))
+                                  (not (store-closed? store)))
+                         (close-store store))))]
+               (try
+                 (update-db
+                   server db-name
+                   (fn [m]
+                     (let [dt-db ^DB (:dt-db m)
                            runtime-store
-                           store)
-                         published-store
-                         (dha/recover-ha-local-store-if-needed
-                          published-store)
-                         ha-runtime-opts
-                         (resolved-ha-runtime-opts
-                          (.-root server)
-                          db-name
-                          published-store
-                          m
-                          explicit-ha-runtime-opts)
-                         _            (vreset! published-store-v
-                                               published-store)
-                         runtime-opts (resolved-runtime-opts
-                                        server db-name published-store m)
-                         runtime-local-opts
-                         (some-> ha-runtime-opts
-                                 dha/select-ha-runtime-local-opts)
-                         next-m       (assoc m
-                                             :store published-store
-                                             :runtime-opts runtime-opts)
-                         next-m       (cond-> next-m
-                                        (and (not activate-runtime?)
-                                             (some? ha-runtime-opts))
-                                        (assoc :ha-runtime-opts
-                                               ha-runtime-opts
-                                               :ha-runtime-local-opts
-                                               runtime-local-opts)
+                           (when (instance? DB dt-db)
+                             (.-store dt-db))
+                           published-store
+                           (if (and (not activate-runtime?)
+                                    (some? runtime-store)
+                                    (not (store-closed? runtime-store))
+                                    (not (identical? runtime-store store)))
+                             runtime-store
+                             store)
+                           published-store
+                           (dha/recover-ha-local-store-if-needed
+                            published-store)
+                           ha-runtime-opts
+                           (resolved-ha-runtime-opts
+                            (.-root server)
+                            db-name
+                            published-store
+                            m
+                            explicit-ha-runtime-opts)
+                           _            (vreset! published-store-v
+                                                 published-store)
+                           runtime-opts (resolved-runtime-opts
+                                          server db-name published-store m)
+                           runtime-local-opts
+                           (some-> ha-runtime-opts
+                                   dha/select-ha-runtime-local-opts)
+                           next-m       (assoc m
+                                               :store published-store
+                                               :runtime-opts runtime-opts)
+                           next-m       (cond-> next-m
+                                          (and (not activate-runtime?)
+                                               (some? ha-runtime-opts))
+                                          (assoc :ha-runtime-opts
+                                                 ha-runtime-opts
+                                                 :ha-runtime-local-opts
+                                                 runtime-local-opts)
 
-                                        (and (not activate-runtime?)
-                                             (nil? ha-runtime-opts))
-                                        (dissoc :ha-runtime-opts
-                                                :ha-runtime-local-opts))
-                         next-m       (cond-> next-m
-                                        (and activate-runtime?
-                                             (instance? IStore
-                                                        published-store))
-                                        (assoc :dt-db
-                                               (new-runtime-db
-                                                 published-store
-                                                 runtime-opts)))]
-                     (if activate-runtime?
-                       (ensure-ha-runtime
-                         (.-root server)
-                         db-name
-                         next-m
-                         published-store
-                         explicit-ha-runtime-opts)
-                       next-m))))
-               (when (and (not (shared-store-lifecycle?
-                                @published-store-v
-                                store))
-                          (not (store-closed? store)))
-                 (close-store store))
-               (ensure-ha-renew-loop server db-name)
-               (ensure-ha-follower-sync-loop server db-name)
-               @published-store-v))
+                                          (and (not activate-runtime?)
+                                               (nil? ha-runtime-opts))
+                                          (dissoc :ha-runtime-opts
+                                                  :ha-runtime-local-opts))
+                           next-m       (cond-> next-m
+                                          (and activate-runtime?
+                                               (instance? IStore
+                                                          published-store))
+                                          (assoc :dt-db
+                                                 (new-runtime-db
+                                                   published-store
+                                                   runtime-opts)))]
+                       (if activate-runtime?
+                         (ensure-ha-runtime
+                           (.-root server)
+                           db-name
+                           next-m
+                           published-store
+                           explicit-ha-runtime-opts)
+                         next-m))))
+                 (when (and (not (shared-store-lifecycle?
+                                  @published-store-v
+                                  store))
+                            (not (store-closed? store)))
+                   (close-store store))
+                 (ensure-ha-renew-loop server db-name)
+                 (ensure-ha-follower-sync-loop server db-name)
+                 @published-store-v
+                 (catch Throwable t
+                   (close-unpublished-store!)
+                   (throw t)))))
           (attempt-add-store [store ^long retries]
             (try
               (add-store* store)
@@ -1783,8 +1803,14 @@
                                                 server db-name schema db-type)
                                                (throw e))
                                            (throw e)))))
-                 store            (add-store
-                                    server db-name store activate-runtime? opts)
+                store            (try
+                                   (add-store
+                                     server db-name store activate-runtime? opts)
+                                   (catch Throwable t
+                                     (when (and (some? store)
+                                                (not (store-closed? store)))
+                                       (close-store store))
+                                     (throw t)))
                  datalog?         (instance? Store store)]
             (update-client server client-id
                            #(cond-> %
@@ -2057,7 +2083,11 @@
             (update-db server db-name #(assoc % :runtime-access-lock lock))
             lock)))))
 
-(defn- with-db-runtime-store-read-access
+(defn with-db-runtime-store-read-access
+  "Run `f` while holding the runtime-store read lock for `db-name`.
+
+  This coordinates readers against runtime store swaps and shutdown in callers
+  that access the live store directly."
   [^Server server db-name f]
   (let [dbs (.-dbs server)]
     (if (and db-name (.containsKey ^ConcurrentHashMap dbs db-name))

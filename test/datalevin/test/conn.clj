@@ -1,19 +1,21 @@
 (ns datalevin.test.conn
   (:require
+   [clojure.edn :as edn]
+   [clojure.java.io :as io]
+   [clojure.string :as str]
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing is use-fixtures]]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.conn :as dc]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.constants :as c]
+   [datalevin.kv :as kv]
    [datalevin.util :as u])
-  (:import [java.util Date UUID]))
+  (:import [java.util Date UUID]
+           [java.util.concurrent TimeUnit]))
 
 (use-fixtures :each db-fixture)
-
-(defn- cached-connections
-  []
-  @(deref #'dc/connections))
 
 (deftest test-close
   (let [dir  (u/tmp-dir (str "test-" (UUID/randomUUID)))
@@ -22,16 +24,6 @@
     (d/close conn)
     (is (d/closed? conn))
     (is (nil? @conn))
-    (u/delete-files dir)))
-
-(deftest test-close-removes-get-conn-cache-entry
-  (let [dir  (u/tmp-dir (str "get-conn-cache-test-" (UUID/randomUUID)))
-        conn (d/get-conn dir)]
-    (is (identical? conn (get (cached-connections) dir)))
-    (d/close conn)
-    (is (d/closed? conn))
-    (is (nil? @conn))
-    (is (nil? (get (cached-connections) dir)))
     (u/delete-files dir)))
 
 (deftest test-update-schema
@@ -207,6 +199,17 @@
       (d/close conn2))
     (u/delete-files dir)))
 
+(deftest test-open-kv-enables-virtual-thread-safe-reader-slots
+  (let [dir (u/tmp-dir (str "open-kv-flags-test-" (UUID/randomUUID)))]
+    (try
+      (let [db (d/open-kv dir)]
+        (try
+          (is (= c/default-env-flags (d/get-env-flags db)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-get-conn
   (let [schema {:name          {:db/valueType :db.type/string}
                 :dt/updated-at {:db/valueType :db.type/instant}}
@@ -342,10 +345,94 @@
           (Thread/sleep 25)
           (recur (+ elapsed 25)))))))
 
-(defn- transact-async-executor-atom
+(defn- current-java-bin
   []
-  (some-> (ns-resolve 'datalevin.conn 'transact-async-executor-atom)
-          var-get))
+  (str (System/getProperty "java.home")
+       u/+separator+
+       "bin"
+       u/+separator+
+       "java"))
+
+(defn- last-nonblank-line
+  [s]
+  (some->> (str/split-lines (or s ""))
+           reverse
+           (remove str/blank?)
+           first))
+
+(defn- child-process-result
+  [^Process process timeout-ms]
+  (let [finished? (.waitFor process
+                            (long timeout-ms)
+                            TimeUnit/MILLISECONDS)]
+    (if finished?
+      (let [exit (.exitValue process)
+            output (try
+                     (slurp (.getInputStream process) :encoding "UTF-8")
+                     (catch Exception _
+                       ""))
+            result (try
+                     (some-> output last-nonblank-line edn/read-string)
+                     (catch Exception _
+                       nil))]
+        {:ok? (zero? exit)
+         :exit exit
+         :output output
+         :result result})
+      (do
+        (.destroy process)
+        (when-not (.waitFor process 200 TimeUnit/MILLISECONDS)
+          (.destroyForcibly process))
+        {:ok? false
+         :reason :timeout
+         :timeout-ms timeout-ms}))))
+
+(defn- start-clojure-child!
+  [form]
+  (let [cmd [(current-java-bin)
+             "-cp"
+             (System/getProperty "java.class.path")
+             "clojure.main"
+             "-e"
+             form]
+        process-builder (ProcessBuilder. ^java.util.List (mapv str cmd))]
+    (.directory process-builder (io/file (System/getProperty "user.dir")))
+    (.redirectErrorStream process-builder true)
+    (.start process-builder)))
+
+(defn- wal-child-overlap-form
+  [dir opts ready-path release-path]
+  (let [form
+        `(do
+           (require '[clojure.java.io :as io]
+                    '[datalevin.core :as d]
+                    '[datalevin.kv :as kv])
+           (let [db# (d/open-kv ~dir ~opts)]
+             (try
+               (d/open-dbi db# "a")
+               (spit ~ready-path "ready")
+               (loop [elapsed# 0]
+                 (cond
+                   (.exists (io/file ~release-path))
+                   nil
+
+                   (>= elapsed# 5000)
+                   (throw (ex-info "timed out waiting for release"
+                                   {:elapsed-ms elapsed#}))
+
+                   :else
+                   (do
+                     (Thread/sleep 25)
+                     (recur (+ elapsed# 25)))))
+               (d/transact-kv db# [[:put "a" :k2 :v2]])
+               (println (pr-str {:status :ok
+                                 :lsns (mapv :lsn (kv/open-tx-log db# 1))
+                                 :applied-lsn
+                                 (get-in (kv/read-commit-marker db#)
+                                         [:current :applied-lsn])}))
+               (finally
+                 (d/close-kv db#)))))]
+    (pr-str form)))
 
 (deftest test-strict-with-transaction-transact-uses-direct-path
   (let [conn  (d/create-conn nil
@@ -369,19 +456,151 @@
       (finally
         (d/close conn)))))
 
-(deftest test-last-lmdb-close-shuts-down-transact-async-executor
-  (let [dir     (u/tmp-dir (str "strict-async-shutdown-test-" (UUID/randomUUID)))
-        ex-atom (transact-async-executor-atom)
-        conn    (d/create-conn dir
-                               {:k {:db/valueType :db.type/long}}
-                               {:wal? true
-                                :wal-durability-profile :strict})]
+(deftest test-wal-allows-multiple-writable-processes
+  (let [dir          (u/tmp-dir (str "wal-multi-process-test-" (UUID/randomUUID)))
+        ready-path   (str dir u/+separator+ "child.ready")
+        release-path (str dir u/+separator+ "child.release")
+        opts         {:wal? true
+                      :wal-commit-marker? true
+                      :snapshot-bootstrap-force? false
+                      :wal-durability-profile :strict}]
     (try
-      (d/transact! conn [{:db/id -1 :k 1}])
-      @(d/transact-async conn [{:db/id -2 :k 2}])
-      (is (some? @ex-atom))
-      (d/close conn)
-      (is (wait-until #(nil? @ex-atom) 2000))
+      (let [db1 (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db1 "a")
+          (let [child (start-clojure-child!
+                       (wal-child-overlap-form dir opts ready-path release-path))]
+            (try
+              (is (wait-until #(u/file-exists ready-path) 5000))
+              (is (= :transacted
+                     (d/transact-kv db1 [[:put "a" :k1 :v1]])))
+              (spit release-path "go")
+              (let [{:keys [ok? result output]}
+                    (child-process-result child 10000)]
+                (is ok? output)
+                (is (= {:status :ok
+                        :lsns [1 2]
+                        :applied-lsn 2}
+                       result))
+                (is (= [1 2]
+                       (mapv :lsn (kv/open-tx-log db1 1))))
+                (is (= 2
+                       (get-in (kv/read-commit-marker db1) [:current :applied-lsn])))
+                (is (= :v1
+                       (d/get-value db1 "a" :k1)))
+                (is (= :v2
+                       (d/get-value db1 "a" :k2)))
+                (is (:ok? (kv/verify-commit-marker! db1))))
+              (finally
+                (when-not (u/file-exists release-path)
+                  (spit release-path "go"))
+                (child-process-result child 1000))))
+          (finally
+            (d/close-kv db1))))
+      (let [db3 (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db3 "a")
+          (is (not (d/closed-kv? db3)))
+          (is (= :v1
+                 (d/get-value db3 "a" :k1)))
+          (is (= :v2
+                 (d/get-value db3 "a" :k2)))
+          (finally
+            (d/close-kv db3))))
       (finally
-        (dc/shutdown-transact-async-executor!)
+        (u/delete-files dir)))))
+
+(deftest test-wal-recovers-after-commit-failure-before-lmdb-commit
+  (let [dir  (u/tmp-dir (str "wal-cross-process-recovery-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true
+              :wal-commit-marker? true
+              :snapshot-bootstrap-force? false
+              :wal-durability-profile :strict}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (thrown-with-msg?
+               Exception
+               #"forced commit failure"
+               (binding [cpp/*before-write-commit-fn*
+                         (fn [ctx]
+                           (when (= (:operation ctx) :close-transact-kv)
+                             (throw (ex-info "forced commit failure"
+                                             {:type ::forced-commit-failure}))))]
+                 (d/transact-kv db [[:put "a" :k :v]]))))
+          (finally
+            (d/close-kv db))))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :v
+                 (d/get-value db "a" :k)))
+          (is (= [1]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= 1
+                 (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
+          (is (= 1
+                 (:last-applied-lsn (kv/txlog-watermarks db))))
+          (is (:ok? (kv/verify-commit-marker! db)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-open-failure-still-allows-reopen
+  (let [dir                    (u/tmp-dir (str "wal-process-lock-failure-test-"
+                                               (UUID/randomUUID)))
+        bootstrap-disabled-opts {:wal? true
+                                 :snapshot-bootstrap-force? false}
+        bootstrap-opts          {:wal? true
+                                 :snapshot-bootstrap-force? true}]
+    (try
+      (let [db (d/open-kv dir bootstrap-disabled-opts)]
+        (try
+          (d/open-dbi db "bootstrap")
+          (d/transact-kv db [[:put "bootstrap" :k :v]])
+          (finally
+            (d/close-kv db))))
+      (let [{:keys [db error]}
+            (binding [kv/*wal-snapshot-copy-failpoint*
+                      (fn [_]
+                        (throw (ex-info "forced snapshot bootstrap failure"
+                                        {:type ::snapshot-bootstrap-failed})))]
+              (try
+                {:db (d/open-kv dir bootstrap-opts)}
+                (catch Exception e
+                  {:error e})))]
+        (when db
+          (d/close-kv db))
+        (is (instance? clojure.lang.ExceptionInfo error))
+        (is (re-find #"forced snapshot bootstrap failure"
+                     (.getMessage ^Exception error))))
+      (let [db (d/open-kv dir bootstrap-opts)]
+        (try
+          (is (not (d/closed-kv? db)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-one-shot-write-uses-explicit-lmdb-write-transaction
+  (let [dir  (u/tmp-dir (str "wal-one-shot-write-test-" (UUID/randomUUID)))
+        ops* (atom [])]
+    (try
+      (let [db (d/open-kv dir {:wal? true})]
+        (try
+          (d/open-dbi db "a")
+          (binding [cpp/*before-write-commit-fn*
+                    (fn [{:keys [operation]}]
+                      (swap! ops* conj operation))]
+            (is (= :transacted
+                   (d/transact-kv db [[:put "a" :k :v]]))))
+          (is (= [:close-transact-kv] @ops*))
+          (is (= :v
+                 (d/get-value db "a" :k)))
+          (finally
+            (d/close-kv db))))
+      (finally
         (u/delete-files dir)))))

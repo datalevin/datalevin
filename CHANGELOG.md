@@ -47,6 +47,10 @@
   nippy](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
   speedup.
 - [Search] Reduce query/update/delete memory allocation.
+- [KV] Harden virtual threads handling in reads by adding `:notls` in default
+env config.
+- [WAL] Enable multiple process working with the same DB in WAL mode
+  [#361](https://github.com/datalevin/datalevin/issues/361).
 
 ## 0.10.7 (2026-03-03)
 

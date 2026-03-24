@@ -4,7 +4,6 @@
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.append :as append]
-   [elle.viz :as elle.viz]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
    [jepsen.db :as jdb]
@@ -187,12 +186,10 @@
                             (local/effective-local-lsn cluster-id
                                                        leader-after)
                             local-history-convergence-timeout-ms)
-            checker-result (with-redefs [elle.viz/plot-analysis!
-                                         (fn [& _] nil)]
-                             (checker/check checker
-                                            test-map
-                                            (history/history @history-ops)
-                                            nil))]
+            checker-result (checker/check checker
+                                          test-map
+                                          (history/history @history-ops)
+                                          nil)]
         {:test-map test-map
          :history @history-ops
          :checker-result checker-result

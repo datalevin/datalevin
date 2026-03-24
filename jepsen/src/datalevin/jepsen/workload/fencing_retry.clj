@@ -224,7 +224,13 @@
 (defn- run-scenario!
   [test key-count state-dir]
   (ensure-registers-initialized! test key-count)
-  (write-hook-mode! state-dir :success)
+  ((if (:remote? (local/cluster-state (:datalevin/cluster-id test)))
+     local/set-fencing-hook-mode!
+     (fn [cluster-id mode]
+       (when state-dir
+         (write-hook-mode! state-dir mode))))
+   (:datalevin/cluster-id test)
+   :success)
   (let [cluster-id          (:datalevin/cluster-id test)
         cluster             (local/cluster-state cluster-id)
         live-before         (-> cluster
@@ -251,7 +257,13 @@
                               (leader-register-values test key-count)
                               converge-timeout-ms
                               key-count)
-        _                   (write-hook-mode! state-dir :fail)
+        _                   ((if (:remote? cluster)
+                               local/set-fencing-hook-mode!
+                               (fn [cluster-id mode]
+                                 (when state-dir
+                                   (write-hook-mode! state-dir mode))))
+                             cluster-id
+                             :fail)
         _                   (local/stop-node! cluster-id leader-before)
         live-after-stop     (-> (local/cluster-state cluster-id)
                                 :live-nodes
@@ -262,7 +274,13 @@
                               candidate-node
                               [[0 1500]]
                               blocked-leader-timeout-ms)
-        _                   (write-hook-mode! state-dir :success)
+        _                   ((if (:remote? cluster)
+                               local/set-fencing-hook-mode!
+                               (fn [cluster-id mode]
+                                 (when state-dir
+                                   (write-hook-mode! state-dir mode))))
+                             cluster-id
+                             :success)
         leader-after        (:leader (local/wait-for-single-leader!
                                       cluster-id
                                       converge-timeout-ms))
@@ -432,17 +450,23 @@
 (defn workload
   [opts]
   (let [key-count (long (or (:key-count opts) 4))
-        state-dir (u/tmp-dir (str "jepsen-fencing-retry-" (UUID/randomUUID)))]
-    (u/create-dirs state-dir)
-    (write-hook-mode! state-dir :success)
-    {:client (->Client nil key-count state-dir)
+        remote?   (true? (:datalevin/remote-runner? opts))
+        state-dir (when-not remote?
+                    (u/tmp-dir (str "jepsen-fencing-retry-" (UUID/randomUUID))))]
+    (when state-dir
+      (u/create-dirs state-dir)
+      (write-hook-mode! state-dir :success))
+    (cond-> {:client (->Client nil key-count state-dir)
      :generator (gen/once (scenario-op))
      :checker (checker*)
      :schema schema
      :nodes default-data-nodes
      :datalevin/control-nodes default-control-nodes
      :datalevin/cluster-opts
-     {:ha-fencing-hook {:cmd (hook-command state-dir)
-                        :timeout-ms hook-timeout-ms
-                        :retries hook-retries
-                        :retry-delay-ms 0}}}))
+     {:ha-fencing-hook (cond-> {:timeout-ms hook-timeout-ms
+                                :retries hook-retries
+                                :retry-delay-ms 0}
+                         state-dir
+                         (assoc :cmd (hook-command state-dir)))}}
+      remote?
+      (assoc :datalevin/remote-fencing-retry? true))))

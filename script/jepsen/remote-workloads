@@ -9,13 +9,22 @@ known_workloads=(
   append
   append-cas
   bank
+  degraded-rejoin
   fencing
+  fencing-retry
   giant-values
   grant
   identity-upsert
   index-consistency
   internal
+  membership-drift
+  membership-drift-live
+  rejoin-bootstrap
   register
+  snapshot-checksum-rejoin
+  snapshot-copy-corruption-rejoin
+  snapshot-db-identity-rejoin
+  snapshot-manifest-corruption-rejoin
   tx-fn-register
   udf-readiness
   witness-topology
@@ -25,13 +34,22 @@ all_workloads=(
   append
   append-cas
   bank
+  degraded-rejoin
   fencing
+  fencing-retry
   giant-values
   grant
   identity-upsert
   index-consistency
   internal
+  membership-drift
+  membership-drift-live
+  rejoin-bootstrap
   register
+  snapshot-checksum-rejoin
+  snapshot-copy-corruption-rejoin
+  snapshot-db-identity-rejoin
+  snapshot-manifest-corruption-rejoin
   tx-fn-register
   udf-readiness
 )

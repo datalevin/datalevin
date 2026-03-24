@@ -4,6 +4,54 @@
     [clojure.string :as str]
     [datalevin.util :as u]))
 
+ (def ^:private control-state-dir-name "jepsen-control")
+
+ (defn control-state-dir
+   [node]
+   (str (:root node) u/+separator+ control-state-dir-name))
+
+ (defn network-state-file
+   [node]
+   (str (control-state-dir node) u/+separator+ "network.edn"))
+
+ (defn storage-fault-state-file
+   [node]
+   (str (control-state-dir node) u/+separator+ "storage-fault.edn"))
+
+ (defn clock-skew-state-file
+   [node]
+   (str (control-state-dir node) u/+separator+ "clock-skew-ms.txt"))
+
+ (defn fencing-mode-file
+   [node]
+   (str (control-state-dir node) u/+separator+ "fencing-mode.txt"))
+
+ (defn snapshot-failpoint-file
+   [node]
+   (str (control-state-dir node) u/+separator+ "snapshot-failpoint.edn"))
+
+ (defn remote-clock-skew-hook
+   [node]
+   {:cmd ["/bin/sh"
+          "-c"
+          "cat \"$1\" 2>/dev/null || echo 0"
+          "clock-skew-hook"
+          (clock-skew-state-file node)]
+    :timeout-ms 1000
+    :retries 0
+    :retry-delay-ms 0})
+
+ (defn remote-fencing-hook
+   [node]
+   {:cmd ["/bin/sh"
+          "-c"
+          (str "mode=$(cat \"$1\" 2>/dev/null || true); "
+               "if [ -z \"$mode\" ]; then mode=success; fi; "
+               "if [ \"$mode\" = fail ]; then exit 7; fi; "
+               "exit 0")
+          "fence-hook"
+          (fencing-mode-file node)]})
+
  (defn read-config
    [path]
    (-> path slurp edn/read-string))
@@ -151,7 +199,8 @@
                                                  :max-writes-per-key
                                                  :min-txn-length
                                                  :max-txn-length
-                                                 :giant-payload-bytes]))
+                                                 :giant-payload-bytes])
+                                   {:datalevin/remote-runner? true})
          workload-opts'     (assoc workload-opts
                                    :nodes data-node-names
                                    :datalevin/control-nodes control-node-names)]
@@ -262,8 +311,24 @@
 
  (defn node-ha-opts
    [config node workload data-nodes control-nodes]
-   (-> (base-ha-opts config data-nodes control-nodes)
-       (merge-ha-opts (:datalevin/cluster-opts workload))
-       (assoc :db-name (:db-name config))
-       (assoc :ha-node-id (:node-id node))
-       (assoc-in [:ha-control-plane :local-peer-id] (:peer-id node))))
+   (let [node-override (get-in config
+                               [:node-ha-opts-overrides (:logical-node node)])]
+     (cond-> (-> (base-ha-opts config data-nodes control-nodes)
+                 (merge-ha-opts (:datalevin/cluster-opts workload))
+                 (merge-ha-opts node-override)
+                 (assoc :db-name (:db-name config))
+                 (assoc :ha-node-id (:node-id node))
+                 (assoc-in [:ha-control-plane :local-peer-id] (:peer-id node)))
+       (true? (:jepsen-remote-clock-skew-hook? config))
+       (assoc :ha-clock-skew-hook (remote-clock-skew-hook node))
+
+       (true? (:datalevin/remote-fencing-retry? workload))
+       (assoc :ha-fencing-hook
+              (merge {:timeout-ms 1000
+                      :retries 0
+                      :retry-delay-ms 0}
+                     (remote-fencing-hook node)
+                     (select-keys (or (:ha-fencing-hook
+                                        (:datalevin/cluster-opts workload))
+                                      {})
+                                  [:timeout-ms :retries :retry-delay-ms]))))))

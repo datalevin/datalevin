@@ -72,11 +72,13 @@
     :txlog-force-sync
     :lmdb-sync})
 (def ^:private storage-stall-poll-ms 100)
+(def ^:private node-store-release-poll-ms 50)
 
 (def default-nodes ["n1" "n2" "n3"])
 
 (defonce ^:private clusters (atom {}))
 (defonce ^:private next-port-block (atom -1))
+(defonce ^:private remote-runtime-nodes (atom {}))
 
 (def ^:private base-fetch-ha-leader-txlog-batch dha/fetch-ha-leader-txlog-batch)
 (def ^:private base-report-ha-replica-floor! dha/report-ha-replica-floor!)
@@ -89,6 +91,10 @@
 (def ^:private remote-launch-log-file "jepsen-remote-launch.log")
 (def ^:private remote-config-file "jepsen-remote-cluster.edn")
 (def ^:private remote-state-poll-ms 500)
+(def ^:private snapshot-unavailable-error-code
+  :ha/follower-snapshot-unavailable)
+(def ^:private snapshot-checksum-mismatch-message
+  "Copy checksum mismatch")
 
 (defn- remote-cluster?
   [cluster-id]
@@ -108,12 +114,112 @@
             [cluster-id cluster]))
         @clusters))
 
+(defn remote-runtime-node
+  [db-identity node-id]
+  (get @remote-runtime-nodes [db-identity node-id]))
+
+(defn register-remote-node-runtime!
+  [config topology node]
+  (let [control-nodes (:control-nodes topology)
+        data-nodes    (:data-nodes topology)
+        metadata      {:db-identity (:db-identity config)
+                       :db-name (:db-name config)
+                       :node-id (:node-id node)
+                       :logical-node (:logical-node node)
+                       :endpoint (:endpoint node)
+                       :root (:root node)
+                       :data-node? (contains? (set (map :logical-node data-nodes))
+                                              (:logical-node node))
+                       :endpoint->node
+                       (into {}
+                             (map (juxt :endpoint :logical-node))
+                             control-nodes)
+                       :network-state-file (remote/network-state-file node)
+                       :storage-fault-state-file
+                       (remote/storage-fault-state-file node)
+                       :clock-skew-state-file
+                       (remote/clock-skew-state-file node)
+                       :fencing-mode-file (remote/fencing-mode-file node)
+                       :snapshot-failpoint-file
+                       (remote/snapshot-failpoint-file node)}]
+    (swap! remote-runtime-nodes assoc
+           [(:db-identity config) (:node-id node)]
+           metadata)
+    metadata))
+
+(defn unregister-remote-node-runtime!
+  [db-identity node-id]
+  (swap! remote-runtime-nodes dissoc [db-identity node-id])
+  true)
+
+(defn- safe-read-edn-file
+  [path]
+  (when (and (string? path) (u/file-exists path))
+    (try
+      (-> path slurp edn/read-string)
+      (catch Throwable _
+        nil))))
+
+(defn- safe-read-long-file
+  [path]
+  (when (and (string? path) (u/file-exists path))
+    (try
+      (some-> path slurp str/trim parse-long)
+      (catch Throwable _
+        nil))))
+
+(declare normalize-storage-fault)
+
+(defn- remote-runtime-link-fault
+  [runtime endpoint]
+  (let [{:keys [logical-node endpoint->node]} runtime
+        dest-logical-node (get endpoint->node endpoint)
+        state             (safe-read-edn-file (:network-state-file runtime))
+        blocked-endpoints (set (:blocked-endpoints state))
+        profile           (get (:endpoint-profiles state) endpoint)]
+    (when (and logical-node dest-logical-node)
+      {:src-logical-node logical-node
+       :dest-logical-node dest-logical-node
+       :blocked? (contains? blocked-endpoints endpoint)
+       :profile profile})))
+
+(defn- remote-runtime-storage-fault
+  [runtime]
+  (some-> (:storage-fault-state-file runtime)
+          safe-read-edn-file
+          normalize-storage-fault))
+
+(defn- active-remote-storage-fault-target
+  [{:keys [db-identity ha-db-identity ha-node-id]}]
+  (let [db-identity (or ha-db-identity db-identity)]
+    (when-let [runtime (and (string? db-identity)
+                            (some? ha-node-id)
+                            (remote-runtime-node db-identity ha-node-id))]
+    (when-let [fault (remote-runtime-storage-fault runtime)]
+      {:cluster-id :remote-runtime
+       :logical-node (:logical-node runtime)
+       :runtime runtime
+       :fault fault}))))
+
+(defn- remote-runtime-snapshot-failpoint
+  [{:keys [ha-db-identity ha-node-id]}]
+  (some-> (and (string? ha-db-identity)
+               (some? ha-node-id)
+               (remote-runtime-node ha-db-identity ha-node-id))
+          :snapshot-failpoint-file
+          safe-read-edn-file
+          :mode))
+
 (defn- logical-node-for-ha-state
   [m]
-  (when-let [[cluster-id cluster]
-             (cluster-entry-for-db-identity (:ha-db-identity m))]
+  (if-let [[cluster-id cluster]
+           (cluster-entry-for-db-identity (:ha-db-identity m))]
     {:cluster-id cluster-id
-     :logical-node (get-in cluster [:node-by-id (:ha-node-id m)])}))
+     :logical-node (get-in cluster [:node-by-id (:ha-node-id m)])}
+    (when-let [runtime (remote-runtime-node (:ha-db-identity m)
+                                            (:ha-node-id m))]
+      {:cluster-id :remote-runtime
+       :logical-node (:logical-node runtime)})))
 
 (defn- blocked-link-exception
   [src-logical-node dest-logical-node endpoint]
@@ -134,6 +240,8 @@
                    nil))]
       (f authority)
       {:backend :diagnostics-unavailable})))
+
+(declare normalize-storage-fault)
 
 (defn- normalize-storage-fault
   [{:keys [mode stages] :as fault}]
@@ -171,8 +279,9 @@
 
 (defn maybe-apply-storage-fault!
   [{:keys [stage] :as context}]
-  (when-let [{:keys [cluster-id logical-node fault]}
-             (active-storage-fault-target context)]
+  (when-let [{:keys [cluster-id logical-node fault runtime]}
+             (or (active-storage-fault-target context)
+                 (active-remote-storage-fault-target context))]
     (when (contains? (:stages fault) stage)
       (case (:mode fault)
         :disk-full
@@ -180,7 +289,9 @@
 
         :stall
         (loop []
-          (when-let [current (storage-fault cluster-id logical-node)]
+          (let [current (if (= :remote-runtime cluster-id)
+                          (remote-runtime-storage-fault runtime)
+                          (storage-fault cluster-id logical-node))]
             (when (and (= :stall (:mode current))
                        (contains? (:stages current) stage))
               (Thread/sleep (long storage-stall-poll-ms))
@@ -212,16 +323,21 @@
 
 (defn- endpoint-link-fault
   [m endpoint]
-  (when-let [{:keys [cluster-id logical-node]} (logical-node-for-ha-state m)]
-    (let [dest-logical-node (get-in @clusters [cluster-id :endpoint->node endpoint])]
-      (when (and logical-node dest-logical-node)
-        {:cluster-id cluster-id
-         :src-logical-node logical-node
-         :dest-logical-node dest-logical-node
-         :blocked? (blocked-link? cluster-id logical-node dest-logical-node)
-         :profile (active-link-profile cluster-id
-                                       logical-node
-                                       dest-logical-node)}))))
+  (if-let [{:keys [cluster-id logical-node]} (logical-node-for-ha-state m)]
+    (if (= :remote-runtime cluster-id)
+      (remote-runtime-link-fault (remote-runtime-node (:ha-db-identity m)
+                                                      (:ha-node-id m))
+                                 endpoint)
+      (let [dest-logical-node (get-in @clusters [cluster-id :endpoint->node endpoint])]
+        (when (and logical-node dest-logical-node)
+          {:cluster-id cluster-id
+           :src-logical-node logical-node
+           :dest-logical-node dest-logical-node
+           :blocked? (blocked-link? cluster-id logical-node dest-logical-node)
+           :profile (active-link-profile cluster-id
+                                         logical-node
+                                         dest-logical-node)})))
+    nil))
 
 (defn- degraded-link-exception
   [src-logical-node dest-logical-node endpoint]
@@ -270,9 +386,48 @@
 
 (defn- partition-aware-fetch-ha-endpoint-snapshot-copy!
   [db-name m endpoint dest-dir]
-  (let [fault (endpoint-link-fault m endpoint)]
+  (let [fault     (endpoint-link-fault m endpoint)
+        fail-mode (remote-runtime-snapshot-failpoint m)]
     (maybe-apply-link-fault! fault endpoint)
-    (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir)))
+    (case fail-mode
+      :snapshot-unavailable
+      (throw (ex-info "forced snapshot source failure"
+                      {:error snapshot-unavailable-error-code
+                       :endpoint endpoint}))
+
+      :db-identity-mismatch
+      (let [{:keys [copy-meta] :as result}
+            (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir)]
+        (assoc result
+               :copy-meta
+               (assoc (or copy-meta {})
+                      :db-name db-name
+                      :db-identity "db-mismatch")))
+
+      :manifest-corruption
+      (let [{:keys [copy-meta] :as result}
+            (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir)]
+        (assoc result
+               :copy-meta
+               (-> (or copy-meta {})
+                   (assoc :db-name db-name
+                          :db-identity (:ha-db-identity m))
+                   (dissoc :snapshot-last-applied-lsn
+                           :payload-last-applied-lsn))))
+
+      :checksum-mismatch
+      (do
+        (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir)
+        (throw (ex-info snapshot-checksum-mismatch-message
+                        {:expected-checksum "forced-invalid-checksum"
+                         :actual-checksum "forced-copy-checksum"})))
+
+      :copy-corruption
+      (let [result (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir)]
+        (spit (str dest-dir u/+separator+ "data.mdb") "not-an-lmdb-file")
+        result)
+
+      (base-fetch-ha-endpoint-snapshot-copy! db-name m endpoint dest-dir))))
 
 (defonce ^:private partition-aware-ha-transports-installed?
   (do
@@ -609,6 +764,58 @@
       (u/delete-files path)
       (catch Throwable _ nil))))
 
+(defn- node-db-dir
+  [root db-name]
+  (str root u/+separator+ (u/hexify-string db-name)))
+
+(defn- multiple-lmdb-open-error?
+  [e]
+  (str/includes? (or (ex-message e) "")
+                 "Please do not open multiple LMDB connections"))
+
+(defn- close-opened-node-store!
+  [store]
+  (when store
+    (if (instance? Store store)
+      (i/close store)
+      (i/close-kv store))))
+
+(defn- node-store-released?
+  [root db-name]
+  (let [dir (io/file (node-db-dir root db-name))]
+    (or (not (.exists dir))
+        (try
+          (let [store (#'srv/open-store root db-name nil true)]
+            (try
+              true
+              (finally
+                (close-opened-node-store! store))))
+          (catch Throwable e
+            (if (multiple-lmdb-open-error? e)
+              false
+              (throw e)))))))
+
+(defn- wait-for-node-store-released!
+  [cluster-id logical-node timeout-ms]
+  (when-not (remote-cluster? cluster-id)
+    (let [{:keys [db-name node-by-name]} (get @clusters cluster-id)
+          root (get-in node-by-name [logical-node :root])
+          deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+      (when root
+        (loop []
+          (if (node-store-released? root db-name)
+            true
+            (if (< (System/currentTimeMillis) deadline)
+              (do
+                (Thread/sleep (long node-store-release-poll-ms))
+                (recur))
+              (u/raise "Timed out waiting for Jepsen node store release"
+                       {:cluster-id cluster-id
+                        :logical-node logical-node
+                        :db-name db-name
+                        :timeout-ms timeout-ms
+                        :root root}))))))))
+
 (declare create-conn-with-timeout!
          transport-failure?)
 
@@ -627,6 +834,84 @@
 (defn- remote-state-file
   [node]
   (str (:root node) u/+separator+ "jepsen-remote-node.edn"))
+
+(defn- write-remote-content!
+  [ssh node remote-path content]
+  (let [tmp-dir  (u/tmp-dir (str "jepsen-remote-upload-" (UUID/randomUUID)))
+        tmp-file (str tmp-dir u/+separator+ "payload")]
+    (u/create-dirs tmp-dir)
+    (spit tmp-file content)
+    (try
+      (control/with-ssh ssh
+        (control/on (:logical-node node)
+          (control/exec :mkdir :-p (.getParent (io/file remote-path)))
+          (control/upload tmp-file remote-path)))
+      (finally
+        (u/delete-files tmp-dir)))))
+
+(defn- delete-remote-path!
+  [ssh node remote-path]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (control/exec :rm :-f remote-path))))
+
+(defn- sync-remote-node-control-defaults!
+  [ssh node]
+  (control/with-ssh ssh
+    (control/on (:logical-node node)
+      (control/exec :mkdir :-p (remote/control-state-dir node))))
+  (write-remote-content! ssh
+                         node
+                         (remote/network-state-file node)
+                         (pr-str {:blocked-endpoints #{}
+                                  :endpoint-profiles {}}))
+  (write-remote-content! ssh
+                         node
+                         (remote/clock-skew-state-file node)
+                         "0\n")
+  (write-remote-content! ssh
+                         node
+                         (remote/fencing-mode-file node)
+                         "success\n")
+  (delete-remote-path! ssh node (remote/storage-fault-state-file node))
+  (delete-remote-path! ssh node (remote/snapshot-failpoint-file node)))
+
+(declare endpoint-for-node)
+
+(defn- remote-network-node-state
+  [cluster-id logical-node]
+  (let [{:keys [node-by-name]} (get @clusters cluster-id)
+        blocked-endpoints      (into #{}
+                                     (keep (fn [[src dest]]
+                                             (when (= src logical-node)
+                                               (endpoint-for-node cluster-id
+                                                                  dest))))
+                                     (get-in @clusters
+                                             [cluster-id :dropped-links]))
+        endpoint-profiles      (into {}
+                                     (keep (fn [[[src dest] profile]]
+                                             (when (= src logical-node)
+                                               [(endpoint-for-node cluster-id
+                                                                   dest)
+                                                profile])))
+                                     (get-in @clusters
+                                             [cluster-id :link-behaviors]))]
+    (when (contains? node-by-name logical-node)
+      {:blocked-endpoints blocked-endpoints
+       :endpoint-profiles endpoint-profiles})))
+
+(defn- sync-remote-network-state!
+  [cluster-id]
+  (when-let [{:keys [remote? ssh node-by-name]} (get @clusters cluster-id)]
+    (when remote?
+      (doseq [[logical-node node] node-by-name
+              :when (get-in @clusters [cluster-id :live-nodes logical-node] true)]
+        (write-remote-content! ssh
+                               node
+                               (remote/network-state-file node)
+                               (pr-str (remote-network-node-state
+                                        cluster-id
+                                        logical-node)))))))
 
 (defn- remote-node-state*
   [ssh logical-node node]
@@ -670,6 +955,13 @@
     (control/on (:logical-node node)
       (control/exec :mkdir :-p (:root node))
       (control/upload local-config-path (remote-config-path-for-node node)))))
+
+(defn- persist-remote-config!
+  [cluster-id]
+  (when-let [{:keys [remote? remote-config remote-config-path]} (get @clusters cluster-id)]
+    (when remote?
+      (spit remote-config-path (pr-str remote-config))
+      remote-config-path)))
 
 (defn- start-remote-node-launcher!
   [ssh repo-root node verbose?]
@@ -901,6 +1193,12 @@
   (when server
     (get (.-dbs ^Server server) db-name)))
 
+(defn- with-live-store-read-access
+  [server db-name f]
+  (if server
+    (srv/with-db-runtime-store-read-access server db-name f)
+    (f)))
+
 (defn- store-open?
   [store]
   (cond
@@ -973,24 +1271,27 @@
     (long (or (:ha-effective-local-lsn
                (remote-node-diagnostics cluster-id logical-node))
               0))
-    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-      (if-let [state (db-state (get servers logical-node) db-name)]
-        (let [txlog-lsn     (long (or (:last-applied-lsn
-                                       (local-watermarks
-                                        (get servers logical-node)
-                                        db-name))
-                                      0))
-              snapshot-lsn  (local-snapshot-lsn state)
-              runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
-              persisted-lsn (local-ha-persisted-lsn state)
-              comparable    (long (max runtime-lsn persisted-lsn))
-              local-truth   (long (max txlog-lsn snapshot-lsn))]
-          (if (= :leader (:ha-role state))
-            (long (max local-truth comparable))
-            (if (pos? local-truth)
-              local-truth
-              comparable)))
-        0))))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          server                    (get servers logical-node)]
+      (with-live-store-read-access
+        server
+        db-name
+        (fn []
+          (if-let [state (db-state server db-name)]
+            (let [txlog-lsn     (long (or (:last-applied-lsn
+                                           (local-watermarks server db-name))
+                                          0))
+                  snapshot-lsn  (local-snapshot-lsn state)
+                  runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
+                  persisted-lsn (local-ha-persisted-lsn state)
+                  comparable    (long (max runtime-lsn persisted-lsn))
+                  local-truth   (long (max txlog-lsn snapshot-lsn))]
+              (if (= :leader (:ha-role state))
+                (long (max local-truth comparable))
+                (if (pos? local-truth)
+                  local-truth
+                  comparable)))
+            0))))))
 
 (defn node-progress-lsn
   [cluster-id logical-node]
@@ -998,21 +1299,25 @@
     (long (or (:last-applied-lsn
                (remote-node-diagnostics cluster-id logical-node))
               0))
-    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-      (if-let [state (db-state (get servers logical-node) db-name)]
-        (let [txlog-lsn     (long (or (:last-applied-lsn
-                                       (local-watermarks
-                                        (get servers logical-node)
-                                        db-name))
-                                      0))
-              runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
-              persisted-lsn (local-ha-persisted-lsn state)
-              comparable    (long (max runtime-lsn persisted-lsn))]
-          ;; Snapshot-floor metadata is a historical retention marker, not proof
-          ;; that a live node has replayed newer WAL. Catch-up waits must use the
-          ;; node's actual applied progress so later snapshots cannot regress.
-          (long (max txlog-lsn comparable)))
-        0))))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          server                    (get servers logical-node)]
+      (with-live-store-read-access
+        server
+        db-name
+        (fn []
+          (if-let [state (db-state server db-name)]
+            (let [txlog-lsn     (long (or (:last-applied-lsn
+                                           (local-watermarks server db-name))
+                                          0))
+                  runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
+                  persisted-lsn (local-ha-persisted-lsn state)
+                  comparable    (long (max runtime-lsn persisted-lsn))]
+              ;; Snapshot-floor metadata is a historical retention marker, not
+              ;; proof that a live node has replayed newer WAL. Catch-up waits
+              ;; must use the node's actual applied progress so later snapshots
+              ;; cannot regress.
+              (long (max txlog-lsn comparable)))
+            0))))))
 
 (defn wait-for-live-nodes-at-least-lsn!
   ([cluster-id target-lsn]
@@ -1418,20 +1723,28 @@
           (apply d/q q @conn inputs)))
       (catch Throwable _
         ::unavailable))
-    (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-      (if-let [state (db-state (get servers logical-node) db-name)]
-        (let [store (:store state)]
-          (if (store-open? store)
-            (try
-              (apply d/q q (ddb/new-db store) inputs)
-              (catch Throwable _
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          server                    (get servers logical-node)]
+      (with-live-store-read-access
+        server
+        db-name
+        (fn []
+          (if-let [state (db-state server db-name)]
+            (let [store (:store state)]
+              (if (store-open? store)
+                (try
+                  (apply d/q q (ddb/new-db store) inputs)
+                  (catch Throwable _
+                    ::unavailable))
                 ::unavailable))
-            ::unavailable))
-        ::unavailable))))
+            ::unavailable))))))
 
 (defn ^:redef clock-skew-enabled?
   [cluster-id]
-  (boolean (get-in @clusters [cluster-id :clock-skew-dir])))
+  (boolean
+   (or (get-in @clusters [cluster-id :clock-skew-dir])
+       (get-in @clusters
+               [cluster-id :remote-config :jepsen-remote-clock-skew-hook?]))))
 
 (defn ^:redef clock-skew-budget-ms
   [cluster-id]
@@ -1440,9 +1753,14 @@
 
 (defn ^:redef set-node-clock-skew!
   [cluster-id logical-node skew-ms]
-  (when-let [{:keys [clock-skew-dir node-by-name]} (get @clusters cluster-id)]
+  (when-let [{:keys [clock-skew-dir node-by-name remote? ssh]} (get @clusters cluster-id)]
     (when-let [node (get node-by-name logical-node)]
-      (write-clock-skew-ms! clock-skew-dir (:node-id node) skew-ms)
+      (if remote?
+        (write-remote-content! ssh
+                               node
+                               (remote/clock-skew-state-file node)
+                               (str (long skew-ms) "\n"))
+        (write-clock-skew-ms! clock-skew-dir (:node-id node) skew-ms))
       true)))
 
 (defn endpoint-for-node
@@ -1570,6 +1888,7 @@
                    (assoc-in [cluster-id :link-behaviors] link-behaviors)
                    (assoc-in [cluster-id :network-behavior] network-state))
                clusters*)))
+    (sync-remote-network-state! cluster-id)
     {:cluster-id cluster-id
      :nodes nodes'
      :link-behaviors link-behaviors
@@ -1587,6 +1906,7 @@
                  (assoc-in [cluster-id :link-behaviors] (sorted-map))
                  (assoc-in [cluster-id :network-behavior] nil))
              clusters*)))
+  (sync-remote-network-state! cluster-id)
   true)
 
 (defn apply-network-grudge!
@@ -1605,6 +1925,7 @@
                    (assoc-in [cluster-id :network-grudge] grudge')
                    (assoc-in [cluster-id :dropped-links] dropped-links))
                clusters*)))
+    (sync-remote-network-state! cluster-id)
     {:cluster-id cluster-id
      :grudge grudge'
      :dropped-links dropped-links}))
@@ -1941,35 +2262,66 @@
 (defn override-node-ha-opts!
   [cluster-id logical-node override-opts]
   (locking clusters
-    (when-let [{:keys [node-by-name]} (get @clusters cluster-id)]
+    (when-let [{:keys [node-by-name remote?]} (get @clusters cluster-id)]
       (when-not (contains? node-by-name logical-node)
         (u/raise "Cannot override HA opts for unknown Jepsen node"
                  {:cluster-id cluster-id
                   :logical-node logical-node}))
-      (swap! clusters assoc-in
-             [cluster-id :node-ha-opt-overrides logical-node]
-             override-opts)
+      (swap! clusters
+             (fn [clusters*]
+               (cond-> (assoc-in clusters*
+                                 [cluster-id :node-ha-opt-overrides logical-node]
+                                 override-opts)
+                 remote?
+                 (assoc-in [cluster-id :remote-config
+                            :node-ha-opts-overrides
+                            logical-node]
+                           override-opts))))
+      (when remote?
+        (persist-remote-config! cluster-id))
       override-opts)))
 
 (defn clear-node-ha-opts-override!
   [cluster-id logical-node]
   (locking clusters
     (let [override (get-in @clusters
-                           [cluster-id :node-ha-opt-overrides logical-node])]
-      (swap! clusters update-in [cluster-id :node-ha-opt-overrides]
-             dissoc logical-node)
+                           [cluster-id :node-ha-opt-overrides logical-node])
+          remote?  (true? (get-in @clusters [cluster-id :remote?]))]
+      (swap! clusters
+             (fn [clusters*]
+               (cond-> (update-in clusters*
+                                  [cluster-id :node-ha-opt-overrides]
+                                  dissoc logical-node)
+                 remote?
+                 (update-in [cluster-id :remote-config :node-ha-opts-overrides]
+                            dissoc logical-node))))
+      (when remote?
+        (persist-remote-config! cluster-id))
       override)))
+
+(declare with-node-kv-store)
 
 (defn txlog-retention-state
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)]
-    (when-let [state (db-state (get servers logical-node) db-name)]
-      (let [store (:store state)
-            lmdb  (if (instance? Store store)
-                    (.-lmdb ^Store store)
-                    store)]
-        (when (store-open? lmdb)
-          (i/txlog-retention-state lmdb))))))
+  (if (remote-cluster? cluster-id)
+    (with-node-kv-store
+      cluster-id
+      logical-node
+      (fn [kv-store]
+        (i/txlog-retention-state kv-store)))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          server                    (get servers logical-node)]
+      (with-live-store-read-access
+        server
+        db-name
+        (fn []
+          (when-let [state (db-state server db-name)]
+            (let [store (:store state)
+                  lmdb  (if (instance? Store store)
+                          (.-lmdb ^Store store)
+                          store)]
+              (when (store-open? lmdb)
+                (i/txlog-retention-state lmdb)))))))))
 
 (defn copy-backup-pin-ids
   [cluster-id logical-node]
@@ -2004,47 +2356,54 @@
 
 (defn assoc-opt-on-node-store!
   [cluster-id logical-node k v]
-  (let [{:keys [db-name admin-conns]} (get @clusters cluster-id)
-        store (some-> (get admin-conns logical-node)
-                      deref
-                      .-store)]
-    (when-not store
-      (u/raise "Cannot update remote store opt on unavailable Jepsen node"
-               {:cluster-id cluster-id
-                :logical-node logical-node
-                :db-name db-name}))
-    (i/assoc-opt store k v)))
+  (if (remote-cluster? cluster-id)
+    (assoc-opt-on-node! cluster-id logical-node k v)
+    (let [{:keys [db-name admin-conns]} (get @clusters cluster-id)
+          store (some-> (get admin-conns logical-node)
+                        deref
+                        .-store)]
+      (when-not store
+        (u/raise "Cannot update remote store opt on unavailable Jepsen node"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node
+                  :db-name db-name}))
+      (i/assoc-opt store k v))))
 
 (defn assoc-opt-on-stopped-node-store!
   [cluster-id logical-node k v]
-  (let [{:keys [db-name node-by-name servers]} (get @clusters cluster-id)
-        node (get node-by-name logical-node)
-        root (:root node)]
-    (when-not node
-      (u/raise "Cannot update local store opt on unknown Jepsen node"
-               {:cluster-id cluster-id
-                :logical-node logical-node
-                :db-name db-name}))
-    (when (get servers logical-node)
-      (u/raise "Cannot update local store opt while Jepsen node is running"
-               {:cluster-id cluster-id
-                :logical-node logical-node
-                :db-name db-name}))
-    (let [store (#'srv/open-store root db-name nil true)]
-      (try
-        (i/assoc-opt store k v)
-        (finally
-          (i/close store))))))
+  (if (remote-cluster? cluster-id)
+    (let [override (merge (or (get-in @clusters
+                                      [cluster-id :node-ha-opt-overrides logical-node])
+                              {})
+                          {k v})]
+      (override-node-ha-opts! cluster-id logical-node override))
+    (let [{:keys [db-name node-by-name servers]} (get @clusters cluster-id)
+          node (get node-by-name logical-node)
+          root (:root node)]
+      (when-not node
+        (u/raise "Cannot update local store opt on unknown Jepsen node"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node
+                  :db-name db-name}))
+      (when (get servers logical-node)
+        (u/raise "Cannot update local store opt while Jepsen node is running"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node
+                  :db-name db-name}))
+      (wait-for-node-store-released!
+       cluster-id
+       logical-node
+       cluster-timeout-ms)
+      (let [store (#'srv/open-store root db-name nil true)]
+        (try
+          (i/assoc-opt store k v)
+          (finally
+            (i/close store)))))))
 
 (defn clear-copy-backup-pins-on-node!
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)
-        state (db-state (get servers logical-node) db-name)]
-    (when-not state
-      (u/raise "Cannot clear copy backup pins on unavailable Jepsen node"
-               {:cluster-id cluster-id
-                :logical-node logical-node}))
-    (let [pin-ids  (copy-backup-pin-ids cluster-id logical-node)]
+  (if (remote-cluster? cluster-id)
+    (let [pin-ids (copy-backup-pin-ids cluster-id logical-node)]
       (when (seq pin-ids)
         (with-node-kv-store
           cluster-id
@@ -2053,27 +2412,49 @@
             (doseq [pin-id pin-ids]
               (i/txlog-unpin-backup-floor! kv-store pin-id)))))
       {:cleared-pin-ids pin-ids
-       :remaining-pin-ids (copy-backup-pin-ids cluster-id logical-node)})))
+       :remaining-pin-ids (copy-backup-pin-ids cluster-id logical-node)})
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          state (db-state (get servers logical-node) db-name)]
+      (when-not state
+        (u/raise "Cannot clear copy backup pins on unavailable Jepsen node"
+                 {:cluster-id cluster-id
+                  :logical-node logical-node}))
+      (let [pin-ids  (copy-backup-pin-ids cluster-id logical-node)]
+        (when (seq pin-ids)
+          (with-node-kv-store
+            cluster-id
+            logical-node
+            (fn [kv-store]
+              (doseq [pin-id pin-ids]
+                (i/txlog-unpin-backup-floor! kv-store pin-id)))))
+        {:cleared-pin-ids pin-ids
+         :remaining-pin-ids (copy-backup-pin-ids cluster-id logical-node)}))))
 
 (defn create-snapshot-on-node!
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)
-        state (db-state (get servers logical-node) db-name)]
-    (when-not state
-      (u/raise "Cannot create snapshot on unavailable Jepsen node"
+  (let [result (if (remote-cluster? cluster-id)
+                 (with-node-kv-store
+                   cluster-id
+                   logical-node
+                   (fn [kv-store]
+                     (i/create-snapshot! kv-store)))
+                 (let [{:keys [db-name servers]} (get @clusters cluster-id)
+                       state (db-state (get servers logical-node) db-name)]
+                   (when-not state
+                     (u/raise "Cannot create snapshot on unavailable Jepsen node"
+                              {:cluster-id cluster-id
+                               :logical-node logical-node}))
+                   (let [store  (:store state)
+                         lmdb   (if (instance? Store store)
+                                  (.-lmdb ^Store store)
+                                  store)]
+                     (i/create-snapshot! lmdb))))]
+    (when-not (:ok? result)
+      (u/raise "Jepsen snapshot creation failed"
                {:cluster-id cluster-id
-                :logical-node logical-node}))
-    (let [store  (:store state)
-          lmdb   (if (instance? Store store)
-                   (.-lmdb ^Store store)
-                   store)
-          result (i/create-snapshot! lmdb)]
-      (when-not (:ok? result)
-        (u/raise "Jepsen snapshot creation failed"
-                 {:cluster-id cluster-id
-                  :logical-node logical-node
-                  :result result}))
-      result)))
+                :logical-node logical-node
+                :result result}))
+    result))
 
 (defn create-snapshots-on-nodes!
   [cluster-id logical-nodes]
@@ -2085,23 +2466,29 @@
 
 (defn gc-txlog-segments-on-node!
   [cluster-id logical-node]
-  (let [{:keys [db-name servers]} (get @clusters cluster-id)
-        state (db-state (get servers logical-node) db-name)]
-    (when-not state
-      (u/raise "Cannot GC WAL segments on unavailable Jepsen node"
+  (let [result (if (remote-cluster? cluster-id)
+                 (with-node-kv-store
+                   cluster-id
+                   logical-node
+                   (fn [kv-store]
+                     (i/gc-txlog-segments! kv-store)))
+                 (let [{:keys [db-name servers]} (get @clusters cluster-id)
+                       state (db-state (get servers logical-node) db-name)]
+                   (when-not state
+                     (u/raise "Cannot GC WAL segments on unavailable Jepsen node"
+                              {:cluster-id cluster-id
+                               :logical-node logical-node}))
+                   (let [store  (:store state)
+                         lmdb   (if (instance? Store store)
+                                  (.-lmdb ^Store store)
+                                  store)]
+                     (i/gc-txlog-segments! lmdb))))]
+    (when-not (:ok? result)
+      (u/raise "Jepsen WAL GC failed"
                {:cluster-id cluster-id
-                :logical-node logical-node}))
-    (let [store  (:store state)
-          lmdb   (if (instance? Store store)
-                   (.-lmdb ^Store store)
-                   store)
-          result (i/gc-txlog-segments! lmdb)]
-      (when-not (:ok? result)
-        (u/raise "Jepsen WAL GC failed"
-                 {:cluster-id cluster-id
-                  :logical-node logical-node
-                  :result result}))
-      result)))
+                :logical-node logical-node
+                :result result}))
+    result))
 
 (defn wait-for-follower-bootstrap!
   ([cluster-id logical-node min-snapshot-lsn]
@@ -2169,6 +2556,7 @@
                        (update-in [cluster-id :live-nodes] disj logical-node)))))
         (let [server   (get-in cluster [:servers logical-node])
               db-name  (:db-name cluster)
+              setup-timeout-ms (:setup-timeout-ms cluster)
               db-state (db-state server db-name)
               stopped-info
               (when db-state
@@ -2178,6 +2566,10 @@
                  :node-diagnostics (node-diagnostics cluster-id logical-node)})]
           (safe-close-conn! (get-in cluster [:admin-conns logical-node]))
           (safe-stop-server! (get-in cluster [:servers logical-node]))
+          (wait-for-node-store-released!
+           cluster-id
+           logical-node
+           (or setup-timeout-ms cluster-timeout-ms))
           (swap! clusters
                  (fn [clusters*]
                    (-> clusters*
@@ -2225,6 +2617,10 @@
         :else
         (let [node     (get node-by-name logical-node)
               override (get node-ha-opt-overrides logical-node)
+              _        (wait-for-node-store-released!
+                        cluster-id
+                        logical-node
+                        (or setup-timeout-ms cluster-timeout-ms))
               server   (start-server! node verbose?)]
           (try
             (let [conn (with-control-backend
@@ -2249,6 +2645,10 @@
               true)
             (catch Throwable e
               (safe-stop-server! server)
+              (wait-for-node-store-released!
+               cluster-id
+               logical-node
+               (or setup-timeout-ms cluster-timeout-ms))
               (throw e))))))))
 
 (defn- pause-server-loop!
@@ -2409,6 +2809,13 @@
                   :logical-node logical-node}))
       (let [fault* (assoc (normalize-storage-fault fault)
                           :faulted-at-ms (now-ms))]
+        (when (:remote? cluster)
+          (let [{:keys [ssh node-by-name]} cluster
+                node (get node-by-name logical-node)]
+            (write-remote-content! ssh
+                                   node
+                                   (remote/storage-fault-state-file node)
+                                   (pr-str fault*))))
         (swap! clusters assoc-in [cluster-id :storage-faults logical-node] fault*)
         fault*))))
 
@@ -2416,8 +2823,48 @@
   [cluster-id logical-node]
   (locking clusters
     (let [fault (storage-fault cluster-id logical-node)]
+      (when-let [{:keys [remote? ssh node-by-name]} (get @clusters cluster-id)]
+        (when remote?
+          (when-let [node (get node-by-name logical-node)]
+            (delete-remote-path! ssh
+                                 node
+                                 (remote/storage-fault-state-file node)))))
       (swap! clusters update-in [cluster-id :storage-faults] dissoc logical-node)
       fault)))
+
+(defn set-node-snapshot-failpoint!
+  [cluster-id logical-node mode]
+  (when-let [{:keys [remote? ssh node-by-name]} (get @clusters cluster-id)]
+    (when remote?
+      (when-let [node (get node-by-name logical-node)]
+        (write-remote-content! ssh
+                               node
+                               (remote/snapshot-failpoint-file node)
+                               (pr-str {:mode mode}))
+        true))))
+
+(defn clear-node-snapshot-failpoint!
+  [cluster-id logical-node]
+  (when-let [{:keys [remote? ssh node-by-name]} (get @clusters cluster-id)]
+    (when remote?
+      (when-let [node (get node-by-name logical-node)]
+        (delete-remote-path! ssh
+                             node
+                             (remote/snapshot-failpoint-file node))
+        true))))
+
+(defn set-fencing-hook-mode!
+  [cluster-id mode]
+  (when-let [{:keys [remote? ssh nodes node-by-name]} (get @clusters cluster-id)]
+    (when remote?
+      (doseq [logical-node (map :logical-node nodes)
+              :let [node (get node-by-name logical-node)]
+              :when node]
+        (write-remote-content! ssh
+                               node
+                               (remote/fencing-mode-file node)
+                               (str (name mode) "\n")))
+      true)))
 
 (defn- safe-stop-remote-launcher!
   [ssh repo-root node]
@@ -2447,11 +2894,13 @@
     {:cluster-id      cluster-id
      :remote?         true
      :db-name         (:db-name config)
+     :db-identity     (:db-identity config)
      :schema          (:schema workload)
      :control-backend (:control-backend config)
      :base-opts       base-opts
      :verbose?        verbose?
      :repo-root       (:repo-root config)
+     :remote-config   config
      :remote-config-path config-path
      :setup-timeout-ms setup-timeout-ms
      :nodes           data-nodes
@@ -2491,9 +2940,18 @@
 
 (defn- init-remote-cluster!
   [cluster-id test {:keys [config config-path ssh topology workload]}]
-  (let [data-nodes       (:data-nodes topology)
+  (let [clock-skew?      (some #{:clock-skew-pause
+                                 :clock-skew-leader-fast
+                                 :clock-skew-leader-slow
+                                 :clock-skew-mixed}
+                               (:datalevin/nemesis-faults test))
+        config*          (cond-> config
+                           clock-skew?
+                           (assoc :jepsen-remote-clock-skew-hook? true))
+        _                (spit config-path (pr-str config*))
+        data-nodes       (:data-nodes topology)
         control-nodes    (:control-nodes topology)
-        base-opts        (remote/base-ha-opts config data-nodes control-nodes)
+        base-opts        (remote/base-ha-opts config* data-nodes control-nodes)
         setup-timeout-ms (cluster-setup-timeout-ms base-opts)
         verbose?         (boolean (:verbose test))
         all-nodes        (vec control-nodes)]
@@ -2503,11 +2961,13 @@
       (doseq [node all-nodes]
         (safe-stop-remote-launcher! ssh (:repo-root config) node))
       (doseq [node all-nodes]
+        (sync-remote-node-control-defaults! ssh node))
+      (doseq [node all-nodes]
         (start-remote-node-launcher! ssh (:repo-root config) node verbose?))
       (doseq [node all-nodes]
         (wait-for-remote-node-running! ssh node setup-timeout-ms))
       (let [cluster (build-remote-cluster-state cluster-id
-                                                config
+                                                config*
                                                 config-path
                                                 ssh
                                                 topology

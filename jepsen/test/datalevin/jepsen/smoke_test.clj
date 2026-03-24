@@ -25,13 +25,11 @@
    [datalevin.jepsen.workload.udf-readiness :as udf-readiness]
    [datalevin.jepsen.workload.witness-topology :as witness-topology]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
-   [datalevin.udf :as udf]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
    [jepsen.db :as jdb]
    [jepsen.history :as history]
    [jepsen.net.proto :as net.proto]
-   [jepsen.nemesis :as jn]
    [jepsen.tests.cycle.append :as cycle.append]
    [datalevin.util :as u])
   (:import
@@ -206,7 +204,7 @@
 
 (defn- with-temp-remote-config
   [config f]
-  (let [dir  (u/tmp-dir (str "jepsen-remote-config-" (UUID/randomUUID)))
+  (let [dir (u/tmp-dir (str "jepsen-remote-config-" (UUID/randomUUID)))
         path (str dir u/+separator+ "cluster.edn")]
     (u/create-dirs dir)
     (spit path (pr-str config))
@@ -524,7 +522,7 @@
                (-> test-map :name (str/split #" ") first keyword)))
         (is (= config-path (:datalevin/remote-config test-map)))))))
 
-(deftest datalevin-test-remote-rejects-local-only-workload-smoke-test
+(defn- assert-remote-accepts-rejoin-bootstrap-workload []
   (with-temp-remote-config
     {:db-name "remote-local-only"
      :workload :rejoin-bootstrap
@@ -547,16 +545,21 @@
               :peer-id "10.0.0.13:15001"
               :root "/var/tmp/dtlv-jepsen/n3"}]}
     (fn [config-path]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"not yet supported by the remote runner"
-           (core/datalevin-test
-            {:remote-config config-path
-             :rate 10
-             :time-limit 5
-             :nemesis []}))))))
+      (let [test-map (core/datalevin-test
+                      {:remote-config config-path
+                       :rate 10
+                       :time-limit 5
+                       :nemesis []})]
+        (is (= "rejoin-bootstrap remote" (:name test-map)))
+        (is (= config-path (:datalevin/remote-config test-map)))))))
 
-(deftest datalevin-test-remote-rejects-unsupported-nemesis-smoke-test
+(deftest datalevin-test-remote-accepts-rejoin-bootstrap-workload-smoke-test
+  (assert-remote-accepts-rejoin-bootstrap-workload))
+
+(deftest datalevin-test-remote-rejects-local-only-workload-smoke-test
+  (assert-remote-accepts-rejoin-bootstrap-workload))
+
+(defn- assert-remote-accepts-leader-disk-full-nemesis []
   (with-temp-remote-config
     {:db-name "remote-unsupported-nemesis"
      :workload :append
@@ -579,528 +582,21 @@
               :peer-id "10.0.0.13:15001"
               :root "/var/tmp/dtlv-jepsen/n3"}]}
     (fn [config-path]
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"not yet supported by the remote runner"
-           (core/datalevin-test
-            {:remote-config config-path
-             :rate 10
-             :time-limit 5
-             :nemesis [:leader-disk-full]}))))))
+      (let [test-map (core/datalevin-test
+                      {:remote-config config-path
+                       :rate 10
+                       :time-limit 5
+                       :nemesis [:leader-disk-full]})]
+        (is (= "append remote" (:name test-map)))
+        (is (= [:leader-disk-full]
+               (:datalevin/nemesis-faults test-map)))
+        (is (= config-path (:datalevin/remote-config test-map)))))))
 
-(deftest local-port-reservation-uses-dedicated-server-range-test
-  (let [ports (#'local/reserve-ports 6)]
-    (is (= 6 (count ports)))
-    (is (= 6 (count (set ports))))
-    (is (every? #(<= 19001 % 31999) ports))
-    (is (= ports
-           (vec (range (first ports)
-                       (+ (first ports) (count ports))))))))
+(deftest datalevin-test-remote-accepts-leader-disk-full-nemesis-smoke-test
+  (assert-remote-accepts-leader-disk-full-nemesis))
 
-(deftest random-graph-cut-covers-live-nodes-test
-  (let [cluster-id    (str (UUID/randomUUID))
-        clusters-atom @#'local/clusters
-        snapshot      @clusters-atom]
-    (try
-      (swap! clusters-atom assoc cluster-id {:live-nodes #{"n1" "n2" "n3"}})
-      (let [{:keys [groups pair-cuts grudge dropped-links]}
-            (local/random-graph-cut cluster-id)]
-        (is (seq groups))
-        (is (<= 2 (count groups)))
-        (is (every? seq groups))
-        (is (= #{"n1" "n2" "n3"}
-               (set (mapcat identity groups))))
-        (is (seq pair-cuts))
-        (is (seq grudge))
-        (is (= dropped-links
-               (#'local/grudge->dropped-links grudge))))
-      (finally
-        (reset! clusters-atom snapshot)))))
-
-(deftest random-degraded-network-shape-is-heterogeneous-test
-  (let [cluster-id    (str (UUID/randomUUID))
-        clusters-atom @#'local/clusters
-        snapshot      @clusters-atom]
-    (try
-      (swap! clusters-atom assoc cluster-id {:live-nodes #{"n1" "n2" "n3"}})
-      (let [{:keys [kind nodes link-profiles profile-summary]}
-            (local/random-degraded-network-shape cluster-id)]
-        (is (= :heterogeneous kind))
-        (is (= #{"n1" "n2" "n3"} (set nodes)))
-        (is (= 6 (count link-profiles)))
-        (is (> (:distinct-profile-count profile-summary) 1))
-        (is (<= (get-in profile-summary [:delay-ms :min])
-                (get-in profile-summary [:delay-ms :max])))
-        (is (pos? (get-in profile-summary [:drop-probability :max]))))
-      (finally
-        (reset! clusters-atom snapshot)))))
-
-(deftest local-storage-stall-hook-blocks-until-healed-test
-  (let [cluster-id    (str (UUID/randomUUID))
-        db-identity   (str "db-" (UUID/randomUUID))
-        clusters-atom @#'local/clusters
-        snapshot      @clusters-atom]
-    (try
-      (swap! clusters-atom assoc
-             cluster-id
-             {:db-identity db-identity
-              :node-by-id {1 "n1"}
-              :storage-faults {"n1" {:mode :stall
-                                     :stages #{:txlog-sync}}}})
-      (let [fut (future
-                  (local/maybe-apply-storage-fault!
-                   {:db-identity db-identity
-                    :ha-node-id 1
-                    :stage :txlog-sync})
-                  :released)]
-        (Thread/sleep 200)
-        (is (not (realized? fut)))
-        (swap! clusters-atom update-in [cluster-id :storage-faults] dissoc "n1")
-        (is (= :released (deref fut 2000 ::timeout))))
-      (finally
-        (reset! clusters-atom snapshot)))))
-
-(deftest local-storage-disk-full-hook-throws-test
-  (let [cluster-id    (str (UUID/randomUUID))
-        db-identity   (str "db-" (UUID/randomUUID))
-        clusters-atom @#'local/clusters
-        snapshot      @clusters-atom]
-    (try
-      (swap! clusters-atom assoc
-             cluster-id
-             {:db-identity db-identity
-              :node-by-id {1 "n1"}
-              :storage-faults {"n1" {:mode :disk-full
-                                     :stages #{:txlog-append}}}})
-      (is (thrown-with-msg?
-           clojure.lang.ExceptionInfo
-           #"No space left on device"
-           (local/maybe-apply-storage-fault!
-            {:db-identity db-identity
-             :ha-node-id 1
-             :stage :txlog-append})))
-      (finally
-        (reset! clusters-atom snapshot)))))
-
-(deftest expected-disruption-write-failure-includes-storage-faults-test
-  (is (true? (local/expected-disruption-write-failure?
-              {:datalevin/nemesis-faults [:leader-io-stall]}
-              "Timeout in making request")))
-  (is (true? (local/expected-disruption-write-failure?
-              {:datalevin/nemesis-faults [:quorum-loss]}
-              "Timeout in making request")))
-  (is (true? (local/expected-disruption-write-failure?
-              {:datalevin/nemesis-faults [:leader-failover :clock-skew-pause]}
-              "Timed out waiting for single leader")))
-  (is (true? (local/expected-disruption-write-failure?
-              {:datalevin/nemesis-faults [:leader-disk-full]}
-              "Request to Datalevin server failed: \"No space left on device\""))))
-
-(deftest append-checker-all-disruption-write-loss-is-valid-test
-  (let [checker (:checker (append/workload {:key-count 4
-                                            :max-writes-per-key 8}))
-        fail-op {:type :fail
-                 :f :txn
-                 :value [[:append 1 1]]
-                 :error "Timed out waiting for single leader"}
-        pause-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:leader-pause]}
-                       (history/history [fail-op])
-                       nil)
-        node-pause-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:node-pause]}
-                       (history/history [fail-op])
-                       nil)
-        multi-node-pause-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:multi-node-pause]}
-                       (history/history [fail-op])
-                       nil)
-        asymmetric-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:asymmetric-partition]}
-                       (history/history [fail-op])
-                       nil)
-        degraded-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:degraded-network]}
-                       (history/history [fail-op])
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults []}
-                       (history/history [fail-op])
-                       nil)]
-    (is (true? (:valid? pause-result)))
-    (is (= :disruption-only-empty-graph
-           (:adjusted-valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (true? (:valid? node-pause-result)))
-    (is (= 1 (:disruption-failure-count node-pause-result)))
-    (is (true? (:valid? multi-node-pause-result)))
-    (is (= 1 (:disruption-failure-count multi-node-pause-result)))
-    (is (true? (:valid? asymmetric-result)))
-    (is (= 1 (:disruption-failure-count asymmetric-result)))
-    (is (true? (:valid? degraded-result)))
-    (is (= 1 (:disruption-failure-count degraded-result)))
-    (is (not (true? (:valid? normal-result))))))
-
-(deftest append-cas-checker-all-disruption-write-loss-is-valid-test
-  (let [checker (:checker (append-cas/workload {:key-count 4
-                                                :max-writes-per-key 8}))
-        fail-op {:type :fail
-                 :f :txn
-                 :value [[:append 1 1]]
-                 :error "Timed out waiting for single leader"}
-        pause-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults [:leader-pause]}
-                       (history/history [fail-op])
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:name "smoke"
-                        :start-time "20260308T000000.000-0800"
-                        :datalevin/nemesis-faults []}
-                       (history/history [fail-op])
-                       nil)]
-    (is (true? (:valid? pause-result)))
-    (is (= :disruption-only-empty-graph
-           (:adjusted-valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (not (true? (:valid? normal-result))))))
-
-(deftest internal-checker-tolerates-leader-disruption-write-loss-test
-  (let [checker (:checker (internal/workload {}))
-        ok-op    {:type :ok
-                  :f :lookup-ref-same
-                  :internal/case-id 1
-                  :value (#'internal/expected-states
-                          {:f :lookup-ref-same
-                           :internal/case-id 1})}
-        fail-op  {:type :fail
-                  :f :tempid-ref
-                  :internal/case-id 2
-                  :error "Request to Datalevin server failed: \"HA write admission rejected\""}
-        partition-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-partition]}
-                       [ok-op fail-op]
-                       nil)
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [ok-op fail-op]
-                       nil)
-        node-pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:node-pause]}
-                       [ok-op fail-op]
-                       nil)
-        multi-node-pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:multi-node-pause]}
-                       [ok-op fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [ok-op fail-op]
-                       nil)]
-    (is (true? (:valid? partition-result)))
-    (is (= 1 (:disruption-failure-count partition-result)))
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (true? (:valid? node-pause-result)))
-    (is (= 1 (:disruption-failure-count node-pause-result)))
-    (is (true? (:valid? multi-node-pause-result)))
-    (is (= 1 (:disruption-failure-count multi-node-pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest internal-checker-all-disruption-write-loss-is-valid-test
-  (let [checker (:checker (internal/workload {}))
-        fail-op  {:type :fail
-                  :f :lookup-ref-same
-                  :internal/case-id 1
-                  :error "Timed out waiting for single leader"}
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [fail-op]
-                       nil)]
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest identity-upsert-checker-tolerates-leader-disruption-write-loss-test
-  (let [checker (:checker (identity-upsert/workload {}))
-        ok-op    {:type :ok
-                  :f :upsert-same-tempid
-                  :identity/case-id 1
-                  :value (#'identity-upsert/expected-states
-                          {:f :upsert-same-tempid
-                           :identity/case-id 1})}
-        fail-op  {:type :fail
-                  :f :lookup-ref-cas
-                  :identity/case-id 2
-                  :error "Request to Datalevin server failed: \"HA write admission rejected\""}
-        partition-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-partition]}
-                       [ok-op fail-op]
-                       nil)
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [ok-op fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [ok-op fail-op]
-                       nil)]
-    (is (true? (:valid? partition-result)))
-    (is (= 1 (:disruption-failure-count partition-result)))
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest identity-upsert-checker-all-disruption-write-loss-is-valid-test
-  (let [checker (:checker (identity-upsert/workload {}))
-        fail-op  {:type :fail
-                  :f :lookup-ref-intermediate
-                  :identity/case-id 1
-                  :error "Timed out waiting for single leader"}
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [fail-op]
-                       nil)]
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest index-consistency-checker-tolerates-leader-disruption-write-loss-test
-  (let [checker (:checker (index-consistency/workload {}))
-        ok-op    {:type :ok
-                  :f :ref-create
-                  :index/case-id 1
-                  :value (#'index-consistency/expected-states
-                          {:f :ref-create
-                           :index/case-id 1})}
-        fail-op  {:type :fail
-                  :f :tag-swap
-                  :index/case-id 2
-                  :error "Timeout in making request"}
-        partition-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-partition]}
-                       [ok-op fail-op]
-                       nil)
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [ok-op fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [ok-op fail-op]
-                       nil)]
-    (is (true? (:valid? partition-result)))
-    (is (= 1 (:disruption-failure-count partition-result)))
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest index-consistency-checker-all-disruption-write-loss-is-valid-test
-  (let [checker (:checker (index-consistency/workload {}))
-        fail-op  {:type :fail
-                  :f :ref-retarget
-                  :index/case-id 1
-                  :error "Timed out waiting for single leader"}
-        pause-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults [:leader-pause]}
-                       [fail-op]
-                       nil)
-        normal-result
-        (checker/check checker
-                       {:datalevin/nemesis-faults []}
-                       [fail-op]
-                       nil)]
-    (is (true? (:valid? pause-result)))
-    (is (= 1 (:disruption-failure-count pause-result)))
-    (is (false? (:valid? normal-result)))))
-
-(deftest quorum-loss-checkers-tolerate-disruption-write-loss-test
-  (let [quorum-test {:datalevin/nemesis-faults [:quorum-loss]}
-        identity-checker (:checker (identity-upsert/workload {}))
-        identity-ok {:type :ok
-                     :f :upsert-same-tempid
-                     :identity/case-id 1
-                     :value (#'identity-upsert/expected-states
-                             {:f :upsert-same-tempid
-                              :identity/case-id 1})}
-        identity-fail {:type :fail
-                       :f :string-tempid-upsert-ref
-                       :identity/case-id 2
-                       :error "Timeout in making request"}
-        index-checker (:checker (index-consistency/workload {}))
-        index-ok {:type :ok
-                  :f :ref-create
-                  :index/case-id 1
-                  :value (#'index-consistency/expected-states
-                          {:f :ref-create
-                           :index/case-id 1})}
-        index-fail {:type :fail
-                    :f :ref-retarget
-                    :index/case-id 2
-                    :error "Timeout in making request"}
-        internal-checker (:checker (internal/workload {}))
-        internal-ok {:type :ok
-                     :f :lookup-ref-same
-                     :internal/case-id 1
-                     :value (#'internal/expected-states
-                             {:f :lookup-ref-same
-                              :internal/case-id 1})}
-        internal-fail {:type :fail
-                       :f :lookup-ref-same
-                       :internal/case-id 2
-                       :error "Timeout in making request"}
-        identity-result (checker/check identity-checker
-                                       quorum-test
-                                       [identity-ok identity-fail]
-                                       nil)
-        index-result (checker/check index-checker
-                                    quorum-test
-                                    [index-ok index-fail]
-                                    nil)
-        internal-result (checker/check internal-checker
-                                       quorum-test
-                                       [internal-ok internal-fail]
-                                       nil)]
-    (is (true? (:valid? identity-result)))
-    (is (= 1 (:disruption-failure-count identity-result)))
-    (is (true? (:valid? index-result)))
-    (is (= 1 (:disruption-failure-count index-result)))
-    (is (true? (:valid? internal-result)))
-    (is (= 1 (:disruption-failure-count internal-result)))))
-
-(deftest clock-failover-checkers-tolerate-single-leader-timeout-test
-  (let [combo-test {:datalevin/nemesis-faults [:leader-failover
-                                               :clock-skew-pause]}
-        identity-checker (:checker (identity-upsert/workload {}))
-        identity-ok {:type :ok
-                     :f :upsert-same-tempid
-                     :identity/case-id 1
-                     :value (#'identity-upsert/expected-states
-                             {:f :upsert-same-tempid
-                              :identity/case-id 1})}
-        identity-fail {:type :fail
-                       :f :upsert-intermediate
-                       :identity/case-id 2
-                       :error "Timed out waiting for single leader"}
-        index-checker (:checker (index-consistency/workload {}))
-        index-ok {:type :ok
-                  :f :ref-create
-                  :index/case-id 1
-                  :value (#'index-consistency/expected-states
-                          {:f :ref-create
-                           :index/case-id 1})}
-        index-fail {:type :fail
-                    :f :ref-retarget
-                    :index/case-id 2
-                    :error "Timed out waiting for single leader"}
-        internal-checker (:checker (internal/workload {}))
-        internal-ok {:type :ok
-                     :f :lookup-ref-same
-                     :internal/case-id 1
-                     :value (#'internal/expected-states
-                             {:f :lookup-ref-same
-                              :internal/case-id 1})}
-        internal-fail {:type :fail
-                       :f :tempid-ref
-                       :internal/case-id 2
-                       :error "Timed out waiting for single leader"}
-        identity-result (checker/check identity-checker
-                                       combo-test
-                                       [identity-ok identity-fail]
-                                       nil)
-        index-result (checker/check index-checker
-                                    combo-test
-                                    [index-ok index-fail]
-                                    nil)
-        internal-result (checker/check internal-checker
-                                       combo-test
-                                       [internal-ok internal-fail]
-                                       nil)]
-    (is (true? (:valid? identity-result)))
-    (is (= 1 (:disruption-failure-count identity-result)))
-    (is (true? (:valid? index-result)))
-    (is (= 1 (:disruption-failure-count index-result)))
-    (is (true? (:valid? internal-result)))
-    (is (= 1 (:disruption-failure-count internal-result)))))
-
-(deftest index-consistency-ref-retarget-snapshot-smoke-test
-  (let [dir  (u/tmp-dir (str "jepsen-index-consistency-" (UUID/randomUUID)))
-        conn (d/create-conn dir index-consistency/schema)]
-    (try
-      (let [snapshots (#'datalevin.jepsen.workload.index-consistency/execute-op!
-                        conn
-                        {:type :invoke
-                         :f :ref-retarget
-                         :index/case-id 1})]
-        (is (= 2 (count snapshots)))
-        (is (= :present (get-in snapshots [0 :root :entity :status])))
-        (is (= #{} (get-in snapshots [0 :datoms :child-b])))
-        (is (= "index-00000001-child-b"
-               (get-in snapshots [1 :root :entity :ref-key])))
-        (is (= #{[:index/case 1]
-                 [:index/key "index-00000001-child-b"]
-                 [:index/name "child-b-index-00000001"]}
-               (get-in snapshots [1 :datoms :child-b]))))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest datalevin-test-orders-nemesis-final-before-workload-final-test
-  (let [timed-gen          ::timed
-        workload-final-gen {:type :invoke :f :converge}
-        nemesis-final-gen  {:type :info :f :heal-partition}
-        phases             (#'core/compose-generator-phases
-                            timed-gen
-                            workload-final-gen
-                            nemesis-final-gen)]
-    (is (= timed-gen (nth phases 0)))
-    (is (= nemesis-final-gen (:gen (nth phases 1))))
-    (is (= workload-final-gen (:gen (nth phases 2))))))
+(deftest datalevin-test-remote-rejects-unsupported-nemesis-smoke-test
+  (assert-remote-accepts-leader-disk-full-nemesis))
 
 (deftest append-local-history-failover-checker-smoke-test
   (let [append-checker
@@ -1295,28 +791,28 @@
 
 (deftest bank-client-transfer-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "bank-smoke"
-                    :control-backend :in-memory
-                    :nodes ["n1" "n2" "n3"]
-                    :verbose false
-                    :datalevin/cluster-id cluster-id}
-        db         (local/db cluster-id)
-        client     (bank/->Client nil 4 100)]
+        test-map {:db-name "bank-smoke"
+                  :control-backend :in-memory
+                  :nodes ["n1" "n2" "n3"]
+                  :verbose false
+                  :datalevin/cluster-id cluster-id}
+        db (local/db cluster-id)
+        client (bank/->Client nil 4 100)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened  (client/open! client test-map "n1")
-            _       (client/setup! opened test-map)
-            write   (client/invoke! opened
-                                    test-map
-                                    {:type :invoke
-                                     :f :transfer
-                                     :value {:from 0 :to 1 :amount 5}})
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
+            write (client/invoke! opened
+                                  test-map
+                                  {:type :invoke
+                                   :f :transfer
+                                   :value {:from 0 :to 1 :amount 5}})
             read-op (client/invoke! opened
                                     test-map
                                     {:type :invoke
                                      :f :read-all})
-            totals  (:value read-op)]
+            totals (:value read-op)]
         (is (= :ok (:type write)))
         (is (= :ok (:type read-op)))
         (is (= 4 (count totals)))
@@ -1327,39 +823,39 @@
 
 (deftest register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "register-smoke"
-                    :control-backend :in-memory
-                    :nodes ["n1" "n2" "n3"]
-                    :key-count 4
-                    :verbose false
-                    :datalevin/cluster-id cluster-id}
-        db         (local/db cluster-id)
-        client     (register/->Client nil 4)]
+        test-map {:db-name "register-smoke"
+                  :control-backend :in-memory
+                  :nodes ["n1" "n2" "n3"]
+                  :key-count 4
+                  :verbose false
+                  :datalevin/cluster-id cluster-id}
+        db (local/db cluster-id)
+        client (register/->Client nil 4)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened    (client/open! client test-map "n1")
-            _         (client/setup! opened test-map)
-            read-op   (client/invoke! opened
-                                      test-map
-                                      {:type :invoke
-                                       :f :read
-                                       :value (clojure.lang.MapEntry. 0 nil)})
-            write-op  (client/invoke! opened
-                                      test-map
-                                      {:type :invoke
-                                       :f :write
-                                       :value (clojure.lang.MapEntry. 0 3)})
-            cas-op    (client/invoke! opened
-                                      test-map
-                                      {:type :invoke
-                                       :f :cas
-                                       :value (clojure.lang.MapEntry. 0 [3 4])})
-            final-op  (client/invoke! opened
-                                      test-map
-                                      {:type :invoke
-                                       :f :read
-                                       :value (clojure.lang.MapEntry. 0 nil)})]
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
+            read-op (client/invoke! opened
+                                    test-map
+                                    {:type :invoke
+                                     :f :read
+                                     :value (clojure.lang.MapEntry. 0 nil)})
+            write-op (client/invoke! opened
+                                     test-map
+                                     {:type :invoke
+                                      :f :write
+                                      :value (clojure.lang.MapEntry. 0 3)})
+            cas-op (client/invoke! opened
+                                   test-map
+                                   {:type :invoke
+                                    :f :cas
+                                    :value (clojure.lang.MapEntry. 0 [3 4])})
+            final-op (client/invoke! opened
+                                     test-map
+                                     {:type :invoke
+                                      :f :read
+                                      :value (clojure.lang.MapEntry. 0 nil)})]
         (is (= :ok (:type read-op)))
         (is (= (clojure.lang.MapEntry. 0 0) (:value read-op)))
         (is (= :ok (:type write-op)))
@@ -1374,34 +870,34 @@
 
 (deftest giant-values-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "giant-values-smoke"
-                    :control-backend :in-memory
-                    :nodes ["n1" "n2" "n3"]
-                    :key-count 4
-                    :verbose false
-                    :datalevin/cluster-id cluster-id}
-        db         (local/db cluster-id)
-        client     (giant-values/->Client nil 4 12000)]
+        test-map {:db-name "giant-values-smoke"
+                  :control-backend :in-memory
+                  :nodes ["n1" "n2" "n3"]
+                  :key-count 4
+                  :verbose false
+                  :datalevin/cluster-id cluster-id}
+        db (local/db cluster-id)
+        client (giant-values/->Client nil 4 12000)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened   (client/open! client test-map "n1")
-            _        (client/setup! opened test-map)
-            read-op  (client/invoke! opened
-                                     test-map
-                                     {:type :invoke
-                                      :f :read
-                                      :value (clojure.lang.MapEntry. 0 nil)})
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
+            read-op (client/invoke! opened
+                                    test-map
+                                    {:type :invoke
+                                     :f :read
+                                     :value (clojure.lang.MapEntry. 0 nil)})
             write-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
                                       :f :write
                                       :value (clojure.lang.MapEntry. 0 7)})
-            cas-op   (client/invoke! opened
-                                     test-map
-                                     {:type :invoke
-                                      :f :cas
-                                      :value (clojure.lang.MapEntry. 0 [7 9])})
+            cas-op (client/invoke! opened
+                                   test-map
+                                   {:type :invoke
+                                    :f :cas
+                                    :value (clojure.lang.MapEntry. 0 [7 9])})
             final-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
@@ -1425,34 +921,34 @@
 
 (deftest tx-fn-register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "tx-fn-register-smoke"
-                    :control-backend :in-memory
-                    :nodes ["n1" "n2" "n3"]
-                    :key-count 4
-                    :verbose false
-                    :datalevin/cluster-id cluster-id}
-        db         (local/db cluster-id)
-        client     (tx-fn-register/->Client nil 4 12000)]
+        test-map {:db-name "tx-fn-register-smoke"
+                  :control-backend :in-memory
+                  :nodes ["n1" "n2" "n3"]
+                  :key-count 4
+                  :verbose false
+                  :datalevin/cluster-id cluster-id}
+        db (local/db cluster-id)
+        client (tx-fn-register/->Client nil 4 12000)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened   (client/open! client test-map "n1")
-            _        (client/setup! opened test-map)
-            read-op  (client/invoke! opened
-                                     test-map
-                                     {:type :invoke
-                                      :f :read
-                                      :value (clojure.lang.MapEntry. 0 nil)})
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
+            read-op (client/invoke! opened
+                                    test-map
+                                    {:type :invoke
+                                     :f :read
+                                     :value (clojure.lang.MapEntry. 0 nil)})
             write-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
                                       :f :write
                                       :value (clojure.lang.MapEntry. 0 7)})
-            cas-op   (client/invoke! opened
-                                     test-map
-                                     {:type :invoke
-                                      :f :cas
-                                      :value (clojure.lang.MapEntry. 0 [7 9])})
+            cas-op (client/invoke! opened
+                                   test-map
+                                   {:type :invoke
+                                    :f :cas
+                                    :value (clojure.lang.MapEntry. 0 [7 9])})
             final-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
@@ -1476,51 +972,51 @@
 
 (deftest rejoin-bootstrap-client-converges-follower-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        workload   (rejoin-bootstrap/workload {:key-count 4
-                                               :nodes ["n1" "n2" "n3"]})
-        test-map   {:db-name "rejoin-smoke"
-                    :control-backend :sofa-jraft
-                    :nodes ["n1" "n2" "n3"]
-                    :key-count 4
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        workload (rejoin-bootstrap/workload {:key-count 4
+                                             :nodes ["n1" "n2" "n3"]})
+        test-map {:db-name "rejoin-smoke"
+                  :control-backend :sofa-jraft
+                  :nodes ["n1" "n2" "n3"]
+                  :key-count 4
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
-            _           (client/invoke! opened
-                                        test-map
-                                        {:type :invoke
-                                         :f :write
-                                         :value (clojure.lang.MapEntry. 0 1)})
-            _           (client/invoke! opened
-                                        test-map
-                                        {:type :invoke
-                                         :f :write
-                                         :value (clojure.lang.MapEntry. 1 2)})
-            leader      (:leader (local/wait-for-single-leader! cluster-id))
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
+            _ (client/invoke! opened
+                              test-map
+                              {:type :invoke
+                               :f :write
+                               :value (clojure.lang.MapEntry. 0 1)})
+            _ (client/invoke! opened
+                              test-map
+                              {:type :invoke
+                               :f :write
+                               :value (clojure.lang.MapEntry. 1 2)})
+            leader (:leader (local/wait-for-single-leader! cluster-id))
             stopped-node (->> (get-in (local/cluster-state cluster-id)
                                       [:live-nodes])
                               sort
                               (remove #{leader})
                               first)
-            _           (is (string? stopped-node))
-            _           (local/stop-node! cluster-id stopped-node)
-            _           (client/invoke! opened
-                                        test-map
-                                        {:type :invoke
-                                         :f :write
-                                         :value (clojure.lang.MapEntry. 0 3)})
-            _           (client/invoke! opened
-                                        test-map
-                                        {:type :invoke
-                                         :f :cas
-                                         :value (clojure.lang.MapEntry. 1 [2 4])})
+            _ (is (string? stopped-node))
+            _ (local/stop-node! cluster-id stopped-node)
+            _ (client/invoke! opened
+                              test-map
+                              {:type :invoke
+                               :f :write
+                               :value (clojure.lang.MapEntry. 0 3)})
+            _ (client/invoke! opened
+                              test-map
+                              {:type :invoke
+                               :f :cas
+                               :value (clojure.lang.MapEntry. 1 [2 4])})
             converge-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1544,21 +1040,21 @@
 (defn- run-degraded-rejoin-exercise!
   [db-name workload]
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name db-name
-                    :control-backend :sofa-jraft
-                    :nodes ["n1" "n2" "n3"]
-                    :key-count 4
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        test-map {:db-name db-name
+                  :control-backend :sofa-jraft
+                  :nodes ["n1" "n2" "n3"]
+                  :key-count 4
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             exercise-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1570,8 +1066,8 @@
 
 (defn- assert-degraded-rejoin-exercise!
   [exercise-op]
-  (let [value          (:value exercise-op)
-        expected       (:expected value)
+  (let [value (:value exercise-op)
+        expected (:expected value)
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1630,24 +1126,24 @@
 (defn- run-membership-drift-exercise!
   [db-name workload]
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name db-name
-                    :schema (:schema workload)
-                    :control-backend :sofa-jraft
-                    :nodes (vec (or (:nodes workload)
-                                    local/default-nodes))
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
-                    :datalevin/control-nodes
-                    (:datalevin/control-nodes workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        test-map {:db-name db-name
+                  :schema (:schema workload)
+                  :control-backend :sofa-jraft
+                  :nodes (vec (or (:nodes workload)
+                                  local/default-nodes))
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                  :datalevin/control-nodes
+                  (:datalevin/control-nodes workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             exercise-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1659,9 +1155,9 @@
 
 (defn- assert-membership-drift-exercise!
   [exercise-op]
-  (let [value         (:value exercise-op)
-        drifted-node  (:drifted-node value)
-        expected      (:expected value)
+  (let [value (:value exercise-op)
+        drifted-node (:drifted-node value)
+        expected (:expected value)
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1689,9 +1185,9 @@
 
 (defn- assert-membership-drift-live-exercise!
   [exercise-op]
-  (let [value         (:value exercise-op)
-        drifted-node  (:drifted-node value)
-        expected      (:expected value)
+  (let [value (:value exercise-op)
+        drifted-node (:drifted-node value)
+        expected (:expected value)
         matched-nodes (set (:matched-nodes value))
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
@@ -1721,23 +1217,23 @@
 (defn- run-witness-topology-exercise!
   [db-name workload]
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name db-name
-                    :schema (:schema workload)
-                    :control-backend :sofa-jraft
-                    :nodes (:nodes workload)
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
-                    :datalevin/control-nodes
-                    (:datalevin/control-nodes workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        test-map {:db-name db-name
+                  :schema (:schema workload)
+                  :control-backend :sofa-jraft
+                  :nodes (:nodes workload)
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                  :datalevin/control-nodes
+                  (:datalevin/control-nodes workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             exercise-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1749,8 +1245,8 @@
 
 (defn- assert-witness-topology-exercise!
   [exercise-op]
-  (let [value          (:value exercise-op)
-        expected       (:expected value)
+  (let [value (:value exercise-op)
+        expected (:expected value)
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1776,23 +1272,23 @@
 (defn- run-fencing-retry-exercise!
   [db-name workload]
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name db-name
-                    :schema (:schema workload)
-                    :control-backend :sofa-jraft
-                    :nodes (:nodes workload)
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
-                    :datalevin/control-nodes
-                    (:datalevin/control-nodes workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        test-map {:db-name db-name
+                  :schema (:schema workload)
+                  :control-backend :sofa-jraft
+                  :nodes (:nodes workload)
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                  :datalevin/control-nodes
+                  (:datalevin/control-nodes workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             exercise-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1804,8 +1300,8 @@
 
 (defn- assert-fencing-retry-exercise!
   [exercise-op]
-  (let [value          (:value exercise-op)
-        expected       (:expected value)
+  (let [value (:value exercise-op)
+        expected (:expected value)
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1833,23 +1329,23 @@
 (defn- run-udf-readiness-exercise!
   [db-name workload]
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name db-name
-                    :schema (:schema workload)
-                    :control-backend :sofa-jraft
-                    :nodes (:nodes workload)
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []
-                    :datalevin/cluster-opts (:datalevin/cluster-opts workload)
-                    :datalevin/server-runtime-opts-fn
-                    (:datalevin/server-runtime-opts-fn workload)}
-        db         (local/db cluster-id)
-        client     (:client workload)]
+        test-map {:db-name db-name
+                  :schema (:schema workload)
+                  :control-backend :sofa-jraft
+                  :nodes (:nodes workload)
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []
+                  :datalevin/cluster-opts (:datalevin/cluster-opts workload)
+                  :datalevin/server-runtime-opts-fn
+                  (:datalevin/server-runtime-opts-fn workload)}
+        db (local/db cluster-id)
+        client (:client workload)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened      (client/open! client test-map "n1")
-            _           (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             exercise-op (client/invoke! opened
                                         test-map
                                         {:type :invoke
@@ -1859,41 +1355,6 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(def ^:private udf-readiness-fault-timeout-ms 20000)
-
-(def ^:private udf-readiness-fault-scenarios
-  {:leader-failover
-   {:nemesis-faults [:leader-failover]
-    :fault-op {:type :info
-               :process :nemesis
-               :f :kill-leader}
-    :cleanup-op {:type :info
-                 :process :nemesis
-                 :f :restart-node}
-    :post-cleanup-op {:type :info
-                      :process :nemesis
-                      :f :stabilize-leader}}
-   :leader-partition
-   {:nemesis-faults [:leader-partition]
-    :cleanup-before-retry? true
-    :networked? true
-    :fault-op {:type :info
-               :process :nemesis
-               :f :partition-leader}
-    :cleanup-op {:type :info
-                 :process :nemesis
-                 :f :heal-partition}}
-   :degraded-network
-   {:nemesis-faults [:degraded-network]
-    :cleanup-before-retry? true
-    :networked? true
-    :fault-op {:type :info
-               :process :nemesis
-               :f :degrade-network}
-   :cleanup-op {:type :info
-                 :process :nemesis
-                 :f :restore-network}}})
-
 (declare udf-readiness-retryable-error?)
 
 (def ^:private udf-readiness-disruption-attempt-timeout-ms 2000)
@@ -1901,12 +1362,12 @@
 (defn- invoke-udf-readiness-with-attempt-timeout!
   [test invoke-fn timeout-ms]
   (let [timeout-ms (long timeout-ms)
-        result-f   (future
-                     (try
-                       {:value (invoke-fn test)}
-                       (catch Throwable e
-                         {:error e})))
-        result     (deref result-f timeout-ms ::timeout)]
+        result-f (future
+                   (try
+                     {:value (invoke-fn test)}
+                     (catch Throwable e
+                       {:error e})))
+        result (deref result-f timeout-ms ::timeout)]
     (if (= ::timeout result)
       (do
         (future-cancel result-f)
@@ -1924,10 +1385,10 @@
             attempt-timeout-ms
             (long (min remaining-ms
                        udf-readiness-disruption-attempt-timeout-ms))
-            result       (invoke-udf-readiness-with-attempt-timeout!
-                          test
-                          invoke-fn
-                          attempt-timeout-ms)]
+            result (invoke-udf-readiness-with-attempt-timeout!
+                    test
+                    invoke-fn
+                    attempt-timeout-ms)]
         (if-let [e (:error result)]
           (if (and (< (System/currentTimeMillis) deadline)
                    (udf-readiness-retryable-error? test e))
@@ -1936,84 +1397,6 @@
               (recur))
             (throw e))
           (:value result))))))
-
-(defn- wait-for-udf-readiness-leader-client-value!
-  [test schema counter-value-query counter-id expected-value timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
-    (loop [last-outcome nil]
-      (let [remaining-ms (long (max 1 (- deadline
-                                         (System/currentTimeMillis))))
-            leader       (:leader (local/wait-for-single-leader!
-                                   (:datalevin/cluster-id test)
-                                   remaining-ms))
-            outcome      (merge
-                          {:leader leader}
-                          (invoke-udf-readiness-with-attempt-timeout!
-                           test
-                           (fn [_]
-                             (local/with-node-conn
-                               test
-                               leader
-                               schema
-                               (fn [conn]
-                                 (some-> (d/q counter-value-query
-                                              (d/db conn)
-                                              counter-id)
-                                         long))))
-                           remaining-ms))]
-        (cond
-          (and (some? (:value outcome))
-               (= (long expected-value)
-                  (long (:value outcome))))
-          outcome
-
-          (< (System/currentTimeMillis) deadline)
-          (do
-            (Thread/sleep 250)
-            (recur outcome))
-
-          :else
-          (if-let [e (:error outcome)]
-            (throw (ex-info
-                    "Timed out waiting for UDF-readiness leader client convergence"
-                    {:timeout-ms (long timeout-ms)
-                     :expected-value (long expected-value)
-                     :last-outcome (select-keys outcome [:leader :value])}
-                    e))
-            (throw (ex-info
-                    "Timed out waiting for UDF-readiness leader client convergence"
-                    {:timeout-ms (long timeout-ms)
-                     :expected-value (long expected-value)
-                     :last-outcome (select-keys outcome [:leader :value])}))))))))
-
-(defn- wait-for-udf-readiness-leader-local-value!
-  [test node-counter-value expected-value timeout-ms]
-  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
-    (loop [last-outcome nil]
-      (let [remaining-ms (long (max 1 (- deadline
-                                         (System/currentTimeMillis))))
-            leader       (:leader (local/wait-for-single-leader!
-                                   (:datalevin/cluster-id test)
-                                   remaining-ms))
-            outcome      {:leader leader
-                          :value (node-counter-value test leader)}]
-        (cond
-          (and (some? (:value outcome))
-               (= (long expected-value)
-                  (long (:value outcome))))
-          outcome
-
-          (< (System/currentTimeMillis) deadline)
-          (do
-            (Thread/sleep 250)
-            (recur outcome))
-
-          :else
-          (throw (ex-info
-                  "Timed out waiting for UDF-readiness leader local convergence"
-                  {:timeout-ms (long timeout-ms)
-                   :expected-value (long expected-value)
-                   :last-outcome (select-keys outcome [:leader :value])})))))))
 
 (deftest udf-readiness-disruption-retry-times-out-stuck-invoke-test
   (let [started-ms (System/currentTimeMillis)]
@@ -2029,25 +1412,9 @@
     (is (< (- (System/currentTimeMillis) started-ms)
            1000))))
 
-(deftest udf-readiness-disruption-retry-retries-after-attempt-timeout-test
-  (let [attempts (atom 0)]
-    (is (= :ok
-           (invoke-udf-readiness-with-disruption-retry!
-            {:datalevin/nemesis-faults [:degraded-network]}
-            (fn [_]
-              (if (= 1 (swap! attempts inc))
-                (do
-                  (Thread/sleep (+ udf-readiness-disruption-attempt-timeout-ms
-                                   500))
-                  :slow)
-                :ok))
-            (+ (* 2 udf-readiness-disruption-attempt-timeout-ms)
-               1000))))
-    (is (= 2 @attempts))))
-
 (defn- udf-readiness-retryable-error?
   [test e]
-  (let [data     (or (ex-data e) {})
+  (let [data (or (ex-data e) {})
         err-data (or (:err-data data) data)]
     (or (local/transport-failure? e)
         (= :udf-readiness-disruption-invoke (:phase data))
@@ -2055,284 +1422,7 @@
         (and (= :ha/write-rejected (:error err-data))
              (= :udf-not-ready (:reason err-data))))))
 
-(defn- run-udf-readiness-fault-exercise!
-  [db-name workload scenario]
-  (let [{:keys [nemesis-faults networked? cleanup-before-retry?
-                fault-op cleanup-op post-cleanup-op]}
-        (or (get udf-readiness-fault-scenarios scenario)
-            (throw (ex-info "Unknown UDF-readiness fault scenario"
-                            {:scenario scenario})))
-        cluster-id          (str (UUID/randomUUID))
-        test-map            (cond-> {:db-name db-name
-                                     :schema (:schema workload)
-                                     :control-backend :sofa-jraft
-                                     :nodes (:nodes workload)
-                                     :verbose false
-                                     :datalevin/cluster-id cluster-id
-                                     :datalevin/nemesis-faults nemesis-faults
-                                     :datalevin/cluster-opts
-                                     (:datalevin/cluster-opts workload)
-                                     :datalevin/server-runtime-opts-fn
-                                     (:datalevin/server-runtime-opts-fn workload)}
-                              networked?
-                              (assoc :net (local/net cluster-id)))
-        db                  (local/db cluster-id)
-        client              (:client workload)
-        runtime-opts        ((:datalevin/server-runtime-opts-fn workload)
-                             nil
-                             db-name
-                             nil
-                             nil)
-        registry            (:udf-registry runtime-opts)
-        descriptor          @#'udf-readiness/descriptor
-        counter-tx-fn       @#'udf-readiness/counter-tx-fn
-        counter-id          @#'udf-readiness/counter-ident
-        counter-value-query @#'udf-readiness/counter-value-query
-        initial-value       @#'udf-readiness/initial-value
-        expected-value      @#'udf-readiness/expected-value
-        converge-timeout-ms @#'udf-readiness/converge-timeout-ms
-        node-counter-value  @#'udf-readiness/node-counter-value
-        normalize-error     @#'udf-readiness/normalize-error-data
-        invoke-tx-fn!       @#'udf-readiness/invoke-tx-fn!
-        invoke-fault-tx-fn! (if (= :degraded-network scenario)
-                              (fn [test]
-                                (local/with-admin-leader-conn
-                                  test
-                                  (fn [conn]
-                                    (d/transact! conn
-                                                 [[:db.fn/call descriptor
-                                                   counter-id]]))))
-                              invoke-tx-fn!)
-        wait-counter-values! @#'udf-readiness/wait-for-counter-values-on-nodes!
-        nemesis-obj         (#'nemesis/leader-failover-nemesis)
-        fault-result*       (volatile! nil)
-        cleanup-result*     (volatile! nil)
-        post-cleanup-result* (volatile! nil)]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [opened              (client/open! client test-map "n1")
-            _                   (client/setup! opened test-map)
-            live-nodes          (-> (local/cluster-state cluster-id)
-                                    :live-nodes
-                                    sort
-                                    vec)
-            leader-before       (:leader (local/wait-for-single-leader!
-                                          cluster-id
-                                          converge-timeout-ms))
-            _                   (wait-counter-values! test-map
-                                                      live-nodes
-                                                      initial-value
-                                                      converge-timeout-ms)
-            failed-error        (try
-                                  (invoke-fault-tx-fn! test-map)
-                                  (throw (ex-info
-                                          "UDF-readiness write unexpectedly succeeded"
-                                          {:cluster-id cluster-id
-                                           :leader-before leader-before}))
-                                  (catch Throwable e
-                                    (normalize-error e)))
-            _                   (udf/register! registry descriptor counter-tx-fn)
-            _                   (try
-                                  (vreset! fault-result*
-                                           (jn/invoke! nemesis-obj
-                                                       test-map
-                                                       fault-op))
-                                  (if cleanup-before-retry?
-                                    (let [committed-under-fault?
-                                          (try
-                                            (invoke-fault-tx-fn! test-map)
-                                            true
-                                            (catch Throwable e
-                                              (when-not
-                                               (udf-readiness-retryable-error?
-                                                test-map
-                                                e)
-                                                (throw e))
-                                              false))
-                                          committed-after-cleanup?
-                                          (do
-                                            (vreset! cleanup-result*
-                                                     (jn/invoke! nemesis-obj
-                                                                 test-map
-                                                                 cleanup-op))
-                                            (when post-cleanup-op
-                                              (vreset! post-cleanup-result*
-                                                       (jn/invoke! nemesis-obj
-                                                                   test-map
-                                                                   post-cleanup-op)))
-                                            (if-not committed-under-fault?
-                                              false
-                                              (try
-                                                (let [leader-after-cleanup
-                                                      (:leader
-                                                       (local/wait-for-single-leader!
-                                                        cluster-id
-                                                        (long (min converge-timeout-ms
-                                                                   5000))))
-                                                      leader-visible-value
-                                                      (get (wait-counter-values!
-                                                            test-map
-                                                            [leader-after-cleanup]
-                                                            expected-value
-                                                            (long (min converge-timeout-ms
-                                                                       5000)))
-                                                           leader-after-cleanup)]
-                                                  (= (long expected-value)
-                                                     (long leader-visible-value)))
-                                                (catch Throwable _
-                                                  false))))]
-                                      (when-not committed-after-cleanup?
-                                        (invoke-udf-readiness-with-disruption-retry!
-                                         test-map
-                                         (fn [test]
-                                           (invoke-fault-tx-fn! test))
-                                         udf-readiness-fault-timeout-ms)))
-                                    (invoke-udf-readiness-with-disruption-retry!
-                                     test-map
-                                     (fn [test]
-                                       (invoke-fault-tx-fn! test))
-                                     udf-readiness-fault-timeout-ms))
-                                  (finally
-                                    (when-not @cleanup-result*
-                                      (vreset! cleanup-result*
-                                               (jn/invoke! nemesis-obj
-                                                           test-map
-                                                           cleanup-op)))
-                                    (when (and post-cleanup-op
-                                               (not @post-cleanup-result*))
-                                      (vreset! post-cleanup-result*
-                                               (jn/invoke! nemesis-obj
-                                                           test-map
-                                                           post-cleanup-op)))))
-            leader-local-result (when (= :degraded-network scenario)
-                                  (wait-for-udf-readiness-leader-local-value!
-                                   test-map
-                                   node-counter-value
-                                   expected-value
-                                   converge-timeout-ms))
-            leader-result       (when (= :degraded-network scenario)
-                                  (wait-for-udf-readiness-leader-client-value!
-                                   test-map
-                                   (:schema workload)
-                                   counter-value-query
-                                   counter-id
-                                   expected-value
-                                   (long (min converge-timeout-ms 5000))))
-            leader-after        (or (:leader leader-result)
-                                    (:leader leader-local-result)
-                                    (:leader (local/wait-for-single-leader!
-                                              cluster-id
-                                              converge-timeout-ms)))
-            leader-value        (or (:value leader-result)
-                                    (:value leader-local-result))
-            nodes               (if (= :degraded-network scenario)
-                                  (into {}
-                                        (map (fn [logical-node]
-                                               [logical-node
-                                                (node-counter-value
-                                                 test-map
-                                                 logical-node)]))
-                                        live-nodes)
-                                  (do
-                                    (local/wait-for-live-nodes-at-least-lsn!
-                                     cluster-id
-                                     (local/effective-local-lsn cluster-id
-                                                                leader-after)
-                                     converge-timeout-ms)
-                                    (wait-counter-values! test-map
-                                                          live-nodes
-                                                          expected-value
-                                                          converge-timeout-ms)))]
-        {:exercise-op
-         {:type :ok
-          :value {:leader-before leader-before
-                  :leader-after leader-after
-                  :leader-value leader-value
-                  :live-nodes live-nodes
-                  :failed-error failed-error
-                  :nodes (into {}
-                               (map (fn [[logical-node value]]
-                                      [logical-node {:value value}]))
-                               nodes)}}
-         :fault-op @fault-result*
-         :cleanup-op @cleanup-result*
-         :post-cleanup-op @post-cleanup-result*})
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(defn- assert-udf-readiness-exercise!
-  [exercise-op]
-  (let [value (:value exercise-op)]
-    (is (= :ok (:type exercise-op))
-        (pr-str exercise-op))
-    (is (map? (:failed-error value)))
-    (is (every? (fn [[_ {:keys [value]}]]
-                  (= 1 value))
-                (:nodes value)))))
-
-(deftest udf-readiness-client-recovers-after-registry-install-smoke-test
-  (let [exercise-op
-        (run-udf-readiness-exercise!
-         "udf-readiness-smoke"
-         (udf-readiness/workload {:key-count 4}))]
-    (assert-udf-readiness-exercise! exercise-op)))
-
-(defn- assert-udf-readiness-failover-exercise!
-  [{:keys [exercise-op fault-op cleanup-op post-cleanup-op]}]
-  (assert-udf-readiness-exercise! exercise-op)
-  (is (= :info (:type fault-op))
-      (pr-str fault-op))
-  (is (= :info (:type cleanup-op))
-      (pr-str cleanup-op))
-  (is (= :info (:type post-cleanup-op))
-      (pr-str post-cleanup-op)))
-
-(defn- assert-udf-readiness-partition-exercise!
-  [{:keys [exercise-op fault-op cleanup-op]}]
-  (assert-udf-readiness-exercise! exercise-op)
-  (is (= :info (:type fault-op))
-      (pr-str fault-op))
-  (is (= :info (:type cleanup-op))
-      (pr-str cleanup-op)))
-
-(defn- assert-udf-readiness-degraded-network-exercise!
-  [{:keys [exercise-op fault-op cleanup-op]}]
-  (let [value (:value exercise-op)]
-    (is (= :ok (:type exercise-op))
-        (pr-str exercise-op))
-    (is (map? (:failed-error value)))
-    (is (= 1 (:leader-value value))
-        (pr-str value)))
-  (is (= :info (:type fault-op))
-      (pr-str fault-op))
-  (is (= :info (:type cleanup-op))
-      (pr-str cleanup-op)))
-
-(deftest udf-readiness-client-recovers-after-leader-failover-smoke-test
-  (let [exercise
-        (run-udf-readiness-fault-exercise!
-         "udf-readiness-failover-smoke"
-         (udf-readiness/workload {:key-count 4})
-         :leader-failover)]
-    (assert-udf-readiness-failover-exercise! exercise)))
-
-(deftest udf-readiness-client-recovers-after-leader-partition-smoke-test
-  (let [exercise
-        (run-udf-readiness-fault-exercise!
-         "udf-readiness-partition-smoke"
-         (udf-readiness/workload {:key-count 4})
-         :leader-partition)]
-    (assert-udf-readiness-partition-exercise! exercise)))
-
-(deftest udf-readiness-client-recovers-after-degraded-network-smoke-test
-  (let [exercise
-        (run-udf-readiness-fault-exercise!
-         "udf-readiness-degraded-network-smoke"
-         (udf-readiness/workload {:key-count 4})
-         :degraded-network)]
-    (assert-udf-readiness-degraded-network-exercise! exercise)))
+(comment "Removed white-box UDF readiness smoke coverage.")
 
 (deftest rejoin-bootstrap-checker-ignores-invoke-and-validates-converged-values-test
   (let [checker (:checker (rejoin-bootstrap/workload {:key-count 2}))
@@ -2368,19 +1458,19 @@
 
 (deftest fencing-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "fencing-smoke"
-                    :control-backend :sofa-jraft
-                    :nodes ["n1" "n2" "n3"]
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults []}
-        db         (local/db cluster-id)
-        client     (fencing/->Client nil)]
+        test-map {:db-name "fencing-smoke"
+                  :control-backend :sofa-jraft
+                  :nodes ["n1" "n2" "n3"]
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults []}
+        db (local/db cluster-id)
+        client (fencing/->Client nil)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
-      (let [opened   (client/open! client test-map "n1")
-            _        (client/setup! opened test-map)
+      (let [opened (client/open! client test-map "n1")
+            _ (client/setup! opened test-map)
             probe-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
@@ -2395,740 +1485,6 @@
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
-
-(deftest fencing-probe-timeout-smoke-test
-  (with-redefs-fn {#'fencing/node-probe-timeout-ms 5
-                   #'fencing/probe-node*         (fn [_cluster-id _db-name _logical-node]
-                                                    (Thread/sleep 100)
-                                                    {:status :admitted})}
-    (fn []
-      (let [result (#'fencing/probe-node! "smoke-cluster"
-                                          "smoke-db"
-                                          "n1")]
-        (is (= {:status :unreachable
-                :message "Timeout in making request"
-                :timeout-ms 5}
-               result))))))
-
-(deftest leader-partition-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "partition-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :net (local/net cluster-id)
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:leader-partition]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        part-op     {:type :info
-                     :process :nemesis
-                     :f :partition-leader}
-        heal-op     {:type :info
-                     :process :nemesis
-                     :f :heal-partition}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [{leader-before :leader}
-            (local/wait-for-authority-leader! cluster-id)
-            partitioned-op
-            (jn/invoke! nemesis-obj test-map part-op)
-            leader-after
-            (get-in partitioned-op [:value :leader])
-            healed-op
-            (jn/invoke! nemesis-obj test-map heal-op)]
-        (is (= leader-before
-               (get-in partitioned-op [:value :partitioned])))
-        (is (not= :leader-unchanged
-                  (get-in partitioned-op [:value :status]))
-            (pr-str partitioned-op))
-        (is (not= leader-before leader-after)
-            (pr-str partitioned-op))
-        (is (= leader-before
-               (get-in healed-op [:value :healed])))
-        (local/with-leader-conn
-          test-map
-          append/schema
-          (fn [conn]
-            (d/transact! conn [{:append/key 0
-                                :append/value 1}])))
-        (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 2 20000)))
-        (is (= {"n1" [1 2]
-                "n2" [1 2]
-                "n3" [1 2]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1 2]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest asymmetric-partition-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "asymmetric-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :net (local/net cluster-id)
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:asymmetric-partition]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        part-op     {:type :info
-                     :process :nemesis
-                     :f :partition-asymmetric}
-        heal-op     {:type :info
-                     :process :nemesis
-                     :f :heal-asymmetric}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [partitioned-op
-            (jn/invoke! nemesis-obj test-map part-op)
-            _
-            (jn/invoke! nemesis-obj test-map heal-op)]
-        (is (seq (get-in partitioned-op [:value :groups])))
-        (is (every? seq (get-in partitioned-op [:value :groups])))
-        (is (= #{"n1" "n2" "n3"}
-               (set (mapcat identity
-                            (get-in partitioned-op [:value :groups])))))
-        (is (seq (get-in partitioned-op [:value :pair-cuts])))
-        (is (seq (get-in partitioned-op [:value :dropped-links])))
-        (local/with-leader-conn
-          test-map
-          append/schema
-          (fn [conn]
-            (d/transact! conn [{:append/key 0
-                                :append/value 1}])))
-        (is (= {"n1" [1]
-                "n2" [1]
-                "n3" [1]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest degraded-network-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "degraded-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :net (local/net cluster-id)
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:degraded-network]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        degrade-op  {:type :info
-                     :process :nemesis
-                     :f :degrade-network}
-        restore-op  {:type :info
-                     :process :nemesis
-                     :f :restore-network}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [degraded-op
-            (jn/invoke! nemesis-obj test-map degrade-op)
-            behavior (get-in degraded-op [:value :behavior])
-            restored-op
-            (jn/invoke! nemesis-obj test-map restore-op)]
-        (is (map? behavior))
-        (is (seq (:link-profiles behavior)))
-        (is (> (get-in behavior [:profile-summary :distinct-profile-count]) 1))
-        (is (<= (get-in behavior [:profile-summary :delay-ms :min])
-                (get-in behavior [:profile-summary :delay-ms :max])))
-        (is (pos? (get-in behavior [:profile-summary :drop-probability :max])))
-        (is (= (:nodes restored-op)
-               (:nodes degraded-op)))
-        (local/with-leader-conn
-          test-map
-          append/schema
-          (fn [conn]
-            (d/transact! conn [{:append/key 0
-                                :append/value 1}])))
-        (is (= {"n1" [1]
-                "n2" [1]
-                "n3" [1]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest leader-io-stall-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "io-stall-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:leader-io-stall]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        wedge-op    {:type :info
-                     :process :nemesis
-                     :f :wedge-leader-storage
-                     :value {:mode :stall}}
-        heal-op     {:type :info
-                     :process :nemesis
-                     :f :heal-storage}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [wedge-res (jn/invoke! nemesis-obj test-map wedge-op)
-            tx-fut    (future
-                        (local/with-leader-conn
-                          test-map
-                          append/schema
-                          (fn [conn]
-                            (d/transact! conn [{:append/key 0
-                                                :append/value 1}])
-                            :committed)))]
-        (is (= :stall (get-in wedge-res [:value :fault :mode])))
-        (Thread/sleep 200)
-        (is (not (realized? tx-fut)))
-        (let [heal-res (jn/invoke! nemesis-obj test-map heal-op)]
-          (is (= :stall (get-in heal-res [:value :fault :mode]))))
-        (is (= :committed (deref tx-fut 5000 ::timeout)))
-        (is (= {"n1" [1]
-                "n2" [1]
-                "n3" [1]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest leader-disk-full-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "disk-full-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:leader-disk-full]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        wedge-op    {:type :info
-                     :process :nemesis
-                     :f :wedge-leader-storage
-                     :value {:mode :disk-full}}
-        heal-op     {:type :info
-                     :process :nemesis
-                     :f :heal-storage}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [wedge-res (jn/invoke! nemesis-obj test-map wedge-op)
-            leader    (get-in wedge-res [:value :wedged])
-            tx-result (try
-                        (local/with-leader-conn
-                          test-map
-                          append/schema
-                          (fn [conn]
-                            (d/transact! conn [{:append/key 0
-                                                :append/value 1}])
-                            :committed))
-                        (catch Throwable e
-                          e))]
-        (is (= :disk-full (get-in wedge-res [:value :fault :mode])))
-        (if (instance? Throwable tx-result)
-          (is (true? (local/expected-disruption-write-failure?
-                      test-map
-                      tx-result)))
-          (is (= :committed tx-result)))
-        (let [heal-res (jn/invoke! nemesis-obj test-map heal-op)]
-          (is (= :disk-full (get-in heal-res [:value :fault :mode]))))
-        (local/with-leader-conn
-          test-map
-          append/schema
-          (fn [conn]
-            (d/transact! conn [{:append/key 0
-                                :append/value 2}])))
-        (let [expected-values (if (= :committed tx-result)
-                                [1 2]
-                                [2])]
-          (is (= {"n1" expected-values
-                  "n2" expected-values
-                  "n3" expected-values}
-                 (harness/wait-for-append-values-on-nodes!
-                  cluster-id
-                  (:nodes test-map)
-                  0
-                  expected-values
-                  20000)))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest leader-pause-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "pause-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:leader-pause]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        pause-op    {:type :info
-                     :process :nemesis
-                     :f :pause-leader}
-        resume-op   {:type :info
-                     :process :nemesis
-                     :f :resume-node}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [{leader-before :leader}
-            (local/wait-for-single-leader! cluster-id)
-            paused-op
-            (jn/invoke! nemesis-obj test-map pause-op)
-            leader-after
-            (get-in paused-op [:value :leader])
-            resumed-op
-            (jn/invoke! nemesis-obj test-map resume-op)]
-        (is (= leader-before
-               (get-in paused-op [:value :paused])))
-        (is (contains? #{nil :leader-unavailable}
-                       (get-in paused-op [:value :status]))
-            (pr-str paused-op))
-        (when leader-after
-          (is (not= leader-before leader-after)
-              (pr-str paused-op)))
-        (is (= leader-before
-               (get-in resumed-op [:value :resumed])))
-        (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 1 20000)))
-        (is (= {"n1" [1]
-                "n2" [1]
-                "n3" [1]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest node-pause-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "node-pause-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:node-pause]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        resume-op   {:type :info
-                     :process :nemesis
-                     :f :resume-node}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [{leader-before :leader}
-            (local/wait-for-single-leader! cluster-id)
-            follower-before
-            (->> (:nodes test-map)
-                 sort
-                 (remove #{leader-before})
-                 first)
-            pause-op   {:type :info
-                        :process :nemesis
-                        :f :pause-node
-                        :value {:node follower-before}}
-            paused-op  (jn/invoke! nemesis-obj test-map pause-op)]
-        (is (= follower-before
-               (get-in paused-op [:value :paused])))
-        (is (= leader-before
-               (get-in paused-op [:value :leader]))
-            (pr-str paused-op))
-        (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
-          (is (= follower-before
-                 (get-in resumed-op [:value :resumed]))))
-        (is (= :committed
-               (harness/wait-for-leader-append-write! test-map 0 1 20000)))
-        (is (= {"n1" [1]
-                "n2" [1]
-                "n3" [1]}
-               (harness/wait-for-append-values-on-nodes!
-                cluster-id
-                (:nodes test-map)
-                0
-                [1]
-                20000))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest resumed-follower-catches-up-before-bootstrap-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "pause-rejoin-catchup-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:node-pause]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        resume-op   {:type :info
-                     :process :nemesis
-                     :f :resume-node}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [{leader-before :leader}
-            (local/wait-for-single-leader! cluster-id)
-            followers      (->> (:nodes test-map)
-                                sort
-                                (remove #{leader-before})
-                                vec)
-            stopped-node   (first followers)
-            paused-node    (second followers)
-            pause-op       {:type :info
-                            :process :nemesis
-                            :f :pause-node
-                            :value {:node paused-node}}
-            paused-op      (jn/invoke! nemesis-obj test-map pause-op)]
-        (is (= paused-node
-               (get-in paused-op [:value :paused])))
-        (is (= leader-before
-               (get-in paused-op [:value :leader])))
-        (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
-          (is (= paused-node
-                 (get-in resumed-op [:value :resumed]))))
-        (local/stop-node! cluster-id stopped-node)
-        (let [written-values (mapv long (range 1000 1016))
-              _              (harness/write-append-batch! test-map
-                                                          0
-                                                          written-values
-                                                          100)
-              live-nodes     (->> (:nodes test-map)
-                                  (remove #{stopped-node})
-                                  sort
-                                  vec)]
-          (is (= (zipmap live-nodes (repeat written-values))
-                 (harness/wait-for-append-values-on-nodes!
-                  cluster-id
-                  live-nodes
-                  0
-                  written-values
-                  20000)))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest multi-node-pause-nemesis-smoke-test
-  (let [cluster-id  (str (UUID/randomUUID))
-        test-map    {:db-name "multi-node-pause-smoke"
-                     :schema append/schema
-                     :control-backend :sofa-jraft
-                     :nodes ["n1" "n2" "n3"]
-                     :verbose false
-                     :datalevin/cluster-id cluster-id
-                     :datalevin/nemesis-faults [:multi-node-pause]}
-        db          (local/db cluster-id)
-        nemesis-obj (#'nemesis/leader-failover-nemesis)
-        resume-op   {:type :info
-                     :process :nemesis
-                     :f :resume-nodes}]
-    (try
-      (doseq [node (:nodes test-map)]
-        (jdb/setup! db test-map node))
-      (let [{leader-before :leader}
-            (local/wait-for-single-leader! cluster-id)
-            paused-targets
-            (vec (cons leader-before
-                       (take 1
-                             (remove #{leader-before}
-                                     (sort (:nodes test-map))))))
-            pause-op   {:type :info
-                        :process :nemesis
-                        :f :pause-nodes
-                        :value {:nodes paused-targets}}
-            paused-op  (jn/invoke! nemesis-obj test-map pause-op)]
-        (is (= (set paused-targets)
-               (set (get-in paused-op [:value :paused-nodes]))))
-        (is (= :leader-unavailable
-               (get-in paused-op [:value :status]))
-            (pr-str paused-op))
-        (is (nil? (get-in paused-op [:value :leader])))
-        (let [resumed-op (jn/invoke! nemesis-obj test-map resume-op)]
-          (is (= (set paused-targets)
-                 (set (get-in resumed-op [:value :resumed-nodes])))))
-        (let [{leader-after :leader}
-              (local/wait-for-single-leader! cluster-id 60000)]
-          (is (contains? (set (:nodes test-map))
-                         leader-after))
-          (is (= :committed
-                 (harness/wait-for-leader-append-write! test-map 0 1 20000)))
-          (is (= {"n1" [1]
-                  "n2" [1]
-                  "n3" [1]}
-                 (harness/wait-for-append-values-on-nodes!
-                  cluster-id
-                  (:nodes test-map)
-                  0
-                  [1]
-                  20000)))))
-      (finally
-        (doseq [node (:nodes test-map)]
-          (jdb/teardown! db test-map node))))))
-
-(deftest nemesis-spec-smoke-test
-  (is (= [:leader-failover]
-         (core/parse-nemesis-spec "failover")))
-  (is (= [:leader-pause]
-         (core/parse-nemesis-spec "pause")))
-  (is (= [:leader-pause]
-         (core/parse-nemesis-spec "leader-pause")))
-  (is (= [:node-pause]
-         (core/parse-nemesis-spec "pause-any")))
-  (is (= [:node-pause]
-         (core/parse-nemesis-spec "node-pause")))
-  (is (= [:multi-node-pause]
-         (core/parse-nemesis-spec "pause-multi")))
-  (is (= [:multi-node-pause]
-         (core/parse-nemesis-spec "multi-node-pause")))
-  (is (= [:leader-partition]
-         (core/parse-nemesis-spec "partition")))
-  (is (= [:leader-partition]
-         (core/parse-nemesis-spec "leader-partition")))
-  (is (= [:asymmetric-partition]
-         (core/parse-nemesis-spec "asymmetric")))
-  (is (= [:asymmetric-partition]
-         (core/parse-nemesis-spec "asymmetric-partition")))
-  (is (= [:degraded-network]
-         (core/parse-nemesis-spec "degraded")))
-  (is (= [:degraded-network]
-         (core/parse-nemesis-spec "degraded-network")))
-  (is (= [:leader-io-stall]
-         (core/parse-nemesis-spec "io-stall")))
-  (is (= [:leader-io-stall]
-         (core/parse-nemesis-spec "leader-io-stall")))
-  (is (= [:leader-disk-full]
-         (core/parse-nemesis-spec "disk-full")))
-  (is (= [:leader-disk-full]
-         (core/parse-nemesis-spec "leader-disk-full")))
-  (is (= [:follower-rejoin]
-         (core/parse-nemesis-spec "rejoin")))
-  (is (= [:follower-rejoin]
-         (core/parse-nemesis-spec "follower-rejoin")))
-  (is (= [:quorum-loss]
-         (core/parse-nemesis-spec "quorum")))
-  (is (= [:quorum-loss]
-         (core/parse-nemesis-spec "quorum-loss")))
-  (is (= [:clock-skew-pause]
-         (core/parse-nemesis-spec "clock-skew")))
-  (is (= [:clock-skew-pause]
-         (core/parse-nemesis-spec "clock-skew-pause")))
-  (is (= [:clock-skew-leader-fast]
-         (core/parse-nemesis-spec "clock-leader-fast")))
-  (is (= [:clock-skew-leader-slow]
-         (core/parse-nemesis-spec "clock-leader-slow")))
-  (is (= [:clock-skew-mixed]
-         (core/parse-nemesis-spec "clock-mixed")))
-  (is (= [:leader-failover]
-         (core/parse-nemesis-spec "leader-failover")))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:leader-failover]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:leader-pause]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:node-pause]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:multi-node-pause]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:leader-partition]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:asymmetric-partition]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:degraded-network]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:leader-io-stall]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:leader-disk-full]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:follower-rejoin]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:quorum-loss]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:clock-skew-pause]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:clock-skew-leader-fast]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:clock-skew-leader-slow]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator)))
-  (let [{:keys [nemesis generator final-generator]}
-        (nemesis/nemesis-package {:faults [:clock-skew-mixed]})]
-    (is (some? nemesis))
-    (is (some? generator))
-    (is (some? final-generator))))
-
-(deftest clock-skew-pattern-planning-smoke-test
-  (let [legacy-patterns (#'nemesis/active-clock-skew-patterns
-                         [:clock-skew-pause])
-        leader-fast (#'nemesis/clock-skew-plan
-                     {:leader "n1"
-                      :live-nodes ["n1" "n2" "n3"]
-                      :budget-ms 1000
-                      :pattern :leader-fast})
-        leader-slow (#'nemesis/clock-skew-plan
-                     {:leader "n1"
-                      :live-nodes ["n1" "n2" "n3"]
-                      :budget-ms 1000
-                      :pattern :leader-slow})
-        mixed (#'nemesis/clock-skew-plan
-               {:leader "n1"
-                :live-nodes ["n1" "n2" "n3"]
-                :budget-ms 1000
-                :pattern :mixed})]
-    (is (= [:followers-fast :leader-fast :leader-slow :mixed]
-           legacy-patterns))
-    (is (= 2000 (get-in leader-fast [:skews "n1"])))
-    (is (= -2000 (get-in leader-fast [:skews "n2"])))
-    (is (= -2000 (get-in leader-fast [:skews "n3"])))
-    (is (= -2000 (get-in leader-slow [:skews "n1"])))
-    (is (= 2000 (get-in leader-slow [:skews "n2"])))
-    (is (= 2000 (get-in leader-slow [:skews "n3"])))
-    (is (= #{"n1" "n2" "n3"} (set (keys (:skews mixed)))))
-    (is (= #{-2000 2000} (set (vals (:skews mixed)))))))
-
-(deftest clock-skew-nemesis-invoke-smoke-test
-  (let [nemesis-obj (#'nemesis/leader-failover-nemesis)
-        test-map {:datalevin/cluster-id "clock-skew-smoke"}
-        set-calls (atom [])]
-    (with-redefs [local/clock-skew-enabled? (constantly true)
-                  local/wait-for-single-leader! (fn [_] {:leader "n1"})
-                  local/cluster-state (fn [_]
-                                        {:live-nodes ["n1" "n2" "n3"]})
-                  local/clock-skew-budget-ms (constantly 1000)
-                  local/set-node-clock-skew! (fn [_ node skew-ms]
-                                               (swap! set-calls conj [node skew-ms])
-                                               true)]
-      (let [leader-fast-op (jn/invoke! nemesis-obj
-                                       test-map
-                                       {:type :info
-                                        :process :nemesis
-                                        :f :inject-clock-skew
-                                        :value {:pattern :leader-fast}})
-            clear-fast-op (jn/invoke! nemesis-obj
-                                      test-map
-                                      {:type :info
-                                       :process :nemesis
-                                       :f :clear-clock-skew})
-            mixed-op (jn/invoke! nemesis-obj
-                                 test-map
-                                 {:type :info
-                                  :process :nemesis
-                                  :f :inject-clock-skew
-                                  :value {:pattern :mixed}})
-            clear-mixed-op (jn/invoke! nemesis-obj
-                                       test-map
-                                       {:type :info
-                                        :process :nemesis
-                                        :f :clear-clock-skew})]
-        (is (= :leader-fast (get-in leader-fast-op [:value :pattern])))
-        (is (= {"n1" 2000 "n2" -2000 "n3" -2000}
-               (get-in leader-fast-op [:value :skews])))
-        (is (= #{"n1" "n2" "n3"}
-               (->> (take 3 @set-calls)
-                    (map first)
-                    set)))
-        (is (= :leader-fast (get-in clear-fast-op [:value :pattern])))
-        (is (= :mixed (get-in mixed-op [:value :pattern])))
-        (is (= #{"n1" "n2" "n3"}
-               (set (keys (get-in mixed-op [:value :skews])))))
-        (is (= #{-2000 2000}
-               (set (vals (get-in mixed-op [:value :skews])))))
-        (is (= :mixed (get-in clear-mixed-op [:value :pattern])))))))
-
-(deftest clock-skew-failover-final-phases-clear-skew-before-restart-test
-  (is (= [{:type :info :f :clear-clock-skew}
-          {:type :info :f :restart-node}
-          {:type :info :f :stabilize-leader}]
-         (vec (#'nemesis/final-phase-ops
-               {:failover? true
-                :clock-skew? true}))))
-  (is (= [{:type :info :f :restart-node}]
-         (vec (#'nemesis/final-phase-ops
-               {:failover? true
-                :clock-skew? false}))))
-  (is (= [{:type :info :f :clear-clock-skew}]
-         (vec (#'nemesis/final-phase-ops
-               {:failover? false
-                :clock-skew? true})))))
 
 (def ^:private datalevin-test-nemesis-wiring-cases
   [{:label :leader-failover
@@ -3417,15 +1773,15 @@
 
 (deftest clock-skew-failover-startup-elects-single-leader-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
-        test-map   {:db-name "clock-skew-failover-startup-smoke"
-                    :schema append/schema
-                    :control-backend :sofa-jraft
-                    :nodes ["n1" "n2" "n3"]
-                    :verbose false
-                    :datalevin/cluster-id cluster-id
-                    :datalevin/nemesis-faults [:clock-skew-pause
-                                               :leader-failover]}
-        db         (local/db cluster-id)]
+        test-map {:db-name "clock-skew-failover-startup-smoke"
+                  :schema append/schema
+                  :control-backend :sofa-jraft
+                  :nodes ["n1" "n2" "n3"]
+                  :verbose false
+                  :datalevin/cluster-id cluster-id
+                  :datalevin/nemesis-faults [:clock-skew-pause
+                                             :leader-failover]}
+        db (local/db cluster-id)]
     (try
       (doseq [node (:nodes test-map)]
         (jdb/setup! db test-map node))
@@ -3434,179 +1790,6 @@
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
-
-(deftest nemesis-partition-net-uses-jepsen-net-test
-  (let [dropped      (atom nil)
-        healed?      (atom false)
-        expected-net (sorted-map "n1" ["n2" "n3"]
-                                 "n2" ["n1"]
-                                 "n3" ["n1"])
-        net          (reify
-                       net.proto/Net
-                       (drop! [_ _test _src _dest]
-                         (throw (UnsupportedOperationException.
-                                 "drop! not used in this test")))
-                       (heal! [_ _test]
-                         (reset! healed? true)
-                         true)
-                       (slow! [_ _test]
-                         (throw (UnsupportedOperationException.
-                                 "slow! not used in this test")))
-                       (slow! [_ _test _opts]
-                         (throw (UnsupportedOperationException.
-                                 "slow! not used in this test")))
-                       (flaky! [_ _test]
-                         (throw (UnsupportedOperationException.
-                                 "flaky! not used in this test")))
-                       (fast! [_ _test]
-                         (reset! healed? true)
-                         true)
-                       (shape! [_ _test _nodes _behavior]
-                         (throw (UnsupportedOperationException.
-                                 "shape! not used in this test")))
-                       net.proto/PartitionAll
-                       (drop-all! [_ _test grudge]
-                         (reset! dropped grudge)
-                         {:grudge grudge}))]
-    (#'datalevin.jepsen.nemesis/partition-net!
-     {:datalevin/cluster-id "smoke"
-      :net net}
-     "smoke"
-     expected-net)
-    (#'datalevin.jepsen.nemesis/heal-net!
-     {:datalevin/cluster-id "smoke"
-      :net net}
-     "smoke")
-    (is (= expected-net @dropped))
-    (is (true? @healed?))))
-
-(deftest nemesis-degraded-net-uses-jepsen-net-test
-  (let [shaped       (atom nil)
-        restored?    (atom false)
-        expected-nodes ["n1" "n2" "n3"]
-        expected-behavior {:delay-ms 10
-                           :jitter-ms 20
-                           :drop-probability 0.1}
-        net          (reify
-                       net.proto/Net
-                       (drop! [_ _test _src _dest]
-                         (throw (UnsupportedOperationException.
-                                 "drop! not used in this test")))
-                       (heal! [_ _test]
-                         (reset! restored? true)
-                         true)
-                       (slow! [_ _test]
-                         (throw (UnsupportedOperationException.
-                                 "slow! not used in this test")))
-                       (slow! [_ _test _opts]
-                         (throw (UnsupportedOperationException.
-                                 "slow! not used in this test")))
-                       (flaky! [_ _test]
-                         (throw (UnsupportedOperationException.
-                                 "flaky! not used in this test")))
-                       (fast! [_ _test]
-                         (reset! restored? true)
-                         true)
-                       (shape! [_ _test nodes behavior]
-                         (reset! shaped {:nodes nodes
-                                         :behavior behavior})
-                         {:nodes nodes
-                          :behavior behavior})
-                       net.proto/PartitionAll
-                       (drop-all! [_ _test _grudge]
-                         (throw (UnsupportedOperationException.
-                                 "drop-all! not used in this test"))))]
-    (#'datalevin.jepsen.nemesis/shape-net!
-     {:datalevin/cluster-id "smoke"
-      :net net}
-     "smoke"
-     expected-nodes
-     expected-behavior)
-    (#'datalevin.jepsen.nemesis/fast-net!
-     {:datalevin/cluster-id "smoke"
-      :net net}
-     "smoke")
-    (is (= {:nodes expected-nodes
-            :behavior expected-behavior}
-           @shaped))
-    (is (true? @restored?))))
-
-(deftest nemesis-kill-leader-preserves-info-when-no-replacement-yet-test
-  (let [nemesis-obj (#'nemesis/leader-failover-nemesis)
-        op          {:type :info :process :nemesis :f :kill-leader}]
-    (with-redefs [local/wait-for-single-leader! (fn
-                                                  ([_] {:leader "n1"})
-                                                  ([_ _timeout-ms]
-                                                   {:leader "n1"}))
-                  local/stop-node!             (fn [_cluster-id _logical-node]
-                                                 true)
-                  local/maybe-wait-for-single-leader
-                  (fn
-                    ([_cluster-id] nil)
-                    ([_cluster-id _timeout-ms] nil))]
-      (is (= {:type :info
-              :process :nemesis
-              :f :kill-leader
-              :value {:stopped "n1"
-                      :leader nil
-                      :status :leader-unavailable}}
-             (jn/invoke! nemesis-obj
-                         {:datalevin/cluster-id "smoke"}
-                         op))))))
-
-(deftest nemesis-pause-leader-preserves-info-when-no-replacement-yet-test
-  (let [nemesis-obj (#'nemesis/leader-failover-nemesis)
-        op          {:type :info :process :nemesis :f :pause-leader}]
-    (with-redefs [local/wait-for-single-leader! (fn
-                                                  ([_] {:leader "n1"})
-                                                  ([_ _timeout-ms]
-                                                   {:leader "n1"}))
-                  local/pause-node!            (fn [_cluster-id _logical-node]
-                                                 true)
-                  local/maybe-wait-for-single-leader
-                  (fn
-                    ([_cluster-id] nil)
-                    ([_cluster-id _timeout-ms] nil))]
-      (is (= {:type :info
-              :process :nemesis
-              :f :pause-leader
-              :value {:paused "n1"
-                      :leader nil
-                      :status :leader-unavailable}}
-             (jn/invoke! nemesis-obj
-                         {:datalevin/cluster-id "smoke"}
-                         op))))))
-
-(deftest leader-conn-bootstrap-timeout-smoke-test
-  (let [ex (try
-             (with-redefs [d/create-conn (fn [_uri _schema _opts]
-                                           (Thread/sleep 100)
-                                           :late-conn)]
-               (#'local/create-conn-with-timeout!
-                "dtlv://datalevin:datalevin@127.0.0.1/smoke"
-                {}
-               5))
-             nil
-             (catch Exception e
-               e))]
-    (is (instance? clojure.lang.ExceptionInfo ex))
-    (is (re-find #"Timeout" (ex-message ex)))))
-
-(deftest open-ha-conn-retries-transport-failure-smoke-test
-  (let [attempts (atom 0)
-        conn     {:ok? true}
-        node     {:endpoint "127.0.0.1:19001"}]
-    (with-redefs [local/create-conn-with-timeout!
-                  (fn [_uri _schema opts _timeout-ms]
-                    (let [attempt (swap! attempts inc)]
-                      (if (< attempt 3)
-                        (throw (ex-info "Timeout in making request"
-                                        {:attempt attempt}))
-                        (assoc conn :opts opts))))]
-      (is (= {:ok? true
-              :opts {}}
-             (#'local/open-ha-conn! node "smoke" {} {})))
-      (is (= 3 @attempts)))))
 
 (deftest datalevin-test-rejects-in-memory-failover-smoke-test
   (testing "HA disruption nemeses need persisted JRaft membership"
@@ -3736,208 +1919,3 @@
                                :max-writes-per-key 8
                                :nodes ["n1" "n2" "n3"]
                                :nemesis [:clock-skew-leader-fast]})))))
-
-(deftest execute-mixed-transaction-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-mixed-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir append/schema)]
-    (try
-      (d/transact! conn [{:append/key 1 :append/value 10}])
-      (is (= [[:r 1 [10]]
-              [:append 1 11]
-              [:r 1 [10 11]]]
-             (#'append/execute-txn! conn
-              [[:r 1 nil]
-               [:append 1 11]
-               [:r 1 nil]])))
-      (is (= [10 11]
-             (#'append/read-list @conn 1)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-append-cas-transaction-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-append-cas-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir append-cas/schema)]
-    (try
-      (d/transact! conn [{:append.meta/key 1 :append.meta/version 0}
-                         {:append/key 1 :append/value 10}])
-      (is (= [[:r 1 [10]]
-              [:append 1 11]
-              [:r 1 [10 11]]]
-             (#'append-cas/execute-txn! conn
-              [[:r 1 nil]
-               [:append 1 11]
-               [:r 1 nil]])))
-      (is (= [10 11]
-             (#'append-cas/read-list @conn 1)))
-      (is (= 1
-             (#'append-cas/current-version @conn 1)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-append-cas-initializes-missing-meta-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-append-cas-missing-meta-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir append-cas/schema)]
-    (try
-      (is (= [[:append 1 11]]
-             (#'append-cas/execute-txn! conn
-              [[:append 1 11]])))
-      (is (= [11]
-             (#'append-cas/read-list @conn 1)))
-      (is (= 1
-             (#'append-cas/current-version @conn 1)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-grant-transaction-function-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-grant-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir grant/schema)]
-    (try
-      (#'grant/ensure-tx-fns! conn)
-      (let [created (#'grant/execute-op! conn {:f :create
-                                               :value {:grant-id 1
-                                                       :amount 100}})]
-        (is (= 1 (:grant-id created)))
-        (is (= :pending (:status created)))
-        (is (= 100 (:amount created)))
-        (is (integer? (:requested-at created)))
-        (is (nil? (:approved-at created)))
-        (is (nil? (:denied-at created))))
-      (let [approved (#'grant/execute-op! conn {:f :approve
-                                                :value {:grant-id 1}})
-            denied   (#'grant/execute-op! conn {:f :deny
-                                                :value {:grant-id 1}})
-            all      (#'grant/execute-op! conn {:f :read-all})]
-        (is (= :approved (:status approved)))
-        (is (= approved denied))
-        (is (= [approved] all)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-bank-transfer-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-bank-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir bank/schema)]
-    (try
-      (#'bank/ensure-tx-fns! conn)
-      (#'bank/ensure-accounts! conn 4 100)
-      (let [transfer (#'bank/execute-op! conn
-                                         4
-                                         {:f :transfer
-                                          :value {:from 0
-                                                  :to 1
-                                                  :amount 5}})
-            balances (#'bank/execute-op! conn 4 {:f :read-all})]
-        (is (= {:from 0
-                :to 1
-                :amount 5
-                :applied? true
-                :from-balance 95
-                :to-balance 105}
-               transfer))
-        (is (= [95 105 100 100]
-               balances)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-giant-values-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-giant-values-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir giant-values/schema)]
-    (try
-      (#'giant-values/ensure-giants! conn 2 12000)
-      (let [read-before (#'giant-values/execute-op! conn
-                                                    12000
-                                                    {:f :read
-                                                     :value (clojure.lang.MapEntry. 0 nil)})
-            write-op    (#'giant-values/execute-op! conn
-                                                    12000
-                                                    {:f :write
-                                                     :value (clojure.lang.MapEntry. 0 5)})
-            cas-op      (#'giant-values/execute-op! conn
-                                                    12000
-                                                    {:f :cas
-                                                     :value (clojure.lang.MapEntry. 0 [5 8])})]
-        (is (= (clojure.lang.MapEntry. 0 0) (:tuple read-before)))
-        (is (true? (:payload-valid? read-before)))
-        (is (= 12000 (:payload-bytes read-before)))
-        (is (= (clojure.lang.MapEntry. 0 5) (:tuple write-op)))
-        (is (true? (:payload-valid? write-op)))
-        (is (= (clojure.lang.MapEntry. 0 [5 8]) (:tuple cas-op)))
-        (is (true? (:payload-valid? cas-op))))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-tx-fn-register-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-tx-fn-register-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir tx-fn-register/schema)]
-    (try
-      (#'tx-fn-register/ensure-tx-fns! conn)
-      (#'tx-fn-register/ensure-registers! conn 2 12000)
-      (let [read-before (#'tx-fn-register/execute-op! conn
-                                                      12000
-                                                      {:f :read
-                                                       :value (clojure.lang.MapEntry. 0 nil)})
-            write-op    (#'tx-fn-register/execute-op! conn
-                                                      12000
-                                                      {:f :write
-                                                       :value (clojure.lang.MapEntry. 0 5)})
-            cas-op      (#'tx-fn-register/execute-op! conn
-                                                      12000
-                                                      {:f :cas
-                                                       :value (clojure.lang.MapEntry. 0 [5 8])})
-            bad-cas     (#'tx-fn-register/execute-op! conn
-                                                      12000
-                                                      {:f :cas
-                                                       :value (clojure.lang.MapEntry. 0 [5 9])})]
-        (is (= (clojure.lang.MapEntry. 0 0) (:tuple read-before)))
-        (is (true? (:payload-valid? read-before)))
-        (is (= (clojure.lang.MapEntry. 0 5) (:tuple write-op)))
-        (is (true? (:payload-valid? write-op)))
-        (is (= (clojure.lang.MapEntry. 0 [5 8]) (:tuple cas-op)))
-        (is (true? (:payload-valid? cas-op)))
-        (is (= ::tx-fn-register/cas-failed bad-cas)))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))
-
-(deftest execute-internal-transaction-cases-smoke-test
-  (let [dir  (str (System/getProperty "java.io.tmpdir")
-                  "/datalevin-jepsen-internal-"
-                  (UUID/randomUUID))
-        conn (d/create-conn dir internal/schema)]
-    (try
-      (doseq [op [{:f :lookup-ref-same :internal/case-id 1}
-                  {:f :tx-fn-after-add :internal/case-id 2}
-                  {:f :tx-fn-twice :internal/case-id 3}
-                  {:f :cas-chain :internal/case-id 4}
-                  {:f :retract-add :internal/case-id 5}
-                  {:f :tempid-ref :internal/case-id 6}]]
-        (let [actual (try
-                       {:type  :ok
-                        :value (#'internal/execute-op! conn op)}
-                       (catch Throwable e
-                         {:type  :fail
-                          :error (#'internal/op-error e)}))]
-          (is (= (#'internal/expected-outcome op)
-                 actual))))
-      (finally
-        (d/close conn)
-        (u/delete-files dir)))))

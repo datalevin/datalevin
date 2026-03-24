@@ -1054,6 +1054,8 @@ Only usable for debug output.
    number of DBIs are created, as a linear scan is used to look up a DBI.
   * `:flags` is a set of keywords corresponding to LMDB environment flags,
    e.g. `:rdonly-env`, `:nosubdir`, and so on. See [[set-env-flags]].
+   Datalevin includes `:notls` in the default flags so read-only transactions
+   remain safe when used from virtual threads.
   * `:temp?` a boolean, indicating if this db is temporary, if so, the file
    will be deleted on JVM exit.
   * `:inmemory?` a boolean, indicating if this db is in-memory only, with no

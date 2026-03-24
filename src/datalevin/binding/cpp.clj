@@ -1580,9 +1580,8 @@
                              mapsize
                              (c/pick-mapsize db-file)))
                      1024 1024)
-          flags (cond
-                  (or inmemory? temp?) (conj flags :nosync)
-                  :else flags)
+          flags (cond-> flags
+                  (or inmemory? temp?) (conj :nosync))
           ^Env env (Env/create env-path mapsize max-readers max-dbs
                                (kv-flags flags))
           info (cond-> (merge opts {:dir dir

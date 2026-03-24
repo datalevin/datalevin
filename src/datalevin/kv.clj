@@ -38,13 +38,15 @@
          txlog-rollout-watermarks
          ensure-txlog-ready!
          txlog-write-path-enabled?
+         write-txn-open?
          txlog-watermarks-map
          txlog-update-snapshot-floor-state!
          txlog-clear-snapshot-floor-state!
          txlog-update-replica-floor-state!
          txlog-clear-replica-floor-state!
          txlog-pin-backup-floor-state!
-         txlog-unpin-backup-floor-state!)
+         txlog-unpin-backup-floor-state!
+         ->KVLMDB)
 
 (defn txlog-watermarks
   [db]
@@ -70,10 +72,12 @@
    (if-let [state (or (txlog/state db)
                       (when (txlog-write-path-enabled? db)
                         (ensure-txlog-ready! db)))]
-     (txlog/select-open-record-rows
-      (txlog-records state from-lsn)
-      from-lsn
-      upto-lsn)
+     (do
+       (txlog/refresh-shared-state! state)
+       (txlog/select-open-record-rows
+        (txlog-records state from-lsn)
+        from-lsn
+        upto-lsn))
      (if (txlog-config-enabled? db)
        []
        (txlog/select-open-record-rows
@@ -1085,195 +1089,199 @@
              (snapshot-source-ready? lmdb))
     (let [tx-v (l/write-txn lmdb)]
       (when-not (and (some? tx-v) (some? @tx-v))
-        (let [info-v (i/kv-info lmdb)
-              {:keys [lock]} (ensure-snapshot-scheduler-runtime! lmdb)
-              now-ms (System/currentTimeMillis)]
-          (locking lock
-            (vswap! info-v assoc :snapshot-scheduler-last-run-ms now-ms)
-            (let [next-eligible-ms (:snapshot-scheduler-next-eligible-ms @info-v)]
-              (when-not (and (number? next-eligible-ms)
-                             (< now-ms (long next-eligible-ms)))
-                (if-let [trigger (snapshot-scheduler-trigger lmdb now-ms)]
-                  (let [trigger-k (:trigger trigger)]
-                    (when (= trigger-k :max-age)
-                      (vswap! info-v
-                              (fn [m]
-                                (-> m
-                                    (update :snapshot-scheduler-max-age-breach-count
-                                            (fnil inc 0))
-                                    (assoc
-                                     :snapshot-scheduler-last-max-age-breach-ms
-                                     now-ms)))))
-                    (if-let [defer (snapshot-scheduler-defer-reason
-                                    lmdb trigger now-ms)]
-                      (let [min-backoff-ms (long
-                                            (snapshot-defer-backoff-min-ms lmdb))
-                            max-backoff-ms (long
-                                            (snapshot-defer-backoff-max-ms lmdb))
-                            m (vswap! info-v
-                                      (fn [m]
-                                        (let [reason (:reason defer)
-                                              defer-count (or
-                                                           (:snapshot-scheduler-defer-count
-                                                            m)
-                                                           {})
-                                              defer-since-ms (long
-                                                              (or (:snapshot-scheduler-defer-since-ms
-                                                                   m)
-                                                                  now-ms))
-                                              defer-ms (max 0
-                                                            (- now-ms
-                                                               defer-since-ms))
-                                              prev-backoff-ms (long
-                                                               (or (:snapshot-scheduler-defer-backoff-ms
-                                                                    m)
-                                                                   0))
-                                              backoff-ms (if (pos?
-                                                              prev-backoff-ms)
-                                                           (long
-                                                            (min
-                                                             max-backoff-ms
-                                                             (max
-                                                              min-backoff-ms
-                                                              (long (* 2
-                                                                       prev-backoff-ms)))))
-                                                           min-backoff-ms)
-                                              next-ms (long (+ (long now-ms)
-                                                               backoff-ms))
-                                              defer* (assoc defer
-                                                            :backoff-ms
-                                                            backoff-ms
-                                                            :next-eligible-ms
-                                                            next-ms)]
-                                          (assoc m
-                                                 :snapshot-scheduler-last-trigger
-                                                 trigger-k
-                                                 :snapshot-scheduler-last-trigger-details
-                                                 trigger
-                                                 :snapshot-scheduler-last-defer-ms
-                                                 now-ms
-                                                 :snapshot-scheduler-last-defer-reason
-                                                 reason
-                                                 :snapshot-scheduler-last-defer-trigger
-                                                 trigger-k
-                                                 :snapshot-scheduler-last-defer-details
-                                                 defer*
-                                                 :snapshot-scheduler-defer-since-ms
-                                                 defer-since-ms
-                                                 :snapshot-scheduler-last-defer-duration-ms
-                                                 defer-ms
-                                                 :snapshot-scheduler-next-eligible-ms
-                                                 next-ms
-                                                 :snapshot-scheduler-defer-backoff-ms
-                                                 backoff-ms
-                                                 :snapshot-scheduler-defer-count
-                                                 (update defer-count
-                                                         reason
-                                                         (fnil inc 0))
-                                                 :snapshot-scheduler-last-error
-                                                 nil))))]
-                        {:deferred? true
-                         :trigger trigger-k
-                         :defer (:snapshot-scheduler-last-defer-details m)
-                         :defer-duration-ms
-                         (:snapshot-scheduler-last-defer-duration-ms m)
-                         :backoff-ms (:snapshot-scheduler-defer-backoff-ms m)
-                         :next-eligible-ms
-                         (:snapshot-scheduler-next-eligible-ms m)})
-                      (let [run-start-ms (System/currentTimeMillis)]
-                        (vswap! info-v
-                                (fn [m]
-                                  (let [defer-since-ms
-                                        (:snapshot-scheduler-defer-since-ms m)
-                                        defer-ms (when (number? defer-since-ms)
-                                                   (max 0
-                                                        (- run-start-ms
-                                                           (long defer-since-ms))))
-                                        m' (-> m
+        (when-let [state (txlog/state lmdb)]
+          (txlog/try-with-maintenance-lock
+           state
+           (fn []
+             (let [info-v (i/kv-info lmdb)
+                   {:keys [lock]} (ensure-snapshot-scheduler-runtime! lmdb)
+                   now-ms (System/currentTimeMillis)]
+               (locking lock
+                 (vswap! info-v assoc :snapshot-scheduler-last-run-ms now-ms)
+                 (let [next-eligible-ms (:snapshot-scheduler-next-eligible-ms @info-v)]
+                   (when-not (and (number? next-eligible-ms)
+                                  (< now-ms (long next-eligible-ms)))
+                     (if-let [trigger (snapshot-scheduler-trigger lmdb now-ms)]
+                       (let [trigger-k (:trigger trigger)]
+                         (when (= trigger-k :max-age)
+                           (vswap! info-v
+                                   (fn [m]
+                                     (-> m
+                                         (update :snapshot-scheduler-max-age-breach-count
+                                                 (fnil inc 0))
+                                         (assoc
+                                          :snapshot-scheduler-last-max-age-breach-ms
+                                          now-ms)))))
+                         (if-let [defer (snapshot-scheduler-defer-reason
+                                         lmdb trigger now-ms)]
+                           (let [min-backoff-ms (long
+                                                 (snapshot-defer-backoff-min-ms lmdb))
+                                 max-backoff-ms (long
+                                                 (snapshot-defer-backoff-max-ms lmdb))
+                                 m (vswap! info-v
+                                           (fn [m]
+                                             (let [reason (:reason defer)
+                                                   defer-count (or
+                                                                (:snapshot-scheduler-defer-count
+                                                                 m)
+                                                                {})
+                                                   defer-since-ms (long
+                                                                   (or (:snapshot-scheduler-defer-since-ms
+                                                                        m)
+                                                                       now-ms))
+                                                   defer-ms (max 0
+                                                                 (- now-ms
+                                                                    defer-since-ms))
+                                                   prev-backoff-ms (long
+                                                                    (or (:snapshot-scheduler-defer-backoff-ms
+                                                                         m)
+                                                                        0))
+                                                   backoff-ms (if (pos?
+                                                                   prev-backoff-ms)
+                                                                (long
+                                                                 (min
+                                                                  max-backoff-ms
+                                                                  (max
+                                                                   min-backoff-ms
+                                                                   (long (* 2
+                                                                            prev-backoff-ms)))))
+                                                                min-backoff-ms)
+                                                   next-ms (long (+ (long now-ms)
+                                                                    backoff-ms))
+                                                   defer* (assoc defer
+                                                                 :backoff-ms
+                                                                 backoff-ms
+                                                                 :next-eligible-ms
+                                                                 next-ms)]
+                                               (assoc m
+                                                      :snapshot-scheduler-last-trigger
+                                                      trigger-k
+                                                      :snapshot-scheduler-last-trigger-details
+                                                      trigger
+                                                      :snapshot-scheduler-last-defer-ms
+                                                      now-ms
+                                                      :snapshot-scheduler-last-defer-reason
+                                                      reason
+                                                      :snapshot-scheduler-last-defer-trigger
+                                                      trigger-k
+                                                      :snapshot-scheduler-last-defer-details
+                                                      defer*
+                                                      :snapshot-scheduler-defer-since-ms
+                                                      defer-since-ms
+                                                      :snapshot-scheduler-last-defer-duration-ms
+                                                      defer-ms
+                                                      :snapshot-scheduler-next-eligible-ms
+                                                      next-ms
+                                                      :snapshot-scheduler-defer-backoff-ms
+                                                      backoff-ms
+                                                      :snapshot-scheduler-defer-count
+                                                      (update defer-count
+                                                              reason
+                                                              (fnil inc 0))
+                                                      :snapshot-scheduler-last-error
+                                                      nil))))]
+                             {:deferred? true
+                              :trigger trigger-k
+                              :defer (:snapshot-scheduler-last-defer-details m)
+                              :defer-duration-ms
+                              (:snapshot-scheduler-last-defer-duration-ms m)
+                              :backoff-ms (:snapshot-scheduler-defer-backoff-ms m)
+                              :next-eligible-ms
+                              (:snapshot-scheduler-next-eligible-ms m)})
+                           (let [run-start-ms (System/currentTimeMillis)]
+                             (vswap! info-v
+                                     (fn [m]
+                                       (let [defer-since-ms
+                                             (:snapshot-scheduler-defer-since-ms m)
+                                             defer-ms (when (number? defer-since-ms)
+                                                        (max 0
+                                                             (- run-start-ms
+                                                                (long defer-since-ms))))
+                                             m' (-> m
+                                                    (assoc
+                                                     :snapshot-scheduler-last-run-start-ms
+                                                     run-start-ms)
+                                                    (dissoc
+                                                     :snapshot-scheduler-next-eligible-ms
+                                                     :snapshot-scheduler-defer-backoff-ms
+                                                     :snapshot-scheduler-defer-since-ms))]
+                                         (if (number? defer-ms)
+                                           (-> m'
+                                               (update :snapshot-scheduler-defer-duration-ms
+                                                       (fnil + 0)
+                                                       (long defer-ms))
                                                (assoc
-                                                :snapshot-scheduler-last-run-start-ms
-                                                run-start-ms)
-                                               (dissoc
-                                                :snapshot-scheduler-next-eligible-ms
-                                                :snapshot-scheduler-defer-backoff-ms
-                                                :snapshot-scheduler-defer-since-ms))]
-                                    (if (number? defer-ms)
-                                      (-> m'
-                                          (update :snapshot-scheduler-defer-duration-ms
-                                                  (fnil + 0)
-                                                  (long defer-ms))
-                                          (assoc
-                                           :snapshot-scheduler-last-defer-duration-ms
-                                           (long defer-ms)))
-                                      m'))))
-                        (try
-                          (let [res (create-snapshot-now! lmdb)
-                                run-finished-ms (System/currentTimeMillis)
-                                run-duration-ms (max 0
-                                                     (- run-finished-ms
-                                                        run-start-ms))]
-                            (vswap! info-v
-                                    (fn [m]
-                                      (-> m
-                                          (update :snapshot-scheduler-run-count
+                                                :snapshot-scheduler-last-defer-duration-ms
+                                                (long defer-ms)))
+                                           m'))))
+                             (try
+                               (let [res (create-snapshot-now! lmdb)
+                                     run-finished-ms (System/currentTimeMillis)
+                                     run-duration-ms (max 0
+                                                          (- run-finished-ms
+                                                             run-start-ms))]
+                                 (vswap! info-v
+                                         (fn [m]
+                                           (-> m
+                                               (update :snapshot-scheduler-run-count
+                                                       (fnil inc 0))
+                                               (update :snapshot-scheduler-run-duration-ms
+                                                       (fnil + 0)
+                                                       run-duration-ms)
+                                               (assoc
+                                                :snapshot-scheduler-last-run-finished-ms
+                                                run-finished-ms
+                                                :snapshot-scheduler-last-run-duration-ms
+                                                run-duration-ms
+                                                :snapshot-scheduler-last-success-ms
+                                                run-finished-ms
+                                                :snapshot-scheduler-last-trigger
+                                                trigger-k
+                                                :snapshot-scheduler-last-trigger-details
+                                                trigger
+                                                :snapshot-scheduler-consecutive-failure-count
+                                                0
+                                                :snapshot-scheduler-last-error nil))))
+                                 (assoc res
+                                        :trigger trigger-k
+                                        :run-duration-ms run-duration-ms))
+                               (catch Exception e
+                                 (let [run-finished-ms (System/currentTimeMillis)
+                                       run-duration-ms (max 0
+                                                            (- run-finished-ms
+                                                               run-start-ms))]
+                                   (vswap! info-v
+                                           (fn [m]
+                                             (-> m
+                                                 (update :snapshot-scheduler-run-count
+                                                         (fnil inc 0))
+                                                 (update :snapshot-scheduler-failure-count
+                                                         (fnil inc 0))
+                                                 (update
+                                                  :snapshot-scheduler-consecutive-failure-count
                                                   (fnil inc 0))
-                                          (update :snapshot-scheduler-run-duration-ms
+                                                 (update
+                                                  :snapshot-scheduler-run-duration-ms
                                                   (fnil + 0)
                                                   run-duration-ms)
-                                          (assoc
-                                           :snapshot-scheduler-last-run-finished-ms
-                                           run-finished-ms
-                                           :snapshot-scheduler-last-run-duration-ms
-                                           run-duration-ms
-                                           :snapshot-scheduler-last-success-ms
-                                           run-finished-ms
-                                           :snapshot-scheduler-last-trigger
-                                           trigger-k
-                                           :snapshot-scheduler-last-trigger-details
-                                           trigger
-                                           :snapshot-scheduler-consecutive-failure-count
-                                           0
-                                           :snapshot-scheduler-last-error nil))))
-                            (assoc res
-                                   :trigger trigger-k
-                                   :run-duration-ms run-duration-ms))
-                          (catch Exception e
-                            (let [run-finished-ms (System/currentTimeMillis)
-                                  run-duration-ms (max 0
-                                                       (- run-finished-ms
-                                                          run-start-ms))]
-                              (vswap! info-v
-                                      (fn [m]
-                                        (-> m
-                                            (update :snapshot-scheduler-run-count
-                                                    (fnil inc 0))
-                                            (update :snapshot-scheduler-failure-count
-                                                    (fnil inc 0))
-                                            (update
-                                             :snapshot-scheduler-consecutive-failure-count
-                                             (fnil inc 0))
-                                            (update
-                                             :snapshot-scheduler-run-duration-ms
-                                             (fnil + 0)
-                                             run-duration-ms)
-                                            (assoc
-                                             :snapshot-scheduler-last-run-finished-ms
-                                             run-finished-ms
-                                             :snapshot-scheduler-last-run-duration-ms
-                                             run-duration-ms
-                                             :snapshot-scheduler-last-failure-ms
-                                             run-finished-ms
-                                             :snapshot-scheduler-last-trigger
-                                             trigger-k
-                                             :snapshot-scheduler-last-trigger-details
-                                             trigger
-                                             :snapshot-scheduler-last-error
-                                             (.getMessage e)))))
-                              nil))))))
-                  (vswap! info-v dissoc
-                          :snapshot-scheduler-defer-since-ms
-                          :snapshot-scheduler-next-eligible-ms
-                          :snapshot-scheduler-defer-backoff-ms))))))))))
+                                                 (assoc
+                                                  :snapshot-scheduler-last-run-finished-ms
+                                                  run-finished-ms
+                                                  :snapshot-scheduler-last-run-duration-ms
+                                                  run-duration-ms
+                                                  :snapshot-scheduler-last-failure-ms
+                                                  run-finished-ms
+                                                  :snapshot-scheduler-last-trigger
+                                                  trigger-k
+                                                  :snapshot-scheduler-last-trigger-details
+                                                  trigger
+                                                  :snapshot-scheduler-last-error
+                                                  (.getMessage e)))))
+                                   nil))))))
+                       (vswap! info-v dissoc
+                               :snapshot-scheduler-defer-since-ms
+                               :snapshot-scheduler-next-eligible-ms
+                               :snapshot-scheduler-defer-backoff-ms)))))))))))))
 
 (defn- start-snapshot-scheduler!
   [lmdb]
@@ -1328,6 +1336,14 @@
     {:slot-a slot-a
      :slot-b slot-b
      :current current}))
+
+(defn- refresh-runtime-marker-revision!
+  [lmdb state]
+  (when (:commit-marker? state)
+    (let [marker-state (read-commit-marker-state lmdb)]
+      (vreset! (:marker-revision state)
+               (long (or (get-in marker-state [:current :revision]) -1)))))
+  state)
 
 (defn- sanitize-kv-info!
   [info-v]
@@ -1479,6 +1495,7 @@
 
 (defn txlog-watermarks-map
   [lmdb state]
+  (txlog/refresh-shared-state! state)
   (let [sync-state (txlog/sync-manager-state (:sync-manager state))
         vec-summary (txlog-vector-checkpoint-summary lmdb)
         rollout-mode (txlog-rollout-mode lmdb)
@@ -1492,7 +1509,7 @@
         last-committed (max 0 (dec next-lsn))
         last-durable (long (:last-durable-lsn sync-state))
         last-applied (long (or (:applied-lsn marker-current)
-                               (:meta-last-applied-lsn state)
+                               (some-> (:meta-last-applied-lsn state) deref)
                                0))
         durable-applied-lag-lsn (max 0 (- last-durable last-applied))
         durable-applied-lag-threshold-lsn (txlog-lag-alert-threshold-lsn lmdb)
@@ -1557,42 +1574,17 @@
 (defn txlog-force-sync!
   [state]
   (txlog-throw-if-fatal! state)
-  (let [sync-manager (:sync-manager state)
-        timeout-ms (long (:commit-wait-ms state))
-        before (txlog/sync-manager-state sync-manager)
-        target-lsn (long (:last-appended-lsn before))
-        durable-lsn (long (:last-durable-lsn before))]
-    (when (> target-lsn durable-lsn)
-      (when-let [{:keys [target-lsn reason]} (txlog/begin-sync! sync-manager)]
-        (let [ch @(:segment-channel state)]
-          (when-not ch
-            (raise "Txn-log segment channel is not available"
-                   {:type :txlog/no-segment-channel}))
-          (try
-            (maybe-run-storage-fault-context!
-             (:fault-context state)
-             :txlog-force-sync
-             {:target-lsn target-lsn
-              :reason reason
-              :sync-mode (:sync-mode state)})
-            (txlog/force-segment! state ch (:sync-mode state))
-            (txlog/complete-sync-success! sync-manager
-                                          target-lsn
-                                          (System/currentTimeMillis)
-                                          reason
-                                          false)
-            (catch Exception e
-              (txlog/complete-sync-failure! sync-manager e false)
-              (txlog-mark-fatal! state e)
-              (throw e)))))
-      (txlog/await-durable-lsn! sync-manager target-lsn timeout-ms
-                                (System/currentTimeMillis)))
-    (let [after (txlog/sync-manager-state sync-manager)]
-      {:target-lsn target-lsn
-       :last-appended-lsn (long (:last-appended-lsn after))
-       :last-durable-lsn (long (:last-durable-lsn after))
-       :pending-count (long (:pending-count after))
-       :synced? (<= target-lsn (long (:last-durable-lsn after)))})))
+  (txlog/force-sync!
+   state
+   {:mark-fatal! txlog-mark-fatal!
+    :before-sync!
+    (fn [state sync-begin]
+      (maybe-run-storage-fault-context!
+       (:fault-context state)
+       :txlog-force-sync
+       {:target-lsn (:target-lsn sync-begin)
+        :reason (:reason sync-begin)
+        :sync-mode (:sync-mode state)}))}))
 
 (defn verify-commit-marker-state
   [lmdb state]
@@ -1606,13 +1598,15 @@
 
 (defn txlog-recovery-context
   [lmdb state]
+  (txlog/refresh-shared-state! state)
   (let [records (txlog-records state)
         marker-state (read-commit-marker-state lmdb)
         recovery (txlog/recovery-state
                   {:commit-marker? (:commit-marker? state)
                    :marker-state marker-state
                    :records records
-                   :meta-last-applied-lsn (:meta-last-applied-lsn state)
+                   :meta-last-applied-lsn
+                   (some-> (:meta-last-applied-lsn state) deref)
                    :next-lsn @(:next-lsn state)})]
     (assoc recovery
            :records records
@@ -1690,6 +1684,14 @@
                 :txlog-last-lmdb-sync-error
                 :txlog-lmdb-sync-count
                 :snapshot-scheduler-last-error)))))
+
+(defn- close-failed-open!
+  [db]
+  (close-txlog-state! db)
+  (try
+    (i/close-kv db)
+    (catch Exception _))
+  nil)
 
 (def ^:private txlog-recovery-reopen-opt-keys
   [:mapsize :max-readers :flags :max-dbs :temp? :key-compress :val-compress
@@ -2035,8 +2037,8 @@
   "Apply txlog payload rows directly to LMDB using the same normalization path
   as local txlog recovery, but without consuming a new local txlog LSN."
   [lmdb rows lsn]
-  (let [rows   (rows-vector rows)
-        record {:lsn  (long lsn)
+  (let [rows (rows-vector rows)
+        record {:lsn (long lsn)
                 :rows rows}]
     (with-runtime-txlog-rollback
       lmdb
@@ -2091,14 +2093,25 @@
                           (drop-while #(<= (long (:lsn %))
                                            (long from-lsn)))
                           (mapv #(txlog-replay-record! lmdb state %)))]
-        (when-let [last-record (peek replayed)]
-          (txlog/publish-meta-best-effort! state
-                                           {:lsn (:lsn last-record)
-                                            :segment-id (:segment-id last-record)
-                                            :offset (:offset last-record)}))
         (i/set-max-val-size lmdb (i/max-val-size lmdb))
         {:from-lsn (long from-lsn)
+         :last-record (peek replayed)
          :replayed (count replayed)}))))
+
+(defn- txlog-recover-under-write-transaction!
+  [lmdb state]
+  (txlog/with-recovery-lock
+    state
+    (fn []
+      (txlog/refresh-shared-state! state)
+      (let [{:keys [last-record] :as recovery} (txlog-recover-on-open! lmdb)]
+        (when last-record
+          (txlog/publish-meta-commit! state
+                                      {:lsn (:lsn last-record)
+                                       :segment-id (:segment-id last-record)
+                                       :offset (:offset last-record)
+                                       :synced? true}))
+        (dissoc recovery :last-record)))))
 
 (defn- ensure-snapshot-bootstrap!
   [lmdb]
@@ -2131,9 +2144,10 @@
       (let [state (or (txlog/state lmdb)
                       (init-txlog-state! lmdb info-v))]
         (when-not (:txlog-recovered? @info-v)
-          (txlog-recover-on-open! lmdb)
+          (txlog-recover-under-write-transaction! lmdb state)
           (ensure-snapshot-bootstrap! lmdb)
           (vswap! info-v assoc :txlog-recovered? true))
+        (txlog/refresh-shared-state! state)
         (align-runtime-txlog-payload-floor! lmdb)
         (start-snapshot-scheduler! lmdb)
         (or (txlog/state lmdb) state)))))
@@ -2226,6 +2240,8 @@
                                        {:target-lsn (:target-lsn sync-begin)
                                         :reason (:reason sync-begin)
                                         :sync-mode (:sync-mode state)}))})
+
+(declare close-with-txlog!)
 
 (defn- write-txn-open?
   [lmdb]
@@ -2322,13 +2338,10 @@
               ;; ahead of their local txlog files. Align the runtime cursor to
               ;; the restored payload floor so the next mirrored HA record can
               ;; append contiguously without inventing placeholder WAL rows.
-              (let [state (if (> floor-lsn
-                                 (long (or (:meta-last-applied-lsn state) 0)))
-                            (let [aligned-state
-                                  (assoc state :meta-last-applied-lsn floor-lsn)]
-                              (vswap! info-v assoc :txlog-state aligned-state)
-                              aligned-state)
-                            state)
+              (let [last-applied-v (:meta-last-applied-lsn state)
+                    _ (when (and last-applied-v
+                                 (> floor-lsn (long @last-applied-v)))
+                        (vreset! last-applied-v floor-lsn))
                     sync-manager (:sync-manager state)
                     now-ms (System/currentTimeMillis)]
                 (vreset! (:next-lsn state) target-next-lsn)
@@ -2486,8 +2499,9 @@
                  {:type :txlog/ha-replay-missing-rows
                   :record (select-keys record [:lsn :segment-id :offset])}))
         (if-let [state (txlog-runtime-state lmdb)]
-          (let [record-lsn (long (:lsn record))
-              expected-lsn (long @(:next-lsn state))]
+          (let [_ (txlog/refresh-shared-state! state)
+                record-lsn (long (:lsn record))
+                expected-lsn (long @(:next-lsn state))]
             (when (> record-lsn expected-lsn)
               (raise "Follower replay local txn-log cursor does not match record LSN"
                      {:type :txlog/ha-replay-lsn-mismatch
@@ -2516,7 +2530,8 @@
                            {:type :txlog/ha-replay-lsn-mismatch
                             :expected-lsn record-lsn
                             :actual-lsn (:lsn append-res)}))
-                  (let [marker-entry
+                  (let [state (refresh-runtime-marker-revision! lmdb state)
+                        marker-entry
                         (txlog/next-commit-marker-entry
                          (:commit-marker? state)
                          (long @(:marker-revision state))
@@ -2527,8 +2542,7 @@
                       (.add ^FastList rows (:row marker-entry)))
                     (apply-lmdb-after-txlog-append! lmdb state rows)
                     (txlog/commit-finished! state marker-entry)
-                    (when (:synced? append-res)
-                      (txlog/maybe-publish-meta-best-effort! state append-res))
+                    (txlog/publish-meta-commit! state append-res)
                     append-res)))))
           (replay-txlog-rows! lmdb record-rows (:lsn record)))))))
 
@@ -2540,23 +2554,27 @@
         (let [res (i/transact-kv lmdb tx-data)]
           (txlog-add-pending! (i/kv-info lmdb) tx-data)
           res)
-        (let [append-res (txlog/append-durable!
-                          state tx-data txlog-append-hooks)
-              marker-entry (txlog/next-commit-marker-entry
-                            (:commit-marker? state)
-                            (long @(:marker-revision state))
-                            append-res)
-              rows (append-payload-lsn-row tx-data (:lsn append-res))
-              _ (when marker-entry
-                  (.add ^FastList rows (:row marker-entry)))]
+        (let [wdb (i/open-transact-kv lmdb)]
           (try
-            (apply-lmdb-after-txlog-append! lmdb state rows)
-            (txlog/commit-finished! state marker-entry)
-            (when (:synced? append-res)
-              (txlog/maybe-publish-meta-best-effort! state append-res))
-            :transacted
+            (let [res (i/transact-kv wdb tx-data)]
+              (when-not (= :transacted res)
+                (raise "Unexpected LMDB transactional write result"
+                       {:type :txlog/unexpected-transact-result
+                        :result res}))
+              (txlog-add-pending! (i/kv-info lmdb) tx-data)
+              (let [status (close-with-txlog! lmdb state)]
+                (when-not (= :committed status)
+                  (raise "Unexpected LMDB transactional close result"
+                         {:type :txlog/unexpected-close-result
+                          :result status}))
+                :transacted))
             (catch Exception e
-              (txlog-mark-fatal! state e)
+              (try
+                (i/abort-transact-kv lmdb)
+                (catch Exception _))
+              (try
+                (i/close-transact-kv lmdb)
+                (catch Exception _))
               (throw e)))))
       (i/transact-kv lmdb dbi-name txs k-type v-type))))
 
@@ -2569,6 +2587,7 @@
           (if (pos? (.size ^java.util.List pending))
             (let [append-res (txlog/append-durable!
                               state pending txlog-append-hooks)
+                  state (refresh-runtime-marker-revision! lmdb state)
                   marker-entry (txlog/next-commit-marker-entry
                                 (:commit-marker? state)
                                 (long @(:marker-revision state))
@@ -2582,8 +2601,7 @@
                 (let [status (i/close-transact-kv lmdb)]
                   (when (= status :committed)
                     (txlog/commit-finished! state marker-entry)
-                    (when (:synced? append-res)
-                      (txlog/maybe-publish-meta-best-effort! state append-res)))
+                    (txlog/publish-meta-commit! state append-res))
                   (when-not (write-txn-open? lmdb)
                     (txlog-reset-pending! info-v))
                   status)
@@ -2722,9 +2740,9 @@
       (if-let [info-v (i/kv-info lmdb)]
         (let [info @info-v]
           (if (true? (:wal? info))
-            (let [had-rollout?  (contains? info :wal-rollout-mode)
+            (let [had-rollout? (contains? info :wal-rollout-mode)
                   had-rollback? (contains? info :wal-rollback?)
-                  prev-rollout  (:wal-rollout-mode info)
+                  prev-rollout (:wal-rollout-mode info)
                   prev-rollback (:wal-rollback? info)]
               ;; Retention-floor bookkeeping is leader-local metadata and
               ;; should not consume replicated WAL LSNs used by HA promotion
@@ -2922,12 +2940,12 @@
               ;; partial record set for bytes that are already visible on disk.
               ;; Once that segment closes, do not trust the cached entry unless
               ;; it covered the full file at cache time.
-              (= (long (or (:scan-bytes entry)
-                           (:file-bytes entry)
-                           -1))
-                 (long (:file-bytes entry)))
-              (= file-bytes (long (:file-bytes entry)))
-              (= modified-ms (long (:modified-ms entry)))))))
+          (= (long (or (:scan-bytes entry)
+                       (:file-bytes entry)
+                       -1))
+             (long (:file-bytes entry)))
+          (= file-bytes (long (:file-bytes entry)))
+          (= modified-ms (long (:modified-ms entry)))))))
 
 (defn- txlog-segment-cache-entry
   [state segment]
@@ -3234,10 +3252,12 @@
     (if-let [state (or (txlog/state db)
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
-      (txlog/select-open-records
-       (txlog-records state from-lsn)
-       from-lsn
-       upto-lsn)
+      (do
+        (txlog/refresh-shared-state! state)
+        (txlog/select-open-records
+         (txlog-records state from-lsn)
+         from-lsn
+         upto-lsn))
       (if (txlog-config-enabled? db)
         []
         (txlog/select-open-records
@@ -3301,9 +3321,11 @@
 
   (read-commit-marker [_]
     (if-let [state (txlog/state db)]
-      (assoc (read-commit-marker-state db)
-             :commit-marker? (boolean (:commit-marker? state))
-             :marker-revision (long @(:marker-revision state)))
+      (do
+        (refresh-runtime-marker-revision! db state)
+        (assoc (read-commit-marker-state db)
+               :commit-marker? (boolean (:commit-marker? state))
+               :marker-revision (long @(:marker-revision state))))
       {:commit-marker? false
        :slot-a nil
        :slot-b nil
@@ -3355,10 +3377,12 @@
 
   i/ILMDB
   (open-transact-kv [_]
+    (when (txlog-write-path-enabled? db)
+      (ensure-txlog-ready! db))
     (let [wdb (i/open-transact-kv db)]
-      (when (ensure-txlog-ready! db)
+      (when (txlog-write-path-enabled? db)
         (txlog-reset-pending! (i/kv-info db)))
-      (wrap-lmdb wdb)))
+      (->KVLMDB wdb)))
   (abort-transact-kv [_]
     (when (txlog-config-enabled? db)
       (txlog-reset-pending! (i/kv-info db)))
@@ -3504,13 +3528,12 @@
         (catch Exception e
           (if fallback-attempted?
             (do
-              (close-txlog-state! db)
-              (try
-                (i/close-kv db)
-                (catch Exception _))
+              (close-failed-open! db)
               (throw e))
             (if-let [recovered (recover-from-snapshot-open! db e)]
               recovered
-              (throw e))))))))
+              (do
+                (close-failed-open! db)
+                (throw e)))))))))
 
 (l/set-open-kv-wrapper! wrap-lmdb)

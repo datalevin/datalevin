@@ -107,11 +107,11 @@
 ;; lmdb
 
 (def default-env-flags
-  "Default LMDB env flag is `#{:nordahead}`. See
+  "Default LMDB env flags are `#{:nordahead :notls}`. See
   [[datalevin.core/set-env-flags]] for a full list of flags.
 
   Passed as `:flags` option value to `open-kv` function."
-  #{:nordahead})
+  #{:nordahead :notls})
 
 (def default-dbi-flags
   "Default DBI flags is `#{:create :counted :prefix-compression}`. See http://www.lmdb.tech/doc/group__mdb__dbi__open.html for a list of flags for stock LMDB, and https://github.com/huahaiy/dlmdb for additional flags."

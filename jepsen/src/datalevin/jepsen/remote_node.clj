@@ -400,6 +400,9 @@
         keep-state-file?   (atom false)
         stop!              (fn []
                              (when (compare-and-set! stopped? false true)
+                               (local/unregister-remote-node-runtime!
+                                (:db-identity config)
+                                (:node-id node))
                                (safe-close-conn! @conn)
                                (safe-stop-server! @server)
                                (alter-var-root #'srv/*server-runtime-opts-fn*
@@ -408,6 +411,7 @@
                                (when-not @keep-state-file?
                                  (delete-if-exists! (state-file node)))))
         shutdown-hook      (Thread. ^Runnable stop!)]
+    (local/register-remote-node-runtime! config topology node)
     (write-pid-file! node)
     (write-state-file! node
                        {:status :starting

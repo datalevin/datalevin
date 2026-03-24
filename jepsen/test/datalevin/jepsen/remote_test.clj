@@ -2,7 +2,6 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.jepsen.core :as core]
-   [datalevin.jepsen.local :as local]
    [datalevin.jepsen.remote :as remote]
    [datalevin.jepsen.workload.witness-topology :as witness-topology]
    [datalevin.util :as u])
@@ -94,6 +93,25 @@
      {:workload workload-name
       :key-count 4})))
 
+(def ^:private previously-unsupported-workloads
+  [:degraded-rejoin
+   :membership-drift
+   :membership-drift-live
+   :rejoin-bootstrap
+   :snapshot-checksum-rejoin
+   :snapshot-copy-corruption-rejoin
+   :snapshot-db-identity-rejoin
+   :snapshot-manifest-corruption-rejoin
+   :fencing-retry])
+
+(def ^:private previously-unsupported-nemeses
+  [:leader-io-stall
+   :leader-disk-full
+   :clock-skew-pause
+   :clock-skew-leader-fast
+   :clock-skew-leader-slow
+   :clock-skew-mixed])
+
 (deftest config-workload-applies-configured-topology-and-workload-opts-test
   (let [config   (-> (witness-remote-config)
                      (remote/validate-config! core/workloads))
@@ -169,30 +187,27 @@
            (mapv :ha-node-id
                  (get-in opts [:ha-control-plane :voters]))))))
 
-(deftest datalevin-test-remote-rejects-all-unsupported-workloads-test
-  (doseq [workload-name (sort @#'core/remote-unsupported-workloads)]
+(deftest datalevin-test-remote-accepts-previously-unsupported-workloads-test
+  (doseq [workload-name previously-unsupported-workloads]
     (testing (name workload-name)
-      (let [e (remote-test-exception
-               (unsupported-workload-config workload-name)
-               {})]
-        (is e)
-        (is (re-find #"not yet supported by the remote runner"
-                     (ex-message e)))
-        (is (= workload-name (:workload (ex-data e))))))))
+      (let [test-map (remote-test-map
+                      (unsupported-workload-config workload-name)
+                      {})
+            remote-spec (:remote-spec (:db test-map))]
+        (is (= (str (name workload-name) " remote")
+               (:name test-map)))
+        (is (= workload-name
+               (get-in remote-spec [:config :workload])))))))
 
-(deftest datalevin-test-remote-rejects-all-unsupported-nemeses-test
-  (doseq [fault (sort @#'core/remote-unsupported-nemeses)]
+(deftest datalevin-test-remote-accepts-previously-unsupported-nemeses-test
+  (doseq [fault previously-unsupported-nemeses]
     (testing (name fault)
-      (let [e (remote-test-exception
-               (base-remote-config
-                {:workload :register
-                 :key-count 4})
-               {:nemesis [fault]})]
-        (is e)
-        (is (re-find #"not yet supported by the remote runner"
-                     (ex-message e)))
-        (is (= fault (:fault (ex-data e))))
-        (is (= [fault] (:nemesis (ex-data e))))))))
+      (let [test-map (remote-test-map
+                      (base-remote-config
+                       {:workload :register
+                        :key-count 4})
+                      {:nemesis [fault]})]
+        (is (= [fault] (:datalevin/nemesis-faults test-map)))))))
 
 (deftest datalevin-test-remote-requires-repo-root-test
   (let [e (remote-test-exception
@@ -219,30 +234,31 @@
     (is (= ["n1" "n2" "n3"] (mapv :logical-node (:control-nodes topology))))
     (is (= ["n3"] (mapv :logical-node (:control-only-nodes topology))))))
 
-(deftest init-remote-cluster-records-control-only-witness-nodes-test
-  (let [cluster-id    (str "remote-witness-" (UUID/randomUUID))
-        config        (-> (witness-remote-config)
-                          (remote/validate-config! core/workloads))
-        workload      (remote/config-workload config core/workloads)
-        topology      (remote/workload-topology config workload)
-        base-opts     (remote/base-ha-opts config
-                                           (:data-nodes topology)
-                                           (:control-nodes topology))
-        cluster       (#'local/build-remote-cluster-state
-                       cluster-id
-                       config
-                       "/tmp/remote-cluster.edn"
-                       {:username "root"}
-                       topology
-                       workload
-                       base-opts
-                       45000
-                       false)]
-    (is (= ["n1" "n2"] (:data-node-names cluster)))
-    (is (= ["n1" "n2" "n3"] (:control-node-names cluster)))
-    (is (= ["n3"] (:control-only-node-names cluster)))
-    (is (= #{"n1" "n2"} (:live-nodes cluster)))
-    (is (= "n3" (get-in cluster [:node-by-id 3])))
-    (is (= "n3" (get-in cluster [:peer-id->node "10.0.0.13:15001"])))
-    (is (= "n3" (get-in cluster [:endpoint->node "10.0.0.13:8898"])))
-    (is (false? (get-in cluster [:node-by-name "n3" :promotable?])))))
+(deftest node-ha-opts-applies-remote-hooks-and-per-node-overrides-test
+  (let [data-nodes [(node "n1" 1)
+                    (node "n2" 2)]
+        config     (-> (base-remote-config
+                        {:workload :register
+                         :key-count 4
+                         :nodes data-nodes
+                         :jepsen-remote-clock-skew-hook? true
+                         :node-ha-opts-overrides
+                         {"n1" {:ha-max-promotion-lag-lsn 11}}})
+                       (remote/validate-config! core/workloads))
+        workload   {:datalevin/cluster-opts
+                    {:ha-fencing-hook {:timeout-ms 2222
+                                       :retries 4
+                                       :retry-delay-ms 0}}
+                    :datalevin/remote-fencing-retry? true}
+        opts       (remote/node-ha-opts config
+                                        (first data-nodes)
+                                        workload
+                                        data-nodes
+                                        data-nodes)]
+    (is (= 11 (:ha-max-promotion-lag-lsn opts)))
+    (is (= 2222 (get-in opts [:ha-fencing-hook :timeout-ms])))
+    (is (= 4 (get-in opts [:ha-fencing-hook :retries])))
+    (is (= (remote/clock-skew-state-file (first data-nodes))
+           (last (get-in opts [:ha-clock-skew-hook :cmd]))))
+    (is (= (remote/fencing-mode-file (first data-nodes))
+           (last (get-in opts [:ha-fencing-hook :cmd]))))))

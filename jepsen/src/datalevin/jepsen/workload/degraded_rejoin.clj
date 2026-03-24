@@ -345,30 +345,55 @@
         dha/fetch-ha-endpoint-snapshot-copy!
         orig-copy
         dha/copy-ha-remote-store!
+        remote?          (:remote? (local/cluster-state cluster-id))
         wal-gap          (wait-for-real-wal-gap! test
                                                  key-count
                                                  source-nodes
                                                  follower-next-lsn
                                                  4000)
-        _                (with-redefs-fn
-                           (snapshot-copy-failure-redefs failure-mode
-                                                         orig-fetch
-                                                         orig-copy)
-                           (fn []
-                             (local/restart-node! cluster-id degraded-node)
-                             (let [_             (local/with-leader-conn
-                                                   test
-                                                   schema
-                                                   (fn [conn]
-                                                     (write-register! conn 0 9000)))
-                                   expected-live (leader-register-values test
-                                                                        key-count)]
-                               (wait-for-register-values-on-nodes!
-                                 test
-                                 source-nodes
-                                 expected-live
-                                 converge-timeout-ms
-                                 key-count))))
+        _                (if remote?
+                           (do
+                             (local/set-node-snapshot-failpoint! cluster-id
+                                                                 degraded-node
+                                                                 failure-mode)
+                             (try
+                               (local/restart-node! cluster-id degraded-node)
+                               (let [_             (local/with-leader-conn
+                                                     test
+                                                     schema
+                                                     (fn [conn]
+                                                       (write-register! conn 0 9000)))
+                                     expected-live (leader-register-values test
+                                                                          key-count)]
+                                 (wait-for-register-values-on-nodes!
+                                   test
+                                   source-nodes
+                                   expected-live
+                                   converge-timeout-ms
+                                   key-count))
+                               (finally
+                                 (local/clear-node-snapshot-failpoint!
+                                  cluster-id
+                                  degraded-node))))
+                           (with-redefs-fn
+                             (snapshot-copy-failure-redefs failure-mode
+                                                           orig-fetch
+                                                           orig-copy)
+                             (fn []
+                               (local/restart-node! cluster-id degraded-node)
+                               (let [_             (local/with-leader-conn
+                                                     test
+                                                     schema
+                                                     (fn [conn]
+                                                       (write-register! conn 0 9000)))
+                                     expected-live (leader-register-values test
+                                                                          key-count)]
+                                 (wait-for-register-values-on-nodes!
+                                   test
+                                   source-nodes
+                                   expected-live
+                                   converge-timeout-ms
+                                   key-count)))))
         _                (local/with-leader-conn
                            test
                            schema

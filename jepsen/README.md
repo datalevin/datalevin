@@ -215,9 +215,12 @@ config instead of the usual local-cluster CLI flags. The controller uploads
 that config to every node, restarts the configured launchers over SSH, waits
 for the cluster to form, runs Jepsen, and then tears the launchers down again.
 The current remote runner supports both standard data-node topologies and
-control-only witness topologies such as `witness-topology`, along with the
-transport-level nemeses. Local-only fault injectors and `fencing-retry` still
-use the local harness or the manual per-host launcher.
+control-only witness topologies such as `witness-topology`. It also supports
+the full current controller-managed workload set, including `degraded-rejoin`,
+the snapshot-rejoin variants, `membership-drift`, `membership-drift-live`,
+`rejoin-bootstrap`, and `fencing-retry`, plus the HA fault injectors exposed
+through the controller-managed runner such as degraded links, leader IO stall,
+leader disk full, quorum loss, and the clock-skew variants.
 
 Run a local append workload:
 

@@ -96,23 +96,10 @@
     (conj (gen/clients workload-final-generator))))
 
 (def ^:private remote-unsupported-workloads
-  #{:degraded-rejoin
-    :membership-drift
-    :membership-drift-live
-    :rejoin-bootstrap
-    :snapshot-checksum-rejoin
-    :snapshot-copy-corruption-rejoin
-    :snapshot-db-identity-rejoin
-    :snapshot-manifest-corruption-rejoin
-    :fencing-retry})
+  #{})
 
 (def ^:private remote-unsupported-nemeses
-  #{:leader-io-stall
-    :leader-disk-full
-    :clock-skew-pause
-    :clock-skew-leader-fast
-    :clock-skew-leader-slow
-    :clock-skew-mixed})
+  #{})
 
 (defn- validate-remote-runner!
   [config workload-name nemesis-faults _topology]

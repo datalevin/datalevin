@@ -48,8 +48,11 @@
  ;; [{:logical-node "n1" ...}
  ;;  {:logical-node "n2" ...}
  ;;  {:logical-node "n3" ... :promotable? false}]
- ;; `fencing-retry` still needs the local harness because its fencing hook path
- ;; is created on the controller host, not the remote nodes.
+ ;;
+ ;; The controller-managed remote runner also supports the degraded-rejoin,
+ ;; snapshot-rejoin, membership-drift, membership-drift-live, rejoin-bootstrap,
+ ;; and fencing-retry workloads, plus the leader IO-stall, leader disk-full,
+ ;; quorum-loss, and clock-skew nemeses.
 
  ;; Optional workload-specific tuning. In remote mode these are read from the
  ;; shared config rather than the usual local-cluster CLI workload flags.
