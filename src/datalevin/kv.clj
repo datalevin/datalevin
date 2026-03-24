@@ -3012,49 +3012,73 @@
           (when (not= cache0 cache1)
             (vreset! cache-v cache1)))))))
 
+(defn- collect-txlog-records
+  [state segments cache-v from]
+  (let [tail-scan? (pos? from)]
+    (if tail-scan?
+      (loop [remaining (seq (rseq segments))
+             collected '()]
+        (if-let [segment (first remaining)]
+          (let [{:keys [records min-lsn]}
+                (txlog-segment-records-entry state segment cache-v)
+                collected' (if (seq records)
+                             (cons records collected)
+                             collected)]
+            (if (and (some? min-lsn)
+                     (<= (long min-lsn) from))
+              (mapcat identity collected')
+              (recur (next remaining) collected')))
+          (mapcat identity collected)))
+      (mapcat #(-> (txlog-segment-records-entry
+                    state
+                    %
+                    cache-v)
+                   :records)
+              segments))))
+
+(defn- validate-txlog-record-sequence!
+  [records]
+  (loop [prev nil
+         records (seq records)]
+    (when-let [record (first records)]
+      (let [lsn (:lsn record)]
+        (when (or (not (pos? ^long lsn))
+                  (and prev (not= lsn (inc ^long prev))))
+          (raise "Txn-log sequence is invalid"
+                 {:type :txlog/corrupt
+                  :previous-lsn prev
+                  :lsn lsn
+                  :record record}))
+        (recur lsn (next records))))))
+
 (defn txlog-records
   ([state]
    (txlog-records state nil))
   ([state from-lsn]
    (let [dir (:dir state)
-         segments (vec (txlog/segment-files dir))
          cache-v (:txlog-records-cache state)
-         _ (prune-txlog-records-cache! cache-v segments)
-         from (long (max 0 (long (or from-lsn 0))))
-         tail-scan? (pos? from)
-         records (if tail-scan?
-                   (loop [remaining (seq (rseq segments))
-                          collected '()]
-                     (if-let [segment (first remaining)]
-                       (let [{:keys [records min-lsn]}
-                             (txlog-segment-records-entry state segment cache-v)
-                             collected' (if (seq records)
-                                          (cons records collected)
-                                          collected)]
-                         (if (and (some? min-lsn)
-                                  (<= (long min-lsn) from))
-                           (mapcat identity collected')
-                           (recur (next remaining) collected')))
-                       (mapcat identity collected)))
-                   (mapcat #(-> (txlog-segment-records-entry
-                                 state
-                                 %
-                                 cache-v)
-                                :records)
-                           segments))]
-     (loop [prev nil
-            records (seq records)]
-       (when-let [record (first records)]
-         (let [lsn (:lsn record)]
-           (when (or (not (pos? ^long lsn))
-                     (and prev (not= lsn (inc ^long prev))))
-             (raise "Txn-log sequence is invalid"
-                    {:type :txlog/corrupt
-                     :previous-lsn prev
-                     :lsn lsn
-                     :record record}))
-           (recur lsn (next records)))))
-     records)))
+         from (long (max 0 (long (or from-lsn 0))))]
+     (loop [retries-left (if cache-v 1 0)]
+       (let [segments (vec (txlog/segment-files dir))
+             _ (prune-txlog-records-cache! cache-v segments)
+             records (collect-txlog-records state segments cache-v from)
+             error (try
+                     (validate-txlog-record-sequence! records)
+                     nil
+                     (catch clojure.lang.ExceptionInfo e
+                       e))]
+         (if error
+           (if (and (pos? retries-left)
+                    cache-v
+                    (= :txlog/corrupt (:type (ex-data error))))
+             (do
+               ;; Segment scans can be cached off a stale active/closed boundary.
+               ;; When sequence validation fails, drop the cache once and rescan
+               ;; from disk before surfacing corruption.
+               (vreset! cache-v {})
+               (recur 0))
+             (throw error))
+           records))))))
 
 (defn- local-dir?
   [dir]
