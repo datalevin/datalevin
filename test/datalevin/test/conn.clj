@@ -434,6 +434,54 @@
                  (d/close-kv db#)))))]
     (pr-str form)))
 
+(defn- wal-child-write-form
+  [dir opts txs]
+  (let [db-sym (gensym "db")
+        form
+        `(do
+           (require '[datalevin.core :as d]
+                    '[datalevin.kv :as kv])
+           (let [~db-sym (d/open-kv ~dir ~opts)]
+             (try
+               (d/open-dbi ~db-sym "a")
+               ~@(map (fn [tx]
+                        `(d/transact-kv ~db-sym [~tx]))
+                      txs)
+               (println (pr-str {:status :ok
+                                 :lsns (mapv :lsn (kv/open-tx-log ~db-sym 1))
+                                 :applied-lsn
+                                 (get-in (kv/read-commit-marker ~db-sym)
+                                         [:current :applied-lsn])}))
+               (finally
+                 (d/close-kv ~db-sym)))))]
+    (pr-str form)))
+
+(defn- wal-child-failing-write-form
+  [dir opts tx]
+  (let [form
+        `(do
+           (require '[datalevin.binding.cpp :as cpp]
+                    '[datalevin.core :as d])
+           (let [db# (d/open-kv ~dir ~opts)]
+             (try
+               (d/open-dbi db# "a")
+               (println
+                (pr-str
+                 (try
+                   (binding [cpp/*before-write-commit-fn*
+                             (fn [ctx#]
+                               (when (= (:operation ctx#) :close-transact-kv)
+                                 (throw (ex-info "forced commit failure"
+                                                 {:type :forced-commit-failure}))))]
+                     (d/transact-kv db# [~tx])
+                     {:status :unexpected-success})
+                   (catch Exception e#
+                     {:status :expected-failure
+                      :message (.getMessage e#)}))))
+               (finally
+                 (d/close-kv db#)))))]
+    (pr-str form)))
+
 (deftest test-strict-with-transaction-transact-uses-direct-path
   (let [conn  (d/create-conn nil
                              {:k {:db/valueType :db.type/long}}
@@ -507,6 +555,112 @@
                  (d/get-value db3 "a" :k2)))
           (finally
             (d/close-kv db3))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-parent-process-appends-after-child-process-advances-wal
+  (let [dir  (u/tmp-dir (str "wal-parent-after-child-test-" (UUID/randomUUID)))
+        opts {:wal? true
+              :wal-commit-marker? true
+              :snapshot-bootstrap-force? false
+              :wal-durability-profile :strict}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k1 :v1]])))
+          (let [{:keys [ok? result output]}
+                (child-process-result
+                 (start-clojure-child!
+                  (wal-child-write-form dir
+                                        opts
+                                        [[:put "a" :k2 :v2]
+                                         [:put "a" :k3 :v3]]))
+                 10000)]
+            (is ok? output)
+            (is (= {:status :ok
+                    :lsns [1 2 3]
+                    :applied-lsn 3}
+                   result)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k4 :v4]])))
+          (is (= [1 2 3 4]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= 4
+                 (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
+          (is (= 4
+                 (:last-applied-lsn (kv/txlog-watermarks db))))
+          (is (= :v1
+                 (d/get-value db "a" :k1)))
+          (is (= :v2
+                 (d/get-value db "a" :k2)))
+          (is (= :v3
+                 (d/get-value db "a" :k3)))
+          (is (= :v4
+                 (d/get-value db "a" :k4)))
+          (is (:ok? (kv/verify-commit-marker! db)))
+          (finally
+            (d/close-kv db))))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= [1 2 3 4]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= :v4
+                 (d/get-value db "a" :k4)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-recovers-child-process-commit-failure-before-lmdb-commit
+  (let [dir  (u/tmp-dir (str "wal-child-commit-failure-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true
+              :wal-commit-marker? true
+              :snapshot-bootstrap-force? false
+              :wal-durability-profile :strict}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k1 :v1]])))
+          (finally
+            (d/close-kv db))))
+      (let [{:keys [ok? result output]}
+            (child-process-result
+             (start-clojure-child!
+              (wal-child-failing-write-form dir
+                                            opts
+                                            [:put "a" :k2 :v2]))
+             10000)]
+        (is ok? output)
+        (is (= :expected-failure (:status result)))
+        (is (re-find #"forced commit failure" (:message result))))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :v1
+                 (d/get-value db "a" :k1)))
+          (is (= :v2
+                 (d/get-value db "a" :k2)))
+          (is (= [1 2]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= 2
+                 (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
+          (is (= 2
+                 (:last-applied-lsn (kv/txlog-watermarks db))))
+          (is (:ok? (kv/verify-commit-marker! db)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k3 :v3]])))
+          (is (= [1 2 3]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= :v3
+                 (d/get-value db "a" :k3)))
+          (finally
+            (d/close-kv db))))
       (finally
         (u/delete-files dir)))))
 
