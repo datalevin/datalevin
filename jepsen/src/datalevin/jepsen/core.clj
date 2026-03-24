@@ -104,8 +104,7 @@
     :snapshot-copy-corruption-rejoin
     :snapshot-db-identity-rejoin
     :snapshot-manifest-corruption-rejoin
-    :fencing-retry
-    :witness-topology})
+    :fencing-retry})
 
 (def ^:private remote-unsupported-nemeses
   #{:leader-io-stall
@@ -116,18 +115,12 @@
     :clock-skew-mixed})
 
 (defn- validate-remote-runner!
-  [config workload-name nemesis-faults topology]
+  [config workload-name nemesis-faults _topology]
   (when (contains? remote-unsupported-workloads workload-name)
     (throw (ex-info
             "This Jepsen workload is not yet supported by the remote runner"
             {:workload workload-name
              :remote-config (:db-name config)})))
-  (when (seq (:control-only-nodes topology))
-    (throw (ex-info
-            "The remote Jepsen runner does not yet support control-only witness nodes"
-            {:workload workload-name
-             :control-nodes (mapv :logical-node (:control-nodes topology))
-             :data-nodes (mapv :logical-node (:data-nodes topology))})))
   (when-let [fault (first (filter remote-unsupported-nemeses nemesis-faults))]
     (throw (ex-info
             "This Jepsen nemesis is not yet supported by the remote runner"

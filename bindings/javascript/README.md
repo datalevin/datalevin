@@ -152,3 +152,6 @@ at another embeddable Datalevin runtime jar, preferably
 
 `.github/workflows/release.javascript.yml` builds, tests, dry-runs the npm
 package on demand, and publishes tagged releases to npm.
+
+For the local manual release helper, see
+[`script/deploy-javascript.md`](../../script/deploy-javascript.md).

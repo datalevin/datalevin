@@ -1896,14 +1896,38 @@
 
 (declare udf-readiness-retryable-error?)
 
+(def ^:private udf-readiness-disruption-attempt-timeout-ms 2000)
+
+(defn- invoke-udf-readiness-with-attempt-timeout!
+  [test invoke-fn timeout-ms]
+  (let [timeout-ms (long timeout-ms)
+        result-f   (future
+                     (try
+                       {:value (invoke-fn test)}
+                       (catch Throwable e
+                         {:error e})))
+        result     (deref result-f timeout-ms ::timeout)]
+    (if (= ::timeout result)
+      (do
+        (future-cancel result-f)
+        {:error (ex-info "Timeout in making request"
+                         {:timeout-ms timeout-ms
+                          :phase :udf-readiness-disruption-invoke})})
+      result)))
+
 (defn- invoke-udf-readiness-with-disruption-retry!
   [test invoke-fn timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
     (loop []
-      (let [result (try
-                     {:value (invoke-fn test)}
-                     (catch Throwable e
-                       {:error e}))]
+      (let [remaining-ms (long (max 1 (- deadline
+                                         (System/currentTimeMillis))))
+            attempt-timeout-ms
+            (long (min remaining-ms
+                       udf-readiness-disruption-attempt-timeout-ms))
+            result       (invoke-udf-readiness-with-attempt-timeout!
+                          test
+                          invoke-fn
+                          attempt-timeout-ms)]
         (if-let [e (:error result)]
           (if (and (< (System/currentTimeMillis) deadline)
                    (udf-readiness-retryable-error? test e))
@@ -1913,11 +1937,120 @@
             (throw e))
           (:value result))))))
 
+(defn- wait-for-udf-readiness-leader-client-value!
+  [test schema counter-value-query counter-id expected-value timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-outcome nil]
+      (let [remaining-ms (long (max 1 (- deadline
+                                         (System/currentTimeMillis))))
+            leader       (:leader (local/wait-for-single-leader!
+                                   (:datalevin/cluster-id test)
+                                   remaining-ms))
+            outcome      (merge
+                          {:leader leader}
+                          (invoke-udf-readiness-with-attempt-timeout!
+                           test
+                           (fn [_]
+                             (local/with-node-conn
+                               test
+                               leader
+                               schema
+                               (fn [conn]
+                                 (some-> (d/q counter-value-query
+                                              (d/db conn)
+                                              counter-id)
+                                         long))))
+                           remaining-ms))]
+        (cond
+          (and (some? (:value outcome))
+               (= (long expected-value)
+                  (long (:value outcome))))
+          outcome
+
+          (< (System/currentTimeMillis) deadline)
+          (do
+            (Thread/sleep 250)
+            (recur outcome))
+
+          :else
+          (if-let [e (:error outcome)]
+            (throw (ex-info
+                    "Timed out waiting for UDF-readiness leader client convergence"
+                    {:timeout-ms (long timeout-ms)
+                     :expected-value (long expected-value)
+                     :last-outcome (select-keys outcome [:leader :value])}
+                    e))
+            (throw (ex-info
+                    "Timed out waiting for UDF-readiness leader client convergence"
+                    {:timeout-ms (long timeout-ms)
+                     :expected-value (long expected-value)
+                     :last-outcome (select-keys outcome [:leader :value])}))))))))
+
+(defn- wait-for-udf-readiness-leader-local-value!
+  [test node-counter-value expected-value timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-outcome nil]
+      (let [remaining-ms (long (max 1 (- deadline
+                                         (System/currentTimeMillis))))
+            leader       (:leader (local/wait-for-single-leader!
+                                   (:datalevin/cluster-id test)
+                                   remaining-ms))
+            outcome      {:leader leader
+                          :value (node-counter-value test leader)}]
+        (cond
+          (and (some? (:value outcome))
+               (= (long expected-value)
+                  (long (:value outcome))))
+          outcome
+
+          (< (System/currentTimeMillis) deadline)
+          (do
+            (Thread/sleep 250)
+            (recur outcome))
+
+          :else
+          (throw (ex-info
+                  "Timed out waiting for UDF-readiness leader local convergence"
+                  {:timeout-ms (long timeout-ms)
+                   :expected-value (long expected-value)
+                   :last-outcome (select-keys outcome [:leader :value])})))))))
+
+(deftest udf-readiness-disruption-retry-times-out-stuck-invoke-test
+  (let [started-ms (System/currentTimeMillis)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo
+         #"Timeout in making request"
+         (invoke-udf-readiness-with-disruption-retry!
+          {:datalevin/nemesis-faults [:degraded-network]}
+          (fn [_]
+            (Thread/sleep 2000)
+            :ok)
+          100)))
+    (is (< (- (System/currentTimeMillis) started-ms)
+           1000))))
+
+(deftest udf-readiness-disruption-retry-retries-after-attempt-timeout-test
+  (let [attempts (atom 0)]
+    (is (= :ok
+           (invoke-udf-readiness-with-disruption-retry!
+            {:datalevin/nemesis-faults [:degraded-network]}
+            (fn [_]
+              (if (= 1 (swap! attempts inc))
+                (do
+                  (Thread/sleep (+ udf-readiness-disruption-attempt-timeout-ms
+                                   500))
+                  :slow)
+                :ok))
+            (+ (* 2 udf-readiness-disruption-attempt-timeout-ms)
+               1000))))
+    (is (= 2 @attempts))))
+
 (defn- udf-readiness-retryable-error?
   [test e]
   (let [data     (or (ex-data e) {})
         err-data (or (:err-data data) data)]
     (or (local/transport-failure? e)
+        (= :udf-readiness-disruption-invoke (:phase data))
         (local/expected-disruption-write-failure? test e)
         (and (= :ha/write-rejected (:error err-data))
              (= :udf-not-ready (:reason err-data))))))
@@ -2072,16 +2205,27 @@
                                                (jn/invoke! nemesis-obj
                                                            test-map
                                                            post-cleanup-op)))))
-            leader-after        (:leader (local/wait-for-single-leader!
-                                          cluster-id
-                                          converge-timeout-ms))
-            leader-value        (when (= :degraded-network scenario)
-                                  (get (wait-counter-values!
-                                        test-map
-                                        [leader-after]
-                                        expected-value
-                                        converge-timeout-ms)
-                                       leader-after))
+            leader-local-result (when (= :degraded-network scenario)
+                                  (wait-for-udf-readiness-leader-local-value!
+                                   test-map
+                                   node-counter-value
+                                   expected-value
+                                   converge-timeout-ms))
+            leader-result       (when (= :degraded-network scenario)
+                                  (wait-for-udf-readiness-leader-client-value!
+                                   test-map
+                                   (:schema workload)
+                                   counter-value-query
+                                   counter-id
+                                   expected-value
+                                   (long (min converge-timeout-ms 5000))))
+            leader-after        (or (:leader leader-result)
+                                    (:leader leader-local-result)
+                                    (:leader (local/wait-for-single-leader!
+                                              cluster-id
+                                              converge-timeout-ms)))
+            leader-value        (or (:value leader-result)
+                                    (:value leader-local-result))
             nodes               (if (= :degraded-network scenario)
                                   (into {}
                                         (map (fn [logical-node]

@@ -152,6 +152,8 @@ Standard 3 data-node config:
  :workload :append
  :group-id "jepsen-remote-group"
  :db-identity "jepsen-remote-db"
+ :control-backend :sofa-jraft
+ :repo-root "/srv/datalevin"
  :nodes
  [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
   {:logical-node "n2" :node-id 2 :endpoint "10.0.0.12:8898" :peer-id "10.0.0.12:15001" :root "/var/tmp/dtlv-jepsen/n2"}
@@ -165,6 +167,8 @@ Witness-topology or `fencing-retry` config:
  :workload :witness-topology
  :group-id "jepsen-witness-group"
  :db-identity "jepsen-witness-db"
+ :control-backend :sofa-jraft
+ :repo-root "/srv/datalevin"
  :nodes
  [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
   {:logical-node "n2" :node-id 2 :endpoint "10.0.0.12:8898" :peer-id "10.0.0.12:15001" :root "/var/tmp/dtlv-jepsen/n2"}]
@@ -178,19 +182,42 @@ In the witness case, start `n3` with the same `start-remote-node` command; the
 launcher will detect that it is control-only and run the control authority
 without opening a Datalevin data store.
 
-Run Jepsen against an already-launched remote cluster with the same shared
-config:
+The top-level `:repo-root` is required by the controller-managed remote runner.
+It should point to the Datalevin checkout on every remote host. The manual
+per-host `start-remote-node` flow above ignores `:repo-root`.
+
+Run a controller-managed remote Jepsen test from the machine that has SSH
+access to every configured node:
+
+```bash
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis degraded append bank -- --time-limit 15 --rate 10
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover witness-topology
+```
+
+The wrapper writes per-workload temporary configs under
+`tmp/jepsen-remote-workloads/`, rewrites `:workload`, `:db-name`, `:group-id`,
+and `:db-identity` for each run so persistent remote roots do not reuse prior
+state, and then invokes the underlying Jepsen remote runner. `witness-topology`
+must be requested explicitly with a witness-style config; it is not part of
+`--all-workloads`.
+
+For one-off direct control, you can still invoke the remote runner yourself:
 
 ```bash
 cd jepsen
 lein run test --remote-config remote-cluster.example.edn --nemesis leader-failover --time-limit 30 --rate 10
 ```
 
-In remote mode, the workload, db name, HA group identity, node topology, and
-control backend come from the shared EDN config instead of the usual local
-cluster CLI flags. The current remote runner supports the standard data-node
-topologies and transport-level nemeses; witness-only topologies and a few
-local-only fault injectors still use the local harness for now.
+In controller-managed remote mode, the workload, db name, HA group identity,
+node topology, workload opts, and control backend come from the shared EDN
+config instead of the usual local-cluster CLI flags. The controller uploads
+that config to every node, restarts the configured launchers over SSH, waits
+for the cluster to form, runs Jepsen, and then tears the launchers down again.
+The current remote runner supports both standard data-node topologies and
+control-only witness topologies such as `witness-topology`, along with the
+transport-level nemeses. Local-only fault injectors and `fencing-retry` still
+use the local harness or the manual per-host launcher.
 
 Run a local append workload:
 

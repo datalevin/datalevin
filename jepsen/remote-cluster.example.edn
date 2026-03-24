@@ -1,27 +1,37 @@
 ;; Shared Jepsen remote-cluster config.
 ;;
-;; Copy this file to every host, then start the matching logical node on each
-;; machine:
+;; Use this file in either of two ways:
+;;
+;; 1. Manual per-host launcher:
 ;;
 ;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n1
 ;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n2
 ;;   script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n3
 ;;
-;; Each host should use the same file contents. Replace the TEST-NET addresses
-;; and root paths with real hostnames/IPs and writable local directories.
+;; 2. Controller-managed remote Jepsen runs:
+;;
+;;   script/jepsen/remote-workloads --config /etc/dtlv-jepsen/cluster.edn --nemesis failover
+;;   script/jepsen/remote-workloads --config /etc/dtlv-jepsen/cluster.edn --nemesis failover witness-topology
+;;
+;; Each host should use the same file contents. Replace the TEST-NET addresses,
+;; repo root, and root paths with real values.
 
 {:db-name "jepsen-remote"
  :workload :append
  :group-id "jepsen-remote-group"
  :db-identity "jepsen-remote-db"
  :control-backend :sofa-jraft
+ ;; Required by the controller-managed remote runner. This should point to the
+ ;; Datalevin checkout on every remote host. The manual per-host launcher
+ ;; ignores this key.
+ :repo-root "/srv/datalevin"
  :nodes
  [{:logical-node "n1"
    :node-id 1
    :endpoint "192.0.2.11:8898"
    :peer-id "192.0.2.11:15001"
    :root "/var/tmp/dtlv-jepsen/n1"}
-  {:logical-node "n2"
+ {:logical-node "n2"
    :node-id 2
    :endpoint "192.0.2.12:8898"
    :peer-id "192.0.2.12:15001"
@@ -32,6 +42,16 @@
    :peer-id "192.0.2.13:15001"
    :root "/var/tmp/dtlv-jepsen/n3"}]
 
- ;; Optional workload-specific tuning. These mirror the main Jepsen CLI opts.
+ ;; To run `witness-topology` remotely, keep `:nodes` to the two data nodes,
+ ;; set `:workload :witness-topology`, and add:
+ ;; :control-nodes
+ ;; [{:logical-node "n1" ...}
+ ;;  {:logical-node "n2" ...}
+ ;;  {:logical-node "n3" ... :promotable? false}]
+ ;; `fencing-retry` still needs the local harness because its fencing hook path
+ ;; is created on the controller host, not the remote nodes.
+
+ ;; Optional workload-specific tuning. In remote mode these are read from the
+ ;; shared config rather than the usual local-cluster CLI workload flags.
  :workload-opts
  {:key-count 4}}

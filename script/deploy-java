@@ -1,0 +1,194 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./script/deploy-java [--automatic|--user-managed] [--dry-run] [--no-sign]
+
+Build the org.datalevin/datalevin-java Maven Central bundle and upload it to
+the Sonatype Central Publisher Portal.
+
+Options:
+  --automatic     Upload with publishingType=AUTOMATIC. This is the default.
+  --user-managed  Upload with publishingType=USER_MANAGED.
+  --dry-run       Build the bundle but skip the upload.
+  --no-sign       Build the bundle without GPG signatures.
+  --help          Show this message.
+
+Environment:
+  SONATYPE_CENTRAL_BEARER_TOKEN  Pre-encoded bearer token value.
+  SONATYPE_CENTRAL_USERNAME      Portal token username.
+  SONATYPE_CENTRAL_PASSWORD      Portal token password.
+  SONATYPE_CENTRAL_URL           Defaults to https://central.sonatype.com
+  SONATYPE_CENTRAL_POLL_INTERVAL Defaults to 10 seconds.
+  SONATYPE_CENTRAL_MAX_POLLS     Defaults to 90 attempts.
+  JAVA_GPG_HOME                  Optional GPG home for signing.
+  JAVA_GPG_KEY_ID                Optional GPG key id for signing.
+
+If SONATYPE_CENTRAL_BEARER_TOKEN is not set, the script will construct one by
+base64-encoding SONATYPE_CENTRAL_USERNAME:SONATYPE_CENTRAL_PASSWORD.
+EOF
+}
+
+json_string_field() {
+  local json=$1
+  local field=$2
+  printf '%s\n' "$json" | sed -nE "s/.*\"${field}\"[[:space:]]*:[[:space:]]*\"([^\"]+)\".*/\\1/p" | head -n1
+}
+
+poll_status() {
+  local deployment_id=$1
+  local auth_header=$2
+  local poll_interval=$3
+  local max_polls=$4
+  local status_url="${central_base}/api/v1/publisher/status?id=${deployment_id}"
+  local attempt=1
+
+  while (( attempt <= max_polls )); do
+    local status_json
+    status_json=$(
+      curl --fail-with-body --silent --show-error \
+        --request POST \
+        --header "Authorization: Bearer ${auth_header}" \
+        "$status_url"
+    )
+
+    local deployment_state
+    deployment_state=$(json_string_field "$status_json" deploymentState)
+
+    if [[ -z "$deployment_state" ]]; then
+      echo "Unable to parse deployment state from Sonatype response:" >&2
+      printf '%s\n' "$status_json" >&2
+      return 1
+    fi
+
+    echo "Deployment ${deployment_id} state: ${deployment_state}"
+
+    case "$deployment_state" in
+      PENDING|VALIDATING|PUBLISHING)
+        sleep "$poll_interval"
+        ;;
+      VALIDATED)
+        echo
+        echo "Deployment validated and is waiting for manual publish in Sonatype Central."
+        printf '%s\n' "$status_json"
+        return 0
+        ;;
+      PUBLISHED)
+        echo
+        echo "Deployment published to Maven Central."
+        printf '%s\n' "$status_json"
+        return 0
+        ;;
+      FAILED)
+        echo
+        echo "Deployment failed validation or publishing." >&2
+        printf '%s\n' "$status_json" >&2
+        return 1
+        ;;
+      *)
+        echo
+        echo "Deployment reached unexpected state ${deployment_state}." >&2
+        printf '%s\n' "$status_json" >&2
+        return 1
+        ;;
+    esac
+
+    ((attempt++))
+  done
+
+  echo "Timed out waiting for Sonatype Central deployment ${deployment_id}." >&2
+  return 1
+}
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+publish_type=${SONATYPE_CENTRAL_PUBLISHING_TYPE:-AUTOMATIC}
+sign_bundle=true
+dry_run=false
+central_base=${SONATYPE_CENTRAL_URL:-https://central.sonatype.com}
+poll_interval=${SONATYPE_CENTRAL_POLL_INTERVAL:-10}
+max_polls=${SONATYPE_CENTRAL_MAX_POLLS:-90}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --automatic)
+      publish_type=AUTOMATIC
+      ;;
+    --user-managed)
+      publish_type=USER_MANAGED
+      ;;
+    --dry-run)
+      dry_run=true
+      ;;
+    --no-sign)
+      sign_bundle=false
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+version=$(sed -n 's/^(def version "\(.*\)")/\1/p' project.clj | head -n1)
+bundle_path="target/java-central/datalevin-java-${version}-central-bundle.zip"
+
+if [[ "$sign_bundle" == true ]]; then
+  clojure -T:build central-java-bundle
+else
+  clojure -T:build central-java-bundle :sign false
+fi
+
+if [[ ! -f "$bundle_path" ]]; then
+  echo "Expected bundle not found at ${bundle_path}" >&2
+  exit 1
+fi
+
+if [[ "$dry_run" == true ]]; then
+  echo "Built Java Central bundle at ${bundle_path}"
+  echo "Dry run only; skipping Sonatype Central upload."
+  exit 0
+fi
+
+if [[ -n "${SONATYPE_CENTRAL_BEARER_TOKEN:-}" ]]; then
+  auth_header=$SONATYPE_CENTRAL_BEARER_TOKEN
+elif [[ -n "${SONATYPE_CENTRAL_USERNAME:-}" && -n "${SONATYPE_CENTRAL_PASSWORD:-}" ]]; then
+  auth_header=$(printf '%s:%s' "$SONATYPE_CENTRAL_USERNAME" "$SONATYPE_CENTRAL_PASSWORD" | base64 | tr -d '\n')
+else
+  cat >&2 <<'EOF'
+Missing Sonatype Central credentials.
+
+Set SONATYPE_CENTRAL_BEARER_TOKEN, or set both SONATYPE_CENTRAL_USERNAME and
+SONATYPE_CENTRAL_PASSWORD using a Central Portal user token.
+EOF
+  exit 1
+fi
+
+upload_url="${central_base}/api/v1/publisher/upload?publishingType=${publish_type}"
+
+echo "Uploading ${bundle_path} to Sonatype Central with publishingType=${publish_type}..."
+deployment_id=$(
+  curl --fail-with-body --silent --show-error \
+    --request POST \
+    --header "Authorization: Bearer ${auth_header}" \
+    --form "bundle=@${bundle_path};type=application/octet-stream" \
+    "$upload_url"
+)
+deployment_id=$(printf '%s' "$deployment_id" | tr -d '\r\n')
+
+if [[ -z "$deployment_id" ]]; then
+  echo "Sonatype Central upload succeeded but did not return a deployment id." >&2
+  exit 1
+fi
+
+echo "Uploaded deployment ${deployment_id}"
+poll_status "$deployment_id" "$auth_header" "$poll_interval" "$max_polls"

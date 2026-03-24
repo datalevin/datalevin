@@ -1,0 +1,462 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+jepsen_dir="$repo_root/jepsen"
+
+known_workloads=(
+  append
+  append-cas
+  bank
+  fencing
+  giant-values
+  grant
+  identity-upsert
+  index-consistency
+  internal
+  register
+  tx-fn-register
+  udf-readiness
+  witness-topology
+)
+
+all_workloads=(
+  append
+  append-cas
+  bank
+  fencing
+  giant-values
+  grant
+  identity-upsert
+  index-consistency
+  internal
+  register
+  tx-fn-register
+  udf-readiness
+)
+
+usage() {
+  cat <<'EOF'
+Usage: script/jepsen/remote-workloads --config PATH --nemesis SPEC [workload ...] [-- extra-jepsen-args]
+
+Runs controller-managed Jepsen tests against real remote Datalevin nodes.
+
+If no workloads are given, the wrapper uses the workload already present in the
+shared remote config. Explicit workloads generate per-workload temporary configs
+that keep the same node topology and workload opts but rewrite:
+
+  * :workload
+  * :db-name
+  * :group-id
+  * :db-identity
+
+This avoids reusing persisted remote state across repeated runs.
+
+Examples:
+  script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover
+  script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis degraded append bank
+  script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis partition append -- --time-limit 15 --rate 10
+  script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover --all-workloads
+  script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover --dry-run
+
+Options:
+  --config PATH      Shared remote-cluster EDN config
+  --nemesis SPEC     Jepsen nemesis spec, e.g. failover or degraded,rejoin
+  --all-workloads    Run every standard workload supported by the remote runner
+  --dry-run          Generate temp configs and print commands without running Jepsen
+  --list             List workloads supported by this wrapper
+  -h, --help         Show this help
+
+Notes:
+  * The shared config must include top-level :repo-root for controller-managed
+    remote runs.
+  * `witness-topology` requires an explicit witness config and is therefore not
+    included in `--all-workloads`; request it explicitly.
+  * Extra args after -- are passed directly to `lein run test`.
+  * Workload-specific tuning comes from :workload-opts in the shared config.
+
+Environment overrides:
+  DTLV_JEPSEN_REMOTE_STREAM_LOGS
+  DTLV_JEPSEN_PORT_RETRY_COUNT
+  DTLV_JEPSEN_PORT_RETRY_DELAY_S
+EOF
+}
+
+list_workloads() {
+  printf '%s\n' "${known_workloads[@]}"
+}
+
+known_workload() {
+  local candidate="$1"
+  local workload
+  for workload in "${known_workloads[@]}"; do
+    if [[ "$workload" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+slugify() {
+  echo "$1" | tr '[:upper:]' '[:lower:]' | tr -cs '[:alnum:]-' '-' | sed 's/^-*//; s/-*$//'
+}
+
+latest_results_file() {
+  local workload="$1"
+  local results_dir="$jepsen_dir/store/${workload} remote"
+  if [[ ! -d "$results_dir" ]]; then
+    return 1
+  fi
+  find "$results_dir" -mindepth 2 -maxdepth 2 -name results.edn -print 2>/dev/null \
+    | sort \
+    | tail -n 1
+}
+
+print_result_summary() {
+  local results_file="$1"
+  (
+    cd "$repo_root"
+    RESULTS_FILE="$results_file" clojure -M -e '
+      (let [m (clojure.edn/read-string
+                {:default (fn [_ value] value)}
+                (slurp (System/getenv "RESULTS_FILE")))
+            summary {:valid? (:valid? m)
+                     :exceptions (get-in m [:exceptions :valid?])
+                     :workload (get-in m [:workload :valid?])}]
+        (println (pr-str summary))
+        (when-not (true? (:valid? m))
+          (System/exit 1)))'
+  )
+}
+
+run_jepsen() {
+  local log_file="$1"
+  shift
+
+  local attempt=0
+  local run_exit=0
+
+  while true; do
+    if [[ "$stream_logs" == "1" ]]; then
+      if (
+        cd "$jepsen_dir"
+        "$@" 2>&1 | tee "$log_file"
+      ); then
+        return 0
+      else
+        run_exit=$?
+      fi
+    else
+      if (
+        cd "$jepsen_dir"
+        "$@" >"$log_file" 2>&1
+      ); then
+        return 0
+      else
+        run_exit=$?
+      fi
+    fi
+
+    if grep -Fq "Operation not permitted" "$log_file"; then
+      printf '    port reservation denied by environment: see %s\n' "$log_file" >&2
+      return "$run_exit"
+    fi
+
+    if ! grep -Fq "Unable to reserve Jepsen server port" "$log_file"; then
+      return "$run_exit"
+    fi
+
+    if (( attempt >= port_retry_count )); then
+      return "$run_exit"
+    fi
+
+    attempt=$((attempt + 1))
+    printf '    retry: port reservation failed, retrying (%d/%d)\n' \
+      "$attempt" \
+      "$port_retry_count"
+    sleep "$port_retry_delay_s"
+  done
+}
+
+read_config_fields() {
+  local path="$1"
+  local config_lines=()
+
+  while IFS= read -r line; do
+    config_lines+=("$line")
+  done < <(
+    cd "$repo_root"
+    CONFIG_PATH="$path" clojure -M -e '
+      (require '\''[clojure.edn :as edn])
+      (let [cfg (-> (System/getenv "CONFIG_PATH") slurp edn/read-string)]
+        (doseq [value [(:workload cfg)
+                       (:db-name cfg)
+                       (:group-id cfg)
+                       (:db-identity cfg)
+                       (:repo-root cfg)]]
+          (println (cond
+                     (keyword? value) (name value)
+                     (nil? value) ""
+                     :else value))))'
+  )
+
+  if [[ ${#config_lines[@]} -ne 5 ]]; then
+    echo "Unable to read remote config: $path" >&2
+    exit 1
+  fi
+
+  config_workload="${config_lines[0]}"
+  base_db_name="${config_lines[1]}"
+  base_group_id="${config_lines[2]}"
+  base_db_identity="${config_lines[3]}"
+  config_repo_root="${config_lines[4]}"
+}
+
+write_generated_config() {
+  local input_path="$1"
+  local output_path="$2"
+  local workload="$3"
+  local db_name="$4"
+  local group_id="$5"
+  local db_identity="$6"
+
+  (
+    cd "$repo_root"
+    CONFIG_PATH="$input_path" \
+    OUTPUT_PATH="$output_path" \
+    WORKLOAD="$workload" \
+    DB_NAME="$db_name" \
+    GROUP_ID="$group_id" \
+    DB_IDENTITY="$db_identity" \
+    clojure -M -e '
+      (require '\''[clojure.edn :as edn]
+               '\''[clojure.pprint :as pp])
+      (let [cfg (-> (System/getenv "CONFIG_PATH") slurp edn/read-string)
+            cfg* (assoc cfg
+                        :workload (keyword (System/getenv "WORKLOAD"))
+                        :db-name (System/getenv "DB_NAME")
+                        :group-id (System/getenv "GROUP_ID")
+                        :db-identity (System/getenv "DB_IDENTITY"))]
+        (spit (System/getenv "OUTPUT_PATH")
+              (with-out-str (pp/pprint cfg*))))'
+  )
+}
+
+config_path=""
+nemesis_spec=""
+selected_workloads=()
+extra_args=()
+use_all_workloads=0
+dry_run=0
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --list)
+      list_workloads
+      exit 0
+      ;;
+    --all-workloads)
+      use_all_workloads=1
+      shift
+      ;;
+    --dry-run)
+      dry_run=1
+      shift
+      ;;
+    --config)
+      if (($# < 2)); then
+        echo "Missing value for --config" >&2
+        exit 2
+      fi
+      config_path="$2"
+      shift 2
+      ;;
+    --nemesis)
+      if (($# < 2)); then
+        echo "Missing value for --nemesis" >&2
+        exit 2
+      fi
+      nemesis_spec="$2"
+      shift 2
+      ;;
+    --)
+      shift
+      extra_args=("$@")
+      break
+      ;;
+    *)
+      if ! known_workload "$1"; then
+        echo "Unknown workload: $1" >&2
+        echo >&2
+        usage >&2
+        exit 2
+      fi
+      selected_workloads+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -z "$config_path" || -z "$nemesis_spec" ]]; then
+  usage >&2
+  exit 2
+fi
+
+if [[ ! -f "$config_path" ]]; then
+  echo "Missing config file: $config_path" >&2
+  exit 2
+fi
+
+if [[ "$use_all_workloads" == "1" && ${#selected_workloads[@]} -gt 0 ]]; then
+  echo "Cannot combine --all-workloads with explicit workloads" >&2
+  exit 2
+fi
+
+config_workload=""
+base_db_name=""
+base_group_id=""
+base_db_identity=""
+config_repo_root=""
+read_config_fields "$config_path"
+
+if [[ -z "$config_workload" ]]; then
+  echo "Remote config must include :workload" >&2
+  exit 2
+fi
+
+if [[ -z "$base_db_name" || -z "$base_group_id" || -z "$base_db_identity" ]]; then
+  echo "Remote config must include :db-name, :group-id, and :db-identity" >&2
+  exit 2
+fi
+
+if [[ -z "$config_repo_root" ]]; then
+  echo "Remote config must include top-level :repo-root for controller-managed runs" >&2
+  exit 2
+fi
+
+if [[ "$use_all_workloads" == "1" ]]; then
+  selected_workloads=("${all_workloads[@]}")
+elif [[ ${#selected_workloads[@]} -eq 0 ]]; then
+  selected_workloads=("$config_workload")
+fi
+
+for workload in "${selected_workloads[@]}"; do
+  if ! known_workload "$workload"; then
+    echo "Remote runner wrapper does not support workload: $workload" >&2
+    exit 2
+  fi
+done
+
+status=0
+summaries=()
+run_id="$(date +%Y%m%dT%H%M%S)"
+nemesis_slug="$(slugify "$nemesis_spec")"
+log_dir="$repo_root/tmp/jepsen-remote-workloads/${nemesis_slug}/$run_id"
+config_dir="$log_dir/config"
+stream_logs="${DTLV_JEPSEN_REMOTE_STREAM_LOGS:-0}"
+port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
+port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
+
+mkdir -p "$config_dir"
+
+for workload in "${selected_workloads[@]}"; do
+  workload_slug="$(slugify "$workload")"
+  generated_config="$config_dir/${workload_slug}.edn"
+  db_name="${base_db_name}-${workload_slug}-${run_id}"
+  group_id="${base_group_id}-${workload_slug}-${run_id}"
+  db_identity="${base_db_identity}-${workload_slug}-${run_id}"
+  log_file="$log_dir/${workload_slug}.log"
+
+  write_generated_config \
+    "$config_path" \
+    "$generated_config" \
+    "$workload" \
+    "$db_name" \
+    "$group_id" \
+    "$db_identity"
+
+  extra_args_display=""
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    extra_args_display=" ${extra_args[*]}"
+  fi
+
+  printf '==> [%s] lein run test --remote-config %s --nemesis %s%s\n' \
+    "$workload" \
+    "$generated_config" \
+    "$nemesis_spec" \
+    "$extra_args_display"
+  printf '    generated config: %s\n' "$generated_config"
+  printf '    remote ids: db=%s group=%s identity=%s\n' \
+    "$db_name" \
+    "$group_id" \
+    "$db_identity"
+  printf '    log: %s\n' "$log_file"
+
+  if [[ "$dry_run" == "1" ]]; then
+    summaries+=("$workload dry-run config=$generated_config db=$db_name group=$group_id identity=$db_identity")
+    continue
+  fi
+
+  before_results="$(latest_results_file "$workload" || true)"
+
+  cmd=(lein run test --remote-config "$generated_config" --nemesis "$nemesis_spec")
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    cmd+=("${extra_args[@]}")
+  fi
+
+  run_exit=0
+  if run_jepsen "$log_file" "${cmd[@]}"; then
+    run_exit=0
+  else
+    run_exit=$?
+  fi
+
+  after_results="$(latest_results_file "$workload" || true)"
+
+  if [[ -n "$after_results" && "$after_results" != "$before_results" ]]; then
+    if summary="$(print_result_summary "$after_results" 2>&1)"; then
+      summary="${summary//$'\n'/ }"
+      summary="${summary//$'\r'/ }"
+      if [[ "$run_exit" -ne 0 ]]; then
+        summary="$summary exit=$run_exit"
+      fi
+      printf '    status: %s\n' "$summary"
+      summaries+=("$workload ok $summary results=$after_results log=$log_file")
+    else
+      summary="${summary//$'\n'/ }"
+      summary="${summary//$'\r'/ }"
+      if [[ "$run_exit" -ne 0 ]]; then
+        summary="$summary exit=$run_exit"
+      fi
+      printf '    status: %s\n' "$summary"
+      summaries+=("$workload invalid $summary results=$after_results log=$log_file")
+      status=1
+    fi
+    continue
+  fi
+
+  if [[ "$run_exit" -ne 0 ]]; then
+    status=1
+    summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+    continue
+  fi
+
+  if [[ -z "$after_results" || "$after_results" == "$before_results" ]]; then
+    printf '    status: missing results.edn\n'
+    summaries+=("$workload missing-results log=$log_file")
+    status=1
+    continue
+  fi
+done
+
+printf '\nSummary (%s)\n' "$log_dir"
+for entry in "${summaries[@]}"; do
+  printf '  %s\n' "$entry"
+done
+
+exit "$status"

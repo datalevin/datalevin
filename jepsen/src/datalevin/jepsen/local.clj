@@ -2438,19 +2438,61 @@
       (u/create-dirs dir)
       dir)))
 
+(defn- build-remote-cluster-state
+  [cluster-id config config-path ssh topology workload base-opts setup-timeout-ms
+   verbose?]
+  (let [data-nodes    (:data-nodes topology)
+        control-nodes (:control-nodes topology)
+        control-only  (:control-only-nodes topology)]
+    {:cluster-id      cluster-id
+     :remote?         true
+     :db-name         (:db-name config)
+     :schema          (:schema workload)
+     :control-backend (:control-backend config)
+     :base-opts       base-opts
+     :verbose?        verbose?
+     :repo-root       (:repo-root config)
+     :remote-config-path config-path
+     :setup-timeout-ms setup-timeout-ms
+     :nodes           data-nodes
+     :control-nodes   control-nodes
+     :data-node-names (vec (map :logical-node data-nodes))
+     :control-node-names (vec (map :logical-node control-nodes))
+     :control-only-node-names
+     (vec (map :logical-node control-only))
+     :node-by-id      (into {}
+                            (map (juxt :node-id :logical-node))
+                            control-nodes)
+     :node-by-name    (into {}
+                            (map (juxt :logical-node identity))
+                            control-nodes)
+     :endpoint->node  (into {}
+                            (map (juxt :endpoint :logical-node))
+                            control-nodes)
+     :peer-id->node   (into {}
+                            (map (juxt :peer-id :logical-node))
+                            control-nodes)
+     :servers         {}
+     :control-authorities {}
+     :admin-conns     {}
+     :remote-admin-clients {}
+     :ssh             ssh
+     :live-nodes      (set (map :logical-node data-nodes))
+     :network-grudge  (sorted-map)
+     :dropped-links   #{}
+     :link-behaviors  (sorted-map)
+     :network-behavior nil
+     :paused-nodes    #{}
+     :paused-node-info {}
+     :node-ha-opt-overrides {}
+     :storage-faults  {}
+     :stopped-node-info {}
+     :teardown-nodes  #{}}))
+
 (defn- init-remote-cluster!
   [cluster-id test {:keys [config config-path ssh topology workload]}]
   (let [data-nodes       (:data-nodes topology)
         control-nodes    (:control-nodes topology)
-        control-only     (:control-only-nodes topology)
-        _                (when (seq control-only)
-                           (u/raise "Remote Jepsen cluster setup does not support control-only nodes"
-                                    {:cluster-id cluster-id
-                                     :control-only-nodes
-                                     (mapv :logical-node control-only)}))
-        db-name          (:db-name config)
-        schema           (:schema workload)
-        control-backend  (:control-backend config)
         base-opts        (remote/base-ha-opts config data-nodes control-nodes)
         setup-timeout-ms (cluster-setup-timeout-ms base-opts)
         verbose?         (boolean (:verbose test))
@@ -2464,49 +2506,15 @@
         (start-remote-node-launcher! ssh (:repo-root config) node verbose?))
       (doseq [node all-nodes]
         (wait-for-remote-node-running! ssh node setup-timeout-ms))
-      (let [cluster {:cluster-id      cluster-id
-                     :remote?         true
-                     :db-name         db-name
-                     :schema          schema
-                     :control-backend control-backend
-                     :base-opts       base-opts
-                     :verbose?        verbose?
-                     :repo-root       (:repo-root config)
-                     :remote-config-path config-path
-                     :setup-timeout-ms setup-timeout-ms
-                     :nodes           data-nodes
-                     :control-nodes   control-nodes
-                     :data-node-names (vec (map :logical-node data-nodes))
-                     :control-node-names (vec (map :logical-node control-nodes))
-                     :control-only-node-names []
-                     :node-by-id      (into {}
-                                            (map (juxt :node-id :logical-node))
-                                            control-nodes)
-                     :node-by-name    (into {}
-                                            (map (juxt :logical-node identity))
-                                            control-nodes)
-                     :endpoint->node  (into {}
-                                            (map (juxt :endpoint :logical-node))
-                                            control-nodes)
-                     :peer-id->node   (into {}
-                                            (map (juxt :peer-id :logical-node))
-                                            control-nodes)
-                     :servers         {}
-                     :control-authorities {}
-                     :admin-conns     {}
-                     :remote-admin-clients {}
-                     :ssh             ssh
-                     :live-nodes      (set (map :logical-node data-nodes))
-                     :network-grudge  (sorted-map)
-                     :dropped-links   #{}
-                     :link-behaviors  (sorted-map)
-                     :network-behavior nil
-                     :paused-nodes    #{}
-                     :paused-node-info {}
-                     :node-ha-opt-overrides {}
-                     :storage-faults  {}
-                     :stopped-node-info {}
-                     :teardown-nodes  #{}}]
+      (let [cluster (build-remote-cluster-state cluster-id
+                                                config
+                                                config-path
+                                                ssh
+                                                topology
+                                                workload
+                                                base-opts
+                                                setup-timeout-ms
+                                                verbose?)]
         (swap! clusters assoc cluster-id cluster)
         (wait-for-single-leader! cluster-id setup-timeout-ms)
         cluster)

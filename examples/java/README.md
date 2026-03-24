@@ -157,8 +157,8 @@ DATALEVIN_URI=dtlv://datalevin:datalevin@localhost \
 - `DatalevinInterop` is the smaller raw-handle surface intended for bridge
   consumers such as JPype or node-java-bridge.
 
-For the Maven Central release procedure for this artifact, see
-[`doc/java-release.md`](../../doc/java-release.md).
+For the Maven Central release procedure for this artifact, including the
+`script/deploy-java` helper, see [`script/deploy-java.md`](../../script/deploy-java.md).
 
 ## API docs
 

@@ -1,0 +1,149 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./script/deploy-python [--pypi|--testpypi] [--dry-run] [--skip-smoke] [--python <bin>]
+
+Build and publish the current-host Datalevin Python wheel.
+
+Options:
+  --pypi         Upload to PyPI. This is the default.
+  --testpypi     Upload to TestPyPI.
+  --dry-run      Build the wheel and stop before upload.
+  --skip-smoke   Skip the smoke-test venv install and pytest run.
+  --python <bin> Python interpreter to use. Defaults to PYTHON_BIN or python.
+  --help         Show this message.
+
+Environment:
+  PYTHON_BIN                 Default Python interpreter.
+  DATALEVIN_NATIVE_PLATFORM  Override the inferred wheel target platform.
+  TWINE_USERNAME             PyPI username, commonly __token__.
+  TWINE_PASSWORD             PyPI or TestPyPI token.
+EOF
+}
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+python_bin=${PYTHON_BIN:-}
+if [[ -z "$python_bin" ]]; then
+  if command -v python >/dev/null 2>&1; then
+    python_bin=python
+  else
+    python_bin=python3
+  fi
+fi
+repository_url="https://upload.pypi.org/legacy/"
+repository_name="PyPI"
+dry_run=false
+skip_smoke=false
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --pypi)
+      repository_url="https://upload.pypi.org/legacy/"
+      repository_name="PyPI"
+      ;;
+    --testpypi)
+      repository_url="https://test.pypi.org/legacy/"
+      repository_name="TestPyPI"
+      ;;
+    --dry-run)
+      dry_run=true
+      ;;
+    --skip-smoke)
+      skip_smoke=true
+      ;;
+    --python)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "--python requires a value." >&2
+        exit 1
+      fi
+      python_bin=$1
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+command -v "$python_bin" >/dev/null 2>&1 || {
+  echo "Python interpreter not found: $python_bin" >&2
+  exit 1
+}
+command -v clojure >/dev/null 2>&1 || {
+  echo "Clojure CLI is required to build the Datalevin runtime jar." >&2
+  exit 1
+}
+
+version=$(sed -n 's/^version = "\(.*\)"/\1/p' bindings/python/pyproject.toml | head -n1)
+dist_dir="bindings/python/dist"
+build_root=$(mktemp -d "${TMPDIR:-/tmp}/datalevin-python-build.XXXXXX")
+smoke_root=""
+trap 'rm -rf "$build_root" "$smoke_root"' EXIT
+
+rm -rf "$dist_dir"
+mkdir -p "$dist_dir"
+
+echo "Building datalevin ${version} wheel..."
+echo "Ensuring Python wheel build tooling is available..."
+"$python_bin" -m venv "$build_root/venv"
+build_python="$build_root/venv/bin/python"
+if [[ ! -x "$build_python" ]]; then
+  build_python="$build_root/venv/Scripts/python.exe"
+fi
+"$build_python" -m pip install --upgrade pip "setuptools>=69" wheel
+(
+  cd bindings/python
+  "$build_python" setup.py bdist_wheel -d dist
+)
+
+shopt -s nullglob
+wheels=("$dist_dir"/datalevin-"$version"-*.whl)
+if [[ ${#wheels[@]} -eq 0 ]]; then
+  wheels=("$dist_dir"/*.whl)
+fi
+shopt -u nullglob
+
+if [[ ${#wheels[@]} -eq 0 ]]; then
+  echo "No Datalevin wheel was produced in ${dist_dir}." >&2
+  exit 1
+fi
+
+printf 'Built wheel(s):\n'
+printf '  %s\n' "${wheels[@]}"
+
+if [[ "$skip_smoke" != true ]]; then
+  smoke_root=$(mktemp -d "${TMPDIR:-/tmp}/datalevin-python-release.XXXXXX")
+  "$python_bin" -m venv "$smoke_root/venv"
+  smoke_python="$smoke_root/venv/bin/python"
+  if [[ ! -x "$smoke_python" ]]; then
+    smoke_python="$smoke_root/venv/Scripts/python.exe"
+  fi
+
+  echo "Smoke testing wheel(s) in an isolated virtualenv..."
+  "$smoke_python" -m pip install --upgrade pip pytest "${wheels[@]}"
+  "$smoke_python" -m pytest bindings/python/tests/test_smoke.py -q
+fi
+
+if [[ "$dry_run" == true ]]; then
+  echo "Dry run only; skipping ${repository_name} upload."
+  exit 0
+fi
+
+echo "Checking wheel metadata with twine..."
+"$build_python" -m pip install --upgrade twine
+"$build_python" -m twine check "${wheels[@]}"
+
+echo "Uploading wheel(s) to ${repository_name}..."
+"$build_python" -m twine upload --repository-url "$repository_url" "${wheels[@]}"

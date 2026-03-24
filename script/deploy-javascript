@@ -1,0 +1,170 @@
+#!/bin/bash
+
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+Usage: ./script/deploy-javascript [--dry-run] [--skip-install] [--skip-tests] [--tag <tag>] [--otp <code>] [--provenance]
+
+Build and publish the Datalevin Node.js package.
+
+Options:
+  --dry-run       Build the package tarball and stop before npm publish.
+  --skip-install  Skip npm dependency installation.
+  --skip-tests    Skip node --test.
+  --tag <tag>     Publish under a non-default npm dist-tag.
+  --otp <code>    Pass a one-time password to npm publish.
+  --provenance    Publish with npm provenance. This only works from supported CI.
+  --help          Show this message.
+
+Environment:
+  MAX_PACKAGE_BYTES  Dry-run package size budget. Defaults to 45000000.
+  NODE_AUTH_TOKEN    npm auth token if not already logged in locally.
+EOF
+}
+
+repo_root=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+cd "$repo_root"
+
+dry_run=false
+skip_install=false
+skip_tests=false
+publish_tag=""
+otp=""
+with_provenance=false
+max_package_bytes=${MAX_PACKAGE_BYTES:-45000000}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --dry-run)
+      dry_run=true
+      ;;
+    --skip-install)
+      skip_install=true
+      ;;
+    --skip-tests)
+      skip_tests=true
+      ;;
+    --tag)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "--tag requires a value." >&2
+        exit 1
+      fi
+      publish_tag=$1
+      ;;
+    --otp)
+      shift
+      if [[ $# -eq 0 ]]; then
+        echo "--otp requires a value." >&2
+        exit 1
+      fi
+      otp=$1
+      ;;
+    --provenance)
+      with_provenance=true
+      ;;
+    --help|-h)
+      usage
+      exit 0
+      ;;
+    *)
+      echo "Unknown option: $1" >&2
+      usage >&2
+      exit 1
+      ;;
+  esac
+  shift
+done
+
+command -v clojure >/dev/null 2>&1 || {
+  echo "Clojure CLI is required to build the vendored runtime jar." >&2
+  exit 1
+}
+command -v node >/dev/null 2>&1 || {
+  echo "Node.js is required." >&2
+  exit 1
+}
+command -v npm >/dev/null 2>&1 || {
+  echo "npm is required." >&2
+  exit 1
+}
+
+package_dir="bindings/javascript"
+version=$(sed -n 's/^  "version": "\(.*\)",/\1/p' "$package_dir/package.json" | head -n1)
+
+echo "Building shared Datalevin runtime jar..."
+clojure -T:build vendor-jar :native-platform all
+
+pushd "$package_dir" >/dev/null
+
+if [[ "$skip_install" != true ]]; then
+  if [[ -f package-lock.json ]]; then
+    echo "Installing JavaScript dependencies with npm ci..."
+    npm ci
+  else
+    echo "Installing JavaScript dependencies with npm install..."
+    npm install
+  fi
+fi
+
+if [[ "$skip_tests" != true ]]; then
+  echo "Running JavaScript tests..."
+  node --test
+fi
+
+echo "Dry-running npm pack..."
+pack_output="$(npm pack --dry-run --json)"
+printf '%s\n' "$pack_output"
+pack_json="$(printf '%s\n' "$pack_output" | sed -n '/^\[$/,$p')"
+if [[ -z "$pack_json" ]]; then
+  echo "Unable to extract npm pack JSON output." >&2
+  exit 1
+fi
+package_size="$(
+  printf '%s\n' "$pack_json" \
+    | node -e 'const fs = require("node:fs"); const data = JSON.parse(fs.readFileSync(0, "utf8")); console.log(data[0].size);'
+)"
+
+if [[ "$package_size" -gt "$max_package_bytes" ]]; then
+  echo "npm package size ${package_size} exceeds limit ${max_package_bytes}" >&2
+  exit 1
+fi
+
+rm -f datalevin-node-*.tgz
+echo "Creating npm package tarball..."
+npm pack
+
+shopt -s nullglob
+tarballs=(datalevin-node-*.tgz)
+shopt -u nullglob
+
+if [[ ${#tarballs[@]} -eq 0 ]]; then
+  echo "No npm package tarball was produced." >&2
+  exit 1
+fi
+
+printf 'Built tarball(s):\n'
+printf '  %s\n' "${tarballs[@]}"
+
+if [[ "$dry_run" == true ]]; then
+  echo "Dry run only; skipping npm publish."
+  popd >/dev/null
+  exit 0
+fi
+
+publish_cmd=(npm publish --access public)
+if [[ "$with_provenance" == true ]]; then
+  publish_cmd+=(--provenance)
+fi
+if [[ -n "$publish_tag" ]]; then
+  publish_cmd+=(--tag "$publish_tag")
+fi
+if [[ -n "$otp" ]]; then
+  publish_cmd+=(--otp "$otp")
+fi
+
+echo "Publishing datalevin-node ${version}..."
+"${publish_cmd[@]}"
+
+popd >/dev/null
