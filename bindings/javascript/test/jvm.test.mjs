@@ -10,9 +10,9 @@ test("findRuntimeJars prefers shared runtime naming and ignores unrelated jars",
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-jars-"));
 
   try {
-    const sharedJar = path.join(dir, "datalevin-runtime-0.10.12.jar");
-    const legacyJar = path.join(dir, "datalevin-python-runtime-0.10.12.jar");
-    const javaJar = path.join(dir, "datalevin-java-0.10.12.jar");
+    const sharedJar = path.join(dir, "datalevin-runtime-0.10.13.jar");
+    const legacyJar = path.join(dir, "datalevin-python-runtime-0.10.13.jar");
+    const javaJar = path.join(dir, "datalevin-java-0.10.13.jar");
     fs.writeFileSync(sharedJar, "");
     fs.writeFileSync(legacyJar, "");
     fs.writeFileSync(javaJar, "");

@@ -10,7 +10,7 @@ Maven:
 <dependency>
   <groupId>org.datalevin</groupId>
   <artifactId>datalevin-java</artifactId>
-  <version>0.10.12</version>
+  <version>0.10.13</version>
 </dependency>
 ```
 
@@ -22,7 +22,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.datalevin:datalevin-java:0.10.12")
+    implementation("org.datalevin:datalevin-java:0.10.13")
 }
 ```
 
