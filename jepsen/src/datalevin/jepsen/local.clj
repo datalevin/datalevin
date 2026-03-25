@@ -90,7 +90,25 @@
 
 (def ^:private remote-launch-log-file "jepsen-remote-launch.log")
 (def ^:private remote-config-file "jepsen-remote-cluster.edn")
+(def ^:dynamic *remote-launcher-ops* nil)
+(defn- control-remote-backend
+  []
+  (case (some-> (System/getenv "DTLV_JEPSEN_CONTROL_REMOTE")
+                str/trim
+                not-empty
+                str/lower-case)
+    "clj-ssh" control/clj-ssh
+    control/ssh))
+
+(defmacro with-control-ssh
+  [ssh & body]
+  `(control/with-remote (control-remote-backend)
+     (control/with-ssh ~ssh
+       ~@body)))
+
 (def ^:private remote-state-poll-ms 500)
+(def ^:private local-launcher-command-timeout-ms 45000)
+(def ^:private remote-daemon-spawn-script "remote-daemon-spawn.py")
 (def ^:private snapshot-unavailable-error-code
   :ha/follower-snapshot-unavailable)
 (def ^:private snapshot-checksum-mismatch-message
@@ -167,6 +185,140 @@
       (some-> path slurp str/trim parse-long)
       (catch Throwable _
         nil))))
+
+(declare remote-config-path-for-node
+         remote-launch-log-path
+         remote-pid-file
+         remote-state-file)
+
+(defn- controller-local-node?
+  [node]
+  (true? (:controller-local? node)))
+
+(defn- remote-node-repo-root
+  [cluster-or-config node]
+  (or (:repo-root node)
+      (:repo-root cluster-or-config)))
+
+(defn- remote-script-path
+  [repo-root script-name]
+  (.getPath (io/file repo-root "script" "jepsen" script-name)))
+
+(defn- copy-local-file!
+  [from to]
+  (u/create-dirs (.getParent (io/file to)))
+  (io/copy (io/file from) (io/file to))
+  to)
+
+(defn- delete-local-path!
+  [path]
+  (let [file (io/file path)]
+    (when (.exists file)
+      (io/delete-file file true)))
+  true)
+
+(defn- run-local-command
+  [repo-root cmd timeout-ms]
+  (try
+    (let [process-builder (ProcessBuilder. ^java.util.List (mapv str cmd))
+          _               (when repo-root
+                            (.directory process-builder (io/file repo-root)))
+          _               (.redirectErrorStream process-builder true)
+          process         (.start process-builder)
+          finished?       (.waitFor process
+                                    (long timeout-ms)
+                                    java.util.concurrent.TimeUnit/MILLISECONDS)]
+      (if finished?
+        (let [exit   (.exitValue process)
+              output (try
+                       (slurp (.getInputStream process) :encoding "UTF-8")
+                       (catch Exception _
+                         ""))]
+          {:ok? true
+           :exit exit
+           :output output})
+        (do
+          (.destroy process)
+          (when-not (.waitFor process
+                              200
+                              java.util.concurrent.TimeUnit/MILLISECONDS)
+            (.destroyForcibly process))
+          {:ok? false
+           :reason :timeout
+           :timeout-ms timeout-ms})))
+    (catch Exception e
+      {:ok? false
+       :reason :exception
+       :message (ex-message e)})))
+
+(defn- ensure-local-command-ok!
+  [result message data]
+  (when-not (and (:ok? result)
+                 (zero? (:exit result)))
+    (u/raise message
+             (merge data
+                    (select-keys result
+                                 [:exit
+                                  :output
+                                  :reason
+                                  :timeout-ms
+                                  :message]))))
+  true)
+
+(defn- controller-local-script
+  [repo-root script-name]
+  (.getPath (io/file repo-root "script" "jepsen" script-name)))
+
+(defn- start-controller-local-launcher!
+  [repo-root node verbose?]
+  (let [command         (cond-> [(controller-local-script repo-root
+                                                          "start-remote-node")
+                                 "--config"
+                                 (remote-config-path-for-node node)
+                                 "--node"
+                                 (:logical-node node)]
+                          verbose?
+                          (conj "--verbose"))
+        launch-log-path (remote-launch-log-path node)
+        process-builder (ProcessBuilder. ^java.util.List (mapv str command))]
+    (u/create-dirs (:root node))
+    (.directory process-builder (io/file repo-root))
+    (.redirectErrorStream process-builder true)
+    (.redirectOutput process-builder (io/file launch-log-path))
+    (.start process-builder)
+    true))
+
+(defn- stop-controller-local-launcher!
+  [repo-root node]
+  (ensure-local-command-ok!
+   (run-local-command repo-root
+                      [(controller-local-script repo-root
+                                                "stop-remote-node")
+                       "--config"
+                       (remote-config-path-for-node node)
+                       "--node"
+                       (:logical-node node)]
+                      local-launcher-command-timeout-ms)
+   "Controller-local remote Jepsen node failed to stop"
+   {:node (:logical-node node)
+    :repo-root repo-root}))
+
+(defn- signal-controller-local-node!
+  [node signal]
+  (let [pid (safe-read-long-file (remote-pid-file node))]
+    (when-not pid
+      (u/raise "Controller-local remote Jepsen node is missing a pid file"
+               {:node (:logical-node node)
+                :pid-file (remote-pid-file node)
+                :signal signal}))
+    (ensure-local-command-ok!
+     (run-local-command nil
+                        ["kill" (str "-" signal) (str pid)]
+                        5000)
+     "Controller-local remote Jepsen node failed to receive a signal"
+     {:node (:logical-node node)
+      :pid pid
+      :signal signal})))
 
 (declare normalize-storage-fault)
 
@@ -837,44 +989,85 @@
 
 (defn- write-remote-content!
   [ssh node remote-path content]
-  (let [tmp-dir  (u/tmp-dir (str "jepsen-remote-upload-" (UUID/randomUUID)))
-        tmp-file (str tmp-dir u/+separator+ "payload")]
-    (u/create-dirs tmp-dir)
-    (spit tmp-file content)
-    (try
-      (control/with-ssh ssh
-        (control/on (:logical-node node)
-          (control/exec :mkdir :-p (.getParent (io/file remote-path)))
-          (control/upload tmp-file remote-path)))
-      (finally
-        (u/delete-files tmp-dir)))))
+  (cond
+    (controller-local-node? node)
+    (do
+      (u/create-dirs (.getParent (io/file remote-path)))
+      (spit remote-path content)
+      remote-path)
+
+    :else
+    (if-let [f (:write-content *remote-launcher-ops*)]
+      (f ssh node remote-path content)
+      (let [tmp-dir  (u/tmp-dir (str "jepsen-remote-upload-" (UUID/randomUUID)))
+            tmp-file (str tmp-dir u/+separator+ "payload")]
+        (u/create-dirs tmp-dir)
+        (spit tmp-file content)
+        (try
+          (with-control-ssh ssh
+            (control/on (:logical-node node)
+              (control/exec :mkdir :-p (.getParent (io/file remote-path)))
+              (control/upload tmp-file remote-path)))
+          (finally
+            (u/delete-files tmp-dir)))))))
 
 (defn- delete-remote-path!
   [ssh node remote-path]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (control/exec :rm :-f remote-path))))
+  (cond
+    (controller-local-node? node)
+    (delete-local-path! remote-path)
+
+    :else
+    (if-let [f (:delete-path *remote-launcher-ops*)]
+      (f ssh node remote-path)
+      (with-control-ssh ssh
+        (control/on (:logical-node node)
+          (control/exec :rm :-f remote-path))))))
 
 (defn- sync-remote-node-control-defaults!
   [ssh node]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (control/exec :mkdir :-p (remote/control-state-dir node))))
-  (write-remote-content! ssh
-                         node
-                         (remote/network-state-file node)
-                         (pr-str {:blocked-endpoints #{}
-                                  :endpoint-profiles {}}))
-  (write-remote-content! ssh
-                         node
-                         (remote/clock-skew-state-file node)
-                         "0\n")
-  (write-remote-content! ssh
-                         node
-                         (remote/fencing-mode-file node)
-                         "success\n")
-  (delete-remote-path! ssh node (remote/storage-fault-state-file node))
-  (delete-remote-path! ssh node (remote/snapshot-failpoint-file node)))
+  (cond
+    (controller-local-node? node)
+    (do
+      (u/create-dirs (remote/control-state-dir node))
+      (write-remote-content! ssh
+                             node
+                             (remote/network-state-file node)
+                             (pr-str {:blocked-endpoints #{}
+                                      :endpoint-profiles {}}))
+      (write-remote-content! ssh
+                             node
+                             (remote/clock-skew-state-file node)
+                             "0\n")
+      (write-remote-content! ssh
+                             node
+                             (remote/fencing-mode-file node)
+                             "success\n")
+      (delete-remote-path! ssh node (remote/storage-fault-state-file node))
+      (delete-remote-path! ssh node (remote/snapshot-failpoint-file node)))
+
+    :else
+    (if-let [f (:sync-control-defaults *remote-launcher-ops*)]
+      (f ssh node)
+      (do
+        (with-control-ssh ssh
+          (control/on (:logical-node node)
+            (control/exec :mkdir :-p (remote/control-state-dir node))))
+        (write-remote-content! ssh
+                               node
+                               (remote/network-state-file node)
+                               (pr-str {:blocked-endpoints #{}
+                                        :endpoint-profiles {}}))
+        (write-remote-content! ssh
+                               node
+                               (remote/clock-skew-state-file node)
+                               "0\n")
+        (write-remote-content! ssh
+                               node
+                               (remote/fencing-mode-file node)
+                               "success\n")
+        (delete-remote-path! ssh node (remote/storage-fault-state-file node))
+        (delete-remote-path! ssh node (remote/snapshot-failpoint-file node))))))
 
 (declare endpoint-for-node)
 
@@ -915,13 +1108,20 @@
 
 (defn- remote-node-state*
   [ssh logical-node node]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (try
-        (some-> (control/exec :cat (remote-state-file node))
-                edn/read-string)
-        (catch Throwable _
-          nil)))))
+  (cond
+    (controller-local-node? node)
+    (safe-read-edn-file (remote-state-file node))
+
+    :else
+    (if-let [f (:node-state *remote-launcher-ops*)]
+      (f ssh logical-node node)
+      (with-control-ssh ssh
+        (control/on (:logical-node node)
+          (try
+            (some-> (control/exec :cat (remote-state-file node))
+                    edn/read-string)
+            (catch Throwable _
+              nil)))))))
 
 (defn- wait-for-remote-node-running!
   [ssh node timeout-ms]
@@ -951,10 +1151,17 @@
 
 (defn- upload-remote-config!
   [ssh node local-config-path]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (control/exec :mkdir :-p (:root node))
-      (control/upload local-config-path (remote-config-path-for-node node)))))
+  (cond
+    (controller-local-node? node)
+    (copy-local-file! local-config-path (remote-config-path-for-node node))
+
+    :else
+    (if-let [f (:upload-config *remote-launcher-ops*)]
+      (f ssh node local-config-path)
+      (with-control-ssh ssh
+        (control/on (:logical-node node)
+          (control/exec :mkdir :-p (:root node))
+          (control/upload local-config-path (remote-config-path-for-node node)))))))
 
 (defn- persist-remote-config!
   [cluster-id]
@@ -965,38 +1172,70 @@
 
 (defn- start-remote-node-launcher!
   [ssh repo-root node verbose?]
-  (let [command (str "mkdir -p " (control/escape (:root node))
-                     " && nohup script/jepsen/start-remote-node"
-                     " --config " (control/escape (remote-config-path-for-node node))
-                     " --node " (control/escape (:logical-node node))
-                     (when verbose? " --verbose")
-                     " > " (control/escape (remote-launch-log-path node))
-                     " 2>&1 < /dev/null &")]
-    (control/with-ssh ssh
-      (control/on (:logical-node node)
-        (control/cd repo-root
-          (control/exec :bash :-lc command))))))
+  (cond
+    (controller-local-node? node)
+    (start-controller-local-launcher! repo-root node verbose?)
+
+    :else
+    (if-let [f (:start-launcher *remote-launcher-ops*)]
+      (f ssh repo-root node verbose?)
+      ;; Some hosts keep SSH exec channels open when a shell backgrounds the
+      ;; launcher. Run the node through a real double-fork daemon wrapper
+      ;; instead so the remote exec returns promptly after launch.
+      (let [launcher-args (cond-> [(remote-script-path repo-root
+                                                       "start-remote-node")
+                                   "--config"
+                                   (remote-config-path-for-node node)
+                                   "--node"
+                                   (:logical-node node)]
+                            verbose? (conj "--verbose"))
+            command (str "mkdir -p " (control/escape (:root node))
+                         " && python3 "
+                         (control/escape
+                          (remote-script-path repo-root
+                                              remote-daemon-spawn-script))
+                         " "
+                         (control/escape (remote-launch-log-path node))
+                         " "
+                         (str/join " " (map control/escape launcher-args)))]
+        (with-control-ssh ssh
+          (control/on (:logical-node node)
+            (control/exec :bash :-lc command)))))))
 
 (defn- stop-remote-node-launcher!
   [ssh repo-root node]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (control/cd repo-root
-        (control/exec :bash :-lc
-                      (str "script/jepsen/stop-remote-node"
-                           " --config "
-                           (control/escape (remote-config-path-for-node node))
-                           " --node "
-                           (control/escape (:logical-node node))))))))
+  (cond
+    (controller-local-node? node)
+    (stop-controller-local-launcher! repo-root node)
+
+    :else
+    (if-let [f (:stop-launcher *remote-launcher-ops*)]
+      (f ssh repo-root node)
+      (with-control-ssh ssh
+        (control/on (:logical-node node)
+          (control/cd repo-root
+            (control/exec :bash :-lc
+                          (str "script/jepsen/stop-remote-node"
+                               " --config "
+                               (control/escape (remote-config-path-for-node node))
+                               " --node "
+                               (control/escape (:logical-node node))))))))))
 
 (defn- signal-remote-node!
   [ssh node signal]
-  (control/with-ssh ssh
-    (control/on (:logical-node node)
-      (control/exec :bash :-lc
-                    (str "kill -" signal " $(cat "
-                         (control/escape (remote-pid-file node))
-                         ")")))))
+  (cond
+    (controller-local-node? node)
+    (signal-controller-local-node! node signal)
+
+    :else
+    (if-let [f (:signal-node *remote-launcher-ops*)]
+      (f ssh node signal)
+      (with-control-ssh ssh
+        (control/on (:logical-node node)
+          (control/exec :bash :-lc
+                        (str "kill -" signal " $(cat "
+                             (control/escape (remote-pid-file node))
+                             ")")))))))
 
 (defn- remote-admin-client!
   [cluster-id logical-node]
@@ -1147,12 +1386,19 @@
                                            control-backend)
                         local-peer-id (get-in ha-opts'
                                               [:ha-control-plane
-                                               :local-peer-id])]
-                    (PartitionFaults/setCurrentLocalPeerId local-peer-id)
-                    (try
-                      (dha/start-ha-authority db-name' ha-opts')
-                      (finally
-                        (PartitionFaults/clearCurrentLocalPeerId)))))
+                                               :local-peer-id])
+                        start-authority! ctrl/start-authority!]
+                    ;; Limit the Jepsen partition identity to authority
+                    ;; startup itself so forward commands don't inherit it.
+                    (with-redefs [ctrl/start-authority!
+                                  (fn [authority]
+                                    (PartitionFaults/setCurrentLocalPeerId
+                                      local-peer-id)
+                                    (try
+                                      (start-authority! authority)
+                                      (finally
+                                        (PartitionFaults/clearCurrentLocalPeerId))))]
+                      (dha/start-ha-authority db-name' ha-opts'))))
                 srv/*stop-ha-authority-fn*
                 dha/stop-ha-authority]
     (f)))
@@ -2530,8 +2776,9 @@
   (locking clusters
     (when-let [cluster (get @clusters cluster-id)]
       (if (:remote? cluster)
-        (let [{:keys [node-by-name ssh repo-root]} cluster
+        (let [{:keys [node-by-name ssh]} cluster
               node         (get node-by-name logical-node)
+              repo-root    (remote-node-repo-root cluster node)
               stopped-info {:stopped-at-ms (now-ms)
                             :ha-role (:ha-role (node-diagnostics
                                                 cluster-id
@@ -2588,7 +2835,8 @@
   (locking clusters
     (let [{:keys [db-name base-opts node-by-name verbose?
                   control-backend node-ha-opt-overrides remote?
-                  ssh repo-root remote-config-path setup-timeout-ms]}
+                  ssh remote-config-path setup-timeout-ms]
+           :as cluster}
           (get @clusters cluster-id)]
       (cond
         (and (not remote?)
@@ -2596,7 +2844,8 @@
         true
 
         remote?
-        (let [node (get node-by-name logical-node)]
+        (let [node      (get node-by-name logical-node)
+              repo-root (remote-node-repo-root cluster node)]
           (upload-remote-config! ssh node remote-config-path)
           (start-remote-node-launcher! ssh repo-root node verbose?)
           (wait-for-remote-node-running! ssh
@@ -2959,11 +3208,14 @@
       (doseq [node all-nodes]
         (upload-remote-config! ssh node config-path))
       (doseq [node all-nodes]
-        (safe-stop-remote-launcher! ssh (:repo-root config) node))
+        (safe-stop-remote-launcher! ssh (remote-node-repo-root config node) node))
       (doseq [node all-nodes]
         (sync-remote-node-control-defaults! ssh node))
       (doseq [node all-nodes]
-        (start-remote-node-launcher! ssh (:repo-root config) node verbose?))
+        (start-remote-node-launcher! ssh
+                                     (remote-node-repo-root config node)
+                                     node
+                                     verbose?))
       (doseq [node all-nodes]
         (wait-for-remote-node-running! ssh node setup-timeout-ms))
       (let [cluster (build-remote-cluster-state cluster-id
@@ -2980,17 +3232,21 @@
         cluster)
       (catch Throwable e
         (doseq [node (reverse all-nodes)]
-          (safe-stop-remote-launcher! ssh (:repo-root config) node))
+          (safe-stop-remote-launcher! ssh
+                                      (remote-node-repo-root config node)
+                                      node))
         (swap! clusters dissoc cluster-id)
         (throw e)))))
 
 (defn- teardown-remote-cluster!
   [cluster-id]
-  (when-let [{:keys [node-by-name ssh repo-root]} (get @clusters cluster-id)]
+  (when-let [{:keys [node-by-name ssh] :as cluster} (get @clusters cluster-id)]
     (doseq [logical-node (keys (:remote-admin-clients (get @clusters cluster-id)))]
       (close-remote-admin-client! cluster-id logical-node))
     (doseq [node (reverse (vals node-by-name))]
-      (safe-stop-remote-launcher! ssh repo-root node))
+      (safe-stop-remote-launcher! ssh
+                                  (remote-node-repo-root cluster node)
+                                  node))
     (swap! clusters dissoc cluster-id)))
 
 (defn- init-cluster!

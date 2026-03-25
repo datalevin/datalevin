@@ -21,6 +21,11 @@
  :group-id "jepsen-remote-group"
  :db-identity "jepsen-remote-db"
  :control-backend :sofa-jraft
+ ;; Optional controller SSH settings. These are used only by the
+ ;; controller-managed remote runner, not by the manual per-host launcher.
+ ;; Leave :password nil for key-based auth.
+ :ssh {:username "ubuntu"
+       :password nil}
  ;; Required by the controller-managed remote runner. This should point to the
  ;; Datalevin checkout on every remote host. The manual per-host launcher
  ;; ignores this key.

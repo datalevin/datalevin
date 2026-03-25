@@ -22,13 +22,15 @@
    [com.alipay.sofa.jraft.core StateMachineAdapter]
    [com.alipay.sofa.jraft.entity PeerId Task]
    [com.alipay.sofa.jraft.error RaftError]
-   [com.alipay.sofa.jraft.option NodeOptions]
+   [com.alipay.sofa.jraft.option NodeOptions RpcOptions]
    [com.alipay.sofa.jraft.rpc RpcContext RpcProcessor RpcClient
     RpcRequests$ErrorResponse ProtobufMsgFactory]
    [com.alipay.sofa.jraft.storage.snapshot SnapshotReader SnapshotWriter]
    [com.alipay.sofa.jraft.util RpcFactoryHelper]
    [datalevin.ha LMDBJRaftServiceFactory]
    [java.io File]
+   [java.net ConnectException InetSocketAddress NoRouteToHostException
+    Socket]
    [java.nio ByteBuffer]
    [java.nio.file AtomicMoveNotSupportedException Files Paths
     StandardCopyOption]
@@ -1190,6 +1192,112 @@
     {:node node
      :rpc-client rpc-client}))
 
+(defn- root-cause
+  [^Throwable e]
+  (loop [t e]
+    (if-let [cause (some-> t .getCause)]
+      (recur cause)
+      t)))
+
+(defn- forward-connect-failure?
+  [^Throwable e]
+  (let [cause (root-cause e)]
+    (or (instance? ConnectException cause)
+        (instance? NoRouteToHostException cause))))
+
+(defn- plain-socket-connect-diagnostics
+  [^PeerId leader timeout-ms]
+  (let [endpoint (.getEndpoint leader)
+        host     (.getIp endpoint)
+        port     (.getPort endpoint)
+        timeout  (int (max 1 (long timeout-ms)))]
+    (try
+      (with-open [socket (Socket.)]
+        (.connect socket (InetSocketAddress. host port) timeout)
+        {:ok? true
+         :host host
+         :port port
+         :local-socket (some-> socket .getLocalSocketAddress str)
+         :remote-socket (some-> socket .getRemoteSocketAddress str)})
+      (catch Throwable t
+        {:ok? false
+         :host host
+         :port port
+         :error-class (.getName (class t))
+         :message (.getMessage t)}))))
+
+(defn- fresh-rpc-client
+  [rpc-timeout-ms]
+  (let [timeout-ms (long (or rpc-timeout-ms
+                             max-command-attempt-timeout-ms))
+        ^RpcClient client (.createRpcClient (RpcFactoryHelper/rpcFactory))
+        ^RpcOptions opts (doto (RpcOptions.)
+                           (.setRpcConnectTimeoutMs (int timeout-ms))
+                           (.setRpcDefaultTimeout (int timeout-ms)))]
+    (when-not (.init client opts)
+      (u/raise "Failed to initialize HA control rpc client"
+               {:error :ha/control-rpc-init-failed}))
+    client))
+
+(defn- invoke-forward-with-fresh-rpc-client
+  [rpc-timeout-ms ^PeerId leader request invoke-timeout]
+  (let [^RpcClient fresh-client (fresh-rpc-client rpc-timeout-ms)]
+    (try
+      (.invokeSync fresh-client
+                   (.getEndpoint leader)
+                   request
+                   invoke-timeout)
+      (finally
+        (try
+          (.shutdown fresh-client)
+          (catch Exception shutdown-e
+            (log/warn shutdown-e "Failed to stop temporary HA control rpc client"
+                      {:leader (peer-id-string leader)})))))))
+
+(defn- invoke-forward-request
+  [^RpcClient rpc-client rpc-timeout-ms ^PeerId leader request
+   invoke-timeout attempt]
+  (let [leader-str (peer-id-string leader)]
+    (try
+      (.invokeSync rpc-client
+                   (.getEndpoint leader)
+                   request
+                   invoke-timeout)
+      (catch InterruptedException e
+        (.interrupt (Thread/currentThread))
+        (u/raise "HA control forward interrupted"
+                 {:error :ha/control-interrupted
+                  :attempt attempt}))
+      (catch Exception e
+        (if (forward-connect-failure? e)
+          (let [plain-socket (plain-socket-connect-diagnostics
+                              leader invoke-timeout)]
+            (log/warn e "HA control forward failed with cached rpc client; retrying with fresh client"
+                      {:attempt attempt
+                       :leader leader-str
+                       :plain-socket plain-socket})
+            (try
+              (invoke-forward-with-fresh-rpc-client
+               rpc-timeout-ms leader request invoke-timeout)
+              (catch InterruptedException fresh-e
+                (.interrupt (Thread/currentThread))
+                (u/raise "HA control forward interrupted"
+                         {:error :ha/control-interrupted
+                          :attempt attempt}))
+              (catch Exception fresh-e
+                (let [plain-socket (plain-socket-connect-diagnostics
+                                    leader invoke-timeout)]
+                  (log/warn fresh-e "HA control forward with fresh rpc client failed"
+                            {:attempt attempt
+                             :leader leader-str
+                             :plain-socket plain-socket})
+                  ::invoke-failed))))
+          (do
+            (log/warn e "HA control forward failed"
+                      {:attempt attempt
+                       :leader leader-str})
+            ::invoke-failed))))))
+
 (defn- authority-fsm-snapshot
   [{:keys [fsm-state]}]
   (some-> fsm-state deref))
@@ -1433,21 +1541,13 @@
                                         remaining
                                         rpc-timeout)]
                       (if (> cap 1) cap 1))
-                    response (try
-                               (.invokeSync rpc-client
-                                            (.getEndpoint leader)
-                                            request
-                                            invoke-timeout)
-                               (catch InterruptedException e
-                                 (.interrupt (Thread/currentThread))
-                                 (u/raise "HA control forward interrupted"
-                                          {:error :ha/control-interrupted
-                                           :attempt attempt}))
-                               (catch Exception e
-                                 (log/warn e "HA control forward failed"
-                                           {:attempt attempt
-                                            :leader (peer-id-string leader)})
-                                 ::invoke-failed))]
+                    response (invoke-forward-request
+                              rpc-client
+                              rpc-timeout-ms
+                              leader
+                              request
+                              invoke-timeout
+                              attempt)]
                 (cond
                   (= ::invoke-failed response)
                   (do (sleep-command-retry! attempt remaining rpc-timeout-ms)
@@ -1722,8 +1822,7 @@
 
   (read-voters [this]
     (ensure-running! running-v)
-    (await-linearizable-read! this)
-    (node-peer-ids (running-node! this)))
+    (:voters (linearizable-read-snapshot! this)))
 
   (replace-voters! [this voters]
     (ensure-running! running-v)
@@ -1769,21 +1868,13 @@
                                 :voters voters})
                       invoke-timeout (long (max 1 (min remaining
                                                        (long rpc-timeout-ms))))
-                      response (try
-                                 (.invokeSync rpc-client
-                                              (.getEndpoint leader)
-                                              request
-                                              invoke-timeout)
-                                 (catch InterruptedException e
-                                   (.interrupt (Thread/currentThread))
-                                   (u/raise "HA control forward interrupted"
-                                            {:error :ha/control-interrupted
-                                             :attempt attempt}))
-                                 (catch Exception e
-                                   (log/warn e "HA control forward failed"
-                                             {:attempt attempt
-                                              :leader (peer-id-string leader)})
-                                   ::invoke-failed))]
+                      response (invoke-forward-request
+                                rpc-client
+                                rpc-timeout-ms
+                                leader
+                                request
+                                invoke-timeout
+                                attempt)]
                   (cond
                     (= ::invoke-failed response)
                     (do (Thread/sleep 20)

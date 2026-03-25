@@ -76,8 +76,8 @@
               {:field label
                :values values})))
 
- (defn- validate-node-entry!
-   [node]
+(defn- validate-node-entry!
+  [node]
    (doseq [k [:logical-node :node-id :endpoint :peer-id :root]]
      (when (nil? (get node k))
        (u/raise "Remote Jepsen node config is missing a required key"
@@ -95,6 +95,10 @@
    (when-let [repo-root (:repo-root node)]
      (when-not (string? repo-root)
        (u/raise "Remote Jepsen node repo roots must be strings"
+                {:node node})))
+   (when-let [controller-local? (:controller-local? node)]
+     (when-not (instance? Boolean controller-local?)
+       (u/raise "Remote Jepsen controller-local flag must be boolean"
                 {:node node})))
    (parse-endpoint (:endpoint node))
    (parse-endpoint (:peer-id node))
@@ -179,6 +183,10 @@
      (when-not (string? (:db-identity config))
        (u/raise "Remote Jepsen config requires :db-identity"
                 {:config config}))
+     (when-let [ssh-opts (:ssh config)]
+       (when-not (map? ssh-opts)
+         (u/raise "Remote Jepsen config :ssh must be a map"
+                  {:ssh ssh-opts})))
      (when-not (= :sofa-jraft (or (:control-backend config) :sofa-jraft))
        (u/raise
         "Remote Jepsen node launcher currently requires :control-backend :sofa-jraft"

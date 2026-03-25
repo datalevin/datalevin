@@ -153,6 +153,8 @@ Standard 3 data-node config:
  :group-id "jepsen-remote-group"
  :db-identity "jepsen-remote-db"
  :control-backend :sofa-jraft
+ :ssh {:username "ubuntu"
+       :password nil}
  :repo-root "/srv/datalevin"
  :nodes
  [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
@@ -168,6 +170,8 @@ Witness-topology or `fencing-retry` config:
  :group-id "jepsen-witness-group"
  :db-identity "jepsen-witness-db"
  :control-backend :sofa-jraft
+ :ssh {:username "ubuntu"
+       :password nil}
  :repo-root "/srv/datalevin"
  :nodes
  [{:logical-node "n1" :node-id 1 :endpoint "10.0.0.11:8898" :peer-id "10.0.0.11:15001" :root "/var/tmp/dtlv-jepsen/n1"}
@@ -185,6 +189,11 @@ without opening a Datalevin data store.
 The top-level `:repo-root` is required by the controller-managed remote runner.
 It should point to the Datalevin checkout on every remote host. The manual
 per-host `start-remote-node` flow above ignores `:repo-root`.
+
+The top-level `:ssh` map is optional and applies only to the controller-managed
+remote runner. Use it to set a non-root SSH username or clear the default
+password for key-based auth. CLI/test-level `:ssh` opts still override config
+values when both are present.
 
 Run a controller-managed remote Jepsen test from the machine that has SSH
 access to every configured node:

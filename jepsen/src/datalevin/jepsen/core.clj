@@ -1,6 +1,9 @@
 (ns datalevin.jepsen.core
+  (:refer-clojure :exclude [run!])
   (:require
+   [clojure.java.shell :refer [sh]]
    [clojure.string :as str]
+   [clojure.tools.logging :refer [info warn]]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.nemesis :as datalevin.nemesis]
    [datalevin.jepsen.remote :as remote]
@@ -23,8 +26,15 @@
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [jepsen.checker :as checker]
    [jepsen.checker.timeline :as timeline]
+   [jepsen.control :as control]
+   [jepsen.core :as jepsen]
+   [jepsen.db :as jdb]
    [jepsen.generator :as gen]
-   [jepsen.tests :as tests])
+   [jepsen.os :as os]
+   [jepsen.store :as store]
+   [jepsen.tests :as tests]
+   [jepsen.util :as jutil]
+   [slingshot.slingshot :refer [try+]])
   (:import
    [java.util UUID]))
 
@@ -101,6 +111,21 @@
 (def ^:private remote-unsupported-nemeses
   #{})
 
+(def ^:private default-ssh-opts
+  {:dummy? false
+   :username "root"
+   :password "root"
+   :private-key-path nil
+   :strict-host-key-checking false})
+
+(defn- explicit-ssh-overrides
+  [ssh-opts]
+  (into {}
+        (keep (fn [[k v]]
+                (when (not= v (get default-ssh-opts k ::missing))
+                  [k v])))
+        ssh-opts))
+
 (defn- validate-remote-runner!
   [config workload-name nemesis-faults _topology]
   (when (contains? remote-unsupported-workloads workload-name)
@@ -131,6 +156,9 @@
         topology       (remote/workload-topology config workload)
         nodes          (vec (or (seq (:nodes workload))
                                 (map :logical-node (:data-nodes topology))))
+        session-nodes  (->> (:data-nodes topology)
+                            (remove #(true? (:controller-local? %)))
+                            (mapv :logical-node))
         control-nodes  (vec (or (seq (:datalevin/control-nodes workload))
                                 (map :logical-node (:control-nodes topology))))
         rate           (double (:rate opts))
@@ -156,10 +184,9 @@
         phases         (compose-generator-phases timed-gen
                                                 workload-final-generator
                                                 final-generator)
-        ssh-opts       (merge {:username "root"
-                               :password "root"
-                               :strict-host-key-checking false}
-                              (:ssh opts))]
+        ssh-opts       (merge default-ssh-opts
+                              (:ssh config)
+                              (explicit-ssh-overrides (:ssh opts)))]
     (merge tests/noop-test
            opts
            {:name (str (name workload-name) " remote")
@@ -184,10 +211,177 @@
             :datalevin/server-runtime-opts-fn
             (:datalevin/server-runtime-opts-fn workload)
             :datalevin/control-nodes control-nodes
+            :datalevin/session-nodes session-nodes
+            :remote (or (:remote opts) control/*remote* control/ssh)
             :ssh ssh-opts
             :datalevin/nemesis-faults nemesis-faults
             :datalevin/cluster-id cluster-id
             :datalevin/remote-config (:remote-config opts)})))
+
+(defn- session-nodes
+  [test]
+  (vec (or (seq (:datalevin/session-nodes test))
+           (seq (:nodes test))
+           [])))
+
+(defn- remote-runner-test?
+  [test]
+  (boolean (:datalevin/remote-config test)))
+
+(defn- invoke-db-on-nodes!
+  [test nodes f]
+  (dorun
+   (jutil/real-pmap
+    (fn [node]
+      (f node))
+    nodes)))
+
+(defn- control-on-session-nodes
+  ([test f]
+   (control-on-session-nodes test (session-nodes test) f))
+  ([test nodes f]
+   (if (seq nodes)
+     (control/on-nodes test nodes f)
+     {})))
+
+(defn- cycle-db!
+  [test]
+  (let [db    (:db test)
+        nodes (vec (:nodes test))]
+    (loop [tries jdb/cycle-tries]
+      (info "Tearing down DB")
+      (if (remote-runner-test? test)
+        (invoke-db-on-nodes! test nodes #(jdb/teardown! db test %))
+        (control-on-session-nodes test (partial jdb/teardown! db)))
+
+      (if (= :retry
+             (try+
+               (info "Setting up DB")
+               (if (remote-runner-test? test)
+                 (invoke-db-on-nodes! test nodes #(jdb/setup! db test %))
+                 (control-on-session-nodes test (partial jdb/setup! db)))
+
+               (when (satisfies? jdb/Primary db)
+                 (let [primary-node (first nodes)]
+                   (when primary-node
+                     (info "Setting up primary" primary-node)
+                     (if (remote-runner-test? test)
+                       (jdb/setup-primary! db test primary-node)
+                       (control-on-session-nodes
+                        test
+                        [primary-node]
+                        (partial jdb/setup-primary! db))))))
+
+               nil
+               (catch [:type :jepsen.db/setup-failed] e
+                 (if (< 1 tries)
+                   (do
+                     (warn (:throwable &throw-context)
+                           "Unable to set up database; retrying...")
+                     :retry)
+                   (throw e)))))
+        (recur (dec tries))))))
+
+(defn- log-test-start!
+  [test]
+  (let [git-head (sh "git" "rev-parse" "HEAD")]
+    (when (zero? (:exit git-head))
+      (let [head   (str/trim-newline (:out git-head))
+            clean? (-> (sh "git" "status" "--porcelain=v1")
+                       :out
+                       str/blank?)]
+        (info (str "Test version " head
+                   (when-not clean? " (plus uncommitted changes)"))))))
+  (when-let [argv (:argv test)]
+    (info (str "Command line:\n"
+               (->> argv
+                    (map control/escape)
+                    (list* "lein" "run")
+                    (str/join " ")))))
+  (info "Running test:"
+        (pr-str (cond-> {:name (:name test)
+                         :db-name (:db-name test)
+                         :nodes (vec (:nodes test))
+                         :session-nodes (session-nodes test)
+                         :control-nodes (vec (:datalevin/control-nodes test))
+                         :nemesis (vec (:datalevin/nemesis-faults test))}
+                  (:datalevin/remote-config test)
+                  (assoc :remote-config (:datalevin/remote-config test))))))
+
+(defmacro with-sessions
+  [[test-sym test] & body]
+  `(let [test# ~test
+         session-nodes# (session-nodes test#)]
+     (control/with-remote (:remote test#)
+       (control/with-ssh (:ssh test#)
+         (jepsen/with-resources [sessions#
+                                 (bound-fn* control/session)
+                                 control/disconnect
+                                 session-nodes#]
+           (let [~test-sym (assoc test#
+                                  :sessions (->> sessions#
+                                                 (map vector session-nodes#)
+                                                 (into {})))]
+             ~@body))))))
+
+(defmacro with-os
+  [test & body]
+  `(try
+     (control-on-session-nodes ~test (partial os/setup! (:os ~test)))
+     ~@body
+     (finally
+       (control-on-session-nodes ~test (partial os/teardown! (:os ~test))))))
+
+(defmacro with-db
+  [test & body]
+  `(try
+     (jepsen/with-log-snarfing ~test
+       (cycle-db! ~test)
+       ~@body)
+     (finally
+       (when-not (:leave-db-running? ~test)
+         (if (remote-runner-test? ~test)
+           (invoke-db-on-nodes! ~test
+                                (vec (:nodes ~test))
+                                #(jdb/teardown! (:db ~test) ~test %))
+           (control-on-session-nodes ~test
+                                     (partial jdb/teardown! (:db ~test))))))))
+
+(defmacro with-logging
+  [test & body]
+  `(try
+     (store/start-logging! ~test)
+     (log-test-start! ~test)
+     ~@body
+     (catch Throwable t#
+       (warn t# "Test crashed!")
+       (throw t#))
+     (finally
+       (store/stop-logging!))))
+
+(defn run!
+  [test]
+  (jutil/with-thread-name "jepsen test runner"
+    (let [test (jepsen/prepare-test test)]
+      (with-logging test
+        (store/with-handle [test test]
+          (let [test (if (:name test)
+                       (store/save-0! test)
+                       test)
+                test (with-sessions [test test]
+                       (let [test (with-os test
+                                    (with-db test
+                                      (jutil/with-relative-time
+                                        (let [test (-> (jepsen/run-case! test)
+                                                       (dissoc :barrier
+                                                               :sessions))
+                                              _    (info "Run complete, writing")
+                                              test (if (:name test)
+                                                     (store/save-1! test)
+                                                     test)]
+                                          test))))]
+                         (jepsen/analyze! test)))]
+            (jepsen/log-results test)))))))
 
 (defn datalevin-test
   [opts]
@@ -220,9 +414,7 @@
         phases         (compose-generator-phases timed-gen
                                                 workload-final-generator
                                                 final-generator)
-        ssh-opts       (assoc (merge {:username "root"
-                                      :password "root"
-                                      :strict-host-key-checking false}
+        ssh-opts       (assoc (merge default-ssh-opts
                                      (:ssh opts))
                          :dummy? true)]
     (merge tests/noop-test
@@ -248,6 +440,7 @@
             :datalevin/server-runtime-opts-fn
             (:datalevin/server-runtime-opts-fn workload)
             :datalevin/control-nodes control-nodes
+            :remote (or (:remote opts) control/*remote* control/ssh)
             :ssh ssh-opts
             :datalevin/nemesis-faults nemesis-faults
             :datalevin/cluster-id cluster-id}))))

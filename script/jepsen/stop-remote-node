@@ -5,5 +5,14 @@ set -euo pipefail
 repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
 jepsen_dir="$repo_root/jepsen"
 
+run_args=("$@")
+lein_cmd=(lein run -m datalevin.jepsen.remote-node stop "${run_args[@]}")
+
 cd "$jepsen_dir"
-exec lein run -m datalevin.jepsen.remote-node stop "$@"
+
+if command -v lein >/dev/null 2>&1; then
+  exec "${lein_cmd[@]}"
+fi
+
+printf -v quoted_cmd '%q ' "${lein_cmd[@]}"
+exec bash -lc "cd $(printf '%q' "$jepsen_dir") && exec ${quoted_cmd}"

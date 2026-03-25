@@ -6,6 +6,7 @@
    [clojure.tools.cli :refer [parse-opts]]
    [datalevin.constants :as c]
    [datalevin.core :as d]
+   [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.local :as local]
@@ -16,7 +17,8 @@
    [java.lang ProcessHandle]
    [java.net InetSocketAddress Socket]
    [java.nio.file Files Paths]
-   [java.util Optional]))
+   [java.util Optional]
+   [datalevin.jepsen PartitionFaults]))
 
 (def ^:private join-timeout-ms-default 60000)
 (def ^:private endpoint-check-timeout-ms 1000)
@@ -115,6 +117,50 @@
              :root (:root node)}
       verbose?
       (assoc :verbose true))))
+
+(defn- with-local-peer-id
+  [peer-id f]
+  (PartitionFaults/setCurrentLocalPeerId peer-id)
+  (try
+    (f)
+    (finally
+      (PartitionFaults/clearCurrentLocalPeerId))))
+
+(defn- with-control-backend
+  [control-backend f]
+  (with-redefs [srv/*start-ha-authority-fn*
+                (fn [db-name' ha-opts]
+                  (let [ha-opts' (assoc-in ha-opts
+                                           [:ha-control-plane :backend]
+                                           control-backend)
+                        local-peer-id (get-in ha-opts'
+                                              [:ha-control-plane
+                                               :local-peer-id])
+                        start-authority! ctrl/start-authority!]
+                    ;; The partition-aware Raft SPI only needs the local peer
+                    ;; identity while the control authority creates its RPC
+                    ;; client/server. Keeping it bound through the rest of
+                    ;; `start-ha-authority` makes init-membership-hash forward
+                    ;; requests run under the wrong Jepsen partition context.
+                    (with-redefs [ctrl/start-authority!
+                                  (fn [authority]
+                                    (with-local-peer-id
+                                      local-peer-id
+                                      #(start-authority! authority)))]
+                      (dha/start-ha-authority db-name' ha-opts'))))
+                srv/*stop-ha-authority-fn*
+                dha/stop-ha-authority]
+    (f)))
+
+(defn- register-control-peers!
+  [config topology]
+  (let [cluster-id (:group-id config)]
+    (doseq [{:keys [logical-node peer-id]} (:control-nodes topology)]
+      (PartitionFaults/registerPeer cluster-id logical-node peer-id))))
+
+(defn- unregister-control-peers!
+  [config]
+  (PartitionFaults/unregisterCluster (:group-id config)))
 
 (defn- endpoint-reachable?
   [endpoint timeout-ms]
@@ -403,6 +449,7 @@
                                (local/unregister-remote-node-runtime!
                                 (:db-identity config)
                                 (:node-id node))
+                               (unregister-control-peers! config)
                                (safe-close-conn! @conn)
                                (safe-stop-server! @server)
                                (alter-var-root #'srv/*server-runtime-opts-fn*
@@ -412,6 +459,7 @@
                                  (delete-if-exists! (state-file node)))))
         shutdown-hook      (Thread. ^Runnable stop!)]
     (local/register-remote-node-runtime! config topology node)
+    (register-control-peers! config topology)
     (write-pid-file! node)
     (write-state-file! node
                        {:status :starting
@@ -423,22 +471,25 @@
     (try
       (alter-var-root #'srv/*server-runtime-opts-fn*
                       (constantly runtime-opts-fn))
-      (reset! server
-              (binding [c/*db-background-sampling?* false]
-                (srv/create (server-options node verbose?))))
-      (binding [c/*db-background-sampling?* false]
-        (srv/start @server))
-      (wait-for-open-prereqs! node topology join-timeout-ms)
-      (reset! conn
-              (open-ha-conn! (:endpoint node)
-                             (:db-name config)
-                             (:schema workload)
-                             (node-ha-opts config
-                                           node
-                                           workload
-                                           (:data-nodes topology)
-                                           (:control-nodes topology))
-                             join-timeout-ms))
+      (with-control-backend
+        (:control-backend config)
+        (fn []
+          (reset! server
+                  (binding [c/*db-background-sampling?* false]
+                    (srv/create (server-options node verbose?))))
+          (binding [c/*db-background-sampling?* false]
+            (srv/start @server))
+          (wait-for-open-prereqs! node topology join-timeout-ms)
+          (reset! conn
+                  (open-ha-conn! (:endpoint node)
+                                 (:db-name config)
+                                 (:schema workload)
+                                 (node-ha-opts config
+                                               node
+                                               workload
+                                               (:data-nodes topology)
+                                               (:control-nodes topology))
+                                 join-timeout-ms))))
       (let [details (running-summary {:kind :data-node
                                       :config config
                                       :node node
@@ -478,11 +529,13 @@
         keep-state-file? (atom false)
         stop!          (fn []
                          (when (compare-and-set! stopped? false true)
+                           (unregister-control-peers! config)
                            (safe-stop-authority! @authority)
                            (delete-if-exists! (pid-file node))
                            (when-not @keep-state-file?
                              (delete-if-exists! (state-file node)))))
         shutdown-hook  (Thread. ^Runnable stop!)]
+    (register-control-peers! config topology)
     (write-pid-file! node)
     (write-state-file! node
                        {:status :starting
@@ -495,7 +548,9 @@
       (let [opts (control-authority-opts node base-opts)]
         (u/create-dirs (:raft-dir opts))
         (reset! authority (ctrl/new-authority opts))
-        (ctrl/start-authority! @authority))
+        (with-local-peer-id
+          (:local-peer-id opts)
+          #(ctrl/start-authority! @authority)))
       (let [details (running-summary {:kind :control-only-node
                                       :config config
                                       :node node

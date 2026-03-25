@@ -2,7 +2,10 @@
   (:require
    [clojure.string :as str]
    [datalevin.jepsen.core :as core]
-   [jepsen.cli :as cli]))
+   [jepsen.cli :as cli]
+   [jepsen.control :as control]
+   [jepsen.core :as jepsen-core]
+   [taoensso.timbre :as log]))
 
 (def ^:private supported-nemesis-labels
   (->> (concat [:none :failover :pause :pause-any :pause-multi
@@ -83,11 +86,40 @@
   (for [i (range (:test-count opts))]
     (core/datalevin-test (assoc opts :test-index i))))
 
+(defn- apply-env-log-level!
+  []
+  (when-let [level (some-> (System/getenv "DTLV_JEPSEN_LOG_LEVEL")
+                           str/trim
+                           not-empty)]
+    (let [level* (-> level
+                     (str/replace-first #"^:" "")
+                     str/lower-case
+                     keyword)
+          slf4j-level (ch.qos.logback.classic.Level/toLevel
+                       (str/upper-case (name level*)))]
+      (log/set-min-level! level*)
+      (doseq [logger-name ["jepsen.cli" "jepsen.core"]]
+        (when-let [logger (org.slf4j.LoggerFactory/getLogger logger-name)]
+          (when (instance? ch.qos.logback.classic.Logger logger)
+            (.setLevel ^ch.qos.logback.classic.Logger logger slf4j-level)))))))
+
+(defn- control-remote-backend
+  []
+  (case (some-> (System/getenv "DTLV_JEPSEN_CONTROL_REMOTE")
+                str/trim
+                not-empty
+                str/lower-case)
+    "clj-ssh" control/clj-ssh
+    control/ssh))
+
 (defn -main
   [& args]
-  (cli/run! (merge (cli/single-test-cmd {:test-fn  core/datalevin-test
-                                         :opt-spec cli-opts})
-                   (cli/test-all-cmd {:tests-fn all-tests
-                                      :opt-spec cli-opts})
-                   (cli/serve-cmd))
-            args))
+  (apply-env-log-level!)
+  (with-redefs [jepsen-core/run! core/run!]
+    (control/with-remote (control-remote-backend)
+      (cli/run! (merge (cli/single-test-cmd {:test-fn  core/datalevin-test
+                                             :opt-spec cli-opts})
+                       (cli/test-all-cmd {:tests-fn all-tests
+                                          :opt-spec cli-opts})
+                       (cli/serve-cmd))
+                args))))
