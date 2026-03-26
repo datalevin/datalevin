@@ -1132,7 +1132,7 @@
                 ((:update-db deps) server db-name
                  (fn [m]
                    (dissoc m :runner :wlmdb)))
-                (.release lock))))))))
+                (.release lock)))))))))
 
 (defn abort-transact-kv
   [deps server skey {:keys [args]}]
@@ -1243,7 +1243,7 @@
                  (fn [m]
                    (dissoc m :wlmdb :wstore :wdt-db :runner)))
                 (.release lock)))
-            (write-complete! deps skey))))))))
+            (write-complete! deps skey)))))))
 
 (defn sync
   [deps server skey {:keys [args]}]
