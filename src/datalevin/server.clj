@@ -24,6 +24,7 @@
    [datalevin.ha :as dha]
    [datalevin.ha.control :as ctrl]
    [datalevin.ha.replication :as drep]
+   [datalevin.ha.util :as hu]
    [datalevin.server.auth :as auth]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha-runtime :as hrt]
@@ -201,7 +202,8 @@
                                    {:type :reconnect}
                                    ~'wire-opts)))))
 
-(declare event-loop close-conn store->db-name session-lmdb remove-store)
+(declare event-loop close-conn store->db-name session-lmdb remove-store
+         halt-run)
 
 (def session-dbi "datalevin-server/sessions")
 
@@ -1020,7 +1022,11 @@
   (let [m (get (.-dbs server) db-name)]
     (if-not (leader-authority-state? m)
       m
-      (let [next-state (dha/refresh-ha-authority-state db-name m)
+      (let [timeout-ms (hu/ha-request-timeout-ms
+                        m
+                        (or (get-in m [:ha-control-plane :operation-timeout-ms])
+                            5000))
+            next-state (dha/refresh-ha-authority-state db-name m timeout-ms)
             refresh-patch (hrt/ha-authority-refresh-state-patch
                            m
                            next-state)
@@ -1077,6 +1083,45 @@
          :result (f)})
       {:ok? true
        :result (f)})))
+
+(def ^:private ha-abort-cleanup-types
+  #{:abort-transact
+    :abort-transact-kv})
+
+(def ^:private ha-rejected-close-cleanup-types
+  #{:close-transact
+    :close-transact-kv})
+
+(defn- cleanup-rejected-close-transact!
+  [^Server server {:keys [type args]}]
+  (let [db-name (nth args 0 nil)
+        dbs     (.-dbs server)
+        runner  (and db-name (get-in dbs [db-name :runner]))]
+    (when (and db-name runner (ha-rejected-close-cleanup-types type))
+      (let [kv-store (get-kv-store server db-name)
+            ^Semaphore lock (get-in dbs [db-name :lock])]
+        (try
+          (i/abort-transact-kv kv-store)
+          (i/close-transact-kv kv-store)
+          (catch Throwable t
+            (let [details (cond-> {:db-name db-name
+                                   :type type
+                                   :error-class (.getName ^Class (class t))}
+                            (some? (ex-message t))
+                            (assoc :message (ex-message t)))]
+              (log/warn
+                "Failed to clean up rejected HA close-transact"
+                details)
+              (log/debug t
+                         "Rejected HA close-transact cleanup stack trace"
+                         {:db-name db-name
+                          :type type})))
+          (finally
+            (halt-run runner)
+            (update-db server db-name
+                       #(dissoc % :runner :wlmdb :wstore :wdt-db))
+            (when lock
+              (.release lock))))))))
 
 (defn- ensure-ha-runtime
   ([root db-name m store]
@@ -2186,29 +2231,37 @@
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
   (let [type (:type message)
-        write? (dha/ha-write-message? message)
+        cleanup-only? (ha-abort-cleanup-types type)
+        write? (and (not cleanup-only?) (dha/ha-write-message? message))
         db-name (nth (:args message) 0 nil)
         ha-txlog-term (current-ha-txlog-term server db-name)
         precheck-only? (contains? #{:open-transact :open-transact-kv} type)
         {:keys [ok? error]}
-        (with-ha-write-admission
-          server
-          message
-          #(cond
-             precheck-only?
-             nil
+        (if cleanup-only?
+          {:ok? true}
+          (with-ha-write-admission
+            server
+            message
+            #(cond
+               precheck-only?
+               nil
 
-             write?
-             (binding [txlog/*commit-payload-ha-term* ha-txlog-term
-                       cpp/*before-write-commit-fn*
-                       (ha-write-commit-check-fn server message)]
-               (dispatch-message server skey message))
+               write?
+               (binding [txlog/*commit-payload-ha-term* ha-txlog-term
+                         cpp/*before-write-commit-fn*
+                         (ha-write-commit-check-fn server message)]
+                 (dispatch-message server skey message))
 
-             :else
-             (dispatch-message server skey message)))]
+               :else
+               (dispatch-message server skey message))))]
     (cond
       (not ok?)
-      (error-response skey "HA write admission rejected" error)
+      (do
+        (cleanup-rejected-close-transact! server message)
+        (error-response skey "HA write admission rejected" error))
+
+      cleanup-only?
+      (dispatch-message server skey message)
 
       precheck-only?
       (dispatch-message server skey message))))

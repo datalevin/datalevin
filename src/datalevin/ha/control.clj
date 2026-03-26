@@ -1053,70 +1053,79 @@
 (declare authority-diagnostics submit-command!)
 
 (defn- await-linearizable-read!
-  [{:keys [operation-timeout-ms] :as authority}]
-  (let [deadline (+ (System/currentTimeMillis) (long operation-timeout-ms))]
-    (loop [attempt 0]
-      (let [remaining (- deadline (System/currentTimeMillis))
-            ^Node node (running-node! authority)]
-        (if (<= remaining 0)
-          (u/raise "HA control readIndex timed out"
-                   {:error :ha/control-timeout
-                    :where :read-index
-                    :attempt attempt
-                    :leader? (.isLeader node)
-                    :authority (authority-diagnostics authority)})
-          (let [status-p   (promise)
-                timeout-ms (read-index-attempt-timeout-ms remaining)
-                invoked?   (try
-                             (.readIndex node (byte-array 0)
-                                         (proxy [ReadIndexClosure] []
-                                           (run
-                                             ([^Status status]
-                                              (deliver status-p
-                                                       {:status status
-                                                        :snapshot
-                                                        (authority-fsm-snapshot
-                                                         authority)}))
-                                             ([^Status status _index _request-ctx]
-                                              (deliver status-p
-                                                       {:status status
-                                                        :snapshot
-                                                        (authority-fsm-snapshot
-                                                         authority)})))))
-                             true
-                             (catch Exception e
-                               (log/warn e "HA control readIndex invocation failed")
-                               false))]
-            (if-not invoked?
-              (do (Thread/sleep 20)
-                  (recur (inc attempt)))
-              (let [result (deref status-p timeout-ms ::timeout)
-                    status (:status result)]
-                (cond
-                  (= ::timeout result)
-                  (do (Thread/sleep 20)
-                      (recur (inc attempt)))
+  ([authority]
+   (await-linearizable-read! authority nil))
+  ([{:keys [operation-timeout-ms] :as authority} timeout-ms]
+   (let [timeout-ms (command-operation-timeout-ms
+                     operation-timeout-ms
+                     timeout-ms)
+         deadline (+ (System/currentTimeMillis) timeout-ms)]
+     (loop [attempt 0]
+       (let [remaining (- deadline (System/currentTimeMillis))
+             ^Node node (running-node! authority)]
+         (if (<= remaining 0)
+           (u/raise "HA control readIndex timed out"
+                    {:error :ha/control-timeout
+                     :where :read-index
+                     :attempt attempt
+                     :leader? (.isLeader node)
+                     :authority (authority-diagnostics authority)})
+           (let [status-p   (promise)
+                 timeout-ms (read-index-attempt-timeout-ms remaining)
+                 invoked?   (try
+                              (.readIndex node (byte-array 0)
+                                          (proxy [ReadIndexClosure] []
+                                            (run
+                                              ([^Status status]
+                                               (deliver status-p
+                                                        {:status status
+                                                         :snapshot
+                                                         (authority-fsm-snapshot
+                                                          authority)}))
+                                              ([^Status status _index _request-ctx]
+                                               (deliver status-p
+                                                        {:status status
+                                                         :snapshot
+                                                         (authority-fsm-snapshot
+                                                          authority)})))))
+                              true
+                              (catch Exception e
+                                (log/warn e "HA control readIndex invocation failed")
+                                false))]
+             (if-not invoked?
+               (do (Thread/sleep 20)
+                   (recur (inc attempt)))
+               (let [result (deref status-p timeout-ms ::timeout)
+                     status (:status result)]
+                 (cond
+                   (= ::timeout result)
+                   (do (Thread/sleep 20)
+                       (recur (inc attempt)))
 
-                  (.isOk ^Status status)
-                  (:snapshot result)
+                   (.isOk ^Status status)
+                   (:snapshot result)
 
-                  (retryable-read-status? ^Status status)
-                  (do (Thread/sleep 20)
-                      (recur (inc attempt)))
+                   (retryable-read-status? ^Status status)
+                   (do (Thread/sleep 20)
+                       (recur (inc attempt)))
 
-                  :else
-                  (u/raise "HA control readIndex failed"
-                           {:error :ha/control-read-failed
-                            :status (status-data ^Status status)
-                            :authority (authority-diagnostics authority)}))))))))))
+                   :else
+                   (u/raise "HA control readIndex failed"
+                            {:error :ha/control-read-failed
+                             :status (status-data ^Status status)
+                             :authority (authority-diagnostics authority)})))))))))))
 
 (defn ^:redef await-read-state-barrier!
-  [authority]
-  (await-linearizable-read! authority))
+  ([authority]
+   (await-linearizable-read! authority))
+  ([authority timeout-ms]
+   (await-linearizable-read! authority timeout-ms)))
 
 (defn ^:redef linearizable-read-snapshot!
-  [authority]
-  (await-linearizable-read! authority))
+  ([authority]
+   (await-linearizable-read! authority))
+  ([authority timeout-ms]
+   (await-linearizable-read! authority timeout-ms)))
 
 (defn ^:redef submit-read-state-command!
   [authority db-identity]
@@ -1737,32 +1746,34 @@
   that failure to the caller instead of falling back to a replicated command.
   The startup path uses read-state-for-startup when it explicitly wants the
   slower command-based read."
-  [authority db-identity]
-  (require-non-blank-string! db-identity :db-identity)
-  (cond
-    (instance? SofaJraftLeaseAuthority authority)
-    (let [{:keys [group-id running-v]} authority]
-      (ensure-running! running-v)
-      (lease/validate-lease-key! group-id db-identity)
-      (let [snapshot (await-read-state-barrier! authority)
-            {:keys [lease version]} (lease-entry snapshot db-identity)]
-        {:lease lease
-         :version version
-         :authority-now-ms (long (control-now-ms))
-         :membership-hash (:membership-hash snapshot)
-         :voters (:voters snapshot)}))
+  ([authority db-identity]
+   (read-state authority db-identity nil))
+  ([authority db-identity timeout-ms]
+   (require-non-blank-string! db-identity :db-identity)
+   (cond
+     (instance? SofaJraftLeaseAuthority authority)
+     (let [{:keys [group-id running-v]} authority]
+       (ensure-running! running-v)
+       (lease/validate-lease-key! group-id db-identity)
+       (let [snapshot (await-read-state-barrier! authority timeout-ms)
+             {:keys [lease version]} (lease-entry snapshot db-identity)]
+         {:lease lease
+          :version version
+          :authority-now-ms (long (control-now-ms))
+          :membership-hash (:membership-hash snapshot)
+          :voters (:voters snapshot)}))
 
-    (satisfies? ILeaseAuthority authority)
-    (let [{:keys [lease version]} (read-lease authority db-identity)]
-      {:lease lease
-       :version version
-       :membership-hash (read-membership-hash authority)
-       :voters (read-voters authority)})
+     (satisfies? ILeaseAuthority authority)
+     (let [{:keys [lease version]} (read-lease authority db-identity)]
+       {:lease lease
+        :version version
+        :membership-hash (read-membership-hash authority)
+        :voters (read-voters authority)})
 
-    :else
-    (u/raise "Unsupported HA control authority type"
-             {:error :ha/control-unsupported-authority
-              :class (some-> authority class .getName)})))
+     :else
+     (u/raise "Unsupported HA control authority type"
+              {:error :ha/control-unsupported-authority
+               :class (some-> authority class .getName)}))))
 
 (defn read-state-for-startup
   "Read the HA control snapshot for db-identity during startup.

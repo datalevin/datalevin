@@ -456,17 +456,19 @@
      :observed-at-ms observed-at-ms}))
 
 (defn ^:redef observe-authority-state
-  [m]
-  (let [authority (:ha-authority m)
-        db-identity (:ha-db-identity m)
-        local-start-ms (ha-now-ms)
-        local-start-nanos (ha-now-nanos)
-        result (ctrl/read-state authority db-identity)]
-    (control-result-authority-observation
-     m
-     local-start-ms
-     local-start-nanos
-     result)))
+  ([m]
+   (observe-authority-state m nil))
+  ([m timeout-ms]
+   (let [authority (:ha-authority m)
+         db-identity (:ha-db-identity m)
+         local-start-ms (ha-now-ms)
+         local-start-nanos (ha-now-nanos)
+         result (ctrl/read-state authority db-identity timeout-ms)]
+     (control-result-authority-observation
+      m
+      local-start-ms
+      local-start-nanos
+      result))))
 
 (defn- apply-authority-observation
   [m {:keys [lease version authority-now-ms
@@ -1352,44 +1354,46 @@
         (maybe-promote-ha-candidate db-name m2 (ha-now-ms))))))
 
 (defn refresh-ha-authority-state
-  [db-name m]
-  (if-not (:ha-authority m)
-    m
-    (try
-      (let [db-identity (:ha-db-identity m)
-            now-ms (ha-now-ms)
-            observation (observe-authority-state m)
-            {:keys [lease authority-membership-hash
-                    db-identity-mismatch? membership-mismatch?]}
-            observation
-            m1 (-> m
-                   (apply-authority-observation observation now-ms)
-                   apply-authority-read-success)]
-        (cond
-          (and db-identity-mismatch? (= :leader (:ha-role m1)))
-          (demote-ha-leader db-name m1
-                            :db-identity-mismatch
-                            {:local-db-identity db-identity
-                             :authority-lease lease}
-                            now-ms)
+  ([db-name m]
+   (refresh-ha-authority-state db-name m nil))
+  ([db-name m timeout-ms]
+   (if-not (:ha-authority m)
+     m
+     (try
+       (let [db-identity (:ha-db-identity m)
+             now-ms (ha-now-ms)
+             observation (observe-authority-state m timeout-ms)
+             {:keys [lease authority-membership-hash
+                     db-identity-mismatch? membership-mismatch?]}
+             observation
+             m1 (-> m
+                    (apply-authority-observation observation now-ms)
+                    apply-authority-read-success)]
+         (cond
+           (and db-identity-mismatch? (= :leader (:ha-role m1)))
+           (demote-ha-leader db-name m1
+                             :db-identity-mismatch
+                             {:local-db-identity db-identity
+                              :authority-lease lease}
+                             now-ms)
 
-          (and membership-mismatch? (= :leader (:ha-role m1)))
-          (demote-ha-leader db-name m1
-                            :membership-hash-mismatch
-                            {:local-membership-hash (:ha-membership-hash m1)
-                             :authority-membership-hash
-                             authority-membership-hash}
-                            now-ms)
+           (and membership-mismatch? (= :leader (:ha-role m1)))
+           (demote-ha-leader db-name m1
+                             :membership-hash-mismatch
+                             {:local-membership-hash (:ha-membership-hash m1)
+                              :authority-membership-hash
+                              authority-membership-hash}
+                             now-ms)
 
-          :else
-          m1))
-      (catch Exception e
-        (let [error (authority-read-error e)
-              failed-m (apply-authority-read-failure m error)]
-          (log/warn e "HA read-lease failed"
-                    {:db-name db-name
-                     :ha-role (:ha-role m)})
-          failed-m)))))
+           :else
+           m1))
+       (catch Exception e
+         (let [error (authority-read-error e)
+               failed-m (apply-authority-read-failure m error)]
+           (log/warn e "HA read-lease failed"
+                     {:db-name db-name
+                      :ha-role (:ha-role m)})
+           failed-m))))))
 
 (defn- finish-ha-leader-renew
   [db-name m result local-start-ms local-start-nanos]
