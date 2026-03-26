@@ -18,11 +18,11 @@
        (str/join ", ")))
 
 (def cli-opts
-  [[nil "--control-backend BACKEND" "HA control-plane backend: in-memory or sofa-jraft"
+  [[nil "--control-backend BACKEND" "HA control-plane backend: sofa-jraft"
     :parse-fn keyword
-    :default :in-memory
-    :validate [#{:in-memory :sofa-jraft}
-               "Must be one of: in-memory, sofa-jraft"]]
+    :default :sofa-jraft
+    :validate [#{:sofa-jraft}
+               "Must be: sofa-jraft"]]
 
    [nil "--db-name NAME" "Database name to create for the workload"
     :default "jepsen-append"]

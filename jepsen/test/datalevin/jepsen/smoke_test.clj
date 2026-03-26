@@ -216,7 +216,7 @@
 (def ^:private datalevin-test-construction-cases
   [{:label :append
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :append
            :rate 10
            :time-limit 5
@@ -227,11 +227,11 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :append-cas
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :append-cas
            :rate 10
            :time-limit 5
@@ -242,11 +242,11 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :grant
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :grant
            :rate 10
            :time-limit 5
@@ -254,11 +254,11 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :bank
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :bank
            :rate 10
            :time-limit 5
@@ -268,11 +268,11 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :giant-values
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :giant-values
            :rate 10
            :time-limit 5
@@ -280,7 +280,7 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :fencing
     :opts {:db-name "smoke"
@@ -295,40 +295,40 @@
                :nemesis-faults []}}
    {:label :internal
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :internal
            :rate 10
            :time-limit 5
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :identity-upsert
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :identity-upsert
            :rate 10
            :time-limit 5
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :index-consistency
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :index-consistency
            :rate 10
            :time-limit 5
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :register
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :register
            :rate 10
            :time-limit 5
@@ -336,11 +336,11 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :tx-fn-register
     :opts {:db-name "smoke"
-           :control-backend :in-memory
+           :control-backend :sofa-jraft
            :workload :tx-fn-register
            :rate 10
            :time-limit 5
@@ -348,7 +348,7 @@
            :nodes ["n1" "n2" "n3"]
            :nemesis []}
     :expected {:nodes ["n1" "n2" "n3"]
-               :control-backend :in-memory
+               :control-backend :sofa-jraft
                :nemesis-faults []}}
    {:label :rejoin-bootstrap
     :opts {:db-name "smoke"
@@ -792,7 +792,7 @@
 (deftest bank-client-transfer-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "bank-smoke"
-                  :control-backend :in-memory
+                  :control-backend :sofa-jraft
                   :nodes ["n1" "n2" "n3"]
                   :verbose false
                   :datalevin/cluster-id cluster-id}
@@ -824,7 +824,7 @@
 (deftest register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "register-smoke"
-                  :control-backend :in-memory
+                  :control-backend :sofa-jraft
                   :nodes ["n1" "n2" "n3"]
                   :key-count 4
                   :verbose false
@@ -871,7 +871,7 @@
 (deftest giant-values-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "giant-values-smoke"
-                  :control-backend :in-memory
+                  :control-backend :sofa-jraft
                   :nodes ["n1" "n2" "n3"]
                   :key-count 4
                   :verbose false
@@ -922,7 +922,7 @@
 (deftest tx-fn-register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "tx-fn-register-smoke"
-                  :control-backend :in-memory
+                  :control-backend :sofa-jraft
                   :nodes ["n1" "n2" "n3"]
                   :key-count 4
                   :verbose false
@@ -1791,131 +1791,18 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest datalevin-test-rejects-in-memory-failover-smoke-test
-  (testing "HA disruption nemeses need persisted JRaft membership"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:node-pause]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:multi-node-pause]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:leader-pause]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:leader-partition]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:leader-failover]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:follower-rejoin]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:quorum-loss]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:clock-skew-pause]})))
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo
-         #"HA disruption nemeses currently require --control-backend sofa-jraft"
-         (core/datalevin-test {:db-name "smoke"
-                               :control-backend :in-memory
-                               :workload :append
-                               :rate 10
-                               :time-limit 5
-                               :key-count 4
-                               :min-txn-length 1
-                               :max-txn-length 1
-                               :max-writes-per-key 8
-                               :nodes ["n1" "n2" "n3"]
-                               :nemesis [:clock-skew-leader-fast]})))))
+(deftest datalevin-test-rejects-unsupported-control-backend-smoke-test
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo
+       #"Jepsen currently supports only --control-backend sofa-jraft"
+       (core/datalevin-test {:db-name "smoke"
+                             :control-backend :bogus
+                             :workload :append
+                             :rate 10
+                             :time-limit 5
+                             :key-count 4
+                             :min-txn-length 1
+                             :max-txn-length 1
+                             :max-writes-per-key 8
+                             :nodes ["n1" "n2" "n3"]
+                             :nemesis []}))))

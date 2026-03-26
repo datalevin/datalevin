@@ -322,11 +322,25 @@
         follower-floor-lsn
         (ha-clamped-follower-floor-lsn
          persisted-lsn snapshot-lsn ceiling-lsn)
+        tracked-follower-next-lsn
+        (when (integer? (:ha-follower-next-lsn m))
+          (long (:ha-follower-next-lsn m)))
+        tracked-follower-applied-lsn
+        (when (and tracked-follower-next-lsn
+                   (pos? (long tracked-follower-next-lsn)))
+          (long (max 0
+                     (dec (long tracked-follower-next-lsn)))))
+        replayed-follower-lsn
+        (if (integer? tracked-follower-applied-lsn)
+          (long-max2 follower-floor-lsn
+                     (long-min2 state-lsn
+                                tracked-follower-applied-lsn))
+          follower-floor-lsn)
         local-last-applied-lsn
         (long (if (= :leader role)
                 ceiling-lsn
                 (if (pos? (long ceiling-lsn))
-                  follower-floor-lsn
+                  (long-min2 ceiling-lsn replayed-follower-lsn)
                   state-lsn)))]
     {:role role
      :kv-store kv-store
@@ -337,6 +351,9 @@
      :persisted-lsn persisted-lsn
      :ceiling-lsn ceiling-lsn
      :follower-floor-lsn follower-floor-lsn
+     :tracked-follower-next-lsn tracked-follower-next-lsn
+     :tracked-follower-applied-lsn tracked-follower-applied-lsn
+     :replayed-follower-lsn replayed-follower-lsn
      :local-last-applied-lsn local-last-applied-lsn}))
 
 (defn- cached-ha-local-watermark-snapshot
@@ -701,33 +718,44 @@
         acc))))
 
 (defn- inspect-ha-local-bootstrap-tail
-  [m snapshot-lsn]
-  (if-let [kv-store (raw-local-kv-store m)]
-    (let [persisted-floor-lsn
-          (read-ha-local-persisted-lsn kv-store)
-          candidate-floor-lsn
-          (long-max4 snapshot-lsn
-                     persisted-floor-lsn
-                     (read-ha-local-watermark-lsn m)
-                     (read-ha-snapshot-payload-lsn m))
-          records
-          (ha-local-contiguous-txlog-tail
-           kv-store
-           (unchecked-inc (long snapshot-lsn))
-           candidate-floor-lsn)
-          verified-floor-lsn
-          (long (if (or (= candidate-floor-lsn (long snapshot-lsn))
-                        (seq records))
-                  candidate-floor-lsn
-                  snapshot-lsn))]
-      {:verified-floor-lsn verified-floor-lsn
-       :persisted-floor-lsn persisted-floor-lsn
-       :candidate-floor-lsn candidate-floor-lsn
-       :tail-record-count (count records)})
-    {:verified-floor-lsn (long snapshot-lsn)
-     :persisted-floor-lsn (long snapshot-lsn)
-     :candidate-floor-lsn (long snapshot-lsn)
-     :tail-record-count 0}))
+  ([m snapshot-lsn]
+   (inspect-ha-local-bootstrap-tail m snapshot-lsn nil))
+  ([m snapshot-lsn trusted-max-lsn]
+   (if-let [kv-store (raw-local-kv-store m)]
+     (let [persisted-floor-lsn
+           (read-ha-local-persisted-lsn kv-store)
+           candidate-floor-lsn-raw
+           (long-max4 snapshot-lsn
+                      persisted-floor-lsn
+                      (read-ha-local-watermark-lsn m)
+                      (read-ha-snapshot-payload-lsn m))
+           candidate-floor-lsn
+           (long (if (integer? trusted-max-lsn)
+                   (long-min2 candidate-floor-lsn-raw
+                              (long trusted-max-lsn))
+                   candidate-floor-lsn-raw))
+           records
+           (ha-local-contiguous-txlog-tail
+            kv-store
+            (unchecked-inc (long snapshot-lsn))
+            candidate-floor-lsn)
+           verified-floor-lsn
+           (long (if (or (= candidate-floor-lsn (long snapshot-lsn))
+                         (seq records))
+                   candidate-floor-lsn
+                   snapshot-lsn))]
+       {:verified-floor-lsn verified-floor-lsn
+        :persisted-floor-lsn persisted-floor-lsn
+        :candidate-floor-lsn-raw candidate-floor-lsn-raw
+        :candidate-floor-lsn candidate-floor-lsn
+        :trusted-max-lsn (some-> trusted-max-lsn long)
+        :tail-record-count (count records)})
+     {:verified-floor-lsn (long snapshot-lsn)
+      :persisted-floor-lsn (long snapshot-lsn)
+      :candidate-floor-lsn-raw (long snapshot-lsn)
+      :candidate-floor-lsn (long snapshot-lsn)
+      :trusted-max-lsn (some-> trusted-max-lsn long)
+      :tail-record-count 0})))
 
 (defn- persist-ha-local-bootstrap-floor!
   [m applied-lsn]
@@ -741,23 +769,25 @@
   (long applied-lsn))
 
 (defn- reconcile-ha-installed-snapshot-state
-  [m snapshot-lsn]
-  (let [{:keys [verified-floor-lsn] :as replay}
-        (inspect-ha-local-bootstrap-tail m snapshot-lsn)
-        reopen-info (ha-local-store-reopen-info m)
-        clamped? (< (long verified-floor-lsn)
-                    (long (:candidate-floor-lsn replay)))
-        _ (when clamped?
-            (persist-ha-local-bootstrap-floor! m verified-floor-lsn))
-        next-m (if (and clamped? reopen-info)
-                 (with-ha-local-store-swap
-                   #(do
-                      (close-ha-local-store! m)
-                      (reopen-ha-local-store-from-info m reopen-info)))
-                 m)]
-    (assoc replay
-           :installed-lsn (long verified-floor-lsn)
-           :state next-m)))
+  ([m snapshot-lsn]
+   (reconcile-ha-installed-snapshot-state m snapshot-lsn nil))
+  ([m snapshot-lsn trusted-max-lsn]
+   (let [{:keys [verified-floor-lsn] :as replay}
+         (inspect-ha-local-bootstrap-tail m snapshot-lsn trusted-max-lsn)
+         reopen-info (ha-local-store-reopen-info m)
+         clamped? (< (long verified-floor-lsn)
+                     (long (:candidate-floor-lsn replay)))
+         _ (when clamped?
+             (persist-ha-local-bootstrap-floor! m verified-floor-lsn))
+         next-m (if (and clamped? reopen-info)
+                  (with-ha-local-store-swap
+                    #(do
+                       (close-ha-local-store! m)
+                       (reopen-ha-local-store-from-info m reopen-info)))
+                  m)]
+     (assoc replay
+            :installed-lsn (long verified-floor-lsn)
+            :state next-m))))
 
 (def ^:private open-ha-store-dbis! snap/open-ha-store-dbis!)
 
@@ -2146,7 +2176,16 @@
               replay-rows)
             next-state
             (do
-              (kv/mirror-replayed-txlog-record! kv-store record)
+              (let [mirror-res (kv/mirror-replayed-txlog-record! kv-store
+                                                                 record)]
+                ;; A restarted follower can already have the replicated WAL
+                ;; record locally while still missing the materialized LMDB
+                ;; rows. If replay sees the LSN and skips the append, reapply
+                ;; the payload directly so the datalog state catches up to the
+                ;; existing txlog floor.
+                (when (:skipped? mirror-res)
+                  (kv/replay-txlog-rows! kv-store replay-rows
+                                         (long (:lsn record)))))
               (when (and (instance? IStore store)
                          (pos? (long replayed-max-gt)))
                 (st/sync-max-gt-floor! store replayed-max-gt))
@@ -2662,10 +2701,16 @@
                                              (read-ha-local-snapshot-current-lsn
                                               kv-store)
                                              0))))
+                          trusted-install-lsn
+                          (long (max snapshot-lsn
+                                     (long (or (:payload-last-applied-lsn
+                                                manifest)
+                                               0))))
                           {:keys [state installed-lsn]}
                           (reconcile-ha-installed-snapshot-state
                            installed-state
-                           snapshot-lsn)
+                           snapshot-lsn
+                           trusted-install-lsn)
                           resume-next-lsn (unchecked-inc (long installed-lsn))
                           _ (persist-ha-local-applied-lsn!
                              state

@@ -804,9 +804,7 @@
                      :retry-delay-ms 0}
    :ha-members (mapv #(select-keys % [:node-id :endpoint]) data-nodes)
    :ha-control-plane
-   {:backend (if (= :in-memory control-backend)
-               :sofa-jraft
-               control-backend)
+   {:backend control-backend
     :group-id group-id
     :voters (control-voters data-nodes control-nodes)
     :rpc-timeout-ms 5000

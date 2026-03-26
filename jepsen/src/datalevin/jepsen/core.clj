@@ -73,6 +73,20 @@
 (def supported-nemeses
   datalevin.nemesis/supported-faults)
 
+(def ^:private supported-control-backends
+  #{:sofa-jraft})
+
+(defn- validate-control-backend!
+  [control-backend]
+  (let [control-backend (or control-backend :sofa-jraft)]
+    (when-not (contains? supported-control-backends control-backend)
+      (throw (ex-info
+              "Jepsen currently supports only --control-backend sofa-jraft"
+              {:control-backend control-backend
+               :supported-control-backends
+               (sort supported-control-backends)})))
+    control-backend))
+
 (defn- validate-nemesis-compatibility!
   [{:keys [control-backend nemesis]}]
   (when (and (some #{:leader-failover
@@ -151,6 +165,7 @@
         config         (-> (:remote-config opts)
                            remote/read-config
                            (remote/validate-config! workloads))
+        control-backend (validate-control-backend! (:control-backend config))
         workload-name  (:workload config)
         workload       (remote/config-workload config workloads)
         topology       (remote/workload-topology config workload)
@@ -165,7 +180,7 @@
         time-limit     (:time-limit opts)
         nemesis-faults (:nemesis opts)
         _              (validate-nemesis-compatibility!
-                        (assoc opts :control-backend (:control-backend config)))
+                        (assoc opts :control-backend control-backend))
         _              (validate-remote-runner! config
                                                workload-name
                                                nemesis-faults
@@ -206,7 +221,7 @@
             :generator (apply gen/phases phases)
             :schema (:schema workload)
             :db-name (:db-name config)
-            :control-backend (:control-backend config)
+            :control-backend control-backend
             :datalevin/cluster-opts (:datalevin/cluster-opts workload)
             :datalevin/server-runtime-opts-fn
             (:datalevin/server-runtime-opts-fn workload)
@@ -387,7 +402,9 @@
   [opts]
   (if (:remote-config opts)
     (remote-datalevin-test opts)
-    (let [_              (validate-nemesis-compatibility! opts)
+    (let [control-backend (validate-control-backend! (:control-backend opts))
+          _              (validate-nemesis-compatibility!
+                          (assoc opts :control-backend control-backend))
         cluster-id     (str (UUID/randomUUID))
         workload-name  (:workload opts)
         workload       ((workloads workload-name) opts)
@@ -419,10 +436,7 @@
                          :dummy? true)]
     (merge tests/noop-test
            opts
-           {:name (str (name workload-name) " "
-                       (if (= :sofa-jraft (:control-backend opts))
-                         "sofa-jraft"
-                         "in-memory"))
+           {:name (str (name workload-name) " " (name control-backend))
             :nodes nodes
             :db (local/db cluster-id)
             :net (local/net cluster-id)
@@ -435,7 +449,7 @@
             :generator (apply gen/phases phases)
             :schema (:schema workload)
             :db-name (:db-name opts)
-            :control-backend (:control-backend opts)
+            :control-backend control-backend
             :datalevin/cluster-opts (:datalevin/cluster-opts workload)
             :datalevin/server-runtime-opts-fn
             (:datalevin/server-runtime-opts-fn workload)

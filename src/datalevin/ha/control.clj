@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.ha.control
-  "Consensus control-plane lease authority protocol and in-memory adapter."
+  "Consensus control-plane lease authority."
   (:require
    [clojure.string :as s]
    [datalevin.ha.lease :as lease]
@@ -87,91 +87,6 @@
 (defn ^:redef control-now-ms
   []
   (System/currentTimeMillis))
-
-(def ^:dynamic *in-memory-cas-timeout-ms*
-  5000)
-
-(def ^:private max-in-memory-cas-backoff-ms
-  10)
-
-(defn ^:redef in-memory-cas-now-ms
-  []
-  (System/currentTimeMillis))
-
-(defn ^:redef commit-state-compare-and-set!
-  [state-atom old-state new-state]
-  (compare-and-set! state-atom old-state new-state))
-
-(defn- in-memory-cas-backoff-ms ^long
-  [attempt]
-  (let [attempt (max 0 (int attempt))
-        delay-ms (bit-shift-left 1 (min attempt 3))
-        max-backoff-ms (long max-in-memory-cas-backoff-ms)]
-    (if (> (long delay-ms) max-backoff-ms)
-      max-backoff-ms
-      (long delay-ms))))
-
-(defn ^:redef sleep-in-memory-cas-retry!
-  [attempt]
-  (Thread/sleep (long (in-memory-cas-backoff-ms attempt))))
-
-(defonce ^:private in-memory-groups
-  (atom {}))
-
-(defonce ^:private in-memory-group-scope-seq
-  (atom 0))
-
-(def ^:dynamic *in-memory-group-scope*
-  :global)
-
-(defn fresh-in-memory-group-scope
-  "Allocate a fresh in-memory authority scope token.
-
-  Authorities created under different scope tokens do not share the same
-  backing group-state atoms even when they reuse the same group-id."
-  []
-  (keyword "datalevin.ha.control.scope"
-           (str (swap! in-memory-group-scope-seq inc))))
-
-(defn- group-state
-  ([group-id]
-   (group-state *in-memory-group-scope* group-id))
-  ([scope-id group-id]
-   (or (get-in @in-memory-groups [scope-id group-id])
-      (let [state (atom (blank-state))]
-        (get-in (swap! in-memory-groups
-                       (fn [m]
-                         (if (contains? (get m scope-id {}) group-id)
-                           m
-                           (assoc-in m [scope-id group-id] state))))
-                [scope-id group-id])))))
-
-(defn reset-in-memory-groups!
-  "Clear shared in-memory authority state for one scope.
-
-  This is intended for test fixtures so separate tests can safely reuse
-  deterministic in-memory group IDs without inheriting leases or membership
-  from earlier tests. When called with no argument it clears the current
-  `*in-memory-group-scope*` only."
-  ([] (reset-in-memory-groups! *in-memory-group-scope*))
-  ([scope-id]
-   (swap! in-memory-groups dissoc scope-id)
-   nil))
-
-(defn with-fresh-in-memory-group-scope
-  "Run `f` with a fresh isolated in-memory authority scope."
-  [f]
-  (let [scope-id (fresh-in-memory-group-scope)]
-    (binding [*in-memory-group-scope* scope-id]
-      (try
-        (f)
-        (finally
-          (reset-in-memory-groups! scope-id))))))
-
-(defn current-in-memory-group-scope
-  "Return the current in-memory authority scope token."
-  []
-  *in-memory-group-scope*)
 
 (defn- non-blank-string?
   [x]
@@ -314,167 +229,6 @@
   (when-not (running? running-v)
     (u/raise "HA lease authority is not started"
              {:error :ha/control-not-started})))
-
-(defn- commit-state-transition!
-  [state-atom transition-fn]
-  (let [timeout-ms (long (max 1 (long *in-memory-cas-timeout-ms*)))
-        deadline   (+ (long (in-memory-cas-now-ms)) timeout-ms)]
-    (loop [attempt 0]
-    (let [old-state @state-atom
-          {:keys [state result]} (transition-fn old-state)]
-      (if (commit-state-compare-and-set! state-atom old-state state)
-        result
-        (let [attempt (unchecked-inc-int attempt)]
-          (when (>= (long (in-memory-cas-now-ms)) deadline)
-            (u/raise "HA in-memory control CAS contention timed out"
-                     {:error :ha/control-cas-timeout
-                      :attempt attempt}))
-          (sleep-in-memory-cas-retry! (dec attempt))
-          (recur attempt)))))))
-
-(defn ^:redef in-memory-linearizable-state-snapshot!
-  [state-atom]
-  (commit-state-transition!
-   state-atom
-   (fn [snapshot]
-     {:state snapshot
-      :result snapshot})))
-
-(declare apply-state-command!)
-
-(defrecord InMemoryLeaseAuthority [group-id state running-v initial-voters
-                                   clock-skew-budget-ms]
-  ILeaseAuthority
-  (start-authority! [this]
-    (when (seq initial-voters)
-      (swap! state
-             (fn [s]
-               (if (seq (:voters s))
-                 s
-                 (assoc s :voters initial-voters)))))
-    (vreset! running-v true)
-    this)
-
-  (stop-authority! [this]
-    (vreset! running-v false)
-    this)
-
-  (read-lease [this db-identity]
-    (ensure-running! running-v)
-    (lease/validate-lease-key! group-id db-identity)
-    (let [{:keys [lease version]}
-          (lease-entry (in-memory-linearizable-state-snapshot! state)
-                       db-identity)]
-      {:lease lease
-       :version version}))
-
-  (try-acquire-lease [_ {:keys [db-identity leader-node-id leader-endpoint
-                                lease-renew-ms lease-timeout-ms
-                                leader-last-applied-lsn now-ms
-                                observed-version observed-lease]}]
-    (ensure-running! running-v)
-    (validate-acquire-request!
-      {:db-identity db-identity
-       :leader-node-id leader-node-id
-       :leader-endpoint leader-endpoint
-       :lease-renew-ms lease-renew-ms
-       :lease-timeout-ms lease-timeout-ms
-       :now-ms now-ms
-       :observed-version observed-version
-       :observed-lease observed-lease})
-    (apply-state-command!
-     state
-     (stamp-lease-command
-      {:op :try-acquire-lease
-       :req {:db-identity db-identity
-             :leader-node-id leader-node-id
-             :leader-endpoint leader-endpoint
-             :lease-renew-ms lease-renew-ms
-             :lease-timeout-ms lease-timeout-ms
-             :leader-last-applied-lsn leader-last-applied-lsn
-             :now-ms now-ms
-             :observed-version observed-version
-             :observed-lease observed-lease}}
-      clock-skew-budget-ms)))
-
-  (renew-lease [_ {:keys [db-identity leader-node-id leader-endpoint
-                          term lease-renew-ms lease-timeout-ms
-                          leader-last-applied-lsn now-ms]}]
-    (ensure-running! running-v)
-    (validate-renew-request!
-      {:db-identity db-identity
-       :leader-node-id leader-node-id
-       :leader-endpoint leader-endpoint
-       :term term
-       :lease-renew-ms lease-renew-ms
-       :lease-timeout-ms lease-timeout-ms
-       :now-ms now-ms})
-    (apply-state-command!
-     state
-     (stamp-lease-command
-      {:op :renew-lease
-       :req {:db-identity db-identity
-             :leader-node-id leader-node-id
-             :leader-endpoint leader-endpoint
-             :term term
-             :lease-renew-ms lease-renew-ms
-             :lease-timeout-ms lease-timeout-ms
-             :leader-last-applied-lsn leader-last-applied-lsn
-             :now-ms now-ms}}
-      clock-skew-budget-ms)))
-
-  (release-lease [_ {:keys [db-identity leader-node-id term] :as req}]
-    (ensure-running! running-v)
-    (validate-release-request! req)
-    (apply-state-command!
-     state
-     {:op :release-lease
-      :req {:db-identity db-identity
-            :leader-node-id leader-node-id
-            :term term}}))
-
-  (read-membership-hash [_]
-    (ensure-running! running-v)
-    (:membership-hash (in-memory-linearizable-state-snapshot! state)))
-
-  (init-membership-hash! [_ membership-hash]
-    (ensure-running! running-v)
-    (require-non-blank-string! membership-hash :membership-hash)
-    (lease/validate-membership-hash-key! group-id)
-    (commit-state-transition!
-     state
-     (fn [s]
-       (let [existing (:membership-hash s)]
-         (cond
-           (nil? existing)
-           {:state (assoc s :membership-hash membership-hash)
-            :result {:ok? true
-                     :initialized? true
-                     :membership-hash membership-hash}}
-
-           (= existing membership-hash)
-           {:state s
-            :result {:ok? true
-                     :initialized? false
-                     :membership-hash existing}}
-
-           :else
-           {:state s
-            :result {:ok? false
-                     :reason :membership-hash-mismatch
-                     :membership-hash existing
-                     :expected membership-hash}})))))
-
-  (read-voters [_]
-    (ensure-running! running-v)
-    (vec (:voters (in-memory-linearizable-state-snapshot! state))))
-
-  (replace-voters! [_ voters]
-    (ensure-running! running-v)
-    (let [peer-ids (validated-peer-ids! voters :ha-control-plane-voters)]
-      (swap! state assoc :voters peer-ids)
-      {:ok? true
-       :voters peer-ids})))
 
 (defn- apply-try-acquire-transition
   [state {:keys [db-identity leader-node-id leader-endpoint
@@ -752,12 +506,6 @@
     (u/raise "Unsupported HA control command"
              {:error :ha/control-invalid-command
               :command cmd})))
-
-(defn- apply-state-command!
-  [state-atom cmd]
-  (commit-state-transition!
-   state-atom
-   #(apply-state-command % cmd)))
 
 (defonce ^:private protobuf-loaded?
   (delay (do (ProtobufMsgFactory/load) true)))
@@ -1923,19 +1671,6 @@
   [authority]
   (try
     (cond
-      (instance? InMemoryLeaseAuthority authority)
-      (let [{:keys [group-id state running-v initial-voters
-                    clock-skew-budget-ms]} authority
-            snapshot @state]
-        {:backend :in-memory
-         :group-id group-id
-         :running? (running? running-v)
-         :clock-skew-budget-ms clock-skew-budget-ms
-         :initial-voters initial-voters
-         :voters (:voters snapshot)
-         :membership-hash (:membership-hash snapshot)
-         :lease-count (count (:leases snapshot))})
-
       (instance? SofaJraftLeaseAuthority authority)
       (let [{:keys [group-id local-peer-id voters
                     rpc-timeout-ms election-timeout-ms
@@ -2005,18 +1740,6 @@
   [authority db-identity]
   (require-non-blank-string! db-identity :db-identity)
   (cond
-    (instance? InMemoryLeaseAuthority authority)
-    (let [{:keys [group-id state running-v]} authority]
-      (ensure-running! running-v)
-      (lease/validate-lease-key! group-id db-identity)
-    (let [snapshot (in-memory-linearizable-state-snapshot! state)
-          {:keys [lease version]} (lease-entry snapshot db-identity)]
-      {:lease lease
-       :version version
-       :authority-now-ms (long (control-now-ms))
-       :membership-hash (:membership-hash snapshot)
-       :voters (:voters snapshot)}))
-
     (instance? SofaJraftLeaseAuthority authority)
     (let [{:keys [group-id running-v]} authority]
       (ensure-running! running-v)
@@ -2056,23 +1779,6 @@
       (submit-read-state-command! authority db-identity))
     (read-state authority db-identity)))
 
-(defn new-in-memory-authority
-  "Create an in-memory authority adapter for deterministic tests."
-  [{:keys [group-id voters clock-skew-budget-ms scope-id]}]
-  (lease/validate-membership-hash-key! group-id)
-  (let [initial-voters (if (seq voters)
-                         (validated-peer-ids! voters :ha-control-plane-voters)
-                         [])
-        scope-id (or scope-id *in-memory-group-scope*)]
-    (->InMemoryLeaseAuthority group-id
-                              (group-state scope-id group-id)
-                              (volatile! false)
-                              initial-voters
-                              (some-> clock-skew-budget-ms
-                                      (validate-clock-skew-budget!
-                                       :clock-skew-budget-ms)
-                                      long))))
-
 (defn new-sofa-jraft-authority
   "Create the SOFAJRaft-backed distributed lease authority."
   [{:keys [group-id local-peer-id voters rpc-timeout-ms
@@ -2107,7 +1813,6 @@
   "Create an authority adapter by backend keyword."
   [{:keys [backend] :as opts}]
   (case backend
-    :in-memory (new-in-memory-authority opts)
     :sofa-jraft (new-sofa-jraft-authority opts)
     (u/raise "Unsupported HA control-plane backend"
              {:error :ha/unsupported-backend

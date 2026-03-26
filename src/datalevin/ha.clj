@@ -1866,11 +1866,6 @@
 (defn start-ha-authority
   [db-name ha-opts]
   (let [validation-opts (cond-> ha-opts
-                          (= :in-memory
-                             (get-in ha-opts [:ha-control-plane :backend]))
-                          (assoc-in [:ha-control-plane :backend]
-                                    :sofa-jraft)
-
                           (nil? (get-in ha-opts [:ha-control-plane :rpc-timeout-ms]))
                           (assoc-in [:ha-control-plane :rpc-timeout-ms] 2000)
 
