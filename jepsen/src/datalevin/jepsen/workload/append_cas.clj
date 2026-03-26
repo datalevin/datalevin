@@ -189,5 +189,6 @@
                           base-checker
                           (fn [op]
                             (= :txn (:f op)))
-                          [:f :error])
+                          [:f :error]
+                          workload.util/read-only-micro-op-txn?)
                :schema schema))))

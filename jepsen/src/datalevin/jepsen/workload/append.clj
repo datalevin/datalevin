@@ -110,6 +110,7 @@
                  (:checker base-workload)
                  (fn [op]
                    (= :txn (:f op)))
-                 [:f :error]))
+                 [:f :error]
+                 workload.util/read-only-micro-op-txn?))
         (assoc :client (->Client nil)
                :schema schema))))
