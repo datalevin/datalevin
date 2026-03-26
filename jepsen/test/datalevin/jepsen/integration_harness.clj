@@ -11,7 +11,10 @@
    [jepsen.nemesis :as jn]))
 
 (def ^:private local-history-start-time "20260312T000000.000-0800")
-(def ^:private local-history-convergence-timeout-ms 30000)
+;; The production sofa-jraft control plane converges more slowly than the old
+;; in-process test backend, so give failover smoke checks a wider replication
+;; window before declaring live-node catch-up failed.
+(def ^:private local-history-convergence-timeout-ms 60000)
 
 (defn wait-for-leader-append-write!
   [test key value timeout-ms]
