@@ -1493,6 +1493,36 @@
                        (s/includes? message "Broken pipe"))))))
       (take-while some? (iterate ex-cause e)))))
 
+(defn- handled-request-error?
+  [e]
+  (let [data     (ex-data e)
+        err-data (:err-data data)]
+    (and (instance? clojure.lang.ExceptionInfo e)
+         (map? data)
+         (nil? (ex-cause e))
+         (or (:type data)
+             (:error data)
+             (:resized data)
+             (map? err-data)))))
+
+(defn- log-handled-request-error!
+  [e]
+  (let [data     (or (ex-data e) {})
+        err-data (:err-data data)
+        details  (cond-> {:message (ex-message e)}
+                   (:type data) (assoc :type (:type data))
+                   (:error data) (assoc :error (:error data))
+                   (:db-name data) (assoc :db-name (:db-name data))
+                   (map? err-data)
+                   (cond->
+                     (:type err-data) (assoc :err-type (:type err-data))
+                     (:error err-data) (assoc :err-error (:error err-data))))]
+    (if (handled-request-error? e)
+      ;; These request failures are returned to the client and are often
+      ;; asserted in tests. Keep them out of stderr unless debug logging is on.
+      (log/debug "Handled request error" details)
+      (log/error e))))
+
 (defn- close-conn-quietly
   [^SelectionKey skey]
   (try
@@ -1532,7 +1562,7 @@
 
       :else
       (do
-        (log/error e)
+        (log-handled-request-error! e)
         (try
           (error-response skey (ex-message e) data)
           (catch Exception response-e

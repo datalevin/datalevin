@@ -2439,54 +2439,72 @@
 
 (defn refresh-shared-state!
   [state]
-  (let [meta-state (current-meta-state state)
+  (let [base-state (base-meta-state state)
+        meta-file-state (or (:current (read-meta-file (:meta-path state))) {})
+        meta-state (merge base-state meta-file-state)
         dir (:dir state)
         newest-segment-id (long (or (:id (peek (segment-files dir))) 1))
-        target-segment-id (long (max 1
-                                     (long (or (:segment-id meta-state) 1))
-                                     newest-segment-id))
-        target-path (activate-next-segment! dir target-segment-id)
-        target-scan (truncate-partial-tail!
-                     target-path {:allow-preallocated-tail? true})
-        target-offset (long
-                       (if (= target-segment-id
-                              (long (or (:segment-id meta-state) target-segment-id)))
-                         (max (segment-end-offset target-scan)
-                              (long (or (:segment-offset meta-state) 0)))
-                         (segment-end-offset target-scan)))
-        target-last-lsn (long (or (some-> (:records target-scan) peek :lsn) 0))
-        committed-lsn (max (long (or (:last-committed-lsn meta-state) 0))
-                           target-last-lsn)
-        durable-lsn (min committed-lsn
-                         (max 0 (long (or (:last-durable-lsn meta-state) 0))))
-        applied-lsn (min committed-lsn
-                         (max 0 (long (or (:last-applied-lsn meta-state) 0))))
-        updated-ms (long (or (:updated-ms meta-state) 0))
-        revision (long (or (:revision meta-state) -1))
-        now-ms (System/currentTimeMillis)]
-    (ensure-runtime-segment-channel! state target-segment-id target-path)
-    (when-let [segment-offset-v (:segment-offset state)]
-      (vreset! segment-offset-v target-offset))
-    (when-let [segment-created-ms-v (:segment-created-ms state)]
-      (vreset! segment-created-ms-v
-               (segment-created-ms-from-file target-path now-ms)))
-    (when-let [next-lsn-v (:next-lsn state)]
-      (vreset! next-lsn-v (inc committed-lsn)))
-    (when-let [meta-revision-v (:meta-revision state)]
-      (vreset! meta-revision-v revision))
-    (when-let [last-applied-v (:meta-last-applied-lsn state)]
-      (vreset! last-applied-v applied-lsn))
-    (apply-shared-watermarks! (:sync-manager state)
-                              committed-lsn
-                              durable-lsn
-                              updated-ms)
-    {:revision revision
-     :last-committed-lsn committed-lsn
-     :last-durable-lsn durable-lsn
-     :last-applied-lsn applied-lsn
-     :segment-id target-segment-id
-     :segment-offset target-offset
-     :updated-ms updated-ms}))
+        current-segment-id (long (or (:segment-id base-state) 1))
+        current-offset (long (or (:segment-offset base-state) 0))
+        current-revision (long (or (:revision base-state) -1))
+        meta-revision (long (or (:revision meta-file-state) -1))
+        ^FileChannel current-ch (some-> (:segment-channel state) deref)
+        synced-runtime?
+        (and current-ch
+             (= newest-segment-id current-segment-id)
+             (<= meta-revision current-revision)
+             (try
+               (= (long (.size current-ch)) current-offset)
+               (catch Exception _
+                 false)))]
+    (if synced-runtime?
+      base-state
+      (let [target-segment-id (long (max 1
+                                         (long (or (:segment-id meta-state) 1))
+                                         newest-segment-id))
+            target-path (activate-next-segment! dir target-segment-id)
+            target-scan (truncate-partial-tail!
+                         target-path {:allow-preallocated-tail? true})
+            target-offset (long
+                           (if (= target-segment-id
+                                  (long (or (:segment-id meta-state)
+                                            target-segment-id)))
+                             (max (segment-end-offset target-scan)
+                                  (long (or (:segment-offset meta-state) 0)))
+                             (segment-end-offset target-scan)))
+            target-last-lsn (long (or (some-> (:records target-scan) peek :lsn) 0))
+            committed-lsn (max (long (or (:last-committed-lsn meta-state) 0))
+                               target-last-lsn)
+            durable-lsn (min committed-lsn
+                             (max 0 (long (or (:last-durable-lsn meta-state) 0))))
+            applied-lsn (min committed-lsn
+                             (max 0 (long (or (:last-applied-lsn meta-state) 0))))
+            updated-ms (long (or (:updated-ms meta-state) 0))
+            revision (long (or (:revision meta-state) -1))
+            now-ms (System/currentTimeMillis)]
+        (ensure-runtime-segment-channel! state target-segment-id target-path)
+        (when-let [segment-offset-v (:segment-offset state)]
+          (vreset! segment-offset-v target-offset))
+        (when-let [segment-created-ms-v (:segment-created-ms state)]
+          (vreset! segment-created-ms-v
+                   (segment-created-ms-from-file target-path now-ms)))
+        (when-let [next-lsn-v (:next-lsn state)]
+          (vreset! next-lsn-v (inc committed-lsn)))
+        (when-let [meta-revision-v (:meta-revision state)]
+          (vreset! meta-revision-v revision))
+        (when-let [last-applied-v (:meta-last-applied-lsn state)]
+          (vreset! last-applied-v applied-lsn))
+        (apply-shared-watermarks! (:sync-manager state)
+                                  committed-lsn
+                                  durable-lsn
+                                  updated-ms)
+        {:revision revision
+         :last-committed-lsn committed-lsn
+         :last-durable-lsn durable-lsn
+         :last-applied-lsn applied-lsn
+         :segment-id target-segment-id
+         :segment-offset target-offset
+         :updated-ms updated-ms}))))
 
 (defn- refresh-shared-watermarks!
   [state]

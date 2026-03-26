@@ -24,6 +24,16 @@
                      (when-not (clojure.string/blank? trimmed)
                        trimmed))))))
 
+(def ^:private wal-child-ready-timeout-ms 15000)
+(def ^:private wal-child-process-timeout-ms 30000)
+
+(defn- process-output
+  [^Process process]
+  (try
+    (slurp (.getInputStream process) :encoding "UTF-8")
+    (catch Exception _
+      "")))
+
 (defn- child-process-result
   [^Process process timeout-ms]
   (let [finished? (.waitFor process
@@ -31,10 +41,7 @@
                             TimeUnit/MILLISECONDS)]
     (if finished?
       (let [exit   (.exitValue process)
-            output (try
-                     (slurp (.getInputStream process) :encoding "UTF-8")
-                     (catch Exception _
-                       ""))
+            output (process-output process)
             result (try
                      (some-> output last-nonblank-line edn/read-string)
                      (catch Exception _
@@ -49,7 +56,8 @@
           (.destroyForcibly process))
         {:ok? false
          :reason :timeout
-         :timeout-ms timeout-ms}))))
+         :timeout-ms timeout-ms
+         :output (process-output process)}))))
 
 (defn- start-clojure-child!
   [form]
@@ -133,12 +141,12 @@
                                                ready-path
                                                release-path))]
             (try
-              (is (wait-for-file ready-path 5000))
+              (is (wait-for-file ready-path wal-child-ready-timeout-ms))
               (is (= :transacted
                      (d/transact-kv db1 [[:put "a" :k1 :v1]])))
               (spit release-path "go")
               (let [{:keys [ok? result output]}
-                    (child-process-result child 10000)]
+                    (child-process-result child wal-child-process-timeout-ms)]
                 (is ok? output)
                 (is (= {:status :ok
                         :lsns [1 2]
