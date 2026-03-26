@@ -714,6 +714,8 @@
       (with-ha-follower-replay-quiesced server db-name publish!)
       (publish!))))
 
+(declare log-ha-loop-crash!)
+
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
   (try
@@ -751,8 +753,10 @@
                   (.set running? false)
                   (sleep-ha-loop! running? (ha-loop-sleep-ms state))))))
           (catch Throwable t
-            (log/error t "HA renew loop crashed"
-                       {:db-name db-name})
+            (log-ha-loop-crash!
+             "HA renew loop crashed; retrying after backoff"
+             db-name
+             t)
             (ha-loop-error-backoff! running?)))
         (recur)))
     (finally
@@ -831,8 +835,10 @@
                   (sleep-ha-loop! running?
                                   (ha-follower-loop-sleep-ms state))))))
           (catch Throwable t
-            (log/error t "HA follower sync loop crashed"
-                       {:db-name db-name})
+            (log-ha-loop-crash!
+             "HA follower sync loop crashed; retrying after backoff"
+             db-name
+             t)
             (ha-loop-error-backoff! running?)))
         (recur)))
     (finally
@@ -1522,6 +1528,17 @@
       ;; asserted in tests. Keep them out of stderr unless debug logging is on.
       (log/debug "Handled request error" details)
       (log/error e))))
+
+(defn- log-ha-loop-crash!
+  [loop-name db-name t]
+  (let [details (cond-> {:db-name db-name
+                         :error-class (.getName ^Class (class t))}
+                  (some? (ex-message t)) (assoc :message (ex-message t))
+                  (some? (ex-data t)) (assoc :error-data (ex-data t)))]
+    ;; HA loops retry after backoff. Keep operator-visible logs compact and
+    ;; reserve the full stack trace for debug logging.
+    (log/warn loop-name details)
+    (log/debug t (str loop-name " stack trace") {:db-name db-name})))
 
 (defn- close-conn-quietly
   [^SelectionKey skey]

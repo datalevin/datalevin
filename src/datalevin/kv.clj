@@ -3014,7 +3014,8 @@
 
 (defn- collect-txlog-records
   [state segments cache-v from]
-  (let [tail-scan? (pos? from)]
+  (let [from (long from)
+        tail-scan? (pos? from)]
     (if tail-scan?
       (loop [remaining (seq (rseq segments))
              collected '()]

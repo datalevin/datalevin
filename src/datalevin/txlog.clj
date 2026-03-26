@@ -2109,7 +2109,7 @@
                     (< lsn from)
                     acc
 
-                    (and upto (> lsn upto))
+                    (and upto (> lsn (long upto)))
                     (reduced acc)
 
                     :else
@@ -2459,19 +2459,20 @@
                  false)))]
     (if synced-runtime?
       base-state
-      (let [target-segment-id (long (max 1
-                                         (long (or (:segment-id meta-state) 1))
-                                         newest-segment-id))
+      (let [meta-segment-id (long (or (:segment-id meta-state) 1))
+            target-segment-id (long (max 1 meta-segment-id newest-segment-id))
             target-path (activate-next-segment! dir target-segment-id)
             target-scan (truncate-partial-tail!
                          target-path {:allow-preallocated-tail? true})
+            scan-end-offset (long (segment-end-offset target-scan))
+            meta-segment-offset (long (or (:segment-offset meta-state) 0))
             target-offset (long
                            (if (= target-segment-id
-                                  (long (or (:segment-id meta-state)
-                                            target-segment-id)))
-                             (max (segment-end-offset target-scan)
-                                  (long (or (:segment-offset meta-state) 0)))
-                             (segment-end-offset target-scan)))
+                                  meta-segment-id)
+                             (if (< scan-end-offset meta-segment-offset)
+                               meta-segment-offset
+                               scan-end-offset)
+                             scan-end-offset))
             target-last-lsn (long (or (some-> (:records target-scan) peek :lsn) 0))
             committed-lsn (max (long (or (:last-committed-lsn meta-state) 0))
                                target-last-lsn)

@@ -229,7 +229,8 @@
 
 (defn- first-candidates
   [{:keys [tids rbms rsls bbm]} ^RoaringBitmap result tao n]
-  (let [z        (inc (- ^long n ^long tao))
+  (let [rbms     ^"[Lorg.roaringbitmap.RoaringBitmap;" rbms
+        z        (inc (- ^long n ^long tao))
         union-bm (prefix-union-bm rbms z)]
     (candidate-array
       (dotimes [i (count tids)]
@@ -590,7 +591,7 @@
     (RoaringBitmap.)))
 
 (defn- boolean-bm
-  [tmid bms max-doc query]
+  [tmid bms ^AtomicInteger max-doc query]
   (cond
     (string? query)
     (term-bm tmid bms query)

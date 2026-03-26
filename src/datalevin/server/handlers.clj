@@ -27,6 +27,7 @@
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
+   [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Paths]
    [java.util UUID]
    [java.util.concurrent Semaphore]))
@@ -43,6 +44,18 @@
 (def ^:private transient-runtime-store-max-attempts 8)
 (def ^:private transient-runtime-store-retry-sleep-ms 25)
 
+(defn- skey-state
+  ^clojure.lang.Volatile [^SelectionKey skey]
+  (.attachment skey))
+
+(defn- db-lock
+  ^Semaphore [deps server db-name]
+  ((:get-lock deps) server db-name))
+
+(defn- state-lock
+  ^Semaphore [dbs db-name]
+  (get-in dbs [db-name :lock]))
+
 (defn- with-error
   [deps skey f]
   (try
@@ -51,9 +64,9 @@
       ((:handle-message-error! deps) skey e))))
 
 (defn- with-permission!
-  [deps server skey req-act req-obj req-tgt denied-message f]
-  (let [{:keys [client-id write-bf wire-opts]} @(.attachment skey)
-        ch                                   (.channel skey)
+  [deps server ^SelectionKey skey req-act req-obj req-tgt denied-message f]
+  (let [{:keys [client-id write-bf wire-opts]} @(skey-state skey)
+        ^SocketChannel ch                    (.channel skey)
         {:keys [permissions]}                ((:get-client deps) server client-id)]
     (if permissions
       (if (auth/has-permission? req-act req-obj req-tgt permissions)
@@ -134,13 +147,16 @@
                        :error e}))]
       (if (:ok? outcome)
         (:value outcome)
-        (let [e (:error outcome)]
-          (if (and (< attempt transient-runtime-store-max-attempts)
+        (let [e (:error outcome)
+              attempt (long attempt)]
+          (if (and (< attempt (long transient-runtime-store-max-attempts))
                    (transient-runtime-store-error? e))
-            (do
-              (Thread/sleep (long (* transient-runtime-store-retry-sleep-ms
-                                     (inc attempt))))
-              (recur (inc attempt)))
+            (let [attempt' (unchecked-inc attempt)]
+              (Thread/sleep
+               (unchecked-multiply
+                (long transient-runtime-store-retry-sleep-ms)
+                (long attempt')))
+              (recur attempt'))
             (throw e)))))))
 
 (defn- with-transient-runtime-store-skip
@@ -315,19 +331,19 @@
        (u/raise "Failed to authenticate" {}))))
 
 (defn disconnect
-  [deps server skey _]
-  (let [{:keys [client-id]} @(.attachment skey)]
+  [deps server ^SelectionKey skey _]
+  (let [{:keys [client-id]} @(skey-state skey)]
     ((:disconnect-client* deps) server client-id)))
 
 (defn set-client-id
-  [deps _server skey message]
+  [deps _server ^SelectionKey skey message]
   (let [client-id         (:client-id message)
         wire-capabilities (:wire-capabilities message)
         wire-opts         (p/negotiate-wire-opts wire-capabilities)]
     ((:write-message deps) skey
      {:type              :set-client-id-ok
       :wire-capabilities (p/local-wire-capabilities)})
-    (vswap! (.attachment skey)
+    (vswap! (skey-state skey)
             assoc :client-id client-id :wire-opts wire-opts)))
 
 (defn create-user
@@ -465,13 +481,13 @@
            (write-complete! deps skey))))))
 
 (defn close-database
-  [deps server skey {:keys [args]}]
+  [deps server ^SelectionKey skey {:keys [args]}]
   (with-error
     deps
     skey
     #(let [sys-conn            (sys-conn deps server)
            [db-name]           args
-           {:keys [client-id]} @(.attachment skey)
+           {:keys [client-id]} @(skey-state skey)
            did                 (auth/db-eid sys-conn db-name)]
        (if did
          (if ((:get-store deps) server db-name)
@@ -902,11 +918,11 @@
        (write-complete! deps skey))))
 
 (defn open-dbi
-  [deps server skey {:keys [args writing?]}]
+  [deps server ^SelectionKey skey {:keys [args writing?]}]
   (with-error
     deps
     skey
-    #(let [{:keys [client-id]} @(.attachment skey)
+    #(let [{:keys [client-id]} @(skey-state skey)
            db-name             (nth args 0)
            kv                  (kv-store deps server skey db-name writing?)
            args                (rest args)
@@ -918,11 +934,11 @@
        (write-complete! deps skey))))
 
 (defn drop-dbi
-  [deps server skey {:keys [args writing?]}]
+  [deps server ^SelectionKey skey {:keys [args writing?]}]
   (with-error
     deps
     skey
-    #(let [{:keys [client-id]} @(.attachment skey)
+    #(let [{:keys [client-id]} @(skey-state skey)
            db-name             (nth args 0)
            kv                  (kv-store deps server skey db-name writing?)
            args                (rest args)
@@ -1073,46 +1089,50 @@
   (with-error
     deps
     skey
-    #(let [db-name (nth args 0)]
-       (db-alter-permission!
-         deps server skey db-name
-         "Don't have permission to alter the database"
-         (fn []
-           (.acquire ((:get-lock deps) server db-name))
-           (try
-             (let [{:keys [kv-store wlmdb]}
-                   ((:open-write-txn-with-retry deps) server db-name)]
-               ((:update-db deps) server db-name
-                (fn [m]
-                  (assoc m :wlmdb wlmdb)))
-               (let [runner ((:write-txn-runner deps) server db-name kv-store)]
-                 (write-complete! deps skey)
-                 ((:run-calls deps) runner)))
-             (catch Throwable t
-               (.release (get-in ((:dbs deps) server) [db-name :lock]))
-               (throw t))))))))
+    (fn []
+      (let [db-name          (nth args 0)
+            ^Semaphore lock (db-lock deps server db-name)]
+        (db-alter-permission!
+          deps server skey db-name
+          "Don't have permission to alter the database"
+          (fn []
+            (.acquire lock)
+            (try
+              (let [{:keys [kv-store wlmdb]}
+                    ((:open-write-txn-with-retry deps) server db-name)]
+                ((:update-db deps) server db-name
+                 (fn [m]
+                   (assoc m :wlmdb wlmdb)))
+                (let [runner ((:write-txn-runner deps) server db-name kv-store)]
+                  (write-complete! deps skey)
+                  ((:run-calls deps) runner)))
+              (catch Throwable t
+                (.release lock)
+                (throw t)))))))))
 
 (defn close-transact-kv
   [deps server skey {:keys [args]}]
   (with-error
     deps
     skey
-    #(let [db-name  (nth args 0)
-           kv-store ((:get-kv-store deps) server db-name)
-           dbs      ((:dbs deps) server)]
-       (db-alter-permission!
-         deps server skey db-name
-         "Don't have permission to alter the database"
-         (fn []
-           (try
-             (i/close-transact-kv kv-store)
-             (write-complete! deps skey)
-             (finally
-               ((:halt-run deps) (get-in dbs [db-name :runner]))
-               ((:update-db deps) server db-name
-                (fn [m]
-                  (dissoc m :runner :wlmdb)))
-               (.release (get-in dbs [db-name :lock])))))))))
+    (fn []
+      (let [db-name          (nth args 0)
+            kv-store         ((:get-kv-store deps) server db-name)
+            dbs              ((:dbs deps) server)
+            ^Semaphore lock (state-lock dbs db-name)]
+        (db-alter-permission!
+          deps server skey db-name
+          "Don't have permission to alter the database"
+          (fn []
+            (try
+              (i/close-transact-kv kv-store)
+              (write-complete! deps skey)
+              (finally
+                ((:halt-run deps) (get-in dbs [db-name :runner]))
+                ((:update-db deps) server db-name
+                 (fn [m]
+                   (dissoc m :runner :wlmdb)))
+                (.release lock))))))))
 
 (defn abort-transact-kv
   [deps server skey {:keys [args]}]
@@ -1120,9 +1140,10 @@
     deps
     skey
     (fn []
-      (let [db-name  (nth args 0)
-            kv-store ((:get-kv-store deps) server db-name)
-            dbs      ((:dbs deps) server)]
+      (let [db-name          (nth args 0)
+            kv-store         ((:get-kv-store deps) server db-name)
+            dbs              ((:dbs deps) server)
+            ^Semaphore lock (state-lock dbs db-name)]
         (db-alter-permission!
           deps server skey db-name
           "Don't have permission to alter the database"
@@ -1135,7 +1156,7 @@
                 ((:update-db deps) server db-name
                  (fn [m]
                    (dissoc m :runner :wlmdb)))
-                (.release (get-in dbs [db-name :lock]))))
+                (.release lock)))
             (write-complete! deps skey)))))))
 
 (defn open-transact
@@ -1143,57 +1164,61 @@
   (with-error
     deps
     skey
-    #(let [db-name (nth args 0)]
-       (db-alter-permission!
-         deps server skey db-name
-         "Don't have permission to alter the database"
-         (fn []
-           (.acquire ((:get-lock deps) server db-name))
-           (try
-             (let [{:keys [store kv-store wlmdb]}
-                   ((:open-write-txn-with-retry deps) server db-name)
-                   wstore (st/transfer store wlmdb)
-                   runner ((:write-txn-runner deps) server db-name kv-store)]
-               ((:update-db deps)
-                server
-                db-name
-                (fn [m]
-                  (assoc m
-                         :wlmdb wlmdb
-                         :wstore wstore
-                         :wdt-db ((:new-runtime-db deps)
-                                  wstore
-                                  ((:current-runtime-opts deps) m)))))
-               (write-complete! deps skey)
-               ((:run-calls deps) runner))
-             (catch Throwable t
-               (.release (get-in ((:dbs deps) server) [db-name :lock]))
-               (throw t))))))))
+    (fn []
+      (let [db-name          (nth args 0)
+            ^Semaphore lock (db-lock deps server db-name)]
+        (db-alter-permission!
+          deps server skey db-name
+          "Don't have permission to alter the database"
+          (fn []
+            (.acquire lock)
+            (try
+              (let [{:keys [store kv-store wlmdb]}
+                    ((:open-write-txn-with-retry deps) server db-name)
+                    wstore (st/transfer store wlmdb)
+                    runner ((:write-txn-runner deps) server db-name kv-store)]
+                ((:update-db deps)
+                 server
+                 db-name
+                 (fn [m]
+                   (assoc m
+                          :wlmdb wlmdb
+                          :wstore wstore
+                          :wdt-db ((:new-runtime-db deps)
+                                   wstore
+                                   ((:current-runtime-opts deps) m)))))
+                (write-complete! deps skey)
+                ((:run-calls deps) runner))
+              (catch Throwable t
+                (.release lock)
+                (throw t)))))))))
 
 (defn close-transact
   [deps server skey {:keys [args]}]
   (with-error
     deps
     skey
-    #(let [db-name  (nth args 0)
-           kv-store ((:get-kv-store deps) server db-name)
-           dbs      ((:dbs deps) server)]
-       (db-alter-permission!
-         deps server skey db-name
-         "Don't have permission to alter the database"
-         (fn []
-           (try
-             (i/close-transact-kv kv-store)
-             ((:add-store deps)
-              server db-name
-              (st/transfer (get-in dbs [db-name :wstore]) kv-store))
-             (write-complete! deps skey)
-             (finally
-               ((:halt-run deps) (get-in dbs [db-name :runner]))
-               ((:update-db deps) server db-name
-                (fn [m]
-                  (dissoc m :wlmdb :wstore :wdt-db :runner)))
-               (.release (get-in dbs [db-name :lock])))))))))
+    (fn []
+      (let [db-name          (nth args 0)
+            kv-store         ((:get-kv-store deps) server db-name)
+            dbs              ((:dbs deps) server)
+            ^Semaphore lock (state-lock dbs db-name)]
+        (db-alter-permission!
+          deps server skey db-name
+          "Don't have permission to alter the database"
+          (fn []
+            (try
+              (i/close-transact-kv kv-store)
+              ((:add-store deps)
+               server db-name
+               (st/transfer (get-in dbs [db-name :wstore]) kv-store))
+              (write-complete! deps skey)
+              (finally
+                ((:halt-run deps) (get-in dbs [db-name :runner]))
+                ((:update-db deps) server db-name
+                 (fn [m]
+                   (dissoc m :wlmdb :wstore :wdt-db :runner)))
+                (.release lock)))))))))
 
 (defn abort-transact
   [deps server skey {:keys [args]}]
@@ -1203,7 +1228,8 @@
     (fn []
       (let [db-name  (nth args 0)
             kv-store ((:get-kv-store deps) server db-name)
-            dbs      ((:dbs deps) server)]
+            dbs      ((:dbs deps) server)
+            ^Semaphore lock (state-lock dbs db-name)]
         (db-alter-permission!
           deps server skey db-name
           "Don't have permission to alter the database"
@@ -1216,8 +1242,8 @@
                 ((:update-db deps) server db-name
                  (fn [m]
                    (dissoc m :wlmdb :wstore :wdt-db :runner)))
-                (.release (get-in dbs [db-name :lock]))))
-            (write-complete! deps skey)))))))
+                (.release lock)))
+            (write-complete! deps skey))))))))
 
 (defn sync
   [deps server skey {:keys [args]}]
@@ -1611,7 +1637,7 @@
     deps skey #(sapi/fulltext-datoms (api-deps deps) server skey message)))
 
 (defn new-search-engine
-  [deps server skey message]
+  [deps server ^SelectionKey skey message]
   (with-error
     deps
     skey
@@ -1619,7 +1645,7 @@
       (api-deps deps)
       server
       skey
-      (:client-id @(.attachment skey))
+      (:client-id @(skey-state skey))
       message)))
 
 (defn add-doc
@@ -1664,7 +1690,7 @@
     deps skey #(sapi/search-re-index (api-deps deps) server skey {:args args})))
 
 (defn new-vector-index
-  [deps server skey message]
+  [deps server ^SelectionKey skey message]
   (with-error
     deps
     skey
@@ -1672,7 +1698,7 @@
       (api-deps deps)
       server
       skey
-      (:client-id @(.attachment skey))
+      (:client-id @(skey-state skey))
       message)))
 
 (defn add-vec

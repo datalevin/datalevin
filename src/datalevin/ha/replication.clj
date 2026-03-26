@@ -1011,11 +1011,13 @@
                    (loop [remaining remaining
                           first-failure first-failure]
                      (if-let [completed-future (.poll completion)]
-                       (let [[remaining first-failure]
+                       (let [[next-remaining next-first-failure]
                              (record-completion
                               remaining
                               first-failure
-                              completed-future)]
+                              completed-future)
+                             remaining (long next-remaining)
+                             first-failure (long next-first-failure)]
                          (recur remaining first-failure))
                        [remaining first-failure])))
                  (timeout-items []
@@ -1039,7 +1041,8 @@
                          (.cancel future true)))))]
            (loop [remaining (long n)
                   first-failure (long -1)]
-             (let [remaining (long remaining)]
+             (let [remaining (long remaining)
+                   first-failure (long first-failure)]
                (if (zero? remaining)
                  (finish first-failure)
                  (let [remaining-nanos
@@ -1054,15 +1057,18 @@
                                                  1000000)))
                                 TimeUnit/MILLISECONDS))]
                    (if completed-future
-                     (let [[remaining first-failure]
+                     (let [[next-remaining next-first-failure]
                            (record-completion
                             remaining
                             first-failure
-                            completed-future)]
+                            completed-future)
+                           remaining (long next-remaining)
+                           first-failure (long next-first-failure)]
                        (recur remaining first-failure))
-                     (let [[remaining first-failure]
+                     (let [[next-remaining next-first-failure]
                            (drain-ready remaining first-failure)
-                           remaining (long remaining)]
+                           remaining (long next-remaining)
+                           first-failure (long next-first-failure)]
                        (if (zero? remaining)
                          (finish first-failure)
                          (do

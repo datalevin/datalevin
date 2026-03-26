@@ -83,8 +83,9 @@
 
 (defn bootstrap-empty-lease?
   [lease]
-  (and (or (nil? lease) (nil? (:leader-node-id lease)))
-       (zero? (observed-term lease))))
+  (let [term (long (or (:term lease) 0))]
+    (and (or (nil? lease) (nil? (:leader-node-id lease)))
+         (zero? term))))
 
 (defn new-lease-record
   "Create a canonical authoritative lease record."
