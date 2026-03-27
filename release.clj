@@ -81,6 +81,9 @@
   (println "\n\n[ Running test1 lein tests (dtlvtest) ]\n")
   (sh "lein" "test" :dir dtlvtest-dir)
 
+  (println "\n\n[ Running Jepsen lein tests ]\n")
+  (sh "lein" "test" :dir "jepsen")
+
   (println "\n\n[ Running JOB tests ]\n")
   (sh "./job-test" :dir "script")
 

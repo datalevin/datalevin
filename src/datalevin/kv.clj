@@ -3065,9 +3065,10 @@
        (let [segments (vec (txlog/segment-files dir))
              _ (prune-txlog-records-cache! cache-v segments)
              raw-records (collect-txlog-records state segments cache-v from)
-             records (if (pos? from)
-                       (drop-while #(<= (long (:lsn %)) from) raw-records)
-                       raw-records)
+             ;; `from-lsn` is inclusive for the public txn-log APIs.
+             ;; Recovery call sites that need exclusive replay already drop
+             ;; applied records after reading the retained segment prefix.
+             records raw-records
              error (try
                      (validate-txlog-record-sequence! records)
                      nil
