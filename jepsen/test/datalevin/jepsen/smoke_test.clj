@@ -1486,6 +1486,12 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
+(deftest parse-nemesis-spec-smoke-test
+  (is (= [:node-kill]
+         (core/parse-nemesis-spec "kill")))
+  (is (= [:node-kill :leader-failover]
+         (core/parse-nemesis-spec "kill,failover"))))
+
 (def ^:private datalevin-test-nemesis-wiring-cases
   [{:label :leader-failover
     :opts {:db-name "smoke"
@@ -1502,6 +1508,22 @@
     :expected {:nodes ["n1" "n2" "n3"]
                :control-backend :sofa-jraft
                :nemesis-faults [:leader-failover]
+               :networked? false}}
+   {:label :node-kill
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:node-kill]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:node-kill]
                :networked? false}}
    {:label :leader-pause
     :opts {:db-name "smoke"

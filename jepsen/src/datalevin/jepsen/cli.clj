@@ -8,7 +8,7 @@
    [taoensso.timbre :as log]))
 
 (def ^:private supported-nemesis-labels
-  (->> (concat [:none :failover :pause :pause-any :pause-multi
+  (->> (concat [:none :failover :kill :pause :pause-any :pause-multi
                 :partition :asymmetric :degraded
                 :io-stall :disk-full :rejoin :quorum :clock-skew
                 :clock-leader-fast :clock-leader-slow :clock-mixed]

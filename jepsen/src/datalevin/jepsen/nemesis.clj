@@ -6,6 +6,7 @@
    [jepsen.nemesis :as n]))
 
 (def ^:private default-failover-interval-s 10)
+(def ^:private default-kill-interval-s 10)
 (def ^:private default-restart-delay-s 5)
 (def ^:private default-pause-interval-s 10)
 (def ^:private default-pause-resume-delay-s 5)
@@ -30,6 +31,7 @@
 
 (def supported-faults
   #{:leader-failover
+    :node-kill
     :leader-pause
     :node-pause
     :multi-node-pause
@@ -48,6 +50,7 @@
 (def ^:private alias-faults
   {:none []
    :failover [:leader-failover]
+   :kill [:node-kill]
    :pause [:leader-pause]
    :pause-any [:node-pause]
    :pause-multi [:multi-node-pause]
@@ -150,6 +153,7 @@
 
 (defn- final-phase-ops
   [{:keys [failover?
+           kill?
            leader-pause?
            node-pause?
            multi-node-pause?
@@ -169,6 +173,8 @@
         {:type :info :f :stabilize-leader}])
      (when (and failover? (not clock-skew-failover?))
        [{:type :info :f :restart-node}])
+     (when kill?
+       [{:type :info :f :restart-killed-node}])
      (when (or leader-pause?
                node-pause?
                multi-node-pause?)
@@ -279,6 +285,7 @@
 (defn- leader-failover-nemesis
   []
   (let [stopped-node (atom nil)
+        killed-node (atom nil)
         paused-nodes (atom #{})
         rejoin-stopped-node (atom nil)
         quorum-stopped-nodes (atom [])
@@ -291,6 +298,7 @@
       n/Reflection
       (fs [_]
         #{:kill-leader :restart-node :stabilize-leader
+          :kill-node :restart-killed-node
           :pause-leader :pause-node :pause-nodes
           :resume-node :resume-nodes
           :partition-leader :heal-partition
@@ -334,6 +342,47 @@
                            (local/maybe-wait-for-single-leader
                             cluster-id
                             (if @active-clock-skew 1000 10000))]
+                    (info-op op {:restarted node
+                                 :leader leader})
+                    (info-op op {:restarted node
+                                 :leader nil
+                                 :status :leader-unavailable})))
+                (info-op op :noop))
+
+              :kill-node
+              (if-let [node @killed-node]
+                (info-op op {:killed node
+                             :status :already-stopped})
+                (let [{:keys [live-nodes]} (local/cluster-state cluster-id)
+                      candidate (or (get-in op [:value :node])
+                                    (when (seq live-nodes)
+                                      (rand-nth (vec (sort live-nodes)))))]
+                  (if candidate
+                    (if (contains? (set live-nodes) candidate)
+                      (do
+                        (local/stop-node! cluster-id candidate)
+                        (reset! killed-node candidate)
+                        (if-let [{leader :leader}
+                                 (local/maybe-wait-for-single-leader
+                                  cluster-id
+                                  10000)]
+                          (info-op op {:killed candidate
+                                       :leader leader})
+                          (info-op op {:killed candidate
+                                       :leader nil
+                                       :status :leader-unavailable})))
+                      (info-op op {:killed candidate
+                                   :status :invalid-node}))
+                    (info-op op {:killed nil
+                                 :status :insufficient-live-nodes}))))
+
+              :restart-killed-node
+              (if-let [node @killed-node]
+                (do
+                  (local/restart-node! cluster-id node)
+                  (reset! killed-node nil)
+                  (if-let [{leader :leader}
+                           (local/maybe-wait-for-single-leader cluster-id)]
                     (info-op op {:restarted node
                                  :leader leader})
                     (info-op op {:restarted node
@@ -723,6 +772,7 @@
 (defn nemesis-package
   [{:keys [faults
            failover-interval-s
+           kill-interval-s
            restart-delay-s
            pause-interval-s
            pause-resume-delay-s
@@ -744,6 +794,7 @@
            clock-skew-apply-delay-s]}]
   (let [faults (set faults)
         failover? (contains? faults :leader-failover)
+        kill? (contains? faults :node-kill)
         leader-pause? (contains? faults :leader-pause)
         node-pause? (contains? faults :node-pause)
         multi-node-pause? (contains? faults :multi-node-pause)
@@ -774,6 +825,8 @@
         (or follower-rejoin-delay-s default-follower-rejoin-delay-s)
         failover-interval
         (or failover-interval-s default-failover-interval-s)
+        kill-interval
+        (or kill-interval-s default-kill-interval-s)
         pause-interval
         (or pause-interval-s default-pause-interval-s)
         partition-interval
@@ -810,6 +863,11 @@
                       (gen/sleep restart-delay)
                       {:type :info :f :restart-node}
                       (gen/sleep failover-interval)])
+                   (when kill?
+                     [{:type :info :f :kill-node}
+                      (gen/sleep restart-delay)
+                      {:type :info :f :restart-killed-node}
+                      (gen/sleep kill-interval)])
                    (when leader-pause?
                      [{:type :info :f :pause-leader}
                       (gen/sleep pause-resume-delay)
@@ -871,6 +929,7 @@
                    (gen/sleep quorum-loss-interval)]))
         final-phases (final-phase-ops
                       {:failover? failover?
+                       :kill? kill?
                        :leader-pause? leader-pause?
                        :node-pause? node-pause?
                        :multi-node-pause? multi-node-pause?

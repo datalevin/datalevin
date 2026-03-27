@@ -23,11 +23,11 @@ The first cut is intentionally narrow:
   fencing-retry, udf-readiness,
   identity-upsert, and index-consistency workloads
 * Datalevin-specific `grant` and `internal` characterization workloads
-* local leader pause, arbitrary-node pause, multi-node pause, leader failover,
-  leader partition, asymmetric multi-way graph cuts, heterogeneous per-link
-  degraded links, leader IO-stall, leader disk-full, follower rejoin,
-  quorum-loss, and richer clock-skew nemeses covering follower-fast,
-  leader-fast, leader-slow, and mixed-sign skew plans
+* local leader failover, arbitrary-node kill, leader pause, arbitrary-node
+  pause, multi-node pause, leader partition, asymmetric multi-way graph cuts,
+  heterogeneous per-link degraded links, leader IO-stall, leader disk-full,
+  follower rejoin, quorum-loss, and richer clock-skew nemeses covering
+  follower-fast, leader-fast, leader-slow, and mixed-sign skew plans
 * list-append transactions support reads, appends, and mixed read/write
   sequences
 
@@ -594,6 +594,19 @@ Run a targeted quorum-loss subset with extra Jepsen CLI overrides:
 
 ```bash
 script/jepsen/quorum-workloads append bank -- --time-limit 15 --rate 10
+```
+
+Run an arbitrary single-node kill cycle:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis kill --time-limit 30 --rate 10
+```
+
+Exercise the arbitrary-node kill nemesis across the local workload set:
+
+```bash
+script/jepsen/kill-workloads
 ```
 
 Run a clock-skew pause combined with leader failover:
