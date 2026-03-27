@@ -345,6 +345,23 @@
       ;; (st/print-stack-trace e)
       -1)))
 
+(defn- await-read-ready!
+  [^SocketChannel ch selector-v ^long deadline-ms ^long timeout-ms]
+  (let [^Selector sel (or @selector-v
+                          (let [^Selector s (Selector/open)]
+                            (.register ch s SelectionKey/OP_READ)
+                            (vreset! selector-v s)
+                            s))]
+    (loop []
+      (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
+        (when-not (pos? remaining-ms)
+          (u/raise "Socket channel receive timed out."
+                   {:error :socket/timeout
+                    :timeout-ms timeout-ms}))
+        (if (pos? (.select sel remaining-ms))
+          (.clear (.selectedKeys sel))
+          (recur))))))
+
 (defn receive-ch
   "Receive one message from channel and put it in buffer, will block
   until one full message is received. When buffer is too small for a
@@ -352,25 +369,49 @@
   ([^SocketChannel ch ^ByteBuffer bf]
    (receive-ch ch bf nil))
   ([^SocketChannel ch ^ByteBuffer bf wire-opts]
-   (loop [^ByteBuffer bf bf]
-     (if (> (.position bf) c/message-header-size)
-       (let [[msg ^ByteBuffer bf] (receive-one-message bf wire-opts)]
-         (if msg
-           [msg bf]
+   (receive-ch ch bf wire-opts nil))
+  ([^SocketChannel ch ^ByteBuffer bf wire-opts timeout-ms]
+   (let [timed?      (some? timeout-ms)
+         timeout-ms  (if timed? (long (max 1 (long timeout-ms))) 0)
+         deadline-ms (if timed?
+                       (long (+ (System/currentTimeMillis) timeout-ms))
+                       0)
+         blocking?   (and timed? (.isBlocking ch))
+         selector-v  (volatile! nil)]
+     (try
+       (when blocking? (.configureBlocking ch false))
+       (loop [^ByteBuffer bf bf]
+         (if (> (.position bf) c/message-header-size)
+           (let [[msg ^ByteBuffer bf] (receive-one-message bf wire-opts)]
+             (if msg
+               [msg bf]
+               (let [^int readn (read-ch ch bf)]
+                 (cond
+                   (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
+                                  (if msg [msg bf] (recur bf)))
+                   (= readn 0)  (do
+                                  (when timed?
+                                    (await-read-ready! ch selector-v
+                                                       deadline-ms timeout-ms))
+                                  (recur bf))
+                   (= readn -1) (do (.close ch)
+                                    (u/raise "Socket channel is closed." {}))))))
            (let [^int readn (read-ch ch bf)]
              (cond
                (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
                               (if msg [msg bf] (recur bf)))
-               (= readn 0)  (recur bf)
+               (= readn 0)  (do
+                              (when timed?
+                                (await-read-ready! ch selector-v
+                                                   deadline-ms timeout-ms))
+                              (recur bf))
                (= readn -1) (do (.close ch)
                                 (u/raise "Socket channel is closed." {}))))))
-       (let [^int readn (read-ch ch bf)]
-         (cond
-           (> readn 0)  (let [[msg bf] (receive-one-message bf wire-opts)]
-                          (if msg [msg bf] (recur bf)))
-           (= readn 0)  (recur bf)
-           (= readn -1) (do (.close ch)
-                            (u/raise "Socket channel is closed." {}))))))))
+       (finally
+         (when-let [^Selector sel @selector-v]
+           (.close sel))
+         (when (and blocking? (.isOpen ch))
+           (.configureBlocking ch true)))))))
 
 (defn extract-message
   "Segment the content of read buffer to extract a message and call msg-handler

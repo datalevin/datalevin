@@ -17,7 +17,7 @@
    [datalevin.protocol :as p])
   (:import
    [java.nio ByteBuffer BufferOverflowException]
-   [java.nio.channels SocketChannel]
+   [java.nio.channels SocketChannel Selector SelectionKey]
    [java.util UUID WeakHashMap Collections]
    [java.util.concurrent ConcurrentLinkedQueue ConcurrentHashMap]
    [java.net InetSocketAddress StandardSocketOptions URI]))
@@ -55,6 +55,7 @@
   (.remove connection-wire-opts ch))
 
 (deftype ^:no-doc Connection [^SocketChannel ch
+                              ^long time-out
                               ^:volatile-mutable ^ByteBuffer bf]
   IConnection
   (send-n-receive [this msg]
@@ -62,7 +63,7 @@
       (locking bf
         (p/write-message-blocking ch bf msg (conn-wire-opts ch))
         (.clear bf)
-        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch))]
+        (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out)]
           (when-not (identical? bf' bf) (set! bf bf'))
           resp))
       (catch BufferOverflowException _
@@ -85,7 +86,7 @@
 
   (receive [this]
     (try
-      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch))]
+      (let [[resp bf'] (p/receive-ch ch bf (conn-wire-opts ch) time-out)]
         (when-not (identical? bf' bf) (set! bf bf'))
         resp)
       (catch Exception e
@@ -99,21 +100,55 @@
 
 (defn- ^SocketChannel connect-socket
   "connect to server and return the client socket channel"
-  [^String host port]
-  (try
-    (doto (SocketChannel/open)
-      (.setOption StandardSocketOptions/SO_KEEPALIVE true)
-      (.setOption StandardSocketOptions/TCP_NODELAY true)
-      (.connect (InetSocketAddress. host ^int port)))
-    (catch Exception e
-      (u/raise "Unable to connect to server: " e
-               {:host host :port port}))))
+  [^String host port timeout-ms]
+  (let [timeout-ms       (long (max 1 (long timeout-ms)))
+        deadline-ms      (+ (System/currentTimeMillis) timeout-ms)
+        ^SocketChannel ch (SocketChannel/open)]
+    (try
+      (.setOption ch StandardSocketOptions/SO_KEEPALIVE true)
+      (.setOption ch StandardSocketOptions/TCP_NODELAY true)
+      (.configureBlocking ch false)
+      (let [address (InetSocketAddress. host ^int port)]
+        (if (.connect ch address)
+          (do
+            (.configureBlocking ch true)
+            ch)
+          (let [connected?
+                (with-open [^Selector selector (Selector/open)]
+                  (.register ch selector SelectionKey/OP_CONNECT)
+                  (loop []
+                    (let [remaining-ms (- deadline-ms
+                                          (System/currentTimeMillis))]
+                      (when-not (pos? remaining-ms)
+                        (u/raise "Unable to connect to server: timed out"
+                                 {:host host
+                                  :port port
+                                  :timeout-ms timeout-ms
+                                  :error :socket/timeout}))
+                      (if (pos? (.select selector remaining-ms))
+                        (do
+                          (.clear (.selectedKeys selector))
+                          (if (.finishConnect ch)
+                            true
+                            (recur)))
+                        (recur)))))]
+            (when connected?
+              (.configureBlocking ch true)
+              ch))))
+      (catch Exception e
+        (try
+          (.close ch)
+          (catch Exception _ nil))
+        (u/raise "Unable to connect to server: " e
+                 {:host host
+                  :port port
+                  :timeout-ms timeout-ms})))))
 
 (defn- new-connection
-  [host port]
-  (let [ch (connect-socket host port)]
+  [host port time-out]
+  (let [ch (connect-socket host port time-out)]
     (set-conn-wire-opts! ch (p/default-wire-opts))
-    (->Connection ch (bf/allocate-buffer c/+buffer-size+))))
+    (->Connection ch (long time-out) (bf/allocate-buffer c/+buffer-size+))))
 
 (defn- set-client-id
   [conn client-id]
@@ -149,7 +184,7 @@
               (if (.isOpen ^SocketChannel (.-ch conn))
                 (do (.add used conn)
                     conn)
-                (let [conn (new-connection host port)]
+                (let [conn (new-connection host port time-out)]
                   (set-client-id conn client-id)
                   (.add used conn)
                   conn))))))))
@@ -173,8 +208,8 @@
   "Send an authenticate message to server, and wait to receive the response.
   If authentication succeeds,  return a client id.
   Otherwise, close connection, raise exception"
-  [host port username password]
-  (let [conn (new-connection host port)
+  [host port username password time-out]
+  (let [conn (new-connection host port time-out)
 
         {:keys [type client-id message]}
         (send-n-receive conn {:type     :authentication
@@ -196,7 +231,7 @@
                                            (ConcurrentLinkedQueue.))
         ^ConcurrentLinkedQueue available (.-available pool)]
     (dotimes [_ pool-size]
-      (let [conn (new-connection host port)]
+      (let [conn (new-connection host port time-out)]
         (set-client-id conn client-id)
         (.add available conn)))
     pool))
@@ -435,7 +470,7 @@
 
          host      (.getHost uri)
          port      (parse-port uri)
-         client-id (authenticate host port username password)
+         client-id (authenticate host port username password time-out)
          pool      (new-connectionpool host port client-id pool-size time-out)]
      (->Client username password host port pool-size time-out
                client-id pool))))
@@ -508,7 +543,7 @@
 
 (defn- new-client-for-endpoint
   [{:keys [username password pool-size time-out]} host port]
-  (let [client-id (authenticate host port username password)
+  (let [client-id (authenticate host port username password time-out)
         pool      (new-connectionpool host port client-id pool-size time-out)]
     (->Client username password host port pool-size time-out
               client-id pool)))
