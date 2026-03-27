@@ -34,6 +34,51 @@ The first cut is intentionally narrow:
 That keeps the first version faithful to Datalevin's existing public API. It
 does not claim full parity with the Datomic Jepsen suite.
 
+## Supported Workloads
+
+`--workload` currently accepts:
+
+* `append`, `append-cas`, `bank`, `degraded-rejoin`, `fencing`,
+  `fencing-retry`, `giant-values`, `grant`, `identity-upsert`,
+  `index-consistency`, `internal`, `membership-drift`,
+  `membership-drift-live`, `rejoin-bootstrap`, `register`,
+  `snapshot-checksum-rejoin`, `snapshot-copy-corruption-rejoin`,
+  `snapshot-db-identity-rejoin`, `snapshot-manifest-corruption-rejoin`,
+  `tx-fn-register`, `udf-readiness`, and `witness-topology`
+
+## Supported Nemeses
+
+`--nemesis` accepts a comma-separated list of aliases or raw fault keywords.
+
+Aliases:
+
+* `none`
+* `failover` -> `leader-failover`
+* `kill` -> `node-kill`
+* `pause` -> `leader-pause`
+* `pause-any` -> `node-pause`
+* `pause-multi` -> `multi-node-pause`
+* `partition` -> `leader-partition`
+* `asymmetric` -> `asymmetric-partition`
+* `degraded` -> `degraded-network`
+* `io-stall` -> `leader-io-stall`
+* `disk-full` -> `leader-disk-full`
+* `rejoin` -> `follower-rejoin`
+* `quorum` -> `quorum-loss`
+* `clock-skew` -> `clock-skew-pause`
+* `clock-leader-fast` -> `clock-skew-leader-fast`
+* `clock-leader-slow` -> `clock-skew-leader-slow`
+* `clock-mixed` -> `clock-skew-mixed`
+
+Raw fault keywords:
+
+* `leader-failover`, `node-kill`, `leader-pause`, `node-pause`,
+  `multi-node-pause`, `leader-partition`, `asymmetric-partition`,
+  `degraded-network`, `leader-io-stall`, `leader-disk-full`,
+  `follower-rejoin`, `quorum-loss`, `clock-skew-pause`,
+  `clock-skew-leader-fast`, `clock-skew-leader-slow`, and
+  `clock-skew-mixed`
+
 ## Layout
 
 * `src/datalevin/jepsen/local.clj`: single-host 3-node HA cluster harness
@@ -634,7 +679,17 @@ Run an explicit leader-fast or mixed clock skew:
 ```bash
 cd jepsen
 lein run test --workload append --control-backend sofa-jraft --nemesis clock-leader-fast --time-limit 30 --rate 10
+lein run test --workload append --control-backend sofa-jraft --nemesis clock-leader-slow --time-limit 30 --rate 10
 lein run test --workload append --control-backend sofa-jraft --nemesis clock-mixed --time-limit 30 --rate 10
+```
+
+Exercise any clock-skew variant across the local workload set:
+
+```bash
+script/jepsen/clock-workloads clock-skew
+script/jepsen/clock-workloads clock-leader-fast
+script/jepsen/clock-workloads clock-leader-slow
+script/jepsen/clock-workloads clock-mixed
 ```
 
 The HA disruption nemeses currently require `--control-backend sofa-jraft`,
