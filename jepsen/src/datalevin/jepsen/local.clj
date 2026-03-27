@@ -2434,26 +2434,46 @@
                disruption-write-failure-markers))))
 
 (defn- authoritative-local-leader-node
-  [cluster-id logical-node]
-  (let [diag           (node-diagnostics cluster-id logical-node)
-        owner-node-id  (:ha-authority-owner-node-id diag)
-        owner-logical  (when (some? owner-node-id)
-                         (get-in @clusters [cluster-id :node-by-id owner-node-id]))]
-    (when (and (= :leader (:ha-role diag))
-               (= logical-node owner-logical))
-      logical-node)))
+  [cluster-id]
+  (let [{:keys [live-nodes]} (get @clusters cluster-id)
+        snapshot
+        (into {}
+              (for [logical-node live-nodes
+                    :let [diag          (node-diagnostics cluster-id logical-node)
+                          owner-node-id (:ha-authority-owner-node-id diag)
+                          owner-logical (when (some? owner-node-id)
+                                          (get-in @clusters
+                                                  [cluster-id
+                                                   :node-by-id
+                                                   owner-node-id]))
+                          leader?       (and (= :leader (:ha-role diag))
+                                             (= logical-node owner-logical)
+                                             (true? (:ha-authority-read-ok? diag))
+                                             (not (true? (:ha-clock-skew-paused? diag))))]]
+                [logical-node
+                 {:leader? leader?
+                  :diagnostics diag}]))
+        leaders (->> snapshot
+                     (keep (fn [[logical-node {:keys [leader?]}]]
+                             (when leader? logical-node)))
+                     vec)]
+    {:snapshot snapshot
+     :leader (when (= 1 (count leaders))
+               (first leaders))}))
 
 (defn open-leader-conn!
   [test schema]
   (let [cluster-id (:datalevin/cluster-id test)
         deadline   (+ (now-ms) cluster-timeout-ms)]
     (loop []
-      (let [candidate-node (:leader (wait-for-single-leader! cluster-id))
-            leader-node    (if (remote-cluster? cluster-id)
-                             candidate-node
-                             (authoritative-local-leader-node
-                               cluster-id
-                               candidate-node))]
+      (let [candidate-node  (when-not (remote-cluster? cluster-id)
+                              (:leader (wait-for-single-leader! cluster-id)))
+            {:keys [leader snapshot]}
+            (when-not (remote-cluster? cluster-id)
+              (authoritative-local-leader-node cluster-id))
+            leader-node     (if (remote-cluster? cluster-id)
+                              (:leader (wait-for-single-leader! cluster-id))
+                              leader)]
         (cond
           (nil? leader-node)
           (if (< (now-ms) deadline)
@@ -2463,8 +2483,7 @@
             (throw (ex-info "Timed out waiting for authoritative local leader"
                             {:cluster-id cluster-id
                              :candidate-node candidate-node
-                             :candidate-diagnostics
-                             (node-diagnostics cluster-id candidate-node)})))
+                             :authoritative-snapshot snapshot})))
 
           :else
           (let [leader-uri (db-uri (endpoint-for-node cluster-id leader-node)

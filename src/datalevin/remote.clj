@@ -378,7 +378,7 @@
     (load-datoms* client db-name data :txs+info simulated? writing?))
 
   (open-transact [this]
-    (cl/normal-request client :open-transact [db-name])
+    (cl/normal-request client :open-transact [db-name] false)
     (cl/disable-ha-write-retry! client)
     (.mark-write this))
 
@@ -872,7 +872,7 @@
                        [db-name pin-id] writing?))
 
   (open-transact-kv [db]
-    (cl/normal-request client :open-transact-kv [db-name])
+    (cl/normal-request client :open-transact-kv [db-name] false)
     (cl/disable-ha-write-retry! client)
     (.mark-write db))
 

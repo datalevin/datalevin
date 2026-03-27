@@ -529,10 +529,9 @@
     [[] seen]
     endpoints))
 
-(defn- ^:redef client-retry-context
+(defn- client-routing-context
   [client]
-  (when (and (instance? Client client)
-             (not (ha-write-retry-disabled? client)))
+  (when (instance? Client client)
     {:username  (.-username ^Client client)
      :password  (.-password ^Client client)
      :pool-size (.-pool-size ^Client client)
@@ -540,6 +539,11 @@
      :host      (.-host ^Client client)
      :port      (.-port ^Client client)
      :client    client}))
+
+(defn- ^:redef client-retry-context
+  [client]
+  (when-not (ha-write-retry-disabled? client)
+    (client-routing-context client)))
 
 (defn- read-preferred-ha-endpoint
   [client]
@@ -878,7 +882,11 @@
    (normal-request client call args false))
   ([client call args writing?]
    (let [req                 {:type call :args args :writing? writing?}
+         routing-context     (and writing? (client-routing-context client))
          retry-context       (and writing? (client-retry-context client))
+         preferred-endpoint  (and writing?
+                                 (not retry-context)
+                                 (read-preferred-ha-endpoint client))
          preferred-attempt   (when retry-context
                                (try-preferred-ha-write-request*
                                  client
@@ -890,16 +898,51 @@
                                  retry-ha-write-request))]
      (if (:handled? preferred-attempt)
        (:result preferred-attempt)
-       (let [{:keys [type message result err-data]} (request client req)]
-         (if (= type :error-response)
-           (if (and writing?
-                    (retryable-ha-write-reject? err-data))
-             (retry-ha-write-request client req message err-data)
-             (raise-normal-request-error req message err-data nil))
-           (do
-             (when retry-context
-               (clear-preferred-ha-endpoint! client))
-             result)))))))
+       (if (and preferred-endpoint routing-context)
+         (let [{:keys [host port]} (parse-ha-endpoint preferred-endpoint)
+               outcome (and host port
+                            (attempt-ha-endpoint-request
+                              req
+                              routing-context
+                              host
+                              port
+                              request
+                              disconnect
+                              new-client-for-endpoint))]
+           (case (:kind outcome)
+             :success
+             (:result outcome)
+
+             :error
+             (raise-normal-request-error
+               req
+               (:message outcome)
+               (:err-data outcome)
+               {:ha-pinned-endpoint preferred-endpoint})
+
+             :exception
+             (raise-normal-request-error
+               req
+               (or (some-> outcome :exception ex-message)
+                   "Pinned HA request failed")
+               {:error :ha/pinned-request-failed
+                :endpoint preferred-endpoint}
+               nil)
+
+             (let [{:keys [type message result err-data]} (request client req)]
+               (if (= type :error-response)
+                 (raise-normal-request-error req message err-data nil)
+                 result))))
+         (let [{:keys [type message result err-data]} (request client req)]
+           (if (= type :error-response)
+             (if (and writing?
+                      (retryable-ha-write-reject? err-data))
+               (retry-ha-write-request client req message err-data)
+               (raise-normal-request-error req message err-data nil))
+             (do
+               (when retry-context
+                 (clear-preferred-ha-endpoint! client))
+               result))))))))
 
 ;; we do input validation and normalization in the server, as
 ;; 3rd party clients may be written
