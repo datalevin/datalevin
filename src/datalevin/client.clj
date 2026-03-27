@@ -41,6 +41,9 @@
 (defonce ^:private ^java.util.Map ha-retry-open-targets
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defonce ^:private ^java.util.Map ha-retry-disabled-clients
+  (Collections/synchronizedMap (WeakHashMap.)))
+
 (defn- conn-wire-opts
   [^SocketChannel ch]
   (or (.get connection-wire-opts ch)
@@ -407,6 +410,7 @@
         (send-only conn {:type :disconnect})
         (release-connection pool conn))
       (finally
+        (.remove ha-retry-disabled-clients client)
         (.remove ha-preferred-endpoints client)
         (disconnect-retry-clients! client disconnect)))
     (close-pool pool))
@@ -485,6 +489,24 @@
        (= :ha/write-rejected (:error err-data))
        (true? (:retryable? err-data))))
 
+(defn ^:no-doc disable-ha-write-retry!
+  [client]
+  (when client
+    (.put ha-retry-disabled-clients client true))
+  client)
+
+(defn ^:no-doc enable-ha-write-retry!
+  [client]
+  (when client
+    (.remove ha-retry-disabled-clients client))
+  client)
+
+(defn- ha-write-retry-disabled?
+  [client]
+  (boolean
+    (and client
+         (.get ha-retry-disabled-clients client))))
+
 (defn- raise-normal-request-error
   [req message err-data extra-data]
   (u/raise "Request to Datalevin server failed: "
@@ -509,7 +531,8 @@
 
 (defn- ^:redef client-retry-context
   [client]
-  (when (instance? Client client)
+  (when (and (instance? Client client)
+             (not (ha-write-retry-disabled? client)))
     {:username  (.-username ^Client client)
      :password  (.-password ^Client client)
      :pool-size (.-pool-size ^Client client)

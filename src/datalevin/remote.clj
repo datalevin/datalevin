@@ -379,13 +379,20 @@
 
   (open-transact [this]
     (cl/normal-request client :open-transact [db-name])
+    (cl/disable-ha-write-retry! client)
     (.mark-write this))
 
   (abort-transact [this]
-    (cl/normal-request client :abort-transact [db-name] true))
+    (try
+      (cl/normal-request client :abort-transact [db-name] true)
+      (finally
+        (cl/enable-ha-write-retry! client))))
 
   (close-transact [_]
-    (cl/normal-request client :close-transact [db-name] true))
+    (try
+      (cl/normal-request client :close-transact [db-name] true)
+      (finally
+        (cl/enable-ha-write-retry! client))))
 
   ILMDB
   (kv-info [_] nil)
@@ -866,13 +873,20 @@
 
   (open-transact-kv [db]
     (cl/normal-request client :open-transact-kv [db-name])
+    (cl/disable-ha-write-retry! client)
     (.mark-write db))
 
   (close-transact-kv [_]
-    (cl/normal-request client :close-transact-kv [db-name] true))
+    (try
+      (cl/normal-request client :close-transact-kv [db-name] true)
+      (finally
+        (cl/enable-ha-write-retry! client))))
 
   (abort-transact-kv [_]
-    (cl/normal-request client :abort-transact-kv [db-name] true))
+    (try
+      (cl/normal-request client :abort-transact-kv [db-name] true)
+      (finally
+        (cl/enable-ha-write-retry! client))))
 
   (transact-kv [this txs] (.transact-kv this nil txs))
   (transact-kv [this dbi-name txs]
