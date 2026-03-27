@@ -46,6 +46,7 @@
          txlog-clear-replica-floor-state!
          txlog-pin-backup-floor-state!
          txlog-unpin-backup-floor-state!
+         persisted-runtime-floor-lsn
          ->KVLMDB)
 
 (defn txlog-watermarks
@@ -1599,7 +1600,8 @@
 (defn txlog-recovery-context
   [lmdb state]
   (txlog/refresh-shared-state! state)
-  (let [records (txlog-records state)
+  (let [recovery-floor-lsn (persisted-runtime-floor-lsn lmdb)
+        records (txlog-records state recovery-floor-lsn)
         marker-state (read-commit-marker-state lmdb)
         recovery (txlog/recovery-state
                   {:commit-marker? (:commit-marker? state)
@@ -3062,7 +3064,10 @@
      (loop [retries-left (if cache-v 1 0)]
        (let [segments (vec (txlog/segment-files dir))
              _ (prune-txlog-records-cache! cache-v segments)
-             records (collect-txlog-records state segments cache-v from)
+             raw-records (collect-txlog-records state segments cache-v from)
+             records (if (pos? from)
+                       (drop-while #(<= (long (:lsn %)) from) raw-records)
+                       raw-records)
              error (try
                      (validate-txlog-record-sequence! records)
                      nil

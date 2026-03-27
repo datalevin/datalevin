@@ -696,12 +696,24 @@
       (let [n (.read ch bf p)]
         (when (neg? n)
           (raise "Unexpected EOF reading txn-log segment"
-                 {:position p :remaining (.remaining bf)}))
+                 {:type :txlog/unexpected-eof
+                  :position p
+                  :remaining (.remaining bf)}))
         (when (zero? n)
           (raise "Unable to progress while reading txn-log segment"
-                 {:position p :remaining (.remaining bf)}))
+                 {:type :txlog/read-stalled
+                  :position p
+                  :remaining (.remaining bf)}))
         (recur (+ p n)))
       bf)))
+
+(defn- txlog-unexpected-eof?
+  [^Throwable e]
+  (loop [t e]
+    (cond
+      (nil? t) false
+      (= :txlog/unexpected-eof (:type (ex-data t))) true
+      :else (recur (.getCause t)))))
 
 (defn decode-record-bytes
   "for test only"
@@ -772,6 +784,113 @@
            (recur (+ pos len))
            false))))))
 
+(def ^:private scan-segment-concurrent-shrink-retries 4)
+
+(defn- scan-segment-once
+  [^String path
+   ^FileChannel ch
+   size
+   allow-preallocated-tail?
+   collect-records?
+   on-record]
+  (let [size             (long size)
+        ^ByteBuffer read-bf (big-endian-buffer! (bf/get-array-buffer 8192))]
+    (try
+      (loop [offset  0
+             records (when collect-records? [])]
+        (let [remaining (- size offset)]
+          (cond
+            (zero? remaining)
+            {:records       records
+             :valid-end     offset
+             :size          size
+             :partial-tail? false}
+
+            (< remaining record-header-size)
+            {:records       records
+             :valid-end     offset
+             :size          size
+             :partial-tail? true}
+
+            :else
+            (let [_         (doto read-bf
+                              (.clear)
+                              (.limit record-header-size))
+                  _         (read-fully-at! ch offset read-bf)
+                  _         (.flip read-bf)
+                  header-map
+                  (try
+                    (decode-header-buffer read-bf offset)
+                    (catch Exception e
+                      (if (and allow-preallocated-tail?
+                               (tail-all-zero? ch offset size read-bf))
+                        :txlog/preallocated-tail
+                        (throw (ex-info "Txn-log segment corruption"
+                                        {:type   :txlog/corrupt
+                                         :path   path
+                                         :offset offset}
+                                        e)))))
+                  body-len  (when (map? header-map)
+                              (:body-len header-map))
+                  total-len (when body-len
+                              (+ ^long record-header-size
+                                 ^long body-len))]
+              (cond
+                (identical? header-map :txlog/preallocated-tail)
+                {:records            records
+                 :valid-end          offset
+                 :size               size
+                 :partial-tail?      true
+                 :preallocated-tail? true}
+
+                (> ^long total-len ^long remaining)
+                {:records       records
+                 :valid-end     offset
+                 :size          size
+                 :partial-tail? true}
+
+                :else
+                (let [record
+                      (try
+                        (let [{:keys [major flags body-len checksum]}
+                              header-map
+                              body (read-fully-at
+                                     ch
+                                     (+ offset record-header-size)
+                                     body-len)]
+                          (when-not (= checksum
+                                       (long (bit-and 0xffffffff
+                                                      (long (crc32c body)))))
+                            (raise "Txn-log record checksum mismatch"
+                                   {:offset   offset
+                                    :expected checksum}))
+                          {:major       major
+                           :flags       flags
+                           :compressed? (pos? (long (bit-and
+                                                     (long flags)
+                                                     compressed-flag)))
+                           :body-len    body-len
+                           :checksum    checksum
+                           :body        body})
+                        (catch Exception e
+                          (throw (ex-info "Txn-log segment corruption"
+                                          {:type   :txlog/corrupt
+                                           :path   path
+                                           :offset offset}
+                                          e))))
+                      next-offset (long (+ offset (long total-len)))
+                      record*     (assoc record
+                                         :offset offset
+                                         :next-offset next-offset)]
+                  (when on-record
+                    (on-record record*))
+                  (recur next-offset
+                         (if collect-records?
+                           (conj records record*)
+                           records))))))))
+      (finally
+        (bf/return-array-buffer read-bf)))))
+
 (defn scan-segment
   "Scan a txn-log segment.
 
@@ -792,111 +911,32 @@
                   :or   {allow-preallocated-tail? false
                          collect-records?         true}}]
    (let [f (io/file path)]
-     (with-open [^FileChannel ch (FileChannel/open
-                                   (.toPath f)
-                                   open-segment-read-options)]
-       (let [file-size           (.size ch)
-             size                (if (some? max-offset)
-                                   (long (min ^long file-size
-                                              (long (max 0
-                                                         (long max-offset)))))
-                                   (long file-size))
-             ^ByteBuffer read-bf (big-endian-buffer! (bf/get-array-buffer 8192))]
-         (try
-           (loop [offset  0
-                  records (when collect-records? [])]
-             (let [remaining (- size offset)]
-               (cond
-                 (zero? remaining)
-                 {:records       records
-                  :valid-end     offset
-                  :size          size
-                  :partial-tail? false}
-
-                 (< remaining record-header-size)
-                 {:records       records
-                  :valid-end     offset
-                  :size          size
-                  :partial-tail? true}
-
-                 :else
-                 (let [_         (doto read-bf
-                                   (.clear)
-                                   (.limit record-header-size))
-                       _         (read-fully-at! ch offset read-bf)
-                       _         (.flip read-bf)
-                       header-map
-                       (try
-                         (decode-header-buffer read-bf offset)
-                         (catch Exception e
-                           (if (and allow-preallocated-tail?
-                                    (tail-all-zero? ch offset size read-bf))
-                             :txlog/preallocated-tail
-                             (throw (ex-info "Txn-log segment corruption"
-                                             {:type   :txlog/corrupt
-                                              :path   path
-                                              :offset offset}
-                                             e)))))
-                       body-len  (when (map? header-map)
-                                   (:body-len header-map))
-                       total-len (when body-len
-                                   (+ ^long record-header-size
-                                      ^long body-len))]
-                   (cond
-                     (identical? header-map :txlog/preallocated-tail)
-                     {:records            records
-                      :valid-end          offset
-                      :size               size
-                      :partial-tail?      true
-                      :preallocated-tail? true}
-
-                     (> ^long total-len ^long remaining)
-                     {:records       records
-                      :valid-end     offset
-                      :size          size
-                      :partial-tail? true}
-
-                     :else
-                     (let [record
-                           (try
-                             (let [{:keys [major flags body-len checksum]}
-                                   header-map
-                                   body (read-fully-at
-                                          ch
-                                          (+ offset record-header-size)
-                                          body-len)]
-                               (when-not (= checksum
-                                            (long (bit-and 0xffffffff
-                                                           (long (crc32c body)))))
-                                 (raise "Txn-log record checksum mismatch"
-                                        {:offset   offset
-                                         :expected checksum}))
-                               {:major       major
-                                :flags       flags
-                                :compressed? (pos? (long (bit-and
-                                                          (long flags)
-                                                          compressed-flag)))
-                                :body-len    body-len
-                                :checksum    checksum
-                                :body        body})
-                             (catch Exception e
-                               (throw (ex-info "Txn-log segment corruption"
-                                               {:type   :txlog/corrupt
-                                                :path   path
-                                                :offset offset}
-                                               e))))
-                           next-offset (long (+ offset (long total-len)))
-                           record*     (assoc record
-                                              :offset offset
-                                              :next-offset next-offset)]
-                       (when on-record
-                         (on-record record*))
-                       (recur next-offset
-                              (if collect-records?
-                                (conj records record*)
-                                records))))))))
-           (finally
-             (bf/return-array-buffer read-bf))))))))
+     (loop [attempt 0]
+       (let [{:keys [value error retry?]}
+             (with-open [^FileChannel ch (FileChannel/open
+                                           (.toPath f)
+                                           open-segment-read-options)]
+               (let [file-size (.size ch)
+                     size      (if (some? max-offset)
+                                 (long (min ^long file-size
+                                            (long (max 0
+                                                       (long max-offset)))))
+                                 (long file-size))]
+                 (try
+                   {:value (scan-segment-once
+                            path ch size allow-preallocated-tail?
+                            collect-records? on-record)}
+                   (catch Exception e
+                     (let [current-size (long (.length f))]
+                       (if (and (< attempt scan-segment-concurrent-shrink-retries)
+                                (txlog-unexpected-eof? e)
+                                (< current-size size))
+                         {:retry? true}
+                         {:error e}))))))]
+         (cond
+           retry? (recur (inc attempt))
+           error (throw error)
+           :else value))))))
 
 (defn truncate-partial-tail!
   ([^String path] (truncate-partial-tail! path {}))
