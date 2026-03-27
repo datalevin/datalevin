@@ -119,6 +119,17 @@
        :reason :write-transaction-open
        :db-name db-name})))
 
+(defn- with-direct-db-transaction-slot
+  [deps server db-name writing? f]
+  (if writing?
+    (f)
+    (let [^Semaphore lock (db-lock deps server db-name)]
+      (.acquire lock)
+      (try
+        (f)
+        (finally
+          (.release lock))))))
+
 (defn- transient-runtime-store-error?
   [e]
   (boolean
@@ -787,21 +798,27 @@
          deps server skey db-name
          "Don't have permission to alter the database"
          (fn []
-           (case mode
-             :copy-in
-             (let [dt-store (dt-store deps server skey db-name writing?)]
-               (i/load-datoms dt-store ((:copy-in deps) server skey))
-               (write-complete! deps skey))
+           (with-direct-db-transaction-slot
+             deps
+             server
+             db-name
+             writing?
+             (fn []
+               (case mode
+                 :copy-in
+                 (let [dt-store (dt-store deps server skey db-name writing?)]
+                   (i/load-datoms dt-store ((:copy-in deps) server skey))
+                   (write-complete! deps skey))
 
-             :request
-             (write-result!
-               deps
-               skey
-               (apply i/load-datoms
-                      (dt-store deps server skey db-name writing?)
-                      (rest args)))
+                 :request
+                 (write-result!
+                   deps
+                   skey
+                   (apply i/load-datoms
+                          (dt-store deps server skey db-name writing?)
+                          (rest args)))
 
-             (u/raise "Missing :mode when loading datoms" {})))))))
+                 (u/raise "Missing :mode when loading datoms" {})))))))))
 
 (defn- transact*
   [deps db0 txs s? server db-name writing?]
@@ -827,29 +844,35 @@
          deps server skey db-name
          "Don't have permission to alter the database"
          (fn []
-           (let [txs (case mode
-                       :copy-in ((:copy-in deps) server skey)
-                       :request (nth args 1)
-                       (u/raise "Missing :mode when transact data" {}))
-                 db0 (get-in (db-state deps server db-name)
-                             [(if writing? :wdt-db :dt-db)])
-                 s?  (last args)
-                 rp  (transact* deps db0 txs s? server db-name writing?)
-                 db1 (:db-after rp)
-                 _   ((:update-db deps) server db-name
-                      (fn [m]
-                        (assoc m (if writing? :wdt-db :dt-db) db1)))
-                 rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
-                 ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
-                 res (cond-> (select-keys rp [:tx-data :tempids])
-                       (:new-attributes rp)
-                       (assoc :new-attributes (:new-attributes rp)))]
-             (if (< ct ^long c/+wire-datom-batch-size+)
-               (write-result! deps skey res)
-               (let [{:keys [tx-data tempids]} res
-                     response-meta            (dissoc res :tx-data :tempids)]
-                 ((:copy-out deps) skey (into tx-data tempids)
-                  c/+wire-datom-batch-size+ nil response-meta)))))))))
+           (with-direct-db-transaction-slot
+             deps
+             server
+             db-name
+             writing?
+             (fn []
+               (let [txs (case mode
+                           :copy-in ((:copy-in deps) server skey)
+                           :request (nth args 1)
+                           (u/raise "Missing :mode when transact data" {}))
+                     db0 (get-in (db-state deps server db-name)
+                                 [(if writing? :wdt-db :dt-db)])
+                     s?  (last args)
+                     rp  (transact* deps db0 txs s? server db-name writing?)
+                     db1 (:db-after rp)
+                     _   ((:update-db deps) server db-name
+                          (fn [m]
+                            (assoc m (if writing? :wdt-db :dt-db) db1)))
+                     rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
+                     ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
+                     res (cond-> (select-keys rp [:tx-data :tempids])
+                           (:new-attributes rp)
+                           (assoc :new-attributes (:new-attributes rp)))]
+                 (if (< ct ^long c/+wire-datom-batch-size+)
+                   (write-result! deps skey res)
+                   (let [{:keys [tx-data tempids]} res
+                         response-meta            (dissoc res :tx-data :tempids)]
+                     ((:copy-out deps) skey (into tx-data tempids)
+                       c/+wire-datom-batch-size+ nil response-meta)))))))))))
 
 (defn db-info
   [deps server skey {:keys [args writing?]}]
@@ -874,35 +897,41 @@
          deps server skey db-name
          "Don't have permission to alter the database"
          (fn []
-           (let [txs (case mode
-                       :copy-in ((:copy-in deps) server skey)
-                       :request (nth args 1)
-                       (u/raise "Missing :mode when transact data" {}))
-                 db0 (get-in (db-state deps server db-name)
-                             [(if writing? :wdt-db :dt-db)])
-                 s?  (last args)
-                 rp  (transact* deps db0 txs s? server db-name writing?)
-                 db1 (:db-after rp)
-                 _   ((:update-db deps) server db-name
-                      (fn [m]
-                        (assoc m (if writing? :wdt-db :dt-db) db1)))
-                 rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
-                 dt-store (dt-store deps server skey db-name writing?)
-                 db-info  {:max-eid       (:max-eid db1)
-                           :max-tx        (i/max-tx dt-store)
-                           :last-modified (i/last-modified dt-store)}
-                 ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
-                 res (cond-> (select-keys rp [:tx-data :tempids])
-                       (:new-attributes rp)
-                       (assoc :new-attributes (:new-attributes rp))
-                       true
-                       (assoc :db-info db-info))]
-             (if (< ct ^long c/+wire-datom-batch-size+)
-               (write-result! deps skey res)
-               (let [{:keys [tx-data tempids]} res
-                     response-meta            (dissoc res :tx-data :tempids)]
-                 ((:copy-out deps) skey (into tx-data tempids)
-                  c/+wire-datom-batch-size+ nil response-meta)))))))))
+           (with-direct-db-transaction-slot
+             deps
+             server
+             db-name
+             writing?
+             (fn []
+               (let [txs (case mode
+                           :copy-in ((:copy-in deps) server skey)
+                           :request (nth args 1)
+                           (u/raise "Missing :mode when transact data" {}))
+                     db0 (get-in (db-state deps server db-name)
+                                 [(if writing? :wdt-db :dt-db)])
+                     s?  (last args)
+                     rp  (transact* deps db0 txs s? server db-name writing?)
+                     db1 (:db-after rp)
+                     _   ((:update-db deps) server db-name
+                          (fn [m]
+                            (assoc m (if writing? :wdt-db :dt-db) db1)))
+                     rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
+                     dt-store (dt-store deps server skey db-name writing?)
+                     db-info  {:max-eid       (:max-eid db1)
+                               :max-tx        (i/max-tx dt-store)
+                               :last-modified (i/last-modified dt-store)}
+                     ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
+                     res (cond-> (select-keys rp [:tx-data :tempids])
+                           (:new-attributes rp)
+                           (assoc :new-attributes (:new-attributes rp))
+                           true
+                           (assoc :db-info db-info))]
+                 (if (< ct ^long c/+wire-datom-batch-size+)
+                   (write-result! deps skey res)
+                   (let [{:keys [tx-data tempids]} res
+                         response-meta            (dissoc res :tx-data :tempids)]
+                     ((:copy-out deps) skey (into tx-data tempids)
+                       c/+wire-datom-batch-size+ nil response-meta)))))))))))
 
 (defn open-kv
   [deps server skey message]

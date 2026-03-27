@@ -1706,7 +1706,44 @@
            :message (ex-message e)})))))
 
 (declare node-diagnostics
-         with-node-conn)
+         with-node-conn
+         authority-leader-logical-node
+         authority-leader-snapshot)
+
+(defn- authority-leader-snapshot
+  [cluster-id diagnostics-snapshot]
+  (let [{:keys [control-node-names]} (get @clusters cluster-id)
+        control-node-names (or control-node-names [])
+        snapshot (into {}
+                       (map (fn [logical-node]
+                              (let [state (get diagnostics-snapshot logical-node)
+                                    leader-peer-id
+                                    (or (:ha-control-leader-peer-id state)
+                                        (when (:ha-control-node-leader? state)
+                                          (:ha-control-local-peer-id state)))]
+                                [logical-node
+                                 {:leader-peer-id leader-peer-id
+                                  :leader (authority-leader-logical-node
+                                           cluster-id
+                                           leader-peer-id)
+                                  :node-leader?
+                                  (:ha-control-node-leader? state)
+                                  :node-state (:ha-control-node-state state)
+                                  :term (:ha-authority-term state)
+                                  :role (:ha-role state)}])))
+                       control-node-names)
+        quorum-size (inc (quot (count control-node-names) 2))
+        leader-counts (frequencies (keep :leader (vals snapshot)))
+        leaders (->> leader-counts
+                     (keep (fn [[logical-node count]]
+                             (when (and (>= count quorum-size)
+                                        (true? (get-in snapshot
+                                                       [logical-node
+                                                        :node-leader?])))
+                               logical-node)))
+                     vec)]
+    {:snapshot snapshot
+     :leaders leaders}))
 
 (defn ^:redef wait-for-single-leader!
   ([cluster-id]
@@ -1830,35 +1867,14 @@
      (loop [last-snapshot nil]
        (let [{:keys [control-node-names]} (get @clusters cluster-id)
              control-node-names (or control-node-names [])
-             snapshot (into {}
-                            (map (fn [logical-node]
-                                   (let [state (node-diagnostics cluster-id
-                                                                 logical-node)
-                                         leader-peer-id
-                                         (or (:ha-control-leader-peer-id state)
-                                             (when (:ha-control-node-leader? state)
-                                               (:ha-control-local-peer-id state)))]
-                                     [logical-node
-                                      {:leader-peer-id leader-peer-id
-                                       :leader (authority-leader-logical-node
-                                                cluster-id
-                                                leader-peer-id)
-                                       :node-leader?
-                                       (:ha-control-node-leader? state)
-                                       :node-state (:ha-control-node-state state)
-                                       :term (:ha-authority-term state)
-                                       :role (:ha-role state)}]))
-                            control-node-names))
-             quorum-size (inc (quot (count control-node-names) 2))
-             leader-counts (frequencies (keep :leader (vals snapshot)))
-             leaders (->> leader-counts
-                          (keep (fn [[logical-node count]]
-                                  (when (and (>= count quorum-size)
-                                             (true? (get-in snapshot
-                                                            [logical-node
-                                                             :node-leader?])))
-                                    logical-node)))
-                          vec)]
+             diagnostics-snapshot
+             (into {}
+                   (map (fn [logical-node]
+                          [logical-node (node-diagnostics cluster-id
+                                                          logical-node)]))
+                   control-node-names)
+             {:keys [snapshot leaders]}
+             (authority-leader-snapshot cluster-id diagnostics-snapshot)]
          (cond
            (= 1 (count leaders))
            {:leader (first leaders)
@@ -2417,28 +2433,56 @@
          (some #(str/includes? message %)
                disruption-write-failure-markers))))
 
+(defn- authoritative-local-leader-node
+  [cluster-id logical-node]
+  (let [diag           (node-diagnostics cluster-id logical-node)
+        owner-node-id  (:ha-authority-owner-node-id diag)
+        owner-logical  (when (some? owner-node-id)
+                         (get-in @clusters [cluster-id :node-by-id owner-node-id]))]
+    (when (and (= :leader (:ha-role diag))
+               (= logical-node owner-logical))
+      logical-node)))
+
 (defn open-leader-conn!
   [test schema]
   (let [cluster-id (:datalevin/cluster-id test)
         deadline   (+ (now-ms) cluster-timeout-ms)]
     (loop []
-      (let [leader-node (:leader (wait-for-single-leader! cluster-id))
-            leader-uri  (db-uri (endpoint-for-node cluster-id leader-node)
-                                (:db-name test))
-            outcome     (try
-                          {:conn (create-conn-with-timeout! leader-uri
-                                                            schema)}
-                          (catch Throwable e
-                            {:error e}))]
-        (if-let [conn (:conn outcome)]
-          conn
-          (let [e (:error outcome)]
-            (if (and (< (now-ms) deadline)
-                     (transport-failure? e))
-              (do
-                (Thread/sleep (long leader-connect-retry-sleep-ms))
-                (recur))
-              (throw e))))))))
+      (let [candidate-node (:leader (wait-for-single-leader! cluster-id))
+            leader-node    (if (remote-cluster? cluster-id)
+                             candidate-node
+                             (authoritative-local-leader-node
+                               cluster-id
+                               candidate-node))]
+        (cond
+          (nil? leader-node)
+          (if (< (now-ms) deadline)
+            (do
+              (Thread/sleep (long leader-connect-retry-sleep-ms))
+              (recur))
+            (throw (ex-info "Timed out waiting for authoritative local leader"
+                            {:cluster-id cluster-id
+                             :candidate-node candidate-node
+                             :candidate-diagnostics
+                             (node-diagnostics cluster-id candidate-node)})))
+
+          :else
+          (let [leader-uri (db-uri (endpoint-for-node cluster-id leader-node)
+                                   (:db-name test))
+                outcome    (try
+                             {:conn (create-conn-with-timeout! leader-uri
+                                                               schema)}
+                             (catch Throwable e
+                               {:error e}))]
+            (if-let [conn (:conn outcome)]
+              conn
+              (let [e (:error outcome)]
+                (if (and (< (now-ms) deadline)
+                         (transport-failure? e))
+                  (do
+                    (Thread/sleep (long leader-connect-retry-sleep-ms))
+                    (recur))
+                  (throw e))))))))))
 
 (defn with-leader-conn
   [test schema f]
