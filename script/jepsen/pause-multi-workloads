@@ -220,6 +220,13 @@ stream_logs="${DTLV_JEPSEN_PAUSE_MULTI_STREAM_LOGS:-0}"
 port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
 hard_timeout_s="${DTLV_JEPSEN_PAUSE_MULTI_HARD_TIMEOUT_S:-180}"
+timeout_bin=""
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin="gtimeout"
+fi
 
 mkdir -p "$log_dir"
 
@@ -279,7 +286,11 @@ for workload in "${selected_workloads[@]}"; do
 
   wrapped_cmd=("${cmd[@]}")
   if [[ -n "$hard_timeout_s" && "$hard_timeout_s" != "0" ]]; then
-    wrapped_cmd=(gtimeout "$hard_timeout_s" "${wrapped_cmd[@]}")
+    if [[ -n "$timeout_bin" ]]; then
+      wrapped_cmd=("$timeout_bin" "$hard_timeout_s" "${wrapped_cmd[@]}")
+    else
+      printf '    warning: timeout command not found; running without hard timeout\n' >&2
+    fi
   fi
 
   run_exit=0
