@@ -300,7 +300,7 @@ for workload in "${selected_workloads[@]}"; do
     extra_args_display=" ${extra_args[*]}"
   fi
 
-  printf '==> [%s] lein %s %s%s\n' \
+  printf '==> [%s] lein trampoline %s %s%s\n' \
     "$workload" \
     "${common_args[*]}" \
     "${run_args[*]}" \
@@ -308,7 +308,7 @@ for workload in "${selected_workloads[@]}"; do
   printf '    log: %s\n' "$log_file"
 
   run_exit=0
-  cmd=(lein "${common_args[@]}" "${run_args[@]}")
+  cmd=(lein trampoline "${common_args[@]}" "${run_args[@]}")
   if [[ ${#extra_args[@]} -gt 0 ]]; then
     cmd+=("${extra_args[@]}")
   fi

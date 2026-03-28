@@ -2,12 +2,13 @@
 
 ## WIP
 ### Added
-- [Server] Read only replicas and high availability with auto roll-over and
-  promotion (Raft consensus based)
-  [#72](https://github.com/datalevin/datalevin/issues/72). This HA
-  implementation comes with a Jepsen test suite to validate correctness
-  [#252](https://github.com/datalevin/datalevin/issues/252). Details in
+- [Server] Read only replicas and high availability (HA) with Raft consensus
+  based auto roll-over and promotion
+  [#72](https://github.com/datalevin/datalevin/issues/72). Details in
   [doc](doc/ha.md).
+  [Test] HA implementation comes with an extensive Jepsen test suite to validate
+  correctness [#252](https://github.com/datalevin/datalevin/issues/252). Details
+  in [doc](jepsen/README.md).
 - [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
 - [Lib] Release a trimmed down embedded use only jar
   `org.datalevin/datalevin-embedded:<version>` to Clojars. This jar does not
@@ -24,7 +25,7 @@
   Javascript, in addition to Clojure.
 - [AI] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 - [AI] Built-in trimmed down llama.cpp that supports CPU only inference for text
-  embedding and generation. Models need to be downloaded separately.
+  embedding, text generation and OCR. Models need to be downloaded separately.
 - [Datalog] Allow `:db/embedding true` property for string attributes, which
   will use an embedding model to embed the texts into vectors and index them.
   A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
@@ -43,13 +44,13 @@
   [#358](https://github.com/datalevin/datalevin/issues/358)
 
 ### Improved
-- Nippy uses `ByteBuffer` internals [PR to
+- [Encode] Nippy uses `ByteBuffer` internals [PR to
   nippy](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
   speedup.
 - [Search] Reduce query/update/delete memory allocation.
 - [KV] Harden virtual threads handling in reads by adding `:notls` in default
 env config.
-- [WAL] Enable multiple process working with the same DB in WAL mode
+- [WAL] Enable multiple processes working with the same DB in WAL mode
   [#361](https://github.com/datalevin/datalevin/issues/361).
 
 ## 0.10.7 (2026-03-03)
