@@ -1056,12 +1056,14 @@
   ([authority]
    (await-linearizable-read! authority nil))
   ([{:keys [operation-timeout-ms] :as authority} timeout-ms]
-   (let [timeout-ms (command-operation-timeout-ms
-                     operation-timeout-ms
-                     timeout-ms)
-         deadline (+ (System/currentTimeMillis) timeout-ms)]
+   (let [timeout-ms (long (command-operation-timeout-ms
+                           operation-timeout-ms
+                           timeout-ms))
+         deadline   (long (unchecked-add (System/currentTimeMillis)
+                                         timeout-ms))]
      (loop [attempt 0]
-       (let [remaining (- deadline (System/currentTimeMillis))
+       (let [remaining (long (unchecked-subtract deadline
+                                                 (System/currentTimeMillis)))
              ^Node node (running-node! authority)]
          (if (<= remaining 0)
            (u/raise "HA control readIndex timed out"
@@ -1126,6 +1128,18 @@
    (await-linearizable-read! authority))
   ([authority timeout-ms]
    (await-linearizable-read! authority timeout-ms)))
+
+(defn- await-read-state-barrier-compat!
+  [authority timeout-ms]
+  (if (some? timeout-ms)
+    (try
+      (await-read-state-barrier! authority timeout-ms)
+      (catch clojure.lang.ArityException e
+        ;; Test overrides may still provide the older one-arg shape.
+        (if (re-find #"Wrong number of args" (or (ex-message e) ""))
+          (await-read-state-barrier! authority)
+          (throw e))))
+    (await-read-state-barrier! authority)))
 
 (defn ^:redef submit-read-state-command!
   [authority db-identity]
@@ -1755,7 +1769,9 @@
      (let [{:keys [group-id running-v]} authority]
        (ensure-running! running-v)
        (lease/validate-lease-key! group-id db-identity)
-       (let [snapshot (await-read-state-barrier! authority timeout-ms)
+       (let [snapshot (await-read-state-barrier-compat!
+                       authority
+                       timeout-ms)
              {:keys [lease version]} (lease-entry snapshot db-identity)]
          {:lease lease
           :version version

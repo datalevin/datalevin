@@ -410,6 +410,14 @@
     (some-> (parse-find-elem (first form))
             (FindScalar.))))
 
+(defn parse-find-tuple-scalar
+  [form]
+  (when (and (sequential? form)
+             (> (count form) 2)
+             (= (last form) '.))
+    (some-> (parse-seq parse-find-elem (butlast form))
+            (FindTuple.))))
+
 (defn parse-find-tuple [form]
   (when (and (sequential? form)
              (= (count form) 1))
@@ -422,6 +430,7 @@
   (or (parse-find-rel form)
       (parse-find-coll form)
       (parse-find-scalar form)
+      (parse-find-tuple-scalar form)
       (parse-find-tuple form)
       (raise "Cannot parse :find, expected: (find-rel | find-coll | find-tuple | find-scalar)"
              {:error :parser/find, :fragment form})))

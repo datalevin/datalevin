@@ -83,12 +83,26 @@
   (when (symbol? s)
     (some #(ns-resolve % s) (conj user-facing-ns *ns*))))
 
+(defn- qualify-static-class-call
+  [f]
+  (when-let [class-part (and (symbol? f) (namespace f))]
+    (let [resolved (resolve (symbol class-part))]
+      (when (instance? Class resolved)
+        (symbol (.getName ^Class resolved) (name f))))))
+
 (defn- qualify-fn [x]
   (if (list? x)
     (let [[f & args] x]
-      (if-let [var (when-not (qu/rule-head f) (resolve-var f))]
-        (apply list (symbol var) args)
-        x))
+      (cond
+        (qu/rule-head f)
+        x
+
+        :else
+        (if-let [var (resolve-var f)]
+          (apply list (symbol var) args)
+          (if-let [class-call (qualify-static-class-call f)]
+            (apply list class-call args)
+            x))))
     x))
 
 (declare ctx)
@@ -205,6 +219,8 @@
 (def ^:no-doc sci-opts
   {:namespaces (merge (user-facing-vars) (additional-vars))
    :classes    {:allow                     :all
+                'Thread                    java.lang.Thread
+                'java.lang.Thread          java.lang.Thread
                 'java.text.Normalizer      java.text.Normalizer
                 'java.text.Normalizer$Form java.text.Normalizer$Form
                 'org.tartarus.snowball.SnowballStemmer

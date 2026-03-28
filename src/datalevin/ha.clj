@@ -470,6 +470,18 @@
       local-start-nanos
       result))))
 
+(defn- observe-authority-state-compat
+  [m timeout-ms]
+  (if (some? timeout-ms)
+    (try
+      (observe-authority-state m timeout-ms)
+      (catch clojure.lang.ArityException e
+        ;; Test overrides may still provide the older one-arg shape.
+        (if (re-find #"Wrong number of args" (or (ex-message e) ""))
+          (observe-authority-state m)
+          (throw e))))
+    (observe-authority-state m)))
+
 (defn- apply-authority-observation
   [m {:keys [lease version authority-now-ms
              lease-local-deadline-ms lease-local-deadline-nanos
@@ -1362,7 +1374,7 @@
      (try
        (let [db-identity (:ha-db-identity m)
              now-ms (ha-now-ms)
-             observation (observe-authority-state m timeout-ms)
+             observation (observe-authority-state-compat m timeout-ms)
              {:keys [lease authority-membership-hash
                      db-identity-mismatch? membership-mismatch?]}
              observation

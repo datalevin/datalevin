@@ -927,10 +927,12 @@
                             path ch size allow-preallocated-tail?
                             collect-records? on-record)}
                    (catch Exception e
-                     (let [current-size (long (.length f))]
+                     (let [current-size (long (.length f))
+                           size-limit   (long size)]
                        (if (and (< attempt scan-segment-concurrent-shrink-retries)
                                 (txlog-unexpected-eof? e)
-                                (< current-size size))
+                                (neg? (Long/compare current-size
+                                                    size-limit)))
                          {:retry? true}
                          {:error e}))))))]
          (cond

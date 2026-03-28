@@ -30,20 +30,72 @@
     TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean AtomicLong]))
 
-(declare closed? remove-conn shutdown-transact-async-executor!
+(declare close closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
 
 (defn conn?
   [conn]
   (and (instance? clojure.lang.IDeref conn) (db/db? @conn)))
 
+(deftype ^:private CloseableConn [^clojure.lang.Atom state]
+  clojure.lang.IDeref
+  (deref [_]
+    @state)
+
+  clojure.lang.IAtom2
+  (swap [_ f]
+    (swap! state f))
+  (swap [_ f x]
+    (swap! state f x))
+  (swap [_ f x y]
+    (swap! state f x y))
+  (swap [_ f x y args]
+    (apply swap! state f x y args))
+  (swapVals [_ f]
+    (swap-vals! state f))
+  (swapVals [_ f x]
+    (swap-vals! state f x))
+  (swapVals [_ f x y]
+    (swap-vals! state f x y))
+  (swapVals [_ f x y args]
+    (apply swap-vals! state f x y args))
+  (compareAndSet [_ oldv newv]
+    (compare-and-set! state oldv newv))
+  (reset [_ newv]
+    (reset! state newv))
+  (resetVals [_ newv]
+    (reset-vals! state newv))
+
+  clojure.lang.IMeta
+  (meta [_]
+    (meta state))
+
+  java.io.Closeable
+  (close [this]
+    (datalevin.conn/close this)))
+
+(defn- conn-state
+  [conn]
+  (if (instance? CloseableConn conn)
+    (.-state ^CloseableConn conn)
+    conn))
+
+(defn- wrap-conn
+  [state]
+  (CloseableConn. state))
+
+(defn- alter-conn-meta!
+  [conn f & args]
+  (apply alter-meta! (conn-state conn) f args))
+
 (defn conn-from-db
   [db]
   {:pre [(db/db? db)]}
-  (atom db :meta {:listeners (atom {})
-                  :runtime-opts (db/runtime-opts db)
-                  :sync-queue-pending (AtomicLong. 0)
-                  :sync-queue-last-enqueue-ms (AtomicLong. 0)}))
+  (wrap-conn
+   (atom db :meta {:listeners (atom {})
+                   :runtime-opts (db/runtime-opts db)
+                   :sync-queue-pending (AtomicLong. 0)
+                   :sync-queue-last-enqueue-ms (AtomicLong. 0)})))
 
 (defn conn-from-datoms
   ([datoms] (conn-from-db (db/init-db datoms)))
@@ -72,7 +124,7 @@
               (reset! listeners {})))
           (when (instance? clojure.lang.IAtom conn)
             (reset! conn nil))
-          (alter-meta! conn dissoc :dir :remote-store-opts-cache))
+          (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
         (shutdown-transact-async-executor-if-idle!))))
   nil)
 
@@ -273,9 +325,9 @@
                            (AtomicLong. 0))]
     (when (or (not (identical? pending* queued-pending))
               (not (identical? last-enqueue-ms* last-enqueue-ms)))
-      (alter-meta! conn assoc
-                   :sync-queue-pending pending*
-                   :sync-queue-last-enqueue-ms last-enqueue-ms*))
+      (alter-conn-meta! conn assoc
+                        :sync-queue-pending pending*
+                        :sync-queue-last-enqueue-ms last-enqueue-ms*))
     {:queued-pending pending*
      :last-enqueue-ms last-enqueue-ms*}))
 
@@ -317,7 +369,7 @@
   (if-some [entry (find (meta conn) :remote-store-opts-cache)]
     (val entry)
     (let [opts (c/canonicalize-wal-opts (i/opts store))]
-      (alter-meta! conn assoc :remote-store-opts-cache opts)
+      (alter-conn-meta! conn assoc :remote-store-opts-cache opts)
       opts)))
 
 (defn- txlog-sync-queue-profile
@@ -466,9 +518,9 @@
   (let [store (.-store ^DB @conn)
         opts  (i/opts store)]
     (when (instance? DatalogStore store)
-      (alter-meta! conn assoc
-                   :remote-store-opts-cache
-                   (c/canonicalize-wal-opts opts)))
+      (alter-conn-meta! conn assoc
+                        :remote-store-opts-cache
+                        (c/canonicalize-wal-opts opts)))
     opts))
 
 (defn schema
@@ -510,7 +562,7 @@
 (defn- new-conn
   [dir schema opts]
   (let [conn (create-conn dir schema opts)]
-    (alter-meta! conn assoc :dir dir)
+    (alter-conn-meta! conn assoc :dir dir)
     (add-conn dir conn)
     conn))
 

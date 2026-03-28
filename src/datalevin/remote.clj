@@ -175,6 +175,7 @@
 (deftype DatalogStore [^String uri
                        ^String db-name
                        ^Client client
+                       ^Client tx-client
                        write-txn
                        writing?
                        open-db-info
@@ -187,7 +188,8 @@
   (write-txn [_] write-txn)
 
   (mark-write [_]
-    (->DatalogStore uri db-name client (volatile! :remote-dl-mutex) true
+    (->DatalogStore uri db-name tx-client tx-client
+                    (volatile! :remote-dl-mutex) true
                     open-db-info
                     sampling-started?
                     owns-client?
@@ -206,9 +208,15 @@
   (close [_]
     (when (.compareAndSet closed? false true)
       (when-not (cl/disconnected? client)
-        (cl/normal-request client :close [db-name] writing?))
+        ;; Closing a remote store detaches the client/session view of the DB.
+        ;; It is not a with-transaction control message and must not route
+        ;; through the server's write-runner path.
+        (cl/normal-request client :close [db-name] false))
       (when (and owns-client? (not (cl/disconnected? client)))
-        (cl/disconnect client))))
+        (cl/disconnect client))
+      (when (and (not (identical? tx-client client))
+                 (not (cl/disconnected? tx-client)))
+        (cl/disconnect tx-client))))
 
   (closed? [_]
     (if (or (.get closed?) (cl/disconnected? client))
@@ -378,21 +386,21 @@
     (load-datoms* client db-name data :txs+info simulated? writing?))
 
   (open-transact [this]
-    (cl/normal-request client :open-transact [db-name] false)
-    (cl/disable-ha-write-retry! client)
+    (cl/normal-request tx-client :open-transact [db-name] false)
+    (cl/disable-ha-write-retry! tx-client)
     (.mark-write this))
 
   (abort-transact [this]
     (try
-      (cl/normal-request client :abort-transact [db-name] true)
+      (cl/normal-request tx-client :abort-transact [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! client))))
+        (cl/enable-ha-write-retry! tx-client))))
 
   (close-transact [_]
     (try
-      (cl/normal-request client :close-transact [db-name] true)
+      (cl/normal-request tx-client :close-transact [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! client))))
+        (cl/enable-ha-write-retry! tx-client))))
 
   ILMDB
   (kv-info [_] nil)
@@ -455,6 +463,24 @@
   (re-index [_ schema opts]
     (cl/normal-request client :datalog-re-index [db-name schema opts])))
 
+(defn ->DatalogStore
+  ([uri db-name client write-txn writing? open-db-info
+    sampling-started? owns-client? closed?]
+   (DatalogStore. uri db-name client client
+                  write-txn writing?
+                  open-db-info
+                  sampling-started?
+                  owns-client?
+                  closed?))
+  ([uri db-name client tx-client write-txn writing? open-db-info
+    sampling-started? owns-client? closed?]
+   (DatalogStore. uri db-name client tx-client
+                  write-txn writing?
+                  open-db-info
+                  sampling-started?
+                  owns-client?
+                  closed?)))
+
 (defn open
   "Open a remote Datalog store"
   ([uri-str]
@@ -474,6 +500,7 @@
                        c/db-store-datalog)
              db-info (cl/open-database client db-name store schema opts true)]
          (->DatalogStore uri-str db-name client
+                         (cl/dedicated-transaction-client client)
                          (volatile! :remote-dl-mutex) false
                          (volatile! db-info)
                          (AtomicBoolean. false)

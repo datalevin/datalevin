@@ -46,7 +46,8 @@
    [java.util.function BiFunction]
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService Future
-    ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit]
+    ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit
+    LinkedBlockingQueue]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -249,8 +250,12 @@
                      (when (.get running)
                        (.submit dispatcher ^Callable init)))))]
       (when-not (.get running)
-        (.submit dispatcher ^Callable init)
-        (.set running true))))
+        (.set running true)
+        (try
+          (.submit dispatcher ^Callable init)
+          (catch Throwable t
+            (.set running false)
+            (throw t))))))
 
   (stop [server]
     (.set running false)
@@ -2217,6 +2222,7 @@
                  {:type :reopen :db-name db-name :db-type "kv"}))))
 
 (declare dispatch-message)
+ (declare trace-remote-tx!)
 
 (defn- current-ha-txlog-term
   [^Server server db-name]
@@ -2273,27 +2279,33 @@
   (run-calls [this])
   (halt-run [this]))
 
-(deftype Runner [server kv-store sk msg running?]
+(def ^:private runner-stop-signal ::runner-stop)
+
+(deftype Runner [server ^LinkedBlockingQueue queue running?]
   IRunner
   (new-message [_ skey message]
-    (vreset! sk skey)
-    (vreset! msg message))
+    (trace-remote-tx! "runner-enqueue" (:type message) (nth (:args message) 0 nil))
+    (.put queue [skey message]))
 
-  (halt-run [_] (vreset! running? false))
+  (halt-run [_]
+    (vreset! running? false)
+    (.clear queue)
+    (.offer queue runner-stop-signal))
 
   (run-calls [_]
-    (locking kv-store
-      (loop []
-        (.wait ^Object kv-store)
-        (let [message @msg
-              skey    @sk]
-          (dispatch-message-with-ha-write-admission server skey message))
-        (when @running? (recur))))))
+    (loop []
+      (let [item (.take queue)]
+        (when-not (= runner-stop-signal item)
+          (let [[skey message] item]
+            (trace-remote-tx! "runner-dispatch" (:type message)
+                              (nth (:args message) 0 nil))
+            (dispatch-message-with-ha-write-admission server skey message))
+          (when @running?
+            (recur)))))))
 
 (defn- write-txn-runner
   [^Server server db-name kv-store]
-  (let [runner (->Runner server kv-store (volatile! nil)
-                         (volatile! nil) (volatile! true))]
+  (let [runner (->Runner server (LinkedBlockingQueue.) (volatile! true))]
     (update-db server db-name #(assoc % :runner runner))
     runner))
 
@@ -2376,6 +2388,16 @@
   [^Server server f]
   (.execute ^Executor (.-work-executor server) f))
 
+(def ^:private trace-remote-tx?
+  (some? (System/getenv "DTLV_TRACE_REMOTE_TX")))
+
+(defn- trace-remote-tx!
+  [& xs]
+  (when trace-remote-tx?
+    (binding [*out* *err*]
+      (apply println xs)
+      (flush))))
+
 (def ^:private idempotent-withtxn-control-types
   #{:close-transact
     :abort-transact
@@ -2392,8 +2414,8 @@
       (cond
         runner
         (do
-          (new-message runner skey message)
-          (locking kv-store (.notify kv-store)))
+          (trace-remote-tx! "handle-writing" type db-name)
+          (new-message runner skey message))
 
         (idempotent-withtxn-control-types type)
         (write-message skey {:type :command-complete})
@@ -2455,17 +2477,28 @@
           capacity                      (.capacity read-bf)
           ^SocketChannel ch             (.channel skey)
           ^int readn                    (p/read-ch ch read-bf)]
+      (when (pos? readn)
+        (trace-remote-tx! "handle-read" readn (.hashCode skey)))
+      (when (> (.position read-bf) c/message-header-size)
+        (let [^ByteBuffer probe (.duplicate read-bf)
+              pos (.position probe)]
+          (.flip probe)
+          (trace-remote-tx! "buffer-header"
+                            (.hashCode skey)
+                            "pos" pos
+                            "len" (.getInt (doto probe (.get))))))
       (cond
-        (> readn 0)  (if (= (.position read-bf) capacity)
-                       (let [size (* ^long c/+buffer-grow-factor+ capacity)
-                             bf   (bf/allocate-buffer size)]
-                         (.flip read-bf)
-                         (bf/buffer-transfer read-bf bf)
-                         (vswap! state assoc :read-bf bf))
+        (> readn 0)  (do
                        (p/extract-message
                          read-bf
                          (fn [fmt msg]
-                           (execute server #(handle-message server skey fmt msg)))))
+                           (execute server #(handle-message server skey fmt msg))))
+                       (when (= (.position read-bf) capacity)
+                         (let [size (* ^long c/+buffer-grow-factor+ capacity)
+                               bf   (bf/allocate-buffer size)]
+                           (.flip read-bf)
+                           (bf/buffer-transfer read-bf bf)
+                           (vswap! state assoc :read-bf bf))))
         (= readn 0)  :continue
         (= readn -1) (.close ch)))
     (catch java.io.IOException e

@@ -101,6 +101,12 @@
       (finally
         (clear-conn-wire-opts! ch)))))
 
+(defn ^:no-doc ->Connection
+  ([^SocketChannel ch ^ByteBuffer bf]
+   (Connection. ch (long c/default-connection-timeout) bf))
+  ([^SocketChannel ch time-out ^ByteBuffer bf]
+   (Connection. ch (long time-out) bf)))
+
 (defn- ^SocketChannel connect-socket
   "connect to server and return the client socket channel"
   [^String host port timeout-ms]
@@ -148,10 +154,13 @@
                   :timeout-ms timeout-ms})))))
 
 (defn- new-connection
-  [host port time-out]
-  (let [ch (connect-socket host port time-out)]
+  ([host port time-out]
+   (new-connection host port time-out time-out))
+  ([host port connect-time-out receive-time-out]
+   (let [ch (connect-socket host port connect-time-out)]
     (set-conn-wire-opts! ch (p/default-wire-opts))
-    (->Connection ch (long time-out) (bf/allocate-buffer c/+buffer-size+))))
+    (->Connection ch (long receive-time-out)
+                  (bf/allocate-buffer c/+buffer-size+)))))
 
 (defn- set-client-id
   [conn client-id]
@@ -212,7 +221,11 @@
   If authentication succeeds,  return a client id.
   Otherwise, close connection, raise exception"
   [host port username password time-out]
-  (let [conn (new-connection host port time-out)
+  (let [conn (new-connection host
+                             port
+                             time-out
+                             (max (long time-out)
+                                  (long c/default-connection-timeout)))
 
         {:keys [type client-id message]}
         (send-n-receive conn {:type     :authentication
@@ -366,7 +379,8 @@
                                          :reconnect
                                          (let [client-id
                                                (authenticate host port username
-                                                             password)]
+                                                             password
+                                                             time-out)]
                                            (close conn)
                                            (vreset! success? false)
                                            {:request-status :reconnect
@@ -477,7 +491,24 @@
          client-id (authenticate host port username password time-out)
          pool      (new-connectionpool host port client-id pool-size time-out)]
      (->Client username password host port pool-size time-out
-               client-id pool))))
+	               client-id pool))))
+
+(defn ^:no-doc dedicated-transaction-client
+  [client]
+  (if (instance? Client client)
+    (let [^Client client client]
+      (if (= 1 (.-pool-size client))
+        client
+        (let [username  (.-username client)
+              password  (.-password client)
+              host      (.-host client)
+              port      (.-port client)
+              time-out  (.-time-out client)
+              client-id (authenticate host port username password time-out)
+              pool      (new-connectionpool host port client-id 1 time-out)]
+          (->Client username password host port 1 time-out
+                    client-id pool))))
+    client))
 
 (defn- endpoint-key
   [host port]
