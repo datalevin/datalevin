@@ -81,9 +81,12 @@
              old-opts                     (normalize-legacy-ha-nil-sentinels
                                             old-opts)
              new-opts                     (merge old-opts opts)
-             new-schema                   (merge old-schema schema)]
-         (db/init-db (for [d datoms] (apply dd/datom d))
-                     dir new-schema new-opts))
+             new-schema                   (merge old-schema schema)
+             db                           (db/init-db
+                                            (for [d datoms]
+                                              (apply dd/datom d))
+                                            dir new-schema new-opts)]
+         (db/close-db db))
        (catch Exception e
          (u/raise "Error loading nippy file into Datalog DB: " e {})))
      (load-datalog dir in schema opts)))

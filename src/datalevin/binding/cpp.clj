@@ -71,6 +71,12 @@
 (def ^:dynamic *before-write-commit-fn*
   nil)
 
+(def ^:private duplicate-local-open-msg
+  "Please do not open multiple LMDB connections to the same DB
+           in the same process. Instead, a LMDB connection should be held onto
+           and managed like a stateful resource. Refer to the documentation of
+           `datalevin.core/open-kv` for more details.")
+
 (defn- run-before-write-commit!
   [context]
   (when-let [f *before-write-commit-fn*]
@@ -756,6 +762,54 @@
     (vreset! scheduled-sync fut)))
 
 (defonce ^:private shutdown-hooks (atom {}))
+(defonce ^:private active-local-kv-handles (atom #{}))
+(defonce ^:private open-local-kv-handles (atom {}))
+
+(defn- canonical-dir-key
+  [^File dir-file]
+  (.getCanonicalPath dir-file))
+
+(defn- local-kv-handle-key
+  [^File dir-file flags]
+  (when-not (some #{:inmemory} flags)
+    (canonical-dir-key dir-file)))
+
+(defn- reserve-local-kv-handle!
+  [^File dir-file flags]
+  (when-let [dir-key (local-kv-handle-key dir-file flags)]
+    (let [[before _]
+          (swap-vals! active-local-kv-handles
+                      #(if (contains? % dir-key) % (conj % dir-key)))]
+      (when (contains? before dir-key)
+        (raise duplicate-local-open-msg
+               {:dir dir-key
+                :type :lmdb/duplicate-open}))
+      dir-key)))
+
+(defn- register-local-kv-handle!
+  [dir-key lmdb]
+  (when dir-key
+    (swap! open-local-kv-handles assoc dir-key lmdb))
+  lmdb)
+
+(defn open-local-kv-handle
+  [dir]
+  (when-let [dir-key (some-> dir u/file canonical-dir-key)]
+    (locking open-local-kv-handles
+      (when-let [lmdb (get @open-local-kv-handles dir-key)]
+        (if (i/closed-kv? lmdb)
+          (do
+            (swap! open-local-kv-handles dissoc dir-key)
+            (swap! active-local-kv-handles disj dir-key)
+            nil)
+          lmdb)))))
+
+(defn- release-local-kv-handle!
+  [dir-key]
+  (when dir-key
+    (swap! active-local-kv-handles disj dir-key)
+    (swap! open-local-kv-handles dissoc dir-key))
+  nil)
 
 (defn- register-shutdown-hook!
   [dir ^Thread hook]
@@ -861,6 +915,7 @@
 
   (close-kv [this]
     (let [dir         (env-dir this)
+          dir-key     (local-kv-handle-key (u/file dir) (@info :flags))
           close-error (volatile! nil)]
       (when-not (.isClosed env)
         (unregister-shutdown-hook! dir)
@@ -892,6 +947,7 @@
                 (vreset! close-error e)))))
         (when (@info :temp?) (u/delete-files (@info :dir))))
       (when (.isClosed env)
+        (release-local-kv-handle! dir-key)
         (swap! l/lmdb-dirs disj dir)
         (when (zero? (count @l/lmdb-dirs))
           (l/shutdown-last-lmdb-executors!)))
@@ -1016,10 +1072,7 @@
         (or (reusable-reader-rtx this tl-reader)
             (fresh-reader-rtx this env tl-reader))
         (catch Exception e
-          (raise "Please do not open multiple LMDB connections to the same DB
-           in the same process. Instead, a LMDB connection should be held onto
-           and managed like a stateful resource. Refer to the documentation of
-           `datalevin.core/open-kv` for more details."
+          (raise duplicate-local-open-msg
                  {:cause (.getMessage e)})))))
 
   (return-rtx [this rtx]
@@ -1569,8 +1622,11 @@
                               flags c/default-env-flags
                               temp? false}
                          :as opts}]
-  (try
-    (let [inmemory? (some #{:inmemory} flags)
+  (let [flags            (cond-> flags
+                           temp? (conj :nosync))
+        local-handle-key (reserve-local-kv-handle! dir-file flags)]
+    (try
+      (let [inmemory? (some #{:inmemory} flags)
           ;; MDB_INMEMORY on Windows expects a simple env identifier instead of
           ;; a filesystem path (which may include ':' or '\').
           env-path (if (and inmemory? (u/windows?))
@@ -1581,7 +1637,7 @@
                              (c/pick-mapsize db-file)))
                      1024 1024)
           flags (cond-> flags
-                  (or inmemory? temp?) (conj :nosync))
+                  inmemory? (conj :nosync))
           ^Env env (Env/create env-path mapsize max-readers max-dbs
                                (kv-flags flags))
           info (cond-> (merge opts {:dir dir
@@ -1609,34 +1665,35 @@
                                    nil
                                    nil
                                    nil)]
-      (swap! l/lmdb-dirs conj dir)
-      (open-dbi lmdb c/kv-info) ;; never compressed
-      (cond
-        inmemory? nil
-        temp? (u/delete-on-exit dir-file)
-        :else
-        (let [k-comp (when (and key-compress
-                                (.exists (io/file dir c/keycode-file-name)))
-                       (cp/load-key-compressor
-                        (str dir u/+separator+ c/keycode-file-name)))
-              v-comp (when (and val-compress
-                                (.exists (io/file dir c/valcode-file-name)))
-                       (cp/load-val-compressor
-                        (str dir u/+separator+ c/valcode-file-name)))
-              loaded-info (load-info-from-kv lmdb)]
-          (if (empty? loaded-info)
-            (init-info lmdb info)
-            (vreset! (.-info lmdb)
-                     (assoc (merge loaded-info info)
-                            :dbis (:dbis loaded-info))))
-          (set-max-val-size lmdb (max-val-size lmdb))
-          (set-key-compressor lmdb k-comp)
-          (set-val-compressor lmdb v-comp)
-          (register-shutdown-hook! dir (Thread. #(close-kv lmdb)))
-          (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
-      (l/wrap-open-kv lmdb))
-    (catch Exception e
-      (raise "Fail to open database: " e {:dir dir}))))
+        (swap! l/lmdb-dirs conj dir)
+        (open-dbi lmdb c/kv-info) ;; never compressed
+        (cond
+          inmemory? nil
+          temp? (u/delete-on-exit dir-file)
+          :else
+          (let [k-comp (when (and key-compress
+                                  (.exists (io/file dir c/keycode-file-name)))
+                         (cp/load-key-compressor
+                          (str dir u/+separator+ c/keycode-file-name)))
+                v-comp (when (and val-compress
+                                  (.exists (io/file dir c/valcode-file-name)))
+                         (cp/load-val-compressor
+                          (str dir u/+separator+ c/valcode-file-name)))
+                loaded-info (load-info-from-kv lmdb)]
+            (if (empty? loaded-info)
+              (init-info lmdb info)
+              (vreset! (.-info lmdb)
+                       (assoc (merge loaded-info info)
+                              :dbis (:dbis loaded-info))))
+            (set-max-val-size lmdb (max-val-size lmdb))
+            (set-key-compressor lmdb k-comp)
+            (set-val-compressor lmdb v-comp)
+            (register-shutdown-hook! dir (Thread. #(close-kv lmdb)))
+            (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
+        (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
+      (catch Exception e
+        (release-local-kv-handle! local-handle-key)
+        (raise "Fail to open database: " e {:dir dir})))))
 
 (defmethod open-kv :cpp
   ([dir] (open-kv dir {}))

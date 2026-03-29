@@ -16,6 +16,7 @@
    [clojure.pprint :as p]
    [clojure.stacktrace :as st]
    [sci.core :as sci]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.core :as d]
    [datalevin.dump :as dump]
    [datalevin.util :as u]
@@ -331,11 +332,16 @@
   (let [txlog-dir (str src-dir u/+separator+ "txlog")
         opts      (when (u/file-exists txlog-dir)
                     {:wal? true})
-        lmdb      (l/open-kv src-dir opts)]
+        opened?   (volatile! false)
+        lmdb      (or (cpp/open-local-kv-handle src-dir)
+                      (do
+                        (vreset! opened? true)
+                        (l/open-kv src-dir opts)))]
     (try
       (if/copy lmdb dest-dir compact?)
       (finally
-        (if/close-kv lmdb)))))
+        (when @opened?
+          (if/close-kv lmdb))))))
 
 (defn- run-copy [{:keys [dir compact]} arguments]
   (assert dir (s/join \newline

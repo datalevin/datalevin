@@ -33,6 +33,8 @@
 (declare close closed? remove-conn shutdown-transact-async-executor!
          shutdown-transact-async-executor-if-idle!)
 
+(defonce ^:private shared-local-stores (atom {}))
+
 (defn conn?
   [conn]
   (and (instance? clojure.lang.IDeref conn) (db/db? @conn)))
@@ -103,21 +105,95 @@
   ([datoms dir schema] (conn-from-db (db/init-db datoms dir schema)))
   ([datoms dir schema opts] (conn-from-db (db/init-db datoms dir schema opts))))
 
+(defn- split-runtime-opts
+  [opts]
+  (if (map? opts)
+    [(dissoc opts :runtime-opts) (:runtime-opts opts)]
+    [opts nil]))
+
+(defn- shared-local-store-key
+  [dir]
+  (when (and (string? dir) (not (r/dtlv-uri? dir)))
+    (.getCanonicalPath ^java.io.File (u/file dir))))
+
+(defn- acquire-shared-local-store
+  [dir schema store-opts]
+  (if-let [dir-key (shared-local-store-key dir)]
+    (locking shared-local-stores
+      (loop []
+        (if-let [{:keys [store]} (get @shared-local-stores dir-key)]
+          (if (i/closed? store)
+            (do
+              (swap! shared-local-stores dissoc dir-key)
+              (recur))
+            (do
+              (swap! shared-local-stores update-in [dir-key :refs] inc)
+              (when schema
+                (i/set-schema store schema))
+              store))
+          (let [store (s/open dir schema store-opts)]
+            (swap! shared-local-stores
+                   assoc dir-key {:store store :refs 1})
+            store))))
+    (s/open dir schema store-opts)))
+
+(defn- release-shared-local-store!
+  [store]
+  (if-let [dir-key (some-> (i/dir store) shared-local-store-key)]
+    (locking shared-local-stores
+      (if-let [{shared-store :store refs :refs}
+               (get @shared-local-stores dir-key)]
+        (if (i/closed? shared-store)
+          (do
+            (swap! shared-local-stores dissoc dir-key)
+            :close)
+          (if (identical? shared-store store)
+            (if (> ^long refs 1)
+              (do
+                (swap! shared-local-stores update-in [dir-key :refs] dec)
+                :detached)
+              (do
+                (swap! shared-local-stores dissoc dir-key)
+                :close))
+            :close))
+        :close))
+    :close))
+
+(defn- open-conn-db
+  [dir schema opts]
+  {:pre [(or (nil? schema) (map? schema))]}
+  (vld/validate-schema schema)
+  (let [[store-opts runtime-opts] (split-runtime-opts opts)]
+    (if-let [dir-key (shared-local-store-key dir)]
+      (let [store (acquire-shared-local-store dir schema store-opts)]
+        (cond-> (db/new-db store)
+          (some? runtime-opts) (db/with-runtime-opts runtime-opts)))
+      (db/empty-db dir schema opts))))
+
 (defn create-conn
   ([] (conn-from-db (db/empty-db)))
-  ([dir] (conn-from-db (db/empty-db dir)))
-  ([dir schema] (conn-from-db (db/empty-db dir schema)))
-  ([dir schema opts] (conn-from-db (db/empty-db dir schema opts))))
+  ([dir] (conn-from-db (open-conn-db dir nil nil)))
+  ([dir schema] (conn-from-db (open-conn-db dir schema nil)))
+  ([dir schema opts] (conn-from-db (open-conn-db dir schema opts))))
 
 (defn close
   [conn]
   (when conn
+    (let [detached? (volatile! false)]
     (try
       (when-not (closed? conn)
         (when-let [store (.-store ^DB @conn)]
-          (i/close store)))
+          (case (release-shared-local-store! store)
+            :detached
+            (vreset! detached? true)
+
+            :close
+            (do
+              (i/close store)
+              (when (i/closed? store)
+                (vreset! detached? true))))))
       (finally
-        (when (closed? conn)
+        (when (or @detached? (closed? conn))
           (remove-conn (:dir (meta conn)) conn)
           (when-let [listeners (:listeners (meta conn))]
             (when (instance? clojure.lang.IAtom listeners)
@@ -125,7 +201,7 @@
           (when (instance? clojure.lang.IAtom conn)
             (reset! conn nil))
           (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
-        (shutdown-transact-async-executor-if-idle!))))
+        (shutdown-transact-async-executor-if-idle!)))))
   nil)
 
 (defn closed?

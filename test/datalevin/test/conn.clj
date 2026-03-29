@@ -210,6 +210,40 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-open-kv-rejects-second-local-handle-in-process
+  (let [dir (u/tmp-dir (str "open-kv-duplicate-handle-test-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [db1 (d/open-kv dir)]
+        (try
+          (d/open-dbi db1 "a")
+          (d/transact-kv db1 [[:put "a" :k :v]])
+          (let [result (try
+                         (let [db2 (d/open-kv dir)]
+                           (try
+                             {:status :opened}
+                             (finally
+                               (d/close-kv db2))))
+                         (catch Exception e
+                           {:status  :error
+                            :message (ex-message e)}))]
+            (is (= :error (:status result)) result)
+            (is (re-find #"Please do not open multiple LMDB connections"
+                         (:message result)))
+            (is (= :v
+                   (d/get-value db1 "a" :k))))
+          (finally
+            (d/close-kv db1))))
+      (let [db2 (d/open-kv dir)]
+        (try
+          (d/open-dbi db2 "a")
+          (is (= :v
+                 (d/get-value db2 "a" :k)))
+          (finally
+            (d/close-kv db2))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-get-conn
   (let [schema {:name          {:db/valueType :db.type/string}
                 :dt/updated-at {:db/valueType :db.type/instant}}
