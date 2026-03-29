@@ -14,6 +14,7 @@
    [datalevin.lmdb :as lmdb :refer [IWriting]]
    [datalevin.binding.cpp]
    [datalevin.inline :refer [update assoc]]
+   [datalevin.remote :as remote]
    [datalevin.util :as u :refer [conjs conjv]]
    [datalevin.relation :as r]
    [datalevin.bits :as b]
@@ -56,6 +57,26 @@
    [datalevin.interface IStore]
    [datalevin.async IAsyncWork]
    [datalevin.bits Retrieved Indexable]))
+
+(declare with-open-opts close-store-resources! release-shared-local-store!)
+
+(defonce ^:private shared-local-stores (atom {}))
+
+(defn- shared-local-store-key
+  [dir]
+  (when (and (string? dir) (not (remote/dtlv-uri? dir)))
+    (.getCanonicalPath ^java.io.File (u/file dir))))
+
+(defn- current-shared-local-store
+  [dir]
+  (when-let [dir-key (shared-local-store-key dir)]
+    (locking shared-local-stores
+      (when-let [store (get-in @shared-local-stores [dir-key :store])]
+        (if (closed? store)
+          (do
+            (swap! shared-local-stores dissoc dir-key)
+            nil)
+          store)))))
 
 (defn- attr->properties [k v]
   (case v
@@ -463,7 +484,9 @@
                 ^:volatile-mutable max-tx
                 scheduled-sampling
                 write-txn
-                ^ReentrantReadWriteLock sampling-lock]
+                ^ReentrantReadWriteLock sampling-lock
+                ^:volatile-mutable local-closed?
+                shared-dir-key]
 
   IWriting
 
@@ -491,23 +514,18 @@
   (dir [_] (env-dir lmdb))
 
   (close [this]
-    (let [wlock (.writeLock sampling-lock)]
-      (.lock wlock)
-      (try
-        (.stop-sampling this)
-        (doseq [index (vals vector-indices)]
-          (when-not (vec-closed? index)
-            (close-vecs index)))
-        (doseq [index (vals embedding-indices)]
-          (when-not (vec-closed? index)
-            (close-vecs index)))
-        (doseq [provider (vals embedding-providers)]
-          (emb/close-provider provider))
-        (close-kv lmdb)
-        (finally
-          (.unlock wlock)))))
+    (when-not local-closed?
+      (case (release-shared-local-store! this)
+        :detached
+        (set! local-closed? true)
 
-  (closed? [_] (closed-kv? lmdb))
+        :close
+        (do
+          (close-store-resources! this)
+          (set! local-closed? true))))
+    nil)
+
+  (closed? [_] (or local-closed? (closed-kv? lmdb)))
 
   (last-modified [_] (get-value lmdb c/meta :last-modified :attr :long))
 
@@ -2199,12 +2217,17 @@
 (defn- load-existing-store-opts
   [dir kv-opts]
   (when (existing-store? dir)
-    (let [probe (lmdb/open-kv dir (existing-store-probe-kv-opts dir kv-opts))]
-      (try
+    (if-let [probe (or (some-> ^Store (current-shared-local-store dir) .-lmdb)
+                       (datalevin.binding.cpp/open-local-kv-handle dir))]
+      (do
         (open-dbis probe)
-        (not-empty (load-opts probe))
-        (finally
-          (close-kv probe))))))
+        (not-empty (load-opts probe)))
+      (let [probe (lmdb/open-kv dir (existing-store-probe-kv-opts dir kv-opts))]
+        (try
+          (open-dbis probe)
+          (not-empty (load-opts probe))
+          (finally
+            (close-kv probe)))))))
 
 (defn open
   "Open and return the storage."
@@ -2237,7 +2260,9 @@
          kv-opts (cond-> (merge persisted-kv-opts kv-opts)
                    wal-default-kv-opts (#(merge wal-default-kv-opts %))
                    (u/file-exists (txlog-dir-path dir)) (assoc :wal? true))
-         lmdb (lmdb/open-kv dir kv-opts)]
+         ^Store shared-store (current-shared-local-store dir)
+         lmdb (or (some-> shared-store .-lmdb)
+                  (lmdb/open-kv dir kv-opts))]
      (open-dbis lmdb)
      (let [opts0     (or persisted-opts
                          (not-empty (load-opts lmdb))
@@ -2336,7 +2361,9 @@
                                                   :wal?
                                                   :kv-opts])}))
            _         (sync-wal-runtime-opts! lmdb opts3)
-           schema    (init-schema lmdb schema)
+           schema    (if shared-store
+                       (datalevin.interface/set-schema shared-store schema)
+                       (init-schema lmdb schema))
            s-domains (init-search-domains (:search-domains opts3)
                                           schema search-opts search-domains)
            v-domains (init-vector-domains (:vector-domains opts3)
@@ -2355,29 +2382,48 @@
                                                              embedding-opts))
                                   :embedding-domains e-domains))
              e-providers (init-embedding-providers dir e-domains
-                                                   embedding-providers)]
-         (let [opts4 (assoc opts4 :embedding-domain-providers e-providers)
-               store-opts (store-visible-opts opts4)]
+                                                   embedding-providers)
+             opts4       (assoc opts4 :embedding-domain-providers e-providers)
+             store-opts  (store-visible-opts opts4)
+             dir-key     (shared-local-store-key dir)]
          (if raw-persist-open-opts?
            (transact-opts-raw lmdb opts4)
            (transact-opts lmdb opts4))
-         (->Store lmdb
-                  (init-engines lmdb s-domains)
-                  (init-indices lmdb v-domains)
-                  (init-embedding-indices lmdb e-domains)
-                  (init-idoc-indices lmdb i-domains)
-                  e-providers
-                  (ConcurrentHashMap.)
-                  store-opts
-                  schema
-                  (schema->rschema schema)
-                  (init-attrs schema)
-                  (init-max-aid schema)
-                  (init-max-gt lmdb)
-                  (init-max-tx lmdb)
-                  (volatile! nil)
-                  (volatile! :storage-mutex)
-                  (ReentrantReadWriteLock.))))))))
+         (if shared-store
+           (let [wrapper (with-open-opts shared-store store-opts)]
+             (when dir-key
+               (locking shared-local-stores
+                 (swap! shared-local-stores
+                        assoc dir-key
+                        {:store wrapper
+                         :refs  (inc (get-in @shared-local-stores
+                                             [dir-key :refs]
+                                             0))})))
+             wrapper)
+           (let [store (->Store lmdb
+                                (init-engines lmdb s-domains)
+                                (init-indices lmdb v-domains)
+                                (init-embedding-indices lmdb e-domains)
+                                (init-idoc-indices lmdb i-domains)
+                                e-providers
+                                (ConcurrentHashMap.)
+                                store-opts
+                                schema
+                                (schema->rschema schema)
+                                (init-attrs schema)
+                                (init-max-aid schema)
+                                (init-max-gt lmdb)
+                                (init-max-tx lmdb)
+                                (volatile! nil)
+                                (volatile! :storage-mutex)
+                                (ReentrantReadWriteLock.)
+                                false
+                                dir-key)]
+             (when dir-key
+               (locking shared-local-stores
+                 (swap! shared-local-stores
+                        assoc dir-key {:store store :refs 1})))
+             store)))))))
 
 (defn- transfer-engines
   [engines lmdb]
@@ -2414,7 +2460,9 @@
            ;; Sampling work may still be queued against an older Store wrapper.
            ;; Keep close/sampling coordination on a shared lock across wrappers
            ;; that refer to the same logical store/LMDB lifecycle.
-           (.-sampling-lock old)))
+           (.-sampling-lock old)
+           false
+           (.-shared-dir-key old)))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different
@@ -2436,7 +2484,48 @@
            (max-tx old)
            (.-scheduled-sampling old)
            (.-write-txn old)
-           (.-sampling-lock old)))
+           (.-sampling-lock old)
+           false
+           (.-shared-dir-key old)))
+
+(defn- close-store-resources!
+  [^Store this]
+  (let [^ReentrantReadWriteLock sampling-lock (.-sampling-lock this)
+        wlock (.writeLock sampling-lock)]
+    (.lock wlock)
+    (try
+      (.stop-sampling this)
+      (doseq [index (vals (.-vector-indices this))]
+        (when-not (vec-closed? index)
+          (close-vecs index)))
+      (doseq [index (vals (.-embedding-indices this))]
+        (when-not (vec-closed? index)
+          (close-vecs index)))
+      (doseq [provider (vals (.-embedding-providers this))]
+        (emb/close-provider provider))
+      (close-kv (.-lmdb this))
+      (finally
+        (.unlock wlock)))))
+
+(defn- release-shared-local-store!
+  [^Store store]
+  (if-let [dir-key (.-shared-dir-key store)]
+    (locking shared-local-stores
+      (if-let [{shared-store :store refs :refs}
+               (get @shared-local-stores dir-key)]
+        (if (> ^long refs 1)
+          (let [replacement (if (identical? shared-store store)
+                              (with-open-opts shared-store (opts shared-store))
+                              shared-store)]
+            (swap! shared-local-stores
+                   assoc dir-key {:store replacement
+                                  :refs  (dec refs)})
+            :detached)
+          (do
+            (swap! shared-local-stores dissoc dir-key)
+            :close))
+        :close))
+    :close))
 
 (defn sync-max-gt-floor!
   "Advance an open store's in-memory giant-id cursor to at least `next-gt`.

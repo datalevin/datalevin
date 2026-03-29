@@ -763,6 +763,7 @@
 
 (defonce ^:private shutdown-hooks (atom {}))
 (defonce ^:private active-local-kv-handles (atom #{}))
+(defonce ^:private open-local-kv-handles (atom {}))
 
 (defn- canonical-dir-key
   [^File dir-file]
@@ -785,10 +786,29 @@
                 :type :lmdb/duplicate-open}))
       dir-key)))
 
+(defn- register-local-kv-handle!
+  [dir-key lmdb]
+  (when dir-key
+    (swap! open-local-kv-handles assoc dir-key lmdb))
+  lmdb)
+
+(defn open-local-kv-handle
+  [dir]
+  (when-let [dir-key (some-> dir u/file canonical-dir-key)]
+    (locking open-local-kv-handles
+      (when-let [lmdb (get @open-local-kv-handles dir-key)]
+        (if (i/closed-kv? lmdb)
+          (do
+            (swap! open-local-kv-handles dissoc dir-key)
+            (swap! active-local-kv-handles disj dir-key)
+            nil)
+          lmdb)))))
+
 (defn- release-local-kv-handle!
   [dir-key]
   (when dir-key
-    (swap! active-local-kv-handles disj dir-key))
+    (swap! active-local-kv-handles disj dir-key)
+    (swap! open-local-kv-handles dissoc dir-key))
   nil)
 
 (defn- register-shutdown-hook!
@@ -1670,7 +1690,7 @@
             (set-val-compressor lmdb v-comp)
             (register-shutdown-hook! dir (Thread. #(close-kv lmdb)))
             (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
-        (l/wrap-open-kv lmdb))
+        (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e
         (release-local-kv-handle! local-handle-key)
         (raise "Fail to open database: " e {:dir dir})))))
