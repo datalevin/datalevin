@@ -2020,8 +2020,27 @@
        (or (= :avg (nth row 4 nil))
            (= :avg (nth row 5 nil)))))
 
+(defn- open-replay-avg-dbi!
+  [lmdb dbi-name opts]
+  (or (try
+        (i/get-dbi lmdb dbi-name false)
+        (catch Throwable _
+          nil))
+      (try
+        (i/open-dbi lmdb dbi-name opts)
+        (catch Throwable _
+          nil))))
+
+(defn- ensure-replay-avg-state!
+  [lmdb]
+  ;; Txlog recovery runs before storage/open has reopened Datalog system DBIs.
+  ;; Open the subset needed to normalize :avg rows against snapshot state.
+  (open-replay-avg-dbi! lmdb c/schema {:key-size c/+max-key-size+})
+  (open-replay-avg-dbi! lmdb c/giants {:key-size c/+id-bytes+}))
+
 (defn- load-replay-attr-state
   [lmdb]
+  (ensure-replay-avg-state! lmdb)
   (try
     (let [schema (into {} (i/get-range lmdb c/schema [:all] :attr :data))
           attrs-by-aid
