@@ -748,6 +748,48 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-open-fallback-restores-snapshot-with-clean-txlog-runtime
+  (let [dir      (u/tmp-dir (str "wal-snapshot-fallback-test-"
+                                 (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")
+        opts     {:wal? true
+                  :snapshot-bootstrap-force? false}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k1 :v1]])))
+          (d/create-snapshot! db)
+          (is (seq (d/list-snapshots db)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k2 :v2]])))
+          (finally
+            (d/close-kv db))))
+      (let [segment-path (->> (or (u/list-files txlog-dir) [])
+                              (map #(.getPath ^java.io.File %))
+                              (filter #(str/ends-with? % ".wal"))
+                              sort
+                              first)]
+        (is (string? segment-path))
+        (with-open [raf (java.io.RandomAccessFile. ^String segment-path "rw")]
+          (.seek raf 0)
+          (.write raf (byte-array [0 0 0 0]))))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :v1
+                 (d/get-value db "a" :k1)))
+          (is (nil? (d/get-value db "a" :k2)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k3 :v3]])))
+          (is (= :v3
+                 (d/get-value db "a" :k3)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-wal-one-shot-write-uses-explicit-lmdb-write-transaction
   (let [dir  (u/tmp-dir (str "wal-one-shot-write-test-" (UUID/randomUUID)))
         ops* (atom [])]

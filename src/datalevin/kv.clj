@@ -1787,6 +1787,96 @@
       (u/copy-file (.getPath f)
                    (str env-dir u/+separator+ (.getName f))))))
 
+(defn- scan-txlog-segment-range
+  [{:keys [id file]}]
+  (let [path (.getPath ^java.io.File file)
+        scan (txlog/truncate-partial-tail!
+              path {:allow-preallocated-tail? true})
+        records (:records scan)
+        first-record (first records)
+        last-record (peek records)]
+    {:segment-id (long id)
+     :path path
+     :file file
+     :min-lsn (some-> first-record txlog-record-lsn long)
+     :max-lsn (some-> last-record txlog-record-lsn long)
+     :end-offset (txlog/segment-end-offset scan)}))
+
+(defn- replayable-txlog-tail-for-snapshot
+  [txlog-dir snapshot-lsn]
+  (let [segments (vec (txlog/segment-files txlog-dir))
+        target-lsn (unchecked-inc (long snapshot-lsn))]
+    (loop [remaining (seq (rseq segments))
+           kept []
+           expected-next-lsn nil]
+      (if-let [segment (first remaining)]
+        (let [{:keys [range error]}
+              (try
+                {:range (scan-txlog-segment-range segment)}
+                (catch Exception e
+                  {:error e}))]
+          (cond
+            error
+            {:kept []}
+
+            (nil? (:max-lsn range))
+            (recur (next remaining) kept expected-next-lsn)
+
+            (nil? expected-next-lsn)
+            (if (<= (long (:max-lsn range)) (long snapshot-lsn))
+              {:kept (vec (reverse kept))}
+              (let [kept' (conj kept range)]
+                (if (<= (long (:min-lsn range)) target-lsn)
+                  {:kept (vec (reverse kept'))}
+                  (recur (next remaining)
+                         kept'
+                         (long (:min-lsn range))))))
+
+            (= (long (:max-lsn range))
+               (dec ^long expected-next-lsn))
+            (let [kept' (conj kept range)]
+              (if (<= (long (:min-lsn range)) target-lsn)
+                {:kept (vec (reverse kept'))}
+                (recur (next remaining)
+                       kept'
+                       (long (:min-lsn range)))))
+
+            :else
+            {:kept []}))
+        (if (seq kept)
+          {:kept []}
+          {:kept []})))))
+
+(defn- reset-txlog-runtime-for-snapshot!
+  [env-dir reopen-opts snapshot]
+  (let [txlog-dir (or (:wal-dir reopen-opts)
+                      (str env-dir u/+separator+ "txlog"))
+        applied-lsn (long (or (:applied-lsn snapshot) 0))
+        {:keys [kept]} (replayable-txlog-tail-for-snapshot
+                        txlog-dir applied-lsn)
+        keep-ids (into #{} (map :segment-id) kept)
+        active-segment (peek kept)
+        active-segment-id (long (or (:segment-id active-segment) 1))
+        active-segment-offset (long (or (:end-offset active-segment) 0))]
+    (u/create-dirs txlog-dir)
+    ;; Snapshot fallback should keep only a contiguous WAL suffix that starts at
+    ;; the restored snapshot floor. Anything older is already covered by the
+    ;; snapshot, and any gapped/corrupt suffix is safer to discard entirely.
+    (doseq [{:keys [id file]} (txlog/segment-files txlog-dir)
+            :when (not (contains? keep-ids (long id)))]
+      (io/delete-file ^java.io.File file true))
+    (doseq [{:keys [file]} (txlog/prepared-segment-files txlog-dir)]
+      (io/delete-file ^java.io.File file true))
+    (txlog/write-meta-file!
+     (txlog/meta-path txlog-dir)
+     {:last-committed-lsn applied-lsn
+      :last-durable-lsn applied-lsn
+      :last-applied-lsn applied-lsn
+      :segment-id active-segment-id
+      :segment-offset active-segment-offset
+      :updated-ms (System/currentTimeMillis)})
+    txlog-dir))
+
 (defn- txlog-reopen-opts
   [env-opts]
   (into {:txlog-recovery-fallback-attempted? true}
@@ -1846,6 +1936,9 @@
               (let [attempt
                     (try
                       (copy-snapshot-lmdb-files! env-dir (:path snapshot))
+                      (reset-txlog-runtime-for-snapshot! env-dir
+                                                         reopen-opts
+                                                         snapshot)
                       {:reopened
                        (txlog-mark-recovery-source!
                         (l/open-kv env-dir reopen-opts)
