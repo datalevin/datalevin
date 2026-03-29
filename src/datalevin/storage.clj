@@ -2396,9 +2396,10 @@
                  (swap! shared-local-stores
                         assoc dir-key
                         {:store wrapper
-                         :refs  (inc (get-in @shared-local-stores
-                                             [dir-key :refs]
-                                             0))})))
+                         :refs  (unchecked-inc
+                                 (long (get-in @shared-local-stores
+                                               [dir-key :refs]
+                                               0)))})))
              wrapper)
            (let [store (->Store lmdb
                                 (init-engines lmdb s-domains)
@@ -2519,7 +2520,7 @@
                               shared-store)]
             (swap! shared-local-stores
                    assoc dir-key {:store replacement
-                                  :refs  (dec refs)})
+                                  :refs  (unchecked-dec (long refs))})
             :detached)
           (do
             (swap! shared-local-stores dissoc dir-key)

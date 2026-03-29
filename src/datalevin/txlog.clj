@@ -910,8 +910,8 @@
                          max-offset on-record]
                   :or   {allow-preallocated-tail? false
                          collect-records?         true}}]
-   (let [f (io/file path)]
-     (loop [attempt 0]
+    (let [f (io/file path)]
+      (loop [attempt 0]
        (let [{:keys [value error retry?]}
              (with-open [^FileChannel ch (FileChannel/open
                                            (.toPath f)
@@ -929,14 +929,15 @@
                    (catch Exception e
                      (let [current-size (long (.length f))
                            size-limit   (long size)]
-                       (if (and (< attempt scan-segment-concurrent-shrink-retries)
+                       (if (and (neg? (Long/compare (long attempt)
+                                                   (long scan-segment-concurrent-shrink-retries)))
                                 (txlog-unexpected-eof? e)
                                 (neg? (Long/compare current-size
                                                     size-limit)))
                          {:retry? true}
                          {:error e}))))))]
          (cond
-           retry? (recur (inc attempt))
+           retry? (recur (unchecked-inc (long attempt)))
            error (throw error)
            :else value))))))
 
