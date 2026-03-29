@@ -176,3 +176,21 @@
             (d/close-kv db2))))
       (finally
         (u/delete-files dir)))))
+
+(deftest expected-disruption-write-failure-matches-transport-errors-test
+  (let [active-test {:datalevin/nemesis-faults [:clock-skew-pause
+                                                :leader-failover]}
+        inactive-test {:datalevin/nemesis-faults []}
+        transport-error "Unable to connect to server: Connection refused"]
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   transport-error))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   {:error transport-error}))))
+    (is (false? (boolean
+                  (local/expected-disruption-write-failure?
+                    inactive-test
+                    transport-error))))))

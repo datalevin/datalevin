@@ -2379,6 +2379,12 @@
 (def ^:private disruption-write-failure-markers
   ["HA write admission rejected"
    "Timed out waiting for single leader"
+   "Socket channel is closed."
+   "ClosedChannelException"
+   "Unable to connect to server:"
+   "Connection refused"
+   "Connection reset by peer"
+   "Broken pipe"
    "Timeout in making request"
    "No space left on device"])
 

@@ -123,6 +123,7 @@
 ;; read caches
 (defonce ^:private caches (ConcurrentHashMap.))
 (defonce ^:private remote-cache-check-ms (ConcurrentHashMap.))
+(defonce ^:private remote-cache-max-tx (ConcurrentHashMap.))
 
 (defn- mark-remote-cache-check!
   [store]
@@ -130,6 +131,19 @@
     (.put ^ConcurrentHashMap remote-cache-check-ms
           (dir store)
           (System/currentTimeMillis))))
+
+(defn- cached-remote-cache-max-tx
+  [store]
+  (when (instance? DatalogStore store)
+    (.get ^ConcurrentHashMap remote-cache-max-tx (dir store))))
+
+(defn- mark-remote-cache-max-tx!
+  [store remote-max-tx]
+  (when (and (instance? DatalogStore store)
+             (some? remote-max-tx))
+    (.put ^ConcurrentHashMap remote-cache-max-tx
+          (dir store)
+          (long remote-max-tx))))
 
 (defn- should-check-remote-cache?
   [store cache]
@@ -147,23 +161,34 @@
 
 (defn refresh-cache
   ([store]
-   (refresh-cache store (last-modified store)))
+   (refresh-cache store (last-modified store) nil))
   ([store target]
+   (refresh-cache store target nil))
+  ([store target remote-max-tx]
    (let [target (long (or target 0))]
      (.put ^ConcurrentHashMap caches (dir store)
            (LRUCache. (:cache-limit (opts store)) target))
+     (mark-remote-cache-max-tx! store remote-max-tx)
      (mark-remote-cache-check! store))))
 
 (defn- ensure-cache
-  [store target]
-  (let [target (long (or target 0))]
-    (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
-      (if (< ^long (.target cache) ^long target)
-        (refresh-cache store target)
-        (do
-          (.setTarget cache target)
-          (mark-remote-cache-check! store)))
-      (refresh-cache store target))))
+  ([store target]
+   (ensure-cache store target nil))
+  ([store target remote-max-tx]
+   (let [target        (long (or target 0))
+         cached-max-tx (cached-remote-cache-max-tx store)]
+     (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+       (if (or (< ^long (.target cache) ^long target)
+               (and (some? remote-max-tx)
+                    (some? cached-max-tx)
+                    (< (long cached-max-tx)
+                       (long remote-max-tx))))
+         (refresh-cache store target remote-max-tx)
+         (do
+           (.setTarget cache target)
+           (mark-remote-cache-max-tx! store remote-max-tx)
+           (mark-remote-cache-check! store)))
+       (refresh-cache store target remote-max-tx)))))
 
 (defn cache-disabled?
   [store]
@@ -188,6 +213,7 @@
 (defn remove-cache
   [store]
   (.remove ^ConcurrentHashMap caches (dir store))
+  (.remove ^ConcurrentHashMap remote-cache-max-tx (dir store))
   (.remove ^ConcurrentHashMap remote-cache-check-ms (dir store)))
 
 (defmacro wrap-cache
@@ -402,16 +428,19 @@
     true))
 
 (defn- invalidate-cache
-  [store tx-data target]
-  (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
-    (do
-      (when (seq tx-data)
-        (let [touches (tx-touch-summary tx-data)]
-          (doseq [k (.keys cache)
-                  :when (tx-affects-cache-key? touches k)]
-            (.remove cache k))))
-      (.setTarget cache target))
-    (refresh-cache store target)))
+  ([store tx-data target]
+   (invalidate-cache store tx-data target nil))
+  ([store tx-data target remote-max-tx]
+   (if-some [^LRUCache cache (.get ^ConcurrentHashMap caches (dir store))]
+     (do
+       (when (seq tx-data)
+         (let [touches (tx-touch-summary tx-data)]
+           (doseq [k (.keys cache)
+                   :when (tx-affects-cache-key? touches k)]
+             (.remove cache k))))
+       (.setTarget cache target)
+       (mark-remote-cache-max-tx! store remote-max-tx))
+     (refresh-cache store target remote-max-tx))))
 
 (defrecord-updatable DB [^IStore store
                          ^long max-eid
@@ -709,11 +738,25 @@
     (let [store  (.-store ^DB x)
           cache  (.get ^ConcurrentHashMap caches (dir store))]
       (when (should-check-remote-cache? store cache)
-        (let [target (long (or (last-modified store) 0))]
-          (mark-remote-cache-check! store)
-          (when (or (nil? cache)
-                    (< ^long (.target ^LRUCache cache) ^long target))
-            (refresh-cache store target)))))
+        (if (instance? DatalogStore store)
+          (let [{:keys [last-modified max-tx]} (r/db-info store)
+                target        (long (or last-modified 0))
+                cached-max-tx (cached-remote-cache-max-tx store)]
+            (if (or (nil? cache)
+                    (< ^long (.target ^LRUCache cache) ^long target)
+                    (and (some? max-tx)
+                         (some? cached-max-tx)
+                         (< (long cached-max-tx)
+                            (long max-tx))))
+              (refresh-cache store target max-tx)
+              (do
+                (mark-remote-cache-max-tx! store max-tx)
+                (mark-remote-cache-check! store))))
+          (let [target (long (or (last-modified store) 0))]
+            (mark-remote-cache-check! store)
+            (when (or (nil? cache)
+                      (< ^long (.target ^LRUCache cache) ^long target))
+              (refresh-cache store target))))))
     true))
 
 (defn search-datoms [db e a v] (-search db [e a v]))
@@ -781,7 +824,8 @@
                  :pull-patterns (LRUCache. 64)})]
      (swap! dbs assoc (db-name store) db)
      (ensure-cache store
-                   (if info (:last-modified info) (last-modified store)))
+                   (if info (:last-modified info) (last-modified store))
+                   (when info (:max-tx info)))
      (start-sampling store)
      db)))
 
@@ -2259,7 +2303,10 @@
           (let [info (resolved-remote-db-info
                        store db (or db-info {}) max-eid simulated?)]
             (when-not simulated?
-              (invalidate-cache store tx-data (:last-modified info)))
+              (invalidate-cache store
+                                tx-data
+                                (:last-modified info)
+                                (:max-tx info)))
             (cond-> (assoc initial-report
                            :db-after (-> (carry-runtime-opts (new-db store info) db)
                                          (assoc :max-eid (:max-eid info))
