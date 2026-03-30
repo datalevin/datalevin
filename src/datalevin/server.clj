@@ -714,7 +714,9 @@
                    (transform-db-state-when
                     server
                     db-name
-                    #(same-ha-runtime-context? % expected-state)
+                    #(same-ha-runtime-state? %
+                                            expected-state
+                                            :ha-renew-loop-running?)
                     #(merge-ha-renew-promotion-state-patch
                       %
                       expected-state

@@ -181,20 +181,23 @@
 
 (defn merge-ha-follower-side-effect-patch
   [current-state expected-state local-patch patch]
-  (let [current-state
+  (let [merged-state
+        ;; `local-patch` never carries `:ha-role`, but merge it first so the
+        ;; follower side-effect guard reads from the actual post-local-patch
+        ;; state rather than the original input binding.
         (merge-ha-follower-local-side-effect-patch
          current-state
          expected-state
          local-patch)]
     (if (and patch
-             (= :follower (:ha-role current-state))
+             (= :follower (:ha-role merged-state))
              (= :follower (:ha-role expected-state))
              (same-ha-runtime-state?
-              current-state
+              merged-state
               expected-state
               :ha-follower-loop-running?))
-      (apply-state-patch current-state patch)
-      current-state)))
+      (apply-state-patch merged-state patch)
+      merged-state)))
 
 (defn merge-ha-renew-state-patch
   [current-state expected-state patch]
@@ -209,9 +212,12 @@
 (defn merge-ha-renew-promotion-state-patch
   [current-state expected-state patch]
   (if (and patch
-           (same-ha-runtime-context?
+           ;; Promotion fallback must not let a stale renew loop publish a
+           ;; leader transition after the renew loop has been restarted.
+           (same-ha-runtime-state?
             current-state
-            expected-state))
+            expected-state
+            :ha-renew-loop-running?))
     (apply-state-patch current-state patch)
     current-state))
 
