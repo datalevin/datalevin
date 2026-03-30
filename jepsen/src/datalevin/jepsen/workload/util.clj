@@ -30,6 +30,20 @@
                  (= :r (first micro-op)))
                (:value op))))
 
+(defn append-only-micro-op-txn?
+  [op]
+  (and (= :ok (:type op))
+       (sequential? (:value op))
+       (seq (:value op))
+       (every? (fn [micro-op]
+                 (= :append (first micro-op)))
+               (:value op))))
+
+(defn append-graph-ignorable-micro-op-txn?
+  [op]
+  (or (read-only-micro-op-txn? op)
+      (append-only-micro-op-txn? op)))
+
 (defn wrap-empty-graph-checker
   ([base-checker pred sample-keys]
    (wrap-empty-graph-checker base-checker
@@ -51,6 +65,10 @@
              empty-graph?         (true? (get-in result
                                                  [:anomalies
                                                   :empty-transaction-graph]))
+             only-ignorable?      (and (= :unknown (:valid? result))
+                                       empty-graph?
+                                       (pos? (count terminal))
+                                       (empty? checked-terminal))
              only-disruption?     (and (= :unknown (:valid? result))
                                        empty-graph?
                                        (pos? (count disruption-failures))
@@ -62,6 +80,11 @@
                                      disruption-failures
                                      sample-keys)}]
          (cond-> (merge result failure-summary)
+           only-ignorable?
+           (assoc :valid? true
+                  :base-valid? (:valid? result)
+                  :adjusted-valid? :ignorable-empty-graph)
+
            only-disruption?
            (assoc :valid? true
                   :base-valid? (:valid? result)

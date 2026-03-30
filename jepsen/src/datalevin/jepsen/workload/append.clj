@@ -111,6 +111,6 @@
                  (fn [op]
                    (= :txn (:f op)))
                  [:f :error]
-                 workload.util/read-only-micro-op-txn?))
+                 workload.util/append-graph-ignorable-micro-op-txn?))
         (assoc :client (->Client nil)
                :schema schema))))

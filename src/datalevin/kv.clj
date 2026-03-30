@@ -3128,28 +3128,36 @@
 
 (defn- collect-txlog-records
   [state segments cache-v from]
-  (let [from (long from)
-        tail-scan? (pos? from)]
-    (if tail-scan?
-      (loop [remaining (seq (rseq segments))
-             collected '()]
-        (if-let [segment (first remaining)]
-          (let [{:keys [records min-lsn]}
-                (txlog-segment-records-entry state segment cache-v)
-                collected' (if (seq records)
-                             (cons records collected)
-                             collected)]
-            (if (and (some? min-lsn)
-                     (<= (long min-lsn) from))
-              (mapcat identity collected')
-              (recur (next remaining) collected')))
-          (mapcat identity collected)))
-      (mapcat #(-> (txlog-segment-records-entry
-                    state
-                    %
-                    cache-v)
-                   :records)
-              segments))))
+  (let [from (long from)]
+    (loop [remaining (seq (rseq segments))
+           collected '()
+           earliest-collected-lsn nil]
+      (if-let [segment (first remaining)]
+        (let [{:keys [records]}
+              (txlog-segment-records-entry state segment cache-v)
+              records' (if (and (seq records)
+                                (some? earliest-collected-lsn))
+                         ;; Segment rollover and snapshot fallback can retain an
+                         ;; overlapping boundary record in both the older and
+                         ;; newer segment. Keep the newer copy and trim the
+                         ;; older prefix so sequence validation still catches
+                         ;; real gaps without failing on duplicate boundaries.
+                         (->> records
+                              (take-while
+                               #(< (long (:lsn %))
+                                   ^long earliest-collected-lsn))
+                              vec)
+                         records)
+              earliest' (or (some-> records' first :lsn long)
+                            earliest-collected-lsn)
+              collected' (if (seq records')
+                           (cons records' collected)
+                           collected)]
+          (if (and (some? earliest')
+                   (<= ^long earliest' from))
+            (mapcat identity collected')
+            (recur (next remaining) collected' earliest')))
+        (mapcat identity collected)))))
 
 (defn- validate-txlog-record-sequence!
   [records]

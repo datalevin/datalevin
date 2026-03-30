@@ -627,6 +627,87 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
+(deftest append-empty-graph-with-uninformative-terminal-history-is-ignorable-test
+  (let [append-checker
+        (workload.util/wrap-empty-graph-checker
+         (cycle.append/checker {:max-plot-bytes 0})
+         (fn [op]
+           (= :txn (:f op)))
+         [:f :error]
+         workload.util/append-graph-ignorable-micro-op-txn?)
+        history
+        [{:index 0
+          :time 8860800
+          :type :invoke
+          :process 0
+          :f :txn
+          :value [[:r 2 nil]]}
+         {:index 1
+          :time 11732333
+          :type :info
+          :process :nemesis
+          :f :kill-leader
+          :value nil}
+         {:index 2
+          :time 12129588
+          :type :invoke
+          :process 2
+          :f :txn
+          :value [[:append 3 1]]}
+         {:index 3
+          :time 241126181
+          :type :invoke
+          :process 1
+          :f :txn
+          :value [[:append 3 2]]}
+         {:index 4
+          :time 4548419224
+          :type :info
+          :process :nemesis
+          :f :kill-leader
+          :value {:stopped "n1"
+                  :leader "n2"}}
+         {:index 5
+          :time 5251817549
+          :type :ok
+          :process 0
+          :f :txn
+          :value [[:r 2 []]]}
+         {:index 6
+          :time 5265330434
+          :type :ok
+          :process 1
+          :f :txn
+          :value [[:append 3 2]]}
+         {:index 7
+          :time 5276528646
+          :type :ok
+          :process 2
+          :f :txn
+          :value [[:append 3 1]]}
+         {:index 8
+          :time 9549831223
+          :type :info
+          :process :nemesis
+          :f :restart-node
+          :value nil}
+         {:index 9
+          :time 11495087760
+          :type :info
+          :process :nemesis
+          :f :restart-node
+          :value {:restarted "n1"
+                  :leader "n2"}}]
+        result (checker/check append-checker
+                              {:name "append-read-only-empty-graph-smoke"
+                               :start-time "20260329T2215"}
+                              (history/history history)
+                              nil)]
+    (is (true? (:valid? result))
+        (pr-str result))
+    (is (= :ignorable-empty-graph
+           (:adjusted-valid? result)))))
+
 (deftest register-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
