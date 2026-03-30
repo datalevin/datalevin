@@ -43,6 +43,18 @@
   []
   (System/nanoTime))
 
+(defn- ha-replay-debug-enabled?
+  []
+  (= "1" (System/getenv "HA_REPLAY_DEBUG")))
+
+(defn- ha-replay-debug!
+  [event data]
+  (when (ha-replay-debug-enabled?)
+    (binding [*out* *err*]
+      (prn (assoc data
+                  :ha-replay-debug true
+                  :event event)))))
+
 (def ^:private long-max2 hu/long-max2)
 (def ^:private long-max3 hu/long-max3)
 (def ^:private long-max4 hu/long-max4)
@@ -2233,18 +2245,29 @@
                                           nil))
                                       0))
                :probe-eid   probe-eid
-               :probe-eav-range
+               :probe-eav-list
                (when probe-eid
                  (try
-                   (vec (i/get-range readback-kv-store
-                                     c/eav
-                                     [probe-eid]
-                                     :id
-                                     :avg))
+                   (vec (i/get-list readback-kv-store
+                                    c/eav
+                                    probe-eid
+                                    :id
+                                    :avg))
                    (catch Throwable _
                      nil)))})
             next-state        (assoc next-state
                                      :ha-follower-last-apply-readback readback)]
+        (ha-replay-debug!
+         :apply-ha-follower-record
+         {:record-lsn (long (:lsn record))
+          :ha-node-id (:ha-node-id next-state)
+          :ha-local-endpoint (:ha-local-endpoint next-state)
+          :ha-term (some-> (:ha-term record) long)
+          :row-count (count replay-rows)
+          :rows replay-rows
+          :readback readback
+          :source-endpoint (:ha-follower-source-endpoint next-state)
+          :leader-endpoint (:ha-follower-leader-endpoint next-state)})
         (when (instance? IStore (:store next-state))
           (when-let [target-max-tx
                      (some->> replay-rows
@@ -2257,7 +2280,14 @@
                               last)]
             (advance-store-max-tx-to-target!
              (:store next-state)
-             (long target-max-tx))))
+             (long target-max-tx))
+            (ha-replay-debug!
+             :apply-ha-follower-record-max-tx
+             {:record-lsn (long (:lsn record))
+              :ha-node-id (:ha-node-id next-state)
+              :ha-local-endpoint (:ha-local-endpoint next-state)
+              :target-max-tx (long target-max-tx)
+              :store-max-tx (long (i/max-tx (:store next-state)))})))
         next-state)
 
       :else
@@ -2547,6 +2577,22 @@
                   source-last-applied-lsn]}
           (fetch-ha-follower-records-with-gap-fallback
            db-name m lease next-lsn upto-lsn)
+          _ (ha-replay-debug!
+             :sync-ha-follower-batch-fetch
+             {:ha-node-id (:ha-node-id m)
+              :ha-local-endpoint (:ha-local-endpoint m)
+              :leader-endpoint leader-endpoint
+              :next-lsn (long next-lsn)
+              :upto-lsn upto-lsn
+              :record-count (count records)
+              :record-lsns (mapv (comp long :lsn) records)
+              :source-endpoint source-endpoint
+              :source-order source-order
+              :source-order-dynamic? source-order-dynamic?
+              :source-last-applied-lsn-known?
+              source-last-applied-lsn-known?
+              :source-last-applied-lsn
+              (some-> source-last-applied-lsn long)})
           apply-record-fn (or *ha-follower-apply-record-fn*
                               apply-ha-follower-txlog-record!)
           next-m (reduce apply-record-fn m records)

@@ -24,6 +24,32 @@
 (def missing-state-value
   (Object.))
 
+(def ^:private identity-sensitive-state-keys
+  #{:store
+    :dt-db
+    :wdt-db
+    :wlmdb
+    :runner
+    :engine
+    :index
+    :ha-authority
+    :ha-renew-loop-running?
+    :ha-renew-loop-future
+    :ha-renew-loop-stopped-latch
+    :ha-follower-loop-running?
+    :ha-follower-loop-future
+    :ha-follower-loop-stopped-latch
+    :lock
+    :open-lock
+    :ha-write-admission-lock
+    :runtime-access-lock})
+
+(defn- state-value-changed?
+  [k expected-v next-v]
+  (if (contains? identity-sensitive-state-keys k)
+    (not (identical? expected-v next-v))
+    (not (= expected-v next-v))))
+
 (def ha-follower-local-side-effect-keys
   [:store
    :dt-db
@@ -67,9 +93,9 @@
                (fn [acc k]
                  (let [expected-v (get expected-state k missing-state-value)
                        next-v     (get next-state k missing-state-value)]
-                   (if (= expected-v next-v)
-                     acc
-                     (assoc acc k next-v))))
+                   (if (state-value-changed? k expected-v next-v)
+                     (assoc acc k next-v)
+                     acc)))
                {}
                keys)]
     (when (seq patch)

@@ -310,6 +310,25 @@
     (.put ^Map (.-clients server) client-id session)))
 
 (declare get-store store-closed?)
+(declare current-runtime-opts new-runtime-db)
+
+(defn- usable-store
+  [store]
+  (when-not
+    (try
+      (cond
+        (nil? store) true
+        (instance? IStore store) (i/closed? store)
+        (instance? ILMDB store) (i/closed-kv? store)
+        :else true)
+      (catch Throwable _
+        true))
+    store))
+
+(defn- runtime-db-store
+  [dt-db]
+  (when (instance? DB dt-db)
+    (usable-store (.-store ^DB dt-db))))
 
 (defn- get-stores
   [^Server server]
@@ -321,28 +340,12 @@
 
 (defn- get-store
   ([^Server server db-name writing?]
-   (let [m (get (.-dbs server) db-name)
-         usable-store
-         (fn [store]
-           (when-not
-             (try
-               (cond
-                 (nil? store) true
-                 (instance? IStore store) (i/closed? store)
-                 (instance? ILMDB store) (i/closed-kv? store)
-                 :else true)
-               (catch Throwable _
-                 true))
-             store))
-         runtime-store
-         (fn [dt-db]
-           (when (instance? DB dt-db)
-             (usable-store (.-store ^DB dt-db))))]
+   (let [m (get (.-dbs server) db-name)]
      (if writing?
        (or (usable-store (:wstore m))
-           (runtime-store (:wdt-db m)))
+           (runtime-db-store (:wdt-db m)))
        (or (usable-store (:store m))
-           (runtime-store (:dt-db m))))))
+           (runtime-db-store (:dt-db m))))))
   ([server db-name]
    (get-store server db-name false)))
 
@@ -1258,7 +1261,19 @@
    (get-db server db-name false))
   ([^Server server db-name writing?]
    (let [m (get (.-dbs server) db-name)]
-     (if writing? (:wdt-db m) (:dt-db m)))))
+     (if writing?
+       (:wdt-db m)
+       (or
+        (when (and (= :follower (:ha-role m))
+                   (:ha-authority m))
+          (when-let [store (or (usable-store (:store m))
+                               (runtime-db-store (:dt-db m)))]
+            ;; HA follower replay mutates the shared store outside the normal
+            ;; query/transaction wrappers. Build a fresh runtime DB view for
+            ;; follower reads so stale in-memory overlays from a previous role
+            ;; or publication epoch cannot leak into query results.
+            (new-runtime-db store (current-runtime-opts m))))
+        (:dt-db m))))))
 
 (defn- remove-store
   [^Server server db-name]

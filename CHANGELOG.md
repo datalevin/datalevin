@@ -52,6 +52,7 @@
 env config.
 - [WAL] Enable multiple processes working with the same DB in WAL mode
   [#361](https://github.com/datalevin/datalevin/issues/361).
+- [KV] Don't accidentally depends on glibc 2.35 on Linux [Thx @baibhavbista].
 
 ## 0.10.7 (2026-03-03)
 
