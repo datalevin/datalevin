@@ -6,10 +6,14 @@
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
    [datalevin.kv :as kv]
+   [datalevin.server :as srv]
    [datalevin.util :as u])
   (:import
+   [datalevin.db DB]
+   [datalevin.server Server]
    [java.util UUID]
-   [java.util.concurrent TimeUnit]))
+   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue TimeUnit]
+   [java.util.concurrent.atomic AtomicBoolean]))
 
 (defn- current-java-bin
   []
@@ -71,6 +75,22 @@
     (.directory process-builder (io/file (System/getProperty "user.dir")))
     (.redirectErrorStream process-builder true)
     (.start process-builder)))
+
+(defn- ha-test-server
+  [dbs]
+  (srv/->Server (AtomicBoolean. true)
+                0
+                ""
+                0
+                nil
+                nil
+                (ConcurrentLinkedQueue.)
+                nil
+                nil
+                nil
+                (ConcurrentHashMap.)
+                (doto (ConcurrentHashMap.)
+                  (.putAll dbs))))
 
 (defn- wal-child-overlap-form
   [dir opts ready-path release-path]
@@ -194,3 +214,38 @@
                   (local/expected-disruption-write-failure?
                     inactive-test
                     transport-error))))))
+
+(deftest local-query-uses-server-ha-read-view-test
+  (let [dir       (u/tmp-dir (str "jepsen-local-query-refresh-"
+                                  (UUID/randomUUID)))
+        db-name   "jepsen-local-query-refresh"
+        conn      (d/create-conn dir {:register/key {:db/valueType :db.type/long
+                                                     :db/unique :db.unique/identity}
+                                      :register/value {:db/valueType :db.type/long}})
+        _         (d/transact! conn [{:register/key 0 :register/value 0}])
+        stale-db  @conn
+        _         (d/transact! conn [{:register/key 0 :register/value 1000}])
+        live-db   @conn
+        store     (.-store ^DB live-db)
+        server    (ha-test-server {db-name
+                                   {:store store
+                                    :dt-db stale-db
+                                    :ha-role :follower
+                                    :ha-authority (Object.)}})
+        cluster-id (keyword (str "local-query-refresh-" (UUID/randomUUID)))
+        clusters* @#'local/clusters]
+    (swap! clusters* assoc cluster-id {:db-name db-name
+                                       :servers {"n1" server}})
+    (try
+      (is (= 1000
+             (local/local-query
+              cluster-id
+              "n1"
+              '[:find ?v .
+                :where
+                [?e :register/key 0]
+                [?e :register/value ?v]])))
+      (finally
+        (swap! clusters* dissoc cluster-id)
+        (d/close conn)
+        (u/delete-files dir)))))

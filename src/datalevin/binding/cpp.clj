@@ -1527,6 +1527,15 @@
   IAdmin
   (re-index [this opts] (l/re-index* this opts)))
 
+(defn invalidate-thread-reader!
+  [lmdb]
+  (when (instance? CppLMDB lmdb)
+    (let [^ThreadLocal tl-reader (.-tl-reader ^CppLMDB lmdb)]
+      (when-let [^Rtx rtx (.get tl-reader)]
+        (close-txn-quiet! (.-txn rtx))
+        (.remove tl-reader))))
+  nil)
+
 (defn- key-range-list-count-fast
   [lmdb dbi-name [range-type k1 k2] k-type]
   (scan/scan

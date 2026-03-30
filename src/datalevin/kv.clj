@@ -3666,6 +3666,12 @@
   (visit-key-sample [this a0 a1 a2 a3 a4] (i/visit-key-sample db a0 a1 a2 a3 a4))
   (visit-key-sample [this a0 a1 a2 a3 a4 a5] (i/visit-key-sample db a0 a1 a2 a3 a4 a5)))
 
+(defn raw-lmdb
+  [db]
+  (if (instance? KVLMDB db)
+    (.-db ^KVLMDB db)
+    db))
+
 (defn wrap-lmdb
   [db]
   (if (instance? KVLMDB db)

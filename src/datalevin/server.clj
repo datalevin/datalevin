@@ -458,9 +458,23 @@
   (cond-> dt-db
     (seq runtime-opts) (db/with-runtime-opts runtime-opts)))
 
+(defn- fresh-runtime-db-info
+  [store]
+  (when (instance? Store store)
+    (let [lmdb          (kv/raw-lmdb (.-lmdb ^Store store))
+          max-tx        (long (or (i/get-value lmdb c/meta :max-tx :attr :long)
+                                  (i/max-tx store)))
+          last-modified (long (or (i/get-value lmdb c/meta :last-modified
+                                               :attr :long)
+                                  (i/last-modified store)))]
+      {:max-eid       (i/init-max-eid store)
+       :max-tx        max-tx
+       :last-modified last-modified})))
+
 (defn- new-runtime-db
   [store runtime-opts]
-  (attach-runtime-opts (db/new-db store) runtime-opts))
+  (attach-runtime-opts (db/new-db store (fresh-runtime-db-info store))
+                       runtime-opts))
 
 (def ^:private installed-udf-query
   '[:find ?ident ?descriptor
@@ -1264,14 +1278,23 @@
      (if writing?
        (:wdt-db m)
        (or
-        (when (and (= :follower (:ha-role m))
-                   (:ha-authority m))
-          (when-let [store (or (usable-store (:store m))
-                               (runtime-db-store (:dt-db m)))]
-            ;; HA follower replay mutates the shared store outside the normal
-            ;; query/transaction wrappers. Build a fresh runtime DB view for
-            ;; follower reads so stale in-memory overlays from a previous role
-            ;; or publication epoch cannot leak into query results.
+       (when (or (:ha-authority m)
+                 (:ha-role m))
+           (when-let [store (or (usable-store (:store m))
+                                (runtime-db-store (:dt-db m)))]
+            (cpp/invalidate-thread-reader!
+             (kv/raw-lmdb
+              (if (instance? Store store)
+                (.-lmdb ^Store store)
+                store)))
+            ;; HA replay and promotion mutate the shared store outside the
+            ;; normal query/transaction wrappers. Clear the shared store cache
+            ;; and build a fresh runtime DB view for HA reads whenever the DB
+            ;; is in HA role state, even if there is no live authority object
+            ;; on this node. Followers can continue serving reads after replay
+            ;; with only :ha-role/:store state, and falling back to a cached
+            ;; :dt-db there leaks stale pre-replay views into remote queries.
+            (db/refresh-cache store)
             (new-runtime-db store (current-runtime-opts m))))
         (:dt-db m))))))
 

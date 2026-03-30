@@ -1989,13 +1989,10 @@
         server
         db-name
         (fn []
-          (if-let [state (db-state server db-name)]
-            (let [store (:store state)]
-              (if (store-open? store)
-                (try
-                  (apply d/q q (ddb/new-db store) inputs)
-                  (catch Throwable _
-                    ::unavailable))
+          (if-let [db (#'srv/get-db server db-name false)]
+            (try
+              (apply d/q q db inputs)
+              (catch Throwable _
                 ::unavailable))
             ::unavailable))))))
 

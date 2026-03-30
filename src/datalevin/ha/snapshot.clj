@@ -12,8 +12,10 @@
   (:require
    [clojure.edn :as edn]
    [clojure.string :as s]
+   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.interface :as i]
+   [datalevin.kv :as kv]
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
@@ -321,9 +323,20 @@
   [m]
   (let [store (:store m)]
     (if (instance? IStore store)
-      (let [info {:max-eid (i/init-max-eid store)
-                  :max-tx (long (i/max-tx store))
-                  :last-modified (long (i/last-modified store))}]
+      (let [lmdb          (kv/raw-lmdb
+                           (if (instance? Store store)
+                             (.-lmdb ^Store store)
+                             store))
+            info          {:max-eid       (i/init-max-eid store)
+                           :max-tx        (long
+                                           (or (i/get-value lmdb c/meta :max-tx
+                                                            :attr :long)
+                                               (i/max-tx store)))
+                           :last-modified (long
+                                           (or (i/get-value lmdb c/meta
+                                                            :last-modified
+                                                            :attr :long)
+                                               (i/last-modified store)))}]
         (assoc m :dt-db (db/new-db store info)))
       m)))
 
