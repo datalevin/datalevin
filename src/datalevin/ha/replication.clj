@@ -165,10 +165,11 @@
       (i/transact-kv kv-store c/kv-info
                      [[:put c/ha-local-applied-lsn (long applied-lsn)]]
                      :keyword :data)
+      (long applied-lsn)
       (catch Throwable t
         (when-not (closed-kv-race? t kv-store)
-          (throw t)))))
-  applied-lsn)
+          (throw t))
+        nil))))
 
 (defn- ha-follower-persist-every-batches
   [m]
@@ -201,6 +202,22 @@
          :ha-local-last-persisted-applied-ms (long now-ms)
          :ha-follower-batches-since-persist 0))
 
+(defn- note-ha-bootstrap-installed-state
+  [m installed-lsn source-endpoint snapshot-lsn now-ms persisted-installed-lsn]
+  (let [resume-next-lsn (unchecked-inc (long installed-lsn))]
+    (cond-> (assoc m
+                   :ha-local-last-applied-lsn (long installed-lsn)
+                   :ha-follower-last-applied-term nil
+                   :ha-follower-batches-since-persist 0
+                   :ha-follower-next-lsn resume-next-lsn
+                   :ha-follower-last-bootstrap-ms (long now-ms)
+                   :ha-follower-bootstrap-source-endpoint source-endpoint
+                   :ha-follower-bootstrap-snapshot-last-applied-lsn
+                   (long snapshot-lsn))
+      persisted-installed-lsn
+      (assoc :ha-local-persisted-lsn (long persisted-installed-lsn)
+             :ha-local-last-persisted-applied-ms (long now-ms)))))
+
 (defn- maybe-persist-ha-follower-local-applied-lsn
   [m applied-lsn now-ms]
   (let [tracked-m (seed-ha-local-persist-tracking m now-ms)
@@ -227,10 +244,11 @@
     (if (and (> (long applied-lsn) persisted-lsn)
              (or interval-elapsed?
                  batch-threshold-reached?))
-      (do
-        (persist-ha-local-applied-lsn! tracked-m applied-lsn)
+      (if-let [persisted-applied-lsn
+               (persist-ha-local-applied-lsn! tracked-m applied-lsn)]
         (note-ha-local-applied-lsn-persisted
-         tracked-m applied-lsn now-ms))
+         tracked-m persisted-applied-lsn now-ms)
+        (assoc tracked-m :ha-follower-batches-since-persist next-batch-count))
       (assoc tracked-m :ha-follower-batches-since-persist next-batch-count))))
 
 (defn- read-ha-local-snapshot-current-lsn
@@ -2757,29 +2775,23 @@
                            installed-state
                            snapshot-lsn
                            trusted-install-lsn)
-                          resume-next-lsn (unchecked-inc (long installed-lsn))
-                          _ (persist-ha-local-applied-lsn!
-                             state
-                             installed-lsn)
+                          persisted-installed-lsn
+                          (persist-ha-local-applied-lsn!
+                           state
+                           installed-lsn)
                           installed-state
-                          (-> state
-                              (assoc
-                               :ha-local-last-applied-lsn installed-lsn
-                               :ha-local-persisted-lsn installed-lsn
-                               :ha-local-last-persisted-applied-ms
-                               (long now-ms)
-                               :ha-follower-last-applied-term nil
-                               :ha-follower-batches-since-persist 0
-                               :ha-follower-next-lsn resume-next-lsn
-                               :ha-follower-last-bootstrap-ms now-ms
-                               :ha-follower-bootstrap-source-endpoint
-                               source-endpoint
-                               :ha-follower-bootstrap-snapshot-last-applied-lsn
-                               snapshot-lsn))]
+                          (note-ha-bootstrap-installed-state
+                           state
+                           installed-lsn
+                           source-endpoint
+                           snapshot-lsn
+                           now-ms
+                           persisted-installed-lsn)]
                       (try
                         (let [sync-res (sync-ha-follower-batch
                                         db-name installed-state lease
-                                        resume-next-lsn now-ms)
+                                        (unchecked-inc (long installed-lsn))
+                                        now-ms)
                               next-state (-> (:state sync-res)
                                              (assoc
                                               :ha-follower-last-bootstrap-ms
@@ -2803,7 +2815,8 @@
                                            :installed-last-applied-lsn
                                            installed-lsn
                                            :resume-next-lsn
-                                           resume-next-lsn})}})))
+                                           (unchecked-inc
+                                            (long installed-lsn))})}})))
                     {:ok? false
                      :state (:state install-res)
                      :error (:error install-res)}))
