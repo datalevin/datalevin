@@ -92,6 +92,37 @@
                 (doto (ConcurrentHashMap.)
                   (.putAll dbs))))
 
+(defn- assert-local-query-refreshes-ha-read-view!
+  [db-state]
+  (let [dir        (u/tmp-dir (str "jepsen-local-query-refresh-"
+                                   (UUID/randomUUID)))
+        db-name    "jepsen-local-query-refresh"
+        query      '[:find ?v .
+                     :where
+                     [?e :register/key 0]
+                     [?e :register/value ?v]]
+        conn       (d/create-conn dir {:register/key {:db/valueType :db.type/long
+                                                      :db/unique :db.unique/identity}
+                                       :register/value {:db/valueType :db.type/long}})
+        _          (d/transact! conn [{:register/key 0 :register/value 0}])
+        stale-db   @conn
+        store      (.-store ^DB stale-db)
+        server     (ha-test-server {db-name (merge {:store store
+                                                    :dt-db stale-db}
+                                                   db-state)})
+        cluster-id (keyword (str "local-query-refresh-" (UUID/randomUUID)))
+        clusters*  @#'local/clusters]
+    (swap! clusters* assoc cluster-id {:db-name db-name
+                                       :servers {"n1" server}})
+    (try
+      (is (= 0 (local/local-query cluster-id "n1" query)))
+      (d/transact! conn [{:register/key 0 :register/value 1000}])
+      (is (= 1000 (local/local-query cluster-id "n1" query)))
+      (finally
+        (swap! clusters* dissoc cluster-id)
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (defn- wal-child-overlap-form
   [dir opts ready-path release-path]
   (let [form
@@ -216,36 +247,15 @@
                     transport-error))))))
 
 (deftest local-query-uses-server-ha-read-view-test
-  (let [dir       (u/tmp-dir (str "jepsen-local-query-refresh-"
-                                  (UUID/randomUUID)))
-        db-name   "jepsen-local-query-refresh"
-        conn      (d/create-conn dir {:register/key {:db/valueType :db.type/long
-                                                     :db/unique :db.unique/identity}
-                                      :register/value {:db/valueType :db.type/long}})
-        _         (d/transact! conn [{:register/key 0 :register/value 0}])
-        stale-db  @conn
-        _         (d/transact! conn [{:register/key 0 :register/value 1000}])
-        live-db   @conn
-        store     (.-store ^DB live-db)
-        server    (ha-test-server {db-name
-                                   {:store store
-                                    :dt-db stale-db
-                                    :ha-role :follower
-                                    :ha-authority (Object.)}})
-        cluster-id (keyword (str "local-query-refresh-" (UUID/randomUUID)))
-        clusters* @#'local/clusters]
-    (swap! clusters* assoc cluster-id {:db-name db-name
-                                       :servers {"n1" server}})
-    (try
-      (is (= 1000
-             (local/local-query
-              cluster-id
-              "n1"
-              '[:find ?v .
-                :where
-                [?e :register/key 0]
-                [?e :register/value ?v]])))
-      (finally
-        (swap! clusters* dissoc cluster-id)
-        (d/close conn)
-        (u/delete-files dir)))))
+  (assert-local-query-refreshes-ha-read-view!
+   {:ha-role :follower
+    :ha-authority (Object.)}))
+
+(deftest local-query-uses-server-ha-read-view-without-authority-test
+  (assert-local-query-refreshes-ha-read-view!
+   {:ha-role :follower}))
+
+(deftest local-query-uses-server-ha-read-view-for-leader-test
+  (assert-local-query-refreshes-ha-read-view!
+   {:ha-role :leader
+    :ha-authority (Object.)}))
