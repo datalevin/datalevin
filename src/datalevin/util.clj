@@ -690,12 +690,26 @@
      (cond
        (= 1 n) [(f (first coll))]
        (= 2 n) [(f (first coll)) (f (last coll))]
-       :else   (let [pool ^ExecutorService (get-worker-thread-pool)
-                     futs (.invokeAll pool (mapv (fn [e] #(f e)) coll))]
+       :else   (let [bindings (get-thread-bindings)
+                     pool     ^ExecutorService (get-worker-thread-pool)
+                     futs     (.invokeAll
+                                pool
+                                (mapv (fn [e]
+                                        ^Callable
+                                        #(with-bindings bindings
+                                           (f e)))
+                                      coll))]
                  (mapv #(.get ^Future %) futs)))))
   ([f c1 c2]
-   (let [pool ^ExecutorService (get-worker-thread-pool)
-         futs (.invokeAll pool (mapv (fn [e1 e2] #(f e1 e2)) c1 c2))]
+   (let [bindings (get-thread-bindings)
+         pool     ^ExecutorService (get-worker-thread-pool)
+         futs     (.invokeAll
+                    pool
+                    (mapv (fn [e1 e2]
+                            ^Callable
+                            #(with-bindings bindings
+                               (f e1 e2)))
+                          c1 c2))]
      (mapv #(.get ^Future %) futs))))
 
 (defn supports-virtual-threads?
