@@ -26,8 +26,12 @@
    [datalevin.ha.replication :as drep]
    [datalevin.ha.util :as hu]
    [datalevin.server.auth :as auth]
+   [datalevin.server.copy :as scopy]
+   [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
+   [datalevin.server.ha :as sha]
    [datalevin.server.ha-runtime :as hrt]
+   [datalevin.server.session :as sess]
    [datalevin.txlog :as txlog]
    [datalevin.kv :as kv]
    [datalevin.constants :as c]
@@ -204,9 +208,9 @@
                                    ~'wire-opts)))))
 
 (declare event-loop close-conn store->db-name session-lmdb remove-store
-         halt-run)
+         halt-run session-deps copy-deps dispatch-deps ha-deps)
 
-(def session-dbi "datalevin-server/sessions")
+(def session-dbi sess/session-dbi)
 
 (defn- shutdown-executor!
   [^ExecutorService es label]
@@ -270,44 +274,19 @@
     (log/info "Datalevin server shuts down.")))
 
 (defn- get-client [^Server server client-id]
-  (when client-id
-    (get (.-clients server) client-id)))
+  (sess/get-client (.-clients server) client-id))
 
 (defn- add-client
   [^Server server ip client-id username]
-  (let [sys-conn (.-sys-conn server)
-        roles    (user-roles sys-conn username)
-        perms    (user-permissions sys-conn username)
-        session  {:ip          ip
-                  :uid         (user-eid sys-conn username)
-                  :username    username
-                  :last-active (System/currentTimeMillis)
-                  :stores      {}
-                  :engines     #{}
-                  :indices     #{}
-                  :dt-dbs      #{}
-                  :roles       roles
-                  :permissions perms}]
-    (d/transact-kv (session-lmdb sys-conn)
-                   [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-    (.put ^Map (.-clients server) client-id session)
-    (log/info "Added client " client-id
-              "from:" ip
-              "for user:" username)))
+  (sess/add-client (session-deps) server ip client-id username))
 
 (defn- remove-client
   [^Server server client-id]
-  (d/transact-kv (session-lmdb (.-sys-conn server))
-                 [(l/kv-tx :del session-dbi client-id :uuid)])
-  (.remove ^Map (.-clients server) client-id)
-  (log/info "Removed client:" client-id))
+  (sess/remove-client (session-deps) server client-id))
 
 (defn- update-client
   [^Server server client-id f]
-  (let [session (f (get-client server client-id))]
-    (d/transact-kv (session-lmdb (.-sys-conn server))
-                   [(l/kv-tx :put session-dbi client-id session :uuid :data)])
-    (.put ^Map (.-clients server) client-id session)))
+  (sess/update-client (session-deps) server client-id f))
 
 (declare get-store store-closed?)
 (declare current-runtime-opts new-runtime-db)
@@ -636,37 +615,12 @@
 
 (defn- ha-follower-apply-record-with-guard
   [^Server server db-name expected-state record]
-  (let [^Semaphore lock (get-lock server db-name)]
-    (.acquire lock)
-    (try
-      (locking (db-write-admission-lock server db-name)
-        (let [current-state (get (.-dbs server) db-name)]
-          (if (and current-state
-                   (= :follower (:ha-role current-state))
-                   (same-ha-runtime-state?
-                    current-state
-                    expected-state
-                    :ha-follower-loop-running?))
-            (drep/apply-ha-follower-txlog-record! expected-state record)
-            (u/raise "HA follower replay aborted because follower state changed"
-                     {:error :ha/follower-stale-state
-                      :db-name db-name
-                      :record-lsn (:lsn record)
-                      :state current-state
-                      :current-role (:ha-role current-state)
-                      :expected-role (:ha-role expected-state)}))))
-      (finally
-        (.release lock)))))
+  (sha/ha-follower-apply-record-with-guard
+   (ha-deps) server db-name expected-state record))
 
 (defn- with-ha-follower-replay-quiesced
   [^Server server db-name f]
-  (let [^Semaphore lock (get-lock server db-name)]
-    (.acquire lock)
-    (try
-      (locking (db-write-admission-lock server db-name)
-        (f))
-      (finally
-        (.release lock)))))
+  (sha/with-ha-follower-replay-quiesced (ha-deps) server db-name f))
 
 (def ^:private ha-loop-sleep-ms hrt/ha-loop-sleep-ms)
 (def ^:private ha-follower-loop-sleep-ms hrt/ha-follower-loop-sleep-ms)
@@ -682,298 +636,37 @@
 
 (defn- publish-ha-renew-state!
   [^Server server db-name expected-state next-state ^AtomicBoolean running?]
-  (let [renew-patch (ha-renew-state-patch expected-state next-state)
-        promotion-result? (ha-renew-promotion-result? expected-state next-state)
-        publish!
-        (fn []
-          (let [{:keys [updated? state]}
-                (replace-db-state-if-current
-                 server
-                 db-name
-                 expected-state
-                 #(identical? running? (:ha-renew-loop-running? %))
-                 next-state)
-                state
-                (if (and (not updated?) renew-patch)
-                  (:state
-                   (transform-db-state-when
-                    server
-                    db-name
-                    #(identical? running? (:ha-renew-loop-running? %))
-                    #(merge-ha-renew-state-patch
-                      %
-                      expected-state
-                      renew-patch)))
-                  state)
-                state
-                (if (and promotion-result?
-                         renew-patch
-                         (or (nil? state)
-                             (not (contains? #{:leader :demoting}
-                                             (:ha-role state)))))
-                  (:state
-                   (transform-db-state-when
-                    server
-                    db-name
-                    #(same-ha-runtime-state? %
-                                            expected-state
-                                            :ha-renew-loop-running?)
-                    #(merge-ha-renew-promotion-state-patch
-                      %
-                      expected-state
-                      renew-patch)))
-                  state)]
-            (when (and promotion-result?
-                       (or (nil? state)
-                           (not (contains? #{:leader :demoting}
-                                           (:ha-role state)))))
-              (log/warn "HA renew promotion could not publish local leader state"
-                        {:db-name db-name
-                         :expected-role (:ha-role expected-state)
-                         :next-role (:ha-role next-state)
-                         :state-role (:ha-role state)}))
-            state))]
-    (if (and promotion-result?
-             (= :follower (:ha-role expected-state)))
-      ;; Followers and leaders share the same underlying store handle. Serialize
-      ;; follower replay and follower->leader publication so replay cannot keep
-      ;; mutating the store after local promotion publishes.
-      (with-ha-follower-replay-quiesced server db-name publish!)
-      (publish!))))
+  (sha/publish-ha-renew-state!
+   (ha-deps) server db-name expected-state next-state running?))
 
 (declare log-ha-loop-crash!)
 
 (defn- run-ha-renew-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
-  (try
-    (loop []
-      (when (and (.get running?)
-                 (.get ^AtomicBoolean (.-running server)))
-        (try
-          (let [m (get (.-dbs server) db-name)]
-            (if (or (nil? m)
-                    (nil? (:ha-authority m))
-                    (not (identical? running?
-                                     (:ha-renew-loop-running? m))))
-              (.set running? false)
-              ;; Keep renew work outside `update-db` so HA probes and peer/server
-              ;; operations do not block on control-plane I/O.
-              (let [next-state (binding [drep/*ha-current-state-fn*
-                                         #(get (.-dbs server) db-name)
-                                         drep/*ha-with-local-store-read-fn*
-                                         (fn [f]
-                                           (with-db-runtime-store-read-access
-                                             server
-                                             db-name
-                                             f))]
-                                 (ha-renew-step db-name m))
-                    state (publish-ha-renew-state!
-                           server
-                           db-name
-                           m
-                           next-state
-                           running?)]
-                (if (or (nil? state)
-                        (nil? (:ha-authority state))
-                        (not (identical? running?
-                                         (:ha-renew-loop-running? state))))
-                  (.set running? false)
-                  (sleep-ha-loop! running? (ha-loop-sleep-ms state))))))
-          (catch Throwable t
-            (log-ha-loop-crash!
-             "HA renew loop crashed; retrying after backoff"
-             db-name
-             t)
-            (ha-loop-error-backoff! running?)))
-        (recur)))
-    (finally
-      (.countDown stopped-latch))))
+  (sha/run-ha-renew-loop (ha-deps) server db-name running? stopped-latch))
 
 (defn- run-ha-follower-sync-loop
   [^Server server db-name ^AtomicBoolean running? ^CountDownLatch stopped-latch]
-  (try
-    (loop []
-      (when (and (.get running?)
-                 (.get ^AtomicBoolean (.-running server)))
-        (try
-          (let [m (get (.-dbs server) db-name)]
-            (if (or (nil? m)
-                    (nil? (:ha-authority m))
-                    (not (identical? running?
-                                     (:ha-follower-loop-running? m))))
-              (.set running? false)
-              ;; Follower replay can block on remote txlog fetch and local apply
-              ;; work. Keep it off the authority renew path so lease reads and
-              ;; promotions are not rate-limited by replication latency.
-              (let [next-state (binding [drep/*ha-current-state-fn*
-                                         #(get (.-dbs server) db-name)
-                                         drep/*ha-follower-apply-record-fn*
-                                         (fn [state record]
-                                           (ha-follower-apply-record-with-guard
-                                            server
-                                            db-name
-                                            state
-                                            record))
-                                         drep/*ha-with-local-store-swap-fn*
-                                         (fn [f]
-                                           (with-db-runtime-store-swap
-                                             server
-                                             db-name
-                                             f))
-                                         drep/*ha-with-local-store-read-fn*
-                                         (fn [f]
-                                           (with-db-runtime-store-read-access
-                                             server
-                                             db-name
-                                             f))]
-                                 (ha-follower-sync-step db-name m))
-                    local-patch (ha-follower-local-side-effect-patch
-                                 m next-state)
-                    side-effect-patch (ha-follower-side-effect-patch
-                                       m next-state)
-                    _ (persist-ha-follower-side-effects!
-                       m next-state local-patch)
-                    {:keys [updated? state]}
-                    (replace-db-state-if-current
-                     server
-                     db-name
-                     m
-                     #(identical? running? (:ha-follower-loop-running? %))
-                     next-state)
-                    state
-                    (if (and (not updated?)
-                             (or local-patch side-effect-patch))
-                      (:state
-                       (transform-db-state-when
-                        server
-                        db-name
-                        #(identical? running? (:ha-follower-loop-running? %))
-                        #(merge-ha-follower-side-effect-patch
-                          %
-                          m
-                          local-patch
-                          side-effect-patch)))
-                      state)]
-                (if (or (nil? state)
-                        (nil? (:ha-authority state))
-                        (not (identical? running?
-                                         (:ha-follower-loop-running? state))))
-                  (.set running? false)
-                  (sleep-ha-loop! running?
-                                  (ha-follower-loop-sleep-ms state))))))
-          (catch Throwable t
-            (log-ha-loop-crash!
-             "HA follower sync loop crashed; retrying after backoff"
-             db-name
-             t)
-            (ha-loop-error-backoff! running?)))
-        (recur)))
-    (finally
-      (.countDown stopped-latch))))
+  (sha/run-ha-follower-sync-loop
+   (ha-deps) server db-name running? stopped-latch))
 
 (declare execute)
 
 (defn- ensure-ha-renew-loop
   [^Server server db-name]
-  (let [new-running-v (volatile! nil)]
-    (update-db server db-name
-      (fn [m]
-        (if (and m
-                 (:ha-authority m))
-          (let [running?    (:ha-renew-loop-running? m)
-                loop-future (:ha-renew-loop-future m)
-                active?     (and (instance? AtomicBoolean running?)
-                                 (.get ^AtomicBoolean running?)
-                                 (instance? Future loop-future)
-                                 (not (.isDone ^Future loop-future)))]
-            (if active?
-              m
-              (do
-                (when (instance? AtomicBoolean running?)
-                  (.set ^AtomicBoolean running? false))
-                (let [new-running?  (AtomicBoolean. true)
-                      stopped-latch (CountDownLatch. 1)]
-                  (vreset! new-running-v new-running?)
-                  (assoc m
-                         :ha-renew-loop-running? new-running?
-                         :ha-renew-loop-stopped-latch stopped-latch
-                         :ha-renew-loop-future nil)))))
-          m)))
-    (when-let [running? @new-running-v]
-      (let [stopped-latch
-            (get-in (.-dbs server) [db-name :ha-renew-loop-stopped-latch])
-            future (.submit ^ExecutorService
-                            (.-work-executor server)
-                            ^Runnable #(run-ha-renew-loop
-                                         server
-                                         db-name
-                                         running?
-                                         stopped-latch))]
-        (update-db server db-name
-          (fn [m]
-            (if (and m
-                     (identical? running?
-                                 (:ha-renew-loop-running? m)))
-              (assoc m :ha-renew-loop-future future)
-              m)))))))
+  (sha/ensure-ha-renew-loop (ha-deps) server db-name))
 
 (defn- ensure-ha-follower-sync-loop
   [^Server server db-name]
-  (let [new-running-v (volatile! nil)]
-    (update-db server db-name
-      (fn [m]
-        (if (and m
-                 (:ha-authority m))
-          (let [running?    (:ha-follower-loop-running? m)
-                loop-future (:ha-follower-loop-future m)
-                active?     (and (instance? AtomicBoolean running?)
-                                 (.get ^AtomicBoolean running?)
-                                 (instance? Future loop-future)
-                                 (not (.isDone ^Future loop-future)))]
-            (if active?
-              m
-              (do
-                (when (instance? AtomicBoolean running?)
-                  (.set ^AtomicBoolean running? false))
-                (let [new-running?  (AtomicBoolean. true)
-                      stopped-latch (CountDownLatch. 1)]
-                  (vreset! new-running-v new-running?)
-                  (assoc m
-                         :ha-follower-loop-running? new-running?
-                         :ha-follower-loop-stopped-latch stopped-latch
-                         :ha-follower-loop-future nil)))))
-          m)))
-    (when-let [running? @new-running-v]
-      (let [stopped-latch
-            (get-in (.-dbs server) [db-name :ha-follower-loop-stopped-latch])
-            future (.submit ^ExecutorService
-                            (.-work-executor server)
-                            ^Runnable #(run-ha-follower-sync-loop
-                                         server
-                                         db-name
-                                         running?
-                                         stopped-latch))]
-        (update-db server db-name
-          (fn [m]
-            (if (and m
-                     (identical? running?
-                                 (:ha-follower-loop-running? m)))
-              (assoc m :ha-follower-loop-future future)
-              m)))))))
+  (sha/ensure-ha-follower-sync-loop (ha-deps) server db-name))
 
 (defn- stop-ha-renew-loop
   [m]
-  (when-let [^AtomicBoolean running? (:ha-renew-loop-running? m)]
-    (.set running? false))
-  (when-let [^Future future (:ha-renew-loop-future m)]
-    (.cancel future true)))
+  (sha/stop-ha-renew-loop m))
 
 (defn- stop-ha-follower-sync-loop
   [m]
-  (when-let [^AtomicBoolean running? (:ha-follower-loop-running? m)]
-    (.set running? false))
-  (when-let [^Future future (:ha-follower-loop-future m)]
-    (.cancel future true)))
+  (sha/stop-ha-follower-sync-loop m))
 
 (def ^:private await-ha-loop-stop hrt/await-ha-loop-stop)
 
@@ -991,7 +684,7 @@
 
 (defn- current-ha-runtime-local-opts
   [m]
-  (hrt/current-ha-runtime-local-opts m current-runtime-opts))
+  (sha/current-ha-runtime-local-opts (ha-deps) m))
 
 (defn- resolved-ha-runtime-opts
   ([root db-name store]
@@ -999,23 +692,14 @@
   ([root db-name store m]
    (resolved-ha-runtime-opts root db-name store m nil))
   ([root db-name store m explicit-ha-runtime-opts]
-   (hrt/resolved-ha-runtime-opts
-    root db-name store m explicit-ha-runtime-opts
-    {:consensus-ha-opts-fn *consensus-ha-opts-fn*
-     :current-runtime-opts-fn current-runtime-opts})))
+   (sha/resolved-ha-runtime-opts
+    (ha-deps) root db-name store m explicit-ha-runtime-opts)))
 
 (def ^:private shared-store-lifecycle? hrt/shared-store-lifecycle?)
 
 (defn- stop-ha-runtime
   [db-name m]
-  (hrt/stop-ha-runtime
-   db-name
-   m
-   {:current-runtime-opts-fn current-runtime-opts
-    :stop-ha-renew-loop-fn *stop-ha-renew-loop-fn*
-    :stop-ha-follower-sync-loop-fn *stop-ha-follower-sync-loop-fn*
-    :await-ha-loop-stop-fn await-ha-loop-stop
-    :stop-ha-authority-fn *stop-ha-authority-fn*}))
+  (sha/stop-ha-runtime (ha-deps) db-name m))
 
 (def ^:private ha-authority-running? hrt/ha-authority-running?)
 
@@ -1023,19 +707,7 @@
 
 (defn- ha-write-admission-error
   [^Server server message]
-  (let [write?  (dha/ha-write-message? message)
-        db-name (nth (:args message) 0 nil)
-        m0      (when (and db-name (contains? (.-dbs server) db-name))
-                  (if write?
-                    (update-db server db-name *ensure-udf-readiness-state-fn*)
-                    (get (.-dbs server) db-name)))
-        m       m0]
-    (or (and write?
-             db-name
-             (not (contains? udf-admission-exempt-write-types
-                             (:type message)))
-             (udf-write-admission-error db-name m))
-        (dha/ha-write-admission-error (.-dbs server) message))))
+  (sha/ha-write-admission-error (ha-deps) server message))
 
 (defn- leader-authority-state?
   [m]
@@ -1044,70 +716,19 @@
 
 (defn- refresh-ha-write-commit-state!
   [^Server server db-name]
-  (let [m (get (.-dbs server) db-name)]
-    (if-not (leader-authority-state? m)
-      m
-      (let [timeout-ms (hu/ha-request-timeout-ms
-                        m
-                        (or (get-in m [:ha-control-plane :operation-timeout-ms])
-                            5000))
-            next-state (dha/refresh-ha-authority-state db-name m timeout-ms)
-            refresh-patch (hrt/ha-authority-refresh-state-patch
-                           m
-                           next-state)
-            {:keys [updated? state]}
-            (replace-db-state-if-current
-             server
-             db-name
-             m
-             leader-authority-state?
-             next-state)]
-        (if (or updated?
-                (nil? refresh-patch))
-          state
-          (:state
-           (transform-db-state-when
-            server
-            db-name
-            #(and (leader-authority-state? %)
-                  (hrt/same-ha-runtime-state?
-                   %
-                   m
-                   :ha-renew-loop-running?))
-            #(hrt/merge-ha-authority-refresh-state-patch
-              %
-              m
-              refresh-patch))))))))
+  (sha/refresh-ha-write-commit-state! (ha-deps) server db-name))
 
 (defn- ha-write-commit-admission!
   [^Server server message]
-  (let [db-name (nth (:args message) 0 nil)]
-    (when db-name
-      (refresh-ha-write-commit-state! server db-name)))
-  (when-let [err (ha-write-admission-error server message)]
-    (u/raise "HA write admission rejected" err)))
+  (sha/ha-write-commit-admission! (ha-deps) server message))
 
 (defn- ha-write-commit-check-fn
   [^Server server message]
-  (fn [_]
-    (ha-write-commit-admission! server message)))
+  (sha/ha-write-commit-check-fn (ha-deps) server message))
 
 (defn- with-ha-write-admission
   [^Server server message f]
-  (let [write?  (dha/ha-write-message? message)
-        db-name (nth (:args message) 0 nil)
-        dbs     (.-dbs server)]
-    (if (and write? db-name (.containsKey ^ConcurrentHashMap dbs db-name))
-      ;; This request-time gate is a cached-state fast path only. The
-      ;; authoritative HA check runs again at commit, so one-shot writes do
-      ;; not need to serialize through the per-DB admission lock here.
-      (if-let [err (ha-write-admission-error server message)]
-        {:ok? false
-         :error err}
-        {:ok? true
-         :result (f)})
-      {:ok? true
-       :result (f)})))
+  (sha/with-ha-write-admission (ha-deps) server message f))
 
 (def ^:private ha-abort-cleanup-types
   #{:abort-transact
@@ -1119,48 +740,14 @@
 
 (defn- cleanup-rejected-close-transact!
   [^Server server {:keys [type args]}]
-  (let [db-name (nth args 0 nil)
-        dbs     (.-dbs server)
-        runner  (and db-name (get-in dbs [db-name :runner]))]
-    (when (and db-name runner (ha-rejected-close-cleanup-types type))
-      (let [kv-store (get-kv-store server db-name)
-            ^Semaphore lock (get-in dbs [db-name :lock])]
-        (try
-          (i/abort-transact-kv kv-store)
-          (i/close-transact-kv kv-store)
-          (catch Throwable t
-            (let [details (cond-> {:db-name db-name
-                                   :type type
-                                   :error-class (.getName ^Class (class t))}
-                            (some? (ex-message t))
-                            (assoc :message (ex-message t)))]
-              (log/warn
-                "Failed to clean up rejected HA close-transact"
-                details)
-              (log/debug t
-                         "Rejected HA close-transact cleanup stack trace"
-                         {:db-name db-name
-                          :type type})))
-          (finally
-            (halt-run runner)
-            (update-db server db-name
-                       #(dissoc % :runner :wlmdb :wstore :wdt-db))
-            (when lock
-              (.release lock))))))))
+  (sha/cleanup-rejected-close-transact! (ha-deps) server {:type type :args args}))
 
 (defn- ensure-ha-runtime
   ([root db-name m store]
    (ensure-ha-runtime root db-name m store nil))
   ([root db-name m store explicit-ha-runtime-opts]
-   (hrt/ensure-ha-runtime
-    root
-    db-name
-    m
-    store
-    explicit-ha-runtime-opts
-    {:resolved-ha-runtime-opts-fn resolved-ha-runtime-opts
-     :start-ha-authority-fn *start-ha-authority-fn*
-     :stop-ha-runtime-fn stop-ha-runtime})))
+   (sha/ensure-ha-runtime
+    (ha-deps) root db-name m store explicit-ha-runtime-opts)))
 
 (defn- add-store
   ([server db-name store]
@@ -1315,42 +902,19 @@
 
 (defn- update-cached-role
   [^Server server target-username]
-  (let [sys-conn    (.-sys-conn server)
-        roles       (user-roles sys-conn target-username)
-        permissions (user-permissions sys-conn target-username)]
-    (doseq [cid (keep (fn [[client-id {:keys [username]}]]
-                        (when (= target-username username) client-id))
-                      (.-clients server))]
-      (update-client server cid
-                     #(assoc % :roles roles :permissions permissions)))))
+  (sess/update-cached-role (session-deps) server target-username))
 
 (defn- disconnect-client*
   [^Server server client-id]
-  (remove-client server client-id)
-  (let [^Selector selector (.-selector server)]
-    (when (.isOpen selector)
-      (doseq [^SelectionKey k (.keys selector)
-              :let            [state (.attachment k)]
-              :when           state]
-        (when (= client-id (@state :client-id))
-          (close-conn k))))))
+  (sess/disconnect-client* (session-deps) server client-id))
 
 (defn- disconnect-user
   [^Server server tgt-username]
-  (doseq [[client-id {:keys [username]}] (.-clients server)
-          :when                          (= tgt-username username)]
-    (disconnect-client* server client-id)))
+  (sess/disconnect-user (session-deps) server tgt-username))
 
 (defn- update-cached-permission
   [^Server server target-role]
-  (let [sys-conn (.-sys-conn server)]
-    (doseq [[cid uname] (keep (fn [[client-id {:keys [username roles]}]]
-                                (when (some #(= % target-role) roles)
-                                  [client-id username]))
-                              (.-clients server))]
-      (update-client server cid
-                     #(assoc % :permissions
-                             (user-permissions sys-conn uname))))))
+  (sess/update-cached-permission (session-deps) server target-role))
 
 ;; networking
 
@@ -1369,59 +933,12 @@
 
 (defn- handle-accept
   [^SelectionKey skey]
-  (when-let [client-socket (.accept ^ServerSocketChannel (.channel skey))]
-    (doto ^SocketChannel client-socket
-      (.configureBlocking false)
-      (.register (.selector skey) SelectionKey/OP_READ
-                 ;; attach a connection state
-                 ;; { read-bf, write-bf, client-id }
-                 (volatile! {:read-bf  (bf/allocate-buffer
-                                         c/+buffer-size+)
-                             :write-bf (bf/allocate-buffer
-                                         c/+buffer-size+)
-                             ;; Preserve client message order per connection.
-                             ;; Authentication/session setup must not race
-                             ;; with subsequent requests like :open.
-                             :message-lock (Object.)
-                             :wire-opts (p/default-wire-opts)})))))
+  (sdisp/handle-accept skey))
 
 (defn- copy-in
   "Continuously read batched data from the client"
   [^Server server ^SelectionKey skey]
-  (let [state                      (.attachment skey)
-        {:keys [read-bf write-bf wire-opts]} @state
-        ^Selector selector         (.selector skey)
-        ^SocketChannel ch          (.channel skey)
-        data                       (transient [])]
-    ;; switch this channel to blocking mode for copy-in
-    (.cancel skey)
-    (.configureBlocking ch true)
-    (try
-      (p/write-message-blocking ch write-bf {:type :copy-in-response}
-                                wire-opts)
-      (.clear ^ByteBuffer read-bf)
-      (loop [bf read-bf]
-        (let [[msg bf'] (p/receive-ch ch bf wire-opts)]
-          (when-not (identical? bf bf') (vswap! state assoc :read-bf bf'))
-          (if (map? msg)
-            (let [{:keys [type]} msg]
-              (case type
-                :copy-done :break
-                :copy-fail (u/raise "Client error while loading data" {})
-                (u/raise "Receive unexpected message while loading data"
-                         {:msg msg})))
-            (do (doseq [d msg] (conj! data d))
-                (recur bf')))))
-      (let [txs (persistent! data)]
-        (log/debug "Copied in" (count txs) "data items")
-        txs)
-      (catch Exception e (throw e))
-      (finally
-        ;; switch back
-        (.configureBlocking ch false)
-        (.add ^ConcurrentLinkedQueue (.-register-queue server)
-              [ch SelectionKey/OP_READ state])
-        (.wakeup selector)))))
+  (scopy/copy-in (copy-deps) server skey))
 
 (defn- copy-out
   "Continiously write data out to client in batches"
@@ -1430,135 +947,46 @@
   ([^SelectionKey skey data batch-size copy-meta]
    (copy-out skey data batch-size copy-meta nil))
   ([^SelectionKey skey data batch-size copy-meta response-meta]
-   (let [state                             (.attachment skey)
-         {:keys [^ByteBuffer write-bf wire-opts]}    @state
-         ^SocketChannel                 ch (.channel skey)
-         response                          (cond-> {:type :copy-out-response}
-                                             copy-meta
-                                             (assoc :copy-meta copy-meta)
-                                             (seq response-meta)
-                                             (merge response-meta))]
-     (locking write-bf
-       (p/write-message-blocking ch write-bf response wire-opts)
-       (doseq [batch (partition batch-size batch-size nil data)]
-         (write-message skey batch))
-       (p/write-message-blocking ch write-bf {:type :copy-done}
-                                 wire-opts))
-     (log/debug "Copied out" (count data) "data items"))))
+   (scopy/copy-out (copy-deps) skey data batch-size copy-meta response-meta)))
 
 (defn- copy-file-out
   "Stream a copied LMDB file to client as raw binary chunks with checksum."
   [^SelectionKey skey path copy-meta]
-  (let [chunk-bytes ^long c/+buffer-size+
-        response    (cond-> {:type          :copy-out-response
-                             :copy-format   :binary-chunks
-                             :checksum-algo :sha-256
-                             :chunk-bytes   chunk-bytes}
-                      copy-meta
-                      (assoc :copy-meta copy-meta))
-        ^MessageDigest md (MessageDigest/getInstance "SHA-256")
-        chunk             (byte-array chunk-bytes)]
-    (write-message skey response)
-    (with-open [in (Files/newInputStream path
-                                         (into-array OpenOption []))]
-      (loop [written-bytes 0
-             chunk-count   0]
-        (let [n (.read in chunk)]
-          (if (neg? n)
-            (let [checksum (u/hexify (.digest md))]
-              (write-message skey {:type          :copy-done
-                                   :copy-format   :binary-chunks
-                                   :checksum-algo :sha-256
-                                   :checksum      checksum
-                                   :bytes         written-bytes
-                                   :chunks        chunk-count})
-              (log/debug "Copied out" written-bytes "bytes in" chunk-count
-                         "chunks"))
-            (let [^bytes out-chunk (if (= n chunk-bytes)
-                                     chunk
-                                     (let [tail (byte-array n)]
-                                       (System/arraycopy chunk 0 tail 0 n)
-                                       tail))]
-              (.update md out-chunk 0 n)
-              (write-message skey [out-chunk])
-              (recur (+ written-bytes n) (inc chunk-count)))))))))
+  (scopy/copy-file-out (copy-deps) skey path copy-meta))
 
 (defn- cleanup-copy-tmp-dir*
   [tf]
-  (u/delete-files tf))
+  (scopy/cleanup-copy-tmp-dir* tf))
 
 (def ^:private ^:redef cleanup-copy-tmp-dir-fn*
-  (atom cleanup-copy-tmp-dir*))
+  scopy/cleanup-copy-tmp-dir-fn*)
 
 (defn- cleanup-copy-tmp-dir!
   [tf]
-  (@cleanup-copy-tmp-dir-fn* tf))
+  (scopy/cleanup-copy-tmp-dir! tf))
 
 (def ^:private ^:redef server-copy-store!
-  i/copy)
+  scopy/server-copy-store!)
 
 (def ^:private ^:redef open-server-copied-store!
-  st/open)
+  scopy/open-server-copied-store!)
 
 (def ^:private ^:redef close-server-copied-store!
-  i/close)
+  scopy/close-server-copied-store!)
 
 (def ^:private ^:redef copy-server-file-out!
   copy-file-out)
 
 (def ^:private ^:redef unpin-server-copy-backup-floor!
-  kv/txlog-unpin-backup-floor!)
+  scopy/unpin-server-copy-backup-floor!)
 
 (defn- copy-source-kv-store
   [store]
-  (cond
-    (instance? Store store) (.-lmdb ^Store store)
-    (instance? ILMDB store) store
-    :else nil))
+  (scopy/copy-source-kv-store store))
 
 (defn- copy-response-meta
   [db-name store base-meta]
-  (let [store-opts (when (instance? IStore store)
-                     (i/opts store))
-        kv-store   (copy-source-kv-store store)
-        kv-opts    (when kv-store
-                     (try
-                       (i/env-opts kv-store)
-                       (catch Exception _
-                         nil)))
-        stored-db-identity
-        (when kv-store
-          (try
-            (i/get-value kv-store c/opts :db-identity :attr :data)
-            (catch Exception _
-              nil)))
-        snapshot-lsn
-        (when kv-store
-          (try
-            (long (or (i/get-value kv-store c/kv-info
-                                   c/wal-snapshot-current-lsn
-                                   :keyword :data)
-                      0))
-            (catch Exception _
-              0)))
-        payload-lsn
-        (when kv-store
-          (try
-            (long (drep/read-ha-snapshot-payload-lsn {:store store}))
-            (catch Exception _
-              0)))
-        db-identity (or (:db-identity store-opts)
-                        (:db-identity kv-opts)
-                        stored-db-identity)]
-    (cond-> (assoc base-meta :db-name db-name)
-      (some? db-identity)
-      (assoc :db-identity db-identity)
-
-      (some? snapshot-lsn)
-      (assoc :snapshot-last-applied-lsn (long snapshot-lsn))
-
-      (some? payload-lsn)
-      (assoc :payload-last-applied-lsn (long payload-lsn)))))
+  (scopy/copy-response-meta db-name store base-meta))
 
 (defn- open-port
   [port]
@@ -1579,16 +1007,7 @@
 
 (defn- client-disconnect?
   [e]
-  (boolean
-    (some
-      (fn [cause]
-        (let [message (ex-message cause)]
-          (or (instance? ClosedChannelException cause)
-              (= message "Socket channel is closed.")
-              (and (string? message)
-                   (or (s/includes? message "Connection reset by peer")
-                       (s/includes? message "Broken pipe"))))))
-      (take-while some? (iterate ex-cause e)))))
+  (sdisp/client-disconnect? e))
 
 (defn- handled-request-error?
   [e]
@@ -1655,28 +1074,7 @@
 
 (defn- handle-message-error!
   [^SelectionKey skey e]
-  (let [data (ex-data e)]
-    (cond
-      (client-disconnect? e)
-      (close-conn-quietly skey)
-
-      (= (:type data) :reopen)
-      (try
-        (reopen-response skey data)
-        (catch Exception reopen-e
-          (when-not (client-disconnect? reopen-e)
-            (log/error reopen-e "Failed to send reopen response"))
-          (close-conn-quietly skey)))
-
-      :else
-      (do
-        (log-handled-request-error! e)
-        (try
-          (error-response skey (ex-message e) data)
-          (catch Exception response-e
-            (when-not (client-disconnect? response-e)
-              (log/error response-e "Failed to send error response"))
-            (close-conn-quietly skey)))))))
+  (sdisp/handle-message-error! (dispatch-deps) skey e))
 
 (defmacro wrap-error
   [& body]
@@ -1983,7 +1381,7 @@
                                  db-info (assoc :result db-info))))
               db-info)))))))
 
-(defn- session-lmdb [sys-conn] (.-lmdb ^Store (.-store ^DB (d/db sys-conn))))
+(defn- session-lmdb [sys-conn] (sess/session-lmdb sys-conn))
 
 (defn get-default-password
   "Return the initial admin password, checking DATALEVIN_DEFAULT_PASSWORD
@@ -2019,88 +1417,20 @@
 
 (defn- load-sessions
   [sys-conn]
-  (let [lmdb (session-lmdb sys-conn)]
-    (d/open-dbi lmdb session-dbi)
-    (ConcurrentHashMap.
-      ^Map (into {} (d/get-range lmdb session-dbi [:all] :uuid :data)))))
+  (sess/load-sessions sys-conn))
 
 (defn- reopen-dbs
   [root clients ^ConcurrentHashMap dbs]
-  (doseq [[_ {:keys [stores engines indices dt-dbs]}] clients]
-    (doseq [[db-name {:keys [datalog? dbis]}]
-            stores
-            :when (not (get-in dbs [db-name :store]))
-            :let  [m (get dbs db-name {})]]
-      (let [store (open-store root db-name dbis datalog?)
-            consensus-ha? (and datalog?
-                               (some? (*consensus-ha-opts-fn* store)))]
-        (if consensus-ha?
-          (do
-            ;; Consensus HA runtime identity is node-local. Restoring a DB from
-            ;; persisted client sessions before a fresh explicit open can start
-            ;; the wrong peer from stale store metadata after restart.
-            (close-store store)
-            (log/info "Skipping automatic reopen of consensus HA database"
-                      {:db-name db-name
-                       :root root}))
-          (let [runtime-opts (resolved-runtime-opts nil db-name store m)
-                next-m (ensure-ha-runtime
-                         root db-name
-                         (cond-> (assoc m
-                                        :store store
-                                        :runtime-opts runtime-opts)
-                           datalog?
-                           (assoc :dt-db (new-runtime-db store runtime-opts)))
-                         store)]
-            (.put dbs db-name next-m)))))
-    (doseq [db-name engines
-            :when   (and (not (get-in dbs [db-name :engine]))
-                         (get-in dbs [db-name :store]))
-            :let    [m (get dbs db-name {})]]
-      (.put dbs db-name
-            (assoc m :engine
-                   (d/new-search-engine (get-in dbs [db-name :store])))))
-    (doseq [db-name indices
-            :when   (and (not (get-in dbs [db-name :index]))
-                         (get-in dbs [db-name :store]))
-            :let    [m (get dbs db-name {})]]
-      (.put dbs db-name
-            (assoc m :index
-                   (d/new-vector-index (get-in dbs [db-name :store])))))
-    (doseq [db-name dt-dbs
-            :when   (and (not (get-in dbs [db-name :dt-db]))
-                         (get-in dbs [db-name :store]))
-            :let    [m (get dbs db-name {})]]
-      (.put dbs db-name
-            (assoc m :dt-db
-                   (new-runtime-db (get-in dbs [db-name :store])
-                                   (current-runtime-opts m)))))))
+  (sess/reopen-dbs (session-deps) root clients dbs))
 
 (defn- authenticate
   [^Server server ^SelectionKey skey {:keys [username password]}]
-  (when-let [{:keys [user/pw-salt user/pw-hash]}
-             (pull-user (.-sys-conn server) username)]
-    (when (password-matches? password pw-hash pw-salt)
-      (let [client-id (UUID/randomUUID)
-            ip        (get-ip skey)]
-        (add-client server ip client-id username)
-        client-id))))
+  (sess/authenticate (session-deps) server skey
+                     {:username username :password password}))
 
 (defn- client-display
   [^Server server [client-id m]]
-  (let [sys-conn (.-sys-conn server)]
-    [client-id
-     (-> m
-         (update :permissions
-                 #(mapv
-                    (fn [{:keys [permission/act permission/obj
-                                permission/tgt]}]
-                      (if-let [{:keys [db/id]} tgt]
-                        [act obj (perm-tgt-name sys-conn obj id)]
-                        [act obj]))
-                    %))
-         (assoc :open-dbs (:stores m))
-         (select-keys [:ip :username :roles :permissions :open-dbs]))]))
+  (sess/client-display (session-deps) server [client-id m]))
 
 
 ;; Server-owned option-mutation helpers used by extracted message handlers.
@@ -2277,51 +1607,12 @@
 
 (defn- current-ha-txlog-term
   [^Server server db-name]
-  (when-let [db-state (and db-name (get (.-dbs server) db-name))]
-    (let [authority-term (:ha-authority-term db-state)]
-      (when (and (:ha-authority db-state)
-                 (= :leader (:ha-role db-state))
-                 (integer? authority-term)
-                 (pos? ^long authority-term))
-        (long authority-term)))))
+  (sdisp/current-ha-txlog-term (dispatch-deps) server db-name))
 
 (defn- dispatch-message-with-ha-write-admission
   [^Server server ^SelectionKey skey message]
-  (let [type (:type message)
-        cleanup-only? (ha-abort-cleanup-types type)
-        write? (and (not cleanup-only?) (dha/ha-write-message? message))
-        db-name (nth (:args message) 0 nil)
-        ha-txlog-term (current-ha-txlog-term server db-name)
-        precheck-only? (contains? #{:open-transact :open-transact-kv} type)
-        {:keys [ok? error]}
-        (if cleanup-only?
-          {:ok? true}
-          (with-ha-write-admission
-            server
-            message
-            #(cond
-               precheck-only?
-               nil
-
-               write?
-               (binding [txlog/*commit-payload-ha-term* ha-txlog-term
-                         cpp/*before-write-commit-fn*
-                         (ha-write-commit-check-fn server message)]
-                 (dispatch-message server skey message))
-
-               :else
-               (dispatch-message server skey message))))]
-    (cond
-      (not ok?)
-      (do
-        (cleanup-rejected-close-transact! server message)
-        (error-response skey "HA write admission rejected" error))
-
-      cleanup-only?
-      (dispatch-message server skey message)
-
-      precheck-only?
-      (dispatch-message server skey message))))
+  (sdisp/dispatch-message-with-ha-write-admission
+   (dispatch-deps) server skey message))
 
 (defprotocol IRunner
   "Ensure calls within `with-transaction-kv` run in the same thread that
@@ -2428,16 +1719,12 @@
 
 (defn- dispatch-message
   [^Server server ^SelectionKey skey message]
-  (if-let [handler (get message-handler-map (:type message))]
-    (handler server skey message)
-    (error-response skey
-                    (str "Unknown message type " (:type message))
-                    {})))
+  (sdisp/dispatch-message (dispatch-deps) server skey message))
 
 (defn- execute
   "Execute a function in a thread from the worker thread pool"
   [^Server server f]
-  (.execute ^Executor (.-work-executor server) f))
+  (sdisp/execute (dispatch-deps) server f))
 
 (def ^:private trace-remote-tx?
   (some? (System/getenv "DTLV_TRACE_REMOTE_TX")))
@@ -2457,108 +1744,19 @@
 
 (defn- handle-writing
   [^Server server ^SelectionKey skey {:keys [args] :as message}]
-  (try
-    (let [db-name  (nth args 0)
-          type     (:type message)
-          kv-store (get-kv-store server db-name)
-          runner   (get-in (.-dbs server) [db-name :runner])]
-      (cond
-        runner
-        (do
-          (trace-remote-tx! "handle-writing" type db-name)
-          (new-message runner skey message))
-
-        (idempotent-withtxn-control-types type)
-        (write-message skey {:type :command-complete})
-
-        :else
-        (u/raise "No active with-transaction runner"
-                 {:db-name db-name
-                  :type    type})))
-    (catch Exception e
-      ;; (stt/print-stack-trace e)
-      (error-response skey (str "Error Handling with-transaction message:"
-                                (ex-message e)) {}))))
+  (sdisp/handle-writing (dispatch-deps) server skey message))
 
 (defn- set-last-active
   [^Server server ^SelectionKey skey]
-  (let [{:keys [client-id]} @(.attachment skey)]
-    (when client-id
-      ;; Avoid durable session writes on every request; this path is hot.
-      (when-let [session (get-client server client-id)]
-        (.put ^Map (.-clients server) client-id
-              (assoc session :last-active (System/currentTimeMillis)))))))
+  nil)
 
 (defn- handle-message
   [^Server server ^SelectionKey skey fmt msg ]
-  (try
-    (let [state (.attachment skey)
-          {:keys [message-lock]} @state
-          message
-          (locking message-lock
-            (let [wire-opts (:wire-opts @state)
-                  {:keys [type] :as message}
-                  (p/read-value fmt msg wire-opts)]
-              (if (= type :set-client-id)
-                (do
-                  (log/debug "Message received:" (dissoc message :password :args))
-                  (dispatch-message server skey message)
-                  ::handled)
-                message)))]
-      (when-not (= ::handled message)
-        (let [{:keys [writing?]} message]
-          (log/debug "Message received:" (dissoc message :password :args))
-          (set-last-active server skey)
-          (if writing?
-            (handle-writing server skey message)
-            (with-db-runtime-read-access
-              server
-              message
-              #(dispatch-message-with-ha-write-admission server skey message))))))
-    (catch Exception e
-      ;; (stt/print-stack-trace e)
-      (log/error "Error Handling message:" e))))
+  (sdisp/handle-message (dispatch-deps) server skey fmt msg))
 
 (defn- handle-read
   [^Server server ^SelectionKey skey]
-  (try
-    (let [state                         (.attachment skey)
-          {:keys [^ByteBuffer read-bf
-                  message-lock]}        @state
-          capacity                      (.capacity read-bf)
-          ^SocketChannel ch             (.channel skey)
-          ^int readn                    (p/read-ch ch read-bf)]
-      (when (pos? readn)
-        (trace-remote-tx! "handle-read" readn (.hashCode skey)))
-      (when (> (.position read-bf) c/message-header-size)
-        (let [^ByteBuffer probe (.duplicate read-bf)
-              pos (.position probe)]
-          (.flip probe)
-          (trace-remote-tx! "buffer-header"
-                            (.hashCode skey)
-                            "pos" pos
-                            "len" (.getInt (doto probe (.get))))))
-      (cond
-        (> readn 0)  (do
-                       (p/extract-message
-                         read-bf
-                         (fn [fmt msg]
-                           (execute server #(handle-message server skey fmt msg))))
-                       (when (= (.position read-bf) capacity)
-                         (let [size (* ^long c/+buffer-grow-factor+ capacity)
-                               bf   (bf/allocate-buffer size)]
-                           (.flip read-bf)
-                           (bf/buffer-transfer read-bf bf)
-                           (vswap! state assoc :read-bf bf))))
-        (= readn 0)  :continue
-        (= readn -1) (.close ch)))
-    (catch java.io.IOException e
-      (if (s/includes? (ex-message e) "Connection reset by peer")
-        (.close (.channel skey))
-        (log/error "Read IOException:" (ex-message e))))
-    (catch Exception e
-      ;; (stt/print-stack-trace e)
-      (log/error "Read error:" (ex-message e)))))
+  (sdisp/handle-read (dispatch-deps) server skey))
 
 (defn- handle-registration
   [^Server server]
@@ -2572,16 +1770,7 @@
 
 (defn- remove-idle-sessions
   [^Server server]
-  (let [timeout (.-idle-timeout server)
-        clients (.-clients server)]
-    (doseq [[client-id session] clients
-            :let                [{:keys [last-active]} session]]
-      (if last-active
-        (when (< timeout (- (System/currentTimeMillis) ^long last-active))
-          (disconnect-client* server client-id))
-        ;; migrate old sessions that don't have last-active
-        (update-client server client-id
-                       #(assoc % :last-active (System/currentTimeMillis)))))))
+  (sess/remove-idle-sessions (session-deps) server))
 
 (defn- event-loop
   [^Server server]
@@ -2604,6 +1793,84 @@
                 (.remove iter)
                 (recur)))))
         (recur)))))
+
+(defn- session-deps
+  []
+  {:sys-conn-fn (fn [^Server server] (.-sys-conn server))
+   :clients-fn (fn [^Server server] (.-clients server))
+   :selector-fn (fn [^Server server] (.-selector server))
+   :user-roles-fn user-roles
+   :user-permissions-fn user-permissions
+   :user-eid-fn user-eid
+   :perm-tgt-name-fn perm-tgt-name
+   :open-store-fn open-store
+   :close-store-fn close-store
+   :consensus-ha-opts-fn *consensus-ha-opts-fn*
+   :resolved-runtime-opts-fn resolved-runtime-opts
+   :ensure-ha-runtime-fn (fn [root db-name m store]
+                           (ensure-ha-runtime root db-name m store))
+   :new-runtime-db-fn new-runtime-db
+   :current-runtime-opts-fn current-runtime-opts
+   :pull-user-fn pull-user
+   :password-matches?-fn password-matches?
+   :get-ip-fn get-ip
+   :close-conn-fn close-conn
+   :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))})
+
+(defn- copy-deps
+  []
+  {:register-queue-fn (fn [^Server server] (.-register-queue server))
+   :write-message-fn write-message})
+
+(defn- dispatch-deps
+  []
+  {:close-conn-fn close-conn
+   :dbs-fn (fn [^Server server] (.-dbs server))
+   :with-ha-write-admission-fn with-ha-write-admission
+   :ha-write-commit-check-fn-fn ha-write-commit-check-fn
+   :cleanup-rejected-close-transact!-fn cleanup-rejected-close-transact!
+   :message-handler-map message-handler-map
+   :work-executor-fn (fn [^Server server] (.-work-executor server))
+   :trace-remote-tx-fn trace-remote-tx!
+   :get-kv-store-fn get-kv-store
+   :new-message-fn new-message
+   :write-message-fn write-message
+   :get-client-fn get-client
+   :clients-fn (fn [^Server server] (.-clients server))
+   :with-db-runtime-read-access-fn with-db-runtime-read-access})
+
+(defn- ha-deps
+  []
+  {:get-lock-fn get-lock
+   :db-write-admission-lock-fn db-write-admission-lock
+   :dbs-fn (fn [^Server server] (.-dbs server))
+   :replace-db-state-if-current-fn replace-db-state-if-current
+   :transform-db-state-when-fn transform-db-state-when
+   :with-db-runtime-store-read-access-fn with-db-runtime-store-read-access
+   :with-db-runtime-store-swap-fn with-db-runtime-store-swap
+   :ha-renew-step-fn ha-renew-step
+   :ha-follower-sync-step-fn ha-follower-sync-step
+   :persist-ha-follower-side-effects!-fn persist-ha-follower-side-effects!
+   :running-fn (fn [^Server server] (.-running server))
+   :work-executor-fn (fn [^Server server] (.-work-executor server))
+   :update-db-fn update-db
+   :current-runtime-opts-fn current-runtime-opts
+   :stop-ha-renew-loop-fn *stop-ha-renew-loop-fn*
+   :stop-ha-follower-sync-loop-fn *stop-ha-follower-sync-loop-fn*
+   :await-ha-loop-stop-fn await-ha-loop-stop
+   :stop-ha-authority-fn *stop-ha-authority-fn*
+   :start-ha-authority-fn *start-ha-authority-fn*
+   :consensus-ha-opts-fn *consensus-ha-opts-fn*
+   :ensure-udf-readiness-state-fn *ensure-udf-readiness-state-fn*
+   :udf-admission-exempt-write-types udf-admission-exempt-write-types
+   :udf-write-admission-error-fn udf-write-admission-error
+   :get-kv-store-fn get-kv-store
+   :halt-run-fn halt-run
+   :log-ha-loop-crash!-fn log-ha-loop-crash!
+   :sleep-ha-loop-fn sleep-ha-loop!
+   :ha-loop-sleep-ms-fn ha-loop-sleep-ms
+   :ha-follower-loop-sleep-ms-fn ha-follower-loop-sleep-ms
+   :ha-loop-error-backoff-fn ha-loop-error-backoff!})
 
 (defn create
   "Create a Datalevin server. Initially not running, call `start` to run."
