@@ -15,6 +15,8 @@
    [datalevin.db :as db]
    [datalevin.ha.client-cache :as cache]
    [datalevin.ha.lease :as lease]
+   [datalevin.ha.replication.bootstrap :as boot]
+   [datalevin.ha.replication.store :as store]
    [datalevin.ha.snapshot :as snap]
    [datalevin.ha.util :as hu]
    [datalevin.interface :as i]
@@ -69,456 +71,95 @@
 (def effective-ha-runtime-local-opts hu/effective-ha-runtime-local-opts)
 (def merge-ha-runtime-local-opts hu/merge-ha-runtime-local-opts)
 
-(defn- closed-kv-message-race?
-  [t]
-  (and t
-       (s/includes? (or (ex-message t) "")
-                    "LMDB env is closed")))
-
-(declare closed-kv-store?)
-
 (def ^:dynamic *ha-current-state-fn*
   (fn []
     nil))
+(declare with-store-runtime-bindings)
 
-(defn- current-ha-state
-  [m]
-  (let [current-m (try
-                    (*ha-current-state-fn*)
-                    (catch Throwable _
-                      nil))]
-    (if (map? current-m)
-      current-m
-      m)))
-
-(defn- kv-store-candidates
-  [m]
-  (let [current-m (current-ha-state m)
-        current-dt-db (:dt-db current-m)
-        stale-dt-db   (:dt-db m)]
-    (distinct
-      (remove nil?
-              (concat
-                [(:store current-m)
-                 (when (instance? DB current-dt-db)
-                   (.-store ^DB current-dt-db))]
-                (when-not (identical? current-m m)
-                  [(:store m)
-                   (when (instance? DB stale-dt-db)
-                     (.-store ^DB stale-dt-db))]))))))
+(def ^:private closed-kv-store? store/closed-kv-store?)
+(def ^:private read-ha-local-persisted-lsn store/read-ha-local-persisted-lsn)
+(def ^:private read-ha-local-snapshot-current-lsn
+  store/read-ha-local-snapshot-current-lsn)
+(def ^:private read-ha-local-payload-lsn store/read-ha-local-payload-lsn)
+(def ^:private ha-local-watermark-snapshot-key
+  store/ha-local-watermark-snapshot-key)
+(def ^:private clear-ha-local-store-transient-state
+  store/clear-ha-local-store-transient-state)
+(def ^:redef fresh-ha-local-watermark-snapshot
+  store/fresh-ha-local-watermark-snapshot)
 
 (defn- local-kv-store
   [m]
-  (some
-    (fn [store]
-      (let [kv-store (cond
-                       (nil? store) nil
-                       (instance? Store store) (.-lmdb ^Store store)
-                       (instance? ILMDB store) store
-                       :else nil)]
-        (when-not (closed-kv-store? kv-store)
-          kv-store)))
-    (kv-store-candidates m)))
+  (with-store-runtime-bindings
+    #(store/local-kv-store m)))
 
 (defn- raw-local-kv-store
   [m]
-  (when-let [kv-store (local-kv-store m)]
-    (if (instance? datalevin.kv.KVLMDB kv-store)
-      (.-db ^datalevin.kv.KVLMDB kv-store)
-      kv-store)))
-
-(defn- closed-kv-store?
-  [kv-store]
-  (try
-    (cond
-      (nil? kv-store) true
-      (instance? IStore kv-store) (i/closed? kv-store)
-      (instance? ILMDB kv-store) (i/closed-kv? kv-store)
-      :else false)
-    (catch Exception e
-      (if (closed-kv-message-race? e)
-        true
-        (throw e)))))
-
-(defn- closed-kv-race?
-  [t kv-store]
-  (or (closed-kv-store? kv-store)
-      (closed-kv-message-race? t)))
-
-(defn- read-ha-local-persisted-lsn
-  [kv-store]
-  (long (or (try
-              (when-not (closed-kv-store? kv-store)
-                (i/get-value kv-store c/kv-info
-                             c/ha-local-applied-lsn
-                             :keyword :data))
-              (catch Throwable t
-                (when-not (closed-kv-race? t kv-store)
-                  (throw t))
-                nil))
-            0)))
+  (with-store-runtime-bindings
+    #(store/raw-local-kv-store m)))
 
 (defn- ^:redef persist-ha-local-applied-lsn!
   [m applied-lsn]
-  (when-let [kv-store (raw-local-kv-store m)]
-    (try
-      (i/transact-kv kv-store c/kv-info
-                     [[:put c/ha-local-applied-lsn (long applied-lsn)]]
-                     :keyword :data)
-      (long applied-lsn)
-      (catch Throwable t
-        (when-not (closed-kv-race? t kv-store)
-          (throw t))
-        nil))))
-
-(defn- ha-follower-persist-every-batches
-  [m]
-  (long-max2 1
-             (long (or (:ha-follower-persist-every-batches m)
-                       c/*ha-follower-persist-every-batches*))))
-
-(defn- ha-follower-persist-interval-ms
-  [m]
-  (max 0
-       (long (or (:ha-follower-persist-interval-ms m)
-                 c/*ha-follower-persist-interval-ms*))))
-
-(defn- seed-ha-local-persist-tracking
-  [m now-ms]
-  (if (integer? (:ha-local-persisted-lsn m))
-    m
-    (assoc m
-           :ha-local-persisted-lsn
-           (long (if-let [kv-store (local-kv-store m)]
-                   (read-ha-local-persisted-lsn kv-store)
-                   0))
-           :ha-local-last-persisted-applied-ms (long now-ms)
-           :ha-follower-batches-since-persist 0)))
-
-(defn- note-ha-local-applied-lsn-persisted
-  [m applied-lsn now-ms]
-  (assoc m
-         :ha-local-persisted-lsn (long applied-lsn)
-         :ha-local-last-persisted-applied-ms (long now-ms)
-         :ha-follower-batches-since-persist 0))
+  (with-store-runtime-bindings
+    #(store/persist-ha-local-applied-lsn! m applied-lsn)))
 
 (defn- note-ha-bootstrap-installed-state
   [m installed-lsn source-endpoint snapshot-lsn now-ms persisted-installed-lsn]
-  (let [resume-next-lsn (unchecked-inc (long installed-lsn))]
-    (cond-> (assoc m
-                   :ha-local-last-applied-lsn (long installed-lsn)
-                   :ha-follower-last-applied-term nil
-                   :ha-follower-batches-since-persist 0
-                   :ha-follower-next-lsn resume-next-lsn
-                   :ha-follower-last-bootstrap-ms (long now-ms)
-                   :ha-follower-bootstrap-source-endpoint source-endpoint
-                   :ha-follower-bootstrap-snapshot-last-applied-lsn
-                   (long snapshot-lsn))
-      persisted-installed-lsn
-      (assoc :ha-local-persisted-lsn (long persisted-installed-lsn)
-             :ha-local-last-persisted-applied-ms (long now-ms)))))
+  (store/note-ha-bootstrap-installed-state
+   m installed-lsn source-endpoint snapshot-lsn now-ms
+   persisted-installed-lsn))
 
 (defn- maybe-persist-ha-follower-local-applied-lsn
   [m applied-lsn now-ms]
-  (let [tracked-m (seed-ha-local-persist-tracking m now-ms)
-        persisted-lsn (long (or (:ha-local-persisted-lsn tracked-m) 0))
-        next-batch-count
-        (long (inc (long (or (:ha-follower-batches-since-persist tracked-m)
-                             0))))
-        persist-interval-ms (ha-follower-persist-interval-ms tracked-m)
-        last-persisted-ms
-        (long (or (:ha-local-last-persisted-applied-ms tracked-m)
-                  now-ms))
-        elapsed-ms (nonnegative-long-diff now-ms last-persisted-ms)
-        persist-every-batches (ha-follower-persist-every-batches tracked-m)
-        interval-elapsed?
-        (and (pos? (long persist-interval-ms))
-             (>= (long elapsed-ms)
-                 (long persist-interval-ms)))
-        batch-threshold-reached?
-        (>= (long next-batch-count)
-            (long persist-every-batches))]
-    ;; `:ha/local-applied-lsn` is a conservative follower floor used for
-    ;; promotion/rejoin decisions. The exact replayed payload watermark is
-    ;; tracked separately via `:wal/local-payload-lsn`.
-    (if (and (> (long applied-lsn) persisted-lsn)
-             (or interval-elapsed?
-                 batch-threshold-reached?))
-      (if-let [persisted-applied-lsn
-               (persist-ha-local-applied-lsn! tracked-m applied-lsn)]
-        (note-ha-local-applied-lsn-persisted
-         tracked-m persisted-applied-lsn now-ms)
-        (assoc tracked-m :ha-follower-batches-since-persist next-batch-count))
-      (assoc tracked-m :ha-follower-batches-since-persist next-batch-count))))
-
-(defn- read-ha-local-snapshot-current-lsn
-  [kv-store]
-  (long (or (try
-              (when-not (closed-kv-store? kv-store)
-                (i/get-value kv-store c/kv-info
-                             c/wal-snapshot-current-lsn
-                             :keyword :data))
-              (catch Throwable t
-                (when-not (closed-kv-race? t kv-store)
-                  (throw t))
-                nil))
-            0)))
-
-(defn- read-ha-local-payload-lsn
-  [kv-store]
-  (long (or (try
-              (when-not (closed-kv-store? kv-store)
-                (i/get-value kv-store c/kv-info
-                             c/wal-local-payload-lsn
-                             :keyword :data))
-              (catch Throwable t
-                (when-not (closed-kv-race? t kv-store)
-                  (throw t))
-                nil))
-            0)))
-
-(def ^:private ha-local-watermark-snapshot-key
-  ::ha-local-watermark-snapshot)
-
-(def ^:private ha-local-store-transient-state-keys
-  [ha-local-watermark-snapshot-key
-   :wdt-db
-   :wlmdb
-   :wstore
-   :runner
-   :engine
-   :index])
-
-(defn- clear-ha-local-store-transient-state
-  [m]
-  (apply dissoc m ha-local-store-transient-state-keys))
-
-(declare read-ha-local-watermark-lsn)
-
-(defn- ha-local-data-lsn-ceiling
-  [m kv-store]
-  (let [role (:ha-role m)
-        watermark-lsn (read-ha-local-watermark-lsn m)
-        snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
-        payload-lsn (if (= :leader role)
-                      (read-ha-local-payload-lsn kv-store)
-                      0)]
-    {:snapshot-lsn snapshot-lsn
-     :watermark-lsn watermark-lsn
-     :payload-lsn payload-lsn
-     :ceiling-lsn (long (if (= :leader role)
-                          (long-max3 watermark-lsn snapshot-lsn payload-lsn)
-                          (long-max2 watermark-lsn snapshot-lsn)))}))
-
-(defn- ha-clamped-follower-floor-lsn
-  [persisted-lsn snapshot-lsn ceiling-lsn]
-  (let [tracked-lsn (long-max2 persisted-lsn snapshot-lsn)]
-    (if (pos? (long ceiling-lsn))
-      (if (pos? tracked-lsn)
-        (long-min2 ceiling-lsn tracked-lsn)
-        ceiling-lsn)
-      tracked-lsn)))
-
-(declare read-ha-local-last-applied-lsn)
-(declare read-ha-local-watermark-lsn)
-(declare with-ha-local-store-read)
-
-(defn- read-ha-local-watermark-lsn*
-  [kv-store]
-  (long (or (try
-              (get (kv/txlog-watermarks kv-store) :last-applied-lsn)
-              (catch Throwable t
-                (when-not (closed-kv-race? t kv-store)
-                  (throw t))
-                nil))
-            0)))
-
-(defn- ^:redef fresh-ha-local-watermark-snapshot
-  [m kv-store]
-  (let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-        role (:ha-role m)
-        watermark-lsn (read-ha-local-watermark-lsn* kv-store)
-        snapshot-lsn (read-ha-local-snapshot-current-lsn kv-store)
-        payload-lsn (if (= :leader role)
-                      (read-ha-local-payload-lsn kv-store)
-                      0)
-        persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
-        ceiling-lsn (long (if (= :leader role)
-                            (long-max3 watermark-lsn
-                                       snapshot-lsn
-                                       payload-lsn)
-                            (long-max2 watermark-lsn
-                                       snapshot-lsn)))
-        follower-floor-lsn
-        (ha-clamped-follower-floor-lsn
-         persisted-lsn snapshot-lsn ceiling-lsn)
-        tracked-follower-next-lsn
-        (when (integer? (:ha-follower-next-lsn m))
-          (long (:ha-follower-next-lsn m)))
-        tracked-follower-applied-lsn
-        (when (and tracked-follower-next-lsn
-                   (pos? (long tracked-follower-next-lsn)))
-          (long (max 0
-                     (dec (long tracked-follower-next-lsn)))))
-        replayed-follower-lsn
-        (if (integer? tracked-follower-applied-lsn)
-          (long-max2 follower-floor-lsn
-                     (long-min2 state-lsn
-                                tracked-follower-applied-lsn))
-          follower-floor-lsn)
-        local-last-applied-lsn
-        (long (if (= :leader role)
-                ceiling-lsn
-                (if (pos? (long ceiling-lsn))
-                  (long-min2 ceiling-lsn replayed-follower-lsn)
-                  state-lsn)))]
-    {:role role
-     :kv-store kv-store
-     :state-lsn state-lsn
-     :watermark-lsn watermark-lsn
-     :snapshot-lsn snapshot-lsn
-     :payload-lsn payload-lsn
-     :persisted-lsn persisted-lsn
-     :ceiling-lsn ceiling-lsn
-     :follower-floor-lsn follower-floor-lsn
-     :tracked-follower-next-lsn tracked-follower-next-lsn
-     :tracked-follower-applied-lsn tracked-follower-applied-lsn
-     :replayed-follower-lsn replayed-follower-lsn
-     :local-last-applied-lsn local-last-applied-lsn}))
-
-(defn- cached-ha-local-watermark-snapshot
-  [m kv-store]
-  (let [snapshot (get m ha-local-watermark-snapshot-key)]
-    (when (and (map? snapshot)
-               (= (:role snapshot) (:ha-role m))
-               (identical? (:kv-store snapshot) kv-store))
-      snapshot)))
-
-(defn- ha-local-watermark-snapshot
-  [m kv-store]
-  (or (cached-ha-local-watermark-snapshot m kv-store)
-      (fresh-ha-local-watermark-snapshot m kv-store)))
+  (with-store-runtime-bindings
+    #(store/maybe-persist-ha-follower-local-applied-lsn*
+      persist-ha-local-applied-lsn!
+      m applied-lsn now-ms)))
 
 (defn ^:redef read-ha-snapshot-payload-lsn
   [m]
-  (with-ha-local-store-read
-    #(if-let [kv-store (local-kv-store m)]
-       (read-ha-local-payload-lsn kv-store)
-       0)))
+  (with-store-runtime-bindings
+    #(store/read-ha-snapshot-payload-lsn m)))
 
 (defn ^:redef read-ha-local-last-applied-lsn
   [m]
-  (with-ha-local-store-read
-    #(let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
-       (try
-         (if-let [kv-store (local-kv-store m)]
-           (:local-last-applied-lsn
-            (ha-local-watermark-snapshot m kv-store))
-           state-lsn)
-         (catch Throwable e
-           (when-not (closed-kv-race? e (local-kv-store m))
-             (log/warn e "Unable to read local txlog watermarks for HA lag guard"
-                       {:db-name (some-> (:store m) i/opts :db-name)}))
-           state-lsn)))))
+  (with-store-runtime-bindings
+    #(store/read-ha-local-last-applied-lsn m)))
 
 (defn- ^:redef read-ha-local-watermark-lsn
   [m]
-  (with-ha-local-store-read
-    #(if-let [kv-store (local-kv-store m)]
-       (if-let [snapshot (cached-ha-local-watermark-snapshot m kv-store)]
-         (long (:watermark-lsn snapshot))
-         (read-ha-local-watermark-lsn* kv-store))
-       0)))
+  (with-store-runtime-bindings
+    #(store/read-ha-local-watermark-lsn m)))
 
 (defn persist-ha-runtime-local-applied-lsn!
   [m]
-  (with-ha-local-store-read
-    #(when-let [kv-store (local-kv-store m)]
-       (let [{:keys [ceiling-lsn]} (ha-local-data-lsn-ceiling m kv-store)
-             persisted-lsn (long (read-ha-local-persisted-lsn kv-store))
-             state-lsn (long (or (:ha-local-last-applied-lsn m) 0))
-             lease-lsn (long (or (get-in m
-                                         [:ha-authority-lease
-                                          :leader-last-applied-lsn])
-                                 0))
-             ;; `:ha/local-applied-lsn` is follower replay state. Persisting a
-             ;; former leader's raw local txlog watermark here can overstate how
-             ;; much replicated history that node actually shares with the current
-             ;; leader on rejoin.
-             target-lsn (long (if (= :leader (:ha-role m))
-                                (long-max2 persisted-lsn lease-lsn)
-                                (long-max2 persisted-lsn state-lsn)))
-             applied-lsn (long (if (pos? (long ceiling-lsn))
-                                 (long-min2 ceiling-lsn target-lsn)
-                                 target-lsn))]
-         (when (> applied-lsn persisted-lsn)
-           (persist-ha-local-applied-lsn! m applied-lsn))
-         applied-lsn))))
+  (with-store-runtime-bindings
+    #(store/persist-ha-runtime-local-applied-lsn! m)))
 
 (defn- ha-local-last-applied-lsn
   [m]
-  (let [state-lsn (:ha-local-last-applied-lsn m)]
-    (if (local-kv-store m)
-      (read-ha-local-last-applied-lsn m)
-      (if (integer? state-lsn)
-        (long state-lsn)
-        0))))
+  (with-store-runtime-bindings
+    #(store/ha-local-last-applied-lsn m)))
 
 (defn- refresh-ha-local-watermarks
   [m]
-  (with-ha-local-store-read
-    #(try
-       (if-let [kv-store (local-kv-store m)]
-         (let [{:keys [role local-last-applied-lsn] :as snapshot}
-               (ha-local-watermark-snapshot m kv-store)]
-           (cond-> (assoc m
-                          ha-local-watermark-snapshot-key snapshot
-                          :ha-local-last-applied-lsn local-last-applied-lsn)
-             (= :leader role)
-             (assoc :ha-leader-last-applied-lsn local-last-applied-lsn)))
-         m)
-       (catch Throwable e
-         (when-not (closed-kv-race? e (local-kv-store m))
-           (log/warn e "Unable to refresh local txlog watermarks for HA renew"
-                     {:db-name (some-> (:store m) i/opts :db-name)}))
-         m))))
-
-(declare fresh-ha-promotion-local-last-applied-lsn)
+  (with-store-runtime-bindings
+    #(store/refresh-ha-local-watermarks m)))
 
 (defn- ha-promotion-lag-guard
-  ([m lease]
-   (ha-promotion-lag-guard m lease
-                           (fresh-ha-promotion-local-last-applied-lsn
-                            m lease)))
-  ([m lease local-last-applied-lsn]
-   (let [leader-last-applied-lsn (long (or (:leader-last-applied-lsn lease) 0))
-         local-last-applied-lsn (long (or local-last-applied-lsn 0))
-        lag-lsn (nonnegative-long-diff leader-last-applied-lsn
-                                       local-last-applied-lsn)
-        max-lag-lsn (long (or (:ha-max-promotion-lag-lsn m) 0))]
-     {:ok? (<= lag-lsn max-lag-lsn)
-      :leader-last-applied-lsn leader-last-applied-lsn
-      :local-last-applied-lsn local-last-applied-lsn
-      :lag-lsn lag-lsn
-      :max-lag-lsn max-lag-lsn})))
+  ([m observed-lease]
+   (with-store-runtime-bindings
+     #(store/ha-promotion-lag-guard m observed-lease)))
+  ([m observed-lease local-last-applied-lsn]
+   (with-store-runtime-bindings
+     #(store/ha-promotion-lag-guard
+       m observed-lease local-last-applied-lsn))))
 
 (defn- fresh-ha-promotion-local-last-applied-lsn
-  [m lease]
-  (with-ha-local-store-read
-    #(let [state-lsn (long (or (:ha-local-last-applied-lsn m) 0))]
-       (try
-         (if-let [kv-store (local-kv-store m)]
-           (:local-last-applied-lsn
-            (fresh-ha-local-watermark-snapshot m kv-store))
-           (if (and (bootstrap-empty-lease? lease)
-                    (zero? state-lsn))
-             (long-max2 state-lsn (read-ha-local-watermark-lsn m))
-             state-lsn))
-         (catch Throwable e
-           (when-not (closed-kv-race? e (local-kv-store m))
-             (log/warn e "Unable to read fresh local txlog watermarks for HA promotion lag guard"
-                       {:db-name (some-> (:store m) i/opts :db-name)}))
-           state-lsn)))))
+  [m observed-lease]
+  (with-store-runtime-bindings
+    #(store/fresh-ha-promotion-local-last-applied-lsn
+      m observed-lease)))
 
 (def ^:private endpoint-pattern
   #"^(.+):([0-9]+)$")
@@ -565,25 +206,13 @@
   snap/sync-ha-snapshot-install-target!)
 (def ha-snapshot-install-marker-path
   snap/ha-snapshot-install-marker-path)
-(def ^:private copy-dir-contents! snap/copy-dir-contents!)
-(def ^:private move-path! snap/move-path!)
-(def ^:private write-ha-snapshot-install-marker!
-  snap/write-ha-snapshot-install-marker!)
-(def ^:private delete-ha-snapshot-install-marker!
-  snap/delete-ha-snapshot-install-marker!)
-(def ^:private recover-ha-local-snapshot-install!
-  snap/recover-ha-local-snapshot-install!)
 (def recover-ha-local-store-dir-if-needed!
   snap/recover-ha-local-store-dir-if-needed!)
 (def ^:private close-ha-local-store! snap/close-ha-local-store!)
 (def ^:private refresh-ha-local-dt-db snap/refresh-ha-local-dt-db)
 
-(declare open-ha-store-dbis!)
 (def ^:private ha-local-store-reopen-info-key
-  ::ha-local-store-reopen-info)
-(declare ha-local-store-reopen-info)
-(declare reopen-ha-local-store-from-info)
-(declare with-ha-local-store-swap)
+  store/ha-local-store-reopen-info-key)
 
 (def ^:dynamic *ha-with-local-store-swap-fn*
   (fn [f]
@@ -601,234 +230,57 @@
   [f]
   (*ha-with-local-store-read-fn* f))
 
+(defn- with-store-runtime-bindings
+  [f]
+  (binding [store/*ha-current-state-fn* *ha-current-state-fn*
+            store/*ha-with-local-store-swap-fn* *ha-with-local-store-swap-fn*
+            store/*ha-with-local-store-read-fn* *ha-with-local-store-read-fn*]
+    (f)))
+
 (defn- ha-local-store-open-opts
   [m store]
-  (let [store-opts (if (instance? IStore store)
-                     (or (i/opts store) {})
-                     {})
-        runtime-opts (effective-ha-runtime-local-opts m)
-        db-name (or (:db-name store-opts)
-                    (some-> store i/db-name))
-        db-identity (or (:ha-db-identity m)
-                        (:db-identity store-opts))
-        open-opts (merge-ha-runtime-local-opts store-opts runtime-opts)]
-    (cond-> open-opts
-      db-name (assoc :db-name db-name)
-      db-identity (assoc :db-identity db-identity))))
+  (store/ha-local-store-open-opts m store))
 
 (defn recover-ha-local-store-if-needed
   ([store]
    (recover-ha-local-store-if-needed store nil))
   ([store open-opts]
-   (if-not (instance? IStore store)
-     store
-     (let [env-dir (i/dir store)]
-       (if-not (recover-ha-local-store-dir-if-needed! env-dir)
-         store
-         (let [schema (i/schema store)
-               opts (merge (or (i/opts store) {})
-                           (or open-opts {}))]
-           (when-not (i/closed? store)
-             (i/close store))
-           (-> (st/open env-dir schema opts)
-               open-ha-store-dbis!)))))))
+   (store/recover-ha-local-store-if-needed store open-opts)))
 
 (defn- reopen-ha-local-store-if-needed
   [m]
-  (let [store (:store m)
-        open-opts (ha-local-store-open-opts m store)
-        recovered-store (recover-ha-local-store-if-needed store open-opts)
-        m (if (identical? recovered-store store)
-            m
-            (-> m
-                clear-ha-local-store-transient-state
-                (assoc :store recovered-store
-                       :dt-db nil)
-                (dissoc ha-local-store-reopen-info-key)
-                refresh-ha-local-dt-db))]
-    (if (local-kv-store m)
-      m
-      (if-let [reopen-info (ha-local-store-reopen-info m)]
-        (try
-          (reopen-ha-local-store-from-info m reopen-info)
-          (catch Throwable e
-            (u/raise "HA local store reopen failed"
-                     {:error :ha/follower-local-store-reopen-failed
-                      :env-dir (:env-dir reopen-info)
-                      :reopen-info reopen-info
-                      :message (ex-message e)
-                      :data (ex-data e)
-                      :state (-> m
-                                 (assoc ha-local-store-reopen-info-key
-                                        reopen-info
-                                        :dt-db nil)
-                                 (dissoc :engine :index))})))
-        m))))
+  (with-store-runtime-bindings
+    #(store/reopen-ha-local-store-if-needed m)))
 
 (defn- ha-local-store-reopen-info
   [m]
-  (let [current-m (current-ha-state m)
-        candidates (if (identical? current-m m)
-                     [m]
-                     [current-m m])]
-    (or (some #(get % ha-local-store-reopen-info-key) candidates)
-        (some (fn [state]
-                (let [store (:store state)]
-        (when (instance? IStore store)
-          (try
-            {:env-dir (i/dir store)
-             :store-opts (ha-local-store-open-opts state store)}
-                      (catch Throwable _
-                        nil)))))
-              candidates))))
+  (with-store-runtime-bindings
+    #(store/ha-local-store-reopen-info m)))
 
 (defn- ^:redef reopen-ha-local-store-from-info
   [m {:keys [env-dir store-opts]}]
-  (when (and (string? env-dir)
-             (not (s/blank? env-dir))
-             (map? store-opts))
-    (-> m
-        ;; A saved reopen recipe can be applied after partial snapshot install
-        ;; recovery while the previous store handle is still present in state.
-        ;; Always retire that handle first; otherwise we can leak multiple LMDB
-        ;; connections to the same env and poison later copy/watermark reads.
-        ((fn [state]
-           (close-ha-local-store! state)
-           state))
-        clear-ha-local-store-transient-state
-        (assoc :store (-> (st/open env-dir nil store-opts)
-                          open-ha-store-dbis!)
-               :dt-db nil)
-        (dissoc ha-local-store-reopen-info-key)
-        refresh-ha-local-dt-db)))
+  (with-store-runtime-bindings
+    #(store/reopen-ha-local-store-from-info
+      m {:env-dir env-dir
+         :store-opts store-opts})))
 
 (defn- normalize-ha-bootstrap-retry-state
   [candidate-m fallback-m reopen-info]
-  (or (try
-        (let [state (reopen-ha-local-store-if-needed candidate-m)]
-          (when (local-kv-store state)
-            state))
-        (catch Throwable _
-          nil))
-      (try
-        (let [state (reopen-ha-local-store-if-needed fallback-m)]
-          (when (local-kv-store state)
-            state))
-        (catch Throwable _
-          nil))
-      (try
-        ;; Snapshot install can leave only a reopen recipe behind after a
-        ;; failed restore; use it before giving up on the next source.
-        (let [state (with-ha-local-store-swap
-                      #(reopen-ha-local-store-from-info fallback-m
-                                                        reopen-info))]
-          (when (local-kv-store state)
-            state))
-        (catch Throwable _
-          nil))
-      candidate-m))
-
-(defn- ha-local-contiguous-txlog-tail
-  [kv-store from-lsn upto-lsn]
-  (if (or (nil? kv-store)
-          (> (long from-lsn) (long upto-lsn)))
-    []
-    (loop [expected (long from-lsn)
-           remaining (seq (kv/open-tx-log-rows kv-store from-lsn upto-lsn))
-           acc []]
-      (if-let [record (first remaining)]
-        (let [record-lsn (long (:lsn record))
-              rows (or (:rows record) (:ops record))]
-          (if (and (= record-lsn expected)
-                   (sequential? rows))
-            (recur (unchecked-inc expected)
-                   (next remaining)
-                   (conj acc record))
-            acc))
-        acc))))
-
-(defn- inspect-ha-local-bootstrap-tail
-  ([m snapshot-lsn]
-   (inspect-ha-local-bootstrap-tail m snapshot-lsn nil))
-  ([m snapshot-lsn trusted-max-lsn]
-   (if-let [kv-store (raw-local-kv-store m)]
-     (let [persisted-floor-lsn
-           (read-ha-local-persisted-lsn kv-store)
-           candidate-floor-lsn-raw
-           (long-max4 snapshot-lsn
-                      persisted-floor-lsn
-                      (read-ha-local-watermark-lsn m)
-                      (read-ha-snapshot-payload-lsn m))
-           candidate-floor-lsn
-           (long (if (integer? trusted-max-lsn)
-                   (long-min2 candidate-floor-lsn-raw
-                              (long trusted-max-lsn))
-                   candidate-floor-lsn-raw))
-           records
-           (ha-local-contiguous-txlog-tail
-            kv-store
-            (unchecked-inc (long snapshot-lsn))
-            candidate-floor-lsn)
-           verified-floor-lsn
-           (long (if (or (= candidate-floor-lsn (long snapshot-lsn))
-                         (seq records))
-                   candidate-floor-lsn
-                   snapshot-lsn))]
-       {:verified-floor-lsn verified-floor-lsn
-        :persisted-floor-lsn persisted-floor-lsn
-        :candidate-floor-lsn-raw candidate-floor-lsn-raw
-        :candidate-floor-lsn candidate-floor-lsn
-        :trusted-max-lsn (some-> trusted-max-lsn long)
-        :tail-record-count (count records)})
-     {:verified-floor-lsn (long snapshot-lsn)
-      :persisted-floor-lsn (long snapshot-lsn)
-      :candidate-floor-lsn-raw (long snapshot-lsn)
-      :candidate-floor-lsn (long snapshot-lsn)
-      :trusted-max-lsn (some-> trusted-max-lsn long)
-      :tail-record-count 0})))
-
-(defn- persist-ha-local-bootstrap-floor!
-  [m applied-lsn]
-  (when-let [kv-store (raw-local-kv-store m)]
-    (i/transact-kv kv-store
-                   c/kv-info
-                   [[:put c/wal-local-payload-lsn (long applied-lsn)]
-                    [:put c/ha-local-applied-lsn (long applied-lsn)]]
-                   :keyword
-                   :data))
-  (long applied-lsn))
+  (with-store-runtime-bindings
+    #(boot/normalize-ha-bootstrap-retry-state
+      candidate-m fallback-m reopen-info)))
 
 (defn- reconcile-ha-installed-snapshot-state
   ([m snapshot-lsn]
    (reconcile-ha-installed-snapshot-state m snapshot-lsn nil))
   ([m snapshot-lsn trusted-max-lsn]
-   (let [{:keys [verified-floor-lsn] :as replay}
-         (inspect-ha-local-bootstrap-tail m snapshot-lsn trusted-max-lsn)
-         reopen-info (ha-local-store-reopen-info m)
-         clamped? (< (long verified-floor-lsn)
-                     (long (:candidate-floor-lsn replay)))
-         _ (when clamped?
-             (persist-ha-local-bootstrap-floor! m verified-floor-lsn))
-         next-m (if (and clamped? reopen-info)
-                  (with-ha-local-store-swap
-                    #(do
-                       (close-ha-local-store! m)
-                       (reopen-ha-local-store-from-info m reopen-info)))
-                  m)]
-     (assoc replay
-            :installed-lsn (long verified-floor-lsn)
-            :state next-m))))
-
-(def ^:private open-ha-store-dbis! snap/open-ha-store-dbis!)
+   (with-store-runtime-bindings
+     #(boot/reconcile-ha-installed-snapshot-state
+       m snapshot-lsn trusted-max-lsn))))
 
 (defn- ha-snapshot-open-opts
   [m db-name db-identity]
-  (let [store (:store m)
-        base-opts (ha-local-store-open-opts m store)]
-    (assoc (or base-opts {})
-           ::st/raw-persist-open-opts? true
-           :db-name db-name
-           :db-identity db-identity)))
+  (boot/ha-snapshot-open-opts m db-name db-identity))
 
 (defn ^:redef fetch-ha-endpoint-watermark-lsn
   [db-name m endpoint]
@@ -2431,151 +1883,13 @@
 
 (defn- validate-ha-snapshot-copy!
   [db-name m source-endpoint snapshot-dir copy-meta required-lsn]
-  (let [snapshot-db-name (:db-name copy-meta)
-        snapshot-db-identity (:db-identity copy-meta)
-        snapshot-last-lsn (:snapshot-last-applied-lsn copy-meta)
-        payload-last-lsn (:payload-last-applied-lsn copy-meta)]
-    (when (not= db-name snapshot-db-name)
-      (u/raise "HA snapshot copy DB name mismatch"
-               {:error :ha/follower-snapshot-db-name-mismatch
-                :db-name db-name
-                :snapshot-db-name snapshot-db-name
-                :source-endpoint source-endpoint}))
-    (when (or (nil? snapshot-db-identity) (s/blank? snapshot-db-identity))
-      (u/raise "HA snapshot copy is missing DB identity"
-               {:error :ha/follower-snapshot-missing-db-identity
-                :db-name db-name
-                :source-endpoint source-endpoint}))
-    (when (not= (:ha-db-identity m) snapshot-db-identity)
-      (u/raise "HA snapshot copy DB identity mismatch"
-               {:error :ha/follower-snapshot-db-identity-mismatch
-                :db-name db-name
-                :local-db-identity (:ha-db-identity m)
-                :snapshot-db-identity snapshot-db-identity
-                :source-endpoint source-endpoint}))
-    (when-not (or (integer? snapshot-last-lsn)
-                  (integer? payload-last-lsn))
-      (u/raise "HA snapshot copy is missing payload last applied LSN"
-               {:error :ha/follower-snapshot-missing-last-applied-lsn
-                :db-name db-name
-                :source-endpoint source-endpoint
-                :copy-meta copy-meta}))
-    (let [snapshot-last-lsn (when (integer? snapshot-last-lsn)
-                              (long snapshot-last-lsn))
-          payload-last-lsn (when (integer? payload-last-lsn)
-                             (long payload-last-lsn))
-          install-last-lsn (long-max2 (or payload-last-lsn 0)
-                                      (or snapshot-last-lsn 0))]
-      (when (< install-last-lsn (long required-lsn))
-        (u/raise "HA snapshot copy payload is older than the required follower floor"
-                 {:error :ha/follower-snapshot-too-stale
-                  :db-name db-name
-                  :required-lsn (long required-lsn)
-                  :snapshot-last-applied-lsn snapshot-last-lsn
-                  :payload-last-applied-lsn payload-last-lsn
-                  :source-endpoint source-endpoint}))
-      {:db-name db-name
-       :db-identity snapshot-db-identity
-       :snapshot-last-applied-lsn (or snapshot-last-lsn install-last-lsn)
-       :payload-last-applied-lsn install-last-lsn})))
+  (boot/validate-ha-snapshot-copy!
+   db-name m source-endpoint snapshot-dir copy-meta required-lsn))
 
 (defn ^:redef install-ha-local-snapshot!
   [m snapshot-dir]
-  (let [store (:store m)]
-    (if-not (instance? IStore store)
-      {:ok? false
-       :state m
-       :error {:error :ha/follower-missing-store
-               :message "HA follower snapshot install requires a local store"}}
-      (let [env-dir (i/dir store)
-            backup-dir (str env-dir ".ha-backup-" (UUID/randomUUID))
-            stage-dir (str env-dir ".ha-install-" (UUID/randomUUID))
-            install-marker {:backup-dir backup-dir
-                            :stage-dir stage-dir
-                            :db-name (some-> store i/db-name)
-                            :created-at-ms (System/currentTimeMillis)}
-            open-opts (ha-snapshot-open-opts
-                       m
-                       (:db-name (i/opts store))
-                       (:ha-db-identity m))]
-        ;; Validate that the copied snapshot is openable before swapping paths.
-        (let [snapshot-store (st/open snapshot-dir nil open-opts)]
-          (try
-            (i/opts snapshot-store)
-            (finally
-              (i/close snapshot-store))))
-        (with-ha-local-store-swap
-          (fn []
-            (try
-              (close-ha-local-store! m)
-              (when (u/file-exists backup-dir)
-                (u/delete-files backup-dir))
-              (when (u/file-exists stage-dir)
-                (u/delete-files stage-dir))
-              (write-ha-snapshot-install-marker!
-               env-dir
-               (assoc install-marker :stage :backup-moving))
-              (move-path! env-dir backup-dir)
-              (write-ha-snapshot-install-marker!
-               env-dir
-               (assoc install-marker :stage :backup-moved))
-              (copy-dir-contents! snapshot-dir stage-dir)
-              (sync-ha-snapshot-install-target! stage-dir)
-              (write-ha-snapshot-install-marker!
-               env-dir
-               (assoc install-marker :stage :snapshot-staged))
-              (move-path! stage-dir env-dir)
-              (sync-ha-snapshot-install-target! env-dir)
-              (let [new-store (open-ha-store-dbis!
-                               (st/open env-dir nil open-opts))
-                    new-db (db/new-db new-store)]
-                (delete-ha-snapshot-install-marker! env-dir)
-                (when (u/file-exists backup-dir)
-                  (u/delete-files backup-dir))
-                {:ok? true
-                 :state (-> m
-                            clear-ha-local-store-transient-state
-                            (assoc :store new-store
-                                   :dt-db new-db))})
-              (catch Exception e
-                (let [log-context {:db-name (some-> store i/db-name)
-                                   :env-dir env-dir}]
-                  (try
-                    (recover-ha-local-snapshot-install! env-dir)
-                    (log/warn e
-                              "HA follower snapshot install failed; restored local store"
-                              log-context)
-                    (let [restored-store (open-ha-store-dbis!
-                                          (st/open env-dir nil open-opts))
-                          restored-db (db/new-db restored-store)]
-                      {:ok? false
-                       :state (-> m
-                                  clear-ha-local-store-transient-state
-                                  (assoc :store restored-store
-                                         :dt-db restored-db))
-                       :error {:error :ha/follower-snapshot-install-failed
-                               :message (ex-message e)
-                               :data (ex-data e)}})
-                    (catch Exception restore-e
-                      (log/error restore-e
-                                 "HA follower snapshot install restore failed"
-                                 (merge log-context
-                                        {:install-message (ex-message e)
-                                         :install-data (ex-data e)}))
-                      {:ok? false
-                       :state (-> m
-                                  ;; Preserve the closed store handle so the next
-                                  ;; renew step can recover and reopen from its
-                                  ;; original env dir instead of getting stuck with
-                                  ;; no local store at all.
-                                  clear-ha-local-store-transient-state
-                                  (assoc :store store
-                                         :dt-db nil))
-                       :error {:error :ha/follower-snapshot-install-restore-failed
-                               :message (ex-message e)
-                               :data (merge (or (ex-data e) {})
-                                            {:restore-message (ex-message restore-e)
-                                             :restore-data (ex-data restore-e)})}})))))))))))
+  (with-store-runtime-bindings
+    #(boot/install-ha-local-snapshot! m snapshot-dir)))
 
 (defn- sync-ha-follower-batch
   [db-name m lease next-lsn now-ms]
@@ -2728,126 +2042,31 @@
 
 (defn- ^:redef bootstrap-ha-follower-from-snapshot
   [db-name m lease source-order next-lsn now-ms]
-  (let [required-lsn (long (max 0 (dec (long next-lsn))))]
-    (loop [remaining source-order
-           current-m (normalize-ha-bootstrap-retry-state
-                      m m (ha-local-store-reopen-info m))
-           current-reopen-info (ha-local-store-reopen-info m)
-           errors []]
-      (if-let [source-endpoint (first remaining)]
-        (let [current-m (normalize-ha-bootstrap-retry-state
-                         current-m current-m current-reopen-info)
-              current-reopen-info (or (ha-local-store-reopen-info current-m)
-                                      current-reopen-info)
-              snapshot-dir (u/tmp-dir (str "ha-snapshot-copy-"
-                                           (UUID/randomUUID)))
-              attempt
-              (try
-                (let [{:keys [copy-meta]}
-                      (fetch-ha-endpoint-snapshot-copy!
-                       db-name current-m source-endpoint snapshot-dir)
-                      manifest
-                      (validate-ha-snapshot-copy!
-                       db-name current-m source-endpoint snapshot-dir
-                       copy-meta required-lsn)
-                      install-res
-                      (install-ha-local-snapshot! current-m snapshot-dir)]
-                  (if (:ok? install-res)
-                    (let [installed-state (:state install-res)
-                          snapshot-lsn
-                          (long (max 0
-                                     (long (or (:snapshot-last-applied-lsn
-                                                manifest)
-                                               0))
-                                     (long (if-let [kv-store
-                                                    (raw-local-kv-store
-                                                     installed-state)]
-                                             (read-ha-local-snapshot-current-lsn
-                                              kv-store)
-                                             0))))
-                          trusted-install-lsn
-                          (long (max snapshot-lsn
-                                     (long (or (:payload-last-applied-lsn
-                                                manifest)
-                                               0))))
-                          {:keys [state installed-lsn]}
-                          (reconcile-ha-installed-snapshot-state
-                           installed-state
-                           snapshot-lsn
-                           trusted-install-lsn)
-                          persisted-installed-lsn
-                          (persist-ha-local-applied-lsn!
-                           state
-                           installed-lsn)
-                          installed-state
-                          (note-ha-bootstrap-installed-state
-                           state
-                           installed-lsn
-                           source-endpoint
-                           snapshot-lsn
-                           now-ms
-                           persisted-installed-lsn)]
-                      (try
-                        (let [sync-res (sync-ha-follower-batch
-                                        db-name installed-state lease
-                                        (unchecked-inc (long installed-lsn))
-                                        now-ms)
-                              next-state (-> (:state sync-res)
-                                             (assoc
-                                              :ha-follower-last-bootstrap-ms
-                                              now-ms
-                                              :ha-follower-bootstrap-source-endpoint
-                                              source-endpoint
-                                              :ha-follower-bootstrap-snapshot-last-applied-lsn
-                                              snapshot-lsn))]
-                          {:ok? true
-                           :state next-state})
-                        (catch Exception e
-                          {:ok? false
-                           :state installed-state
-                           :error {:error (or (:error (ex-data e))
-                                              :ha/follower-snapshot-resume-failed)
-                                   :message (ex-message e)
-                                   :data (merge
-                                          (or (ex-data e) {})
-                                          {:snapshot-last-applied-lsn
-                                           snapshot-lsn
-                                           :installed-last-applied-lsn
-                                           installed-lsn
-                                           :resume-next-lsn
-                                           (unchecked-inc
-                                            (long installed-lsn))})}})))
-                    {:ok? false
-                     :state (:state install-res)
-                     :error (:error install-res)}))
-                (catch Exception e
-                  {:ok? false
-                   :state current-m
-                   :error {:error (or (:error (ex-data e))
-                                      :ha/follower-snapshot-bootstrap-failed)
-                           :message (ex-message e)
-                           :data (ex-data e)}})
-                (finally
-                  (when (u/file-exists snapshot-dir)
-                    (u/delete-files snapshot-dir))))]
-          (if (:ok? attempt)
-            attempt
-            (let [next-m (normalize-ha-bootstrap-retry-state
-                          (:state attempt)
-                          current-m
-                          current-reopen-info)
-                  next-reopen-info (or (ha-local-store-reopen-info next-m)
-                                       current-reopen-info)]
-              (recur (rest remaining)
-                     next-m
-                     next-reopen-info
-                     (conj errors
-                           (assoc (:error attempt)
-                                  :source-endpoint source-endpoint))))))
-        {:ok? false
-         :state current-m
-         :source-order (vec source-order)
-         :errors errors}))))
+  (with-store-runtime-bindings
+    #(boot/bootstrap-ha-follower-from-snapshot*
+      {:normalize-ha-bootstrap-retry-state
+       normalize-ha-bootstrap-retry-state
+       :ha-local-store-reopen-info
+       ha-local-store-reopen-info
+       :fetch-ha-endpoint-snapshot-copy!
+       fetch-ha-endpoint-snapshot-copy!
+       :validate-ha-snapshot-copy!
+       validate-ha-snapshot-copy!
+       :install-ha-local-snapshot!
+       install-ha-local-snapshot!
+       :raw-local-kv-store
+       raw-local-kv-store
+       :read-ha-local-snapshot-current-lsn
+       read-ha-local-snapshot-current-lsn
+       :reconcile-ha-installed-snapshot-state
+       reconcile-ha-installed-snapshot-state
+       :persist-ha-local-applied-lsn!
+       persist-ha-local-applied-lsn!
+       :note-ha-bootstrap-installed-state
+       note-ha-bootstrap-installed-state
+       :sync-ha-follower-batch
+       sync-ha-follower-batch}
+      db-name m lease source-order next-lsn now-ms)))
 
 (defn- sync-ha-follower-state
   [db-name m now-ms]
