@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.server.session
-  "Client/session bookkeeping extracted from datalevin.server."
+  "Client tracking and session bookkeeping."
   (:require
    [datalevin.constants :as c]
    [datalevin.core :as d]

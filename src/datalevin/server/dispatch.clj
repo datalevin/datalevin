@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.server.dispatch
-  "Message dispatch and request handlers extracted from datalevin.server."
+  "Message dispatch and request handlers."
   (:require
    [clojure.string :as s]
    [datalevin.binding.cpp :as cpp]

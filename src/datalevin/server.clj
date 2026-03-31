@@ -30,7 +30,6 @@
    [datalevin.server.dispatch :as sdisp]
    [datalevin.server.handlers :as sh]
    [datalevin.server.ha :as sha]
-   [datalevin.server.ha-runtime :as hrt]
    [datalevin.server.session :as sess]
    [datalevin.txlog :as txlog]
    [datalevin.kv :as kv]
@@ -381,32 +380,32 @@
     {:updated? @updated?
      :state (when @present? @final-v)}))
 
-(def ^:private missing-state-value hrt/missing-state-value)
+(def ^:private missing-state-value sha/missing-state-value)
 (def ^:private ha-follower-local-side-effect-keys
-  hrt/ha-follower-local-side-effect-keys)
+  sha/ha-follower-local-side-effect-keys)
 (def ^:private ha-follower-side-effect-keys
-  hrt/ha-follower-side-effect-keys)
-(def ^:private state-patch hrt/state-patch)
+  sha/ha-follower-side-effect-keys)
+(def ^:private state-patch sha/state-patch)
 (def ^:private ha-follower-local-side-effect-patch
-  hrt/ha-follower-local-side-effect-patch)
+  sha/ha-follower-local-side-effect-patch)
 (def ^:private ha-follower-side-effect-patch
-  hrt/ha-follower-side-effect-patch)
+  sha/ha-follower-side-effect-patch)
 (def ^:private ha-renew-merge-excluded-keys
-  hrt/ha-renew-merge-excluded-keys)
-(def ^:private ha-renew-state-patch hrt/ha-renew-state-patch)
-(def ^:private apply-state-patch hrt/apply-state-patch)
-(def ^:private same-ha-runtime-context? hrt/same-ha-runtime-context?)
-(def ^:private same-ha-runtime-state? hrt/same-ha-runtime-state?)
+  sha/ha-renew-merge-excluded-keys)
+(def ^:private ha-renew-state-patch sha/ha-renew-state-patch)
+(def ^:private apply-state-patch sha/apply-state-patch)
+(def ^:private same-ha-runtime-context? sha/same-ha-runtime-context?)
+(def ^:private same-ha-runtime-state? sha/same-ha-runtime-state?)
 (def ^:private merge-ha-follower-local-side-effect-patch
-  hrt/merge-ha-follower-local-side-effect-patch)
+  sha/merge-ha-follower-local-side-effect-patch)
 (def ^:private merge-ha-follower-side-effect-patch
-  hrt/merge-ha-follower-side-effect-patch)
+  sha/merge-ha-follower-side-effect-patch)
 (def ^:private merge-ha-renew-state-patch
-  hrt/merge-ha-renew-state-patch)
+  sha/merge-ha-renew-state-patch)
 (def ^:private merge-ha-renew-promotion-state-patch
-  hrt/merge-ha-renew-promotion-state-patch)
+  sha/merge-ha-renew-promotion-state-patch)
 (def ^:private persist-ha-follower-side-effects!
-  hrt/persist-ha-follower-side-effects!)
+  sha/persist-ha-follower-side-effects!)
 
 (def ^:dynamic *server-runtime-opts-fn*
   (fn [_ _ _ _] nil))
@@ -580,19 +579,19 @@
     :txlog-pin-backup-floor!
     :txlog-unpin-backup-floor!})
 
-(def consensus-ha-opts hrt/consensus-ha-opts)
+(def consensus-ha-opts sha/consensus-ha-opts)
 
 (def ^:dynamic *consensus-ha-opts-fn*
   consensus-ha-opts)
 
-(def ^:private ha-runtime-option-keys hrt/ha-runtime-option-keys)
-(def ^:private ha-runtime-option-key-set hrt/ha-runtime-option-key-set)
-(def ^:private sanitize-ha-path-segment hrt/sanitize-ha-path-segment)
-(def ^:private default-ha-control-raft-dir hrt/default-ha-control-raft-dir)
+(def ^:private ha-runtime-option-keys sha/ha-runtime-option-keys)
+(def ^:private ha-runtime-option-key-set sha/ha-runtime-option-key-set)
+(def ^:private sanitize-ha-path-segment sha/sanitize-ha-path-segment)
+(def ^:private default-ha-control-raft-dir sha/default-ha-control-raft-dir)
 (def ^:private with-default-ha-control-raft-dir
-  hrt/with-default-ha-control-raft-dir)
-(def ^:private start-ha-authority hrt/start-ha-authority)
-(def ^:private stop-ha-authority hrt/stop-ha-authority)
+  sha/with-default-ha-control-raft-dir)
+(def ^:private start-ha-authority sha/start-ha-authority)
+(def ^:private stop-ha-authority sha/stop-ha-authority)
 
 (def ^:dynamic *ha-renew-step-fn*
   dha/ha-renew-step)
@@ -622,10 +621,10 @@
   [^Server server db-name f]
   (sha/with-ha-follower-replay-quiesced (ha-deps) server db-name f))
 
-(def ^:private ha-loop-sleep-ms hrt/ha-loop-sleep-ms)
-(def ^:private ha-follower-loop-sleep-ms hrt/ha-follower-loop-sleep-ms)
-(def ^:private sleep-ha-loop! hrt/sleep-ha-loop!)
-(def ^:private ha-loop-error-backoff! hrt/ha-loop-error-backoff!)
+(def ^:private ha-loop-sleep-ms sha/ha-loop-sleep-ms)
+(def ^:private ha-follower-loop-sleep-ms sha/ha-follower-loop-sleep-ms)
+(def ^:private sleep-ha-loop! sha/sleep-ha-loop!)
+(def ^:private ha-loop-error-backoff! sha/ha-loop-error-backoff!)
 
 (defn- ha-renew-promotion-result?
   [expected-state next-state]
@@ -668,7 +667,7 @@
   [m]
   (sha/stop-ha-follower-sync-loop m))
 
-(def ^:private await-ha-loop-stop hrt/await-ha-loop-stop)
+(def ^:private await-ha-loop-stop sha/await-ha-loop-stop)
 
 (def ^:dynamic *start-ha-authority-fn*
   start-ha-authority)
@@ -695,13 +694,13 @@
    (sha/resolved-ha-runtime-opts
     (ha-deps) root db-name store m explicit-ha-runtime-opts)))
 
-(def ^:private shared-store-lifecycle? hrt/shared-store-lifecycle?)
+(def ^:private shared-store-lifecycle? sha/shared-store-lifecycle?)
 
 (defn- stop-ha-runtime
   [db-name m]
   (sha/stop-ha-runtime (ha-deps) db-name m))
 
-(def ^:private ha-authority-running? hrt/ha-authority-running?)
+(def ^:private ha-authority-running? sha/ha-authority-running?)
 
 (declare db-write-admission-lock)
 

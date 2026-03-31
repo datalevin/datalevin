@@ -8,7 +8,7 @@
 ;; You must not remove this notice, or any other, from this software.
 ;;
 (ns ^:no-doc datalevin.server.copy
-  "Copy helpers extracted from datalevin.server."
+  "Copy helpers for large client/server data transfer."
   (:require
    [datalevin.constants :as c]
    [datalevin.ha.replication :as drep]
