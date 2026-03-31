@@ -208,6 +208,14 @@
   (or (get-value lmdb c/meta :max-tx :attr :long)
       c/tx0))
 
+(defn- ensure-open-last-modified!
+  [lmdb]
+  (when-not (get-value lmdb c/meta :last-modified :attr :long)
+    (transact-kv
+      lmdb
+      [(lmdb/kv-tx :put c/meta :last-modified
+                   (System/currentTimeMillis) :attr :long)])))
+
 (defn e-aid-v->datom
   [store e-aid-v]
   (d/datom (nth e-aid-v 0) ((attrs store) (nth e-aid-v 1)) (peek e-aid-v)))
@@ -2389,6 +2397,7 @@
          (if raw-persist-open-opts?
            (transact-opts-raw lmdb opts4)
            (transact-opts lmdb opts4))
+         (ensure-open-last-modified! lmdb)
          (if shared-store
            (let [wrapper (with-open-opts shared-store store-opts)]
              (when dir-key

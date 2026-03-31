@@ -466,7 +466,8 @@
                                   (i/max-tx store)))
           last-modified (long (or (i/get-value lmdb c/meta :last-modified
                                                :attr :long)
-                                  (i/last-modified store)))]
+                                  (i/last-modified store)
+                                  (System/currentTimeMillis)))]
       {:max-eid       (i/init-max-eid store)
        :max-tx        max-tx
        :last-modified last-modified})))
@@ -1834,12 +1835,24 @@
   (cond
     (instance? Store store)
     (when-not (i/closed? store)
-      ;; Preserve the legacy remote open-with-schema behavior for plain stores,
-      ;; but never synthesize follower-local schema rows on HA databases.
-      (when (and schema
-                 (nil? (:ha-mode (i/opts store))))
-        (i/set-schema store schema))
-      store)
+      (let [lmdb (kv/raw-lmdb (.-lmdb ^Store store))]
+        (if (and (nil? (i/get-value lmdb c/meta :last-modified :attr :long))
+                 (empty? (i/get-range lmdb c/schema [:all] :attr :data)))
+          ;; `conn/clear` can wipe DBIs via a raw KV handle while the server
+          ;; still holds an open Datalog Store. Reopen from disk so runtime
+          ;; schema/meta state matches the cleared LMDB contents.
+          (let [env-dir (i/dir store)]
+            (close-store store)
+            (dha/recover-ha-local-store-dir-if-needed! env-dir)
+            (st/open env-dir schema))
+          (do
+            ;; Preserve the legacy remote open-with-schema behavior for plain
+            ;; stores, but never synthesize follower-local schema rows on HA
+            ;; databases.
+            (when (and schema
+                       (nil? (:ha-mode (i/opts store))))
+              (i/set-schema store schema))
+            store))))
 
     (some? store)
     (when-not (i/closed-kv? store)
@@ -1962,10 +1975,8 @@
                              #(assoc % :permissions
                                      (user-permissions sys-conn username))))
             (let [db-info (when (and return-db-info? datalog?)
-                            {:max-eid       (i/init-max-eid store)
-                             :max-tx        (i/max-tx store)
-                             :last-modified (i/last-modified store)
-                             :opts          (i/opts store)})]
+                            (assoc (fresh-runtime-db-info store)
+                                   :opts (i/opts store)))]
               (when respond?
                 (write-message skey
                                (cond-> {:type :command-complete}
