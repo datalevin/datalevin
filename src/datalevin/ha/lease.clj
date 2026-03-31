@@ -11,7 +11,11 @@
   "Pure consensus-lease helpers shared by HA control-plane adapters."
   (:require
    [clojure.string :as s]
-   [datalevin.util :as u]))
+   [datalevin.constants :as c]
+   [datalevin.ha.util :as hu]
+   [datalevin.util :as u])
+  (:import
+   [java.util.concurrent TimeUnit]))
 
 (def ^:private lease-prefix "/ha/v2/db/")
 (def ^:private lease-suffix "/lease")
@@ -99,3 +103,70 @@
    :lease-renew-ms lease-renew-ms
    :updated-ms now-ms
    :leader-last-applied-lsn (long (or leader-last-applied-lsn 0))})
+
+(defn ha-lease-local-remaining-ms
+  [m now-ms now-nanos]
+  (cond
+    (integer? (:ha-lease-local-deadline-nanos m))
+    (max 0
+         (.toMillis TimeUnit/NANOSECONDS
+                    (max 0
+                         (- (long (:ha-lease-local-deadline-nanos m))
+                            (long now-nanos)))))
+
+    (integer? (:ha-lease-local-deadline-ms m))
+    (max 0
+         (- (long (:ha-lease-local-deadline-ms m))
+            (long now-ms)))
+
+    (integer? (:ha-lease-until-ms m))
+    (max 0
+         (- (long (:ha-lease-until-ms m))
+            (long now-ms)))
+
+    :else
+    nil))
+
+(defn ha-write-admission-lease-margin-ms
+  [m]
+  (long (max 0
+             (long (or (:ha-write-admission-lease-margin-ms m)
+                       c/*ha-write-admission-lease-margin-ms*
+                       0)))))
+
+(defn ha-write-admission-lease-margin-nanos
+  [m]
+  (.toNanos TimeUnit/MILLISECONDS
+            (ha-write-admission-lease-margin-ms m)))
+
+(defn ha-clock-skew-budget-ms ^long
+  [m]
+  (long (max 0
+             (long (or (:ha-clock-skew-budget-ms m)
+                       c/*ha-clock-skew-budget-ms*
+                       0)))))
+
+(defn ha-lease-expired-for-promotion?
+  [m lease now-ms]
+  (let [lease-until-ms (:lease-until-ms lease)]
+    (or (nil? lease)
+        (nil? lease-until-ms)
+        (let [lease-until-ms (long lease-until-ms)
+              skew-budget-ms (ha-clock-skew-budget-ms m)]
+          (>= (long now-ms)
+              (hu/saturated-long-add lease-until-ms
+                                     skew-budget-ms))))))
+
+(defn ha-renew-timeout-ms ^long
+  [m now-ms now-nanos]
+  (let [lease-timeout-ms   (long (or (:ha-lease-timeout-ms m)
+                                     c/*ha-lease-timeout-ms*))
+        request-timeout-ms (long (hu/ha-request-timeout-ms m lease-timeout-ms))
+        remaining-ms       (ha-lease-local-remaining-ms m now-ms now-nanos)
+        timeout-ms         (long (if (integer? remaining-ms)
+                                   (let [remaining-ms (long remaining-ms)]
+                                     (if (< remaining-ms request-timeout-ms)
+                                       remaining-ms
+                                       request-timeout-ms))
+                                   request-timeout-ms))]
+    (if (< timeout-ms 1) 1 timeout-ms)))
