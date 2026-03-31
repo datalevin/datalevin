@@ -16,6 +16,8 @@
    [clojure.set]
    [datalevin.constants :as c :refer [e0 tx0 emax txmax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom-added datom?]]
+   [datalevin.db.tx.execute :as txexec]
+   [datalevin.db.tx.prepare :as txprep]
    [datalevin.util :as u
     :refer [case-tree defrecord-updatable conjv conjs concatv cond+]]
    [datalevin.idoc :as idoc]
@@ -1058,6 +1060,39 @@
 
 ;;;;;;;;;; Transacting
 
+(declare de-entity? de-entity->txs commit-prepared-tx-data!)
+
+(defn- prepare-deps []
+  {:ref?-fn           ref?
+   :multi-value?-fn   multi-value?
+   :multival?-fn      multival?
+   :reverse-ref?-fn   reverse-ref?
+   :reverse-ref-fn    reverse-ref
+   :tuple-attr?-fn    tuple-attr?
+   :is-attr?-fn       -is-attr?
+   :attrs-by-fn       -attrs-by
+   :entid-fn          entid
+   :entid-strict-fn   entid-strict
+   :udf-registry-fn   udf-registry
+   :de-entity?-fn     (fn [entity] (@de-entity? entity))
+   :de-entity->txs-fn (fn [entity] (@de-entity->txs entity))})
+
+(defn- execute-deps []
+  {:is-attr?-fn                -is-attr?
+   :attrs-by-fn                -attrs-by
+   :tuple-source?-fn           tuple-source?
+   :component?-fn              component?
+   :ref?-fn                    ref?
+   :multival?-fn               multival?
+   :entid-fn                   entid
+   :entid-strict-fn            entid-strict
+   :tuple-attr?-fn             tuple-attr?
+   :tuple-type?-fn             tuple-type?
+   :tuple-types?-fn            tuple-types?
+   :clear-tx-cache-fn          -clear-tx-cache
+   :commit-prepared-tx-data!-fn commit-prepared-tx-data!
+   :prepare-deps               (prepare-deps)})
+
 (def *last-auto-tempid (volatile! 0))
 
 (deftype AutoTempid [id]
@@ -1069,9 +1104,9 @@
   (binding [*out* w]
     (pr [(.-id id)])))
 
-(defn- auto-tempid [] (AutoTempid. (vswap! *last-auto-tempid u/long-inc)))
+(defn- auto-tempid [] (txprep/auto-tempid))
 
-(defn- auto-tempid? ^Boolean [x] (instance? AutoTempid x))
+(defn- auto-tempid? ^Boolean [x] (txprep/auto-tempid? x))
 
 (declare assoc-auto-tempid)
 
@@ -1145,9 +1180,7 @@
 
 (defn- tempid?
   ^Boolean [x]
-  (or (and (number? x) (neg? ^long x))
-      (string? x)
-      (auto-tempid? x)))
+  (txprep/tempid? x))
 
 (defn- new-eid? [db ^long eid] (> eid ^long (:max-eid db)))
 
@@ -1297,24 +1330,11 @@
   "Throws if not all upserts point to the same entity.
    Returns single eid that all upserts point to, or null."
   [entity upserts]
-  (vld/validate-upserts entity upserts tempid?))
+  (txprep/validate-upserts entity upserts))
 
 ;; multivals/reverse can be specified as coll or as a single value, trying to guess
 (defn- maybe-wrap-multival [db a vs]
-  (cond
-    ;; not a multival context
-    (not (or (reverse-ref? a) (multival? db a)))
-    [vs]
-
-    ;; not a collection at all, so definitely a single value
-    (not (and (coll? vs) (not (map? vs))))
-    [vs]
-
-    ;; probably lookup ref
-    (and (= (count vs) 2) (-is-attr? db (first vs) :db.unique/identity))
-    [vs]
-
-    :else vs))
+  (txprep/maybe-wrap-multival (prepare-deps) db a vs))
 
 (defn- explode [db entity]
   (let [eid  (:db/id entity)
@@ -1566,14 +1586,7 @@
   ([db target]
    (installed-udf-descriptor db nil target))
   ([db allowed target]
-   (when-some [{:keys [ident udf]} (lookup-installed-callable db target)]
-     (when udf
-       (let [descriptor (udf/descriptor udf)]
-         (vld/validate-installed-udf-ident ident descriptor
-                                           [:db/udf target])
-         (if allowed
-           (udf/ensure-kind descriptor allowed)
-           descriptor))))))
+   (txprep/installed-udf-descriptor (prepare-deps) db allowed target)))
 
 (defn- wrap-tx-udf
   [db descriptor]
@@ -1987,58 +2000,7 @@
 (defn- execute-tx-loop
   "Execute the transaction processing loop. Returns a finalized report."
   [initial-report initial-es tx-time]
-  (let [initial-report' (update initial-report :db-after -clear-tx-cache)
-        db              ^DB (:db-before initial-report)
-        initial-es'     (if (seq (-attrs-by db :db.type/tuple))
-                          (sequence
-                            (mapcat vector)
-                            initial-es (repeat ::flush-tuples))
-                          initial-es)
-        store           (.-store db)
-        schema          (schema store)]
-    (loop [report initial-report'
-           es     initial-es']
-      (cond+
-        (empty? es)
-        (finalize-report report)
-
-        :let [[entity & entities] es]
-
-        (identical? ::flush-tuples entity)
-        (let [[r' es'] (handle-flush-tuples report entities)]
-          (recur r' es'))
-
-        :let [^DB db      (:db-after report)
-              tempids (:tempids report)]
-
-        (map? entity)
-        (let [result (handle-map-entity initial-report report db entity
-                                         entities initial-es tx-time)]
-          (if (map? result)
-            result
-            (let [[r' es'] result]
-              (recur r' es'))))
-
-        (sequential? entity)
-        (let [result (handle-sequential-entity
-                       initial-report report db store schema tempids
-                       entity entities initial-es tx-time)]
-          (if (map? result)
-            result
-            (let [[r' es'] result]
-              (recur r' es'))))
-
-        (datom? entity)
-        (let [[e a v tx added] entity]
-          (if added
-            (recur (transact-add report [:db/add e a v tx]) entities)
-            (recur report (cons [:db/retract e a v] entities))))
-
-        (nil? entity)
-        (recur report entities)
-
-        :else
-        (vld/validate-tx-entity-type entity)))))
+  (txexec/execute-tx-loop (execute-deps) initial-report initial-es tx-time))
 
 (declare commit-prepared-tx-data!)
 
@@ -2046,27 +2008,8 @@
   ([initial-report initial-es tx-time]
    (local-transact-tx-data initial-report initial-es tx-time false))
   ([initial-report initial-es tx-time simulated?]
-   (let [rp (if c/*use-prepare-path*
-              (let [db    ^DB (:db-before initial-report)
-                    store (.-store db)
-                    lmdb  (when (instance? Store store)
-                            (.-lmdb ^Store store))
-                    ctx   (prepare/make-prepare-ctx db lmdb)
-                    ptx   (prepare/prepare-tx
-                             ctx initial-es tx-time
-                             (fn [es t]
-                               (execute-tx-loop initial-report es t)))]
-                (cond-> (assoc initial-report
-                               :db-after       (:db-after ptx)
-                               :tx-data        (:tx-data ptx)
-                               :tempids        (:tempids ptx))
-                  (seq (:new-attributes ptx))
-                  (assoc :new-attributes (:new-attributes ptx))))
-              (execute-tx-loop initial-report initial-es tx-time))
-         db-after ^DB (:db-after rp)]
-     (when-not simulated?
-       (commit-prepared-tx-data! db-after (:tx-data rp)))
-     rp)))
+   (txexec/local-transact-tx-data
+     (execute-deps) initial-report initial-es tx-time simulated?)))
 
 (defn ^:no-doc commit-prepared-tx-data!
   "Persist already prepared tx-data to the given DB store."
@@ -2108,45 +2051,15 @@
 
 (defn- expand-transactable-entity
   [entity]
-  (if (@de-entity? entity)
-    (@de-entity->txs entity)
-    [entity]))
+  (txprep/expand-transactable-entity (prepare-deps) entity))
 
 (defn- update-entity-time
   [entity tx-time]
-  (cond
-    (map? entity)
-    [(assoc entity :db/updated-at tx-time)]
-
-    (sequential? entity)
-    (let [[op e _ _] entity]
-      (if (or (identical? op :db/retractEntity)
-              (identical? op :db.fn/retractEntity))
-        [entity]
-        [entity [:db/add e :db/updated-at tx-time]]))
-
-    (datom? entity)
-    (let [e (d/datom-e entity)]
-      [entity [:db/add e :db/updated-at tx-time]])
-
-    (nil? entity)
-    []
-
-    :else
-    (vld/validate-tx-entity-type entity)))
+  (txprep/update-entity-time entity tx-time))
 
 (defn- prepare-entities
   [^DB db entities tx-time]
-  (let [aat #(assoc-auto-tempid db %)
-        uet #(update-entity-time % tx-time)]
-    (sequence
-      (if (:auto-entity-time? (opts (.-store db)))
-        (comp (mapcat expand-transactable-entity)
-           (map aat)
-           (mapcat uet))
-        (comp (mapcat expand-transactable-entity)
-           (map aat)))
-      entities)))
+  (txprep/prepare-entities (prepare-deps) db entities tx-time))
 
 (def ^:private blind-write-unsupported
   ::blind-write-unsupported)
