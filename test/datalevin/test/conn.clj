@@ -394,8 +394,8 @@
            (remove str/blank?)
            first))
 
-(def ^:private wal-child-ready-timeout-ms 15000)
 (def ^:private wal-child-process-timeout-ms 30000)
+(def ^:private wal-child-ready-timeout-ms 30000)
 
 (defn- process-output
   [^Process process]
@@ -428,6 +428,41 @@
          :reason :timeout
          :timeout-ms timeout-ms
          :output (process-output process)}))))
+
+(defn- wait-for-child-ready
+  [^Process process ready-path timeout-ms]
+  (let [deadline-ms (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop []
+      (cond
+        (u/file-exists ready-path)
+        {:ready? true}
+
+        (not (.isAlive process))
+        (let [{:keys [exit output result]}
+              (child-process-result process 0)
+              last-line (last-nonblank-line output)]
+          {:ready? false
+           :reason :exited
+           :message
+           (str "child exited before signaling ready"
+                " exit=" exit
+                (when result
+                  (str " result=" (pr-str result)))
+                (when last-line
+                  (str " last-line=" last-line))
+                (when-not (str/blank? output)
+                  (str "\n" output)))})
+
+        (>= (System/currentTimeMillis) deadline-ms)
+        {:ready? false
+         :reason :timeout
+         :message (str "timed out waiting " timeout-ms
+                       "ms for child ready file " ready-path)}
+
+        :else
+        (do
+          (Thread/sleep 25)
+          (recur))))))
 
 (defn- start-clojure-child!
   [form]
@@ -561,8 +596,11 @@
           (let [child (start-clojure-child!
                        (wal-child-overlap-form dir opts ready-path release-path))]
             (try
-              (is (wait-until #(u/file-exists ready-path)
-                              wal-child-ready-timeout-ms))
+              (let [ready-state (wait-for-child-ready child
+                                                      ready-path
+                                                      wal-child-ready-timeout-ms)]
+                (is (:ready? ready-state)
+                    (:message ready-state)))
               (is (= :transacted
                      (d/transact-kv db1 [[:put "a" :k1 :v1]])))
               (spit release-path "go")
