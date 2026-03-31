@@ -79,14 +79,17 @@ a document database, similar to MongoDB or PostgreSQL JSONB column.
 
 Datalevin supports [vector database](doc/vector.md) features by integrating an
 efficient SIMD accelerated vector indexing and search
-[library](https://github.com/unum-cloud/usearch). Datalevin has a [novel
-full-text search engine](doc/search.md) that has
-[competitive](benchmarks/search-bench) search performance.
+[library](https://github.com/unum-cloud/usearch). Datalevin also
+integrates , so it it natively
+supports embedding, OCR and generation. Datalevin has a [novel full-text search
+engine](doc/search.md) that has [competitive](benchmarks/search-bench) search
+performance.
 
-Datalevin is also AI-native. It ships with a built-in local
-[MCP server](doc/mcp.md) and an in-db embedding service backed by local
-`llama.cpp`, so AI clients can query Datalevin over MCP while applications keep
-embedding generation and search in the same database runtime.
+Datalevin is also AI-native. It ships with a built-in local [MCP
+server](doc/mcp.md). Datalevin supports in-DB embedding, OCR and text generation
+with built-in [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama.cpp`, so
+AI clients can query Datalevin over MCP while RAG applications keep embedding
+generation and search in the same database runtime.
 
 Datalevin can be used as a fast key-value store for
 [EDN](https://en.wikipedia.org/wiki/Extensible_Data_Notation) data. The native
@@ -96,8 +99,10 @@ Datalevin can be used as a library, embedded in applications written in Java,
 Python, Node.js or Clojure, to manage state, e.g. used like SQLite; or it can
 run in a networked
 [client/server](https://github.com/datalevin/datalevin/blob/master/doc/server.md)
-mode (default port is 8898) with full-fledged role-based access control (RBAC)
-on the server, e.g. used like PostgreSQL; or it can be used as a [babashka
+mode (default port is 8898) with a Raft concensus based high availability
+clustering configuration. Datalevin server has full-fledged role-based access
+control (RBAC) on the server, e.g. used like PostgreSQL; or it can be used as a
+[babashka
 pod](https://github.com/babashka/pod-registry/blob/master/examples/datalevin.clj)
 for shell scripting.
 
