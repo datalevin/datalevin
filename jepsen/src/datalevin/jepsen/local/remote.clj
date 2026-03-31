@@ -562,6 +562,17 @@
      :stopped-node-info {}
      :teardown-nodes  #{}}))
 
+(defn- launch-node-stages
+  [topology]
+  (let [control-only-nodes (vec (:control-only-nodes topology))
+        data-node-names    (set (map :logical-node (:data-nodes topology)))
+        data-launch-nodes  (vec (filter #(contains? data-node-names
+                                                   (:logical-node %))
+                                        (:control-nodes topology)))]
+    (cond-> []
+      (seq control-only-nodes) (conj control-only-nodes)
+      (seq data-launch-nodes) (conj data-launch-nodes))))
+
 (defn init-remote-cluster!
   [{:keys [clusters cluster-setup-timeout-ms wait-for-single-leader!
            cluster-timeout-ms] :as deps}
@@ -580,6 +591,7 @@
         base-opts        (remote/base-ha-opts config* data-nodes control-nodes)
         setup-timeout-ms (cluster-setup-timeout-ms base-opts)
         verbose?         (boolean (:verbose test))
+        launch-stages    (launch-node-stages topology)
         all-nodes        (vec control-nodes)]
     (try
       (doseq [node all-nodes]
@@ -588,17 +600,19 @@
         (safe-stop-remote-launcher! deps ssh (remote-node-repo-root config node) node))
       (doseq [node all-nodes]
         (sync-remote-node-control-defaults! deps ssh node))
-      (doseq [node all-nodes]
-        (start-remote-node-launcher! deps
-                                     ssh
-                                     (remote-node-repo-root config node)
-                                     node
-                                     verbose?))
-      (doseq [node all-nodes]
-        (wait-for-remote-node-running! (assoc deps :now-ms now-ms)
+      (doseq [nodes launch-stages
+              :when (seq nodes)]
+        (doseq [node nodes]
+          (start-remote-node-launcher! deps
                                        ssh
+                                       (remote-node-repo-root config node)
                                        node
-                                       setup-timeout-ms))
+                                       verbose?))
+        (doseq [node nodes]
+          (wait-for-remote-node-running! (assoc deps :now-ms now-ms)
+                                         ssh
+                                         node
+                                         setup-timeout-ms)))
       (let [cluster (build-remote-cluster-state cluster-id
                                                 config*
                                                 config-path

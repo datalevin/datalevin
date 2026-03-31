@@ -6,6 +6,7 @@
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.integration-harness :as harness]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.local.remote :as lremote]
    [datalevin.jepsen.remote :as remote]
    [datalevin.jepsen.remote-node :as remote-node]
    [datalevin.jepsen.workload.witness-topology :as witness-topology]
@@ -681,6 +682,19 @@
                   (jdb/teardown! db test-map node-name))))
             (is (nil? (local/cluster-state cluster-id)))
             (is (nil? (local/remote-runtime-node db-identity 1)))))))))
+
+(deftest init-remote-cluster-starts-control-only-witnesses-before-data-nodes-test
+  (with-temp-controller-remote-config
+    (fn [config config-path]
+      (let [config    (remote/validate-config! config core/workloads)
+            workload  (remote/config-workload config core/workloads)
+            topology  (remote/workload-topology config workload)
+            stages    (#'lremote/launch-node-stages topology)]
+        (is (= [["n2" "n3"]
+                ["n1"]]
+               (mapv (fn [stage]
+                       (mapv :logical-node stage))
+                     stages)))))))
 
 (deftest controller-managed-mixed-local-remote-cluster-lifecycle-test
   (with-temp-controller-remote-config

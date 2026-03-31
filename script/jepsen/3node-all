@@ -1,0 +1,265 @@
+#!/bin/bash
+
+set -euo pipefail
+
+repo_root="$(cd "$(dirname "$0")/../.." && pwd)"
+
+default_steps=(
+  failover
+  kill
+  pause
+  pause-any
+  pause-multi
+  partition
+  asymmetric
+  degraded
+  io-stall
+  disk-full
+  rejoin
+  quorum
+  clock-skew
+  clock-leader-fast
+  clock-leader-slow
+  clock-mixed
+  combo-clock-skew-failover
+  combo-degraded-rejoin
+)
+
+usage() {
+  cat <<'EOF'
+Usage: script/jepsen/3node-all [step ...] [-- extra-jepsen-args]
+
+Runs the full local 3-node Jepsen sweep used for Datalevin regression passes.
+By default it executes the standard wrapper sequence:
+
+  failover
+  kill
+  pause
+  pause-any
+  pause-multi
+  partition
+  asymmetric
+  degraded
+  io-stall
+  disk-full
+  rejoin
+  quorum
+  clock-skew
+  clock-leader-fast
+  clock-leader-slow
+  clock-mixed
+  combo-clock-skew-failover
+  combo-degraded-rejoin
+
+Examples:
+  script/jepsen/3node-all
+  script/jepsen/3node-all quorum clock-leader-slow
+  script/jepsen/3node-all -- --time-limit 15 --rate 10
+  script/jepsen/3node-all failover rejoin -- --keep-work-dir
+
+Options:
+  --list     Print the available step names
+  -h, --help Show this help text
+
+Environment overrides:
+  DTLV_JEPSEN_3NODE_ALL_STREAM_LOGS=1
+      Stream wrapper output to stdout while also writing the driver log.
+
+  DTLV_JEPSEN_3NODE_ALL_LOG=/tmp/custom.log
+      Override the default driver log path.
+EOF
+}
+
+list_steps() {
+  printf '%s\n' "${default_steps[@]}"
+}
+
+known_step() {
+  local candidate="$1"
+  local step
+  for step in "${default_steps[@]}"; do
+    if [[ "$step" == "$candidate" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+quote_cmd() {
+  local rendered=""
+  printf -v rendered '%q ' "$@"
+  printf '%s' "${rendered% }"
+}
+
+build_step_command() {
+  local step="$1"
+
+  step_cmd=()
+
+  case "$step" in
+    failover)
+      step_cmd=(script/jepsen/failover-workloads)
+      ;;
+    kill)
+      step_cmd=(script/jepsen/kill-workloads)
+      ;;
+    pause)
+      step_cmd=(script/jepsen/pause-workloads)
+      ;;
+    pause-any)
+      step_cmd=(script/jepsen/pause-any-workloads)
+      ;;
+    pause-multi)
+      step_cmd=(script/jepsen/pause-multi-workloads)
+      ;;
+    partition)
+      step_cmd=(script/jepsen/partition-workloads)
+      ;;
+    asymmetric)
+      step_cmd=(script/jepsen/asymmetric-workloads)
+      ;;
+    degraded)
+      step_cmd=(script/jepsen/degraded-workloads)
+      ;;
+    io-stall)
+      step_cmd=(script/jepsen/io-stall-workloads)
+      ;;
+    disk-full)
+      step_cmd=(script/jepsen/disk-full-workloads)
+      ;;
+    rejoin)
+      step_cmd=(script/jepsen/rejoin-workloads)
+      ;;
+    quorum)
+      step_cmd=(script/jepsen/quorum-workloads)
+      ;;
+    clock-skew)
+      step_cmd=(script/jepsen/clock-workloads clock-skew)
+      ;;
+    clock-leader-fast)
+      step_cmd=(script/jepsen/clock-workloads clock-leader-fast)
+      ;;
+    clock-leader-slow)
+      step_cmd=(script/jepsen/clock-workloads clock-leader-slow)
+      ;;
+    clock-mixed)
+      step_cmd=(script/jepsen/clock-workloads clock-mixed)
+      ;;
+    combo-clock-skew-failover)
+      step_cmd=(script/jepsen/combo-workloads clock-skew,failover --all-workloads)
+      ;;
+    combo-degraded-rejoin)
+      step_cmd=(script/jepsen/combo-workloads degraded,rejoin --all-workloads)
+      ;;
+    *)
+      echo "Unknown step: $step" >&2
+      exit 2
+      ;;
+  esac
+
+  if [[ ${#extra_args[@]} -gt 0 ]]; then
+    step_cmd+=(-- "${extra_args[@]}")
+  fi
+}
+
+selected_steps=()
+extra_args=()
+
+while (($#)); do
+  case "$1" in
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --list)
+      list_steps
+      exit 0
+      ;;
+    --)
+      shift
+      extra_args=("$@")
+      break
+      ;;
+    *)
+      if ! known_step "$1"; then
+        echo "Unknown step: $1" >&2
+        echo >&2
+        usage >&2
+        exit 2
+      fi
+      selected_steps+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ${#selected_steps[@]} -eq 0 ]]; then
+  selected_steps=("${default_steps[@]}")
+fi
+
+run_id="$(date +%Y%m%dT%H%M%S)"
+log_file="${DTLV_JEPSEN_3NODE_ALL_LOG:-/tmp/jepsen-3node-all-${run_id}.log}"
+stream_logs="${DTLV_JEPSEN_3NODE_ALL_STREAM_LOGS:-0}"
+
+status=0
+passed_steps=()
+failed_steps=()
+
+mkdir -p "$(dirname "$log_file")"
+
+{
+  echo "RUN_ID=$run_id"
+  echo "LOG=$log_file"
+  echo "STARTED_AT=$(date +%Y-%m-%dT%H:%M:%S%:z)"
+} > "$log_file"
+
+for step in "${selected_steps[@]}"; do
+  build_step_command "$step"
+  step_display="$(quote_cmd "${step_cmd[@]}")"
+
+  echo ">>> $step_display" | tee -a "$log_file"
+
+  if [[ "$stream_logs" == "1" ]]; then
+    if (
+      cd "$repo_root"
+      "${step_cmd[@]}"
+    ) 2>&1 | tee -a "$log_file"; then
+      rc=0
+    else
+      rc=$?
+    fi
+  else
+    if (
+      cd "$repo_root"
+      "${step_cmd[@]}"
+    ) >>"$log_file" 2>&1; then
+      rc=0
+    else
+      rc=$?
+    fi
+  fi
+
+  if [[ "$rc" == "0" ]]; then
+    passed_steps+=("$step")
+    echo "<<< OK $step_display" | tee -a "$log_file"
+  else
+    failed_steps+=("$step")
+    status=1
+    echo "<<< FAIL rc=$rc $step_display" | tee -a "$log_file"
+  fi
+done
+
+{
+  echo "PASSED_COUNT=${#passed_steps[@]}"
+  echo "FAILED_COUNT=${#failed_steps[@]}"
+  if [[ ${#passed_steps[@]} -gt 0 ]]; then
+    echo "PASSED_STEPS=${passed_steps[*]}"
+  fi
+  if [[ ${#failed_steps[@]} -gt 0 ]]; then
+    echo "FAILED_STEPS=${failed_steps[*]}"
+  fi
+  echo "FINISHED_AT=$(date +%Y-%m-%dT%H:%M:%S%:z)"
+  echo "EXIT=$status"
+} >> "$log_file"
+
+exit "$status"
