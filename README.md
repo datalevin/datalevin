@@ -106,6 +106,10 @@ control (RBAC) on the server, e.g. used like PostgreSQL; or it can be used as a
 pod](https://github.com/babashka/pod-registry/blob/master/examples/datalevin.clj)
 for shell scripting.
 
+For embedded usage, start with the [Java bindings README](examples/java/README.md),
+[Python bindings README](bindings/python/README.md), or
+[Node.js bindings README](bindings/javascript/README.md).
+
 More information about our vision and design decisions can be found in these
 articles and presentation:
 
