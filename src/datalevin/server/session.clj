@@ -16,6 +16,7 @@
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
+   [java.nio.channels Selector SelectionKey]
    [java.util Map UUID]
    [java.util.concurrent ConcurrentHashMap]))
 
@@ -165,11 +166,11 @@
 (defn disconnect-client*
   [deps server client-id]
   (remove-client deps server client-id)
-  (let [selector ((:selector-fn deps) server)]
+  (let [^Selector selector ((:selector-fn deps) server)]
     (when (.isOpen selector)
-      (doseq [^java.nio.channels.SelectionKey k (.keys selector)
-              :let                               [state (.attachment k)]
-              :when                              state]
+      (doseq [^SelectionKey k (.keys selector)
+              :let            [state (.attachment k)]
+              :when           state]
         (when (= client-id (@state :client-id))
           ((:close-conn-fn deps) k))))))
 
@@ -203,7 +204,7 @@
 
 (defn remove-idle-sessions
   [deps server]
-  (let [timeout ((:idle-timeout-fn deps) server)
+  (let [^long timeout ((:idle-timeout-fn deps) server)
         clients ((:clients-fn deps) server)]
     (doseq [[client-id session] clients
             :let                [{:keys [last-active]} session]]

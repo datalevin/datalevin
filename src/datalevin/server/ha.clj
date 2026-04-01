@@ -22,6 +22,7 @@
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
+   [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent CountDownLatch ExecutorService Future Semaphore
     TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]
@@ -904,7 +905,7 @@
   [deps server message f]
   (let [write?  (dha/ha-write-message? message)
         db-name (nth (:args message) 0 nil)
-        dbs     ((:dbs-fn deps) server)]
+        ^ConcurrentHashMap dbs ((:dbs-fn deps) server)]
     (if (and write? db-name (.containsKey dbs db-name))
       ;; This request-time gate is a cached-state fast path only. The
       ;; authoritative HA check runs again at commit, so one-shot writes do
