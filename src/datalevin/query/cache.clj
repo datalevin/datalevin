@@ -15,6 +15,7 @@
    [datalevin.interface :refer [db-name dir]]
    [datalevin.lmdb :as l]
    [datalevin.parser :as dp]
+   [datalevin.query.execute :as qexec]
    [datalevin.query.resolve :as qresolve])
   (:import
    [datalevin.db DB]
@@ -24,17 +25,14 @@
 
 (def ^:dynamic *query-cache* (LRUCache. c/query-result-cache-size))
 
-(def ^:dynamic *cache-deps* nil)
-
-(defn- dep [k]
-  (get *cache-deps* k))
+(def ^:dynamic *cache?* true)
 
 (defn- run-query
   [parsed-q inputs]
-  ((dep :q*) parsed-q inputs))
+  (qexec/q* parsed-q inputs))
 
 (defn- cache-enabled? []
-  (boolean ((dep :cache-enabled?))))
+  (boolean *cache?*))
 
 (defn parsed-q
   [q]
