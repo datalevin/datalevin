@@ -14,6 +14,7 @@
    [clojure.java.io :as io]
    [clojure.string :as str]
    [datalevin.bits :as b]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.constants :as c]
    [datalevin.datom :as dd]
    [datalevin.interface :as i]
@@ -2699,7 +2700,13 @@
       (let [pending (txlog-pending-rows info-v)]
         (try
           (if (pos? (.size ^java.util.List pending))
-            (let [append-res (txlog/append-durable!
+            ;; HA commit admission cannot safely reject after we append durable
+            ;; txn-log payload, because followers may replay the payload even if
+            ;; the local LMDB commit is later aborted. Run the hook before the
+            ;; append and suppress the lower-level duplicate invocation.
+            (let [_ (when-let [f cpp/*before-write-commit-fn*]
+                      (f {:operation :close-transact-kv}))
+                  append-res (txlog/append-durable!
                               state pending txlog-append-hooks)
                   state (refresh-runtime-marker-revision! lmdb state)
                   marker-entry (txlog/next-commit-marker-entry
@@ -2712,7 +2719,8 @@
               (try
                 (when (pos? (.size ^FastList commit-rows))
                   (apply-lmdb-after-txlog-append! lmdb state commit-rows))
-                (let [status (i/close-transact-kv lmdb)]
+                (let [status (binding [cpp/*before-write-commit-fn* nil]
+                               (i/close-transact-kv lmdb))]
                   (when (= status :committed)
                     (txlog/commit-finished! state marker-entry)
                     (txlog/publish-meta-commit! state append-res))

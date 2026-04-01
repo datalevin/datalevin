@@ -319,7 +319,12 @@
           (catch Throwable e
             (if (multiple-lmdb-open-error? e)
               false
-              (throw e)))))))
+              ;; This probe only answers whether the stopped node still holds
+              ;; the LMDB lock. Full store reopen can legitimately fail here
+              ;; if the node will need bootstrap/recovery on the next start,
+              ;; and surfacing that during stop/restart orchestration blocks
+              ;; the intended repair path.
+              true))))))
 
 (defn wait-for-node-store-released!
   [{:keys [clusters]} cluster-id logical-node timeout-ms]

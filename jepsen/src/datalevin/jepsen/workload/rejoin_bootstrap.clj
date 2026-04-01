@@ -445,12 +445,6 @@
                                                             key-count
                                                             1000
                                                             follower-next-lsn)
-        _                 (local/wait-for-live-nodes-at-least-lsn!
-                           cluster-id
-                           follower-next-lsn
-                           converge-timeout-ms)
-        source-leader     (:leader (local/wait-for-single-leader! cluster-id
-                                                                  converge-timeout-ms))
         source-nodes      (->> (get-in (local/cluster-state cluster-id)
                                        [:live-nodes])
                                (remove #{logical-node})
@@ -460,6 +454,14 @@
                             (throw (ex-info "No live Jepsen source nodes available for bootstrap"
                                             {:cluster-id cluster-id
                                              :logical-node logical-node})))
+        _                 (local/wait-for-at-least-nodes-at-least-lsn!
+                           cluster-id
+                           source-nodes
+                           follower-next-lsn
+                           1
+                           converge-timeout-ms)
+        source-leader     (:leader (local/wait-for-single-leader! cluster-id
+                                                                  converge-timeout-ms))
         snapshot-1        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)
         min-snapshot-lsn  (apply min
@@ -477,9 +479,11 @@
                                                             key-count
                                                             (:next-start-value phase-1)
                                                             phase-2-target-lsn)
-        _                 (local/wait-for-live-nodes-at-least-lsn!
+        _                 (local/wait-for-at-least-nodes-at-least-lsn!
                            cluster-id
+                           source-nodes
                            phase-2-target-lsn
+                           1
                            converge-timeout-ms)
         snapshot-2        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)

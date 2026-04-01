@@ -695,7 +695,7 @@
       (finally
         (u/delete-files dir)))))
 
-(deftest test-wal-recovers-child-process-commit-failure-before-lmdb-commit
+(deftest test-wal-rejects-child-process-commit-before-txlog-append
   (let [dir  (u/tmp-dir (str "wal-child-commit-failure-test-"
                              (UUID/randomUUID)))
         opts {:wal? true
@@ -725,18 +725,17 @@
           (d/open-dbi db "a")
           (is (= :v1
                  (d/get-value db "a" :k1)))
-          (is (= :v2
-                 (d/get-value db "a" :k2)))
-          (is (= [1 2]
+          (is (nil? (d/get-value db "a" :k2)))
+          (is (= [1]
                  (mapv :lsn (kv/open-tx-log db 1))))
-          (is (= 2
+          (is (= 1
                  (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
-          (is (= 2
+          (is (= 1
                  (:last-applied-lsn (kv/txlog-watermarks db))))
           (is (:ok? (kv/verify-commit-marker! db)))
           (is (= :transacted
                  (d/transact-kv db [[:put "a" :k3 :v3]])))
-          (is (= [1 2 3]
+          (is (= [1 2]
                  (mapv :lsn (kv/open-tx-log db 1))))
           (is (= :v3
                  (d/get-value db "a" :k3)))
@@ -745,7 +744,7 @@
       (finally
         (u/delete-files dir)))))
 
-(deftest test-wal-recovers-after-commit-failure-before-lmdb-commit
+(deftest test-wal-rejects-commit-before-txlog-append
   (let [dir  (u/tmp-dir (str "wal-cross-process-recovery-test-"
                              (UUID/randomUUID)))
         opts {:wal? true
@@ -770,13 +769,11 @@
       (let [db (d/open-kv dir opts)]
         (try
           (d/open-dbi db "a")
-          (is (= :v
-                 (d/get-value db "a" :k)))
-          (is (= [1]
+          (is (nil? (d/get-value db "a" :k)))
+          (is (= []
                  (mapv :lsn (kv/open-tx-log db 1))))
-          (is (= 1
-                 (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
-          (is (= 1
+          (is (nil? (get-in (kv/read-commit-marker db) [:current :applied-lsn])))
+          (is (= 0
                  (:last-applied-lsn (kv/txlog-watermarks db))))
           (is (:ok? (kv/verify-commit-marker! db)))
           (finally
