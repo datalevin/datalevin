@@ -10,6 +10,7 @@
 (ns datalevin.client
   "Datalevin client to Datalevin server, blocking API, with a connection pool"
   (:require
+   [datalevin.datom :as dd]
    [datalevin.util :as u]
    [datalevin.constants :as c]
    [clojure.string :as s]
@@ -538,12 +539,47 @@
     (and client
          (.get ha-retry-disabled-clients client))))
 
+(defn- sanitize-error-data
+  [x]
+  (cond
+    (dd/datom? x)
+    {:e     (dd/datom-e x)
+     :a     (dd/datom-a x)
+     :v     (dd/datom-v x)
+     :tx    (dd/datom-tx x)
+     :added (dd/datom-added x)}
+
+    (map? x)
+    (into {}
+          (map (fn [[k v]]
+                 [(sanitize-error-data k)
+                  (sanitize-error-data v)]))
+          x)
+
+    (instance? java.util.Map x)
+    (sanitize-error-data (into {} x))
+
+    (vector? x)
+    (mapv sanitize-error-data x)
+
+    (set? x)
+    (into #{} (map sanitize-error-data) x)
+
+    (sequential? x)
+    (mapv sanitize-error-data x)
+
+    (instance? java.util.Collection x)
+    (mapv sanitize-error-data x)
+
+    :else
+    x))
+
 (defn- raise-normal-request-error
   [req message err-data extra-data]
   (u/raise "Request to Datalevin server failed: "
            message
            (merge req
-                  {:err-data err-data
+                  {:err-data (sanitize-error-data err-data)
                    :server-message message}
                   extra-data)))
 
