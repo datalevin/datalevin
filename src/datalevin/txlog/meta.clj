@@ -225,12 +225,11 @@
                          target-path {:allow-preallocated-tail? true})
             scan-end-offset (long (seg/segment-end-offset target-scan))
             meta-segment-offset (long (or (:segment-offset meta-state) 0))
-            target-offset (long
-                           (if (= target-segment-id meta-segment-id)
-                             (if (< scan-end-offset meta-segment-offset)
-                               meta-segment-offset
-                               scan-end-offset)
-                             scan-end-offset))
+            ;; Meta can be ahead of the actual segment bytes after snapshot
+            ;; restore or other recovery fallback paths. Never resume appends at
+            ;; the higher meta offset or the next write will create a zero-filled
+            ;; hole that later segment scans report as corruption.
+            target-offset (long scan-end-offset)
             target-last-lsn (long (or (some-> (:records target-scan) peek :lsn) 0))
             committed-lsn (max (long (or (:last-committed-lsn meta-state) 0))
                                target-last-lsn)

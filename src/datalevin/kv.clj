@@ -2735,6 +2735,13 @@
                 (txlog-reset-pending! info-v))
               status))
           (catch Exception e
+            (when (write-txn-open? lmdb)
+              (try
+                (i/abort-transact-kv lmdb)
+                (catch Exception _))
+              (try
+                (i/close-transact-kv lmdb)
+                (catch Exception _)))
             (when-not (write-txn-open? lmdb)
               (txlog-reset-pending! info-v))
             (throw e))))

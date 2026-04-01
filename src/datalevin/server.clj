@@ -169,16 +169,21 @@
   (loop [attempt 0]
     (let [store (get-store server db-name)
           kv-store (get-kv-store server db-name)
+          tx-lock (l/write-txn kv-store)
           result (locking kv-store
-                   (try
-                     {:ok? true
-                      :store store
-                      :kv-store kv-store
-                      :wlmdb (i/open-transact-kv kv-store)}
-                     (catch Throwable t
-                       {:ok? false
+                   ;; Keep explicit write-txn opens on the same LMDB monitor as
+                   ;; txlog floor bookkeeping and `with-transaction-kv` so
+                   ;; background one-shot writes cannot race shared write state.
+                   (locking tx-lock
+                     (try
+                       {:ok? true
                         :store store
-                        :error t})))]
+                        :kv-store kv-store
+                        :wlmdb (i/open-transact-kv kv-store)}
+                       (catch Throwable t
+                         {:ok? false
+                          :store store
+                          :error t}))))]
       (if (:ok? result)
         result
         (let [t (:error result)]

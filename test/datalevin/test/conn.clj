@@ -9,6 +9,7 @@
    [datalevin.conn :as dc]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.interface :as i]
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
    [datalevin.util :as u])
@@ -781,6 +782,43 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-explicit-write-transaction-rejects-commit-before-txlog-append
+  (let [dir  (u/tmp-dir (str "wal-explicit-write-transaction-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true
+              :wal-commit-marker? true
+              :snapshot-bootstrap-force? false
+              :wal-durability-profile :strict}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (let [wdb (i/open-transact-kv db)]
+            (is (= :transacted
+                   (d/transact-kv wdb [[:put "a" :k :v]])))
+            (is (thrown-with-msg?
+                 Exception
+                 #"forced commit failure"
+                 (binding [cpp/*before-write-commit-fn*
+                           (fn [ctx]
+                             (when (= (:operation ctx) :close-transact-kv)
+                               (throw (ex-info "forced commit failure"
+                                               {:type ::forced-commit-failure}))))]
+                   (i/close-transact-kv db)))))
+          (is (nil? (d/get-value db "a" :k)))
+          (is (= []
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k2 :v2]])))
+          (is (= :v2
+                 (d/get-value db "a" :k2)))
+          (is (= [1]
+                 (mapv :lsn (kv/open-tx-log db 1))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-wal-open-failure-still-allows-reopen
   (let [dir                    (u/tmp-dir (str "wal-process-lock-failure-test-"
                                                (UUID/randomUUID)))
@@ -854,6 +892,58 @@
                  (d/transact-kv db [[:put "a" :k3 :v3]])))
           (is (= :v3
                  (d/get-value db "a" :k3)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-refresh-shared-state-clamps-stale-meta-segment-offset
+  (let [dir       (u/tmp-dir (str "wal-stale-meta-offset-test-"
+                                  (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")
+        opts      {:wal? true}
+        segment-path
+        (fn []
+          (->> (or (u/list-files txlog-dir) [])
+               (map #(.getPath ^java.io.File %))
+               (filter #(str/ends-with? % ".wal"))
+               sort
+               last))]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k1 :v1]])))
+          (finally
+            (d/close-kv db))))
+      (let [path (segment-path)]
+        (is (string? path))
+        ;; Leave the WAL meta file intact but wipe the active segment bytes to
+        ;; simulate recovery paths where metadata survives while the segment
+        ;; tail is rebuilt from scratch.
+        (with-open [raf (java.io.RandomAccessFile. ^String path "rw")]
+          (.setLength raf 0)))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :v1
+                 (d/get-value db "a" :k1)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k2 :v2]])))
+          (finally
+            (d/close-kv db))))
+      (let [path (segment-path)]
+        (with-open [raf (java.io.RandomAccessFile. ^String path "r")]
+          (let [magic (byte-array 4)]
+            (is (= 4 (.read raf magic)))
+            (is (= [0x44 0x4c 0x57 0x4c]
+                   (mapv (fn [b] (bit-and 0xff (int b))) magic))))))
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :v2
+                 (d/get-value db "a" :k2)))
           (finally
             (d/close-kv db))))
       (finally

@@ -23,8 +23,8 @@
    [taoensso.timbre :as log])
   (:import
    [java.util.concurrent ConcurrentHashMap]
-   [java.util.concurrent CountDownLatch ExecutorService Future Semaphore
-    TimeUnit]
+   [java.util.concurrent CountDownLatch ExecutorService Future FutureTask
+    Semaphore TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]
    [datalevin.storage Store]))
 
@@ -667,7 +667,9 @@
 
 (defn ensure-ha-renew-loop
   [deps server db-name]
-  (let [new-running-v (volatile! nil)]
+  (let [new-running-v (volatile! nil)
+        new-future-v  (volatile! nil)
+        stopped-latch-v (volatile! nil)]
     ((:update-db-fn deps)
      server
      db-name
@@ -686,38 +688,53 @@
                (when (instance? AtomicBoolean running?)
                  (.set ^AtomicBoolean running? false))
                (let [new-running?  (AtomicBoolean. true)
-                     stopped-latch (CountDownLatch. 1)]
+                     stopped-latch (CountDownLatch. 1)
+                     future-task
+                     (FutureTask.
+                      ^Runnable #(run-ha-renew-loop
+                                   deps
+                                   server
+                                   db-name
+                                   new-running?
+                                   stopped-latch)
+                      nil)]
                  (vreset! new-running-v new-running?)
+                 (vreset! new-future-v future-task)
+                 (vreset! stopped-latch-v stopped-latch)
                  (assoc m
                         :ha-renew-loop-running? new-running?
                         :ha-renew-loop-stopped-latch stopped-latch
-                        :ha-renew-loop-future nil)))))
+                        :ha-renew-loop-future future-task)))))
          m)))
-    (when-let [running? @new-running-v]
-      (let [stopped-latch
-            (get-in ((:dbs-fn deps) server)
-                    [db-name :ha-renew-loop-stopped-latch])
-            future (.submit ^ExecutorService
-                            ((:work-executor-fn deps) server)
-                            ^Runnable #(run-ha-renew-loop
-                                         deps
-                                         server
-                                         db-name
-                                         running?
-                                         stopped-latch))]
-        ((:update-db-fn deps)
-         server
-         db-name
-         (fn [m]
-           (if (and m
-                    (identical? running?
-                                (:ha-renew-loop-running? m)))
-             (assoc m :ha-renew-loop-future future)
-             m)))))))
+    (when-let [^FutureTask future @new-future-v]
+      (try
+        (.execute ^ExecutorService ((:work-executor-fn deps) server) future)
+        (catch Throwable t
+          (when-let [^AtomicBoolean running? @new-running-v]
+            (.set running? false))
+          (when-let [^CountDownLatch stopped-latch @stopped-latch-v]
+            (.countDown stopped-latch))
+          (.cancel future true)
+          ((:update-db-fn deps)
+           server
+           db-name
+           (fn [m]
+             (if (and m
+                      (identical? @new-running-v
+                                  (:ha-renew-loop-running? m))
+                      (identical? future
+                                  (:ha-renew-loop-future m)))
+               (assoc m
+                      :ha-renew-loop-future nil
+                      :ha-renew-loop-stopped-latch nil)
+               m)))
+          (throw t))))))
 
 (defn ensure-ha-follower-sync-loop
   [deps server db-name]
-  (let [new-running-v (volatile! nil)]
+  (let [new-running-v (volatile! nil)
+        new-future-v  (volatile! nil)
+        stopped-latch-v (volatile! nil)]
     ((:update-db-fn deps)
      server
      db-name
@@ -736,34 +753,47 @@
                (when (instance? AtomicBoolean running?)
                  (.set ^AtomicBoolean running? false))
                (let [new-running?  (AtomicBoolean. true)
-                     stopped-latch (CountDownLatch. 1)]
+                     stopped-latch (CountDownLatch. 1)
+                     future-task
+                     (FutureTask.
+                      ^Runnable #(run-ha-follower-sync-loop
+                                   deps
+                                   server
+                                   db-name
+                                   new-running?
+                                   stopped-latch)
+                      nil)]
                  (vreset! new-running-v new-running?)
+                 (vreset! new-future-v future-task)
+                 (vreset! stopped-latch-v stopped-latch)
                  (assoc m
                         :ha-follower-loop-running? new-running?
                         :ha-follower-loop-stopped-latch stopped-latch
-                        :ha-follower-loop-future nil)))))
+                        :ha-follower-loop-future future-task)))))
          m)))
-    (when-let [running? @new-running-v]
-      (let [stopped-latch
-            (get-in ((:dbs-fn deps) server)
-                    [db-name :ha-follower-loop-stopped-latch])
-            future (.submit ^ExecutorService
-                            ((:work-executor-fn deps) server)
-                            ^Runnable #(run-ha-follower-sync-loop
-                                         deps
-                                         server
-                                         db-name
-                                         running?
-                                         stopped-latch))]
-        ((:update-db-fn deps)
-         server
-         db-name
-         (fn [m]
-           (if (and m
-                    (identical? running?
-                                (:ha-follower-loop-running? m)))
-             (assoc m :ha-follower-loop-future future)
-             m)))))))
+    (when-let [^FutureTask future @new-future-v]
+      (try
+        (.execute ^ExecutorService ((:work-executor-fn deps) server) future)
+        (catch Throwable t
+          (when-let [^AtomicBoolean running? @new-running-v]
+            (.set running? false))
+          (when-let [^CountDownLatch stopped-latch @stopped-latch-v]
+            (.countDown stopped-latch))
+          (.cancel future true)
+          ((:update-db-fn deps)
+           server
+           db-name
+           (fn [m]
+             (if (and m
+                      (identical? @new-running-v
+                                  (:ha-follower-loop-running? m))
+                      (identical? future
+                                  (:ha-follower-loop-future m)))
+               (assoc m
+                      :ha-follower-loop-future nil
+                      :ha-follower-loop-stopped-latch nil)
+               m)))
+          (throw t))))))
 
 (defn stop-ha-renew-loop
   [m]
