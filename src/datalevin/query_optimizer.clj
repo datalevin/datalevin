@@ -21,6 +21,8 @@
    [datalevin.query.optimizer.graph :as qog]
    [datalevin.pipe :as p]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.plan :as qplan]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
@@ -33,83 +35,54 @@
     DefaultSrc Function Or Variable Pattern Predicate Not RuleExpr]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
-(def ^:dynamic *optimizer-deps* nil)
-
-(defn- dep [k]
-  (or (get *optimizer-deps* k)
-      (raise "Missing query optimizer dependency " k {:dependency k})))
-
-(defn- resolve-pattern-lookup-refs [source pattern]
-  ((dep :resolve-pattern-lookup-refs) source pattern))
-
-(defn- make-call [f]
-  ((dep :make-call) f))
-
-(defn- resolve-pred [f context]
-  ((dep :resolve-pred) f context))
+(def ^:dynamic *plan-cache* (LRUCache. c/query-result-cache-size))
 
 (defn- or-join-execute-link
   [db sources rules tuples clause bound-var bound-idx free-vars tgt-attr]
-  ((dep :or-join-execute-link)
-   db sources rules tuples clause bound-var bound-idx free-vars tgt-attr))
-
-(defn- execute-steps [context db steps]
-  ((dep :execute-steps) context db steps))
-
-(defn- resolve-clause [context clause]
-  ((dep :resolve-clause) context clause))
+  (qresolve/or-join-execute-link db sources rules tuples clause bound-var
+                                 bound-idx free-vars tgt-attr))
 
 (defn- -sample [step db source]
-  ((dep :step-sample) step db source))
+  (qplan/step-sample step db source))
 
 (defn- -execute [step db source]
-  ((dep :step-execute) step db source))
+  (qplan/step-execute step db source))
 
 (defn- -type [step]
-  ((dep :step-type) step))
-
-(defn- map->Clause [m]
-  ((dep :map->Clause) m))
-
-(defn- map->Node [m]
-  ((dep :map->Node) m))
-
-(defn- mk-link [type tgt var attrs attr]
-  ((dep :link) type tgt var attrs attr))
-
-(defn- mk-or-join-link [type tgt clause bound-var free-vars tgt-attr source]
-  ((dep :or-join-link) type tgt clause bound-var free-vars tgt-attr source))
+  (qplan/step-type step))
 
 (defn- map->init-step [m]
-  ((dep :map->InitStep) m))
+  (qplan/map->InitStep m))
 
 (defn- mk-merge-scan-step
   [index attrs-v vars in out cols strata seen-or-joins result sample]
-  ((dep :merge-scan-step)
-   index attrs-v vars in out cols strata seen-or-joins result sample))
+  (qplan/->MergeScanStep index attrs-v vars in out cols strata seen-or-joins
+                         result sample))
 
 (defn- mk-link-step [type index attr var fidx in out cols strata seen-or-joins]
-  ((dep :link-step) type index attr var fidx in out cols strata seen-or-joins))
+  (qplan/->LinkStep type index attr var fidx in out cols strata
+                    seen-or-joins))
 
 (defn- mk-hash-join-step
   [link link-e in out in-cols cols strata seen-or-joins tgt-steps in-size tgt-size]
-  ((dep :hash-join-step)
-   link link-e in out in-cols cols strata seen-or-joins tgt-steps in-size tgt-size))
+  (qplan/->HashJoinStep link link-e in out in-cols cols strata seen-or-joins
+                        tgt-steps in-size tgt-size))
 
 (defn- mk-or-join-step
   [clause bound-var bound-idx free-vars tgt tgt-attr sources rules in out cols strata seen-or-joins]
-  ((dep :or-join-step)
-   clause bound-var bound-idx free-vars tgt tgt-attr sources rules in out cols strata seen-or-joins))
+  (qplan/->OrJoinStep clause bound-var bound-idx free-vars tgt tgt-attr
+                      sources rules in out cols strata seen-or-joins))
 
 (defn- mk-not-join-step
   [clause vars sources rules in out cols strata seen-or-joins]
-  ((dep :not-join-step) clause vars sources rules in out cols strata seen-or-joins))
+  (qplan/->NotJoinStep clause vars sources rules in out cols strata
+                       seen-or-joins))
 
 (defn- make-plan [steps cost size recency]
-  ((dep :plan) steps cost size recency))
+  (qplan/->Plan steps cost size recency))
 
 (defn- plan-cache ^LRUCache []
-  ^LRUCache (dep :plan-cache))
+  *plan-cache*)
 
 (declare estimate-hash-join-cost)
 
@@ -359,11 +332,21 @@
 
 (defn- activate-var-pred
   [var clause]
-  (qor/activate-var-pred {:make-call make-call
-                          :resolve-pred resolve-pred}
+  (qor/activate-var-pred {:make-call qresolve/make-call
+                          :resolve-pred qresolve/resolve-pred}
                          var clause))
 
-(def build-graph qog/build-graph)
+(defn build-graph
+  [context]
+  (qog/build-graph
+    {:resolve-pattern-lookup-refs qresolve/resolve-pattern-lookup-refs
+     :make-call qresolve/make-call
+     :resolve-pred qresolve/resolve-pred
+     :map->Clause qresolve/map->Clause
+     :map->Node qplan/map->Node
+     :link qplan/->Link
+     :or-join-link qresolve/->OrJoinLink}
+    context))
 
 (defn- estimate-round [x]
   (let [v (Math/ceil (double x))]
@@ -599,10 +582,7 @@
                (map f component)
                (map+ f component)))))
 
-(defn find-index
-  [a-or-v cols]
-  (when a-or-v
-    (u/index-of (fn [x] (if (set? x) (x a-or-v) (= x a-or-v))) cols)))
+(def find-index qplan/find-index)
 
 (defn- merge-scan-step
   [db last-step index new-key new-steps]
@@ -1143,26 +1123,25 @@
 
   :op here means step type.
   :result-set will be #{} if there is any clause that matches nothing."
-  [deps {:keys [graph sources rules] :as context}]
-  (binding [*optimizer-deps* deps]
-    (if graph
-      (unreduced
-        (reduce-kv
-          (fn [c src nodes]
-            (let [^DB db (sources src)
-                  k      [(.-store db) nodes]]
-              (if-let [cached (.get ^LRUCache (plan-cache) k)]
-                (assoc-in c [:plan src] cached)
-                (let [nodes (update-nodes db nodes)
-                      plans (if (< 1 (count nodes))
-                              (build-plan* db sources rules nodes)
-                              [[(base-plan db nodes (ffirst nodes) true)]])]
-                  (if (some #(some nil? %) plans)
-                    (reduced (assoc c :result-set #{}))
-                    (do (.put ^LRUCache (plan-cache) k (strip-result plans))
-                        (assoc-in c [:plan src] plans)))))))
-          context graph))
-      context)))
+  [{:keys [graph sources rules] :as context}]
+  (if graph
+    (unreduced
+      (reduce-kv
+        (fn [c src nodes]
+          (let [^DB db (sources src)
+                k      [(.-store db) nodes]]
+            (if-let [cached (.get ^LRUCache (plan-cache) k)]
+              (assoc-in c [:plan src] cached)
+              (let [nodes (update-nodes db nodes)
+                    plans (if (< 1 (count nodes))
+                            (build-plan* db sources rules nodes)
+                            [[(base-plan db nodes (ffirst nodes) true)]])]
+                (if (some #(some nil? %) plans)
+                  (reduced (assoc c :result-set #{}))
+                  (do (.put ^LRUCache (plan-cache) k (strip-result plans))
+                      (assoc-in c [:plan src] plans)))))))
+        context graph))
+    context))
 
 (defn- component-binds-vars?
   [plans vars]
@@ -1186,35 +1165,34 @@
 (defn plan-not-joins
   "Attach optimizable not-join clauses to source plans when all join vars are
    bound by a single component. Unlinked clauses remain in :late-clauses."
-  [deps {:keys [plan sources rules optimizable-not-joins] :as context}]
-  (binding [*optimizer-deps* deps]
-    (if (seq optimizable-not-joins)
-      (let [plan'                (into {} (map (fn [[src comps]]
-                                                 [src (mapv vec comps)]))
-                                      plan)
-            [planned unlinked]
-            (reduce
-              (fn [[p u] clause]
-                (let [src        (get-not-join-source clause)
-                      vars       (get-not-join-vars clause)
-                      components (get p src)]
-                  (if (and (seq vars) (seq components))
-                    (let [idxs (keep-indexed
-                                 (fn [i comp]
-                                   (when (component-binds-vars? comp vars) i))
-                                 components)]
-                      (if (= 1 (count idxs))
-                        (let [idx (first idxs)]
-                          [(assoc-in p [src idx]
-                                     (add-not-join-step
-                                       (nth components idx) clause sources rules))
-                           u])
-                        [p (conj u clause)]))
-                    [p (conj u clause)])))
-              [plan' []]
-              optimizable-not-joins)]
-        (-> context
-            (assoc :plan planned)
-            (update :late-clauses into unlinked)
-            (assoc :optimizable-not-joins [])))
-      context)))
+  [{:keys [plan sources rules optimizable-not-joins] :as context}]
+  (if (seq optimizable-not-joins)
+    (let [plan'                (into {} (map (fn [[src comps]]
+                                               [src (mapv vec comps)]))
+                                    plan)
+          [planned unlinked]
+          (reduce
+            (fn [[p u] clause]
+              (let [src        (get-not-join-source clause)
+                    vars       (get-not-join-vars clause)
+                    components (get p src)]
+                (if (and (seq vars) (seq components))
+                  (let [idxs (keep-indexed
+                               (fn [i comp]
+                                 (when (component-binds-vars? comp vars) i))
+                               components)]
+                    (if (= 1 (count idxs))
+                      (let [idx (first idxs)]
+                        [(assoc-in p [src idx]
+                                   (add-not-join-step
+                                     (nth components idx) clause sources rules))
+                         u])
+                      [p (conj u clause)]))
+                  [p (conj u clause)])))
+            [plan' []]
+            optimizable-not-joins)]
+      (-> context
+          (assoc :plan planned)
+          (update :late-clauses into unlinked)
+          (assoc :optimizable-not-joins [])))
+    context))

@@ -11,6 +11,7 @@
   "Transaction preparation."
   (:require
    [datalevin.constants :refer [e0 tx0 emax txmax]]
+   [datalevin.db.tx.common :as txcommon]
    [datalevin.interface :refer [av-first-e ea-first-v opts]]
    [datalevin.prepare :as coreprep]
    [datalevin.datom :as d :refer [datom?]]
@@ -49,29 +50,29 @@
 (declare assoc-auto-tempid)
 
 (defn assoc-auto-tempids
-  [deps db entities]
-  (mapv #(assoc-auto-tempid deps db %) entities))
+  [db entities]
+  (mapv #(assoc-auto-tempid db %) entities))
 
 (defn assoc-auto-tempid
-  [deps db entity]
+  [db entity]
   (cond+
     (map? entity)
     (persistent!
       (reduce-kv
         (fn [entity a v]
           (cond
-            (and ((:ref?-fn deps) db a)
-                 ((:multi-value?-fn deps) db a v))
-            (assoc! entity a (assoc-auto-tempids deps db v))
+            (and (txcommon/ref? db a)
+                 (txcommon/multi-value? db a v))
+            (assoc! entity a (assoc-auto-tempids db v))
 
-            ((:ref?-fn deps) db a)
-            (assoc! entity a (assoc-auto-tempid deps db v))
+            (txcommon/ref? db a)
+            (assoc! entity a (assoc-auto-tempid db v))
 
-            (and ((:reverse-ref?-fn deps) a) (sequential? v))
-            (assoc! entity a (assoc-auto-tempids deps db v))
+            (and (txcommon/reverse-ref? a) (sequential? v))
+            (assoc! entity a (assoc-auto-tempids db v))
 
-            ((:reverse-ref?-fn deps) a)
-            (assoc! entity a (assoc-auto-tempid deps db v))
+            (txcommon/reverse-ref? a)
+            (assoc! entity a (assoc-auto-tempid db v))
 
             :else
             (assoc! entity a v)))
@@ -85,10 +86,10 @@
 
     :let [[op e a v] entity]
 
-    (and (= :db/add op) ((:ref?-fn deps) db a))
-    (if ((:multi-value?-fn deps) db a v)
-      [op e a (assoc-auto-tempids deps db v)]
-      [op e a (assoc-auto-tempid deps db v)])
+    (and (= :db/add op) (txcommon/ref? db a))
+    (if (txcommon/multi-value? db a v)
+      [op e a (assoc-auto-tempids db v)]
+      [op e a (assoc-auto-tempid db v)])
 
     :else
     entity))
@@ -97,19 +98,19 @@
   "Returns [entity' upserts]. Upsert attributes that resolve to existing entities
    are removed from entity, rest are kept in entity for insertion. No validation
    is performed."
-  [deps db entity]
-  (if-some [idents (not-empty ((:attrs-by-fn deps) db :db.unique/identity))]
+  [db entity]
+  (if-some [idents (not-empty (txcommon/attrs-by db :db.unique/identity))]
     (let [store   (:store db)
           resolve (fn [a v]
                     (cond
-                      (not ((:ref?-fn deps) db a))
+                      (not (txcommon/ref? db a))
                       (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
                                            (d/datom e0 a v tx0)
                                            (d/datom emax a v txmax))))
                           (av-first-e store a v))
 
                       (not (tempid? v))
-                      (let [rv ((:entid-fn deps) db v)]
+                      (let [rv (txcommon/entid db v)]
                         (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
                                              (d/datom e0 a rv tx0)
                                              (d/datom emax a rv txmax))))
@@ -129,7 +130,7 @@
             (not (contains? idents a))
             [(assoc entity' a v) upserts]
 
-            ((:multi-value?-fn deps) db a v)
+            (txcommon/multi-value? db a v)
             (let [[insert upsert] (split a v)]
               [(cond-> entity'
                  (seq insert) (assoc a insert))
@@ -137,7 +138,7 @@
                  (seq upsert) (assoc a upsert))])
 
             :else
-            (let [v' (if ((:ref?-fn deps) db a)
+            (let [v' (if (txcommon/ref? db a)
                        v
                        (coreprep/correct-value store a v))]
               (if-some [e (resolve a v')]
@@ -163,9 +164,9 @@
     :db/retractEntity})
 
 (defn- lookup-installed-callable
-  [deps db target]
+  [db target]
   (when-not (udf/descriptor? target)
-    (when-some [eid ((:entid-fn deps) db target)]
+    (when-some [eid (txcommon/entid db target)]
       (let [store    (:store db)
             fun      (ea-first-v store eid :db/fn)
             udf-desc (ea-first-v store eid :db/udf)
@@ -190,10 +191,10 @@
    :store     (:store db)})
 
 (defn installed-udf-descriptor
-  ([deps db target]
-   (installed-udf-descriptor deps db nil target))
-  ([deps db allowed target]
-   (when-some [{:keys [ident udf]} (lookup-installed-callable deps db target)]
+  ([db target]
+   (installed-udf-descriptor db nil target))
+  ([db allowed target]
+   (when-some [{:keys [ident udf]} (lookup-installed-callable db target)]
      (when udf
        (let [descriptor (udf/descriptor udf)]
          (vld/validate-installed-udf-ident ident descriptor
@@ -203,8 +204,8 @@
            descriptor))))))
 
 (defn- wrap-tx-udf
-  [deps db descriptor]
-  (let [registry   ((:udf-registry-fn deps) db)
+  [db descriptor]
+  (let [registry   (txcommon/udf-registry db)
         descriptor (udf/ensure-kind descriptor :tx-fn)]
     (fn [db* & args]
       (let [callable (udf/materialize registry (tx-udf-context db*)
@@ -212,9 +213,9 @@
         (apply callable db* args)))))
 
 (defn- resolve-installed-tx-callable
-  [deps db target entity]
+  [db target entity]
   (when-some [{:keys [udf] :as installed}
-              (lookup-installed-callable deps db target)]
+              (lookup-installed-callable db target)]
     (let [fun (:fn installed)]
       (cond
         fun
@@ -223,105 +224,108 @@
           fun)
 
         udf
-        (wrap-tx-udf deps db
-                     (installed-udf-descriptor deps db :tx-fn target))
+        (wrap-tx-udf db
+                     (installed-udf-descriptor db :tx-fn target))
 
         :else
         nil))))
 
 (defn- resolve-tx-callable
-  [deps db target]
+  [db target]
   (cond
     (fn? target)
     target
 
     (udf/descriptor? target)
-    (wrap-tx-udf deps db target)
+    (wrap-tx-udf db target)
 
     :else
-    (or (resolve-installed-tx-callable deps db target [:db.fn/call target])
-        (if ((:entid-fn deps) db target)
+    (or (resolve-installed-tx-callable db target [:db.fn/call target])
+        (if (txcommon/entid db target)
           (do
             (vld/validate-custom-tx-fn-value nil target [:db.fn/call target])
             nil)
-          (wrap-tx-udf deps db
+          (wrap-tx-udf db
                        (udf/descriptor-or-registered
-                         ((:udf-registry-fn deps) db) :tx-fn target))))))
+                         (txcommon/udf-registry db) :tx-fn target))))))
 
 (defn handle-fn-call
-  [deps db entity]
+  [db entity]
   (let [[_ target & args] entity
-        f                 (resolve-tx-callable deps db target)]
+        f                 (resolve-tx-callable db target)]
     (apply f db args)))
 
 (defn handle-custom-tx-fn
-  [deps db store entity entities]
+  [db store entity entities]
   (let [op    (first entity)
         ident (or (:e (sf (.subSet
                             ^TreeSortedSet (:avet db)
                             (d/datom e0 op nil tx0)
                             (d/datom emax op nil txmax))))
-                  ((:entid-fn deps) db op))]
+                  (txcommon/entid db op))]
     (vld/validate-custom-tx-fn-entity ident op entity)
-    (let [fun  (or (resolve-installed-tx-callable deps db op entity)
+    (let [fun  (or (resolve-installed-tx-callable db op entity)
                    (lookup-tx-fn-value db store ident))
           args (next entity)]
       (vld/validate-custom-tx-fn-value fun op entity)
       (concat (apply fun db args) entities))))
 
 (defn maybe-wrap-multival
-  [deps db a vs]
+  [db a vs]
   (cond
-    (not (or ((:reverse-ref?-fn deps) a)
-             ((:multival?-fn deps) db a)))
+    (not (or (txcommon/reverse-ref? a)
+             (txcommon/multival? db a)))
     [vs]
 
     (not (and (coll? vs) (not (map? vs))))
     [vs]
 
     (and (= (count vs) 2)
-         ((:is-attr?-fn deps) db (first vs) :db.unique/identity))
+         (txcommon/is-attr? db (first vs) :db.unique/identity))
     [vs]
 
     :else
     vs))
 
 (defn explode
-  [deps db entity]
+  [db entity]
   (let [eid  (:db/id entity)
         a+vs (into []
                    cat
                    (reduce
                      (fn [acc [a vs]]
                        (update acc
-                               (if ((:tuple-attr?-fn deps) db a) 1 0)
+                               (if (txcommon/tuple-attr? db a) 1 0)
                                conj
                                [a vs]))
                      [[] []]
                      entity))]
     (for [[a vs] a+vs
           :when  (not (identical? a :db/id))
-          :let   [reverse?   ((:reverse-ref?-fn deps) a)
+          :let   [reverse?   (txcommon/reverse-ref? a)
                   straight-a (if reverse?
-                               ((:reverse-ref-fn deps) a)
+                               (txcommon/reverse-ref a)
                                a)
                   _          (when reverse?
                                (vld/validate-reverse-ref-type
-                                 ((:ref?-fn deps) db straight-a)
+                                 (txcommon/ref? db straight-a)
                                  a
                                  eid
                                  vs))]
-          v      (maybe-wrap-multival deps db a vs)]
-      (if (and ((:ref?-fn deps) db straight-a) (map? v))
-        (assoc v ((:reverse-ref-fn deps) a) eid)
+          v      (maybe-wrap-multival db a vs)]
+      (if (and (txcommon/ref? db straight-a) (map? v))
+        (assoc v (txcommon/reverse-ref a) eid)
         (if reverse?
           [:db/add v straight-a eid]
           [:db/add eid straight-a v])))))
 
+(def de-entity? (delay (resolve 'datalevin.entity/entity?)))
+(def de-entity->txs (delay (resolve 'datalevin.entity/->txs)))
+
 (defn expand-transactable-entity
-  [deps entity]
-  (if ((:de-entity?-fn deps) entity)
-    ((:de-entity->txs-fn deps) entity)
+  [entity]
+  (if (@de-entity? entity)
+    (@de-entity->txs entity)
     [entity]))
 
 (defn update-entity-time
@@ -348,14 +352,14 @@
     (vld/validate-tx-entity-type entity)))
 
 (defn prepare-entities
-  [deps db entities tx-time]
-  (let [aat #(assoc-auto-tempid deps db %)
+  [db entities tx-time]
+  (let [aat #(assoc-auto-tempid db %)
         uet #(update-entity-time % tx-time)]
     (sequence
       (if (:auto-entity-time? (opts (:store db)))
-        (comp (mapcat #(expand-transactable-entity deps %))
+        (comp (mapcat expand-transactable-entity)
               (map aat)
               (mapcat uet))
-        (comp (mapcat #(expand-transactable-entity deps %))
+        (comp (mapcat expand-transactable-entity)
               (map aat)))
       entities)))
