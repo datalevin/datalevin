@@ -10,6 +10,7 @@
    [datalevin.interface :as i]
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
+   [datalevin.txlog :as txlog]
    [datalevin.util :as u])
   (:import [java.util Date UUID]))
 
@@ -600,6 +601,31 @@
                  (d/get-value db "a" :k2)))
           (finally
             (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-commit-meta-segment-offset-matches-segment-end
+  (let [dir       (u/tmp-dir (str "wal-commit-meta-offset-test-"
+                                  (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")
+        opts      {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k1 :v1]])))
+          (finally
+            (d/close-kv db))))
+      (let [{:keys [file]} (last (txlog/segment-files txlog-dir))
+            meta-state (get-in (txlog/read-meta-file (txlog/meta-path txlog-dir))
+                               [:current])
+            scan (txlog/scan-segment (.getPath ^java.io.File file)
+                                     {:allow-preallocated-tail? true})
+            end-offset (txlog/segment-end-offset scan)]
+        (is (map? meta-state))
+        (is (= (long end-offset)
+               (long (:segment-offset meta-state)))))
       (finally
         (u/delete-files dir)))))
 
