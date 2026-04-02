@@ -255,6 +255,9 @@
 (def ^:const opts
   "dbi name for Datalog options is `datalevin/opts`"
   "datalevin/opts")
+(def ^:const ha-client-ops
+  "dbi name for persisted HA client write replay records is `datalevin/ha-client-ops`"
+  "datalevin/ha-client-ops")
 
 ;; compression
 

@@ -918,7 +918,7 @@
                   (open-kv dir))
                 (.-lmdb ^Store store))]
     (try
-      (doseq [dbi [c/eav c/ave c/giants c/schema c/meta]]
+      (doseq [dbi [c/eav c/ave c/giants c/ha-client-ops c/schema c/meta]]
         (i/clear-dbi lmdb dbi))
       (finally
         (db/remove-cache store)

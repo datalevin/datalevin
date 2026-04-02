@@ -13,6 +13,7 @@
   (:require
    [datalevin.util :as u]
    [datalevin.constants :as c]
+   [datalevin.ha.client-op :as hcop]
    [datalevin.interface]
    [datalevin.client :as cl]
    [datalevin.bits :as b]
@@ -90,36 +91,124 @@
     (str/replace-first s #"(dtlv://.+):(.+)@" "$1:***@")
     s))
 
+(defn- normalize-remote-tx-data
+  [tx-data]
+  (mapv (fn [tx]
+          (if (d/datom? tx)
+            tx
+            (apply d/datom tx)))
+        tx-data))
+
+(defn- copy-out-tx-response-meta
+  [response]
+  (select-keys response [:db-info :new-attributes]))
+
+(defn- cached-ha-member-endpoints
+  [db-info-or-opts]
+  (let [opts (cond
+               (and (instance? clojure.lang.IDeref db-info-or-opts)
+                    (map? @db-info-or-opts))
+               (or (:opts @db-info-or-opts) @db-info-or-opts)
+
+               (map? db-info-or-opts)
+               (or (:opts db-info-or-opts) db-info-or-opts)
+
+               :else
+               nil)]
+    (->> (:ha-members opts)
+         (keep :endpoint)
+         distinct
+         vec)))
+
+(defn- retry-ha-transport-failure
+  [client req request-fn known-endpoints throwable]
+  (when-let [retry-context (#'cl/client-retry-context client)]
+    (let [self-endpoint (str (:host retry-context) ":" (:port retry-context))
+          retry-endpoints (->> known-endpoints
+                               (remove #(= self-endpoint %))
+                               vec)]
+      (when (seq retry-endpoints)
+        (let [retry-result
+              (#'cl/retry-ha-write-request*
+               req
+               (or (ex-message throwable)
+                   "HA write target became unavailable")
+               {:error :ha/write-rejected
+                :reason :endpoint-unreachable
+                :retryable? true
+                :ha-retry-endpoints retry-endpoints}
+               retry-context
+               request-fn
+               cl/disconnect
+               #'cl/new-client-for-endpoint
+               #(#'cl/set-preferred-ha-endpoint! client %))]
+          (cond-> {:type :command-complete
+                   :result retry-result}
+            (map? retry-result)
+            (merge (select-keys retry-result [:db-info :new-attributes]))))))))
+
 (defn- load-datoms*
   ([client db-name datoms datom-type simulated?]
-   (load-datoms* client db-name datoms datom-type simulated? false))
+   (load-datoms* client db-name datoms datom-type simulated? false nil))
   ([client db-name datoms datom-type simulated? writing?]
+   (load-datoms* client db-name datoms datom-type simulated? writing? nil))
+  ([client db-name datoms datom-type simulated? writing? ha-source]
    (let [tx? (#{:txs :txs+info} datom-type)
          t   (case datom-type
                :txs      :tx-data
                :txs+info :tx-data+db-info
                :load-datoms)
+         client-op-id (when (and writing? tx?)
+                        (hcop/new-client-op-id))
+         client-op-hash (when client-op-id
+                          (hcop/request-hash
+                           (hcop/tx-request-payload t db-name datoms
+                                                    simulated?)))
+         response-kind (case t
+                         :tx-data+db-info hcop/tx-data+db-info-response-kind
+                         :tx-data hcop/tx-data-response-kind
+                         nil)
          req (if (< (count datoms) ^long c/+wire-datom-batch-size+)
-               {:type     t
-                :mode     :request
-                :writing? writing?
-                :args     (if tx?
-                            [db-name datoms simulated?]
-                            [db-name datoms])}
-               {:type     t
-                :mode     :copy-in
-                :writing? writing?
-                :args     (if tx?
-                            [db-name simulated?]
-                            [db-name])})
+               (cond-> {:type     t
+                        :mode     :request
+                        :writing? writing?
+                        :args     (if tx?
+                                    [db-name datoms simulated?]
+                                    [db-name datoms])}
+                 client-op-id
+                 (assoc :client-op-id client-op-id
+                        :client-op-hash client-op-hash
+                        :client-op-response-kind response-kind))
+               (cond-> {:type     t
+                        :mode     :copy-in
+                        :writing? writing?
+                        :args     (if tx?
+                                    [db-name simulated?]
+                                    [db-name])}
+                 client-op-id
+                 (assoc :client-op-id client-op-id
+                        :client-op-hash client-op-hash
+                        :client-op-response-kind response-kind)))
          request-fn
          (fn [retry-client req]
            (if (= :copy-in (:mode req))
              (cl/copy-in retry-client req datoms c/+wire-datom-batch-size+)
              (cl/request retry-client req)))
+         response
+         (try
+           (request-fn client req)
+           (catch Exception e
+             (or (and client-op-id
+                      (retry-ha-transport-failure
+                       client
+                       req
+                       request-fn
+                       (cached-ha-member-endpoints ha-source)
+                       e))
+                 (throw e))))
          {:keys [type message result err-data]
           :as   response}
-         (request-fn client req)]
+         response]
      (if (= type :error-response)
        (if (:resized err-data)
          (u/raise message err-data)
@@ -136,19 +225,20 @@
               #(#'cl/set-preferred-ha-endpoint! client %))
              (#'cl/raise-normal-request-error req message err-data nil))
            (#'cl/raise-normal-request-error req message err-data nil)))
-       (if (and tx?
-                (or (contains? response :db-info)
-                    (contains? response :new-attributes)))
-         (let [[tx-data tempids] (if (map? result)
-                                   [(:tx-data result) (:tempids result)]
-                                   (let [[tx-data tempids] (split-with d/datom?
-                                                                       result)]
-                                     [tx-data (apply hash-map tempids)]))]
-           (cond-> {:tx-data tx-data :tempids tempids}
-             (contains? response :db-info)
-             (assoc :db-info (:db-info response))
-             (contains? response :new-attributes)
-             (assoc :new-attributes (:new-attributes response))))
+       (cond
+         (and tx? (map? result) (contains? result :tx-data))
+         (merge
+           (update result :tx-data normalize-remote-tx-data)
+           (copy-out-tx-response-meta response))
+
+         (and tx? (sequential? result))
+         (let [[tx-data tempids] (split-with d/datom? result)]
+           (merge
+             {:tx-data (normalize-remote-tx-data tx-data)
+              :tempids (apply hash-map tempids)}
+             (copy-out-tx-response-meta response)))
+
+         :else
          result)))))
 
 ;; remote datalog db
@@ -383,7 +473,8 @@
       (cl/normal-request client :db-info [db-name] writing?)))
 
   (tx-data [_ data simulated?]
-    (load-datoms* client db-name data :txs+info simulated? writing?))
+    (load-datoms* client db-name data :txs+info simulated? writing?
+                  open-db-info))
 
   (open-transact [this]
     (cl/normal-request tx-client :open-transact [db-name] false)
@@ -724,6 +815,7 @@
                   ^Client client
                   write-txn
                   writing?
+                  open-db-opts
                   owns-client?
                   ^AtomicBoolean closed?]
   IWriting
@@ -733,6 +825,7 @@
 
   (mark-write [_]
     (->KVStore uri db-name client (volatile! :remote-kv-mutex) true
+               open-db-opts
                owns-client? closed?))
 
   ILMDB
@@ -921,23 +1014,64 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [_ dbi-name txs k-type v-type]
-    (let [{:keys [type message err-data]}
-          (if (< (count txs) ^long c/+wire-datom-batch-size+)
-            (cl/request client
-                        {:type     :transact-kv
-                         :mode     :request
-                         :writing? writing?
-                         :args     [db-name dbi-name txs k-type v-type]})
-            (cl/copy-in client
-                        {:type     :transact-kv
-                         :mode     :copy-in
-                         :writing? writing?
-                         :args     [db-name dbi-name k-type v-type]}
-                        txs c/+wire-datom-batch-size+))]
+    (let [client-op-id   (when writing? (hcop/new-client-op-id))
+          client-op-hash (when client-op-id
+                           (hcop/request-hash
+                            (hcop/kv-request-payload db-name dbi-name txs
+                                                     k-type v-type)))
+          base-req       (if (< (count txs) ^long c/+wire-datom-batch-size+)
+                           {:type     :transact-kv
+                            :mode     :request
+                            :writing? writing?
+                            :args     [db-name dbi-name txs k-type v-type]}
+                           {:type     :transact-kv
+                            :mode     :copy-in
+                            :writing? writing?
+                            ;; Keep arg positions aligned with :request mode.
+                            ;; Slot 2 is reserved for txs when they travel in-band.
+                            :args     [db-name dbi-name nil k-type v-type]})
+          req            (cond-> base-req
+                           client-op-id
+                           (assoc :client-op-id client-op-id
+                                  :client-op-hash client-op-hash
+                                  :client-op-response-kind
+                                  (if (= :request (:mode base-req))
+                                    hcop/kv-result-response-kind
+                                    hcop/command-complete-response-kind)))
+          request-fn     (fn [retry-client retry-req]
+                           (if (= :copy-in (:mode retry-req))
+                             (cl/copy-in retry-client retry-req txs
+                                         c/+wire-datom-batch-size+)
+                             (cl/request retry-client retry-req)))
+          {:keys [type message err-data]}
+          (try
+            (request-fn client req)
+            (catch Exception e
+              (or (and client-op-id
+                       (retry-ha-transport-failure
+                        client
+                        req
+                        request-fn
+                        (cached-ha-member-endpoints open-db-opts)
+                        e)
+                       {:type :command-complete})
+                  (throw e))))]
       (when (= type :error-response)
         (if (:resized err-data)
           (u/raise message err-data)
-          (u/raise "Error transacting kv to server:" message {:uri uri})))))
+          (if (#'cl/retryable-ha-write-reject? err-data)
+            (if-let [retry-context (#'cl/client-retry-context client)]
+              (#'cl/retry-ha-write-request*
+               req
+               message
+               err-data
+               retry-context
+               request-fn
+               cl/disconnect
+               #'cl/new-client-for-endpoint
+               #(#'cl/set-preferred-ha-endpoint! client %))
+              (#'cl/raise-normal-request-error req message err-data nil))
+            (u/raise "Error transacting kv to server:" message {:uri uri}))))))
 
   (get-value [db dbi-name k]
     (.get-value db dbi-name k :data :data true))
@@ -1263,14 +1397,36 @@
     db))
 
 (defn ->KVStore
+  ([uri db-name client]
+   (KVStore. uri db-name client
+             (volatile! :remote-kv-mutex)
+             false
+             (volatile! nil)
+             false
+             (AtomicBoolean. false)))
+  ([uri db-name client write-txn]
+   (KVStore. uri db-name client
+             write-txn
+             false
+             (volatile! nil)
+             false
+             (AtomicBoolean. false)))
   ([uri db-name client write-txn writing?]
-   (KVStore. uri db-name client write-txn writing?
+   (KVStore. uri db-name client
+             write-txn
+             writing?
+             (volatile! nil)
+             false
+             (AtomicBoolean. false)))
+  ([uri db-name client write-txn writing? open-db-opts]
+   (KVStore. uri db-name client write-txn writing? open-db-opts
              false (AtomicBoolean. false)))
-  ([uri db-name client write-txn writing? owns-client?]
-   (KVStore. uri db-name client write-txn writing?
+  ([uri db-name client write-txn writing? open-db-opts owns-client?]
+   (KVStore. uri db-name client write-txn writing? open-db-opts
              owns-client? (AtomicBoolean. false)))
-  ([uri db-name client write-txn writing? owns-client? closed?]
-   (KVStore. uri db-name client write-txn writing? owns-client? closed?)))
+  ([uri db-name client write-txn writing? open-db-opts owns-client? closed?]
+   (KVStore. uri db-name client write-txn writing? open-db-opts owns-client?
+             closed?)))
 
 (defn open-kv
   "Open a remote kv store."
@@ -1290,6 +1446,9 @@
        (do (cl/open-database client db-name c/db-store-kv opts)
            (->KVStore uri-str db-name client
                       (volatile! :remote-kv-mutex) false
+                      ;; KV stores do not implement IStore/opts on the server.
+                      ;; Preserve caller-supplied open opts only for HA retry hints.
+                      (volatile! opts)
                       owns-client?
                       (AtomicBoolean. false)))
        (u/raise "URI should contain a database name" {})))))
