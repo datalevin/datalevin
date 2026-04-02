@@ -83,36 +83,44 @@
 (defn reopen-dbs
   [deps root clients ^ConcurrentHashMap dbs]
   (doseq [[_ {:keys [stores engines indices dt-dbs]}] clients]
-    (doseq [[db-name {:keys [datalog? dbis]}]
+    (doseq [[db-name {:keys [datalog? dbis consensus-ha?]}]
             stores
             :when (not (get-in dbs [db-name :store]))
             :let  [m (get dbs db-name {})]]
-      (let [store ((:open-store-fn deps) root db-name dbis datalog?)
-            consensus-ha? (and datalog?
-                               (some? ((:consensus-ha-opts-fn deps) store)))]
-        (if consensus-ha?
-          (do
-            ;; Consensus HA runtime identity is node-local. Restoring a DB from
-            ;; persisted client sessions before a fresh explicit open can start
-            ;; the wrong peer from stale store metadata after restart.
-            ((:close-store-fn deps) store)
-            (log/info "Skipping automatic reopen of consensus HA database"
-                      {:db-name db-name
-                       :root root}))
-          (let [runtime-opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
-                next-m       ((:ensure-ha-runtime-fn deps)
-                              root
-                              db-name
-                              (cond-> (assoc m
-                                             :store store
-                                             :runtime-opts runtime-opts)
-                                datalog?
-                                (assoc :dt-db
-                                       ((:new-runtime-db-fn deps)
-                                        store
-                                        runtime-opts)))
-                              store)]
-            (.put dbs db-name next-m)))))
+      (if consensus-ha?
+        (do
+          ;; Consensus HA runtime identity is node-local. Persist the
+          ;; classification at explicit open time so restart can skip automatic
+          ;; reopen entirely, instead of probing the store and triggering txlog
+          ;; recovery before the fresh HA peer open happens.
+          (log/info "Skipping automatic reopen of consensus HA database"
+                    {:db-name db-name
+                     :root root}))
+        (let [store ((:open-store-fn deps) root db-name dbis datalog?)
+              consensus-ha? (and datalog?
+                                 (some? ((:consensus-ha-opts-fn deps) store)))]
+          (if consensus-ha?
+            (do
+              ;; Backward compatibility for persisted sessions created before
+              ;; the stored `:consensus-ha?` flag existed.
+              ((:close-store-fn deps) store)
+              (log/info "Skipping automatic reopen of consensus HA database"
+                        {:db-name db-name
+                         :root root}))
+            (let [runtime-opts ((:resolved-runtime-opts-fn deps) nil db-name store m)
+                  next-m       ((:ensure-ha-runtime-fn deps)
+                                root
+                                db-name
+                                (cond-> (assoc m
+                                               :store store
+                                               :runtime-opts runtime-opts)
+                                  datalog?
+                                  (assoc :dt-db
+                                         ((:new-runtime-db-fn deps)
+                                          store
+                                          runtime-opts)))
+                                store)]
+              (.put dbs db-name next-m))))))
     (doseq [db-name engines
             :when   (and (not (get-in dbs [db-name :engine]))
                          (get-in dbs [db-name :store]))
