@@ -694,8 +694,7 @@ script/jepsen/clock-workloads clock-mixed
 
 The HA disruption nemeses currently require `--control-backend sofa-jraft`,
 because node restart/rejoin and quorum recovery depend on persisted authority
-membership. The default `in-memory` backend remains useful for no-fault local
-iteration.
+membership. `:sofa-jraft` is the current control-plane backend.
 
 ## Next steps
 
