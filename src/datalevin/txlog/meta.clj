@@ -319,24 +319,46 @@
             :segment-id (long segment-id)
             :segment-offset (long offset)))))
 
+(defn- commit-segment-end-offset
+  [{:keys [offset size payload-bytes]}]
+  (let [offset (long (or offset 0))]
+    (cond
+      (some? size)
+      (+ offset (long size))
+
+      (some? payload-bytes)
+      (+ offset codec/record-header-size (long payload-bytes))
+
+      :else
+      offset)))
+
 (defn publish-meta-commit!
-  [state {:keys [lsn segment-id offset synced?]}]
+  [state {:keys [lsn segment-id synced?] :as record}]
   (update-shared-meta!
    state
    (fn [current]
-     (cond-> (assoc current
-                    :last-committed-lsn
-                    (max (long (or (:last-committed-lsn current) 0))
-                         (long lsn))
-                    :last-applied-lsn
-                    (max (long (or (:last-applied-lsn current) 0))
-                         (long lsn))
-                    :segment-id (long segment-id)
-                    :segment-offset (long offset))
+     (let [segment-id (long segment-id)
+           current-segment-id (long (or (:segment-id current) segment-id))
+           current-segment-offset (long (or (:segment-offset current) 0))
+           commit-end-offset (long (commit-segment-end-offset record))
+           segment-offset (if (= current-segment-id segment-id)
+                            (if (> current-segment-offset commit-end-offset)
+                              current-segment-offset
+                              commit-end-offset)
+                            commit-end-offset)]
+       (cond-> (assoc current
+                      :last-committed-lsn
+                      (max (long (or (:last-committed-lsn current) 0))
+                           (long lsn))
+                      :last-applied-lsn
+                      (max (long (or (:last-applied-lsn current) 0))
+                           (long lsn))
+                      :segment-id segment-id
+                      :segment-offset segment-offset)
        synced?
        (assoc :last-durable-lsn
               (max (long (or (:last-durable-lsn current) 0))
-                   (long lsn)))))))
+                   (long lsn))))))))
 
 (defn publish-meta-durable!
   [state target-lsn]
