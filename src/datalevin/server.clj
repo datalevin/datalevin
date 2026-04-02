@@ -1363,12 +1363,15 @@
                                                 (not (store-closed? store)))
                                        (close-store store))
                                      (throw t)))
-                 datalog?         (instance? Store store)]
+                 datalog?         (instance? Store store)
+                 consensus-ha?    (and datalog?
+                                       (some? (*consensus-ha-opts-fn* store)))]
             (update-client server client-id
                            #(cond-> %
                               true     (update :stores assoc db-name
                                                {:datalog? datalog?
-                                                :dbis     #{}})
+                                                :dbis     #{}
+                                                :consensus-ha? consensus-ha?})
                               (and datalog? activate-runtime?)
                               (update :dt-dbs conj db-name)))
             (when-not existing-db-now?
