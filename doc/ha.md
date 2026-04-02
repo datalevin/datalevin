@@ -466,10 +466,3 @@ Typical operator responses are correspondingly simple:
   replay or snapshot bootstrap; do not force promotion during recovery
 * for degraded followers, restore a valid WAL or snapshot source before
   treating the node as healthy
-
-In practice, the fastest confidence ladder is:
-
-1. unit and integration tests
-2. localhost drill-harness scenarios in the development workspace
-3. Jepsen local workloads
-4. Jepsen remote workloads on real multi-host infrastructure
