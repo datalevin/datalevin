@@ -177,6 +177,34 @@ Example:
                   :time-out 120000}))
 ```
 
+#### HA replica reads
+
+In HA deployments, a client can read from a replica/follower by connecting to
+that node's endpoint with the normal client APIs. There is currently no
+separate "read-only replica client" API or URI flag.
+
+For example, both of the following are valid ways to read from a replica:
+
+```clojure
+(require '[datalevin.client :as cl]
+         '[datalevin.core :as d])
+
+(def client
+  (cl/new-client "dtlv://user:pass@replica-host:8898"))
+
+(def conn
+  (d/create-conn "dtlv://user:pass@replica-host:8898/app"))
+```
+
+The existing client is sufficient for replica reads. In HA mode, write
+operations may be retried or routed to the authoritative leader, but ordinary
+read requests are served by the node you connect to.
+
+If you need enforced read-only access, use RBAC rather than a special client
+type: grant the user or role only `:datalevin.server/view` permission on the
+database, and do not grant `:datalevin.server/alter`,
+`:datalevin.server/create`, or `:datalevin.server/control`.
+
 #### Server idle session timeout
 
 CLI option `--idle-timeout` (default `172800000` ms, i.e. 48 hours) controls
