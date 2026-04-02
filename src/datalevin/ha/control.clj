@@ -523,18 +523,41 @@
 (def ^:private max-read-index-attempt-timeout-ms 500)
 (def ^:private max-command-attempt-timeout-ms 5000)
 (def ^:private initial-command-retry-delay-ms 20)
-(def ^:private read-retryable-errors
-  #{RaftError/EAGAIN
-    RaftError/EBUSY
-    RaftError/EPERM
-    RaftError/ETIMEDOUT
-    RaftError/ERAFTTIMEDOUT})
+;; Avoid top-level RaftError enum singletons in the image heap during Graal
+;; native-image analysis by comparing stable names/codes instead.
+(def ^:private read-retryable-error-names
+  #{"EAGAIN"
+    "EBUSY"
+    "EPERM"
+    "ETIMEDOUT"
+    "ERAFTTIMEDOUT"})
+(def ^:private not-leader-error-names
+  #{"EPERM"
+    "EBUSY"
+    "EAGAIN"})
+
+(defn- raft-error-name
+  [raft-error]
+  (some-> raft-error str))
+
+(defn- status-raft-error-name
+  [^Status status]
+  (raft-error-name (.getRaftError status)))
+
+(defn- status-has-raft-error?
+  [^Status status error-names]
+  (contains? error-names
+             (status-raft-error-name status)))
+
+(defn- raft-error-code
+  [error-name]
+  (int (.getNumber (RaftError/valueOf error-name))))
 
 (defn- retryable-read-status?
   [^Status status]
   (let [message (some-> status .getErrorMsg)]
-    (or (contains? read-retryable-errors
-                   (.getRaftError status))
+    (or (status-has-raft-error? status
+                                read-retryable-error-names)
         (and (string? message)
              (or (s/includes? message "leader stepped down")
                  (s/includes? message
@@ -852,7 +875,7 @@
 (defn- fsm-apply-error-status
   [^Exception e]
   (Status.
-   (int (.getNumber RaftError/ESTATEMACHINE))
+   (raft-error-code "ESTATEMACHINE")
    (str "HA FSM apply failed: "
         (.getMessage e))))
 
@@ -880,8 +903,8 @@
             (.isOk status)
             {:ok? true :result (:result outcome)}
 
-            (contains? #{RaftError/EPERM RaftError/EBUSY RaftError/EAGAIN}
-                       (.getRaftError status))
+            (status-has-raft-error? status
+                                    not-leader-error-names)
             {:ok? false
              :error :not-leader
              :status status}
@@ -909,8 +932,8 @@
             (.isOk status)
             {:ok? true}
 
-            (contains? #{RaftError/EPERM RaftError/EBUSY RaftError/EAGAIN}
-                       (.getRaftError status))
+            (status-has-raft-error? status
+                                    not-leader-error-names)
             {:ok? false
              :error :not-leader
              :status status}
@@ -1409,7 +1432,7 @@
           (when done
             (.run ^Closure done
                   (Status.
-                   (int (.getNumber RaftError/EIO))
+                   (raft-error-code "EIO")
                    (str "HA FSM snapshot save failed: "
                         (.getMessage e))))))))
 
