@@ -165,6 +165,11 @@ Example:
 * `:pool-size` (default `3`): max pooled connections per client instance.
 * `:time-out` (default `60000` ms): timeout for getting a connection and for
   retrying requests.
+* `:ha-write-retry-timeout-ms` (default `min(:time-out, 5000)`): extra wall
+  clock budget for retryable HA write failover after an endpoint rejects a
+  write because leadership changed.
+* `:ha-write-retry-delay-ms` (default `100` ms): sleep between HA write retry
+  rounds.
 
 Example:
 
@@ -174,8 +179,30 @@ Example:
 (def client
   (cl/new-client "dtlv://user:pass@db-host:8898"
                  {:pool-size 12
-                  :time-out 120000}))
+                  :time-out 120000
+                  :ha-write-retry-timeout-ms 8000
+                  :ha-write-retry-delay-ms 150}))
 ```
+
+#### HA write failover
+
+In HA deployments, ordinary write requests use bounded automatic failover:
+
+* if a node quickly replies with a retryable HA write rejection such as
+  `:not-leader`, the client immediately moves on to the next known endpoint
+* after probing the current endpoint set once, the client can retry the same
+  set in later rounds, sleeping `:ha-write-retry-delay-ms` between rounds
+* the whole retry process stops once a write succeeds or the extra
+  `:ha-write-retry-timeout-ms` budget is exhausted
+
+This matters because leader failover is not usually instantaneous. The
+control-plane defaults are already in the seconds range, so a client may need a
+short bounded retry window to ride through election and promotion convergence.
+
+The automatic HA retry path is for ordinary one-shot writes. Explicit remote
+write transactions opened with `open-transact` / `open-transact-kv` stay bound
+to their chosen server connection and are not automatically migrated to a new
+leader mid-transaction.
 
 #### HA replica reads
 

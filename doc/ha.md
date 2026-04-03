@@ -334,15 +334,32 @@ leadership back when it returns. It rejoins as a follower.
 Client behavior is intentionally simple:
 
 * normal Datalevin remote APIs still apply
-* writes may be retried or redirected as leadership changes
+* ordinary one-shot writes may be retried or redirected as leadership changes
 * stale-leader write failures are explicit and retryable
 * direct follower reads are allowed by connecting to that node
+
+The retry behavior is bounded rather than open-ended:
+
+* the client probes the currently known endpoints
+* if none accepts the write yet, it can retry the same endpoint set in later
+  rounds
+* the rounds stop when a leader accepts the write or the client's
+  `:ha-write-retry-timeout-ms` budget is exhausted
+
+This is important because leader failover is not instant. With the default
+control-plane settings, election and promotion convergence is normally measured
+in hundreds of milliseconds to seconds, not microseconds.
 
 The normal HA cluster client story is therefore:
 
 * connect to the leader if you want normal write traffic
 * connect to a follower directly if you want replica reads
 * use RBAC if you need a user to be read-only
+* tune `:ha-write-retry-timeout-ms` and `:ha-write-retry-delay-ms` if your
+  failover environment needs a longer or shorter write retry window
+* do not expect explicit remote write transactions to hop to a new leader after
+  `open-transact` / `open-transact-kv`; those stay pinned to their original
+  server session
 
 ## How The Design Is Verified
 
