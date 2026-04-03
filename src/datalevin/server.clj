@@ -117,6 +117,7 @@
     :else                    (u/raise "Unknown store" {})))
 
 (declare store-closed?)
+(declare ensure-ha-client-op-dbi-open!)
 
 (defn- reopen-store
   [store]
@@ -139,7 +140,8 @@
           (close-store store)
           (catch Throwable _
             nil)))
-      (l/open-kv env-dir env-opts))
+      (ensure-ha-client-op-dbi-open!
+        (l/open-kv env-dir env-opts)))
 
     :else
     (u/raise "Unknown store" {})))
@@ -164,6 +166,14 @@
 
 (declare get-store get-kv-store add-store)
 
+(defn- ensure-ha-client-op-dbi-open!
+  [lmdb]
+  (try
+    (i/get-dbi lmdb c/ha-client-ops false)
+    (catch Exception _
+      (i/open-dbi lmdb c/ha-client-ops)))
+  lmdb)
+
 (defn- open-write-txn-with-retry
   [server db-name]
   (loop [attempt 0]
@@ -176,6 +186,7 @@
                    ;; background one-shot writes cannot race shared write state.
                    (locking tx-lock
                      (try
+                       (ensure-ha-client-op-dbi-open! kv-store)
                        {:ok? true
                         :store store
                         :kv-store kv-store
@@ -1228,7 +1239,7 @@
       (do
         (dha/recover-ha-local-store-dir-if-needed! dir)
         (st/open dir))
-      (let [lmdb (l/open-kv dir)]
+      (let [lmdb (ensure-ha-client-op-dbi-open! (l/open-kv dir))]
         (doseq [dbi dbis] (i/open-dbi lmdb dbi))
         lmdb))))
 
@@ -1258,6 +1269,7 @@
 
     (some? store)
     (when-not (i/closed-kv? store)
+      (ensure-ha-client-op-dbi-open! store)
       store)
 
     :else
@@ -1348,7 +1360,8 @@
                                          :datalog   (do
                                                       (dha/recover-ha-local-store-dir-if-needed! dir)
                                                       (st/open dir schema opts))
-                                         :key-value (l/open-kv dir opts))
+                                         :key-value (ensure-ha-client-op-dbi-open!
+                                                      (l/open-kv dir opts)))
                                        (catch Exception e
                                          (if (multiple-lmdb-open-error? e)
                                            (or (await-reusable-store

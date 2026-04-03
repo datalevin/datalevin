@@ -45,6 +45,9 @@
 (defonce ^:private ^java.util.Map ha-retry-disabled-clients
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defonce ^:private ^java.util.Map ha-write-retry-settings
+  (Collections/synchronizedMap (WeakHashMap.)))
+
 (defn- conn-wire-opts
   [^SocketChannel ch]
   (or (.get connection-wire-opts ch)
@@ -425,6 +428,7 @@
         (send-only conn {:type :disconnect})
         (release-connection pool conn))
       (finally
+        (.remove ha-write-retry-settings client)
         (.remove ha-retry-disabled-clients client)
         (.remove ha-preferred-endpoints client)
         (disconnect-retry-clients! client disconnect)))
@@ -436,6 +440,39 @@
   (get-pool [client] pool)
 
   (get-id [client] id))
+
+(def ^:private default-ha-write-retry-timeout-ms 5000)
+(def ^:private default-ha-write-retry-delay-ms 100)
+
+(defn- normalize-ha-write-retry-settings
+  [time-out opts]
+  {:ha-write-retry-timeout-ms
+   (long
+     (max 0
+          (long
+            (or (:ha-write-retry-timeout-ms opts)
+                (min (long (or time-out c/default-connection-timeout))
+                     (long default-ha-write-retry-timeout-ms))))))
+   :ha-write-retry-delay-ms
+   (long
+     (max 0
+          (long
+            (or (:ha-write-retry-delay-ms opts)
+                default-ha-write-retry-delay-ms))))})
+
+(defn- set-client-ha-write-retry-settings!
+  [client time-out opts]
+  (.put ha-write-retry-settings client
+        (normalize-ha-write-retry-settings time-out opts))
+  client)
+
+(defn- client-ha-write-retry-settings
+  [client]
+  (or (.get ha-write-retry-settings client)
+      (when (instance? Client client)
+        (normalize-ha-write-retry-settings
+          (.-time-out ^Client client)
+          nil))))
 
 (defn open-database
   "Open a database on server. `db-type` can be \"datalog\", \"kv\",
@@ -477,11 +514,16 @@
   * `:pool-size` determines number of connections maintained in the connection
   pool, default is 3.
   * `:time-out` specifies the time (milliseconds) before an exception is thrown
-  when obtaining an open network connection, default is 60000."
+  when obtaining an open network connection, default is 60000.
+  * `:ha-write-retry-timeout-ms` bounds extra HA failover retry time after a
+  retryable write rejection, default is 5000.
+  * `:ha-write-retry-delay-ms` sleeps between HA failover retry rounds,
+  default is 100."
   ([uri-str]
    (new-client uri-str {:pool-size c/default-connection-pool-size
                         :time-out  c/default-connection-timeout}))
   ([uri-str {:keys [pool-size time-out]
+             :as   opts
              :or   {pool-size c/default-connection-pool-size
                     time-out  c/default-connection-timeout}}]
    (let [uri                         (URI. uri-str)
@@ -491,8 +533,9 @@
          port      (parse-port uri)
          client-id (authenticate host port username password time-out)
          pool      (new-connectionpool host port client-id pool-size time-out)]
-     (->Client username password host port pool-size time-out
-	               client-id pool))))
+     (-> (->Client username password host port pool-size time-out
+                   client-id pool)
+         (set-client-ha-write-retry-settings! time-out opts)))))
 
 (defn ^:no-doc dedicated-transaction-client
   [client]
@@ -505,10 +548,12 @@
               host      (.-host client)
               port      (.-port client)
               time-out  (.-time-out client)
+              ha-settings (client-ha-write-retry-settings client)
               client-id (authenticate host port username password time-out)
               pool      (new-connectionpool host port client-id 1 time-out)]
-          (->Client username password host port 1 time-out
-                    client-id pool))))
+          (-> (->Client username password host port 1 time-out
+                        client-id pool)
+              (set-client-ha-write-retry-settings! time-out ha-settings)))))
     client))
 
 (defn- endpoint-key
@@ -596,16 +641,26 @@
     [[] seen]
     endpoints))
 
+(defn- append-ha-retry-endpoint
+  [endpoints endpoint]
+  (cond-> (vec (or endpoints []))
+    (and (string? endpoint)
+         (not (s/blank? endpoint))
+         (not (some #(= endpoint %) endpoints)))
+    (conj endpoint)))
+
 (defn- client-routing-context
   [client]
   (when (instance? Client client)
-    {:username  (.-username ^Client client)
-     :password  (.-password ^Client client)
-     :pool-size (.-pool-size ^Client client)
-     :time-out  (.-time-out ^Client client)
-     :host      (.-host ^Client client)
-     :port      (.-port ^Client client)
-     :client    client}))
+    (merge
+      {:username  (.-username ^Client client)
+       :password  (.-password ^Client client)
+       :pool-size (.-pool-size ^Client client)
+       :time-out  (.-time-out ^Client client)
+       :host      (.-host ^Client client)
+       :port      (.-port ^Client client)
+       :client    client}
+      (client-ha-write-retry-settings client))))
 
 (defn- ^:redef client-retry-context
   [client]
@@ -636,11 +691,13 @@
       endpoint)))
 
 (defn- new-client-for-endpoint
-  [{:keys [username password pool-size time-out]} host port]
+  [{:keys [username password pool-size time-out]
+    :as   retry-context} host port]
   (let [client-id (authenticate host port username password time-out)
         pool      (new-connectionpool host port client-id pool-size time-out)]
-    (->Client username password host port pool-size time-out
-              client-id pool)))
+    (-> (->Client username password host port pool-size time-out
+                  client-id pool)
+        (set-client-ha-write-retry-settings! time-out retry-context))))
 
 (def ^:private ha-kv-retry-request-types
   #{:transact-kv
@@ -841,11 +898,26 @@
   ([req message err-data retry-context request-fn disconnect-fn new-client-fn
     on-success-endpoint!]
    (let [self-key (endpoint-key (:host retry-context) (:port retry-context))
-         [pending seen]
+         retry-delay-ms
+         (long (or (:ha-write-retry-delay-ms retry-context)
+                   default-ha-write-retry-delay-ms))
+         deadline-ms
+         (+ (System/currentTimeMillis)
+            (long (or (:ha-write-retry-timeout-ms retry-context)
+                      default-ha-write-retry-timeout-ms)))
+         [pending _]
          (collect-ha-retry-endpoints
            #{self-key}
-           (:ha-retry-endpoints err-data))]
-     (loop [remaining    pending
+           (:ha-retry-endpoints err-data))
+         [round-order seen]
+         (collect-ha-retry-endpoints
+           #{}
+           (append-ha-retry-endpoint
+             (:ha-retry-endpoints err-data)
+             self-key))]
+     (loop [round        1
+            remaining    pending
+            round-order  round-order
             seen         seen
             last-message message
             last-err     err-data
@@ -861,7 +933,9 @@
                (:result outcome))
 
              (= :exception (:kind outcome))
-             (recur (rest remaining)
+             (recur round
+                    (rest remaining)
+                    round-order
                     seen
                     last-message
                     last-err
@@ -877,8 +951,12 @@
                  (let [[extra seen']
                        (collect-ha-retry-endpoints
                          seen
-                         (:ha-retry-endpoints retry-err))]
-                   (recur (concat (rest remaining) extra)
+                         (:ha-retry-endpoints retry-err))
+                       round-order'
+                       (into round-order extra)]
+                   (recur round
+                          (concat (rest remaining) extra)
+                          round-order'
                           seen'
                           retry-message
                           retry-err
@@ -893,8 +971,23 @@
                           {:endpoint endpoint
                            :type :error-response
                            :reason (:reason retry-err)})})))))
-        (raise-normal-request-error req last-message last-err
-                                    {:ha-retry-attempts attempts}))))))
+         (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
+           (if (or (empty? round-order)
+                   (<= remaining-ms 0))
+             (raise-normal-request-error
+               req last-message last-err
+               {:ha-retry-attempts attempts
+                :ha-retry-rounds round})
+             (do
+               (when (pos? retry-delay-ms)
+                 (Thread/sleep (long (min retry-delay-ms remaining-ms))))
+               (recur (inc round)
+                      round-order
+                      round-order
+                      seen
+                      last-message
+                      last-err
+                      attempts)))))))))
 
 (defn- ^:redef try-preferred-ha-write-request*
   [client req retry-context request-fn disconnect-fn new-client-fn retry-fn]
@@ -915,7 +1008,10 @@
             {:handled? true
              :result (retry-fn client req
                                (:message outcome)
-                               (:err-data outcome))}
+                               (update (:err-data outcome)
+                                       :ha-retry-endpoints
+                                       append-ha-retry-endpoint
+                                       endpoint))}
             (raise-normal-request-error
               req (:message outcome) (:err-data outcome) nil))
 

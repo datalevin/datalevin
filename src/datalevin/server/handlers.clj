@@ -17,9 +17,11 @@
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.ha :as dha]
+   [datalevin.ha.client-op :as hcop]
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
+   [datalevin.lmdb :as l]
    [datalevin.protocol :as p]
    [datalevin.server.api :as sapi]
    [datalevin.server.auth :as auth]
@@ -30,7 +32,7 @@
    [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Paths]
    [java.util UUID]
-   [java.util.concurrent Semaphore]))
+   [java.util.concurrent ConcurrentHashMap Semaphore]))
 
 (def ^:private view-act :datalevin.server/view)
 (def ^:private alter-act :datalevin.server/alter)
@@ -43,6 +45,8 @@
 (def ^:private server-obj :datalevin.server/server)
 (def ^:private transient-runtime-store-max-attempts 8)
 (def ^:private transient-runtime-store-retry-sleep-ms 25)
+(def ^:private client-op-await-timeout-ms 30000)
+(def ^:private client-op-completed-retain-ms 60000)
 
 (defn- skey-state
   ^clojure.lang.Volatile [^SelectionKey skey]
@@ -99,6 +103,30 @@
 (defn- write-result!
   [deps skey result]
   ((:write-message deps) skey {:type :command-complete :result result}))
+
+(defn- internal-kv-dbi?
+  [dbi-name]
+  (= c/ha-client-ops dbi-name))
+
+(defn- internal-kv-dbi-open?
+  [kv dbi-name]
+  (try
+    (some? (i/get-dbi kv dbi-name false))
+    (catch Exception _
+      false)))
+
+(defn- tx-response-count
+  ^long [res]
+  (+ (count (:tx-data res)) (count (:tempids res))))
+
+(defn- write-tx-response!
+  [deps skey res]
+  (if (< (tx-response-count res) ^long c/+wire-datom-batch-size+)
+    (write-result! deps skey res)
+    (let [{:keys [tx-data tempids]} res
+          response-meta            (dissoc res :tx-data :tempids)]
+      ((:copy-out deps) skey (into tx-data tempids)
+       c/+wire-datom-batch-size+ nil response-meta))))
 
 (defn- with-runtime-store-read-access
   [deps server db-name f]
@@ -330,6 +358,151 @@
                 :update-db
                 :vector-index
                 :write-message]))
+
+(defn- client-op-request
+  [{:keys [client-op-id client-op-hash client-op-response-kind type]
+    :as   message}]
+  (let [present-keys (keep (fn [[k v]] (when (some? v) k))
+                           [[:client-op-id client-op-id]
+                            [:client-op-hash client-op-hash]
+                            [:client-op-response-kind client-op-response-kind]])]
+    (cond
+      (empty? present-keys)
+      nil
+
+      (= 3 (count present-keys))
+      {:client-op-id  client-op-id
+       :request-type  type
+       :request-hash  client-op-hash
+       :response-kind client-op-response-kind}
+
+      :else
+      (u/raise "Incomplete HA client op metadata"
+               {:message-type type
+                :present-keys present-keys
+                :error        :ha/client-op-invalid-request}))))
+
+(defn- client-op-pending-map
+  [deps server db-name]
+  (let [pending-map
+        (or (:ha-client-op-pending (db-state deps server db-name))
+            (:ha-client-op-pending
+             ((:update-db deps) server db-name
+              (fn [m]
+                (if (:ha-client-op-pending m)
+                  m
+                  (assoc m :ha-client-op-pending (ConcurrentHashMap.)))))))]
+    (doseq [entry (.entrySet ^ConcurrentHashMap pending-map)]
+      (let [pending-entry (.getValue entry)
+            result-promise (:result-promise pending-entry)
+            result         (when (realized? result-promise)
+                             @result-promise)]
+        (when-let [completed-at-ms (some-> result :completed-at-ms)]
+          (let [completed-at-ms (long completed-at-ms)
+                retain-ms       (long client-op-completed-retain-ms)]
+            (when (>= (- (System/currentTimeMillis) completed-at-ms)
+                      retain-ms)
+              (.remove ^ConcurrentHashMap pending-map
+                       (.getKey entry)
+                       pending-entry))))))
+    pending-map))
+
+(defn- ^:redef read-committed-client-op-record
+  [deps server skey db-name writing? client-op-id]
+  (let [store (kv-store deps server skey db-name writing?)]
+    (i/get-value store
+                 c/ha-client-ops
+                 (hcop/kv-info-key client-op-id)
+                 :string
+                 :data)))
+
+(defn- validate-client-op-record!
+  [{:keys [client-op-id request-type request-hash response-kind]}
+   record]
+  (when (or (not= request-type (:request-type record))
+            (not= request-hash (:request-hash record))
+            (not= response-kind (:response-kind record)))
+    (u/raise "HA client op id reused for a different request"
+             {:error              :ha/client-op-conflict
+              :client-op-id       client-op-id
+              :request-type       request-type
+              :request-hash       request-hash
+              :response-kind      response-kind
+              :existing-record    (select-keys record
+                                               [:request-type
+                                                :request-hash
+                                                :response-kind])}))
+  record)
+
+(defn- write-client-op-replay!
+  [deps skey response-kind response]
+  (case response-kind
+    (:tx-data :tx-data+db-info) (write-result! deps skey response)
+    :kv-result                  (write-result! deps skey response)
+    :command-complete           (write-complete! deps skey)
+    (u/raise "Unsupported HA client op response kind"
+             {:response-kind response-kind
+              :error         :ha/client-op-invalid-response-kind})))
+
+(defn- await-pending-client-op!
+  [client-op-id result-promise]
+  (let [result (deref result-promise client-op-await-timeout-ms ::timeout)]
+    (if (= ::timeout result)
+      (u/raise "Timed out waiting for HA client op replay"
+               {:error        :ha/client-op-timeout
+                :client-op-id client-op-id
+                :timeout-ms   client-op-await-timeout-ms})
+      result)))
+
+(defn- with-idempotent-client-op
+  [deps server skey db-name writing? message exec-fn]
+  (if-let [request (client-op-request message)]
+    (let [{:keys [client-op-id response-kind]} request
+          pending-map (client-op-pending-map deps server db-name)]
+      (if-let [record (some->> client-op-id
+                               (read-committed-client-op-record
+                                deps server skey db-name writing?)
+                               (validate-client-op-record! request))]
+        {:replay?       true
+         :response-kind response-kind
+         :response      (:response record)}
+        (let [result-promise (promise)
+              pending-entry  {:request request
+                              :result-promise result-promise}
+              existing       (.putIfAbsent pending-map client-op-id
+                                           pending-entry)]
+          (if existing
+            (let [_ (validate-client-op-record! request (:request existing))
+                  {:keys [status response-kind response exception]}
+                  (await-pending-client-op! client-op-id
+                                            (:result-promise existing))]
+              (case status
+                :ok    {:replay?       true
+                        :response-kind response-kind
+                        :response      response}
+                :error (throw exception)
+                (u/raise "Unexpected pending HA client op state"
+                         {:client-op-id client-op-id
+                          :status       status})))
+            (try
+              (let [response (exec-fn request)]
+                (deliver result-promise {:status          :ok
+                                         :response-kind   response-kind
+                                         :response        response
+                                         :completed-at-ms
+                                         (System/currentTimeMillis)})
+                {:replay?       false
+                 :response-kind response-kind
+                 :response      response})
+              (catch Throwable t
+                (deliver result-promise
+                         {:status          :error
+                          :exception       t
+                          :completed-at-ms
+                          (System/currentTimeMillis)})
+                (throw t)))))))
+    {:replay? false
+     :response (exec-fn nil)}))
 
 (defn authentication
   [deps server skey message]
@@ -821,9 +994,9 @@
                  (u/raise "Missing :mode when loading datoms" {})))))))))
 
 (defn- transact*
-  [deps db0 txs s? server db-name writing?]
+  [deps db0 txs tx-meta s? server db-name writing?]
   (try
-    (d/with db0 txs {} s?)
+    (d/with db0 txs (or tx-meta {}) s?)
     (catch Exception e
       (when (:resized (ex-data e))
         (let [new-db (db/carry-runtime-opts
@@ -834,8 +1007,35 @@
              (assoc m (if writing? :wdt-db :dt-db) new-db)))))
       (throw e))))
 
+(defn- build-tx-response
+  [deps server skey db-name mode args writing? tx-meta include-db-info?]
+  (let [txs (case mode
+              :copy-in ((:copy-in deps) server skey)
+              :request (nth args 1)
+              (u/raise "Missing :mode when transact data" {}))
+        db0 (get-in (db-state deps server db-name)
+                    [(if writing? :wdt-db :dt-db)])
+        s?  (last args)
+        rp  (transact* deps db0 txs tx-meta s? server db-name writing?)
+        db1 (:db-after rp)
+        _   ((:update-db deps) server db-name
+             (fn [m]
+               (assoc m (if writing? :wdt-db :dt-db) db1)))
+        rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))]
+    (cond-> (cond-> (select-keys rp [:tx-data :tempids])
+              (:new-attributes rp)
+              (assoc :new-attributes (:new-attributes rp)))
+      include-db-info?
+      (assoc :db-info {:max-eid       (:max-eid db1)
+                       :max-tx        (i/max-tx
+                                       (dt-store deps server skey db-name
+                                                 writing?))
+                       :last-modified (i/last-modified
+                                       (dt-store deps server skey db-name
+                                                 writing?))}))))
+
 (defn tx-data
-  [deps server skey {:keys [mode args writing?]}]
+  [deps server skey {:keys [mode args writing?] :as message}]
   (with-error
     deps
     skey
@@ -850,29 +1050,28 @@
              db-name
              writing?
              (fn []
-               (let [txs (case mode
-                           :copy-in ((:copy-in deps) server skey)
-                           :request (nth args 1)
-                           (u/raise "Missing :mode when transact data" {}))
-                     db0 (get-in (db-state deps server db-name)
-                                 [(if writing? :wdt-db :dt-db)])
-                     s?  (last args)
-                     rp  (transact* deps db0 txs s? server db-name writing?)
-                     db1 (:db-after rp)
-                     _   ((:update-db deps) server db-name
-                          (fn [m]
-                            (assoc m (if writing? :wdt-db :dt-db) db1)))
-                     rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
-                     ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
-                     res (cond-> (select-keys rp [:tx-data :tempids])
-                           (:new-attributes rp)
-                           (assoc :new-attributes (:new-attributes rp)))]
-                 (if (< ct ^long c/+wire-datom-batch-size+)
-                   (write-result! deps skey res)
-                   (let [{:keys [tx-data tempids]} res
-                         response-meta            (dissoc res :tx-data :tempids)]
-                     ((:copy-out deps) skey (into tx-data tempids)
-                       c/+wire-datom-batch-size+ nil response-meta)))))))))))
+               (let [{:keys [response replay?]}
+                     (with-idempotent-client-op
+                       deps server skey db-name writing? message
+                       (fn [client-op]
+                         (build-tx-response
+                           deps
+                           server
+                           skey
+                           db-name
+                           mode
+                           args
+                           writing?
+                           (when client-op
+                             (hcop/tx-meta
+                               (:client-op-id client-op)
+                               (:request-type client-op)
+                               (:request-hash client-op)
+                               (:response-kind client-op)))
+                           false)))]
+                 (if replay?
+                   (write-result! deps skey response)
+                   (write-tx-response! deps skey response))))))))))
 
 (defn db-info
   [deps server skey {:keys [args writing?]}]
@@ -888,7 +1087,7 @@
                        :opts          (i/opts dt-store)}))))
 
 (defn tx-data+db-info
-  [deps server skey {:keys [mode args writing?]}]
+  [deps server skey {:keys [mode args writing?] :as message}]
   (with-error
     deps
     skey
@@ -903,35 +1102,28 @@
              db-name
              writing?
              (fn []
-               (let [txs (case mode
-                           :copy-in ((:copy-in deps) server skey)
-                           :request (nth args 1)
-                           (u/raise "Missing :mode when transact data" {}))
-                     db0 (get-in (db-state deps server db-name)
-                                 [(if writing? :wdt-db :dt-db)])
-                     s?  (last args)
-                     rp  (transact* deps db0 txs s? server db-name writing?)
-                     db1 (:db-after rp)
-                     _   ((:update-db deps) server db-name
-                          (fn [m]
-                            (assoc m (if writing? :wdt-db :dt-db) db1)))
-                     rp  (assoc-in rp [:tempids :max-eid] (:max-eid db1))
-                     dt-store (dt-store deps server skey db-name writing?)
-                     db-info  {:max-eid       (:max-eid db1)
-                               :max-tx        (i/max-tx dt-store)
-                               :last-modified (i/last-modified dt-store)}
-                     ct  (+ (count (:tx-data rp)) (count (:tempids rp)))
-                     res (cond-> (select-keys rp [:tx-data :tempids])
-                           (:new-attributes rp)
-                           (assoc :new-attributes (:new-attributes rp))
-                           true
-                           (assoc :db-info db-info))]
-                 (if (< ct ^long c/+wire-datom-batch-size+)
-                   (write-result! deps skey res)
-                   (let [{:keys [tx-data tempids]} res
-                         response-meta            (dissoc res :tx-data :tempids)]
-                     ((:copy-out deps) skey (into tx-data tempids)
-                       c/+wire-datom-batch-size+ nil response-meta)))))))))))
+               (let [{:keys [response replay?]}
+                     (with-idempotent-client-op
+                       deps server skey db-name writing? message
+                       (fn [client-op]
+                         (build-tx-response
+                           deps
+                           server
+                           skey
+                           db-name
+                           mode
+                           args
+                           writing?
+                           (when client-op
+                             (hcop/tx-meta
+                               (:client-op-id client-op)
+                               (:request-type client-op)
+                               (:request-hash client-op)
+                               (:response-kind client-op)))
+                           true)))]
+                 (if replay?
+                   (write-result! deps skey response)
+                   (write-tx-response! deps skey response))))))))))
 
 (defn open-kv
   [deps server skey message]
@@ -961,6 +1153,30 @@
         (fn [m]
           (update-in m [:stores db-name :dbis] conj dbi-name)))
        (write-complete! deps skey))))
+
+(defn list-dbis
+  [deps server skey {:keys [args writing?]}]
+  (with-error
+    deps
+    skey
+    #(let [kv      (kv-store deps server skey (nth args 0) writing?)
+           visible (into [] (remove internal-kv-dbi?) (i/list-dbis kv))]
+       (write-result! deps skey visible))))
+
+(defn stat
+  [deps server skey {:keys [args writing?]}]
+  (with-error
+    deps
+    skey
+    #(let [db-name  (nth args 0)
+           dbi-name (nth args 1 nil)
+           kv       (kv-store deps server skey db-name writing?)
+           result   (i/stat kv dbi-name)
+           result   (if (and (nil? dbi-name)
+                             (internal-kv-dbi-open? kv c/ha-client-ops))
+                      (update result :entries dec)
+                      result)]
+       (write-result! deps skey result))))
 
 (defn drop-dbi
   [deps server ^SelectionKey skey {:keys [args writing?]}]
@@ -1611,38 +1827,66 @@
                   pin-id)))))))))
 
 (defn transact-kv
-  [deps server skey {:keys [mode args writing?]}]
+  [deps server skey {:keys [mode args writing?] :as message}]
   (with-error
     deps
     skey
     #(let [db-name  (nth args 0)
-           kv-store ((:get-store deps) server db-name)]
+           kv-store (kv-store deps server skey db-name writing?)]
        (db-alter-permission!
          deps server skey db-name
          "Don't have permission to alter the database"
          (fn []
-           (case mode
-             :copy-in
-             (let [txs ((:copy-in deps) server skey)]
-               (case (count args)
-                 1 (i/transact-kv kv-store txs)
-                 2 (i/transact-kv kv-store (nth args 1) txs)
-                 3 (i/transact-kv kv-store (nth args 1) txs (nth args 2))
-                 4 (i/transact-kv kv-store (nth args 1) txs
-                                  (nth args 2) (nth args 3))
-                 5 (i/transact-kv kv-store (nth args 1) txs
-                                  (nth args 3) (nth args 4))
-                 (u/raise "Invalid :args for transact-kv copy-in"
-                          {:args args :mode mode}))
-               (write-complete! deps skey))
-
-             :request
-             (write-result!
-               deps
-               skey
-               (apply i/transact-kv kv-store (rest args)))
-
-             (u/raise "Missing :mode when transacting kv" {})))))))
+           (let [{:keys [response]}
+                 (with-idempotent-client-op
+                   deps server skey db-name writing? message
+                   (fn [client-op]
+                     (let [txs0 (case mode
+                                  :copy-in ((:copy-in deps) server skey)
+                                  :request (nth args 2)
+                                  (u/raise "Missing :mode when transacting kv"
+                                           {}))
+                           dbi-name (nth args 1)
+                           k-type   (nth args 3 nil)
+                           v-type   (nth args 4 nil)
+                           response-kind
+                           (or (:response-kind client-op)
+                               hcop/command-complete-response-kind)
+                           response
+                           (when (= :request mode)
+                             :transacted)
+                           txs (cond-> (if (and client-op dbi-name)
+                                         (mapv
+                                           (fn [tx]
+                                             (let [^datalevin.lmdb.KVTxData row
+                                                   (l/->kv-tx-data tx
+                                                                   k-type
+                                                                   v-type)]
+                                               (datalevin.lmdb.KVTxData.
+                                                 (.-op row)
+                                                 dbi-name
+                                                 (.-k row)
+                                                 (.-v row)
+                                                 (.-kt row)
+                                                 (.-vt row)
+                                                 (.-flags row))))
+                                           txs0)
+                                         txs0)
+                                 client-op
+                                 (conj (hcop/committed-record-tx
+                                         (:client-op-id client-op)
+                                         (hcop/committed-record
+                                           (:request-type client-op)
+                                           (:request-hash client-op)
+                                           response-kind
+                                           response))))]
+                       (if client-op
+                         (i/transact-kv kv-store txs)
+                         (i/transact-kv kv-store dbi-name txs k-type v-type))
+                       response)))]
+             (if (= :request mode)
+               (write-result! deps skey response)
+               (write-complete! deps skey))))))))
 
 (defn q
   [deps server skey message]
@@ -1893,9 +2137,9 @@
    :open-dbi open-dbi
    :clear-dbi (normal-kv-handler i/clear-dbi)
    :drop-dbi drop-dbi
-   :list-dbis (normal-kv-handler i/list-dbis)
+   :list-dbis list-dbis
    :copy copy
-   :stat (normal-kv-handler i/stat)
+   :stat stat
    :entries (normal-kv-handler i/entries)
    :open-transact-kv open-transact-kv
    :close-transact-kv close-transact-kv

@@ -19,6 +19,7 @@
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
+   [datalevin.ha.client-op :as hcop]
    [datalevin.util :as u
     :refer [case-tree defrecord-updatable conjv concatv]]
    [datalevin.lmdb :as l]
@@ -1061,19 +1062,65 @@
    (let [report (txexec/local-transact-tx-data
                   initial-report initial-es tx-time)]
      (when-not simulated?
-       (commit-prepared-tx-data! (:db-after report) (:tx-data report)))
+       (commit-prepared-tx-data! (:db-after report) (:tx-data report) report))
      report)))
+
+(defn- committed-client-op-response
+  [report last-modified-ms]
+  (let [tx-meta (:tx-meta report)
+        client-op-id (:ha/client-op-id tx-meta)
+        request-type (:ha/client-op-request-type tx-meta)
+        request-hash (:ha/client-op-hash tx-meta)
+        response-kind (:ha/client-op-response-kind tx-meta)
+        db-after (:db-after report)]
+    (when (and client-op-id request-type request-hash response-kind)
+      (let [response
+            ;; Persist replay payloads without Datom objects so reopening a DB
+            ;; doesn't depend on the custom Datom Nippy reader being loaded.
+            (cond-> {:tx-data (mapv (fn [datom]
+                                      [(d/datom-e datom)
+                                       (d/datom-a datom)
+                                       (d/datom-v datom)
+                                       (d/datom-tx datom)
+                                       (d/datom-added datom)])
+                                    (:tx-data report))
+                     :tempids (assoc (:tempids report)
+                                     :max-eid
+                                     (:max-eid db-after))}
+              (:new-attributes report)
+              (assoc :new-attributes (:new-attributes report))
+
+              (= response-kind hcop/tx-data+db-info-response-kind)
+              (assoc :db-info {:max-eid       (:max-eid db-after)
+                               :max-tx        (:max-tx db-after)
+                               :last-modified last-modified-ms}))]
+        (hcop/committed-record-tx
+          client-op-id
+          (hcop/committed-record request-type
+                                 request-hash
+                                 response-kind
+                                 response))))))
 
 (defn ^:no-doc commit-prepared-tx-data!
   "Persist already prepared tx-data to the given DB store."
-  [^DB db tx-data]
+  ([^DB db tx-data]
+   (commit-prepared-tx-data! db tx-data nil))
+  ([^DB db tx-data report]
   (let [store (.-store db)]
     (if (instance? Store store)
-      (let [embedding-plan (s/prepare-embedding-plan ^Store store tx-data)]
-        (s/load-datoms-with-plan! ^Store store tx-data embedding-plan))
+      (let [embedding-plan    (s/prepare-embedding-plan ^Store store tx-data)
+            last-modified-ms  (System/currentTimeMillis)
+            extra-kv-tx       (some-> report
+                                      (committed-client-op-response
+                                        last-modified-ms))
+            commit-opts       (cond-> {:last-modified-ms last-modified-ms}
+                                extra-kv-tx
+                                (assoc :extra-kv-txs [extra-kv-tx]))]
+        (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
+                                  commit-opts))
       (load-datoms store tx-data))
     (invalidate-cache store tx-data (last-modified store))
-    db))
+    db)))
 
 (defn- remote-tx-result
   [res]

@@ -1596,11 +1596,18 @@
       (let [k (decode-kv-info-buffer kb
                                      (when (= key-type c/type-keyword)
                                        :keyword))
-            v (decode-kv-info-buffer vb (raw-header-type val-type))]
-        (when-not (and (vector? k)
-                       (= 2 (count k))
-                       (= :dbis (nth k 0)))
-          [k v])))))
+            dbi-key? (and (vector? k)
+                          (= 2 (count k))
+                          (= :dbis (nth k 0)))]
+        (when-not dbi-key?
+          (try
+            [k (decode-kv-info-buffer vb (raw-header-type val-type))]
+            (catch Exception e
+              (u/raise "Fail to decode kv-info entry"
+                       e
+                       {:key k
+                        :key-type key-type
+                        :raw-val-type val-type}))))))))
 
 (defn- load-info-from-kv
   [^CppLMDB lmdb]

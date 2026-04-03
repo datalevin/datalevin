@@ -1490,15 +1490,21 @@
         plan))))
 
 (defn load-datoms-with-plan!
-  [^Store store datoms embedding-plan]
-  (locking (.-write-txn store)
-    (->> (prepare-datoms-kv-plan store datoms embedding-plan)
-         (commit-datoms-kv-plan!
-           (.-lmdb store)
-           (.-search-engines store)
-           (.-vector-indices store)
-           (.-embedding-indices store)
-           (.-idoc-indices store)))))
+  ([^Store store datoms embedding-plan]
+   (load-datoms-with-plan! store datoms embedding-plan nil))
+  ([^Store store datoms embedding-plan {:keys [extra-kv-txs last-modified-ms]}]
+   (locking (.-write-txn store)
+     (->> (prepare-datoms-kv-plan store
+                                  datoms
+                                  embedding-plan
+                                  extra-kv-txs
+                                  last-modified-ms)
+          (commit-datoms-kv-plan!
+            (.-lmdb store)
+            (.-search-engines store)
+            (.-vector-indices store)
+            (.-embedding-indices store)
+            (.-idoc-indices store))))))
 
 (defn- insert-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
@@ -1601,32 +1607,38 @@
   ([^Store store datoms]
    (prepare-datoms-kv-plan store datoms nil))
   ([^Store store datoms embedding-plan]
-  (let [txs    (FastList. (* 3 (count datoms)))
-        ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-        ;; or [:r d gt]
-        ft-ds  (FastList.)
-        ;; vector, same
-        vi-ds  (FastList.)
-        ;; embedding [:a [doc-ref vec]], [:d doc-ref]
-        em-ds  (FastList.)
-        ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-        ;; or [:r d [gt v]]
-        id-ds  (FastList.)
-        giants (HashMap.)]
-    (doseq [datom datoms]
-      (if (d/datom-added datom)
-        (insert-datom store datom txs ft-ds vi-ds em-ds id-ds giants
-                      embedding-plan)
-        (delete-datom store datom txs ft-ds vi-ds em-ds id-ds giants)))
-    (.add txs (lmdb/kv-tx :put c/meta :max-tx
-                          (.advance-max-tx store) :attr :long))
-    (.add txs (lmdb/kv-tx :put c/meta :last-modified
-                          (System/currentTimeMillis) :attr :long))
-    {:txs txs
-     :ft-ds ft-ds
-     :vi-ds vi-ds
-     :em-ds em-ds
-     :id-ds id-ds})))
+   (prepare-datoms-kv-plan store datoms embedding-plan nil nil))
+  ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms]
+   (let [txs    (FastList. (* 3 (count datoms)))
+         ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
+         ;; or [:r d gt]
+         ft-ds  (FastList.)
+         ;; vector, same
+         vi-ds  (FastList.)
+         ;; embedding [:a [doc-ref vec]], [:d doc-ref]
+         em-ds  (FastList.)
+         ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
+         ;; or [:r d [gt v]]
+         id-ds  (FastList.)
+         giants (HashMap.)]
+     (doseq [datom datoms]
+       (if (d/datom-added datom)
+         (insert-datom store datom txs ft-ds vi-ds em-ds id-ds giants
+                       embedding-plan)
+         (delete-datom store datom txs ft-ds vi-ds em-ds id-ds giants)))
+     (.add txs (lmdb/kv-tx :put c/meta :max-tx
+                           (.advance-max-tx store) :attr :long))
+     (.add txs (lmdb/kv-tx :put c/meta :last-modified
+                           (long (or last-modified-ms
+                                     (System/currentTimeMillis)))
+                           :attr :long))
+     (doseq [tx extra-kv-txs]
+       (.add txs tx))
+     {:txs txs
+      :ft-ds ft-ds
+      :vi-ds vi-ds
+      :em-ds em-ds
+      :id-ds id-ds})))
 
 (defn- commit-datoms-kv-plan!
   "Commit a prepared datom KV plan."
@@ -1935,6 +1947,7 @@
   (open-list-dbi lmdb c/eav {:key-size c/+id-bytes+
                              :val-size c/+max-key-size+})
   (open-dbi lmdb c/giants {:key-size c/+id-bytes+})
+  (open-dbi lmdb c/ha-client-ops)
   (open-dbi lmdb c/meta {:key-size c/+max-key-size+})
   (open-dbi lmdb c/opts {:key-size c/+max-key-size+})
   (open-dbi lmdb c/schema {:key-size c/+max-key-size+}))
