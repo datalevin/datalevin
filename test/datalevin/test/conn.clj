@@ -629,6 +629,45 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-replay-aligns-runtime-cursor-to-persisted-payload-floor
+  (let [dir  (u/tmp-dir (str "wal-replay-align-floor-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          ;; Build a local WAL tail that ends at LSN 13, then simulate a
+          ;; snapshot-installed follower whose persisted payload floor has
+          ;; already advanced to LSN 14 before the runtime txlog cursor is
+          ;; realigned.
+          (dotimes [i 13]
+            (is (= :transacted
+                   (d/transact-kv db [[:put "a" i i]]))))
+          (let [state (txlog/state db)]
+            (is (some? state))
+            (is (= 14 (long @(:next-lsn state))))
+            (is (= :transacted
+                   (i/transact-kv db
+                                  c/kv-info
+                                  [[:put c/wal-local-payload-lsn 14]]
+                                  :keyword
+                                  :data)))
+            (let [res (kv/mirror-replayed-txlog-record!
+                       db
+                       {:lsn 15
+                        :ha-term 7
+                        :rows [[:put "a" :replayed :ok]]})]
+              (is (= 15 (long (:lsn res))))
+              (is (not (:skipped? res)))
+              (is (= 16 (long @(:next-lsn state))))
+              (is (= :ok
+                     (d/get-value db "a" :replayed)))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-wal-one-shot-write-uses-explicit-lmdb-write-transaction
   (let [dir  (u/tmp-dir (str "wal-one-shot-write-test-" (UUID/randomUUID)))
         ops* (atom [])]
