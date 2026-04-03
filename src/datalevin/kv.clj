@@ -2616,7 +2616,18 @@
         (if-let [state (txlog-runtime-state lmdb)]
           (let [_ (txlog/refresh-shared-state! state)
                 record-lsn (long (:lsn record))
-                expected-lsn (long @(:next-lsn state))]
+                expected-lsn0 (long @(:next-lsn state))
+                expected-lsn (if (> record-lsn expected-lsn0)
+                               (do
+                                 ;; Snapshot bootstrap and reopen paths can
+                                 ;; advance the persisted payload floor before
+                                 ;; the in-memory txlog cursor catches up.
+                                 ;; Realign once from kv-info before treating a
+                                 ;; one-step-ahead follower record as a hard
+                                 ;; replay gap.
+                                 (align-runtime-txlog-payload-floor! lmdb)
+                                 (long @(:next-lsn state)))
+                               expected-lsn0)]
             (when (> record-lsn expected-lsn)
               (raise "Follower replay local txn-log cursor does not match record LSN"
                      {:type :txlog/ha-replay-lsn-mismatch
