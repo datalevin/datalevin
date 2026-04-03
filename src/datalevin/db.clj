@@ -219,7 +219,9 @@
 
 (defmacro wrap-cache
   [store pattern body]
-  `(let [cache# (.get ^ConcurrentHashMap caches (dir ~store))]
+  `(let [store# ~store
+         _#     (s/maybe-ensure-current! store#)
+         cache# (.get ^ConcurrentHashMap caches (dir store#))]
      (if-some [cached# (.get ^LRUCache cache# ~pattern)]
        cached#
        (let [res# ~body]
@@ -468,6 +470,7 @@
   ITuples
   (-init-tuples
     [db out a v-ranges pred get-v?]
+    (s/maybe-ensure-current! store)
     (ave-tuples store out a v-ranges pred get-v?))
 
   (-init-tuples-list
@@ -478,6 +481,7 @@
 
   (-sample-init-tuples
     [db out a mcount v-ranges pred get-v?]
+    (s/maybe-ensure-current! store)
     (sample-ave-tuples store out a mcount v-ranges pred get-v?))
 
   (-sample-init-tuples-list
@@ -500,6 +504,7 @@
 
   (-eav-scan-v
     [db in out eid-idx attrs-v]
+    (s/maybe-ensure-current! store)
     (eav-scan-v store in out eid-idx attrs-v))
 
   (-eav-scan-v-list
@@ -510,6 +515,7 @@
 
   (-val-eq-scan-e
     [db in out v-idx attr]
+    (s/maybe-ensure-current! store)
     (val-eq-scan-e store in out v-idx attr))
 
   (-val-eq-scan-e-list
@@ -520,6 +526,7 @@
 
   (-val-eq-scan-e
     [db in out v-idx attr bound]
+    (s/maybe-ensure-current! store)
     (val-eq-scan-e store in out v-idx attr bound))
 
   (-val-eq-scan-e-list
@@ -530,6 +537,7 @@
 
   (-val-eq-filter-e
     [db in out v-idx attr f-idx]
+    (s/maybe-ensure-current! store)
     (val-eq-filter-e store in out v-idx attr f-idx))
 
   (-val-eq-filter-e-list
@@ -1117,7 +1125,8 @@
                                 extra-kv-tx
                                 (assoc :extra-kv-txs [extra-kv-tx]))]
         (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
-                                  commit-opts))
+                                  commit-opts)
+        (s/mark-state-current! ^Store store last-modified-ms))
       (load-datoms store tx-data))
     (invalidate-cache store tx-data (last-modified store))
     db)))

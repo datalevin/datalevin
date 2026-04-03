@@ -208,6 +208,10 @@
   (or (get-value lmdb c/meta :max-tx :attr :long)
       c/tx0))
 
+(defn- init-state-sync-ms
+  [lmdb]
+  (long (or (get-value lmdb c/meta :last-modified :attr :long) 0)))
+
 (defn- ensure-open-last-modified!
   [lmdb]
   (when-not (get-value lmdb c/meta :last-modified :attr :long)
@@ -468,6 +472,16 @@
       (when (= ^int aid ^int (b/read-buffer bf :int))
         (b/read-buffer (.rewind bf) :avg)))))
 
+(defprotocol IStateSync
+  (mark-state-current! [this last-modified-ms])
+  (ensure-current! [this]))
+
+(defn maybe-ensure-current!
+  [this]
+  (if (satisfies? IStateSync this)
+    (ensure-current! this)
+    this))
+
 (declare insert-datom delete-datom fulltext-index vector-index embedding-index
          idoc-index check
          load-datoms-with-plan! prepare-embedding-plan
@@ -490,6 +504,7 @@
                 ^:volatile-mutable max-aid
                 ^:volatile-mutable max-gt
                 ^:volatile-mutable max-tx
+                ^:volatile-mutable state-sync-ms
                 scheduled-sampling
                 write-txn
                 ^ReentrantReadWriteLock sampling-lock
@@ -499,6 +514,24 @@
   IWriting
 
   (write-txn [_] write-txn)
+
+  IStateSync
+
+  (mark-state-current! [this last-modified-ms]
+    (set! state-sync-ms (long (or last-modified-ms 0)))
+    this)
+
+  (ensure-current! [this]
+    (when-not (closed? this)
+      (let [last-modified-ms (init-state-sync-ms lmdb)]
+        (when (< ^long state-sync-ms ^long last-modified-ms)
+          (let [schema* (load-schema lmdb)]
+            (set! schema schema*)
+            (set! rschema (schema->rschema schema*))
+            (set! attrs (init-attrs schema*))
+            (set! max-aid (init-max-aid schema*))
+            (mark-state-current! this last-modified-ms)))))
+    this)
 
   IStore
 
@@ -570,7 +603,8 @@
       (set! schema (init-schema lmdb new-schema))
       (set! rschema (schema->rschema schema))
       (set! attrs (init-attrs schema))
-      (set! max-aid (init-max-aid schema)))
+      (set! max-aid (init-max-aid schema))
+      (mark-state-current! this (init-state-sync-ms lmdb)))
     schema)
 
   (attrs [_] attrs)
@@ -603,6 +637,7 @@
       (set! schema (assoc schema attr p))
       (set! rschema (schema->rschema schema))
       (set! attrs (assoc attrs (p :db/aid) attr))
+      (mark-state-current! this (init-state-sync-ms lmdb))
       p))
 
   (del-attr [this attr]
@@ -617,9 +652,10 @@
       (set! schema (dissoc schema attr))
       (set! rschema (schema->rschema schema))
       (set! attrs (dissoc attrs aid))
+      (mark-state-current! this (init-state-sync-ms lmdb))
       attrs))
 
-  (rename-attr [_ attr new-attr]
+  (rename-attr [this attr new-attr]
     (let [props (schema attr)]
       (transact-kv
         lmdb [(lmdb/kv-tx :del c/schema attr :attr)
@@ -629,6 +665,7 @@
       (set! schema (-> schema (dissoc attr) (assoc new-attr props)))
       (set! rschema (schema->rschema schema))
       (set! attrs (assoc attrs (props :db/aid) new-attr))
+      (mark-state-current! this (init-state-sync-ms lmdb))
       attrs))
 
   (datom-count [_ index]
@@ -2437,6 +2474,7 @@
                                 (init-max-aid schema)
                                 (init-max-gt lmdb)
                                 (init-max-tx lmdb)
+                                (init-state-sync-ms lmdb)
                                 (volatile! nil)
                                 (volatile! :storage-mutex)
                                 (ReentrantReadWriteLock.)
@@ -2464,52 +2502,56 @@
   "transfer state of an existing store to a new store that has a different
   LMDB instance"
   [^Store old lmdb]
-  (->Store lmdb
-           (transfer-engines (.-search-engines old) lmdb)
-           (transfer-indices (.-vector-indices old) lmdb)
-           (transfer-indices (.-embedding-indices old) lmdb)
-           (transfer-idoc-indices (.-idoc-indices old) lmdb)
-           (.-embedding-providers old)
-           (.-counts old)
-           (opts old)
-           (schema old)
-           (rschema old)
-           (attrs old)
-           (max-aid old)
-           (max-gt old)
-           (max-tx old)
-           (.-scheduled-sampling old)
-           (.-write-txn old)
-           ;; Sampling work may still be queued against an older Store wrapper.
-           ;; Keep close/sampling coordination on a shared lock across wrappers
-           ;; that refer to the same logical store/LMDB lifecycle.
-           (.-sampling-lock old)
-           false
-           (.-shared-dir-key old)))
+  (let [schema* (schema old)]
+    (->Store lmdb
+             (transfer-engines (.-search-engines old) lmdb)
+             (transfer-indices (.-vector-indices old) lmdb)
+             (transfer-indices (.-embedding-indices old) lmdb)
+             (transfer-idoc-indices (.-idoc-indices old) lmdb)
+             (.-embedding-providers old)
+             (.-counts old)
+             (opts old)
+             schema*
+             (schema->rschema schema*)
+             (init-attrs schema*)
+             (init-max-aid schema*)
+             (max-gt old)
+             (max-tx old)
+             (init-state-sync-ms lmdb)
+             (.-scheduled-sampling old)
+             (.-write-txn old)
+             ;; Sampling work may still be queued against an older Store wrapper.
+             ;; Keep close/sampling coordination on a shared lock across wrappers
+             ;; that refer to the same logical store/LMDB lifecycle.
+             (.-sampling-lock old)
+             false
+             (.-shared-dir-key old))))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different
   in-memory opts. This does not persist opts back into LMDB."
   [^Store old new-opts]
-  (->Store (.-lmdb old)
-           (.-search-engines old)
-           (.-vector-indices old)
-           (.-embedding-indices old)
-           (.-idoc-indices old)
-           (.-embedding-providers old)
-           (.-counts old)
-           (store-visible-opts new-opts)
-           (schema old)
-           (rschema old)
-           (attrs old)
-           (max-aid old)
-           (max-gt old)
-           (max-tx old)
-           (.-scheduled-sampling old)
-           (.-write-txn old)
-           (.-sampling-lock old)
-           false
-           (.-shared-dir-key old)))
+  (let [schema* (schema old)]
+    (->Store (.-lmdb old)
+             (.-search-engines old)
+             (.-vector-indices old)
+             (.-embedding-indices old)
+             (.-idoc-indices old)
+             (.-embedding-providers old)
+             (.-counts old)
+             (store-visible-opts new-opts)
+             schema*
+             (schema->rschema schema*)
+             (init-attrs schema*)
+             (init-max-aid schema*)
+             (max-gt old)
+             (max-tx old)
+             (init-state-sync-ms (.-lmdb old))
+             (.-scheduled-sampling old)
+             (.-write-txn old)
+             (.-sampling-lock old)
+             false
+             (.-shared-dir-key old))))
 
 (defn- close-store-resources!
   [^Store this]

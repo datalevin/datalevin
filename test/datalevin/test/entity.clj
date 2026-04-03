@@ -3,6 +3,7 @@
    [clojure.edn :as edn]
    [clojure.test :as t :refer [is deftest testing]]
    [datalevin.core :as d]
+   [datalevin.db :as ddb]
    [datalevin.util :as u]
    [datalevin.test.core :as tdc])
   (:import [java.util UUID]))
@@ -244,6 +245,35 @@
     (d/transact! conn [{:id "ent-b" :some-edn :replace}])
     (is (= 3 (count (d/datoms @conn :eav))))
     (is (= :replace (:some-edn (d/entity @conn [:id "ent-b"]))))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest stale-db-snapshot-sees-new-attrs
+  (let [dir  (u/tmp-dir (str "entity-stale-db-test-" (UUID/randomUUID)))
+        conn (d/create-conn dir {:company/name {}
+                                 :company/linkedin {}})
+        db   @conn]
+    (d/transact! conn [{:db/id 1
+                        :company/name "8AM Golf"
+                        :company/linkedin
+                        "https://www.linkedin.com/company/8am-golf/"
+                        :company/url "https://8amgolf.com/"}])
+
+    (ddb/refresh-cache (:store db))
+
+    (is (= [[1 :company/name "8AM Golf"]
+            [1 :company/linkedin
+             "https://www.linkedin.com/company/8am-golf/"]
+            [1 :company/url "https://8amgolf.com/"]]
+           (mapv (fn [datom] [(:e datom) (:a datom) (:v datom)])
+                 (ddb/-search db [1 nil nil]))))
+
+    (is (= #:company{:name "8AM Golf"
+                     :linkedin
+                     "https://www.linkedin.com/company/8am-golf/"
+                     :url "https://8amgolf.com/"}
+           (into {} (d/touch (d/entity db 1)))))
+
     (d/close conn)
     (u/delete-files dir)))
 

@@ -287,22 +287,34 @@
                 (d/transact! c tx-data tx-meta)
                 (catch Exception e
                   (when (:resized (ex-data e))
-                    (let [s (.-store ^DB @c)
-                          d (db/new-db s)]
-                      (swap! (if writing? wdl-dbs dl-dbs)
-                             assoc conn d)
-                      (swap! (if writing? wdl-conns dl-conns)
-                             assoc conn (atom d :meta (meta c)))))
+                    (if writing?
+                      (let [outer-c  (get @dl-conns conn)
+                            outer-db ^DB @outer-c
+                            outer-s  (.-store outer-db)
+                            write-s  (.-store ^DB @c)
+                            write-l  (.-lmdb ^Store write-s)
+                            d        (db/transfer outer-db
+                                                  (st/transfer outer-s write-l))]
+                        (swap! wdl-dbs assoc conn d)
+                        (swap! wdl-conns assoc conn
+                               (atom d :meta (meta outer-c))))
+                      (let [s (.-store ^DB @c)
+                            d (db/new-db s)]
+                        (swap! dl-dbs assoc conn d)
+                        (swap! dl-conns assoc conn
+                               (atom d :meta (meta c))))))
                   (throw e)))]
        (rp->res rp)))))
 
 (defn db [{:keys [::conn] :as cn}]
   (when-let [c (get-cn cn)]
-    (let [db (d/db c)]
-      (if-let [i (some (fn [[i d]] (when (= db d) i)) @dl-dbs)]
-        {::db i}
-        (do (swap! dl-dbs assoc conn db)
-            {::db conn})))))
+    (let [db       (d/db c)
+          writing? (:writing? cn)
+          dbs      (if writing? wdl-dbs dl-dbs)
+          ref      (cond-> {::db conn}
+                     writing? (assoc :writing? true))]
+      (swap! dbs assoc conn db)
+      ref)))
 
 (defn schema [cn] (when-let [c (get-cn cn)] (d/schema c)))
 
@@ -412,24 +424,30 @@
 
 (defn open-transact [{:keys [::conn] :as cn}]
   (when-let [c (get @dl-conns conn)]
-    (let [s  (.-store ^DB @c)
+    (let [db ^DB @c
+          s  (.-store db)
           l  (.-lmdb ^Store s)
           wl (if/open-transact-kv l)
           ws (st/transfer s wl)
-          wd (db/new-db ws)]
+          wd (db/transfer db ws)]
       (swap! wdl-dbs assoc conn wd)
       (swap! wdl-conns assoc conn (atom wd :meta (meta c)))
       (assoc cn :writing? true))))
 
 (defn close-transact [{:keys [::conn]}]
   (when-let [c (get @dl-conns conn)]
-    (let [wc (get @wdl-conns conn)
-          ws (.-store ^DB @wc)
-          l  (.-lmdb ^Store (.-store ^DB @c))]
-      (reset! c (db/new-db (st/transfer ws l)))
+    (let [outer-db ^DB @c
+          wc       (get @wdl-conns conn)
+          ws       (.-store ^DB @wc)
+          l        (.-lmdb ^Store (.-store outer-db))]
+      (if/close-transact-kv l)
+      (reset! c (db/carry-runtime-opts
+                  (db/new-db (st/transfer ws l))
+                  outer-db))
+      (swap! dl-dbs assoc conn @c)
       (swap! wdl-dbs dissoc conn)
       (swap! wdl-conns dissoc conn)
-      (if/close-transact-kv l))))
+      nil)))
 
 (defn abort-transact [{:keys [::conn]}]
   (when-let [c (get @dl-conns conn)]
