@@ -1,16 +1,186 @@
-# Datalevin Jepsen
+# Datalevin Jepsen Operator Guide
 
-This directory hosts a Datalevin-specific Jepsen subproject.
+This directory is Datalevin's operator-facing Jepsen harness for HA fault
+injection and correctness validation.
 
-The goal is to adapt the useful parts of the Datomic Jepsen suite structure to
-Datalevin's HA design:
+Use it when you want to answer questions like:
 
-* reuse Jepsen/Elle workloads, generators, and checkers
-* keep Datalevin deployment and fault handling specific to the current HA stack
-* start with a single-host 3-node HA cluster so workload semantics are wired
-  before full remote fault injection lands
+* does leader failover preserve write safety and recovery?
+* does follower rejoin converge after restart, degraded bootstrap, or snapshot
+  corruption?
+* do fencing, membership checks, witness topologies, and UDF-readiness gates
+  block unsafe write admission?
 
-## Current scope
+The harness is built around Datalevin's current consensus-lease HA stack:
+
+* Jepsen and Elle workloads/checkers for correctness
+* Datalevin-specific deployment, HA, and recovery behavior
+* a fast local 3-node harness for regression work
+* controller-managed remote runs for real multi-host fault injection
+
+## Start Here
+
+Pick the operating mode that matches your goal:
+
+* local 3-node harness: fastest smoke test, targeted debugging, CI regression
+* remote multi-host run: production-like process, network, disk, and rejoin
+  behavior
+
+Compile Java first so `../target/classes` exists:
+
+```bash
+clojure -T:build compile-java
+```
+
+Smoke-test the Jepsen subproject itself:
+
+```bash
+cd jepsen
+lein test
+```
+
+Fastest local failover check:
+
+```bash
+cd jepsen
+lein run test --workload append --control-backend sofa-jraft --nemesis failover --time-limit 30 --rate 10
+```
+
+Fastest local sweep:
+
+```bash
+script/jepsen/failover-workloads
+```
+
+Full local regression sweep:
+
+```bash
+script/jepsen/3node-all
+```
+
+Fastest controller-managed remote run:
+
+```bash
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover
+```
+
+If you want a long-lived Jepsen-backed cluster instead of a one-shot run:
+
+```bash
+script/jepsen/start-local-cluster --workload append
+script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n1
+```
+
+## Operator Runbook
+
+Use these entry points most of the time:
+
+* one direct local test:
+  `cd jepsen && lein run test --workload append --control-backend sofa-jraft --nemesis failover --time-limit 30 --rate 10`
+* one wrapper-driven local sweep:
+  `script/jepsen/failover-workloads`
+* one controller-managed remote sweep:
+  `script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis degraded append bank -- --time-limit 15 --rate 10`
+* one long-lived remote launcher per host:
+  `script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n1`
+
+Operational rules:
+
+* HA disruption runs currently require `--control-backend sofa-jraft`
+* use wrapper scripts for standard sweeps; use direct `lein run test` when you
+  need a very specific workload or CLI override
+* use the manual remote launchers when you want the cluster to stay up outside
+  a single Jepsen run
+* use the controller-managed remote runner when you want one command to upload
+  config, restart launchers, run Jepsen, and tear the cluster down
+* remote controller mode needs a valid top-level `:repo-root` on every target
+  host
+
+## Workloads By Question
+
+Use the workload family that matches the operator question:
+
+* core correctness: `append`, `append-cas`, `bank`, `register`,
+  `giant-values`, `tx-fn-register`
+* HA safety and admission: `fencing`, `fencing-retry`, `udf-readiness`,
+  `witness-topology`
+* recovery and rejoin: `rejoin-bootstrap`, `degraded-rejoin`,
+  `snapshot-db-identity-rejoin`, `snapshot-checksum-rejoin`,
+  `snapshot-manifest-corruption-rejoin`,
+  `snapshot-copy-corruption-rejoin`, `membership-drift`,
+  `membership-drift-live`
+* characterization and semantic regression: `grant`, `internal`,
+  `identity-upsert`, `index-consistency`
+
+## Faults By Class
+
+Use these nemesis aliases for the common operator fault classes:
+
+* leader movement and admission churn: `failover`
+* process death: `kill`
+* scheduler or host stalls: `pause`, `pause-any`, `pause-multi`
+* network isolation: `partition`, `asymmetric`, `degraded`
+* storage and host pressure: `io-stall`, `disk-full`
+* recovery paths: `rejoin`, `quorum`
+* time distortion: `clock-skew`, `clock-leader-fast`,
+  `clock-leader-slow`, `clock-mixed`
+
+## Results And Logs
+
+Expect Jepsen artifacts under `jepsen/store/`, including `results.edn`,
+histories, and Jepsen-generated timeline output. Wrapper scripts also write
+their own temporary logs/configs under repo-local `tmp/jepsen-*` directories.
+
+## Remote Config Essentials
+
+Start from `jepsen/remote-cluster.example.edn`.
+
+For controller-managed remote runs, make sure the shared config includes:
+
+* `:db-name`
+* `:workload`
+* `:group-id`
+* `:db-identity`
+* `:control-backend`
+* `:nodes`
+* `:repo-root`
+* optional `:ssh`
+* optional `:workload-opts`
+
+For witness-style topologies:
+
+* keep `:nodes` to the data nodes
+* add `:control-nodes`
+* mark the witness with `:promotable? false`
+* use the same config contents on every host when running manual launchers
+
+Use the manual per-host launchers when you want a cluster that stays up:
+
+```bash
+script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n1
+script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n2
+script/jepsen/start-remote-node --config /etc/dtlv-jepsen/cluster.edn --node n3
+```
+
+Use the controller-managed runner when you want one-shot orchestrated tests:
+
+```bash
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover --all-workloads
+script/jepsen/remote-workloads --config jepsen/remote-cluster.example.edn --nemesis failover --dry-run
+```
+
+Important controller-managed behavior:
+
+* explicit workload lists generate temporary per-workload configs that rewrite
+  `:workload`, `:db-name`, `:group-id`, and `:db-identity`
+* `witness-topology` must be requested explicitly and is not part of
+  `--all-workloads`
+
+Everything below is the detailed reference: exact workload names, exact nemesis
+names, code layout, and command examples.
+
+## Scope And Coverage
 
 The first cut is intentionally narrow:
 
@@ -79,7 +249,7 @@ Raw fault keywords:
   `clock-skew-leader-fast`, `clock-skew-leader-slow`, and
   `clock-skew-mixed`
 
-## Layout
+## Code Layout
 
 * `src/datalevin/jepsen/local.clj`: single-host 3-node HA cluster harness
 * `src/datalevin/jepsen/workload/append.clj`: Datalevin append workload using
@@ -153,7 +323,7 @@ Raw fault keywords:
 * `src/datalevin/jepsen/core.clj`: test construction
 * `src/datalevin/jepsen/cli.clj`: CLI entrypoint
 
-## Running
+## Command Reference
 
 Compile Datalevin's Java sources first so `../target/classes` is available:
 
@@ -696,7 +866,7 @@ The HA disruption nemeses currently require `--control-backend sofa-jraft`,
 because node restart/rejoin and quorum recovery depend on persisted authority
 membership. `:sofa-jraft` is the current control-plane backend.
 
-## Next steps
+## Forward Look
 
 The next meaningful increments are:
 
