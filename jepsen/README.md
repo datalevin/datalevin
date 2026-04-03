@@ -178,7 +178,7 @@ Important controller-managed behavior:
   `--all-workloads`
 
 Everything below is the detailed reference: exact workload names, exact nemesis
-names, code layout, and command examples.
+names, and command examples.
 
 ## Scope And Coverage
 
@@ -248,80 +248,6 @@ Raw fault keywords:
   `follower-rejoin`, `quorum-loss`, `clock-skew-pause`,
   `clock-skew-leader-fast`, `clock-skew-leader-slow`, and
   `clock-skew-mixed`
-
-## Code Layout
-
-* `src/datalevin/jepsen/local.clj`: single-host 3-node HA cluster harness
-* `src/datalevin/jepsen/workload/append.clj`: Datalevin append workload using
-  Elle list-append histories
-* `src/datalevin/jepsen/workload/append_cas.clj`: append workload variant
-  using transaction-local CAS guards for write-write conflicts
-* `src/datalevin/jepsen/workload/bank.clj`: transfer workload checking
-  conservation of total balance and non-negative account state
-* `src/datalevin/jepsen/workload/giant_values.clj`: linearizable register
-  workload that stores oversized payloads and validates exact replay/readback
-* `src/datalevin/jepsen/workload/fencing.clj`: HA admission/fencing workload
-  that probes every node directly and fails on split-brain write admission
-* `src/datalevin/jepsen/workload/fencing_retry.clj`: witness-topology HA
-  failover workload that forces fencing-hook retries and failures on the sole
-  surviving candidate, verifies promotion stays blocked with a stable
-  `DTLV_FENCE_OP_ID`, and then confirms recovery after the hook is restored
-  with the full fencing environment contract (`DTLV_DB_NAME`,
-  old-leader identity/endpoint, terms, and `DTLV_FENCE_OP_ID`)
-* `src/datalevin/jepsen/workload/udf_readiness.clj`: HA write-admission
-  workload that installs a tx-UDF descriptor, enables
-  `:ha-require-udf-ready?`, verifies leaders reject writes while the runtime
-  registry is missing the tx function, confirms recovery once the registry is
-  populated, and is smoke-tested under leader failover, leader partition, and
-  degraded-network Jepsen runs
-* `src/datalevin/jepsen/workload/register.clj`: linearizable per-key register
-  workload using Jepsen's independent register checker
-* `src/datalevin/jepsen/workload/tx_fn_register.clj`: linearizable register
-  workload whose writes and CAS operations go through installed giant `:db/fn`s
-* `src/datalevin/jepsen/workload/identity_upsert.clj`: unique-identity,
-  lookup-ref, and tempid/upsert characterization workload
-* `src/datalevin/jepsen/workload/index_consistency.clj`: cross-checks the
-  same logical state through entity, pull, query, datoms, and index-range
-* `src/datalevin/jepsen/workload/rejoin_bootstrap.clj`: follower rejoin
-  convergence workload that restarts missing nodes and verifies cluster-wide
-  register state after catch-up
-* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: forced WAL-gap rejoin
-  workload that blocks snapshot copy, verifies degraded follower state, and
-  then confirms bootstrap recovery once a valid snapshot source is available
-* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
-  `snapshot-db-identity-rejoin` variant, which corrupts snapshot metadata,
-  verifies the follower rejects the copy, and then confirms recovery from a
-  subsequent valid bootstrap
-* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
-  `snapshot-checksum-rejoin` variant, which injects a checksum-style snapshot
-  copy failure, verifies the follower stays degraded, and then confirms
-  recovery from a subsequent valid bootstrap
-* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
-  `snapshot-manifest-corruption-rejoin` variant, which strips the copied
-  snapshot's applied-LSN metadata, verifies the follower rejects the malformed
-  manifest before install, and then confirms recovery from a subsequent valid
-  bootstrap
-* `src/datalevin/jepsen/workload/degraded_rejoin.clj`: also exposes the
-  `snapshot-copy-corruption-rejoin` variant, which corrupts the copied
-  `data.mdb`, verifies the follower reports snapshot install failure, and then
-  confirms recovery from a subsequent valid bootstrap
-* `src/datalevin/jepsen/workload/witness_topology.clj`: two-data-node plus
-  one non-promotable witness topology workload that verifies write availability
-  across data-leader loss while control quorum remains intact
-* `src/datalevin/jepsen/workload/membership_drift.clj`: follower restart
-  workload that injects drifted HA membership, expects startup rejection via
-  membership-hash mismatch, and then verifies clean recovery after
-  configuration reconciliation
-* `src/datalevin/jepsen/workload/membership_drift.clj`: also exposes the
-  `membership-drift-live` variant, which injects drift directly into the live
-  leader, expects the repaired node to rejoin through follower recovery, and
-  then verifies quorum-visible writes after the cluster settles
-* `src/datalevin/jepsen/workload/grant.clj`: transaction-function workload for
-  single-decision grant approval races
-* `src/datalevin/jepsen/workload/internal.clj`: single-threaded internal
-  transaction semantics characterization workload
-* `src/datalevin/jepsen/core.clj`: test construction
-* `src/datalevin/jepsen/cli.clj`: CLI entrypoint
 
 ## Command Reference
 
