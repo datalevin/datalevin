@@ -731,6 +731,12 @@ Exercise the quorum-loss nemesis across the local workload set:
 script/jepsen/quorum-workloads
 ```
 
+Expand quorum-loss to the full standard local workload set:
+
+```bash
+script/jepsen/quorum-workloads --all-workloads
+```
+
 Run a targeted quorum-loss subset with extra Jepsen CLI overrides:
 
 ```bash
@@ -788,14 +794,22 @@ script/jepsen/clock-workloads clock-leader-slow
 script/jepsen/clock-workloads clock-mixed
 ```
 
+Expand a clock-skew variant to the full standard local workload set:
+
+```bash
+script/jepsen/clock-workloads clock-mixed --all-workloads
+```
+
+`--all-workloads` on the quorum/clock wrappers covers every standard local
+workload except `witness-topology`, which still needs its explicit 2-data-node
+/ 3-control-node topology.
+
 The HA disruption nemeses currently require `--control-backend sofa-jraft`,
 because node restart/rejoin and quorum recovery depend on persisted authority
 membership. `:sofa-jraft` is the current control-plane backend.
 
 ## Forward Look
 
-The next meaningful increments are:
+The main gap still worth closing is:
 
 * leader-side membership-hash mismatch demotion coverage beyond restart-time rejection
-* full workload characterization under quorum-loss and clock-skew faults
-* remote multi-host deployment instead of the current single-host harness

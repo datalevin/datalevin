@@ -20,25 +20,61 @@ default_workloads=(
   tx-fn-register
 )
 
+known_workloads=(
+  append
+  append-cas
+  bank
+  degraded-rejoin
+  fencing
+  fencing-retry
+  giant-values
+  grant
+  identity-upsert
+  index-consistency
+  internal
+  membership-drift
+  membership-drift-live
+  rejoin-bootstrap
+  register
+  snapshot-checksum-rejoin
+  snapshot-copy-corruption-rejoin
+  snapshot-db-identity-rejoin
+  snapshot-manifest-corruption-rejoin
+  tx-fn-register
+  udf-readiness
+)
+
 usage() {
   cat <<'EOF'
-Usage: script/jepsen/quorum-workloads [workload ...] [-- extra-jepsen-args]
+Usage: script/jepsen/quorum-workloads [workload ...] [--all-workloads] [-- extra-jepsen-args]
 
 Runs the real Jepsen quorum-loss nemesis against the selected workloads.
 
 Examples:
   script/jepsen/quorum-workloads
   script/jepsen/quorum-workloads append bank
+  script/jepsen/quorum-workloads --all-workloads
   script/jepsen/quorum-workloads append bank -- --time-limit 15 --rate 10
 
 Defaults:
   nemesis: quorum-loss
+  workloads: append, append-cas, bank, fencing, giant-values, grant,
+             identity-upsert, index-consistency, internal, register,
+             rejoin-bootstrap, tx-fn-register
   control backend: sofa-jraft
   nodes: n1,n2,n3
   key count: 4
   rate/time-limit: 6/5 for most workloads
   fencing rate/time-limit: 1/2
+  admission rate/time-limit: 1/20 for fencing-retry, membership-drift,
+                             membership-drift-live, udf-readiness
+  snapshot/rejoin rate/time-limit: 5/30 for degraded-rejoin and snapshot
+                                   corruption/identity recovery workloads
   rejoin-bootstrap rate/time-limit: 4/8
+
+Notes:
+  --all-workloads runs every standard local workload except witness-topology,
+  which needs an explicit 2-data-node/3-control-node topology.
 
 Environment overrides:
   DTLV_JEPSEN_QUORUM_KEY_COUNT
@@ -46,6 +82,10 @@ Environment overrides:
   DTLV_JEPSEN_QUORUM_TIME_LIMIT
   DTLV_JEPSEN_QUORUM_FENCING_RATE
   DTLV_JEPSEN_QUORUM_FENCING_TIME_LIMIT
+  DTLV_JEPSEN_QUORUM_ADMISSION_RATE
+  DTLV_JEPSEN_QUORUM_ADMISSION_TIME_LIMIT
+  DTLV_JEPSEN_QUORUM_RECOVERY_RATE
+  DTLV_JEPSEN_QUORUM_RECOVERY_TIME_LIMIT
   DTLV_JEPSEN_QUORUM_REJOIN_RATE
   DTLV_JEPSEN_QUORUM_REJOIN_TIME_LIMIT
   DTLV_JEPSEN_QUORUM_ACCOUNT_BALANCE
@@ -59,13 +99,13 @@ EOF
 }
 
 list_workloads() {
-  printf '%s\n' "${default_workloads[@]}"
+  printf '%s\n' "${known_workloads[@]}"
 }
 
 known_workload() {
   local candidate="$1"
   local workload
-  for workload in "${default_workloads[@]}"; do
+  for workload in "${known_workloads[@]}"; do
     if [[ "$workload" == "$candidate" ]]; then
       return 0
     fi
@@ -152,6 +192,7 @@ run_jepsen() {
 
 selected_workloads=()
 extra_args=()
+use_all_workloads=0
 
 while (($#)); do
   case "$1" in
@@ -162,6 +203,10 @@ while (($#)); do
     --list)
       list_workloads
       exit 0
+      ;;
+    --all-workloads)
+      use_all_workloads=1
+      shift
       ;;
     --)
       shift
@@ -181,7 +226,14 @@ while (($#)); do
   esac
 done
 
-if [[ ${#selected_workloads[@]} -eq 0 ]]; then
+if [[ "$use_all_workloads" == "1" && ${#selected_workloads[@]} -gt 0 ]]; then
+  echo "Cannot combine --all-workloads with explicit workloads" >&2
+  exit 2
+fi
+
+if [[ "$use_all_workloads" == "1" ]]; then
+  selected_workloads=("${known_workloads[@]}")
+elif [[ ${#selected_workloads[@]} -eq 0 ]]; then
   selected_workloads=("${default_workloads[@]}")
 fi
 
@@ -190,6 +242,10 @@ rate="${DTLV_JEPSEN_QUORUM_RATE:-6}"
 time_limit="${DTLV_JEPSEN_QUORUM_TIME_LIMIT:-5}"
 fencing_rate="${DTLV_JEPSEN_QUORUM_FENCING_RATE:-1}"
 fencing_time_limit="${DTLV_JEPSEN_QUORUM_FENCING_TIME_LIMIT:-2}"
+admission_rate="${DTLV_JEPSEN_QUORUM_ADMISSION_RATE:-1}"
+admission_time_limit="${DTLV_JEPSEN_QUORUM_ADMISSION_TIME_LIMIT:-20}"
+recovery_rate="${DTLV_JEPSEN_QUORUM_RECOVERY_RATE:-5}"
+recovery_time_limit="${DTLV_JEPSEN_QUORUM_RECOVERY_TIME_LIMIT:-30}"
 rejoin_rate="${DTLV_JEPSEN_QUORUM_REJOIN_RATE:-4}"
 rejoin_time_limit="${DTLV_JEPSEN_QUORUM_REJOIN_TIME_LIMIT:-8}"
 account_balance="${DTLV_JEPSEN_QUORUM_ACCOUNT_BALANCE:-100}"
@@ -226,6 +282,19 @@ for workload in "${selected_workloads[@]}"; do
   if [[ "$workload" == "fencing" ]]; then
     workload_rate="$fencing_rate"
     workload_time_limit="$fencing_time_limit"
+  elif [[ "$workload" == "fencing-retry" || \
+          "$workload" == "membership-drift" || \
+          "$workload" == "membership-drift-live" || \
+          "$workload" == "udf-readiness" ]]; then
+    workload_rate="$admission_rate"
+    workload_time_limit="$admission_time_limit"
+  elif [[ "$workload" == "degraded-rejoin" || \
+          "$workload" == "snapshot-checksum-rejoin" || \
+          "$workload" == "snapshot-copy-corruption-rejoin" || \
+          "$workload" == "snapshot-db-identity-rejoin" || \
+          "$workload" == "snapshot-manifest-corruption-rejoin" ]]; then
+    workload_rate="$recovery_rate"
+    workload_time_limit="$recovery_time_limit"
   elif [[ "$workload" == "rejoin-bootstrap" ]]; then
     workload_rate="$rejoin_rate"
     workload_time_limit="$rejoin_time_limit"
