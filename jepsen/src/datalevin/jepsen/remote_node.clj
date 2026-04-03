@@ -242,6 +242,13 @@
 (defn- normalize-runtime-opts-override
   [override]
   (cond
+    (symbol? override)
+    (when-let [resolved (try
+                          (requiring-resolve override)
+                          (catch Throwable _
+                            nil))]
+      (normalize-runtime-opts-override (var-get resolved)))
+
     (ifn? override) override
     (map? override) (constantly override)
     :else nil))

@@ -259,3 +259,17 @@
   (assert-local-query-refreshes-ha-read-view!
    {:ha-role :leader
     :ha-authority (Object.)}))
+
+(deftest local-query-returns-unavailable-for-stopped-node-test
+  (let [cluster-id (keyword (str "local-query-stopped-" (UUID/randomUUID)))
+        query      '[:find ?e .
+                     :where
+                     [?e :db/ident ?ident]]
+        clusters*  @#'local/clusters]
+    (swap! clusters* assoc cluster-id {:db-name "jepsen-local-query-stopped"
+                                       :servers {"n1" nil}})
+    (try
+      (is (= ::local/unavailable
+             (local/local-query cluster-id "n1" query)))
+      (finally
+        (swap! clusters* dissoc cluster-id)))))

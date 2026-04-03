@@ -580,12 +580,14 @@
         server
         db-name
         (fn []
-          (if-let [db (#'srv/get-db server db-name false)]
-            (try
-              (apply d/q q db inputs)
-              (catch Throwable _
-                unavailable-sentinel))
-            unavailable-sentinel))))))
+          (if (nil? server)
+            unavailable-sentinel
+            (if-let [db (#'srv/get-db server db-name false)]
+              (try
+                (apply d/q q db inputs)
+                (catch Throwable _
+                  unavailable-sentinel))
+              unavailable-sentinel)))))))
 
 (defn open-leader-conn!
   [{:keys [remote-cluster? transport-failure? clusters] :as deps} test schema]

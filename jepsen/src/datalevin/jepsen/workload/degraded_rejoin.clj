@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.workload.degraded-rejoin
   (:require
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.ha :as dha]
    [datalevin.jepsen.local :as local]
@@ -19,6 +20,7 @@
 (def ^:private wal-gap-retry-sleep-ms 250)
 (def ^:private write-sleep-ms 150)
 (def ^:private writes-per-batch 4)
+(def ^:private leader-conn-retry-sleep-ms 250)
 (def ^:private wal-gap-segment-max-ms 100)
 (def ^:private wal-gap-replica-floor-ttl-ms 500)
 (def ^:private sample-limit 10)
@@ -32,6 +34,12 @@
   :ha/follower-snapshot-install-failed)
 (def ^:private snapshot-checksum-mismatch-message
   "Copy checksum mismatch")
+(def ^:private retryable-leader-failure-markers
+  ["HA write admission rejected"
+   "Timed out waiting for single leader"
+   "Timeout in making request"
+   "Unable to connect to server:"
+   "Connection refused"])
 (defonce ^:private initialized-clusters (atom #{}))
 (defonce ^:private scenario-runs (atom {}))
 (def ^:private cluster-opts
@@ -45,6 +53,8 @@
     :where
     [?e :register/key ?key]
     [?e :register/value ?value]])
+
+(declare with-retrying-leader-conn)
 
 (defn- register-values-from-rows
   [rows key-count]
@@ -133,13 +143,47 @@
     (when-not (contains? @initialized-clusters cluster-id)
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
-          (local/with-leader-conn
+          (with-retrying-leader-conn
             test
             schema
+            (local/workload-setup-timeout-ms cluster-id
+                                             default-setup-timeout-ms)
             (fn [conn]
               (ensure-registers! conn key-count)))
           (wait-for-initial-registers! test key-count)
           (swap! initialized-clusters conj cluster-id))))))
+
+(defn- retryable-leader-conn-error?
+  [e]
+  (let [err-data (or (:err-data (ex-data e))
+                     (ex-data e))
+        message  (ex-message e)]
+    (or (local/transport-failure? e)
+        (true? (:retryable? err-data))
+        (= :ha/write-rejected (:error err-data))
+        (and (string? message)
+             (some #(str/includes? message %)
+                   retryable-leader-failure-markers)))))
+
+(defn- with-retrying-leader-conn
+  [test schema timeout-ms f]
+  (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop []
+      (let [result (try
+                     {:ok? true
+                      :value (local/with-leader-conn test schema f)}
+                     (catch Throwable e
+                       {:ok? false
+                        :error e}))]
+        (if (:ok? result)
+          (:value result)
+          (let [e (:error result)]
+            (if (and (< (System/currentTimeMillis) deadline)
+                     (retryable-leader-conn-error? e))
+              (do
+                (Thread/sleep (long leader-conn-retry-sleep-ms))
+                (recur))
+              (throw e))))))))
 
 (defn- write-register!
   [conn k v]
@@ -149,9 +193,10 @@
 
 (defn- leader-register-values
   [test key-count]
-  (local/with-leader-conn
+  (with-retrying-leader-conn
     test
     schema
+    converge-timeout-ms
     (fn [conn]
       (register-values-from-rows
         (d/q register-rows-query @conn)
@@ -159,9 +204,10 @@
 
 (defn- write-register-batch-with-rolls!
   [test key-count start-value n sleep-ms]
-  (local/with-leader-conn
+  (with-retrying-leader-conn
     test
     schema
+    converge-timeout-ms
     (fn [conn]
       (ensure-registers! conn key-count)
       (doseq [offset (range (long n))]
@@ -358,9 +404,10 @@
                                                                  failure-mode)
                              (try
                                (local/restart-node! cluster-id degraded-node)
-                               (let [_             (local/with-leader-conn
+                               (let [_             (with-retrying-leader-conn
                                                      test
                                                      schema
+                                                     converge-timeout-ms
                                                      (fn [conn]
                                                        (write-register! conn 0 9000)))
                                      expected-live (leader-register-values test
@@ -381,9 +428,10 @@
                                                            orig-copy)
                              (fn []
                                (local/restart-node! cluster-id degraded-node)
-                               (let [_             (local/with-leader-conn
+                               (let [_             (with-retrying-leader-conn
                                                      test
                                                      schema
+                                                     converge-timeout-ms
                                                      (fn [conn]
                                                        (write-register! conn 0 9000)))
                                      expected-live (leader-register-values test
@@ -394,9 +442,10 @@
                                    expected-live
                                    converge-timeout-ms
                                    key-count)))))
-        _                (local/with-leader-conn
+        _                (with-retrying-leader-conn
                            test
                            schema
+                           converge-timeout-ms
                            (fn [conn]
                              (write-register! conn 1 10000)))
         expected         (leader-register-values test key-count)

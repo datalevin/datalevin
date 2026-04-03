@@ -1503,7 +1503,21 @@
         (and (= :ha/write-rejected (:error err-data))
              (= :udf-not-ready (:reason err-data))))))
 
-(comment "Removed white-box UDF readiness smoke coverage.")
+(deftest udf-readiness-client-smoke-test
+  (let [exercise-op
+        (run-udf-readiness-exercise!
+         "udf-readiness-smoke"
+         (udf-readiness/workload {}))
+        values-by-node (get-in exercise-op [:value :nodes])]
+    (is (= :ok (:type exercise-op)))
+    (is (= :exercise (:f exercise-op)))
+    (is (map? (:value exercise-op)))
+    (is (map? (get-in exercise-op [:value :failed-error])))
+    (is (= ["n1" "n2" "n3"]
+           (sort (keys values-by-node))))
+    (is (every? (fn [[_ {:keys [value]}]]
+                  (= 1 value))
+                values-by-node))))
 
 (deftest rejoin-bootstrap-checker-ignores-invoke-and-validates-converged-values-test
   (let [checker (:checker (rejoin-bootstrap/workload {:key-count 2}))
