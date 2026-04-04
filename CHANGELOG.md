@@ -2,8 +2,8 @@
 
 ## WIP
 ### Added
-- [Server] Read only replicas and high availability (HA) with Raft consensus
-  based auto roll-over and promotion
+- [Server] Read only replicas and high availability (HA) cluster with Raft
+  consensus based auto roll-over and promotion
   [#72](https://github.com/datalevin/datalevin/issues/72). Details in
   [doc](doc/ha.md).
   [Test] HA implementation comes with an extensive Jepsen test suite to validate
@@ -31,7 +31,8 @@
   A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
   HuggingFace on first use. This small 384 dimensions model is sufficient for
   short text snippets embedding. For large and complex text passages, user
-  should download a larger model in GGUF format.
+  should download a larger model in GGUF format, or use an OpeanAI compatible
+  external LLM provider instead.
 - [Datalog] For embedding enabled datoms, `embedding-neighbors` built-in function to
   return `[e, a, v]` based on vector similarity. Details in [doc](doc/vector.md).
 - [Search] `:display :refs+scores` to show relevance score.
@@ -40,19 +41,23 @@
 - clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
 
 ### Fixed
+- [WAL] DB startup slow down in WAL mode
+  [#360](https://github.com/datalevin/datalevin/issues/360)
 - [Datalog] Handle `false` value correctly in query
   [#358](https://github.com/datalevin/datalevin/issues/358)
+- [Datalog] Occasional stale DB meta data
+  [#362](https://github.com/datalevin/datalevin/issues/362)
 
 ### Improved
-- [Encode] Nippy uses `ByteBuffer` internals [PR to
-  nippy](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
+- [KV] Our version of nippy that uses `ByteBuffer` internals
+  [PR](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
   speedup.
-- [Search] Reduce query/update/delete memory allocation.
 - [KV] Harden virtual threads handling in reads by adding `:notls` in default
 env config.
-- [WAL] Enable multiple processes working with the same DB in WAL mode
-  [#361](https://github.com/datalevin/datalevin/issues/361).
 - [KV] Don't accidentally depends on glibc 2.35 on Linux [Thx @baibhavbista].
+- [WAL] Enable multiple processes working with the same DB in WAL mode
+- [Search] Reduce query/update/delete memory allocation.
+  [#361](https://github.com/datalevin/datalevin/issues/361).
 
 ## 0.10.7 (2026-03-03)
 
