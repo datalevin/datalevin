@@ -972,11 +972,9 @@
     (.putLong bf (long tx-time)))
   body)
 
-(defn decode-commit-row-payload
-  "Decode raw binary txn-log payload bytes."
-  [^bytes body]
-  (let [bf (ByteBuffer/wrap body)
-        ^bytes magic (bb-get-bytes bf 4 {:field :magic})
+(defn- decode-commit-row-payload-prefix
+  [^ByteBuffer bf]
+  (let [^bytes magic (bb-get-bytes bf 4 {:field :magic})
         major (bb-get-u8 bf {:field :major})
         flags (bb-get-u8 bf {:field :flags})
         _reserved (bb-get-u16 bf {:field :reserved})
@@ -998,13 +996,35 @@
       (raise "Txn-log payload op count overflow"
              {:type :txlog/corrupt
               :op-count op-count}))
+    {:lsn lsn
+     :ts tx-time
+     :ha-term (some-> ha-term long)
+     :op-count op-count}))
+
+(defn decode-commit-row-payload-header
+  "Decode only the fixed-size txn-log payload header without materializing ops."
+  [^bytes body]
+  (let [{:keys [lsn ts ha-term op-count]}
+        (decode-commit-row-payload-prefix (ByteBuffer/wrap body))]
+    (cond-> {:lsn lsn
+             :ts ts
+             :op-count op-count}
+      (some? ha-term)
+      (assoc :ha-term ha-term))))
+
+(defn decode-commit-row-payload
+  "Decode raw binary txn-log payload bytes."
+  [^bytes body]
+  (let [bf (ByteBuffer/wrap body)
+        {:keys [lsn ts ha-term op-count]}
+        (decode-commit-row-payload-prefix bf)]
     (let [ops (loop [i (int 0)
                      acc []]
                 (if (< i ^long op-count)
                   (recur (unchecked-inc-int i) (conj acc (decode-kv-row bf)))
                   acc))]
       (cond-> {:lsn lsn
-               :ts tx-time
+               :ts ts
                :ops ops}
         (some? ha-term)
         (assoc :ha-term (long ha-term))))))

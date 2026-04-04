@@ -253,26 +253,34 @@
                                 nil
                                 (finally
                                   (.close tmp-ch)))))
+        active-last-record-summary-v (volatile! nil)
+        active-last-lsn-v            (volatile! 0)
         active-scan       (truncate-partial-tail!
-                            active-path {:allow-preallocated-tail? true})
-        active-records    (mapv (fn [record]
-                                  (decode-scanned-record-entry
-                                   (long active-id)
-                                   active-path
-                                   record))
-                                (or (:records active-scan) []))
+                           active-path
+                           {:allow-preallocated-tail? true
+                            :collect-records? false
+                            :on-record
+                            (fn [record]
+                              (let [payload
+                                    (tcodec/decode-commit-row-payload-header
+                                     ^bytes (:body record))
+                                    lsn (long (or (:lsn payload) 0))]
+                                (when-not (pos? lsn)
+                                  (raise "Txn-log payload missing valid positive LSN"
+                                         {:type :txlog/corrupt
+                                          :segment-id (long active-id)
+                                          :path active-path
+                                          :offset (long (:offset record))
+                                          :record record}))
+                                (vreset! active-last-lsn-v lsn)
+                                (vreset! active-last-record-summary-v
+                                         {:lsn lsn
+                                          :segment-id (long active-id)
+                                          :offset (long (:offset record))
+                                          :checksum (long (:checksum record))})))})
         active-offset     (segment-end-offset active-scan)
         active-file       (io/file active-path)
-        active-record-cache
-        (txlog-records-cache-entry
-         (long active-id)
-         active-path
-         (long (.length ^File active-file))
-         (long (.lastModified ^File active-file))
-         active-records)
-        txlog-records-cache (assoc closed-record-cache
-                                   (long active-id)
-                                   active-record-cache)
+        txlog-records-cache closed-record-cache
         closed-bytes      (reduce
                             (fn [acc {:keys [id file]}]
                               (if (= ^long (long id) ^long active-id)
@@ -284,10 +292,7 @@
         meta              (read-meta-file meta-path)
         meta-cur          (:current meta)
         marker-cur        (:current marker-state)
-        last-from-active  (long (or (some-> active-records
-                                            peek
-                                            :lsn)
-                                    0))
+        last-from-active  (long @active-last-lsn-v)
         last-from-seg     (long (max last-from-active
                                      (long last-from-closed)))
         last-committed    (max (long (or (:last-committed-lsn meta-cur) 0))
@@ -359,8 +364,11 @@
          :segment-summaries-cache                 (volatile! {})
          :txlog-records-cache                     (volatile! txlog-records-cache)
          :retention-total-bytes                   (volatile! total-bytes)
+         ;; Preserve the tail record summary from the active segment scan so a
+         ;; clean reopen can validate the current commit marker without walking
+         ;; the full retained WAL again.
+         :last-record-summary                     @active-last-record-summary-v
          :fatal-error                             (volatile! nil)}]
-    (ensure-next-segment-prepared! state)
     {:dir dir :state state}))
 
 (def segment-file-name tseg/segment-file-name)

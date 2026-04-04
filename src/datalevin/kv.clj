@@ -2196,22 +2196,46 @@
     (txlog/commit-finished! state marker-entry)
     record))
 
+(defn- clean-open-recovery-fast-path
+  [lmdb state]
+  (let [last-record (:last-record-summary state)
+        marker (some-> (read-commit-marker-state lmdb) :current)
+        applied-lsn (long (or (some-> (:meta-last-applied-lsn state) deref) 0))
+        committed-lsn (long (max 0 (dec (long @(:next-lsn state)))))]
+    (when (and (:commit-marker? state)
+               last-record
+               marker
+               (= applied-lsn committed-lsn)
+               (= committed-lsn (long (:lsn last-record)))
+               (= committed-lsn (long (:applied-lsn marker)))
+               (= (long (:segment-id last-record))
+                  (long (:txlog-segment-id marker)))
+               (= (long (:offset last-record))
+                  (long (:txlog-record-offset marker)))
+               (= (long (:checksum last-record))
+                  (long (:txlog-record-crc marker))))
+      (vreset! (:marker-revision state) (long (:revision marker)))
+      {:from-lsn committed-lsn
+       :last-record nil
+       :replayed 0})))
+
 (defn txlog-recover-on-open!
   [lmdb]
   (when-let [state (txlog/state lmdb)]
-    (let [{:keys [records valid-marker from-lsn]}
-          (txlog-recovery-context lmdb state)]
-      (when (and (:commit-marker? state) valid-marker)
-        (vreset! (:marker-revision state) (long (:revision valid-marker))))
-      (txlog-prepare-replay-dbis! lmdb records from-lsn)
-      (let [replayed (->> records
-                          (drop-while #(<= (long (:lsn %))
-                                           (long from-lsn)))
-                          (mapv #(txlog-replay-record! lmdb state %)))]
-        (i/set-max-val-size lmdb (i/max-val-size lmdb))
-        {:from-lsn (long from-lsn)
-         :last-record (peek replayed)
-         :replayed (count replayed)}))))
+    (or (clean-open-recovery-fast-path lmdb state)
+        (let [{:keys [records valid-marker from-lsn]}
+              (txlog-recovery-context lmdb state)]
+          (when (and (:commit-marker? state) valid-marker)
+            (vreset! (:marker-revision state) (long (:revision valid-marker))))
+          (txlog-prepare-replay-dbis! lmdb records from-lsn)
+          (let [replayed (->> records
+                              (drop-while #(<= (long (:lsn %))
+                                               (long from-lsn)))
+                              (mapv #(txlog-replay-record! lmdb state %)))]
+            (i/set-max-val-size lmdb (i/max-val-size lmdb))
+            {:from-lsn (long from-lsn)
+             :last-record (peek replayed)
+             :replayed (count replayed)})))))
 
 (defn- txlog-recover-under-write-transaction!
   [lmdb state]
