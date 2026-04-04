@@ -2229,19 +2229,26 @@
         (dissoc recovery :last-record)))))
 
 (defn- ensure-snapshot-bootstrap!
-  [lmdb]
+  [lmdb state]
   (when (and (snapshot-bootstrap-force? lmdb)
              (not (rdonly-env? lmdb))
              (snapshot-source-ready? lmdb))
     (let [snapshots (list-snapshot-entries lmdb)
-          restored-snapshot? (and (empty? snapshots)
-                                  (some? (kv-info-value
-                                          lmdb
-                                          c/wal-snapshot-current-lsn)))]
+          persisted-current-lsn (some-> (kv-info-value
+                                         lmdb
+                                         c/wal-snapshot-current-lsn)
+                                        long)
+          applied-lsn (long (or (:last-applied-lsn
+                                 (txlog-watermarks-map lmdb state))
+                                0))
+          restored-snapshot? (and (some? persisted-current-lsn)
+                                  (or (empty? snapshots)
+                                      (> (long persisted-current-lsn)
+                                         applied-lsn)))]
       ;; Restored HA snapshot copies persist the snapshot floor in kv-info but
-      ;; do not carry over snapshot slot directories. Treat that persisted floor
-      ;; as already bootstrapped rather than synthesizing a new snapshot at a
-      ;; lower txlog-applied LSN during open.
+      ;; can reopen without a matching txlog history. Treat an already-persisted
+      ;; floor that is ahead of the recovered local LSN as bootstrapped rather
+      ;; than synthesizing a new snapshot at a lower applied LSN during open.
       (when (and (not restored-snapshot?)
                  (< (count snapshots) 1))
         (create-snapshot-now! lmdb))
@@ -2260,7 +2267,8 @@
                       (init-txlog-state! lmdb info-v))]
         (when-not (:txlog-recovered? @info-v)
           (txlog-recover-under-write-transaction! lmdb state)
-          (ensure-snapshot-bootstrap! lmdb)
+          (align-runtime-txlog-payload-floor! lmdb)
+          (ensure-snapshot-bootstrap! lmdb state)
           (vswap! info-v assoc :txlog-recovered? true))
         (txlog/refresh-shared-state! state)
         (align-runtime-txlog-payload-floor! lmdb)
