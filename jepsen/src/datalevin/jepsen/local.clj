@@ -452,7 +452,7 @@
   [cluster-id logical-node]
   (lcluster/stop-node! (cluster-deps) cluster-id logical-node))
 
-(defn restart-node!
+(defn ^:redef restart-node!
   [cluster-id logical-node]
   (lcluster/restart-node! (cluster-deps) cluster-id logical-node))
 
