@@ -417,6 +417,13 @@
   [cluster-id logical-node k v]
   (lops/assoc-opt-on-node-store! (ops-deps) cluster-id logical-node k v))
 
+(defn set-live-node-ha-membership!
+  [cluster-id logical-node members]
+  (lops/set-live-node-ha-membership! (ops-deps)
+                                     cluster-id
+                                     logical-node
+                                     members))
+
 (defn assoc-opt-on-stopped-node-store!
   [cluster-id logical-node k v]
   (lops/assoc-opt-on-stopped-node-store! (ops-deps) cluster-id logical-node k v))
@@ -452,7 +459,7 @@
   [cluster-id logical-node]
   (lcluster/stop-node! (cluster-deps) cluster-id logical-node))
 
-(defn restart-node!
+(defn ^:redef restart-node!
   [cluster-id logical-node]
   (lcluster/restart-node! (cluster-deps) cluster-id logical-node))
 

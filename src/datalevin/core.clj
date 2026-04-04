@@ -2295,7 +2295,7 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
   `provider-spec` may be:
 
    * an existing provider instance
-   * `:default` or `:llama.cpp`
+   * `:default`, `:llama.cpp`, or `:openai-compatible`
    * a map such as
 
      `{:provider :default
@@ -2308,6 +2308,19 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
   from Hugging Face on first use if it is missing. Optional tuning keys are
   `:gpu-layers`, `:ctx-size`, `:batch-size`, and `:threads`. Providers also
   expose stable embedding-space metadata via [[embedding-metadata]].
+
+  Datalevin also ships a built-in `:openai-compatible` provider for remote
+  `/embeddings` APIs. The minimal spec is:
+
+    `{:provider :openai-compatible
+      :model    \"text-embedding-3-small\"
+      :base-url \"https://api.openai.com/v1\"}`
+
+  Use `:endpoint` instead of `:base-url` when the server does not follow the
+  standard `/embeddings` path. Authentication may be supplied via `:api-key`
+  or `:api-key-env`. `:request-dimensions` requests a specific output size
+  when supported by the remote provider and allows Datalevin to resolve the
+  embedding space without probing the endpoint during store open.
 
   The returned provider is `AutoCloseable`; use [[close-embedding-provider]]
   when finished."}

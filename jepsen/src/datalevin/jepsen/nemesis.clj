@@ -15,6 +15,7 @@
 (def ^:private default-follower-rejoin-delay-s 5)
 (def ^:private default-quorum-loss-interval-s 10)
 (def ^:private default-quorum-restore-delay-s 5)
+(def ^:private default-quorum-restore-retry-sleep-ms 250)
 (def ^:private default-clock-skew-interval-s 10)
 (def ^:private default-clock-skew-apply-delay-s 3)
 (def ^:private default-final-leader-stabilize-timeout-ms 30000)
@@ -228,6 +229,62 @@
         (when (< (System/currentTimeMillis) deadline)
           (Thread/sleep 250)
           (recur last-state))))))
+
+(defn- restart-error
+  [e]
+  {:message (or (ex-message e)
+                (.getName (class e)))
+   :class (.getName (class e))
+   :data (ex-data e)})
+
+(defn- restore-quorum-nodes!
+  [cluster-id logical-nodes]
+  (let [logical-nodes    (->> logical-nodes distinct vec)
+        base-timeout-ms  (long (local/workload-setup-timeout-ms cluster-id))
+        deadline         (+ (System/currentTimeMillis)
+                            (* (max 1 (count logical-nodes))
+                               base-timeout-ms))]
+    (loop [pending   logical-nodes
+           restarted []
+           errors    {}]
+      (if (empty? pending)
+        {:restarted restarted
+         :pending   []
+         :errors    errors}
+        (let [[pending* restarted* errors*]
+              (reduce (fn [[pending-acc restarted-acc errors-acc] logical-node]
+                        (let [outcome (try
+                                        (local/restart-node! cluster-id logical-node)
+                                        {:ok? true}
+                                        (catch Throwable e
+                                          {:ok? false
+                                           :error e}))]
+                          (if (:ok? outcome)
+                            [pending-acc
+                             (conj restarted-acc logical-node)
+                             (dissoc errors-acc logical-node)]
+                            [(conj pending-acc logical-node)
+                             restarted-acc
+                             (assoc errors-acc
+                                    logical-node
+                                    (restart-error (:error outcome)))])))
+                      [[] restarted errors]
+                      pending)]
+          (cond
+            (empty? pending*)
+            {:restarted restarted*
+             :pending   []
+             :errors    errors*}
+
+            (< (System/currentTimeMillis) deadline)
+            (do
+              (Thread/sleep (long default-quorum-restore-retry-sleep-ms))
+              (recur pending* restarted* errors*))
+
+            :else
+            {:restarted restarted*
+             :pending   pending*
+             :errors    errors*}))))))
 
 (defn- available-pause-nodes
   [cluster-id paused-nodes]
@@ -713,15 +770,21 @@
 
               :restore-quorum
               (if (seq @quorum-stopped-nodes)
-                (let [nodes-to-restart @quorum-stopped-nodes]
-                  (doseq [node nodes-to-restart]
-                    (local/restart-node! cluster-id node))
-                  (reset! quorum-stopped-nodes [])
+                (let [nodes-to-restart @quorum-stopped-nodes
+                      {:keys [restarted pending errors]}
+                      (restore-quorum-nodes! cluster-id nodes-to-restart)]
+                  (reset! quorum-stopped-nodes (vec pending))
+                  (when (seq pending)
+                    (throw (ex-info "Timed out restoring quorum"
+                                    {:cluster-id cluster-id
+                                     :restarted restarted
+                                     :pending pending
+                                     :restart-errors errors})))
                   (if-let [{leader :leader}
                            (local/maybe-wait-for-single-leader cluster-id)]
-                    (info-op op {:restarted nodes-to-restart
+                    (info-op op {:restarted restarted
                                  :leader leader})
-                    (info-op op {:restarted nodes-to-restart
+                    (info-op op {:restarted restarted
                                  :leader nil
                                  :status :leader-unavailable})))
                 (info-op op :noop))

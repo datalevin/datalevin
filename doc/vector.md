@@ -174,6 +174,23 @@ Hugging Face on first use. The default model (`intfloat/multilingual-e5-small`)
 produces 384-dimensional vectors and supports a maximum input of 512 tokens.
 Text longer than 512 tokens is truncated by the model.
 
+Datalevin also ships a built-in `:openai-compatible` provider for remote
+`/embeddings` APIs:
+
+```Clojure
+(with-open [provider (d/new-embedding-provider
+                       {:provider :openai-compatible
+                        :model    "text-embedding-3-small"
+                        :base-url "https://api.openai.com/v1"
+                        :api-key-env "OPENAI_API_KEY"})]
+  (d/embed-text provider "hello world"))
+```
+
+Use `:endpoint` instead of `:base-url` when the server does not expose the
+standard `/embeddings` path. `:api-key` and `:api-key-env` are runtime
+authentication options. `:request-dimensions` requests a specific output size
+when supported by the remote provider.
+
 ### Vector Indexing and Search in Datalog Store
 
 Vectors can be stored in Datalog as attribute values of data type
@@ -274,6 +291,24 @@ specs; it is not persisted in LMDB.
 The built-in default provider is `:default` (also available as `:llama.cpp`).
 It uses the local GGUF model described above and resolves the default model path
 relative to the DB root.
+
+The built-in `:openai-compatible` provider can also be used in store options:
+
+```Clojure
+{:embedding-opts
+ {:provider           :openai-compatible
+  :model              "text-embedding-3-small"
+  :base-url           "https://api.openai.com/v1"
+  :api-key-env        "OPENAI_API_KEY"
+  :request-dimensions 1536
+  :metric-type        :cosine}}
+```
+
+For store persistence, direct `:api-key` values are never written into LMDB.
+`:api-key-env` is safe to persist because it stores only the environment
+variable name. `:request-dimensions` is useful for remote providers because it
+lets Datalevin resolve the embedding space during store open without probing the
+endpoint.
 
 ```Clojure
 (let [conn (d/create-conn

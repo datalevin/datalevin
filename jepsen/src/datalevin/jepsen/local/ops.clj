@@ -11,6 +11,7 @@
    [datalevin.remote :as r]
    [datalevin.server :as srv]
    [datalevin.util :as u]
+   [datalevin.validate :as vld]
    [taoensso.timbre :as log])
   (:import
    [datalevin.server Server]
@@ -506,6 +507,15 @@
            {:ha-role (:ha-role state)
             :ha-authority-owner-node-id (:ha-authority-owner-node-id state)
             :ha-authority-term (:ha-authority-term state)
+            :ha-membership-hash (:ha-membership-hash state)
+            :ha-authority-membership-hash
+            (:ha-authority-membership-hash state)
+            :ha-membership-mismatch? (:ha-membership-mismatch? state)
+            :ha-demotion-reason (:ha-demotion-reason state)
+            :ha-demotion-details (:ha-demotion-details state)
+            :ha-demoted-at-ms (:ha-demoted-at-ms state)
+            :ha-demotion-drain-until-ms
+            (:ha-demotion-drain-until-ms state)
             :udf-ready? (:udf-ready? state)
             :udf-missing (:udf-missing state)
             :udf-readiness-token (:udf-readiness-token state)
@@ -818,11 +828,58 @@
                         deref
                         .-store)]
       (when-not store
-        (u/raise "Cannot update remote store opt on unavailable Jepsen node"
+           (u/raise "Cannot update remote store opt on unavailable Jepsen node"
                  {:cluster-id cluster-id
                   :logical-node logical-node
                   :db-name db-name}))
       (i/assoc-opt store k v))))
+
+(defn set-live-node-ha-membership!
+  [{:keys [clusters remote-cluster?]} cluster-id logical-node members]
+  (when (remote-cluster? cluster-id)
+    (u/raise "Cannot inject live membership drift on remote Jepsen node"
+             {:cluster-id cluster-id
+              :logical-node logical-node}))
+  (let [{:keys [db-name servers base-opts]} (get @clusters cluster-id)
+        server                              (get servers logical-node)]
+    (when-not server
+      (u/raise "Cannot inject live membership drift on unavailable Jepsen node"
+               {:cluster-id cluster-id
+                :logical-node logical-node
+                :db-name db-name}))
+    (#'srv/with-db-runtime-store-swap
+     server
+     db-name
+     (fn []
+       (let [members         (->> members
+                                  (sort-by :node-id)
+                                  vec)
+             membership-hash (vld/derive-ha-membership-hash
+                              (assoc base-opts :ha-members members))
+             updated         (volatile! nil)]
+         (when-not (db-state server db-name)
+           (u/raise "Cannot inject live membership drift on missing Jepsen db state"
+                    {:cluster-id cluster-id
+                     :logical-node logical-node
+                     :db-name db-name}))
+         (#'srv/update-db
+          server
+          db-name
+          (fn [state]
+            (let [next-state
+                  (assoc state
+                         :ha-members members
+                         :ha-members-sorted members
+                         :ha-membership-hash membership-hash
+                         :ha-membership-mismatch? false)]
+              (vreset! updated next-state)
+              next-state)))
+         {:logical-node logical-node
+          :ha-members members
+          :ha-membership-hash membership-hash
+          :ha-authority-membership-hash
+          (:ha-authority-membership-hash @updated)
+          :ha-role (:ha-role @updated)})))))
 
 (defn assoc-opt-on-stopped-node-store!
   [{:keys [clusters remote-cluster? cluster-deps] :as deps}

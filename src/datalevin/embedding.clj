@@ -13,17 +13,20 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as s]
+   [jsonista.core :as json]
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin LlamaEmbedder]
    [java.io InputStream]
    [java.lang AutoCloseable]
    [java.net URI]
-   [java.net.http HttpClient HttpClient$Redirect HttpRequest HttpResponse
+   [java.net.http HttpClient HttpClient$Redirect HttpRequest HttpRequest$Builder
+    HttpRequest$BodyPublishers HttpResponse
     HttpResponse$BodyHandlers]
    [java.nio.file Files Path Paths StandardCopyOption]
    [java.nio.file.attribute FileAttribute]
-   [java.security MessageDigest]))
+   [java.security MessageDigest]
+   [java.time Duration]))
 
 (defprotocol IEmbeddingProvider
   (embedding [this items opts]
@@ -42,6 +45,9 @@
     "Truncate a single input item so it fits within `max-tokens`."))
 
 (def ^:private built-in-provider-ids
+  #{:default :llama.cpp :openai-compatible})
+
+(def ^:private llama-provider-ids
   #{:default :llama.cpp})
 
 (def ^:const default-model-file
@@ -83,7 +89,18 @@
 (def ^:private default-model-lock
   (Object.))
 
-(declare create-llama-provider init-embedding-provider)
+(declare create-llama-provider init-embedding-provider
+         perform-openai-compatible-request
+         normalized-openai-compatible-base-url)
+
+(def ^:private openai-compatible-default-base-url
+  "https://api.openai.com/v1")
+
+(def ^:private openai-compatible-default-probe-text
+  "datalevin")
+
+(def ^:private openai-json-read-mapper
+  (json/object-mapper {:decode-key-fn keyword}))
 
 (defn- non-blank-string?
   [x]
@@ -176,6 +193,14 @@
         (if (nil? v) acc (assoc acc k v))))
     {}
     (or metadata {})))
+
+(defn- coerce-long
+  [label value]
+  (when (some? value)
+    (when-not (integer? value)
+      (raise (str label " must be an integer")
+             {:value value}))
+    (long value)))
 
 (defn- merge-metadata
   [base override]
@@ -386,6 +411,206 @@
                      validate-metadata-shape)]
     (validate-metadata-dimensions metadata dimensions)))
 
+(defn- openai-compatible-model-id
+  [spec]
+  (or (:model spec)
+      (:model-id spec)
+      (raise "OpenAI-compatible embedding provider requires :model"
+             {:provider-spec spec})))
+
+(defn- openai-compatible-endpoint
+  [spec]
+  (if (contains? spec :endpoint)
+    (let [endpoint (:endpoint spec)]
+      (when-not (non-blank-string? endpoint)
+        (raise "OpenAI-compatible embedding provider :endpoint must be a non-blank string"
+               {:provider-spec spec}))
+      endpoint)
+    (let [base-url (normalized-openai-compatible-base-url spec)]
+      (when-not (non-blank-string? base-url)
+        (raise "OpenAI-compatible embedding provider requires a non-blank :base-url or :endpoint"
+               {:provider-spec spec}))
+      (str base-url "/embeddings"))))
+
+(defn- normalized-openai-compatible-base-url
+  [spec]
+  (some-> (or (:base-url spec) openai-compatible-default-base-url)
+          (s/replace #"/+$" "")))
+
+(defn- openai-compatible-api-key
+  [spec]
+  (cond
+    (non-blank-string? (:api-key spec))
+    (:api-key spec)
+
+    (contains? spec :api-key-env)
+    (let [env-name (:api-key-env spec)
+          value    (System/getenv env-name)]
+      (when-not (non-blank-string? env-name)
+        (raise "OpenAI-compatible embedding provider :api-key-env must be a non-blank string"
+               {:provider-spec spec}))
+      (when-not (non-blank-string? value)
+        (raise "OpenAI-compatible embedding provider API key env var is missing or blank"
+               {:env env-name}))
+      value)
+
+    :else
+    nil))
+
+(defn- openai-compatible-output-metadata
+  [spec dimensions]
+  (cond-> {:dimensions dimensions}
+    (contains? spec :query-prefix)    (assoc :query-prefix (:query-prefix spec))
+    (contains? spec :document-prefix) (assoc :document-prefix (:document-prefix spec))
+    (contains? spec :max-tokens)      (assoc :max-tokens (:max-tokens spec))))
+
+(defn- openai-compatible-base-metadata
+  [spec dimensions]
+  (let [metadata (-> {:embedding/provider
+                      (cond-> {:kind     :remote
+                               :id       :openai-compatible
+                               :model-id (openai-compatible-model-id spec)}
+                        (not (contains? spec :endpoint))
+                        (assoc :base-url
+                               (normalized-openai-compatible-base-url spec))
+
+                        (contains? spec :endpoint)
+                        (assoc :endpoint (:endpoint spec)))
+                      :embedding/output
+                      (openai-compatible-output-metadata spec dimensions)}
+                     (merge-metadata (some-> (:embedding-metadata spec)
+                                             validate-metadata-shape))
+                     compact-metadata
+                     validate-metadata-shape)]
+    (validate-metadata-dimensions metadata dimensions)))
+
+(defn- openai-compatible-explicit-metadata
+  [spec]
+  (let [dimensions (or (:dimensions spec)
+                       (get-in spec [:embedding/output :dimensions])
+                       (get-in spec [:embedding-metadata
+                                     :embedding/output
+                                     :dimensions]))]
+    (when (some? dimensions)
+      (openai-compatible-base-metadata spec dimensions))))
+
+(defn- openai-compatible-request-dimensions
+  [spec]
+  (or (:request-dimensions spec)
+      (:dimensions spec)))
+
+(defn- openai-compatible-configured-dimensions
+  [spec]
+  (or (openai-compatible-request-dimensions spec)
+      (get-in spec [:embedding/output :dimensions])
+      (get-in spec [:embedding-metadata :embedding/output :dimensions])))
+
+(defn- openai-compatible-shaping-metadata
+  [spec]
+  {:embedding/output
+   (cond-> {}
+     (contains? spec :query-prefix)    (assoc :query-prefix (:query-prefix spec))
+     (contains? spec :document-prefix) (assoc :document-prefix (:document-prefix spec)))})
+
+(defn- float-vector
+  [values]
+  (when-not (or (vector? values)
+                (instance? java.util.List values))
+    (raise "Embedding response vector must be a JSON array"
+           {:embedding values}))
+  (float-array
+    (map-indexed
+      (fn [idx value]
+        (when-not (number? value)
+          (raise "Embedding response vector contains a non-numeric value"
+                 {:index idx :value value}))
+        (float value))
+      values)))
+
+(defn- openai-compatible-response-vectors
+  [body]
+  (let [rows (or (:data body) (get body "data"))]
+    (when-not (or (vector? rows) (instance? java.util.List rows))
+      (raise "OpenAI-compatible embedding response missing :data"
+             {:response body}))
+    (mapv
+      (fn [row]
+        (let [embedding (or (:embedding row) (get row "embedding"))]
+          (float-vector embedding)))
+      rows)))
+
+(defn- openai-compatible-response-error
+  [body]
+  (let [error (or (:error body) (get body "error"))]
+    (cond
+      (string? error)
+      error
+
+      (map? error)
+      (or (:message error) (get error "message"))
+
+      (instance? java.util.Map error)
+      (or (get error "message") (.get ^java.util.Map error "message"))
+
+      :else
+      nil)))
+
+(defn- openai-compatible-headers
+  [spec]
+  (when-not (or (nil? (:headers spec))
+                (map? (:headers spec)))
+    (raise "OpenAI-compatible provider :headers must be a map"
+           {:provider-spec spec}))
+  (let [api-key (openai-compatible-api-key spec)
+        headers (cond-> {"Content-Type" "application/json"
+                         "Accept"       "application/json"}
+                  (some? api-key)
+                  (assoc "Authorization" (str "Bearer " api-key)))]
+    (reduce-kv
+      (fn [acc k v]
+        (let [header-name (cond
+                            (keyword? k) (name k)
+                            (string? k)  k
+                            (symbol? k)  (name k)
+                            :else        nil)]
+          (when-not (and (non-blank-string? header-name)
+                       (non-blank-string? v))
+            (raise "OpenAI-compatible provider header keys and values must be non-blank strings"
+                   {:key k :value v}))
+          (assoc acc header-name v)))
+      headers
+      (or (:headers spec) {}))))
+
+(defn- openai-compatible-request-body
+  [spec items]
+  (cond-> {"model" (openai-compatible-model-id spec)
+           "input" (mapv #(shaped-item-text (openai-compatible-shaping-metadata
+                                              spec)
+                               %)
+                         items)}
+    (some? (openai-compatible-request-dimensions spec))
+    (assoc "dimensions" (openai-compatible-request-dimensions spec))))
+
+(defn- parse-openai-json-response
+  [body]
+  (cond
+    (string? body)
+    (try
+      (json/read-value body openai-json-read-mapper)
+      (catch Exception e
+        (raise "Unable to decode OpenAI-compatible embedding response"
+               {:body body :cause (.getMessage e)})))
+
+    (map? body)
+    body
+
+    (instance? java.util.Map body)
+    (into {} body)
+
+    :else
+    (raise "Unsupported OpenAI-compatible embedding response body"
+           {:body body})))
+
 (deftype LlamaCppProvider [^LlamaEmbedder embedder provider-spec metadata]
   IEmbeddingProvider
   (embedding [_ items _opts]
@@ -411,6 +636,101 @@
   (close [_]
     (.close embedder)))
 
+(defn- ensure-provider-open
+  [closed? provider-spec]
+  (when @closed?
+    (raise "Embedding provider is closed"
+           {:provider-spec provider-spec})))
+
+(defn- openai-compatible-space
+  [spec metadata* dimensions*]
+  (or (when-let [dimensions @dimensions*]
+        {:dimensions dimensions
+         :metadata   (or @metadata*
+                         (reset! metadata*
+                                 (openai-compatible-base-metadata spec
+                                                                  dimensions)))})
+      (locking dimensions*
+        (or (when-let [dimensions @dimensions*]
+              {:dimensions dimensions
+               :metadata   (or @metadata*
+                               (reset! metadata*
+                                       (openai-compatible-base-metadata spec
+                                                                        dimensions)))})
+            (let [vectors (openai-compatible-response-vectors
+                            (perform-openai-compatible-request
+                              spec
+                              [openai-compatible-default-probe-text]))
+                  _       (when-not (= 1 (count vectors))
+                            (raise "OpenAI-compatible embedding probe returned the wrong number of vectors"
+                                   {:vectors (count vectors)}))
+                  dims    (alength ^floats (first vectors))
+                  _       (when-let [expected (openai-compatible-configured-dimensions spec)]
+                            (when-not (= (long expected) (long dims))
+                              (raise "Embedding dimensions do not match the configured OpenAI-compatible provider dimensions"
+                                     {:expected-dimensions expected
+                                      :provider-dimensions dims
+                                      :provider-spec spec})))
+                  metadata (openai-compatible-base-metadata spec dims)]
+              (reset! dimensions* dims)
+              (reset! metadata* metadata)
+              {:dimensions dims
+               :metadata   metadata})))))
+
+(defn- validate-openai-compatible-vectors
+  [spec dimensions* metadata* items vectors]
+  (when-not (= (count items) (count vectors))
+    (raise "OpenAI-compatible embedding provider returned the wrong number of vectors"
+           {:items (count items)
+            :vectors (count vectors)
+            :provider-spec spec}))
+  (let [dims (when-let [vector (first vectors)]
+               (alength ^floats vector))]
+    (doseq [vector vectors]
+      (when-not (= dims (alength ^floats vector))
+        (raise "OpenAI-compatible embedding provider returned inconsistent vector dimensions"
+               {:provider-spec spec
+                :expected-dimensions dims
+                :actual-dimensions (alength ^floats vector)})))
+    (when dims
+      (when-let [expected (or @dimensions*
+                              (openai-compatible-configured-dimensions spec))]
+        (when-not (= (long expected) (long dims))
+          (raise "Embedding dimensions do not match the OpenAI-compatible provider output"
+                 {:expected-dimensions expected
+                  :provider-dimensions dims
+                  :provider-spec spec})))
+      (when-not @dimensions*
+        (reset! dimensions* dims))
+      (when-not @metadata*
+        (reset! metadata* (openai-compatible-base-metadata spec dims)))))
+  vectors)
+
+(deftype OpenAICompatibleProvider [provider-spec metadata* dimensions* closed?]
+  IEmbeddingProvider
+  (embedding [_ items _opts]
+    (ensure-provider-open closed? provider-spec)
+    (->> items
+         (perform-openai-compatible-request provider-spec)
+         openai-compatible-response-vectors
+         (validate-openai-compatible-vectors provider-spec dimensions*
+                                            metadata* items)))
+  (embedding-metadata [_]
+    (ensure-provider-open closed? provider-spec)
+    (or @metadata*
+        (:metadata (openai-compatible-space provider-spec metadata* dimensions*))))
+  (embedding-dimensions [_]
+    (ensure-provider-open closed? provider-spec)
+    (or @dimensions*
+        (:dimensions (openai-compatible-space provider-spec metadata*
+                                             dimensions*))))
+  (close-provider [_]
+    (reset! closed? true))
+
+  AutoCloseable
+  (close [this]
+    (close-provider this)))
+
 (defn- default-embed-dir
   [spec]
   (or (:embed-dir spec)
@@ -427,6 +747,52 @@
   (-> (HttpClient/newBuilder)
       (.followRedirects HttpClient$Redirect/NORMAL)
       (.build)))
+
+(defn- http-request-timeout
+  [spec]
+  (coerce-long "OpenAI-compatible embedding provider :timeout-ms"
+               (:timeout-ms spec)))
+
+(defn- send-json-request
+  [{:keys [url headers body timeout-ms]}]
+  (let [^HttpClient client (create-http-client)
+        builder           (-> (HttpRequest/newBuilder (URI/create url))
+                              (.header "User-Agent" "Datalevin"))
+        builder           (reduce-kv
+                            (fn [^HttpRequest$Builder b k v]
+                              (.header b ^String k ^String v))
+                            builder
+                            headers)
+        builder           (cond-> builder
+                            timeout-ms
+                            (.timeout (Duration/ofMillis (long timeout-ms))))
+        ^HttpRequest req  (-> builder
+                              (.POST (HttpRequest$BodyPublishers/ofString
+                                       (json/write-value-as-string body)))
+                              (.build))
+        ^HttpResponse resp (.send client req
+                                  (HttpResponse$BodyHandlers/ofString))]
+    {:status (.statusCode resp)
+     :body   (.body resp)}))
+
+(def ^:dynamic *openai-compatible-request!*
+  send-json-request)
+
+(defn- perform-openai-compatible-request
+  [spec items]
+  (let [resp (*openai-compatible-request!*
+               {:url        (openai-compatible-endpoint spec)
+                :headers    (openai-compatible-headers spec)
+                :body       (openai-compatible-request-body spec items)
+                :timeout-ms (http-request-timeout spec)})
+        status (:status resp)
+        body   (parse-openai-json-response (:body resp))]
+    (when-not (= 200 status)
+      (raise "OpenAI-compatible embedding request failed"
+             {:status status
+              :error  (openai-compatible-response-error body)
+              :body   body}))
+    body))
 
 (defn- move-file!
   [^Path source ^Path target]
@@ -511,6 +877,21 @@
 (def ^:dynamic *llama-provider-factory*
   create-llama-provider)
 
+(defn- create-openai-compatible-provider
+  [spec]
+  (let [dimensions (openai-compatible-configured-dimensions spec)
+        metadata   (or (openai-compatible-explicit-metadata spec)
+                       (when dimensions
+                         (openai-compatible-base-metadata spec dimensions)))]
+    (OpenAICompatibleProvider.
+      spec
+      (atom metadata)
+      (atom dimensions)
+      (atom false))))
+
+(def ^:dynamic *openai-compatible-provider-factory*
+  create-openai-compatible-provider)
+
 (defn- explicit-provider-space
   [spec]
   (let [dimensions (or (:dimensions spec)
@@ -550,10 +931,9 @@
              explicit  (explicit-provider-space spec)
              dims      (:dimensions explicit)
              metadata  (:embedding-metadata explicit)
-             built-in? (built-in-provider-ids provider)
-             default?  (and built-in?
-                           (nil? (:model spec))
-                           (nil? (:model-path spec)))]
+             default?  (and (llama-provider-ids provider)
+                            (nil? (:model spec))
+                            (nil? (:model-path spec)))]
          (cond
            (and default? (or dims metadata))
            (let [dimensions (or dims default-model-dimensions)
@@ -621,7 +1001,7 @@
   `provider-spec` may be:
 
   * an existing provider instance implementing `IEmbeddingProvider`
-  * `:default` or `:llama.cpp`
+  * `:default`, `:llama.cpp`, or `:openai-compatible`
   * a map such as:
 
     `{:provider :default
@@ -631,10 +1011,25 @@
   When omitted, Datalevin uses the default model
   `multilingual-e5-small-Q8_0.gguf` from `dir/embed/`, where `:dir` is the DB
   root. If the file is missing, Datalevin downloads it from Hugging Face on
-  first use. Providers expose stable embedding-space metadata via
-  `embedding-metadata`; built-in local providers derive it from the model
-  artifact, an optional adjacent `model.gguf.edn` manifest, and an optional
-  `:embedding-metadata` override in `provider-spec`. Optional tuning keys are
+  first use.
+
+  The built-in `:openai-compatible` provider sends `POST` requests to an
+  OpenAI-compatible `/embeddings` endpoint. The minimal spec is:
+
+    `{:provider :openai-compatible
+      :model    \"text-embedding-3-small\"
+      :base-url \"https://api.openai.com/v1\"}`
+
+  `:endpoint` may be used instead of `:base-url`. Authentication is optional
+  and may be supplied via `:api-key` or `:api-key-env`. `:request-dimensions`
+  requests a specific output size when the remote provider supports it and also
+  lets Datalevin resolve the embedding space without a network probe during
+  store open.
+
+  Providers expose stable embedding-space metadata via `embedding-metadata`;
+  built-in local providers derive it from the model artifact, an optional
+  adjacent `model.gguf.edn` manifest, and an optional `:embedding-metadata`
+  override in `provider-spec`. Optional llama.cpp tuning keys are
   `:gpu-layers`, `:ctx-size`, `:batch-size`, and `:threads`. When omitted,
   they default to `0` and defer to native defaults."
   ([provider-spec]
@@ -649,7 +1044,12 @@
            (raise "Unknown embedding provider"
                   {:provider provider
                    :known-providers built-in-provider-ids}))
-         (lazy-provider spec *llama-provider-factory*))))))
+         (case provider
+           (:default :llama.cpp)
+           (lazy-provider spec *llama-provider-factory*)
+
+           :openai-compatible
+           (lazy-provider spec *openai-compatible-provider-factory*)))))))
 
 (defn embed-text
   "Embed a single text string and return a float array."

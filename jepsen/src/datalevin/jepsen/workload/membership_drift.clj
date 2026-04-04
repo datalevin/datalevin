@@ -191,6 +191,60 @@
    :class (.getName (class e))
    :data (ex-data e)})
 
+(defn- wait-for-membership-hash-demotion!
+  [test logical-node timeout-ms]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-state nil]
+      (let [state (local/node-diagnostics cluster-id logical-node)]
+        (cond
+          (and (map? state)
+               (not= :leader (:ha-role state))
+               (= :membership-hash-mismatch
+                  (:ha-demotion-reason state)))
+          state
+
+          (< (System/currentTimeMillis) deadline)
+          (do
+            (Thread/sleep 250)
+            (recur (or state last-state)))
+
+          :else
+          (throw (ex-info
+                  "Timed out waiting for live leader membership-hash demotion"
+                  {:logical-node logical-node
+                   :timeout-ms timeout-ms
+                   :last-state last-state})))))))
+
+(defn- wait-for-replacement-leader!
+  [test old-leader timeout-ms]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-state nil]
+      (if-let [{:keys [leader] :as state}
+               (local/maybe-wait-for-single-leader cluster-id 1000)]
+        (if (and (string? leader)
+                 (not= old-leader leader))
+          state
+          (if (< (System/currentTimeMillis) deadline)
+            (do
+              (Thread/sleep 250)
+              (recur state))
+            (throw (ex-info
+                    "Timed out waiting for replacement leader after membership drift"
+                    {:old-leader old-leader
+                     :timeout-ms timeout-ms
+                     :last-state state}))))
+        (if (< (System/currentTimeMillis) deadline)
+          (do
+            (Thread/sleep 250)
+            (recur last-state))
+          (throw (ex-info
+                  "Timed out waiting for replacement leader after membership drift"
+                  {:old-leader old-leader
+                   :timeout-ms timeout-ms
+                   :last-state last-state})))))))
+
 (defn- run-scenario!
   [test key-count]
   (ensure-registers-initialized! test key-count)
@@ -289,6 +343,7 @@
   [test key-count]
   (ensure-registers-initialized! test key-count)
   (let [cluster-id (:datalevin/cluster-id test)
+        remote? (true? (:remote? (local/cluster-state cluster-id)))
         leader-before (:leader (local/wait-for-single-leader!
                                 cluster-id
                                 converge-timeout-ms))
@@ -336,9 +391,25 @@
                    :drifted-node drifted-node
                    :drifted-node-id drifted-node-id
                    :drifted-members drifted-members})))
+        (let [demotion-injection (when-not remote?
+                                   (local/set-live-node-ha-membership!
+                                    cluster-id
+                                    drifted-node
+                                    drifted-members))
+              demotion-state (when demotion-injection
+                               (wait-for-membership-hash-demotion!
+                                test
+                                drifted-node
+                                live-converge-timeout-ms))]
         ;; Restore the drifted node's persisted membership offline so we don't
         ;; race the live node's own restart path after the mismatch.
         (local/stop-node! cluster-id drifted-node)
+        (let [leader-after-drift
+              (when demotion-injection
+                (:leader (wait-for-replacement-leader!
+                          test
+                          drifted-node
+                          live-converge-timeout-ms)))]
         (local/assoc-opt-on-stopped-node-store!
          cluster-id
          drifted-node
@@ -385,9 +456,13 @@
                key-count)
               _ (local/node-diagnostics cluster-id drifted-node)]
           {:leader-before leader-before
+           :leader-after-drift leader-after-drift
            :leader-after leader-after
            :drifted-node drifted-node
            :drifted-node-id drifted-node-id
+           :demotion-skipped? remote?
+           :demotion-injection demotion-injection
+           :demotion-state demotion-state
            :drift-error drift-error
            :live-before live-before
            :live-after-restore live-after-restore
@@ -397,21 +472,28 @@
            :nodes (into {}
                         (map (fn [[logical-node values]]
                                [logical-node {:values values}]))
-                        snapshot)}))
+                        snapshot)}))))
       (finally
         (try
-          (if (get-in (local/cluster-state cluster-id)
-                      [:servers drifted-node])
-            (local/assoc-opt-on-node-store!
+          (if (and (not remote?)
+                   (get-in (local/cluster-state cluster-id)
+                           [:servers drifted-node]))
+            (local/set-live-node-ha-membership!
              cluster-id
              drifted-node
-             :ha-members
              original-members)
-            (local/assoc-opt-on-stopped-node-store!
-             cluster-id
-             drifted-node
-             :ha-members
-             original-members))
+            (if (get-in (local/cluster-state cluster-id)
+                        [:servers drifted-node])
+              (local/assoc-opt-on-node-store!
+               cluster-id
+               drifted-node
+               :ha-members
+               original-members)
+              (local/assoc-opt-on-stopped-node-store!
+               cluster-id
+               drifted-node
+               :ha-members
+               original-members)))
           (catch Throwable _
             nil))))))
 
@@ -568,6 +650,21 @@
                                 (contains? (set (keys nodes))
                                            drifted-node))))
                  vec)
+            missing-live-demotion
+            (->> oks
+                 (remove
+                  (fn [{:keys [demotion-skipped?
+                               drifted-node
+                               leader-after-drift
+                               demotion-state]}]
+                    (or demotion-skipped?
+                        (and (map? demotion-state)
+                             (= :membership-hash-mismatch
+                                (:ha-demotion-reason demotion-state))
+                             (not= :leader (:ha-role demotion-state))
+                             (string? leader-after-drift)
+                             (not= drifted-node leader-after-drift)))))
+                 vec)
             insufficient-quorum
             (->> oks
                  (remove (fn [{:keys [matched-nodes]}]
@@ -576,6 +673,7 @@
         {:valid? (boolean (and (seq oks)
                                (empty? failures)
                                (empty? missing-drift-failure)
+                               (empty? missing-live-demotion)
                                (empty? missing-recovery)
                                (empty? insufficient-quorum)))
          :exercise-count (count oks)
@@ -587,6 +685,13 @@
                     (map #(select-keys % [:drifted-node
                                           :drift-error])
                          missing-drift-failure)))
+         :missing-live-demotion-count (count missing-live-demotion)
+         :missing-live-demotion-samples
+         (vec (take sample-limit
+                    (map #(select-keys % [:drifted-node
+                                          :leader-after-drift
+                                          :demotion-state])
+                         missing-live-demotion)))
          :missing-recovery-count (count missing-recovery)
          :missing-recovery-samples
          (vec (take sample-limit

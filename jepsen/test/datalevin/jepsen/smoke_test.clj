@@ -1270,6 +1270,7 @@
         drifted-node (:drifted-node value)
         expected (:expected value)
         matched-nodes (set (:matched-nodes value))
+        demotion-state (:demotion-state value)
         values-by-node (into {}
                              (map (fn [[logical-node {:keys [values]}]]
                                     [logical-node values]))
@@ -1277,6 +1278,14 @@
     (is (= :ok (:type exercise-op))
         (pr-str exercise-op))
     (is (some? (:drift-error value)))
+    (is (false? (:demotion-skipped? value))
+        (pr-str value))
+    (is (= :membership-hash-mismatch
+           (:ha-demotion-reason demotion-state))
+        (pr-str value))
+    (is (not= drifted-node
+              (:leader-after-drift value))
+        (pr-str value))
     (is (contains? (set (:live-after-restore value))
                    drifted-node))
     (is (contains? (set (keys values-by-node))
