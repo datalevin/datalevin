@@ -1845,7 +1845,7 @@
 (defn- persistable-provider-spec
   [spec]
   (cond-> (or spec {})
-    (map? spec) (dissoc :dir :embed-dir)))
+    (map? spec) (dissoc :dir :embed-dir :api-key :headers)))
 
 (defn- maybe-persistable-provider-spec
   [spec]
@@ -2129,7 +2129,7 @@
                 :provider provider-id
                 :entry runtime})
 
-      (#{:default :llama.cpp} provider-id)
+      (#{:default :llama.cpp :openai-compatible} provider-id)
       (assoc domain-opts :provider provider-id :dir dir)
 
       :else

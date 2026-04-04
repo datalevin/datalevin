@@ -47,6 +47,9 @@
 (def ^:private built-in-provider-ids
   #{:default :llama.cpp :openai-compatible})
 
+(def ^:private llama-provider-ids
+  #{:default :llama.cpp})
+
 (def ^:const default-model-file
   "multilingual-e5-small-Q8_0.gguf")
 
@@ -86,7 +89,9 @@
 (def ^:private default-model-lock
   (Object.))
 
-(declare create-llama-provider init-embedding-provider)
+(declare create-llama-provider init-embedding-provider
+         perform-openai-compatible-request
+         normalized-openai-compatible-base-url)
 
 (def ^:private openai-compatible-default-base-url
   "https://api.openai.com/v1")
@@ -196,11 +201,6 @@
       (raise (str label " must be an integer")
              {:value value}))
     (long value)))
-
-(defn- keyword-or-string=
-  [candidate expected]
-  (or (= candidate expected)
-      (= (name candidate) expected)))
 
 (defn- merge-metadata
   [base override]
@@ -420,12 +420,22 @@
 
 (defn- openai-compatible-endpoint
   [spec]
-  (or (:endpoint spec)
-      (let [base-url (or (:base-url spec) openai-compatible-default-base-url)]
-        (when-not (non-blank-string? base-url)
-          (raise "OpenAI-compatible embedding provider requires a non-blank :base-url or :endpoint"
-                 {:provider-spec spec}))
-        (str (s/replace base-url #"/+$" "") "/embeddings"))))
+  (if (contains? spec :endpoint)
+    (let [endpoint (:endpoint spec)]
+      (when-not (non-blank-string? endpoint)
+        (raise "OpenAI-compatible embedding provider :endpoint must be a non-blank string"
+               {:provider-spec spec}))
+      endpoint)
+    (let [base-url (normalized-openai-compatible-base-url spec)]
+      (when-not (non-blank-string? base-url)
+        (raise "OpenAI-compatible embedding provider requires a non-blank :base-url or :endpoint"
+               {:provider-spec spec}))
+      (str base-url "/embeddings"))))
+
+(defn- normalized-openai-compatible-base-url
+  [spec]
+  (some-> (or (:base-url spec) openai-compatible-default-base-url)
+          (s/replace #"/+$" "")))
 
 (defn- openai-compatible-api-key
   [spec]
@@ -460,8 +470,9 @@
                       (cond-> {:kind     :remote
                                :id       :openai-compatible
                                :model-id (openai-compatible-model-id spec)}
-                        (contains? spec :base-url)
-                        (assoc :base-url (:base-url spec))
+                        (not (contains? spec :endpoint))
+                        (assoc :base-url
+                               (normalized-openai-compatible-base-url spec))
 
                         (contains? spec :endpoint)
                         (assoc :endpoint (:endpoint spec)))
@@ -483,9 +494,14 @@
     (when (some? dimensions)
       (openai-compatible-base-metadata spec dimensions))))
 
+(defn- openai-compatible-request-dimensions
+  [spec]
+  (or (:request-dimensions spec)
+      (:dimensions spec)))
+
 (defn- openai-compatible-configured-dimensions
   [spec]
-  (or (:dimensions spec)
+  (or (openai-compatible-request-dimensions spec)
       (get-in spec [:embedding/output :dimensions])
       (get-in spec [:embedding-metadata :embedding/output :dimensions])))
 
@@ -541,6 +557,10 @@
 
 (defn- openai-compatible-headers
   [spec]
+  (when-not (or (nil? (:headers spec))
+                (map? (:headers spec)))
+    (raise "OpenAI-compatible provider :headers must be a map"
+           {:provider-spec spec}))
   (let [api-key (openai-compatible-api-key spec)
         headers (cond-> {"Content-Type" "application/json"
                          "Accept"       "application/json"}
@@ -548,11 +568,16 @@
                   (assoc "Authorization" (str "Bearer " api-key)))]
     (reduce-kv
       (fn [acc k v]
-        (when-not (and (non-blank-string? (name k))
+        (let [header-name (cond
+                            (keyword? k) (name k)
+                            (string? k)  k
+                            (symbol? k)  (name k)
+                            :else        nil)]
+          (when-not (and (non-blank-string? header-name)
                        (non-blank-string? v))
-          (raise "OpenAI-compatible provider header keys and values must be non-blank strings"
-                 {:key k :value v}))
-        (assoc acc (name k) v))
+            (raise "OpenAI-compatible provider header keys and values must be non-blank strings"
+                   {:key k :value v}))
+          (assoc acc header-name v)))
       headers
       (or (:headers spec) {}))))
 
@@ -563,8 +588,8 @@
                                               spec)
                                %)
                          items)}
-    (some? (openai-compatible-configured-dimensions spec))
-    (assoc "dimensions" (openai-compatible-configured-dimensions spec))))
+    (some? (openai-compatible-request-dimensions spec))
+    (assoc "dimensions" (openai-compatible-request-dimensions spec))))
 
 (defn- parse-openai-json-response
   [body]
@@ -610,6 +635,101 @@
   AutoCloseable
   (close [_]
     (.close embedder)))
+
+(defn- ensure-provider-open
+  [closed? provider-spec]
+  (when @closed?
+    (raise "Embedding provider is closed"
+           {:provider-spec provider-spec})))
+
+(defn- openai-compatible-space
+  [spec metadata* dimensions*]
+  (or (when-let [dimensions @dimensions*]
+        {:dimensions dimensions
+         :metadata   (or @metadata*
+                         (reset! metadata*
+                                 (openai-compatible-base-metadata spec
+                                                                  dimensions)))})
+      (locking dimensions*
+        (or (when-let [dimensions @dimensions*]
+              {:dimensions dimensions
+               :metadata   (or @metadata*
+                               (reset! metadata*
+                                       (openai-compatible-base-metadata spec
+                                                                        dimensions)))})
+            (let [vectors (openai-compatible-response-vectors
+                            (perform-openai-compatible-request
+                              spec
+                              [openai-compatible-default-probe-text]))
+                  _       (when-not (= 1 (count vectors))
+                            (raise "OpenAI-compatible embedding probe returned the wrong number of vectors"
+                                   {:vectors (count vectors)}))
+                  dims    (alength ^floats (first vectors))
+                  _       (when-let [expected (openai-compatible-configured-dimensions spec)]
+                            (when-not (= (long expected) (long dims))
+                              (raise "Embedding dimensions do not match the configured OpenAI-compatible provider dimensions"
+                                     {:expected-dimensions expected
+                                      :provider-dimensions dims
+                                      :provider-spec spec})))
+                  metadata (openai-compatible-base-metadata spec dims)]
+              (reset! dimensions* dims)
+              (reset! metadata* metadata)
+              {:dimensions dims
+               :metadata   metadata})))))
+
+(defn- validate-openai-compatible-vectors
+  [spec dimensions* metadata* items vectors]
+  (when-not (= (count items) (count vectors))
+    (raise "OpenAI-compatible embedding provider returned the wrong number of vectors"
+           {:items (count items)
+            :vectors (count vectors)
+            :provider-spec spec}))
+  (let [dims (when-let [vector (first vectors)]
+               (alength ^floats vector))]
+    (doseq [vector vectors]
+      (when-not (= dims (alength ^floats vector))
+        (raise "OpenAI-compatible embedding provider returned inconsistent vector dimensions"
+               {:provider-spec spec
+                :expected-dimensions dims
+                :actual-dimensions (alength ^floats vector)})))
+    (when dims
+      (when-let [expected (or @dimensions*
+                              (openai-compatible-configured-dimensions spec))]
+        (when-not (= (long expected) (long dims))
+          (raise "Embedding dimensions do not match the OpenAI-compatible provider output"
+                 {:expected-dimensions expected
+                  :provider-dimensions dims
+                  :provider-spec spec})))
+      (when-not @dimensions*
+        (reset! dimensions* dims))
+      (when-not @metadata*
+        (reset! metadata* (openai-compatible-base-metadata spec dims)))))
+  vectors)
+
+(deftype OpenAICompatibleProvider [provider-spec metadata* dimensions* closed?]
+  IEmbeddingProvider
+  (embedding [_ items _opts]
+    (ensure-provider-open closed? provider-spec)
+    (->> items
+         (perform-openai-compatible-request provider-spec)
+         openai-compatible-response-vectors
+         (validate-openai-compatible-vectors provider-spec dimensions*
+                                            metadata* items)))
+  (embedding-metadata [_]
+    (ensure-provider-open closed? provider-spec)
+    (or @metadata*
+        (:metadata (openai-compatible-space provider-spec metadata* dimensions*))))
+  (embedding-dimensions [_]
+    (ensure-provider-open closed? provider-spec)
+    (or @dimensions*
+        (:dimensions (openai-compatible-space provider-spec metadata*
+                                             dimensions*))))
+  (close-provider [_]
+    (reset! closed? true))
+
+  AutoCloseable
+  (close [this]
+    (close-provider this)))
 
 (defn- default-embed-dir
   [spec]
@@ -757,6 +877,21 @@
 (def ^:dynamic *llama-provider-factory*
   create-llama-provider)
 
+(defn- create-openai-compatible-provider
+  [spec]
+  (let [dimensions (openai-compatible-configured-dimensions spec)
+        metadata   (or (openai-compatible-explicit-metadata spec)
+                       (when dimensions
+                         (openai-compatible-base-metadata spec dimensions)))]
+    (OpenAICompatibleProvider.
+      spec
+      (atom metadata)
+      (atom dimensions)
+      (atom false))))
+
+(def ^:dynamic *openai-compatible-provider-factory*
+  create-openai-compatible-provider)
+
 (defn- explicit-provider-space
   [spec]
   (let [dimensions (or (:dimensions spec)
@@ -796,10 +931,9 @@
              explicit  (explicit-provider-space spec)
              dims      (:dimensions explicit)
              metadata  (:embedding-metadata explicit)
-             built-in? (built-in-provider-ids provider)
-             default?  (and built-in?
-                           (nil? (:model spec))
-                           (nil? (:model-path spec)))]
+             default?  (and (llama-provider-ids provider)
+                            (nil? (:model spec))
+                            (nil? (:model-path spec)))]
          (cond
            (and default? (or dims metadata))
            (let [dimensions (or dims default-model-dimensions)
@@ -867,7 +1001,7 @@
   `provider-spec` may be:
 
   * an existing provider instance implementing `IEmbeddingProvider`
-  * `:default` or `:llama.cpp`
+  * `:default`, `:llama.cpp`, or `:openai-compatible`
   * a map such as:
 
     `{:provider :default
@@ -877,10 +1011,25 @@
   When omitted, Datalevin uses the default model
   `multilingual-e5-small-Q8_0.gguf` from `dir/embed/`, where `:dir` is the DB
   root. If the file is missing, Datalevin downloads it from Hugging Face on
-  first use. Providers expose stable embedding-space metadata via
-  `embedding-metadata`; built-in local providers derive it from the model
-  artifact, an optional adjacent `model.gguf.edn` manifest, and an optional
-  `:embedding-metadata` override in `provider-spec`. Optional tuning keys are
+  first use.
+
+  The built-in `:openai-compatible` provider sends `POST` requests to an
+  OpenAI-compatible `/embeddings` endpoint. The minimal spec is:
+
+    `{:provider :openai-compatible
+      :model    \"text-embedding-3-small\"
+      :base-url \"https://api.openai.com/v1\"}`
+
+  `:endpoint` may be used instead of `:base-url`. Authentication is optional
+  and may be supplied via `:api-key` or `:api-key-env`. `:request-dimensions`
+  requests a specific output size when the remote provider supports it and also
+  lets Datalevin resolve the embedding space without a network probe during
+  store open.
+
+  Providers expose stable embedding-space metadata via `embedding-metadata`;
+  built-in local providers derive it from the model artifact, an optional
+  adjacent `model.gguf.edn` manifest, and an optional `:embedding-metadata`
+  override in `provider-spec`. Optional llama.cpp tuning keys are
   `:gpu-layers`, `:ctx-size`, `:batch-size`, and `:threads`. When omitted,
   they default to `0` and defer to native defaults."
   ([provider-spec]
@@ -895,7 +1044,12 @@
            (raise "Unknown embedding provider"
                   {:provider provider
                    :known-providers built-in-provider-ids}))
-         (lazy-provider spec *llama-provider-factory*))))))
+         (case provider
+           (:default :llama.cpp)
+           (lazy-provider spec *llama-provider-factory*)
+
+           :openai-compatible
+           (lazy-provider spec *openai-compatible-provider-factory*)))))))
 
 (defn embed-text
   "Embed a single text string and return a float array."
