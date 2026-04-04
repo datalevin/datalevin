@@ -14,6 +14,7 @@
    [datalevin.lmdb :as lmdb :refer [IWriting]]
    [datalevin.binding.cpp]
    [datalevin.inline :refer [update assoc]]
+   [datalevin.kv :as kv]
    [datalevin.remote :as remote]
    [datalevin.util :as u :refer [conjs conjv]]
    [datalevin.relation :as r]
@@ -1969,13 +1970,16 @@
   (let [opts (c/canonicalize-wal-opts opts)]
     (when (true? (:wal? opts))
       (let [runtime-opts (or (env-opts lmdb) {})
-            info-v       (kv-info lmdb)]
-        (when (and info-v (not (true? (:wal? runtime-opts))))
-          (let [wal-opts (into {}
+            info-v       (kv-info lmdb)
+            wal-opts     (into {}
                                (filter (fn [[k _]]
                                          (c/wal-option-key? k)))
                                opts)]
-            (vswap! info-v merge wal-opts)))))))
+        (when (and info-v
+                   (some (fn [[k v]]
+                           (not= v (get runtime-opts k)))
+                         wal-opts))
+          (vswap! info-v merge wal-opts))))))
 
 (defn- open-dbis
   [lmdb]
@@ -2266,26 +2270,16 @@
     (u/file-exists (txlog-dir-path dir))
     (assoc :wal? true)))
 
-(defn- existing-store-probe-kv-opts
-  [dir kv-opts]
-  (assoc (existing-store-open-kv-opts dir kv-opts)
-         :snapshot-bootstrap-force? false
-         :snapshot-scheduler? false))
-
 (defn- load-existing-store-opts
-  [dir kv-opts]
+  [dir _kv-opts]
   (when (existing-store? dir)
-    (if-let [probe (or (some-> ^Store (current-shared-local-store dir) .-lmdb)
-                       (datalevin.binding.cpp/open-local-kv-handle dir))]
+    ;; Reuse persisted opts from an already-open handle when available, but do
+    ;; not probe closed stores just to read them; the real open can load opts.
+    (when-let [probe (or (some-> ^Store (current-shared-local-store dir) .-lmdb)
+                         (datalevin.binding.cpp/open-local-kv-handle dir))]
       (do
         (open-dbis probe)
-        (not-empty (load-opts probe)))
-      (let [probe (lmdb/open-kv dir (existing-store-probe-kv-opts dir kv-opts))]
-        (try
-          (open-dbis probe)
-          (not-empty (load-opts probe))
-          (finally
-            (close-kv probe)))))))
+        (not-empty (load-opts probe))))))
 
 (defn open
   "Open and return the storage."
@@ -2318,12 +2312,15 @@
          kv-opts (cond-> (merge persisted-kv-opts kv-opts)
                    wal-default-kv-opts (#(merge wal-default-kv-opts %))
                    (u/file-exists (txlog-dir-path dir)) (assoc :wal? true))
+         opened-with-wal? (true? (:wal? kv-opts))
          ^Store shared-store (current-shared-local-store dir)
          lmdb (or (some-> shared-store .-lmdb)
                   (lmdb/open-kv dir kv-opts))]
      (open-dbis lmdb)
-     (let [opts0     (or persisted-opts
-                         (not-empty (load-opts lmdb))
+     (let [loaded-opts (when-not persisted-opts
+                         (not-empty (load-opts lmdb)))
+           opts0     (or persisted-opts
+                         loaded-opts
                          {})
            opts1     (if (empty? opts0)
                        {:validate-data?       false
@@ -2382,7 +2379,8 @@
            opts2-base (-> (merge opts1 opts)
                           c/canonicalize-wal-opts
                           normalize-ha-open-opts)
-           opts2     (if (and (some? persisted-opts)
+           opts2     (if (and (or (some? persisted-opts)
+                                  (some? loaded-opts))
                               (empty? (or incoming-opts0 {})))
                        (propagate-top-level-txlog-opts-to-kv-opts opts2-base)
                        opts2-base)
@@ -2419,6 +2417,9 @@
                                                   :wal?
                                                   :kv-opts])}))
            _         (sync-wal-runtime-opts! lmdb opts3)
+           _         (when (and (not opened-with-wal?)
+                                (true? (:wal? opts3)))
+                       (kv/ensure-txlog-ready! lmdb))
            schema    (if shared-store
                        (datalevin.interface/set-schema shared-store schema)
                        (init-schema lmdb schema))

@@ -10,6 +10,7 @@
    [datalevin.interface :as i]
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
+   [datalevin.lmdb :as lmdb]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u])
   (:import [java.util Date UUID]))
@@ -260,6 +261,36 @@
       (is (= 4 (count (d/datoms @conn2 :eav))))
       (d/close conn2))
     (u/delete-files dir)))
+
+(deftest test-get-conn-existing-store-opens-lmdb-once
+  (let [schema {:name {:db/valueType :db.type/string}}
+        dir    (u/tmp-dir (str "get-conn-open-once-test-" (UUID/randomUUID)))]
+    (try
+      (let [conn (d/get-conn dir schema)]
+        (try
+          (d/transact! conn [{:db/id -1 :name "Namebo"}])
+          (finally
+            (d/close conn))))
+      (let [open-count (atom 0)
+            orig-open  lmdb/open-kv]
+        (with-redefs [lmdb/open-kv (fn
+                                     ([dir]
+                                      (swap! open-count inc)
+                                      (orig-open dir))
+                                     ([dir opts]
+                                      (swap! open-count inc)
+                                      (orig-open dir opts)))]
+          (let [conn (d/get-conn dir schema)]
+            (try
+              (is (= 1 @open-count))
+              (is (= 1 (d/q '[:find (count ?e) .
+                              :where
+                              [?e :name]]
+                            @conn)))
+              (finally
+                (d/close conn))))))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest test-with-conn
   (let [dir (u/tmp-dir (str "with-conn-test-" (UUID/randomUUID)))]
