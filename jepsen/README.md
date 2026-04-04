@@ -807,9 +807,3 @@ workload except `witness-topology`, which still needs its explicit 2-data-node
 The HA disruption nemeses currently require `--control-backend sofa-jraft`,
 because node restart/rejoin and quorum recovery depend on persisted authority
 membership. `:sofa-jraft` is the current control-plane backend.
-
-## Forward Look
-
-The main gap still worth closing is:
-
-* leader-side membership-hash mismatch demotion coverage beyond restart-time rejection

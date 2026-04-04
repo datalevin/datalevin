@@ -1547,6 +1547,15 @@
          (cond-> {:last-applied-lsn effective-lsn
                   :txlog-last-applied-lsn txlog-lsn
                   :ha-runtime? (boolean authority)
+                  :ha-membership-hash (:ha-membership-hash db-state)
+                  :ha-authority-membership-hash
+                  (:ha-authority-membership-hash db-state)
+                  :ha-membership-mismatch? (:ha-membership-mismatch? db-state)
+                  :ha-demotion-reason (:ha-demotion-reason db-state)
+                  :ha-demotion-details (:ha-demotion-details db-state)
+                  :ha-demoted-at-ms (:ha-demoted-at-ms db-state)
+                  :ha-demotion-drain-until-ms
+                  (:ha-demotion-drain-until-ms db-state)
                   :udf-ready? (:udf-ready? db-state)
                   :udf-missing (:udf-missing db-state)
                   :udf-readiness-token (:udf-readiness-token db-state)
