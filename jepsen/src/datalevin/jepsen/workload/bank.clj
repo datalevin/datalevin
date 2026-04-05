@@ -211,23 +211,17 @@
           from (long from)
           to (long to)
           amount (long amount)
-          before-from (account-balance @conn from)
-          before-to (account-balance @conn to)]
-      (d/transact! conn [[:bank/transfer from to amount]])
-      (let [after-from (account-balance @conn from)
-            after-to (account-balance @conn to)
-            applied? (and (some? before-from)
-                          (some? before-to)
-                          (some? after-from)
-                          (some? after-to)
-                          (= after-from (- before-from amount))
-                          (= after-to (+ before-to amount)))]
+          report (d/transact! conn [[:bank/transfer from to amount]])
+          db-after (:db-after report)
+          applied? (boolean (seq (:tx-data report)))
+          after-from (account-balance db-after from)
+          after-to (account-balance db-after to)]
         {:from from
          :to to
          :amount amount
          :applied? applied?
          :from-balance after-from
-         :to-balance after-to}))
+         :to-balance after-to})
 
     :read-all
     (all-balances @conn account-count)

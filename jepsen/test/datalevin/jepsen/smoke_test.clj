@@ -889,12 +889,24 @@
                                   {:type :invoke
                                    :f :transfer
                                    :value {:from 0 :to 1 :amount 5}})
+            noop-write (client/invoke! opened
+                                       test-map
+                                       {:type :invoke
+                                        :f :transfer
+                                        :value {:from 0 :to 1 :amount 500}})
             read-op (client/invoke! opened
                                     test-map
                                     {:type :invoke
                                      :f :read-all})
             totals (:value read-op)]
         (is (= :ok (:type write)))
+        (is (true? (:applied? write)))
+        (is (= 95 (:from-balance write)))
+        (is (= 105 (:to-balance write)))
+        (is (= :ok (:type noop-write)))
+        (is (false? (:applied? noop-write)))
+        (is (= 95 (:from-balance noop-write)))
+        (is (= 105 (:to-balance noop-write)))
         (is (= :ok (:type read-op)))
         (is (= 4 (count totals)))
         (is (= 400 (reduce + 0 totals))))
