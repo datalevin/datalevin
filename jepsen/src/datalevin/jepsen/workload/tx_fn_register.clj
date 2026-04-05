@@ -395,6 +395,14 @@
     (range (long key-count))
     nil))
 
+(defn- final-read-generator
+  [key-count]
+  (independent/sequential-generator
+    (range (long key-count))
+    (fn [_k]
+      [{:type :invoke
+        :f :read}])))
+
 (defrecord Client [node key-count payload-bytes]
   client/Client
   (open! [this _test node]
@@ -449,5 +457,6 @@
         per-key-limit (long (or (:max-writes-per-key opts) 32))]
     {:client    (->Client nil key-count payload-bytes)
      :generator (txreg-generator key-count worker-count per-key-limit)
+     :final-generator (final-read-generator key-count)
      :checker   (txreg-checker payload-bytes)
      :schema    schema}))

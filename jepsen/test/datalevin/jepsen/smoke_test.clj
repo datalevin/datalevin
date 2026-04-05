@@ -120,7 +120,8 @@
     :builder giant-values/workload
     :opts {:key-count 4
            :nodes ["n1" "n2" "n3"]}
-    :schema giant-values/schema}
+    :schema giant-values/schema
+    :final-generator? true}
    {:label :fencing
     :builder fencing/workload
     :opts {}
@@ -141,25 +142,30 @@
    {:label :internal
     :builder internal/workload
     :opts {}
-    :schema internal/schema}
+    :schema internal/schema
+    :final-generator? true}
    {:label :identity-upsert
     :builder identity-upsert/workload
     :opts {}
-    :schema identity-upsert/schema}
+    :schema identity-upsert/schema
+    :final-generator? true}
    {:label :index-consistency
     :builder index-consistency/workload
     :opts {}
-    :schema index-consistency/schema}
+    :schema index-consistency/schema
+    :final-generator? true}
    {:label :register
     :builder register/workload
     :opts {:key-count 4
            :nodes ["n1" "n2" "n3"]}
-    :schema register/schema}
+    :schema register/schema
+    :final-generator? true}
    {:label :tx-fn-register
     :builder tx-fn-register/workload
     :opts {:key-count 4
            :nodes ["n1" "n2" "n3"]}
-    :schema tx-fn-register/schema}
+    :schema tx-fn-register/schema
+    :final-generator? true}
    {:label :rejoin-bootstrap
     :builder rejoin-bootstrap/workload
     :opts {:key-count 4
