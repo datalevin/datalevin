@@ -174,6 +174,12 @@
     (testing (name label)
       (assert-workload-shape! (builder opts) expected))))
 
+(deftest append-family-defaults-include-multi-op-transactions-test
+  (is (re-find #"(?s)\(merge\s+\{:min-txn-length 1\s+:max-txn-length 4\}"
+               (slurp "src/datalevin/jepsen/workload/append.clj")))
+  (is (re-find #"(?s)\(merge\s+\{:min-txn-length 1\s+:max-txn-length 4\}"
+               (slurp "src/datalevin/jepsen/workload/append_cas.clj"))))
+
 (deftest bank-workload-rejects-too-few-accounts-test
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo

@@ -99,7 +99,7 @@
 (defn workload
   [opts]
   (let [opts'          (merge {:min-txn-length 1
-                               :max-txn-length 1}
+                               :max-txn-length 4}
                               (select-keys opts [:key-count
                                                  :min-txn-length
                                                  :max-txn-length
