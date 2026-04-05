@@ -3,6 +3,7 @@
    [datalevin.core :as d]
    [datalevin.interpret :as i]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.client :as client]))
 
@@ -221,9 +222,7 @@
                      :type :ok
                      :value value)))))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (op-error e)))))
+        (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)

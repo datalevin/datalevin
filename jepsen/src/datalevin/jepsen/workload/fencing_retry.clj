@@ -3,6 +3,7 @@
    [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.workload.util :as workload.util]
    [datalevin.util :as u]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
@@ -432,14 +433,12 @@
                :type :fail
                :error [:unsupported-client-op (:f op)]))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (or (ex-message e)
-                          (.getName (class e)))
-               :value (cond-> {:message (ex-message e)
-                               :class (.getName (class e))}
-                        (map? (ex-data e))
-                        (merge (ex-data e)))))))
+        (workload.util/assoc-exception-op
+          op
+          e
+          (or (ex-message e)
+              (.getName (class e)))
+          (workload.util/exception-detail e)))))
 
   (teardown! [this _test]
     this)

@@ -7,6 +7,34 @@
   [op]
   (contains? #{:ok :fail :info} (:type op)))
 
+(defn indeterminate-exception?
+  [e]
+  (local/transport-failure? e))
+
+(defn exception-result-type
+  [e]
+  (if (indeterminate-exception? e)
+    :info
+    :fail))
+
+(defn exception-detail
+  [e]
+  (cond-> {:message (or (ex-message e)
+                        (.getName (class e)))
+           :class (.getName (class e))}
+    (map? (ex-data e))
+    (merge (ex-data e))))
+
+(defn assoc-exception-op
+  ([op e error]
+   (assoc-exception-op op e error nil))
+  ([op e error detail]
+   (cond-> (assoc op
+                  :type (exception-result-type e)
+                  :error error)
+     (some? detail)
+     (assoc :value detail))))
+
 (defn expected-disruption-failures
   [test history pred]
   (->> history

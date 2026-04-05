@@ -3,6 +3,7 @@
    [datalevin.core :as d]
    [datalevin.interpret :as i]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
    [jepsen.generator :as gen]))
@@ -178,10 +179,15 @@
                              test
                              error)))
                  vec)
+            indeterminate
+            (->> terminal
+                 (remove (set disruption-failures))
+                 (filter (comp #{:info} :type))
+                 vec)
             checked-terminal
-            (remove (set disruption-failures) terminal)
+            (remove (set (concat disruption-failures indeterminate)) terminal)
             oks        (filter (comp #{:ok} :type) checked-terminal)
-            failures   (filter (comp #{:fail :info} :type) checked-terminal)
+            failures   (filter (comp #{:fail} :type) checked-terminal)
             mismatches (->> checked-terminal
                             (keep (fn [op]
                                     (let [expected (expected-outcome op)
@@ -202,6 +208,11 @@
                                          (count disruption-failures))))
          :ok-count         (count oks)
          :failure-count    (count failures)
+         :indeterminate-count (count indeterminate)
+         :indeterminate-samples
+         (vec (take 10
+                    (map #(select-keys % [:f :internal/case-id :error])
+                         indeterminate)))
          :disruption-failure-count (count disruption-failures)
          :disruption-failure-samples
          (vec (take 10
@@ -234,9 +245,7 @@
                      :type :ok
                      :value value)))))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (op-error e)))))
+        (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)

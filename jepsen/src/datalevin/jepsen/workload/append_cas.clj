@@ -161,9 +161,7 @@
                      :type :ok
                      :value (execute-txn! conn (:value op)))))))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (op-error e)))))
+        (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)

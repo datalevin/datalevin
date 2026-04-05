@@ -3,6 +3,7 @@
    [datalevin.core :as d]
    [datalevin.interpret :as i]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.checker.timeline :as timeline]
    [jepsen.client :as client]
@@ -428,9 +429,7 @@
                      :txreg/payload-valid? (:payload-valid? result)
                      :txreg/payload-bytes (:payload-bytes result))))))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (op-error e)))))
+        (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)

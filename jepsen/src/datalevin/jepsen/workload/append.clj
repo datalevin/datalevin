@@ -84,10 +84,11 @@
                    :type :ok
                    :value (execute-txn! conn (:value op))))))
       (catch Throwable e
-        (assoc op
-               :type :fail
-               :error (or (ex-message e)
-                          (.getName (class e)))))))
+        (workload.util/assoc-exception-op
+          op
+          e
+          (or (ex-message e)
+              (.getName (class e)))))))
 
   (teardown! [this _test]
     this)
