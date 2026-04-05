@@ -11,9 +11,9 @@
   "Proxy for remote stores"
   (:refer-clojure :exclude [sync])
   (:require
+   [datalevin.client-op :as cop]
    [datalevin.util :as u]
    [datalevin.constants :as c]
-   [datalevin.ha.client-op :as hcop]
    [datalevin.interface]
    [datalevin.client :as cl]
    [datalevin.bits :as b]
@@ -159,14 +159,14 @@
                :txs+info :tx-data+db-info
                :load-datoms)
          client-op-id (when (and writing? tx?)
-                        (hcop/new-client-op-id))
+                        (cop/new-client-op-id))
          client-op-hash (when client-op-id
-                          (hcop/request-hash
-                           (hcop/tx-request-payload t db-name datoms
-                                                    simulated?)))
+                          (cop/request-hash
+                           (cop/tx-request-payload t db-name datoms
+                                                   simulated?)))
          response-kind (case t
-                         :tx-data+db-info hcop/tx-data+db-info-response-kind
-                         :tx-data hcop/tx-data-response-kind
+                         :tx-data+db-info cop/tx-data+db-info-response-kind
+                         :tx-data cop/tx-data-response-kind
                          nil)
          req (if (< (count datoms) ^long c/+wire-datom-batch-size+)
                (cond-> {:type     t
@@ -1014,11 +1014,11 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [_ dbi-name txs k-type v-type]
-    (let [client-op-id   (when writing? (hcop/new-client-op-id))
+    (let [client-op-id   (when writing? (cop/new-client-op-id))
           client-op-hash (when client-op-id
-                           (hcop/request-hash
-                            (hcop/kv-request-payload db-name dbi-name txs
-                                                     k-type v-type)))
+                           (cop/request-hash
+                            (cop/kv-request-payload db-name dbi-name txs
+                                                    k-type v-type)))
           base-req       (if (< (count txs) ^long c/+wire-datom-batch-size+)
                            {:type     :transact-kv
                             :mode     :request
@@ -1036,8 +1036,8 @@
                                   :client-op-hash client-op-hash
                                   :client-op-response-kind
                                   (if (= :request (:mode base-req))
-                                    hcop/kv-result-response-kind
-                                    hcop/command-complete-response-kind)))
+                                    cop/kv-result-response-kind
+                                    cop/command-complete-response-kind)))
           request-fn     (fn [retry-client retry-req]
                            (if (= :copy-in (:mode retry-req))
                              (cl/copy-in retry-client retry-req txs

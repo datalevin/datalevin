@@ -189,7 +189,7 @@ def test_exec_json_raises_datalevin_error(monkeypatch) -> None:
 def test_preferred_runtime_jar_prefers_shared_runtime_and_latest_version(tmp_path) -> None:
     legacy = tmp_path / "datalevin-java-0.10.6.jar"
     shared_old = tmp_path / "datalevin-runtime-0.10.6.jar"
-    shared_new = tmp_path / "datalevin-runtime-0.10.13.jar"
+    shared_new = tmp_path / "datalevin-runtime-0.10.15.jar"
     for path in (legacy, shared_old, shared_new):
         path.write_text("", encoding="utf-8")
 

@@ -13,11 +13,11 @@
   (:require
    [clojure.string :as s]
    [datalevin.bits :as b]
+   [datalevin.client-op :as cop]
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.ha :as dha]
-   [datalevin.ha.client-op :as hcop]
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
@@ -412,7 +412,7 @@
   (let [store (kv-store deps server skey db-name writing?)]
     (i/get-value store
                  c/ha-client-ops
-                 (hcop/kv-info-key client-op-id)
+                 (cop/kv-info-key client-op-id)
                  :string
                  :data)))
 
@@ -1063,7 +1063,7 @@
                            args
                            writing?
                            (when client-op
-                             (hcop/tx-meta
+                             (cop/tx-meta
                                (:client-op-id client-op)
                                (:request-type client-op)
                                (:request-hash client-op)
@@ -1115,7 +1115,7 @@
                            args
                            writing?
                            (when client-op
-                             (hcop/tx-meta
+                             (cop/tx-meta
                                (:client-op-id client-op)
                                (:request-type client-op)
                                (:request-hash client-op)
@@ -1860,7 +1860,7 @@
                            v-type   (nth args 4 nil)
                            response-kind
                            (or (:response-kind client-op)
-                               hcop/command-complete-response-kind)
+                               cop/command-complete-response-kind)
                            response
                            (when (= :request mode)
                              :transacted)
@@ -1879,12 +1879,12 @@
                                                  (.-kt row)
                                                  (.-vt row)
                                                  (.-flags row))))
-                                           txs0)
+                                         txs0)
                                          txs0)
                                  client-op
-                                 (conj (hcop/committed-record-tx
+                                 (conj (cop/committed-record-tx
                                          (:client-op-id client-op)
-                                         (hcop/committed-record
+                                         (cop/committed-record
                                            (:request-type client-op)
                                            (:request-hash client-op)
                                            response-kind

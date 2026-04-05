@@ -14,12 +14,12 @@
    [clojure.walk]
    [clojure.data]
    [clojure.set]
+   [datalevin.client-op :as cop]
    [datalevin.constants :as c :refer [e0 tx0 emax txmax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
    [datalevin.db.tx.prepare :as txprep]
-   [datalevin.ha.client-op :as hcop]
    [datalevin.util :as u
     :refer [case-tree defrecord-updatable conjv concatv]]
    [datalevin.lmdb :as l]
@@ -1076,10 +1076,10 @@
 (defn- committed-client-op-response
   [report last-modified-ms]
   (let [tx-meta (:tx-meta report)
-        client-op-id (:ha/client-op-id tx-meta)
-        request-type (:ha/client-op-request-type tx-meta)
-        request-hash (:ha/client-op-hash tx-meta)
-        response-kind (:ha/client-op-response-kind tx-meta)
+        client-op-id (:client-op/id tx-meta)
+        request-type (:client-op/request-type tx-meta)
+        request-hash (:client-op/hash tx-meta)
+        response-kind (:client-op/response-kind tx-meta)
         db-after (:db-after report)]
     (when (and client-op-id request-type request-hash response-kind)
       (let [response
@@ -1098,16 +1098,16 @@
               (:new-attributes report)
               (assoc :new-attributes (:new-attributes report))
 
-              (= response-kind hcop/tx-data+db-info-response-kind)
+              (= response-kind cop/tx-data+db-info-response-kind)
               (assoc :db-info {:max-eid       (:max-eid db-after)
                                :max-tx        (:max-tx db-after)
                                :last-modified last-modified-ms}))]
-        (hcop/committed-record-tx
+        (cop/committed-record-tx
           client-op-id
-          (hcop/committed-record request-type
-                                 request-hash
-                                 response-kind
-                                 response))))))
+          (cop/committed-record request-type
+                                request-hash
+                                response-kind
+                                response))))))
 
 (defn ^:no-doc commit-prepared-tx-data!
   "Persist already prepared tx-data to the given DB store."

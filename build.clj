@@ -56,11 +56,13 @@
   ["pod"
    "datalevin/ha"
    "datalevin/ha.clj"
+   "datalevin/server"
    "datalevin/main.clj"
    "datalevin/mcp.clj"
    "datalevin/server.clj"])
 (def release-runtime-class-excludes
-  ["datalevin/ha"])
+  ["datalevin/ha"
+   "datalevin/server"])
 (def runtime-excluded-deps
   release-runtime-excluded-deps)
 (def runtime-source-excludes
@@ -142,6 +144,36 @@
   [root paths]
   (doseq [path paths]
     (b/delete {:path (str root "/" path)})))
+
+(def ^:private trimmed-runtime-forbidden-requires
+  ["[datalevin.ha"
+   "[datalevin.server"])
+
+(defn- relative-path
+  [root ^File file]
+  (str (.relativize (.toPath (File. root)) (.toPath file))))
+
+(defn- assert-trimmed-artifact!
+  [target-dir]
+  (doseq [path (distinct (concat release-runtime-source-excludes
+                                 release-runtime-class-excludes))
+          :let [trimmed-path (File. target-dir path)]
+          :when (.exists trimmed-path)]
+    (throw (ex-info "Trimmed artifact still contains an excluded path."
+                    {:target-dir target-dir
+                     :path       path})))
+  (doseq [^File source (file-seq (File. target-dir))
+          :when (and (.isFile source)
+                     (or (str/ends-with? (.getName source) ".clj")
+                         (str/ends-with? (.getName source) ".cljc")))]
+    (let [content (slurp source)]
+      (doseq [snippet trimmed-runtime-forbidden-requires
+              :when (str/includes? content snippet)]
+        (throw (ex-info
+                 "Trimmed artifact source still requires a removed runtime namespace."
+                 {:target-dir target-dir
+                  :path       (relative-path target-dir source)
+                  :snippet    snippet}))))))
 
 (defn- platform-arg->string
   [value]
@@ -414,7 +446,8 @@
   (b/delete {:path (str target-dir "/java")})
   ;; Embedded consumers do not need the CLI, pod entrypoint, or HA/server runtime.
   (delete-under-root! target-dir release-runtime-source-excludes)
-  (delete-under-root! target-dir release-runtime-class-excludes))
+  (delete-under-root! target-dir release-runtime-class-excludes)
+  (assert-trimmed-artifact! target-dir))
 
 (defn- prep-java-artifact! []
   (prep-trimmed-artifact! java-artifact-dir)
