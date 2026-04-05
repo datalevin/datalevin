@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.register
   (:require
    [datalevin.core :as d]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -17,7 +18,7 @@
 
 (def ^:private initial-value 0)
 (def ^:private default-setup-timeout-ms 15000)
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private register-rows-query
   '[:find ?key ?value
     :where

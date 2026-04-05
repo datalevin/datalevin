@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.witness-topology
   (:require
    [datalevin.core :as d]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -25,7 +26,7 @@
     :where
     [?e :register/key ?key]
     [?e :register/value ?value]])
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (defonce ^:private scenario-runs (atom {}))
 
 (defn- register-values-from-rows

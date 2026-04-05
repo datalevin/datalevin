@@ -2,6 +2,7 @@
   (:require
    [datalevin.core :as d]
    [datalevin.interpret :as i]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -22,7 +23,7 @@
 (def ^:private tx-fn-padding
   (apply str (repeat 512 "tx-fn-register-padding-")))
 (def ^:private default-setup-timeout-ms 15000)
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private txreg-rows-query
   '[:find ?key ?version ?payload
     :where

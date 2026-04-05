@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.append-cas
   (:require
    [datalevin.core :as d]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.client :as client]
@@ -14,7 +15,7 @@
                          :db/unique :db.unique/identity}
    :append.meta/version {:db/valueType :db.type/long}})
 
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 
 (defn- append-op?
   [[f]]

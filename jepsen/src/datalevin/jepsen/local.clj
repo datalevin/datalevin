@@ -2,6 +2,7 @@
   (:require
    [datalevin.constants :as c]
    [datalevin.ha :as dha]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local.cluster :as lcluster]
    [datalevin.jepsen.local.faults :as lfaults]
    [datalevin.jepsen.local.ops :as lops]
@@ -519,7 +520,8 @@
         (let [teardown-nodes (conj (:teardown-nodes cluster) node)]
           (swap! clusters assoc-in [cluster-id :teardown-nodes] teardown-nodes)
           (when (= teardown-nodes (set (:nodes test)))
-            (lcluster/teardown-cluster! (cluster-deps) cluster-id)))))
+            (lcluster/teardown-cluster! (cluster-deps) cluster-id)
+            (init-cache/release-cluster! cluster-id)))))
     this))
 
 (defrecord RemoteClusterDB [cluster-id remote-spec]
@@ -544,7 +546,8 @@
         (let [teardown-nodes (conj (:teardown-nodes cluster) node)]
           (swap! clusters assoc-in [cluster-id :teardown-nodes] teardown-nodes)
           (when (= teardown-nodes (set (:nodes test)))
-            (lremote/teardown-remote-cluster! (remote-deps) cluster-id)))))
+            (lremote/teardown-remote-cluster! (remote-deps) cluster-id)
+            (init-cache/release-cluster! cluster-id)))))
     this))
 
 (defn db

@@ -2,6 +2,7 @@
   (:require
    [clojure.string :as str]
    [datalevin.core :as d]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -24,7 +25,7 @@
 (def ^:private wal-gap-replica-floor-ttl-ms 500)
 (def ^:private leader-conn-retry-sleep-ms 250)
 (def ^:private sample-limit 10)
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (defonce ^:private converged-clusters (atom {}))
 (def ^:private cluster-opts
   {:wal-segment-max-ms wal-gap-segment-max-ms

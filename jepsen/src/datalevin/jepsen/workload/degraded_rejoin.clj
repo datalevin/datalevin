@@ -3,6 +3,7 @@
    [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.ha :as dha]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -41,7 +42,7 @@
    "Timeout in making request"
    "Unable to connect to server:"
    "Connection refused"])
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (defonce ^:private scenario-runs (atom {}))
 (def ^:private cluster-opts
   {:wal-segment-max-ms wal-gap-segment-max-ms

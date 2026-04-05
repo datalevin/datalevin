@@ -2,6 +2,7 @@
   (:require
    [datalevin.core :as d]
    [datalevin.interpret :as i]
+   [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
@@ -42,7 +43,7 @@
   [{:db/ident :bank/transfer
     :db/fn transfer-balance}])
 
-(defonce ^:private initialized-clusters (atom #{}))
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private default-setup-timeout-ms 15000)
 (def ^:private tx-fn-query
   '[:find ?fn .
