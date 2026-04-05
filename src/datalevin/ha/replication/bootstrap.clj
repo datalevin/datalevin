@@ -74,25 +74,34 @@
   (if (or (nil? kv-store)
           (> (long from-lsn) (long upto-lsn)))
     []
-    (loop [expected (long from-lsn)
-           remaining (seq (kv/open-tx-log-rows kv-store from-lsn upto-lsn))
-           acc []]
-      (if-let [record (first remaining)]
-        (let [record-lsn (long (:lsn record))
-              rows (or (:rows record) (:ops record))]
-          (if (and (= record-lsn expected)
-                   (sequential? rows))
-            (recur (unchecked-inc expected)
-                   (next remaining)
-                   (conj acc record))
-            acc))
-        acc))))
+    (try
+      (loop [expected (long from-lsn)
+             remaining (seq (kv/open-tx-log-rows kv-store from-lsn upto-lsn))
+             acc []]
+        (if-let [record (first remaining)]
+          (let [record-lsn (long (:lsn record))
+                rows (or (:rows record) (:ops record))]
+            (if (and (= record-lsn expected)
+                     (sequential? rows))
+              (recur (unchecked-inc expected)
+                     (next remaining)
+                     (conj acc record))
+              acc))
+          acc))
+      (catch clojure.lang.ExceptionInfo e
+        ;; Snapshot installs can reopen on a copied payload before the local
+        ;; runtime txlog path is available again. Treat that as an unverified
+        ;; tail and clamp back to the snapshot floor instead of aborting the
+        ;; whole bootstrap.
+        (if (= :txlog/not-enabled (:type (ex-data e)))
+          []
+          (throw e))))))
 
 (defn- inspect-ha-local-bootstrap-tail
   ([m snapshot-lsn]
    (inspect-ha-local-bootstrap-tail m snapshot-lsn nil))
   ([m snapshot-lsn trusted-max-lsn]
-   (if-let [kv-store (store/raw-local-kv-store m)]
+   (if-let [kv-store (store/local-kv-store m)]
      (let [persisted-floor-lsn
            (store/read-ha-local-persisted-lsn kv-store)
            candidate-floor-lsn-raw
