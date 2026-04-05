@@ -898,15 +898,17 @@
                                     test-map
                                     {:type :invoke
                                      :f :read-all})
+            write-value (:value write)
+            noop-write-value (:value noop-write)
             totals (:value read-op)]
         (is (= :ok (:type write)))
-        (is (true? (:applied? write)))
-        (is (= 95 (:from-balance write)))
-        (is (= 105 (:to-balance write)))
+        (is (true? (:applied? write-value)))
+        (is (= 95 (:from-balance write-value)))
+        (is (= 105 (:to-balance write-value)))
         (is (= :ok (:type noop-write)))
-        (is (false? (:applied? noop-write)))
-        (is (= 95 (:from-balance noop-write)))
-        (is (= 105 (:to-balance noop-write)))
+        (is (false? (:applied? noop-write-value)))
+        (is (= 95 (:from-balance noop-write-value)))
+        (is (= 105 (:to-balance noop-write-value)))
         (is (= :ok (:type read-op)))
         (is (= 4 (count totals)))
         (is (= 400 (reduce + 0 totals))))

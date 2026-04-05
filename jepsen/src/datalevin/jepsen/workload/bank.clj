@@ -212,10 +212,10 @@
           to (long to)
           amount (long amount)
           report (d/transact! conn [[:bank/transfer from to amount]])
-          db-after (:db-after report)
+          db-snapshot (or (:db-after report) (:db-before report))
           applied? (boolean (seq (:tx-data report)))
-          after-from (account-balance db-after from)
-          after-to (account-balance db-after to)]
+          after-from (account-balance db-snapshot from)
+          after-to (account-balance db-snapshot to)]
         {:from from
          :to to
          :amount amount
