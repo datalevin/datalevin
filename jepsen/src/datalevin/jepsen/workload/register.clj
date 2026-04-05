@@ -159,17 +159,20 @@
   [conn k [expected new-value]]
   (let [expected (long expected)
         new-value (long new-value)
-        db @conn
-        current-row (first (d/q register-state-query db (long k)))]
-    (if-some [[entid current] current-row]
-      (if (= (long current) expected)
-        (do
-          (d/transact! conn [[:db/cas entid
-                              :register/value
-                              expected
-                              new-value]])
-          [expected new-value])
-        ::cas-failed)
+        k         (long k)]
+    (if-some [[entid _] (first (d/q register-state-query @conn k))]
+      (try
+        (d/transact! conn [[:db/cas entid
+                            :register/value
+                            expected
+                            new-value]])
+        [expected new-value]
+        (catch Throwable e
+          (if (or (= :transact/cas (:error (ex-data e)))
+                  (when-some [message (ex-message e)]
+                    (re-find #":db\.fn/cas failed" message)))
+            ::cas-failed
+            (throw e))))
       ::cas-failed)))
 
 (defn- execute-op!
@@ -192,7 +195,9 @@
 
 (defn- op-error
   [e]
-  (if (= :transact/cas (:error (ex-data e)))
+  (if (or (= :transact/cas (:error (ex-data e)))
+          (when-some [message (ex-message e)]
+            (re-find #":db\.fn/cas failed" message)))
     :cas-failed
     (or (ex-message e)
         (.getName (class e)))))

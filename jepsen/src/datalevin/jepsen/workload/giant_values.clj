@@ -213,23 +213,26 @@
   (let [expected  (long expected)
         new-value (long new-value)
         payload   (payload-for k new-value payload-bytes)
-        db        @conn
-        current-row (first (d/q giant-state-query db (long k)))]
-    (if-some [[entid current-version _] current-row]
-      (if (= (long current-version) expected)
-        (do
-          (d/transact! conn [[:db/cas entid
-                              :giant/version
-                              expected
-                              new-value]
-                             [:db/add
-                              entid
-                              :giant/payload
-                              payload]])
-          {:version        new-value
-           :payload-valid? true
-           :payload-bytes  (long payload-bytes)})
-        ::cas-failed)
+        k         (long k)]
+    (if-some [[entid _ _] (first (d/q giant-state-query @conn k))]
+      (try
+        (d/transact! conn [[:db/cas entid
+                            :giant/version
+                            expected
+                            new-value]
+                           [:db/add
+                            entid
+                            :giant/payload
+                            payload]])
+        {:version        new-value
+         :payload-valid? true
+         :payload-bytes  (long payload-bytes)}
+        (catch Throwable e
+          (if (or (= :transact/cas (:error (ex-data e)))
+                  (when-some [message (ex-message e)]
+                    (re-find #":db\.fn/cas failed" message)))
+            ::cas-failed
+            (throw e))))
       ::cas-failed)))
 
 (defn- execute-op!
@@ -260,7 +263,9 @@
 
 (defn- op-error
   [e]
-  (if (= :transact/cas (:error (ex-data e)))
+  (if (or (= :transact/cas (:error (ex-data e)))
+          (when-some [message (ex-message e)]
+            (re-find #":db\.fn/cas failed" message)))
     :cas-failed
     (or (ex-message e)
         (.getName (class e)))))
