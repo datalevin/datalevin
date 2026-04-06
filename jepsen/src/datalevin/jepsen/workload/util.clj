@@ -9,7 +9,12 @@
 
 (defn indeterminate-exception?
   [e]
-  (local/transport-failure? e))
+  (or (local/transport-failure? e)
+      (boolean
+       (some
+        (fn [cause]
+          (true? (:indeterminate? (ex-data cause))))
+        (take-while some? (iterate ex-cause e))))))
 
 (defn exception-result-type
   [e]

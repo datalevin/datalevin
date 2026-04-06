@@ -21,7 +21,19 @@
           error  (ex-info "boom" {:error :unexpected})
           result (workload.util/assoc-exception-op op error :unexpected)]
       (is (= :fail (:type result)))
-      (is (= :unexpected (:error result))))))
+      (is (= :unexpected (:error result)))))
+
+  (testing "explicit indeterminate HA confirmation errors are reported as info"
+    (let [op     {:type :invoke :f :write}
+          error  (ex-info "HA write commit confirmation failed"
+                          {:error :ha/write-indeterminate
+                           :indeterminate? true})
+          result (workload.util/assoc-exception-op
+                  op
+                  error
+                  :ha/write-indeterminate)]
+      (is (= :info (:type result)))
+      (is (= :ha/write-indeterminate (:error result))))))
 
 (defn- exact-state-checker-result
   [checker-f expected-value-f op]

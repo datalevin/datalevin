@@ -15,6 +15,7 @@
    [datalevin.buffer :as bf]
    [datalevin.constants :as c]
    [datalevin.ha :as dha]
+   [datalevin.kv :as kv]
    [datalevin.protocol :as p]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u]
@@ -176,7 +177,11 @@
               write?
               (binding [txlog/*commit-payload-ha-term* ha-txlog-term
                         cpp/*before-write-commit-fn*
-                        ((:ha-write-commit-check-fn-fn deps) server message)]
+                        ((:ha-write-commit-check-fn-fn deps) server message)
+                        kv/*after-txlog-append-fn*
+                        ((:ha-write-commit-publish-fn-fn deps)
+                         server
+                         message)]
                 (dispatch-message deps server skey message))
 
               :else
