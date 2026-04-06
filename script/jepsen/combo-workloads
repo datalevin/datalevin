@@ -39,6 +39,9 @@ product sweeps.
 Examples:
   script/jepsen/combo-workloads clock-skew,failover
   script/jepsen/combo-workloads degraded,rejoin append bank
+  script/jepsen/combo-workloads failover,rejoin
+  script/jepsen/combo-workloads degraded,failover
+  script/jepsen/combo-workloads io-stall,failover
   script/jepsen/combo-workloads clock-skew,failover --all-workloads
   script/jepsen/combo-workloads clock-skew,failover append -- --time-limit 15 --rate 10
 

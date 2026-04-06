@@ -160,8 +160,8 @@
                                      60000))
             _              (doseq [op pre-ops]
                              (record-op! op))
-            pre-fault-lsn  (local/effective-local-lsn cluster-id
-                                                     leader-before)
+            pre-fault-lsn  (local/node-progress-lsn cluster-id
+                                                   leader-before)
             _              (when (pos? (long (or pre-fault-lsn 0)))
                              (local/wait-for-live-nodes-at-least-lsn!
                               cluster-id
@@ -186,8 +186,8 @@
                                      local-history-convergence-timeout-ms))
             _              (local/wait-for-live-nodes-at-least-lsn!
                             cluster-id
-                            (local/effective-local-lsn cluster-id
-                                                       leader-after)
+                            (local/node-progress-lsn cluster-id
+                                                     leader-after)
                             local-history-convergence-timeout-ms)
             checker-result (checker/check checker
                                           test-map

@@ -1898,6 +1898,57 @@
                :nemesis-faults [:degraded-network
                                 :follower-rejoin]
                :networked? true}}
+   {:label :failover-rejoin-combo
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :rejoin-bootstrap
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-failover
+                     :follower-rejoin]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-failover
+                                :follower-rejoin]
+               :networked? false}}
+   {:label :degraded-failover-combo
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:degraded-network
+                     :leader-failover]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:degraded-network
+                                :leader-failover]
+               :networked? true}}
+   {:label :io-stall-failover-combo
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :append
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :min-txn-length 1
+           :max-txn-length 1
+           :max-writes-per-key 8
+           :nodes ["n1" "n2" "n3"]
+           :nemesis [:leader-io-stall
+                     :leader-failover]}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults [:leader-io-stall
+                                :leader-failover]
+               :networked? false}}
    {:label :udf-readiness-failover
     :opts {:db-name "smoke"
            :control-backend :sofa-jraft

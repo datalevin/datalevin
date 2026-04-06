@@ -768,6 +768,9 @@ Exercise a likely compound fault against the sentinel workload set:
 ```bash
 script/jepsen/combo-workloads clock-skew,failover
 script/jepsen/combo-workloads degraded,rejoin
+script/jepsen/combo-workloads failover,rejoin
+script/jepsen/combo-workloads degraded,failover
+script/jepsen/combo-workloads io-stall,failover
 ```
 
 Expand a compound fault run to the full local workload set:

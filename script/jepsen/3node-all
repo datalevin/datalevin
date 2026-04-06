@@ -23,6 +23,9 @@ default_steps=(
   clock-mixed
   combo-clock-skew-failover
   combo-degraded-rejoin
+  combo-failover-rejoin
+  combo-degraded-failover
+  combo-io-stall-failover
 )
 
 usage() {
@@ -50,6 +53,9 @@ By default it executes the standard wrapper sequence:
   clock-mixed
   combo-clock-skew-failover
   combo-degraded-rejoin
+  combo-failover-rejoin
+  combo-degraded-failover
+  combo-io-stall-failover
 
 Examples:
   script/jepsen/3node-all
@@ -150,6 +156,15 @@ build_step_command() {
       ;;
     combo-degraded-rejoin)
       step_cmd=(script/jepsen/combo-workloads degraded,rejoin --all-workloads)
+      ;;
+    combo-failover-rejoin)
+      step_cmd=(script/jepsen/combo-workloads failover,rejoin --all-workloads)
+      ;;
+    combo-degraded-failover)
+      step_cmd=(script/jepsen/combo-workloads degraded,failover --all-workloads)
+      ;;
+    combo-io-stall-failover)
+      step_cmd=(script/jepsen/combo-workloads io-stall,failover --all-workloads)
       ;;
     *)
       echo "Unknown step: $step" >&2

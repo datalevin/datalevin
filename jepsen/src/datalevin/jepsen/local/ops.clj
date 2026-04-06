@@ -163,9 +163,12 @@
 (defn node-progress-lsn
   [{:keys [clusters remote-cluster?] :as deps} cluster-id logical-node]
   (if (remote-cluster? cluster-id)
-    (long (or (:last-applied-lsn
-               (remote-node-diagnostics deps cluster-id logical-node))
-              0))
+    (let [state (remote-node-diagnostics deps cluster-id logical-node)
+          txlog-lsn (long (or (:txlog-last-applied-lsn state) 0))
+          effective-lsn (long (or (:last-applied-lsn state) 0))]
+      (if (pos? txlog-lsn)
+        txlog-lsn
+        effective-lsn))
     (let [{:keys [db-name servers]} (get @clusters cluster-id)
           server                    (get servers logical-node)]
       (with-live-store-read-access
@@ -176,10 +179,14 @@
             (let [txlog-lsn     (long (or (:last-applied-lsn
                                            (local-watermarks server db-name))
                                           0))
+                  snapshot-lsn  (local-snapshot-lsn state)
                   runtime-lsn   (long (or (:ha-local-last-applied-lsn state) 0))
                   persisted-lsn (local-ha-persisted-lsn state)
-                  comparable    (long (max runtime-lsn persisted-lsn))]
-              (long (max txlog-lsn comparable)))
+                  comparable    (long (max runtime-lsn persisted-lsn))
+                  local-truth   (long (max txlog-lsn snapshot-lsn))]
+              (if (pos? local-truth)
+                local-truth
+                comparable))
             0))))))
 
 (defn wait-for-live-nodes-at-least-lsn!
