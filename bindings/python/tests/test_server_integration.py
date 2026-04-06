@@ -12,7 +12,12 @@ from datalevin.errors import DatalevinJavaError
 
 pytestmark = pytest.mark.usefixtures("require_runtime")
 
-CLIENT_OPTS = {":pool-size": 1, ":time-out": 5000}
+CLIENT_OPTS = {
+    ":pool-size": 1,
+    ":time-out": 5000,
+    ":ha-write-retry-timeout-ms": 5000,
+    ":ha-write-retry-delay-ms": 100,
+}
 SCHEMA = {
     ":name": {
         ":db/valueType": ":db.type/string",

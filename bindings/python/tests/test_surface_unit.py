@@ -158,17 +158,33 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert interop_module.exec_json("ping", {"count": 1}) == {"status": "ok"}
     assert fake.last_request == {"op": "ping", "args": {"count": 1}}
 
-    conn = interop_module.connect("/tmp/db", schema={":name": {}}, opts={":x": 1}, shared=True)
+    conn_opts = {
+        ":embedding-opts": {
+            ":provider": ":openai-compatible",
+            ":model": "text-embedding-3-small",
+            ":api-key-env": "OPENAI_API_KEY",
+        },
+        ":client-opts": {
+            ":pool-size": 1,
+            ":ha-write-retry-timeout-ms": 5000,
+        },
+    }
+    conn = interop_module.connect("/tmp/db", schema={":name": {}}, opts=conn_opts, shared=True)
     assert conn.raw_handle() == "CONN"
-    assert fake.last_connection == ("/tmp/db", {":name": {}}, {":x": 1}, True)
+    assert fake.last_connection == ("/tmp/db", {":name": {}}, conn_opts, True)
 
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
     assert fake.last_kv == ("/tmp/kv", {":mapsize": 1})
 
-    client = interop_module.new_client("dtlv://user:pass@host", opts={":pool-size": 1})
+    client_opts = {
+        ":pool-size": 1,
+        ":ha-write-retry-timeout-ms": 5000,
+        ":ha-write-retry-delay-ms": 100,
+    }
+    client = interop_module.new_client("dtlv://user:pass@host", opts=client_opts)
     assert client.raw_handle() == "CLIENT"
-    assert fake.last_client == ("dtlv://user:pass@host", {":pool-size": 1})
+    assert fake.last_client == ("dtlv://user:pass@host", client_opts)
 
 
 def test_exec_json_raises_datalevin_error(monkeypatch) -> None:

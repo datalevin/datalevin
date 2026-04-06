@@ -6,7 +6,12 @@ import { DatalevinJavaError, jvmStarted, newClient } from "../src/index.js";
 import { clojureCliAvailable, runtimeAvailable, startLiveServer } from "../test-support/live-server.mjs";
 
 const integrationAvailable = runtimeAvailable() && clojureCliAvailable();
-const CLIENT_OPTS = { ":pool-size": 1, ":time-out": 5000 };
+const CLIENT_OPTS = {
+  ":pool-size": 1,
+  ":time-out": 5000,
+  ":ha-write-retry-timeout-ms": 5000,
+  ":ha-write-retry-delay-ms": 100
+};
 const SCHEMA = {
   ":name": {
     ":db/valueType": ":db.type/string",

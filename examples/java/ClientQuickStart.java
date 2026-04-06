@@ -15,8 +15,13 @@ public final class ClientQuickStart {
     public static void main(String[] args) {
         String uri = System.getenv().getOrDefault("DATALEVIN_URI", DEFAULT_URI);
         String dbName = "java-quickstart-" + UUID.randomUUID();
+        Map<String, Object> clientOpts = Map.of(
+                ":pool-size", 1L,
+                ":time-out", 5000L,
+                ":ha-write-retry-timeout-ms", 5000L,
+                ":ha-write-retry-delay-ms", 100L);
 
-        try (Client client = Datalevin.newClient(uri)) {
+        try (Client client = Datalevin.newClient(uri, clientOpts)) {
             boolean created = false;
             boolean opened = false;
 

@@ -83,7 +83,14 @@ Use `new_client()` for server administration against a running Datalevin server:
 ```python
 from datalevin import new_client
 
-client = new_client("dtlv://datalevin:datalevin@localhost")
+CLIENT_OPTS = {
+    ":pool-size": 1,
+    ":time-out": 5000,
+    ":ha-write-retry-timeout-ms": 5000,
+    ":ha-write-retry-delay-ms": 100,
+}
+
+client = new_client("dtlv://datalevin:datalevin@localhost", opts=CLIENT_OPTS)
 created = False
 opened = False
 
@@ -113,9 +120,49 @@ finally:
     client.disconnect()
 ```
 
+## Embedding Search Options
+
+Python bindings pass Datalevin option maps through unchanged, so newer store
+features such as `:embedding-opts`, `:embedding-domains`, and remote
+`:openai-compatible` embedding providers are available directly from
+`connect()`:
+
+```python
+from datalevin import connect
+
+with connect(
+    "/tmp/dtlv-py-embed",
+    schema={
+        ":doc/id": {
+            ":db/valueType": ":db.type/string",
+            ":db/unique": ":db.unique/identity",
+        },
+        ":doc/text": {
+            ":db/valueType": ":db.type/string",
+            ":db/embedding": True,
+            ":db.embedding/domains": ["docs"],
+            ":db.embedding/autoDomain": True,
+        },
+    },
+    opts={
+        ":embedding-opts": {
+            ":provider": ":openai-compatible",
+            ":model": "text-embedding-3-small",
+            ":base-url": "https://api.openai.com/v1",
+            ":api-key-env": "OPENAI_API_KEY",
+            ":request-dimensions": 1536,
+            ":metric-type": ":cosine",
+        }
+    },
+) as conn:
+    pass
+```
+
 ## Notes
 
 - Datalevin values come back as ordinary Python values where possible.
+- Remote client options such as `:ha-write-retry-timeout-ms` and
+  `:ha-write-retry-delay-ms` can be passed to `new_client()`.
 - `interop()` is available for advanced raw-handle access when you need it.
 
 ## Development

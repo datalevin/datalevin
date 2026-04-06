@@ -81,7 +81,14 @@ Use `newClient()` for server administration against a running Datalevin server:
 ```js
 import { newClient } from "datalevin-node";
 
-const client = await newClient("dtlv://datalevin:datalevin@localhost");
+const clientOpts = {
+  ":pool-size": 1,
+  ":time-out": 5000,
+  ":ha-write-retry-timeout-ms": 5000,
+  ":ha-write-retry-delay-ms": 100
+};
+
+const client = await newClient("dtlv://datalevin:datalevin@localhost", clientOpts);
 let created = false;
 let opened = false;
 
@@ -112,10 +119,50 @@ try {
 }
 ```
 
+## Embedding Search Options
+
+Node bindings pass Datalevin option maps through unchanged, so newer store
+features such as `:embedding-opts`, `:embedding-domains`, and remote
+`:openai-compatible` embedding providers are available directly from
+`connect()`:
+
+```js
+import { connect } from "datalevin-node";
+
+const conn = await connect("/tmp/dtlv-js-embed", {
+  schema: {
+    ":doc/id": {
+      ":db/valueType": ":db.type/string",
+      ":db/unique": ":db.unique/identity"
+    },
+    ":doc/text": {
+      ":db/valueType": ":db.type/string",
+      ":db/embedding": true,
+      ":db.embedding/domains": ["docs"],
+      ":db.embedding/autoDomain": true
+    }
+  },
+  opts: {
+    ":embedding-opts": {
+      ":provider": ":openai-compatible",
+      ":model": "text-embedding-3-small",
+      ":base-url": "https://api.openai.com/v1",
+      ":api-key-env": "OPENAI_API_KEY",
+      ":request-dimensions": 1536,
+      ":metric-type": ":cosine"
+    }
+  }
+});
+
+await conn.close();
+```
+
 ## Notes
 
 - Datalevin results are converted into JavaScript values by default.
 - Large integer values are exposed as `bigint`.
+- Remote client options such as `:ha-write-retry-timeout-ms` and
+  `:ha-write-retry-delay-ms` can be passed to `newClient()`.
 - `interop()` is intended for advanced bridge use.
 
 ## Development

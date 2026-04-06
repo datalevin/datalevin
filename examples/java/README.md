@@ -10,7 +10,7 @@ Maven:
 <dependency>
   <groupId>org.datalevin</groupId>
   <artifactId>datalevin-java</artifactId>
-  <version>0.10.13</version>
+  <version>0.10.15</version>
 </dependency>
 ```
 
@@ -22,7 +22,7 @@ repositories {
 }
 
 dependencies {
-    implementation("org.datalevin:datalevin-java:0.10.13")
+    implementation("org.datalevin:datalevin-java:0.10.15")
 }
 ```
 
@@ -102,7 +102,15 @@ import datalevin.Client;
 import datalevin.DatabaseType;
 import datalevin.Datalevin;
 
-try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost")) {
+import java.util.Map;
+
+Map<String, Object> clientOpts = Map.of(
+        ":pool-size", 1L,
+        ":time-out", 5000L,
+        ":ha-write-retry-timeout-ms", 5000L,
+        ":ha-write-retry-delay-ms", 100L);
+
+try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost", clientOpts)) {
     client.createDatabase("demo", DatabaseType.DATALOG);
     try {
         System.out.println(client.openDatabaseInfo("demo", DatabaseType.DATALOG, null, null));
@@ -113,6 +121,11 @@ try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost")
     }
 }
 ```
+
+The Java wrapper also passes raw Datalevin option maps through unchanged, so
+store options like `:embedding-opts`, `:embedding-domains`, and remote
+`:openai-compatible` embedding providers can be supplied directly to
+`Datalevin.createConn(dir, schema, opts)`.
 
 ## More Examples
 
