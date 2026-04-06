@@ -48,6 +48,15 @@
 (defonce ^:private ^java.util.Map ha-write-retry-settings
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(declare read-preferred-ha-endpoint
+         set-preferred-ha-endpoint!
+         clear-preferred-ha-endpoint!
+         sync-ha-routing!
+         cached-retry-client
+         retry-client-disconnected?
+         evict-retry-client!
+         disconnect)
+
 (defn- conn-wire-opts
   [^SocketChannel ch]
   (or (.get connection-wire-opts ch)
@@ -553,8 +562,9 @@
               pool      (new-connectionpool host port client-id 1 time-out)]
           (-> (->Client username password host port 1 time-out
                         client-id pool)
-              (set-client-ha-write-retry-settings! time-out ha-settings)))))
-    client))
+              (set-client-ha-write-retry-settings! time-out ha-settings)
+              (sync-ha-routing! client))))
+    client)))
 
 (defn- endpoint-key
   [host port]
@@ -648,6 +658,26 @@
          (not (s/blank? endpoint))
          (not (some #(= endpoint %) endpoints)))
     (conj endpoint)))
+
+(defn ^:no-doc sync-ha-routing!
+  [source-client target-client]
+  (when (and source-client target-client)
+    (if-let [endpoint (read-preferred-ha-endpoint source-client)]
+      (set-preferred-ha-endpoint! target-client endpoint)
+      (clear-preferred-ha-endpoint! target-client)))
+  target-client)
+
+(defn ^:no-doc active-ha-request-client
+  [client]
+  (if-let [endpoint (read-preferred-ha-endpoint client)]
+    (if-let [retry-client (cached-retry-client client endpoint)]
+      (if (retry-client-disconnected? retry-client)
+        (do
+          (evict-retry-client! client endpoint disconnect)
+          client)
+        retry-client)
+      client)
+    client))
 
 (defn- client-routing-context
   [client]

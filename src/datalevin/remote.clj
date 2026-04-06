@@ -147,6 +147,33 @@
             (map? retry-result)
             (merge (select-keys retry-result [:db-info :new-attributes]))))))))
 
+(defn- request-ha-open
+  [client req]
+  (if-let [retry-context (#'cl/client-retry-context client)]
+    (let [preferred-attempt
+          (#'cl/try-preferred-ha-write-request*
+           client
+           req
+           retry-context
+           cl/request
+           cl/disconnect
+           #'cl/new-client-for-endpoint
+           #'cl/retry-ha-write-request)]
+      (if (:handled? preferred-attempt)
+        (:result preferred-attempt)
+        (let [{:keys [type message result err-data]} (cl/request client req)]
+          (if (= type :error-response)
+            (if (#'cl/retryable-ha-write-reject? err-data)
+              (#'cl/retry-ha-write-request client req message err-data)
+              (#'cl/raise-normal-request-error req message err-data nil))
+            (do
+              (#'cl/clear-preferred-ha-endpoint! client)
+              result)))))
+    (let [{:keys [type message result err-data]} (cl/request client req)]
+      (if (= type :error-response)
+        (#'cl/raise-normal-request-error req message err-data nil)
+        result))))
+
 (defn- load-datoms*
   ([client db-name datoms datom-type simulated?]
    (load-datoms* client db-name datoms datom-type simulated? false nil))
@@ -477,21 +504,31 @@
                   open-db-info))
 
   (open-transact [this]
-    (cl/normal-request tx-client :open-transact [db-name] false)
-    (cl/disable-ha-write-retry! tx-client)
-    (.mark-write this))
+    (#'cl/sync-ha-routing! client tx-client)
+    (#'request-ha-open tx-client {:type :open-transact
+                                  :args [db-name]
+                                  :writing? false})
+    (#'cl/sync-ha-routing! tx-client client)
+    (let [active-client (#'cl/active-ha-request-client tx-client)]
+      (#'cl/disable-ha-write-retry! active-client)
+      (->DatalogStore uri db-name active-client active-client
+                      (volatile! :remote-dl-mutex) true
+                      open-db-info
+                      sampling-started?
+                      owns-client?
+                      closed?)))
 
   (abort-transact [this]
     (try
-      (cl/normal-request tx-client :abort-transact [db-name] true)
+      (#'cl/normal-request tx-client :abort-transact [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! tx-client))))
+        (#'cl/enable-ha-write-retry! tx-client))))
 
   (close-transact [_]
     (try
-      (cl/normal-request tx-client :close-transact [db-name] true)
+      (#'cl/normal-request tx-client :close-transact [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! tx-client))))
+        (#'cl/enable-ha-write-retry! tx-client))))
 
   ILMDB
   (kv-info [_] nil)
@@ -992,21 +1029,28 @@
                        [db-name pin-id] writing?))
 
   (open-transact-kv [db]
-    (cl/normal-request client :open-transact-kv [db-name] false)
-    (cl/disable-ha-write-retry! client)
-    (.mark-write db))
+    (#'request-ha-open client {:type :open-transact-kv
+                               :args [db-name]
+                               :writing? false})
+    (let [active-client (#'cl/active-ha-request-client client)]
+      (#'cl/disable-ha-write-retry! active-client)
+      (->KVStore uri db-name active-client
+                 (volatile! :remote-kv-mutex) true
+                 open-db-opts
+                 owns-client?
+                 closed?)))
 
   (close-transact-kv [_]
     (try
-      (cl/normal-request client :close-transact-kv [db-name] true)
+      (#'cl/normal-request client :close-transact-kv [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! client))))
+        (#'cl/enable-ha-write-retry! client))))
 
   (abort-transact-kv [_]
     (try
-      (cl/normal-request client :abort-transact-kv [db-name] true)
+      (#'cl/normal-request client :abort-transact-kv [db-name] true)
       (finally
-        (cl/enable-ha-write-retry! client))))
+        (#'cl/enable-ha-write-retry! client))))
 
   (transact-kv [this txs] (.transact-kv this nil txs))
   (transact-kv [this dbi-name txs]
