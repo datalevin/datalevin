@@ -50,6 +50,14 @@
          persisted-runtime-floor-lsn
          ->KVLMDB)
 
+(def ^:dynamic *after-txlog-append-fn*
+  nil)
+
+(defn- run-after-txlog-append!
+  [context]
+  (when-let [f *after-txlog-append-fn*]
+    (f context)))
+
 (defn txlog-watermarks
   [db]
   (try
@@ -2751,6 +2759,10 @@
                       (f {:operation :close-transact-kv}))
                   append-res (txlog/append-durable!
                               state pending txlog-append-hooks)
+                  _ (run-after-txlog-append!
+                     {:operation :close-transact-kv
+                      :txlog-lsn (long (:lsn append-res))
+                      :append-res append-res})
                   state (refresh-runtime-marker-revision! lmdb state)
                   marker-entry (txlog/next-commit-marker-entry
                                 (:commit-marker? state)

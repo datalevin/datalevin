@@ -741,6 +741,10 @@
   [^Server server message]
   (sha/ha-write-commit-check-fn (ha-deps) server message))
 
+(defn- ha-write-commit-publish-fn
+  [^Server server message]
+  (sha/ha-write-commit-publish-fn (ha-deps) server message))
+
 (defn- with-ha-write-admission
   [^Server server message f]
   (sha/with-ha-write-admission (ha-deps) server message f))
@@ -1848,6 +1852,7 @@
    :dbs-fn (fn [^Server server] (.-dbs server))
    :with-ha-write-admission-fn with-ha-write-admission
    :ha-write-commit-check-fn-fn ha-write-commit-check-fn
+   :ha-write-commit-publish-fn-fn ha-write-commit-publish-fn
    :cleanup-rejected-close-transact!-fn cleanup-rejected-close-transact!
    :message-handler-map message-handler-map
    :work-executor-fn (fn [^Server server] (.-work-executor server))

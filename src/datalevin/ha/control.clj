@@ -309,6 +309,12 @@
                   :term new-term
                   :authority-now-ms authority-now-ms}}))))
 
+(defn- monotonic-leader-last-applied-lsn
+  [lease leader-last-applied-lsn]
+  (long (max 0
+             (long (or (:leader-last-applied-lsn lease) 0))
+             (long (or leader-last-applied-lsn 0)))))
+
 (defn- apply-renew-transition
   [state {:keys [db-identity leader-node-id leader-endpoint
                  term lease-renew-ms lease-timeout-ms
@@ -372,7 +378,11 @@
                 :version current-version}}
 
       :else
-      (let [new-lease   (lease/new-lease-record
+      (let [leader-last-applied-lsn
+            (monotonic-leader-last-applied-lsn
+             lease
+             leader-last-applied-lsn)
+            new-lease   (lease/new-lease-record
                          {:db-identity db-identity
                           :leader-node-id leader-node-id
                           :leader-endpoint leader-endpoint
