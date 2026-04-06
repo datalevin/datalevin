@@ -957,97 +957,101 @@
 
 (defn- publish-ha-write-commit-lsn!
   [deps server db-name txlog-lsn]
-  (let [txlog-lsn (long (or txlog-lsn 0))]
-    (when-not (pos? txlog-lsn)
-      (u/raise "HA write commit confirmation failed"
-               {:error :ha/write-indeterminate
-                :indeterminate? true
-                :reason :invalid-txlog-lsn
-                :db-name db-name
-                :leader-last-applied-lsn txlog-lsn}))
-    (locking ((:db-write-admission-lock-fn deps) server db-name)
-      (let [m (or (get ((:dbs-fn deps) server) db-name)
-                  (u/raise "HA write commit confirmation failed"
-                           {:error :ha/write-indeterminate
-                            :indeterminate? true
-                            :reason :missing-db-state
-                            :db-name db-name
-                            :leader-last-applied-lsn txlog-lsn}))]
-        (when-not (leader-authority-state? m)
+  (let [dbs      ((:dbs-fn deps) server)
+        state0   (get dbs db-name)]
+    ;; Non-HA databases do not need authority-side commit confirmation.
+    (when (satisfies? ctrl/ILeaseAuthority (:ha-authority state0))
+      (let [txlog-lsn (long (or txlog-lsn 0))]
+        (when-not (pos? txlog-lsn)
           (u/raise "HA write commit confirmation failed"
                    {:error :ha/write-indeterminate
                     :indeterminate? true
-                    :reason :not-leader
+                    :reason :invalid-txlog-lsn
                     :db-name db-name
-                    :ha-role (:ha-role m)
                     :leader-last-applied-lsn txlog-lsn}))
-        (let [local-start-ms    (System/currentTimeMillis)
-              local-start-nanos (System/nanoTime)
-              timeout-ms        (hu/ha-request-timeout-ms
-                                 m
-                                 (or (get-in m [:ha-control-plane
-                                                :operation-timeout-ms])
-                                     5000))
-              leader-term       (:ha-leader-term m)
-              commit-lsn        (long (max txlog-lsn
-                                           (long (or (:ha-leader-last-applied-lsn
-                                                      m)
-                                                     0))
-                                           (long (or (get-in m
-                                                             [:ha-authority-lease
-                                                              :leader-last-applied-lsn])
-                                                     0))))
-              result            (if (and (integer? leader-term)
-                                         (pos? ^long leader-term))
-                                  (ctrl/renew-lease
-                                   (:ha-authority m)
-                                   {:db-identity (:ha-db-identity m)
-                                    :leader-node-id (:ha-node-id m)
-                                    :leader-endpoint (:ha-local-endpoint m)
-                                    :term leader-term
-                                    :lease-renew-ms (:ha-lease-renew-ms m)
-                                    :lease-timeout-ms (:ha-lease-timeout-ms m)
-                                    :leader-last-applied-lsn commit-lsn
-                                    :now-ms local-start-ms
-                                    :timeout-ms timeout-ms})
-                                  {:ok? false
-                                   :reason :missing-leader-term})
-              observation       (when (auth/control-result-authority-observation?
-                                       result)
-                                  (auth/control-result-authority-observation
-                                   m
-                                   local-start-ms
-                                   local-start-nanos
-                                   result))
-              observed-at-ms    (System/currentTimeMillis)]
-          (when observation
-            ((:transform-db-state-when-fn deps)
-             server
-             db-name
-             #(and (leader-authority-state? %)
-                   (same-ha-runtime-state? %
-                                           m
-                                           :ha-renew-loop-running?))
-             (fn [state]
-               (-> state
-                   (auth/apply-authority-observation observation observed-at-ms)
-                   auth/apply-authority-read-success
-                   (assoc :ha-leader-last-applied-lsn
-                          (long (max commit-lsn
-                                     (long (or (:ha-leader-last-applied-lsn
-                                                state)
-                                               0))
-                                     (long (or (get-in state
-                                                       [:ha-authority-lease
-                                                        :leader-last-applied-lsn])
-                                               0)))))))))
-          (when-not (:ok? result)
-            (u/raise "HA write commit confirmation failed"
-                     (ha-write-commit-confirmation-error
-                      db-name
-                      commit-lsn
-                      m
-                      result))))))))
+        (locking ((:db-write-admission-lock-fn deps) server db-name)
+          (let [m (or (get ((:dbs-fn deps) server) db-name)
+                      (u/raise "HA write commit confirmation failed"
+                               {:error :ha/write-indeterminate
+                                :indeterminate? true
+                                :reason :missing-db-state
+                                :db-name db-name
+                                :leader-last-applied-lsn txlog-lsn}))]
+            (when-not (leader-authority-state? m)
+              (u/raise "HA write commit confirmation failed"
+                       {:error :ha/write-indeterminate
+                        :indeterminate? true
+                        :reason :not-leader
+                        :db-name db-name
+                        :ha-role (:ha-role m)
+                        :leader-last-applied-lsn txlog-lsn}))
+            (let [local-start-ms    (System/currentTimeMillis)
+                  local-start-nanos (System/nanoTime)
+                  timeout-ms        (hu/ha-request-timeout-ms
+                                     m
+                                     (or (get-in m [:ha-control-plane
+                                                    :operation-timeout-ms])
+                                         5000))
+                  leader-term       (:ha-leader-term m)
+                  commit-lsn        (long (max txlog-lsn
+                                              (long (or (:ha-leader-last-applied-lsn
+                                                         m)
+                                                        0))
+                                              (long (or (get-in m
+                                                                [:ha-authority-lease
+                                                                 :leader-last-applied-lsn])
+                                                        0))))
+                  result            (if (and (integer? leader-term)
+                                             (pos? ^long leader-term))
+                                      (ctrl/renew-lease
+                                       (:ha-authority m)
+                                       {:db-identity (:ha-db-identity m)
+                                        :leader-node-id (:ha-node-id m)
+                                        :leader-endpoint (:ha-local-endpoint m)
+                                        :term leader-term
+                                        :lease-renew-ms (:ha-lease-renew-ms m)
+                                        :lease-timeout-ms (:ha-lease-timeout-ms m)
+                                        :leader-last-applied-lsn commit-lsn
+                                        :now-ms local-start-ms
+                                        :timeout-ms timeout-ms})
+                                      {:ok? false
+                                       :reason :missing-leader-term})
+                  observation       (when (auth/control-result-authority-observation?
+                                           result)
+                                      (auth/control-result-authority-observation
+                                       m
+                                       local-start-ms
+                                       local-start-nanos
+                                       result))
+                  observed-at-ms    (System/currentTimeMillis)]
+              (when observation
+                ((:transform-db-state-when-fn deps)
+                 server
+                 db-name
+                 #(and (leader-authority-state? %)
+                       (same-ha-runtime-state? %
+                                               m
+                                               :ha-renew-loop-running?))
+                 (fn [state]
+                   (-> state
+                       (auth/apply-authority-observation observation observed-at-ms)
+                       auth/apply-authority-read-success
+                       (assoc :ha-leader-last-applied-lsn
+                              (long (max commit-lsn
+                                         (long (or (:ha-leader-last-applied-lsn
+                                                    state)
+                                                   0))
+                                         (long (or (get-in state
+                                                           [:ha-authority-lease
+                                                            :leader-last-applied-lsn])
+                                                   0)))))))))
+              (when-not (:ok? result)
+                (u/raise "HA write commit confirmation failed"
+                         (ha-write-commit-confirmation-error
+                          db-name
+                          commit-lsn
+                          m
+                          result))))))))))
 
 (defn ha-write-commit-publish-fn
   [deps server message]
