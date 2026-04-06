@@ -40,6 +40,7 @@
           (dissoc :ha-leader-term
                   :ha-leader-last-applied-lsn
                   :ha-leader-fencing-pending?
+                  :ha-leader-fencing-started-at-ms
                   :ha-leader-fencing-observed-lease
                   :ha-leader-fencing-last-error)))
     m))
@@ -383,6 +384,7 @@
                          :ha-promotion-last-failure nil
                          :ha-promotion-failure-details nil
                          :ha-leader-fencing-pending? true
+                         :ha-leader-fencing-started-at-ms observed-at-ms
                          :ha-leader-fencing-observed-lease observed-lease
                          :ha-leader-fencing-last-error nil))]
           (maybe-complete-ha-leader-fencing deps promoted-m db-name)))

@@ -39,6 +39,12 @@
 (defonce ^:private ^java.util.Map ha-retry-clients
   (Collections/synchronizedMap (WeakHashMap.)))
 
+(defonce ^:private ^java.util.Map ha-known-db-endpoints
+  (Collections/synchronizedMap (WeakHashMap.)))
+
+(defonce ^:private ^java.util.Map ha-preferred-read-endpoints
+  (Collections/synchronizedMap (WeakHashMap.)))
+
 (defonce ^:private ^java.util.Map ha-retry-open-targets
   (Collections/synchronizedMap (WeakHashMap.)))
 
@@ -51,6 +57,9 @@
 (declare read-preferred-ha-endpoint
          set-preferred-ha-endpoint!
          clear-preferred-ha-endpoint!
+         preferred-ha-read-endpoint
+         known-ha-db-endpoints
+         cache-known-ha-db-endpoints!
          sync-ha-routing!
          cached-retry-client
          retry-client-disconnected?
@@ -440,6 +449,8 @@
         (.remove ha-write-retry-settings client)
         (.remove ha-retry-disabled-clients client)
         (.remove ha-preferred-endpoints client)
+        (.remove ha-preferred-read-endpoints client)
+        (.remove ha-known-db-endpoints client)
         (disconnect-retry-clients! client disconnect)))
     (close-pool pool))
 
@@ -450,8 +461,23 @@
 
   (get-id [client] id))
 
-(def ^:private default-ha-write-retry-timeout-ms 5000)
+(def ^:private minimum-ha-write-retry-timeout-ms 5000)
 (def ^:private default-ha-write-retry-delay-ms 100)
+
+(defn- derived-default-ha-write-retry-timeout-ms
+  [time-out]
+  (let [connection-budget-ms
+        (long (or time-out c/default-connection-timeout))
+        failover-budget-ms
+        (+ (long (or c/*ha-lease-timeout-ms* 0))
+           (long (or c/*ha-demotion-drain-ms* 0))
+           (long (or c/*ha-promotion-base-delay-ms* 0))
+           (long (or c/*ha-promotion-rank-delay-ms* 0)))
+        default-budget-ms
+        (long (max (long minimum-ha-write-retry-timeout-ms)
+                   (long failover-budget-ms)))]
+    (long (max 0
+               (min connection-budget-ms default-budget-ms)))))
 
 (defn- normalize-ha-write-retry-settings
   [time-out opts]
@@ -460,8 +486,7 @@
      (max 0
           (long
             (or (:ha-write-retry-timeout-ms opts)
-                (min (long (or time-out c/default-connection-timeout))
-                     (long default-ha-write-retry-timeout-ms))))))
+                (derived-default-ha-write-retry-timeout-ms time-out)))))
    :ha-write-retry-delay-ms
    (long
      (max 0
@@ -508,6 +533,17 @@
      (when (= type :error-response)
        (u/raise "Unable to open database:" db-name " " message
                 {:db-type db-type}))
+     (cache-known-ha-db-endpoints! client db-name
+                                   (concat
+                                     (or (map :endpoint (:ha-members opts)) [])
+                                     (or (map :endpoint
+                                              (get-in result [:opts :ha-members]))
+                                         [])
+                                     (or (:ha-retry-endpoints result) [])
+                                     (when-let [endpoint
+                                                (:ha-authoritative-leader-endpoint
+                                                  result)]
+                                       [endpoint])))
      (when return-db-info?
        result))))
 
@@ -525,7 +561,8 @@
   * `:time-out` specifies the time (milliseconds) before an exception is thrown
   when obtaining an open network connection, default is 60000.
   * `:ha-write-retry-timeout-ms` bounds extra HA failover retry time after a
-  retryable write rejection, default is 5000.
+  retryable write rejection. By default it is derived from HA lease/promotion
+  timing and capped by `:time-out`.
   * `:ha-write-retry-delay-ms` sleeps between HA failover retry rounds,
   default is 100."
   ([uri-str]
@@ -659,6 +696,102 @@
          (not (some #(= endpoint %) endpoints)))
     (conj endpoint)))
 
+(defn- ^ConcurrentHashMap known-ha-db-endpoint-cache
+  [client]
+  (locking ha-known-db-endpoints
+    (or (.get ha-known-db-endpoints client)
+        (let [cache (ConcurrentHashMap.)]
+          (.put ha-known-db-endpoints client cache)
+          cache))))
+
+(defn- ^ConcurrentHashMap preferred-ha-read-endpoint-cache
+  [client]
+  (locking ha-preferred-read-endpoints
+    (or (.get ha-preferred-read-endpoints client)
+        (let [cache (ConcurrentHashMap.)]
+          (.put ha-preferred-read-endpoints client cache)
+          cache))))
+
+(defn- known-ha-db-endpoints
+  [client db-name]
+  (when (and client (string? db-name))
+    (when-let [^ConcurrentHashMap cache (.get ha-known-db-endpoints client)]
+      (let [endpoints (->> (.get cache db-name)
+                           (keep (fn [endpoint]
+                                   (cond
+                                     (string? endpoint) endpoint
+                                     (map? endpoint) (:endpoint endpoint)
+                                     :else nil)))
+                           vec)]
+        (when (seq endpoints)
+          endpoints)))))
+
+(defn- cache-known-ha-db-endpoints!
+  [client db-name endpoints]
+  (when (and client (string? db-name))
+    (let [[merged _]
+          (collect-ha-retry-endpoints
+            #{}
+            (concat (or (known-ha-db-endpoints client db-name) [])
+                    (or endpoints [])))]
+      (if (seq merged)
+        (.put (known-ha-db-endpoint-cache client) db-name (mapv :endpoint merged))
+        (when-let [^ConcurrentHashMap cache (.get ha-known-db-endpoints client)]
+          (.remove cache db-name)))))
+  client)
+
+(defn- read-preferred-ha-read-endpoint
+  [client db-name]
+  (when (and client (string? db-name))
+    (when-let [^ConcurrentHashMap cache (.get ha-preferred-read-endpoints client)]
+      (let [endpoint (.get cache db-name)]
+        (when (and (string? endpoint) (not (s/blank? endpoint)))
+          endpoint)))))
+
+(defn- set-preferred-ha-read-endpoint!
+  [client db-name endpoint]
+  (when (and client (string? db-name))
+    (if (and (string? endpoint) (not (s/blank? endpoint)))
+      (.put (preferred-ha-read-endpoint-cache client) db-name endpoint)
+      (when-let [^ConcurrentHashMap cache (.get ha-preferred-read-endpoints client)]
+        (.remove cache db-name))))
+  client)
+
+(defn- clear-preferred-ha-read-endpoint!
+  [client db-name]
+  (set-preferred-ha-read-endpoint! client db-name nil))
+
+(defn- preferred-ha-read-endpoint
+  [client db-name]
+  (or (read-preferred-ha-read-endpoint client db-name)
+      (read-preferred-ha-endpoint client)))
+
+(defn- ha-retry-after-ms
+  [err-data]
+  (when (map? err-data)
+    (when-let [retry-after-ms (:ha-retry-after-ms err-data)]
+      (long (max 0 (long retry-after-ms))))))
+
+(defn- merge-ha-retry-after-ms
+  [current-ms err-data]
+  (if-let [retry-after-ms (ha-retry-after-ms err-data)]
+    (let [current-ms (long (or current-ms 0))
+          retry-after-ms (long retry-after-ms)]
+      (long (if (> retry-after-ms current-ms)
+              retry-after-ms
+              current-ms)))
+    (long (or current-ms 0))))
+
+(defn- next-ha-write-retry-round-delay-ms
+  [retry-context remaining-ms round-retry-after-ms]
+  (let [base-delay-ms
+        (long (or (:ha-write-retry-delay-ms retry-context)
+                  default-ha-write-retry-delay-ms))
+        delay-ms
+        (long (max base-delay-ms
+                   (long (or round-retry-after-ms 0))))]
+    (long (min delay-ms (long remaining-ms)))))
+
 (defn ^:no-doc sync-ha-routing!
   [source-client target-client]
   (when (and source-client target-client)
@@ -759,6 +892,12 @@
     :clear-docs
     :search-re-index})
 
+(defn- request-db-name
+  [req]
+  (let [db-name (or (:db-name req) (first (:args req)))]
+    (when (string? db-name)
+      db-name)))
+
 (defn- request-db-type
   [req]
   (or (:db-type req)
@@ -778,7 +917,7 @@
 (defn- request-db-target
   [req]
   (when-let [db-type (request-db-type req)]
-    (let [db-name (or (:db-name req) (first (:args req)))]
+    (let [db-name (request-db-name req)]
       (when (string? db-name)
         [db-name db-type]))))
 
@@ -926,15 +1065,13 @@
      new-client-fn
      (constantly nil)))
   ([req message err-data retry-context request-fn disconnect-fn new-client-fn
-    on-success-endpoint!]
+   on-success-endpoint!]
    (let [self-key (endpoint-key (:host retry-context) (:port retry-context))
-         retry-delay-ms
-         (long (or (:ha-write-retry-delay-ms retry-context)
-                   default-ha-write-retry-delay-ms))
          deadline-ms
          (+ (System/currentTimeMillis)
             (long (or (:ha-write-retry-timeout-ms retry-context)
-                      default-ha-write-retry-timeout-ms)))
+                      (derived-default-ha-write-retry-timeout-ms
+                        (:time-out retry-context)))))
          [pending _]
          (collect-ha-retry-endpoints
            #{self-key}
@@ -949,6 +1086,8 @@
             remaining    pending
             round-order  round-order
             seen         seen
+            round-retry-after-ms
+            (merge-ha-retry-after-ms nil err-data)
             last-message message
             last-err     err-data
             attempts     []]
@@ -967,6 +1106,7 @@
                     (rest remaining)
                     round-order
                     seen
+                    round-retry-after-ms
                     last-message
                     last-err
                     (conj attempts
@@ -988,6 +1128,8 @@
                           (concat (rest remaining) extra)
                           round-order'
                           seen'
+                          (merge-ha-retry-after-ms
+                            round-retry-after-ms retry-err)
                           retry-message
                           retry-err
                           (conj attempts
@@ -1009,12 +1151,17 @@
                {:ha-retry-attempts attempts
                 :ha-retry-rounds round})
              (do
-               (when (pos? retry-delay-ms)
-                 (Thread/sleep (long (min retry-delay-ms remaining-ms))))
+               (let [retry-delay-ms
+                     (long
+                       (next-ha-write-retry-round-delay-ms
+                         retry-context remaining-ms round-retry-after-ms))]
+                 (when (pos? ^long retry-delay-ms)
+                   (Thread/sleep ^long retry-delay-ms)))
                (recur (inc round)
                       round-order
                       round-order
                       seen
+                      0
                       last-message
                       last-err
                       attempts)))))))))
@@ -1067,6 +1214,72 @@
       #(set-preferred-ha-endpoint! client %))
     (raise-normal-request-error req message err-data nil)))
 
+(defn- try-preferred-ha-read-request*
+  [client req routing-context request-fn disconnect-fn new-client-fn]
+  (when (and routing-context
+             (request-db-name req))
+    (when-let [db-name (request-db-name req)]
+      (when-let [endpoint (preferred-ha-read-endpoint client db-name)]
+        (let [self-endpoint (endpoint-key (:host routing-context)
+                                          (:port routing-context))]
+          (if (= endpoint self-endpoint)
+            {:handled? false}
+            (if-let [{:keys [host port]} (parse-ha-endpoint endpoint)]
+              (let [outcome (attempt-ha-endpoint-request
+                              req routing-context host port
+                              request-fn disconnect-fn new-client-fn)]
+                (case (:kind outcome)
+                  :success
+                  {:handled? true
+                   :result (:result outcome)}
+
+                  :error
+                  (raise-normal-request-error
+                    req (:message outcome) (:err-data outcome)
+                    {:ha-pinned-endpoint endpoint})
+
+                  :exception
+                  (do
+                    (clear-preferred-ha-read-endpoint! client db-name)
+                    {:handled? false})))
+              (do
+                (clear-preferred-ha-read-endpoint! client db-name)
+                {:handled? false}))))))))
+
+(defn- retry-ha-read-request*
+  [client req message routing-context known-endpoints
+   request-fn disconnect-fn new-client-fn]
+  (when-let [db-name (request-db-name req)]
+    (let [self-endpoint (endpoint-key (:host routing-context)
+                                      (:port routing-context))
+          retry-endpoints (->> (or known-endpoints
+                                   (known-ha-db-endpoints client db-name))
+                               (remove #(= self-endpoint %))
+                               vec)]
+      (when (seq retry-endpoints)
+        (retry-ha-write-request*
+          req
+          message
+          {:ha-retry-endpoints retry-endpoints}
+          routing-context
+          request-fn
+          disconnect-fn
+          new-client-fn
+          #(set-preferred-ha-read-endpoint! client db-name %))))))
+
+(defn- retry-ha-read-request
+  [client req message known-endpoints]
+  (when-let [routing-context (client-routing-context client)]
+    (retry-ha-read-request*
+      client
+      req
+      message
+      routing-context
+      known-endpoints
+      request
+      disconnect
+      new-client-for-endpoint)))
+
 (defn ^:no-doc normal-request
   "Send request to server and returns results. Does not use the
   copy-in protocol. `call` is a keyword, `args` is a vector,
@@ -1075,11 +1288,24 @@
    (normal-request client call args false))
   ([client call args writing?]
    (let [req                 {:type call :args args :writing? writing?}
+         db-name             (request-db-name req)
+         known-endpoints     (and db-name
+                                  (known-ha-db-endpoints client db-name))
+         read-routing-context (and (not writing?) (client-routing-context client))
          routing-context     (and writing? (client-routing-context client))
          retry-context       (and writing? (client-retry-context client))
          preferred-endpoint  (and writing?
                                  (not retry-context)
                                  (read-preferred-ha-endpoint client))
+         preferred-read-attempt
+         (when-not writing?
+           (try-preferred-ha-read-request*
+             client
+             req
+             read-routing-context
+             request
+             disconnect
+             new-client-for-endpoint))
          preferred-attempt   (when retry-context
                                (try-preferred-ha-write-request*
                                  client
@@ -1089,9 +1315,14 @@
                                  disconnect
                                  new-client-for-endpoint
                                  retry-ha-write-request))]
-     (if (:handled? preferred-attempt)
+     (cond
+       (:handled? preferred-read-attempt)
+       (:result preferred-read-attempt)
+
+       (:handled? preferred-attempt)
        (:result preferred-attempt)
-       (if (and preferred-endpoint routing-context)
+
+       (and preferred-endpoint routing-context)
          (let [{:keys [host port]} (parse-ha-endpoint preferred-endpoint)
                outcome (and host port
                             (attempt-ha-endpoint-request
@@ -1126,16 +1357,32 @@
                (if (= type :error-response)
                  (raise-normal-request-error req message err-data nil)
                  result))))
+
+       :else
+       (try
          (let [{:keys [type message result err-data]} (request client req)]
            (if (= type :error-response)
              (if (and writing?
                       (retryable-ha-write-reject? err-data))
-               (retry-ha-write-request client req message err-data)
+               (do
+                 (cache-known-ha-db-endpoints! client db-name
+                                               (:ha-retry-endpoints err-data))
+                 (retry-ha-write-request client req message err-data))
                (raise-normal-request-error req message err-data nil))
              (do
                (when retry-context
                  (clear-preferred-ha-endpoint! client))
-               result))))))))
+               result)))
+         (catch Exception e
+           (if writing?
+             (throw e)
+             (or (retry-ha-read-request
+                   client
+                   req
+                   (or (ex-message e)
+                       "HA read target became unavailable")
+                   known-endpoints)
+                 (throw e)))))))))
 
 ;; we do input validation and normalization in the server, as
 ;; 3rd party clients may be written

@@ -165,9 +165,10 @@ Example:
 * `:pool-size` (default `3`): max pooled connections per client instance.
 * `:time-out` (default `60000` ms): timeout for getting a connection and for
   retrying requests.
-* `:ha-write-retry-timeout-ms` (default `min(:time-out, 5000)`): extra wall
-  clock budget for retryable HA write failover after an endpoint rejects a
-  write because leadership changed.
+* `:ha-write-retry-timeout-ms` (default `min(:time-out, 17000)` with current HA
+  defaults): extra wall clock budget for retryable HA write failover after an
+  endpoint rejects a write because leadership changed. The default is derived
+  from HA lease timeout and promotion timing, rather than being a fixed 5s.
 * `:ha-write-retry-delay-ms` (default `100` ms): sleep between HA write retry
   rounds.
 
@@ -191,7 +192,11 @@ In HA deployments, ordinary write requests use bounded automatic failover:
 * if a node quickly replies with a retryable HA write rejection such as
   `:not-leader`, the client immediately moves on to the next known endpoint
 * after probing the current endpoint set once, the client can retry the same
-  set in later rounds, sleeping `:ha-write-retry-delay-ms` between rounds
+  set in later rounds, sleeping at least `:ha-write-retry-delay-ms` between
+  rounds
+* retryable HA rejections may also carry an internal `:ha-retry-after-ms` hint;
+  the client treats that as a per-round minimum delay when it is larger than
+  the configured base delay
 * the whole retry process stops once a write succeeds or the extra
   `:ha-write-retry-timeout-ms` budget is exhausted
 
@@ -199,9 +204,11 @@ This matters because leader failover is not usually instantaneous. The
 control-plane defaults are already in the seconds range, so a client may need a
 short bounded retry window to ride through election and promotion convergence.
 
-The automatic HA retry path is for ordinary one-shot writes. Explicit remote
-write transactions opened with `open-transact` / `open-transact-kv` stay bound
-to their chosen server connection and are not automatically migrated to a new
+The automatic HA retry path applies to ordinary one-shot writes, and also to
+opening explicit remote write transactions. `open-transact` /
+`open-transact-kv` can retry across known HA endpoints until a leader accepts
+the open request. Once the transaction session is opened, however, it stays
+bound to that server connection and is not automatically migrated to a new
 leader mid-transaction.
 
 #### HA replica reads
@@ -224,8 +231,11 @@ For example, both of the following are valid ways to read from a replica:
 ```
 
 The existing client is sufficient for replica reads. In HA mode, write
-operations may be retried or routed to the authoritative leader, but ordinary
-read requests are served by the node you connect to.
+operations may be retried or routed to the authoritative leader. Ordinary read
+requests remain follower-eligible, and if the connected node becomes
+unreachable, the client can retry the read against other known HA endpoints for
+that database. A successful failover read may therefore be served by a follower
+rather than the former leader.
 
 If you need enforced read-only access, use RBAC rather than a special client
 type: grant the user or role only `:datalevin.server/view` permission on the

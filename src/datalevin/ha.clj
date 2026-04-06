@@ -196,8 +196,41 @@
   [m]
   (dissoc m
           :ha-leader-fencing-pending?
+          :ha-leader-fencing-started-at-ms
           :ha-leader-fencing-observed-lease
           :ha-leader-fencing-last-error))
+
+(defn- ha-demotion-retry-after-ms
+  [m now-ms]
+  (when-let [deadline-ms (ha-demotion-deadline-ms m)]
+    (long (max 0 (- (long deadline-ms) (long now-ms))))))
+
+(defn- ha-fencing-budget-ms
+  [m]
+  (let [{:keys [timeout-ms retries retry-delay-ms]} (:ha-fencing-hook m)
+        attempts (inc (long (max 0 (long (or retries 0)))))
+        timeout-ms (long (max 0 (long (or timeout-ms 3000))))
+        retry-delay-ms (long (max 0 (long (or retry-delay-ms 1000))))]
+    (long (+ (* attempts timeout-ms)
+             (* (max 0 (dec attempts)) retry-delay-ms)))))
+
+(defn- ha-fencing-retry-after-ms
+  [m now-ms]
+  (let [budget-ms (long (ha-fencing-budget-ms m))
+        started-at-ms (:ha-leader-fencing-started-at-ms m)]
+    (when (pos? budget-ms)
+      (if (integer? started-at-ms)
+        (let [remaining-ms
+              (long (- (+ (long started-at-ms) budget-ms)
+                       (long now-ms)))]
+          (long (if (neg? remaining-ms) 0 remaining-ms)))
+        budget-ms))))
+
+(defn- assoc-ha-retry-after-ms
+  [m retry-after-ms]
+  (cond-> m
+    (some? retry-after-ms)
+    (assoc :ha-retry-after-ms (long retry-after-ms))))
 
 (defn ^:redef ha-now-ms
   []
@@ -687,6 +720,7 @@
   [:ha-role
    :ha-leader-term
    :ha-leader-fencing-pending?
+   :ha-leader-fencing-started-at-ms
    :ha-leader-fencing-observed-lease
    :ha-leader-fencing-last-error
    :ha-demotion-drain-until-ms])
@@ -841,11 +875,13 @@
               leader-fencing-error (:ha-leader-fencing-last-error m)]
           (cond
             (= role :demoting)
-            (merge common-meta
-                   {:error :ha/write-rejected
-                    :reason :demoting
-                    :ha-role role
-                    :retryable? true})
+            (assoc-ha-retry-after-ms
+              (merge common-meta
+                     {:error :ha/write-rejected
+                      :reason :demoting
+                      :ha-role role
+                      :retryable? true})
+              (ha-demotion-retry-after-ms m now-ms))
 
             (not= role :leader)
             (merge common-meta
@@ -875,11 +911,13 @@
                     :retryable? true})
 
             leader-fencing-pending?
-            (merge common-meta
-                   {:error :ha/write-rejected
-                    :reason :fencing-pending
-                    :ha-fencing-error leader-fencing-error
-                    :retryable? true})
+            (assoc-ha-retry-after-ms
+              (merge common-meta
+                     {:error :ha/write-rejected
+                      :reason :fencing-pending
+                      :ha-fencing-error leader-fencing-error
+                      :retryable? true})
+              (ha-fencing-retry-after-ms m now-ms))
 
             db-id-mismatch?
             (merge common-meta

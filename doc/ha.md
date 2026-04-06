@@ -337,12 +337,17 @@ Client behavior is intentionally simple:
 * ordinary one-shot writes may be retried or redirected as leadership changes
 * stale-leader write failures are explicit and retryable
 * direct follower reads are allowed by connecting to that node
+* read requests can also fail over to another known HA endpoint if the current
+  endpoint becomes unreachable; the successful retry may be served by a follower
 
 The retry behavior is bounded rather than open-ended:
 
 * the client probes the currently known endpoints
 * if none accepts the write yet, it can retry the same endpoint set in later
   rounds
+* retryable HA rejections can carry a `:ha-retry-after-ms` hint for transient
+  states such as `:demoting` or `:fencing-pending`; the client uses that as a
+  minimum delay between rounds when it is larger than the configured base delay
 * the rounds stop when a leader accepts the write or the client's
   `:ha-write-retry-timeout-ms` budget is exhausted
 
@@ -356,10 +361,13 @@ The normal HA cluster client story is therefore:
 * connect to a follower directly if you want replica reads
 * use RBAC if you need a user to be read-only
 * tune `:ha-write-retry-timeout-ms` and `:ha-write-retry-delay-ms` if your
-  failover environment needs a longer or shorter write retry window
-* do not expect explicit remote write transactions to hop to a new leader after
-  `open-transact` / `open-transact-kv`; those stay pinned to their original
-  server session
+  failover environment needs a longer or shorter write retry window; the
+  default timeout is derived from HA lease timeout and promotion timing
+* expect `open-transact` / `open-transact-kv` themselves to retry across known
+  HA endpoints before a write session is established
+* do not expect an already-open explicit remote write transaction to hop to a
+  new leader after `open-transact` / `open-transact-kv`; once opened, it stays
+  pinned to its original server session
 
 ## How The Design Is Verified
 
