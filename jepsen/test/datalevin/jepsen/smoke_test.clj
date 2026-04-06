@@ -1070,6 +1070,11 @@
                                    {:type :invoke
                                     :f :cas
                                     :value (clojure.lang.MapEntry. 0 [7 9])})
+            failed-cas-op (client/invoke! opened
+                                          test-map
+                                          {:type :invoke
+                                           :f :cas
+                                           :value (clojure.lang.MapEntry. 0 [7 11])})
             final-op (client/invoke! opened
                                      test-map
                                      {:type :invoke
@@ -1084,6 +1089,8 @@
         (is (= :ok (:type cas-op)))
         (is (= (clojure.lang.MapEntry. 0 [7 9]) (:value cas-op)))
         (is (true? (:txreg/payload-valid? cas-op)))
+        (is (= :fail (:type failed-cas-op)))
+        (is (= :cas-failed (:error failed-cas-op)))
         (is (= :ok (:type final-op)))
         (is (= (clojure.lang.MapEntry. 0 9) (:value final-op)))
         (is (true? (:txreg/payload-valid? final-op))))

@@ -43,6 +43,7 @@
     :where
     [?e :db/ident ?ident]
     [?e :db/fn ?fn]])
+(def ^:private txreg-cas-failed-error :txreg/cas-failed)
 
 (defn- payload-for
   [k version payload-bytes]
@@ -104,8 +105,16 @@
             [{:db/id         entid
               :txreg/version new-value
               :txreg/payload payload}]
-            [])
-          [])))))
+            (throw (clojure.core/ex-info "tx-fn register CAS failed"
+                                         {:error    :txreg/cas-failed
+                                          :key      k
+                                          :expected expected
+                                          :actual   (long current-version)})))
+          (throw (clojure.core/ex-info "tx-fn register CAS failed"
+                                       {:error    :txreg/cas-failed
+                                        :key      k
+                                        :expected expected
+                                        :actual   nil})))))))
 
 (def ^:private txreg-write (make-txreg-write))
 
@@ -303,15 +312,18 @@
   [conn payload-bytes k [expected new-value]]
   (let [expected  (long expected)
         new-value (long new-value)
-        payload   (payload-for k new-value payload-bytes)
-        report    (d/transact! conn [[:txreg/cas
-                                      (long k)
-                                      expected
-                                      new-value
-                                      payload]])]
-    (if (seq (:tx-data report))
+        payload   (payload-for k new-value payload-bytes)]
+    (try
+      (d/transact! conn [[:txreg/cas
+                          (long k)
+                          expected
+                          new-value
+                          payload]])
       (txreg-state @conn payload-bytes k)
-      ::cas-failed)))
+      (catch Throwable e
+        (if (= txreg-cas-failed-error (:error (ex-data e)))
+          ::cas-failed
+          (throw e))))))
 
 (defn- execute-op!
   [conn payload-bytes op]
@@ -341,7 +353,10 @@
 
 (defn- op-error
   [e]
-  (if (= :transact/cas (:error (ex-data e)))
+  (if (or (= :transact/cas (:error (ex-data e)))
+          (= txreg-cas-failed-error (:error (ex-data e)))
+          (when-some [message (ex-message e)]
+            (re-find #"tx-fn register CAS failed" message)))
     :cas-failed
     (or (ex-message e)
         (.getName (class e)))))
