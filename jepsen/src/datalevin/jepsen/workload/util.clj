@@ -40,6 +40,12 @@
      (some? detail)
      (assoc :value detail))))
 
+(defn tx-report-db
+  [conn report]
+  (or (:db-after report)
+      (:db-before report)
+      @conn))
+
 (defn expected-disruption-failures
   [test history pred]
   (->> history

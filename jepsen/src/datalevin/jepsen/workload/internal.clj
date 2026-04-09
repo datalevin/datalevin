@@ -165,8 +165,9 @@
         (if (= ::unsupported txns)
           [:unsupported-client-op (:f op)]
           (mapv (fn [tx]
-                  (d/transact! conn tx)
-                  (state-for-key @conn k))
+                  (let [report (d/transact! conn tx)]
+                    (state-for-key (workload.util/tx-report-db conn report)
+                                   k)))
                 txns))))))
 
 (defn- op-error

@@ -243,11 +243,12 @@
     (probe-snapshot @conn)
     (let [txns    (case-txns op)
           case-id (long (:identity/case-id op))]
-      (if (= ::unsupported txns)
-        [:unsupported-client-op (:f op)]
-        (mapv (fn [tx]
-                (d/transact! conn tx)
-                (case-state @conn case-id))
+        (if (= ::unsupported txns)
+          [:unsupported-client-op (:f op)]
+          (mapv (fn [tx]
+                  (let [report (d/transact! conn tx)]
+                    (case-state (workload.util/tx-report-db conn report)
+                                case-id)))
               txns)))))
 
 (defn- op-error

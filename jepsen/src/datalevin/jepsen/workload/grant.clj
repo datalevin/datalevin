@@ -110,21 +110,25 @@
   (case (:f op)
     :create
     (let [{:keys [grant-id amount]} (:value op)]
-      (d/transact! conn [[:grant/create
-                          (long grant-id)
-                          (long amount)
-                          (now-ms)]])
-      (grant-state @conn grant-id))
+      (let [report (d/transact! conn [[:grant/create
+                                       (long grant-id)
+                                       (long amount)
+                                       (now-ms)]])]
+        (grant-state (workload.util/tx-report-db conn report) grant-id)))
 
     :approve
     (let [{:keys [grant-id]} (:value op)]
-      (d/transact! conn [[:grant/approve (long grant-id) (now-ms)]])
-      (grant-state @conn grant-id))
+      (let [report (d/transact! conn [[:grant/approve
+                                       (long grant-id)
+                                       (now-ms)]])]
+        (grant-state (workload.util/tx-report-db conn report) grant-id)))
 
     :deny
     (let [{:keys [grant-id]} (:value op)]
-      (d/transact! conn [[:grant/deny (long grant-id) (now-ms)]])
-      (grant-state @conn grant-id))
+      (let [report (d/transact! conn [[:grant/deny
+                                       (long grant-id)
+                                       (now-ms)]])]
+        (grant-state (workload.util/tx-report-db conn report) grant-id)))
 
     :read
     (grant-state @conn (:grant-id (:value op)))

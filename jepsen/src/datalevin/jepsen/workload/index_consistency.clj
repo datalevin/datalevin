@@ -428,8 +428,9 @@
       (if (= ::unsupported txns)
         [:unsupported-client-op (:f op)]
         (mapv (fn [tx]
-                (d/transact! conn tx)
-                (case-snapshot @conn case-id))
+                (let [report (d/transact! conn tx)]
+                  (case-snapshot (workload.util/tx-report-db conn report)
+                                 case-id)))
               txns)))))
 
 (defn- op-error
