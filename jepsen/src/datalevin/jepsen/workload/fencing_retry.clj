@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.fencing-retry
   (:require
    [clojure.string :as str]
+   [datalevin.client :as cl]
    [datalevin.core :as d]
    [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
@@ -179,21 +180,71 @@
         (some #(str/includes? message %)
               blocked-write-failure-markers))))
 
+(defn- node-client
+  [cluster-id logical-node]
+  (cl/new-client (local/admin-uri
+                   (local/endpoint-for-node cluster-id logical-node))
+                 {:pool-size 1
+                  :time-out blocked-leader-timeout-ms}))
+
+(defn- abort-open-transact!
+  [client db-name]
+  (try
+    (cl/request client {:type :abort-transact
+                        :args [db-name]
+                        :writing? true})
+    (catch Throwable _
+      nil)))
+
+(defn- probe-blocked-write
+  [test logical-node]
+  (let [cluster-id (:datalevin/cluster-id test)
+        db-name    (:db-name test)
+        client*    (volatile! nil)]
+    (try
+      (let [client (node-client cluster-id logical-node)]
+        (vreset! client* client)
+        (let [{:keys [type message err-data]}
+              (cl/request client {:type :open-transact
+                                  :args [db-name]})]
+          (case type
+            :command-complete
+            (do
+              (abort-open-transact! client db-name)
+              :admitted)
+
+            :error-response
+            {:status :blocked
+             :server-message message
+             :reason (:reason err-data)
+             :retryable? (:retryable? err-data)
+             :err-data err-data}
+
+            {:status :unexpected-response
+             :response-type type
+             :server-message message})))
+      (catch Throwable e
+        e)
+      (finally
+        (when-let [client @client*]
+          (try
+            (cl/disconnect client)
+            (catch Throwable _
+              nil)))))))
+
 (defn- wait-for-write-blocked!
   [test logical-node pairs timeout-ms]
   (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
     (loop [attempt-count 0]
-      (let [result (try
-                     (local/with-node-conn
-                       test
-                       logical-node
-                       schema
-                       (fn [conn]
-                         (write-register-pairs! conn pairs)
-                         :committed))
-                     (catch Throwable e
-                       e))]
+      (let [result (probe-blocked-write test logical-node)]
         (cond
+          (and (map? result)
+               (= :blocked (:status result)))
+          (merge {:logical-node logical-node
+                  :attempt-count (inc attempt-count)}
+                 (select-keys result
+                              [:server-message :reason :retryable? :err-data]))
+
           (and (instance? Throwable result)
                (blocked-write-error? result))
           {:logical-node logical-node
@@ -202,8 +253,8 @@
                            (.getName (class result)))
            :last-error-class (.getName (class result))}
 
-          (= :committed result)
-          (throw (ex-info "Write unexpectedly committed before fencing blocked it"
+          (= :admitted result)
+          (throw (ex-info "Write unexpectedly admitted before fencing blocked it"
                           {:logical-node logical-node
                            :pairs pairs
                            :attempt-count attempt-count}))
