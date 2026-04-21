@@ -39,6 +39,9 @@
 - [Async] A semaphore to limit the number of async jobs in backlog. Will
   block if the backlog is full (min of 4098 and 1024 * cores).
 - clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
+- [KV] Add a registry to track cached reader txn with its thread, so the
+  corresponding reader slot can be released when the thread is gone. This
+  handles the often lamented reader slot exhaustion problem.
 
 ### Fixed
 - [WAL] DB startup slow down in WAL mode

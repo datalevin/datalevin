@@ -80,3 +80,38 @@
             (i/close-kv db))))
       (finally
         (u/delete-files dir)))))
+
+(deftest test-short-lived-platform-reader-threads-release-slots
+  (let [dir (u/tmp-dir (str "platform-reader-cleanup-test-" (UUID/randomUUID)))]
+    (try
+      (let [db (l/open-kv dir {:max-readers 4})]
+        (try
+          (i/open-dbi db "a")
+          (i/transact-kv db "a" [[:put "k" "v"]] :string :string)
+          (dotimes [n 32]
+            (let [result (atom nil)
+                  t      (Thread.
+                          (fn []
+                            (try
+                              (when (.isVirtual (Thread/currentThread))
+                                (throw (ex-info "expected platform thread" {})))
+                              (let [dbi (i/get-dbi db "a")
+                                    rtx (i/get-rtx db)]
+                                (try
+                                  (reset! result
+                                          (read-string-value dbi rtx "k"))
+                                  (finally
+                                    (i/return-rtx db rtx))))
+                              (catch Throwable e
+                                (reset! result e)))))]
+              (.start t)
+              (.join t 10000)
+              (is (not (.isAlive t))
+                  (str "reader thread " n " should finish"))
+              (is (= "v" @result)
+                  (pr-str {:iteration n
+                           :result    (result-summary @result)}))))
+          (finally
+            (i/close-kv db))))
+      (finally
+        (u/delete-files dir)))))

@@ -39,10 +39,11 @@
    [datalevin.lmdb RangeContext KVTxData]
    [datalevin.async IAsyncWork]
    [datalevin.utl BitOps]
-   [java.util.concurrent TimeUnit ScheduledExecutorService ScheduledFuture]
+   [java.util.concurrent TimeUnit ScheduledExecutorService ScheduledFuture
+    ConcurrentHashMap]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util Iterator HashMap ArrayDeque]
+   [java.util Iterator HashMap ArrayDeque Map$Entry]
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
@@ -702,26 +703,60 @@
       (.close txn)
       (catch Exception _))))
 
+(defn- close-rtx-quiet!
+  [^Rtx rtx]
+  (when rtx
+    (close-txn-quiet! (.-txn rtx))))
+
+(defn- discard-thread-reader!
+  [^ThreadLocal tl-reader ^ConcurrentHashMap reader-registry
+   ^Thread thread ^Rtx rtx]
+  (.remove tl-reader)
+  (.remove reader-registry thread rtx)
+  (close-rtx-quiet! rtx)
+  nil)
+
+(defn- sweep-dead-reader-rtxs!
+  [^ConcurrentHashMap reader-registry]
+  (let [closed (volatile! 0)]
+    (doseq [^Map$Entry entry (.entrySet reader-registry)]
+      (let [^Thread thread (.getKey entry)
+            ^Rtx rtx      (.getValue entry)]
+        (when-not (.isAlive thread)
+          (when (.remove reader-registry thread rtx)
+            (close-rtx-quiet! rtx)
+            (vswap! closed u/long-inc)))))
+    @closed))
+
+(defn- close-reader-rtxs!
+  [^ConcurrentHashMap reader-registry]
+  (doseq [^Map$Entry entry (.entrySet reader-registry)]
+    (let [^Thread thread (.getKey entry)
+          ^Rtx rtx      (.getValue entry)]
+      (when (.remove reader-registry thread rtx)
+        (close-rtx-quiet! rtx)))))
+
 (defn- reusable-reader-rtx
-  [this ^ThreadLocal tl-reader]
-  (when-not (.isVirtual (Thread/currentThread))
-    (when-let [^Rtx rtx (.get tl-reader)]
-      (when (<= (long (max-val-size this))
+  [this ^ThreadLocal tl-reader ^ConcurrentHashMap reader-registry]
+  (let [thread (Thread/currentThread)]
+    (when-not (.isVirtual thread)
+      (when-let [^Rtx rtx (.get tl-reader)]
+        (if (<= (long (max-val-size this))
                 ^int (.capacity ^ByteBuffer (l/val-bf rtx)))
-        (try
-          (.renew rtx)
-          (catch Exception _
-            ;; Storage faults can leave a cached reader txn stale even though
-            ;; the LMDB env itself remains valid. Drop the stale reader and let
-            ;; the caller open a fresh one instead of surfacing a misleading
-            ;; "multiple connections" error for subsequent reads.
-            (close-txn-quiet! (.-txn rtx))
-            (.remove tl-reader)
-            nil))))))
+          (try
+            (.renew rtx)
+            (catch Exception _
+              ;; Storage faults can leave a cached reader txn stale even though
+              ;; the LMDB env itself remains valid. Drop the stale reader and let
+              ;; the caller open a fresh one instead of surfacing a misleading
+              ;; "multiple connections" error for subsequent reads.
+              (discard-thread-reader! tl-reader reader-registry thread rtx)))
+          (discard-thread-reader! tl-reader reader-registry thread rtx))))))
 
 (defn- fresh-reader-rtx
-  [this ^Env env ^ThreadLocal tl-reader]
-  (let [max-val-size* (long (max-val-size this))
+  [this ^Env env ^ThreadLocal tl-reader ^ConcurrentHashMap reader-registry]
+  (let [thread        (Thread/currentThread)
+        max-val-size* (long (max-val-size this))
         rtx (Rtx. this
                   (Txn/createReadOnly env)
                   (volatile! 1)
@@ -735,6 +770,10 @@
                   (bf/allocate-buffer max-val-size*)
                   (volatile! false))]
     (.set tl-reader rtx)
+    (when-not (.isVirtual thread)
+      (when-let [^Rtx old (.put reader-registry thread rtx)]
+        (when-not (identical? old rtx)
+          (close-rtx-quiet! old))))
     rtx))
 
 (defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
@@ -852,6 +891,7 @@
 (deftype CppLMDB [^Env env
                   info
                   ^ThreadLocal tl-reader
+                  ^ConcurrentHashMap reader-registry
                   ^HashMap dbis
                   scheduled-sync
                   ^BufVal kp-w
@@ -875,7 +915,7 @@
 
   (mark-write [_]
     (->CppLMDB
-      env info tl-reader dbis scheduled-sync kp-w vp-w start-kp-w
+      env info tl-reader reader-registry dbis scheduled-sync kp-w vp-w start-kp-w
       stop-kp-w start-vp-w stop-vp-w k-comp-bf-w v-comp-bf-w
       write-txn true k-comp v-comp meta))
 
@@ -920,6 +960,8 @@
       (when-not (.isClosed env)
         (unregister-shutdown-hook! dir)
         (stop-scheduled-sync scheduled-sync)
+        (close-reader-rtxs! reader-registry)
+        (.remove tl-reader)
         (let [dir-prefix (str (.env-dir this) u/+separator+)
               indices    (->> @l/vector-indices
                               (keep (fn [[fname idx]]
@@ -1069,8 +1111,10 @@
   (get-rtx [this]
     (when-not (.closed-kv? this)
       (try
-        (or (reusable-reader-rtx this tl-reader)
-            (fresh-reader-rtx this env tl-reader))
+        (or (reusable-reader-rtx this tl-reader reader-registry)
+            (do
+              (sweep-dead-reader-rtxs! reader-registry)
+              (fresh-reader-rtx this env tl-reader reader-registry)))
         (catch Exception e
           (raise duplicate-local-open-msg
                  {:cause (.getMessage e)})))))
@@ -1666,6 +1710,7 @@
           ^CppLMDB lmdb (->CppLMDB env
                                    (volatile! info)
                                    (ThreadLocal.)
+                                   (ConcurrentHashMap.)
                                    (HashMap.)
                                    (volatile! nil)
                                    (new-bufval c/+max-key-size+)
