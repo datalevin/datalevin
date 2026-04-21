@@ -49,8 +49,7 @@
   [#362](https://github.com/datalevin/datalevin/issues/362)
 
 ### Improved
-- [KV] Our version of nippy that uses `ByteBuffer` internals
-  [PR](https://github.com/taoensso/nippy/pull/190) to gain about 17%-30%
+- [KV] nippy uses `ByteBuffer` internals that we contributed to gain about 17%-30%
   speedup.
 - [KV] Harden virtual threads handling in reads by adding `:notls` in default
 env config.

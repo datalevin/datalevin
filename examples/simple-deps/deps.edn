@@ -5,7 +5,7 @@
            {:mvn/version "0.9.22"}
            ;; {:local/root "../.."}
            com.cognitect/transit-clj                     {:mvn/version "1.0.333"}
-           org.clojars.huahaiy/nippy                     {:mvn/version "3.6.2"}
+           com.taoensso/nippy                            {:mvn/version "3.7.0-beta1"}
            me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.10"}
            org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.3"}
            org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.3"}
