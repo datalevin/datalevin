@@ -1602,9 +1602,16 @@
             (.unlock read-lock))))
       (f))))
 
+(defn- message-runtime-db-name
+  [{:keys [args db-name]}]
+  (when-let [db-name (or db-name (nth args 0 nil))]
+    (if (string? db-name)
+      (u/lisp-case db-name)
+      db-name)))
+
 (defn- with-db-runtime-read-access
   [^Server server message f]
-  (with-db-runtime-store-read-access server (nth (:args message) 0 nil) f))
+  (with-db-runtime-store-read-access server (message-runtime-db-name message) f))
 
 (defn- with-db-runtime-store-swap
   [^Server server db-name f]

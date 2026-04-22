@@ -232,7 +232,10 @@
   (let [active-test {:datalevin/nemesis-faults [:clock-skew-pause
                                                 :leader-failover]}
         inactive-test {:datalevin/nemesis-faults []}
-        transport-error "Unable to connect to server: Connection refused"]
+        transport-error "Unable to connect to server: Connection refused"
+        control-timeout "Request to Datalevin server failed: \"HA control command timed out\""
+        commit-confirmation-failure
+        "Request to Datalevin server failed: \"HA write commit confirmation failed\""]
     (is (true? (boolean
                  (local/expected-disruption-write-failure?
                    active-test
@@ -244,7 +247,19 @@
     (is (false? (boolean
                   (local/expected-disruption-write-failure?
                     inactive-test
-                    transport-error))))))
+                    transport-error))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   control-timeout))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   {:error commit-confirmation-failure}))))
+    (is (false? (boolean
+                  (local/expected-disruption-write-failure?
+                    inactive-test
+                    control-timeout))))))
 
 (deftest local-query-uses-server-ha-read-view-test
   (assert-local-query-refreshes-ha-read-view!
