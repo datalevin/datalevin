@@ -31,7 +31,7 @@
   (:import
    [java.nio.channels SelectionKey SocketChannel]
    [java.nio.file Paths]
-   [java.util UUID]
+   [java.util Map$Entry UUID]
    [java.util.concurrent ConcurrentHashMap Semaphore]))
 
 (def ^:private view-act :datalevin.server/view)
@@ -392,7 +392,7 @@
                 (if (:ha-client-op-pending m)
                   m
                   (assoc m :ha-client-op-pending (ConcurrentHashMap.)))))))]
-    (doseq [entry (.entrySet ^ConcurrentHashMap pending-map)]
+    (doseq [^Map$Entry entry (.entrySet ^ConcurrentHashMap pending-map)]
       (let [pending-entry (.getValue entry)
             result-promise (:result-promise pending-entry)
             result         (when (realized? result-promise)
@@ -458,7 +458,8 @@
   [deps server skey db-name writing? message exec-fn]
   (if-let [request (client-op-request message)]
     (let [{:keys [client-op-id response-kind]} request
-          pending-map (client-op-pending-map deps server db-name)]
+          ^ConcurrentHashMap pending-map
+          (client-op-pending-map deps server db-name)]
       (if-let [record (some->> client-op-id
                                (read-committed-client-op-record
                                 deps server skey db-name writing?)
