@@ -1936,10 +1936,9 @@
               (db/refresh-cache (:store next-m)))
           last-record-lsn (when-let [record (peek records)]
                             (long (:lsn record)))
-          ;; Empty batches prove only that the chosen source returned no new
-          ;; replicated rows. Preserve the tracked replay cursor only when the
-          ;; source explicitly advertised that it is caught up through
-          ;; `(dec next-lsn)`; otherwise fall back to the local floor.
+          ;; Empty batches do not advance the follower's materialized local
+          ;; state. Keep the next fetch anchored to the applied floor so a
+          ;; speculative cursor cannot skip missing rows forever.
           current-local-floor-lsn
           (long (max 0
                      (long (or (:ha-local-last-applied-lsn next-m)
@@ -1948,24 +1947,7 @@
           applied-lsn (long (or last-record-lsn
                                 current-local-floor-lsn))
           next-fetch-lsn
-          (long
-           (if (seq records)
-             (unchecked-inc applied-lsn)
-             (let [leader-last-applied-lsn
-                   (long (or (:leader-last-applied-lsn lease) 0))
-                   empty-batch-proven-cursor?
-                   (and (true? source-last-applied-lsn-known?)
-                        (= (long (or source-last-applied-lsn 0))
-                           (long (max 0 (dec (long next-lsn))))))
-                   preserve-tracked-cursor?
-                   (and empty-batch-proven-cursor?
-                        (> (long next-lsn)
-                           (long (unchecked-inc current-local-floor-lsn)))
-                        (> leader-last-applied-lsn
-                           current-local-floor-lsn))]
-               (if preserve-tracked-cursor?
-                 (long next-lsn)
-                 (unchecked-inc applied-lsn)))))
+          (unchecked-inc applied-lsn)
           batch-estimated-bytes (estimate-ha-follower-batch-bytes records)
           next-m (if (seq records)
                    (maybe-persist-ha-follower-local-applied-lsn
@@ -2025,6 +2007,10 @@
                          :ha-follower-leader-endpoint leader-endpoint
                          :ha-follower-source-endpoint source-endpoint
                          :ha-follower-source-order source-order
+                         :ha-follower-source-last-applied-lsn-known?
+                         source-last-applied-lsn-known?
+                         :ha-follower-source-last-applied-lsn
+                         (some-> source-last-applied-lsn long)
                          :ha-follower-source-order-dynamic?
                          source-order-dynamic?
                          :ha-follower-source-order-authority-version
@@ -2068,6 +2054,14 @@
        sync-ha-follower-batch}
       db-name m lease source-order next-lsn now-ms)))
 
+(defn- next-ha-follower-sync-lsn
+  [local-next-lsn tracked-next-lsn]
+  (let [local-next-lsn (long (max 1 (long local-next-lsn)))]
+    (if (and (integer? tracked-next-lsn)
+             (pos? (long tracked-next-lsn)))
+      (long-min2 (long tracked-next-lsn) local-next-lsn)
+      local-next-lsn)))
+
 (defn- sync-ha-follower-state
   [db-name m now-ms]
   (if (not= :follower (:ha-role m))
@@ -2103,37 +2097,15 @@
                     (long (max 1
                                (unchecked-inc
                                 (long (ha-local-last-applied-lsn m)))))
-                    local-last-applied-lsn
-                    (long (max 0
-                               (dec local-next-lsn)))
-                    leader-last-applied-lsn
-                    (long (or (:leader-last-applied-lsn lease)
-                              0))
                     tracked-next-lsn
                     (when (integer? (:ha-follower-next-lsn m))
                       (long (:ha-follower-next-lsn m)))
-                    ;; Fresh follower stores can expose internal LMDB txlog
-                    ;; watermarks before they have replayed any replicated rows.
-                    ;; Honor the tracked follower cursor when the local watermark
-                    ;; floor is behind the leader, such as after snapshot install
-                    ;; resets. Otherwise clamp speculative cursors to the local
-                    ;; floor.
+                    ;; The follower cursor is only advisory. The local applied
+                    ;; floor is authoritative because it reflects the
+                    ;; materialized store after snapshot installs and reopens.
                     next-lsn
-                    (cond
-                      (and tracked-next-lsn
-                           (pos? (long tracked-next-lsn))
-                           (> (long tracked-next-lsn)
-                              local-next-lsn)
-                           (> leader-last-applied-lsn
-                              local-last-applied-lsn))
-                      tracked-next-lsn
-
-                      (and tracked-next-lsn
-                           (pos? (long tracked-next-lsn)))
-                      (long-min2 tracked-next-lsn local-next-lsn)
-
-                      :else
-                      local-next-lsn)]
+                    (next-ha-follower-sync-lsn
+                     local-next-lsn tracked-next-lsn)]
                 (:state (sync-ha-follower-batch
                          db-name m lease next-lsn now-ms)))
               (catch Exception e

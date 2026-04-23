@@ -223,6 +223,7 @@
                                    ~'wire-opts)))))
 
 (declare event-loop close-conn store->db-name session-lmdb remove-store
+         with-db-runtime-store-swap
          halt-run session-deps copy-deps dispatch-deps ha-deps)
 
 (def session-dbi sess/session-dbi)
@@ -909,15 +910,19 @@
 
 (defn- remove-store
   [^Server server db-name]
-  (let [m (get (.-dbs server) db-name)]
-    (stop-ha-renew-loop m)
-    (stop-ha-follower-sync-loop m)
-    (stop-ha-authority db-name m)
-    (when-let [store (:store m)]
-      (if-let [db (:dt-db m)]
-        (db/close-db db)
-        (close-store store))))
-  (.remove ^Map (.-dbs server) db-name))
+  (with-db-runtime-store-swap
+    server
+    db-name
+    (fn []
+      (let [m (get (.-dbs server) db-name)]
+        (stop-ha-renew-loop m)
+        (stop-ha-follower-sync-loop m)
+        (stop-ha-authority db-name m)
+        (when-let [store (:store m)]
+          (if-let [db (:dt-db m)]
+            (db/close-db db)
+            (close-store store))))
+      (.remove ^Map (.-dbs server) db-name))))
 
 (defn- update-cached-role
   [^Server server target-username]

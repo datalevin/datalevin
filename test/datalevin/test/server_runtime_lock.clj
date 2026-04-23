@@ -1,6 +1,7 @@
 (ns datalevin.test.server-runtime-lock
   (:require
    [clojure.test :refer [deftest is]]
+   [datalevin.interface :as i]
    [datalevin.server :as srv])
   (:import
    [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue CountDownLatch
@@ -55,3 +56,44 @@
         (.countDown release-writer)
         (future-cancel writer)
         (future-cancel reader)))))
+
+(deftest remove-store-waits-for-runtime-read-access-test
+  (let [^datalevin.server.Server
+        server           (test-server)
+        ^ConcurrentHashMap
+        dbs              (.-dbs server)
+        reader-entered   (CountDownLatch. 1)
+        release-reader   (CountDownLatch. 1)
+        close-called     (CountDownLatch. 1)
+        remover-finished (CountDownLatch. 1)]
+    (.put dbs
+          "db"
+          {:store (reify i/IStore
+                    (close [_]
+                      (.countDown close-called)))})
+    (let [reader  (future
+                    (srv/with-db-runtime-store-read-access
+                     server
+                     "db"
+                     (fn []
+                       (.countDown reader-entered)
+                       (.await release-reader 5 TimeUnit/SECONDS)
+                       :read)))
+          _       (is (.await reader-entered 1 TimeUnit/SECONDS))
+          remover (future
+                    (#'srv/remove-store server "db")
+                    (.countDown remover-finished)
+                    :removed)]
+      (try
+        (is (false? (.await close-called 100 TimeUnit/MILLISECONDS)))
+        (is (false? (.await remover-finished 100 TimeUnit/MILLISECONDS)))
+        (.countDown release-reader)
+        (is (= :read (deref reader 1000 ::timeout)))
+        (is (= :removed (deref remover 1000 ::timeout)))
+        (is (.await close-called 1 TimeUnit/SECONDS))
+        (is (.await remover-finished 1 TimeUnit/SECONDS))
+        (is (nil? (get dbs "db")))
+        (finally
+          (.countDown release-reader)
+          (future-cancel reader)
+          (future-cancel remover))))))
