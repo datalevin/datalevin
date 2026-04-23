@@ -223,6 +223,7 @@
                                    ~'wire-opts)))))
 
 (declare event-loop close-conn store->db-name session-lmdb remove-store
+         with-db-runtime-store-swap
          halt-run session-deps copy-deps dispatch-deps ha-deps)
 
 (def session-dbi sess/session-dbi)
@@ -909,15 +910,19 @@
 
 (defn- remove-store
   [^Server server db-name]
-  (let [m (get (.-dbs server) db-name)]
-    (stop-ha-renew-loop m)
-    (stop-ha-follower-sync-loop m)
-    (stop-ha-authority db-name m)
-    (when-let [store (:store m)]
-      (if-let [db (:dt-db m)]
-        (db/close-db db)
-        (close-store store))))
-  (.remove ^Map (.-dbs server) db-name))
+  (with-db-runtime-store-swap
+    server
+    db-name
+    (fn []
+      (let [m (get (.-dbs server) db-name)]
+        (stop-ha-renew-loop m)
+        (stop-ha-follower-sync-loop m)
+        (stop-ha-authority db-name m)
+        (when-let [store (:store m)]
+          (if-let [db (:dt-db m)]
+            (db/close-db db)
+            (close-store store))))
+      (.remove ^Map (.-dbs server) db-name))))
 
 (defn- update-cached-role
   [^Server server target-username]
@@ -1602,9 +1607,16 @@
             (.unlock read-lock))))
       (f))))
 
+(defn- message-runtime-db-name
+  [{:keys [args db-name]}]
+  (when-let [db-name (or db-name (nth args 0 nil))]
+    (if (string? db-name)
+      (u/lisp-case db-name)
+      db-name)))
+
 (defn- with-db-runtime-read-access
   [^Server server message f]
-  (with-db-runtime-store-read-access server (nth (:args message) 0 nil) f))
+  (with-db-runtime-store-read-access server (message-runtime-db-name message) f))
 
 (defn- with-db-runtime-store-swap
   [^Server server db-name f]
