@@ -524,7 +524,7 @@
 
 (def ^{:dynamic true
        :doc     "WAL group-commit threshold by number of records (primarily affects `:relaxed` durability profile)."}
-  *wal-group-commit* 512)
+  *wal-group-commit* 128)
 
 (def ^{:dynamic true
        :doc     "WAL group-commit threshold by milliseconds (primarily affects `:relaxed` durability profile)."}

@@ -91,7 +91,7 @@ Batch durability is triggered when either threshold is reached first.
 
 Defaults come from dynamic vars:
 
-* `datalevin.constants/*wal-group-commit*` (default `512`)
+* `datalevin.constants/*wal-group-commit*` (default `128`)
 * `datalevin.constants/*wal-group-commit-ms*` (default `10`)
 
 You can set them per database via options:
