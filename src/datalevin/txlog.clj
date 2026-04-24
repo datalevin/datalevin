@@ -125,6 +125,13 @@
       (if (= :none mode) :none :extra)
       mode)))
 
+(defn- sync-on-write?
+  [profile mode]
+  ;; O_DSYNC makes each segment append durable as the write returns. Keep this
+  ;; out of relaxed mode, where explicit group-commit fsyncs are the point.
+  (and (not= :relaxed profile)
+       (= :fdatasync mode)))
+
 (defn durability-profile
   [info]
   (or (:wal-durability-profile info)
@@ -246,9 +253,14 @@
          (butlast segments))
         active-id         (if (seq segments) (:id (last segments)) 1)
         active-path       (segment-path dir active-id)
+        profile           (durability-profile info)
+        sync-mode*        (sync-mode info)
+        sync-on-write?    (sync-on-write? profile sync-mode*)
         _                 (when-not (.exists (io/file active-path))
                             (let [^FileChannel tmp-ch
-                                  (open-segment-channel active-path)]
+                                  (open-segment-channel
+                                   active-path
+                                   sync-on-write?)]
                               (try
                                 nil
                                 (finally
@@ -303,8 +315,7 @@
         last-sync-ms      (long (or (:updated-ms meta-cur)
                                     (System/currentTimeMillis)))
         now               (System/currentTimeMillis)
-        ch                (open-segment-channel active-path)
-        profile           (durability-profile info)
+        ch                (open-segment-channel active-path sync-on-write?)
         prealloc-mode     (segment-prealloc-mode info)
         prealloc?         (and (segment-prealloc? info)
                                (not= prealloc-mode :none))
@@ -331,11 +342,16 @@
          :segment-prealloc-mode  prealloc-mode
          :segment-prealloc-bytes (long (segment-prealloc-bytes info))
          :durability-profile     profile
-         :sync-mode              (sync-mode info)
+         :sync-mode              sync-mode*
+         :sync-on-write?         sync-on-write?
          :commit-marker?         (commit-marker? info)
          :commit-marker-version  (long (commit-marker-version info))
          :meta-last-applied-lsn  (volatile! last-applied)
          :meta-revision          (volatile! (long (or (:revision meta-cur) -1)))
+         :meta-flush-max-txs     (long (meta-flush-max-txs info))
+         :meta-flush-max-ms      (long (meta-flush-max-ms info))
+         :meta-dirty-count       (volatile! 0)
+         :meta-last-flush-ms     (volatile! last-sync-ms)
          :marker-revision        (volatile! (or (:revision marker-cur)
                                                 -1))
          :commit-wait-ms         (long (commit-wait-ms info))
@@ -636,7 +652,9 @@
                       next-offset (activated-segment-offset
                                    final-path
                                    preserve-preallocated-tail?)
-                      ^FileChannel next-ch (open-segment-channel next-path)
+                      ^FileChannel next-ch (open-segment-channel
+                                            next-path
+                                            (boolean (:sync-on-write? state)))
                       swapped? (volatile! false)]
                   (try
                     (let [swap-result
@@ -787,11 +805,51 @@
 
 (def publish-meta-durable! tmeta/publish-meta-durable!)
 
+(def publish-meta-current! tmeta/publish-meta-current!)
+
 (def try-with-maintenance-lock tmeta/try-with-maintenance-lock)
 
 (def with-recovery-lock tmeta/with-recovery-lock)
 
 (def note-gc-deleted-bytes! tmeta/note-gc-deleted-bytes!)
+
+(defn- mark-meta-dirty!
+  [state]
+  (when-let [dirty-v (:meta-dirty-count state)]
+    (vreset! dirty-v (inc (long @dirty-v)))))
+
+(defn flush-meta!
+  ([state] (flush-meta! state true))
+  ([state force?]
+   (let [dirty-v (:meta-dirty-count state)
+         dirty (long (or (some-> dirty-v deref) 0))
+         max-txs (long (or (:meta-flush-max-txs state) 0))
+         max-ms (long (or (:meta-flush-max-ms state) 0))
+         last-flush-v (:meta-last-flush-ms state)
+         now-ms (System/currentTimeMillis)
+         elapsed-ms (max 0 (- ^long now-ms
+                              ^long (long (or (some-> last-flush-v deref)
+                                              now-ms))))
+         txs-due? (and (pos? max-txs)
+                       (>= ^long dirty ^long max-txs))
+         time-due? (and (pos? max-ms)
+                        (>= ^long elapsed-ms ^long max-ms))]
+     (when (and (pos? dirty)
+                (or force? txs-due? time-due?))
+       (let [written (publish-meta-current! state)]
+         (when dirty-v
+           (vreset! dirty-v 0))
+         (when last-flush-v
+           (vreset! last-flush-v now-ms))
+         written)))))
+
+(defn note-commit-applied!
+  [state {:keys [lsn]}]
+  (when-let [last-applied-v (:meta-last-applied-lsn state)]
+    (vreset! last-applied-v
+             (max (long @last-applied-v) (long lsn))))
+  (mark-meta-dirty! state)
+  (flush-meta! state false))
 
 (def encode-commit-marker-slot tcodec/encode-commit-marker-slot)
 
@@ -905,10 +963,7 @@
       (vreset! total-bytes-v (+ ^long @total-bytes-v
                                 ^long (:size append-res))))
     (vreset! lsn-v (inc lsn))
-    (publish-meta-append! state
-                          {:lsn lsn
-                           :segment-id sid
-                           :offset next-offset})
+    (mark-meta-dirty! state)
     {:append-res append-res
      :append-start-ms append-start-ms
      :ch ch
@@ -922,49 +977,74 @@
   [state ^FileChannel ch sync-manager sync-begin
    {:keys [mark-fatal! before-sync!]}]
   (when-let [target-lsn (:target-lsn sync-begin)]
-    (if-let [lock-state (try-acquire-file-lock! (:sync-lock-path state))]
+    (if (:sync-on-write? state)
       (try
-        (refresh-shared-watermarks! state)
         (let [reason (:reason sync-begin)
-              durable-before (long @(:last-durable-lsn sync-manager))]
-          (if (<= ^long target-lsn ^long durable-before)
-            (let [done-ms (System/currentTimeMillis)]
-              (complete-sync-success! sync-manager
-                                      target-lsn
-                                      done-ms
-                                      reason
-                                      false)
-              {:target-lsn target-lsn
-               :sync-done-ms done-ms
-               :sync-reason reason})
-            (do
-              (when before-sync!
-                (before-sync! state sync-begin))
-              (let [force-start-ms (System/currentTimeMillis)]
-                (force-segment! state ch (:sync-mode state))
-                (let [force-end-ms (System/currentTimeMillis)]
-                  (publish-meta-durable! state target-lsn)
-                  (record-fsync-ms! sync-manager
-                                    (- force-end-ms force-start-ms)
-                                    false)
-                  (complete-sync-success! sync-manager
-                                          target-lsn
-                                          force-end-ms
-                                          reason
-                                          false)
-                  {:target-lsn target-lsn
-                   :sync-done-ms force-end-ms
-                   :sync-reason reason})))))
+              done-ms (System/currentTimeMillis)]
+          (when before-sync!
+            (before-sync! state sync-begin))
+          (mark-meta-dirty! state)
+          (record-fsync-ms! sync-manager 0 false)
+          (complete-sync-success! sync-manager
+                                  target-lsn
+                                  done-ms
+                                  reason
+                                  false)
+          {:target-lsn target-lsn
+           :sync-done-ms done-ms
+           :sync-reason reason})
         (catch Exception e
-          (complete-sync-failure! sync-manager e false)
-          (when mark-fatal!
-            (mark-fatal! state e))
-          (throw e))
-        (finally
-          (release-file-lock! lock-state)))
-      (do
-        (refresh-shared-watermarks! state)
-        nil))))
+          (try
+            (when mark-fatal!
+              (mark-fatal! state e))
+            (finally
+              (complete-sync-failure! sync-manager e false)))
+          (throw e)))
+      (if-let [lock-state (try-acquire-file-lock! (:sync-lock-path state))]
+        (try
+          (refresh-shared-watermarks! state)
+          (let [reason (:reason sync-begin)
+                durable-before (long @(:last-durable-lsn sync-manager))]
+            (if (<= ^long target-lsn ^long durable-before)
+              (let [done-ms (System/currentTimeMillis)]
+                (complete-sync-success! sync-manager
+                                        target-lsn
+                                        done-ms
+                                        reason
+                                        false)
+                {:target-lsn target-lsn
+                 :sync-done-ms done-ms
+                 :sync-reason reason})
+              (do
+                (when before-sync!
+                  (before-sync! state sync-begin))
+                (let [force-start-ms (System/currentTimeMillis)]
+                  (force-segment! state ch (:sync-mode state))
+                  (let [force-end-ms (System/currentTimeMillis)]
+                    (mark-meta-dirty! state)
+                    (record-fsync-ms! sync-manager
+                                      (- force-end-ms force-start-ms)
+                                      false)
+                    (complete-sync-success! sync-manager
+                                            target-lsn
+                                            force-end-ms
+                                            reason
+                                            false)
+                    {:target-lsn target-lsn
+                     :sync-done-ms force-end-ms
+                     :sync-reason reason})))))
+          (catch Exception e
+            (try
+              (when mark-fatal!
+                (mark-fatal! state e))
+              (finally
+                (complete-sync-failure! sync-manager e false)))
+            (throw e))
+          (finally
+            (release-file-lock! lock-state)))
+        (do
+          (refresh-shared-watermarks! state)
+          nil)))))
 
 (defn- wait-strict-durable!
   ([state ^FileChannel ch sync-manager lsn timeout-ms hooks]
@@ -1096,6 +1176,7 @@
                                                  :begin-lsn target-lsn})]
         (wait-strict-durable! state ch sync-manager target-lsn timeout-ms hooks
                               sync-begin)))
+    (flush-meta! state true)
     (let [after (sync-manager-state sync-manager)]
       {:target-lsn target-lsn
        :last-appended-lsn (long (:last-appended-lsn after))

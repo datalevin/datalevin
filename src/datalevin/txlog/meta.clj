@@ -129,10 +129,76 @@
      :segment-offset (long (or (some-> segment-offset-v deref) 0))
      :updated-ms (long (or (some-> sync-manager :last-sync-ms deref) 0))}))
 
+(defn- meta-long
+  ^long
+  [m k]
+  (long (or (get m k) 0)))
+
+(defn- newer-position
+  [base file]
+  (let [base-committed (long (meta-long base :last-committed-lsn))
+        file-committed (long (meta-long file :last-committed-lsn))
+        base-segment (long (meta-long base :segment-id))
+        file-segment (long (meta-long file :segment-id))
+        base-offset (long (meta-long base :segment-offset))
+        file-offset (long (meta-long file :segment-offset))]
+    (if (or (pos? (Long/compare file-committed base-committed))
+            (and (zero? (Long/compare file-committed base-committed))
+                 (or (pos? (Long/compare file-segment base-segment))
+                     (and (zero? (Long/compare file-segment base-segment))
+                          (pos? (Long/compare file-offset base-offset))))))
+      {:segment-id file-segment
+       :segment-offset file-offset}
+      {:segment-id base-segment
+       :segment-offset base-offset})))
+
+(defn- merge-meta-state
+  [base file]
+  (let [file (or file {})
+        base-committed (long (meta-long base :last-committed-lsn))
+        file-committed (long (meta-long file :last-committed-lsn))
+        committed (long (if (neg? (Long/compare base-committed file-committed))
+                          file-committed
+                          base-committed))
+        base-durable (long (meta-long base :last-durable-lsn))
+        file-durable (long (meta-long file :last-durable-lsn))
+        max-durable (long (if (neg? (Long/compare base-durable file-durable))
+                            file-durable
+                            base-durable))
+        durable (long (if (pos? (Long/compare max-durable committed))
+                        committed
+                        max-durable))
+        base-applied (long (meta-long base :last-applied-lsn))
+        file-applied (long (meta-long file :last-applied-lsn))
+        max-applied (long (if (neg? (Long/compare base-applied file-applied))
+                            file-applied
+                            base-applied))
+        applied (long (if (pos? (Long/compare max-applied committed))
+                        committed
+                        max-applied))
+        position (newer-position base file)]
+    (assoc (merge base file position)
+           :revision
+           (let [base-revision (long (or (:revision base) -1))
+                 file-revision (long (or (:revision file) -1))]
+             (if (neg? (Long/compare base-revision file-revision))
+               file-revision
+               base-revision))
+           :last-committed-lsn committed
+           :last-durable-lsn durable
+           :last-applied-lsn applied
+           :updated-ms
+           (let [base-updated (long (meta-long base :updated-ms))
+                 file-updated (long (meta-long file :updated-ms))]
+             (if (neg? (Long/compare base-updated file-updated))
+               file-updated
+               base-updated)))))
+
 (defn- current-meta-state
   [state]
-  (merge (base-meta-state state)
-         (or (:current (read-meta-file (:meta-path state))) {})))
+  (merge-meta-state
+   (base-meta-state state)
+   (:current (read-meta-file (:meta-path state)))))
 
 (defn- next-meta-state
   [current f]
@@ -157,7 +223,9 @@
             current-ch (some-> segment-channel-v deref)]
         (if (and current-ch (= current-id target-id))
           current-ch
-          (let [next-ch (seg/open-segment-channel target-path)]
+          (let [next-ch (seg/open-segment-channel
+                         target-path
+                         (boolean (:sync-on-write? state)))]
             (try
               (when-let [old-ch @segment-channel-v]
                 (when-not (identical? old-ch next-ch)
@@ -200,7 +268,7 @@
   [state]
   (let [base-state (base-meta-state state)
         meta-file-state (or (:current (read-meta-file (:meta-path state))) {})
-        meta-state (merge base-state meta-file-state)
+        meta-state (merge-meta-state base-state meta-file-state)
         dir (:dir state)
         newest-segment-id (long (or (:id (peek (seg/segment-files dir))) 1))
         current-segment-id (long (or (:segment-id base-state) 1))
@@ -313,11 +381,19 @@
   (update-shared-meta!
    state
    (fn [current]
-     (assoc current
-            :last-committed-lsn (max (long (or (:last-committed-lsn current) 0))
-                                     (long lsn))
-            :segment-id (long segment-id)
-            :segment-offset (long offset)))))
+     (let [committed-lsn (max (long (or (:last-committed-lsn current) 0))
+                              (long lsn))
+           durable-lsn (max (long (or (:last-durable-lsn current) 0))
+                            (long (or (some-> state
+                                              :sync-manager
+                                              :last-durable-lsn
+                                              deref)
+                                      0)))]
+       (assoc current
+              :last-committed-lsn committed-lsn
+              :last-durable-lsn (min committed-lsn durable-lsn)
+              :segment-id (long segment-id)
+              :segment-offset (long offset))))))
 
 (defn- commit-segment-end-offset
   [{:keys [offset size payload-bytes]}]
@@ -369,6 +445,21 @@
             :last-durable-lsn
             (max (long (or (:last-durable-lsn current) 0))
                  (long target-lsn))))))
+
+(defn publish-meta-current!
+  [state]
+  (update-shared-meta!
+   state
+   (fn [current]
+     (let [base (base-meta-state state)]
+       (merge current
+              (select-keys
+               base
+               [:last-committed-lsn
+                :last-durable-lsn
+                :last-applied-lsn
+                :segment-id
+                :segment-offset]))))))
 
 (defn try-with-maintenance-lock
   [state f]

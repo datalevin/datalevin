@@ -37,6 +37,13 @@
               [StandardOpenOption/CREATE
                StandardOpenOption/READ
                StandardOpenOption/WRITE]))
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  open-segment-create-read-write-dsync-options
+  (into-array StandardOpenOption
+              [StandardOpenOption/CREATE
+               StandardOpenOption/READ
+               StandardOpenOption/WRITE
+               StandardOpenOption/DSYNC]))
 
 (def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
   open-lock-create-write-options
@@ -456,10 +463,14 @@
      (or (:valid-end scan) 0))))
 
 (defn open-segment-channel
-  [^String path]
-  (FileChannel/open
-   (.toPath (io/file path))
-   open-segment-create-read-write-options))
+  ([^String path]
+   (open-segment-channel path false))
+  ([^String path sync-on-write?]
+   (FileChannel/open
+    (.toPath (io/file path))
+    (if sync-on-write?
+      open-segment-create-read-write-dsync-options
+      open-segment-create-read-write-options))))
 
 (defn append-record-at!
   ([^FileChannel ch ^long offset ^bytes body]

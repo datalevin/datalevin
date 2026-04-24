@@ -47,6 +47,7 @@
          txlog-clear-replica-floor-state!
          txlog-pin-backup-floor-state!
          txlog-unpin-backup-floor-state!
+         persisted-payload-floor-lsn
          persisted-runtime-floor-lsn
          ->KVLMDB)
 
@@ -1347,6 +1348,13 @@
      :slot-b slot-b
      :current current}))
 
+(defn- commit-marker-applied-lsn
+  [lmdb]
+  (long (or (some-> (read-commit-marker-state lmdb)
+                    :current
+                    :applied-lsn)
+            0)))
+
 (defn- refresh-runtime-marker-revision!
   [lmdb state]
   (when (:commit-marker? state)
@@ -1609,15 +1617,27 @@
 (defn txlog-recovery-context
   [lmdb state]
   (txlog/refresh-shared-state! state)
-  (let [recovery-floor-lsn (persisted-runtime-floor-lsn lmdb)
+  (let [marker-state (read-commit-marker-state lmdb)
+        marker-applied-lsn
+        (long (or (some-> marker-state :current :applied-lsn) 0))
+        payload-floor-lsn (long (persisted-payload-floor-lsn lmdb))
+        recovery-floor-lsn (if (and (:commit-marker? state)
+                                    (pos? marker-applied-lsn))
+                             marker-applied-lsn
+                             (max marker-applied-lsn payload-floor-lsn))
         records (txlog-records state recovery-floor-lsn)
-        marker-state (read-commit-marker-state lmdb)
+        meta-applied-lsn
+        (long (or (some-> (:meta-last-applied-lsn state) deref) 0))
+        meta-last-applied-lsn
+        (if (and (:commit-marker? state)
+                 (pos? marker-applied-lsn))
+          meta-applied-lsn
+          (max payload-floor-lsn meta-applied-lsn))
         recovery (txlog/recovery-state
                   {:commit-marker? (:commit-marker? state)
                    :marker-state marker-state
                    :records records
-                   :meta-last-applied-lsn
-                   (some-> (:meta-last-applied-lsn state) deref)
+                   :meta-last-applied-lsn meta-last-applied-lsn
                    :next-lsn @(:next-lsn state)})]
     (assoc recovery
            :records records
@@ -1650,6 +1670,9 @@
     (when (some? info-v)
       (when-let [state (:txlog-state @info-v)]
         (stop-snapshot-scheduler! info-v)
+        (try
+          (txlog/flush-meta! state)
+          (catch Exception _))
         (let [append-lock (or (:append-lock state) state)
               ch (locking append-lock
                    (when-let [segment-channel-v
@@ -2376,9 +2399,13 @@
   (l/kv-tx :put c/kv-info c/wal-local-payload-lsn (long lsn) :keyword :data))
 
 (defn- append-payload-lsn-row
-  ^FastList [rows lsn]
-  (doto (ensure-fast-list rows)
-    (.add (payload-lsn-row lsn))))
+  (^FastList [rows lsn]
+   (append-payload-lsn-row rows lsn true))
+  (^FastList [rows lsn persist?]
+   (let [^FastList rows* (ensure-fast-list rows)]
+     (when persist?
+       (.add rows* (payload-lsn-row lsn)))
+     rows*)))
 
 (def ^:private txlog-append-hooks
   {:throw-if-fatal! txlog-throw-if-fatal!
@@ -2455,7 +2482,7 @@
     (or (txlog/state lmdb)
         (ensure-txlog-ready! lmdb))))
 
-(defn- persisted-runtime-floor-lsn
+(defn- persisted-payload-floor-lsn
   [lmdb]
   (long
    (max
@@ -2477,6 +2504,13 @@
                 (catch Throwable _
                   nil))
               0)))))
+
+(defn- persisted-runtime-floor-lsn
+  [lmdb]
+  (long
+   (max
+    (long (commit-marker-applied-lsn lmdb))
+    (long (persisted-payload-floor-lsn lmdb)))))
 
 (defn- align-runtime-txlog-payload-floor!
   [lmdb]
@@ -2708,7 +2742,7 @@
                       (.add ^FastList rows (:row marker-entry)))
                     (apply-lmdb-after-txlog-append! lmdb state rows)
                     (txlog/commit-finished! state marker-entry)
-                    (txlog/publish-meta-commit! state append-res)
+                    (txlog/note-commit-applied! state append-res)
                     append-res)))))
           (replay-txlog-rows! lmdb record-rows (:lsn record)))))))
 
@@ -2778,7 +2812,7 @@
                                (i/close-transact-kv lmdb))]
                   (when (= status :committed)
                     (txlog/commit-finished! state marker-entry)
-                    (txlog/publish-meta-commit! state append-res))
+                    (txlog/note-commit-applied! state append-res))
                   (when-not (write-txn-open? lmdb)
                     (txlog-reset-pending! info-v))
                   status)
