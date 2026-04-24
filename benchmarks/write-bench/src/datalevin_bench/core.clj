@@ -295,14 +295,14 @@
                    (.mkdirs (java.io.File. base-dir)))
         kvdb     (when kv?
                    (doto (d/open-kv dir
-                                    (cond-> {:mapsize 60000
-                                             :flags   (-> c/default-env-flags
-                                                          ;; (conj :writemap)
-                                                          ;; (conj :mapasync)
-                                                          ;; (conj :nosync)
-                                                          ;; (conj :nometasync)
-                                                          )}
-                                      wal? (assoc :wal? true)
+                                    (cond-> (assoc {:mapsize 60000
+                                                    :flags   (-> c/default-env-flags
+                                                                 ;; (conj :writemap)
+                                                                 ;; (conj :mapasync)
+                                                                 ;; (conj :nosync)
+                                                                 ;; (conj :nometasync)
+                                                                 )}
+                                                   :wal? wal?)
                                       (and wal? effective-profile)
                                       (assoc :wal-durability-profile
                                              effective-profile)))
@@ -320,14 +320,14 @@
                      dir
                      {:k {:db/valueType :db.type/long}
                       :v {:db/valueType :db.type/string}}
-                     (cond-> {:kv-opts {:mapsize 60000
-                                        :flags   (-> c/default-env-flags
-                                                     ;; (conj :writemap)
-                                                     ;; (conj :mapasync)
-                                                     ;; (conj :nosync)
-                                                     ;; (conj :nometasync)
-                                                     )}}
-                       wal? (assoc :wal? true)
+                     (cond-> (assoc {:kv-opts {:mapsize 60000
+                                               :flags   (-> c/default-env-flags
+                                                            ;; (conj :writemap)
+                                                            ;; (conj :mapasync)
+                                                            ;; (conj :nosync)
+                                                            ;; (conj :nometasync)
+                                                            )}}
+                                    :wal? wal?)
                        (and wal? effective-profile)
                        (assoc :wal-durability-profile
                               effective-profile))))
@@ -418,8 +418,12 @@
         (when-not (= written total) (println "Write only" written)))
       (d/close-kv kvdb))
     (when conn
-      (let [datoms (d/count-datoms (d/db conn) nil nil nil)]
-        (when-not (= datoms (* 2 total)) (println "Write only" datoms)))
+      (let [db              (d/db conn)
+            user-datoms     (+ (d/count-datoms db nil :k nil)
+                               (d/count-datoms db nil :v nil))
+            expected-datoms (* 2 total)]
+        (when-not (= user-datoms expected-datoms)
+          (println "Write only" user-datoms)))
       (d/close conn))
     (when (or sql-conn sql-tl)
       (let [verify-conn (or sql-conn (jdbc/get-connection sql-spec))
@@ -452,14 +456,14 @@
         _        (ensure-native-wal-sync-path! nf wal? kv? dl?)
         kvdb     (when kv?
                    (doto (d/open-kv dir
-                                    (cond-> {:mapsize 60000
-                                             :flags   (-> c/default-env-flags
-                                                          ;; (conj :writemap)
-                                                          ;; (conj :mapasync)
-                                                          ;; (conj :nosync)
-                                                          ;; (conj :nometasync)
-                                                          )}
-                                      wal? (assoc :wal? true)
+                                    (cond-> (assoc {:mapsize 60000
+                                                    :flags   (-> c/default-env-flags
+                                                                 ;; (conj :writemap)
+                                                                 ;; (conj :mapasync)
+                                                                 ;; (conj :nosync)
+                                                                 ;; (conj :nometasync)
+                                                                 )}
+                                                   :wal? wal?)
                                       (and wal? durability-profile)
                                       (assoc :wal-durability-profile
                                              durability-profile)))
@@ -479,14 +483,14 @@
                      dir
                      {:k {:db/valueType :db.type/long}
                       :v {:db/valueType :db.type/string}}
-                     (cond-> {:kv-opts {:mapsize 60000
-                                        :flags   (-> c/default-env-flags
-                                                     ;; (conj :writemap)
-                                                     ;; (conj :mapasync)
-                                                     ;; (conj :nosync)
-                                                     ;; (conj :nometasync)
-                                                     )}}
-                       wal? (assoc :wal? true)
+                     (cond-> (assoc {:kv-opts {:mapsize 60000
+                                               :flags   (-> c/default-env-flags
+                                                            ;; (conj :writemap)
+                                                            ;; (conj :mapasync)
+                                                            ;; (conj :nosync)
+                                                            ;; (conj :nometasync)
+                                                            )}}
+                                    :wal? wal?)
                        (and wal? durability-profile)
                        (assoc :wal-durability-profile durability-profile))))
         query    '[:find (pull ?e [:v])

@@ -73,6 +73,10 @@ an error.
 
 Clojure command line is needed to run the benchmarks.
 
+Use a disk-backed directory for `:base-dir` / `:dir`. On some Linux systems,
+`/tmp` is mounted as `tmpfs`, which will inflate write throughput and hide real
+fsync costs.
+
 For example, the command below runs pure write benchmark for `transact-async`
 with batch size 10, and save the results in `dl-async-10.csv`:
 
