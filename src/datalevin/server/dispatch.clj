@@ -206,6 +206,17 @@
                     (str "Unknown message type " (:type message))
                     {})))
 
+(def ^:private runtime-read-access-exempt-types
+  ;; `:close-database` removes the live store and takes the runtime-store write
+  ;; lock during `remove-store`. Wrapping it in the generic read-access guard
+  ;; would deadlock on a same-thread read->write lock upgrade.
+  #{:close-database})
+
+(defn- runtime-read-access-message?
+  [{:keys [type writing?]}]
+  (and (not writing?)
+       (not (contains? runtime-read-access-exempt-types type))))
+
 (defn execute
   "Execute a function in a thread from the worker thread pool"
   [deps server f]
@@ -263,16 +274,19 @@
                   ::handled)
                 message)))]
       (when-not (= ::handled message)
-        (let [{:keys [writing?]} message]
+        (do
           (log/debug "Message received:" (dissoc message :password :args))
           (set-last-active deps server skey)
-          (if writing?
+          (if (:writing? message)
             (handle-writing deps server skey message)
-            ((:with-db-runtime-read-access-fn deps)
-             server
-             message
-             #(dispatch-message-with-ha-write-admission
-               deps server skey message))))))
+            (let [dispatch! #(dispatch-message-with-ha-write-admission
+                              deps server skey message)]
+              (if (runtime-read-access-message? message)
+                ((:with-db-runtime-read-access-fn deps)
+                 server
+                 message
+                 dispatch!)
+                (dispatch!)))))))
     (catch Exception e
       (log/error "Error Handling message:" e))))
 
