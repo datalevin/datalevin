@@ -1,6 +1,14 @@
 # Change Log
 
 ## WIP
+
+### Changed
+- [Datalog] The default write mode for embedded store is returned to `:wal?
+  false`, as it is safe and fast. `:wal? true` is opt in. However, once opted
+  in, the default is `:wal-durability-profile :relaxted`, so as to meet user's
+  expectation of enhanced throughput. Server mode continues to default to `:wal?
+  true` and `:wal-durability-profile :strict`.
+
 ### Added
 - [Server] Read only replicas and high availability (HA) cluster with Raft
   consensus based auto roll-over and promotion

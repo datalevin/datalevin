@@ -219,7 +219,10 @@ Only usable for debug output.
  remote URI string.
 
   For Datalog stores opened through this API, the default for a new local
-  store is `:wal? true` with `:wal-durability-profile :strict`.
+  store is `:wal? false`. When WAL is enabled explicitly, the default
+  durability profile is `:relaxed`; specify `:strict` or `:extra` for
+  stronger crash durability. Consensus-lease HA stores require WAL and use
+  `:strict` by default.
 
 
   Usage:
@@ -779,7 +782,10 @@ Only usable for debug output.
    when `:ha-mode` is `:consensus-lease`.
 
   For Datalog stores opened through this API, the default for a new local
-  store is `:wal? true` with `:wal-durability-profile :strict`.
+  store is `:wal? false`. When WAL is enabled explicitly, the default
+  durability profile is `:relaxed`; specify `:strict` or `:extra` for
+  stronger crash durability. Consensus-lease HA stores require WAL and use
+  `:strict` by default.
 
   Please note that the connection should be managed like a stateful resource.
   Application should hold on to the same connection rather than opening
@@ -1071,7 +1077,8 @@ Only usable for debug output.
    small crash window; `:extra` is stricter than `:strict` (SQLite-style extra
    durability, e.g. fullsync on macOS). For local single-thread idle writes,
    `:strict` and `:extra` may take a direct fast path; `:relaxed` always uses
-   the sync queue so batching remains effective.
+   the sync queue so batching remains effective. When WAL is enabled and this
+   option is omitted, the default is `:relaxed`.
   * `:wal-group-commit` sets the max transactions per durability batch in
    `:relaxed` mode. Default comes from
    `datalevin.constants/*wal-group-commit*`.

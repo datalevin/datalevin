@@ -225,7 +225,7 @@ throughput, use `transact-async` instead.
 
 In non-WAL mode, a single write thread is effective at a time, parallel
 transactions actually slow writes down due to mutex contention and
-thread switching overhead. Use WAL mode (default in Datalog store) if
+thread switching overhead. Use WAL mode (opt-in for local Datalog stores) if
 concurrent writers are needed.
 
 Transacting Datalog data involves a great number of data transformation and

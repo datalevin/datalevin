@@ -2246,9 +2246,51 @@
                         (merge kv-opts txlog-opts)
                         kv-opts)))))
 
+(def ^:private ha-wal-durability-profile :strict)
+
+(defn- kv-wal-opts
+  [opts]
+  (when-let [kv-opts (:kv-opts opts)]
+    (into {}
+          (filter (fn [[k _]] (c/wal-option-key? k)))
+          kv-opts)))
+
+(defn- promote-kv-wal-opts
+  [opts]
+  (let [wal-opts (kv-wal-opts opts)]
+    (cond-> opts
+      (seq wal-opts) (merge wal-opts))))
+
+(defn- ha-wal-durability-profile-for
+  [opts]
+  (let [profile (or (get-in opts [:kv-opts :wal-durability-profile])
+                    (:wal-durability-profile opts)
+                    ha-wal-durability-profile)]
+    (when (= :relaxed profile)
+      (u/raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
+               {:error :ha/validation
+                :option :wal-durability-profile
+                :value profile}))
+    profile))
+
+(defn- force-ha-wal-opts
+  [opts]
+  (let [profile (ha-wal-durability-profile-for opts)]
+    (-> opts
+        (assoc :wal? true
+               :wal-durability-profile profile)
+        (update :kv-opts
+                (fn [kv-opts]
+                  (assoc (or kv-opts {})
+                         :wal? true
+                         :wal-durability-profile profile))))))
+
 (defn- normalize-ha-open-opts
   [opts]
   (cond-> opts
+    (= :consensus-lease (:ha-mode opts))
+    force-ha-wal-opts
+
     (= :consensus-lease (:ha-mode opts))
     ;; Background sampling performs follower-local metadata writes. In HA mode
     ;; that extra local write traffic obscures replicated progress and can race
@@ -2291,7 +2333,9 @@
    (open dir schema nil))
   ([dir schema opts0]
    (let [incoming-opts0 opts0
-         opts (propagate-top-level-txlog-opts-to-kv-opts opts0)
+         opts (-> opts0
+                  propagate-top-level-txlog-opts-to-kv-opts
+                  normalize-ha-open-opts)
          raw-persist-open-opts? (true? (get opts raw-persist-open-opts-key))
          opts (dissoc opts raw-persist-open-opts-key)
          {:keys [kv-opts search-opts search-domains vector-opts vector-domains
@@ -2378,12 +2422,16 @@
                        opts0)
            opts2-base (-> (merge opts1 opts)
                           c/canonicalize-wal-opts
-                          normalize-ha-open-opts)
-           opts2     (if (and (or (some? persisted-opts)
-                                  (some? loaded-opts))
-                              (empty? (or incoming-opts0 {})))
-                       (propagate-top-level-txlog-opts-to-kv-opts opts2-base)
-                       opts2-base)
+                          normalize-ha-open-opts
+                          promote-kv-wal-opts)
+           opts2     (-> (if (and (or (some? persisted-opts)
+                                      (some? loaded-opts))
+                                  (empty? (or incoming-opts0 {})))
+                           (propagate-top-level-txlog-opts-to-kv-opts
+                             opts2-base)
+                           opts2-base)
+                         normalize-ha-open-opts
+                         promote-kv-wal-opts)
            db-identity (or (:db-identity opts2)
                            (:db-name opts2)
                            (str (UUID/randomUUID)))

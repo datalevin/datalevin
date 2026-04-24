@@ -13,8 +13,8 @@ a little over 3X increases.
 
 ### Datalog
 
-For Datalog stores, WAL is enabled by default for new databases.
-You can set WAL options when creating/opening a connection:
+For local Datalog stores, WAL is off by default for new databases. Enable it
+explicitly when you want WAL write concurrency and throughput behavior:
 
 ```clojure
 (require '[datalevin.core :as d])
@@ -23,13 +23,26 @@ You can set WAL options when creating/opening a connection:
   (d/create-conn
     "/tmp/my-datalog-db"
     {}
-    {:wal? true
-     :wal-durability-profile :strict}))
+    {:wal? true}))
 ```
+
+When a local Datalog or KV store enables WAL and omits
+`:wal-durability-profile`, the default profile is `:relaxed`. Specify
+`:strict` or `:extra` when the WAL opt-in is primarily for crash durability:
+
+```clojure
+(d/create-conn
+  "/tmp/my-datalog-db"
+  {}
+  {:wal? true
+   :wal-durability-profile :strict})
+```
+
+Consensus-lease HA databases require WAL and default to `:strict`.
 
 ### KV
 
-For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
+For direct KV usage (`open-kv`), WAL is also off by default and must be enabled:
 
 ```clojure
 (require '[datalevin.core :as d])
@@ -37,8 +50,7 @@ For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
 (def kv
   (d/open-kv
     "/tmp/my-kv-db"
-    {:wal? true
-     :wal-durability-profile :strict}))
+    {:wal? true}))
 ```
 
 ## Durability Profiles
@@ -46,9 +58,11 @@ For direct KV usage (`open-kv`), WAL is off by default and must be enabled:
 WAL supports three durability profiles in WAL:
 
 * `:strict`: each transaction waits for durable WAL acknowledgment, i.e,
-  `fsync` success for the WAL segment file. This is the default.
+  `fsync` success for the WAL segment file. This is the default for
+  consensus-lease HA.
 * `:relaxed`: transactions can return before durability is forced for every
-  single write, using batched syncs for a higher throughput.
+  single write, using batched syncs for a higher throughput. This is the
+  default for explicit non-HA WAL opt-in.
 * `:extra`: each transaction waits for stricter durability than `:strict`,
   on macOS, that is `fcntl(F_FULLSYNC)`.
 

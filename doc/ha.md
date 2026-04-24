@@ -49,6 +49,9 @@ The data plane is the Datalevin database itself:
   snapshot and then resumes WAL replay
 * replica progress is tracked with replica floors so WAL retention stays safe
 
+Consensus-lease HA requires WAL. HA opens force `:wal? true` and use the
+`:strict` WAL durability profile by default.
+
 This part is described in more detail in [wal.md](wal.md).
 
 ### 2. Control plane

@@ -496,6 +496,17 @@
                 :option :ha-mode
                 :value mode}))
     (when (= mode :consensus-lease)
+      (when (and (contains? opts :wal?)
+                 (not (true? (:wal? opts))))
+        (u/raise "Consensus-lease HA requires :wal? true"
+                 {:error :ha/validation
+                  :option :wal?
+                  :value (:wal? opts)}))
+      (when (= :relaxed (:wal-durability-profile opts))
+        (u/raise "Consensus-lease HA requires :wal-durability-profile :strict or :extra"
+                 {:error :ha/validation
+                  :option :wal-durability-profile
+                  :value (:wal-durability-profile opts)}))
       (let [node-id (:ha-node-id opts)
             members (validate-ha-members-shape (:ha-members opts))
             member-ids (mapv :node-id members)

@@ -13,9 +13,115 @@
    [datalevin.lmdb :as lmdb]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u])
-  (:import [java.util Date UUID]))
+  (:import
+   [datalevin.db DB]
+   [datalevin.storage Store]
+   [java.util Date UUID]))
 
 (use-fixtures :each db-fixture)
+
+(defn- conn-store
+  [conn]
+  (.-store ^DB @conn))
+
+(defn- conn-env-opts
+  [conn]
+  (i/env-opts (.-lmdb ^Store (conn-store conn))))
+
+(defn- test-ha-opts
+  []
+  (let [group-id    (str "test-ha-group-" (UUID/randomUUID))
+        db-identity (str "test-ha-db-" (UUID/randomUUID))
+        members     [{:node-id 1 :endpoint "127.0.0.1:19001"}
+                     {:node-id 2 :endpoint "127.0.0.1:19002"}
+                     {:node-id 3 :endpoint "127.0.0.1:19003"}]
+        voters      [{:peer-id "127.0.0.1:19101"
+                      :ha-node-id 1
+                      :promotable? true}
+                     {:peer-id "127.0.0.1:19102"
+                      :ha-node-id 2
+                      :promotable? true}
+                     {:peer-id "127.0.0.1:19103"
+                      :ha-node-id 3
+                      :promotable? true}]]
+    {:db-identity db-identity
+     :ha-mode :consensus-lease
+     :ha-lease-renew-ms 1000
+     :ha-lease-timeout-ms 5000
+     :ha-promotion-base-delay-ms 100
+     :ha-promotion-rank-delay-ms 200
+     :ha-max-promotion-lag-lsn 0
+     :ha-clock-skew-budget-ms 1000
+     :ha-members members
+     :ha-control-plane {:backend :sofa-jraft
+                        :group-id group-id
+                        :voters voters
+                        :rpc-timeout-ms 1000
+                        :election-timeout-ms 1000
+                        :operation-timeout-ms 1000}}))
+
+(deftest test-datalog-wal-default-is-opt-in
+  (let [dir  (u/tmp-dir (str "test-datalog-wal-default-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn dir)]
+    (try
+      (is (false? (:wal? (conn-env-opts conn))))
+      (is (false? (:wal? (i/opts (conn-store conn)))))
+      (is (not (u/file-exists (str dir u/+separator+ "txlog"))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-datalog-wal-opt-in-defaults-to-relaxed
+  (let [dir  (u/tmp-dir (str "test-datalog-wal-relaxed-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn dir nil {:wal? true})]
+    (try
+      (is (true? (:wal? (conn-env-opts conn))))
+      (is (= :relaxed (:wal-durability-profile (conn-env-opts conn))))
+      (is (true? (:wal? (i/opts (conn-store conn)))))
+      (is (= :relaxed
+             (:wal-durability-profile (i/opts (conn-store conn)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-kv-wal-opt-in-defaults-to-relaxed
+  (let [dir (u/tmp-dir (str "test-kv-wal-relaxed-"
+                            (UUID/randomUUID)))
+        db  (d/open-kv dir {:wal? true})]
+    (try
+      (is (= :relaxed (:durability-profile (d/txlog-watermarks db))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files dir)))))
+
+(deftest test-datalog-ha-forces-safe-wal
+  (let [dir  (u/tmp-dir (str "test-datalog-ha-wal-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn dir nil (test-ha-opts))]
+    (try
+      (is (true? (:wal? (conn-env-opts conn))))
+      (is (= :strict (:wal-durability-profile (conn-env-opts conn))))
+      (is (true? (:wal? (i/opts (conn-store conn)))))
+      (is (= :strict
+             (:wal-durability-profile (i/opts (conn-store conn)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-datalog-ha-rejects-relaxed-wal
+  (let [dir (u/tmp-dir (str "test-datalog-ha-relaxed-"
+                            (UUID/randomUUID)))]
+    (try
+      (is (thrown-with-msg?
+            Exception
+            #"Consensus-lease HA requires :wal-durability-profile :strict or :extra"
+            (d/create-conn dir nil
+                           (assoc (test-ha-opts)
+                                  :wal-durability-profile :relaxed))))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest test-close
   (let [dir  (u/tmp-dir (str "test-" (UUID/randomUUID)))

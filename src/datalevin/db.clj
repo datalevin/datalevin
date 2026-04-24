@@ -1274,7 +1274,7 @@
             (let [^long next-eid next-eid
                   eid         (unchecked-inc next-eid)
                   tx-data     (cond-> tx-data
-                                true
+                                auto-entity-time?
                                 (conj (datom eid :db/created-at tx-time tx-id))
 
                                 auto-entity-time?
