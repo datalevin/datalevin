@@ -973,6 +973,12 @@
      :sync-manager sync-manager
      :timeout-ms (long (:commit-wait-ms state))}))
 
+(defn- defer-sync-attempt!
+  [{:keys [monitor] :as sync-manager}]
+  (locking monitor
+    (vreset! (:sync-in-progress? sync-manager) false)
+    (.notifyAll monitor)))
+
 (defn- perform-sync-round!
   [state ^FileChannel ch sync-manager sync-begin
    {:keys [mark-fatal! before-sync!]}]
@@ -1044,6 +1050,7 @@
             (release-file-lock! lock-state)))
         (do
           (refresh-shared-watermarks! state)
+          (defer-sync-attempt! sync-manager)
           nil)))))
 
 (defn- wait-strict-durable!
