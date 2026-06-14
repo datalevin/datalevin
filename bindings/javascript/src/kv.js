@@ -119,6 +119,38 @@ export class KV extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("sync", args));
   }
 
+  async txLogWatermarks() {
+    return toJsResult(await _BINDINGS.coreInvoke("txlog-watermarks", [this.rawHandle()]));
+  }
+
+  async openTxLog(fromLsn, { uptoLsn = null, limit = null } = {}) {
+    const args = [this.rawHandle(), fromLsn];
+    if (hasValue(uptoLsn)) {
+      args.push(uptoLsn);
+    }
+    const rows = await toJsResult(await _BINDINGS.coreInvoke("open-tx-log", args));
+    if (!hasValue(limit)) {
+      return rows;
+    }
+    return rows.slice(0, Math.max(limit, 0));
+  }
+
+  async createSnapshot() {
+    return toJsResult(await _BINDINGS.coreInvoke("create-snapshot!", [this.rawHandle()]));
+  }
+
+  async listSnapshots() {
+    return toJsResult(await _BINDINGS.coreInvoke("list-snapshots", [this.rawHandle()]));
+  }
+
+  async gcTxLogSegments({ retainFloorLsn = null } = {}) {
+    const args = [this.rawHandle()];
+    if (hasValue(retainFloorLsn)) {
+      args.push(retainFloorLsn);
+    }
+    return toJsResult(await _BINDINGS.coreInvoke("gc-txlog-segments!", args));
+  }
+
   async transact(txs, { dbiName = null, kType = null, vType = null } = {}) {
     if (dbiName === null && (kType !== null || vType !== null)) {
       throw new TypeError("kType and vType require dbiName for KV transact().");

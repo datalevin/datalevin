@@ -501,6 +501,69 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Copies the Datalog database to {@code dest}.
+     */
+    public void copy(String dest) {
+        ClojureRuntime.core("copy", db(), dest);
+    }
+
+    /**
+     * Copies the Datalog database to {@code dest}, optionally compacting pages.
+     */
+    public void copy(String dest, boolean compact) {
+        ClojureRuntime.core("copy", db(), dest, compact);
+    }
+
+    /**
+     * Returns WAL watermarks for this connection's backing store.
+     */
+    public Map<?, ?> txLogWatermarks() {
+        return (Map<?, ?>) ClojureRuntime.core("txlog-watermarks", store());
+    }
+
+    /**
+     * Reads committed WAL records from {@code fromLsn}, inclusive.
+     */
+    public List<?> openTxLog(long fromLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", store(), fromLsn));
+    }
+
+    /**
+     * Reads committed WAL records in the inclusive LSN range.
+     */
+    public List<?> openTxLog(long fromLsn, long uptoLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", store(), fromLsn, uptoLsn));
+    }
+
+    /**
+     * Creates or rotates the LMDB snapshot for this connection's backing store.
+     */
+    public Map<?, ?> createSnapshot() {
+        return (Map<?, ?>) ClojureRuntime.core("create-snapshot!", store());
+    }
+
+    /**
+     * Lists available LMDB snapshots for this connection's backing store.
+     */
+    public List<?> listSnapshots() {
+        return ResultSupport.sequence(ClojureRuntime.core("list-snapshots", store()));
+    }
+
+    /**
+     * Runs WAL segment GC for this connection's backing store.
+     */
+    public Map<?, ?> gcTxLogSegments() {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", store());
+    }
+
+    /**
+     * Runs WAL segment GC while retaining records from {@code retainFloorLsn}.
+     */
+    public Map<?, ?> gcTxLogSegments(long retainFloorLsn) {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", store(), retainFloorLsn);
+    }
+
+    /**
      * Escape hatch for calling a connection-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {
@@ -509,6 +572,13 @@ public final class Connection extends HandleResource {
 
     private Object db() {
         return ClojureRuntime.core("db", resource());
+    }
+
+    private Object store() {
+        return ClojureRuntime.invoke("clojure.core",
+                                     "get",
+                                     db(),
+                                     ClojureCodec.keyword(":store"));
     }
 
     private Object runQuery(Object queryForm, List<?> inputs) {

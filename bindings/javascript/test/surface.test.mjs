@@ -19,10 +19,22 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.Client, "function");
   assert.equal(typeof datalevin.Connection.prototype.fillDb, "function");
+  for (const method of [
+    "copy",
+    "createSnapshot",
+    "gcTxLogSegments",
+    "listSnapshots",
+    "openTxLog",
+    "txLogWatermarks"
+  ]) {
+    assert.equal(typeof datalevin.Connection.prototype[method], "function");
+  }
 
   for (const method of [
     "copy",
+    "createSnapshot",
     "delListItems",
+    "gcTxLogSegments",
     "getByRank",
     "getFirst",
     "getFirstN",
@@ -32,11 +44,14 @@ test("public surface stays importable without starting the JVM", () => {
     "keyRange",
     "keyRangeCount",
     "listCount",
+    "listSnapshots",
+    "openTxLog",
     "putListItems",
     "rangeCount",
     "sampleKv",
     "stat",
-    "sync"
+    "sync",
+    "txLogWatermarks"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");
   }

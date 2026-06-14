@@ -211,7 +211,9 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
 def test_kv_public_surface_includes_richer_operations() -> None:
     for method in [
         "copy",
+        "create_snapshot",
         "del_list_items",
+        "gc_tx_log_segments",
         "get_by_rank",
         "get_first",
         "get_first_n",
@@ -221,17 +223,29 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "key_range",
         "key_range_count",
         "list_count",
+        "list_snapshots",
+        "open_tx_log",
         "put_list_items",
         "range_count",
         "sample_kv",
         "stat",
         "sync",
+        "tx_log_watermarks",
     ]:
         assert callable(getattr(kv_module.KV, method))
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(connection_module.Connection, "fill_db"))
+    for method in [
+        "copy",
+        "create_snapshot",
+        "gc_tx_log_segments",
+        "list_snapshots",
+        "open_tx_log",
+        "tx_log_watermarks",
+    ]:
+        assert callable(getattr(connection_module.Connection, method))
 
 
 def test_exec_json_raises_datalevin_error(monkeypatch) -> None:

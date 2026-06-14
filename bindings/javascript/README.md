@@ -112,6 +112,37 @@ try {
 }
 ```
 
+## Operational Example
+
+KV stores expose backup, durability, snapshot, and WAL inspection helpers
+without raw JSON calls.
+
+```js
+import { openKv } from "datalevin-node";
+
+const kv = await openKv("/tmp/dtlv-js-ops", { ":wal?": true });
+
+try {
+  await kv.openDbi("items");
+  await kv.transact([[":put", "a", "alpha"]], {
+    dbiName: "items",
+    kType: ":string",
+    vType: ":string"
+  });
+
+  await kv.sync();
+  await kv.copy("/tmp/dtlv-js-ops-copy");
+
+  console.log(await kv.txLogWatermarks());
+  console.log(await kv.openTxLog(1, { limit: 10 }));
+  console.log(await kv.createSnapshot());
+  console.log(await kv.listSnapshots());
+  console.log(await kv.gcTxLogSegments());
+} finally {
+  await kv.close();
+}
+```
+
 ## Remote Client Example
 
 Use `newClient()` for server administration against a running Datalevin server:

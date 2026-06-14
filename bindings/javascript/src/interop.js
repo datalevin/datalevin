@@ -8,6 +8,10 @@ async function unwrapInteropHandle(value) {
   return value;
 }
 
+function hasValue(value) {
+  return value !== null && value !== undefined;
+}
+
 async function normalizeInteropArgs(args = []) {
   const normalized = [];
   for (const arg of args) {
@@ -107,6 +111,53 @@ class InteropBindings {
   async connectionDb(handle) {
     const cls = await classes();
     return callJavaMethod(cls.interop, "connectionDb", handle);
+  }
+
+  async connectionCopy(handle, dest, compact = null) {
+    const cls = await classes();
+    await callJavaMethod(
+      cls.interop,
+      "connectionCopy",
+      await unwrapInteropHandle(handle),
+      dest,
+      hasValue(compact) ? Boolean(compact) : null
+    );
+  }
+
+  async connectionTxLogWatermarks(handle) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionTxLogWatermarks", await unwrapInteropHandle(handle));
+  }
+
+  async connectionOpenTxLog(handle, fromLsn, uptoLsn = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionOpenTxLog",
+      await unwrapInteropHandle(handle),
+      await toJava(fromLsn),
+      hasValue(uptoLsn) ? await toJava(uptoLsn) : null
+    );
+  }
+
+  async connectionCreateSnapshot(handle) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionCreateSnapshot", await unwrapInteropHandle(handle));
+  }
+
+  async connectionListSnapshots(handle) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "connectionListSnapshots", await unwrapInteropHandle(handle));
+  }
+
+  async connectionGcTxLogSegments(handle, retainFloorLsn = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionGcTxLogSegments",
+      await unwrapInteropHandle(handle),
+      hasValue(retainFloorLsn) ? await toJava(retainFloorLsn) : null
+    );
   }
 
   async openKeyValue(dir, opts = null) {

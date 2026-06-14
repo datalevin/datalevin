@@ -723,6 +723,20 @@ public final class KV extends HandleResource {
     }
 
     /**
+     * Copies this KV store to {@code dest}.
+     */
+    public void copy(String dest) {
+        ClojureRuntime.core("copy", resource(), dest);
+    }
+
+    /**
+     * Copies this KV store to {@code dest}, optionally compacting pages.
+     */
+    public void copy(String dest, boolean compact) {
+        ClojureRuntime.core("copy", resource(), dest, compact);
+    }
+
+    /**
      * Returns the number of entries in the named DBI.
      */
     public long entries(String dbiName) {
@@ -1020,6 +1034,55 @@ public final class KV extends HandleResource {
      */
     public void sync(long force) {
         ClojureRuntime.core("sync", resource(), force);
+    }
+
+    /**
+     * Returns WAL watermarks for this KV store.
+     */
+    public Map<?, ?> txLogWatermarks() {
+        return (Map<?, ?>) ClojureRuntime.core("txlog-watermarks", resource());
+    }
+
+    /**
+     * Reads committed WAL records from {@code fromLsn}, inclusive.
+     */
+    public List<?> openTxLog(long fromLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", resource(), fromLsn));
+    }
+
+    /**
+     * Reads committed WAL records in the inclusive LSN range.
+     */
+    public List<?> openTxLog(long fromLsn, long uptoLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", resource(), fromLsn, uptoLsn));
+    }
+
+    /**
+     * Creates or rotates the LMDB snapshot for this KV store.
+     */
+    public Map<?, ?> createSnapshot() {
+        return (Map<?, ?>) ClojureRuntime.core("create-snapshot!", resource());
+    }
+
+    /**
+     * Lists available LMDB snapshots for this KV store.
+     */
+    public List<?> listSnapshots() {
+        return ResultSupport.sequence(ClojureRuntime.core("list-snapshots", resource()));
+    }
+
+    /**
+     * Runs WAL segment GC for this KV store.
+     */
+    public Map<?, ?> gcTxLogSegments() {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", resource());
+    }
+
+    /**
+     * Runs WAL segment GC while retaining records from {@code retainFloorLsn}.
+     */
+    public Map<?, ?> gcTxLogSegments(long retainFloorLsn) {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", resource(), retainFloorLsn);
     }
 
     /**

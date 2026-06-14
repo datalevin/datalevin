@@ -38,6 +38,24 @@ class RawInterop:
     def connection_db(self, handle):
         return _BINDINGS.connection_db(handle)
 
+    def connection_copy(self, handle, dest, compact=None):
+        return _BINDINGS.connection_copy(handle, dest, compact)
+
+    def connection_tx_log_watermarks(self, handle):
+        return _BINDINGS.connection_tx_log_watermarks(handle)
+
+    def connection_open_tx_log(self, handle, from_lsn, upto_lsn=None):
+        return _BINDINGS.connection_open_tx_log(handle, from_lsn, upto_lsn)
+
+    def connection_create_snapshot(self, handle):
+        return _BINDINGS.connection_create_snapshot(handle)
+
+    def connection_list_snapshots(self, handle):
+        return _BINDINGS.connection_list_snapshots(handle)
+
+    def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
+        return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
+
     def open_key_value(self, dir, opts=None):
         return _BINDINGS.open_key_value(dir, opts)
 

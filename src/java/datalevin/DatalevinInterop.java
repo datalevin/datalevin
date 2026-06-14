@@ -157,6 +157,58 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Copies the database backing a raw connection handle.
+     */
+    public static void connectionCopy(Object conn, String dest, Boolean compact) {
+        if (compact == null) {
+            ClojureRuntime.core("copy", connectionDb(conn), dest);
+        } else {
+            ClojureRuntime.core("copy", connectionDb(conn), dest, compact);
+        }
+    }
+
+    /**
+     * Returns WAL watermarks for the database backing a raw connection handle.
+     */
+    public static Object connectionTxLogWatermarks(Object conn) {
+        return ClojureRuntime.core("txlog-watermarks", connectionStore(conn));
+    }
+
+    /**
+     * Opens WAL records for the database backing a raw connection handle.
+     */
+    public static Object connectionOpenTxLog(Object conn, long fromLsn, Long uptoLsn) {
+        if (uptoLsn == null) {
+            return ClojureRuntime.core("open-tx-log", connectionStore(conn), fromLsn);
+        }
+        return ClojureRuntime.core("open-tx-log", connectionStore(conn), fromLsn, uptoLsn);
+    }
+
+    /**
+     * Creates an LMDB snapshot for the database backing a raw connection handle.
+     */
+    public static Object connectionCreateSnapshot(Object conn) {
+        return ClojureRuntime.core("create-snapshot!", connectionStore(conn));
+    }
+
+    /**
+     * Lists LMDB snapshots for the database backing a raw connection handle.
+     */
+    public static Object connectionListSnapshots(Object conn) {
+        return ClojureRuntime.core("list-snapshots", connectionStore(conn));
+    }
+
+    /**
+     * Runs WAL segment GC for the database backing a raw connection handle.
+     */
+    public static Object connectionGcTxLogSegments(Object conn, Long retainFloorLsn) {
+        if (retainFloorLsn == null) {
+            return ClojureRuntime.core("gc-txlog-segments!", connectionStore(conn));
+        }
+        return ClojureRuntime.core("gc-txlog-segments!", connectionStore(conn), retainFloorLsn);
+    }
+
+    /**
      * Opens a raw KV handle.
      */
     public static Object openKeyValue(String dir, Map<?, ?> opts) {
@@ -456,5 +508,12 @@ public final class DatalevinInterop {
             }
         }
         return normalized;
+    }
+
+    private static Object connectionStore(Object conn) {
+        return ClojureRuntime.invoke("clojure.core",
+                                     "get",
+                                     connectionDb(conn),
+                                     ClojureCodec.keyword(":store"));
     }
 }

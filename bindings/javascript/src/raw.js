@@ -64,6 +64,30 @@ class RawInterop {
     );
   }
 
+  async connectionCopy(handle, dest, compact = null) {
+    return _BINDINGS.connectionCopy(resourceHandle(handle), dest, compact);
+  }
+
+  async connectionTxLogWatermarks(handle) {
+    return _BINDINGS.connectionTxLogWatermarks(resourceHandle(handle));
+  }
+
+  async connectionOpenTxLog(handle, fromLsn, uptoLsn = null) {
+    return _BINDINGS.connectionOpenTxLog(resourceHandle(handle), fromLsn, uptoLsn);
+  }
+
+  async connectionCreateSnapshot(handle) {
+    return _BINDINGS.connectionCreateSnapshot(resourceHandle(handle));
+  }
+
+  async connectionListSnapshots(handle) {
+    return _BINDINGS.connectionListSnapshots(resourceHandle(handle));
+  }
+
+  async connectionGcTxLogSegments(handle, retainFloorLsn = null) {
+    return _BINDINGS.connectionGcTxLogSegments(resourceHandle(handle), retainFloorLsn);
+  }
+
   async openKeyValue(dir, opts = null) {
     return _BINDINGS.openKeyValue(dir, opts);
   }

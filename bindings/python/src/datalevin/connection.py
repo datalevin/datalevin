@@ -79,3 +79,24 @@ class Connection(ResourceWrapper):
     def fill_db(self, datoms):
         _BINDINGS.fill_db(self.raw_handle(), datoms)
         return self
+
+    def copy(self, dest, compact=None) -> None:
+        _BINDINGS.connection_copy(self.raw_handle(), dest, compact)
+
+    def tx_log_watermarks(self):
+        return to_python(_BINDINGS.connection_tx_log_watermarks(self.raw_handle()))
+
+    def open_tx_log(self, from_lsn, upto_lsn=None, limit=None):
+        rows = to_python(_BINDINGS.connection_open_tx_log(self.raw_handle(), from_lsn, upto_lsn))
+        if limit is None:
+            return rows
+        return rows[: max(limit, 0)]
+
+    def create_snapshot(self):
+        return to_python(_BINDINGS.connection_create_snapshot(self.raw_handle()))
+
+    def list_snapshots(self):
+        return to_python(_BINDINGS.connection_list_snapshots(self.raw_handle()))
+
+    def gc_tx_log_segments(self, retain_floor_lsn=None):
+        return to_python(_BINDINGS.connection_gc_tx_log_segments(self.raw_handle(), retain_floor_lsn))

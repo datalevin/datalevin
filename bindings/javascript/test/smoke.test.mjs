@@ -327,6 +327,38 @@ test(
 );
 
 test(
+  "kv operational methods cover wal snapshots and tx log inspection",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-kv-ops-"));
+    const kv = await openKv(dir, { ":wal?": true });
+
+    try {
+      await kv.openDbi("items");
+      await kv.transact([[":put", "a", "alpha"]], {
+        dbiName: "items",
+        kType: ":string",
+        vType: ":string"
+      });
+
+      const watermarks = await kv.txLogWatermarks();
+      assert.equal(watermarks[":wal?"] ?? watermarks.wal, true);
+      assert.equal(Array.isArray(await kv.openTxLog(1, { limit: 10 })), true);
+
+      const snapshot = await kv.createSnapshot();
+      const snapshots = await kv.listSnapshots();
+      const gc = await kv.gcTxLogSegments();
+
+      assert.equal(typeof snapshot, "object");
+      assert.equal(Array.isArray(snapshots), true);
+      assert.equal(typeof gc, "object");
+    } finally {
+      await kv.close();
+    }
+  }
+);
+
+test(
   "kv argument validation",
   { skip: !runtimeAvailable, timeout: 30000 },
   async () => {

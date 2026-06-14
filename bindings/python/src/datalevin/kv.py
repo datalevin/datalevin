@@ -86,6 +86,30 @@ class KV(ResourceWrapper):
             args.append(force)
         return to_python(_BINDINGS.core_invoke("sync", args))
 
+    def tx_log_watermarks(self):
+        return to_python(_BINDINGS.core_invoke("txlog-watermarks", [self.raw_handle()]))
+
+    def open_tx_log(self, from_lsn, upto_lsn=None, limit=None):
+        args = [self.raw_handle(), from_lsn]
+        if upto_lsn is not None:
+            args.append(upto_lsn)
+        rows = to_python(_BINDINGS.core_invoke("open-tx-log", args))
+        if limit is None:
+            return rows
+        return rows[: max(limit, 0)]
+
+    def create_snapshot(self):
+        return to_python(_BINDINGS.core_invoke("create-snapshot!", [self.raw_handle()]))
+
+    def list_snapshots(self):
+        return to_python(_BINDINGS.core_invoke("list-snapshots", [self.raw_handle()]))
+
+    def gc_tx_log_segments(self, retain_floor_lsn=None):
+        args = [self.raw_handle()]
+        if retain_floor_lsn is not None:
+            args.append(retain_floor_lsn)
+        return to_python(_BINDINGS.core_invoke("gc-txlog-segments!", args))
+
     def transact(self, txs, dbi_name=None, k_type=None, v_type=None):
         if dbi_name is None and (k_type is not None or v_type is not None):
             raise ValueError("k_type and v_type require dbi_name for KV transact().")

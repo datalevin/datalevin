@@ -149,4 +149,34 @@ export class Connection extends ResourceWrapper {
     await callJavaMethod(this.rawHandle(), "fillDb", await toJava(datoms));
     return this;
   }
+
+  async copy(dest, { compact = null } = {}) {
+    await _BINDINGS.connectionCopy(this.rawHandle(), dest, compact);
+  }
+
+  async txLogWatermarks() {
+    return toJsResult(await _BINDINGS.connectionTxLogWatermarks(this.rawHandle()));
+  }
+
+  async openTxLog(fromLsn, { uptoLsn = null, limit = null } = {}) {
+    const rows = await toJsResult(
+      await _BINDINGS.connectionOpenTxLog(this.rawHandle(), fromLsn, uptoLsn)
+    );
+    if (limit === null || limit === undefined) {
+      return rows;
+    }
+    return rows.slice(0, Math.max(limit, 0));
+  }
+
+  async createSnapshot() {
+    return toJsResult(await _BINDINGS.connectionCreateSnapshot(this.rawHandle()));
+  }
+
+  async listSnapshots() {
+    return toJsResult(await _BINDINGS.connectionListSnapshots(this.rawHandle()));
+  }
+
+  async gcTxLogSegments({ retainFloorLsn = null } = {}) {
+    return toJsResult(await _BINDINGS.connectionGcTxLogSegments(this.rawHandle(), retainFloorLsn));
+  }
 }

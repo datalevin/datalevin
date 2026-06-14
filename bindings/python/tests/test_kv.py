@@ -113,3 +113,26 @@ def test_kv_argument_validation(tmp_path) -> None:
             kv.put_list_items("items", "a", ["alpha"], None, ":string")
         with pytest.raises(ValueError):
             kv.get_by_rank("items", 0, ignore_key=True)
+
+
+def test_kv_operational_methods_cover_wal_snapshots_and_tx_log(tmp_path) -> None:
+    with open_kv(str(tmp_path / "kv-ops"), opts={":wal?": True}) as kv:
+        kv.open_dbi("items")
+        kv.transact(
+            [(":put", "a", "alpha")],
+            dbi_name="items",
+            k_type=":string",
+            v_type=":string",
+        )
+
+        watermarks = kv.tx_log_watermarks()
+        assert watermarks.get(":wal?", watermarks.get("wal")) is True
+        assert isinstance(kv.open_tx_log(1, limit=10), list)
+
+        snapshot = kv.create_snapshot()
+        snapshots = kv.list_snapshots()
+        gc = kv.gc_tx_log_segments()
+
+        assert isinstance(snapshot, dict)
+        assert isinstance(snapshots, list)
+        assert isinstance(gc, dict)

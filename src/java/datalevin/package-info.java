@@ -39,5 +39,10 @@
  *     conn.fillDb(Datalevin.listOf(Datalevin.datom(2, "name", "Bob")));
  * }
  * }</pre>
+ *
+ * <p>Operational helpers are available on local handles, for example
+ * {@link datalevin.KV#copy}, {@link datalevin.KV#sync},
+ * {@link datalevin.KV#createSnapshot}, {@link datalevin.KV#txLogWatermarks},
+ * {@link datalevin.KV#openTxLog}, and {@link datalevin.KV#gcTxLogSegments}.
  */
 package datalevin;

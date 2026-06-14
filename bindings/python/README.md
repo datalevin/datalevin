@@ -98,6 +98,28 @@ with open_kv("/tmp/dtlv-py-kv") as kv:
     print(kv.get_list("tags", "doc-1", ":string", ":string"))
 ```
 
+## Operational Example
+
+KV stores expose backup, durability, snapshot, and WAL inspection helpers
+without raw JSON calls.
+
+```python
+from datalevin import open_kv
+
+with open_kv("/tmp/dtlv-py-ops", opts={":wal?": True}) as kv:
+    kv.open_dbi("items")
+    kv.transact([(":put", "a", "alpha")], "items", ":string", ":string")
+
+    kv.sync()
+    kv.copy("/tmp/dtlv-py-ops-copy")
+
+    print(kv.tx_log_watermarks())
+    print(kv.open_tx_log(1, limit=10))
+    print(kv.create_snapshot())
+    print(kv.list_snapshots())
+    print(kv.gc_tx_log_segments())
+```
+
 ## Remote Client Example
 
 Use `new_client()` for server administration against a running Datalevin server:

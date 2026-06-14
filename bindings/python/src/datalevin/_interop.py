@@ -48,6 +48,24 @@ class InteropBindings:
     def connection_db(self, handle):
         return call_java(classes().interop.connectionDb, handle)
 
+    def connection_copy(self, handle, dest, compact=None) -> None:
+        call_java(classes().interop.connectionCopy, handle, dest, None if compact is None else bool(compact))
+
+    def connection_tx_log_watermarks(self, handle):
+        return call_java(classes().interop.connectionTxLogWatermarks, handle)
+
+    def connection_open_tx_log(self, handle, from_lsn, upto_lsn=None):
+        return call_java(classes().interop.connectionOpenTxLog, handle, from_lsn, upto_lsn)
+
+    def connection_create_snapshot(self, handle):
+        return call_java(classes().interop.connectionCreateSnapshot, handle)
+
+    def connection_list_snapshots(self, handle):
+        return call_java(classes().interop.connectionListSnapshots, handle)
+
+    def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
+        return call_java(classes().interop.connectionGcTxLogSegments, handle, retain_floor_lsn)
+
     def open_key_value(self, dir, opts=None):
         return call_java(classes().interop.openKeyValue, dir, to_java(opts))
 
