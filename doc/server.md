@@ -189,6 +189,8 @@ Example:
                   :ha-write-retry-delay-ms 150}))
 ```
 
+Close a client with `cl/close-client` when the application owns its lifecycle.
+
 #### HA write failover
 
 In HA deployments, ordinary write requests use bounded automatic failover:

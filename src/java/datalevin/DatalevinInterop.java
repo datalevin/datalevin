@@ -156,7 +156,7 @@ public final class DatalevinInterop {
      * Closes a raw remote client handle.
      */
     public static void closeClient(Object client) {
-        ClojureRuntime.client("disconnect", client);
+        ClojureRuntime.client("close-client", client);
     }
 
     /**
