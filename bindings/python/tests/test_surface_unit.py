@@ -67,6 +67,17 @@ class FakeInteropBindings:
         self.last_connection = (dir, schema, opts, shared)
         return "CONN"
 
+    def init_db(self, datoms, dir=None, schema=None, opts=None):
+        self.last_init_db = (datoms, dir, schema, opts)
+        return "INIT_CONN"
+
+    def fill_db(self, conn, datoms):
+        self.last_fill_db = (conn, datoms)
+        return conn
+
+    def datom(self, e, attr, value, tx=None, added=None):
+        return ("datom", e, attr, value, tx, added)
+
     def close_connection(self, handle):
         self.conn_closed.add(handle)
 
@@ -173,6 +184,16 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert conn.raw_handle() == "CONN"
     assert fake.last_connection == ("/tmp/db", {":name": {}}, conn_opts, True)
 
+    init_conn = interop_module.init_db([(1, ":name", "Ada")], dir="/tmp/init", schema={":name": {}})
+    assert init_conn.raw_handle() == "INIT_CONN"
+    assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
+
+    assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
+    assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
+    assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
+    assert interop_module.fill_db(init_conn, [(3, ":name", "Cara")]) is init_conn
+    assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
+
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
     assert fake.last_kv == ("/tmp/kv", {":mapsize": 1})
@@ -207,6 +228,10 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "sync",
     ]:
         assert callable(getattr(kv_module.KV, method))
+
+
+def test_connection_public_surface_includes_bulk_load_operations() -> None:
+    assert callable(getattr(connection_module.Connection, "fill_db"))
 
 
 def test_exec_json_raises_datalevin_error(monkeypatch) -> None:

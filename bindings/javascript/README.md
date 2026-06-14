@@ -46,6 +46,29 @@ try {
 }
 ```
 
+## Bulk Load Example
+
+Use `initDb()` and `fillDb()` when you already have Datom-shaped data and want
+the fast bulk-load path. Datoms can be compact arrays in
+`[entityId, attr, value]` shape, and `datom()` creates the same shape.
+
+```js
+import { datom, fillDb, initDb } from "datalevin-node";
+
+const schema = { ":name": { ":db/valueType": ":db.type/string" } };
+const conn = await initDb([[1, ":name", "Ada"]], {
+  dir: "/tmp/dtlv-js-bulk",
+  schema
+});
+
+try {
+  await fillDb(conn, [[2, ":name", "Bob"]]);
+  await conn.fillDb([datom(3, ":name", "Cara")]);
+} finally {
+  await conn.close();
+}
+```
+
 ## KV Example
 
 ```js

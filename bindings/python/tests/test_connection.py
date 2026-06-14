@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from datalevin import connect
+from datalevin import connect, datom, fill_db, init_db
 from datalevin.errors import DatalevinJavaError
 
 
@@ -69,3 +69,25 @@ def test_clear_closes_underlying_connection(tmp_path) -> None:
         assert conn.closed() is True
         with pytest.raises(DatalevinJavaError):
             conn.query("[:find [?name ...] :where [?e :name ?name]]")
+
+
+def test_bulk_load_init_db_and_fill_db(tmp_path) -> None:
+    db_dir = tmp_path / "bulk"
+    schema = {
+        ":name": {
+            ":db/valueType": ":db.type/string",
+            ":db/unique": ":db.unique/identity",
+        }
+    }
+
+    with init_db([(1, ":name", "Ada")], dir=str(db_dir), schema=schema) as conn:
+        assert conn.query("[:find [?name ...] :where [?e :name ?name]]") == ["Ada"]
+
+        assert fill_db(conn, [(2, ":name", "Bob")]) is conn
+        assert conn.fill_db([datom(3, ":name", "Cara")]) is conn
+
+        assert sorted(conn.query("[:find [?name ...] :where [?e :name ?name]]")) == [
+            "Ada",
+            "Bob",
+            "Cara",
+        ]

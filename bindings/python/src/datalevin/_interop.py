@@ -32,6 +32,13 @@ class InteropBindings:
         target = classes().interop.getConnection if shared else classes().interop.createConnection
         return call_java(target, dir, to_java(schema), to_java(opts))
 
+    def init_db(self, datoms, dir=None, schema=None, opts=None):
+        return call_java(classes().interop.initDb, to_java(datoms), dir, to_java(schema), to_java(opts))
+
+    def fill_db(self, conn, datoms):
+        handle = conn.raw_handle() if callable(getattr(conn, "raw_handle", None)) else conn
+        return call_java(classes().interop.fillDb, handle, to_java(datoms))
+
     def close_connection(self, handle) -> None:
         call_java(classes().interop.closeConnection, handle)
 
@@ -110,6 +117,15 @@ class InteropBindings:
             return None
         return call_java(classes().interop.lookupRef, to_java(value))
 
+    def datom(self, e, attr, value, tx=None, added=None):
+        if added is not None and tx is None:
+            raise TypeError("tx is required when added is provided")
+        if added is not None:
+            return call_java(classes().interop.datom, to_java(e), to_java(attr), to_java(value), to_java(tx), added)
+        if tx is not None:
+            return call_java(classes().interop.datom, to_java(e), to_java(attr), to_java(value), to_java(tx))
+        return call_java(classes().interop.datom, to_java(e), to_java(attr), to_java(value))
+
     def tx_data(self, tx_data):
         if tx_data is None:
             return None
@@ -139,6 +155,7 @@ class InteropBindings:
 
 
 _BINDINGS = InteropBindings()
+_MISSING = object()
 
 
 def api_info():
@@ -169,6 +186,33 @@ def connect(dir=None, schema=None, opts=None, *, shared: bool = False) -> Connec
     return Connection(_BINDINGS.create_connection(dir, schema, opts, shared=shared))
 
 
+def init_db(datoms, dir=None, schema=None, opts=None) -> Connection:
+    """Create a Datalevin Datalog connection by bulk-loading datoms."""
+
+    from .connection import Connection
+
+    return Connection(_BINDINGS.init_db(datoms, dir, schema, opts))
+
+
+def fill_db(conn: Connection, datoms) -> Connection:
+    """Bulk-load datoms into an existing Datalevin Datalog connection."""
+
+    _BINDINGS.fill_db(conn, datoms)
+    return conn
+
+
+def datom(e, attr, value, tx=_MISSING, added=_MISSING):
+    """Create Datom-shaped data for `init_db()` or `fill_db()`."""
+
+    if added is not _MISSING and tx is _MISSING:
+        raise TypeError("tx is required when added is provided")
+    if added is not _MISSING:
+        return (e, attr, value, tx, added)
+    if tx is not _MISSING:
+        return (e, attr, value, tx)
+    return (e, attr, value)
+
+
 def open_kv(dir, opts=None) -> KV:
     """Open a Datalevin KV store."""
 
@@ -189,7 +233,10 @@ __all__ = [
     "_BINDINGS",
     "api_info",
     "connect",
+    "datom",
     "exec_json",
+    "fill_db",
+    "init_db",
     "jvm_started",
     "new_client",
     "open_kv",

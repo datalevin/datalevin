@@ -277,7 +277,7 @@ final class ClojureCodec {
         return Symbol.intern(value);
     }
 
-    private static boolean isDatom(Object value) {
+    static boolean isDatom(Object value) {
         return value != null && javaBoolean(ClojureRuntime.datom("datom?", value));
     }
 

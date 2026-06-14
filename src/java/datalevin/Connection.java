@@ -488,6 +488,19 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Bulk-loads Datom values into this connection and returns this handle.
+     *
+     * <p>Datoms may be raw Datalevin Datom objects, 3/4/5-element collections
+     * in {@code [e, attr, value, tx?, added?]} shape, or maps with
+     * {@code :e}, {@code :a}, and {@code :v} keys.
+     */
+    public Connection fillDb(Object datoms) {
+        Object newDb = ClojureRuntime.core("fill-db", db(), DatalevinForms.datomsInput(datoms));
+        ClojureRuntime.core("reset-conn!", resource(), newDb);
+        return this;
+    }
+
+    /**
      * Escape hatch for calling a connection-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {

@@ -9,7 +9,10 @@ import {
   DatalevinJavaError,
   apiInfo,
   connect,
+  datom,
   execJson,
+  fillDb,
+  initDb,
   interop,
   openKv
 } from "../src/index.js";
@@ -146,6 +149,33 @@ test(
     }
 
     assert.equal(String(conn), "<Connection closed>");
+  }
+);
+
+test(
+  "bulk load initDb and fillDb cover datom inputs",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-bulk-"));
+    const schema = {
+      ":name": {
+        ":db/valueType": ":db.type/string",
+        ":db/unique": ":db.unique/identity"
+      }
+    };
+    const conn = await initDb([[1, ":name", "Ada"]], { dir, schema });
+
+    try {
+      assert.deepEqual(await conn.query("[:find [?name ...] :where [?e :name ?name]]"), ["Ada"]);
+
+      assert.equal(await fillDb(conn, [[2, ":name", "Bob"]]), conn);
+      assert.equal(await conn.fillDb([datom(3, ":name", "Cara")]), conn);
+
+      const names = await conn.query("[:find [?name ...] :where [?e :name ?name]]");
+      assert.deepEqual([...names].sort(), ["Ada", "Bob", "Cara"]);
+    } finally {
+      await conn.close();
+    }
   }
 );
 

@@ -47,6 +47,22 @@ with connect(
 Structured query forms and inputs can also be passed as normal Python lists and
 dictionaries when that is more convenient than EDN strings.
 
+## Bulk Load Example
+
+Use `init_db()` and `fill_db()` when you already have Datom-shaped data and want
+the fast bulk-load path. Datoms can be compact tuples in
+`(entity_id, attr, value)` shape, and `datom()` creates the same shape.
+
+```python
+from datalevin import datom, fill_db, init_db
+
+schema = {":name": {":db/valueType": ":db.type/string"}}
+
+with init_db([(1, ":name", "Ada")], dir="/tmp/dtlv-py-bulk", schema=schema) as conn:
+    fill_db(conn, [(2, ":name", "Bob")])
+    conn.fill_db([datom(3, ":name", "Cara")])
+```
+
 ## KV Example
 
 ```python

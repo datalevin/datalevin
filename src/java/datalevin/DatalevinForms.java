@@ -23,6 +23,7 @@ import java.util.Objects;
  * ergonomic wrapper API.
  */
 final class DatalevinForms {
+    private static final Object MISSING = new Object();
 
     private DatalevinForms() {
     }
@@ -274,6 +275,66 @@ final class DatalevinForms {
         throw new IllegalArgumentException("Transaction data must be a collection.");
     }
 
+    static Object datomInput(Object datom) {
+        if (datom == null || ClojureCodec.isDatom(datom)) {
+            return datom;
+        }
+        if (datom instanceof Map<?, ?> map) {
+            return datomFromMap(map);
+        }
+        List<?> values = toList(datom);
+        if (values != null) {
+            return datomFromList(values);
+        }
+        throw new IllegalArgumentException(
+                "Datom data must contain Datom values, 3/4/5-element collections, or maps with :e/:a/:v keys.");
+    }
+
+    static Object datomsInput(Object datoms) {
+        if (datoms == null) {
+            return null;
+        }
+        if (datoms instanceof Collection<?> collection) {
+            ArrayList<Object> converted = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                converted.add(datomInput(item));
+            }
+            return PersistentVector.create(converted);
+        }
+        if (datoms instanceof Object[] array) {
+            ArrayList<Object> converted = new ArrayList<>(array.length);
+            for (Object item : array) {
+                converted.add(datomInput(item));
+            }
+            return PersistentVector.create(converted);
+        }
+        throw new IllegalArgumentException("Datoms must be a collection.");
+    }
+
+    static Object datom(Object e, Object attr, Object value) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value));
+    }
+
+    static Object datom(Object e, Object attr, Object value, Object tx) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value),
+                                    ClojureCodec.runtimeInput(tx));
+    }
+
+    static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value),
+                                    ClojureCodec.runtimeInput(tx),
+                                    ClojureCodec.runtimeInput(added));
+    }
+
     static Object kvTxsInput(Object txs) {
         return kvTxsInput(txs, null, null);
     }
@@ -328,6 +389,61 @@ final class DatalevinForms {
             return txVector(Arrays.asList(array));
         }
         return ClojureCodec.runtimeInput(item);
+    }
+
+    private static Object datomFromList(List<?> values) {
+        int size = values.size();
+        if (size < 3 || size > 5) {
+            throw new IllegalArgumentException(
+                    "Datom collection values must have 3, 4, or 5 elements, got: " + size);
+        }
+        if (size == 3) {
+            return datom(values.get(0), values.get(1), values.get(2));
+        }
+        if (size == 4) {
+            return datom(values.get(0), values.get(1), values.get(2), values.get(3));
+        }
+        return datom(values.get(0), values.get(1), values.get(2), values.get(3), values.get(4));
+    }
+
+    private static Object datomFromMap(Map<?, ?> map) {
+        Object e = datomMapValue(map, "e");
+        Object a = datomMapValue(map, "a");
+        Object v = datomMapValue(map, "v");
+        if (e == MISSING || a == MISSING || v == MISSING) {
+            throw new IllegalArgumentException("Datom maps must contain :e, :a, and :v keys.");
+        }
+        Object tx = datomMapValue(map, "tx");
+        Object added = datomMapValue(map, "added");
+        if (added != MISSING && tx == MISSING) {
+            throw new IllegalArgumentException("Datom maps with :added must also contain :tx.");
+        }
+        if (added != MISSING) {
+            return datom(e, a, v, tx, added);
+        }
+        if (tx != MISSING) {
+            return datom(e, a, v, tx);
+        }
+        return datom(e, a, v);
+    }
+
+    private static Object datomMapValue(Map<?, ?> map, String key) {
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (key.equals(datomMapKey(entry.getKey()))) {
+                return entry.getValue();
+            }
+        }
+        return MISSING;
+    }
+
+    private static String datomMapKey(Object key) {
+        if (key instanceof Keyword keyword) {
+            return stripLeadingColon(keyword.toString());
+        }
+        if (key instanceof String s) {
+            return stripLeadingColon(s);
+        }
+        return null;
     }
 
     private static Object txVector(Collection<?> collection) {

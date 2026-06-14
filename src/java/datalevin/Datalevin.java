@@ -109,6 +109,67 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a Datalog connection by bulk-loading Datom values.
+     */
+    public static Connection initDb(Object datoms) {
+        return connFromDatoms(datoms, null, null, null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values.
+     */
+    public static Connection initDb(Object datoms, String dir) {
+        return connFromDatoms(datoms, dir, null, null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a raw schema map.
+     */
+    public static Connection initDb(Object datoms, String dir, Map<?, ?> schema) {
+        return connFromDatoms(datoms, dir, DatalevinForms.schemaInput(schema), null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a typed schema builder.
+     */
+    public static Connection initDb(Object datoms, String dir, Schema schema) {
+        return connFromDatoms(datoms, dir, schema == null ? null : schema.buildForm(), null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a raw schema map and options.
+     */
+    public static Connection initDb(Object datoms, String dir, Map<?, ?> schema, Map<?, ?> opts) {
+        return connFromDatoms(datoms,
+                              dir,
+                              DatalevinForms.schemaInput(schema),
+                              DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a typed schema builder and options.
+     */
+    public static Connection initDb(Object datoms, String dir, Schema schema, Map<?, ?> opts) {
+        return connFromDatoms(datoms,
+                              dir,
+                              schema == null ? null : schema.buildForm(),
+                              DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Bulk-loads Datom values into an existing connection and returns it.
+     */
+    public static Connection fillDb(Connection conn, Object datoms) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.fillDb(datoms);
+    }
+
+    /**
      * Returns an anonymous connection managed by the Datalevin runtime.
      *
      * <p>The underlying Clojure API only supports shared lookup for
@@ -333,6 +394,28 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a Datalevin Datom from entity id, attribute, and value.
+     */
+    public static Object datom(Object e, Object attr, Object value) {
+        return DatalevinForms.datom(e, attr, value);
+    }
+
+    /**
+     * Creates a Datalevin Datom with an explicit transaction id.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx) {
+        return DatalevinForms.datom(e, attr, value, tx);
+    }
+
+    /**
+     * Creates a Datalevin Datom with an explicit transaction id and assertion
+     * flag.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return DatalevinForms.datom(e, attr, value, tx, added);
+    }
+
+    /**
      * Creates an ordered string-keyed map from alternating key and value pairs.
      */
     public static LinkedHashMap<String, Object> mapOf(Object... keyValues) {
@@ -410,5 +493,26 @@ public final class Datalevin {
      */
     public static Set<?> setResult(Object value) {
         return (Set<?>) value;
+    }
+
+    private static Connection connFromDatoms(Object datoms, String dir, Object schema, Object opts) {
+        Object normalizedDatoms = DatalevinForms.datomsInput(datoms);
+        if (opts != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms",
+                                                     normalizedDatoms,
+                                                     dir,
+                                                     schema,
+                                                     opts));
+        }
+        if (schema != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms",
+                                                     normalizedDatoms,
+                                                     dir,
+                                                     schema));
+        }
+        if (dir != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms, dir));
+        }
+        return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms));
     }
 }

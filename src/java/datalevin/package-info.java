@@ -26,5 +26,18 @@
  *         String.class);
  * }
  * }</pre>
+ *
+ * <p>For bulk load, use Datom-shaped input with {@link datalevin.Datalevin#initDb}
+ * and {@link datalevin.Connection#fillDb}:
+ *
+ * <pre>{@code
+ * try (Connection conn = Datalevin.initDb(
+ *         Datalevin.listOf(Datalevin.datom(1, "name", "Alice")),
+ *         "/tmp/example-bulk",
+ *         Datalevin.schema()
+ *             .attr("name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
+ *     conn.fillDb(Datalevin.listOf(Datalevin.datom(2, "name", "Bob")));
+ * }
+ * }</pre>
  */
 package datalevin;

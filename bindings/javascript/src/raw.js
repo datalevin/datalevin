@@ -1,6 +1,19 @@
 import { DatalevinError } from "./errors.js";
 import { _BINDINGS } from "./interop.js";
 
+function datomTuple(e, attr, value, tx = undefined, added = undefined) {
+  if (added !== undefined && tx === undefined) {
+    throw new TypeError("tx is required when added is provided");
+  }
+  if (added !== undefined) {
+    return [e, attr, value, tx, added];
+  }
+  if (tx !== undefined) {
+    return [e, attr, value, tx];
+  }
+  return [e, attr, value];
+}
+
 function resourceHandle(value) {
   if (typeof value?.rawHandle === "function") {
     return value.rawHandle();
@@ -27,6 +40,14 @@ class RawInterop {
 
   async createConnection(dir = null, schema = null, opts = null, { shared = false } = {}) {
     return _BINDINGS.createConnection(dir, schema, opts, { shared });
+  }
+
+  async initDb(datoms, dir = null, schema = null, opts = null) {
+    return _BINDINGS.initDb(datoms, dir, schema, opts);
+  }
+
+  async fillDb(conn, datoms) {
+    return _BINDINGS.fillDb(conn, datoms);
   }
 
   async closeConnection(handle) {
@@ -117,6 +138,10 @@ class RawInterop {
 
   async lookupRef(value) {
     return _BINDINGS.lookupRef(value);
+  }
+
+  async datom(e, attr, value, tx = undefined, added = undefined) {
+    return datomTuple(e, attr, value, tx, added);
   }
 
   async txData(txData) {

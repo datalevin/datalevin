@@ -23,6 +23,12 @@ class RawInterop:
     def create_connection(self, dir=None, schema=None, opts=None, *, shared: bool = False):
         return _BINDINGS.create_connection(dir, schema, opts, shared=shared)
 
+    def init_db(self, datoms, dir=None, schema=None, opts=None):
+        return _BINDINGS.init_db(datoms, dir, schema, opts)
+
+    def fill_db(self, conn, datoms):
+        return _BINDINGS.fill_db(conn, datoms)
+
     def close_connection(self, handle):
         _BINDINGS.close_connection(handle)
 
@@ -88,6 +94,9 @@ class RawInterop:
 
     def lookup_ref(self, value):
         return _BINDINGS.lookup_ref(value)
+
+    def datom(self, e, attr, value, tx=None, added=None):
+        return _BINDINGS.datom(e, attr, value, tx, added)
 
     def tx_data(self, tx_data):
         return _BINDINGS.tx_data(tx_data)

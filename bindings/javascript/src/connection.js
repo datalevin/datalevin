@@ -144,4 +144,9 @@ export class Connection extends ResourceWrapper {
     }
     return toJsResult(await _BINDINGS.coreInvoke("transact!", args));
   }
+
+  async fillDb(datoms) {
+    await callJavaMethod(this.rawHandle(), "fillDb", await toJava(datoms));
+    return this;
+  }
 }

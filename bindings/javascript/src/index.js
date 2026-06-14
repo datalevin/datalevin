@@ -9,7 +9,10 @@ export {
 export {
   apiInfo,
   connect,
+  datom,
   execJson,
+  fillDb,
+  initDb,
   jvmStarted,
   newClient,
   openKv,

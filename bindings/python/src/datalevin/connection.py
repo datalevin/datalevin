@@ -75,3 +75,7 @@ class Connection(ResourceWrapper):
         if tx_meta is not None:
             args.append(to_java(tx_meta))
         return to_python(_BINDINGS.core_invoke("transact!", args))
+
+    def fill_db(self, datoms):
+        _BINDINGS.fill_db(self.raw_handle(), datoms)
+        return self

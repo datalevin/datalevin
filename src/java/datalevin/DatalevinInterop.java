@@ -98,6 +98,44 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Creates a raw connection handle by bulk-loading datoms.
+     */
+    public static Object initDb(Object datoms,
+                                String dir,
+                                Map<?, ?> schema,
+                                Map<?, ?> opts) {
+        Object normalizedDatoms = DatalevinForms.datomsInput(datoms);
+        if (opts != null) {
+            return ClojureRuntime.core("conn-from-datoms",
+                                       normalizedDatoms,
+                                       dir,
+                                       DatalevinForms.schemaInput(schema),
+                                       DatalevinForms.optionsInput(opts));
+        }
+        if (schema != null) {
+            return ClojureRuntime.core("conn-from-datoms",
+                                       normalizedDatoms,
+                                       dir,
+                                       DatalevinForms.schemaInput(schema));
+        }
+        if (dir != null) {
+            return ClojureRuntime.core("conn-from-datoms", normalizedDatoms, dir);
+        }
+        return ClojureRuntime.core("conn-from-datoms", normalizedDatoms);
+    }
+
+    /**
+     * Bulk-loads datoms into an existing raw connection handle.
+     */
+    public static Object fillDb(Object conn, Object datoms) {
+        Object newDb = ClojureRuntime.core("fill-db",
+                                           ClojureRuntime.core("db", conn),
+                                           DatalevinForms.datomsInput(datoms));
+        ClojureRuntime.core("reset-conn!", conn, newDb);
+        return conn;
+    }
+
+    /**
      * Closes a raw connection handle.
      */
     public static void closeConnection(Object conn) {
@@ -295,6 +333,35 @@ public final class DatalevinInterop {
      */
     public static Object lookupRef(Object value) {
         return DatalevinForms.lookupRefInput(value);
+    }
+
+    /**
+     * Creates a raw Datalevin datom.
+     */
+    public static Object datom(Object e, Object attr, Object value) {
+        return DatalevinForms.datom(e, attr, value);
+    }
+
+    /**
+     * Creates a raw Datalevin datom with an explicit transaction id.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx) {
+        return DatalevinForms.datom(e, attr, value, tx);
+    }
+
+    /**
+     * Creates a raw Datalevin datom with an explicit transaction id and
+     * assertion flag.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return DatalevinForms.datom(e, attr, value, tx, added);
+    }
+
+    /**
+     * Normalizes datom input into the raw Clojure form expected by Datalevin.
+     */
+    public static Object datoms(Object datoms) {
+        return DatalevinForms.datomsInput(datoms);
     }
 
     /**

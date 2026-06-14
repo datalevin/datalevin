@@ -76,6 +76,26 @@ class InteropBindings {
     return callJavaMethod(cls.datalevin, target);
   }
 
+  async initDb(datoms, dir = null, schema = null, opts = null) {
+    const cls = await classes();
+    if (opts !== null && opts !== undefined) {
+      return callJavaMethod(cls.datalevin, "initDb", await toJava(datoms), dir, await toJava(schema), await toJava(opts));
+    }
+    if (schema !== null && schema !== undefined) {
+      return callJavaMethod(cls.datalevin, "initDb", await toJava(datoms), dir, await toJava(schema));
+    }
+    if (dir !== null && dir !== undefined) {
+      return callJavaMethod(cls.datalevin, "initDb", await toJava(datoms), dir);
+    }
+    return callJavaMethod(cls.datalevin, "initDb", await toJava(datoms));
+  }
+
+  async fillDb(conn, datoms) {
+    const handle = await unwrapInteropHandle(conn);
+    await callJavaMethod(handle, "fillDb", await toJava(datoms));
+    return handle;
+  }
+
   async closeConnection(handle) {
     await callJavaMethod(handle, "close");
   }
@@ -211,6 +231,35 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "lookupRef", await toJava(value));
   }
 
+  async datom(e, attr, value, tx = undefined, added = undefined) {
+    const cls = await classes();
+    if (added !== undefined) {
+      if (tx === undefined) {
+        throw new TypeError("tx is required when added is provided");
+      }
+      return callJavaMethod(
+        cls.datalevin,
+        "datom",
+        await toJava(e),
+        await toJava(attr),
+        await toJava(value),
+        await toJava(tx),
+        await toJava(added)
+      );
+    }
+    if (tx !== undefined) {
+      return callJavaMethod(
+        cls.datalevin,
+        "datom",
+        await toJava(e),
+        await toJava(attr),
+        await toJava(value),
+        await toJava(tx)
+      );
+    }
+    return callJavaMethod(cls.datalevin, "datom", await toJava(e), await toJava(attr), await toJava(value));
+  }
+
   async txData(txData) {
     if (txData === null || txData === undefined) {
       return null;
@@ -299,6 +348,29 @@ export async function execJson(op, args = null) {
 export async function connect(dir = null, { schema = null, opts = null, shared = false } = {}) {
   const { Connection } = await import("./connection.js");
   return new Connection(await _BINDINGS.createConnection(dir, schema, opts, { shared }));
+}
+
+export async function initDb(datoms, { dir = null, schema = null, opts = null } = {}) {
+  const { Connection } = await import("./connection.js");
+  return new Connection(await _BINDINGS.initDb(datoms, dir, schema, opts));
+}
+
+export async function fillDb(conn, datoms) {
+  await _BINDINGS.fillDb(conn, datoms);
+  return conn;
+}
+
+export function datom(e, attr, value, tx = undefined, added = undefined) {
+  if (added !== undefined && tx === undefined) {
+    throw new TypeError("tx is required when added is provided");
+  }
+  if (added !== undefined) {
+    return [e, attr, value, tx, added];
+  }
+  if (tx !== undefined) {
+    return [e, attr, value, tx];
+  }
+  return [e, attr, value];
 }
 
 export async function openKv(dir, opts = null) {
