@@ -7,7 +7,7 @@
 ;; the terms of this license.
 ;; You must not remove this notice, or any other, from this software.
 ;;
-(ns datalevin.embedding
+(ns ^:no-doc datalevin.embedding
   "Text embedding providers"
   (:require
    [clojure.edn :as edn]

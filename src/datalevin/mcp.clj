@@ -7,7 +7,7 @@
 ;; the terms of this license.
 ;; You must not remove this notice, or any other, from this software.
 ;;
-(ns datalevin.mcp
+(ns ^:no-doc datalevin.mcp
   "Minimal MCP stdio server for Datalevin."
   (:require
    [clojure.string :as str]
