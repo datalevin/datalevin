@@ -69,6 +69,21 @@ try {
     kType: ":long",
     vType: ":string"
   }));
+  console.log(await kv.getRank("items", 2, { kType: ":long" }));
+  console.log(await kv.getFirstN("items", 2, [":all"], {
+    kType: ":long",
+    vType: ":string"
+  }));
+
+  await kv.openListDbi("tags");
+  await kv.putListItems("tags", "doc-1", ["clj", "db"], {
+    kType: ":string",
+    vType: ":string"
+  });
+  console.log(await kv.getList("tags", "doc-1", {
+    kType: ":string",
+    vType: ":string"
+  }));
 } finally {
   await kv.close();
 }

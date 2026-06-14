@@ -15,4 +15,25 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.Client, "function");
+
+  for (const method of [
+    "copy",
+    "delListItems",
+    "getByRank",
+    "getFirst",
+    "getFirstN",
+    "getList",
+    "getRank",
+    "inList",
+    "keyRange",
+    "keyRangeCount",
+    "listCount",
+    "putListItems",
+    "rangeCount",
+    "sampleKv",
+    "stat",
+    "sync"
+  ]) {
+    assert.equal(typeof datalevin.KV.prototype[method], "function");
+  }
 });

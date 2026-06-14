@@ -14,6 +14,33 @@ def _slice_page(items, limit=None, offset=None):
     return items[start : start + max(limit, 0)]
 
 
+def _require_k_type(k_type, op):
+    if k_type is None:
+        raise ValueError(f"k_type is required for KV {op}().")
+
+
+def _require_v_type(v_type, op):
+    if v_type is None:
+        raise ValueError(f"v_type is required for KV {op}().")
+
+
+def _reject_v_type_without_k_type(k_type, v_type, op):
+    if v_type is not None and k_type is None:
+        raise ValueError(f"v_type requires k_type for KV {op}().")
+
+
+def _append_typed_args(args, *, k_type=None, v_type=None, ignore_key=None, op):
+    _reject_v_type_without_k_type(k_type, v_type, op)
+    if ignore_key is not None and (k_type is None or v_type is None):
+        raise ValueError(f"ignore_key requires k_type and v_type for KV {op}().")
+    if k_type is not None:
+        args.append(_BINDINGS.kv_type(k_type))
+    if v_type is not None:
+        args.append(_BINDINGS.kv_type(v_type))
+    if ignore_key is not None:
+        args.append(bool(ignore_key))
+
+
 class KV(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin KV handle."""
 
@@ -40,6 +67,24 @@ class KV(ResourceWrapper):
 
     def entries(self, dbi_name):
         return to_python(_BINDINGS.core_invoke("entries", [self.raw_handle(), dbi_name]))
+
+    def stat(self, dbi_name=None):
+        args = [self.raw_handle()]
+        if dbi_name is not None:
+            args.append(dbi_name)
+        return to_python(_BINDINGS.core_invoke("stat", args))
+
+    def copy(self, dest, compact=None):
+        args = [self.raw_handle(), dest]
+        if compact is not None:
+            args.append(bool(compact))
+        return to_python(_BINDINGS.core_invoke("copy", args))
+
+    def sync(self, force=None):
+        args = [self.raw_handle()]
+        if force is not None:
+            args.append(force)
+        return to_python(_BINDINGS.core_invoke("sync", args))
 
     def transact(self, txs, dbi_name=None, k_type=None, v_type=None):
         if dbi_name is None and (k_type is not None or v_type is not None):
@@ -68,6 +113,36 @@ class KV(ResourceWrapper):
             args.append(bool(ignore_key))
         return to_python(_BINDINGS.core_invoke("get-value", args))
 
+    def get_rank(self, dbi_name, key, k_type=None):
+        args = [self.raw_handle(), dbi_name, to_java(key)]
+        if k_type is not None:
+            args.append(_BINDINGS.kv_type(k_type))
+        return to_python(_BINDINGS.core_invoke("get-rank", args))
+
+    def get_by_rank(self, dbi_name, rank, k_type=None, v_type=None, ignore_key=None):
+        args = [self.raw_handle(), dbi_name, rank]
+        _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="get_by_rank")
+        return to_python(_BINDINGS.core_invoke("get-by-rank", args))
+
+    def sample_kv(self, dbi_name, n, k_type=None, v_type=None, ignore_key=None):
+        args = [self.raw_handle(), dbi_name, n]
+        _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="sample_kv")
+        return to_python(_BINDINGS.core_invoke("sample-kv", args))
+
+    def get_first(self, dbi_name, key_range, k_type=None, v_type=None, ignore_key=None):
+        if key_range is None:
+            raise ValueError("key_range is required for KV get_first().")
+        args = [self.raw_handle(), dbi_name, to_edn_form(key_range)]
+        _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="get_first")
+        return to_python(_BINDINGS.core_invoke("get-first", args))
+
+    def get_first_n(self, dbi_name, n, key_range, k_type=None, v_type=None, ignore_key=None):
+        if key_range is None:
+            raise ValueError("key_range is required for KV get_first_n().")
+        args = [self.raw_handle(), dbi_name, n, to_edn_form(key_range)]
+        _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="get_first_n")
+        return to_python(_BINDINGS.core_invoke("get-first-n", args))
+
     def get_range(self, dbi_name, key_range, k_type=None, v_type=None, limit=None, offset=None):
         if key_range is None:
             raise ValueError("key_range is required for KV get_range().")
@@ -79,6 +154,103 @@ class KV(ResourceWrapper):
             if v_type is not None:
                 args.append(_BINDINGS.kv_type(v_type))
         return _slice_page(to_python(_BINDINGS.core_invoke("get-range", args)), limit, offset)
+
+    def key_range(self, dbi_name, key_range, k_type=None, limit=None, offset=None):
+        if key_range is None:
+            raise ValueError("key_range is required for KV key_range().")
+        args = [self.raw_handle(), dbi_name, to_edn_form(key_range)]
+        if k_type is not None:
+            args.append(_BINDINGS.kv_type(k_type))
+        return _slice_page(to_python(_BINDINGS.core_invoke("key-range", args)), limit, offset)
+
+    def key_range_count(self, dbi_name, key_range, k_type=None):
+        if key_range is None:
+            raise ValueError("key_range is required for KV key_range_count().")
+        args = [self.raw_handle(), dbi_name, to_edn_form(key_range)]
+        if k_type is not None:
+            args.append(_BINDINGS.kv_type(k_type))
+        return to_python(_BINDINGS.core_invoke("key-range-count", args))
+
+    def range_count(self, dbi_name, key_range, k_type=None):
+        if key_range is None:
+            raise ValueError("key_range is required for KV range_count().")
+        args = [self.raw_handle(), dbi_name, to_edn_form(key_range)]
+        if k_type is not None:
+            args.append(_BINDINGS.kv_type(k_type))
+        return to_python(_BINDINGS.core_invoke("range-count", args))
+
+    def put_list_items(self, list_name, key, values, k_type, v_type):
+        _require_k_type(k_type, "put_list_items")
+        _require_v_type(v_type, "put_list_items")
+        _BINDINGS.core_invoke(
+            "put-list-items",
+            [
+                self.raw_handle(),
+                list_name,
+                to_java(key),
+                to_java(values),
+                _BINDINGS.kv_type(k_type),
+                _BINDINGS.kv_type(v_type),
+            ],
+        )
+
+    def del_list_items(self, list_name, key, k_type, *, values=None, v_type=None):
+        _require_k_type(k_type, "del_list_items")
+        args = [self.raw_handle(), list_name, to_java(key)]
+        if values is None:
+            if v_type is not None:
+                raise ValueError("v_type requires values for KV del_list_items().")
+            args.append(_BINDINGS.kv_type(k_type))
+        else:
+            _require_v_type(v_type, "del_list_items")
+            args.extend([to_java(values), _BINDINGS.kv_type(k_type), _BINDINGS.kv_type(v_type)])
+        _BINDINGS.core_invoke("del-list-items", args)
+
+    def get_list(self, list_name, key, k_type, v_type, limit=None, offset=None):
+        _require_k_type(k_type, "get_list")
+        _require_v_type(v_type, "get_list")
+        return _slice_page(
+            to_python(
+                _BINDINGS.core_invoke(
+                    "get-list",
+                    [
+                        self.raw_handle(),
+                        list_name,
+                        to_java(key),
+                        _BINDINGS.kv_type(k_type),
+                        _BINDINGS.kv_type(v_type),
+                    ],
+                )
+            ),
+            limit,
+            offset,
+        )
+
+    def list_count(self, list_name, key, k_type):
+        _require_k_type(k_type, "list_count")
+        return to_python(
+            _BINDINGS.core_invoke(
+                "list-count",
+                [self.raw_handle(), list_name, to_java(key), _BINDINGS.kv_type(k_type)],
+            )
+        )
+
+    def in_list(self, list_name, key, value, k_type, v_type):
+        _require_k_type(k_type, "in_list")
+        _require_v_type(v_type, "in_list")
+        return bool(
+            _BINDINGS.core_invoke(
+                "in-list?",
+                [
+                    self.raw_handle(),
+                    list_name,
+                    to_java(key),
+                    to_java(value),
+                    _BINDINGS.kv_type(k_type),
+                    _BINDINGS.kv_type(v_type),
+                ],
+            )
+        )
 
     def clear_dbi(self, dbi_name) -> None:
         _BINDINGS.core_invoke("clear-dbi", [self.raw_handle(), dbi_name])

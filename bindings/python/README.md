@@ -74,6 +74,12 @@ with open_kv("/tmp/dtlv-py-kv") as kv:
         )
     )
     print(kv.get_range("items", [":all"], k_type=":long", v_type=":string"))
+    print(kv.get_rank("items", 2, k_type=":long"))
+    print(kv.get_first_n("items", 2, [":all"], k_type=":long", v_type=":string"))
+
+    kv.open_list_dbi("tags")
+    kv.put_list_items("tags", "doc-1", ["clj", "db"], ":string", ":string")
+    print(kv.get_list("tags", "doc-1", ":string", ":string"))
 ```
 
 ## Remote Client Example

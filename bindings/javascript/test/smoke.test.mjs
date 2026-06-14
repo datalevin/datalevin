@@ -179,17 +179,46 @@ test(
         ],
         { dbiName: "blob-keys", kType: ":bytes", vType: ":bytes" }
       );
-      await kv.transact(
-        [[":put", "a", 1], [":put", "a", 2], [":put", "b", 3]],
-        { dbiName: "list", kType: ":string", vType: ":long" }
-      );
+      await kv.putListItems("list", "a", [1, 2], { kType: ":string", vType: ":long" });
+      await kv.putListItems("list", "b", [3], { kType: ":string", vType: ":long" });
 
       assert.deepEqual((await kv.listDbis()).sort(), ["blob-keys", "blobs", "items", "list"]);
       assert.equal(intValue(await kv.entries("items")), 3);
+      const itemStat = await kv.stat("items");
+      assert.equal(intValue(itemStat[":entries"] ?? itemStat.entries), 3);
       assert.equal(
         await kv.getValue("items", "b", { kType: ":string", vType: ":string", ignoreKey: true }),
         "beta"
       );
+      assert.equal(intValue(await kv.getRank("items", "b", { kType: ":string" })), 1);
+      assert.equal(
+        await kv.getByRank("items", 1, { kType: ":string", vType: ":string" }),
+        "beta"
+      );
+      assert.deepEqual(
+        await kv.getByRank("items", 1, { kType: ":string", vType: ":string", ignoreKey: false }),
+        ["b", "beta"]
+      );
+      assert.deepEqual(
+        await kv.getFirst("items", [":all"], { kType: ":string", vType: ":string" }),
+        ["a", "alpha"]
+      );
+      assert.deepEqual(
+        await kv.getFirstN("items", 2, [":all"], { kType: ":string", vType: ":string" }),
+        [["a", "alpha"], ["b", "beta"]]
+      );
+      const samples = await kv.sampleKv("items", 2, {
+        kType: ":string",
+        vType: ":string",
+        ignoreKey: false
+      });
+      const validSamples = new Set([
+        JSON.stringify(["a", "alpha"]),
+        JSON.stringify(["b", "beta"]),
+        JSON.stringify(["c", "gamma"])
+      ]);
+      assert.equal(samples.length, 2);
+      assert.equal(samples.every((sample) => validSamples.has(JSON.stringify(sample))), true);
       const blobFromBuffer = await kv.getValue("blobs", "buf", {
         kType: ":string",
         vType: ":bytes",
@@ -213,6 +242,12 @@ test(
         await kv.getRange("items", [":all"], { kType: ":string", vType: ":string", limit: 2, offset: 1 }),
         [["b", "beta"], ["c", "gamma"]]
       );
+      assert.deepEqual(
+        await kv.keyRange("items", [":all"], { kType: ":string", limit: 2, offset: 1 }),
+        ["b", "c"]
+      );
+      assert.equal(intValue(await kv.keyRangeCount("items", [":all"], { kType: ":string" })), 3);
+      assert.equal(intValue(await kv.rangeCount("items", [":all"], { kType: ":string" })), 3);
       assert.equal(Buffer.isBuffer(blobFromBuffer), true);
       assert.equal(Buffer.isBuffer(blobFromUint8), true);
       assert.equal(Buffer.isBuffer(blobKeyValue), true);
@@ -228,6 +263,24 @@ test(
           .map(([key, value]) => [key, intValue(value)]),
         [["a", 1], ["a", 2], ["b", 3]]
       );
+      assert.deepEqual((await kv.getList("list", "a", { kType: ":string", vType: ":long" })).map(intValue), [1, 2]);
+      assert.deepEqual(
+        (await kv.getList("list", "a", { kType: ":string", vType: ":long", limit: 1, offset: 1 })).map(intValue),
+        [2]
+      );
+      assert.equal(intValue(await kv.listCount("list", "a", { kType: ":string" })), 2);
+      assert.equal(await kv.inList("list", "a", 2, { kType: ":string", vType: ":long" }), true);
+      assert.equal(await kv.inList("list", "a", 9, { kType: ":string", vType: ":long" }), false);
+      await kv.delListItems("list", "a", { kType: ":string", values: [2], vType: ":long" });
+      assert.deepEqual((await kv.getList("list", "a", { kType: ":string", vType: ":long" })).map(intValue), [1]);
+      await kv.delListItems("list", "a", { kType: ":string" });
+      assert.equal(intValue(await kv.listCount("list", "a", { kType: ":string" })), 0);
+
+      await kv.sync();
+      const copyDir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-kv-copy-"));
+      fs.rmSync(copyDir, { recursive: true, force: true });
+      await kv.copy(copyDir);
+      assert.equal(fs.existsSync(copyDir), true);
 
       await kv.clearDbi("items");
       assert.equal(intValue(await kv.entries("items")), 0);
@@ -263,6 +316,14 @@ test(
       );
       await assert.rejects(
         async () => kv.getRange("items", [":all"], { vType: ":string" }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.putListItems("items", "a", ["alpha"], { vType: ":string" }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.getByRank("items", 0, { ignoreKey: true }),
         TypeError
       );
     } finally {

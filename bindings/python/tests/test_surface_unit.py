@@ -187,6 +187,28 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_client == ("dtlv://user:pass@host", client_opts)
 
 
+def test_kv_public_surface_includes_richer_operations() -> None:
+    for method in [
+        "copy",
+        "del_list_items",
+        "get_by_rank",
+        "get_first",
+        "get_first_n",
+        "get_list",
+        "get_rank",
+        "in_list",
+        "key_range",
+        "key_range_count",
+        "list_count",
+        "put_list_items",
+        "range_count",
+        "sample_kv",
+        "stat",
+        "sync",
+    ]:
+        assert callable(getattr(kv_module.KV, method))
+
+
 def test_exec_json_raises_datalevin_error(monkeypatch) -> None:
     fake = FakeInteropBindings()
     fake.exec_response = json.dumps(
