@@ -20,6 +20,9 @@ Supported programming languages are:
 * Python
 * Clojure
 
+See the [language compatibility matrix](language-compatibility.md) for current
+API parity across these languages.
+
 ## Clojure Library
 
 The core of Datalevin is a JVM Clojure library with some native dependencies.

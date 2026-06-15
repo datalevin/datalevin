@@ -101,6 +101,9 @@ class RawInterop:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
 
+    def connection_with_transaction(self, handle, fn):
+        return _BINDINGS.connection_with_transaction(handle, fn)
+
     def connection_re_index(self, handle, schema=None, opts=None):
         return _BINDINGS.connection_re_index(handle, schema, opts)
 
@@ -112,6 +115,18 @@ class RawInterop:
 
     def key_value_closed(self, handle):
         return _BINDINGS.key_value_closed(handle)
+
+    def key_value_begin_transaction(self, handle):
+        return _BINDINGS.key_value_begin_transaction(handle)
+
+    def key_value_commit_transaction(self, tx):
+        return _BINDINGS.key_value_commit_transaction(tx)
+
+    def key_value_abort_transaction(self, tx):
+        return _BINDINGS.key_value_abort_transaction(tx)
+
+    def key_value_with_transaction(self, handle, fn):
+        return _BINDINGS.key_value_with_transaction(handle, fn)
 
     def key_value_re_index(self, handle, opts=None):
         return _BINDINGS.key_value_re_index(handle, opts)

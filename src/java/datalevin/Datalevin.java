@@ -11,6 +11,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 import clojure.lang.Keyword;
 import clojure.lang.Symbol;
@@ -268,6 +269,30 @@ public final class Datalevin {
      */
     public static KV openKV(String dir, Map<?, ?> opts) {
         return new KV(ClojureRuntime.core("open-kv", dir, DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Opens an explicit KV write transaction.
+     */
+    public static KVTransaction beginTransaction(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.beginTransaction();
+    }
+
+    /**
+     * Runs {@code fn} inside a single KV write transaction.
+     */
+    public static <T> T withTransaction(KV kv, Function<KV, T> fn) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.withTransaction(fn);
+    }
+
+    /**
+     * Runs {@code fn} inside a single Datalog write transaction.
+     */
+    public static <T> T withTransaction(Connection conn, Function<Connection, T> fn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.withTransaction(fn);
     }
 
     /**

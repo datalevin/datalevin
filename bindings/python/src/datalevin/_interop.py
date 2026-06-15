@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import json
 
+import jpype
+
 from ._convert import to_java, to_python
 from ._java import call_java, classes
 from ._jvm import jvm_started, start_jvm
@@ -160,6 +162,15 @@ class InteropBindings:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return call_java(classes().interop.connectionGcTxLogSegments, handle, retain_floor_lsn)
 
+    def connection_with_transaction(self, handle, fn):
+        from .connection import Connection
+
+        proxy = jpype.JProxy(
+            classes().function_type,
+            inst=_PythonFunction(lambda tx: fn(Connection(tx, owned=False))),
+        )
+        return call_java(classes().interop.connectionWithTransaction, handle, proxy)
+
     def connection_re_index(self, handle, schema=None, opts=None):
         return call_java(classes().interop.connectionReIndex, handle, to_java(schema), to_java(opts))
 
@@ -171,6 +182,24 @@ class InteropBindings:
 
     def key_value_closed(self, handle) -> bool:
         return bool(call_java(classes().interop.keyValueClosed, handle))
+
+    def key_value_begin_transaction(self, handle):
+        return call_java(classes().interop.keyValueBeginTransaction, handle)
+
+    def key_value_commit_transaction(self, tx):
+        return call_java(classes().interop.keyValueCommitTransaction, tx)
+
+    def key_value_abort_transaction(self, tx):
+        return call_java(classes().interop.keyValueAbortTransaction, tx)
+
+    def key_value_with_transaction(self, handle, fn):
+        from .kv import KV
+
+        proxy = jpype.JProxy(
+            classes().function_type,
+            inst=_PythonFunction(lambda tx: fn(KV(tx, owned=False))),
+        )
+        return call_java(classes().interop.keyValueWithTransaction, handle, proxy)
 
     def key_value_re_index(self, handle, opts=None):
         return call_java(classes().interop.keyValueReIndex, handle, to_java(opts))
@@ -321,6 +350,14 @@ class InteropBindings:
 
 _BINDINGS = InteropBindings()
 _MISSING = object()
+
+
+class _PythonFunction:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def apply(self, value):
+        return to_java(self._fn(value))
 
 
 def api_info():
@@ -680,6 +717,12 @@ def re_index(target, opts=None, *, schema=None):
     return target.re_index(opts, schema=schema) if schema is not None else target.re_index(opts)
 
 
+def with_transaction(target, fn):
+    """Run a callback inside a KV or Datalog write transaction."""
+
+    return target.with_transaction(fn)
+
+
 def datom(e, attr, value, tx=_MISSING, added=_MISSING):
     """Create Datom-shaped data for `init_db()` or `fill_db()`."""
 
@@ -769,5 +812,6 @@ __all__ = [
     "tx_retract_entity",
     "vector_attr",
     "vector_options",
+    "with_transaction",
     "write_edn",
 ]

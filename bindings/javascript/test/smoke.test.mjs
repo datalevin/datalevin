@@ -8,6 +8,7 @@ import {
   DatalevinError,
   DatalevinJavaError,
   Entity,
+  KVTransaction,
   apiInfo,
   connect,
   createUdfRegistry,
@@ -26,7 +27,8 @@ import {
   searchIndexWriter,
   transactAsync,
   txEntity,
-  udfDescriptor
+  udfDescriptor,
+  withTransaction
 } from "../src/index.js";
 import { toJs } from "../src/interop.js";
 import { jvmStarted, resolveClasspath } from "../src/jvm.js";
@@ -391,6 +393,57 @@ test(
       );
       assert.equal(intValue(await kv.keyRangeCount("items", [":all"], { kType: ":string" })), 3);
       assert.equal(intValue(await kv.rangeCount("items", [":all"], { kType: ":string" })), 3);
+      assert.equal(await kv.withTransaction(async (txKv) => {
+        await txKv.transact([[":put", "d", "delta"]], {
+          dbiName: "items",
+          kType: ":string",
+          vType: ":string"
+        });
+        return txKv.getValue("items", "d", {
+          kType: ":string",
+          vType: ":string",
+          ignoreKey: true
+        });
+      }), "delta");
+      assert.equal(await withTransaction(kv, async (txKv) => {
+        await txKv.transact([[":put", "g", "gamma-2"]], {
+          dbiName: "items",
+          kType: ":string",
+          vType: ":string"
+        });
+        return txKv.getValue("items", "g", {
+          kType: ":string",
+          vType: ":string",
+          ignoreKey: true
+        });
+      }), "gamma-2");
+      const explicitTx = await kv.beginTransaction();
+      assert.equal(explicitTx instanceof KVTransaction, true);
+      assert.equal(explicitTx.active(), true);
+      await explicitTx.transact([[":put", "e", "epsilon"]], {
+        dbiName: "items",
+        kType: ":string",
+        vType: ":string"
+      });
+      assert.equal(await explicitTx.commit(), ":committed");
+      assert.equal(explicitTx.active(), false);
+      const abortedTx = await kv.transaction();
+      await abortedTx.transact([[":put", "f", "phi"]], {
+        dbiName: "items",
+        kType: ":string",
+        vType: ":string"
+      });
+      assert.equal(await abortedTx.abort(), ":aborted");
+      assert.equal(await kv.getValue("items", "e", {
+        kType: ":string",
+        vType: ":string",
+        ignoreKey: true
+      }), "epsilon");
+      assert.equal(await kv.getValue("items", "f", {
+        kType: ":string",
+        vType: ":string",
+        ignoreKey: true
+      }), null);
       assert.equal(Buffer.isBuffer(blobFromBuffer), true);
       assert.equal(Buffer.isBuffer(blobFromUint8), true);
       assert.equal(Buffer.isBuffer(blobKeyValue), true);

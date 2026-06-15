@@ -31,6 +31,7 @@ class JavaClasses:
     list_type: object
     set_type: object
     collection_type: object
+    function_type: object
     keyword_type: object
     symbol_type: object
 
@@ -57,6 +58,7 @@ def classes() -> JavaClasses:
         list_type=jpype.JClass("java.util.List"),
         set_type=jpype.JClass("java.util.Set"),
         collection_type=jpype.JClass("java.util.Collection"),
+        function_type=jpype.JClass("java.util.function.Function"),
         keyword_type=jpype.JClass("clojure.lang.Keyword"),
         symbol_type=jpype.JClass("clojure.lang.Symbol"),
     )

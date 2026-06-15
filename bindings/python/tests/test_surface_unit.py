@@ -86,6 +86,10 @@ class FakeInteropBindings:
         self.last_transact_async = (conn, tx_data, tx_meta)
         return "TX_FUTURE"
 
+    def connection_with_transaction(self, conn, fn):
+        self.last_connection_with_transaction = conn
+        return fn(connection_module.Connection("TX_CONN", owned=False))
+
     def datom(self, e, attr, value, tx=None, added=None):
         return ("datom", e, attr, value, tx, added)
 
@@ -108,6 +112,22 @@ class FakeInteropBindings:
 
     def key_value_closed(self, handle):
         return handle in self.kv_closed
+
+    def key_value_begin_transaction(self, kv):
+        self.last_kv_begin_transaction = kv
+        return "KV_TX"
+
+    def key_value_commit_transaction(self, tx):
+        self.last_kv_commit_transaction = tx
+        return ":committed"
+
+    def key_value_abort_transaction(self, tx):
+        self.last_kv_abort_transaction = tx
+        return ":aborted"
+
+    def key_value_with_transaction(self, kv, fn):
+        self.last_kv_with_transaction = kv
+        return fn(kv_module.KV("KV_TX", owned=False))
 
     def key_value_re_index(self, kv, opts=None):
         self.last_kv_re_index = (kv, opts)
@@ -322,6 +342,9 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
     assert interop_module.re_index(init_conn, opts={":backup?": False}) is init_conn
     assert fake.last_connection_re_index == ("INIT_CONN", None, {":backup?": False})
+    assert init_conn.with_transaction(lambda tx: tx.raw_handle()) == "TX_CONN"
+    assert fake.last_connection_with_transaction == "INIT_CONN"
+    assert interop_module.with_transaction(init_conn, lambda tx: tx.raw_handle()) == "TX_CONN"
     assert callable(interop_module.transact_async)
     backing_kv = interop_module.datalog_kv(init_conn)
     assert backing_kv.raw_handle() == "DATALOG_KV"
@@ -330,6 +353,16 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
     assert fake.last_kv == ("/tmp/kv", {":mapsize": 1})
+    tx = kv.begin_transaction()
+    assert tx.raw_handle() == "KV_TX"
+    assert fake.last_kv_begin_transaction == "KV"
+    assert tx.commit() == ":committed"
+    assert fake.last_kv_commit_transaction == "KV_TX"
+    tx = kv.transaction()
+    assert tx.abort() == ":aborted"
+    assert fake.last_kv_abort_transaction == "KV_TX"
+    assert kv.with_transaction(lambda tx: tx.raw_handle()) == "KV_TX"
+    assert fake.last_kv_with_transaction == "KV"
     assert kv.re_index(opts={":backup?": False}) is kv
     assert fake.last_kv_re_index == ("KV", {":backup?": False})
     engine = interop_module.new_search_engine(kv, opts={":include-text?": True})
@@ -407,14 +440,20 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "open_tx_log",
         "put_list_items",
         "range_count",
+        "begin_transaction",
         "re_index",
         "sample_kv",
         "search_index_writer",
         "stat",
         "sync",
+        "transaction",
         "tx_log_watermarks",
+        "with_transaction",
     ]:
         assert callable(getattr(kv_module.KV, method))
+    assert callable(getattr(datalevin.KVTransaction, "abort"))
+    assert callable(getattr(datalevin.KVTransaction, "active"))
+    assert callable(getattr(datalevin.KVTransaction, "commit"))
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
@@ -447,6 +486,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "seek_datoms",
         "tx_log_watermarks",
         "transact_async",
+        "with_transaction",
     ]:
         assert callable(getattr(connection_module.Connection, method))
 

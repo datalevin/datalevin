@@ -39,6 +39,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.udfDescriptor, "function");
   assert.equal(typeof datalevin.vectorAttr, "function");
   assert.equal(typeof datalevin.vectorOptions, "function");
+  assert.equal(typeof datalevin.withTransaction, "function");
   assert.equal(typeof datalevin.writeEdn, "function");
   assert.deepEqual(datalevin.schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }), {
     ":db/valueType": ":db.type/string",
@@ -113,6 +114,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
+  assert.equal(typeof datalevin.KVTransaction, "function");
   assert.equal(typeof datalevin.SearchEngine, "function");
   assert.equal(typeof datalevin.SearchIndexWriter, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
@@ -142,6 +144,7 @@ test("public surface stays importable without starting the JVM", () => {
   }
 
   for (const method of [
+    "beginTransaction",
     "copy",
     "createSnapshot",
     "delListItems",
@@ -165,9 +168,14 @@ test("public surface stays importable without starting the JVM", () => {
     "searchIndexWriter",
     "stat",
     "sync",
-    "txLogWatermarks"
+    "transaction",
+    "txLogWatermarks",
+    "withTransaction"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");
+  }
+  for (const method of ["abort", "active", "close", "commit"]) {
+    assert.equal(typeof datalevin.KVTransaction.prototype[method], "function");
   }
   for (const method of [
     "addDoc",

@@ -223,6 +223,12 @@ class RawInterop {
     return toJsResult(await callJavaMethod(resourceHandle(handle), "gcTxLogSegments"), { bridge: true });
   }
 
+  async connectionWithTransaction(handle, fn) {
+    throw new DatalevinError(
+      "Connection withTransaction is not exposed by the Node binding because Java interface callbacks deadlock when the callback calls back into Datalevin. Use transact() for a single Datalog transaction, or KV withTransaction for explicit KV transactions."
+    );
+  }
+
   async connectionReIndex(handle, schema = null, opts = null) {
     return _BINDINGS.connectionReIndex(resourceHandle(handle), schema, opts);
   }
@@ -237,6 +243,22 @@ class RawInterop {
 
   async keyValueClosed(handle) {
     return _BINDINGS.keyValueClosed(resourceHandle(handle));
+  }
+
+  async keyValueBeginTransaction(handle) {
+    return _BINDINGS.keyValueBeginTransaction(resourceHandle(handle));
+  }
+
+  async keyValueCommitTransaction(tx) {
+    return toJsResult(await _BINDINGS.keyValueCommitTransaction(resourceHandle(tx)));
+  }
+
+  async keyValueAbortTransaction(tx) {
+    return toJsResult(await _BINDINGS.keyValueAbortTransaction(resourceHandle(tx)));
+  }
+
+  async keyValueWithTransaction(handle, fn) {
+    return toJsResult(await _BINDINGS.keyValueWithTransaction(resourceHandle(handle), fn), { bridge: true });
   }
 
   async keyValueReIndex(handle, opts = null) {

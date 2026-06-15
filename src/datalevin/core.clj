@@ -321,6 +321,29 @@ Only usable for debug output.
 (u/import-macro conn/with-transaction)
 (u/import-macro conn/with-conn)
 
+(defn ^:no-doc with-transaction-fn
+  [conn f]
+  (conn/with-transaction [tx-conn conn]
+    (.apply ^java.util.function.Function f tx-conn)))
+
+(defn ^:no-doc with-transaction-kv-fn
+  [kv f]
+  (l/with-transaction-kv [tx-kv kv]
+    (.apply ^java.util.function.Function f tx-kv)))
+
+(defn ^:no-doc begin-kv-transaction
+  [kv]
+  (i/open-transact-kv kv))
+
+(defn ^:no-doc commit-kv-transaction
+  [kv]
+  (i/close-transact-kv kv))
+
+(defn ^:no-doc abort-kv-transaction
+  [kv]
+  (i/abort-transact-kv kv)
+  (i/close-transact-kv kv))
+
 (def ^{:arglists '([db]
                    [db n])
        :doc      "Get or set the cache limit of a Datalog DB. Default is 256. Set to 0 to

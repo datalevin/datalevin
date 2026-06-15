@@ -87,6 +87,33 @@ export class KV extends ResourceWrapper {
     await _BINDINGS.coreInvoke("open-list-dbi", args);
   }
 
+  async beginTransaction() {
+    return new KVTransaction(await _BINDINGS.keyValueBeginTransaction(this.rawHandle()));
+  }
+
+  async transaction() {
+    return this.beginTransaction();
+  }
+
+  async withTransaction(fn) {
+    if (typeof fn !== "function") {
+      throw new TypeError("fn must be a function.");
+    }
+    const tx = await this.beginTransaction();
+    try {
+      const result = await fn(tx);
+      if (tx.active()) {
+        await tx.commit();
+      }
+      return result;
+    } catch (error) {
+      if (tx.active()) {
+        await tx.abort();
+      }
+      throw error;
+    }
+  }
+
   async searchIndexWriter(opts = null) {
     const { SearchIndexWriter } = await import("./search.js");
     return new SearchIndexWriter(await _BINDINGS.searchIndexWriter(this.rawHandle(), opts));
@@ -391,5 +418,45 @@ export class KV extends ResourceWrapper {
 
   async dropDbi(dbiName) {
     await _BINDINGS.coreInvoke("drop-dbi", [this.rawHandle(), dbiName]);
+  }
+}
+
+export class KVTransaction extends KV {
+  constructor(handle) {
+    super(handle, { owned: false });
+  }
+
+  active() {
+    return !this._closed;
+  }
+
+  async commit() {
+    this.#requireActive();
+    try {
+      return toJsResult(await _BINDINGS.keyValueCommitTransaction(this.rawHandle()));
+    } finally {
+      this._closed = true;
+    }
+  }
+
+  async abort() {
+    this.#requireActive();
+    try {
+      return toJsResult(await _BINDINGS.keyValueAbortTransaction(this.rawHandle()));
+    } finally {
+      this._closed = true;
+    }
+  }
+
+  async close() {
+    if (!this._closed) {
+      await this.abort();
+    }
+  }
+
+  #requireActive() {
+    if (this._closed) {
+      throw new Error("KV transaction is closed.");
+    }
   }
 }

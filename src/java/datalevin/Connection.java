@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Handle for a Datalog connection.
@@ -17,8 +18,14 @@ import java.util.concurrent.CompletableFuture;
  */
 public final class Connection extends HandleResource {
     Connection(Object conn) {
+        this(conn, true);
+    }
+
+    Connection(Object conn, boolean owned) {
         super(conn,
-              resource -> ClojureRuntime.core("close", resource),
+              owned ? resource -> ClojureRuntime.core("close", resource)
+                    : resource -> {
+                    },
               "conn",
               "conn");
     }
@@ -103,6 +110,16 @@ public final class Connection extends HandleResource {
      */
     public void clear() {
         ClojureRuntime.core("clear", resource());
+    }
+
+    /**
+     * Runs {@code fn} inside a single Datalevin write transaction.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(Function<Connection, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return (T) ClojureRuntime.core("with-transaction-fn", resource(), wrapped);
     }
 
     /**

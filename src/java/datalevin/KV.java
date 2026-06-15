@@ -3,10 +3,12 @@ package datalevin;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
+import java.util.function.Function;
 
 /**
  * Handle for a local key-value store.
@@ -14,7 +16,7 @@ import java.util.function.BiPredicate;
  * <p>Use instances with try-with-resources when you own the handle lifecycle.
  * Methods in this class expose common DBI operations and range lookups.
  */
-public final class KV extends HandleResource {
+public class KV extends HandleResource {
 
     KV(Object kv) {
         this(kv, true);
@@ -69,6 +71,23 @@ public final class KV extends HandleResource {
      */
     public void openListDbi(String listName, Map<?, ?> opts) {
         ClojureRuntime.core("open-list-dbi", resource(), listName, DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Opens an explicit KV write transaction.
+     */
+    public KVTransaction beginTransaction() {
+        return new KVTransaction(this, ClojureRuntime.core("begin-kv-transaction", resource()));
+    }
+
+    /**
+     * Runs {@code fn} inside a single KV write transaction.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(Function<KV, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return (T) ClojureRuntime.core("with-transaction-kv-fn", resource(), wrapped);
     }
 
     /**

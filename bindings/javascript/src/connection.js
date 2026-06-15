@@ -38,10 +38,10 @@ function fetchLimit(limit, offset = 0) {
 }
 
 export class Connection extends ResourceWrapper {
-  constructor(handle) {
+  constructor(handle, { owned = true } = {}) {
     super(
       handle,
-      (rawHandle) => _BINDINGS.closeConnection(rawHandle),
+      owned ? (rawHandle) => _BINDINGS.closeConnection(rawHandle) : async () => {},
       (rawHandle) => _BINDINGS.connectionClosed(rawHandle),
       "connection"
     );

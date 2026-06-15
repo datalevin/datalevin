@@ -46,8 +46,9 @@ def _python_future(java_future):
 class Connection(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin connection handle."""
 
-    def __init__(self, handle) -> None:
-        super().__init__(handle, _BINDINGS.close_connection, _BINDINGS.connection_closed, "connection")
+    def __init__(self, handle, *, owned: bool = True) -> None:
+        close_fn = _BINDINGS.close_connection if owned else lambda _handle: None
+        super().__init__(handle, close_fn, _BINDINGS.connection_closed, "connection")
 
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
@@ -66,6 +67,9 @@ class Connection(ResourceWrapper):
 
     def clear(self) -> None:
         _BINDINGS.core_invoke("clear", [self.raw_handle()])
+
+    def with_transaction(self, fn):
+        return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn))
 
     def entid(self, eid):
         db = _BINDINGS.connection_db(self.raw_handle())

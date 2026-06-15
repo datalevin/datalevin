@@ -31,6 +31,7 @@ from ._interop import (
     tx_retract_entity,
     vector_attr,
     vector_options,
+    with_transaction,
     write_edn,
 )
 from ._jvm import jvm_started, start_jvm
@@ -44,7 +45,7 @@ from .errors import (
     DatalevinJavaError,
     DatalevinJvmError,
 )
-from .kv import KV
+from .kv import KV, KVTransaction
 from .search import SearchEngine, SearchIndexWriter
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
 
@@ -57,6 +58,7 @@ __all__ = [
     "DatalevinJavaError",
     "DatalevinJvmError",
     "KV",
+    "KVTransaction",
     "SearchEngine",
     "SearchIndexWriter",
     "UdfRegistry",
@@ -95,6 +97,7 @@ __all__ = [
     "udf_descriptor",
     "vector_attr",
     "vector_options",
+    "with_transaction",
     "write_edn",
 ]
 

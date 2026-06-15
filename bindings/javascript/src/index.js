@@ -40,9 +40,10 @@ export {
   txRetractEntity,
   vectorAttr,
   vectorOptions,
+  withTransaction,
   writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";
-export { KV } from "./kv.js";
+export { KV, KVTransaction } from "./kv.js";
 export { SearchEngine, SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";

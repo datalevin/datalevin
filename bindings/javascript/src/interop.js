@@ -1,5 +1,5 @@
 import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
-import { callJavaMethod, classes, jvmStarted, startJvm } from "./jvm.js";
+import { callJavaMethod, classes, javaBridgeModule, jvmStarted, startJvm } from "./jvm.js";
 
 async function unwrapInteropHandle(value) {
   if (typeof value?.rawHandle === "function") {
@@ -18,6 +18,36 @@ async function normalizeInteropArgs(args = []) {
     normalized.push(await unwrapInteropHandle(arg));
   }
   return normalized;
+}
+
+async function createFunctionProxy(fn) {
+  const { newProxy } = await javaBridgeModule();
+  return newProxy("java.util.function.Function", {
+    apply: async (value) => {
+      const result = await fn(value);
+      return toJava(result === undefined ? null : result);
+    }
+  });
+}
+
+let interfaceProxyEventLoopDepth = 0;
+let interfaceProxyEventLoopPrevious = false;
+
+async function withInterfaceProxyEventLoop(fn) {
+  const bridge = await javaBridgeModule();
+  if (interfaceProxyEventLoopDepth === 0) {
+    interfaceProxyEventLoopPrevious = bridge.config.runEventLoopWhenInterfaceProxyIsActive;
+    bridge.config.runEventLoopWhenInterfaceProxyIsActive = true;
+  }
+  interfaceProxyEventLoopDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    interfaceProxyEventLoopDepth -= 1;
+    if (interfaceProxyEventLoopDepth === 0) {
+      bridge.config.runEventLoopWhenInterfaceProxyIsActive = interfaceProxyEventLoopPrevious;
+    }
+  }
 }
 
 class InteropBindings {
@@ -310,6 +340,23 @@ class InteropBindings {
     );
   }
 
+  async connectionWithTransaction(handle, fn) {
+    const cls = await classes();
+    const proxy = await createFunctionProxy(fn);
+    try {
+      return await withInterfaceProxyEventLoop(async () => (
+        callJavaMethod(
+          cls.interop,
+          "connectionWithTransaction",
+          await unwrapInteropHandle(handle),
+          proxy
+        )
+      ));
+    } finally {
+      proxy.reset?.();
+    }
+  }
+
   async connectionReIndex(handle, schema = null, opts = null) {
     const cls = await classes();
     return callJavaMethod(
@@ -335,6 +382,38 @@ class InteropBindings {
 
   async keyValueClosed(handle) {
     return Boolean(await callJavaMethod(handle, "closed"));
+  }
+
+  async keyValueBeginTransaction(handle) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "keyValueBeginTransaction", await unwrapInteropHandle(handle));
+  }
+
+  async keyValueCommitTransaction(tx) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "keyValueCommitTransaction", await unwrapInteropHandle(tx));
+  }
+
+  async keyValueAbortTransaction(tx) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "keyValueAbortTransaction", await unwrapInteropHandle(tx));
+  }
+
+  async keyValueWithTransaction(handle, fn) {
+    const cls = await classes();
+    const proxy = await createFunctionProxy(fn);
+    try {
+      return await withInterfaceProxyEventLoop(async () => (
+        callJavaMethod(
+          cls.interop,
+          "keyValueWithTransaction",
+          await unwrapInteropHandle(handle),
+          proxy
+        )
+      ));
+    } finally {
+      proxy.reset?.();
+    }
   }
 
   async keyValueReIndex(handle, opts = null) {
@@ -701,6 +780,13 @@ export async function reIndex(target, opts = null, options = {}) {
     throw new TypeError("target must provide reIndex().");
   }
   return target.reIndex(opts, options);
+}
+
+export async function withTransaction(target, fn) {
+  if (typeof target?.withTransaction !== "function") {
+    throw new TypeError("target must provide withTransaction().");
+  }
+  return target.withTransaction(fn);
 }
 
 export async function keyword(value) {

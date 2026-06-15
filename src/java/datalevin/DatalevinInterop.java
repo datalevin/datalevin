@@ -404,6 +404,55 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Opens an explicit KV write transaction.
+     */
+    public static Object keyValueBeginTransaction(Object kv) {
+        Object rawKv = rawResource(kv);
+        return new KVTransaction(new KV(rawKv, false),
+                                 ClojureRuntime.core("begin-kv-transaction", rawKv));
+    }
+
+    /**
+     * Commits an explicit KV write transaction.
+     */
+    public static Object keyValueCommitTransaction(Object tx) {
+        if (tx instanceof KVTransaction transaction) {
+            return ClojureCodec.bridgeOutput(transaction.commit());
+        }
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("commit-kv-transaction", rawResource(tx)));
+    }
+
+    /**
+     * Aborts an explicit KV write transaction.
+     */
+    public static Object keyValueAbortTransaction(Object tx) {
+        if (tx instanceof KVTransaction transaction) {
+            return ClojureCodec.bridgeOutput(transaction.abort());
+        }
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("abort-kv-transaction", rawResource(tx)));
+    }
+
+    /**
+     * Runs a function inside a single KV write transaction.
+     */
+    public static Object keyValueWithTransaction(Object kv, Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-kv-fn",
+                                                             rawResource(kv),
+                                                             wrapped));
+    }
+
+    /**
+     * Runs a function inside a single Datalog write transaction.
+     */
+    public static Object connectionWithTransaction(Object conn, Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-fn",
+                                                             rawResource(conn),
+                                                             wrapped));
+    }
+
+    /**
      * Rebuilds a raw KV handle's index and returns a bridge-safe handle.
      */
     public static Object keyValueReIndex(Object kv, Map<?, ?> opts) {

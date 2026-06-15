@@ -4,7 +4,16 @@ from pathlib import Path
 
 import pytest
 
-from datalevin import api_info, connect, new_search_engine, open_kv, re_index, search_domain, search_index_writer
+from datalevin import (
+    api_info,
+    connect,
+    new_search_engine,
+    open_kv,
+    re_index,
+    search_domain,
+    search_index_writer,
+    with_transaction,
+)
 pytestmark = pytest.mark.usefixtures("require_runtime")
 
 
@@ -19,9 +28,16 @@ def test_local_datalog_smoke(tmp_path: Path) -> None:
         schema={":name": {":db/valueType": ":db.type/string"}},
     ) as conn:
         conn.transact([{":db/id": -1, ":name": "Ada"}])
+        assert conn.with_transaction(
+            lambda tx: tx.transact([{":db/id": -2, ":name": "Bob"}]) and "ok"
+        ) == "ok"
+        assert with_transaction(
+            conn,
+            lambda tx: tx.transact([{":db/id": -3, ":name": "Cara"}]) and "top",
+        ) == "top"
         assert conn.re_index() is conn
         names = conn.query("[:find [?name ...] :where [?e :name ?name]]")
-        assert names == ["Ada"]
+        assert sorted(names) == ["Ada", "Bob", "Cara"]
 
 
 def test_structured_query_forms_and_inputs(tmp_path: Path) -> None:
@@ -61,8 +77,20 @@ def test_kv_range_specs_accept_python_forms(tmp_path: Path) -> None:
             [2, "b"],
             [3, "c"],
         ]
+        assert kv.with_transaction(
+            lambda tx: tx.transact([(":put", 4, "d")], "items", ":long", ":string")
+            and tx.get_value("items", 4, ":long", ":string", ignore_key=True)
+        ) == "d"
+        with kv.transaction() as tx:
+            tx.transact([(":put", 5, "e")], "items", ":long", ":string")
+            assert tx.commit() == ":committed"
+        with kv.transaction() as tx:
+            tx.transact([(":put", 6, "f")], "items", ":long", ":string")
+            assert tx.abort() == ":aborted"
+        assert kv.get_value("items", 5, ":long", ":string", ignore_key=True) == "e"
+        assert kv.get_value("items", 6, ":long", ":string", ignore_key=True) is None
         assert re_index(kv) is kv
-        assert kv.entries("items") == 3
+        assert kv.entries("items") == 5
 
 
 def test_search_index_writer_commits_to_kv_index(tmp_path: Path) -> None:

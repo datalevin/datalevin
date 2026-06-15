@@ -63,6 +63,15 @@ class KV(ResourceWrapper):
             args.append(_BINDINGS.options(opts))
         _BINDINGS.core_invoke("open-list-dbi", args)
 
+    def begin_transaction(self):
+        return KVTransaction(_BINDINGS.key_value_begin_transaction(self.raw_handle()))
+
+    def transaction(self):
+        return self.begin_transaction()
+
+    def with_transaction(self, fn):
+        return to_python(_BINDINGS.key_value_with_transaction(self.raw_handle(), fn))
+
     def search_index_writer(self, opts=None):
         from .search import SearchIndexWriter
 
@@ -296,3 +305,34 @@ class KV(ResourceWrapper):
 
     def drop_dbi(self, dbi_name) -> None:
         _BINDINGS.core_invoke("drop-dbi", [self.raw_handle(), dbi_name])
+
+
+class KVTransaction(KV):
+    """Explicit KV write transaction."""
+
+    def __init__(self, handle) -> None:
+        super().__init__(handle, owned=False)
+        self._finished = False
+
+    def active(self) -> bool:
+        return self._handle is not None and not self._finished
+
+    def commit(self):
+        handle = self.raw_handle()
+        try:
+            return to_python(_BINDINGS.key_value_commit_transaction(handle))
+        finally:
+            self._finished = True
+            self._handle = None
+
+    def abort(self):
+        handle = self.raw_handle()
+        try:
+            return to_python(_BINDINGS.key_value_abort_transaction(handle))
+        finally:
+            self._finished = True
+            self._handle = None
+
+    def close(self) -> None:
+        if self.active():
+            self.abort()
