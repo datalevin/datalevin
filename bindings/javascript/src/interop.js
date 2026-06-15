@@ -113,6 +113,56 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "connectionDb", handle);
   }
 
+  async connectionEntity(handle, eid) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionEntity",
+      await unwrapInteropHandle(handle),
+      await toJava(eid)
+    );
+  }
+
+  async entityIs(value) {
+    if (value === null || value === undefined || (typeof value !== "object" && typeof value !== "function")) {
+      return false;
+    }
+    const cls = await classes();
+    return Boolean(await callJavaMethod(cls.interop, "entityIs", value));
+  }
+
+  async entityId(entity) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "entityId", await unwrapInteropHandle(entity));
+  }
+
+  async entityGet(entity, attr) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "entityGet",
+      await unwrapInteropHandle(entity),
+      await toJava(attr)
+    );
+  }
+
+  async entityContains(entity, attr) {
+    const cls = await classes();
+    return Boolean(
+      await callJavaMethod(
+        cls.interop,
+        "entityContains",
+        await unwrapInteropHandle(entity),
+        await toJava(attr)
+      )
+    );
+  }
+
+  async entityTouch(entity) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "entityTouch", await unwrapInteropHandle(entity));
+  }
+
   async connectionTransactAsync(handle, txData, txMeta = null) {
     const cls = await classes();
     return callJavaMethod(

@@ -101,9 +101,11 @@ test("public surface stays importable without starting the JVM", () => {
     ":udf/id": ":math/inc"
   });
   assert.equal(typeof datalevin.Connection, "function");
+  assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
+  assert.equal(typeof datalevin.Entity.prototype.touch, "function");
   assert.equal(typeof datalevin.Connection.prototype.fillDb, "function");
   for (const method of [
     "countDatoms",
@@ -111,6 +113,7 @@ test("public surface stays importable without starting the JVM", () => {
     "createSnapshot",
     "datalogKv",
     "datoms",
+    "entityMap",
     "fulltextDatoms",
     "gcTxLogSegments",
     "indexRange",

@@ -1,8 +1,12 @@
 package datalevin;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
 
@@ -156,6 +160,64 @@ public final class DatalevinInterop {
      */
     public static Object connectionDb(Object conn) {
         return ClojureRuntime.core("db", rawResource(conn));
+    }
+
+    /**
+     * Returns a Java handle for a lazy entity id or lookup ref.
+     */
+    public static LazyEntity connectionEntity(Object conn, Object eid) {
+        Object entity = ClojureRuntime.core("entity",
+                                            connectionDb(conn),
+                                            DatalevinForms.lookupRefInput(eid));
+        return entity == null ? null : new LazyEntity(entity);
+    }
+
+    /**
+     * Returns whether a value is a Datalevin lazy entity handle.
+     */
+    public static boolean entityIs(Object value) {
+        return value instanceof LazyEntity || rawEntity(value);
+    }
+
+    /**
+     * Returns the bridge-safe entity id for a lazy entity handle.
+     */
+    public static Object entityId(Object entity) {
+        return ClojureCodec.bridgeOutput(
+                ClojureRuntime.invoke("clojure.core",
+                                      "get",
+                                      rawResource(entity),
+                                      ClojureCodec.keyword(":db/id")));
+    }
+
+    /**
+     * Reads one attribute from a lazy entity handle without touching the whole
+     * entity.
+     */
+    public static Object entityGet(Object entity, Object attr) {
+        return bridgeEntityValue(ClojureRuntime.invoke("clojure.core",
+                                                       "get",
+                                                       rawResource(entity),
+                                                       DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Returns whether a lazy entity handle has a value for the supplied
+     * attribute.
+     */
+    public static boolean entityContains(Object entity, Object attr) {
+        return ClojureCodec.javaBoolean(
+                ClojureRuntime.invoke("clojure.core",
+                                      "contains?",
+                                      rawResource(entity),
+                                      DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Touches and materializes a lazy entity handle into bridge-safe data.
+     */
+    public static Object entityTouch(Object entity) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", rawResource(entity)));
     }
 
     /**
@@ -643,10 +705,70 @@ public final class DatalevinInterop {
         if (value instanceof HandleResource handle) {
             return handle.handle();
         }
+        if (value instanceof LazyEntity entity) {
+            return entity.handle();
+        }
         if (value instanceof UdfRegistry registry) {
             return registry.rawHandle();
         }
         return value;
+    }
+
+    private static boolean rawEntity(Object value) {
+        return value != null && "datalevin.entity.Entity".equals(value.getClass().getName());
+    }
+
+    private static Object bridgeEntityValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+
+        if (rawEntity(value)) {
+            return new LazyEntity(value);
+        }
+
+        if (value instanceof Map<?, ?> map) {
+            LinkedHashMap<Object, Object> result = new LinkedHashMap<>(map.size());
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                result.put(ClojureCodec.bridgeOutput(entry.getKey()),
+                           bridgeEntityValue(entry.getValue()));
+            }
+            return result;
+        }
+
+        if (value instanceof Set<?> set) {
+            LinkedHashSet<Object> result = new LinkedHashSet<>(set.size());
+            for (Object item : set) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Collection<?> collection) {
+            ArrayList<Object> result = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Iterable<?> iterable) {
+            ArrayList<Object> result = new ArrayList<>();
+            for (Object item : iterable) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Object[] array) {
+            ArrayList<Object> result = new ArrayList<>(array.length);
+            for (Object item : array) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        return ClojureCodec.bridgeOutput(value);
     }
 
     private static Object connectionStore(Object conn) {

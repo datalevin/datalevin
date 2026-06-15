@@ -72,6 +72,10 @@ final class ClojureCodec {
             return registry.rawHandle();
         }
 
+        if (value instanceof LazyEntity entity) {
+            return entity.handle();
+        }
+
         if (value instanceof UdfDescriptor descriptor) {
             return descriptor.buildForm();
         }

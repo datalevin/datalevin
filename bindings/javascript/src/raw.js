@@ -71,6 +71,30 @@ class RawInterop {
     );
   }
 
+  async connectionEntity(handle, eid) {
+    return _BINDINGS.connectionEntity(resourceHandle(handle), eid);
+  }
+
+  async entityIs(value) {
+    return _BINDINGS.entityIs(value);
+  }
+
+  async entityId(entity) {
+    return _BINDINGS.entityId(resourceHandle(entity));
+  }
+
+  async entityGet(entity, attr) {
+    return _BINDINGS.entityGet(resourceHandle(entity), attr);
+  }
+
+  async entityContains(entity, attr) {
+    return _BINDINGS.entityContains(resourceHandle(entity), attr);
+  }
+
+  async entityTouch(entity) {
+    return toJsResult(await _BINDINGS.entityTouch(resourceHandle(entity)), { bridge: true });
+  }
+
   async connectionDatalogKv(handle) {
     return callJavaMethod(resourceHandle(handle), "datalogKV");
   }

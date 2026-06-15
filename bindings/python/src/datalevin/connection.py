@@ -72,11 +72,18 @@ class Connection(ResourceWrapper):
         return to_python(_BINDINGS.core_invoke("entid", [db, _BINDINGS.lookup_ref(eid)]))
 
     def entity(self, eid):
-        db = _BINDINGS.connection_db(self.raw_handle())
-        entity = _BINDINGS.core_invoke("entity", [db, _BINDINGS.lookup_ref(eid)])
+        from .entity import Entity
+
+        entity = _BINDINGS.connection_entity(self.raw_handle(), eid)
         if entity is None:
             return None
-        return to_python(_BINDINGS.core_invoke("touch", [entity]))
+        return Entity(entity)
+
+    def entity_map(self, eid):
+        entity = _BINDINGS.connection_entity(self.raw_handle(), eid)
+        if entity is None:
+            return None
+        return to_python(_BINDINGS.entity_touch(entity))
 
     def pull(self, selector, eid):
         db = _BINDINGS.connection_db(self.raw_handle())

@@ -7,6 +7,7 @@ import { after, test } from "node:test";
 import {
   DatalevinError,
   DatalevinJavaError,
+  Entity,
   apiInfo,
   connect,
   createUdfRegistry,
@@ -105,7 +106,8 @@ test(
           fulltext: true,
           extra: { ":db.fulltext/autoDomain": true }
         }),
-        ":status": schemaAttr({ valueType: ":db.type/keyword" })
+        ":status": schemaAttr({ valueType: ":db.type/keyword" }),
+        ":friend": schemaAttr({ valueType: ":db.type/ref" })
       }
     });
 
@@ -117,7 +119,8 @@ test(
         txEntity(-1, {
           ":name": "Ada",
           ":bio": "Ada builds database systems",
-          ":status": await keyword(":active")
+          ":status": await keyword(":active"),
+          ":friend": -2
         }),
         txEntity(-2, {
           ":name": "Bob",
@@ -156,13 +159,22 @@ test(
       await conn.updateSchema(null, { delAttrs: [":age"] });
 
       assert.equal(Array.isArray(tx[":tx-data"]), true);
-      assert.equal(tx[":tx-data"].length, 6);
+      assert.equal(tx[":tx-data"].length, 7);
       assert.equal(Array.isArray(asyncTx[":tx-data"]), true);
       assert.equal(Array.isArray(topAsyncTx[":tx-data"]), true);
       assert.equal(":name" in await conn.schema(), true);
       assert.equal(typeof await conn.opts(), "object");
       assert.equal(intValue(await conn.entid([":name", "Ada"])), 1);
-      assert.equal(entity[":name"], "Ada");
+      assert.equal(intValue(await entity.id()), 1);
+      assert.equal(intValue(await entity.get(":db/id")), 1);
+      assert.equal(await entity.get(":name"), "Ada");
+      assert.equal(await entity.has(":name"), true);
+      assert.equal(await entity.get(":missing", "fallback"), "fallback");
+      const friend = await entity.get(":friend");
+      assert.equal(friend instanceof Entity, true);
+      assert.equal(await friend.get(":name"), "Bob");
+      assert.equal((await entity.touch())[":name"], "Ada");
+      assert.equal((await conn.entityMap([":name", "Ada"]))[":name"], "Ada");
       assert.equal((await conn.pull([":status"], 1))[":status"], ":active");
       assert.deepEqual(await conn.pull([":name"], 1), { ":name": "Ada" });
       assert.deepEqual(await conn.pullMany([":name"], [1, [":name", "Bob"]]), [

@@ -1,5 +1,6 @@
 export { Client } from "./client.js";
 export { Connection } from "./connection.js";
+export { Entity } from "./entity.js";
 export {
   DatalevinConfigurationError,
   DatalevinError,

@@ -48,6 +48,26 @@ class InteropBindings:
     def connection_db(self, handle):
         return call_java(classes().interop.connectionDb, handle)
 
+    def connection_entity(self, handle, eid):
+        return call_java(classes().interop.connectionEntity, handle, to_java(eid))
+
+    def entity_is(self, value) -> bool:
+        if value is None:
+            return False
+        return bool(call_java(classes().interop.entityIs, value))
+
+    def entity_id(self, entity):
+        return call_java(classes().interop.entityId, entity)
+
+    def entity_get(self, entity, attr):
+        return call_java(classes().interop.entityGet, entity, to_java(attr))
+
+    def entity_contains(self, entity, attr) -> bool:
+        return bool(call_java(classes().interop.entityContains, entity, to_java(attr)))
+
+    def entity_touch(self, entity):
+        return call_java(classes().interop.entityTouch, entity)
+
     def connection_datalog_kv(self, handle):
         return call_java(classes().interop.connectionDatalogKv, handle)
 

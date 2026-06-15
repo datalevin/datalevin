@@ -74,6 +74,23 @@ const form = await readEdn("[:find ?e :where [?e :name _]]");
 const text = await writeEdn([":find", "?e", ":where", ["?e", ":name", "_"]]);
 ```
 
+## Lazy Entity Example
+
+`conn.entity()` returns a lazy entity wrapper. Use `get()` for individual
+attributes, and call `touch()` only when you want a fully materialized object.
+`entityMap()` is available for the old eager touched-object shape.
+
+```js
+const entity = await conn.entity([":name", "Ada"]);
+
+console.log(await entity.id());
+console.log(await entity.get(":name"));
+console.log(await entity.get(":db/id"));
+
+const touched = await entity.touch();
+const eager = await conn.entityMap(1);
+```
+
 ## Search, Vector, and Idoc Builders
 
 Use helper builders for search/vector/idoc schema and option maps instead of

@@ -3,6 +3,7 @@ from __future__ import annotations
 import pytest
 
 from datalevin import (
+    Entity,
     connect,
     datalog_kv,
     datom,
@@ -34,6 +35,7 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
                 extra={":db.fulltext/autoDomain": True},
             ),
             ":status": schema_attr(value_type=":db.type/keyword"),
+            ":friend": schema_attr(value_type=":db.type/ref"),
         },
     ) as conn:
         assert repr(conn) == "<Connection open>"
@@ -47,6 +49,7 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
                         ":name": "Ada",
                         ":bio": "Ada builds database systems",
                         ":status": keyword(":active"),
+                        ":friend": -2,
                     },
                 ),
                 tx_entity(
@@ -70,6 +73,18 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert ":name" in conn.schema()
         assert isinstance(conn.opts(), dict)
         assert conn.entid([":name", "Ada"]) == 1
+        entity = conn.entity(1)
+        assert entity.id == 1
+        assert entity[":db/id"] == 1
+        assert entity.get(":name") == "Ada"
+        assert entity[":name"] == "Ada"
+        assert ":name" in entity
+        assert entity.get(":missing", "fallback") == "fallback"
+        friend = entity.get(":friend")
+        assert isinstance(friend, Entity)
+        assert friend.get(":name") == "Bob"
+        assert entity.touch()[":name"] == "Ada"
+        assert conn.entity_map([":name", "Ada"])[":name"] == "Ada"
         assert conn.pull([":name"], 1) == {":name": "Ada"}
         assert conn.pull([":status"], 1) == {":status": ":active"}
         assert conn.pull_many([":name"], [1, [":name", "Bob"]]) == [

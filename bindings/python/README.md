@@ -75,6 +75,23 @@ form = read_edn("[:find ?e :where [?e :name _]]")
 text = write_edn([":find", "?e", ":where", ["?e", ":name", "_"]])
 ```
 
+## Lazy Entity Example
+
+`conn.entity()` returns a lazy entity wrapper. Use `get()` or index syntax for
+individual attributes, and call `touch()` only when you want a fully materialized
+dictionary. `entity_map()` is available for the old eager touched-map shape.
+
+```python
+entity = conn.entity([":name", "Ada"])
+
+print(entity.id)
+print(entity.get(":name"))
+print(entity[":db/id"])
+
+touched = entity.touch()
+eager = conn.entity_map(1)
+```
+
 ## Search, Vector, and Idoc Builders
 
 Use helper builders for search/vector/idoc schema and option maps instead of

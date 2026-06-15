@@ -34,6 +34,7 @@ from ._jvm import jvm_started, start_jvm
 from ._raw import interop
 from .client import Client
 from .connection import Connection
+from .entity import Entity
 from .errors import (
     DatalevinConfigurationError,
     DatalevinError,
@@ -47,6 +48,7 @@ __all__ = [
     "Client",
     "Connection",
     "DatalevinConfigurationError",
+    "Entity",
     "DatalevinError",
     "DatalevinJavaError",
     "DatalevinJvmError",

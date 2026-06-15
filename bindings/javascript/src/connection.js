@@ -80,6 +80,12 @@ export class Connection extends ResourceWrapper {
   }
 
   async entity(eid) {
+    const { Entity } = await import("./entity.js");
+    const entity = await _BINDINGS.connectionEntity(this.rawHandle(), eid);
+    return entity === null || entity === undefined ? null : new Entity(entity);
+  }
+
+  async entityMap(eid) {
     return toJsResult(await callJavaMethod(this.rawHandle(), "entityMap", await toJava(eid)));
   }
 

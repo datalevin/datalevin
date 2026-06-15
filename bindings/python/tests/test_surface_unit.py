@@ -4,6 +4,7 @@ import json
 
 import pytest
 
+import datalevin
 import datalevin._jvm as jvm_module
 import datalevin.client as client_module
 import datalevin.connection as connection_module
@@ -327,12 +328,14 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(connection_module.Connection, "fill_db"))
+    assert callable(getattr(datalevin.Entity, "touch"))
     for method in [
         "count_datoms",
         "copy",
         "create_snapshot",
         "datalog_kv",
         "datoms",
+        "entity_map",
         "fulltext_datoms",
         "gc_tx_log_segments",
         "index_range",
