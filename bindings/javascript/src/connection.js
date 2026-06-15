@@ -185,6 +185,11 @@ export class Connection extends ResourceWrapper {
     return new KV(await callJavaMethod(this.rawHandle(), "datalogKV"), { owned: false });
   }
 
+  async reIndex(opts = null, { schema = null } = {}) {
+    this._handle = await _BINDINGS.connectionReIndex(this.rawHandle(), schema, opts);
+    return this;
+  }
+
   async datoms(index, { c1 = null, c2 = null, c3 = null, limit = null, offset = 0 } = {}) {
     const capped = fetchLimit(limit, offset);
     const args = [this.rawHandle(), "datoms", await toJava(index), await toJava(c1), await toJava(c2), await toJava(c3)];

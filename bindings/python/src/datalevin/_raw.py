@@ -101,6 +101,9 @@ class RawInterop:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
 
+    def connection_re_index(self, handle, schema=None, opts=None):
+        return _BINDINGS.connection_re_index(handle, schema, opts)
+
     def open_key_value(self, dir, opts=None):
         return _BINDINGS.open_key_value(dir, opts)
 
@@ -109,6 +112,33 @@ class RawInterop:
 
     def key_value_closed(self, handle):
         return _BINDINGS.key_value_closed(handle)
+
+    def key_value_re_index(self, handle, opts=None):
+        return _BINDINGS.key_value_re_index(handle, opts)
+
+    def new_search_engine(self, kv, opts=None):
+        return _BINDINGS.new_search_engine(kv, opts)
+
+    def search_add_doc(self, search, doc_ref, doc_text, check_exist=None):
+        return _BINDINGS.search_add_doc(search, doc_ref, doc_text, check_exist)
+
+    def search_remove_doc(self, search, doc_ref):
+        return _BINDINGS.search_remove_doc(search, doc_ref)
+
+    def search_clear_docs(self, search):
+        return _BINDINGS.search_clear_docs(search)
+
+    def search_doc_indexed(self, search, doc_ref):
+        return _BINDINGS.search_doc_indexed(search, doc_ref)
+
+    def search_doc_count(self, search):
+        return _BINDINGS.search_doc_count(search)
+
+    def search(self, search, query, opts=None):
+        return _BINDINGS.search(search, query, opts)
+
+    def search_re_index(self, search, opts=None):
+        return _BINDINGS.search_re_index(search, opts)
 
     def search_index_writer(self, kv, opts=None):
         return _BINDINGS.search_index_writer(kv, opts)

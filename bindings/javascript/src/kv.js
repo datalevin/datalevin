@@ -92,6 +92,16 @@ export class KV extends ResourceWrapper {
     return new SearchIndexWriter(await _BINDINGS.searchIndexWriter(this.rawHandle(), opts));
   }
 
+  async newSearchEngine(opts = null) {
+    const { SearchEngine } = await import("./search.js");
+    return new SearchEngine(await _BINDINGS.newSearchEngine(this.rawHandle(), opts));
+  }
+
+  async reIndex(opts = null) {
+    this._handle = await _BINDINGS.keyValueReIndex(this.rawHandle(), opts);
+    return this;
+  }
+
   async listDbis() {
     return toJsResult(await _BINDINGS.coreInvoke("list-dbis", [this.rawHandle()]));
   }

@@ -18,7 +18,9 @@ import {
   initDb,
   interop,
   keyword,
+  newSearchEngine,
   openKv,
+  reIndex,
   schemaAttr,
   searchDomain,
   searchIndexWriter,
@@ -197,6 +199,12 @@ test(
         (await conn.fulltextDatoms("async", { opts: { ":top": 5 } }))
           .some((row) => row[2] === "Async transactions help ingestion"),
         true
+      );
+      assert.equal(await conn.reIndex(), conn);
+      const namesAfterReIndex = await conn.query("[:find [?name ...] :where [?e :name ?name]]");
+      assert.deepEqual(
+        [...namesAfterReIndex].sort(),
+        ["Ada", "Bob"]
       );
       const backingKv = await conn.datalogKv();
       await backingKv.openDbi("app-state");
@@ -422,6 +430,15 @@ test(
 
       await kv.dropDbi("items");
       assert.deepEqual((await kv.listDbis()).sort(), ["blob-keys", "blobs", "list"]);
+
+      await kv.openDbi("post-reindex");
+      await kv.transact([[":put", "x", "xi"]], {
+        dbiName: "post-reindex",
+        kType: ":string",
+        vType: ":string"
+      });
+      assert.equal(await kv.reIndex(), kv);
+      assert.equal(intValue(await kv.entries("post-reindex")), 1);
     } finally {
       await kv.close();
     }
@@ -487,6 +504,24 @@ test(
       await notesWriter.write("note-1", "searchable local note");
       await notesWriter.commit();
       assert.equal(intValue(await kv.entries("notes/docs")), 1);
+
+      const engine = await newSearchEngine(kv, searchDomain({ includeText: true }));
+      assert.equal(String(engine), "<SearchEngine open>");
+      assert.equal(await engine.addDoc("doc-3", "pizza search engine"), engine);
+      await engine.addDoc("doc-4", "engine indexing", { checkExist: false });
+      assert.equal(intValue(await engine.docCount()), 4);
+      assert.equal(await engine.docIndexed("doc-3"), true);
+      assert.deepEqual(await engine.search("pizza"), ["doc-1", "doc-3"]);
+      assert.equal(await engine.reIndex(searchDomain({ includeText: true })), engine);
+      assert.deepEqual(await engine.search("pizza"), ["doc-1", "doc-3"]);
+      assert.equal(await reIndex(engine, searchDomain({ includeText: true })), engine);
+      await engine.removeDoc("doc-3");
+      assert.equal(await reIndex(engine), engine);
+      assert.equal(await engine.docIndexed("doc-3"), false);
+      await engine.clearDocs();
+      assert.equal(intValue(await engine.docCount()), 0);
+      await engine.close();
+      assert.equal(await engine.closed(), true);
     } finally {
       await kv.close();
     }

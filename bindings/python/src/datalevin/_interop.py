@@ -160,6 +160,9 @@ class InteropBindings:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return call_java(classes().interop.connectionGcTxLogSegments, handle, retain_floor_lsn)
 
+    def connection_re_index(self, handle, schema=None, opts=None):
+        return call_java(classes().interop.connectionReIndex, handle, to_java(schema), to_java(opts))
+
     def open_key_value(self, dir, opts=None):
         return call_java(classes().interop.openKeyValue, dir, to_java(opts))
 
@@ -168,6 +171,41 @@ class InteropBindings:
 
     def key_value_closed(self, handle) -> bool:
         return bool(call_java(classes().interop.keyValueClosed, handle))
+
+    def key_value_re_index(self, handle, opts=None):
+        return call_java(classes().interop.keyValueReIndex, handle, to_java(opts))
+
+    def new_search_engine(self, kv, opts=None):
+        handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
+        return call_java(classes().interop.newSearchEngine, handle, to_java(opts))
+
+    def search_add_doc(self, search, doc_ref, doc_text, check_exist=None):
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return call_java(classes().interop.searchAddDoc, handle, to_java(doc_ref), doc_text, check_exist)
+
+    def search_remove_doc(self, search, doc_ref):
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return call_java(classes().interop.searchRemoveDoc, handle, to_java(doc_ref))
+
+    def search_clear_docs(self, search):
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return call_java(classes().interop.searchClearDocs, handle)
+
+    def search_doc_indexed(self, search, doc_ref) -> bool:
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return bool(call_java(classes().interop.searchDocIndexed, handle, to_java(doc_ref)))
+
+    def search_doc_count(self, search) -> int:
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return int(call_java(classes().interop.searchDocCount, handle))
+
+    def search(self, search, query, opts=None):
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return call_java(classes().interop.search, handle, query, to_java(opts))
+
+    def search_re_index(self, search, opts=None):
+        handle = search.raw_handle() if callable(getattr(search, "raw_handle", None)) else search
+        return call_java(classes().interop.searchReIndex, handle, to_java(opts))
 
     def search_index_writer(self, kv, opts=None):
         handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
@@ -636,6 +674,12 @@ def datalog_kv(conn: Connection) -> KV:
     return KV(_BINDINGS.connection_datalog_kv(handle), owned=False)
 
 
+def re_index(target, opts=None, *, schema=None):
+    """Rebuild indexes for a Connection, KV, or SearchEngine wrapper."""
+
+    return target.re_index(opts, schema=schema) if schema is not None else target.re_index(opts)
+
+
 def datom(e, attr, value, tx=_MISSING, added=_MISSING):
     """Create Datom-shaped data for `init_db()` or `fill_db()`."""
 
@@ -665,6 +709,14 @@ def open_kv(dir, opts=None) -> KV:
     from .kv import KV
 
     return KV(_BINDINGS.open_key_value(dir, opts))
+
+
+def new_search_engine(kv: KV, opts=None):
+    """Create a full-text search engine for a KV store."""
+
+    from .search import SearchEngine
+
+    return SearchEngine(_BINDINGS.new_search_engine(kv, opts))
 
 
 def search_index_writer(kv: KV, opts=None):
@@ -702,7 +754,9 @@ __all__ = [
     "new_client",
     "open_kv",
     "read_edn",
+    "re_index",
     "schema_attr",
+    "new_search_engine",
     "search_index_writer",
     "search_domain",
     "search_options",

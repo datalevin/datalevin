@@ -203,3 +203,7 @@ class Connection(ResourceWrapper):
 
     def gc_tx_log_segments(self, retain_floor_lsn=None):
         return to_python(_BINDINGS.connection_gc_tx_log_segments(self.raw_handle(), retain_floor_lsn))
+
+    def re_index(self, opts=None, *, schema=None):
+        self._handle = _BINDINGS.connection_re_index(self.raw_handle(), schema, opts)
+        return self

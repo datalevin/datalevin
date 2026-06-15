@@ -295,6 +295,102 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a full-text search engine over {@code kv}.
+     */
+    public static SearchEngine newSearchEngine(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine();
+    }
+
+    /**
+     * Creates a full-text search engine with raw options.
+     */
+    public static SearchEngine newSearchEngine(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine(opts);
+    }
+
+    /**
+     * Creates a full-text search engine with typed options.
+     */
+    public static SearchEngine newSearchEngine(KV kv, RetrievalOptions opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine(opts);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text.
+     */
+    public static SearchEngine reIndex(SearchEngine engine) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex();
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text with raw options.
+     */
+    public static SearchEngine reIndex(SearchEngine engine, Map<?, ?> opts) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text with typed options.
+     */
+    public static SearchEngine reIndex(SearchEngine engine, RetrievalOptions opts) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a KV store index and returns the same wrapper.
+     */
+    public static KV reIndex(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.reIndex();
+    }
+
+    /**
+     * Rebuilds a KV store index with options and returns the same wrapper.
+     */
+    public static KV reIndex(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index and returns the same wrapper.
+     */
+    public static Connection reIndex(Connection conn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex();
+    }
+
+    /**
+     * Rebuilds a Datalog database index with options and returns the same wrapper.
+     */
+    public static Connection reIndex(Connection conn, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index with a raw schema and options.
+     */
+    public static Connection reIndex(Connection conn, Map<?, ?> schema, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(schema, opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index with a typed schema and options.
+     */
+    public static Connection reIndex(Connection conn, Schema schema, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(schema, opts);
+    }
+
+    /**
      * Opens a remote admin client for the given Datalevin URI.
      */
     public static Client newClient(String uri) {

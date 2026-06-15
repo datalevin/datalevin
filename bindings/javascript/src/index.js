@@ -23,8 +23,10 @@ export {
   jvmStarted,
   keyword,
   newClient,
+  newSearchEngine,
   openKv,
   readEdn,
+  reIndex,
   schemaAttr,
   searchIndexWriter,
   searchDomain,
@@ -42,5 +44,5 @@ export {
 } from "./interop.js";
 export { interop } from "./raw.js";
 export { KV } from "./kv.js";
-export { SearchIndexWriter } from "./search.js";
+export { SearchEngine, SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";

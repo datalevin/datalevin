@@ -21,8 +21,10 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.jvmStarted, "function");
   assert.equal(typeof datalevin.keyword, "function");
   assert.equal(typeof datalevin.newClient, "function");
+  assert.equal(typeof datalevin.newSearchEngine, "function");
   assert.equal(typeof datalevin.openKv, "function");
   assert.equal(typeof datalevin.readEdn, "function");
+  assert.equal(typeof datalevin.reIndex, "function");
   assert.equal(typeof datalevin.schemaAttr, "function");
   assert.equal(typeof datalevin.searchIndexWriter, "function");
   assert.equal(typeof datalevin.searchDomain, "function");
@@ -111,6 +113,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
+  assert.equal(typeof datalevin.SearchEngine, "function");
   assert.equal(typeof datalevin.SearchIndexWriter, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
@@ -128,6 +131,7 @@ test("public surface stays importable without starting the JVM", () => {
     "indexRange",
     "listSnapshots",
     "openTxLog",
+    "reIndex",
     "rseekDatoms",
     "searchDatoms",
     "seekDatoms",
@@ -152,9 +156,11 @@ test("public surface stays importable without starting the JVM", () => {
     "keyRangeCount",
     "listCount",
     "listSnapshots",
+    "newSearchEngine",
     "openTxLog",
     "putListItems",
     "rangeCount",
+    "reIndex",
     "sampleKv",
     "searchIndexWriter",
     "stat",
@@ -162,6 +168,17 @@ test("public surface stays importable without starting the JVM", () => {
     "txLogWatermarks"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");
+  }
+  for (const method of [
+    "addDoc",
+    "clearDocs",
+    "docCount",
+    "docIndexed",
+    "reIndex",
+    "removeDoc",
+    "search"
+  ]) {
+    assert.equal(typeof datalevin.SearchEngine.prototype[method], "function");
   }
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.write, "function");
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.commit, "function");

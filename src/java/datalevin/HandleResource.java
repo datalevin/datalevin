@@ -67,6 +67,20 @@ abstract class HandleResource implements AutoCloseable {
         return resource.get() == null;
     }
 
+    protected final Object replaceResource(Object next) {
+        Objects.requireNonNull(next, "next");
+        synchronized (jsonLock) {
+            Object current = requireResource();
+            awaitJsonCalls();
+            if (jsonHandle != null) {
+                ClojureRuntime.jsonApi("unregister!", jsonSession, jsonHandle);
+                jsonHandle = null;
+            }
+            resource.set(next);
+            return current;
+        }
+    }
+
     private Object requireResource() {
         Object current = resource.get();
         if (current == null) {

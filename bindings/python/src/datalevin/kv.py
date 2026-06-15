@@ -116,6 +116,15 @@ class KV(ResourceWrapper):
             args.append(retain_floor_lsn)
         return to_python(_BINDINGS.core_invoke("gc-txlog-segments!", args))
 
+    def re_index(self, opts=None):
+        self._handle = _BINDINGS.key_value_re_index(self.raw_handle(), opts)
+        return self
+
+    def new_search_engine(self, opts=None):
+        from .search import SearchEngine
+
+        return SearchEngine(_BINDINGS.new_search_engine(self.raw_handle(), opts))
+
     def transact(self, txs, dbi_name=None, k_type=None, v_type=None):
         if dbi_name is None and (k_type is not None or v_type is not None):
             raise ValueError("k_type and v_type require dbi_name for KV transact().")

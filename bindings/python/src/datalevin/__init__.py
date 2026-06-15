@@ -15,8 +15,10 @@ from ._interop import (
     init_db,
     keyword,
     new_client,
+    new_search_engine,
     open_kv,
     read_edn,
+    re_index,
     schema_attr,
     search_index_writer,
     search_domain,
@@ -43,7 +45,7 @@ from .errors import (
     DatalevinJvmError,
 )
 from .kv import KV
-from .search import SearchIndexWriter
+from .search import SearchEngine, SearchIndexWriter
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
 
 __all__ = [
@@ -55,6 +57,7 @@ __all__ = [
     "DatalevinJavaError",
     "DatalevinJvmError",
     "KV",
+    "SearchEngine",
     "SearchIndexWriter",
     "UdfRegistry",
     "api_info",
@@ -74,8 +77,10 @@ __all__ = [
     "jvm_started",
     "keyword",
     "new_client",
+    "new_search_engine",
     "open_kv",
     "read_edn",
+    "re_index",
     "schema_attr",
     "search_index_writer",
     "search_domain",

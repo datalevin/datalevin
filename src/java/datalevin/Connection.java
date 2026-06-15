@@ -106,6 +106,48 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Rebuilds this Datalog database index and returns this handle.
+     */
+    public Connection reIndex() {
+        return reIndex((Map<?, ?>) null);
+    }
+
+    /**
+     * Rebuilds this Datalog database index with options and returns this handle.
+     */
+    public Connection reIndex(Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
+    }
+
+    /**
+     * Rebuilds this Datalog database index with a raw schema and options.
+     */
+    public Connection reIndex(Map<?, ?> schema, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.schemaInput(schema),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
+    }
+
+    /**
+     * Rebuilds this Datalog database index with a typed schema and options.
+     */
+    public Connection reIndex(Schema schema, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          schema == null ? null : schema.buildForm(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
+    }
+
+    /**
      * Returns the highest entity id currently allocated.
      */
     public long maxEid() {

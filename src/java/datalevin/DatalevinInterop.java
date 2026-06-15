@@ -404,6 +404,129 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Rebuilds a raw KV handle's index and returns a bridge-safe handle.
+     */
+    public static Object keyValueReIndex(Object kv, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          rawResource(kv),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        if (kv instanceof KV keyValue) {
+            keyValue.replaceResource(next);
+            return keyValue;
+        }
+        return next;
+    }
+
+    /**
+     * Rebuilds a raw connection handle's index and returns a bridge-safe handle.
+     */
+    public static Object connectionReIndex(Object conn, Map<?, ?> schema, Map<?, ?> opts) {
+        Object next = schema == null
+                ? ClojureRuntime.core("re-index",
+                                      rawResource(conn),
+                                      DatalevinForms.optionsInput(opts == null ? Map.of() : opts))
+                : ClojureRuntime.core("re-index",
+                                      rawResource(conn),
+                                      DatalevinForms.schemaInput(schema),
+                                      DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        if (conn instanceof Connection connection) {
+            connection.replaceResource(next);
+            return connection;
+        }
+        return next;
+    }
+
+    /**
+     * Creates a raw full-text search engine handle.
+     */
+    public static Object newSearchEngine(Object kv, Map<?, ?> opts) {
+        Object rawKv = rawResource(kv);
+        if (opts == null) {
+            Object optsForm = DatalevinForms.optionsInput(Map.of());
+            return new SearchEngine(ClojureRuntime.core("new-search-engine", rawKv, optsForm), optsForm);
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts);
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", rawKv, optsForm), optsForm);
+    }
+
+    /**
+     * Adds one document to a full-text search engine handle.
+     */
+    public static Object searchAddDoc(Object search, Object docRef, String docText, Boolean checkExist) {
+        Object result = checkExist == null
+                ? ClojureRuntime.core("add-doc",
+                                      rawResource(search),
+                                      ClojureCodec.runtimeInput(docRef),
+                                      docText)
+                : ClojureRuntime.core("add-doc",
+                                      rawResource(search),
+                                      ClojureCodec.runtimeInput(docRef),
+                                      docText,
+                                      checkExist);
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Removes one document from a full-text search engine handle.
+     */
+    public static Object searchRemoveDoc(Object search, Object docRef) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("remove-doc",
+                                                             rawResource(search),
+                                                             ClojureCodec.runtimeInput(docRef)));
+    }
+
+    /**
+     * Clears a full-text search engine handle.
+     */
+    public static Object searchClearDocs(Object search) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("clear-docs", rawResource(search)));
+    }
+
+    /**
+     * Returns whether one document is indexed in a full-text search engine.
+     */
+    public static boolean searchDocIndexed(Object search, Object docRef) {
+        return ClojureRuntime.core("doc-indexed?",
+                                   rawResource(search),
+                                   ClojureCodec.runtimeInput(docRef)) != null;
+    }
+
+    /**
+     * Returns the document count for a full-text search engine.
+     */
+    public static long searchDocCount(Object search) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("doc-count", rawResource(search)));
+    }
+
+    /**
+     * Searches a full-text search engine.
+     */
+    public static Object search(Object search, String query, Map<?, ?> opts) {
+        Object result = opts == null
+                ? ClojureRuntime.core("search", rawResource(search), query)
+                : ClojureRuntime.core("search",
+                                      rawResource(search),
+                                      query,
+                                      DatalevinForms.optionsInput(opts));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text.
+     */
+    public static Object searchReIndex(Object search, Map<?, ?> opts) {
+        if (search instanceof SearchEngine engine) {
+            engine.reIndex(opts);
+            return engine;
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts == null ? Map.of() : opts);
+        Object next = ClojureRuntime.core("re-index",
+                                          rawResource(search),
+                                          optsForm);
+        return new SearchEngine(next, optsForm);
+    }
+
+    /**
      * Creates a raw batched full-text search index writer handle.
      */
     public static Object searchIndexWriter(Object kv, Map<?, ?> opts) {

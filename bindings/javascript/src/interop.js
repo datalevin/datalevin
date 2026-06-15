@@ -310,6 +310,17 @@ class InteropBindings {
     );
   }
 
+  async connectionReIndex(handle, schema = null, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionReIndex",
+      await unwrapInteropHandle(handle),
+      hasValue(schema) ? await toJava(schema) : null,
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
   async openKeyValue(dir, opts = null) {
     const cls = await classes();
     if (opts !== null && opts !== undefined) {
@@ -324,6 +335,91 @@ class InteropBindings {
 
   async keyValueClosed(handle) {
     return Boolean(await callJavaMethod(handle, "closed"));
+  }
+
+  async keyValueReIndex(handle, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "keyValueReIndex",
+      await unwrapInteropHandle(handle),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async newSearchEngine(kv, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "newSearchEngine",
+      await unwrapInteropHandle(kv),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async searchAddDoc(search, docRef, docText, checkExist = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "searchAddDoc",
+      await unwrapInteropHandle(search),
+      await toJava(docRef),
+      docText,
+      hasValue(checkExist) ? Boolean(checkExist) : null
+    );
+  }
+
+  async searchRemoveDoc(search, docRef) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "searchRemoveDoc",
+      await unwrapInteropHandle(search),
+      await toJava(docRef)
+    );
+  }
+
+  async searchClearDocs(search) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "searchClearDocs", await unwrapInteropHandle(search));
+  }
+
+  async searchDocIndexed(search, docRef) {
+    const cls = await classes();
+    return Boolean(
+      await callJavaMethod(
+        cls.interop,
+        "searchDocIndexed",
+        await unwrapInteropHandle(search),
+        await toJava(docRef)
+      )
+    );
+  }
+
+  async searchDocCount(search) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "searchDocCount", await unwrapInteropHandle(search));
+  }
+
+  async search(search, query, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "search",
+      await unwrapInteropHandle(search),
+      query,
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async searchReIndex(search, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "searchReIndex",
+      await unwrapInteropHandle(search),
+      hasValue(opts) ? await toJava(opts) : null
+    );
   }
 
   async searchIndexWriter(kv, opts = null) {
@@ -598,6 +694,13 @@ export async function transactAsync(conn, txData, txMeta = null) {
 
 export async function datalogKv(conn) {
   return conn.datalogKv();
+}
+
+export async function reIndex(target, opts = null, options = {}) {
+  if (typeof target?.reIndex !== "function") {
+    throw new TypeError("target must provide reIndex().");
+  }
+  return target.reIndex(opts, options);
 }
 
 export async function keyword(value) {
@@ -923,6 +1026,11 @@ export function datom(e, attr, value, tx = undefined, added = undefined) {
 export async function openKv(dir, opts = null) {
   const { KV } = await import("./kv.js");
   return new KV(await _BINDINGS.openKeyValue(dir, opts));
+}
+
+export async function newSearchEngine(kv, opts = null) {
+  const { SearchEngine } = await import("./search.js");
+  return new SearchEngine(await _BINDINGS.newSearchEngine(kv, opts));
 }
 
 export async function searchIndexWriter(kv, opts = null) {

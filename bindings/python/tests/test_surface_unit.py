@@ -95,6 +95,10 @@ class FakeInteropBindings:
     def connection_closed(self, handle):
         return handle in self.conn_closed
 
+    def connection_re_index(self, conn, schema=None, opts=None):
+        self.last_connection_re_index = (conn, schema, opts)
+        return conn
+
     def open_key_value(self, dir, opts=None):
         self.last_kv = (dir, opts)
         return "KV"
@@ -104,6 +108,39 @@ class FakeInteropBindings:
 
     def key_value_closed(self, handle):
         return handle in self.kv_closed
+
+    def key_value_re_index(self, kv, opts=None):
+        self.last_kv_re_index = (kv, opts)
+        return kv
+
+    def new_search_engine(self, kv, opts=None):
+        self.last_search_engine = (kv, opts)
+        return "SEARCH_ENGINE"
+
+    def search_add_doc(self, search, doc_ref, doc_text, check_exist=None):
+        self.last_search_add_doc = (search, doc_ref, doc_text, check_exist)
+
+    def search_remove_doc(self, search, doc_ref):
+        self.last_search_remove_doc = (search, doc_ref)
+
+    def search_clear_docs(self, search):
+        self.last_search_clear_docs = search
+
+    def search_doc_indexed(self, search, doc_ref):
+        self.last_search_doc_indexed = (search, doc_ref)
+        return True
+
+    def search_doc_count(self, search):
+        self.last_search_doc_count = search
+        return 2
+
+    def search(self, search, query, opts=None):
+        self.last_search = (search, query, opts)
+        return ["doc-1"]
+
+    def search_re_index(self, search, opts=None):
+        self.last_search_re_index = (search, opts)
+        return search
 
     def search_index_writer(self, kv, opts=None):
         self.last_search_writer = (kv, opts)
@@ -277,12 +314,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
 
     assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
-    for helper in ["keyword", "read_edn", "search_index_writer", "symbol", "write_edn"]:
+    for helper in ["keyword", "new_search_engine", "read_edn", "re_index", "search_index_writer", "symbol", "write_edn"]:
         assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
     assert interop_module.fill_db(init_conn, [(3, ":name", "Cara")]) is init_conn
     assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
+    assert interop_module.re_index(init_conn, opts={":backup?": False}) is init_conn
+    assert fake.last_connection_re_index == ("INIT_CONN", None, {":backup?": False})
     assert callable(interop_module.transact_async)
     backing_kv = interop_module.datalog_kv(init_conn)
     assert backing_kv.raw_handle() == "DATALOG_KV"
@@ -291,6 +330,27 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
     assert fake.last_kv == ("/tmp/kv", {":mapsize": 1})
+    assert kv.re_index(opts={":backup?": False}) is kv
+    assert fake.last_kv_re_index == ("KV", {":backup?": False})
+    engine = interop_module.new_search_engine(kv, opts={":include-text?": True})
+    assert engine.raw_handle() == "SEARCH_ENGINE"
+    assert fake.last_search_engine == (kv, {":include-text?": True})
+    assert engine.add_doc("doc-1", "pizza and pasta") is engine
+    assert fake.last_search_add_doc == ("SEARCH_ENGINE", "doc-1", "pizza and pasta", None)
+    assert engine.add_doc("doc-2", "just pie", check_exist=False) is engine
+    assert fake.last_search_add_doc == ("SEARCH_ENGINE", "doc-2", "just pie", False)
+    assert engine.doc_indexed("doc-1") is True
+    assert fake.last_search_doc_indexed == ("SEARCH_ENGINE", "doc-1")
+    assert engine.doc_count() == 2
+    assert fake.last_search_doc_count == "SEARCH_ENGINE"
+    assert engine.search("pizza", opts={":top": 1}) == ["doc-1"]
+    assert fake.last_search == ("SEARCH_ENGINE", "pizza", {":top": 1})
+    assert engine.re_index(opts={":include-text?": True}) is engine
+    assert fake.last_search_re_index == ("SEARCH_ENGINE", {":include-text?": True})
+    assert engine.remove_doc("doc-2") is engine
+    assert fake.last_search_remove_doc == ("SEARCH_ENGINE", "doc-2")
+    assert engine.clear_docs() is engine
+    assert fake.last_search_clear_docs == "SEARCH_ENGINE"
     writer = interop_module.search_index_writer(kv, opts={":include-text?": True})
     assert writer.raw_handle() == "SEARCH_WRITER"
     assert fake.last_search_writer == (kv, {":include-text?": True})
@@ -343,9 +403,11 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "key_range_count",
         "list_count",
         "list_snapshots",
+        "new_search_engine",
         "open_tx_log",
         "put_list_items",
         "range_count",
+        "re_index",
         "sample_kv",
         "search_index_writer",
         "stat",
@@ -358,6 +420,13 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(connection_module.Connection, "fill_db"))
     assert callable(getattr(datalevin.Entity, "touch"))
+    assert callable(getattr(datalevin.SearchEngine, "add_doc"))
+    assert callable(getattr(datalevin.SearchEngine, "clear_docs"))
+    assert callable(getattr(datalevin.SearchEngine, "doc_count"))
+    assert callable(getattr(datalevin.SearchEngine, "doc_indexed"))
+    assert callable(getattr(datalevin.SearchEngine, "re_index"))
+    assert callable(getattr(datalevin.SearchEngine, "remove_doc"))
+    assert callable(getattr(datalevin.SearchEngine, "search"))
     assert callable(getattr(datalevin.SearchIndexWriter, "commit"))
     assert callable(getattr(datalevin.SearchIndexWriter, "write"))
     for method in [
@@ -372,6 +441,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "index_range",
         "list_snapshots",
         "open_tx_log",
+        "re_index",
         "rseek_datoms",
         "search_datoms",
         "seek_datoms",

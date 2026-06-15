@@ -72,6 +72,39 @@ public final class KV extends HandleResource {
     }
 
     /**
+     * Creates a full-text search engine over this KV store.
+     */
+    public SearchEngine newSearchEngine() {
+        Object opts = DatalevinForms.optionsInput(Map.of());
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", resource(), opts), opts);
+    }
+
+    /**
+     * Creates a full-text search engine with raw options.
+     */
+    public SearchEngine newSearchEngine(Map<?, ?> opts) {
+        if (opts == null) {
+            return newSearchEngine();
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts);
+        return new SearchEngine(ClojureRuntime.core("new-search-engine",
+                                                    resource(),
+                                                    optsForm),
+                                optsForm);
+    }
+
+    /**
+     * Creates a full-text search engine with typed options.
+     */
+    public SearchEngine newSearchEngine(RetrievalOptions opts) {
+        if (opts == null) {
+            return newSearchEngine();
+        }
+        Object optsForm = opts.buildForm();
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", resource(), optsForm), optsForm);
+    }
+
+    /**
      * Creates a batched full-text search index writer over this KV store.
      */
     public SearchIndexWriter searchIndexWriter() {
@@ -1120,6 +1153,24 @@ public final class KV extends HandleResource {
      */
     public Map<?, ?> gcTxLogSegments(long retainFloorLsn) {
         return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", resource(), retainFloorLsn);
+    }
+
+    /**
+     * Rebuilds this KV store index and returns this handle.
+     */
+    public KV reIndex() {
+        return reIndex((Map<?, ?>) null);
+    }
+
+    /**
+     * Rebuilds this KV store index with options and returns this handle.
+     */
+    public KV reIndex(Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
     }
 
     /**

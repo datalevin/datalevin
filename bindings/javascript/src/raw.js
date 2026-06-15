@@ -223,6 +223,10 @@ class RawInterop {
     return toJsResult(await callJavaMethod(resourceHandle(handle), "gcTxLogSegments"), { bridge: true });
   }
 
+  async connectionReIndex(handle, schema = null, opts = null) {
+    return _BINDINGS.connectionReIndex(resourceHandle(handle), schema, opts);
+  }
+
   async openKeyValue(dir, opts = null) {
     return _BINDINGS.openKeyValue(dir, opts);
   }
@@ -233,6 +237,42 @@ class RawInterop {
 
   async keyValueClosed(handle) {
     return _BINDINGS.keyValueClosed(resourceHandle(handle));
+  }
+
+  async keyValueReIndex(handle, opts = null) {
+    return _BINDINGS.keyValueReIndex(resourceHandle(handle), opts);
+  }
+
+  async newSearchEngine(kv, opts = null) {
+    return _BINDINGS.newSearchEngine(resourceHandle(kv), opts);
+  }
+
+  async searchAddDoc(search, docRef, docText, checkExist = null) {
+    return _BINDINGS.searchAddDoc(resourceHandle(search), docRef, docText, checkExist);
+  }
+
+  async searchRemoveDoc(search, docRef) {
+    return _BINDINGS.searchRemoveDoc(resourceHandle(search), docRef);
+  }
+
+  async searchClearDocs(search) {
+    return _BINDINGS.searchClearDocs(resourceHandle(search));
+  }
+
+  async searchDocIndexed(search, docRef) {
+    return _BINDINGS.searchDocIndexed(resourceHandle(search), docRef);
+  }
+
+  async searchDocCount(search) {
+    return toJsResult(await _BINDINGS.searchDocCount(resourceHandle(search)));
+  }
+
+  async search(search, query, opts = null) {
+    return toJsResult(await _BINDINGS.search(resourceHandle(search), query, opts));
+  }
+
+  async searchReIndex(search, opts = null) {
+    return _BINDINGS.searchReIndex(resourceHandle(search), opts);
   }
 
   async searchIndexWriter(kv, opts = null) {
