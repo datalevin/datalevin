@@ -21,7 +21,8 @@
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
    [datalevin.txlog.segment :as tseg]
-   [datalevin.util :as u :refer [raise map+]])
+   [datalevin.util :as u :refer [raise map+]]
+   [taoensso.timbre :as log])
   (:import
    [datalevin.io PosixFsync]
    [java.io File]
@@ -337,11 +338,31 @@
         last-from-active  (long @active-last-lsn-v)
         last-from-seg     (long (max last-from-active
                                      (long last-from-closed)))
-        last-committed    (max (long (or (:last-committed-lsn meta-cur) 0))
-                               last-from-seg)
-        last-durable      (max (long (or (:last-durable-lsn meta-cur) 0))
-                               last-committed)
-        last-applied      (long (or (:last-applied-lsn meta-cur) 0))
+        meta-committed-lsn (long (or (:last-committed-lsn meta-cur) 0))
+        meta-durable-lsn   (long (or (:last-durable-lsn meta-cur) 0))
+        meta-applied-lsn   (long (or (:last-applied-lsn meta-cur) 0))
+        last-committed    (long last-from-seg)
+        last-durable      (long (min last-committed
+                                     (max meta-durable-lsn last-from-seg)))
+        last-applied      (long (min last-committed
+                                     (max 0 meta-applied-lsn)))
+        startup-watermark-warning
+        (when (or (> meta-committed-lsn last-from-seg)
+                  (> meta-durable-lsn last-from-seg)
+                  (> meta-applied-lsn last-from-seg))
+          {:type :txlog/meta-watermark-overclaim
+           :dir dir
+           :meta-last-committed-lsn meta-committed-lsn
+           :meta-last-durable-lsn meta-durable-lsn
+           :meta-last-applied-lsn meta-applied-lsn
+           :scanned-last-lsn last-from-seg
+           :recovered-last-committed-lsn last-committed
+           :recovered-last-durable-lsn last-durable
+           :recovered-last-applied-lsn last-applied})
+        _                 (when startup-watermark-warning
+                            (log/warn
+                             "Txn-log meta watermarks exceed scanned WAL; using segment scan"
+                             startup-watermark-warning))
         last-sync-ms      (long (or (:updated-ms meta-cur)
                                     (System/currentTimeMillis)))
         now               (System/currentTimeMillis)
@@ -414,7 +435,33 @@
          ;; clean reopen can validate the current commit marker without walking
          ;; the full retained WAL again.
          :last-record-summary                     @active-last-record-summary-v
+         :startup-warnings                        (cond-> []
+                                                    startup-watermark-warning
+                                                    (conj startup-watermark-warning))
          :fatal-error                             (volatile! nil)}]
+    (when startup-watermark-warning
+      (try
+        (tseg/with-file-lock
+          (tmeta/meta-lock-path dir)
+          (fn []
+            (let [written (tmeta/write-meta-file!
+                           meta-path
+                           {:last-committed-lsn last-committed
+                            :last-durable-lsn last-durable
+                            :last-applied-lsn last-applied
+                            :segment-id active-id
+                            :segment-offset active-offset
+                            :updated-ms now}
+                           {:sync-mode :none})]
+              (when-let [meta-revision-v (:meta-revision state)]
+                (vreset! meta-revision-v (long (:revision written))))
+              (when-let [last-applied-v (:meta-last-applied-lsn state)]
+                (vreset! last-applied-v
+                         (long (:last-applied-lsn written)))))))
+        (catch Exception e
+          (log/warn e
+                    "Failed to repair txn-log meta watermarks after WAL scan"
+                    startup-watermark-warning))))
     {:dir dir :state state}))
 
 (def segment-file-name tseg/segment-file-name)
