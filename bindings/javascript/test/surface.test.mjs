@@ -13,9 +13,27 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.initDb, "function");
   assert.equal(typeof datalevin.interop, "function");
   assert.equal(typeof datalevin.jvmStarted, "function");
+  assert.equal(typeof datalevin.keyword, "function");
   assert.equal(typeof datalevin.newClient, "function");
   assert.equal(typeof datalevin.openKv, "function");
+  assert.equal(typeof datalevin.readEdn, "function");
+  assert.equal(typeof datalevin.schemaAttr, "function");
   assert.equal(typeof datalevin.startJvm, "function");
+  assert.equal(typeof datalevin.symbol, "function");
+  assert.equal(typeof datalevin.transactAsync, "function");
+  assert.equal(typeof datalevin.txAdd, "function");
+  assert.equal(typeof datalevin.txEntity, "function");
+  assert.equal(typeof datalevin.txRetract, "function");
+  assert.equal(typeof datalevin.txRetractEntity, "function");
+  assert.equal(typeof datalevin.writeEdn, "function");
+  assert.deepEqual(datalevin.schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }), {
+    ":db/valueType": ":db.type/string",
+    ":db/unique": ":db.unique/identity"
+  });
+  assert.deepEqual(datalevin.txEntity(-1, { ":name": "Ada" }), { ":db/id": -1, ":name": "Ada" });
+  assert.deepEqual(datalevin.txAdd(1, "name", "Ada"), [":db/add", 1, ":name", "Ada"]);
+  assert.deepEqual(datalevin.txRetract(1, ":name", "Ada"), [":db/retract", 1, ":name", "Ada"]);
+  assert.deepEqual(datalevin.txRetractEntity(1), [":db/retractEntity", 1]);
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.Client, "function");
@@ -34,7 +52,8 @@ test("public surface stays importable without starting the JVM", () => {
     "rseekDatoms",
     "searchDatoms",
     "seekDatoms",
-    "txLogWatermarks"
+    "txLogWatermarks",
+    "transactAsync"
   ]) {
     assert.equal(typeof datalevin.Connection.prototype[method], "function");
   }

@@ -6,10 +6,13 @@
  * bindings such as JPype or node-java-bridge, {@link datalevin.DatalevinInterop}
  * exposes a smaller raw-handle surface with direct Clojure runtime values.
  *
- * <p>Keyword and symbol values can be passed directly as
- * {@link clojure.lang.Keyword} and {@link clojure.lang.Symbol}. Query,
- * transaction, schema, pull, and rule builders are available to avoid
- * hand-writing most EDN forms.
+ * <p>The canonical Java style is to use the typed builders for schemas,
+ * transactions, queries, pull selectors, and rules. Use
+ * {@link datalevin.Datalevin#kw}, {@link datalevin.Datalevin#sym},
+ * {@link datalevin.Datalevin#readEdn}, and
+ * {@link datalevin.Datalevin#writeEdn} when explicit EDN values are needed.
+ * Raw EDN text can be marked with {@link datalevin.Datalevin#edn} for APIs
+ * that accept an EDN form.
  *
  * <p>Typical usage:
  *
@@ -26,6 +29,11 @@
  *         String.class);
  * }
  * }</pre>
+ *
+ * <p>For async ingestion workloads, use
+ * {@link datalevin.Connection#transactAsync}, which returns a
+ * {@link java.util.concurrent.CompletableFuture} containing the transaction
+ * report.
  *
  * <p>For bulk load, use Datom-shaped input with {@link datalevin.Datalevin#initDb}
  * and {@link datalevin.Connection#fillDb}:

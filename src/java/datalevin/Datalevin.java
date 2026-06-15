@@ -10,6 +10,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
 
 import clojure.lang.Keyword;
 import clojure.lang.Symbol;
@@ -167,6 +168,25 @@ public final class Datalevin {
     public static Connection fillDb(Connection conn, Object datoms) {
         Objects.requireNonNull(conn, "conn");
         return conn.fillDb(datoms);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously on {@code conn}.
+     */
+    public static CompletableFuture<Map<?, ?>> transactAsync(Connection conn, Object txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transactAsync(txData);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously on {@code conn} with
+     * optional transaction metadata.
+     */
+    public static CompletableFuture<Map<?, ?>> transactAsync(Connection conn,
+                                                             Object txData,
+                                                             Map<?, ?> txMeta) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transactAsync(txData, txMeta);
     }
 
     /**
@@ -388,11 +408,34 @@ public final class Datalevin {
     }
 
     /**
+     * Reads EDN text into the corresponding JVM/Clojure value.
+     */
+    public static Object readEdn(String value) {
+        Objects.requireNonNull(value, "value");
+        return ClojureRuntime.readEdn(value);
+    }
+
+    /**
+     * Writes a JVM/Clojure value as EDN text.
+     */
+    public static String writeEdn(Object value) {
+        return Edn.render(ClojureCodec.runtimeInput(value));
+    }
+
+    /**
      * Marks a keyword value such as {@code :person/name} for APIs that need an
      * EDN keyword rather than a Java string.
      */
     public static Keyword kw(String value) {
         return ClojureCodec.keyword(value);
+    }
+
+    /**
+     * Marks a symbol value such as {@code person/name} or {@code ?e}.
+     */
+    public static Symbol sym(String value) {
+        Objects.requireNonNull(value, "value");
+        return ClojureCodec.symbol(value);
     }
 
     /**

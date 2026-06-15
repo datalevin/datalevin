@@ -6,6 +6,7 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Handle for a Datalog connection.
@@ -488,6 +489,55 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Transacts raw transaction data asynchronously.
+     *
+     * <p>The returned {@link CompletableFuture} completes with the transaction
+     * report when the underlying Datalevin async transaction commits.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(Object txData) {
+        return transactAsync(txData, null);
+    }
+
+    /**
+     * Transacts typed transaction data asynchronously.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(TxData txData) {
+        return transactAsync(txData, null);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously with optional transaction
+     * metadata.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(Object txData, Map<?, ?> txMeta) {
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      DatalevinForms.txDataInput(txData))
+                : ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      DatalevinForms.txDataInput(txData),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return txReportFuture(future);
+    }
+
+    /**
+     * Transacts typed transaction data asynchronously with optional transaction
+     * metadata.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(TxData txData, Map<?, ?> txMeta) {
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      txData == null ? null : txData.buildForm())
+                : ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      txData == null ? null : txData.buildForm(),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return txReportFuture(future);
+    }
+
+    /**
      * Bulk-loads Datom values into this connection and returns this handle.
      *
      * <p>Datoms may be raw Datalevin Datom objects, 3/4/5-element collections
@@ -825,6 +875,18 @@ public final class Connection extends HandleResource {
             args[base + i] = ClojureCodec.runtimeInput(inputs.get(i));
         }
         return ClojureRuntime.core("explain", args);
+    }
+
+    private CompletableFuture<Map<?, ?>> txReportFuture(Object future) {
+        CompletableFuture<Map<?, ?>> result = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                result.complete((Map<?, ?>) ClojureRuntime.deref(future));
+            } catch (Throwable e) {
+                result.completeExceptionally(e);
+            }
+        });
+        return result;
     }
 
     private static void requireShape(DatalogQuery query,

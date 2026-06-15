@@ -47,6 +47,45 @@ with connect(
 Structured query forms and inputs can also be passed as normal Python lists and
 dictionaries when that is more convenient than EDN strings.
 
+## Data Style
+
+Use ordinary Python data as the canonical style:
+
+- schemas are dictionaries keyed by colon-prefixed attribute strings
+- transaction entity maps are dictionaries, and transaction forms are lists
+- query and pull forms may be EDN strings or Python lists
+- colon-prefixed strings are converted to keywords in schema/query/form
+  positions
+- use `keyword()` when the stored value itself must be a keyword
+
+```python
+from datalevin import keyword, read_edn, schema_attr, tx_add, tx_entity, write_edn
+
+schema = {
+    ":name": schema_attr(value_type=":db.type/string", unique=":db.unique/identity"),
+    ":status": schema_attr(value_type=":db.type/keyword"),
+}
+
+tx = [
+    tx_entity(-1, {":name": "Ada", ":status": keyword(":active")}),
+    tx_add(-1, ":nickname", "A"),
+]
+
+form = read_edn("[:find ?e :where [?e :name _]]")
+text = write_edn([":find", "?e", ":where", ["?e", ":name", "_"]])
+```
+
+## Async Transaction Example
+
+Use `transact_async()` for ingestion and application-server workloads that
+benefit from Datalevin's async transaction batching. It returns a standard
+`concurrent.futures.Future`.
+
+```python
+future = conn.transact_async([{":db/id": -1, ":name": "Cara"}])
+report = future.result(timeout=10)
+```
+
 ## Datalog-Backed KV Example
 
 Use `datalog_kv()` when you need ordinary KV tables in the same store as a

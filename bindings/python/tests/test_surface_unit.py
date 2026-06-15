@@ -79,6 +79,10 @@ class FakeInteropBindings:
         self.last_datalog_kv = conn
         return "DATALOG_KV"
 
+    def connection_transact_async(self, conn, tx_data, tx_meta=None):
+        self.last_transact_async = (conn, tx_data, tx_meta)
+        return "TX_FUTURE"
+
     def datom(self, e, attr, value, tx=None, added=None):
         return ("datom", e, attr, value, tx, added)
 
@@ -172,6 +176,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
 
     assert interop_module.exec_json("ping", {"count": 1}) == {"status": "ok"}
     assert fake.last_request == {"op": "ping", "args": {"count": 1}}
+    assert interop_module.schema_attr(value_type=":db.type/string", unique=":db.unique/identity") == {
+        ":db/valueType": ":db.type/string",
+        ":db/unique": ":db.unique/identity",
+    }
+    assert interop_module.tx_entity(-1, name="Ada") == {":db/id": -1, ":name": "Ada"}
+    assert interop_module.tx_add(1, "name", "Ada") == [":db/add", 1, ":name", "Ada"]
+    assert interop_module.tx_retract(1, ":name", "Ada") == [":db/retract", 1, ":name", "Ada"]
+    assert interop_module.tx_retract_entity(1) == [":db/retractEntity", 1]
 
     conn_opts = {
         ":embedding-opts": {
@@ -193,10 +205,13 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
 
     assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
+    for helper in ["keyword", "read_edn", "symbol", "write_edn"]:
+        assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
     assert interop_module.fill_db(init_conn, [(3, ":name", "Cara")]) is init_conn
     assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
+    assert callable(interop_module.transact_async)
     backing_kv = interop_module.datalog_kv(init_conn)
     assert backing_kv.raw_handle() == "DATALOG_KV"
     assert fake.last_datalog_kv == "INIT_CONN"
@@ -259,6 +274,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "search_datoms",
         "seek_datoms",
         "tx_log_watermarks",
+        "transact_async",
     ]:
         assert callable(getattr(connection_module.Connection, method))
 

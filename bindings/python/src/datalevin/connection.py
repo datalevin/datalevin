@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+from concurrent.futures import Future
+from threading import Thread
+
 from ._convert import to_edn_form, to_java, to_python, to_query_input
 from ._interop import _BINDINGS
+from ._java import call_java
 from ._resource import ResourceWrapper
 
 
@@ -24,6 +28,19 @@ def _fetch_limit(limit, offset=0):
     if limit is None:
         return None
     return max(limit, 0) + max(offset or 0, 0)
+
+
+def _python_future(java_future):
+    future = Future()
+
+    def complete():
+        try:
+            future.set_result(to_python(call_java(java_future.get)))
+        except BaseException as exc:
+            future.set_exception(exc)
+
+    Thread(target=complete, daemon=True).start()
+    return future
 
 
 class Connection(ResourceWrapper):
@@ -88,6 +105,13 @@ class Connection(ResourceWrapper):
         if tx_meta is not None:
             args.append(to_java(tx_meta))
         return to_python(_BINDINGS.core_invoke("transact!", args))
+
+    def transact_async(self, tx_data, tx_meta=None):
+        """Start an async transaction and return a concurrent.futures.Future."""
+
+        return _python_future(
+            _BINDINGS.connection_transact_async(self.raw_handle(), tx_data, tx_meta)
+        )
 
     def fill_db(self, datoms):
         _BINDINGS.fill_db(self.raw_handle(), datoms)

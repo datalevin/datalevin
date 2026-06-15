@@ -29,6 +29,14 @@ dependencies {
 The published artifact is a self-contained Datalevin Java runtime from Maven
 Central. The current runtime requires Java 21+.
 
+## Data Style
+
+Use the typed Java builders as the canonical style for schemas, transactions,
+queries, pull selectors, and rules. Use `Datalevin.kw(...)`,
+`Datalevin.sym(...)`, `Datalevin.readEdn(...)`, and
+`Datalevin.writeEdn(...)` when explicit EDN values are needed. Use
+`Datalevin.edn(...)` to mark raw EDN text for APIs that accept an EDN form.
+
 ## Datalog Quick Start
 
 ```java

@@ -164,6 +164,11 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("transact!", args));
   }
 
+  async transactAsync(txData, txMeta = null) {
+    const future = await _BINDINGS.connectionTransactAsync(this.rawHandle(), txData, txMeta);
+    return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
+  }
+
   async fillDb(datoms) {
     await callJavaMethod(this.rawHandle(), "fillDb", await toJava(datoms));
     return this;

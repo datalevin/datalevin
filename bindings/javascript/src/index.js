@@ -15,9 +15,19 @@ export {
   fillDb,
   initDb,
   jvmStarted,
+  keyword,
   newClient,
   openKv,
-  startJvm
+  readEdn,
+  schemaAttr,
+  startJvm,
+  symbol,
+  transactAsync,
+  txAdd,
+  txEntity,
+  txRetract,
+  txRetractEntity,
+  writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";
 export { KV } from "./kv.js";

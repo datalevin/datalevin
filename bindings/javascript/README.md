@@ -46,6 +46,46 @@ try {
 }
 ```
 
+## Data Style
+
+Use ordinary JavaScript data as the canonical style:
+
+- schemas are objects keyed by colon-prefixed attribute strings
+- transaction entity maps are objects, and transaction forms are arrays
+- query and pull forms may be EDN strings or JavaScript arrays
+- colon-prefixed strings are converted to keywords in schema/query/form
+  positions
+- use `keyword()` when the stored value itself must be a keyword
+
+```js
+import { keyword, readEdn, schemaAttr, txAdd, txEntity, writeEdn } from "datalevin-node";
+
+const schema = {
+  ":name": schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }),
+  ":status": schemaAttr({ valueType: ":db.type/keyword" })
+};
+
+const tx = [
+  txEntity(-1, { ":name": "Ada", ":status": await keyword(":active") }),
+  txAdd(-1, ":nickname", "A")
+];
+
+const form = await readEdn("[:find ?e :where [?e :name _]]");
+const text = await writeEdn([":find", "?e", ":where", ["?e", ":name", "_"]]);
+```
+
+## Async Transaction Example
+
+Use `transactAsync()` for ingestion and application-server workloads that
+benefit from Datalevin's async transaction batching. It returns a normal
+JavaScript `Promise`.
+
+```js
+const report = await conn.transactAsync([
+  { ":db/id": -1, ":name": "Cara" }
+]);
+```
+
 ## Datalog-Backed KV Example
 
 Use `datalogKv()` when you need ordinary KV tables in the same store as a

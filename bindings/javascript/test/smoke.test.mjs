@@ -15,7 +15,11 @@ import {
   fillDb,
   initDb,
   interop,
-  openKv
+  keyword,
+  openKv,
+  schemaAttr,
+  transactAsync,
+  txEntity
 } from "../src/index.js";
 import { toJs } from "../src/interop.js";
 import { jvmStarted, resolveClasspath } from "../src/jvm.js";
@@ -57,15 +61,16 @@ test(
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-conn-"));
     const conn = await connect(dir, {
       schema: {
-        ":name": {
-          ":db/valueType": ":db.type/string",
-          ":db/unique": ":db.unique/identity"
-        },
-        ":bio": {
-          ":db/valueType": ":db.type/string",
-          ":db/fulltext": true,
-          ":db.fulltext/autoDomain": true
-        }
+        ":name": schemaAttr({
+          valueType: ":db.type/string",
+          unique: ":db.unique/identity"
+        }),
+        ":bio": schemaAttr({
+          valueType: ":db.type/string",
+          fulltext: true,
+          extra: { ":db.fulltext/autoDomain": true }
+        }),
+        ":status": schemaAttr({ valueType: ":db.type/keyword" })
       }
     });
 
@@ -74,8 +79,22 @@ test(
       assert.equal(await conn.closed(), false);
 
       const tx = await conn.transact([
-        { ":db/id": -1, ":name": "Ada", ":bio": "Ada builds database systems" },
-        { ":db/id": -2, ":name": "Bob", ":bio": "Bob writes migration tools" }
+        txEntity(-1, {
+          ":name": "Ada",
+          ":bio": "Ada builds database systems",
+          ":status": await keyword(":active")
+        }),
+        txEntity(-2, {
+          ":name": "Bob",
+          ":bio": "Bob writes migration tools",
+          ":status": await keyword(":draft")
+        })
+      ]);
+      const asyncTx = await conn.transactAsync([
+        { ":db/id": -3, ":bio": "Async transactions help ingestion" }
+      ]);
+      const topAsyncTx = await transactAsync(conn, [
+        { ":db/id": -4, ":bio": "Top-level async helper" }
       ]);
       const entity = await conn.entity(1);
       const namesFromString = await conn.query(
@@ -102,11 +121,14 @@ test(
       await conn.updateSchema(null, { delAttrs: [":age"] });
 
       assert.equal(Array.isArray(tx[":tx-data"]), true);
-      assert.equal(tx[":tx-data"].length, 4);
+      assert.equal(tx[":tx-data"].length, 6);
+      assert.equal(Array.isArray(asyncTx[":tx-data"]), true);
+      assert.equal(Array.isArray(topAsyncTx[":tx-data"]), true);
       assert.equal(":name" in await conn.schema(), true);
       assert.equal(typeof await conn.opts(), "object");
       assert.equal(intValue(await conn.entid([":name", "Ada"])), 1);
       assert.equal(entity[":name"], "Ada");
+      assert.equal((await conn.pull([":status"], 1))[":status"], ":active");
       assert.deepEqual(await conn.pull([":name"], 1), { ":name": "Ada" });
       assert.deepEqual(await conn.pullMany([":name"], [1, [":name", "Bob"]]), [
         { ":name": "Ada" },
@@ -122,6 +144,11 @@ test(
         ["Ada", "Bob"]
       );
       assert.equal((await conn.fulltextDatoms("database", { opts: { ":top": 5 } }))[0][2], "Ada builds database systems");
+      assert.equal(
+        (await conn.fulltextDatoms("async", { opts: { ":top": 5 } }))
+          .some((row) => row[2] === "Async transactions help ingestion"),
+        true
+      );
       const backingKv = await conn.datalogKv();
       await backingKv.openDbi("app-state");
       await backingKv.transact([[":put", "k", "v"]], {

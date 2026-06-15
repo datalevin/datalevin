@@ -51,6 +51,14 @@ class InteropBindings:
     def connection_datalog_kv(self, handle):
         return call_java(classes().interop.connectionDatalogKv, handle)
 
+    def connection_transact_async(self, handle, tx_data, tx_meta=None):
+        return call_java(
+            classes().interop.connectionTransactAsync,
+            handle,
+            to_java(tx_data),
+            to_java(tx_meta),
+        )
+
     def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
         return call_java(
             classes().interop.connectionDatoms,
@@ -152,6 +160,9 @@ class InteropBindings:
 
     def read_edn(self, edn: str):
         return call_java(classes().interop.readEdn, edn)
+
+    def write_edn(self, value) -> str:
+        return str(call_java(classes().interop.writeEdn, to_java(value)))
 
     def keyword(self, value: str):
         return call_java(classes().interop.keyword, value)
@@ -285,6 +296,114 @@ def fill_db(conn: Connection, datoms) -> Connection:
     return conn
 
 
+def keyword(value: str):
+    """Create a Clojure/EDN keyword value for places where a string is literal."""
+
+    return _BINDINGS.keyword(value)
+
+
+def symbol(value: str):
+    """Create a Clojure/EDN symbol value."""
+
+    return _BINDINGS.symbol(value)
+
+
+def read_edn(edn: str):
+    """Read EDN text into JVM-backed Datalevin values."""
+
+    return _BINDINGS.read_edn(edn)
+
+
+def write_edn(value) -> str:
+    """Write an EDN-like Python value as EDN text."""
+
+    from ._convert import to_edn_form
+
+    return _BINDINGS.write_edn(to_edn_form(value))
+
+
+def schema_attr(
+    *,
+    value_type=None,
+    cardinality=None,
+    unique=None,
+    index=None,
+    fulltext=None,
+    is_component=None,
+    no_history=None,
+    doc=None,
+    tuple_type=None,
+    tuple_types=None,
+    tuple_attrs=None,
+    extra=None,
+):
+    """Build one schema attribute map using the public Python data convention."""
+
+    spec = {}
+    if value_type is not None:
+        spec[":db/valueType"] = value_type
+    if cardinality is not None:
+        spec[":db/cardinality"] = cardinality
+    if unique is not None:
+        spec[":db/unique"] = unique
+    if index is not None:
+        spec[":db/index"] = bool(index)
+    if fulltext is not None:
+        spec[":db/fulltext"] = bool(fulltext)
+    if is_component is not None:
+        spec[":db/isComponent"] = bool(is_component)
+    if no_history is not None:
+        spec[":db/noHistory"] = bool(no_history)
+    if doc is not None:
+        spec[":db/doc"] = doc
+    if tuple_type is not None:
+        spec[":db/tupleType"] = tuple_type
+    if tuple_types is not None:
+        spec[":db/tupleTypes"] = list(tuple_types)
+    if tuple_attrs is not None:
+        spec[":db/tupleAttrs"] = list(tuple_attrs)
+    if extra:
+        spec.update(extra)
+    return spec
+
+
+def tx_entity(db_id=None, attrs=None, **values):
+    """Build an entity-map transaction item."""
+
+    entity = {}
+    if db_id is not None:
+        entity[":db/id"] = db_id
+    if attrs:
+        entity.update(attrs)
+    for attr, value in values.items():
+        entity[_attr_key(attr)] = value
+    return entity
+
+
+def tx_add(entity_id, attr, value):
+    """Build a :db/add transaction form."""
+
+    return [":db/add", entity_id, _attr_key(attr), value]
+
+
+def tx_retract(entity_id, attr, value):
+    """Build a :db/retract transaction form."""
+
+    return [":db/retract", entity_id, _attr_key(attr), value]
+
+
+def tx_retract_entity(entity_id):
+    """Build a :db/retractEntity transaction form."""
+
+    return [":db/retractEntity", entity_id]
+
+
+def transact_async(conn: Connection, tx_data, tx_meta=None):
+    """Start an async transaction and return a concurrent.futures.Future."""
+
+    return conn.transact_async(tx_data, tx_meta)
+
+
 def datalog_kv(conn: Connection) -> KV:
     """Return the borrowed KV handle backing a Datalog connection."""
 
@@ -304,6 +423,12 @@ def datom(e, attr, value, tx=_MISSING, added=_MISSING):
     if tx is not _MISSING:
         return (e, attr, value, tx)
     return (e, attr, value)
+
+
+def _attr_key(attr):
+    if isinstance(attr, str) and attr.startswith(":"):
+        return attr
+    return f":{attr}"
 
 
 def open_kv(dir, opts=None) -> KV:
@@ -332,7 +457,17 @@ __all__ = [
     "fill_db",
     "init_db",
     "jvm_started",
+    "keyword",
     "new_client",
     "open_kv",
+    "read_edn",
+    "schema_attr",
     "start_jvm",
+    "symbol",
+    "transact_async",
+    "tx_add",
+    "tx_entity",
+    "tx_retract",
+    "tx_retract_entity",
+    "write_edn",
 ]

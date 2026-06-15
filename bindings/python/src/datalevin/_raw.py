@@ -41,6 +41,9 @@ class RawInterop:
     def connection_datalog_kv(self, handle):
         return _BINDINGS.connection_datalog_kv(handle)
 
+    def connection_transact_async(self, handle, tx_data, tx_meta=None):
+        return _BINDINGS.connection_transact_async(handle, tx_data, tx_meta)
+
     def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
         return _BINDINGS.connection_datoms(handle, index, c1, c2, c3, limit)
 
@@ -100,6 +103,9 @@ class RawInterop:
 
     def read_edn(self, edn: str):
         return _BINDINGS.read_edn(edn)
+
+    def write_edn(self, value):
+        return _BINDINGS.write_edn(value)
 
     def keyword(self, value: str):
         return _BINDINGS.keyword(value)

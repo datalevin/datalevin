@@ -3,6 +3,8 @@ package datalevin;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Small bridge-oriented interop layer for non-Java bindings.
@@ -153,14 +155,32 @@ public final class DatalevinInterop {
      * Returns the raw immutable database value for a connection handle.
      */
     public static Object connectionDb(Object conn) {
-        return ClojureRuntime.core("db", conn);
+        return ClojureRuntime.core("db", rawResource(conn));
     }
 
     /**
      * Returns the raw KV handle backing a Datalog connection handle.
      */
     public static Object connectionDatalogKv(Object conn) {
-        return ClojureRuntime.core("datalog-kv", conn);
+        return ClojureRuntime.core("datalog-kv", rawResource(conn));
+    }
+
+    /**
+     * Starts an async transaction and returns a bridge-safe Java future.
+     */
+    public static CompletableFuture<Object> connectionTransactAsync(Object conn,
+                                                                    Object txData,
+                                                                    Map<?, ?> txMeta) {
+        Object rawConn = rawResource(conn);
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      rawConn,
+                                      DatalevinForms.txDataInput(txData))
+                : ClojureRuntime.core("transact-async",
+                                      rawConn,
+                                      DatalevinForms.txDataInput(txData),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return derefFuture(future, ClojureCodec::bridgeOutput);
     }
 
     /**
@@ -350,6 +370,13 @@ public final class DatalevinInterop {
      */
     public static Object readEdn(String edn) {
         return ClojureRuntime.readEdn(edn);
+    }
+
+    /**
+     * Writes a JVM/Clojure value as EDN text.
+     */
+    public static String writeEdn(Object value) {
+        return Edn.render(ClojureCodec.runtimeInput(value));
     }
 
     /**
@@ -597,6 +624,23 @@ public final class DatalevinInterop {
             }
         }
         return normalized;
+    }
+
+    private static CompletableFuture<Object> derefFuture(Object future,
+                                                         Function<Object, Object> converter) {
+        CompletableFuture<Object> result = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                result.complete(converter.apply(ClojureRuntime.deref(future)));
+            } catch (Throwable e) {
+                result.completeExceptionally(e);
+            }
+        });
+        return result;
+    }
+
+    private static Object rawResource(Object value) {
+        return value instanceof HandleResource handle ? handle.handle() : value;
     }
 
     private static Object connectionStore(Object conn) {

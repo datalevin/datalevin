@@ -113,6 +113,17 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "connectionDb", handle);
   }
 
+  async connectionTransactAsync(handle, txData, txMeta = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionTransactAsync",
+      await unwrapInteropHandle(handle),
+      await toJava(txData),
+      hasValue(txMeta) ? await toJava(txMeta) : null
+    );
+  }
+
   async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
     const cls = await classes();
     return callJavaMethod(
@@ -289,6 +300,11 @@ class InteropBindings {
   async readEdn(edn) {
     const cls = await classes();
     return callJavaMethod(cls.interop, "readEdn", edn);
+  }
+
+  async writeEdn(value) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "writeEdn", await toJava(value));
   }
 
   async keyword(value) {
@@ -500,8 +516,103 @@ export async function fillDb(conn, datoms) {
   return conn;
 }
 
+export async function transactAsync(conn, txData, txMeta = null) {
+  return conn.transactAsync(txData, txMeta);
+}
+
 export async function datalogKv(conn) {
   return conn.datalogKv();
+}
+
+export async function keyword(value) {
+  return _BINDINGS.keyword(value);
+}
+
+export async function symbol(value) {
+  return _BINDINGS.symbol(value);
+}
+
+export async function readEdn(edn) {
+  return _BINDINGS.readEdn(edn);
+}
+
+export async function writeEdn(value) {
+  return _BINDINGS.writeEdn(await toEdnForm(value));
+}
+
+export function schemaAttr({
+  valueType = null,
+  cardinality = null,
+  unique = null,
+  index = null,
+  fulltext = null,
+  isComponent = null,
+  noHistory = null,
+  doc = null,
+  tupleType = null,
+  tupleTypes = null,
+  tupleAttrs = null,
+  extra = null,
+  ...props
+} = {}) {
+  const spec = { ...props };
+  if (valueType !== null && valueType !== undefined) {
+    spec[":db/valueType"] = valueType;
+  }
+  if (cardinality !== null && cardinality !== undefined) {
+    spec[":db/cardinality"] = cardinality;
+  }
+  if (unique !== null && unique !== undefined) {
+    spec[":db/unique"] = unique;
+  }
+  if (index !== null && index !== undefined) {
+    spec[":db/index"] = Boolean(index);
+  }
+  if (fulltext !== null && fulltext !== undefined) {
+    spec[":db/fulltext"] = Boolean(fulltext);
+  }
+  if (isComponent !== null && isComponent !== undefined) {
+    spec[":db/isComponent"] = Boolean(isComponent);
+  }
+  if (noHistory !== null && noHistory !== undefined) {
+    spec[":db/noHistory"] = Boolean(noHistory);
+  }
+  if (doc !== null && doc !== undefined) {
+    spec[":db/doc"] = doc;
+  }
+  if (tupleType !== null && tupleType !== undefined) {
+    spec[":db/tupleType"] = tupleType;
+  }
+  if (tupleTypes !== null && tupleTypes !== undefined) {
+    spec[":db/tupleTypes"] = [...tupleTypes];
+  }
+  if (tupleAttrs !== null && tupleAttrs !== undefined) {
+    spec[":db/tupleAttrs"] = [...tupleAttrs];
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(spec, extra);
+  }
+  return spec;
+}
+
+export function txEntity(dbId = null, attrs = {}) {
+  const entity = { ...attrs };
+  if (dbId !== null && dbId !== undefined) {
+    entity[":db/id"] = dbId;
+  }
+  return entity;
+}
+
+export function txAdd(entityId, attr, value) {
+  return [":db/add", entityId, attrKey(attr), value];
+}
+
+export function txRetract(entityId, attr, value) {
+  return [":db/retract", entityId, attrKey(attr), value];
+}
+
+export function txRetractEntity(entityId) {
+  return [":db/retractEntity", entityId];
 }
 
 export function datom(e, attr, value, tx = undefined, added = undefined) {
@@ -528,3 +639,7 @@ export async function newClient(uri, opts = null) {
 }
 
 export { jvmStarted, startJvm, toEdnForm, toJava, toJs, toQueryInput };
+
+function attrKey(attr) {
+  return typeof attr === "string" && attr.startsWith(":") ? attr : `:${attr}`;
+}

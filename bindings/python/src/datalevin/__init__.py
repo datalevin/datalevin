@@ -1,6 +1,26 @@
 """Datalevin Python bindings over the JVM interop bridge."""
 
-from ._interop import api_info, connect, datalog_kv, datom, exec_json, fill_db, init_db, new_client, open_kv
+from ._interop import (
+    api_info,
+    connect,
+    datalog_kv,
+    datom,
+    exec_json,
+    fill_db,
+    init_db,
+    keyword,
+    new_client,
+    open_kv,
+    read_edn,
+    schema_attr,
+    symbol,
+    transact_async,
+    tx_add,
+    tx_entity,
+    tx_retract,
+    tx_retract_entity,
+    write_edn,
+)
 from ._jvm import jvm_started, start_jvm
 from ._raw import interop
 from .client import Client
@@ -33,9 +53,19 @@ __all__ = [
     "init_db",
     "interop",
     "jvm_started",
+    "keyword",
     "new_client",
     "open_kv",
+    "read_edn",
+    "schema_attr",
     "start_jvm",
+    "symbol",
+    "transact_async",
+    "tx_add",
+    "tx_entity",
+    "tx_retract",
+    "tx_retract_entity",
+    "write_edn",
 ]
 
 __version__ = "0.10.18"

@@ -2,7 +2,17 @@ from __future__ import annotations
 
 import pytest
 
-from datalevin import connect, datalog_kv, datom, fill_db, init_db
+from datalevin import (
+    connect,
+    datalog_kv,
+    datom,
+    fill_db,
+    init_db,
+    keyword,
+    schema_attr,
+    transact_async,
+    tx_entity,
+)
 from datalevin.errors import DatalevinJavaError
 
 
@@ -14,15 +24,16 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
     with connect(
         str(db_dir),
         schema={
-            ":name": {
-                ":db/valueType": ":db.type/string",
-                ":db/unique": ":db.unique/identity",
-            },
-            ":bio": {
-                ":db/valueType": ":db.type/string",
-                ":db/fulltext": True,
-                ":db.fulltext/autoDomain": True,
-            }
+            ":name": schema_attr(
+                value_type=":db.type/string",
+                unique=":db.unique/identity",
+            ),
+            ":bio": schema_attr(
+                value_type=":db.type/string",
+                fulltext=True,
+                extra={":db.fulltext/autoDomain": True},
+            ),
+            ":status": schema_attr(value_type=":db.type/keyword"),
         },
     ) as conn:
         assert repr(conn) == "<Connection open>"
@@ -30,15 +41,37 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
 
         conn.transact(
             [
-                {":db/id": -1, ":name": "Ada", ":bio": "Ada builds database systems"},
-                {":db/id": -2, ":name": "Bob", ":bio": "Bob writes migration tools"},
+                tx_entity(
+                    -1,
+                    {
+                        ":name": "Ada",
+                        ":bio": "Ada builds database systems",
+                        ":status": keyword(":active"),
+                    },
+                ),
+                tx_entity(
+                    -2,
+                    {
+                        ":name": "Bob",
+                        ":bio": "Bob writes migration tools",
+                        ":status": keyword(":draft"),
+                    },
+                ),
             ]
         )
+        async_report = conn.transact_async(
+            [{":db/id": -3, ":bio": "Async transactions help ingestion"}]
+        ).result(timeout=10)
+        top_async_report = transact_async(
+            conn,
+            [{":db/id": -4, ":bio": "Top-level async helper"}],
+        ).result(timeout=10)
 
         assert ":name" in conn.schema()
         assert isinstance(conn.opts(), dict)
         assert conn.entid([":name", "Ada"]) == 1
         assert conn.pull([":name"], 1) == {":name": "Ada"}
+        assert conn.pull([":status"], 1) == {":status": ":active"}
         assert conn.pull_many([":name"], [1, [":name", "Bob"]]) == [
             {":name": "Ada"},
             {":name": "Bob"},
@@ -50,6 +83,11 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert conn.count_datoms(None, ":name", "Ada") == 1
         assert [row[":v"] for row in conn.index_range(":name", "A", "C")] == ["Ada", "Bob"]
         assert conn.fulltext_datoms("database", opts={":top": 5})[0][2] == "Ada builds database systems"
+        assert ":tx-data" in async_report
+        assert ":tx-data" in top_async_report
+        assert "Async transactions help ingestion" in [
+            row[2] for row in conn.fulltext_datoms("async", opts={":top": 5})
+        ]
         kv = conn.datalog_kv()
         kv.open_dbi("app-state")
         kv.transact([(":put", "k", "v")], "app-state", ":string", ":string")

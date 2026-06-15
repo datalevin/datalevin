@@ -75,6 +75,11 @@ class RawInterop {
     return callJavaMethod(resourceHandle(handle), "datalogKV");
   }
 
+  async connectionTransactAsync(handle, txData, txMeta = null) {
+    const future = await _BINDINGS.connectionTransactAsync(resourceHandle(handle), txData, txMeta);
+    return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
+  }
+
   async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
     const args = [resourceHandle(handle), "datoms", await toJava(index), await toJava(c1), await toJava(c2), await toJava(c3)];
     if (hasValue(limit)) {
@@ -220,6 +225,10 @@ class RawInterop {
 
   async readEdn(edn) {
     return _BINDINGS.readEdn(edn);
+  }
+
+  async writeEdn(value) {
+    return _BINDINGS.writeEdn(value);
   }
 
   async keyword(value) {
