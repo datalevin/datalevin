@@ -1,6 +1,9 @@
 # Change Log
 
 ## WIP
+### Added
+- `datalog-kv` function to return the underlying DLMDB instance for a Datalog
+  DB.
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
   [#369](https://github.com/datalevin/datalevin/issues/369).
@@ -15,6 +18,7 @@
 
 ### Improved
 - Java, Python, JS API parity with Clojure.
+- [WAL] handle more edge cases.
 
 ## 0.10.18 (2026-05-27)
 ### Fixed

@@ -17,6 +17,7 @@
   (:import
    [datalevin.db DB]
    [datalevin.storage Store]
+   [java.nio ByteBuffer]
    [java.util Arrays Date UUID]))
 
 (use-fixtures :each db-fixture)
@@ -1231,6 +1232,67 @@
           (is (false? (:partial-tail? scan)))
           (is (= (long (:valid-end scan))
                  (long (.length file))))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
+(deftest test-wal-open-truncates-torn-active-tail-checksum-mismatch
+  (let [dir       (u/tmp-dir (str "wal-torn-active-tail-test-"
+                                  (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")
+        state     (atom nil)]
+    (try
+      (u/create-dirs txlog-dir)
+      (let [active-path (txlog/segment-path txlog-dir 1)]
+        (txlog/prepare-segment! active-path 4096)
+        (let [valid-payload (txlog/encode-commit-row-payload 1 1 [])
+              bad-payload   (txlog/encode-commit-row-payload 2 2 [])
+              bad-record    (txlog/encode-record bad-payload)
+              header-len    (alength ^bytes (txlog/encode-record
+                                              (byte-array 0)))
+              body-fragment (max 1 (min 8
+                                         (dec (alength ^bytes bad-payload))))
+              torn-len      (+ header-len body-fragment)
+              valid-end
+              (with-open [^java.nio.channels.FileChannel ch
+                          (txlog/open-segment-channel active-path)]
+                (let [{:keys [size]} (txlog/append-record-at!
+                                      ch
+                                      0
+                                      valid-payload)
+                      tail-offset (long size)
+                      ^ByteBuffer torn-bf (ByteBuffer/wrap
+                                           ^bytes bad-record
+                                           0
+                                           torn-len)]
+                  (.position ch tail-offset)
+                  (while (.hasRemaining torn-bf)
+                    (.write ch torn-bf))
+                  tail-offset))]
+          (let [scan (txlog/scan-segment
+                      active-path
+                      {:allow-preallocated-tail? true
+                       :collect-records?         false})]
+            (is (:partial-tail? scan))
+            (is (not (:preallocated-tail? scan)))
+            (is (:checksum-mismatch-tail? scan))
+            (is (= valid-end (long (:valid-end scan)))))
+          (is (thrown-with-msg?
+               Exception
+               #"Txn-log segment corruption"
+               (txlog/scan-segment active-path {:collect-records? false})))
+          (reset! state
+                  (:state (txlog/init-runtime-state {:dir dir} {})))
+          (is (= 2 (long @(:next-lsn @state))))
+          (is (= valid-end (long @(:segment-offset @state))))
+          (let [file (java.io.File. ^String active-path)
+                scan (txlog/scan-segment active-path
+                                         {:collect-records? false})]
+            (is (= valid-end (long (.length file))))
+            (is (false? (:partial-tail? scan)))
+            (is (= valid-end (long (:valid-end scan)))))))
       (finally
         (when-let [state @state]
           (when-let [ch @(:segment-channel state)]
