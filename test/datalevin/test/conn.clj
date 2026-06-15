@@ -133,6 +133,20 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-datalog-kv-exposes-backing-kv-handle
+  (let [dir  (u/tmp-dir (str "test-datalog-kv-" (UUID/randomUUID)))
+        conn (d/create-conn dir)]
+    (try
+      (let [kv (d/datalog-kv conn)]
+        (is (= dir (d/dir kv)))
+        (d/open-dbi kv "app-state")
+        (d/transact-kv kv "app-state" [[:put "k" "v"]] :string :string)
+        (is (= "v" (d/get-value kv "app-state" "k" :string :string true)))
+        (is (= kv (d/datalog-kv @conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-kv-wal-opt-in-defaults-to-relaxed
   (let [dir (u/tmp-dir (str "test-kv-wal-relaxed-"
                             (UUID/randomUUID)))

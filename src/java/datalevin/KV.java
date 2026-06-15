@@ -17,8 +17,14 @@ import java.util.function.BiPredicate;
 public final class KV extends HandleResource {
 
     KV(Object kv) {
+        this(kv, true);
+    }
+
+    KV(Object kv, boolean owned) {
         super(kv,
-              resource -> ClojureRuntime.core("close-kv", resource),
+              owned ? resource -> ClojureRuntime.core("close-kv", resource)
+                      : resource -> {
+                      },
               "kv",
               "kv");
     }

@@ -48,6 +48,72 @@ class InteropBindings:
     def connection_db(self, handle):
         return call_java(classes().interop.connectionDb, handle)
 
+    def connection_datalog_kv(self, handle):
+        return call_java(classes().interop.connectionDatalogKv, handle)
+
+    def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return call_java(
+            classes().interop.connectionDatoms,
+            handle,
+            to_java(index),
+            to_java(c1),
+            to_java(c2),
+            to_java(c3),
+            to_java(limit),
+        )
+
+    def connection_search_datoms(self, handle, e=None, attr=None, value=None):
+        return call_java(
+            classes().interop.connectionSearchDatoms,
+            handle,
+            to_java(e),
+            to_java(attr),
+            to_java(value),
+        )
+
+    def connection_count_datoms(self, handle, e=None, attr=None, value=None):
+        return call_java(
+            classes().interop.connectionCountDatoms,
+            handle,
+            to_java(e),
+            to_java(attr),
+            to_java(value),
+        )
+
+    def connection_seek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return call_java(
+            classes().interop.connectionSeekDatoms,
+            handle,
+            to_java(index),
+            to_java(c1),
+            to_java(c2),
+            to_java(c3),
+            to_java(limit),
+        )
+
+    def connection_rseek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return call_java(
+            classes().interop.connectionRseekDatoms,
+            handle,
+            to_java(index),
+            to_java(c1),
+            to_java(c2),
+            to_java(c3),
+            to_java(limit),
+        )
+
+    def connection_index_range(self, handle, attr, start, end):
+        return call_java(
+            classes().interop.connectionIndexRange,
+            handle,
+            to_java(attr),
+            to_java(start),
+            to_java(end),
+        )
+
+    def connection_fulltext_datoms(self, handle, query, opts=None):
+        return call_java(classes().interop.connectionFulltextDatoms, handle, query, to_java(opts))
+
     def connection_copy(self, handle, dest, compact=None) -> None:
         call_java(classes().interop.connectionCopy, handle, dest, None if compact is None else bool(compact))
 
@@ -219,6 +285,15 @@ def fill_db(conn: Connection, datoms) -> Connection:
     return conn
 
 
+def datalog_kv(conn: Connection) -> KV:
+    """Return the borrowed KV handle backing a Datalog connection."""
+
+    from .kv import KV
+
+    handle = conn.raw_handle() if callable(getattr(conn, "raw_handle", None)) else conn
+    return KV(_BINDINGS.connection_datalog_kv(handle), owned=False)
+
+
 def datom(e, attr, value, tx=_MISSING, added=_MISSING):
     """Create Datom-shaped data for `init_db()` or `fill_db()`."""
 
@@ -252,6 +327,7 @@ __all__ = [
     "api_info",
     "connect",
     "datom",
+    "datalog_kv",
     "exec_json",
     "fill_db",
     "init_db",

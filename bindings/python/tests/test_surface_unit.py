@@ -75,6 +75,10 @@ class FakeInteropBindings:
         self.last_fill_db = (conn, datoms)
         return conn
 
+    def connection_datalog_kv(self, conn):
+        self.last_datalog_kv = conn
+        return "DATALOG_KV"
+
     def datom(self, e, attr, value, tx=None, added=None):
         return ("datom", e, attr, value, tx, added)
 
@@ -193,6 +197,9 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
     assert interop_module.fill_db(init_conn, [(3, ":name", "Cara")]) is init_conn
     assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
+    backing_kv = interop_module.datalog_kv(init_conn)
+    assert backing_kv.raw_handle() == "DATALOG_KV"
+    assert fake.last_datalog_kv == "INIT_CONN"
 
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
@@ -238,11 +245,19 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(connection_module.Connection, "fill_db"))
     for method in [
+        "count_datoms",
         "copy",
         "create_snapshot",
+        "datalog_kv",
+        "datoms",
+        "fulltext_datoms",
         "gc_tx_log_segments",
+        "index_range",
         "list_snapshots",
         "open_tx_log",
+        "rseek_datoms",
+        "search_datoms",
+        "seek_datoms",
         "tx_log_watermarks",
     ]:
         assert callable(getattr(connection_module.Connection, method))

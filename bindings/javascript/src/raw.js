@@ -1,5 +1,8 @@
 import { DatalevinError } from "./errors.js";
 import { _BINDINGS } from "./interop.js";
+import { toJava } from "./convert.js";
+import { callJavaMethod } from "./jvm.js";
+import { toJsResult } from "./result.js";
 
 function datomTuple(e, attr, value, tx = undefined, added = undefined) {
   if (added !== undefined && tx === undefined) {
@@ -19,6 +22,10 @@ function resourceHandle(value) {
     return value.rawHandle();
   }
   return value;
+}
+
+function hasValue(value) {
+  return value !== null && value !== undefined;
 }
 
 class RawInterop {
@@ -64,28 +71,127 @@ class RawInterop {
     );
   }
 
+  async connectionDatalogKv(handle) {
+    return callJavaMethod(resourceHandle(handle), "datalogKV");
+  }
+
+  async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const args = [resourceHandle(handle), "datoms", await toJava(index), await toJava(c1), await toJava(c2), await toJava(c3)];
+    if (hasValue(limit)) {
+      args.push(await toJava(limit));
+    }
+    return toJsResult(await callJavaMethod(...args), { bridge: true });
+  }
+
+  async connectionSearchDatoms(handle, e = null, attr = null, value = null) {
+    return toJsResult(
+      await callJavaMethod(
+        resourceHandle(handle),
+        "searchDatoms",
+        await toJava(e),
+        await toJava(attr),
+        await toJava(value)
+      ),
+      { bridge: true }
+    );
+  }
+
+  async connectionCountDatoms(handle, e = null, attr = null, value = null) {
+    return toJsResult(
+      await callJavaMethod(
+        resourceHandle(handle),
+        "countDatoms",
+        await toJava(e),
+        await toJava(attr),
+        await toJava(value)
+      )
+    );
+  }
+
+  async connectionSeekDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const args = [
+      resourceHandle(handle),
+      "seekDatoms",
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3)
+    ];
+    if (hasValue(limit)) {
+      args.push(await toJava(limit));
+    }
+    return toJsResult(await callJavaMethod(...args), { bridge: true });
+  }
+
+  async connectionRseekDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const args = [
+      resourceHandle(handle),
+      "rseekDatoms",
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3)
+    ];
+    if (hasValue(limit)) {
+      args.push(await toJava(limit));
+    }
+    return toJsResult(await callJavaMethod(...args), { bridge: true });
+  }
+
+  async connectionIndexRange(handle, attr, start, end) {
+    return toJsResult(
+      await callJavaMethod(
+        resourceHandle(handle),
+        "indexRange",
+        await toJava(attr),
+        await toJava(start),
+        await toJava(end)
+      ),
+      { bridge: true }
+    );
+  }
+
+  async connectionFulltextDatoms(handle, query, opts = null) {
+    const result = hasValue(opts)
+      ? await callJavaMethod(resourceHandle(handle), "fulltextDatoms", query, await toJava(opts))
+      : await callJavaMethod(resourceHandle(handle), "fulltextDatoms", query);
+    return toJsResult(result, { bridge: true });
+  }
+
   async connectionCopy(handle, dest, compact = null) {
-    return _BINDINGS.connectionCopy(resourceHandle(handle), dest, compact);
+    if (hasValue(compact)) {
+      return callJavaMethod(resourceHandle(handle), "copy", dest, Boolean(compact));
+    }
+    return callJavaMethod(resourceHandle(handle), "copy", dest);
   }
 
   async connectionTxLogWatermarks(handle) {
-    return _BINDINGS.connectionTxLogWatermarks(resourceHandle(handle));
+    return toJsResult(await callJavaMethod(resourceHandle(handle), "txLogWatermarks"), { bridge: true });
   }
 
   async connectionOpenTxLog(handle, fromLsn, uptoLsn = null) {
-    return _BINDINGS.connectionOpenTxLog(resourceHandle(handle), fromLsn, uptoLsn);
+    const result = hasValue(uptoLsn)
+      ? await callJavaMethod(resourceHandle(handle), "openTxLog", await toJava(fromLsn), await toJava(uptoLsn))
+      : await callJavaMethod(resourceHandle(handle), "openTxLog", await toJava(fromLsn));
+    return toJsResult(result, { bridge: true });
   }
 
   async connectionCreateSnapshot(handle) {
-    return _BINDINGS.connectionCreateSnapshot(resourceHandle(handle));
+    return toJsResult(await callJavaMethod(resourceHandle(handle), "createSnapshot"), { bridge: true });
   }
 
   async connectionListSnapshots(handle) {
-    return _BINDINGS.connectionListSnapshots(resourceHandle(handle));
+    return toJsResult(await callJavaMethod(resourceHandle(handle), "listSnapshots"), { bridge: true });
   }
 
   async connectionGcTxLogSegments(handle, retainFloorLsn = null) {
-    return _BINDINGS.connectionGcTxLogSegments(resourceHandle(handle), retainFloorLsn);
+    if (hasValue(retainFloorLsn)) {
+      return toJsResult(
+        await callJavaMethod(resourceHandle(handle), "gcTxLogSegments", await toJava(retainFloorLsn)),
+        { bridge: true }
+      );
+    }
+    return toJsResult(await callJavaMethod(resourceHandle(handle), "gcTxLogSegments"), { bridge: true });
   }
 
   async openKeyValue(dir, opts = null) {

@@ -10,6 +10,7 @@ import {
   apiInfo,
   connect,
   datom,
+  datalogKv,
   execJson,
   fillDb,
   initDb,
@@ -59,6 +60,11 @@ test(
         ":name": {
           ":db/valueType": ":db.type/string",
           ":db/unique": ":db.unique/identity"
+        },
+        ":bio": {
+          ":db/valueType": ":db.type/string",
+          ":db/fulltext": true,
+          ":db.fulltext/autoDomain": true
         }
       }
     });
@@ -68,8 +74,8 @@ test(
       assert.equal(await conn.closed(), false);
 
       const tx = await conn.transact([
-        { ":db/id": -1, ":name": "Ada" },
-        { ":db/id": -2, ":name": "Bob" }
+        { ":db/id": -1, ":name": "Ada", ":bio": "Ada builds database systems" },
+        { ":db/id": -2, ":name": "Bob", ":bio": "Bob writes migration tools" }
       ]);
       const entity = await conn.entity(1);
       const namesFromString = await conn.query(
@@ -96,7 +102,7 @@ test(
       await conn.updateSchema(null, { delAttrs: [":age"] });
 
       assert.equal(Array.isArray(tx[":tx-data"]), true);
-      assert.equal(tx[":tx-data"].length, 2);
+      assert.equal(tx[":tx-data"].length, 4);
       assert.equal(":name" in await conn.schema(), true);
       assert.equal(typeof await conn.opts(), "object");
       assert.equal(intValue(await conn.entid([":name", "Ada"])), 1);
@@ -106,6 +112,29 @@ test(
         { ":name": "Ada" },
         { ":name": "Bob" }
       ]);
+      assert.equal((await conn.datoms(":eav", { c1: 1, c2: ":name", limit: 1 }))[0][":v"], "Ada");
+      assert.equal((await conn.seekDatoms(":eav", { c1: 1, c2: ":name", limit: 1 }))[0][":v"], "Ada");
+      assert.equal((await conn.rseekDatoms(":ave", { c1: ":name", c2: "Bob", limit: 1 }))[0][":v"], "Bob");
+      assert.equal((await conn.searchDatoms({ attr: ":name", value: "Ada" }))[0][":v"], "Ada");
+      assert.equal(intValue(await conn.countDatoms({ attr: ":name", value: "Ada" })), 1);
+      assert.deepEqual(
+        (await conn.indexRange(":name", "A", "C")).map((row) => row[":v"]),
+        ["Ada", "Bob"]
+      );
+      assert.equal((await conn.fulltextDatoms("database", { opts: { ":top": 5 } }))[0][2], "Ada builds database systems");
+      const backingKv = await conn.datalogKv();
+      await backingKv.openDbi("app-state");
+      await backingKv.transact([[":put", "k", "v"]], {
+        dbiName: "app-state",
+        kType: ":string",
+        vType: ":string"
+      });
+      assert.equal(await backingKv.getValue("app-state", "k", {
+        kType: ":string",
+        vType: ":string",
+        ignoreKey: true
+      }), "v");
+      assert.equal(await (await datalogKv(conn)).dir(), dir);
       assert.deepEqual([...namesFromString].sort(), ["Ada", "Bob"]);
       assert.equal(intValue(entidFromForm), 1);
       assert.equal(":plan" in explain, true);

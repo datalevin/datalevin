@@ -58,10 +58,10 @@ async function appendTypedArgs(args, { kType = null, vType = null, ignoreKey = n
 }
 
 export class KV extends ResourceWrapper {
-  constructor(handle) {
+  constructor(handle, { owned = true } = {}) {
     super(
       handle,
-      (rawHandle) => _BINDINGS.closeKeyValue(rawHandle),
+      owned ? (rawHandle) => _BINDINGS.closeKeyValue(rawHandle) : async () => {},
       (rawHandle) => _BINDINGS.keyValueClosed(rawHandle),
       "kv"
     );

@@ -501,6 +501,179 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Returns the KV handle backing this Datalog connection.
+     *
+     * <p>The returned handle is borrowed from the connection. Closing it does
+     * not close the underlying store; close this connection instead.
+     */
+    public KV datalogKV() {
+        return new KV(ClojureRuntime.core("datalog-kv", resource()), false);
+    }
+
+    /**
+     * Returns datoms from {@code index}, ordered by index order.
+     */
+    public List<?> datoms(Object index) {
+        return datoms(index, null, null, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the first index component.
+     */
+    public List<?> datoms(Object index, Object c1) {
+        return datoms(index, c1, null, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the first two index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2) {
+        return datoms(index, c1, c2, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the supplied index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Returns up to {@code n} datoms from {@code index} matching the supplied
+     * index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Returns datoms matching the entity, attribute, and value pattern. A
+     * {@code null} component is a wildcard.
+     */
+    public List<?> searchDatoms(Object e, Object attr, Object value) {
+        return ResultSupport.sequence(ClojureRuntime.core("search-datoms",
+                                                          db(),
+                                                          ClojureCodec.runtimeInput(e),
+                                                          DatalevinForms.datalogAttrInput(attr),
+                                                          ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Counts datoms matching the entity, attribute, and value pattern. A
+     * {@code null} component is a wildcard.
+     */
+    public long countDatoms(Object e, Object attr, Object value) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("count-datoms",
+                                                         db(),
+                                                         ClojureCodec.runtimeInput(e),
+                                                         DatalevinForms.datalogAttrInput(attr),
+                                                         ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index) {
+        return seekDatoms(index, null, null, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1) {
+        return seekDatoms(index, c1, null, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2) {
+        return seekDatoms(index, c1, c2, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("seek-datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Seeks forward in {@code index}, returning up to {@code n} datoms.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("seek-datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index) {
+        return rseekDatoms(index, null, null, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1) {
+        return rseekDatoms(index, c1, null, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2) {
+        return rseekDatoms(index, c1, c2, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("rseek-datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Seeks backward in {@code index}, returning up to {@code n} datoms.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("rseek-datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Returns datoms in AVE order for {@code attr} values in the inclusive
+     * {@code [start, end]} range.
+     */
+    public List<?> indexRange(Object attr, Object start, Object end) {
+        return ResultSupport.sequence(ClojureRuntime.core("index-range",
+                                                          db(),
+                                                          DatalevinForms.datalogAttrInput(attr),
+                                                          ClojureCodec.runtimeInput(start),
+                                                          ClojureCodec.runtimeInput(end)));
+    }
+
+    /**
+     * Returns datoms found by the fulltext query.
+     */
+    public List<?> fulltextDatoms(String query) {
+        return ResultSupport.sequence(ClojureRuntime.core("fulltext-datoms", db(), query));
+    }
+
+    /**
+     * Returns datoms found by the fulltext query using Datalevin fulltext
+     * options.
+     */
+    public List<?> fulltextDatoms(String query, Map<?, ?> opts) {
+        if (opts == null) {
+            return fulltextDatoms(query);
+        }
+        return ResultSupport.sequence(ClojureRuntime.core("fulltext-datoms",
+                                                          db(),
+                                                          query,
+                                                          DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
      * Copies the Datalog database to {@code dest}.
      */
     public void copy(String dest) {
@@ -579,6 +752,22 @@ public final class Connection extends HandleResource {
                                      "get",
                                      db(),
                                      ClojureCodec.keyword(":store"));
+    }
+
+    private List<?> datomIndexRead(String function,
+                                   Object index,
+                                   Object c1,
+                                   Object c2,
+                                   Object c3,
+                                   Long limit) {
+        Object normalizedIndex = DatalevinForms.datalogIndexInput(index);
+        Object nc1 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 0, c1);
+        Object nc2 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 1, c2);
+        Object nc3 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 2, c3);
+        if (limit == null) {
+            return ResultSupport.sequence(ClojureRuntime.core(function, db(), normalizedIndex, nc1, nc2, nc3));
+        }
+        return ResultSupport.sequence(ClojureRuntime.core(function, db(), normalizedIndex, nc1, nc2, nc3, limit));
     }
 
     private Object runQuery(Object queryForm, List<?> inputs) {

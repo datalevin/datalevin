@@ -1,6 +1,6 @@
 """Datalevin Python bindings over the JVM interop bridge."""
 
-from ._interop import api_info, connect, datom, exec_json, fill_db, init_db, new_client, open_kv
+from ._interop import api_info, connect, datalog_kv, datom, exec_json, fill_db, init_db, new_client, open_kv
 from ._jvm import jvm_started, start_jvm
 from ._raw import interop
 from .client import Client
@@ -27,6 +27,7 @@ __all__ = [
     "connect",
     "create_udf_registry",
     "datom",
+    "datalog_kv",
     "exec_json",
     "fill_db",
     "init_db",

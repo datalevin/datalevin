@@ -10,6 +10,7 @@ export {
   apiInfo,
   connect,
   datom,
+  datalogKv,
   execJson,
   fillDb,
   initDb,

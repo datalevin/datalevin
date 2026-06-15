@@ -44,5 +44,15 @@
  * {@link datalevin.KV#copy}, {@link datalevin.KV#sync},
  * {@link datalevin.KV#createSnapshot}, {@link datalevin.KV#txLogWatermarks},
  * {@link datalevin.KV#openTxLog}, and {@link datalevin.KV#gcTxLogSegments}.
+ *
+ * <p>Datalog connections expose lower-level inspection helpers including
+ * {@link datalevin.Connection#datoms}, {@link datalevin.Connection#seekDatoms},
+ * {@link datalevin.Connection#indexRange},
+ * {@link datalevin.Connection#countDatoms}, and
+ * {@link datalevin.Connection#fulltextDatoms}.
+ *
+ * <p>Use {@link datalevin.Connection#datalogKV} when you need the KV handle
+ * backing a Datalog connection. The returned KV wrapper is borrowed from the
+ * connection; close the connection, not that KV wrapper.
  */
 package datalevin;

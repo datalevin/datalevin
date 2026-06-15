@@ -46,6 +46,39 @@ try {
 }
 ```
 
+## Datalog-Backed KV Example
+
+Use `datalogKv()` when you need ordinary KV tables in the same store as a
+Datalog connection. The returned KV handle is borrowed from the connection; do
+not close it separately.
+
+```js
+import { datalogKv } from "datalevin-node";
+
+const kv = await datalogKv(conn);
+await kv.openDbi("app-state");
+await kv.transact([[":put", "k", "v"]], {
+  dbiName: "app-state",
+  kType: ":string",
+  vType: ":string"
+});
+```
+
+## Datom Inspection Example
+
+Connection objects expose index-level reads for debugging, teaching, and
+migration tooling. Datom reads return objects with `:e`, `:a`, `:v`, `:tx`,
+and `:added` keys; `fulltextDatoms()` returns `[e, attr, value]` triples.
+
+```js
+console.log(await conn.datoms(":eav", { c1: 1, c2: ":name", limit: 10 }));
+console.log(await conn.seekDatoms(":ave", { c1: ":name", c2: "Ada", limit: 5 }));
+console.log(await conn.rseekDatoms(":ave", { c1: ":name", c2: "Bob", limit: 5 }));
+console.log(await conn.indexRange(":name", "A", "C"));
+console.log(await conn.countDatoms({ attr: ":name", value: "Ada" }));
+console.log(await conn.fulltextDatoms("database", { opts: { ":top": 5 } }));
+```
+
 ## Bulk Load Example
 
 Use `initDb()` and `fillDb()` when you already have Datom-shaped data and want

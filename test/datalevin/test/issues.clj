@@ -8,7 +8,6 @@
    [clojure.test :refer [deftest testing is use-fixtures]]
    [datalevin.util :as u])
   (:import
-   [datalevin.storage Store]
    [java.util UUID]))
 
 (use-fixtures :each db-fixture)
@@ -152,8 +151,7 @@
     (try
       (d/transact! conn [{:db/id -1 :name "first"}])
       (is (= #{"first"} (set (d/q query @conn))))
-      (cpp/invalidate-thread-reader!
-        (kv/raw-lmdb (.-lmdb ^Store (:store @conn))))
+      (cpp/invalidate-thread-reader! (kv/raw-lmdb (d/datalog-kv conn)))
       (is (= #{"first"} (set (d/q query @conn))))
       (finally
         (d/close conn)

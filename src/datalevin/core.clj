@@ -1169,6 +1169,22 @@ Only usable for debug output.
        :doc      "Return the path or URI string of the key-value store"}
   dir i/env-dir)
 
+(def ^{:arglists '([conn-or-db])
+       :doc      "Return the KV handle backing a Datalog connection or DB.
+
+  This is the supported way to use Datalevin KV APIs against the same
+  underlying store as a Datalog database, for example to keep application KV
+  tables beside Datalog indexes:
+
+      (let [kv (d/datalog-kv conn)]
+        (d/open-dbi kv \"app-state\")
+        (d/transact-kv kv \"app-state\" [[:put \"k\" \"v\"]]
+                       :string :string))
+
+  The returned handle is owned by the Datalog connection. Do not close it
+  separately; close the Datalog connection instead."}
+  datalog-kv conn/datalog-kv)
+
 (def ^{:arglists '([db dbi-name]
                    [db dbi-name opts])
        :doc      "Open a named DBI (i.e. sub-db) in the key-value store. `opts` is an option map that may have the following keys:

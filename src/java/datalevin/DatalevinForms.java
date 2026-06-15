@@ -335,6 +335,33 @@ final class DatalevinForms {
                                     ClojureCodec.runtimeInput(added));
     }
 
+    static Object datalogIndexInput(Object index) {
+        if (index instanceof Keyword) {
+            return index;
+        }
+        if (index instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+        if (index instanceof String s) {
+            return ClojureCodec.keyword(s);
+        }
+        return ClojureCodec.runtimeInput(index);
+    }
+
+    static Object datalogAttrInput(Object attr) {
+        return attr == null ? null : keywordFromAttr(attr);
+    }
+
+    static Object datalogIndexComponentInput(Object index, int position, Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (datalogAttributePosition(index, position)) {
+            return keywordFromAttr(value);
+        }
+        return ClojureCodec.runtimeInput(value);
+    }
+
     static Object kvTxsInput(Object txs) {
         return kvTxsInput(txs, null, null);
     }
@@ -643,6 +670,12 @@ final class DatalevinForms {
             return ClojureRuntime.readEdn(literal.value());
         }
         return ClojureCodec.runtimeInput(value);
+    }
+
+    private static boolean datalogAttributePosition(Object index, int position) {
+        String indexName = stripLeadingColon(String.valueOf(index));
+        return ("eav".equals(indexName) && position == 1)
+                || ("ave".equals(indexName) && position == 0);
     }
 
     private static Object rangeInput(Object rangeType, List<?> bounds, Object boundType) {

@@ -170,6 +170,17 @@ public final class Datalevin {
     }
 
     /**
+     * Returns the KV handle backing a Datalog connection.
+     *
+     * <p>The returned handle is borrowed from {@code conn}. Closing it does not
+     * close the underlying store; close the Datalog connection instead.
+     */
+    public static KV datalogKV(Connection conn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.datalogKV();
+    }
+
+    /**
      * Returns an anonymous connection managed by the Datalevin runtime.
      *
      * <p>The underlying Clojure API only supports shared lookup for

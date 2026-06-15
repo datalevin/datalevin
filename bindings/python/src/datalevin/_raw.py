@@ -38,6 +38,30 @@ class RawInterop:
     def connection_db(self, handle):
         return _BINDINGS.connection_db(handle)
 
+    def connection_datalog_kv(self, handle):
+        return _BINDINGS.connection_datalog_kv(handle)
+
+    def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_search_datoms(self, handle, e=None, attr=None, value=None):
+        return _BINDINGS.connection_search_datoms(handle, e, attr, value)
+
+    def connection_count_datoms(self, handle, e=None, attr=None, value=None):
+        return _BINDINGS.connection_count_datoms(handle, e, attr, value)
+
+    def connection_seek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_seek_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_rseek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_rseek_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_index_range(self, handle, attr, start, end):
+        return _BINDINGS.connection_index_range(handle, attr, start, end)
+
+    def connection_fulltext_datoms(self, handle, query, opts=None):
+        return _BINDINGS.connection_fulltext_datoms(handle, query, opts)
+
     def connection_copy(self, handle, dest, compact=None):
         return _BINDINGS.connection_copy(handle, dest, compact)
 

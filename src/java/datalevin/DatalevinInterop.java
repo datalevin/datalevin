@@ -157,6 +157,95 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Returns the raw KV handle backing a Datalog connection handle.
+     */
+    public static Object connectionDatalogKv(Object conn) {
+        return ClojureRuntime.core("datalog-kv", conn);
+    }
+
+    /**
+     * Returns bridge-safe datoms from a raw connection handle.
+     */
+    public static Object connectionDatoms(Object conn,
+                                          Object index,
+                                          Object c1,
+                                          Object c2,
+                                          Object c3,
+                                          Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Returns bridge-safe datoms matching entity, attribute, and value.
+     */
+    public static Object connectionSearchDatoms(Object conn, Object e, Object attr, Object value) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("search-datoms",
+                                                             connectionDb(conn),
+                                                             ClojureCodec.runtimeInput(e),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Counts datoms matching entity, attribute, and value.
+     */
+    public static Object connectionCountDatoms(Object conn, Object e, Object attr, Object value) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("count-datoms",
+                                                             connectionDb(conn),
+                                                             ClojureCodec.runtimeInput(e),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Seeks bridge-safe datoms forward from the supplied index components.
+     */
+    public static Object connectionSeekDatoms(Object conn,
+                                              Object index,
+                                              Object c1,
+                                              Object c2,
+                                              Object c3,
+                                              Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("seek-datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Seeks bridge-safe datoms backward from the supplied index components.
+     */
+    public static Object connectionRseekDatoms(Object conn,
+                                               Object index,
+                                               Object c1,
+                                               Object c2,
+                                               Object c3,
+                                               Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("rseek-datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Returns bridge-safe datoms in an inclusive AVE value range.
+     */
+    public static Object connectionIndexRange(Object conn, Object attr, Object start, Object end) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("index-range",
+                                                             connectionDb(conn),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(start),
+                                                             ClojureCodec.runtimeInput(end)));
+    }
+
+    /**
+     * Returns bridge-safe fulltext datom results.
+     */
+    public static Object connectionFulltextDatoms(Object conn, String query, Map<?, ?> opts) {
+        Object result = opts == null
+                ? ClojureRuntime.core("fulltext-datoms", connectionDb(conn), query)
+                : ClojureRuntime.core("fulltext-datoms",
+                                      connectionDb(conn),
+                                      query,
+                                      DatalevinForms.optionsInput(opts));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
      * Copies the database backing a raw connection handle.
      */
     public static void connectionCopy(Object conn, String dest, Boolean compact) {
@@ -515,5 +604,22 @@ public final class DatalevinInterop {
                                      "get",
                                      connectionDb(conn),
                                      ClojureCodec.keyword(":store"));
+    }
+
+    private static Object connectionDatomIndexRead(String function,
+                                                   Object conn,
+                                                   Object index,
+                                                   Object c1,
+                                                   Object c2,
+                                                   Object c3,
+                                                   Long limit) {
+        Object normalizedIndex = DatalevinForms.datalogIndexInput(index);
+        Object nc1 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 0, c1);
+        Object nc2 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 1, c2);
+        Object nc3 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 2, c3);
+        if (limit == null) {
+            return ClojureRuntime.core(function, connectionDb(conn), normalizedIndex, nc1, nc2, nc3);
+        }
+        return ClojureRuntime.core(function, connectionDb(conn), normalizedIndex, nc1, nc2, nc3, limit);
     }
 }

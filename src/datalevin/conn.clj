@@ -39,6 +39,27 @@
   [conn]
   (and (instance? clojure.lang.IDeref conn) (db/db? @conn)))
 
+(defn datalog-kv
+  "Return the KV handle backing a Datalog connection or DB."
+  [x]
+  (let [db    (cond
+                (conn? x) @x
+                (db/db? x) x
+                :else
+                (u/raise "Expected a Datalog connection or DB"
+                         {:input x}))
+        store (.-store ^DB db)]
+    (cond
+      (instance? Store store)
+      (.-lmdb ^Store store)
+
+      (instance? DatalogStore store)
+      store
+
+      :else
+      (u/raise "Datalog DB does not expose a KV handle"
+               {:store store}))))
+
 (deftype ^:private CloseableConn [^clojure.lang.Atom state]
   clojure.lang.IDeref
   (deref [_]

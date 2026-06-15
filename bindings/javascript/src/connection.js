@@ -18,6 +18,25 @@ async function queryForm(query) {
   return query;
 }
 
+function hasValue(value) {
+  return value !== null && value !== undefined;
+}
+
+function sliceRows(rows, { limit = null, offset = 0 } = {}) {
+  const start = Math.max(offset ?? 0, 0);
+  if (!hasValue(limit)) {
+    return start === 0 ? rows : rows.slice(start);
+  }
+  return rows.slice(start, start + Math.max(limit, 0));
+}
+
+function fetchLimit(limit, offset = 0) {
+  if (!hasValue(limit)) {
+    return null;
+  }
+  return Math.max(limit, 0) + Math.max(offset ?? 0, 0);
+}
+
 export class Connection extends ResourceWrapper {
   constructor(handle) {
     super(
@@ -150,18 +169,114 @@ export class Connection extends ResourceWrapper {
     return this;
   }
 
+  async datalogKv() {
+    const { KV } = await import("./kv.js");
+    return new KV(await callJavaMethod(this.rawHandle(), "datalogKV"), { owned: false });
+  }
+
+  async datoms(index, { c1 = null, c2 = null, c3 = null, limit = null, offset = 0 } = {}) {
+    const capped = fetchLimit(limit, offset);
+    const args = [this.rawHandle(), "datoms", await toJava(index), await toJava(c1), await toJava(c2), await toJava(c3)];
+    if (hasValue(capped)) {
+      args.push(await toJava(capped));
+    }
+    const rows = await toJsResult(
+      await callJavaMethod(...args),
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
+  async searchDatoms({ e = null, attr = null, value = null, limit = null, offset = 0 } = {}) {
+    const rows = await toJsResult(
+      await callJavaMethod(this.rawHandle(), "searchDatoms", await toJava(e), await toJava(attr), await toJava(value)),
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
+  async countDatoms({ e = null, attr = null, value = null } = {}) {
+    return toJsResult(
+      await callJavaMethod(this.rawHandle(), "countDatoms", await toJava(e), await toJava(attr), await toJava(value))
+    );
+  }
+
+  async seekDatoms(index, { c1 = null, c2 = null, c3 = null, limit = null, offset = 0 } = {}) {
+    const capped = fetchLimit(limit, offset);
+    const args = [
+      this.rawHandle(),
+      "seekDatoms",
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3)
+    ];
+    if (hasValue(capped)) {
+      args.push(await toJava(capped));
+    }
+    const rows = await toJsResult(
+      await callJavaMethod(...args),
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
+  async rseekDatoms(index, { c1 = null, c2 = null, c3 = null, limit = null, offset = 0 } = {}) {
+    const capped = fetchLimit(limit, offset);
+    const args = [
+      this.rawHandle(),
+      "rseekDatoms",
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3)
+    ];
+    if (hasValue(capped)) {
+      args.push(await toJava(capped));
+    }
+    const rows = await toJsResult(
+      await callJavaMethod(...args),
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
+  async indexRange(attr, start, end, { limit = null, offset = 0 } = {}) {
+    const rows = await toJsResult(
+      await callJavaMethod(this.rawHandle(), "indexRange", await toJava(attr), await toJava(start), await toJava(end)),
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
+  async fulltextDatoms(query, { opts = null, limit = null, offset = 0 } = {}) {
+    const result = hasValue(opts)
+      ? await callJavaMethod(this.rawHandle(), "fulltextDatoms", query, await toJava(opts))
+      : await callJavaMethod(this.rawHandle(), "fulltextDatoms", query);
+    const rows = await toJsResult(
+      result,
+      { bridge: true }
+    );
+    return sliceRows(rows, { limit, offset });
+  }
+
   async copy(dest, { compact = null } = {}) {
-    await _BINDINGS.connectionCopy(this.rawHandle(), dest, compact);
+    if (hasValue(compact)) {
+      await callJavaMethod(this.rawHandle(), "copy", dest, Boolean(compact));
+      return;
+    }
+    await callJavaMethod(this.rawHandle(), "copy", dest);
   }
 
   async txLogWatermarks() {
-    return toJsResult(await _BINDINGS.connectionTxLogWatermarks(this.rawHandle()));
+    return toJsResult(await callJavaMethod(this.rawHandle(), "txLogWatermarks"), { bridge: true });
   }
 
   async openTxLog(fromLsn, { uptoLsn = null, limit = null } = {}) {
-    const rows = await toJsResult(
-      await _BINDINGS.connectionOpenTxLog(this.rawHandle(), fromLsn, uptoLsn)
-    );
+    const result = hasValue(uptoLsn)
+      ? await callJavaMethod(this.rawHandle(), "openTxLog", await toJava(fromLsn), await toJava(uptoLsn))
+      : await callJavaMethod(this.rawHandle(), "openTxLog", await toJava(fromLsn));
+    const rows = await toJsResult(result, { bridge: true });
     if (limit === null || limit === undefined) {
       return rows;
     }
@@ -169,14 +284,20 @@ export class Connection extends ResourceWrapper {
   }
 
   async createSnapshot() {
-    return toJsResult(await _BINDINGS.connectionCreateSnapshot(this.rawHandle()));
+    return toJsResult(await callJavaMethod(this.rawHandle(), "createSnapshot"), { bridge: true });
   }
 
   async listSnapshots() {
-    return toJsResult(await _BINDINGS.connectionListSnapshots(this.rawHandle()));
+    return toJsResult(await callJavaMethod(this.rawHandle(), "listSnapshots"), { bridge: true });
   }
 
   async gcTxLogSegments({ retainFloorLsn = null } = {}) {
-    return toJsResult(await _BINDINGS.connectionGcTxLogSegments(this.rawHandle(), retainFloorLsn));
+    if (hasValue(retainFloorLsn)) {
+      return toJsResult(
+        await callJavaMethod(this.rawHandle(), "gcTxLogSegments", await toJava(retainFloorLsn)),
+        { bridge: true }
+      );
+    }
+    return toJsResult(await callJavaMethod(this.rawHandle(), "gcTxLogSegments"), { bridge: true });
   }
 }

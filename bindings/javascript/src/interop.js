@@ -113,6 +113,95 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "connectionDb", handle);
   }
 
+  async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionDatoms",
+      await unwrapInteropHandle(handle),
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3),
+      hasValue(limit) ? await toJava(limit) : null
+    );
+  }
+
+  async connectionSearchDatoms(handle, e = null, attr = null, value = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionSearchDatoms",
+      await unwrapInteropHandle(handle),
+      await toJava(e),
+      await toJava(attr),
+      await toJava(value)
+    );
+  }
+
+  async connectionCountDatoms(handle, e = null, attr = null, value = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionCountDatoms",
+      await unwrapInteropHandle(handle),
+      await toJava(e),
+      await toJava(attr),
+      await toJava(value)
+    );
+  }
+
+  async connectionSeekDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionSeekDatoms",
+      await unwrapInteropHandle(handle),
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3),
+      hasValue(limit) ? await toJava(limit) : null
+    );
+  }
+
+  async connectionRseekDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionRseekDatoms",
+      await unwrapInteropHandle(handle),
+      await toJava(index),
+      await toJava(c1),
+      await toJava(c2),
+      await toJava(c3),
+      hasValue(limit) ? await toJava(limit) : null
+    );
+  }
+
+  async connectionIndexRange(handle, attr, start, end) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionIndexRange",
+      await unwrapInteropHandle(handle),
+      await toJava(attr),
+      await toJava(start),
+      await toJava(end)
+    );
+  }
+
+  async connectionFulltextDatoms(handle, query, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionFulltextDatoms",
+      await unwrapInteropHandle(handle),
+      query,
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
   async connectionCopy(handle, dest, compact = null) {
     const cls = await classes();
     await callJavaMethod(
@@ -409,6 +498,10 @@ export async function initDb(datoms, { dir = null, schema = null, opts = null } 
 export async function fillDb(conn, datoms) {
   await _BINDINGS.fillDb(conn, datoms);
   return conn;
+}
+
+export async function datalogKv(conn) {
+  return conn.datalogKv();
 }
 
 export function datom(e, attr, value, tx = undefined, added = undefined) {

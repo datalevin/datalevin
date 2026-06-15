@@ -44,8 +44,9 @@ def _append_typed_args(args, *, k_type=None, v_type=None, ignore_key=None, op):
 class KV(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin KV handle."""
 
-    def __init__(self, handle) -> None:
-        super().__init__(handle, _BINDINGS.close_key_value, _BINDINGS.key_value_closed, "kv")
+    def __init__(self, handle, *, owned: bool = True) -> None:
+        close_fn = _BINDINGS.close_key_value if owned else lambda _handle: None
+        super().__init__(handle, close_fn, _BINDINGS.key_value_closed, "kv")
 
     def dir(self):
         return to_python(_BINDINGS.core_invoke("dir", [self.raw_handle()]))

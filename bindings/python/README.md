@@ -47,6 +47,36 @@ with connect(
 Structured query forms and inputs can also be passed as normal Python lists and
 dictionaries when that is more convenient than EDN strings.
 
+## Datalog-Backed KV Example
+
+Use `datalog_kv()` when you need ordinary KV tables in the same store as a
+Datalog connection. The returned KV handle is borrowed from the connection; do
+not close it separately.
+
+```python
+from datalevin import datalog_kv
+
+kv = datalog_kv(conn)
+kv.open_dbi("app-state")
+kv.transact([(":put", "k", "v")], "app-state", ":string", ":string")
+```
+
+## Datom Inspection Example
+
+Connection objects expose index-level reads for debugging, teaching, and
+migration tooling. Datom reads return dictionaries with `:e`, `:a`, `:v`,
+`:tx`, and `:added` keys; `fulltext_datoms()` returns `[e, attr, value]`
+triples.
+
+```python
+print(conn.datoms(":eav", 1, ":name", limit=10))
+print(conn.seek_datoms(":ave", ":name", "Ada", limit=5))
+print(conn.rseek_datoms(":ave", ":name", "Bob", limit=5))
+print(conn.index_range(":name", "A", "C"))
+print(conn.count_datoms(None, ":name", "Ada"))
+print(conn.fulltext_datoms("database", opts={":top": 5}))
+```
+
 ## Bulk Load Example
 
 Use `init_db()` and `fill_db()` when you already have Datom-shaped data and want
