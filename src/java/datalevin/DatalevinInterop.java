@@ -453,7 +453,7 @@ public final class DatalevinInterop {
         Object normalizedDescriptor = DatalevinForms.udfDescriptorInput(descriptor);
         return ClojureRuntime.invoke("datalevin.udf",
                                      "register!",
-                                     registry,
+                                     rawResource(registry),
                                      normalizedDescriptor,
                                      ClojureFns.udfFunction(fn, normalizedDescriptor));
     }
@@ -464,7 +464,7 @@ public final class DatalevinInterop {
     public static Object unregisterUdf(Object registry, Map<?, ?> descriptor) {
         return ClojureRuntime.invoke("datalevin.udf",
                                      "unregister!",
-                                     registry,
+                                     rawResource(registry),
                                      DatalevinForms.udfDescriptorInput(descriptor));
     }
 
@@ -475,7 +475,7 @@ public final class DatalevinInterop {
         return ClojureCodec.javaBoolean(
                 ClojureRuntime.invoke("datalevin.udf",
                                       "registered?",
-                                      registry,
+                                      rawResource(registry),
                                       DatalevinForms.udfDescriptorInput(descriptor)));
     }
 
@@ -640,7 +640,13 @@ public final class DatalevinInterop {
     }
 
     private static Object rawResource(Object value) {
-        return value instanceof HandleResource handle ? handle.handle() : value;
+        if (value instanceof HandleResource handle) {
+            return handle.handle();
+        }
+        if (value instanceof UdfRegistry registry) {
+            return registry.rawHandle();
+        }
+        return value;
     }
 
     private static Object connectionStore(Object conn) {

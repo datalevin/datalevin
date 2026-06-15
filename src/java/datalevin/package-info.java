@@ -35,6 +35,25 @@
  * {@link java.util.concurrent.CompletableFuture} containing the transaction
  * report.
  *
+ * <p>For runtime UDFs, use {@link datalevin.Datalevin#udfRegistry} and
+ * {@link datalevin.UdfDescriptor}. Pass the registry through connection
+ * runtime options and call descriptors from query with Datalevin's {@code udf}
+ * function:
+ *
+ * <pre>{@code
+ * UdfRegistry registry = Datalevin.udfRegistry()
+ *     .queryFn("math/inc", args -> ((Number) args.get(0)).longValue() + 1);
+ * UdfDescriptor descriptor = UdfDescriptor.queryFn("math/inc");
+ *
+ * try (Connection conn = Datalevin.createConn("/tmp/example-udf", (Map<?, ?>) null,
+ *         Map.of(":runtime-opts", Map.of(":udf-registry", registry)))) {
+ *     Object value = conn.query(
+ *         "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+ *         descriptor,
+ *         41L);
+ * }
+ * }</pre>
+ *
  * <p>For bulk load, use Datom-shaped input with {@link datalevin.Datalevin#initDb}
  * and {@link datalevin.Connection#fillDb}:
  *

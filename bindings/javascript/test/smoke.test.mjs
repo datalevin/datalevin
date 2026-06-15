@@ -9,6 +9,7 @@ import {
   DatalevinJavaError,
   apiInfo,
   connect,
+  createUdfRegistry,
   datom,
   datalogKv,
   execJson,
@@ -19,7 +20,8 @@ import {
   openKv,
   schemaAttr,
   transactAsync,
-  txEntity
+  txEntity,
+  udfDescriptor
 } from "../src/index.js";
 import { toJs } from "../src/interop.js";
 import { jvmStarted, resolveClasspath } from "../src/jvm.js";
@@ -51,6 +53,39 @@ test(
     const jsonInfo = await execJson("api-info");
 
     assert.equal(info["datalevin-version"], jsonInfo["datalevin-version"]);
+  }
+);
+
+test(
+  "UDF registry supports inline query functions",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-udf-"));
+    const registry = await createUdfRegistry();
+    const descriptor = udfDescriptor(":math/inc");
+
+    await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
+
+    const conn = await connect(dir, {
+      opts: { ":runtime-opts": { ":udf-registry": registry } }
+    });
+
+    try {
+      assert.equal(await registry.registered(descriptor), true);
+      assert.equal(
+        intValue(await conn.query(
+          "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+          descriptor,
+          41
+        )),
+        42
+      );
+
+      await registry.unregister(descriptor);
+      assert.equal(await registry.registered(descriptor), false);
+    } finally {
+      await conn.close();
+    }
   }
 );
 

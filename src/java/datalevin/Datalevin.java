@@ -364,11 +364,55 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a typed UDF registry wrapper.
+     */
+    public static UdfRegistry udfRegistry() {
+        return new UdfRegistry(DatalevinInterop.createUdfRegistry());
+    }
+
+    /**
+     * Creates a query function UDF descriptor.
+     */
+    public static UdfDescriptor queryUdf(String id) {
+        return UdfDescriptor.queryFn(id);
+    }
+
+    /**
+     * Creates a query predicate UDF descriptor.
+     */
+    public static UdfDescriptor predicateUdf(String id) {
+        return UdfDescriptor.predicate(id);
+    }
+
+    /**
+     * Creates a transaction function UDF descriptor.
+     */
+    public static UdfDescriptor txUdf(String id) {
+        return UdfDescriptor.txFn(id);
+    }
+
+    /**
      * Normalizes a UDF descriptor into the raw Clojure form expected by
      * Datalevin.
      */
     public static Object udfDescriptor(Map<?, ?> descriptor) {
         return DatalevinInterop.udfDescriptor(descriptor);
+    }
+
+    /**
+     * Normalizes a typed UDF descriptor into the raw Clojure form expected by
+     * Datalevin.
+     */
+    public static Object udfDescriptor(UdfDescriptor descriptor) {
+        Objects.requireNonNull(descriptor, "descriptor");
+        return descriptor.buildForm();
+    }
+
+    /**
+     * Creates a typed UDF descriptor for the given kind and id.
+     */
+    public static UdfDescriptor udfDescriptor(String kind, String id) {
+        return UdfDescriptor.of(kind, id);
     }
 
     /**

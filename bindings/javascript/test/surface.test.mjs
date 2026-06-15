@@ -6,6 +6,7 @@ import * as datalevin from "../src/index.js";
 test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.apiInfo, "function");
   assert.equal(typeof datalevin.connect, "function");
+  assert.equal(typeof datalevin.createUdfRegistry, "function");
   assert.equal(typeof datalevin.datom, "function");
   assert.equal(typeof datalevin.datalogKv, "function");
   assert.equal(typeof datalevin.execJson, "function");
@@ -25,6 +26,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.txEntity, "function");
   assert.equal(typeof datalevin.txRetract, "function");
   assert.equal(typeof datalevin.txRetractEntity, "function");
+  assert.equal(typeof datalevin.udfDescriptor, "function");
   assert.equal(typeof datalevin.writeEdn, "function");
   assert.deepEqual(datalevin.schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }), {
     ":db/valueType": ":db.type/string",
@@ -34,8 +36,14 @@ test("public surface stays importable without starting the JVM", () => {
   assert.deepEqual(datalevin.txAdd(1, "name", "Ada"), [":db/add", 1, ":name", "Ada"]);
   assert.deepEqual(datalevin.txRetract(1, ":name", "Ada"), [":db/retract", 1, ":name", "Ada"]);
   assert.deepEqual(datalevin.txRetractEntity(1), [":db/retractEntity", 1]);
+  assert.deepEqual(datalevin.udfDescriptor("math/inc"), {
+    ":udf/lang": ":java",
+    ":udf/kind": ":query-fn",
+    ":udf/id": ":math/inc"
+  });
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.KV, "function");
+  assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
   assert.equal(typeof datalevin.Connection.prototype.fillDb, "function");
   for (const method of [

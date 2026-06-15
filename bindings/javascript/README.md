@@ -86,6 +86,34 @@ const report = await conn.transactAsync([
 ]);
 ```
 
+## UDF Example
+
+Use `createUdfRegistry()` and `udfDescriptor()` for runtime UDFs. Pass the
+registry in connection runtime options, then call the descriptor from query with
+Datalevin's `udf` function.
+
+```js
+import { connect, createUdfRegistry, udfDescriptor } from "datalevin-node";
+
+const registry = await createUdfRegistry();
+await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
+
+const descriptor = udfDescriptor(":math/inc");
+const conn = await connect("/tmp/dtlv-js-udf", {
+  opts: { ":runtime-opts": { ":udf-registry": registry } }
+});
+
+try {
+  const value = await conn.query(
+    "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+    descriptor,
+    41
+  );
+} finally {
+  await conn.close();
+}
+```
+
 ## Datalog-Backed KV Example
 
 Use `datalogKv()` when you need ordinary KV tables in the same store as a

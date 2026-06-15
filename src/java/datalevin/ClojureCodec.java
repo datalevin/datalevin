@@ -68,6 +68,14 @@ final class ClojureCodec {
             return ClojureRuntime.readEdn(literal.value());
         }
 
+        if (value instanceof UdfRegistry registry) {
+            return registry.rawHandle();
+        }
+
+        if (value instanceof UdfDescriptor descriptor) {
+            return descriptor.buildForm();
+        }
+
         if (value instanceof IPersistentMap) {
             return value;
         }

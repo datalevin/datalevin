@@ -86,6 +86,34 @@ future = conn.transact_async([{":db/id": -1, ":name": "Cara"}])
 report = future.result(timeout=10)
 ```
 
+## UDF Example
+
+Use `create_udf_registry()` and `udf_descriptor()` for runtime UDFs. Pass the
+registry in connection runtime options, then call the descriptor from query with
+Datalevin's `udf` function.
+
+```python
+from datalevin import connect, create_udf_registry, udf_descriptor
+
+registry = create_udf_registry()
+
+@registry.query_udf(":math/inc")
+def inc(value):
+    return value + 1
+
+descriptor = udf_descriptor(":math/inc")
+
+with connect(
+    "/tmp/dtlv-py-udf",
+    opts={":runtime-opts": {":udf-registry": registry}},
+) as conn:
+    value = conn.query(
+        "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+        descriptor,
+        41,
+    )
+```
+
 ## Datalog-Backed KV Example
 
 Use `datalog_kv()` when you need ordinary KV tables in the same store as a

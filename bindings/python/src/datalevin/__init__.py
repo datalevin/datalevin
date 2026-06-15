@@ -32,7 +32,7 @@ from .errors import (
     DatalevinJvmError,
 )
 from .kv import KV
-from .udf import UdfRegistry, create_udf_registry
+from .udf import UdfRegistry, create_udf_registry, udf_descriptor
 
 __all__ = [
     "Client",
@@ -65,6 +65,7 @@ __all__ = [
     "tx_entity",
     "tx_retract",
     "tx_retract_entity",
+    "udf_descriptor",
     "write_edn",
 ]
 

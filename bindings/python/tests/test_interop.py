@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from datalevin import api_info, connect, create_udf_registry, exec_json, interop
+from datalevin import api_info, connect, create_udf_registry, exec_json, interop, udf_descriptor
 from datalevin._convert import to_python
 
 
@@ -99,8 +99,8 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
     def bootstrap(db, name):
         return [{":db/id": -1, ":name": name, ":score": 10}]
 
-    query_descriptor = {":udf/lang": ":java", ":udf/kind": ":query-fn", ":udf/id": ":math/inc"}
-    tx_descriptor = {":udf/lang": ":java", ":udf/kind": ":tx-fn", ":udf/id": ":person/bootstrap"}
+    query_descriptor = udf_descriptor(":math/inc")
+    tx_descriptor = udf_descriptor(":person/bootstrap", kind=":tx-fn")
 
     with connect(
         str(tmp_path / "db"),

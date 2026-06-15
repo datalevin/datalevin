@@ -31,3 +31,4 @@ export {
 } from "./interop.js";
 export { interop } from "./raw.js";
 export { KV } from "./kv.js";
+export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";

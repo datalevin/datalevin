@@ -40,19 +40,52 @@ class UdfRegistry:
 
     def query_udf(self, udf_id: str):
         def decorator(fn):
-            descriptor = {":udf/lang": ":java", ":udf/kind": ":query-fn", ":udf/id": udf_id}
-            self.register(descriptor, fn)
+            self.register(udf_descriptor(udf_id, kind=":query-fn"), fn)
+            return fn
+
+        return decorator
+
+    def predicate_udf(self, udf_id: str):
+        def decorator(fn):
+            self.register(udf_descriptor(udf_id, kind=":predicate"), fn)
             return fn
 
         return decorator
 
     def tx_udf(self, udf_id: str):
         def decorator(fn):
-            descriptor = {":udf/lang": ":java", ":udf/kind": ":tx-fn", ":udf/id": udf_id}
-            self.register(descriptor, fn)
+            self.register(udf_descriptor(udf_id, kind=":tx-fn"), fn)
             return fn
 
         return decorator
+
+
+def _keyword_string(value) -> str:
+    text = str(value)
+    return text if text.startswith(":") else f":{text}"
+
+
+def udf_descriptor(udf_id=None, *, kind=":query-fn", lang=":java", version=None):
+    """Create a Datalevin UDF descriptor dictionary."""
+
+    if isinstance(udf_id, dict):
+        descriptor = dict(udf_id)
+        udf_id = descriptor.get(":udf/id", descriptor.get("id"))
+        kind = descriptor.get(":udf/kind", descriptor.get("kind", kind))
+        lang = descriptor.get(":udf/lang", descriptor.get("lang", lang))
+        version = descriptor.get(":udf/version", descriptor.get("version", version))
+
+    if udf_id is None:
+        raise TypeError("udf_id is required")
+
+    descriptor = {
+        ":udf/lang": _keyword_string(lang),
+        ":udf/kind": _keyword_string(kind),
+        ":udf/id": _keyword_string(udf_id),
+    }
+    if version is not None:
+        descriptor[":udf/version"] = version
+    return descriptor
 
 
 def create_udf_registry() -> UdfRegistry:

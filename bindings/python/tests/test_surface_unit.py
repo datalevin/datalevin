@@ -9,6 +9,7 @@ import datalevin.client as client_module
 import datalevin.connection as connection_module
 import datalevin.kv as kv_module
 import datalevin._interop as interop_module
+import datalevin.udf as udf_module
 from datalevin.errors import DatalevinError
 
 
@@ -228,6 +229,23 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     client = interop_module.new_client("dtlv://user:pass@host", opts=client_opts)
     assert client.raw_handle() == "CLIENT"
     assert fake.last_client == ("dtlv://user:pass@host", client_opts)
+
+
+def test_udf_descriptor_helper() -> None:
+    assert udf_module.udf_descriptor("math/inc") == {
+        ":udf/lang": ":java",
+        ":udf/kind": ":query-fn",
+        ":udf/id": ":math/inc",
+    }
+    assert udf_module.udf_descriptor(
+        {"id": "math/positive?", "kind": "predicate", "version": "v1"}
+    ) == {
+        ":udf/lang": ":java",
+        ":udf/kind": ":predicate",
+        ":udf/id": ":math/positive?",
+        ":udf/version": "v1",
+    }
+    assert callable(getattr(udf_module.UdfRegistry, "predicate_udf"))
 
 
 def test_kv_public_surface_includes_richer_operations() -> None:

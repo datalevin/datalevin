@@ -13,6 +13,8 @@
   tuple identities no longer creates partial `[nil ...]` tuple values
   [#372](https://github.com/datalevin/datalevin/issues/372).
 
+### Improved
+- Java, Python, JS API parity with Clojure.
 
 ## 0.10.18 (2026-05-27)
 ### Fixed
