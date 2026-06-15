@@ -26,6 +26,7 @@ export {
   openKv,
   readEdn,
   schemaAttr,
+  searchIndexWriter,
   searchDomain,
   searchOptions,
   startJvm,
@@ -41,4 +42,5 @@ export {
 } from "./interop.js";
 export { interop } from "./raw.js";
 export { KV } from "./kv.js";
+export { SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";

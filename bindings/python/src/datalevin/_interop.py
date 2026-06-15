@@ -169,6 +169,18 @@ class InteropBindings:
     def key_value_closed(self, handle) -> bool:
         return bool(call_java(classes().interop.keyValueClosed, handle))
 
+    def search_index_writer(self, kv, opts=None):
+        handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
+        return call_java(classes().interop.searchIndexWriter, handle, to_java(opts))
+
+    def search_write(self, writer, doc_ref, doc_text):
+        handle = writer.raw_handle() if callable(getattr(writer, "raw_handle", None)) else writer
+        return call_java(classes().interop.searchWrite, handle, to_java(doc_ref), doc_text)
+
+    def search_commit(self, writer):
+        handle = writer.raw_handle() if callable(getattr(writer, "raw_handle", None)) else writer
+        return call_java(classes().interop.searchCommit, handle)
+
     def new_client(self, uri, opts=None):
         return call_java(classes().interop.newClient, uri, to_java(opts))
 
@@ -481,12 +493,16 @@ def search_options(
     return opts
 
 
-def search_domain(*, index_position=None, indexing_mode=None, extra=None):
+def search_domain(*, domain=None, index_position=None, include_text=None, indexing_mode=None, extra=None):
     """Build a full-text domain option map."""
 
     opts = {}
+    if domain is not None:
+        opts[":domain"] = domain
     if index_position is not None:
         opts[":index-position?"] = bool(index_position)
+    if include_text is not None:
+        opts[":include-text?"] = bool(include_text)
     if indexing_mode is not None:
         opts[":indexing-mode"] = _keyword_value(indexing_mode)
     if extra:
@@ -651,6 +667,14 @@ def open_kv(dir, opts=None) -> KV:
     return KV(_BINDINGS.open_key_value(dir, opts))
 
 
+def search_index_writer(kv: KV, opts=None):
+    """Create a batched full-text search index writer for a KV store."""
+
+    from .search import SearchIndexWriter
+
+    return SearchIndexWriter(_BINDINGS.search_index_writer(kv, opts))
+
+
 def new_client(uri, opts=None) -> Client:
     """Open a remote Datalevin admin client."""
 
@@ -679,6 +703,7 @@ __all__ = [
     "open_kv",
     "read_edn",
     "schema_attr",
+    "search_index_writer",
     "search_domain",
     "search_options",
     "start_jvm",

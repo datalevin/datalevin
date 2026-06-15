@@ -72,6 +72,37 @@ public final class KV extends HandleResource {
     }
 
     /**
+     * Creates a batched full-text search index writer over this KV store.
+     */
+    public SearchIndexWriter searchIndexWriter() {
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer", resource()));
+    }
+
+    /**
+     * Creates a batched full-text search index writer with raw options.
+     */
+    public SearchIndexWriter searchIndexWriter(Map<?, ?> opts) {
+        if (opts == null) {
+            return searchIndexWriter();
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        resource(),
+                                                        DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Creates a batched full-text search index writer with typed options.
+     */
+    public SearchIndexWriter searchIndexWriter(RetrievalOptions opts) {
+        if (opts == null) {
+            return searchIndexWriter();
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        resource(),
+                                                        opts.buildForm()));
+    }
+
+    /**
      * Adds values to the list associated with {@code key}.
      */
     public void putListItems(String listName, Object key, Object values, String kType, String vType) {

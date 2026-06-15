@@ -10,6 +10,7 @@ import datalevin.client as client_module
 import datalevin.connection as connection_module
 import datalevin.kv as kv_module
 import datalevin._interop as interop_module
+import datalevin.search as search_module
 import datalevin.udf as udf_module
 from datalevin.errors import DatalevinError
 
@@ -104,6 +105,17 @@ class FakeInteropBindings:
     def key_value_closed(self, handle):
         return handle in self.kv_closed
 
+    def search_index_writer(self, kv, opts=None):
+        self.last_search_writer = (kv, opts)
+        return "SEARCH_WRITER"
+
+    def search_write(self, writer, doc_ref, doc_text):
+        self.last_search_write = (writer, doc_ref, doc_text)
+
+    def search_commit(self, writer):
+        self.last_search_commit = writer
+        return ":transacted"
+
     def new_client(self, uri, opts=None):
         self.last_client = (uri, opts)
         return "CLIENT"
@@ -175,6 +187,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     monkeypatch.setattr(connection_module, "_BINDINGS", fake)
     monkeypatch.setattr(kv_module, "_BINDINGS", fake)
     monkeypatch.setattr(client_module, "_BINDINGS", fake)
+    monkeypatch.setattr(search_module, "_BINDINGS", fake)
 
     assert interop_module.exec_json("ping", {"count": 1}) == {"status": "ok"}
     assert fake.last_request == {"op": "ping", "args": {"count": 1}}
@@ -208,8 +221,15 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         ":display": ":refs+scores",
         ":domains": ["docs"],
     }
-    assert interop_module.search_domain(index_position=True, indexing_mode="async") == {
+    assert interop_module.search_domain(
+        domain="docs",
+        index_position=True,
+        include_text=True,
+        indexing_mode="async",
+    ) == {
+        ":domain": "docs",
         ":index-position?": True,
+        ":include-text?": True,
         ":indexing-mode": ":async",
     }
     assert interop_module.vector_options(dimensions=384, metric_type="cosine") == {
@@ -257,7 +277,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
 
     assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
-    for helper in ["keyword", "read_edn", "symbol", "write_edn"]:
+    for helper in ["keyword", "read_edn", "search_index_writer", "symbol", "write_edn"]:
         assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
@@ -271,6 +291,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     kv = interop_module.open_kv("/tmp/kv", opts={":mapsize": 1})
     assert kv.raw_handle() == "KV"
     assert fake.last_kv == ("/tmp/kv", {":mapsize": 1})
+    writer = interop_module.search_index_writer(kv, opts={":include-text?": True})
+    assert writer.raw_handle() == "SEARCH_WRITER"
+    assert fake.last_search_writer == (kv, {":include-text?": True})
+    assert writer.write("doc-1", "pizza and pasta") is writer
+    assert fake.last_search_write == ("SEARCH_WRITER", "doc-1", "pizza and pasta")
+    assert writer.commit() == ":transacted"
+    assert fake.last_search_commit == "SEARCH_WRITER"
+    assert writer.closed() is True
 
     client_opts = {
         ":pool-size": 1,
@@ -319,6 +347,7 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "put_list_items",
         "range_count",
         "sample_kv",
+        "search_index_writer",
         "stat",
         "sync",
         "tx_log_watermarks",
@@ -329,6 +358,8 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(connection_module.Connection, "fill_db"))
     assert callable(getattr(datalevin.Entity, "touch"))
+    assert callable(getattr(datalevin.SearchIndexWriter, "commit"))
+    assert callable(getattr(datalevin.SearchIndexWriter, "write"))
     for method in [
         "count_datoms",
         "copy",

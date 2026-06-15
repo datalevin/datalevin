@@ -326,6 +326,32 @@ class InteropBindings {
     return Boolean(await callJavaMethod(handle, "closed"));
   }
 
+  async searchIndexWriter(kv, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "searchIndexWriter",
+      await unwrapInteropHandle(kv),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async searchWrite(writer, docRef, docText) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "searchWrite",
+      await unwrapInteropHandle(writer),
+      await toJava(docRef),
+      docText
+    );
+  }
+
+  async searchCommit(writer) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "searchCommit", await unwrapInteropHandle(writer));
+  }
+
   async newClient(uri, opts = null) {
     const cls = await classes();
     if (opts !== null && opts !== undefined) {
@@ -744,10 +770,22 @@ export function searchOptions({
   return opts;
 }
 
-export function searchDomain({ indexPosition = null, indexingMode = null, extra = null } = {}) {
+export function searchDomain({
+  domain = null,
+  indexPosition = null,
+  includeText = null,
+  indexingMode = null,
+  extra = null
+} = {}) {
   const opts = {};
+  if (domain !== null && domain !== undefined) {
+    opts[":domain"] = domain;
+  }
   if (indexPosition !== null && indexPosition !== undefined) {
     opts[":index-position?"] = Boolean(indexPosition);
+  }
+  if (includeText !== null && includeText !== undefined) {
+    opts[":include-text?"] = Boolean(includeText);
   }
   if (indexingMode !== null && indexingMode !== undefined) {
     opts[":indexing-mode"] = keywordValue(indexingMode);
@@ -885,6 +923,11 @@ export function datom(e, attr, value, tx = undefined, added = undefined) {
 export async function openKv(dir, opts = null) {
   const { KV } = await import("./kv.js");
   return new KV(await _BINDINGS.openKeyValue(dir, opts));
+}
+
+export async function searchIndexWriter(kv, opts = null) {
+  const { SearchIndexWriter } = await import("./search.js");
+  return new SearchIndexWriter(await _BINDINGS.searchIndexWriter(kv, opts));
 }
 
 export async function newClient(uri, opts = null) {

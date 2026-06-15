@@ -110,6 +110,15 @@ class RawInterop:
     def key_value_closed(self, handle):
         return _BINDINGS.key_value_closed(handle)
 
+    def search_index_writer(self, kv, opts=None):
+        return _BINDINGS.search_index_writer(kv, opts)
+
+    def search_write(self, writer, doc_ref, doc_text):
+        return _BINDINGS.search_write(writer, doc_ref, doc_text)
+
+    def search_commit(self, writer):
+        return _BINDINGS.search_commit(writer)
+
     def new_client(self, uri, opts=None):
         return _BINDINGS.new_client(uri, opts)
 

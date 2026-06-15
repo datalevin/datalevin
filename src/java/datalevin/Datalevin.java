@@ -271,6 +271,30 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a batched full-text search index writer for {@code kv}.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter();
+    }
+
+    /**
+     * Creates a batched full-text search index writer with raw options.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter(opts);
+    }
+
+    /**
+     * Creates a batched full-text search index writer with typed options.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv, RetrievalOptions opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter(opts);
+    }
+
+    /**
      * Opens a remote admin client for the given Datalevin URI.
      */
     public static Client newClient(String uri) {

@@ -24,6 +24,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.openKv, "function");
   assert.equal(typeof datalevin.readEdn, "function");
   assert.equal(typeof datalevin.schemaAttr, "function");
+  assert.equal(typeof datalevin.searchIndexWriter, "function");
   assert.equal(typeof datalevin.searchDomain, "function");
   assert.equal(typeof datalevin.searchOptions, "function");
   assert.equal(typeof datalevin.startJvm, "function");
@@ -67,8 +68,15 @@ test("public surface stays importable without starting the JVM", () => {
     ":display": ":refs+scores",
     ":domains": ["docs"]
   });
-  assert.deepEqual(datalevin.searchDomain({ indexPosition: true, indexingMode: "async" }), {
+  assert.deepEqual(datalevin.searchDomain({
+    domain: "docs",
+    indexPosition: true,
+    includeText: true,
+    indexingMode: "async"
+  }), {
+    ":domain": "docs",
     ":index-position?": true,
+    ":include-text?": true,
     ":indexing-mode": ":async"
   });
   assert.deepEqual(datalevin.vectorOptions({ dimensions: 384, metricType: "cosine" }), {
@@ -103,6 +111,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Connection, "function");
   assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
+  assert.equal(typeof datalevin.SearchIndexWriter, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
   assert.equal(typeof datalevin.Entity.prototype.touch, "function");
@@ -147,10 +156,13 @@ test("public surface stays importable without starting the JVM", () => {
     "putListItems",
     "rangeCount",
     "sampleKv",
+    "searchIndexWriter",
     "stat",
     "sync",
     "txLogWatermarks"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");
   }
+  assert.equal(typeof datalevin.SearchIndexWriter.prototype.write, "function");
+  assert.equal(typeof datalevin.SearchIndexWriter.prototype.commit, "function");
 });

@@ -20,6 +20,8 @@ import {
   keyword,
   openKv,
   schemaAttr,
+  searchDomain,
+  searchIndexWriter,
   transactAsync,
   txEntity,
   udfDescriptor
@@ -455,6 +457,36 @@ test(
       assert.equal(typeof snapshot, "object");
       assert.equal(Array.isArray(snapshots), true);
       assert.equal(typeof gc, "object");
+    } finally {
+      await kv.close();
+    }
+  }
+);
+
+test(
+  "search index writer commits kv full-text batches",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-search-writer-"));
+    const kv = await openKv(dir);
+
+    try {
+      const writer = await searchIndexWriter(kv, searchDomain({ includeText: true }));
+      assert.equal(String(writer), "<SearchIndexWriter open>");
+      assert.equal(await writer.write("doc-1", "pizza and pasta"), writer);
+      await writer.write("doc-2", "just pie");
+      assert.equal(await writer.commit(), ":transacted");
+      assert.equal(await writer.closed(), true);
+      assert.equal(String(writer), "<SearchIndexWriter closed>");
+
+      assert.equal(intValue(await kv.entries("datalevin/docs")), 2);
+      assert.equal(intValue(await kv.entries("datalevin/rawtext")), 2);
+      assert.equal(intValue(await kv.entries("datalevin/terms")) > 0, true);
+
+      const notesWriter = await kv.searchIndexWriter(searchDomain({ domain: "notes", includeText: true }));
+      await notesWriter.write("note-1", "searchable local note");
+      await notesWriter.commit();
+      assert.equal(intValue(await kv.entries("notes/docs")), 1);
     } finally {
       await kv.close();
     }

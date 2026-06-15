@@ -235,6 +235,18 @@ class RawInterop {
     return _BINDINGS.keyValueClosed(resourceHandle(handle));
   }
 
+  async searchIndexWriter(kv, opts = null) {
+    return _BINDINGS.searchIndexWriter(resourceHandle(kv), opts);
+  }
+
+  async searchWrite(writer, docRef, docText) {
+    return _BINDINGS.searchWrite(resourceHandle(writer), docRef, docText);
+  }
+
+  async searchCommit(writer) {
+    return toJsResult(await _BINDINGS.searchCommit(resourceHandle(writer)));
+  }
+
   async newClient(uri, opts = null) {
     return _BINDINGS.newClient(uri, opts);
   }

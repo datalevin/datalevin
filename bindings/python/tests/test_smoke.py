@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from datalevin import api_info, connect, open_kv
+from datalevin import api_info, connect, open_kv, search_domain, search_index_writer
 pytestmark = pytest.mark.usefixtures("require_runtime")
 
 
@@ -60,3 +60,22 @@ def test_kv_range_specs_accept_python_forms(tmp_path: Path) -> None:
             [2, "b"],
             [3, "c"],
         ]
+
+
+def test_search_index_writer_commits_to_kv_index(tmp_path: Path) -> None:
+    kv_dir = tmp_path / "search-kv"
+    with open_kv(str(kv_dir)) as kv:
+        writer = search_index_writer(kv, search_domain(include_text=True))
+        assert writer.write("doc-1", "pizza and pasta") is writer
+        writer.write("doc-2", "just pie")
+        assert writer.commit() == ":transacted"
+        assert writer.closed() is True
+
+        assert kv.entries("datalevin/docs") == 2
+        assert kv.entries("datalevin/rawtext") == 2
+        assert kv.entries("datalevin/terms") > 0
+
+        writer = kv.search_index_writer(search_domain(domain="notes", include_text=True))
+        writer.write("note-1", "searchable local note")
+        writer.commit()
+        assert kv.entries("notes/docs") == 1

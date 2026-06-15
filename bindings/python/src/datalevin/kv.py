@@ -63,6 +63,11 @@ class KV(ResourceWrapper):
             args.append(_BINDINGS.options(opts))
         _BINDINGS.core_invoke("open-list-dbi", args)
 
+    def search_index_writer(self, opts=None):
+        from .search import SearchIndexWriter
+
+        return SearchIndexWriter(_BINDINGS.search_index_writer(self.raw_handle(), opts))
+
     def list_dbis(self):
         return to_python(_BINDINGS.core_invoke("list-dbis", [self.raw_handle()]))
 

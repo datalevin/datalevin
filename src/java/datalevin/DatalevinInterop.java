@@ -404,6 +404,40 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Creates a raw batched full-text search index writer handle.
+     */
+    public static Object searchIndexWriter(Object kv, Map<?, ?> opts) {
+        Object rawKv = rawResource(kv);
+        if (opts == null) {
+            return new SearchIndexWriter(ClojureRuntime.core("search-index-writer", rawKv));
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        rawKv,
+                                                        DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Adds one document to a raw full-text search index writer handle.
+     */
+    public static Object searchWrite(Object writer, Object docRef, String docText) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("write",
+                                                             rawResource(writer),
+                                                             ClojureCodec.runtimeInput(docRef),
+                                                             docText));
+    }
+
+    /**
+     * Flushes all pending documents in a raw full-text search index writer.
+     */
+    public static Object searchCommit(Object writer) {
+        Object result = ClojureCodec.bridgeOutput(ClojureRuntime.core("commit", rawResource(writer)));
+        if (writer instanceof SearchIndexWriter searchWriter) {
+            searchWriter.close();
+        }
+        return result;
+    }
+
+    /**
      * Opens a raw remote client handle.
      */
     public static Object newClient(String uri, Map<?, ?> opts) {

@@ -99,6 +99,14 @@ public final class RetrievalOptions {
     }
 
     /**
+     * Sets {@code :include-text?}.
+     */
+    public RetrievalOptions includeText(boolean enabled) {
+        props.put(Datalevin.kw("include-text?"), enabled);
+        return this;
+    }
+
+    /**
      * Sets {@code :indexing-mode}.
      */
     public RetrievalOptions indexingMode(String mode) {
