@@ -37,6 +37,45 @@ queries, pull selectors, and rules. Use `Datalevin.kw(...)`,
 `Datalevin.writeEdn(...)` when explicit EDN values are needed. Use
 `Datalevin.edn(...)` to mark raw EDN text for APIs that accept an EDN form.
 
+Search, vector, embedding, and idoc maps have typed helpers as well:
+
+```java
+Map<Object, Object> schema = Datalevin.schema()
+        .attr("doc/text", Schema.attribute()
+                .valueType(Schema.ValueType.STRING)
+                .fulltext(true)
+                .fulltextDomains("docs")
+                .fulltextAutoDomain(true))
+        .attr("doc/body", Schema.attribute()
+                .valueType(Schema.ValueType.STRING)
+                .embedding(true)
+                .embeddingDomains("docs")
+                .embeddingAutoDomain(true))
+        .attr("doc/vec", Schema.attribute()
+                .valueType(Schema.ValueType.VEC)
+                .vectorDomains("docs"))
+        .attr("doc/json", Schema.attribute()
+                .valueType(Schema.ValueType.IDOC)
+                .idocFormat(Schema.IdocFormat.JSON)
+                .domain("profiles"))
+        .build();
+
+Map<String, Object> opts = Map.of(
+        ":search-domains", Map.of("docs",
+                Datalevin.searchDomain().indexPosition(true).build()),
+        ":search-opts", Datalevin.searchOptions()
+                .top(5)
+                .display("refs+scores")
+                .build(),
+        ":vector-opts", Datalevin.vectorOptions(384)
+                .metricType("cosine")
+                .build(),
+        ":embedding-opts", Datalevin.embeddingOptions()
+                .provider("default")
+                .metricType("cosine")
+                .build());
+```
+
 ## UDF Style
 
 Use `Datalevin.udfRegistry()` and `UdfDescriptor` for runtime UDFs. Pass the

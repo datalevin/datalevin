@@ -14,6 +14,14 @@
  * Raw EDN text can be marked with {@link datalevin.Datalevin#edn} for APIs
  * that accept an EDN form.
  *
+ * <p>For full-text, vector, embedding, and idoc features, use the fluent
+ * schema helpers on {@link datalevin.Schema.Attribute} and the option builders
+ * returned by {@link datalevin.Datalevin#searchOptions},
+ * {@link datalevin.Datalevin#searchDomain},
+ * {@link datalevin.Datalevin#vectorOptions},
+ * {@link datalevin.Datalevin#embeddingOptions}, and
+ * {@link datalevin.Datalevin#idocOptions}.
+ *
  * <p>Typical usage:
  *
  * <pre>{@code

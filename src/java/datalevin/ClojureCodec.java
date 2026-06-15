@@ -76,6 +76,10 @@ final class ClojureCodec {
             return descriptor.buildForm();
         }
 
+        if (value instanceof RetrievalOptions options) {
+            return options.buildForm();
+        }
+
         if (value instanceof IPersistentMap) {
             return value;
         }

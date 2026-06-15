@@ -367,6 +367,193 @@ def schema_attr(
     return spec
 
 
+def fulltext_attr(
+    *,
+    value_type=":db.type/string",
+    domains=None,
+    auto_domain=None,
+    extra=None,
+    **schema_kwargs,
+):
+    """Build a full-text indexed schema attribute."""
+
+    merged = {":db/fulltext": True}
+    if domains is not None:
+        merged[":db.fulltext/domains"] = list(domains)
+    if auto_domain is not None:
+        merged[":db.fulltext/autoDomain"] = bool(auto_domain)
+    if extra:
+        merged.update(extra)
+    return schema_attr(value_type=value_type, extra=merged, **schema_kwargs)
+
+
+def embedding_attr(
+    *,
+    value_type=":db.type/string",
+    domains=None,
+    auto_domain=None,
+    extra=None,
+    **schema_kwargs,
+):
+    """Build an embedding-indexed text schema attribute."""
+
+    merged = {":db/embedding": True}
+    if domains is not None:
+        merged[":db.embedding/domains"] = list(domains)
+    if auto_domain is not None:
+        merged[":db.embedding/autoDomain"] = bool(auto_domain)
+    if extra:
+        merged.update(extra)
+    return schema_attr(value_type=value_type, extra=merged, **schema_kwargs)
+
+
+def vector_attr(*, domains=None, extra=None, **schema_kwargs):
+    """Build a vector schema attribute."""
+
+    merged = {}
+    if domains is not None:
+        merged[":db.vec/domains"] = list(domains)
+    if extra:
+        merged.update(extra)
+    return schema_attr(value_type=":db.type/vec", extra=merged, **schema_kwargs)
+
+
+def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
+    """Build an indexed-document schema attribute."""
+
+    merged = {}
+    if format is not None:
+        merged[":db/idocFormat"] = _keyword_value(format)
+    if domain is not None:
+        merged[":db/domain"] = domain
+    if extra:
+        merged.update(extra)
+    return schema_attr(value_type=":db.type/idoc", extra=merged, **schema_kwargs)
+
+
+def search_options(
+    *,
+    top=None,
+    display=None,
+    domains=None,
+    proximity_expansion=None,
+    proximity_max_dist=None,
+    indexing_mode=None,
+    extra=None,
+):
+    """Build full-text query/default options."""
+
+    opts = {}
+    if top is not None:
+        opts[":top"] = top
+    if display is not None:
+        opts[":display"] = _keyword_value(display)
+    if domains is not None:
+        opts[":domains"] = list(domains)
+    if proximity_expansion is not None:
+        opts[":proximity-expansion"] = proximity_expansion
+    if proximity_max_dist is not None:
+        opts[":proximity-max-dist"] = proximity_max_dist
+    if indexing_mode is not None:
+        opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def search_domain(*, index_position=None, indexing_mode=None, extra=None):
+    """Build a full-text domain option map."""
+
+    opts = {}
+    if index_position is not None:
+        opts[":index-position?"] = bool(index_position)
+    if indexing_mode is not None:
+        opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def vector_options(
+    *,
+    dimensions=None,
+    metric_type=None,
+    quantization=None,
+    connectivity=None,
+    expansion_add=None,
+    expansion_search=None,
+    domain=None,
+    indexing_mode=None,
+    extra=None,
+):
+    """Build vector index/domain/default options."""
+
+    opts = {}
+    if dimensions is not None:
+        opts[":dimensions"] = dimensions
+    if metric_type is not None:
+        opts[":metric-type"] = _keyword_value(metric_type)
+    if quantization is not None:
+        opts[":quantization"] = _keyword_value(quantization)
+    if connectivity is not None:
+        opts[":connectivity"] = connectivity
+    if expansion_add is not None:
+        opts[":expansion-add"] = expansion_add
+    if expansion_search is not None:
+        opts[":expansion-search"] = expansion_search
+    if domain is not None:
+        opts[":domain"] = domain
+    if indexing_mode is not None:
+        opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def embedding_options(
+    *,
+    provider=None,
+    model=None,
+    base_url=None,
+    api_key_env=None,
+    request_dimensions=None,
+    metric_type=None,
+    indexing_mode=None,
+    extra=None,
+):
+    """Build embedding provider/domain/default options."""
+
+    opts = {}
+    if provider is not None:
+        opts[":provider"] = _keyword_value(provider)
+    if model is not None:
+        opts[":model"] = model
+    if base_url is not None:
+        opts[":base-url"] = base_url
+    if api_key_env is not None:
+        opts[":api-key-env"] = api_key_env
+    if request_dimensions is not None:
+        opts[":request-dimensions"] = request_dimensions
+    if metric_type is not None:
+        opts[":metric-type"] = _keyword_value(metric_type)
+    if indexing_mode is not None:
+        opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def idoc_options(*, domains=None, extra=None):
+    """Build idoc-match query options."""
+
+    opts = {}
+    if domains is not None:
+        opts[":domains"] = list(domains)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
 def tx_entity(db_id=None, attrs=None, **values):
     """Build an entity-map transaction item."""
 
@@ -431,6 +618,11 @@ def _attr_key(attr):
     return f":{attr}"
 
 
+def _keyword_value(value):
+    text = str(value)
+    return text if text.startswith(":") else f":{text}"
+
+
 def open_kv(dir, opts=None) -> KV:
     """Open a Datalevin KV store."""
 
@@ -453,8 +645,13 @@ __all__ = [
     "connect",
     "datom",
     "datalog_kv",
+    "embedding_attr",
+    "embedding_options",
     "exec_json",
     "fill_db",
+    "fulltext_attr",
+    "idoc_attr",
+    "idoc_options",
     "init_db",
     "jvm_started",
     "keyword",
@@ -462,6 +659,8 @@ __all__ = [
     "open_kv",
     "read_edn",
     "schema_attr",
+    "search_domain",
+    "search_options",
     "start_jvm",
     "symbol",
     "transact_async",
@@ -469,5 +668,7 @@ __all__ = [
     "tx_entity",
     "tx_retract",
     "tx_retract_entity",
+    "vector_attr",
+    "vector_options",
     "write_edn",
 ]

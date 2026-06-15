@@ -181,6 +181,56 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         ":db/valueType": ":db.type/string",
         ":db/unique": ":db.unique/identity",
     }
+    assert interop_module.fulltext_attr(domains=["docs"], auto_domain=True) == {
+        ":db/valueType": ":db.type/string",
+        ":db/fulltext": True,
+        ":db.fulltext/domains": ["docs"],
+        ":db.fulltext/autoDomain": True,
+    }
+    assert interop_module.embedding_attr(domains=["docs"], auto_domain=True) == {
+        ":db/valueType": ":db.type/string",
+        ":db/embedding": True,
+        ":db.embedding/domains": ["docs"],
+        ":db.embedding/autoDomain": True,
+    }
+    assert interop_module.vector_attr(domains=["vectors"]) == {
+        ":db/valueType": ":db.type/vec",
+        ":db.vec/domains": ["vectors"],
+    }
+    assert interop_module.idoc_attr(format="json", domain="profiles") == {
+        ":db/valueType": ":db.type/idoc",
+        ":db/idocFormat": ":json",
+        ":db/domain": "profiles",
+    }
+    assert interop_module.search_options(top=5, display="refs+scores", domains=["docs"]) == {
+        ":top": 5,
+        ":display": ":refs+scores",
+        ":domains": ["docs"],
+    }
+    assert interop_module.search_domain(index_position=True, indexing_mode="async") == {
+        ":index-position?": True,
+        ":indexing-mode": ":async",
+    }
+    assert interop_module.vector_options(dimensions=384, metric_type="cosine") == {
+        ":dimensions": 384,
+        ":metric-type": ":cosine",
+    }
+    assert interop_module.embedding_options(
+        provider="openai-compatible",
+        model="text-embedding-3-small",
+        api_key_env="OPENAI_API_KEY",
+        request_dimensions=1536,
+        metric_type="cosine",
+    ) == {
+        ":provider": ":openai-compatible",
+        ":model": "text-embedding-3-small",
+        ":api-key-env": "OPENAI_API_KEY",
+        ":request-dimensions": 1536,
+        ":metric-type": ":cosine",
+    }
+    assert interop_module.idoc_options(domains=["profiles"]) == {
+        ":domains": ["profiles"],
+    }
     assert interop_module.tx_entity(-1, name="Ada") == {":db/id": -1, ":name": "Ada"}
     assert interop_module.tx_add(1, "name", "Ada") == [":db/add", 1, ":name", "Ada"]
     assert interop_module.tx_retract(1, ":name", "Ada") == [":db/retract", 1, ":name", "Ada"]

@@ -595,6 +595,210 @@ export function schemaAttr({
   return spec;
 }
 
+export function fulltextAttr({
+  valueType = ":db.type/string",
+  domains = null,
+  autoDomain = null,
+  extra = null,
+  ...schemaProps
+} = {}) {
+  const merged = { ":db/fulltext": true };
+  if (domains !== null && domains !== undefined) {
+    merged[":db.fulltext/domains"] = [...domains];
+  }
+  if (autoDomain !== null && autoDomain !== undefined) {
+    merged[":db.fulltext/autoDomain"] = Boolean(autoDomain);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(merged, extra);
+  }
+  return schemaAttr({ valueType, extra: merged, ...schemaProps });
+}
+
+export function embeddingAttr({
+  valueType = ":db.type/string",
+  domains = null,
+  autoDomain = null,
+  extra = null,
+  ...schemaProps
+} = {}) {
+  const merged = { ":db/embedding": true };
+  if (domains !== null && domains !== undefined) {
+    merged[":db.embedding/domains"] = [...domains];
+  }
+  if (autoDomain !== null && autoDomain !== undefined) {
+    merged[":db.embedding/autoDomain"] = Boolean(autoDomain);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(merged, extra);
+  }
+  return schemaAttr({ valueType, extra: merged, ...schemaProps });
+}
+
+export function vectorAttr({ domains = null, extra = null, ...schemaProps } = {}) {
+  const merged = {};
+  if (domains !== null && domains !== undefined) {
+    merged[":db.vec/domains"] = [...domains];
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(merged, extra);
+  }
+  return schemaAttr({ valueType: ":db.type/vec", extra: merged, ...schemaProps });
+}
+
+export function idocAttr({ format = null, domain = null, extra = null, ...schemaProps } = {}) {
+  const merged = {};
+  if (format !== null && format !== undefined) {
+    merged[":db/idocFormat"] = keywordValue(format);
+  }
+  if (domain !== null && domain !== undefined) {
+    merged[":db/domain"] = domain;
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(merged, extra);
+  }
+  return schemaAttr({ valueType: ":db.type/idoc", extra: merged, ...schemaProps });
+}
+
+export function searchOptions({
+  top = null,
+  display = null,
+  domains = null,
+  proximityExpansion = null,
+  proximityMaxDist = null,
+  indexingMode = null,
+  extra = null
+} = {}) {
+  const opts = {};
+  if (top !== null && top !== undefined) {
+    opts[":top"] = top;
+  }
+  if (display !== null && display !== undefined) {
+    opts[":display"] = keywordValue(display);
+  }
+  if (domains !== null && domains !== undefined) {
+    opts[":domains"] = [...domains];
+  }
+  if (proximityExpansion !== null && proximityExpansion !== undefined) {
+    opts[":proximity-expansion"] = proximityExpansion;
+  }
+  if (proximityMaxDist !== null && proximityMaxDist !== undefined) {
+    opts[":proximity-max-dist"] = proximityMaxDist;
+  }
+  if (indexingMode !== null && indexingMode !== undefined) {
+    opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function searchDomain({ indexPosition = null, indexingMode = null, extra = null } = {}) {
+  const opts = {};
+  if (indexPosition !== null && indexPosition !== undefined) {
+    opts[":index-position?"] = Boolean(indexPosition);
+  }
+  if (indexingMode !== null && indexingMode !== undefined) {
+    opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function vectorOptions({
+  dimensions = null,
+  metricType = null,
+  quantization = null,
+  connectivity = null,
+  expansionAdd = null,
+  expansionSearch = null,
+  domain = null,
+  indexingMode = null,
+  extra = null
+} = {}) {
+  const opts = {};
+  if (dimensions !== null && dimensions !== undefined) {
+    opts[":dimensions"] = dimensions;
+  }
+  if (metricType !== null && metricType !== undefined) {
+    opts[":metric-type"] = keywordValue(metricType);
+  }
+  if (quantization !== null && quantization !== undefined) {
+    opts[":quantization"] = keywordValue(quantization);
+  }
+  if (connectivity !== null && connectivity !== undefined) {
+    opts[":connectivity"] = connectivity;
+  }
+  if (expansionAdd !== null && expansionAdd !== undefined) {
+    opts[":expansion-add"] = expansionAdd;
+  }
+  if (expansionSearch !== null && expansionSearch !== undefined) {
+    opts[":expansion-search"] = expansionSearch;
+  }
+  if (domain !== null && domain !== undefined) {
+    opts[":domain"] = domain;
+  }
+  if (indexingMode !== null && indexingMode !== undefined) {
+    opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function embeddingOptions({
+  provider = null,
+  model = null,
+  baseUrl = null,
+  apiKeyEnv = null,
+  requestDimensions = null,
+  metricType = null,
+  indexingMode = null,
+  extra = null
+} = {}) {
+  const opts = {};
+  if (provider !== null && provider !== undefined) {
+    opts[":provider"] = keywordValue(provider);
+  }
+  if (model !== null && model !== undefined) {
+    opts[":model"] = model;
+  }
+  if (baseUrl !== null && baseUrl !== undefined) {
+    opts[":base-url"] = baseUrl;
+  }
+  if (apiKeyEnv !== null && apiKeyEnv !== undefined) {
+    opts[":api-key-env"] = apiKeyEnv;
+  }
+  if (requestDimensions !== null && requestDimensions !== undefined) {
+    opts[":request-dimensions"] = requestDimensions;
+  }
+  if (metricType !== null && metricType !== undefined) {
+    opts[":metric-type"] = keywordValue(metricType);
+  }
+  if (indexingMode !== null && indexingMode !== undefined) {
+    opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function idocOptions({ domains = null, extra = null } = {}) {
+  const opts = {};
+  if (domains !== null && domains !== undefined) {
+    opts[":domains"] = [...domains];
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
 export function txEntity(dbId = null, attrs = {}) {
   const entity = { ...attrs };
   if (dbId !== null && dbId !== undefined) {
@@ -642,4 +846,9 @@ export { jvmStarted, startJvm, toEdnForm, toJava, toJs, toQueryInput };
 
 function attrKey(attr) {
   return typeof attr === "string" && attr.startsWith(":") ? attr : `:${attr}`;
+}
+
+function keywordValue(value) {
+  const text = String(value);
+  return text.startsWith(":") ? text : `:${text}`;
 }

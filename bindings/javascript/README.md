@@ -74,6 +74,38 @@ const form = await readEdn("[:find ?e :where [?e :name _]]");
 const text = await writeEdn([":find", "?e", ":where", ["?e", ":name", "_"]]);
 ```
 
+## Search, Vector, and Idoc Builders
+
+Use helper builders for search/vector/idoc schema and option maps instead of
+hand-writing every namespaced key:
+
+```js
+import {
+  embeddingAttr,
+  embeddingOptions,
+  fulltextAttr,
+  idocAttr,
+  searchDomain,
+  searchOptions,
+  vectorAttr,
+  vectorOptions
+} from "datalevin-node";
+
+const schema = {
+  ":doc/text": fulltextAttr({ domains: ["docs"], autoDomain: true }),
+  ":doc/body": embeddingAttr({ domains: ["docs"], autoDomain: true }),
+  ":doc/vec": vectorAttr({ domains: ["docs"] }),
+  ":doc/json": idocAttr({ format: "json", domain: "profiles" })
+};
+
+const opts = {
+  ":search-domains": { docs: searchDomain({ indexPosition: true }) },
+  ":search-opts": searchOptions({ top: 5, display: "refs+scores" }),
+  ":vector-opts": vectorOptions({ dimensions: 384, metricType: "cosine" }),
+  ":embedding-opts": embeddingOptions({ provider: "default", metricType: "cosine" })
+};
+```
+
 ## Async Transaction Example
 
 Use `transactAsync()` for ingestion and application-server workloads that

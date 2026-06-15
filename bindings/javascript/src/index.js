@@ -11,8 +11,13 @@ export {
   connect,
   datom,
   datalogKv,
+  embeddingAttr,
+  embeddingOptions,
   execJson,
   fillDb,
+  fulltextAttr,
+  idocAttr,
+  idocOptions,
   initDb,
   jvmStarted,
   keyword,
@@ -20,6 +25,8 @@ export {
   openKv,
   readEdn,
   schemaAttr,
+  searchDomain,
+  searchOptions,
   startJvm,
   symbol,
   transactAsync,
@@ -27,6 +34,8 @@ export {
   txEntity,
   txRetract,
   txRetractEntity,
+  vectorAttr,
+  vectorOptions,
   writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";

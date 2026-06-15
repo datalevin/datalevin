@@ -75,6 +75,38 @@ form = read_edn("[:find ?e :where [?e :name _]]")
 text = write_edn([":find", "?e", ":where", ["?e", ":name", "_"]])
 ```
 
+## Search, Vector, and Idoc Builders
+
+Use helper builders for search/vector/idoc schema and option maps instead of
+hand-writing every namespaced key:
+
+```python
+from datalevin import (
+    embedding_attr,
+    embedding_options,
+    fulltext_attr,
+    idoc_attr,
+    search_domain,
+    search_options,
+    vector_attr,
+    vector_options,
+)
+
+schema = {
+    ":doc/text": fulltext_attr(domains=["docs"], auto_domain=True),
+    ":doc/body": embedding_attr(domains=["docs"], auto_domain=True),
+    ":doc/vec": vector_attr(domains=["docs"]),
+    ":doc/json": idoc_attr(format="json", domain="profiles"),
+}
+
+opts = {
+    ":search-domains": {"docs": search_domain(index_position=True)},
+    ":search-opts": search_options(top=5, display="refs+scores"),
+    ":vector-opts": vector_options(dimensions=384, metric_type="cosine"),
+    ":embedding-opts": embedding_options(provider="default", metric_type="cosine"),
+}
+```
+
 ## Async Transaction Example
 
 Use `transact_async()` for ingestion and application-server workloads that

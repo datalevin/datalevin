@@ -357,6 +357,41 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a full-text query/default option builder.
+     */
+    public static RetrievalOptions searchOptions() {
+        return RetrievalOptions.search();
+    }
+
+    /**
+     * Creates a full-text domain option builder.
+     */
+    public static RetrievalOptions searchDomain() {
+        return RetrievalOptions.searchDomain();
+    }
+
+    /**
+     * Creates a vector index/domain option builder with required dimensions.
+     */
+    public static RetrievalOptions vectorOptions(long dimensions) {
+        return RetrievalOptions.vector(dimensions);
+    }
+
+    /**
+     * Creates an embedding provider/domain option builder.
+     */
+    public static RetrievalOptions embeddingOptions() {
+        return RetrievalOptions.embedding();
+    }
+
+    /**
+     * Creates an idoc match option builder.
+     */
+    public static RetrievalOptions idocOptions() {
+        return RetrievalOptions.idoc();
+    }
+
+    /**
      * Creates a raw UDF registry handle.
      */
     public static Object createUdfRegistry() {

@@ -127,10 +127,10 @@ final class DatalevinForms {
         if (opts == null) {
             return null;
         }
-        if (opts instanceof IPersistentMap && normalizedKeywordMap(opts, true)) {
+        if (opts instanceof IPersistentMap && normalizedOptionsMap(opts)) {
             return opts;
         }
-        return keywordMap(opts, true);
+        return optionsMap(opts);
     }
 
     static Object udfDescriptorInput(Map<?, ?> descriptor) {
@@ -628,6 +628,33 @@ final class DatalevinForms {
         return result;
     }
 
+    private static IPersistentMap optionsMap(Map<?, ?> map) {
+        IPersistentMap result = PersistentArrayMap.EMPTY;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            Object key = keywordFromAttr(entry.getKey());
+            Object value = domainOptionsKey(key)
+                    ? domainOptionsMap(entry.getValue())
+                    : keywordValue(entry.getValue(), true);
+            result = result.assoc(key, value);
+        }
+        return result;
+    }
+
+    private static Object domainOptionsMap(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            return keywordValue(value, true);
+        }
+        IPersistentMap result = PersistentArrayMap.EMPTY;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            result = result.assoc(domainName(entry.getKey()),
+                                  keywordValue(entry.getValue(), true));
+        }
+        return result;
+    }
+
     private static Object keywordValue(Object value, boolean keywordizeColonValues) {
         if (value instanceof String s && keywordizeColonValues && s.startsWith(":")) {
             return ClojureCodec.keyword(s);
@@ -872,12 +899,60 @@ final class DatalevinForms {
         return value.startsWith(":") ? value.substring(1) : value;
     }
 
+    private static boolean domainOptionsKey(Object key) {
+        String name = key instanceof Keyword ? key.toString() : String.valueOf(key);
+        return ":search-domains".equals(name)
+                || ":vector-domains".equals(name)
+                || ":embedding-domains".equals(name);
+    }
+
+    private static String domainName(Object key) {
+        if (key instanceof Keyword keyword) {
+            return stripLeadingColon(keyword.toString());
+        }
+        return String.valueOf(key);
+    }
+
     private static boolean normalizedKeywordMap(Map<?, ?> map, boolean keywordizeColonValues) {
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (!(entry.getKey() instanceof Keyword)) {
                 return false;
             }
             if (!normalizedKeywordValue(entry.getValue(), keywordizeColonValues)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean normalizedOptionsMap(Map<?, ?> map) {
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof Keyword)) {
+                return false;
+            }
+            if (domainOptionsKey(entry.getKey())) {
+                if (!normalizedDomainOptionsMap(entry.getValue())) {
+                    return false;
+                }
+            } else if (!normalizedKeywordValue(entry.getValue(), true)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean normalizedDomainOptionsMap(Object value) {
+        if (value == null) {
+            return true;
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            return false;
+        }
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof String s) || s.startsWith(":")) {
+                return false;
+            }
+            if (!normalizedKeywordValue(entry.getValue(), true)) {
                 return false;
             }
         }
