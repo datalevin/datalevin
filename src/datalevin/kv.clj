@@ -2807,6 +2807,50 @@
           (txlog-mark-fatal! state e)
           (throw e))))))
 
+(defn- txlog-record-at-lsn
+  [state record-lsn]
+  (let [record-lsn (long record-lsn)]
+    (some (fn [record]
+            (when (= record-lsn (long (:lsn record)))
+              record))
+          (txlog-records state record-lsn))))
+
+(defn- txlog-record-replay-summary
+  [record]
+  (select-keys record [:lsn :segment-id :offset :checksum :ha-term
+                       :tx-kind :payload-bytes :path]))
+
+(defn- comparable-txlog-record?
+  [local incoming]
+  (let [local-checksum (some-> (:checksum local) long)
+        incoming-checksum (some-> (:checksum incoming) long)
+        local-term (some-> (:ha-term local) long)
+        incoming-term (some-> (:ha-term incoming) long)]
+    (and (= (long (:lsn local)) (long (:lsn incoming)))
+         (= local-term incoming-term)
+         (if (and (some? local-checksum) (some? incoming-checksum))
+           (= local-checksum incoming-checksum)
+           (= (rows-vector (:rows local))
+              (rows-vector (or (:rows incoming) (:ops incoming))))))))
+
+(defn- assert-skipped-replay-record-matches-local!
+  [state record expected-lsn]
+  (let [record-lsn (long (:lsn record))
+        local-record (txlog-record-at-lsn state record-lsn)
+        local-term (some-> (:ha-term local-record) long)
+        incoming-term (some-> (:ha-term record) long)]
+    (when (and (or (some? local-term) (some? incoming-term))
+               (not (and local-record
+                         (comparable-txlog-record? local-record record))))
+      (raise "Follower replay found divergent local txn-log record"
+             {:type :txlog/ha-replay-divergent-local-record
+              :error :ha/txlog-divergent-local-record
+              :expected-lsn expected-lsn
+              :record-lsn record-lsn
+              :local-record (some-> local-record
+                                    txlog-record-replay-summary)
+              :incoming-record (txlog-record-replay-summary record)}))))
+
 (defn ^:no-doc mirror-replayed-txlog-record!
   "Append a replicated HA record into the local txlog at the same LSN and
   apply its payload to LMDB. This keeps promoted followers on the same WAL
@@ -2855,8 +2899,13 @@
                        :expected-lsn expected-lsn
                        :record-lsn record-lsn}))
              (if (< record-lsn expected-lsn)
-               {:lsn record-lsn
-                :skipped? true}
+               (do
+                 (assert-skipped-replay-record-matches-local!
+                  state
+                  record
+                  expected-lsn)
+                 {:lsn record-lsn
+                  :skipped? true})
                (do
                  (txlog-prepare-replay-dbis!
                   lmdb

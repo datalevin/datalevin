@@ -1363,6 +1363,57 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-replay-rejects-divergent-local-skip
+  (let [source-dir (u/tmp-dir (str "wal-replay-divergent-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-divergent-target-"
+                                   (UUID/randomUUID)))
+        opts       {:wal? true}
+        source-db  (atom nil)
+        target-db  (atom nil)]
+    (try
+      (let [source (d/open-kv source-dir opts)
+            target (d/open-kv target-dir opts)]
+        (reset! source-db source)
+        (reset! target-db target)
+        (kv/mirror-replayed-txlog-record!
+         target
+         {:lsn 1
+          :ha-term 1
+          :rows [[:put c/kv-info [:replay-divergent :k] :rogue
+                  :data :data]]})
+        (let [local-record (first (kv/open-tx-log target 1))]
+          (is (= {:lsn 1 :skipped? true}
+                 (select-keys
+                  (kv/mirror-replayed-txlog-record! target local-record)
+                  [:lsn :skipped?]))))
+        (kv/mirror-replayed-txlog-record!
+         source
+         {:lsn 1
+          :ha-term 2
+          :rows [[:put c/kv-info [:replay-divergent :k] :canonical
+                  :data :data]]})
+        (let [incoming (first (kv/open-tx-log source 1))
+              err      (try
+                         (kv/mirror-replayed-txlog-record! target incoming)
+                         nil
+                         (catch clojure.lang.ExceptionInfo e
+                           e))
+              data     (ex-data err)]
+          (is (some? err))
+          (is (= :txlog/ha-replay-divergent-local-record (:type data)))
+          (is (= :ha/txlog-divergent-local-record (:error data)))
+          (is (= 1 (long (:record-lsn data))))
+          (is (= 2 (get-in data [:incoming-record :ha-term])))
+          (is (= 1 (get-in data [:local-record :ha-term])))))
+      (finally
+        (when-let [db @source-db]
+          (d/close-kv db))
+        (when-let [db @target-db]
+          (d/close-kv db))
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
 (deftest test-wal-replay-preserves-lookup-ref-cas
   (let [source-dir (u/tmp-dir (str "wal-replay-cas-source-"
                                    (UUID/randomUUID)))

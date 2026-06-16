@@ -976,6 +976,7 @@
                :ha/txlog-source-authority-mismatch
                :ha/txlog-non-contiguous
                :ha/txlog-record-invalid-term
+               :ha/txlog-divergent-local-record
                :ha/txlog-gap-unresolved}
              (:error (ex-data e))))
 
