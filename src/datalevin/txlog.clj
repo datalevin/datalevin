@@ -231,19 +231,45 @@
       (raise "WAL segment preallocation bytes must be non-negative"
              {:wal-segment-prealloc-bytes bytes}))))
 
-(def ^:private decode-scanned-record-entry trec/decode-scanned-record-entry)
+(defn- scanned-record-summary
+  [^long segment-id ^String path record]
+  (let [payload (tcodec/decode-commit-row-payload-header
+                 ^bytes (:body record))
+        lsn (long (or (:lsn payload) 0))]
+    (when-not (pos? lsn)
+      (raise "Txn-log payload missing valid positive LSN"
+             {:type :txlog/corrupt
+              :segment-id segment-id
+              :path path
+              :offset (long (:offset record))
+              :record record}))
+    {:lsn lsn
+     :segment-id segment-id
+     :offset (long (:offset record))
+     :checksum (long (:checksum record))}))
 
-(def ^:private txlog-records-cache-entry trec/txlog-records-cache-entry)
+(defn- scan-closed-segment-last-record-summary-once
+  [^long segment-id ^File file allow-preallocated-tail?]
+  (let [path (.getPath file)
+        last-record-summary-v (volatile! nil)
+        scan (scan-segment
+              path
+              {:allow-preallocated-tail? allow-preallocated-tail?
+               :collect-records? false
+               :on-record
+               (fn [record]
+                 (vreset! last-record-summary-v
+                          (scanned-record-summary
+                           segment-id path record)))})]
+    (assoc scan :last-record-summary @last-record-summary-v)))
 
-(def ^:private scan-segment-records-cache-entry
-  trec/scan-segment-records-cache-entry)
-
-(defn- repair-closed-segment-preallocated-tail!
+(defn- repair-closed-segment-tail-summary!
   [^long segment-id ^File file cause]
   (let [path (.getPath file)
         repaired
         (try
-          (scan-segment-records-cache-entry segment-id file true)
+          (scan-closed-segment-last-record-summary-once
+           segment-id file true)
           (catch Exception e
             (if cause
               (throw cause)
@@ -253,24 +279,38 @@
         (truncate-partial-tail!
          path
          {:allow-preallocated-tail? true
-          :collect-records?         false})
-        (scan-segment-records-cache-entry segment-id file false))
+          :collect-records? false})
+        (scan-closed-segment-last-record-summary-once
+         segment-id file false))
       (if cause
         (throw cause)
         (raise "Partial tail found on closed txn-log segment"
                {:type :txlog/corrupt
                 :path path})))))
 
-(defn- scan-closed-segment-records-cache-entry!
+(defn- scan-closed-segment-last-record-summary!
   [^long segment-id ^File file]
   (try
     (let [{:keys [partial-tail?] :as result}
-          (scan-segment-records-cache-entry segment-id file false)]
+          (scan-closed-segment-last-record-summary-once
+           segment-id file false)]
       (if partial-tail?
-        (repair-closed-segment-preallocated-tail! segment-id file nil)
+        (repair-closed-segment-tail-summary! segment-id file nil)
         result))
     (catch Exception e
-      (repair-closed-segment-preallocated-tail! segment-id file e))))
+      (repair-closed-segment-tail-summary! segment-id file e))))
+
+(defn- latest-closed-record-summary!
+  [closed-segments]
+  (loop [segments (seq (rseq (vec closed-segments)))]
+    (when-let [{:keys [id file]} (first segments)]
+      (let [summary (:last-record-summary
+                     (scan-closed-segment-last-record-summary!
+                      (long id)
+                      ^File file))]
+        (if summary
+          summary
+          (recur (next segments)))))))
 
 (defn init-runtime-state
   [info marker-state]
@@ -280,26 +320,6 @@
         _                 (u/create-dirs dir)
         segments          (segment-files dir)
         closed-segments   (vec (butlast segments))
-        record-cache-limit (let [n (long c/*wal-records-cache-segments*)]
-                             (if (neg? n) 0 n))
-        cached-closed-segment-ids
-        (when (pos? record-cache-limit)
-          (into #{}
-                (map (comp long :id))
-                (take-last record-cache-limit closed-segments)))
-        [closed-record-cache last-from-closed]
-        (reduce
-         (fn [[cache ^long closed-last-lsn] {:keys [id file]}]
-           (let [segment-id (long id)
-                 {:keys [cache-entry last-lsn]}
-                 (scan-closed-segment-records-cache-entry! segment-id file)]
-             [(if (and cached-closed-segment-ids
-                       (contains? cached-closed-segment-ids segment-id))
-                (assoc cache segment-id cache-entry)
-                cache)
-              (long (or last-lsn closed-last-lsn))]))
-         [{} 0]
-         closed-segments)
         active-id         (if (seq segments) (:id (last segments)) 1)
         active-path       (segment-path dir active-id)
         profile           (durability-profile info)
@@ -335,13 +355,12 @@
                                           :record record}))
                                 (vreset! active-last-lsn-v lsn)
                                 (vreset! active-last-record-summary-v
-                                         {:lsn lsn
-                                          :segment-id (long active-id)
-                                          :offset (long (:offset record))
-                                          :checksum (long (:checksum record))})))})
+                                        {:lsn lsn
+                                         :segment-id (long active-id)
+                                         :offset (long (:offset record))
+                                         :checksum (long (:checksum record))})))})
         active-offset     (segment-end-offset active-scan)
-        active-file       (io/file active-path)
-        txlog-records-cache closed-record-cache
+        txlog-records-cache {}
         closed-bytes      (reduce
                             (fn [acc {:keys [id file]}]
                               (if (= ^long (long id) ^long active-id)
@@ -354,8 +373,14 @@
         meta-cur          (:current meta)
         marker-cur        (:current marker-state)
         last-from-active  (long @active-last-lsn-v)
+        last-from-closed-summary (when (zero? last-from-active)
+                                   (latest-closed-record-summary!
+                                    closed-segments))
+        last-record-summary (or @active-last-record-summary-v
+                                last-from-closed-summary)
+        last-from-closed (long (or (:lsn last-from-closed-summary) 0))
         last-from-seg     (long (max last-from-active
-                                     (long last-from-closed)))
+                                     last-from-closed))
         meta-committed-lsn (long (or (:last-committed-lsn meta-cur) 0))
         meta-durable-lsn   (long (or (:last-durable-lsn meta-cur) 0))
         meta-applied-lsn   (long (or (:last-applied-lsn meta-cur) 0))
@@ -450,10 +475,9 @@
          :segment-summaries-cache                 (volatile! {})
          :txlog-records-cache                     (volatile! txlog-records-cache)
          :retention-total-bytes                   (volatile! total-bytes)
-         ;; Preserve the tail record summary from the active segment scan so a
-         ;; clean reopen can validate the current commit marker without walking
-         ;; the full retained WAL again.
-         :last-record-summary                     @active-last-record-summary-v
+         ;; Preserve the tail record summary so a clean reopen can validate the
+         ;; current commit marker without walking the full retained WAL again.
+         :last-record-summary                     last-record-summary
          :startup-warnings                        (cond-> []
                                                     startup-watermark-warning
                                                     (conj startup-watermark-warning))
