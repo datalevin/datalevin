@@ -3,9 +3,10 @@
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing are is use-fixtures]]
    [datalevin.util :as u]
-   [datalevin.core :as d])
+   [datalevin.core :as d]
+   [datalevin.prepare :as prepare])
   (:import
-   [java.util UUID]))
+   [java.util Date UUID]))
 
 (use-fixtures :each db-fixture)
 
@@ -55,3 +56,22 @@
     (d/db-with db [[:db/add 3 :nick "Ivan"]])
     (d/close-db db)
     (u/delete-files dir)))
+
+
+(deftest coerce-inst-test
+  (is (instance? Date (prepare/coerce-inst 1000)))
+  (is (= 1000 (.getTime (prepare/coerce-inst 1000))))
+
+  (is (instance? Date (prepare/coerce-inst (Date. 1000))))
+  (is (= 1000 (.getTime (prepare/coerce-inst (Date. 1000)))))
+
+  (is (instance? Date (prepare/coerce-inst (java.sql.Date. 1000))))
+  (is (= 1000 (.getTime (prepare/coerce-inst (java.sql.Date. 1000)))))
+
+  (is (instance? Date (prepare/coerce-inst (java.sql.Timestamp. 1000))))
+  (is (= 1000 (.getTime (prepare/coerce-inst (java.sql.Timestamp. 1000)))))
+
+  (is (instance? Date (prepare/coerce-inst (java.time.Instant/ofEpochMilli 1000))))
+  (is (= 1000 (.getTime (prepare/coerce-inst (java.time.Instant/ofEpochMilli 1000)))))
+
+  (is (thrown-with-msg? Throwable #"Expect java.util.Date" (prepare/coerce-inst "1970-01-01T00:00:01.000-00:00"))))

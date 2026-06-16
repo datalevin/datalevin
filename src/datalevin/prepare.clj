@@ -121,7 +121,8 @@
   "Coerce a value to java.util.Date."
   [v]
   (cond
-    (inst? v)    v
+    (instance? java.time.Instant v) (Date. (inst-ms v))
+    (inst? v)    v ; java.sql.Date and java.sql.Timestamp are java.util.Date
     (integer? v) (Date. (long v))
     :else        (u/raise "Expect java.util.Date" {:input v})))
 
