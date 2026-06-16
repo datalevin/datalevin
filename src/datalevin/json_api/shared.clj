@@ -7,7 +7,7 @@
 ;; the terms of this license.
 ;; You must not remove this notice, or any other, from this software.
 ;;
-(ns datalevin.json-api.shared
+(ns ^:no-doc datalevin.json-api.shared
   (:require
    [clojure.edn :as edn]
    [clojure.string :as str]

@@ -15,7 +15,7 @@ public final class Client extends HandleResource {
 
     Client(Object client) {
         super(client,
-              resource -> ClojureRuntime.client("disconnect", resource),
+              resource -> ClojureRuntime.client("close-client", resource),
               "client",
               "client");
     }

@@ -587,6 +587,13 @@
                    client-id pool)
          (set-client-ha-write-retry-settings! time-out opts)))))
 
+(defn close-client
+  "Close a remote client and release its connection pool. Safe to call more
+  than once."
+  [client]
+  (when-not (disconnected? client)
+    (disconnect client)))
+
 (defn ^:no-doc dedicated-transaction-client
   [client]
   (if (instance? Client client)

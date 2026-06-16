@@ -62,6 +62,48 @@
               :path path
               :offset (long (:offset record))}))))
 
+(defn decode-scanned-record-summary
+  [^long segment-id ^String path record]
+  (try
+    (let [^bytes body (:body record)
+          payload (codec/decode-commit-row-payload-header body)
+          lsn     (long (or (:lsn payload) 0))]
+      (when-not (pos? lsn)
+        (raise "Txn-log payload missing valid positive LSN"
+               {:type :txlog/corrupt
+                :segment-id segment-id
+                :path path
+                :offset (long (:offset record))
+                :record record}))
+      (let [tx-time (long (or (:tx-time payload)
+                              (:ts payload)
+                              0))
+            ha-term (some-> (:ha-term payload) long)
+            payload-bytes (long (or (:body-len record)
+                                    (some-> body alength)
+                                    0))
+            next-offset (long (or (:next-offset record)
+                                  (+ (long (:offset record))
+                                     codec/record-header-size
+                                     payload-bytes)))]
+        (cond-> {:lsn lsn
+                 :tx-time tx-time
+                 :payload-bytes payload-bytes
+                 :segment-id segment-id
+                 :offset (long (:offset record))
+                 :next-offset next-offset
+                 :checksum (long (:checksum record))
+                 :path path}
+          (some? ha-term)
+          (assoc :ha-term ha-term))))
+    (catch Exception e
+      (raise "Malformed txn-log payload"
+             e
+             {:type :txlog/corrupt
+              :segment-id segment-id
+              :path path
+              :offset (long (:offset record))}))))
+
 (defn txlog-records-cache-entry
   [segment-id path file-bytes modified-ms records]
   {:segment-id segment-id
@@ -83,7 +125,7 @@
                                 :on-record
                                 (fn [record]
                                   (.add acc
-                                        (decode-scanned-record-entry
+                                        (decode-scanned-record-summary
                                          segment-id
                                          path
                                          record)))})
@@ -800,9 +842,9 @@
     (when (> (long min-retained-lsn) (long (safe-inc-lsn applied-lsn)))
       (raise
        "Retained txn-log floor exceeds recovery cursor coverage"
-       {:type :txlog/recovery-floor-gap}
-       :min-retained-lsn min-retained-lsn
-       :applied-lsn applied-lsn))
+       {:type :txlog/recovery-floor-gap
+        :min-retained-lsn min-retained-lsn
+        :applied-lsn applied-lsn}))
     {:valid-marker valid-marker
      :applied-lsn applied-lsn}))
 
@@ -861,7 +903,7 @@
   [record]
   (let [payload-bytes (or (:payload-bytes record)
                           (:body-len record))]
-    (cond-> (dissoc record :path :body-len)
+    (cond-> (dissoc record :path :body-len :next-offset)
       (some? payload-bytes)
       (assoc :payload-bytes (long payload-bytes)))))
 

@@ -20,9 +20,7 @@
    [java.nio ByteBuffer]
    [java.nio.channels FileChannel FileLock OverlappingFileLockException]
    [java.nio.file Files Path StandardCopyOption StandardOpenOption
-    AtomicMoveNotSupportedException]
-   [java.util Arrays]
-   [java.util.concurrent.locks ReentrantLock]))
+    AtomicMoveNotSupportedException]))
 
 (def ^:private segment-pattern #"^segment-(\d{16})\.wal$")
 (def ^:private prepared-segment-pattern #"^segment-(\d{16})\.wal\.tmp$")
@@ -50,6 +48,9 @@
   (into-array StandardOpenOption
               [StandardOpenOption/CREATE
                StandardOpenOption/WRITE]))
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  open-directory-read-options
+  (into-array StandardOpenOption [StandardOpenOption/READ]))
 
 (def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 
@@ -220,6 +221,16 @@
      :extra     (PosixFsync/fullsync ch))
    sync-mode))
 
+(defn force-parent-directory!
+  "Force the parent directory entry for path to stable storage."
+  [^String path]
+  (when path
+    (when-let [^File parent (.getParentFile (io/file path))]
+      (with-open [^FileChannel ch (FileChannel/open
+                                   (.toPath parent)
+                                   open-directory-read-options)]
+        (PosixFsync/fsync ch)))))
+
 (defn read-fully-at!
   ^ByteBuffer [^FileChannel ch ^long pos ^ByteBuffer bf]
   (loop [p pos]
@@ -284,17 +295,33 @@
            (recur (+ pos len))
            false))))))
 
+(defn- partial-tail
+  ([records ^long offset ^long size]
+   (partial-tail records offset size false))
+  ([records ^long offset ^long size preallocated-tail?]
+   (cond-> {:records       records
+            :valid-end     offset
+            :size          size
+            :partial-tail? true}
+     preallocated-tail? (assoc :preallocated-tail? true))))
+
+(defn- checksum-mismatch-tail?
+  [^FileChannel ch ^long next-offset ^long size ^ByteBuffer read-bf]
+  (tail-all-zero? ch next-offset size read-bf))
+
 (defn- scan-segment-once
   [^String path
    ^FileChannel ch
    size
+   start-offset
    allow-preallocated-tail?
    collect-records?
    on-record]
   (let [size             (long size)
+        start-offset     (long (min size (max 0 (long start-offset))))
         ^ByteBuffer read-bf (codec/big-endian-buffer! (bf/get-array-buffer 8192))]
     (try
-      (loop [offset  0
+      (loop [offset  start-offset
              records (when collect-records? [])]
         (let [remaining (- size offset)]
           (cond
@@ -307,15 +334,8 @@
             (< remaining codec/record-header-size)
             (if (and allow-preallocated-tail?
                      (tail-all-zero? ch offset size read-bf))
-              {:records            records
-               :valid-end          offset
-               :size               size
-               :partial-tail?      true
-               :preallocated-tail? true}
-              {:records       records
-               :valid-end     offset
-               :size          size
-               :partial-tail? true})
+              (partial-tail records offset size true)
+              (partial-tail records offset size))
 
             :else
             (let [_         (doto read-bf
@@ -342,57 +362,57 @@
                                  ^long body-len))]
               (cond
                 (identical? header-map :txlog/preallocated-tail)
-                {:records            records
-                 :valid-end          offset
-                 :size               size
-                 :partial-tail?      true
-                 :preallocated-tail? true}
+                (partial-tail records offset size true)
 
                 (> ^long total-len ^long remaining)
-                {:records       records
-                 :valid-end     offset
-                 :size          size
-                 :partial-tail? true}
+                (partial-tail records offset size)
 
                 :else
-                (let [record
-                      (try
-                        (let [{:keys [major flags body-len checksum]}
-                              header-map
-                              body (read-fully-at
-                                    ch
-                                    (+ offset codec/record-header-size)
-                                    body-len)]
-                          (when-not (= checksum
-                                       (long (bit-and 0xffffffff
-                                                      (long (codec/crc32c body)))))
-                            (raise "Txn-log record checksum mismatch"
-                                   {:offset   offset
-                                    :expected checksum}))
-                          {:major       major
-                           :flags       flags
-                           :compressed? (pos? (long (bit-and
-                                                     (long flags)
-                                                     codec/compressed-flag)))
-                           :body-len    body-len
-                           :checksum    checksum
-                           :body        body})
-                        (catch Exception e
-                          (throw (ex-info "Txn-log segment corruption"
-                                          {:type   :txlog/corrupt
-                                           :path   path
-                                           :offset offset}
-                                          e))))
+                (let [{:keys [major flags body-len checksum]} header-map
+                      body (read-fully-at
+                            ch
+                            (+ offset codec/record-header-size)
+                            body-len)
                       next-offset (long (+ offset (long total-len)))
-                      record*     (assoc record
+                      actual-checksum
+                      (long (codec/record-checksum-for-major
+                             major flags body-len body))]
+                  (if-not (= checksum actual-checksum)
+                    (if (and allow-preallocated-tail?
+                             (checksum-mismatch-tail? ch
+                                                       next-offset
+                                                       size
+                                                       read-bf))
+                      (assoc (partial-tail records offset size)
+                             :checksum-mismatch-tail? true)
+                      (throw (ex-info "Txn-log segment corruption"
+                                      {:type            :txlog/corrupt
+                                       :path            path
+                                       :offset          offset
+                                       :expected        checksum
+                                       :actual-checksum actual-checksum}
+                                      (ex-info
+                                       "Txn-log record checksum mismatch"
+                                       {:offset          offset
+                                        :expected        checksum
+                                        :actual-checksum actual-checksum}))))
+                    (let [record  {:major       major
+                                   :flags       flags
+                                   :compressed? (pos? (long (bit-and
+                                                             (long flags)
+                                                             codec/compressed-flag)))
+                                   :body-len    body-len
+                                   :checksum    checksum
+                                   :body        body}
+                          record* (assoc record
                                          :offset offset
                                          :next-offset next-offset)]
-                  (when on-record
-                    (on-record record*))
-                  (recur next-offset
-                         (if collect-records?
-                           (conj records record*)
-                           records))))))))
+                      (when on-record
+                        (on-record record*))
+                      (recur next-offset
+                             (if collect-records?
+                               (conj records record*)
+                               records))))))))))
       (finally
         (bf/return-array-buffer read-bf)))))
 
@@ -400,9 +420,10 @@
   "Scan a txn-log segment."
   ([^String path] (scan-segment path {}))
   ([^String path {:keys [allow-preallocated-tail? collect-records?
-                         max-offset on-record]
+                         max-offset start-offset on-record]
                   :or   {allow-preallocated-tail? false
-                         collect-records?         true}}]
+                         collect-records?         true
+                         start-offset             0}}]
    (let [f (io/file path)]
      (loop [attempt 0]
        (let [{:keys [value error retry?]}
@@ -417,7 +438,7 @@
                                  (long file-size))]
                  (try
                    {:value (scan-segment-once
-                            path ch size allow-preallocated-tail?
+                            path ch size start-offset allow-preallocated-tail?
                             collect-records? on-record)}
                    (catch Exception e
                      (let [current-size (long (.length f))
@@ -473,11 +494,22 @@
   ([^String path]
    (open-segment-channel path false))
   ([^String path sync-on-write?]
-   (FileChannel/open
-    (.toPath (io/file path))
-    (if sync-on-write?
-      open-segment-create-read-write-dsync-options
-      open-segment-create-read-write-options))))
+   (let [f (io/file path)
+         created? (not (.exists f))
+         ch (FileChannel/open
+             (.toPath f)
+             (if sync-on-write?
+               open-segment-create-read-write-dsync-options
+               open-segment-create-read-write-options))]
+     (try
+       (when created?
+         (force-parent-directory! path))
+       ch
+       (catch Exception e
+         (try
+           (.close ^FileChannel ch)
+           (catch Exception _))
+         (throw e))))))
 
 (defn append-record-at!
   ([^FileChannel ch ^long offset ^bytes body]
@@ -485,7 +517,8 @@
   ([^FileChannel ch ^long offset ^bytes body
     {:keys [compressed?] :or {compressed? false}}]
    (let [body-len        (codec/checked-record-body-len body)
-         checksum        (codec/record-body-checksum body)
+         checksum        (codec/current-record-checksum
+                          body-len (boolean compressed?) body)
          total-size      (+ codec/record-header-size (long body-len))
          ^ByteBuffer hdr (codec/write-record-header!
                           (.get tl-record-header-buffer)
@@ -506,13 +539,15 @@
      (append-record-at! ch offset body opts))))
 
 (defn force-segment!
-  [state ^FileChannel ch sync-mode]
+  [_state ^FileChannel ch sync-mode]
   (force-channel! ch sync-mode))
 
 (defn prepare-segment!
   "Create and preallocate a segment at `tmp-path`."
   [^String tmp-path ^long bytes]
-  (let [p (.toPath (io/file tmp-path))]
+  (let [f (io/file tmp-path)
+        created? (not (.exists f))
+        p (.toPath f)]
     (with-open [^FileChannel ch
                 (FileChannel/open
                  p
@@ -525,6 +560,8 @@
         (.position ch (dec bytes))
         (.write ch (ByteBuffer/wrap (byte-array [(byte 0x00)]))))
       (.force ch true))
+    (when created?
+      (force-parent-directory! tmp-path))
     tmp-path))
 
 (defn activate-prepared-segment!
@@ -541,6 +578,7 @@
         (Files/move src dst
                     (into-array StandardCopyOption
                                 [StandardCopyOption/REPLACE_EXISTING]))))
+    (force-parent-directory! final-path)
     final-path))
 
 (defn prepare-next-segment!

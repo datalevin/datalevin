@@ -976,6 +976,7 @@
                :ha/txlog-source-authority-mismatch
                :ha/txlog-non-contiguous
                :ha/txlog-record-invalid-term
+               :ha/txlog-divergent-local-record
                :ha/txlog-gap-unresolved}
              (:error (ex-data e))))
 
@@ -1735,10 +1736,12 @@
   [store kv-store replay-rows]
   (if-not (instance? IStore store)
     []
-    (let [schema  (i/schema store)
-          attrs   (i/attrs store)
-          targets (sort-by (fn [[e aid]] [e aid])
-                           (replay-cardinality-one-eav-targets replay-rows))]
+    (let [schema         (i/schema store)
+          attrs          (i/attrs store)
+          eav-list-cache (volatile! {})
+          targets        (sort-by (fn [[e aid]] [e aid])
+                                  (replay-cardinality-one-eav-targets
+                                   replay-rows))]
       (vec
        (mapcat
         (fn [[e aid]]
@@ -1754,7 +1757,17 @@
                    (when-let [idx (replay-indexable-for-existing-eav
                                    kv-store props e aid existing)]
                      (cardinality-one-eav-cleanup-row-set idx e))))
-               (i/get-list kv-store c/eav (long e) :id :avg)))))
+               (let [cache @eav-list-cache]
+                 (if (contains? cache e)
+                   (get cache e)
+                   (let [existing-list (i/get-list kv-store
+                                                   c/eav
+                                                   (long e)
+                                                   :id
+                                                   :avg)]
+                     (vreset! eav-list-cache
+                              (assoc cache e existing-list))
+                     existing-list)))))))
         targets)))))
 
 (defn ^:redef apply-ha-follower-txlog-record!
@@ -1838,14 +1851,17 @@
                                                     :dt-db nil)
                                              (dissoc :engine :index))}))))))
                  m))
-            readback-kv-store (raw-local-kv-store next-state)
-            probe-eid         (some->> replay-rows
-                                       (keep (fn [[op dbi k]]
-                                               (when (and (= op :put)
-                                                          (= dbi c/eav)
-                                                          (integer? k))
-                                                 (long k))))
-                                       first)
+            debug?            (ha-replay-debug-enabled?)
+            readback-kv-store (when debug?
+                                (raw-local-kv-store next-state))
+            probe-eid         (when debug?
+                                (some->> replay-rows
+                                         (keep (fn [[op dbi k]]
+                                                 (when (and (= op :put)
+                                                            (= dbi c/eav)
+                                                            (integer? k))
+                                                   (long k))))
+                                         first))
             readback
             (when readback-kv-store
               {:lsn         (long (:lsn record))
@@ -1870,8 +1886,11 @@
                                     :avg))
                    (catch Throwable _
                      nil)))})
-            next-state        (assoc next-state
-                                     :ha-follower-last-apply-readback readback)]
+            next-state        (if debug?
+                                (assoc next-state
+                                       :ha-follower-last-apply-readback readback)
+                                (dissoc next-state
+                                        :ha-follower-last-apply-readback))]
         (ha-replay-debug!
          :apply-ha-follower-record
          {:record-lsn (long (:lsn record))

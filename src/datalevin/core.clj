@@ -321,6 +321,29 @@ Only usable for debug output.
 (u/import-macro conn/with-transaction)
 (u/import-macro conn/with-conn)
 
+(defn ^:no-doc with-transaction-fn
+  [conn f]
+  (conn/with-transaction [tx-conn conn]
+    (.apply ^java.util.function.Function f tx-conn)))
+
+(defn ^:no-doc with-transaction-kv-fn
+  [kv f]
+  (l/with-transaction-kv [tx-kv kv]
+    (.apply ^java.util.function.Function f tx-kv)))
+
+(defn ^:no-doc begin-kv-transaction
+  [kv]
+  (i/open-transact-kv kv))
+
+(defn ^:no-doc commit-kv-transaction
+  [kv]
+  (i/close-transact-kv kv))
+
+(defn ^:no-doc abort-kv-transaction
+  [kv]
+  (i/abort-transact-kv kv)
+  (i/close-transact-kv kv))
+
 (def ^{:arglists '([db]
                    [db n])
        :doc      "Get or set the cache limit of a Datalog DB. Default is 256. Set to 0 to
@@ -1168,6 +1191,22 @@ Only usable for debug output.
 (def ^{:arglists '([db])
        :doc      "Return the path or URI string of the key-value store"}
   dir i/env-dir)
+
+(def ^{:arglists '([conn-or-db])
+       :doc      "Return the KV handle backing a Datalog connection or DB.
+
+  This is the supported way to use Datalevin KV APIs against the same
+  underlying store as a Datalog database, for example to keep application KV
+  tables beside Datalog indexes:
+
+      (let [kv (d/datalog-kv conn)]
+        (d/open-dbi kv \"app-state\")
+        (d/transact-kv kv \"app-state\" [[:put \"k\" \"v\"]]
+                       :string :string))
+
+  The returned handle is owned by the Datalog connection. Do not close it
+  separately; close the Datalog connection instead."}
+  datalog-kv conn/datalog-kv)
 
 (def ^{:arglists '([db dbi-name]
                    [db dbi-name opts])

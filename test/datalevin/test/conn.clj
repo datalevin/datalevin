@@ -17,6 +17,7 @@
   (:import
    [datalevin.db DB]
    [datalevin.storage Store]
+   [java.nio ByteBuffer]
    [java.util Arrays Date UUID]))
 
 (use-fixtures :each db-fixture)
@@ -59,7 +60,7 @@
        first))
 
 (defn- test-ha-opts
-  []
+  [raft-dir]
   (let [group-id    (str "test-ha-group-" (UUID/randomUUID))
         db-identity (str "test-ha-db-" (UUID/randomUUID))
         members     [{:node-id 1 :endpoint "127.0.0.1:19001"}
@@ -88,7 +89,8 @@
                         :voters voters
                         :rpc-timeout-ms 1000
                         :election-timeout-ms 1000
-                        :operation-timeout-ms 1000}}))
+                        :operation-timeout-ms 1000
+                        :raft-dir raft-dir}}))
 
 (deftest test-datalog-wal-default-is-opt-in
   (let [dir  (u/tmp-dir (str "test-datalog-wal-default-"
@@ -133,6 +135,20 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-datalog-kv-exposes-backing-kv-handle
+  (let [dir  (u/tmp-dir (str "test-datalog-kv-" (UUID/randomUUID)))
+        conn (d/create-conn dir)]
+    (try
+      (let [kv (d/datalog-kv conn)]
+        (is (= dir (d/dir kv)))
+        (d/open-dbi kv "app-state")
+        (d/transact-kv kv "app-state" [[:put "k" "v"]] :string :string)
+        (is (= "v" (d/get-value kv "app-state" "k" :string :string true)))
+        (is (= kv (d/datalog-kv @conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-kv-wal-opt-in-defaults-to-relaxed
   (let [dir (u/tmp-dir (str "test-kv-wal-relaxed-"
                             (UUID/randomUUID)))
@@ -171,7 +187,11 @@
 (deftest test-datalog-ha-forces-safe-wal
   (let [dir  (u/tmp-dir (str "test-datalog-ha-wal-"
                              (UUID/randomUUID)))
-        conn (d/create-conn dir nil (test-ha-opts))]
+        conn (d/create-conn
+              dir
+              nil
+              (test-ha-opts
+               (str dir u/+separator+ "ha-control-raft")))]
     (try
       (is (true? (:wal? (conn-env-opts conn))))
       (is (= :strict (:wal-durability-profile (conn-env-opts conn))))
@@ -188,7 +208,11 @@
     (try
       (let [conn (d/create-conn dir)]
         (d/close conn))
-      (let [conn (d/create-conn dir nil (test-ha-opts))]
+      (let [conn (d/create-conn
+                  dir
+                  nil
+                  (test-ha-opts
+                   (str dir u/+separator+ "ha-control-raft")))]
         (try
           (is (true? (:wal? (conn-env-opts conn))))
           (is (= :strict (:wal-durability-profile (conn-env-opts conn))))
@@ -216,7 +240,8 @@
             Exception
             #"Consensus-lease HA requires :wal-durability-profile :strict or :extra"
             (d/create-conn dir nil
-                           (assoc (test-ha-opts)
+                           (assoc (test-ha-opts
+                                   (str dir u/+separator+ "ha-control-raft"))
                                   :wal-durability-profile :relaxed))))
       (finally
         (u/delete-files dir)))))
@@ -1129,11 +1154,74 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-refresh-shared-state-skips-meta-read-by-default
+  (let [dir   (u/tmp-dir (str "wal-refresh-fast-path-test-"
+                              (UUID/randomUUID)))
+        state (atom nil)]
+    (try
+      (reset! state
+              (:state (txlog/init-runtime-state {:dir dir
+                                                 :wal-shared? false}
+                                                {})))
+      (txlog/write-meta-file!
+       (:meta-path @state)
+       {:last-committed-lsn 0
+        :last-durable-lsn 0
+        :last-applied-lsn 0
+        :segment-id 1
+        :segment-offset 0
+        :updated-ms (System/currentTimeMillis)}
+       {:sync-mode :none})
+      (let [refreshed (txlog/refresh-shared-state! @state)
+            watermarks (#'datalevin.txlog/refresh-shared-watermarks!
+                        @state)]
+        (is (= -1 (long @(:meta-revision @state))))
+        (is (= 1 (long (:segment-id refreshed))))
+        (is (= 0 (long (:last-committed-lsn refreshed))))
+        (is (= 0 (long (:last-committed-lsn watermarks)))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
+(deftest test-wal-refresh-shared-state-reads-meta-when-shared
+  (let [dir   (u/tmp-dir (str "wal-refresh-shared-test-"
+                              (UUID/randomUUID)))
+        state (atom nil)]
+    (try
+      (reset! state
+              (:state (txlog/init-runtime-state {:dir dir
+                                                 :wal-shared? true}
+                                                {})))
+      (txlog/write-meta-file!
+       (:meta-path @state)
+       {:last-committed-lsn 0
+        :last-durable-lsn 0
+        :last-applied-lsn 0
+        :segment-id 1
+        :segment-offset 0
+        :updated-ms (System/currentTimeMillis)}
+       {:sync-mode :none})
+      (is (= 0 (long (:revision (txlog/refresh-shared-state! @state)))))
+      (is (= 0 (long @(:meta-revision @state))))
+      (vreset! (:meta-revision @state) -1)
+      (is (= 0 (long (:revision
+                      (#'datalevin.txlog/refresh-shared-watermarks!
+                       @state)))))
+      (is (= 0 (long @(:meta-revision @state))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
 (deftest test-wal-refresh-shared-state-clamps-stale-meta-segment-offset
   (let [dir       (u/tmp-dir (str "wal-stale-meta-offset-test-"
                                   (UUID/randomUUID)))
         txlog-dir (str dir u/+separator+ "txlog")
-        opts      {:wal? true}
+        opts      {:wal? true
+                   :wal-shared? true}
         segment-path
         (fn []
           (->> (or (u/list-files txlog-dir) [])
@@ -1223,6 +1311,67 @@
             (.close ^java.io.Closeable ch)))
         (u/delete-files dir)))))
 
+(deftest test-wal-open-truncates-torn-active-tail-checksum-mismatch
+  (let [dir       (u/tmp-dir (str "wal-torn-active-tail-test-"
+                                  (UUID/randomUUID)))
+        txlog-dir (str dir u/+separator+ "txlog")
+        state     (atom nil)]
+    (try
+      (u/create-dirs txlog-dir)
+      (let [active-path (txlog/segment-path txlog-dir 1)]
+        (txlog/prepare-segment! active-path 4096)
+        (let [valid-payload (txlog/encode-commit-row-payload 1 1 [])
+              bad-payload   (txlog/encode-commit-row-payload 2 2 [])
+              bad-record    (txlog/encode-record bad-payload)
+              header-len    (alength ^bytes (txlog/encode-record
+                                              (byte-array 0)))
+              body-fragment (max 1 (min 8
+                                         (dec (alength ^bytes bad-payload))))
+              torn-len      (+ header-len body-fragment)
+              valid-end
+              (with-open [^java.nio.channels.FileChannel ch
+                          (txlog/open-segment-channel active-path)]
+                (let [{:keys [size]} (txlog/append-record-at!
+                                      ch
+                                      0
+                                      valid-payload)
+                      tail-offset (long size)
+                      ^ByteBuffer torn-bf (ByteBuffer/wrap
+                                           ^bytes bad-record
+                                           0
+                                           torn-len)]
+                  (.position ch tail-offset)
+                  (while (.hasRemaining torn-bf)
+                    (.write ch torn-bf))
+                  tail-offset))]
+          (let [scan (txlog/scan-segment
+                      active-path
+                      {:allow-preallocated-tail? true
+                       :collect-records?         false})]
+            (is (:partial-tail? scan))
+            (is (not (:preallocated-tail? scan)))
+            (is (:checksum-mismatch-tail? scan))
+            (is (= valid-end (long (:valid-end scan)))))
+          (is (thrown-with-msg?
+               Exception
+               #"Txn-log segment corruption"
+               (txlog/scan-segment active-path {:collect-records? false})))
+          (reset! state
+                  (:state (txlog/init-runtime-state {:dir dir} {})))
+          (is (= 2 (long @(:next-lsn @state))))
+          (is (= valid-end (long @(:segment-offset @state))))
+          (let [file (java.io.File. ^String active-path)
+                scan (txlog/scan-segment active-path
+                                         {:collect-records? false})]
+            (is (= valid-end (long (.length file))))
+            (is (false? (:partial-tail? scan)))
+            (is (= valid-end (long (:valid-end scan)))))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
 (deftest test-wal-commit-meta-segment-offset-matches-segment-end
   (let [dir       (u/tmp-dir (str "wal-commit-meta-offset-test-"
                                   (UUID/randomUUID)))
@@ -1286,6 +1435,57 @@
             (d/close-kv db))))
       (finally
         (u/delete-files dir)))))
+
+(deftest test-wal-replay-rejects-divergent-local-skip
+  (let [source-dir (u/tmp-dir (str "wal-replay-divergent-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-divergent-target-"
+                                   (UUID/randomUUID)))
+        opts       {:wal? true}
+        source-db  (atom nil)
+        target-db  (atom nil)]
+    (try
+      (let [source (d/open-kv source-dir opts)
+            target (d/open-kv target-dir opts)]
+        (reset! source-db source)
+        (reset! target-db target)
+        (kv/mirror-replayed-txlog-record!
+         target
+         {:lsn 1
+          :ha-term 1
+          :rows [[:put c/kv-info [:replay-divergent :k] :rogue
+                  :data :data]]})
+        (let [local-record (first (kv/open-tx-log target 1))]
+          (is (= {:lsn 1 :skipped? true}
+                 (select-keys
+                  (kv/mirror-replayed-txlog-record! target local-record)
+                  [:lsn :skipped?]))))
+        (kv/mirror-replayed-txlog-record!
+         source
+         {:lsn 1
+          :ha-term 2
+          :rows [[:put c/kv-info [:replay-divergent :k] :canonical
+                  :data :data]]})
+        (let [incoming (first (kv/open-tx-log source 1))
+              err      (try
+                         (kv/mirror-replayed-txlog-record! target incoming)
+                         nil
+                         (catch clojure.lang.ExceptionInfo e
+                           e))
+              data     (ex-data err)]
+          (is (some? err))
+          (is (= :txlog/ha-replay-divergent-local-record (:type data)))
+          (is (= :ha/txlog-divergent-local-record (:error data)))
+          (is (= 1 (long (:record-lsn data))))
+          (is (= 2 (get-in data [:incoming-record :ha-term])))
+          (is (= 1 (get-in data [:local-record :ha-term])))))
+      (finally
+        (when-let [db @source-db]
+          (d/close-kv db))
+        (when-let [db @target-db]
+          (d/close-kv db))
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
 
 (deftest test-wal-replay-preserves-lookup-ref-cas
   (let [source-dir (u/tmp-dir (str "wal-replay-cas-source-"

@@ -29,6 +29,82 @@ dependencies {
 The published artifact is a self-contained Datalevin Java runtime from Maven
 Central. The current runtime requires Java 21+.
 
+## Data Style
+
+Use the typed Java builders as the canonical style for schemas, transactions,
+queries, pull selectors, and rules. Use `Datalevin.kw(...)`,
+`Datalevin.sym(...)`, `Datalevin.readEdn(...)`, and
+`Datalevin.writeEdn(...)` when explicit EDN values are needed. Use
+`Datalevin.edn(...)` to mark raw EDN text for APIs that accept an EDN form.
+
+Search, vector, embedding, and idoc maps have typed helpers as well:
+
+```java
+Map<Object, Object> schema = Datalevin.schema()
+        .attr("doc/text", Schema.attribute()
+                .valueType(Schema.ValueType.STRING)
+                .fulltext(true)
+                .fulltextDomains("docs")
+                .fulltextAutoDomain(true))
+        .attr("doc/body", Schema.attribute()
+                .valueType(Schema.ValueType.STRING)
+                .embedding(true)
+                .embeddingDomains("docs")
+                .embeddingAutoDomain(true))
+        .attr("doc/vec", Schema.attribute()
+                .valueType(Schema.ValueType.VEC)
+                .vectorDomains("docs"))
+        .attr("doc/json", Schema.attribute()
+                .valueType(Schema.ValueType.IDOC)
+                .idocFormat(Schema.IdocFormat.JSON)
+                .domain("profiles"))
+        .build();
+
+Map<String, Object> opts = Map.of(
+        ":search-domains", Map.of("docs",
+                Datalevin.searchDomain().indexPosition(true).build()),
+        ":search-opts", Datalevin.searchOptions()
+                .top(5)
+                .display("refs+scores")
+                .build(),
+        ":vector-opts", Datalevin.vectorOptions(384)
+                .metricType("cosine")
+                .build(),
+        ":embedding-opts", Datalevin.embeddingOptions()
+                .provider("default")
+                .metricType("cosine")
+                .build());
+```
+
+## UDF Style
+
+Use `Datalevin.udfRegistry()` and `UdfDescriptor` for runtime UDFs. Pass the
+registry in connection runtime options, then call the descriptor from query with
+Datalevin's `udf` function.
+
+```java
+import datalevin.Connection;
+import datalevin.Datalevin;
+import datalevin.UdfDescriptor;
+import datalevin.UdfRegistry;
+
+import java.util.Map;
+
+UdfRegistry registry = Datalevin.udfRegistry()
+        .queryFn("math/inc", args -> ((Number) args.get(0)).longValue() + 1);
+UdfDescriptor descriptor = UdfDescriptor.queryFn("math/inc");
+
+try (Connection conn = Datalevin.createConn(
+        "/tmp/dtlv-java-udf",
+        (Map<?, ?>) null,
+        Map.of(":runtime-opts", Map.of(":udf-registry", registry)))) {
+    Object value = conn.query(
+            "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+            descriptor,
+            41L);
+}
+```
+
 ## Datalog Quick Start
 
 ```java

@@ -36,19 +36,31 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
             k_type=":bytes",
             v_type=":bytes",
         )
-        kv.transact(
-            [(":put", "a", 1), (":put", "a", 2), (":put", "b", 3)],
-            dbi_name="list",
-            k_type=":string",
-            v_type=":long",
-        )
+        kv.put_list_items("list", "a", [1, 2], ":string", ":long")
+        kv.put_list_items("list", "b", [3], ":string", ":long")
 
         assert sorted(kv.list_dbis()) == ["blob-keys", "blobs", "items", "list"]
         assert kv.entries("items") == 3
+        item_stat = kv.stat("items")
+        assert item_stat.get(":entries", item_stat.get("entries")) == 3
         assert kv.get_value("items", "b", ":string", ":string", True) == "beta"
+        assert kv.get_rank("items", "b", ":string") == 1
+        assert kv.get_by_rank("items", 1, ":string", ":string") == "beta"
+        assert kv.get_by_rank("items", 1, ":string", ":string", False) == ["b", "beta"]
+        assert kv.get_first("items", [":all"], ":string", ":string") == ["a", "alpha"]
+        assert kv.get_first_n("items", 2, [":all"], ":string", ":string") == [
+            ["a", "alpha"],
+            ["b", "beta"],
+        ]
+        samples = kv.sample_kv("items", 2, ":string", ":string", False)
+        assert len(samples) == 2
+        assert all(sample in [["a", "alpha"], ["b", "beta"], ["c", "gamma"]] for sample in samples)
         assert kv.get_value("blobs", "buf", ":string", ":bytes", True) == b"\x00\x01\x02\xff"
         assert kv.get_value("blobs", "arr", ":string", ":bytes", True) == b"\x09\x08\x07"
         assert kv.get_value("blob-keys", b"\x00\x02", ":bytes", ":bytes", True) == b"\x09\x0a"
+        assert kv.key_range("items", [":all"], ":string", 2, 1) == ["b", "c"]
+        assert kv.key_range_count("items", [":all"], ":string") == 3
+        assert kv.range_count("items", [":all"], ":string") == 3
         assert kv.get_range("items", [":all"], ":string", ":string", 2, 1) == [
             ["b", "beta"],
             ["c", "gamma"],
@@ -62,6 +74,20 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
             ["a", 2],
             ["b", 3],
         ]
+        assert kv.get_list("list", "a", ":string", ":long") == [1, 2]
+        assert kv.get_list("list", "a", ":string", ":long", limit=1, offset=1) == [2]
+        assert kv.list_count("list", "a", ":string") == 2
+        assert kv.in_list("list", "a", 2, ":string", ":long") is True
+        assert kv.in_list("list", "a", 9, ":string", ":long") is False
+        kv.del_list_items("list", "a", ":string", values=[2], v_type=":long")
+        assert kv.get_list("list", "a", ":string", ":long") == [1]
+        kv.del_list_items("list", "a", ":string")
+        assert kv.list_count("list", "a", ":string") == 0
+
+        kv.sync()
+        copy_dir = tmp_path / "kv-copy"
+        kv.copy(str(copy_dir))
+        assert copy_dir.exists()
 
         kv.clear_dbi("items")
         assert kv.entries("items") == 0
@@ -83,3 +109,30 @@ def test_kv_argument_validation(tmp_path) -> None:
             kv.get_value("items", "a", ":string")
         with pytest.raises(ValueError):
             kv.get_range("items", [":all"], v_type=":string")
+        with pytest.raises(ValueError):
+            kv.put_list_items("items", "a", ["alpha"], None, ":string")
+        with pytest.raises(ValueError):
+            kv.get_by_rank("items", 0, ignore_key=True)
+
+
+def test_kv_operational_methods_cover_wal_snapshots_and_tx_log(tmp_path) -> None:
+    with open_kv(str(tmp_path / "kv-ops"), opts={":wal?": True}) as kv:
+        kv.open_dbi("items")
+        kv.transact(
+            [(":put", "a", "alpha")],
+            dbi_name="items",
+            k_type=":string",
+            v_type=":string",
+        )
+
+        watermarks = kv.tx_log_watermarks()
+        assert watermarks.get(":wal?", watermarks.get("wal")) is True
+        assert isinstance(kv.open_tx_log(1, limit=10), list)
+
+        snapshot = kv.create_snapshot()
+        snapshots = kv.list_snapshots()
+        gc = kv.gc_tx_log_segments()
+
+        assert isinstance(snapshot, dict)
+        assert isinstance(snapshots, list)
+        assert isinstance(gc, dict)

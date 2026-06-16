@@ -10,6 +10,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 import clojure.lang.Keyword;
 import clojure.lang.Symbol;
@@ -109,6 +111,97 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a Datalog connection by bulk-loading Datom values.
+     */
+    public static Connection initDb(Object datoms) {
+        return connFromDatoms(datoms, null, null, null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values.
+     */
+    public static Connection initDb(Object datoms, String dir) {
+        return connFromDatoms(datoms, dir, null, null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a raw schema map.
+     */
+    public static Connection initDb(Object datoms, String dir, Map<?, ?> schema) {
+        return connFromDatoms(datoms, dir, DatalevinForms.schemaInput(schema), null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a typed schema builder.
+     */
+    public static Connection initDb(Object datoms, String dir, Schema schema) {
+        return connFromDatoms(datoms, dir, schema == null ? null : schema.buildForm(), null);
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a raw schema map and options.
+     */
+    public static Connection initDb(Object datoms, String dir, Map<?, ?> schema, Map<?, ?> opts) {
+        return connFromDatoms(datoms,
+                              dir,
+                              DatalevinForms.schemaInput(schema),
+                              DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Creates or replaces a path-addressed Datalog database by bulk-loading
+     * Datom values with a typed schema builder and options.
+     */
+    public static Connection initDb(Object datoms, String dir, Schema schema, Map<?, ?> opts) {
+        return connFromDatoms(datoms,
+                              dir,
+                              schema == null ? null : schema.buildForm(),
+                              DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Bulk-loads Datom values into an existing connection and returns it.
+     */
+    public static Connection fillDb(Connection conn, Object datoms) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.fillDb(datoms);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously on {@code conn}.
+     */
+    public static CompletableFuture<Map<?, ?>> transactAsync(Connection conn, Object txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transactAsync(txData);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously on {@code conn} with
+     * optional transaction metadata.
+     */
+    public static CompletableFuture<Map<?, ?>> transactAsync(Connection conn,
+                                                             Object txData,
+                                                             Map<?, ?> txMeta) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transactAsync(txData, txMeta);
+    }
+
+    /**
+     * Returns the KV handle backing a Datalog connection.
+     *
+     * <p>The returned handle is borrowed from {@code conn}. Closing it does not
+     * close the underlying store; close the Datalog connection instead.
+     */
+    public static KV datalogKV(Connection conn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.datalogKV();
+    }
+
+    /**
      * Returns an anonymous connection managed by the Datalevin runtime.
      *
      * <p>The underlying Clojure API only supports shared lookup for
@@ -176,6 +269,150 @@ public final class Datalevin {
      */
     public static KV openKV(String dir, Map<?, ?> opts) {
         return new KV(ClojureRuntime.core("open-kv", dir, DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Opens an explicit KV write transaction.
+     */
+    public static KVTransaction beginTransaction(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.beginTransaction();
+    }
+
+    /**
+     * Runs {@code fn} inside a single KV write transaction.
+     */
+    public static <T> T withTransaction(KV kv, Function<KV, T> fn) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.withTransaction(fn);
+    }
+
+    /**
+     * Runs {@code fn} inside a single Datalog write transaction.
+     */
+    public static <T> T withTransaction(Connection conn, Function<Connection, T> fn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.withTransaction(fn);
+    }
+
+    /**
+     * Creates a batched full-text search index writer for {@code kv}.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter();
+    }
+
+    /**
+     * Creates a batched full-text search index writer with raw options.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter(opts);
+    }
+
+    /**
+     * Creates a batched full-text search index writer with typed options.
+     */
+    public static SearchIndexWriter searchIndexWriter(KV kv, RetrievalOptions opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.searchIndexWriter(opts);
+    }
+
+    /**
+     * Creates a full-text search engine over {@code kv}.
+     */
+    public static SearchEngine newSearchEngine(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine();
+    }
+
+    /**
+     * Creates a full-text search engine with raw options.
+     */
+    public static SearchEngine newSearchEngine(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine(opts);
+    }
+
+    /**
+     * Creates a full-text search engine with typed options.
+     */
+    public static SearchEngine newSearchEngine(KV kv, RetrievalOptions opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newSearchEngine(opts);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text.
+     */
+    public static SearchEngine reIndex(SearchEngine engine) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex();
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text with raw options.
+     */
+    public static SearchEngine reIndex(SearchEngine engine, Map<?, ?> opts) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text with typed options.
+     */
+    public static SearchEngine reIndex(SearchEngine engine, RetrievalOptions opts) {
+        Objects.requireNonNull(engine, "engine");
+        return engine.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a KV store index and returns the same wrapper.
+     */
+    public static KV reIndex(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.reIndex();
+    }
+
+    /**
+     * Rebuilds a KV store index with options and returns the same wrapper.
+     */
+    public static KV reIndex(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index and returns the same wrapper.
+     */
+    public static Connection reIndex(Connection conn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex();
+    }
+
+    /**
+     * Rebuilds a Datalog database index with options and returns the same wrapper.
+     */
+    public static Connection reIndex(Connection conn, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index with a raw schema and options.
+     */
+    public static Connection reIndex(Connection conn, Map<?, ?> schema, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(schema, opts);
+    }
+
+    /**
+     * Rebuilds a Datalog database index with a typed schema and options.
+     */
+    public static Connection reIndex(Connection conn, Schema schema, Map<?, ?> opts) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.reIndex(schema, opts);
     }
 
     /**
@@ -265,10 +502,73 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a full-text query/default option builder.
+     */
+    public static RetrievalOptions searchOptions() {
+        return RetrievalOptions.search();
+    }
+
+    /**
+     * Creates a full-text domain option builder.
+     */
+    public static RetrievalOptions searchDomain() {
+        return RetrievalOptions.searchDomain();
+    }
+
+    /**
+     * Creates a vector index/domain option builder with required dimensions.
+     */
+    public static RetrievalOptions vectorOptions(long dimensions) {
+        return RetrievalOptions.vector(dimensions);
+    }
+
+    /**
+     * Creates an embedding provider/domain option builder.
+     */
+    public static RetrievalOptions embeddingOptions() {
+        return RetrievalOptions.embedding();
+    }
+
+    /**
+     * Creates an idoc match option builder.
+     */
+    public static RetrievalOptions idocOptions() {
+        return RetrievalOptions.idoc();
+    }
+
+    /**
      * Creates a raw UDF registry handle.
      */
     public static Object createUdfRegistry() {
         return DatalevinInterop.createUdfRegistry();
+    }
+
+    /**
+     * Creates a typed UDF registry wrapper.
+     */
+    public static UdfRegistry udfRegistry() {
+        return new UdfRegistry(DatalevinInterop.createUdfRegistry());
+    }
+
+    /**
+     * Creates a query function UDF descriptor.
+     */
+    public static UdfDescriptor queryUdf(String id) {
+        return UdfDescriptor.queryFn(id);
+    }
+
+    /**
+     * Creates a query predicate UDF descriptor.
+     */
+    public static UdfDescriptor predicateUdf(String id) {
+        return UdfDescriptor.predicate(id);
+    }
+
+    /**
+     * Creates a transaction function UDF descriptor.
+     */
+    public static UdfDescriptor txUdf(String id) {
+        return UdfDescriptor.txFn(id);
     }
 
     /**
@@ -277,6 +577,22 @@ public final class Datalevin {
      */
     public static Object udfDescriptor(Map<?, ?> descriptor) {
         return DatalevinInterop.udfDescriptor(descriptor);
+    }
+
+    /**
+     * Normalizes a typed UDF descriptor into the raw Clojure form expected by
+     * Datalevin.
+     */
+    public static Object udfDescriptor(UdfDescriptor descriptor) {
+        Objects.requireNonNull(descriptor, "descriptor");
+        return descriptor.buildForm();
+    }
+
+    /**
+     * Creates a typed UDF descriptor for the given kind and id.
+     */
+    public static UdfDescriptor udfDescriptor(String kind, String id) {
+        return UdfDescriptor.of(kind, id);
     }
 
     /**
@@ -316,11 +632,34 @@ public final class Datalevin {
     }
 
     /**
+     * Reads EDN text into the corresponding JVM/Clojure value.
+     */
+    public static Object readEdn(String value) {
+        Objects.requireNonNull(value, "value");
+        return ClojureRuntime.readEdn(value);
+    }
+
+    /**
+     * Writes a JVM/Clojure value as EDN text.
+     */
+    public static String writeEdn(Object value) {
+        return Edn.render(ClojureCodec.runtimeInput(value));
+    }
+
+    /**
      * Marks a keyword value such as {@code :person/name} for APIs that need an
      * EDN keyword rather than a Java string.
      */
     public static Keyword kw(String value) {
         return ClojureCodec.keyword(value);
+    }
+
+    /**
+     * Marks a symbol value such as {@code person/name} or {@code ?e}.
+     */
+    public static Symbol sym(String value) {
+        Objects.requireNonNull(value, "value");
+        return ClojureCodec.symbol(value);
     }
 
     /**
@@ -330,6 +669,28 @@ public final class Datalevin {
     public static Symbol var(String value) {
         Objects.requireNonNull(value, "value");
         return ClojureCodec.symbol(value.startsWith("?") ? value : "?" + value);
+    }
+
+    /**
+     * Creates a Datalevin Datom from entity id, attribute, and value.
+     */
+    public static Object datom(Object e, Object attr, Object value) {
+        return DatalevinForms.datom(e, attr, value);
+    }
+
+    /**
+     * Creates a Datalevin Datom with an explicit transaction id.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx) {
+        return DatalevinForms.datom(e, attr, value, tx);
+    }
+
+    /**
+     * Creates a Datalevin Datom with an explicit transaction id and assertion
+     * flag.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return DatalevinForms.datom(e, attr, value, tx, added);
     }
 
     /**
@@ -410,5 +771,26 @@ public final class Datalevin {
      */
     public static Set<?> setResult(Object value) {
         return (Set<?>) value;
+    }
+
+    private static Connection connFromDatoms(Object datoms, String dir, Object schema, Object opts) {
+        Object normalizedDatoms = DatalevinForms.datomsInput(datoms);
+        if (opts != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms",
+                                                     normalizedDatoms,
+                                                     dir,
+                                                     schema,
+                                                     opts));
+        }
+        if (schema != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms",
+                                                     normalizedDatoms,
+                                                     dir,
+                                                     schema));
+        }
+        if (dir != null) {
+            return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms, dir));
+        }
+        return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms));
     }
 }

@@ -3,10 +3,12 @@ package datalevin;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
+import java.util.function.Function;
 
 /**
  * Handle for a local key-value store.
@@ -14,11 +16,17 @@ import java.util.function.BiPredicate;
  * <p>Use instances with try-with-resources when you own the handle lifecycle.
  * Methods in this class expose common DBI operations and range lookups.
  */
-public final class KV extends HandleResource {
+public class KV extends HandleResource {
 
     KV(Object kv) {
+        this(kv, true);
+    }
+
+    KV(Object kv, boolean owned) {
         super(kv,
-              resource -> ClojureRuntime.core("close-kv", resource),
+              owned ? resource -> ClojureRuntime.core("close-kv", resource)
+                      : resource -> {
+                      },
               "kv",
               "kv");
     }
@@ -63,6 +71,87 @@ public final class KV extends HandleResource {
      */
     public void openListDbi(String listName, Map<?, ?> opts) {
         ClojureRuntime.core("open-list-dbi", resource(), listName, DatalevinForms.optionsInput(opts));
+    }
+
+    /**
+     * Opens an explicit KV write transaction.
+     */
+    public KVTransaction beginTransaction() {
+        return new KVTransaction(this, ClojureRuntime.core("begin-kv-transaction", resource()));
+    }
+
+    /**
+     * Runs {@code fn} inside a single KV write transaction.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(Function<KV, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return (T) ClojureRuntime.core("with-transaction-kv-fn", resource(), wrapped);
+    }
+
+    /**
+     * Creates a full-text search engine over this KV store.
+     */
+    public SearchEngine newSearchEngine() {
+        Object opts = DatalevinForms.optionsInput(Map.of());
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", resource(), opts), opts);
+    }
+
+    /**
+     * Creates a full-text search engine with raw options.
+     */
+    public SearchEngine newSearchEngine(Map<?, ?> opts) {
+        if (opts == null) {
+            return newSearchEngine();
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts);
+        return new SearchEngine(ClojureRuntime.core("new-search-engine",
+                                                    resource(),
+                                                    optsForm),
+                                optsForm);
+    }
+
+    /**
+     * Creates a full-text search engine with typed options.
+     */
+    public SearchEngine newSearchEngine(RetrievalOptions opts) {
+        if (opts == null) {
+            return newSearchEngine();
+        }
+        Object optsForm = opts.buildForm();
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", resource(), optsForm), optsForm);
+    }
+
+    /**
+     * Creates a batched full-text search index writer over this KV store.
+     */
+    public SearchIndexWriter searchIndexWriter() {
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer", resource()));
+    }
+
+    /**
+     * Creates a batched full-text search index writer with raw options.
+     */
+    public SearchIndexWriter searchIndexWriter(Map<?, ?> opts) {
+        if (opts == null) {
+            return searchIndexWriter();
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        resource(),
+                                                        DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Creates a batched full-text search index writer with typed options.
+     */
+    public SearchIndexWriter searchIndexWriter(RetrievalOptions opts) {
+        if (opts == null) {
+            return searchIndexWriter();
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        resource(),
+                                                        opts.buildForm()));
     }
 
     /**
@@ -723,6 +812,20 @@ public final class KV extends HandleResource {
     }
 
     /**
+     * Copies this KV store to {@code dest}.
+     */
+    public void copy(String dest) {
+        ClojureRuntime.core("copy", resource(), dest);
+    }
+
+    /**
+     * Copies this KV store to {@code dest}, optionally compacting pages.
+     */
+    public void copy(String dest, boolean compact) {
+        ClojureRuntime.core("copy", resource(), dest, compact);
+    }
+
+    /**
      * Returns the number of entries in the named DBI.
      */
     public long entries(String dbiName) {
@@ -1020,6 +1123,73 @@ public final class KV extends HandleResource {
      */
     public void sync(long force) {
         ClojureRuntime.core("sync", resource(), force);
+    }
+
+    /**
+     * Returns WAL watermarks for this KV store.
+     */
+    public Map<?, ?> txLogWatermarks() {
+        return (Map<?, ?>) ClojureRuntime.core("txlog-watermarks", resource());
+    }
+
+    /**
+     * Reads committed WAL records from {@code fromLsn}, inclusive.
+     */
+    public List<?> openTxLog(long fromLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", resource(), fromLsn));
+    }
+
+    /**
+     * Reads committed WAL records in the inclusive LSN range.
+     */
+    public List<?> openTxLog(long fromLsn, long uptoLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", resource(), fromLsn, uptoLsn));
+    }
+
+    /**
+     * Creates or rotates the LMDB snapshot for this KV store.
+     */
+    public Map<?, ?> createSnapshot() {
+        return (Map<?, ?>) ClojureRuntime.core("create-snapshot!", resource());
+    }
+
+    /**
+     * Lists available LMDB snapshots for this KV store.
+     */
+    public List<?> listSnapshots() {
+        return ResultSupport.sequence(ClojureRuntime.core("list-snapshots", resource()));
+    }
+
+    /**
+     * Runs WAL segment GC for this KV store.
+     */
+    public Map<?, ?> gcTxLogSegments() {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", resource());
+    }
+
+    /**
+     * Runs WAL segment GC while retaining records from {@code retainFloorLsn}.
+     */
+    public Map<?, ?> gcTxLogSegments(long retainFloorLsn) {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", resource(), retainFloorLsn);
+    }
+
+    /**
+     * Rebuilds this KV store index and returns this handle.
+     */
+    public KV reIndex() {
+        return reIndex((Map<?, ?>) null);
+    }
+
+    /**
+     * Rebuilds this KV store index with options and returns this handle.
+     */
+    public KV reIndex(Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
     }
 
     /**

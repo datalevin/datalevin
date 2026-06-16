@@ -25,6 +25,42 @@
       (is (false? (runtime-read-access-message?
                     {:type :transact :writing? true}))))))
 
+(deftest ha-rejoin-unconfirmed-local-tail-test
+  (let [tail (#'handlers/ha-rejoin-unconfirmed-local-tail
+              {:ha-role :follower
+               :ha-node-id 1
+               :ha-authority-owner-node-id 2
+               :ha-authority-lease {:leader-last-applied-lsn 10}}
+              {:last-committed-lsn 14
+               :last-durable-lsn 13
+               :last-applied-lsn 12}
+              12)]
+    (is (true? (:ha-rejoin-unconfirmed-local-tail? tail)))
+    (is (= 4 (:ha-rejoin-unconfirmed-local-tail-lsn-count tail)))
+    (is (= 4 (:ha-rejoin-unconfirmed-local-committed-lsn-count tail)))
+    (is (= 3 (:ha-rejoin-unconfirmed-local-durable-lsn-count tail)))
+    (is (= 2 (:ha-rejoin-unconfirmed-local-applied-lsn-count tail)))
+    (is (= 10 (:ha-rejoin-authority-confirmed-lsn tail)))))
+
+(deftest ha-rejoin-unconfirmed-local-tail-omits-non-rejoin-test
+  (let [watermarks {:last-committed-lsn 14
+                    :last-durable-lsn 13
+                    :last-applied-lsn 12}]
+    (is (nil? (#'handlers/ha-rejoin-unconfirmed-local-tail
+               {:ha-role :leader
+                :ha-node-id 1
+                :ha-authority-owner-node-id 1
+                :ha-authority-lease {:leader-last-applied-lsn 10}}
+               watermarks
+               12)))
+    (is (nil? (#'handlers/ha-rejoin-unconfirmed-local-tail
+               {:ha-role :follower
+                :ha-node-id 1
+                :ha-authority-owner-node-id 2
+                :ha-authority-lease {:leader-last-applied-lsn 14}}
+               watermarks
+               12)))))
+
 (deftest ha-read-floor-refreshes-ha-store-cache-test
   (let [store     (fake-store (str "/tmp/dtlv-test-cache-"
                                    (java.util.UUID/randomUUID))

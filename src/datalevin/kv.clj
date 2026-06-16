@@ -29,6 +29,7 @@
 (declare txlog-retention-state-map
          delete-txlog-segment!
          txlog-records
+         txlog-records-for-recovery
          txlog-record-lsn
          snapshot-current-lsn
          txlog-snapshot-floor-state
@@ -88,13 +89,13 @@
      (do
        (txlog/refresh-shared-state! state)
        (txlog/select-open-record-rows
-        (txlog-records state from-lsn)
+        (txlog-records state from-lsn upto-lsn)
         from-lsn
         upto-lsn))
      (if (txlog-config-enabled? db)
        []
        (txlog/select-open-record-rows
-        (txlog-records (txlog/enabled-state db) from-lsn)
+        (txlog-records (txlog/enabled-state db) from-lsn upto-lsn)
         from-lsn
         upto-lsn)))))
 
@@ -1555,6 +1556,7 @@
      :write-path-enabled? write-path-enabled?
      :rollback? (not write-path-enabled?)
      :durability-profile (:durability-profile state)
+     :wal-shared? (true? (:wal-shared? state))
      :dir (:dir state)
      :segment-id (long @(:segment-id state))
      :next-lsn next-lsn
@@ -1636,7 +1638,7 @@
                                     (pos? marker-applied-lsn))
                              marker-applied-lsn
                              (max marker-applied-lsn payload-floor-lsn))
-        records (txlog-records state recovery-floor-lsn)
+        records (txlog-records-for-recovery state recovery-floor-lsn)
         meta-applied-lsn
         (long (or (some-> (:meta-last-applied-lsn state) deref) 0))
         meta-last-applied-lsn
@@ -1685,16 +1687,27 @@
           (txlog/flush-meta! state)
           (catch Exception _))
         (let [append-lock (or (:append-lock state) state)
-              ch (locking append-lock
-                   (when-let [segment-channel-v
-                              (:segment-channel state)]
-                     (let [ch @segment-channel-v]
-                       (when ch
-                         (vreset! segment-channel-v nil))
-                       ch)))]
+              [ch sync-lock-ch]
+              (locking append-lock
+                [(when-let [segment-channel-v
+                            (:segment-channel state)]
+                   (let [ch @segment-channel-v]
+                     (when ch
+                       (vreset! segment-channel-v nil))
+                     ch))
+                 (when-let [sync-lock-channel-v
+                            (:sync-lock-channel state)]
+                   (let [ch @sync-lock-channel-v]
+                     (when ch
+                       (vreset! sync-lock-channel-v nil))
+                     ch))])]
           (when ch
             (try
               (.close ^java.io.Closeable ch)
+              (catch Exception _)))
+          (when sync-lock-ch
+            (try
+              (.close ^java.io.Closeable sync-lock-ch)
               (catch Exception _))))
         (vswap! info-v dissoc :txlog-state :txlog-pending-ops
                 :txlog-recovered?
@@ -2807,6 +2820,50 @@
           (txlog-mark-fatal! state e)
           (throw e))))))
 
+(defn- txlog-record-at-lsn
+  [state record-lsn]
+  (let [record-lsn (long record-lsn)]
+    (some (fn [record]
+            (when (= record-lsn (long (:lsn record)))
+              record))
+          (txlog-records state record-lsn record-lsn))))
+
+(defn- txlog-record-replay-summary
+  [record]
+  (select-keys record [:lsn :segment-id :offset :checksum :ha-term
+                       :tx-kind :payload-bytes :path]))
+
+(defn- comparable-txlog-record?
+  [local incoming]
+  (let [local-checksum (some-> (:checksum local) long)
+        incoming-checksum (some-> (:checksum incoming) long)
+        local-term (some-> (:ha-term local) long)
+        incoming-term (some-> (:ha-term incoming) long)]
+    (and (= (long (:lsn local)) (long (:lsn incoming)))
+         (= local-term incoming-term)
+         (if (and (some? local-checksum) (some? incoming-checksum))
+           (= local-checksum incoming-checksum)
+           (= (rows-vector (:rows local))
+              (rows-vector (or (:rows incoming) (:ops incoming))))))))
+
+(defn- assert-skipped-replay-record-matches-local!
+  [state record expected-lsn]
+  (let [record-lsn (long (:lsn record))
+        local-record (txlog-record-at-lsn state record-lsn)
+        local-term (some-> (:ha-term local-record) long)
+        incoming-term (some-> (:ha-term record) long)]
+    (when (and (or (some? local-term) (some? incoming-term))
+               (not (and local-record
+                         (comparable-txlog-record? local-record record))))
+      (raise "Follower replay found divergent local txn-log record"
+             {:type :txlog/ha-replay-divergent-local-record
+              :error :ha/txlog-divergent-local-record
+              :expected-lsn expected-lsn
+              :record-lsn record-lsn
+              :local-record (some-> local-record
+                                    txlog-record-replay-summary)
+              :incoming-record (txlog-record-replay-summary record)}))))
+
 (defn ^:no-doc mirror-replayed-txlog-record!
   "Append a replicated HA record into the local txlog at the same LSN and
   apply its payload to LMDB. This keeps promoted followers on the same WAL
@@ -2855,8 +2912,13 @@
                        :expected-lsn expected-lsn
                        :record-lsn record-lsn}))
              (if (< record-lsn expected-lsn)
-               {:lsn record-lsn
-                :skipped? true}
+               (do
+                 (assert-skipped-replay-record-matches-local!
+                  state
+                  record
+                  expected-lsn)
+                 {:lsn record-lsn
+                  :skipped? true})
                (do
                  (txlog-prepare-replay-dbis!
                   lmdb
@@ -3253,11 +3315,28 @@
         (raise "Malformed txn-log payload" {:record record}))
       payload)
     (catch Exception e
-      (raise "Malformed txn-log payload" e {}))))
+      (raise "Malformed txn-log payload"
+             e
+             {:type :txlog/corrupt
+              :record record}))))
+
+(defn- txlog-record-payload-header
+  [record]
+  (try
+    (let [payload (txlog/decode-commit-row-payload-header
+                   ^bytes (:body record))]
+      (when-not (map? payload)
+        (raise "Malformed txn-log payload" {:record record}))
+      payload)
+    (catch Exception e
+      (raise "Malformed txn-log payload"
+             e
+             {:type :txlog/corrupt
+              :record record}))))
 
 (defn txlog-record-lsn
   [record]
-  (let [payload (txlog-record-payload record)
+  (let [payload (txlog-record-payload-header record)
         lsn (long (or (:lsn payload) 0))]
     (when-not (pos? lsn)
       (raise "Txn-log payload missing valid positive LSN"
@@ -3266,52 +3345,106 @@
     lsn))
 
 (defn- txlog-record-entry
-  [segment-id path record]
-  (let [payload (txlog-record-payload record)
+  ([segment-id path record]
+   (txlog-record-entry segment-id path record true))
+  ([segment-id path record include-rows?]
+   (let [payload (if include-rows?
+                   (txlog-record-payload record)
+                   (txlog-record-payload-header record))
         lsn (long (or (:lsn payload) 0))
         tx-time (long (or (:tx-time payload)
                           (:ts payload)
                           0))
         ha-term (some-> (:ha-term payload) long)
-        rows (rows-vector (:ops payload))
-        tx-kind (txlog/classify-record-kind rows)
+        rows (when include-rows?
+               (rows-vector (:ops payload)))
+        tx-kind (when include-rows?
+                  (txlog/classify-record-kind rows))
         payload-bytes (long (or (:body-len record)
                                 (some-> ^bytes (:body record) alength)
-                                0))]
-    (cond-> {:lsn lsn
-             :tx-kind tx-kind
-             :tx-time tx-time
-             :rows rows
-             :segment-id (long segment-id)
-             :offset (long (:offset record))
-             :checksum (long (:checksum record))
-             :path path}
-      (pos? payload-bytes)
-      (assoc :payload-bytes payload-bytes)
+                                0))
+        next-offset (long (or (:next-offset record)
+                              (+ (long (:offset record))
+                                 txlog/record-header-size
+                                 payload-bytes)))]
+     (when-not (pos? lsn)
+       (raise "Txn-log payload missing valid positive LSN"
+              {:type :txlog/corrupt
+               :record record}))
+     (cond-> {:lsn lsn
+              :tx-time tx-time
+              :segment-id (long segment-id)
+              :offset (long (:offset record))
+              :next-offset next-offset
+              :checksum (long (:checksum record))
+              :path path}
+       include-rows?
+       (assoc :tx-kind tx-kind
+              :rows rows)
 
-      (some? ha-term)
-      (assoc :ha-term ha-term))))
+       (pos? payload-bytes)
+       (assoc :payload-bytes payload-bytes)
+
+       (some? ha-term)
+       (assoc :ha-term ha-term)))))
+
+(defn- txlog-segment-scan-bytes
+  [state segment-id file-bytes]
+  (let [active-segment-id (some-> state :segment-id deref long)
+        active-segment-offset (some-> state :segment-offset deref long)]
+    (if (and (some? active-segment-id)
+             (= (long segment-id) active-segment-id)
+             (some? active-segment-offset))
+      (long (min (long file-bytes)
+                 (long active-segment-offset)))
+      (long file-bytes))))
 
 (defn- txlog-segment-records
-  [state segment]
+  [segment start-offset scan-bytes]
   (let [{:keys [id file]} segment
         segment-id (long id)
         path (.getPath ^java.io.File file)
-        active-segment-id (some-> state :segment-id deref long)
-        active-segment-offset (some-> state :segment-offset deref long)
-        max-offset (when (and (some? active-segment-id)
-                              (= segment-id active-segment-id)
-                              (some? active-segment-offset))
-                     active-segment-offset)
+        start-offset (long (max 0 (long (or start-offset 0))))
+        scan-bytes (long (max start-offset (long (or scan-bytes 0))))
         acc (FastList.)]
     (txlog/scan-segment
      path
      {:allow-preallocated-tail? true
-      :max-offset max-offset
+      :start-offset start-offset
+      :max-offset scan-bytes
       :collect-records? false
       :on-record (fn [record]
-                   (.add acc (txlog-record-entry segment-id path record)))})
+                   (.add acc
+                         (txlog-record-entry
+                          segment-id path record false)))})
     (vec acc)))
+
+(defn- txlog-records-cache-max-segments
+  []
+  (let [n (long c/*wal-records-cache-segments*)]
+    (if (neg? n) 0 n)))
+
+(defn- limit-txlog-records-cache-map
+  [cache]
+  (let [cache (or cache {})
+        max-segments (long (txlog-records-cache-max-segments))]
+    (cond
+      (zero? max-segments)
+      {}
+
+      (<= (long (count cache)) max-segments)
+      cache
+
+      :else
+      (let [keep-ids (into #{}
+                           (take-last (int max-segments)
+                                      (sort (keys cache))))]
+        (reduce-kv (fn [acc sid entry]
+                     (if (contains? keep-ids sid)
+                       (assoc acc sid entry)
+                       acc))
+                   {}
+                   cache)))))
 
 (defn- txlog-segment-cache-valid?
   [entry path file-bytes modified-ms active-segment? active-offset]
@@ -3332,22 +3465,55 @@
           (= file-bytes (long (:file-bytes entry)))
           (= modified-ms (long (:modified-ms entry)))))))
 
+(defn- txlog-segment-cache-extendable?
+  [entry path file-bytes active-segment? active-offset]
+  (let [target-scan-bytes (when (and active-segment? (some? active-offset))
+                            (long (min (long file-bytes)
+                                       (long active-offset))))
+        scan-bytes (some-> (:scan-bytes entry) long)
+        records (:records entry)
+        last-next-offset (some-> records peek :next-offset long)]
+    (and entry
+         active-segment?
+         (some? target-scan-bytes)
+         (= path (:path entry))
+         (some? scan-bytes)
+         (<= ^long scan-bytes ^long target-scan-bytes)
+         (<= ^long scan-bytes ^long file-bytes)
+         (or (zero? ^long scan-bytes)
+             (= ^long scan-bytes ^long (or last-next-offset -1))))))
+
 (defn- txlog-segment-cache-entry
   [state segment]
-  (let [records (txlog-segment-records state segment)
-        {:keys [id file]} segment
+  (let [{:keys [id file]} segment
         path (.getPath ^java.io.File file)
         file-bytes (long (.length ^java.io.File file))
         modified-ms (long (.lastModified ^java.io.File file))
-        active-segment-id (some-> state :segment-id deref long)
-        active-segment-offset (some-> state :segment-offset deref long)
-        scan-bytes (if (and (some? active-segment-id)
-                            (= (long id) active-segment-id)
-                            (some? active-segment-offset))
-                     (long (min file-bytes
-                                (long active-segment-offset)))
-                     file-bytes)]
+        scan-bytes (txlog-segment-scan-bytes state (long id) file-bytes)
+        records (txlog-segment-records segment 0 scan-bytes)]
     {:segment-id (long id)
+     :path path
+     :file-bytes file-bytes
+     :modified-ms modified-ms
+     :scan-bytes scan-bytes
+     :min-lsn (some-> records first :lsn long)
+     :records records}))
+
+(defn- txlog-extend-segment-cache-entry
+  [state segment cached]
+  (let [{:keys [id file]} segment
+        segment-id (long id)
+        path (.getPath ^java.io.File file)
+        file-bytes (long (.length ^java.io.File file))
+        modified-ms (long (.lastModified ^java.io.File file))
+        scan-bytes (txlog-segment-scan-bytes state segment-id file-bytes)
+        cached-scan-bytes (long (:scan-bytes cached))
+        tail-records (if (< ^long cached-scan-bytes ^long scan-bytes)
+                       (txlog-segment-records
+                        segment cached-scan-bytes scan-bytes)
+                       [])
+        records (into (vec (:records cached)) tail-records)]
+    {:segment-id segment-id
      :path path
      :file-bytes file-bytes
      :modified-ms modified-ms
@@ -3376,8 +3542,18 @@
                                       active-segment?
                                       active-segment-offset)
         cached
-        (let [entry (txlog-segment-cache-entry state segment)]
-          (vreset! cache-v (assoc cache0 segment-id entry))
+        (let [entry (if (txlog-segment-cache-extendable?
+                         cached
+                         path
+                         file-bytes
+                         active-segment?
+                         active-segment-offset)
+                      (txlog-extend-segment-cache-entry
+                       state segment cached)
+                      (txlog-segment-cache-entry state segment))]
+          (vreset! cache-v
+                   (limit-txlog-records-cache-map
+                    (assoc cache0 segment-id entry)))
           entry)))
     (txlog-segment-cache-entry state segment)))
 
@@ -3387,18 +3563,70 @@
     (let [cache0 (or @cache-v {})]
       (when (seq cache0)
         (let [segment-ids (into #{} (map (comp long :id)) segments)
-              cache1 (reduce-kv
+             cache1 (reduce-kv
                       (fn [acc sid entry]
                         (if (contains? segment-ids sid)
                           (assoc acc sid entry)
                           acc))
                       {}
-                      cache0)]
-          (when (not= cache0 cache1)
-            (vreset! cache-v cache1)))))))
+                      cache0)
+              cache2 (limit-txlog-records-cache-map cache1)]
+          (when (not= cache0 cache2)
+            (vreset! cache-v cache2)))))))
+
+(defn- txlog-record-lower-bound-index
+  [records lsn]
+  (let [records (if (vector? records) records (vec records))
+        lsn (long lsn)]
+    (loop [lo (long 0)
+           hi (long (count records))]
+      (if (< ^long lo ^long hi)
+        (let [mid (long (quot (+ ^long lo ^long hi) 2))
+              mid-lsn (long (:lsn (nth records mid)))]
+          (if (< ^long mid-lsn ^long lsn)
+            (recur (inc ^long mid) hi)
+            (recur lo mid)))
+        lo))))
+
+(defn- txlog-records-validation-tail
+  [records from]
+  (let [records (if (vector? records) records (vec records))
+        n (long (count records))]
+    (if (zero? ^long n)
+      records
+      (let [idx (long (txlog-record-lower-bound-index records from))
+            start (long (if (pos? ^long idx) (dec ^long idx) 0))]
+        (subvec records start n)))))
+
+(defn- txlog-safe-inc-lsn
+  [lsn]
+  (if (= (long lsn) Long/MAX_VALUE)
+    Long/MAX_VALUE
+    (inc (long lsn))))
+
+(defn- txlog-record-window
+  [records from upto include-predecessor? include-successor?]
+  (let [records (if (vector? records) records (vec records))
+        n (long (count records))
+        start0 (long (txlog-record-lower-bound-index records from))
+        start (long (if include-predecessor?
+                      (if (pos? ^long start0) (dec ^long start0) 0)
+                      start0))
+        end0 (long (if (some? upto)
+                     (txlog-record-lower-bound-index
+                      records
+                      (txlog-safe-inc-lsn upto))
+                     n))
+        end (long (if (and include-successor? (some? upto))
+                    (min ^long n (inc ^long end0))
+                    end0))
+        end (long (if (< ^long end ^long start) start end))]
+    (subvec records start end)))
 
 (defn- collect-txlog-records
-  [state segments cache-v from]
+  ([state segments cache-v from]
+   (collect-txlog-records state segments cache-v from true))
+  ([state segments cache-v from trim-terminal?]
   (let [from (long from)]
     (loop [remaining (seq (rseq segments))
            collected '()
@@ -3421,14 +3649,18 @@
                          records)
               earliest' (or (some-> records' first :lsn long)
                             earliest-collected-lsn)
+              terminal? (and (some? earliest')
+                             (<= ^long earliest' from))
+              records'' (if (and trim-terminal? terminal? (seq records'))
+                          (txlog-records-validation-tail records' from)
+                          records')
               collected' (if (seq records')
-                           (cons records' collected)
+                           (cons records'' collected)
                            collected)]
-          (if (and (some? earliest')
-                   (<= ^long earliest' from))
+          (if terminal?
             (mapcat identity collected')
             (recur (next remaining) collected' earliest')))
-        (mapcat identity collected)))))
+        (mapcat identity collected))))))
 
 (defn- validate-txlog-record-sequence!
   [records]
@@ -3445,38 +3677,134 @@
                   :record record}))
         (recur lsn (next records))))))
 
+(defn- assert-hydrated-record-matches-summary!
+  [summary record]
+  (let [expected-lsn (some-> (:lsn summary) long)
+        actual-lsn (some-> (:lsn record) long)
+        expected-checksum (some-> (:checksum summary) long)
+        actual-checksum (some-> (:checksum record) long)]
+    (when (or (not= expected-lsn actual-lsn)
+              (and (some? expected-checksum)
+                   (some? actual-checksum)
+                   (not= expected-checksum actual-checksum)))
+      (raise "Txn-log record index no longer matches segment contents"
+             {:type :txlog/corrupt
+              :expected summary
+              :actual (select-keys record
+                                   [:lsn :segment-id :offset :checksum
+                                    :path])}))))
+
+(defn- hydrate-txlog-record-group
+  [records]
+  (let [records (vec records)]
+    (if (every? #(contains? % :rows) records)
+      records
+      (let [{:keys [path offset]} (first records)
+            end-offset (:next-offset (peek records))
+            segment-id (:segment-id (first records))]
+        (when (or (nil? path)
+                  (nil? offset)
+                  (nil? end-offset)
+                  (nil? segment-id))
+          (raise "Txn-log record cache entry is missing segment offsets"
+                 {:type :txlog/corrupt
+                  :record (first records)}))
+        (let [by-offset (into {}
+                              (map (fn [record]
+                                     [(long (:offset record)) record]))
+                              records)
+              acc (FastList.)]
+          (txlog/scan-segment
+           path
+           {:allow-preallocated-tail? true
+            :start-offset (long offset)
+            :max-offset (long end-offset)
+            :collect-records? false
+            :on-record
+            (fn [record]
+              (when-let [summary (get by-offset (long (:offset record)))]
+                (let [hydrated (txlog-record-entry
+                                (long segment-id) path record true)]
+                  (assert-hydrated-record-matches-summary!
+                   summary hydrated)
+                  (.add acc hydrated))))})
+          (let [hydrated (vec acc)]
+            (when-not (= (count records) (count hydrated))
+              (raise "Txn-log record hydration missed indexed records"
+                     {:type :txlog/corrupt
+                      :path path
+                      :expected (mapv :offset records)
+                      :actual (mapv :offset hydrated)}))
+            hydrated))))))
+
+(defn- hydrate-txlog-records
+  [records]
+  (->> records
+       (partition-by (juxt :segment-id :path))
+       (mapcat hydrate-txlog-record-group)
+       vec))
+
+(defn- txlog-records-read
+  [state from-lsn upto-lsn recovery?]
+  (let [dir (:dir state)
+        cache-v (:txlog-records-cache state)
+        from (long (max 0 (long (or from-lsn 0))))
+        upto (some-> upto-lsn long)]
+    (when (and (some? upto) (< ^long upto from))
+      (raise "Invalid txlog range: upto-lsn is smaller than from-lsn"
+             {:type :txlog/invalid-range
+              :from-lsn from
+              :upto-lsn upto}))
+    (loop [retries-left (if cache-v 1 0)]
+      (let [segments (vec (txlog/segment-files dir))
+            _ (prune-txlog-records-cache! cache-v segments)
+            raw-records (vec (collect-txlog-records
+                              state segments cache-v from
+                              (not recovery?)))
+            ;; `from-lsn` is inclusive for the public txn-log APIs. Recovery
+            ;; keeps the retained segment prefix so marker references and
+            ;; snapshot floors can be validated before replay drops applied
+            ;; records.
+            validation-records (if recovery?
+                                 raw-records
+                                 (txlog-record-window
+                                  raw-records from upto true true))
+            selected-records (if recovery?
+                               validation-records
+                               (txlog-record-window
+                                validation-records from upto false false))
+            [records error] (try
+                              (validate-txlog-record-sequence!
+                               validation-records)
+                              [(hydrate-txlog-records selected-records) nil]
+                              (catch clojure.lang.ExceptionInfo e
+                                [nil e]))]
+        (if error
+          (if (and (pos? retries-left)
+                   cache-v
+                   (= :txlog/corrupt (:type (ex-data error))))
+            (do
+              ;; Segment scans can be cached off a stale active/closed boundary.
+              ;; When sequence validation fails, drop the cache once and rescan
+              ;; from disk before surfacing corruption.
+              (vreset! cache-v {})
+              (recur 0))
+            (throw error))
+          (do
+            (prune-txlog-records-cache! cache-v segments)
+            records))))))
+
 (defn txlog-records
   ([state]
    (txlog-records state nil))
   ([state from-lsn]
-   (let [dir (:dir state)
-         cache-v (:txlog-records-cache state)
-         from (long (max 0 (long (or from-lsn 0))))]
-     (loop [retries-left (if cache-v 1 0)]
-       (let [segments (vec (txlog/segment-files dir))
-             _ (prune-txlog-records-cache! cache-v segments)
-             raw-records (collect-txlog-records state segments cache-v from)
-             ;; `from-lsn` is inclusive for the public txn-log APIs.
-             ;; Recovery call sites that need exclusive replay already drop
-             ;; applied records after reading the retained segment prefix.
-             records raw-records
-             error (try
-                     (validate-txlog-record-sequence! records)
-                     nil
-                     (catch clojure.lang.ExceptionInfo e
-                       e))]
-         (if error
-           (if (and (pos? retries-left)
-                    cache-v
-                    (= :txlog/corrupt (:type (ex-data error))))
-             (do
-               ;; Segment scans can be cached off a stale active/closed boundary.
-               ;; When sequence validation fails, drop the cache once and rescan
-               ;; from disk before surfacing corruption.
-               (vreset! cache-v {})
-               (recur 0))
-             (throw error))
-           records))))))
+   (txlog-records state from-lsn nil))
+  ([state from-lsn upto-lsn]
+   (txlog-records-read state from-lsn upto-lsn false)))
+
+(defn- txlog-records-for-recovery
+  [state from-lsn]
+  (txlog-records-read state from-lsn nil true))
 
 (defn- local-dir?
   [dir]
@@ -3711,17 +4039,17 @@
                        (when (txlog-write-path-enabled? db)
                          (ensure-txlog-ready! db)))]
       (do
-        (txlog/refresh-shared-state! state)
-        (txlog/select-open-records
-         (txlog-records state from-lsn)
-         from-lsn
-         upto-lsn))
-      (if (txlog-config-enabled? db)
-        []
-        (txlog/select-open-records
-         (txlog-records (txlog/enabled-state db) from-lsn)
-         from-lsn
-         upto-lsn))))
+      (txlog/refresh-shared-state! state)
+      (txlog/select-open-records
+       (txlog-records state from-lsn upto-lsn)
+       from-lsn
+       upto-lsn))
+     (if (txlog-config-enabled? db)
+       []
+       (txlog/select-open-records
+        (txlog-records (txlog/enabled-state db) from-lsn upto-lsn)
+        from-lsn
+        upto-lsn))))
 
   (force-txlog-sync! [_]
     (with-runtime-txlog-state-guard

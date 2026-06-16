@@ -1,8 +1,14 @@
 package datalevin;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Small bridge-oriented interop layer for non-Java bindings.
@@ -98,6 +104,44 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Creates a raw connection handle by bulk-loading datoms.
+     */
+    public static Object initDb(Object datoms,
+                                String dir,
+                                Map<?, ?> schema,
+                                Map<?, ?> opts) {
+        Object normalizedDatoms = DatalevinForms.datomsInput(datoms);
+        if (opts != null) {
+            return ClojureRuntime.core("conn-from-datoms",
+                                       normalizedDatoms,
+                                       dir,
+                                       DatalevinForms.schemaInput(schema),
+                                       DatalevinForms.optionsInput(opts));
+        }
+        if (schema != null) {
+            return ClojureRuntime.core("conn-from-datoms",
+                                       normalizedDatoms,
+                                       dir,
+                                       DatalevinForms.schemaInput(schema));
+        }
+        if (dir != null) {
+            return ClojureRuntime.core("conn-from-datoms", normalizedDatoms, dir);
+        }
+        return ClojureRuntime.core("conn-from-datoms", normalizedDatoms);
+    }
+
+    /**
+     * Bulk-loads datoms into an existing raw connection handle.
+     */
+    public static Object fillDb(Object conn, Object datoms) {
+        Object newDb = ClojureRuntime.core("fill-db",
+                                           ClojureRuntime.core("db", conn),
+                                           DatalevinForms.datomsInput(datoms));
+        ClojureRuntime.core("reset-conn!", conn, newDb);
+        return conn;
+    }
+
+    /**
      * Closes a raw connection handle.
      */
     public static void closeConnection(Object conn) {
@@ -115,7 +159,224 @@ public final class DatalevinInterop {
      * Returns the raw immutable database value for a connection handle.
      */
     public static Object connectionDb(Object conn) {
-        return ClojureRuntime.core("db", conn);
+        return ClojureRuntime.core("db", rawResource(conn));
+    }
+
+    /**
+     * Returns a Java handle for a lazy entity id or lookup ref.
+     */
+    public static LazyEntity connectionEntity(Object conn, Object eid) {
+        Object entity = ClojureRuntime.core("entity",
+                                            connectionDb(conn),
+                                            DatalevinForms.lookupRefInput(eid));
+        return entity == null ? null : new LazyEntity(entity);
+    }
+
+    /**
+     * Returns whether a value is a Datalevin lazy entity handle.
+     */
+    public static boolean entityIs(Object value) {
+        return value instanceof LazyEntity || rawEntity(value);
+    }
+
+    /**
+     * Returns the bridge-safe entity id for a lazy entity handle.
+     */
+    public static Object entityId(Object entity) {
+        return ClojureCodec.bridgeOutput(
+                ClojureRuntime.invoke("clojure.core",
+                                      "get",
+                                      rawResource(entity),
+                                      ClojureCodec.keyword(":db/id")));
+    }
+
+    /**
+     * Reads one attribute from a lazy entity handle without touching the whole
+     * entity.
+     */
+    public static Object entityGet(Object entity, Object attr) {
+        return bridgeEntityValue(ClojureRuntime.invoke("clojure.core",
+                                                       "get",
+                                                       rawResource(entity),
+                                                       DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Returns whether a lazy entity handle has a value for the supplied
+     * attribute.
+     */
+    public static boolean entityContains(Object entity, Object attr) {
+        return ClojureCodec.javaBoolean(
+                ClojureRuntime.invoke("clojure.core",
+                                      "contains?",
+                                      rawResource(entity),
+                                      DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Touches and materializes a lazy entity handle into bridge-safe data.
+     */
+    public static Object entityTouch(Object entity) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", rawResource(entity)));
+    }
+
+    /**
+     * Returns the raw KV handle backing a Datalog connection handle.
+     */
+    public static Object connectionDatalogKv(Object conn) {
+        return ClojureRuntime.core("datalog-kv", rawResource(conn));
+    }
+
+    /**
+     * Starts an async transaction and returns a bridge-safe Java future.
+     */
+    public static CompletableFuture<Object> connectionTransactAsync(Object conn,
+                                                                    Object txData,
+                                                                    Map<?, ?> txMeta) {
+        Object rawConn = rawResource(conn);
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      rawConn,
+                                      DatalevinForms.txDataInput(txData))
+                : ClojureRuntime.core("transact-async",
+                                      rawConn,
+                                      DatalevinForms.txDataInput(txData),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return derefFuture(future, ClojureCodec::bridgeOutput);
+    }
+
+    /**
+     * Returns bridge-safe datoms from a raw connection handle.
+     */
+    public static Object connectionDatoms(Object conn,
+                                          Object index,
+                                          Object c1,
+                                          Object c2,
+                                          Object c3,
+                                          Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Returns bridge-safe datoms matching entity, attribute, and value.
+     */
+    public static Object connectionSearchDatoms(Object conn, Object e, Object attr, Object value) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("search-datoms",
+                                                             connectionDb(conn),
+                                                             ClojureCodec.runtimeInput(e),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Counts datoms matching entity, attribute, and value.
+     */
+    public static Object connectionCountDatoms(Object conn, Object e, Object attr, Object value) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("count-datoms",
+                                                             connectionDb(conn),
+                                                             ClojureCodec.runtimeInput(e),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Seeks bridge-safe datoms forward from the supplied index components.
+     */
+    public static Object connectionSeekDatoms(Object conn,
+                                              Object index,
+                                              Object c1,
+                                              Object c2,
+                                              Object c3,
+                                              Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("seek-datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Seeks bridge-safe datoms backward from the supplied index components.
+     */
+    public static Object connectionRseekDatoms(Object conn,
+                                               Object index,
+                                               Object c1,
+                                               Object c2,
+                                               Object c3,
+                                               Long limit) {
+        return ClojureCodec.bridgeOutput(connectionDatomIndexRead("rseek-datoms", conn, index, c1, c2, c3, limit));
+    }
+
+    /**
+     * Returns bridge-safe datoms in an inclusive AVE value range.
+     */
+    public static Object connectionIndexRange(Object conn, Object attr, Object start, Object end) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("index-range",
+                                                             connectionDb(conn),
+                                                             DatalevinForms.datalogAttrInput(attr),
+                                                             ClojureCodec.runtimeInput(start),
+                                                             ClojureCodec.runtimeInput(end)));
+    }
+
+    /**
+     * Returns bridge-safe fulltext datom results.
+     */
+    public static Object connectionFulltextDatoms(Object conn, String query, Map<?, ?> opts) {
+        Object result = opts == null
+                ? ClojureRuntime.core("fulltext-datoms", connectionDb(conn), query)
+                : ClojureRuntime.core("fulltext-datoms",
+                                      connectionDb(conn),
+                                      query,
+                                      DatalevinForms.optionsInput(opts));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Copies the database backing a raw connection handle.
+     */
+    public static void connectionCopy(Object conn, String dest, Boolean compact) {
+        if (compact == null) {
+            ClojureRuntime.core("copy", connectionDb(conn), dest);
+        } else {
+            ClojureRuntime.core("copy", connectionDb(conn), dest, compact);
+        }
+    }
+
+    /**
+     * Returns WAL watermarks for the database backing a raw connection handle.
+     */
+    public static Object connectionTxLogWatermarks(Object conn) {
+        return ClojureRuntime.core("txlog-watermarks", connectionStore(conn));
+    }
+
+    /**
+     * Opens WAL records for the database backing a raw connection handle.
+     */
+    public static Object connectionOpenTxLog(Object conn, long fromLsn, Long uptoLsn) {
+        if (uptoLsn == null) {
+            return ClojureRuntime.core("open-tx-log", connectionStore(conn), fromLsn);
+        }
+        return ClojureRuntime.core("open-tx-log", connectionStore(conn), fromLsn, uptoLsn);
+    }
+
+    /**
+     * Creates an LMDB snapshot for the database backing a raw connection handle.
+     */
+    public static Object connectionCreateSnapshot(Object conn) {
+        return ClojureRuntime.core("create-snapshot!", connectionStore(conn));
+    }
+
+    /**
+     * Lists LMDB snapshots for the database backing a raw connection handle.
+     */
+    public static Object connectionListSnapshots(Object conn) {
+        return ClojureRuntime.core("list-snapshots", connectionStore(conn));
+    }
+
+    /**
+     * Runs WAL segment GC for the database backing a raw connection handle.
+     */
+    public static Object connectionGcTxLogSegments(Object conn, Long retainFloorLsn) {
+        if (retainFloorLsn == null) {
+            return ClojureRuntime.core("gc-txlog-segments!", connectionStore(conn));
+        }
+        return ClojureRuntime.core("gc-txlog-segments!", connectionStore(conn), retainFloorLsn);
     }
 
     /**
@@ -143,6 +404,212 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Opens an explicit KV write transaction.
+     */
+    public static Object keyValueBeginTransaction(Object kv) {
+        Object rawKv = rawResource(kv);
+        return new KVTransaction(new KV(rawKv, false),
+                                 ClojureRuntime.core("begin-kv-transaction", rawKv));
+    }
+
+    /**
+     * Commits an explicit KV write transaction.
+     */
+    public static Object keyValueCommitTransaction(Object tx) {
+        if (tx instanceof KVTransaction transaction) {
+            return ClojureCodec.bridgeOutput(transaction.commit());
+        }
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("commit-kv-transaction", rawResource(tx)));
+    }
+
+    /**
+     * Aborts an explicit KV write transaction.
+     */
+    public static Object keyValueAbortTransaction(Object tx) {
+        if (tx instanceof KVTransaction transaction) {
+            return ClojureCodec.bridgeOutput(transaction.abort());
+        }
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("abort-kv-transaction", rawResource(tx)));
+    }
+
+    /**
+     * Runs a function inside a single KV write transaction.
+     */
+    public static Object keyValueWithTransaction(Object kv, Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-kv-fn",
+                                                             rawResource(kv),
+                                                             wrapped));
+    }
+
+    /**
+     * Runs a function inside a single Datalog write transaction.
+     */
+    public static Object connectionWithTransaction(Object conn, Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-fn",
+                                                             rawResource(conn),
+                                                             wrapped));
+    }
+
+    /**
+     * Rebuilds a raw KV handle's index and returns a bridge-safe handle.
+     */
+    public static Object keyValueReIndex(Object kv, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          rawResource(kv),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        if (kv instanceof KV keyValue) {
+            keyValue.replaceResource(next);
+            return keyValue;
+        }
+        return next;
+    }
+
+    /**
+     * Rebuilds a raw connection handle's index and returns a bridge-safe handle.
+     */
+    public static Object connectionReIndex(Object conn, Map<?, ?> schema, Map<?, ?> opts) {
+        Object next = schema == null
+                ? ClojureRuntime.core("re-index",
+                                      rawResource(conn),
+                                      DatalevinForms.optionsInput(opts == null ? Map.of() : opts))
+                : ClojureRuntime.core("re-index",
+                                      rawResource(conn),
+                                      DatalevinForms.schemaInput(schema),
+                                      DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        if (conn instanceof Connection connection) {
+            connection.replaceResource(next);
+            return connection;
+        }
+        return next;
+    }
+
+    /**
+     * Creates a raw full-text search engine handle.
+     */
+    public static Object newSearchEngine(Object kv, Map<?, ?> opts) {
+        Object rawKv = rawResource(kv);
+        if (opts == null) {
+            Object optsForm = DatalevinForms.optionsInput(Map.of());
+            return new SearchEngine(ClojureRuntime.core("new-search-engine", rawKv, optsForm), optsForm);
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts);
+        return new SearchEngine(ClojureRuntime.core("new-search-engine", rawKv, optsForm), optsForm);
+    }
+
+    /**
+     * Adds one document to a full-text search engine handle.
+     */
+    public static Object searchAddDoc(Object search, Object docRef, String docText, Boolean checkExist) {
+        Object result = checkExist == null
+                ? ClojureRuntime.core("add-doc",
+                                      rawResource(search),
+                                      ClojureCodec.runtimeInput(docRef),
+                                      docText)
+                : ClojureRuntime.core("add-doc",
+                                      rawResource(search),
+                                      ClojureCodec.runtimeInput(docRef),
+                                      docText,
+                                      checkExist);
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Removes one document from a full-text search engine handle.
+     */
+    public static Object searchRemoveDoc(Object search, Object docRef) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("remove-doc",
+                                                             rawResource(search),
+                                                             ClojureCodec.runtimeInput(docRef)));
+    }
+
+    /**
+     * Clears a full-text search engine handle.
+     */
+    public static Object searchClearDocs(Object search) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("clear-docs", rawResource(search)));
+    }
+
+    /**
+     * Returns whether one document is indexed in a full-text search engine.
+     */
+    public static boolean searchDocIndexed(Object search, Object docRef) {
+        return ClojureRuntime.core("doc-indexed?",
+                                   rawResource(search),
+                                   ClojureCodec.runtimeInput(docRef)) != null;
+    }
+
+    /**
+     * Returns the document count for a full-text search engine.
+     */
+    public static long searchDocCount(Object search) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("doc-count", rawResource(search)));
+    }
+
+    /**
+     * Searches a full-text search engine.
+     */
+    public static Object search(Object search, String query, Map<?, ?> opts) {
+        Object result = opts == null
+                ? ClojureRuntime.core("search", rawResource(search), query)
+                : ClojureRuntime.core("search",
+                                      rawResource(search),
+                                      query,
+                                      DatalevinForms.optionsInput(opts));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Rebuilds a full-text search engine from stored raw text.
+     */
+    public static Object searchReIndex(Object search, Map<?, ?> opts) {
+        if (search instanceof SearchEngine engine) {
+            engine.reIndex(opts);
+            return engine;
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts == null ? Map.of() : opts);
+        Object next = ClojureRuntime.core("re-index",
+                                          rawResource(search),
+                                          optsForm);
+        return new SearchEngine(next, optsForm);
+    }
+
+    /**
+     * Creates a raw batched full-text search index writer handle.
+     */
+    public static Object searchIndexWriter(Object kv, Map<?, ?> opts) {
+        Object rawKv = rawResource(kv);
+        if (opts == null) {
+            return new SearchIndexWriter(ClojureRuntime.core("search-index-writer", rawKv));
+        }
+        return new SearchIndexWriter(ClojureRuntime.core("search-index-writer",
+                                                        rawKv,
+                                                        DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Adds one document to a raw full-text search index writer handle.
+     */
+    public static Object searchWrite(Object writer, Object docRef, String docText) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("write",
+                                                             rawResource(writer),
+                                                             ClojureCodec.runtimeInput(docRef),
+                                                             docText));
+    }
+
+    /**
+     * Flushes all pending documents in a raw full-text search index writer.
+     */
+    public static Object searchCommit(Object writer) {
+        Object result = ClojureCodec.bridgeOutput(ClojureRuntime.core("commit", rawResource(writer)));
+        if (writer instanceof SearchIndexWriter searchWriter) {
+            searchWriter.close();
+        }
+        return result;
+    }
+
+    /**
      * Opens a raw remote client handle.
      */
     public static Object newClient(String uri, Map<?, ?> opts) {
@@ -156,7 +623,7 @@ public final class DatalevinInterop {
      * Closes a raw remote client handle.
      */
     public static void closeClient(Object client) {
-        ClojureRuntime.client("disconnect", client);
+        ClojureRuntime.client("close-client", client);
     }
 
     /**
@@ -171,6 +638,13 @@ public final class DatalevinInterop {
      */
     public static Object readEdn(String edn) {
         return ClojureRuntime.readEdn(edn);
+    }
+
+    /**
+     * Writes a JVM/Clojure value as EDN text.
+     */
+    public static String writeEdn(Object value) {
+        return Edn.render(ClojureCodec.runtimeInput(value));
     }
 
     /**
@@ -247,7 +721,7 @@ public final class DatalevinInterop {
         Object normalizedDescriptor = DatalevinForms.udfDescriptorInput(descriptor);
         return ClojureRuntime.invoke("datalevin.udf",
                                      "register!",
-                                     registry,
+                                     rawResource(registry),
                                      normalizedDescriptor,
                                      ClojureFns.udfFunction(fn, normalizedDescriptor));
     }
@@ -258,7 +732,7 @@ public final class DatalevinInterop {
     public static Object unregisterUdf(Object registry, Map<?, ?> descriptor) {
         return ClojureRuntime.invoke("datalevin.udf",
                                      "unregister!",
-                                     registry,
+                                     rawResource(registry),
                                      DatalevinForms.udfDescriptorInput(descriptor));
     }
 
@@ -269,7 +743,7 @@ public final class DatalevinInterop {
         return ClojureCodec.javaBoolean(
                 ClojureRuntime.invoke("datalevin.udf",
                                       "registered?",
-                                      registry,
+                                      rawResource(registry),
                                       DatalevinForms.udfDescriptorInput(descriptor)));
     }
 
@@ -295,6 +769,35 @@ public final class DatalevinInterop {
      */
     public static Object lookupRef(Object value) {
         return DatalevinForms.lookupRefInput(value);
+    }
+
+    /**
+     * Creates a raw Datalevin datom.
+     */
+    public static Object datom(Object e, Object attr, Object value) {
+        return DatalevinForms.datom(e, attr, value);
+    }
+
+    /**
+     * Creates a raw Datalevin datom with an explicit transaction id.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx) {
+        return DatalevinForms.datom(e, attr, value, tx);
+    }
+
+    /**
+     * Creates a raw Datalevin datom with an explicit transaction id and
+     * assertion flag.
+     */
+    public static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return DatalevinForms.datom(e, attr, value, tx, added);
+    }
+
+    /**
+     * Normalizes datom input into the raw Clojure form expected by Datalevin.
+     */
+    public static Object datoms(Object datoms) {
+        return DatalevinForms.datomsInput(datoms);
     }
 
     /**
@@ -389,5 +892,112 @@ public final class DatalevinInterop {
             }
         }
         return normalized;
+    }
+
+    private static CompletableFuture<Object> derefFuture(Object future,
+                                                         Function<Object, Object> converter) {
+        CompletableFuture<Object> result = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                result.complete(converter.apply(ClojureRuntime.deref(future)));
+            } catch (Throwable e) {
+                result.completeExceptionally(e);
+            }
+        });
+        return result;
+    }
+
+    private static Object rawResource(Object value) {
+        if (value instanceof HandleResource handle) {
+            return handle.handle();
+        }
+        if (value instanceof LazyEntity entity) {
+            return entity.handle();
+        }
+        if (value instanceof UdfRegistry registry) {
+            return registry.rawHandle();
+        }
+        return value;
+    }
+
+    private static boolean rawEntity(Object value) {
+        return value != null && "datalevin.entity.Entity".equals(value.getClass().getName());
+    }
+
+    private static Object bridgeEntityValue(Object value) {
+        if (value == null) {
+            return null;
+        }
+
+        if (rawEntity(value)) {
+            return new LazyEntity(value);
+        }
+
+        if (value instanceof Map<?, ?> map) {
+            LinkedHashMap<Object, Object> result = new LinkedHashMap<>(map.size());
+            for (Map.Entry<?, ?> entry : map.entrySet()) {
+                result.put(ClojureCodec.bridgeOutput(entry.getKey()),
+                           bridgeEntityValue(entry.getValue()));
+            }
+            return result;
+        }
+
+        if (value instanceof Set<?> set) {
+            LinkedHashSet<Object> result = new LinkedHashSet<>(set.size());
+            for (Object item : set) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Collection<?> collection) {
+            ArrayList<Object> result = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Iterable<?> iterable) {
+            ArrayList<Object> result = new ArrayList<>();
+            for (Object item : iterable) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        if (value instanceof Object[] array) {
+            ArrayList<Object> result = new ArrayList<>(array.length);
+            for (Object item : array) {
+                result.add(bridgeEntityValue(item));
+            }
+            return result;
+        }
+
+        return ClojureCodec.bridgeOutput(value);
+    }
+
+    private static Object connectionStore(Object conn) {
+        return ClojureRuntime.invoke("clojure.core",
+                                     "get",
+                                     connectionDb(conn),
+                                     ClojureCodec.keyword(":store"));
+    }
+
+    private static Object connectionDatomIndexRead(String function,
+                                                   Object conn,
+                                                   Object index,
+                                                   Object c1,
+                                                   Object c2,
+                                                   Object c3,
+                                                   Long limit) {
+        Object normalizedIndex = DatalevinForms.datalogIndexInput(index);
+        Object nc1 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 0, c1);
+        Object nc2 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 1, c2);
+        Object nc3 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 2, c3);
+        if (limit == null) {
+            return ClojureRuntime.core(function, connectionDb(conn), normalizedIndex, nc1, nc2, nc3);
+        }
+        return ClojureRuntime.core(function, connectionDb(conn), normalizedIndex, nc1, nc2, nc3, limit);
     }
 }

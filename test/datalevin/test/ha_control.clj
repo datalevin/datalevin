@@ -1,8 +1,11 @@
 (ns datalevin.test.ha-control
   (:require
+   [clojure.string :as str]
    [clojure.test :refer [deftest is]]
    [datalevin.ha.authority :as authority]
-   [datalevin.ha.control :as ctrl]))
+   [datalevin.ha.control :as ctrl]
+   [datalevin.server.ha :as server-ha]
+   [datalevin.util :as u]))
 
 (def apply-state-command #'ctrl/apply-state-command)
 
@@ -73,3 +76,18 @@
             :lease-timeout-ms 3000
             :write-admission-margin-ms 100}
            (authority/ha-authority-read-failure-details m 3000)))))
+
+(deftest server-ha-control-raft-dir-default-is-under-db-root-test
+  (let [root    "/var/lib/datalevin"
+        db-name "orders"
+        ha-opts {:ha-control-plane
+                 {:backend :sofa-jraft
+                  :group-id "ha/prod"
+                  :local-peer-id "10.0.0.12:7801"}}
+        resolved (server-ha/with-default-ha-control-raft-dir
+                  root db-name ha-opts)
+        raft-dir (get-in resolved [:ha-control-plane :raft-dir])]
+    (is (str/starts-with?
+         raft-dir
+         (str root u/+separator+ "ha-control" u/+separator+)))
+    (is (str/includes? raft-dir (u/hexify-string db-name)))))

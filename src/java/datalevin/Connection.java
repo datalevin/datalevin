@@ -6,6 +6,8 @@ import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
 
 /**
  * Handle for a Datalog connection.
@@ -16,8 +18,14 @@ import java.util.Objects;
  */
 public final class Connection extends HandleResource {
     Connection(Object conn) {
+        this(conn, true);
+    }
+
+    Connection(Object conn, boolean owned) {
         super(conn,
-              resource -> ClojureRuntime.core("close", resource),
+              owned ? resource -> ClojureRuntime.core("close", resource)
+                    : resource -> {
+                    },
               "conn",
               "conn");
     }
@@ -102,6 +110,58 @@ public final class Connection extends HandleResource {
      */
     public void clear() {
         ClojureRuntime.core("clear", resource());
+    }
+
+    /**
+     * Runs {@code fn} inside a single Datalevin write transaction.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(Function<Connection, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return (T) ClojureRuntime.core("with-transaction-fn", resource(), wrapped);
+    }
+
+    /**
+     * Rebuilds this Datalog database index and returns this handle.
+     */
+    public Connection reIndex() {
+        return reIndex((Map<?, ?>) null);
+    }
+
+    /**
+     * Rebuilds this Datalog database index with options and returns this handle.
+     */
+    public Connection reIndex(Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
+    }
+
+    /**
+     * Rebuilds this Datalog database index with a raw schema and options.
+     */
+    public Connection reIndex(Map<?, ?> schema, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          DatalevinForms.schemaInput(schema),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
+    }
+
+    /**
+     * Rebuilds this Datalog database index with a typed schema and options.
+     */
+    public Connection reIndex(Schema schema, Map<?, ?> opts) {
+        Object next = ClojureRuntime.core("re-index",
+                                          resource(),
+                                          schema == null ? null : schema.buildForm(),
+                                          DatalevinForms.optionsInput(opts == null ? Map.of() : opts));
+        replaceResource(next);
+        return this;
     }
 
     /**
@@ -488,6 +548,304 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Transacts raw transaction data asynchronously.
+     *
+     * <p>The returned {@link CompletableFuture} completes with the transaction
+     * report when the underlying Datalevin async transaction commits.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(Object txData) {
+        return transactAsync(txData, null);
+    }
+
+    /**
+     * Transacts typed transaction data asynchronously.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(TxData txData) {
+        return transactAsync(txData, null);
+    }
+
+    /**
+     * Transacts raw transaction data asynchronously with optional transaction
+     * metadata.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(Object txData, Map<?, ?> txMeta) {
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      DatalevinForms.txDataInput(txData))
+                : ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      DatalevinForms.txDataInput(txData),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return txReportFuture(future);
+    }
+
+    /**
+     * Transacts typed transaction data asynchronously with optional transaction
+     * metadata.
+     */
+    public CompletableFuture<Map<?, ?>> transactAsync(TxData txData, Map<?, ?> txMeta) {
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      txData == null ? null : txData.buildForm())
+                : ClojureRuntime.core("transact-async",
+                                      resource(),
+                                      txData == null ? null : txData.buildForm(),
+                                      ClojureCodec.runtimeInput(txMeta));
+        return txReportFuture(future);
+    }
+
+    /**
+     * Bulk-loads Datom values into this connection and returns this handle.
+     *
+     * <p>Datoms may be raw Datalevin Datom objects, 3/4/5-element collections
+     * in {@code [e, attr, value, tx?, added?]} shape, or maps with
+     * {@code :e}, {@code :a}, and {@code :v} keys.
+     */
+    public Connection fillDb(Object datoms) {
+        Object newDb = ClojureRuntime.core("fill-db", db(), DatalevinForms.datomsInput(datoms));
+        ClojureRuntime.core("reset-conn!", resource(), newDb);
+        return this;
+    }
+
+    /**
+     * Returns the KV handle backing this Datalog connection.
+     *
+     * <p>The returned handle is borrowed from the connection. Closing it does
+     * not close the underlying store; close this connection instead.
+     */
+    public KV datalogKV() {
+        return new KV(ClojureRuntime.core("datalog-kv", resource()), false);
+    }
+
+    /**
+     * Returns datoms from {@code index}, ordered by index order.
+     */
+    public List<?> datoms(Object index) {
+        return datoms(index, null, null, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the first index component.
+     */
+    public List<?> datoms(Object index, Object c1) {
+        return datoms(index, c1, null, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the first two index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2) {
+        return datoms(index, c1, c2, null);
+    }
+
+    /**
+     * Returns datoms from {@code index} matching the supplied index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Returns up to {@code n} datoms from {@code index} matching the supplied
+     * index components.
+     */
+    public List<?> datoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Returns datoms matching the entity, attribute, and value pattern. A
+     * {@code null} component is a wildcard.
+     */
+    public List<?> searchDatoms(Object e, Object attr, Object value) {
+        return ResultSupport.sequence(ClojureRuntime.core("search-datoms",
+                                                          db(),
+                                                          ClojureCodec.runtimeInput(e),
+                                                          DatalevinForms.datalogAttrInput(attr),
+                                                          ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Counts datoms matching the entity, attribute, and value pattern. A
+     * {@code null} component is a wildcard.
+     */
+    public long countDatoms(Object e, Object attr, Object value) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("count-datoms",
+                                                         db(),
+                                                         ClojureCodec.runtimeInput(e),
+                                                         DatalevinForms.datalogAttrInput(attr),
+                                                         ClojureCodec.runtimeInput(value)));
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index) {
+        return seekDatoms(index, null, null, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1) {
+        return seekDatoms(index, c1, null, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2) {
+        return seekDatoms(index, c1, c2, null);
+    }
+
+    /**
+     * Seeks forward in {@code index} from the supplied components.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("seek-datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Seeks forward in {@code index}, returning up to {@code n} datoms.
+     */
+    public List<?> seekDatoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("seek-datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index) {
+        return rseekDatoms(index, null, null, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1) {
+        return rseekDatoms(index, c1, null, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2) {
+        return rseekDatoms(index, c1, c2, null);
+    }
+
+    /**
+     * Seeks backward in {@code index} from the supplied components.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2, Object c3) {
+        return datomIndexRead("rseek-datoms", index, c1, c2, c3, null);
+    }
+
+    /**
+     * Seeks backward in {@code index}, returning up to {@code n} datoms.
+     */
+    public List<?> rseekDatoms(Object index, Object c1, Object c2, Object c3, long n) {
+        return datomIndexRead("rseek-datoms", index, c1, c2, c3, n);
+    }
+
+    /**
+     * Returns datoms in AVE order for {@code attr} values in the inclusive
+     * {@code [start, end]} range.
+     */
+    public List<?> indexRange(Object attr, Object start, Object end) {
+        return ResultSupport.sequence(ClojureRuntime.core("index-range",
+                                                          db(),
+                                                          DatalevinForms.datalogAttrInput(attr),
+                                                          ClojureCodec.runtimeInput(start),
+                                                          ClojureCodec.runtimeInput(end)));
+    }
+
+    /**
+     * Returns datoms found by the fulltext query.
+     */
+    public List<?> fulltextDatoms(String query) {
+        return ResultSupport.sequence(ClojureRuntime.core("fulltext-datoms", db(), query));
+    }
+
+    /**
+     * Returns datoms found by the fulltext query using Datalevin fulltext
+     * options.
+     */
+    public List<?> fulltextDatoms(String query, Map<?, ?> opts) {
+        if (opts == null) {
+            return fulltextDatoms(query);
+        }
+        return ResultSupport.sequence(ClojureRuntime.core("fulltext-datoms",
+                                                          db(),
+                                                          query,
+                                                          DatalevinForms.optionsInput(opts)));
+    }
+
+    /**
+     * Copies the Datalog database to {@code dest}.
+     */
+    public void copy(String dest) {
+        ClojureRuntime.core("copy", db(), dest);
+    }
+
+    /**
+     * Copies the Datalog database to {@code dest}, optionally compacting pages.
+     */
+    public void copy(String dest, boolean compact) {
+        ClojureRuntime.core("copy", db(), dest, compact);
+    }
+
+    /**
+     * Returns WAL watermarks for this connection's backing store.
+     */
+    public Map<?, ?> txLogWatermarks() {
+        return (Map<?, ?>) ClojureRuntime.core("txlog-watermarks", store());
+    }
+
+    /**
+     * Reads committed WAL records from {@code fromLsn}, inclusive.
+     */
+    public List<?> openTxLog(long fromLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", store(), fromLsn));
+    }
+
+    /**
+     * Reads committed WAL records in the inclusive LSN range.
+     */
+    public List<?> openTxLog(long fromLsn, long uptoLsn) {
+        return ResultSupport.sequence(ClojureRuntime.core("open-tx-log", store(), fromLsn, uptoLsn));
+    }
+
+    /**
+     * Creates or rotates the LMDB snapshot for this connection's backing store.
+     */
+    public Map<?, ?> createSnapshot() {
+        return (Map<?, ?>) ClojureRuntime.core("create-snapshot!", store());
+    }
+
+    /**
+     * Lists available LMDB snapshots for this connection's backing store.
+     */
+    public List<?> listSnapshots() {
+        return ResultSupport.sequence(ClojureRuntime.core("list-snapshots", store()));
+    }
+
+    /**
+     * Runs WAL segment GC for this connection's backing store.
+     */
+    public Map<?, ?> gcTxLogSegments() {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", store());
+    }
+
+    /**
+     * Runs WAL segment GC while retaining records from {@code retainFloorLsn}.
+     */
+    public Map<?, ?> gcTxLogSegments(long retainFloorLsn) {
+        return (Map<?, ?>) ClojureRuntime.core("gc-txlog-segments!", store(), retainFloorLsn);
+    }
+
+    /**
      * Escape hatch for calling a connection-scoped JSON API operation directly.
      */
     public Object exec(String op, Map<String, ?> args) {
@@ -496,6 +854,29 @@ public final class Connection extends HandleResource {
 
     private Object db() {
         return ClojureRuntime.core("db", resource());
+    }
+
+    private Object store() {
+        return ClojureRuntime.invoke("clojure.core",
+                                     "get",
+                                     db(),
+                                     ClojureCodec.keyword(":store"));
+    }
+
+    private List<?> datomIndexRead(String function,
+                                   Object index,
+                                   Object c1,
+                                   Object c2,
+                                   Object c3,
+                                   Long limit) {
+        Object normalizedIndex = DatalevinForms.datalogIndexInput(index);
+        Object nc1 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 0, c1);
+        Object nc2 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 1, c2);
+        Object nc3 = DatalevinForms.datalogIndexComponentInput(normalizedIndex, 2, c3);
+        if (limit == null) {
+            return ResultSupport.sequence(ClojureRuntime.core(function, db(), normalizedIndex, nc1, nc2, nc3));
+        }
+        return ResultSupport.sequence(ClojureRuntime.core(function, db(), normalizedIndex, nc1, nc2, nc3, limit));
     }
 
     private Object runQuery(Object queryForm, List<?> inputs) {
@@ -553,6 +934,18 @@ public final class Connection extends HandleResource {
             args[base + i] = ClojureCodec.runtimeInput(inputs.get(i));
         }
         return ClojureRuntime.core("explain", args);
+    }
+
+    private CompletableFuture<Map<?, ?>> txReportFuture(Object future) {
+        CompletableFuture<Map<?, ?>> result = new CompletableFuture<>();
+        CompletableFuture.runAsync(() -> {
+            try {
+                result.complete((Map<?, ?>) ClojureRuntime.deref(future));
+            } catch (Throwable e) {
+                result.completeExceptionally(e);
+            }
+        });
+        return result;
     }
 
     private static void requireShape(DatalogQuery query,

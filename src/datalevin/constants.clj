@@ -551,6 +551,10 @@
   *wal-sync-adaptive?* true)
 
 (def ^{:dynamic true
+       :doc     "Enable multi-process WAL directory reconciliation. Keep false for normal single-process stores to avoid per-commit directory/meta probes."}
+  *wal-shared?* false)
+
+(def ^{:dynamic true
        :doc     "WAL segment size cap in bytes before roll."}
   *wal-segment-max-bytes* (* 256 1024 1024))
 
@@ -577,6 +581,10 @@
 (def ^{:dynamic true
        :doc     "WAL retention cap in milliseconds."}
   *wal-retention-ms* (* 7 24 60 60 1000))
+
+(def ^{:dynamic true
+       :doc     "Maximum number of WAL segment record-index entries kept in memory for open tx-log serving."}
+  *wal-records-cache-segments* 64)
 
 (def ^{:dynamic true
        :doc     "Replica heartbeat TTL in milliseconds for WAL retention floor computation."}

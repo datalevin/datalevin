@@ -147,6 +147,25 @@ public final class Schema {
     }
 
     /**
+     * Built-in idoc formats.
+     */
+    public enum IdocFormat {
+        EDN("edn"),
+        JSON("json"),
+        MARKDOWN("markdown");
+
+        private final String keyword;
+
+        IdocFormat(String keyword) {
+            this.keyword = keyword;
+        }
+
+        String keyword() {
+            return keyword;
+        }
+    }
+
+    /**
      * Builder for a single schema attribute definition.
      */
     public static final class Attribute {
@@ -262,6 +281,73 @@ public final class Schema {
         }
 
         /**
+         * Sets {@code :db.fulltext/domains}.
+         */
+        public Attribute fulltextDomains(String... domains) {
+            return stringVectorProp("db.fulltext/domains", domains);
+        }
+
+        /**
+         * Sets {@code :db.fulltext/autoDomain}.
+         */
+        public Attribute fulltextAutoDomain(boolean enabled) {
+            props.put(Datalevin.kw("db.fulltext/autoDomain"), enabled);
+            return this;
+        }
+
+        /**
+         * Sets {@code :db/embedding}.
+         */
+        public Attribute embedding(boolean enabled) {
+            props.put(Datalevin.kw("db/embedding"), enabled);
+            return this;
+        }
+
+        /**
+         * Sets {@code :db.embedding/domains}.
+         */
+        public Attribute embeddingDomains(String... domains) {
+            return stringVectorProp("db.embedding/domains", domains);
+        }
+
+        /**
+         * Sets {@code :db.embedding/autoDomain}.
+         */
+        public Attribute embeddingAutoDomain(boolean enabled) {
+            props.put(Datalevin.kw("db.embedding/autoDomain"), enabled);
+            return this;
+        }
+
+        /**
+         * Sets {@code :db.vec/domains}.
+         */
+        public Attribute vectorDomains(String... domains) {
+            return stringVectorProp("db.vec/domains", domains);
+        }
+
+        /**
+         * Sets {@code :db/idocFormat}.
+         */
+        public Attribute idocFormat(String format) {
+            return keywordProp("db/idocFormat", format);
+        }
+
+        /**
+         * Sets {@code :db/idocFormat}.
+         */
+        public Attribute idocFormat(IdocFormat format) {
+            return keywordProp("db/idocFormat", format.keyword());
+        }
+
+        /**
+         * Sets {@code :db/domain}.
+         */
+        public Attribute domain(String domain) {
+            props.put(Datalevin.kw("db/domain"), domain);
+            return this;
+        }
+
+        /**
          * Sets {@code :db/isComponent}.
          */
         public Attribute isComponent(boolean enabled) {
@@ -327,6 +413,15 @@ public final class Schema {
 
         private Attribute keywordProp(String key, String value) {
             props.put(Datalevin.kw(key), Datalevin.kw(value));
+            return this;
+        }
+
+        private Attribute stringVectorProp(String key, String... values) {
+            ArrayList<Object> items = new ArrayList<>(values.length);
+            for (String value : values) {
+                items.add(value);
+            }
+            props.put(Datalevin.kw(key), PersistentVector.create(items));
             return this;
         }
     }

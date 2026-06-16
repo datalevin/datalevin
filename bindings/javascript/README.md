@@ -46,6 +46,179 @@ try {
 }
 ```
 
+## Data Style
+
+Use ordinary JavaScript data as the canonical style:
+
+- schemas are objects keyed by colon-prefixed attribute strings
+- transaction entity maps are objects, and transaction forms are arrays
+- query and pull forms may be EDN strings or JavaScript arrays
+- colon-prefixed strings are converted to keywords in schema/query/form
+  positions
+- use `keyword()` when the stored value itself must be a keyword
+
+```js
+import { keyword, readEdn, schemaAttr, txAdd, txEntity, writeEdn } from "datalevin-node";
+
+const schema = {
+  ":name": schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }),
+  ":status": schemaAttr({ valueType: ":db.type/keyword" })
+};
+
+const tx = [
+  txEntity(-1, { ":name": "Ada", ":status": await keyword(":active") }),
+  txAdd(-1, ":nickname", "A")
+];
+
+const form = await readEdn("[:find ?e :where [?e :name _]]");
+const text = await writeEdn([":find", "?e", ":where", ["?e", ":name", "_"]]);
+```
+
+## Lazy Entity Example
+
+`conn.entity()` returns a lazy entity wrapper. Use `get()` for individual
+attributes, and call `touch()` only when you want a fully materialized object.
+`entityMap()` is available for the old eager touched-object shape.
+
+```js
+const entity = await conn.entity([":name", "Ada"]);
+
+console.log(await entity.id());
+console.log(await entity.get(":name"));
+console.log(await entity.get(":db/id"));
+
+const touched = await entity.touch();
+const eager = await conn.entityMap(1);
+```
+
+## Search, Vector, and Idoc Builders
+
+Use helper builders for search/vector/idoc schema and option maps instead of
+hand-writing every namespaced key:
+
+```js
+import {
+  embeddingAttr,
+  embeddingOptions,
+  fulltextAttr,
+  idocAttr,
+  searchDomain,
+  searchOptions,
+  vectorAttr,
+  vectorOptions
+} from "datalevin-node";
+
+const schema = {
+  ":doc/text": fulltextAttr({ domains: ["docs"], autoDomain: true }),
+  ":doc/body": embeddingAttr({ domains: ["docs"], autoDomain: true }),
+  ":doc/vec": vectorAttr({ domains: ["docs"] }),
+  ":doc/json": idocAttr({ format: "json", domain: "profiles" })
+};
+
+const opts = {
+  ":search-domains": { docs: searchDomain({ indexPosition: true }) },
+  ":search-opts": searchOptions({ top: 5, display: "refs+scores" }),
+  ":vector-opts": vectorOptions({ dimensions: 384, metricType: "cosine" }),
+  ":embedding-opts": embeddingOptions({ provider: "default", metricType: "cosine" })
+};
+```
+
+## Async Transaction Example
+
+Use `transactAsync()` for ingestion and application-server workloads that
+benefit from Datalevin's async transaction batching. It returns a normal
+JavaScript `Promise`.
+
+```js
+const report = await conn.transactAsync([
+  { ":db/id": -1, ":name": "Cara" }
+]);
+```
+
+## UDF Example
+
+Use `createUdfRegistry()` and `udfDescriptor()` for runtime UDFs. Pass the
+registry in connection runtime options, then call the descriptor from query with
+Datalevin's `udf` function.
+
+```js
+import { connect, createUdfRegistry, udfDescriptor } from "datalevin-node";
+
+const registry = await createUdfRegistry();
+await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
+
+const descriptor = udfDescriptor(":math/inc");
+const conn = await connect("/tmp/dtlv-js-udf", {
+  opts: { ":runtime-opts": { ":udf-registry": registry } }
+});
+
+try {
+  const value = await conn.query(
+    "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
+    descriptor,
+    41
+  );
+} finally {
+  await conn.close();
+}
+```
+
+## Datalog-Backed KV Example
+
+Use `datalogKv()` when you need ordinary KV tables in the same store as a
+Datalog connection. The returned KV handle is borrowed from the connection; do
+not close it separately.
+
+```js
+import { datalogKv } from "datalevin-node";
+
+const kv = await datalogKv(conn);
+await kv.openDbi("app-state");
+await kv.transact([[":put", "k", "v"]], {
+  dbiName: "app-state",
+  kType: ":string",
+  vType: ":string"
+});
+```
+
+## Datom Inspection Example
+
+Connection objects expose index-level reads for debugging, teaching, and
+migration tooling. Datom reads return objects with `:e`, `:a`, `:v`, `:tx`,
+and `:added` keys; `fulltextDatoms()` returns `[e, attr, value]` triples.
+
+```js
+console.log(await conn.datoms(":eav", { c1: 1, c2: ":name", limit: 10 }));
+console.log(await conn.seekDatoms(":ave", { c1: ":name", c2: "Ada", limit: 5 }));
+console.log(await conn.rseekDatoms(":ave", { c1: ":name", c2: "Bob", limit: 5 }));
+console.log(await conn.indexRange(":name", "A", "C"));
+console.log(await conn.countDatoms({ attr: ":name", value: "Ada" }));
+console.log(await conn.fulltextDatoms("database", { opts: { ":top": 5 } }));
+```
+
+## Bulk Load Example
+
+Use `initDb()` and `fillDb()` when you already have Datom-shaped data and want
+the fast bulk-load path. Datoms can be compact arrays in
+`[entityId, attr, value]` shape, and `datom()` creates the same shape.
+
+```js
+import { datom, fillDb, initDb } from "datalevin-node";
+
+const schema = { ":name": { ":db/valueType": ":db.type/string" } };
+const conn = await initDb([[1, ":name", "Ada"]], {
+  dir: "/tmp/dtlv-js-bulk",
+  schema
+});
+
+try {
+  await fillDb(conn, [[2, ":name", "Bob"]]);
+  await conn.fillDb([datom(3, ":name", "Cara")]);
+} finally {
+  await conn.close();
+}
+```
+
 ## KV Example
 
 ```js
@@ -69,6 +242,52 @@ try {
     kType: ":long",
     vType: ":string"
   }));
+  console.log(await kv.getRank("items", 2, { kType: ":long" }));
+  console.log(await kv.getFirstN("items", 2, [":all"], {
+    kType: ":long",
+    vType: ":string"
+  }));
+
+  await kv.openListDbi("tags");
+  await kv.putListItems("tags", "doc-1", ["clj", "db"], {
+    kType: ":string",
+    vType: ":string"
+  });
+  console.log(await kv.getList("tags", "doc-1", {
+    kType: ":string",
+    vType: ":string"
+  }));
+} finally {
+  await kv.close();
+}
+```
+
+## Operational Example
+
+KV stores expose backup, durability, snapshot, and WAL inspection helpers
+without raw JSON calls.
+
+```js
+import { openKv } from "datalevin-node";
+
+const kv = await openKv("/tmp/dtlv-js-ops", { ":wal?": true });
+
+try {
+  await kv.openDbi("items");
+  await kv.transact([[":put", "a", "alpha"]], {
+    dbiName: "items",
+    kType: ":string",
+    vType: ":string"
+  });
+
+  await kv.sync();
+  await kv.copy("/tmp/dtlv-js-ops-copy");
+
+  console.log(await kv.txLogWatermarks());
+  console.log(await kv.openTxLog(1, { limit: 10 }));
+  console.log(await kv.createSnapshot());
+  console.log(await kv.listSnapshots());
+  console.log(await kv.gcTxLogSegments());
 } finally {
   await kv.close();
 }

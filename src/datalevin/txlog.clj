@@ -21,7 +21,8 @@
    [datalevin.txlog.meta :as tmeta]
    [datalevin.txlog.recovery :as trec]
    [datalevin.txlog.segment :as tseg]
-   [datalevin.util :as u :refer [raise map+]])
+   [datalevin.util :as u :refer [raise map+]]
+   [taoensso.timbre :as log])
   (:import
    [datalevin.io PosixFsync]
    [java.io File]
@@ -36,7 +37,7 @@
    [java.util.zip CRC32C]))
 
 (def ^:const record-header-size 14)
-(def ^:const format-major 1)
+(def ^:const format-major 2)
 (def ^:const compressed-flag 0x01)
 (def ^:private magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x57) (byte 0x4c)]))
@@ -107,12 +108,15 @@
          complete-sync-success!
          complete-sync-failure!
          await-durable-lsn!
+         open-reusable-file-lock-channel!
+         now-ms
          sync-manager-state
          record-fsync-ms!
          record-commit-wait-ms!
          request-sync-now!
          classify-record-kind
          decode-commit-row-payload
+         decode-commit-row-payload-header
          durability-profile)
 
 (defn enabled? [info] (true? (:wal? info)))
@@ -174,6 +178,12 @@
     (boolean (:wal-sync-adaptive? info))
     c/*wal-sync-adaptive?*))
 
+(defn wal-shared?
+  [info]
+  (if (contains? info :wal-shared?)
+    (boolean (:wal-shared? info))
+    c/*wal-shared?*))
+
 (defn segment-max-bytes
   [info]
   (or (:wal-segment-max-bytes info) c/*wal-segment-max-bytes*))
@@ -223,19 +233,45 @@
       (raise "WAL segment preallocation bytes must be non-negative"
              {:wal-segment-prealloc-bytes bytes}))))
 
-(def ^:private decode-scanned-record-entry trec/decode-scanned-record-entry)
+(defn- scanned-record-summary
+  [^long segment-id ^String path record]
+  (let [payload (tcodec/decode-commit-row-payload-header
+                 ^bytes (:body record))
+        lsn (long (or (:lsn payload) 0))]
+    (when-not (pos? lsn)
+      (raise "Txn-log payload missing valid positive LSN"
+             {:type :txlog/corrupt
+              :segment-id segment-id
+              :path path
+              :offset (long (:offset record))
+              :record record}))
+    {:lsn lsn
+     :segment-id segment-id
+     :offset (long (:offset record))
+     :checksum (long (:checksum record))}))
 
-(def ^:private txlog-records-cache-entry trec/txlog-records-cache-entry)
+(defn- scan-closed-segment-last-record-summary-once
+  [^long segment-id ^File file allow-preallocated-tail?]
+  (let [path (.getPath file)
+        last-record-summary-v (volatile! nil)
+        scan (scan-segment
+              path
+              {:allow-preallocated-tail? allow-preallocated-tail?
+               :collect-records? false
+               :on-record
+               (fn [record]
+                 (vreset! last-record-summary-v
+                          (scanned-record-summary
+                           segment-id path record)))})]
+    (assoc scan :last-record-summary @last-record-summary-v)))
 
-(def ^:private scan-segment-records-cache-entry
-  trec/scan-segment-records-cache-entry)
-
-(defn- repair-closed-segment-preallocated-tail!
+(defn- repair-closed-segment-tail-summary!
   [^long segment-id ^File file cause]
   (let [path (.getPath file)
         repaired
         (try
-          (scan-segment-records-cache-entry segment-id file true)
+          (scan-closed-segment-last-record-summary-once
+           segment-id file true)
           (catch Exception e
             (if cause
               (throw cause)
@@ -245,24 +281,38 @@
         (truncate-partial-tail!
          path
          {:allow-preallocated-tail? true
-          :collect-records?         false})
-        (scan-segment-records-cache-entry segment-id file false))
+          :collect-records? false})
+        (scan-closed-segment-last-record-summary-once
+         segment-id file false))
       (if cause
         (throw cause)
         (raise "Partial tail found on closed txn-log segment"
                {:type :txlog/corrupt
                 :path path})))))
 
-(defn- scan-closed-segment-records-cache-entry!
+(defn- scan-closed-segment-last-record-summary!
   [^long segment-id ^File file]
   (try
     (let [{:keys [partial-tail?] :as result}
-          (scan-segment-records-cache-entry segment-id file false)]
+          (scan-closed-segment-last-record-summary-once
+           segment-id file false)]
       (if partial-tail?
-        (repair-closed-segment-preallocated-tail! segment-id file nil)
+        (repair-closed-segment-tail-summary! segment-id file nil)
         result))
     (catch Exception e
-      (repair-closed-segment-preallocated-tail! segment-id file e))))
+      (repair-closed-segment-tail-summary! segment-id file e))))
+
+(defn- latest-closed-record-summary!
+  [closed-segments]
+  (loop [segments (seq (rseq (vec closed-segments)))]
+    (when-let [{:keys [id file]} (first segments)]
+      (let [summary (:last-record-summary
+                     (scan-closed-segment-last-record-summary!
+                      (long id)
+                      ^File file))]
+        (if summary
+          summary
+          (recur (next segments)))))))
 
 (defn init-runtime-state
   [info marker-state]
@@ -271,16 +321,7 @@
                               (str (:dir info) u/+separator+ "txlog"))
         _                 (u/create-dirs dir)
         segments          (segment-files dir)
-        [closed-record-cache last-from-closed]
-        (reduce
-         (fn [[cache ^long closed-last-lsn] {:keys [id file]}]
-           (let [segment-id (long id)
-                 {:keys [cache-entry last-lsn]}
-                 (scan-closed-segment-records-cache-entry! segment-id file)]
-             [(assoc cache segment-id cache-entry)
-              (long (or last-lsn closed-last-lsn))]))
-         [{} 0]
-         (butlast segments))
+        closed-segments   (vec (butlast segments))
         active-id         (if (seq segments) (:id (last segments)) 1)
         active-path       (segment-path dir active-id)
         profile           (durability-profile info)
@@ -316,13 +357,12 @@
                                           :record record}))
                                 (vreset! active-last-lsn-v lsn)
                                 (vreset! active-last-record-summary-v
-                                         {:lsn lsn
-                                          :segment-id (long active-id)
-                                          :offset (long (:offset record))
-                                          :checksum (long (:checksum record))})))})
+                                        {:lsn lsn
+                                         :segment-id (long active-id)
+                                         :offset (long (:offset record))
+                                         :checksum (long (:checksum record))})))})
         active-offset     (segment-end-offset active-scan)
-        active-file       (io/file active-path)
-        txlog-records-cache closed-record-cache
+        txlog-records-cache {}
         closed-bytes      (reduce
                             (fn [acc {:keys [id file]}]
                               (if (= ^long (long id) ^long active-id)
@@ -335,13 +375,39 @@
         meta-cur          (:current meta)
         marker-cur        (:current marker-state)
         last-from-active  (long @active-last-lsn-v)
+        last-from-closed-summary (when (zero? last-from-active)
+                                   (latest-closed-record-summary!
+                                    closed-segments))
+        last-record-summary (or @active-last-record-summary-v
+                                last-from-closed-summary)
+        last-from-closed (long (or (:lsn last-from-closed-summary) 0))
         last-from-seg     (long (max last-from-active
-                                     (long last-from-closed)))
-        last-committed    (max (long (or (:last-committed-lsn meta-cur) 0))
-                               last-from-seg)
-        last-durable      (max (long (or (:last-durable-lsn meta-cur) 0))
-                               last-committed)
-        last-applied      (long (or (:last-applied-lsn meta-cur) 0))
+                                     last-from-closed))
+        meta-committed-lsn (long (or (:last-committed-lsn meta-cur) 0))
+        meta-durable-lsn   (long (or (:last-durable-lsn meta-cur) 0))
+        meta-applied-lsn   (long (or (:last-applied-lsn meta-cur) 0))
+        last-committed    (long last-from-seg)
+        last-durable      (long (min last-committed
+                                     (max meta-durable-lsn last-from-seg)))
+        last-applied      (long (min last-committed
+                                     (max 0 meta-applied-lsn)))
+        startup-watermark-warning
+        (when (or (> meta-committed-lsn last-from-seg)
+                  (> meta-durable-lsn last-from-seg)
+                  (> meta-applied-lsn last-from-seg))
+          {:type :txlog/meta-watermark-overclaim
+           :dir dir
+           :meta-last-committed-lsn meta-committed-lsn
+           :meta-last-durable-lsn meta-durable-lsn
+           :meta-last-applied-lsn meta-applied-lsn
+           :scanned-last-lsn last-from-seg
+           :recovered-last-committed-lsn last-committed
+           :recovered-last-durable-lsn last-durable
+           :recovered-last-applied-lsn last-applied})
+        _                 (when startup-watermark-warning
+                            (log/warn
+                             "Txn-log meta watermarks exceed scanned WAL; using segment scan"
+                             startup-watermark-warning))
         last-sync-ms      (long (or (:updated-ms meta-cur)
                                     (System/currentTimeMillis)))
         now               (System/currentTimeMillis)
@@ -357,6 +423,7 @@
          :meta-path              meta-path
          :meta-lock-path         (meta-lock-path dir)
          :sync-lock-path         (sync-lock-path dir)
+         :sync-lock-channel      (volatile! nil)
          :recovery-lock-path     (recovery-lock-path dir)
          :maintenance-lock-path  (maintenance-lock-path dir)
          :segment-id             (volatile! active-id)
@@ -372,6 +439,7 @@
          :segment-prealloc-mode  prealloc-mode
          :segment-prealloc-bytes (long (segment-prealloc-bytes info))
          :durability-profile     profile
+         :wal-shared?            (wal-shared? info)
          :sync-mode              sync-mode*
          :sync-on-write?         sync-on-write?
          :commit-marker?         (commit-marker? info)
@@ -410,11 +478,36 @@
          :segment-summaries-cache                 (volatile! {})
          :txlog-records-cache                     (volatile! txlog-records-cache)
          :retention-total-bytes                   (volatile! total-bytes)
-         ;; Preserve the tail record summary from the active segment scan so a
-         ;; clean reopen can validate the current commit marker without walking
-         ;; the full retained WAL again.
-         :last-record-summary                     @active-last-record-summary-v
+         ;; Preserve the tail record summary so a clean reopen can validate the
+         ;; current commit marker without walking the full retained WAL again.
+         :last-record-summary                     last-record-summary
+         :startup-warnings                        (cond-> []
+                                                    startup-watermark-warning
+                                                    (conj startup-watermark-warning))
          :fatal-error                             (volatile! nil)}]
+    (when startup-watermark-warning
+      (try
+        (tseg/with-file-lock
+          (tmeta/meta-lock-path dir)
+          (fn []
+            (let [written (tmeta/write-meta-file!
+                           meta-path
+                           {:last-committed-lsn last-committed
+                            :last-durable-lsn last-durable
+                            :last-applied-lsn last-applied
+                            :segment-id active-id
+                            :segment-offset active-offset
+                            :updated-ms now}
+                           {:sync-mode :none})]
+              (when-let [meta-revision-v (:meta-revision state)]
+                (vreset! meta-revision-v (long (:revision written))))
+              (when-let [last-applied-v (:meta-last-applied-lsn state)]
+                (vreset! last-applied-v
+                         (long (:last-applied-lsn written)))))))
+        (catch Exception e
+          (log/warn e
+                    "Failed to repair txn-log meta watermarks after WAL scan"
+                    startup-watermark-warning))))
     {:dir dir :state state}))
 
 (def segment-file-name tseg/segment-file-name)
@@ -751,6 +844,45 @@
 
 (def ^:private release-file-lock! tseg/release-file-lock!)
 
+(defn- open-reusable-file-lock-channel!
+  [^String path]
+  (FileChannel/open
+   (.toPath (io/file path))
+   open-lock-create-write-options))
+
+(defn- try-acquire-reusable-file-lock!
+  [^String path ^FileChannel ch]
+  (when-let [lock (try
+                    (.tryLock ch)
+                    (catch OverlappingFileLockException _
+                      nil))]
+    {:channel ch
+     :lock lock
+     :path path
+     :close-channel? false}))
+
+(defn- try-acquire-sync-lock!
+  [state]
+  (let [path (:sync-lock-path state)]
+    (if-let [channel-v (:sync-lock-channel state)]
+      (let [^FileChannel ch (locking channel-v
+                              (or @channel-v
+                                  (let [ch (open-reusable-file-lock-channel!
+                                            path)]
+                                    (vreset! channel-v ch)
+                                    ch)))]
+        (try-acquire-reusable-file-lock! path ch))
+      (try-acquire-file-lock! path))))
+
+(defn- release-sync-lock!
+  [{:keys [lock close-channel?] :as lock-state}]
+  (if (= false close-channel?)
+    (when lock
+      (try
+        (.release ^FileLock lock)
+        (catch Exception _)))
+    (release-file-lock! lock-state)))
+
 (def preallocation-enabled-state? tseg/preallocation-enabled-state?)
 
 (def no-floor-lsn trec/no-floor-lsn)
@@ -899,6 +1031,8 @@
 
 (def decode-commit-row-payload tcodec/decode-commit-row-payload)
 
+(def decode-commit-row-payload-header tcodec/decode-commit-row-payload-header)
+
 (def ^:private patch-commit-row-payload-header!
   tcodec/patch-commit-row-payload-header!)
 
@@ -1036,7 +1170,7 @@
             (finally
               (complete-sync-failure! sync-manager e false)))
           (throw e)))
-      (if-let [lock-state (try-acquire-file-lock! (:sync-lock-path state))]
+      (if-let [lock-state (try-acquire-sync-lock! state)]
         (try
           (refresh-shared-watermarks! state)
           (let [reason (:reason sync-begin)
@@ -1077,11 +1211,57 @@
                 (complete-sync-failure! sync-manager e false)))
             (throw e))
           (finally
-            (release-file-lock! lock-state)))
+            (release-sync-lock! lock-state)))
         (do
           (refresh-shared-watermarks! state)
           (defer-sync-attempt! sync-manager)
           nil)))))
+
+(defn- commit-timeout?
+  [e]
+  (= :txlog/commit-timeout (:type (ex-data e))))
+
+(defn- await-durable-or-sync-available!
+  [{:keys [monitor] :as manager} lsn timeout-ms start-ms]
+  (locking monitor
+    (loop [deadline (+ ^long start-ms (max 0 ^long timeout-ms))]
+      (let [last-durable-lsn (long @(:last-durable-lsn manager))
+            healthy? (boolean @(:healthy? manager))
+            failure @(:failure manager)
+            sync-in-progress? (boolean @(:sync-in-progress? manager))]
+        (cond
+          (<= ^long lsn ^long last-durable-lsn)
+          {:durable? true :last-durable-lsn last-durable-lsn}
+
+          (not healthy?)
+          (throw (ex-info "Txn-log sync manager is unhealthy"
+                          {:type :txlog/unhealthy
+                           :lsn lsn}
+                          failure))
+
+          (not sync-in-progress?)
+          {:durable? false :last-durable-lsn last-durable-lsn}
+
+          :else
+          (let [now (now-ms)
+                remaining (- ^long deadline ^long now)]
+            (if (pos? remaining)
+              (do
+                (.wait monitor remaining)
+                (recur deadline))
+              (throw (ex-info "Timed out waiting for durable LSN"
+                              {:type :txlog/commit-timeout
+                               :lsn lsn
+                               :timeout-ms timeout-ms})))))))))
+
+(defn- await-durable-retry-window!
+  [sync-manager lsn wait-ms]
+  (try
+    (await-durable-lsn! sync-manager lsn wait-ms (now-ms))
+    (catch Exception e
+      (if (commit-timeout? e)
+        {:durable? false}
+        (throw e)))))
 
 (defn- wait-strict-durable!
   ([state ^FileChannel ch sync-manager lsn timeout-ms hooks]
@@ -1106,22 +1286,33 @@
                                {:type :txlog/commit-timeout
                                 :lsn lsn
                                 :timeout-ms timeout-ms})))
-             (if-let [sync-res
-                      (perform-sync-round! state
-                                           ch
-                                           sync-manager
-                                           ;; Reuse the first sync begin from append path
-                                           ;; so strict mode avoids an immediate extra
-                                           ;; monitor-lock round-trip.
-                                           (or sync-begin
-                                               (begin-sync! sync-manager lsn))
-                                           hooks)]
-               (recur (:sync-done-ms sync-res)
-                      (:sync-reason sync-res)
-                      nil)
-               (do
-                 (Thread/sleep (long (min 5 remaining)))
-                 (recur last-sync-ms last-sync-reason nil))))))))))
+            (if-let [sync-begin* (or sync-begin
+                                     (begin-sync! sync-manager lsn))]
+              (if-let [sync-res
+                       (perform-sync-round! state
+                                            ch
+                                            sync-manager
+                                            ;; Reuse the first sync begin from append path
+                                            ;; so strict mode avoids an immediate extra
+                                            ;; monitor-lock round-trip.
+                                            sync-begin*
+                                            hooks)]
+                (recur (:sync-done-ms sync-res)
+                       (:sync-reason sync-res)
+                       nil)
+                (do
+                  (await-durable-retry-window!
+                   sync-manager
+                   lsn
+                   (long (min 5 remaining)))
+                  (recur last-sync-ms last-sync-reason nil)))
+              (do
+                (await-durable-or-sync-available!
+                 sync-manager
+                 lsn
+                 remaining
+                 now)
+                (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
   [state rows {:keys [mark-fatal!] :as hooks}]

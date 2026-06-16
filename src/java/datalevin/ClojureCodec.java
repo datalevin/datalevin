@@ -68,6 +68,22 @@ final class ClojureCodec {
             return ClojureRuntime.readEdn(literal.value());
         }
 
+        if (value instanceof UdfRegistry registry) {
+            return registry.rawHandle();
+        }
+
+        if (value instanceof LazyEntity entity) {
+            return entity.handle();
+        }
+
+        if (value instanceof UdfDescriptor descriptor) {
+            return descriptor.buildForm();
+        }
+
+        if (value instanceof RetrievalOptions options) {
+            return options.buildForm();
+        }
+
         if (value instanceof IPersistentMap) {
             return value;
         }
@@ -277,7 +293,7 @@ final class ClojureCodec {
         return Symbol.intern(value);
     }
 
-    private static boolean isDatom(Object value) {
+    static boolean isDatom(Object value) {
         return value != null && javaBoolean(ClojureRuntime.datom("datom?", value));
     }
 

@@ -23,6 +23,12 @@ class RawInterop:
     def create_connection(self, dir=None, schema=None, opts=None, *, shared: bool = False):
         return _BINDINGS.create_connection(dir, schema, opts, shared=shared)
 
+    def init_db(self, datoms, dir=None, schema=None, opts=None):
+        return _BINDINGS.init_db(datoms, dir, schema, opts)
+
+    def fill_db(self, conn, datoms):
+        return _BINDINGS.fill_db(conn, datoms)
+
     def close_connection(self, handle):
         _BINDINGS.close_connection(handle)
 
@@ -32,6 +38,75 @@ class RawInterop:
     def connection_db(self, handle):
         return _BINDINGS.connection_db(handle)
 
+    def connection_entity(self, handle, eid):
+        return _BINDINGS.connection_entity(handle, eid)
+
+    def entity_is(self, value):
+        return _BINDINGS.entity_is(value)
+
+    def entity_id(self, entity):
+        return _BINDINGS.entity_id(entity)
+
+    def entity_get(self, entity, attr):
+        return _BINDINGS.entity_get(entity, attr)
+
+    def entity_contains(self, entity, attr):
+        return _BINDINGS.entity_contains(entity, attr)
+
+    def entity_touch(self, entity):
+        return _BINDINGS.entity_touch(entity)
+
+    def connection_datalog_kv(self, handle):
+        return _BINDINGS.connection_datalog_kv(handle)
+
+    def connection_transact_async(self, handle, tx_data, tx_meta=None):
+        return _BINDINGS.connection_transact_async(handle, tx_data, tx_meta)
+
+    def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_search_datoms(self, handle, e=None, attr=None, value=None):
+        return _BINDINGS.connection_search_datoms(handle, e, attr, value)
+
+    def connection_count_datoms(self, handle, e=None, attr=None, value=None):
+        return _BINDINGS.connection_count_datoms(handle, e, attr, value)
+
+    def connection_seek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_seek_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_rseek_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
+        return _BINDINGS.connection_rseek_datoms(handle, index, c1, c2, c3, limit)
+
+    def connection_index_range(self, handle, attr, start, end):
+        return _BINDINGS.connection_index_range(handle, attr, start, end)
+
+    def connection_fulltext_datoms(self, handle, query, opts=None):
+        return _BINDINGS.connection_fulltext_datoms(handle, query, opts)
+
+    def connection_copy(self, handle, dest, compact=None):
+        return _BINDINGS.connection_copy(handle, dest, compact)
+
+    def connection_tx_log_watermarks(self, handle):
+        return _BINDINGS.connection_tx_log_watermarks(handle)
+
+    def connection_open_tx_log(self, handle, from_lsn, upto_lsn=None):
+        return _BINDINGS.connection_open_tx_log(handle, from_lsn, upto_lsn)
+
+    def connection_create_snapshot(self, handle):
+        return _BINDINGS.connection_create_snapshot(handle)
+
+    def connection_list_snapshots(self, handle):
+        return _BINDINGS.connection_list_snapshots(handle)
+
+    def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
+        return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
+
+    def connection_with_transaction(self, handle, fn):
+        return _BINDINGS.connection_with_transaction(handle, fn)
+
+    def connection_re_index(self, handle, schema=None, opts=None):
+        return _BINDINGS.connection_re_index(handle, schema, opts)
+
     def open_key_value(self, dir, opts=None):
         return _BINDINGS.open_key_value(dir, opts)
 
@@ -40,6 +115,54 @@ class RawInterop:
 
     def key_value_closed(self, handle):
         return _BINDINGS.key_value_closed(handle)
+
+    def key_value_begin_transaction(self, handle):
+        return _BINDINGS.key_value_begin_transaction(handle)
+
+    def key_value_commit_transaction(self, tx):
+        return _BINDINGS.key_value_commit_transaction(tx)
+
+    def key_value_abort_transaction(self, tx):
+        return _BINDINGS.key_value_abort_transaction(tx)
+
+    def key_value_with_transaction(self, handle, fn):
+        return _BINDINGS.key_value_with_transaction(handle, fn)
+
+    def key_value_re_index(self, handle, opts=None):
+        return _BINDINGS.key_value_re_index(handle, opts)
+
+    def new_search_engine(self, kv, opts=None):
+        return _BINDINGS.new_search_engine(kv, opts)
+
+    def search_add_doc(self, search, doc_ref, doc_text, check_exist=None):
+        return _BINDINGS.search_add_doc(search, doc_ref, doc_text, check_exist)
+
+    def search_remove_doc(self, search, doc_ref):
+        return _BINDINGS.search_remove_doc(search, doc_ref)
+
+    def search_clear_docs(self, search):
+        return _BINDINGS.search_clear_docs(search)
+
+    def search_doc_indexed(self, search, doc_ref):
+        return _BINDINGS.search_doc_indexed(search, doc_ref)
+
+    def search_doc_count(self, search):
+        return _BINDINGS.search_doc_count(search)
+
+    def search(self, search, query, opts=None):
+        return _BINDINGS.search(search, query, opts)
+
+    def search_re_index(self, search, opts=None):
+        return _BINDINGS.search_re_index(search, opts)
+
+    def search_index_writer(self, kv, opts=None):
+        return _BINDINGS.search_index_writer(kv, opts)
+
+    def search_write(self, writer, doc_ref, doc_text):
+        return _BINDINGS.search_write(writer, doc_ref, doc_text)
+
+    def search_commit(self, writer):
+        return _BINDINGS.search_commit(writer)
 
     def new_client(self, uri, opts=None):
         return _BINDINGS.new_client(uri, opts)
@@ -52,6 +175,9 @@ class RawInterop:
 
     def read_edn(self, edn: str):
         return _BINDINGS.read_edn(edn)
+
+    def write_edn(self, value):
+        return _BINDINGS.write_edn(value)
 
     def keyword(self, value: str):
         return _BINDINGS.keyword(value)
@@ -88,6 +214,9 @@ class RawInterop:
 
     def lookup_ref(self, value):
         return _BINDINGS.lookup_ref(value)
+
+    def datom(self, e, attr, value, tx=None, added=None):
+        return _BINDINGS.datom(e, attr, value, tx, added)
 
     def tx_data(self, tx_data):
         return _BINDINGS.tx_data(tx_data)

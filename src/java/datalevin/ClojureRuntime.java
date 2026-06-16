@@ -217,6 +217,10 @@ final class ClojureRuntime {
         return parsed;
     }
 
+    static Object deref(Object value) {
+        return invoke("clojure.core", "deref", value);
+    }
+
     static Object invoke(String ns, String name, Object... args) {
         try {
             return invoke(lookup(ns, name), args);

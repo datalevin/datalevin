@@ -23,6 +23,7 @@ import java.util.Objects;
  * ergonomic wrapper API.
  */
 final class DatalevinForms {
+    private static final Object MISSING = new Object();
 
     private DatalevinForms() {
     }
@@ -126,10 +127,10 @@ final class DatalevinForms {
         if (opts == null) {
             return null;
         }
-        if (opts instanceof IPersistentMap && normalizedKeywordMap(opts, true)) {
+        if (opts instanceof IPersistentMap && normalizedOptionsMap(opts)) {
             return opts;
         }
-        return keywordMap(opts, true);
+        return optionsMap(opts);
     }
 
     static Object udfDescriptorInput(Map<?, ?> descriptor) {
@@ -274,6 +275,93 @@ final class DatalevinForms {
         throw new IllegalArgumentException("Transaction data must be a collection.");
     }
 
+    static Object datomInput(Object datom) {
+        if (datom == null || ClojureCodec.isDatom(datom)) {
+            return datom;
+        }
+        if (datom instanceof Map<?, ?> map) {
+            return datomFromMap(map);
+        }
+        List<?> values = toList(datom);
+        if (values != null) {
+            return datomFromList(values);
+        }
+        throw new IllegalArgumentException(
+                "Datom data must contain Datom values, 3/4/5-element collections, or maps with :e/:a/:v keys.");
+    }
+
+    static Object datomsInput(Object datoms) {
+        if (datoms == null) {
+            return null;
+        }
+        if (datoms instanceof Collection<?> collection) {
+            ArrayList<Object> converted = new ArrayList<>(collection.size());
+            for (Object item : collection) {
+                converted.add(datomInput(item));
+            }
+            return PersistentVector.create(converted);
+        }
+        if (datoms instanceof Object[] array) {
+            ArrayList<Object> converted = new ArrayList<>(array.length);
+            for (Object item : array) {
+                converted.add(datomInput(item));
+            }
+            return PersistentVector.create(converted);
+        }
+        throw new IllegalArgumentException("Datoms must be a collection.");
+    }
+
+    static Object datom(Object e, Object attr, Object value) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value));
+    }
+
+    static Object datom(Object e, Object attr, Object value, Object tx) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value),
+                                    ClojureCodec.runtimeInput(tx));
+    }
+
+    static Object datom(Object e, Object attr, Object value, Object tx, Object added) {
+        return ClojureRuntime.datom("datom",
+                                    ClojureCodec.runtimeInput(e),
+                                    keywordFromAttr(attr),
+                                    ClojureCodec.runtimeInput(value),
+                                    ClojureCodec.runtimeInput(tx),
+                                    ClojureCodec.runtimeInput(added));
+    }
+
+    static Object datalogIndexInput(Object index) {
+        if (index instanceof Keyword) {
+            return index;
+        }
+        if (index instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+        if (index instanceof String s) {
+            return ClojureCodec.keyword(s);
+        }
+        return ClojureCodec.runtimeInput(index);
+    }
+
+    static Object datalogAttrInput(Object attr) {
+        return attr == null ? null : keywordFromAttr(attr);
+    }
+
+    static Object datalogIndexComponentInput(Object index, int position, Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (datalogAttributePosition(index, position)) {
+            return keywordFromAttr(value);
+        }
+        return ClojureCodec.runtimeInput(value);
+    }
+
     static Object kvTxsInput(Object txs) {
         return kvTxsInput(txs, null, null);
     }
@@ -328,6 +416,61 @@ final class DatalevinForms {
             return txVector(Arrays.asList(array));
         }
         return ClojureCodec.runtimeInput(item);
+    }
+
+    private static Object datomFromList(List<?> values) {
+        int size = values.size();
+        if (size < 3 || size > 5) {
+            throw new IllegalArgumentException(
+                    "Datom collection values must have 3, 4, or 5 elements, got: " + size);
+        }
+        if (size == 3) {
+            return datom(values.get(0), values.get(1), values.get(2));
+        }
+        if (size == 4) {
+            return datom(values.get(0), values.get(1), values.get(2), values.get(3));
+        }
+        return datom(values.get(0), values.get(1), values.get(2), values.get(3), values.get(4));
+    }
+
+    private static Object datomFromMap(Map<?, ?> map) {
+        Object e = datomMapValue(map, "e");
+        Object a = datomMapValue(map, "a");
+        Object v = datomMapValue(map, "v");
+        if (e == MISSING || a == MISSING || v == MISSING) {
+            throw new IllegalArgumentException("Datom maps must contain :e, :a, and :v keys.");
+        }
+        Object tx = datomMapValue(map, "tx");
+        Object added = datomMapValue(map, "added");
+        if (added != MISSING && tx == MISSING) {
+            throw new IllegalArgumentException("Datom maps with :added must also contain :tx.");
+        }
+        if (added != MISSING) {
+            return datom(e, a, v, tx, added);
+        }
+        if (tx != MISSING) {
+            return datom(e, a, v, tx);
+        }
+        return datom(e, a, v);
+    }
+
+    private static Object datomMapValue(Map<?, ?> map, String key) {
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (key.equals(datomMapKey(entry.getKey()))) {
+                return entry.getValue();
+            }
+        }
+        return MISSING;
+    }
+
+    private static String datomMapKey(Object key) {
+        if (key instanceof Keyword keyword) {
+            return stripLeadingColon(keyword.toString());
+        }
+        if (key instanceof String s) {
+            return stripLeadingColon(s);
+        }
+        return null;
     }
 
     private static Object txVector(Collection<?> collection) {
@@ -485,6 +628,33 @@ final class DatalevinForms {
         return result;
     }
 
+    private static IPersistentMap optionsMap(Map<?, ?> map) {
+        IPersistentMap result = PersistentArrayMap.EMPTY;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            Object key = keywordFromAttr(entry.getKey());
+            Object value = domainOptionsKey(key)
+                    ? domainOptionsMap(entry.getValue())
+                    : keywordValue(entry.getValue(), true);
+            result = result.assoc(key, value);
+        }
+        return result;
+    }
+
+    private static Object domainOptionsMap(Object value) {
+        if (value == null) {
+            return null;
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            return keywordValue(value, true);
+        }
+        IPersistentMap result = PersistentArrayMap.EMPTY;
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            result = result.assoc(domainName(entry.getKey()),
+                                  keywordValue(entry.getValue(), true));
+        }
+        return result;
+    }
+
     private static Object keywordValue(Object value, boolean keywordizeColonValues) {
         if (value instanceof String s && keywordizeColonValues && s.startsWith(":")) {
             return ClojureCodec.keyword(s);
@@ -527,6 +697,12 @@ final class DatalevinForms {
             return ClojureRuntime.readEdn(literal.value());
         }
         return ClojureCodec.runtimeInput(value);
+    }
+
+    private static boolean datalogAttributePosition(Object index, int position) {
+        String indexName = stripLeadingColon(String.valueOf(index));
+        return ("eav".equals(indexName) && position == 1)
+                || ("ave".equals(indexName) && position == 0);
     }
 
     private static Object rangeInput(Object rangeType, List<?> bounds, Object boundType) {
@@ -723,12 +899,60 @@ final class DatalevinForms {
         return value.startsWith(":") ? value.substring(1) : value;
     }
 
+    private static boolean domainOptionsKey(Object key) {
+        String name = key instanceof Keyword ? key.toString() : String.valueOf(key);
+        return ":search-domains".equals(name)
+                || ":vector-domains".equals(name)
+                || ":embedding-domains".equals(name);
+    }
+
+    private static String domainName(Object key) {
+        if (key instanceof Keyword keyword) {
+            return stripLeadingColon(keyword.toString());
+        }
+        return String.valueOf(key);
+    }
+
     private static boolean normalizedKeywordMap(Map<?, ?> map, boolean keywordizeColonValues) {
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             if (!(entry.getKey() instanceof Keyword)) {
                 return false;
             }
             if (!normalizedKeywordValue(entry.getValue(), keywordizeColonValues)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean normalizedOptionsMap(Map<?, ?> map) {
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof Keyword)) {
+                return false;
+            }
+            if (domainOptionsKey(entry.getKey())) {
+                if (!normalizedDomainOptionsMap(entry.getValue())) {
+                    return false;
+                }
+            } else if (!normalizedKeywordValue(entry.getValue(), true)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static boolean normalizedDomainOptionsMap(Object value) {
+        if (value == null) {
+            return true;
+        }
+        if (!(value instanceof Map<?, ?> map)) {
+            return false;
+        }
+        for (Map.Entry<?, ?> entry : map.entrySet()) {
+            if (!(entry.getKey() instanceof String s) || s.startsWith(":")) {
+                return false;
+            }
+            if (!normalizedKeywordValue(entry.getValue(), true)) {
                 return false;
             }
         }
