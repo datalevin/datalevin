@@ -313,13 +313,15 @@
   [^String path
    ^FileChannel ch
    size
+   start-offset
    allow-preallocated-tail?
    collect-records?
    on-record]
   (let [size             (long size)
+        start-offset     (long (min size (max 0 (long start-offset))))
         ^ByteBuffer read-bf (codec/big-endian-buffer! (bf/get-array-buffer 8192))]
     (try
-      (loop [offset  0
+      (loop [offset  start-offset
              records (when collect-records? [])]
         (let [remaining (- size offset)]
           (cond
@@ -418,9 +420,10 @@
   "Scan a txn-log segment."
   ([^String path] (scan-segment path {}))
   ([^String path {:keys [allow-preallocated-tail? collect-records?
-                         max-offset on-record]
+                         max-offset start-offset on-record]
                   :or   {allow-preallocated-tail? false
-                         collect-records?         true}}]
+                         collect-records?         true
+                         start-offset             0}}]
    (let [f (io/file path)]
      (loop [attempt 0]
        (let [{:keys [value error retry?]}
@@ -435,7 +438,7 @@
                                  (long file-size))]
                  (try
                    {:value (scan-segment-once
-                            path ch size allow-preallocated-tail?
+                            path ch size start-offset allow-preallocated-tail?
                             collect-records? on-record)}
                    (catch Exception e
                      (let [current-size (long (.length f))

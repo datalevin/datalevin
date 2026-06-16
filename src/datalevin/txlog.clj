@@ -114,6 +114,7 @@
          request-sync-now!
          classify-record-kind
          decode-commit-row-payload
+         decode-commit-row-payload-header
          durability-profile)
 
 (defn enabled? [info] (true? (:wal? info)))
@@ -278,16 +279,27 @@
                               (str (:dir info) u/+separator+ "txlog"))
         _                 (u/create-dirs dir)
         segments          (segment-files dir)
+        closed-segments   (vec (butlast segments))
+        record-cache-limit (let [n (long c/*wal-records-cache-segments*)]
+                             (if (neg? n) 0 n))
+        cached-closed-segment-ids
+        (when (pos? record-cache-limit)
+          (into #{}
+                (map (comp long :id))
+                (take-last record-cache-limit closed-segments)))
         [closed-record-cache last-from-closed]
         (reduce
          (fn [[cache ^long closed-last-lsn] {:keys [id file]}]
            (let [segment-id (long id)
                  {:keys [cache-entry last-lsn]}
                  (scan-closed-segment-records-cache-entry! segment-id file)]
-             [(assoc cache segment-id cache-entry)
+             [(if (and cached-closed-segment-ids
+                       (contains? cached-closed-segment-ids segment-id))
+                (assoc cache segment-id cache-entry)
+                cache)
               (long (or last-lsn closed-last-lsn))]))
          [{} 0]
-         (butlast segments))
+         closed-segments)
         active-id         (if (seq segments) (:id (last segments)) 1)
         active-path       (segment-path dir active-id)
         profile           (durability-profile info)
@@ -952,6 +964,8 @@
 (def tl-row-encode-buffer tcodec/tl-row-encode-buffer)
 
 (def decode-commit-row-payload tcodec/decode-commit-row-payload)
+
+(def decode-commit-row-payload-header tcodec/decode-commit-row-payload-header)
 
 (def ^:private patch-commit-row-payload-header!
   tcodec/patch-commit-row-payload-header!)

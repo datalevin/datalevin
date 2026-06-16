@@ -583,6 +583,10 @@
   *wal-retention-ms* (* 7 24 60 60 1000))
 
 (def ^{:dynamic true
+       :doc     "Maximum number of WAL segment record-index entries kept in memory for open tx-log serving."}
+  *wal-records-cache-segments* 64)
+
+(def ^{:dynamic true
        :doc     "Replica heartbeat TTL in milliseconds for WAL retention floor computation."}
   *wal-replica-floor-ttl-ms* 30000)
 
