@@ -377,72 +377,80 @@
 (defn- validate-ha-control-plane-shape
   ([cp]
    (validate-ha-control-plane-shape cp true))
-  ([cp require-local-peer?]
-  (when-not (map? cp)
-    (u/raise "Option :ha-control-plane expects a map"
-             {:error :ha/validation
-              :option :ha-control-plane
-              :value cp}))
-  (when-not (= :sofa-jraft (:backend cp))
-    (u/raise "Option :ha-control-plane :backend must be :sofa-jraft in V2"
-             {:error :ha/validation
-              :option :ha-control-plane
-              :backend (:backend cp)}))
-  (when-not (non-blank-string? (:group-id cp))
-    (u/raise "Option :ha-control-plane :group-id must be a non-blank string"
-             {:error :ha/validation
-              :option :ha-control-plane
-              :group-id (:group-id cp)}))
-  (when (or require-local-peer?
-            (contains? cp :local-peer-id))
-    (validate-peer-id (:local-peer-id cp) :ha-control-plane-local-peer))
-  (doseq [[k v] [[:rpc-timeout-ms (:rpc-timeout-ms cp)]
-                 [:election-timeout-ms (:election-timeout-ms cp)]
-                 [:operation-timeout-ms (:operation-timeout-ms cp)]]]
-    (when-not (positive-int? v)
-      (u/raise "HA control-plane timeout must be a positive integer"
-               {:error :ha/validation
-                :option :ha-control-plane
-                :field k
-                :value v})))
-  (let [voters (:voters cp)]
-    (when-not (vector? voters)
-      (u/raise "Option :ha-control-plane :voters must be a vector"
+  ([cp require-local-runtime?]
+   (when-not (map? cp)
+     (u/raise "Option :ha-control-plane expects a map"
+              {:error :ha/validation
+               :option :ha-control-plane
+               :value cp}))
+   (when-not (= :sofa-jraft (:backend cp))
+     (u/raise "Option :ha-control-plane :backend must be :sofa-jraft in V2"
+              {:error :ha/validation
+               :option :ha-control-plane
+               :backend (:backend cp)}))
+   (when-not (non-blank-string? (:group-id cp))
+     (u/raise "Option :ha-control-plane :group-id must be a non-blank string"
+              {:error :ha/validation
+               :option :ha-control-plane
+               :group-id (:group-id cp)}))
+   (when (or require-local-runtime?
+             (contains? cp :local-peer-id))
+     (validate-peer-id (:local-peer-id cp) :ha-control-plane-local-peer))
+   (when (or require-local-runtime?
+             (contains? cp :raft-dir))
+     (when-not (non-blank-string? (:raft-dir cp))
+       (u/raise "Option :ha-control-plane :raft-dir must be a non-blank durable path"
+                {:error :ha/validation
+                 :option :ha-control-plane
+                 :field :raft-dir
+                 :value (:raft-dir cp)})))
+   (doseq [[k v] [[:rpc-timeout-ms (:rpc-timeout-ms cp)]
+                  [:election-timeout-ms (:election-timeout-ms cp)]
+                  [:operation-timeout-ms (:operation-timeout-ms cp)]]]
+     (when-not (positive-int? v)
+       (u/raise "HA control-plane timeout must be a positive integer"
+                {:error :ha/validation
+                 :option :ha-control-plane
+                 :field k
+                 :value v})))
+   (let [voters (:voters cp)]
+     (when-not (vector? voters)
+       (u/raise "Option :ha-control-plane :voters must be a vector"
                {:error :ha/validation
                 :option :ha-control-plane
                 :voters voters}))
-    (when (< (count voters) 3)
-      (u/raise "Consensus HA requires at least 3 control-plane voters"
-               {:error :ha/validation
-                :option :ha-control-plane
-                :voter-count (count voters)}))
-    (doseq [[idx v] (map-indexed vector voters)]
-      (validate-ha-voter v idx))
-    (let [peer-ids (mapv :peer-id voters)
-          local-peer-id (:local-peer-id cp)
-          local-peer-present? (contains? cp :local-peer-id)
-          local-count (count (filter #(= local-peer-id %) peer-ids))
-          promotable-voters (filter :promotable? voters)
-          promotable-node-ids (mapv :ha-node-id promotable-voters)]
-      (when-not (= (count peer-ids) (count (set peer-ids)))
-        (u/raise "HA control-plane voter :peer-id values must be unique"
-                 {:error :ha/validation
-                  :option :ha-control-plane
-                  :peer-ids peer-ids}))
-      (when (or require-local-peer? local-peer-present?)
-        (when-not (= local-count 1)
-          (u/raise "HA local control-plane peer must appear exactly once in :voters"
-                   {:error :ha/validation
-                    :option :ha-control-plane
-                    :local-peer-id local-peer-id
-                    :matches local-count})))
-      (when-not (= (count promotable-node-ids)
-                   (count (set promotable-node-ids)))
-        (u/raise "Promotable HA voters must map one-to-one by :ha-node-id"
-                 {:error :ha/validation
-                  :option :ha-control-plane
-                  :promotable-node-ids promotable-node-ids}))))
-  cp))
+     (when (< (count voters) 3)
+       (u/raise "Consensus HA requires at least 3 control-plane voters"
+                {:error :ha/validation
+                 :option :ha-control-plane
+                 :voter-count (count voters)}))
+     (doseq [[idx v] (map-indexed vector voters)]
+       (validate-ha-voter v idx))
+     (let [peer-ids (mapv :peer-id voters)
+           local-peer-id (:local-peer-id cp)
+           local-peer-present? (contains? cp :local-peer-id)
+           local-count (count (filter #(= local-peer-id %) peer-ids))
+           promotable-voters (filter :promotable? voters)
+           promotable-node-ids (mapv :ha-node-id promotable-voters)]
+       (when-not (= (count peer-ids) (count (set peer-ids)))
+         (u/raise "HA control-plane voter :peer-id values must be unique"
+                  {:error :ha/validation
+                   :option :ha-control-plane
+                   :peer-ids peer-ids}))
+       (when (or require-local-runtime? local-peer-present?)
+         (when-not (= local-count 1)
+           (u/raise "HA local control-plane peer must appear exactly once in :voters"
+                    {:error :ha/validation
+                     :option :ha-control-plane
+                     :local-peer-id local-peer-id
+                     :matches local-count})))
+       (when-not (= (count promotable-node-ids)
+                    (count (set promotable-node-ids)))
+         (u/raise "Promotable HA voters must map one-to-one by :ha-node-id"
+                  {:error :ha/validation
+                   :option :ha-control-plane
+                   :promotable-node-ids promotable-node-ids}))))
+   cp))
 
 (defn- canonical-ha-membership-payload
   [opts]

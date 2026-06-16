@@ -60,7 +60,7 @@
        first))
 
 (defn- test-ha-opts
-  []
+  [raft-dir]
   (let [group-id    (str "test-ha-group-" (UUID/randomUUID))
         db-identity (str "test-ha-db-" (UUID/randomUUID))
         members     [{:node-id 1 :endpoint "127.0.0.1:19001"}
@@ -89,7 +89,8 @@
                         :voters voters
                         :rpc-timeout-ms 1000
                         :election-timeout-ms 1000
-                        :operation-timeout-ms 1000}}))
+                        :operation-timeout-ms 1000
+                        :raft-dir raft-dir}}))
 
 (deftest test-datalog-wal-default-is-opt-in
   (let [dir  (u/tmp-dir (str "test-datalog-wal-default-"
@@ -186,7 +187,11 @@
 (deftest test-datalog-ha-forces-safe-wal
   (let [dir  (u/tmp-dir (str "test-datalog-ha-wal-"
                              (UUID/randomUUID)))
-        conn (d/create-conn dir nil (test-ha-opts))]
+        conn (d/create-conn
+              dir
+              nil
+              (test-ha-opts
+               (str dir u/+separator+ "ha-control-raft")))]
     (try
       (is (true? (:wal? (conn-env-opts conn))))
       (is (= :strict (:wal-durability-profile (conn-env-opts conn))))
@@ -203,7 +208,11 @@
     (try
       (let [conn (d/create-conn dir)]
         (d/close conn))
-      (let [conn (d/create-conn dir nil (test-ha-opts))]
+      (let [conn (d/create-conn
+                  dir
+                  nil
+                  (test-ha-opts
+                   (str dir u/+separator+ "ha-control-raft")))]
         (try
           (is (true? (:wal? (conn-env-opts conn))))
           (is (= :strict (:wal-durability-profile (conn-env-opts conn))))
@@ -231,7 +240,8 @@
             Exception
             #"Consensus-lease HA requires :wal-durability-profile :strict or :extra"
             (d/create-conn dir nil
-                           (assoc (test-ha-opts)
+                           (assoc (test-ha-opts
+                                   (str dir u/+separator+ "ha-control-raft"))
                                   :wal-durability-profile :relaxed))))
       (finally
         (u/delete-files dir)))))

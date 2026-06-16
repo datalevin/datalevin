@@ -115,6 +115,7 @@ All HA options are per database.
  {:backend :sofa-jraft
   :group-id "ha-prod"
   :local-peer-id "10.0.0.12:7801"
+  :raft-dir "/var/lib/datalevin/orders/ha-control/10.0.0.12-7801"
   :voters [{:peer-id "10.0.0.11:7801" :ha-node-id 1 :promotable? true}
            {:peer-id "10.0.0.12:7801" :ha-node-id 2 :promotable? true}
            {:peer-id "10.0.0.13:7801" :ha-node-id 3 :promotable? true}
@@ -147,6 +148,9 @@ Important validation rules:
   `(:ha-lease-timeout-ms - :ha-lease-renew-ms)`.
 * promotable control-plane voters must map exactly to the `:ha-members`
   `node-id`s
+* `:ha-control-plane :raft-dir` must be a non-blank durable path for each
+  local SOFAJRaft authority. The server runtime fills this in under the DB root
+  when omitted; direct control-plane APIs require it explicitly.
 * the fencing hook shape must be valid
 * if `:ha-client-credentials` is supplied, it must be a non-blank username and
   password pair

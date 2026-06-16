@@ -729,18 +729,16 @@
   [{:keys [voters]}]
   (= 1 (count voters)))
 
-(defn- sanitize-path-segment
-  [x]
-  (-> x
-      (str)
-      (s/replace #"[^A-Za-z0-9._-]" "_")))
-
-(defn- default-raft-dir
-  [group-id local-peer-id]
-  (u/tmp-dir (str "datalevin-ha-control/"
-                  (sanitize-path-segment group-id)
-                  "/"
-                  (sanitize-path-segment local-peer-id))))
+(defn- require-raft-dir!
+  [raft-dir group-id local-peer-id]
+  (when-not (non-blank-string? raft-dir)
+    (u/raise
+     "HA control-plane :raft-dir is required for :sofa-jraft; use a durable directory outside tmp"
+     {:error :ha/control-missing-raft-dir
+      :group-id group-id
+      :local-peer-id local-peer-id
+      :raft-dir raft-dir}))
+  raft-dir)
 
 (defn- path-join
   [^String root ^String child]
@@ -1594,9 +1592,9 @@
                   conf               (peer-ids->configuration
                                       peer-ids
                                       :ha-control-plane-voters)
-                  root-dir           (or raft-dir
-                                         (default-raft-dir
-                                           group-id local-peer-id))
+                  root-dir           (require-raft-dir! raft-dir
+                                                        group-id
+                                                        local-peer-id)
                   log-dir            (path-join root-dir "log")
                   meta-dir           (path-join root-dir "meta")
                   snapshot-dir       (path-join root-dir "snapshot")
@@ -1969,6 +1967,9 @@
                                        default-election-timeout-ms))
         operation-timeout-ms (long (or operation-timeout-ms
                                        default-operation-timeout-ms))
+        raft-dir             (require-raft-dir! raft-dir
+                                                group-id
+                                                local-peer-id)
         clock-skew-budget-ms
         (some-> clock-skew-budget-ms
                 (validate-clock-skew-budget! :clock-skew-budget-ms)
