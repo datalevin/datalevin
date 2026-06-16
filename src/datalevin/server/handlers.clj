@@ -279,6 +279,51 @@
     :else
     (str x)))
 
+(defn- ha-rejoin-unconfirmed-local-tail
+  [db-state txlog-watermarks txlog-lsn]
+  (let [role (:ha-role db-state)
+        local-node-id (:ha-node-id db-state)
+        authority-owner-id (:ha-authority-owner-node-id db-state)
+        authority-lsn* (get-in db-state
+                               [:ha-authority-lease
+                                :leader-last-applied-lsn])
+        authority-lsn (long (or authority-lsn* 0))
+        txlog-lsn (long (or txlog-lsn 0))
+        committed-lsn (long (or (:last-committed-lsn txlog-watermarks)
+                                txlog-lsn
+                                0))
+        durable-lsn (long (or (:last-durable-lsn txlog-watermarks)
+                              txlog-lsn
+                              0))
+        applied-lsn (long (or (:last-applied-lsn txlog-watermarks)
+                              txlog-lsn
+                              0))
+        max-local-lsn (max committed-lsn durable-lsn applied-lsn)
+        count-from-authority
+        (fn [lsn]
+          (long (max 0 (- (long lsn) authority-lsn))))
+        rejoining-follower?
+        (and (= :follower role)
+             (integer? local-node-id)
+             (integer? authority-owner-id)
+             (not= (long local-node-id) (long authority-owner-id))
+             (integer? authority-lsn*))
+        ^long upper-bound (count-from-authority max-local-lsn)]
+    (when (and rejoining-follower?
+               (< 0 upper-bound))
+      {:ha-rejoin-unconfirmed-local-tail? true
+       :ha-rejoin-unconfirmed-local-tail-lsn-count upper-bound
+       :ha-rejoin-unconfirmed-local-committed-lsn-count
+       (count-from-authority committed-lsn)
+       :ha-rejoin-unconfirmed-local-durable-lsn-count
+       (count-from-authority durable-lsn)
+       :ha-rejoin-unconfirmed-local-applied-lsn-count
+       (count-from-authority applied-lsn)
+       :ha-rejoin-authority-confirmed-lsn authority-lsn
+       :ha-rejoin-local-committed-lsn committed-lsn
+       :ha-rejoin-local-durable-lsn durable-lsn
+       :ha-rejoin-local-applied-lsn applied-lsn})))
+
 (defn- internal-kv-dbi?
   [dbi-name]
   (= c/ha-client-ops dbi-name))
@@ -2007,7 +2052,9 @@
                                   (long (or (:ha-local-last-applied-lsn
                                              db-state)
                                             0)))))
-           effective-lsn    (long (or runtime-lsn txlog-lsn))]
+           effective-lsn    (long (or runtime-lsn txlog-lsn))
+           rejoin-tail      (ha-rejoin-unconfirmed-local-tail
+                             db-state txlog-watermarks txlog-lsn)]
        (write-result!
          deps
          skey
@@ -2082,6 +2129,9 @@
             (some? runtime-lsn)
             (assoc :ha-local-last-applied-lsn runtime-lsn
                    :ha-role (:ha-role db-state))
+
+            rejoin-tail
+            (merge rejoin-tail)
 
             authority-diag
             (assoc :ha-control-node-leader? (:node-leader? authority-diag)

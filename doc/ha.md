@@ -325,6 +325,45 @@ hash. If it does not, promotion and write admission fail closed.
 With the default `:ha-max-promotion-lag-lsn 0`, a node must be fully caught up
 to auto-promote.
 
+### Write acknowledgement and RPO
+
+Consensus-lease HA uses asynchronous pull replication. A successful write means
+the current leader accepted and applied the transaction locally under an active
+lease. It does not mean a quorum of data nodes has durably replicated that
+transaction.
+
+The control-plane lease records `leader-last-applied-lsn`, but the leader
+publishes that value on lease renew, not on every write. If the leader is lost
+permanently before any surviving follower has pulled its latest records, the
+next leader starts from the maximum LSN proven by the authority lease and
+reachable member watermarks. Writes only present on the lost leader can be
+absent after failover. This is the intended availability/latency tradeoff of
+the current HA design, not quorum-write replication.
+
+The exposure is bounded operationally by:
+
+* the leader lease-renew interval (`:ha-lease-renew-ms`, default `5000`)
+* follower pull lag, visible through `:ha-follower-source-last-applied-lsn` and
+  local `ha-watermark`/`txlog-watermarks`
+* local WAL durability profile. HA defaults to `:strict`; using `:relaxed`
+  allows a single-node power loss to lose the unsynced group-commit tail
+  described in `doc/wal.md`
+
+When a former leader rejoins as a follower and its local WAL is ahead of the
+authority-confirmed LSN, `ha-watermark` reports a conservative upper bound:
+
+* `:ha-rejoin-unconfirmed-local-tail?`
+* `:ha-rejoin-unconfirmed-local-tail-lsn-count`
+* `:ha-rejoin-unconfirmed-local-committed-lsn-count`
+* `:ha-rejoin-unconfirmed-local-durable-lsn-count`
+* `:ha-rejoin-authority-confirmed-lsn`
+
+These fields mean "local records beyond the authority floor existed on this
+node". If snapshot bootstrap or divergent WAL repair replaces that local tail,
+the count is the operator-visible upper bound on records discarded from that
+rejoining node. It is not proof that client-visible data was lost cluster-wide;
+another survivor may already have had those records.
+
 ### Clock skew is part of the safety model
 
 Consensus-lease HA assumes bounded clock error. Datalevin therefore includes a
