@@ -259,9 +259,8 @@
         (when (<= committed* durable*)
           (vreset! (:sync-requested? sync-manager) false)
           (vreset! (:sync-request-reason sync-manager) nil))
-        (vreset! (:sync-in-progress? sync-manager) false)
-        (vreset! (:healthy? sync-manager) true)
-        (vreset! (:failure sync-manager) nil)
+        ;; Watermark refresh is an observer/reconciler. Sync round ownership and
+        ;; health are updated only by begin/complete/defer/reset transitions.
         (.notifyAll ^Object (:monitor sync-manager))))))
 
 (defn refresh-shared-state!
