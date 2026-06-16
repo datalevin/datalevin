@@ -108,6 +108,8 @@
          complete-sync-success!
          complete-sync-failure!
          await-durable-lsn!
+         open-reusable-file-lock-channel!
+         now-ms
          sync-manager-state
          record-fsync-ms!
          record-commit-wait-ms!
@@ -421,6 +423,7 @@
          :meta-path              meta-path
          :meta-lock-path         (meta-lock-path dir)
          :sync-lock-path         (sync-lock-path dir)
+         :sync-lock-channel      (volatile! nil)
          :recovery-lock-path     (recovery-lock-path dir)
          :maintenance-lock-path  (maintenance-lock-path dir)
          :segment-id             (volatile! active-id)
@@ -841,6 +844,45 @@
 
 (def ^:private release-file-lock! tseg/release-file-lock!)
 
+(defn- open-reusable-file-lock-channel!
+  [^String path]
+  (FileChannel/open
+   (.toPath (io/file path))
+   open-lock-create-write-options))
+
+(defn- try-acquire-reusable-file-lock!
+  [^String path ^FileChannel ch]
+  (when-let [lock (try
+                    (.tryLock ch)
+                    (catch OverlappingFileLockException _
+                      nil))]
+    {:channel ch
+     :lock lock
+     :path path
+     :close-channel? false}))
+
+(defn- try-acquire-sync-lock!
+  [state]
+  (let [path (:sync-lock-path state)]
+    (if-let [channel-v (:sync-lock-channel state)]
+      (let [^FileChannel ch (locking channel-v
+                              (or @channel-v
+                                  (let [ch (open-reusable-file-lock-channel!
+                                            path)]
+                                    (vreset! channel-v ch)
+                                    ch)))]
+        (try-acquire-reusable-file-lock! path ch))
+      (try-acquire-file-lock! path))))
+
+(defn- release-sync-lock!
+  [{:keys [lock close-channel?] :as lock-state}]
+  (if (= false close-channel?)
+    (when lock
+      (try
+        (.release ^FileLock lock)
+        (catch Exception _)))
+    (release-file-lock! lock-state)))
+
 (def preallocation-enabled-state? tseg/preallocation-enabled-state?)
 
 (def no-floor-lsn trec/no-floor-lsn)
@@ -1128,7 +1170,7 @@
             (finally
               (complete-sync-failure! sync-manager e false)))
           (throw e)))
-      (if-let [lock-state (try-acquire-file-lock! (:sync-lock-path state))]
+      (if-let [lock-state (try-acquire-sync-lock! state)]
         (try
           (refresh-shared-watermarks! state)
           (let [reason (:reason sync-begin)
@@ -1169,11 +1211,57 @@
                 (complete-sync-failure! sync-manager e false)))
             (throw e))
           (finally
-            (release-file-lock! lock-state)))
+            (release-sync-lock! lock-state)))
         (do
           (refresh-shared-watermarks! state)
           (defer-sync-attempt! sync-manager)
           nil)))))
+
+(defn- commit-timeout?
+  [e]
+  (= :txlog/commit-timeout (:type (ex-data e))))
+
+(defn- await-durable-or-sync-available!
+  [{:keys [monitor] :as manager} lsn timeout-ms start-ms]
+  (locking monitor
+    (loop [deadline (+ ^long start-ms (max 0 ^long timeout-ms))]
+      (let [last-durable-lsn (long @(:last-durable-lsn manager))
+            healthy? (boolean @(:healthy? manager))
+            failure @(:failure manager)
+            sync-in-progress? (boolean @(:sync-in-progress? manager))]
+        (cond
+          (<= ^long lsn ^long last-durable-lsn)
+          {:durable? true :last-durable-lsn last-durable-lsn}
+
+          (not healthy?)
+          (throw (ex-info "Txn-log sync manager is unhealthy"
+                          {:type :txlog/unhealthy
+                           :lsn lsn}
+                          failure))
+
+          (not sync-in-progress?)
+          {:durable? false :last-durable-lsn last-durable-lsn}
+
+          :else
+          (let [now (now-ms)
+                remaining (- ^long deadline ^long now)]
+            (if (pos? remaining)
+              (do
+                (.wait monitor remaining)
+                (recur deadline))
+              (throw (ex-info "Timed out waiting for durable LSN"
+                              {:type :txlog/commit-timeout
+                               :lsn lsn
+                               :timeout-ms timeout-ms})))))))))
+
+(defn- await-durable-retry-window!
+  [sync-manager lsn wait-ms]
+  (try
+    (await-durable-lsn! sync-manager lsn wait-ms (now-ms))
+    (catch Exception e
+      (if (commit-timeout? e)
+        {:durable? false}
+        (throw e)))))
 
 (defn- wait-strict-durable!
   ([state ^FileChannel ch sync-manager lsn timeout-ms hooks]
@@ -1198,22 +1286,33 @@
                                {:type :txlog/commit-timeout
                                 :lsn lsn
                                 :timeout-ms timeout-ms})))
-             (if-let [sync-res
-                      (perform-sync-round! state
-                                           ch
-                                           sync-manager
-                                           ;; Reuse the first sync begin from append path
-                                           ;; so strict mode avoids an immediate extra
-                                           ;; monitor-lock round-trip.
-                                           (or sync-begin
-                                               (begin-sync! sync-manager lsn))
-                                           hooks)]
-               (recur (:sync-done-ms sync-res)
-                      (:sync-reason sync-res)
-                      nil)
-               (do
-                 (Thread/sleep (long (min 5 remaining)))
-                 (recur last-sync-ms last-sync-reason nil))))))))))
+            (if-let [sync-begin* (or sync-begin
+                                     (begin-sync! sync-manager lsn))]
+              (if-let [sync-res
+                       (perform-sync-round! state
+                                            ch
+                                            sync-manager
+                                            ;; Reuse the first sync begin from append path
+                                            ;; so strict mode avoids an immediate extra
+                                            ;; monitor-lock round-trip.
+                                            sync-begin*
+                                            hooks)]
+                (recur (:sync-done-ms sync-res)
+                       (:sync-reason sync-res)
+                       nil)
+                (do
+                  (await-durable-retry-window!
+                   sync-manager
+                   lsn
+                   (long (min 5 remaining)))
+                  (recur last-sync-ms last-sync-reason nil)))
+              (do
+                (await-durable-or-sync-available!
+                 sync-manager
+                 lsn
+                 remaining
+                 now)
+                (recur last-sync-ms last-sync-reason nil))))))))))
 
 (defn- append-durable-relaxed!
   [state rows {:keys [mark-fatal!] :as hooks}]

@@ -1687,16 +1687,27 @@
           (txlog/flush-meta! state)
           (catch Exception _))
         (let [append-lock (or (:append-lock state) state)
-              ch (locking append-lock
-                   (when-let [segment-channel-v
-                              (:segment-channel state)]
-                     (let [ch @segment-channel-v]
-                       (when ch
-                         (vreset! segment-channel-v nil))
-                       ch)))]
+              [ch sync-lock-ch]
+              (locking append-lock
+                [(when-let [segment-channel-v
+                            (:segment-channel state)]
+                   (let [ch @segment-channel-v]
+                     (when ch
+                       (vreset! segment-channel-v nil))
+                     ch))
+                 (when-let [sync-lock-channel-v
+                            (:sync-lock-channel state)]
+                   (let [ch @sync-lock-channel-v]
+                     (when ch
+                       (vreset! sync-lock-channel-v nil))
+                     ch))])]
           (when ch
             (try
               (.close ^java.io.Closeable ch)
+              (catch Exception _)))
+          (when sync-lock-ch
+            (try
+              (.close ^java.io.Closeable sync-lock-ch)
               (catch Exception _))))
         (vswap! info-v dissoc :txlog-state :txlog-pending-ops
                 :txlog-recovered?
