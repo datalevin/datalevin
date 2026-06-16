@@ -1154,11 +1154,74 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-wal-refresh-shared-state-skips-meta-read-by-default
+  (let [dir   (u/tmp-dir (str "wal-refresh-fast-path-test-"
+                              (UUID/randomUUID)))
+        state (atom nil)]
+    (try
+      (reset! state
+              (:state (txlog/init-runtime-state {:dir dir
+                                                 :wal-shared? false}
+                                                {})))
+      (txlog/write-meta-file!
+       (:meta-path @state)
+       {:last-committed-lsn 0
+        :last-durable-lsn 0
+        :last-applied-lsn 0
+        :segment-id 1
+        :segment-offset 0
+        :updated-ms (System/currentTimeMillis)}
+       {:sync-mode :none})
+      (let [refreshed (txlog/refresh-shared-state! @state)
+            watermarks (#'datalevin.txlog/refresh-shared-watermarks!
+                        @state)]
+        (is (= -1 (long @(:meta-revision @state))))
+        (is (= 1 (long (:segment-id refreshed))))
+        (is (= 0 (long (:last-committed-lsn refreshed))))
+        (is (= 0 (long (:last-committed-lsn watermarks)))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
+(deftest test-wal-refresh-shared-state-reads-meta-when-shared
+  (let [dir   (u/tmp-dir (str "wal-refresh-shared-test-"
+                              (UUID/randomUUID)))
+        state (atom nil)]
+    (try
+      (reset! state
+              (:state (txlog/init-runtime-state {:dir dir
+                                                 :wal-shared? true}
+                                                {})))
+      (txlog/write-meta-file!
+       (:meta-path @state)
+       {:last-committed-lsn 0
+        :last-durable-lsn 0
+        :last-applied-lsn 0
+        :segment-id 1
+        :segment-offset 0
+        :updated-ms (System/currentTimeMillis)}
+       {:sync-mode :none})
+      (is (= 0 (long (:revision (txlog/refresh-shared-state! @state)))))
+      (is (= 0 (long @(:meta-revision @state))))
+      (vreset! (:meta-revision @state) -1)
+      (is (= 0 (long (:revision
+                      (#'datalevin.txlog/refresh-shared-watermarks!
+                       @state)))))
+      (is (= 0 (long @(:meta-revision @state))))
+      (finally
+        (when-let [state @state]
+          (when-let [ch @(:segment-channel state)]
+            (.close ^java.io.Closeable ch)))
+        (u/delete-files dir)))))
+
 (deftest test-wal-refresh-shared-state-clamps-stale-meta-segment-offset
   (let [dir       (u/tmp-dir (str "wal-stale-meta-offset-test-"
                                   (UUID/randomUUID)))
         txlog-dir (str dir u/+separator+ "txlog")
-        opts      {:wal? true}
+        opts      {:wal? true
+                   :wal-shared? true}
         segment-path
         (fn []
           (->> (or (u/list-files txlog-dir) [])

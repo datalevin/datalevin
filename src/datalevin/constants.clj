@@ -551,6 +551,10 @@
   *wal-sync-adaptive?* true)
 
 (def ^{:dynamic true
+       :doc     "Enable multi-process WAL directory reconciliation. Keep false for normal single-process stores to avoid per-commit directory/meta probes."}
+  *wal-shared?* false)
+
+(def ^{:dynamic true
        :doc     "WAL segment size cap in bytes before roll."}
   *wal-segment-max-bytes* (* 256 1024 1024))
 

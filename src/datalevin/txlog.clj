@@ -175,6 +175,12 @@
     (boolean (:wal-sync-adaptive? info))
     c/*wal-sync-adaptive?*))
 
+(defn wal-shared?
+  [info]
+  (if (contains? info :wal-shared?)
+    (boolean (:wal-shared? info))
+    c/*wal-shared?*))
+
 (defn segment-max-bytes
   [info]
   (or (:wal-segment-max-bytes info) c/*wal-segment-max-bytes*))
@@ -393,6 +399,7 @@
          :segment-prealloc-mode  prealloc-mode
          :segment-prealloc-bytes (long (segment-prealloc-bytes info))
          :durability-profile     profile
+         :wal-shared?            (wal-shared? info)
          :sync-mode              sync-mode*
          :sync-on-write?         sync-on-write?
          :commit-marker?         (commit-marker? info)

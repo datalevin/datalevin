@@ -130,7 +130,7 @@
   #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?
     :wal? :wal-sync-adaptive?
     :wal-segment-prealloc? :wal-commit-marker?
-    :wal-rollback?})
+    :wal-rollback? :wal-shared?})
 
 (def ^:private non-negative-int-opts
   #{:cache-limit

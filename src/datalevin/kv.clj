@@ -1555,6 +1555,7 @@
      :write-path-enabled? write-path-enabled?
      :rollback? (not write-path-enabled?)
      :durability-profile (:durability-profile state)
+     :wal-shared? (true? (:wal-shared? state))
      :dir (:dir state)
      :segment-id (long @(:segment-id state))
      :next-lsn next-lsn
