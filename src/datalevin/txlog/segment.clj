@@ -48,6 +48,9 @@
   (into-array StandardOpenOption
               [StandardOpenOption/CREATE
                StandardOpenOption/WRITE]))
+(def ^:private ^"[Ljava.nio.file.StandardOpenOption;"
+  open-directory-read-options
+  (into-array StandardOpenOption [StandardOpenOption/READ]))
 
 (def ^:private sync-mode-values #{:fsync :fdatasync :extra :none})
 
@@ -217,6 +220,16 @@
      :fsync     (PosixFsync/fsync ch)
      :extra     (PosixFsync/fullsync ch))
    sync-mode))
+
+(defn force-parent-directory!
+  "Force the parent directory entry for path to stable storage."
+  [^String path]
+  (when path
+    (when-let [^File parent (.getParentFile (io/file path))]
+      (with-open [^FileChannel ch (FileChannel/open
+                                   (.toPath parent)
+                                   open-directory-read-options)]
+        (PosixFsync/fsync ch)))))
 
 (defn read-fully-at!
   ^ByteBuffer [^FileChannel ch ^long pos ^ByteBuffer bf]
@@ -477,11 +490,22 @@
   ([^String path]
    (open-segment-channel path false))
   ([^String path sync-on-write?]
-   (FileChannel/open
-    (.toPath (io/file path))
-    (if sync-on-write?
-      open-segment-create-read-write-dsync-options
-      open-segment-create-read-write-options))))
+   (let [f (io/file path)
+         created? (not (.exists f))
+         ch (FileChannel/open
+             (.toPath f)
+             (if sync-on-write?
+               open-segment-create-read-write-dsync-options
+               open-segment-create-read-write-options))]
+     (try
+       (when created?
+         (force-parent-directory! path))
+       ch
+       (catch Exception e
+         (try
+           (.close ^FileChannel ch)
+           (catch Exception _))
+         (throw e))))))
 
 (defn append-record-at!
   ([^FileChannel ch ^long offset ^bytes body]
@@ -516,7 +540,9 @@
 (defn prepare-segment!
   "Create and preallocate a segment at `tmp-path`."
   [^String tmp-path ^long bytes]
-  (let [p (.toPath (io/file tmp-path))]
+  (let [f (io/file tmp-path)
+        created? (not (.exists f))
+        p (.toPath f)]
     (with-open [^FileChannel ch
                 (FileChannel/open
                  p
@@ -529,6 +555,8 @@
         (.position ch (dec bytes))
         (.write ch (ByteBuffer/wrap (byte-array [(byte 0x00)]))))
       (.force ch true))
+    (when created?
+      (force-parent-directory! tmp-path))
     tmp-path))
 
 (defn activate-prepared-segment!
@@ -545,6 +573,7 @@
         (Files/move src dst
                     (into-array StandardCopyOption
                                 [StandardCopyOption/REPLACE_EXISTING]))))
+    (force-parent-directory! final-path)
     final-path))
 
 (defn prepare-next-segment!

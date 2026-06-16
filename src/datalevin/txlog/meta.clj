@@ -99,7 +99,8 @@
          slot-offset (long (* slot-index codec/meta-slot-size))
          payload (assoc meta :revision revision)
          slot-bytes (codec/encode-meta-slot payload)
-         f (io/file path)]
+         f (io/file path)
+         created? (not (.exists f))]
      (when-let [^File parent (.getParentFile f)]
        (u/create-dirs (.getPath parent)))
      (with-open [^FileChannel ch (FileChannel/open
@@ -111,6 +112,8 @@
        (.position ch slot-offset)
        (seg/write-fully! ch (ByteBuffer/wrap slot-bytes))
        (seg/force-channel! ch sync-mode))
+     (when created?
+       (seg/force-parent-directory! path))
      (assoc payload :slot (if (zero? slot-index) :a :b)))))
 
 (defn- base-meta-state
