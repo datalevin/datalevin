@@ -22,10 +22,12 @@
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:const record-header-size 14)
-(def ^:const format-major 1)
+(def ^:const legacy-format-major 1)
+(def ^:const format-major 2)
 (def ^:const compressed-flag 0x01)
 (def ^:private magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x57) (byte 0x4c)]))
+(def ^:private supported-format-majors #{legacy-format-major format-major})
 
 (def ^:const meta-slot-payload-size 64)
 (def ^:const meta-slot-size (+ meta-slot-payload-size 4))
@@ -136,6 +138,48 @@
   [body]
   (bit-and 0xffffffff ^int (crc32c body)))
 
+(defn- crc-update-byte!
+  [^CRC32C crc x]
+  (.update crc (int (bit-and (long x) 0xff))))
+
+(defn- crc-update-u32!
+  [^CRC32C crc x]
+  (let [x (long x)]
+    (crc-update-byte! crc (unsigned-bit-shift-right x 24))
+    (crc-update-byte! crc (unsigned-bit-shift-right x 16))
+    (crc-update-byte! crc (unsigned-bit-shift-right x 8))
+    (crc-update-byte! crc x)))
+
+(defn record-checksum
+  "Checksum a v2 record over header fields that are not the checksum slot plus
+  the record body."
+  [major flags body-len ^bytes body]
+  (let [^CRC32C crc (.get tl-crc32c)
+        body-len (long body-len)]
+    (.reset crc)
+    (.update crc ^bytes magic-bytes 0 (alength ^bytes magic-bytes))
+    (crc-update-byte! crc major)
+    (crc-update-byte! crc flags)
+    (crc-update-u32! crc body-len)
+    (when (pos? body-len)
+      (.update crc body 0 (int body-len)))
+    (bit-and 0xffffffff (long (.getValue crc)))))
+
+(defn current-record-checksum
+  [body-len compressed? ^bytes body]
+  (record-checksum format-major
+                   (if compressed? compressed-flag 0x00)
+                   body-len
+                   body))
+
+(defn record-checksum-for-major
+  [major flags body-len ^bytes body]
+  (case (int major)
+    1 (record-body-checksum body)
+    2 (record-checksum major flags body-len body)
+    (raise "Unsupported txn-log record format major"
+           {:major major :supported supported-format-majors})))
+
 (defn write-record-header!
   [^ByteBuffer header-bf body-len compressed? checksum]
   (.clear header-bf)
@@ -152,7 +196,7 @@
   ([^bytes body {:keys [compressed?]
                  :or   {compressed? false}}]
    (let [body-len  (checked-record-body-len body)
-         checksum  (record-body-checksum body)
+         checksum  (current-record-checksum body-len (boolean compressed?) body)
          total-len (+ record-header-size (long body-len))
          record    (byte-array (int total-len))
          header-bf (big-endian-buffer!
@@ -184,9 +228,11 @@
           flags    (bit-and 0xff (int (.get header)))
           body-len (read-int-unsigned header)
           checksum (read-int-unsigned header)]
-      (when-not (= major format-major)
+      (when-not (contains? supported-format-majors major)
         (raise "Unsupported txn-log record format major"
-               {:offset offset :major major :expected format-major}))
+               {:offset offset
+                :major major
+                :supported supported-format-majors}))
       {:major    major
        :flags    flags
        :body-len body-len
@@ -216,9 +262,14 @@
        (let [body (Arrays/copyOfRange data
                                       (int (+ offset record-header-size))
                                       (int end))]
-         (when-not (= ^int checksum (bit-and 0xffffffff ^int (crc32c body)))
-           (raise "Txn-log record checksum mismatch"
-                  {:offset offset :expected checksum}))
+        (let [actual-checksum (record-checksum-for-major
+                               major flags body-len body)]
+          (when-not (= (long checksum) (long actual-checksum))
+            (raise "Txn-log record checksum mismatch"
+                   {:offset offset
+                    :major major
+                    :expected checksum
+                    :actual-checksum actual-checksum})))
          {:offset      offset
           :next-offset end
           :major       major

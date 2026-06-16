@@ -373,7 +373,8 @@
                             body-len)
                       next-offset (long (+ offset (long total-len)))
                       actual-checksum
-                      (long (bit-and 0xffffffff (long (codec/crc32c body))))]
+                      (long (codec/record-checksum-for-major
+                             major flags body-len body))]
                   (if-not (= checksum actual-checksum)
                     (if (and allow-preallocated-tail?
                              (checksum-mismatch-tail? ch
@@ -513,7 +514,8 @@
   ([^FileChannel ch ^long offset ^bytes body
     {:keys [compressed?] :or {compressed? false}}]
    (let [body-len        (codec/checked-record-body-len body)
-         checksum        (codec/record-body-checksum body)
+         checksum        (codec/current-record-checksum
+                          body-len (boolean compressed?) body)
          total-size      (+ codec/record-header-size (long body-len))
          ^ByteBuffer hdr (codec/write-record-header!
                           (.get tl-record-header-buffer)

@@ -37,7 +37,7 @@
    [java.util.zip CRC32C]))
 
 (def ^:const record-header-size 14)
-(def ^:const format-major 1)
+(def ^:const format-major 2)
 (def ^:const compressed-flag 0x01)
 (def ^:private magic-bytes
   (byte-array [(byte 0x44) (byte 0x4c) (byte 0x57) (byte 0x4c)]))
