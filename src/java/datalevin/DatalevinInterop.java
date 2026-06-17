@@ -1,11 +1,15 @@
 package datalevin;
 
+import datalevin.llm.LlamaEmbedder;
+import datalevin.llm.LlamaGenerator;
+
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
@@ -1079,6 +1083,130 @@ public final class DatalevinInterop {
                                    false);
     }
 
+    public static LlamaEmbedder newLlamaEmbedder(String modelPath,
+                                                 int gpuLayers,
+                                                 int ctxSize,
+                                                 int batchSize,
+                                                 int threads) {
+        return Datalevin.newLlamaEmbedder(modelPath, gpuLayers, ctxSize, batchSize, threads);
+    }
+
+    public static void closeLlamaEmbedder(LlamaEmbedder embedder) {
+        embedder.close();
+    }
+
+    public static boolean llamaEmbedderClosed(LlamaEmbedder embedder) {
+        return embedder.closed();
+    }
+
+    public static String llamaEmbedderModelPath(LlamaEmbedder embedder) {
+        return embedder.modelPath();
+    }
+
+    public static int llamaEmbedderGpuLayers(LlamaEmbedder embedder) {
+        return embedder.gpuLayers();
+    }
+
+    public static int llamaEmbedderCtxSize(LlamaEmbedder embedder) {
+        return embedder.ctxSize();
+    }
+
+    public static int llamaEmbedderContextSize(LlamaEmbedder embedder) {
+        return embedder.contextSize();
+    }
+
+    public static int llamaEmbedderBatchSize(LlamaEmbedder embedder) {
+        return embedder.batchSize();
+    }
+
+    public static int llamaEmbedderThreads(LlamaEmbedder embedder) {
+        return embedder.threads();
+    }
+
+    public static int llamaEmbedderDimensions(LlamaEmbedder embedder) {
+        return embedder.dimensions();
+    }
+
+    public static List<Double> llamaEmbedderEmbed(LlamaEmbedder embedder, String text) {
+        return floatArrayAsList(embedder.embed(text));
+    }
+
+    public static List<List<Double>> llamaEmbedderEmbedAll(LlamaEmbedder embedder, List<?> texts) {
+        ArrayList<String> input = new ArrayList<>(texts.size());
+        for (Object text : texts) {
+            input.add((String) Objects.requireNonNull(text, "text"));
+        }
+        List<float[]> vectors = embedder.embedAll(input);
+        ArrayList<List<Double>> result = new ArrayList<>(vectors.size());
+        for (float[] vector : vectors) {
+            result.add(floatArrayAsList(vector));
+        }
+        return result;
+    }
+
+    public static int llamaEmbedderTokenCount(LlamaEmbedder embedder, String text) {
+        return embedder.tokenCount(text);
+    }
+
+    public static List<Integer> llamaEmbedderTokenize(LlamaEmbedder embedder, String text) {
+        return intArrayAsList(embedder.tokenize(text));
+    }
+
+    public static String llamaEmbedderDetokenize(LlamaEmbedder embedder, List<?> tokens) {
+        return embedder.detokenize(intListAsArray(tokens));
+    }
+
+    public static String llamaEmbedderTruncateText(LlamaEmbedder embedder, String text, int maxTokens) {
+        return embedder.truncateText(text, maxTokens);
+    }
+
+    public static LlamaGenerator newLlamaGenerator(String modelPath,
+                                                   int gpuLayers,
+                                                   int ctxSize,
+                                                   int threads) {
+        return Datalevin.newLlamaGenerator(modelPath, gpuLayers, ctxSize, threads);
+    }
+
+    public static void closeLlamaGenerator(LlamaGenerator generator) {
+        generator.close();
+    }
+
+    public static boolean llamaGeneratorClosed(LlamaGenerator generator) {
+        return generator.closed();
+    }
+
+    public static String llamaGeneratorModelPath(LlamaGenerator generator) {
+        return generator.modelPath();
+    }
+
+    public static int llamaGeneratorGpuLayers(LlamaGenerator generator) {
+        return generator.gpuLayers();
+    }
+
+    public static int llamaGeneratorCtxSize(LlamaGenerator generator) {
+        return generator.ctxSize();
+    }
+
+    public static int llamaGeneratorContextSize(LlamaGenerator generator) {
+        return generator.contextSize();
+    }
+
+    public static int llamaGeneratorThreads(LlamaGenerator generator) {
+        return generator.threads();
+    }
+
+    public static int llamaGeneratorTokenCount(LlamaGenerator generator, String text) {
+        return generator.tokenCount(text);
+    }
+
+    public static String llamaGeneratorGenerate(LlamaGenerator generator, String prompt, int maxTokens) {
+        return generator.generate(prompt, maxTokens);
+    }
+
+    public static String llamaGeneratorSummarize(LlamaGenerator generator, String text, int maxTokens) {
+        return generator.summarize(text, maxTokens);
+    }
+
     /**
      * Normalizes a database type string into the raw Clojure form expected by
      * the client API.
@@ -1140,6 +1268,34 @@ public final class DatalevinInterop {
             return DatalevinForms.rangeInput(spec.build(), normalizedType);
         }
         return DatalevinForms.rangeInput((List<?>) range, normalizedType);
+    }
+
+    private static List<Double> floatArrayAsList(float[] values) {
+        ArrayList<Double> result = new ArrayList<>(values.length);
+        for (float value : values) {
+            result.add((double) value);
+        }
+        return result;
+    }
+
+    private static List<Integer> intArrayAsList(int[] values) {
+        ArrayList<Integer> result = new ArrayList<>(values.length);
+        for (int value : values) {
+            result.add(value);
+        }
+        return result;
+    }
+
+    private static int[] intListAsArray(List<?> values) {
+        int[] result = new int[values.size()];
+        for (int i = 0; i < values.size(); i++) {
+            Object value = values.get(i);
+            if (!(value instanceof Number number)) {
+                throw new IllegalArgumentException("token ids must be numbers");
+            }
+            result[i] = number.intValue();
+        }
+        return result;
     }
 
     private static CompletableFuture<Object> derefFuture(Object future,

@@ -350,6 +350,104 @@ class InteropBindings:
         handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
         return call_java(classes().interop.vectorCheckpointState, handle)
 
+    def new_llama_embedder(self, model_path, gpu_layers=0, ctx_size=0, batch_size=0, threads=0):
+        return call_java(
+            classes().interop.newLlamaEmbedder,
+            model_path,
+            int(gpu_layers),
+            int(ctx_size),
+            int(batch_size),
+            int(threads),
+        )
+
+    def close_llama_embedder(self, embedder):
+        handle = embedder.raw_handle() if callable(getattr(embedder, "raw_handle", None)) else embedder
+        call_java(classes().interop.closeLlamaEmbedder, handle)
+
+    def llama_embedder_closed(self, embedder):
+        handle = embedder.raw_handle() if callable(getattr(embedder, "raw_handle", None)) else embedder
+        return call_java(classes().interop.llamaEmbedderClosed, handle)
+
+    def llama_embedder_model_path(self, embedder):
+        return call_java(classes().interop.llamaEmbedderModelPath, embedder)
+
+    def llama_embedder_gpu_layers(self, embedder):
+        return call_java(classes().interop.llamaEmbedderGpuLayers, embedder)
+
+    def llama_embedder_ctx_size(self, embedder):
+        return call_java(classes().interop.llamaEmbedderCtxSize, embedder)
+
+    def llama_embedder_context_size(self, embedder):
+        return call_java(classes().interop.llamaEmbedderContextSize, embedder)
+
+    def llama_embedder_batch_size(self, embedder):
+        return call_java(classes().interop.llamaEmbedderBatchSize, embedder)
+
+    def llama_embedder_threads(self, embedder):
+        return call_java(classes().interop.llamaEmbedderThreads, embedder)
+
+    def llama_embedder_dimensions(self, embedder):
+        return call_java(classes().interop.llamaEmbedderDimensions, embedder)
+
+    def llama_embedder_embed(self, embedder, text):
+        return call_java(classes().interop.llamaEmbedderEmbed, embedder, text)
+
+    def llama_embedder_embed_all(self, embedder, texts):
+        return call_java(classes().interop.llamaEmbedderEmbedAll, embedder, to_java(texts))
+
+    def llama_embedder_token_count(self, embedder, text):
+        return call_java(classes().interop.llamaEmbedderTokenCount, embedder, text)
+
+    def llama_embedder_tokenize(self, embedder, text):
+        return call_java(classes().interop.llamaEmbedderTokenize, embedder, text)
+
+    def llama_embedder_detokenize(self, embedder, tokens):
+        return call_java(classes().interop.llamaEmbedderDetokenize, embedder, to_java(tokens))
+
+    def llama_embedder_truncate_text(self, embedder, text, max_tokens):
+        return call_java(classes().interop.llamaEmbedderTruncateText, embedder, text, int(max_tokens))
+
+    def new_llama_generator(self, model_path, gpu_layers=0, ctx_size=0, threads=0):
+        return call_java(
+            classes().interop.newLlamaGenerator,
+            model_path,
+            int(gpu_layers),
+            int(ctx_size),
+            int(threads),
+        )
+
+    def close_llama_generator(self, generator):
+        handle = generator.raw_handle() if callable(getattr(generator, "raw_handle", None)) else generator
+        call_java(classes().interop.closeLlamaGenerator, handle)
+
+    def llama_generator_closed(self, generator):
+        handle = generator.raw_handle() if callable(getattr(generator, "raw_handle", None)) else generator
+        return call_java(classes().interop.llamaGeneratorClosed, handle)
+
+    def llama_generator_model_path(self, generator):
+        return call_java(classes().interop.llamaGeneratorModelPath, generator)
+
+    def llama_generator_gpu_layers(self, generator):
+        return call_java(classes().interop.llamaGeneratorGpuLayers, generator)
+
+    def llama_generator_ctx_size(self, generator):
+        return call_java(classes().interop.llamaGeneratorCtxSize, generator)
+
+    def llama_generator_context_size(self, generator):
+        return call_java(classes().interop.llamaGeneratorContextSize, generator)
+
+    def llama_generator_threads(self, generator):
+        return call_java(classes().interop.llamaGeneratorThreads, generator)
+
+    def llama_generator_token_count(self, generator, text):
+        return call_java(classes().interop.llamaGeneratorTokenCount, generator, text)
+
+    def llama_generator_generate(self, generator, prompt, max_tokens):
+        return call_java(classes().interop.llamaGeneratorGenerate, generator, prompt, int(max_tokens))
+
+    def llama_generator_summarize(self, generator, text, max_tokens):
+        return call_java(classes().interop.llamaGeneratorSummarize, generator, text, int(max_tokens))
+
     def new_client(self, uri, opts=None):
         return call_java(classes().interop.newClient, uri, to_java(opts))
 

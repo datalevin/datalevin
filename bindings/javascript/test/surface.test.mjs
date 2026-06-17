@@ -21,6 +21,8 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.jvmStarted, "function");
   assert.equal(typeof datalevin.keyword, "function");
   assert.equal(typeof datalevin.newClient, "function");
+  assert.equal(typeof datalevin.newLlamaEmbedder, "function");
+  assert.equal(typeof datalevin.newLlamaGenerator, "function");
   assert.equal(typeof datalevin.newSearchEngine, "function");
   assert.equal(typeof datalevin.newVectorIndex, "function");
   assert.equal(typeof datalevin.openKv, "function");
@@ -116,6 +118,8 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.KVTransaction, "function");
+  assert.equal(typeof datalevin.LlamaEmbedder, "function");
+  assert.equal(typeof datalevin.LlamaGenerator, "function");
   assert.equal(typeof datalevin.SearchEngine, "function");
   assert.equal(typeof datalevin.SearchIndexWriter, "function");
   assert.equal(typeof datalevin.VectorIndex, "function");
@@ -204,6 +208,39 @@ test("public surface stays importable without starting the JVM", () => {
   }
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.write, "function");
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.commit, "function");
+  for (const method of [
+    "batchSize",
+    "close",
+    "closed",
+    "contextSize",
+    "ctxSize",
+    "detokenize",
+    "dimensions",
+    "embed",
+    "embedAll",
+    "gpuLayers",
+    "modelPath",
+    "threads",
+    "tokenCount",
+    "tokenize",
+    "truncateText"
+  ]) {
+    assert.equal(typeof datalevin.LlamaEmbedder.prototype[method], "function");
+  }
+  for (const method of [
+    "close",
+    "closed",
+    "contextSize",
+    "ctxSize",
+    "generate",
+    "gpuLayers",
+    "modelPath",
+    "summarize",
+    "threads",
+    "tokenCount"
+  ]) {
+    assert.equal(typeof datalevin.LlamaGenerator.prototype[method], "function");
+  }
   for (const method of [
     "addVec",
     "checkpointState",

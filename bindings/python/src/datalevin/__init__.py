@@ -47,6 +47,7 @@ from .errors import (
     DatalevinJvmError,
 )
 from .kv import KV, KVTransaction
+from .llm import LlamaEmbedder, LlamaGenerator, new_llama_embedder, new_llama_generator
 from .search import SearchEngine, SearchIndexWriter
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
 from .vector import VectorIndex
@@ -61,6 +62,8 @@ __all__ = [
     "DatalevinJvmError",
     "KV",
     "KVTransaction",
+    "LlamaEmbedder",
+    "LlamaGenerator",
     "SearchEngine",
     "SearchIndexWriter",
     "UdfRegistry",
@@ -82,6 +85,8 @@ __all__ = [
     "jvm_started",
     "keyword",
     "new_client",
+    "new_llama_embedder",
+    "new_llama_generator",
     "new_search_engine",
     "new_vector_index",
     "open_kv",

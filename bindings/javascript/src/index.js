@@ -23,6 +23,8 @@ export {
   jvmStarted,
   keyword,
   newClient,
+  newLlamaEmbedder,
+  newLlamaGenerator,
   newSearchEngine,
   newVectorIndex,
   openKv,
@@ -46,6 +48,7 @@ export {
 } from "./interop.js";
 export { interop } from "./raw.js";
 export { KV, KVTransaction } from "./kv.js";
+export { LlamaEmbedder, LlamaGenerator } from "./llm.js";
 export { SearchEngine, SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";
 export { VectorIndex } from "./vector.js";

@@ -10,6 +10,7 @@ import datalevin.client as client_module
 import datalevin.connection as connection_module
 import datalevin.kv as kv_module
 import datalevin._interop as interop_module
+import datalevin.llm as llm_module
 import datalevin.search as search_module
 import datalevin.udf as udf_module
 import datalevin.vector as vector_module
@@ -219,6 +220,102 @@ class FakeInteropBindings:
         self.last_vector_checkpoint_state = index
         return {":snapshot-lsn": 1}
 
+    def new_llama_embedder(self, model_path, gpu_layers=0, ctx_size=0, batch_size=0, threads=0):
+        self.last_llama_embedder = (model_path, gpu_layers, ctx_size, batch_size, threads)
+        return "LLAMA_EMBEDDER"
+
+    def close_llama_embedder(self, embedder):
+        self.last_close_llama_embedder = embedder
+
+    def llama_embedder_closed(self, embedder):
+        self.last_llama_embedder_closed = embedder
+        return False
+
+    def llama_embedder_model_path(self, embedder):
+        self.last_llama_embedder_model_path = embedder
+        return "/models/embed.gguf"
+
+    def llama_embedder_gpu_layers(self, embedder):
+        return 1
+
+    def llama_embedder_ctx_size(self, embedder):
+        return 2048
+
+    def llama_embedder_context_size(self, embedder):
+        return 2048
+
+    def llama_embedder_batch_size(self, embedder):
+        return 128
+
+    def llama_embedder_threads(self, embedder):
+        return 4
+
+    def llama_embedder_dimensions(self, embedder):
+        return 2
+
+    def llama_embedder_embed(self, embedder, text):
+        self.last_llama_embedder_embed = (embedder, text)
+        return [0.25, 0.75]
+
+    def llama_embedder_embed_all(self, embedder, texts):
+        self.last_llama_embedder_embed_all = (embedder, texts)
+        return [[0.25, 0.75] for _text in texts]
+
+    def llama_embedder_token_count(self, embedder, text):
+        self.last_llama_embedder_token_count = (embedder, text)
+        return 2
+
+    def llama_embedder_tokenize(self, embedder, text):
+        self.last_llama_embedder_tokenize = (embedder, text)
+        return [1, 2]
+
+    def llama_embedder_detokenize(self, embedder, tokens):
+        self.last_llama_embedder_detokenize = (embedder, tokens)
+        return "hi"
+
+    def llama_embedder_truncate_text(self, embedder, text, max_tokens):
+        self.last_llama_embedder_truncate_text = (embedder, text, max_tokens)
+        return text
+
+    def new_llama_generator(self, model_path, gpu_layers=0, ctx_size=0, threads=0):
+        self.last_llama_generator = (model_path, gpu_layers, ctx_size, threads)
+        return "LLAMA_GENERATOR"
+
+    def close_llama_generator(self, generator):
+        self.last_close_llama_generator = generator
+
+    def llama_generator_closed(self, generator):
+        self.last_llama_generator_closed = generator
+        return False
+
+    def llama_generator_model_path(self, generator):
+        self.last_llama_generator_model_path = generator
+        return "/models/generate.gguf"
+
+    def llama_generator_gpu_layers(self, generator):
+        return 2
+
+    def llama_generator_ctx_size(self, generator):
+        return 4096
+
+    def llama_generator_context_size(self, generator):
+        return 4096
+
+    def llama_generator_threads(self, generator):
+        return 6
+
+    def llama_generator_token_count(self, generator, text):
+        self.last_llama_generator_token_count = (generator, text)
+        return 3
+
+    def llama_generator_generate(self, generator, prompt, max_tokens):
+        self.last_llama_generator_generate = (generator, prompt, max_tokens)
+        return "generated"
+
+    def llama_generator_summarize(self, generator, text, max_tokens):
+        self.last_llama_generator_summarize = (generator, text, max_tokens)
+        return "summary"
+
     def new_client(self, uri, opts=None):
         self.last_client = (uri, opts)
         return "CLIENT"
@@ -290,6 +387,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     monkeypatch.setattr(connection_module, "_BINDINGS", fake)
     monkeypatch.setattr(kv_module, "_BINDINGS", fake)
     monkeypatch.setattr(client_module, "_BINDINGS", fake)
+    monkeypatch.setattr(llm_module, "_BINDINGS", fake)
     monkeypatch.setattr(search_module, "_BINDINGS", fake)
     monkeypatch.setattr(vector_module, "_BINDINGS", fake)
 
@@ -470,6 +568,48 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert index.clear() is index
     assert fake.last_vector_clear == "VECTOR_INDEX"
     assert index.closed() is True
+    embedder = datalevin.new_llama_embedder(
+        "/models/embed.gguf",
+        gpu_layers=1,
+        ctx_size=2048,
+        batch_size=128,
+        threads=4,
+    )
+    assert embedder.raw_handle() == "LLAMA_EMBEDDER"
+    assert fake.last_llama_embedder == ("/models/embed.gguf", 1, 2048, 128, 4)
+    assert embedder.model_path() == "/models/embed.gguf"
+    assert embedder.gpu_layers() == 1
+    assert embedder.ctx_size() == 2048
+    assert embedder.context_size() == 2048
+    assert embedder.batch_size() == 128
+    assert embedder.threads() == 4
+    assert embedder.dimensions() == 2
+    assert embedder.embed("hi") == [0.25, 0.75]
+    assert embedder.embed_all(["hi", "there"]) == [[0.25, 0.75], [0.25, 0.75]]
+    assert embedder.token_count("hi") == 2
+    assert embedder.tokenize("hi") == [1, 2]
+    assert embedder.detokenize([1, 2]) == "hi"
+    assert embedder.truncate_text("hi there", 2) == "hi there"
+    embedder.close()
+    assert fake.last_close_llama_embedder == "LLAMA_EMBEDDER"
+    generator = datalevin.new_llama_generator(
+        "/models/generate.gguf",
+        gpu_layers=2,
+        ctx_size=4096,
+        threads=6,
+    )
+    assert generator.raw_handle() == "LLAMA_GENERATOR"
+    assert fake.last_llama_generator == ("/models/generate.gguf", 2, 4096, 6)
+    assert generator.model_path() == "/models/generate.gguf"
+    assert generator.gpu_layers() == 2
+    assert generator.ctx_size() == 4096
+    assert generator.context_size() == 4096
+    assert generator.threads() == 6
+    assert generator.token_count("prompt") == 3
+    assert generator.generate("prompt", 8) == "generated"
+    assert generator.summarize("long text", 8) == "summary"
+    generator.close()
+    assert fake.last_close_llama_generator == "LLAMA_GENERATOR"
 
     client_opts = {
         ":pool-size": 1,
@@ -558,6 +698,35 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(datalevin.SearchEngine, "search"))
     assert callable(getattr(datalevin.SearchIndexWriter, "commit"))
     assert callable(getattr(datalevin.SearchIndexWriter, "write"))
+    assert callable(getattr(datalevin, "new_llama_embedder"))
+    assert callable(getattr(datalevin, "new_llama_generator"))
+    for method in [
+        "batch_size",
+        "context_size",
+        "ctx_size",
+        "detokenize",
+        "dimensions",
+        "embed",
+        "embed_all",
+        "gpu_layers",
+        "model_path",
+        "threads",
+        "token_count",
+        "tokenize",
+        "truncate_text",
+    ]:
+        assert callable(getattr(datalevin.LlamaEmbedder, method))
+    for method in [
+        "context_size",
+        "ctx_size",
+        "generate",
+        "gpu_layers",
+        "model_path",
+        "summarize",
+        "threads",
+        "token_count",
+    ]:
+        assert callable(getattr(datalevin.LlamaGenerator, method))
     assert callable(getattr(datalevin.VectorIndex, "add_vec"))
     assert callable(getattr(datalevin.VectorIndex, "checkpoint_state"))
     assert callable(getattr(datalevin.VectorIndex, "clear"))

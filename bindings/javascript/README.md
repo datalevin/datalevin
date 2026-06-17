@@ -147,6 +147,31 @@ try {
 }
 ```
 
+## Local Llama Example
+
+Use `newLlamaEmbedder()` and `newLlamaGenerator()` with local GGUF models when
+you want direct llama.cpp handles outside Datalog embedding/search setup.
+
+```js
+import { newLlamaEmbedder, newLlamaGenerator } from "datalevin-node";
+
+const embedder = await newLlamaEmbedder("/models/embed.gguf");
+try {
+  const vector = await embedder.embed("Datalevin stores facts.");
+  console.log(await embedder.dimensions(), vector.length);
+  console.log(await embedder.tokenCount("Datalevin stores facts."));
+} finally {
+  await embedder.close();
+}
+
+const generator = await newLlamaGenerator("/models/generate.gguf");
+try {
+  console.log(await generator.generate("Write one database tagline:", 32));
+} finally {
+  await generator.close();
+}
+```
+
 ## Async Transaction Example
 
 Use `transactAsync()` for ingestion and application-server workloads that

@@ -710,6 +710,174 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "vectorCheckpointState", await unwrapInteropHandle(index));
   }
 
+  async newLlamaEmbedder(modelPath, { gpuLayers = 0, ctxSize = 0, batchSize = 0, threads = 0 } = {}) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "newLlamaEmbedder",
+      modelPath,
+      Number(gpuLayers),
+      Number(ctxSize),
+      Number(batchSize),
+      Number(threads)
+    );
+  }
+
+  async closeLlamaEmbedder(embedder) {
+    const cls = await classes();
+    await callJavaMethod(cls.interop, "closeLlamaEmbedder", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderClosed(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderClosed", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderModelPath(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderModelPath", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderGpuLayers(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderGpuLayers", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderCtxSize(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderCtxSize", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderContextSize(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderContextSize", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderBatchSize(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderBatchSize", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderThreads(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderThreads", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderDimensions(embedder) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderDimensions", await unwrapInteropHandle(embedder));
+  }
+
+  async llamaEmbedderEmbed(embedder, text) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderEmbed", await unwrapInteropHandle(embedder), text);
+  }
+
+  async llamaEmbedderEmbedAll(embedder, texts) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderEmbedAll", await unwrapInteropHandle(embedder), await toJava(texts));
+  }
+
+  async llamaEmbedderTokenCount(embedder, text) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderTokenCount", await unwrapInteropHandle(embedder), text);
+  }
+
+  async llamaEmbedderTokenize(embedder, text) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderTokenize", await unwrapInteropHandle(embedder), text);
+  }
+
+  async llamaEmbedderDetokenize(embedder, tokens) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaEmbedderDetokenize", await unwrapInteropHandle(embedder), await toJava(tokens));
+  }
+
+  async llamaEmbedderTruncateText(embedder, text, maxTokens) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "llamaEmbedderTruncateText",
+      await unwrapInteropHandle(embedder),
+      text,
+      Number(maxTokens)
+    );
+  }
+
+  async newLlamaGenerator(modelPath, { gpuLayers = 0, ctxSize = 0, threads = 0 } = {}) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "newLlamaGenerator",
+      modelPath,
+      Number(gpuLayers),
+      Number(ctxSize),
+      Number(threads)
+    );
+  }
+
+  async closeLlamaGenerator(generator) {
+    const cls = await classes();
+    await callJavaMethod(cls.interop, "closeLlamaGenerator", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorClosed(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorClosed", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorModelPath(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorModelPath", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorGpuLayers(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorGpuLayers", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorCtxSize(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorCtxSize", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorContextSize(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorContextSize", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorThreads(generator) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorThreads", await unwrapInteropHandle(generator));
+  }
+
+  async llamaGeneratorTokenCount(generator, text) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "llamaGeneratorTokenCount", await unwrapInteropHandle(generator), text);
+  }
+
+  async llamaGeneratorGenerate(generator, prompt, maxTokens) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "llamaGeneratorGenerate",
+      await unwrapInteropHandle(generator),
+      prompt,
+      Number(maxTokens)
+    );
+  }
+
+  async llamaGeneratorSummarize(generator, text, maxTokens) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "llamaGeneratorSummarize",
+      await unwrapInteropHandle(generator),
+      text,
+      Number(maxTokens)
+    );
+  }
+
   async newClient(uri, opts = null) {
     const cls = await classes();
     if (opts !== null && opts !== undefined) {
@@ -1305,6 +1473,16 @@ export async function newSearchEngine(kv, opts = null) {
 export async function newVectorIndex(kv, opts) {
   const { VectorIndex } = await import("./vector.js");
   return new VectorIndex(await _BINDINGS.newVectorIndex(kv, opts));
+}
+
+export async function newLlamaEmbedder(modelPath, opts = {}) {
+  const { LlamaEmbedder } = await import("./llm.js");
+  return new LlamaEmbedder(await _BINDINGS.newLlamaEmbedder(modelPath, opts));
+}
+
+export async function newLlamaGenerator(modelPath, opts = {}) {
+  const { LlamaGenerator } = await import("./llm.js");
+  return new LlamaGenerator(await _BINDINGS.newLlamaGenerator(modelPath, opts));
 }
 
 export async function searchIndexWriter(kv, opts = null) {

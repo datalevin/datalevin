@@ -143,6 +143,23 @@ with open_kv("/tmp/dtlv-py-vec") as kv:
     index.close()
 ```
 
+## Local Llama Example
+
+Use `new_llama_embedder()` and `new_llama_generator()` with local GGUF models
+when you want direct llama.cpp handles outside Datalog embedding/search setup.
+
+```python
+from datalevin import new_llama_embedder, new_llama_generator
+
+with new_llama_embedder("/models/embed.gguf") as embedder:
+    vector = embedder.embed("Datalevin stores facts.")
+    print(embedder.dimensions(), len(vector))
+    print(embedder.token_count("Datalevin stores facts."))
+
+with new_llama_generator("/models/generate.gguf") as generator:
+    print(generator.generate("Write one database tagline:", 32))
+```
+
 ## Async Transaction Example
 
 Use `transact_async()` for ingestion and application-server workloads that

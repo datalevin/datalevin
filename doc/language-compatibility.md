@@ -86,6 +86,7 @@ but not staged mutation of entity objects. Use transaction maps/builders instead
 | Search/vector/idoc option builders | N/A, native maps | Yes | Yes | Yes |
 | Standalone KV search engine | Yes | Yes | Yes | Yes |
 | Standalone vector index | Yes | Yes | Yes | Yes |
+| Local llama.cpp embedder/generator handles/providers | Yes, providers | Yes | Yes | Yes |
 | Search index writer: create, write, commit | Yes | Yes | Yes | Yes |
 | Search engine re-index | Yes | Yes | Yes | Yes |
 
