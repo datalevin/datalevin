@@ -74,6 +74,20 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
             ["a", 2],
             ["b", 3],
         ]
+        assert kv.list_range("list", [":all"], ":string", [":all"], ":long", limit=1, offset=1) == [
+            ["a", 2],
+        ]
+        assert kv.list_range("list", [":closed", "a", "b"], ":string", [":closed", 2, 3], ":long") == [
+            ["a", 2],
+            ["b", 3],
+        ]
+        assert kv.list_range_count("list", [":all"], ":string") == 3
+        assert kv.list_range_first("list", [":all"], ":string", [":all"], ":long") == ["a", 1]
+        assert kv.list_range_first_n("list", 2, [":all"], ":string", [":all"], ":long") == [
+            ["a", 1],
+            ["a", 2],
+        ]
+        assert kv.key_range_list_count("list", [":all"], ":string") == 3
         assert kv.get_list("list", "a", ":string", ":long") == [1, 2]
         assert kv.get_list("list", "a", ":string", ":long", limit=1, offset=1) == [2]
         assert kv.list_count("list", "a", ":string") == 2
@@ -111,6 +125,12 @@ def test_kv_argument_validation(tmp_path) -> None:
             kv.get_range("items", [":all"], v_type=":string")
         with pytest.raises(ValueError):
             kv.put_list_items("items", "a", ["alpha"], None, ":string")
+        with pytest.raises(ValueError):
+            kv.list_range("items", [":all"], None, [":all"], ":string")
+        with pytest.raises(ValueError):
+            kv.list_range("items", [":all"], ":string", [":all"], None)
+        with pytest.raises(ValueError):
+            kv.list_range_count("items", [":all"], None)
         with pytest.raises(ValueError):
             kv.get_by_rank("items", 0, ignore_key=True)
 

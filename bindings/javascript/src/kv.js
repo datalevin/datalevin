@@ -34,6 +34,12 @@ function rejectVTypeWithoutKType(kType, vType, methodName) {
   }
 }
 
+function requireRange(value, rangeName, methodName) {
+  if (!hasValue(value)) {
+    throw new TypeError(`${rangeName} is required for KV ${methodName}().`);
+  }
+}
+
 async function typedRangeArg(keyRange, kType) {
   if (hasValue(kType)) {
     return _BINDINGS.kvRange(keyRange, kType);
@@ -414,6 +420,89 @@ export class KV extends ResourceWrapper {
           await _BINDINGS.kvType(vType)
         ])
       )
+    );
+  }
+
+  async listRange(
+    listName,
+    kRange,
+    { kType = null, vRange = null, vType = null, limit = null, offset = null } = {}
+  ) {
+    requireRange(kRange, "kRange", "listRange");
+    requireRange(vRange, "vRange", "listRange");
+    requireKType(kType, "listRange");
+    requireVType(vType, "listRange");
+    const items = await toJsResult(
+      await _BINDINGS.coreInvoke("list-range", [
+        this.rawHandle(),
+        listName,
+        await _BINDINGS.kvRange(kRange, kType),
+        await _BINDINGS.kvType(kType),
+        await _BINDINGS.kvRange(vRange, vType),
+        await _BINDINGS.kvType(vType)
+      ])
+    );
+    return slicePage(items, limit, offset);
+  }
+
+  async listRangeCount(listName, kRange, { kType = null } = {}) {
+    requireRange(kRange, "kRange", "listRangeCount");
+    requireKType(kType, "listRangeCount");
+    return toJsResult(
+      await _BINDINGS.coreInvoke("list-range-count", [
+        this.rawHandle(),
+        listName,
+        await _BINDINGS.kvRange(kRange, kType),
+        await _BINDINGS.kvType(kType)
+      ])
+    );
+  }
+
+  async listRangeFirst(listName, kRange, { kType = null, vRange = null, vType = null } = {}) {
+    requireRange(kRange, "kRange", "listRangeFirst");
+    requireRange(vRange, "vRange", "listRangeFirst");
+    requireKType(kType, "listRangeFirst");
+    requireVType(vType, "listRangeFirst");
+    return toJsResult(
+      await _BINDINGS.coreInvoke("list-range-first", [
+        this.rawHandle(),
+        listName,
+        await _BINDINGS.kvRange(kRange, kType),
+        await _BINDINGS.kvType(kType),
+        await _BINDINGS.kvRange(vRange, vType),
+        await _BINDINGS.kvType(vType)
+      ])
+    );
+  }
+
+  async listRangeFirstN(listName, n, kRange, { kType = null, vRange = null, vType = null } = {}) {
+    requireRange(kRange, "kRange", "listRangeFirstN");
+    requireRange(vRange, "vRange", "listRangeFirstN");
+    requireKType(kType, "listRangeFirstN");
+    requireVType(vType, "listRangeFirstN");
+    return toJsResult(
+      await _BINDINGS.coreInvoke("list-range-first-n", [
+        this.rawHandle(),
+        listName,
+        n,
+        await _BINDINGS.kvRange(kRange, kType),
+        await _BINDINGS.kvType(kType),
+        await _BINDINGS.kvRange(vRange, vType),
+        await _BINDINGS.kvType(vType)
+      ])
+    );
+  }
+
+  async keyRangeListCount(listName, kRange, { kType = null } = {}) {
+    requireRange(kRange, "kRange", "keyRangeListCount");
+    requireKType(kType, "keyRangeListCount");
+    return toJsResult(
+      await _BINDINGS.coreInvoke("key-range-list-count", [
+        this.rawHandle(),
+        listName,
+        await _BINDINGS.kvRange(kRange, kType),
+        await _BINDINGS.kvType(kType)
+      ])
     );
   }
 

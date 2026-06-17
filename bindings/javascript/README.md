@@ -281,6 +281,25 @@ try {
     kType: ":string",
     vType: ":string"
   }));
+  console.log(await kv.listRange("tags", [":all"], {
+    kType: ":string",
+    vRange: [":all"],
+    vType: ":string"
+  }));
+  console.log(await kv.listRangeFirst("tags", [":all"], {
+    kType: ":string",
+    vRange: [":all"],
+    vType: ":string"
+  }));
+  console.log(await kv.listRangeFirstN("tags", 2, [":all"], {
+    kType: ":string",
+    vRange: [":all"],
+    vType: ":string"
+  }));
+  console.log(await kv.listRangeCount("tags", [":all"], { kType: ":string" }));
+  console.log(await kv.keyRangeListCount("tags", [":all"], {
+    kType: ":string"
+  }));
 } finally {
   await kv.close();
 }

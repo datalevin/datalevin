@@ -55,6 +55,7 @@ but not staged mutation of entity objects. Use transaction maps/builders instead
 | Entries and basic get/range reads | Yes | Yes | Yes | Yes |
 | KV transaction data writes | Yes | Yes | Yes | Yes |
 | List DB operations: get, put, delete, count, membership | Yes | Yes | Yes | Yes |
+| List DB range reads: range, first, first N, range counts | Yes | Yes | Yes | Yes |
 | Range helpers: range count, key range, key range count | Yes | Yes | Yes | Yes |
 | Rank/sample helpers: first, first N, rank, by-rank, sample | Yes | Yes | Yes | Yes |
 | Stats, copy, sync | Yes | Yes | Yes | Yes |

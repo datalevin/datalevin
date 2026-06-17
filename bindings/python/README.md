@@ -261,6 +261,11 @@ with open_kv("/tmp/dtlv-py-kv") as kv:
     kv.open_list_dbi("tags")
     kv.put_list_items("tags", "doc-1", ["clj", "db"], ":string", ":string")
     print(kv.get_list("tags", "doc-1", ":string", ":string"))
+    print(kv.list_range("tags", [":all"], ":string", [":all"], ":string"))
+    print(kv.list_range_first("tags", [":all"], ":string", [":all"], ":string"))
+    print(kv.list_range_first_n("tags", 2, [":all"], ":string", [":all"], ":string"))
+    print(kv.list_range_count("tags", [":all"], ":string"))
+    print(kv.key_range_list_count("tags", [":all"], ":string"))
 ```
 
 ## Operational Example

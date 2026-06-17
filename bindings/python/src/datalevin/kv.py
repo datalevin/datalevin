@@ -305,6 +305,96 @@ class KV(ResourceWrapper):
             )
         )
 
+    def list_range(self, list_name, k_range, k_type, v_range, v_type, limit=None, offset=None):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range().")
+        _require_k_type(k_type, "list_range")
+        _require_v_type(v_type, "list_range")
+        return _slice_page(
+            to_python(
+                _BINDINGS.core_invoke(
+                    "list-range",
+                    [
+                        self.raw_handle(),
+                        list_name,
+                        to_edn_form(k_range),
+                        _BINDINGS.kv_type(k_type),
+                        to_edn_form(v_range),
+                        _BINDINGS.kv_type(v_type),
+                    ],
+                )
+            ),
+            limit,
+            offset,
+        )
+
+    def list_range_count(self, list_name, k_range, k_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_count().")
+        _require_k_type(k_type, "list_range_count")
+        return to_python(
+            _BINDINGS.core_invoke(
+                "list-range-count",
+                [self.raw_handle(), list_name, to_edn_form(k_range), _BINDINGS.kv_type(k_type)],
+            )
+        )
+
+    def list_range_first(self, list_name, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_first().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_first().")
+        _require_k_type(k_type, "list_range_first")
+        _require_v_type(v_type, "list_range_first")
+        return to_python(
+            _BINDINGS.core_invoke(
+                "list-range-first",
+                [
+                    self.raw_handle(),
+                    list_name,
+                    to_edn_form(k_range),
+                    _BINDINGS.kv_type(k_type),
+                    to_edn_form(v_range),
+                    _BINDINGS.kv_type(v_type),
+                ],
+            )
+        )
+
+    def list_range_first_n(self, list_name, n, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_first_n().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_first_n().")
+        _require_k_type(k_type, "list_range_first_n")
+        _require_v_type(v_type, "list_range_first_n")
+        return to_python(
+            _BINDINGS.core_invoke(
+                "list-range-first-n",
+                [
+                    self.raw_handle(),
+                    list_name,
+                    n,
+                    to_edn_form(k_range),
+                    _BINDINGS.kv_type(k_type),
+                    to_edn_form(v_range),
+                    _BINDINGS.kv_type(v_type),
+                ],
+            )
+        )
+
+    def key_range_list_count(self, list_name, k_range, k_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV key_range_list_count().")
+        _require_k_type(k_type, "key_range_list_count")
+        return to_python(
+            _BINDINGS.core_invoke(
+                "key-range-list-count",
+                [self.raw_handle(), list_name, to_edn_form(k_range), _BINDINGS.kv_type(k_type)],
+            )
+        )
+
     def clear_dbi(self, dbi_name) -> None:
         _BINDINGS.core_invoke("clear-dbi", [self.raw_handle(), dbi_name])
 

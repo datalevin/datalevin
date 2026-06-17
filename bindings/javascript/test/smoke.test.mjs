@@ -460,6 +460,42 @@ test(
           .map(([key, value]) => [key, intValue(value)]),
         [["a", 1], ["a", 2], ["b", 3]]
       );
+      assert.deepEqual(
+        (await kv.listRange("list", [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long",
+          limit: 1,
+          offset: 1
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 2]]
+      );
+      assert.deepEqual(
+        (await kv.listRange("list", [":closed", "a", "b"], {
+          kType: ":string",
+          vRange: [":closed", 2, 3],
+          vType: ":long"
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 2], ["b", 3]]
+      );
+      assert.equal(intValue(await kv.listRangeCount("list", [":all"], { kType: ":string" })), 3);
+      assert.deepEqual(
+        (await kv.listRangeFirst("list", [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map((value) => typeof value === "bigint" ? intValue(value) : value),
+        ["a", 1]
+      );
+      assert.deepEqual(
+        (await kv.listRangeFirstN("list", 2, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 1], ["a", 2]]
+      );
+      assert.equal(intValue(await kv.keyRangeListCount("list", [":all"], { kType: ":string" })), 3);
       assert.deepEqual((await kv.getList("list", "a", { kType: ":string", vType: ":long" })).map(intValue), [1, 2]);
       assert.deepEqual(
         (await kv.getList("list", "a", { kType: ":string", vType: ":long", limit: 1, offset: 1 })).map(intValue),
@@ -648,6 +684,18 @@ test(
       );
       await assert.rejects(
         async () => kv.putListItems("items", "a", ["alpha"], { vType: ":string" }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.listRange("items", [":all"], { vRange: [":all"], vType: ":string" }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.listRange("items", [":all"], { kType: ":string", vRange: [":all"] }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.listRangeCount("items", [":all"]),
         TypeError
       );
       await assert.rejects(
