@@ -998,6 +998,11 @@
                 (create-snapshot-on-node! deps cluster-id logical-node)]))
         logical-nodes))
 
+(defn- expected-txlog-gc-skip?
+  [result]
+  (and (:skipped? result)
+       (contains? #{:rollback :wal-disabled} (:reason result))))
+
 (defn gc-txlog-segments-on-node!
   [{:keys [clusters remote-cluster?] :as deps} cluster-id logical-node]
   (let [result (if (remote-cluster? cluster-id)
@@ -1015,10 +1020,11 @@
                                :logical-node logical-node}))
                    (let [store  (:store state)
                          lmdb   (if (instance? Store store)
-                                  (.-lmdb ^Store store)
-                                  store)]
+                                   (.-lmdb ^Store store)
+                                   store)]
                      (i/gc-txlog-segments! lmdb))))]
-    (when-not (:ok? result)
+    (when-not (or (:ok? result)
+                  (expected-txlog-gc-skip? result))
       (u/raise "Jepsen WAL GC failed"
                {:cluster-id cluster-id
                 :logical-node logical-node

@@ -4,6 +4,7 @@
    [clojure.java.io :as io]
    [clojure.test :refer [deftest is]]
    [datalevin.core :as d]
+   [datalevin.interface :as i]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.local.ops :as lops]
    [datalevin.kv :as kv]
@@ -19,6 +20,8 @@
 (defn- current-java-bin
   []
   (.getPath (io/file (System/getProperty "java.home") "bin" "java")))
+
+(declare ha-test-server)
 
 (defn- last-nonblank-line
   [s]
@@ -96,6 +99,44 @@
            (get-in opts [:ha-control-plane :operation-timeout-ms])))
     (is (= {:pool-size 1 :time-out 10000}
            (:client-opts opts)))))
+
+(defn- local-ops-test-deps
+  [db-name server]
+  {:clusters (atom {:test-cluster {:db-name db-name
+                                   :servers {"n1" server}}})
+   :remote-cluster? (constantly false)})
+
+(deftest gc-txlog-segments-on-node-allows-expected-skip-test
+  (let [db-name "gc-skip-test"
+        server  (ha-test-server {db-name {:store ::store}})
+        result  {:ok? false
+                 :skipped? true
+                 :reason :rollback
+                 :watermarks {:wal? true}}]
+    (with-redefs [i/gc-txlog-segments! (fn
+                                          ([_] result)
+                                          ([_ _] result))]
+      (is (= result
+             (lops/gc-txlog-segments-on-node!
+              (local-ops-test-deps db-name server)
+              :test-cluster
+              "n1"))))))
+
+(deftest gc-txlog-segments-on-node-rejects-real-failure-test
+  (let [db-name "gc-failure-test"
+        server  (ha-test-server {db-name {:store ::store}})
+        result  {:ok? false
+                 :reason :delete-failed}]
+    (with-redefs [i/gc-txlog-segments! (fn
+                                          ([_] result)
+                                          ([_ _] result))]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"Jepsen WAL GC failed"
+           (lops/gc-txlog-segments-on-node!
+            (local-ops-test-deps db-name server)
+            :test-cluster
+            "n1"))))))
 
 (defn- start-clojure-child!
   [form]
