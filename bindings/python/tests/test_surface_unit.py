@@ -12,6 +12,7 @@ import datalevin.kv as kv_module
 import datalevin._interop as interop_module
 import datalevin.search as search_module
 import datalevin.udf as udf_module
+import datalevin.vector as vector_module
 from datalevin.errors import DatalevinError
 
 
@@ -173,6 +174,51 @@ class FakeInteropBindings:
         self.last_search_commit = writer
         return ":transacted"
 
+    def new_vector_index(self, kv, opts=None):
+        self.last_vector_index = (kv, opts)
+        return "VECTOR_INDEX"
+
+    def close_vector_index(self, index):
+        self.last_close_vector_index = index
+
+    def vector_index_closed(self, index):
+        self.last_vector_index_closed = index
+        return False
+
+    def vector_add_vec(self, index, vec_ref, vec_data):
+        self.last_vector_add_vec = (index, vec_ref, vec_data)
+
+    def vector_remove_vec(self, index, vec_ref):
+        self.last_vector_remove_vec = (index, vec_ref)
+
+    def vector_indexed(self, index, vec_ref):
+        self.last_vector_indexed = (index, vec_ref)
+        return True
+
+    def vector_search(self, index, query_vec, opts=None):
+        self.last_vector_search = (index, query_vec, opts)
+        return [["vec-1", 0.0]]
+
+    def vector_re_index(self, index, opts=None):
+        self.last_vector_re_index = (index, opts)
+        return index
+
+    def vector_clear(self, index):
+        self.last_vector_clear = index
+        return True
+
+    def vector_force_checkpoint(self, index):
+        self.last_vector_force_checkpoint = index
+        return True
+
+    def vector_info(self, index):
+        self.last_vector_info = index
+        return {":size": 1}
+
+    def vector_checkpoint_state(self, index):
+        self.last_vector_checkpoint_state = index
+        return {":snapshot-lsn": 1}
+
     def new_client(self, uri, opts=None):
         self.last_client = (uri, opts)
         return "CLIENT"
@@ -245,6 +291,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     monkeypatch.setattr(kv_module, "_BINDINGS", fake)
     monkeypatch.setattr(client_module, "_BINDINGS", fake)
     monkeypatch.setattr(search_module, "_BINDINGS", fake)
+    monkeypatch.setattr(vector_module, "_BINDINGS", fake)
 
     assert interop_module.exec_json("ping", {"count": 1}) == {"status": "ok"}
     assert fake.last_request == {"op": "ping", "args": {"count": 1}}
@@ -334,7 +381,16 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
 
     assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
-    for helper in ["keyword", "new_search_engine", "read_edn", "re_index", "search_index_writer", "symbol", "write_edn"]:
+    for helper in [
+        "keyword",
+        "new_search_engine",
+        "new_vector_index",
+        "read_edn",
+        "re_index",
+        "search_index_writer",
+        "symbol",
+        "write_edn",
+    ]:
         assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
@@ -392,6 +448,28 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert writer.commit() == ":transacted"
     assert fake.last_search_commit == "SEARCH_WRITER"
     assert writer.closed() is True
+    index = interop_module.new_vector_index(kv, opts={":dimensions": 2})
+    assert index.raw_handle() == "VECTOR_INDEX"
+    assert fake.last_vector_index == (kv, {":dimensions": 2})
+    assert index.add_vec("vec-1", [1.0, 0.0]) is index
+    assert fake.last_vector_add_vec == ("VECTOR_INDEX", "vec-1", [1.0, 0.0])
+    assert index.vec_indexed("vec-1") is True
+    assert fake.last_vector_indexed == ("VECTOR_INDEX", "vec-1")
+    assert index.search_vec([1.0, 0.0], opts={":display": ":refs+dists"}) == [["vec-1", 0.0]]
+    assert fake.last_vector_search == ("VECTOR_INDEX", [1.0, 0.0], {":display": ":refs+dists"})
+    assert index.info() == {":size": 1}
+    assert fake.last_vector_info == "VECTOR_INDEX"
+    assert index.force_checkpoint() is index
+    assert fake.last_vector_force_checkpoint == "VECTOR_INDEX"
+    assert index.checkpoint_state() == {":snapshot-lsn": 1}
+    assert fake.last_vector_checkpoint_state == "VECTOR_INDEX"
+    assert index.re_index(opts={":dimensions": 2}) is index
+    assert fake.last_vector_re_index == ("VECTOR_INDEX", {":dimensions": 2})
+    assert index.remove_vec("vec-1") is index
+    assert fake.last_vector_remove_vec == ("VECTOR_INDEX", "vec-1")
+    assert index.clear() is index
+    assert fake.last_vector_clear == "VECTOR_INDEX"
+    assert index.closed() is True
 
     client_opts = {
         ":pool-size": 1,
@@ -437,6 +515,7 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "list_count",
         "list_snapshots",
         "new_search_engine",
+        "new_vector_index",
         "open_tx_log",
         "put_list_items",
         "range_count",
@@ -468,6 +547,15 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(datalevin.SearchEngine, "search"))
     assert callable(getattr(datalevin.SearchIndexWriter, "commit"))
     assert callable(getattr(datalevin.SearchIndexWriter, "write"))
+    assert callable(getattr(datalevin.VectorIndex, "add_vec"))
+    assert callable(getattr(datalevin.VectorIndex, "checkpoint_state"))
+    assert callable(getattr(datalevin.VectorIndex, "clear"))
+    assert callable(getattr(datalevin.VectorIndex, "force_checkpoint"))
+    assert callable(getattr(datalevin.VectorIndex, "info"))
+    assert callable(getattr(datalevin.VectorIndex, "re_index"))
+    assert callable(getattr(datalevin.VectorIndex, "remove_vec"))
+    assert callable(getattr(datalevin.VectorIndex, "search_vec"))
+    assert callable(getattr(datalevin.VectorIndex, "vec_indexed"))
     for method in [
         "count_datoms",
         "copy",

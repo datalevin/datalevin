@@ -123,6 +123,30 @@ const opts = {
 };
 ```
 
+## Standalone Vector Index Example
+
+Use `newVectorIndex()` when you want a KV-backed vector index without a Datalog
+schema attribute.
+
+```js
+import { newVectorIndex, openKv, vectorOptions } from "datalevin-node";
+
+const kv = await openKv("/tmp/dtlv-js-vec");
+
+try {
+  const index = await newVectorIndex(kv, vectorOptions({ dimensions: 2 }));
+  await index.addVec("doc-1", [1.0, 0.0]);
+  await index.addVec("doc-2", [0.0, 1.0]);
+
+  console.log(await index.searchVec([1.0, 0.0], { ":top": 1 }));
+  await index.forceCheckpoint();
+  console.log(await index.info());
+  await index.close();
+} finally {
+  await kv.close();
+}
+```
+
 ## Async Transaction Example
 
 Use `transactAsync()` for ingestion and application-server workloads that

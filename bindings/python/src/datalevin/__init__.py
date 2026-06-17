@@ -16,6 +16,7 @@ from ._interop import (
     keyword,
     new_client,
     new_search_engine,
+    new_vector_index,
     open_kv,
     read_edn,
     re_index,
@@ -48,6 +49,7 @@ from .errors import (
 from .kv import KV, KVTransaction
 from .search import SearchEngine, SearchIndexWriter
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
+from .vector import VectorIndex
 
 __all__ = [
     "Client",
@@ -62,6 +64,7 @@ __all__ = [
     "SearchEngine",
     "SearchIndexWriter",
     "UdfRegistry",
+    "VectorIndex",
     "api_info",
     "connect",
     "create_udf_registry",
@@ -80,6 +83,7 @@ __all__ = [
     "keyword",
     "new_client",
     "new_search_engine",
+    "new_vector_index",
     "open_kv",
     "read_edn",
     "re_index",

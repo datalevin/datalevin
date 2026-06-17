@@ -309,6 +309,54 @@ class RawInterop {
     return toJsResult(await _BINDINGS.searchCommit(resourceHandle(writer)));
   }
 
+  async newVectorIndex(kv, opts) {
+    return _BINDINGS.newVectorIndex(resourceHandle(kv), opts);
+  }
+
+  async closeVectorIndex(index) {
+    await _BINDINGS.closeVectorIndex(resourceHandle(index));
+  }
+
+  async vectorIndexClosed(index) {
+    return _BINDINGS.vectorIndexClosed(resourceHandle(index));
+  }
+
+  async vectorAddVec(index, vecRef, vecData) {
+    return toJsResult(await _BINDINGS.vectorAddVec(resourceHandle(index), vecRef, vecData));
+  }
+
+  async vectorRemoveVec(index, vecRef) {
+    return toJsResult(await _BINDINGS.vectorRemoveVec(resourceHandle(index), vecRef));
+  }
+
+  async vectorIndexed(index, vecRef) {
+    return _BINDINGS.vectorIndexed(resourceHandle(index), vecRef);
+  }
+
+  async vectorSearch(index, queryVec, opts = null) {
+    return toJsResult(await _BINDINGS.vectorSearch(resourceHandle(index), queryVec, opts));
+  }
+
+  async vectorReIndex(index, opts = null) {
+    return _BINDINGS.vectorReIndex(resourceHandle(index), opts);
+  }
+
+  async vectorClear(index) {
+    return toJsResult(await _BINDINGS.vectorClear(resourceHandle(index)));
+  }
+
+  async vectorForceCheckpoint(index) {
+    return toJsResult(await _BINDINGS.vectorForceCheckpoint(resourceHandle(index)));
+  }
+
+  async vectorInfo(index) {
+    return toJsResult(await _BINDINGS.vectorInfo(resourceHandle(index)));
+  }
+
+  async vectorCheckpointState(index) {
+    return toJsResult(await _BINDINGS.vectorCheckpointState(resourceHandle(index)));
+  }
+
   async newClient(uri, opts = null) {
     return _BINDINGS.newClient(uri, opts);
   }

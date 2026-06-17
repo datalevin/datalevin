@@ -248,6 +248,54 @@ class InteropBindings:
         handle = writer.raw_handle() if callable(getattr(writer, "raw_handle", None)) else writer
         return call_java(classes().interop.searchCommit, handle)
 
+    def new_vector_index(self, kv, opts=None):
+        handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
+        return call_java(classes().interop.newVectorIndex, handle, to_java(opts))
+
+    def close_vector_index(self, index) -> None:
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        call_java(classes().interop.closeVectorIndex, handle)
+
+    def vector_index_closed(self, index) -> bool:
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return bool(call_java(classes().interop.vectorIndexClosed, handle))
+
+    def vector_add_vec(self, index, vec_ref, vec_data):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorAddVec, handle, to_java(vec_ref), to_java(vec_data))
+
+    def vector_remove_vec(self, index, vec_ref):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorRemoveVec, handle, to_java(vec_ref))
+
+    def vector_indexed(self, index, vec_ref) -> bool:
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return bool(call_java(classes().interop.vectorIndexed, handle, to_java(vec_ref)))
+
+    def vector_search(self, index, query_vec, opts=None):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorSearch, handle, to_java(query_vec), to_java(opts))
+
+    def vector_re_index(self, index, opts=None):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorReIndex, handle, to_java(opts))
+
+    def vector_clear(self, index):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorClear, handle)
+
+    def vector_force_checkpoint(self, index):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorForceCheckpoint, handle)
+
+    def vector_info(self, index):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorInfo, handle)
+
+    def vector_checkpoint_state(self, index):
+        handle = index.raw_handle() if callable(getattr(index, "raw_handle", None)) else index
+        return call_java(classes().interop.vectorCheckpointState, handle)
+
     def new_client(self, uri, opts=None):
         return call_java(classes().interop.newClient, uri, to_java(opts))
 
@@ -762,6 +810,14 @@ def new_search_engine(kv: KV, opts=None):
     return SearchEngine(_BINDINGS.new_search_engine(kv, opts))
 
 
+def new_vector_index(kv: KV, opts):
+    """Create a standalone vector index for a KV store."""
+
+    from .vector import VectorIndex
+
+    return VectorIndex(_BINDINGS.new_vector_index(kv, opts))
+
+
 def search_index_writer(kv: KV, opts=None):
     """Create a batched full-text search index writer for a KV store."""
 
@@ -795,6 +851,7 @@ __all__ = [
     "jvm_started",
     "keyword",
     "new_client",
+    "new_vector_index",
     "open_kv",
     "read_edn",
     "re_index",

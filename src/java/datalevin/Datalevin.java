@@ -344,6 +344,22 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a standalone vector index over {@code kv} with raw options.
+     */
+    public static VectorIndex newVectorIndex(KV kv, Map<?, ?> opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newVectorIndex(opts);
+    }
+
+    /**
+     * Creates a standalone vector index over {@code kv} with typed options.
+     */
+    public static VectorIndex newVectorIndex(KV kv, RetrievalOptions opts) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.newVectorIndex(opts);
+    }
+
+    /**
      * Rebuilds a full-text search engine from stored raw text.
      */
     public static SearchEngine reIndex(SearchEngine engine) {
@@ -365,6 +381,30 @@ public final class Datalevin {
     public static SearchEngine reIndex(SearchEngine engine, RetrievalOptions opts) {
         Objects.requireNonNull(engine, "engine");
         return engine.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a standalone vector index with its previous options.
+     */
+    public static VectorIndex reIndex(VectorIndex index) {
+        Objects.requireNonNull(index, "index");
+        return index.reIndex();
+    }
+
+    /**
+     * Rebuilds a standalone vector index with raw options.
+     */
+    public static VectorIndex reIndex(VectorIndex index, Map<?, ?> opts) {
+        Objects.requireNonNull(index, "index");
+        return index.reIndex(opts);
+    }
+
+    /**
+     * Rebuilds a standalone vector index with typed options.
+     */
+    public static VectorIndex reIndex(VectorIndex index, RetrievalOptions opts) {
+        Objects.requireNonNull(index, "index");
+        return index.reIndex(opts);
     }
 
     /**

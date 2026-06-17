@@ -124,6 +124,25 @@ opts = {
 }
 ```
 
+## Standalone Vector Index Example
+
+Use `new_vector_index()` when you want a KV-backed vector index without a
+Datalog schema attribute.
+
+```python
+from datalevin import new_vector_index, open_kv, vector_options
+
+with open_kv("/tmp/dtlv-py-vec") as kv:
+    index = new_vector_index(kv, vector_options(dimensions=2))
+    index.add_vec("doc-1", [1.0, 0.0])
+    index.add_vec("doc-2", [0.0, 1.0])
+
+    print(index.search_vec([1.0, 0.0], {":top": 1}))
+    index.force_checkpoint()
+    print(index.info())
+    index.close()
+```
+
 ## Async Transaction Example
 
 Use `transact_async()` for ingestion and application-server workloads that

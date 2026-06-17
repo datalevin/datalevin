@@ -124,6 +124,11 @@ export class KV extends ResourceWrapper {
     return new SearchEngine(await _BINDINGS.newSearchEngine(this.rawHandle(), opts));
   }
 
+  async newVectorIndex(opts) {
+    const { VectorIndex } = await import("./vector.js");
+    return new VectorIndex(await _BINDINGS.newVectorIndex(this.rawHandle(), opts));
+  }
+
   async reIndex(opts = null) {
     this._handle = await _BINDINGS.keyValueReIndex(this.rawHandle(), opts);
     return this;

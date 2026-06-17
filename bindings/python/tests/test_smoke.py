@@ -8,6 +8,7 @@ from datalevin import (
     api_info,
     connect,
     new_search_engine,
+    new_vector_index,
     open_kv,
     re_index,
     search_domain,
@@ -126,3 +127,34 @@ def test_search_index_writer_commits_to_kv_index(tmp_path: Path) -> None:
         assert engine.doc_indexed("doc-3") is False
         assert engine.clear_docs() is engine
         assert engine.doc_count() == 0
+
+
+def test_standalone_vector_index(tmp_path: Path) -> None:
+    kv_dir = tmp_path / "vector-kv"
+    opts = {":dimensions": 2}
+    with open_kv(str(kv_dir)) as kv:
+        index = new_vector_index(kv, opts)
+        assert repr(index) == "<VectorIndex open>"
+        assert index.info()[":dimensions"] == 2
+
+        assert index.add_vec("vec-1", [1.0, 0.0]) is index
+        assert index.add_vec("vec-2", [0.0, 1.0]) is index
+        assert index.vec_indexed("vec-1") is True
+        assert index.search_vec([1.0, 0.0], opts={":top": 1}) == ["vec-1"]
+        assert index.search_vec([1.0, 0.0], opts={":top": 1, ":display": ":refs+dists"}) == [["vec-1", 0.0]]
+
+        assert index.force_checkpoint() is index
+        assert isinstance(index.checkpoint_state(), dict)
+        assert re_index(index) is index
+        assert index.search_vec([0.0, 1.0], opts={":top": 1}) == ["vec-2"]
+        assert index.remove_vec("vec-1") is index
+        assert index.vec_indexed("vec-1") is False
+
+        assert index.clear() is index
+        assert index.closed() is True
+
+        index = kv.new_vector_index(opts)
+        try:
+            assert index.info()[":size"] == 0
+        finally:
+            index.close()

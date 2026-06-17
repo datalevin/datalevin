@@ -124,6 +124,23 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Creates a standalone vector index over this KV store with raw options.
+     */
+    public VectorIndex newVectorIndex(Map<?, ?> opts) {
+        Object optsForm = DatalevinForms.optionsInput(Objects.requireNonNull(opts, "opts"));
+        return new VectorIndex(ClojureRuntime.core("new-vector-index", resource(), optsForm), optsForm);
+    }
+
+    /**
+     * Creates a standalone vector index over this KV store with typed options.
+     */
+    public VectorIndex newVectorIndex(RetrievalOptions opts) {
+        Objects.requireNonNull(opts, "opts");
+        Object optsForm = opts.buildForm();
+        return new VectorIndex(ClojureRuntime.core("new-vector-index", resource(), optsForm), optsForm);
+    }
+
+    /**
      * Creates a batched full-text search index writer over this KV store.
      */
     public SearchIndexWriter searchIndexWriter() {

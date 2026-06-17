@@ -134,6 +134,11 @@ class KV(ResourceWrapper):
 
         return SearchEngine(_BINDINGS.new_search_engine(self.raw_handle(), opts))
 
+    def new_vector_index(self, opts):
+        from .vector import VectorIndex
+
+        return VectorIndex(_BINDINGS.new_vector_index(self.raw_handle(), opts))
+
     def transact(self, txs, dbi_name=None, k_type=None, v_type=None):
         if dbi_name is None and (k_type is not None or v_type is not None):
             raise ValueError("k_type and v_type require dbi_name for KV transact().")

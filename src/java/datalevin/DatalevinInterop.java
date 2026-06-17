@@ -610,6 +610,129 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Creates a raw standalone vector index handle.
+     */
+    public static Object newVectorIndex(Object kv, Map<?, ?> opts) {
+        Object optsForm = DatalevinForms.optionsInput(opts == null ? Map.of() : opts);
+        return new VectorIndex(ClojureRuntime.core("new-vector-index", rawResource(kv), optsForm), optsForm);
+    }
+
+    /**
+     * Closes a standalone vector index handle.
+     */
+    public static void closeVectorIndex(Object index) {
+        if (index instanceof VectorIndex vectorIndex) {
+            vectorIndex.close();
+        } else {
+            ClojureRuntime.core("close-vector-index", rawResource(index));
+        }
+    }
+
+    /**
+     * Returns whether a standalone vector index handle has been closed.
+     */
+    public static boolean vectorIndexClosed(Object index) {
+        if (index instanceof VectorIndex vectorIndex) {
+            return vectorIndex.closed();
+        }
+        return ClojureCodec.javaBoolean(ClojureRuntime.invoke("datalevin.interface",
+                                                              "vec-closed?",
+                                                              rawResource(index)));
+    }
+
+    /**
+     * Adds one vector to a standalone vector index handle.
+     */
+    public static Object vectorAddVec(Object index, Object vecRef, Object vecData) {
+        Object result = ClojureRuntime.core("add-vec",
+                                            rawResource(index),
+                                            ClojureCodec.runtimeInput(vecRef),
+                                            ClojureCodec.runtimeInput(vecData));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Removes all vectors for a reference from a standalone vector index.
+     */
+    public static Object vectorRemoveVec(Object index, Object vecRef) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("remove-vec",
+                                                             rawResource(index),
+                                                             ClojureCodec.runtimeInput(vecRef)));
+    }
+
+    /**
+     * Returns whether one vector reference is indexed.
+     */
+    public static boolean vectorIndexed(Object index, Object vecRef) {
+        return ClojureRuntime.invoke("datalevin.interface",
+                                     "vec-indexed?",
+                                     rawResource(index),
+                                     ClojureCodec.runtimeInput(vecRef)) != null;
+    }
+
+    /**
+     * Searches a standalone vector index.
+     */
+    public static Object vectorSearch(Object index, Object queryVec, Map<?, ?> opts) {
+        Object result = opts == null
+                ? ClojureRuntime.core("search-vec",
+                                      rawResource(index),
+                                      ClojureCodec.runtimeInput(queryVec))
+                : ClojureRuntime.core("search-vec",
+                                      rawResource(index),
+                                      ClojureCodec.runtimeInput(queryVec),
+                                      DatalevinForms.optionsInput(opts));
+        return ClojureCodec.bridgeOutput(result);
+    }
+
+    /**
+     * Rebuilds a standalone vector index and returns a bridge-safe handle.
+     */
+    public static Object vectorReIndex(Object index, Map<?, ?> opts) {
+        if (index instanceof VectorIndex vectorIndex) {
+            vectorIndex.reIndex(opts);
+            return vectorIndex;
+        }
+        Object optsForm = DatalevinForms.optionsInput(opts == null ? Map.of() : opts);
+        Object next = ClojureRuntime.core("re-index", rawResource(index), optsForm);
+        return new VectorIndex(next, optsForm);
+    }
+
+    /**
+     * Clears a standalone vector index from memory and disk.
+     */
+    public static Object vectorClear(Object index) {
+        if (index instanceof VectorIndex vectorIndex) {
+            vectorIndex.clear();
+        } else {
+            ClojureRuntime.core("clear-vector-index", rawResource(index));
+        }
+        return true;
+    }
+
+    /**
+     * Forces vector checkpoint persistence to the backing KV store.
+     */
+    public static Object vectorForceCheckpoint(Object index) {
+        ClojureRuntime.core("force-vec-checkpoint!", rawResource(index));
+        return true;
+    }
+
+    /**
+     * Returns bridge-safe standalone vector index metadata.
+     */
+    public static Object vectorInfo(Object index) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("vector-index-info", rawResource(index)));
+    }
+
+    /**
+     * Returns bridge-safe checkpoint metadata for a standalone vector index.
+     */
+    public static Object vectorCheckpointState(Object index) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("vector-checkpoint-state", rawResource(index)));
+    }
+
+    /**
      * Opens a raw remote client handle.
      */
     public static Object newClient(String uri, Map<?, ?> opts) {

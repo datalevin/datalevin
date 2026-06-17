@@ -527,6 +527,100 @@ class InteropBindings {
     return callJavaMethod(cls.interop, "searchCommit", await unwrapInteropHandle(writer));
   }
 
+  async newVectorIndex(kv, opts) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "newVectorIndex",
+      await unwrapInteropHandle(kv),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async closeVectorIndex(index) {
+    const cls = await classes();
+    await callJavaMethod(cls.interop, "closeVectorIndex", await unwrapInteropHandle(index));
+  }
+
+  async vectorIndexClosed(index) {
+    const cls = await classes();
+    return Boolean(await callJavaMethod(cls.interop, "vectorIndexClosed", await unwrapInteropHandle(index)));
+  }
+
+  async vectorAddVec(index, vecRef, vecData) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "vectorAddVec",
+      await unwrapInteropHandle(index),
+      await toJava(vecRef),
+      await toJava(vecData)
+    );
+  }
+
+  async vectorRemoveVec(index, vecRef) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "vectorRemoveVec",
+      await unwrapInteropHandle(index),
+      await toJava(vecRef)
+    );
+  }
+
+  async vectorIndexed(index, vecRef) {
+    const cls = await classes();
+    return Boolean(
+      await callJavaMethod(
+        cls.interop,
+        "vectorIndexed",
+        await unwrapInteropHandle(index),
+        await toJava(vecRef)
+      )
+    );
+  }
+
+  async vectorSearch(index, queryVec, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "vectorSearch",
+      await unwrapInteropHandle(index),
+      await toJava(queryVec),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async vectorReIndex(index, opts = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "vectorReIndex",
+      await unwrapInteropHandle(index),
+      hasValue(opts) ? await toJava(opts) : null
+    );
+  }
+
+  async vectorClear(index) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "vectorClear", await unwrapInteropHandle(index));
+  }
+
+  async vectorForceCheckpoint(index) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "vectorForceCheckpoint", await unwrapInteropHandle(index));
+  }
+
+  async vectorInfo(index) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "vectorInfo", await unwrapInteropHandle(index));
+  }
+
+  async vectorCheckpointState(index) {
+    const cls = await classes();
+    return callJavaMethod(cls.interop, "vectorCheckpointState", await unwrapInteropHandle(index));
+  }
+
   async newClient(uri, opts = null) {
     const cls = await classes();
     if (opts !== null && opts !== undefined) {
@@ -1117,6 +1211,11 @@ export async function openKv(dir, opts = null) {
 export async function newSearchEngine(kv, opts = null) {
   const { SearchEngine } = await import("./search.js");
   return new SearchEngine(await _BINDINGS.newSearchEngine(kv, opts));
+}
+
+export async function newVectorIndex(kv, opts) {
+  const { VectorIndex } = await import("./vector.js");
+  return new VectorIndex(await _BINDINGS.newVectorIndex(kv, opts));
 }
 
 export async function searchIndexWriter(kv, opts = null) {

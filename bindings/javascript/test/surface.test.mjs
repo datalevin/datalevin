@@ -22,6 +22,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.keyword, "function");
   assert.equal(typeof datalevin.newClient, "function");
   assert.equal(typeof datalevin.newSearchEngine, "function");
+  assert.equal(typeof datalevin.newVectorIndex, "function");
   assert.equal(typeof datalevin.openKv, "function");
   assert.equal(typeof datalevin.readEdn, "function");
   assert.equal(typeof datalevin.reIndex, "function");
@@ -117,6 +118,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.KVTransaction, "function");
   assert.equal(typeof datalevin.SearchEngine, "function");
   assert.equal(typeof datalevin.SearchIndexWriter, "function");
+  assert.equal(typeof datalevin.VectorIndex, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
   assert.equal(typeof datalevin.Entity.prototype.touch, "function");
@@ -160,6 +162,7 @@ test("public surface stays importable without starting the JVM", () => {
     "listCount",
     "listSnapshots",
     "newSearchEngine",
+    "newVectorIndex",
     "openTxLog",
     "putListItems",
     "rangeCount",
@@ -190,4 +193,17 @@ test("public surface stays importable without starting the JVM", () => {
   }
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.write, "function");
   assert.equal(typeof datalevin.SearchIndexWriter.prototype.commit, "function");
+  for (const method of [
+    "addVec",
+    "checkpointState",
+    "clear",
+    "forceCheckpoint",
+    "info",
+    "reIndex",
+    "removeVec",
+    "searchVec",
+    "vecIndexed"
+  ]) {
+    assert.equal(typeof datalevin.VectorIndex.prototype[method], "function");
+  }
 });

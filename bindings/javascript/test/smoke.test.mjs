@@ -20,6 +20,7 @@ import {
   interop,
   keyword,
   newSearchEngine,
+  newVectorIndex,
   openKv,
   reIndex,
   schemaAttr,
@@ -575,6 +576,48 @@ test(
       assert.equal(intValue(await engine.docCount()), 0);
       await engine.close();
       assert.equal(await engine.closed(), true);
+    } finally {
+      await kv.close();
+    }
+  }
+);
+
+test(
+  "standalone vector index supports add search checkpoint reindex and clear",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-vector-"));
+    const kv = await openKv(dir);
+    const opts = { ":dimensions": 2 };
+
+    try {
+      const index = await newVectorIndex(kv, opts);
+      assert.equal(String(index), "<VectorIndex open>");
+      assert.equal(intValue((await index.info())[":dimensions"]), 2);
+
+      assert.equal(await index.addVec("vec-1", [1.0, 0.0]), index);
+      assert.equal(await index.addVec("vec-2", [0.0, 1.0]), index);
+      assert.equal(await index.vecIndexed("vec-1"), true);
+      assert.deepEqual(await index.searchVec([1.0, 0.0], { ":top": 1 }), ["vec-1"]);
+      assert.deepEqual(await index.searchVec([1.0, 0.0], { ":top": 1, ":display": ":refs+dists" }), [["vec-1", 0.0]]);
+
+      assert.equal(await index.forceCheckpoint(), index);
+      assert.equal(typeof await index.checkpointState(), "object");
+      assert.equal(await reIndex(index), index);
+      assert.deepEqual(await index.searchVec([0.0, 1.0], { ":top": 1 }), ["vec-2"]);
+      assert.equal(await index.removeVec("vec-1"), index);
+      assert.equal(await index.vecIndexed("vec-1"), false);
+
+      assert.equal(await index.clear(), index);
+      assert.equal(await index.closed(), true);
+      assert.equal(String(index), "<VectorIndex closed>");
+
+      const kvIndex = await kv.newVectorIndex(opts);
+      try {
+        assert.equal(intValue((await kvIndex.info())[":size"]), 0);
+      } finally {
+        await kvIndex.close();
+      }
     } finally {
       await kv.close();
     }

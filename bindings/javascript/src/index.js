@@ -24,6 +24,7 @@ export {
   keyword,
   newClient,
   newSearchEngine,
+  newVectorIndex,
   openKv,
   readEdn,
   reIndex,
@@ -47,3 +48,4 @@ export { interop } from "./raw.js";
 export { KV, KVTransaction } from "./kv.js";
 export { SearchEngine, SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";
+export { VectorIndex } from "./vector.js";

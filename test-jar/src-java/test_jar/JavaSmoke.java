@@ -10,6 +10,7 @@ import datalevin.PullSelector;
 import datalevin.RangeSpec;
 import datalevin.Schema;
 import datalevin.Tx;
+import datalevin.VectorIndex;
 
 import java.io.IOException;
 import java.nio.file.Files;
@@ -199,6 +200,34 @@ public final class JavaSmoke {
                         KVType.LONG);
                 if (!List.of(List.of("a", 2L), List.of("a", 3L), List.of("b", 4L)).equals(ranged)) {
                     throw new IllegalStateException("Unexpected visit-list-range result: " + ranged);
+                }
+
+                try (VectorIndex index = Datalevin.newVectorIndex(kv, Datalevin.vectorOptions(2))) {
+                    index.addVec("vec-1", List.of(1.0, 0.0));
+                    index.addVec("vec-2", List.of(0.0, 1.0));
+                    if (!index.vecIndexed("vec-1")) {
+                        throw new IllegalStateException("Vector ref was not indexed");
+                    }
+                    List<?> vectorResult = index.searchVec(List.of(1.0, 0.0), Map.of(":top", 1L));
+                    if (!List.of("vec-1").equals(vectorResult)) {
+                        throw new IllegalStateException("Unexpected vector search result: " + vectorResult);
+                    }
+                    if (!Long.valueOf(2L).equals(index.info().get(Datalevin.kw("dimensions")))) {
+                        throw new IllegalStateException("Unexpected vector index info: " + index.info());
+                    }
+                    index.forceCheckpoint();
+                    if (index.checkpointState() == null) {
+                        throw new IllegalStateException("Missing vector checkpoint state");
+                    }
+                    Datalevin.reIndex(index);
+                    index.removeVec("vec-1");
+                    if (index.vecIndexed("vec-1")) {
+                        throw new IllegalStateException("Vector ref was not removed");
+                    }
+                    index.clear();
+                    if (!index.closed()) {
+                        throw new IllegalStateException("Vector index was not closed after clear");
+                    }
                 }
             }
 
