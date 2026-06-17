@@ -300,6 +300,20 @@ try {
   console.log(await kv.keyRangeListCount("tags", [":all"], {
     kType: ":string"
   }));
+  console.log(await kv.listRangeFilter("tags", (key, value) => (
+    key === "doc-1" && value.startsWith("c")
+  ), [":all"], {
+    kType: ":string",
+    vRange: [":all"],
+    vType: ":string"
+  }));
+  console.log(await kv.listRangeKeep("tags", (key, value) => (
+    value === "db" ? `${key}:${value}` : null
+  ), [":all"], {
+    kType: ":string",
+    vRange: [":all"],
+    vType: ":string"
+  }));
 } finally {
   await kv.close();
 }

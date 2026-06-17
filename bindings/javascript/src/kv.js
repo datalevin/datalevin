@@ -1,6 +1,6 @@
-import { toEdnForm, toJava } from "./convert.js";
+import { toEdnForm, toJava, toJs } from "./convert.js";
 import { _BINDINGS } from "./interop.js";
-import { callJavaMethod } from "./jvm.js";
+import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
 import { toJsResult } from "./result.js";
 
@@ -34,9 +34,45 @@ function rejectVTypeWithoutKType(kType, vType, methodName) {
   }
 }
 
+function requireCallback(fn, methodName) {
+  if (typeof fn !== "function") {
+    throw new TypeError(`callback is required for KV ${methodName}().`);
+  }
+}
+
 function requireRange(value, rangeName, methodName) {
   if (!hasValue(value)) {
     throw new TypeError(`${rangeName} is required for KV ${methodName}().`);
+  }
+}
+
+let interfaceProxyEventLoopDepth = 0;
+let interfaceProxyEventLoopPrevious = false;
+
+async function withInterfaceProxyEventLoop(fn) {
+  const bridge = await javaBridgeModule();
+  if (interfaceProxyEventLoopDepth === 0) {
+    interfaceProxyEventLoopPrevious = bridge.config.runEventLoopWhenInterfaceProxyIsActive;
+    bridge.config.runEventLoopWhenInterfaceProxyIsActive = true;
+  }
+  interfaceProxyEventLoopDepth += 1;
+  try {
+    return await fn();
+  } finally {
+    interfaceProxyEventLoopDepth -= 1;
+    if (interfaceProxyEventLoopDepth === 0) {
+      bridge.config.runEventLoopWhenInterfaceProxyIsActive = interfaceProxyEventLoopPrevious;
+    }
+  }
+}
+
+async function withJavaProxy(interfaceName, implementation, fn) {
+  const { newProxy } = await javaBridgeModule();
+  const proxy = newProxy(interfaceName, implementation);
+  try {
+    return await withInterfaceProxyEventLoop(() => fn(proxy));
+  } finally {
+    proxy.reset?.();
   }
 }
 
@@ -421,6 +457,178 @@ export class KV extends ResourceWrapper {
         ])
       )
     );
+  }
+
+  async visitList(listName, visitor, key, { kType = null, vType = null } = {}) {
+    requireCallback(visitor, "visitList");
+    requireKType(kType, "visitList");
+    requireVType(vType, "visitList");
+    await withJavaProxy(
+      "java.util.function.Consumer",
+      {
+        accept: async (value) => {
+          await visitor(await toJs(value));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisitList(
+        this.rawHandle(),
+        listName,
+        proxy,
+        await toJava(key),
+        kType,
+        vType
+      )
+    );
+  }
+
+  async visitListRange(listName, visitor, kRange, { kType = null, vRange = null, vType = null } = {}) {
+    requireRange(kRange, "kRange", "visitListRange");
+    requireRange(vRange, "vRange", "visitListRange");
+    requireCallback(visitor, "visitListRange");
+    requireKType(kType, "visitListRange");
+    requireVType(vType, "visitListRange");
+    const normalizedKRange = await toEdnForm(kRange);
+    const normalizedVRange = await toEdnForm(vRange);
+    await withJavaProxy(
+      "java.util.function.BiConsumer",
+      {
+        accept: async (key, value) => {
+          await visitor(await toJs(key), await toJs(value));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisitListRange(
+        this.rawHandle(),
+        listName,
+        proxy,
+        normalizedKRange,
+        kType,
+        normalizedVRange,
+        vType
+      )
+    );
+  }
+
+  async listRangeFilter(
+    listName,
+    predicate,
+    kRange,
+    { kType = null, vRange = null, vType = null, limit = null, offset = null } = {}
+  ) {
+    requireRange(kRange, "kRange", "listRangeFilter");
+    requireRange(vRange, "vRange", "listRangeFilter");
+    requireCallback(predicate, "listRangeFilter");
+    requireKType(kType, "listRangeFilter");
+    requireVType(vType, "listRangeFilter");
+    const normalizedKRange = await toEdnForm(kRange);
+    const normalizedVRange = await toEdnForm(vRange);
+    const items = await toJsResult(await withJavaProxy(
+      "java.util.function.BiPredicate",
+      {
+        test: async (key, value) => Boolean(await predicate(await toJs(key), await toJs(value)))
+      },
+      async (proxy) => _BINDINGS.kvListRangeFilter(
+        this.rawHandle(),
+        listName,
+        proxy,
+        normalizedKRange,
+        kType,
+        normalizedVRange,
+        vType
+      )
+    ));
+    return slicePage(items, limit, offset);
+  }
+
+  async listRangeFilterCount(
+    listName,
+    predicate,
+    kRange,
+    { kType = null, vRange = null, vType = null } = {}
+  ) {
+    requireRange(kRange, "kRange", "listRangeFilterCount");
+    requireRange(vRange, "vRange", "listRangeFilterCount");
+    requireCallback(predicate, "listRangeFilterCount");
+    requireKType(kType, "listRangeFilterCount");
+    requireVType(vType, "listRangeFilterCount");
+    const normalizedKRange = await toEdnForm(kRange);
+    const normalizedVRange = await toEdnForm(vRange);
+    return toJsResult(await withJavaProxy(
+      "java.util.function.BiPredicate",
+      {
+        test: async (key, value) => Boolean(await predicate(await toJs(key), await toJs(value)))
+      },
+      async (proxy) => _BINDINGS.kvListRangeFilterCount(
+        this.rawHandle(),
+        listName,
+        proxy,
+        normalizedKRange,
+        kType,
+        normalizedVRange,
+        vType
+      )
+    ));
+  }
+
+  async listRangeKeep(
+    listName,
+    fn,
+    kRange,
+    { kType = null, vRange = null, vType = null, limit = null, offset = null } = {}
+  ) {
+    requireRange(kRange, "kRange", "listRangeKeep");
+    requireRange(vRange, "vRange", "listRangeKeep");
+    requireCallback(fn, "listRangeKeep");
+    requireKType(kType, "listRangeKeep");
+    requireVType(vType, "listRangeKeep");
+    const normalizedKRange = await toEdnForm(kRange);
+    const normalizedVRange = await toEdnForm(vRange);
+    const items = await toJsResult(await withJavaProxy(
+      "java.util.function.BiFunction",
+      {
+        apply: async (key, value) => {
+          const result = await fn(await toJs(key), await toJs(value));
+          return toJava(result === undefined ? null : result);
+        }
+      },
+      async (proxy) => _BINDINGS.kvListRangeKeep(
+        this.rawHandle(),
+        listName,
+        proxy,
+        normalizedKRange,
+        kType,
+        normalizedVRange,
+        vType
+      )
+    ));
+    return slicePage(items, limit, offset);
+  }
+
+  async listRangeSome(listName, fn, kRange, { kType = null, vRange = null, vType = null } = {}) {
+    requireRange(kRange, "kRange", "listRangeSome");
+    requireRange(vRange, "vRange", "listRangeSome");
+    requireCallback(fn, "listRangeSome");
+    requireKType(kType, "listRangeSome");
+    requireVType(vType, "listRangeSome");
+    const normalizedKRange = await toEdnForm(kRange);
+    const normalizedVRange = await toEdnForm(vRange);
+    return toJsResult(await withJavaProxy(
+      "java.util.function.BiFunction",
+      {
+        apply: async (key, value) => {
+          const result = await fn(await toJs(key), await toJs(value));
+          return toJava(result === undefined ? null : result);
+        }
+      },
+      async (proxy) => _BINDINGS.kvListRangeSome(
+        this.rawHandle(),
+        listName,
+        proxy,
+        normalizedKRange,
+        kType,
+        normalizedVRange,
+        vType
+      )
+    ));
   }
 
   async listRange(

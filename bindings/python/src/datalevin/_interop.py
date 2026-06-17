@@ -204,6 +204,60 @@ class InteropBindings:
     def key_value_re_index(self, handle, opts=None):
         return call_java(classes().interop.keyValueReIndex, handle, to_java(opts))
 
+    def kv_visit_list(self, handle, list_name, visitor, key, k_type, v_type):
+        return call_java(classes().interop.kvVisitList, handle, list_name, visitor, to_java(key), k_type, v_type)
+
+    def kv_visit_list_range(self, handle, list_name, visitor, k_range, k_type, v_range, v_type):
+        return call_java(classes().interop.kvVisitListRange, handle, list_name, visitor, k_range, k_type, v_range, v_type)
+
+    def kv_list_range_filter(self, handle, list_name, predicate, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeFilter,
+            handle,
+            list_name,
+            predicate,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
+    def kv_list_range_filter_count(self, handle, list_name, predicate, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeFilterCount,
+            handle,
+            list_name,
+            predicate,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
+    def kv_list_range_keep(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeKeep,
+            handle,
+            list_name,
+            fn,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
+    def kv_list_range_some(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeSome,
+            handle,
+            list_name,
+            fn,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
     def new_search_engine(self, kv, opts=None):
         handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
         return call_java(classes().interop.newSearchEngine, handle, to_java(opts))

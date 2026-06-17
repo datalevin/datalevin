@@ -135,6 +135,64 @@ def test_kv_argument_validation(tmp_path) -> None:
             kv.get_by_rank("items", 0, ignore_key=True)
 
 
+def test_kv_list_functional_operations(tmp_path) -> None:
+    with open_kv(str(tmp_path / "kv-list-fns")) as kv:
+        kv.open_list_dbi("list")
+        kv.put_list_items("list", "a", [1, 2], ":string", ":long")
+        kv.put_list_items("list", "b", [3], ":string", ":long")
+
+        values = []
+        kv.visit_list("list", values.append, "a", ":string", ":long")
+        assert values == [1, 2]
+
+        pairs = []
+        kv.visit_list_range("list", lambda key, value: pairs.append([key, value]), [":all"], ":string", [":all"], ":long")
+        assert pairs == [["a", 1], ["a", 2], ["b", 3]]
+
+        assert kv.list_range_filter(
+            "list",
+            lambda _key, value: value >= 2,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == [["a", 2], ["b", 3]]
+        assert kv.list_range_filter(
+            "list",
+            lambda _key, _value: True,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+            limit=1,
+            offset=1,
+        ) == [["a", 2]]
+        assert kv.list_range_filter_count(
+            "list",
+            lambda key, _value: key == "a",
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == 2
+        assert kv.list_range_keep(
+            "list",
+            lambda key, value: f"{key}:{value}" if value > 1 else None,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == ["a:2", "b:3"]
+        assert kv.list_range_some(
+            "list",
+            lambda key, value: [key, value] if value == 3 else None,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == ["b", 3]
+
+
 def test_kv_operational_methods_cover_wal_snapshots_and_tx_log(tmp_path) -> None:
     with open_kv(str(tmp_path / "kv-ops"), opts={":wal?": True}) as kv:
         kv.open_dbi("items")

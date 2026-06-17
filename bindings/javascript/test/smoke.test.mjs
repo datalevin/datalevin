@@ -539,6 +539,78 @@ test(
 );
 
 test(
+  "kv list functional operations",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-kv-list-fns-"));
+    const kv = await openKv(dir);
+
+    try {
+      await kv.openListDbi("list");
+      await kv.putListItems("list", "a", [1, 2], { kType: ":string", vType: ":long" });
+      await kv.putListItems("list", "b", [3], { kType: ":string", vType: ":long" });
+
+      const values = [];
+      await kv.visitList("list", (value) => {
+        values.push(intValue(value));
+      }, "a", { kType: ":string", vType: ":long" });
+      assert.deepEqual(values, [1, 2]);
+
+      const pairs = [];
+      await kv.visitListRange("list", (key, value) => {
+        pairs.push([key, intValue(value)]);
+      }, [":all"], { kType: ":string", vRange: [":all"], vType: ":long" });
+      assert.deepEqual(pairs, [["a", 1], ["a", 2], ["b", 3]]);
+
+      assert.deepEqual(
+        (await kv.listRangeFilter("list", (_key, value) => intValue(value) >= 2, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 2], ["b", 3]]
+      );
+      assert.deepEqual(
+        (await kv.listRangeFilter("list", () => true, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long",
+          limit: 1,
+          offset: 1
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 2]]
+      );
+      assert.equal(
+        intValue(await kv.listRangeFilterCount("list", (key) => key === "a", [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })),
+        2
+      );
+      assert.deepEqual(
+        await kv.listRangeKeep("list", (key, value) => intValue(value) > 1 ? `${key}:${intValue(value)}` : null, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        }),
+        ["a:2", "b:3"]
+      );
+      assert.deepEqual(
+        (await kv.listRangeSome("list", (key, value) => intValue(value) === 3 ? [key, intValue(value)] : null, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map((value) => typeof value === "bigint" ? intValue(value) : value),
+        ["b", 3]
+      );
+    } finally {
+      await kv.close();
+    }
+  }
+);
+
+test(
   "kv operational methods cover wal snapshots and tx log inspection",
   { skip: !runtimeAvailable, timeout: 30000 },
   async () => {

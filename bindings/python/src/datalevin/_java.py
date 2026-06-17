@@ -32,6 +32,10 @@ class JavaClasses:
     set_type: object
     collection_type: object
     function_type: object
+    consumer_type: object
+    bi_consumer_type: object
+    bi_function_type: object
+    bi_predicate_type: object
     keyword_type: object
     symbol_type: object
 
@@ -59,6 +63,10 @@ def classes() -> JavaClasses:
         set_type=jpype.JClass("java.util.Set"),
         collection_type=jpype.JClass("java.util.Collection"),
         function_type=jpype.JClass("java.util.function.Function"),
+        consumer_type=jpype.JClass("java.util.function.Consumer"),
+        bi_consumer_type=jpype.JClass("java.util.function.BiConsumer"),
+        bi_function_type=jpype.JClass("java.util.function.BiFunction"),
+        bi_predicate_type=jpype.JClass("java.util.function.BiPredicate"),
         keyword_type=jpype.JClass("clojure.lang.Keyword"),
         symbol_type=jpype.JClass("clojure.lang.Symbol"),
     )

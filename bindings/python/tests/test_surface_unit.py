@@ -516,8 +516,12 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "list_count",
         "list_range",
         "list_range_count",
+        "list_range_filter",
+        "list_range_filter_count",
         "list_range_first",
         "list_range_first_n",
+        "list_range_keep",
+        "list_range_some",
         "list_snapshots",
         "new_search_engine",
         "new_vector_index",
@@ -532,6 +536,8 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "sync",
         "transaction",
         "tx_log_watermarks",
+        "visit_list",
+        "visit_list_range",
         "with_transaction",
     ]:
         assert callable(getattr(kv_module.KV, method))

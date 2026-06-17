@@ -266,6 +266,26 @@ with open_kv("/tmp/dtlv-py-kv") as kv:
     print(kv.list_range_first_n("tags", 2, [":all"], ":string", [":all"], ":string"))
     print(kv.list_range_count("tags", [":all"], ":string"))
     print(kv.key_range_list_count("tags", [":all"], ":string"))
+    print(
+        kv.list_range_filter(
+            "tags",
+            lambda key, value: key == "doc-1" and value.startswith("c"),
+            [":all"],
+            ":string",
+            [":all"],
+            ":string",
+        )
+    )
+    print(
+        kv.list_range_keep(
+            "tags",
+            lambda key, value: f"{key}:{value}" if value == "db" else None,
+            [":all"],
+            ":string",
+            [":all"],
+            ":string",
+        )
+    )
 ```
 
 ## Operational Example

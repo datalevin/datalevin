@@ -9,6 +9,10 @@ import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import java.util.function.Consumer;
+import java.util.function.BiConsumer;
+import java.util.function.BiFunction;
+import java.util.function.BiPredicate;
 
 /**
  * Small bridge-oriented interop layer for non-Java bindings.
@@ -969,6 +973,112 @@ public final class DatalevinInterop {
         return DatalevinForms.typeInput(value);
     }
 
+    public static void kvVisitList(Object kv,
+                                   String listName,
+                                   Consumer<Object> visitor,
+                                   Object key,
+                                   Object kType,
+                                   Object vType) {
+        ClojureRuntime.core("visit-list",
+                            runtimeArg(kv),
+                            listName,
+                            ClojureFns.consumer(visitor),
+                            ClojureCodec.runtimeInput(key),
+                            typeInput(kType),
+                            typeInput(vType),
+                            false);
+    }
+
+    public static void kvVisitListRange(Object kv,
+                                        String listName,
+                                        BiConsumer<Object, Object> visitor,
+                                        Object kRange,
+                                        Object kType,
+                                        Object vRange,
+                                        Object vType) {
+        ClojureRuntime.core("visit-list-range",
+                            runtimeArg(kv),
+                            listName,
+                            ClojureFns.biConsumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            rangeInput(vRange, vType),
+                            typeInput(vType),
+                            false);
+    }
+
+    public static List<?> kvListRangeFilter(Object kv,
+                                            String listName,
+                                            BiPredicate<Object, Object> predicate,
+                                            Object kRange,
+                                            Object kType,
+                                            Object vRange,
+                                            Object vType) {
+        return ResultSupport.sequence(ClojureRuntime.core("list-range-filter",
+                                                          runtimeArg(kv),
+                                                          listName,
+                                                          ClojureFns.biPredicate(predicate),
+                                                          rangeInput(kRange, kType),
+                                                          typeInput(kType),
+                                                          rangeInput(vRange, vType),
+                                                          typeInput(vType),
+                                                          false));
+    }
+
+    public static long kvListRangeFilterCount(Object kv,
+                                              String listName,
+                                              BiPredicate<Object, Object> predicate,
+                                              Object kRange,
+                                              Object kType,
+                                              Object vRange,
+                                              Object vType) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("list-range-filter-count",
+                                                         runtimeArg(kv),
+                                                         listName,
+                                                         ClojureFns.biPredicate(predicate),
+                                                         rangeInput(kRange, kType),
+                                                         typeInput(kType),
+                                                         rangeInput(vRange, vType),
+                                                         typeInput(vType),
+                                                         false));
+    }
+
+    public static List<?> kvListRangeKeep(Object kv,
+                                          String listName,
+                                          BiFunction<Object, Object, ?> fn,
+                                          Object kRange,
+                                          Object kType,
+                                          Object vRange,
+                                          Object vType) {
+        return ResultSupport.sequence(ClojureRuntime.core("list-range-keep",
+                                                          runtimeArg(kv),
+                                                          listName,
+                                                          ClojureFns.biFunction(fn),
+                                                          rangeInput(kRange, kType),
+                                                          typeInput(kType),
+                                                          rangeInput(vRange, vType),
+                                                          typeInput(vType),
+                                                          false));
+    }
+
+    public static Object kvListRangeSome(Object kv,
+                                         String listName,
+                                         BiFunction<Object, Object, ?> fn,
+                                         Object kRange,
+                                         Object kType,
+                                         Object vRange,
+                                         Object vType) {
+        return ClojureRuntime.core("list-range-some",
+                                   runtimeArg(kv),
+                                   listName,
+                                   ClojureFns.biFunction(fn),
+                                   rangeInput(kRange, kType),
+                                   typeInput(kType),
+                                   rangeInput(vRange, vType),
+                                   typeInput(vType),
+                                   false);
+    }
+
     /**
      * Normalizes a database type string into the raw Clojure form expected by
      * the client API.
@@ -1008,13 +1118,28 @@ public final class DatalevinInterop {
         Object[] normalized = new Object[args.size()];
         int i = 0;
         for (Object arg : args) {
-            if (arg instanceof HandleResource handle) {
-                normalized[i++] = ClojureCodec.runtimeInput(handle.handle());
-            } else {
-                normalized[i++] = ClojureCodec.runtimeInput(arg);
-            }
+            normalized[i++] = runtimeArg(arg);
         }
         return normalized;
+    }
+
+    private static Object runtimeArg(Object arg) {
+        if (arg instanceof HandleResource handle) {
+            return ClojureCodec.runtimeInput(handle.handle());
+        }
+        return ClojureCodec.runtimeInput(arg);
+    }
+
+    private static Object typeInput(Object type) {
+        return DatalevinForms.typeInput(type);
+    }
+
+    private static Object rangeInput(Object range, Object type) {
+        Object normalizedType = typeInput(type);
+        if (range instanceof RangeSpec spec) {
+            return DatalevinForms.rangeInput(spec.build(), normalizedType);
+        }
+        return DatalevinForms.rangeInput((List<?>) range, normalizedType);
     }
 
     private static CompletableFuture<Object> derefFuture(Object future,

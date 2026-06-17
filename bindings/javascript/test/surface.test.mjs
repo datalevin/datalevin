@@ -163,8 +163,12 @@ test("public surface stays importable without starting the JVM", () => {
     "listCount",
     "listRange",
     "listRangeCount",
+    "listRangeFilter",
+    "listRangeFilterCount",
     "listRangeFirst",
     "listRangeFirstN",
+    "listRangeKeep",
+    "listRangeSome",
     "listSnapshots",
     "newSearchEngine",
     "newVectorIndex",
@@ -178,6 +182,8 @@ test("public surface stays importable without starting the JVM", () => {
     "sync",
     "transaction",
     "txLogWatermarks",
+    "visitList",
+    "visitListRange",
     "withTransaction"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");

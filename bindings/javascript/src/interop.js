@@ -426,6 +426,95 @@ class InteropBindings {
     );
   }
 
+  async kvVisitList(handle, listName, visitor, key, kType, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitList",
+      await unwrapInteropHandle(handle),
+      listName,
+      visitor,
+      await toJava(key),
+      await toJava(kType),
+      await toJava(vType)
+    );
+  }
+
+  async kvVisitListRange(handle, listName, visitor, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitListRange",
+      await unwrapInteropHandle(handle),
+      listName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeFilter(handle, listName, predicate, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeFilter",
+      await unwrapInteropHandle(handle),
+      listName,
+      predicate,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeFilterCount(handle, listName, predicate, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeFilterCount",
+      await unwrapInteropHandle(handle),
+      listName,
+      predicate,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeKeep(handle, listName, fn, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeKeep",
+      await unwrapInteropHandle(handle),
+      listName,
+      fn,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeSome(handle, listName, fn, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeSome",
+      await unwrapInteropHandle(handle),
+      listName,
+      fn,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
   async newSearchEngine(kv, opts = null) {
     const cls = await classes();
     return callJavaMethod(

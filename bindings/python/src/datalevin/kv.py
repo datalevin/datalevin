@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import jpype
+
 from ._convert import to_edn_form, to_java, to_python
 from ._interop import _BINDINGS
+from ._java import classes
 from ._resource import ResourceWrapper
 
 
@@ -24,6 +27,11 @@ def _require_v_type(v_type, op):
         raise ValueError(f"v_type is required for KV {op}().")
 
 
+def _require_callable(fn, op):
+    if not callable(fn):
+        raise TypeError(f"callback is required for KV {op}().")
+
+
 def _reject_v_type_without_k_type(k_type, v_type, op):
     if v_type is not None and k_type is None:
         raise ValueError(f"v_type requires k_type for KV {op}().")
@@ -39,6 +47,54 @@ def _append_typed_args(args, *, k_type=None, v_type=None, ignore_key=None, op):
         args.append(_BINDINGS.kv_type(v_type))
     if ignore_key is not None:
         args.append(bool(ignore_key))
+
+
+class _PythonConsumer:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def accept(self, value):
+        self._fn(to_python(value))
+
+
+class _PythonBiConsumer:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def accept(self, key, value):
+        self._fn(to_python(key), to_python(value))
+
+
+class _PythonBiPredicate:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def test(self, key, value):
+        return bool(self._fn(to_python(key), to_python(value)))
+
+
+class _PythonBiFunction:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def apply(self, key, value):
+        return to_java(self._fn(to_python(key), to_python(value)))
+
+
+def _consumer_proxy(fn):
+    return jpype.JProxy(classes().consumer_type, inst=_PythonConsumer(fn))
+
+
+def _bi_consumer_proxy(fn):
+    return jpype.JProxy(classes().bi_consumer_type, inst=_PythonBiConsumer(fn))
+
+
+def _bi_predicate_proxy(fn):
+    return jpype.JProxy(classes().bi_predicate_type, inst=_PythonBiPredicate(fn))
+
+
+def _bi_function_proxy(fn):
+    return jpype.JProxy(classes().bi_function_type, inst=_PythonBiFunction(fn))
 
 
 class KV(ResourceWrapper):
@@ -302,6 +358,125 @@ class KV(ResourceWrapper):
                     _BINDINGS.kv_type(k_type),
                     _BINDINGS.kv_type(v_type),
                 ],
+            )
+        )
+
+    def visit_list(self, list_name, visitor, key, k_type, v_type):
+        _require_callable(visitor, "visit_list")
+        _require_k_type(k_type, "visit_list")
+        _require_v_type(v_type, "visit_list")
+        _BINDINGS.kv_visit_list(
+            self.raw_handle(),
+            list_name,
+            _consumer_proxy(visitor),
+            to_java(key),
+            k_type,
+            v_type,
+        )
+
+    def visit_list_range(self, list_name, visitor, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV visit_list_range().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV visit_list_range().")
+        _require_callable(visitor, "visit_list_range")
+        _require_k_type(k_type, "visit_list_range")
+        _require_v_type(v_type, "visit_list_range")
+        _BINDINGS.kv_visit_list_range(
+            self.raw_handle(),
+            list_name,
+            _bi_consumer_proxy(visitor),
+            to_edn_form(k_range),
+            k_type,
+            to_edn_form(v_range),
+            v_type,
+        )
+
+    def list_range_filter(self, list_name, predicate, k_range, k_type, v_range, v_type, limit=None, offset=None):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_filter().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_filter().")
+        _require_callable(predicate, "list_range_filter")
+        _require_k_type(k_type, "list_range_filter")
+        _require_v_type(v_type, "list_range_filter")
+        return _slice_page(
+            to_python(
+                _BINDINGS.kv_list_range_filter(
+                    self.raw_handle(),
+                    list_name,
+                    _bi_predicate_proxy(predicate),
+                    to_edn_form(k_range),
+                    k_type,
+                    to_edn_form(v_range),
+                    v_type,
+                )
+            ),
+            limit,
+            offset,
+        )
+
+    def list_range_filter_count(self, list_name, predicate, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_filter_count().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_filter_count().")
+        _require_callable(predicate, "list_range_filter_count")
+        _require_k_type(k_type, "list_range_filter_count")
+        _require_v_type(v_type, "list_range_filter_count")
+        return to_python(
+            _BINDINGS.kv_list_range_filter_count(
+                self.raw_handle(),
+                list_name,
+                _bi_predicate_proxy(predicate),
+                to_edn_form(k_range),
+                k_type,
+                to_edn_form(v_range),
+                v_type,
+            )
+        )
+
+    def list_range_keep(self, list_name, fn, k_range, k_type, v_range, v_type, limit=None, offset=None):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_keep().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_keep().")
+        _require_callable(fn, "list_range_keep")
+        _require_k_type(k_type, "list_range_keep")
+        _require_v_type(v_type, "list_range_keep")
+        return _slice_page(
+            to_python(
+                _BINDINGS.kv_list_range_keep(
+                    self.raw_handle(),
+                    list_name,
+                    _bi_function_proxy(fn),
+                    to_edn_form(k_range),
+                    k_type,
+                    to_edn_form(v_range),
+                    v_type,
+                )
+            ),
+            limit,
+            offset,
+        )
+
+    def list_range_some(self, list_name, fn, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_some().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_some().")
+        _require_callable(fn, "list_range_some")
+        _require_k_type(k_type, "list_range_some")
+        _require_v_type(v_type, "list_range_some")
+        return to_python(
+            _BINDINGS.kv_list_range_some(
+                self.raw_handle(),
+                list_name,
+                _bi_function_proxy(fn),
+                to_edn_form(k_range),
+                k_type,
+                to_edn_form(v_range),
+                v_type,
             )
         )
 
