@@ -971,14 +971,16 @@
 
 (defn- ha-follower-gap-error?
   [e]
-  (contains? #{:ha/txlog-gap
-               :ha/txlog-source-behind
-               :ha/txlog-source-authority-mismatch
-               :ha/txlog-non-contiguous
-               :ha/txlog-record-invalid-term
-               :ha/txlog-divergent-local-record
-               :ha/txlog-gap-unresolved}
-             (:error (ex-data e))))
+  (let [data (ex-data e)]
+    (or (= :txlog/not-enabled (:type data))
+        (contains? #{:ha/txlog-gap
+                     :ha/txlog-source-behind
+                     :ha/txlog-source-authority-mismatch
+                     :ha/txlog-non-contiguous
+                     :ha/txlog-record-invalid-term
+                     :ha/txlog-divergent-local-record
+                     :ha/txlog-gap-unresolved}
+                   (:error data)))))
 
 (defn- collect-ha-gap-actual-lsns
   [x]
