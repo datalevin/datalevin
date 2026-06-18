@@ -60,6 +60,7 @@ but not staged mutation of entity objects. Use transaction maps/builders instead
 | Range helpers: range count, key range, key range count | Yes | Yes | Yes | Yes |
 | Rank/sample helpers: first, first N, rank, by-rank, entry by-rank, sample | Yes | Yes | Yes | Yes |
 | Stats, copy, sync | Yes | Yes | Yes | Yes |
+| Runtime env flag read/mutation | Yes | Yes | Yes | Yes |
 | KV transaction callback | Yes, `with-transaction-kv` | Yes, `withTransaction` | Yes, `with_transaction` | Yes, `withTransaction` |
 | Explicit KV begin/commit/abort | Partial, lower-level storage primitives | Yes, `KVTransaction` | Yes, `KVTransaction` | Yes, `KVTransaction` |
 | KV re-index | Yes | Yes | Yes | Yes |

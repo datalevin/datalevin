@@ -133,6 +133,15 @@ final class DatalevinForms {
         return optionsMap(opts);
     }
 
+    static Object envFlagsInput(Collection<?> flags) {
+        Objects.requireNonNull(flags, "flags");
+        ArrayList<Object> converted = new ArrayList<>(flags.size());
+        for (Object flag : flags) {
+            converted.add(envFlagInput(flag));
+        }
+        return PersistentHashSet.create(converted);
+    }
+
     static Object udfDescriptorInput(Map<?, ?> descriptor) {
         if (descriptor == null) {
             return null;
@@ -471,6 +480,19 @@ final class DatalevinForms {
             return stripLeadingColon(s);
         }
         return null;
+    }
+
+    private static Object envFlagInput(Object flag) {
+        if (flag instanceof Keyword) {
+            return flag;
+        }
+        if (flag instanceof String s) {
+            return ClojureCodec.keyword(s);
+        }
+        if (flag instanceof EdnLiteral literal) {
+            return ClojureRuntime.readEdn(literal.value());
+        }
+        return ClojureCodec.runtimeInput(flag);
     }
 
     private static Object txVector(Collection<?> collection) {

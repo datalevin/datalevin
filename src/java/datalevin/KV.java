@@ -1,9 +1,11 @@
 package datalevin;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Set;
 import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
@@ -1140,6 +1142,27 @@ public class KV extends HandleResource {
      */
     public void sync(long force) {
         ClojureRuntime.core("sync", resource(), force);
+    }
+
+    /**
+     * Sets or clears LMDB environment flags for this KV store.
+     *
+     * <p>Flags may be strings with or without a leading colon, or Clojure
+     * keyword values.
+     */
+    public void setEnvFlags(Collection<?> flags, boolean onOff) {
+        ClojureRuntime.core("set-env-flags",
+                            resource(),
+                            DatalevinForms.envFlagsInput(flags),
+                            onOff);
+    }
+
+    /**
+     * Returns the LMDB environment flags currently in effect.
+     */
+    @SuppressWarnings("unchecked")
+    public Set<?> getEnvFlags() {
+        return (Set<?>) ClojureRuntime.core("get-env-flags", resource());
     }
 
     /**

@@ -8,7 +8,7 @@ from decimal import Decimal
 import uuid as py_uuid
 
 import jpype
-from jpype.types import JByte, JLong
+from jpype.types import JBoolean, JByte, JLong
 
 from ._java import call_java, classes, is_java_object
 
@@ -20,8 +20,10 @@ FORM_SYMBOL_STRINGS = {"*", "...", ".", "$", "%", "_"}
 def to_java(value):
     """Recursively convert Python values into Java/JVM-friendly values."""
 
-    if value is None or isinstance(value, (bool, float, str)):
+    if value is None or isinstance(value, (float, str)):
         return value
+    if isinstance(value, bool):
+        return JBoolean(value)
     if is_java_object(value):
         return value
 

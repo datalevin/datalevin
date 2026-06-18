@@ -96,6 +96,15 @@ public final class JavaSmoke {
             }
 
             try (KV kv = Datalevin.openKV(dir.resolve("kv").toString())) {
+                kv.setEnvFlags(List.of("nosync"), true);
+                if (!kv.getEnvFlags().contains(Datalevin.kw("nosync"))) {
+                    throw new IllegalStateException("Expected :nosync env flag after set: " + kv.getEnvFlags());
+                }
+                Datalevin.setEnvFlags(kv, List.of(":nosync"), false);
+                if (Datalevin.getEnvFlags(kv).contains(Datalevin.kw("nosync"))) {
+                    throw new IllegalStateException("Unexpected :nosync env flag after clear: " + kv.getEnvFlags());
+                }
+
                 kv.openListDbi("list");
                 kv.putListItems("list", "a", List.of(1L, 2L, 3L), KVType.STRING, KVType.LONG);
                 kv.putListItems("list", "b", List.of(4L, 5L), KVType.STRING, KVType.LONG);

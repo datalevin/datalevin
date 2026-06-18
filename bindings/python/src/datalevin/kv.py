@@ -37,6 +37,18 @@ def _reject_v_type_without_k_type(k_type, v_type, op):
         raise ValueError(f"v_type requires k_type for KV {op}().")
 
 
+def _env_flags(flags):
+    if isinstance(flags, str):
+        items = [flags]
+    else:
+        items = list(flags)
+    result = set()
+    for flag in items:
+        text = str(flag)
+        result.add(_BINDINGS.keyword(text if text.startswith(":") else f":{text}"))
+    return result
+
+
 def _append_typed_args(args, *, k_type=None, v_type=None, ignore_key=None, op):
     _reject_v_type_without_k_type(k_type, v_type, op)
     if ignore_key is not None and (k_type is None or v_type is None):
@@ -156,6 +168,14 @@ class KV(ResourceWrapper):
         if force is not None:
             args.append(force)
         return to_python(_BINDINGS.core_invoke("sync", args))
+
+    def set_env_flags(self, flags, on_off):
+        return to_python(
+            _BINDINGS.core_invoke("set-env-flags", [self.raw_handle(), _env_flags(flags), True if on_off else None])
+        )
+
+    def get_env_flags(self):
+        return to_python(_BINDINGS.core_invoke("get-env-flags", [self.raw_handle()]))
 
     def tx_log_watermarks(self):
         return to_python(_BINDINGS.core_invoke("txlog-watermarks", [self.raw_handle()]))

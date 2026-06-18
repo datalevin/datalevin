@@ -4,6 +4,7 @@ import datalevin.llm.LlamaEmbedder;
 import datalevin.llm.LlamaGenerator;
 
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -285,6 +286,22 @@ public final class Datalevin {
     public static <T> T withTransaction(KV kv, Function<KV, T> fn) {
         Objects.requireNonNull(kv, "kv");
         return kv.withTransaction(fn);
+    }
+
+    /**
+     * Sets or clears LMDB environment flags for a KV store.
+     */
+    public static void setEnvFlags(KV kv, Collection<?> flags, boolean onOff) {
+        Objects.requireNonNull(kv, "kv");
+        kv.setEnvFlags(flags, onOff);
+    }
+
+    /**
+     * Returns the LMDB environment flags currently in effect for a KV store.
+     */
+    public static Set<?> getEnvFlags(KV kv) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.getEnvFlags();
     }
 
     /**

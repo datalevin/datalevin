@@ -514,6 +514,11 @@ test(
       assert.equal(intValue(await kv.listCount("list", "a", { kType: ":string" })), 0);
 
       await kv.sync();
+      await kv.setEnvFlags(new Set(["nosync"]), true);
+      assert.equal((await kv.getEnvFlags()).has(":nosync"), true);
+      await kv.setEnvFlags([":nosync"], false);
+      assert.equal((await kv.getEnvFlags()).has(":nosync"), false);
+
       const copyDir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-kv-copy-"));
       fs.rmSync(copyDir, { recursive: true, force: true });
       await kv.copy(copyDir);

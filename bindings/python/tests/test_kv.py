@@ -100,6 +100,11 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
         assert kv.list_count("list", "a", ":string") == 0
 
         kv.sync()
+        kv.set_env_flags({"nosync"}, True)
+        assert ":nosync" in kv.get_env_flags()
+        kv.set_env_flags([":nosync"], False)
+        assert ":nosync" not in kv.get_env_flags()
+
         copy_dir = tmp_path / "kv-copy"
         kv.copy(str(copy_dir))
         assert copy_dir.exists()

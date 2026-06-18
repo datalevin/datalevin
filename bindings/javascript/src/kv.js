@@ -34,6 +34,16 @@ function rejectVTypeWithoutKType(kType, vType, methodName) {
   }
 }
 
+async function envFlags(flags) {
+  const items = typeof flags === "string" ? [flags] : [...flags];
+  const result = new Set();
+  for (const flag of items) {
+    const text = String(flag);
+    result.add(await _BINDINGS.keyword(text.startsWith(":") ? text : `:${text}`));
+  }
+  return result;
+}
+
 function requireCallback(fn, methodName) {
   if (typeof fn !== "function") {
     throw new TypeError(`callback is required for KV ${methodName}().`);
@@ -206,6 +216,16 @@ export class KV extends ResourceWrapper {
       args.push(force);
     }
     return toJsResult(await _BINDINGS.coreInvoke("sync", args));
+  }
+
+  async setEnvFlags(flags, onOff) {
+    return toJsResult(
+      await _BINDINGS.coreInvoke("set-env-flags", [this.rawHandle(), await envFlags(flags), onOff ? true : null])
+    );
+  }
+
+  async getEnvFlags() {
+    return toJsResult(await _BINDINGS.coreInvoke("get-env-flags", [this.rawHandle()]));
   }
 
   async txLogWatermarks() {
