@@ -376,6 +376,12 @@
 (def ^:redef close-ha-snapshot-remote-store!
   i/close-kv)
 
+(defn- ha-snapshot-remote-open-opts
+  [timeout-ms]
+  {:wal? true
+   :client-opts {:pool-size 1
+                 :time-out timeout-ms}})
+
 (defn- safe-fetch-ha-endpoint-watermark-lsn
   [db-name m endpoint]
   (try
@@ -2024,8 +2030,7 @@
                                                   c/*ha-lease-renew-ms*))))))
           remote-store (open-ha-snapshot-remote-store!
                         uri
-                        {:client-opts {:pool-size 1
-                                       :time-out timeout-ms}})]
+                        (ha-snapshot-remote-open-opts timeout-ms))]
       (try
         (let [copy-meta (copy-ha-remote-store! remote-store dest-dir false)]
           (when-let [pin-id (get-in copy-meta [:backup-pin :pin-id])]

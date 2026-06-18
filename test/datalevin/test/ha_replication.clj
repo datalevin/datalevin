@@ -1,6 +1,7 @@
 (ns datalevin.test.ha-replication
   (:require
    [clojure.test :refer [deftest is]]
+   [datalevin.ha.client-cache :as cache]
    [datalevin.ha.replication :as repl]))
 
 (deftest txlog-not-enabled-source-enters-gap-bootstrap-path-test
@@ -34,3 +35,13 @@
         (is (= :ha/txlog-gap-unresolved (:error data)))
         (is (= :txlog/not-enabled
                (get-in data [:gap-errors 0 :data :type])))))))
+
+(deftest ha-internal-kv-source-open-enables-wal-test
+  (is (= {:wal? true}
+         (#'cache/ha-kv-open-opts))))
+
+(deftest ha-snapshot-copy-source-open-enables-wal-test
+  (is (= {:wal? true
+          :client-opts {:pool-size 1
+                        :time-out 2500}}
+         (#'repl/ha-snapshot-remote-open-opts 2500))))
