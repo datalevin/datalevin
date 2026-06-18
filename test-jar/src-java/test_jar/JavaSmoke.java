@@ -68,6 +68,19 @@ public final class JavaSmoke {
                     throw new IllegalStateException("Unexpected adult query result: " + adults);
                 }
 
+                try (Connection other = Datalevin.createConn(
+                        dir.resolve("other").toString(),
+                        Datalevin.schema().attr("name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
+                    other.transact(List.of(Map.of(":db/id", -1L, "name", "Eve")));
+                    Object sourceResult = conn.query(
+                            "[:find [?name ...] :in $ $other :where "
+                                    + "[$ ?e :name \"Alice\"] [$other ?x :name ?name]]",
+                            other);
+                    if (!List.of("Eve").equals(sourceResult)) {
+                        throw new IllegalStateException("Unexpected multi-source query result: " + sourceResult);
+                    }
+                }
+
                 List<?> keyed = conn.queryKeyed(keyedQuery);
                 if (keyed.size() != 2) {
                     throw new IllegalStateException("Unexpected keyed query fields: " + keyed);

@@ -102,6 +102,7 @@ test(
   { skip: !runtimeAvailable, timeout: 30000 },
   async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-conn-"));
+    const otherDir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-conn-other-"));
     const conn = await connect(dir, {
       schema: {
         ":name": schemaAttr({
@@ -117,8 +118,14 @@ test(
         ":friend": schemaAttr({ valueType: ":db.type/ref" })
       }
     });
+    let otherConn = null;
 
     try {
+      otherConn = await connect(otherDir, {
+        schema: {
+          ":name": schemaAttr({ valueType: ":db.type/string" })
+        }
+      });
       assert.equal(String(conn), "<Connection open>");
       assert.equal(await conn.closed(), false);
 
@@ -137,6 +144,9 @@ test(
           ":bio": "Bob writes migration tools",
           ":status": await keyword(":draft")
         })
+      ]);
+      await otherConn.transact([
+        { ":db/id": -1, ":name": "Cara" }
       ]);
       await conn.unlisten(listenerKey);
       const asyncTx = await conn.transactAsync([
@@ -160,6 +170,10 @@ test(
         ":where",
         ["?e", "?attr", "?value"]
       ], ":name", "Ada");
+      const namesFromOtherSource = await conn.query(
+        "[:find [?name ...] :in $ $other :where [$ ?e :name \"Ada\"] [$other ?x :name ?name]]",
+        otherConn
+      );
       const explain = await conn.explain("[:find ?e :where [?e :name _]]");
 
       await conn.updateSchema({
@@ -231,9 +245,13 @@ test(
       assert.equal(await (await datalogKv(conn)).dir(), dir);
       assert.deepEqual([...namesFromString].sort(), ["Ada", "Bob"]);
       assert.equal(intValue(entidFromForm), 1);
+      assert.deepEqual(namesFromOtherSource, ["Cara"]);
       assert.equal(":plan" in explain, true);
       assert.equal(":age" in await conn.schema(), false);
     } finally {
+      if (otherConn !== null) {
+        await otherConn.close();
+      }
       await conn.close();
     }
 

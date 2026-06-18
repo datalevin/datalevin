@@ -71,6 +71,12 @@ class Connection(ResourceWrapper):
         self._listeners.clear()
         super().close()
 
+    @staticmethod
+    def _query_input(value):
+        if isinstance(value, Connection):
+            return _BINDINGS.connection_db(value.raw_handle())
+        return to_query_input(value)
+
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
 
@@ -123,13 +129,13 @@ class Connection(ResourceWrapper):
 
     def query(self, query, *inputs):
         db = _BINDINGS.connection_db(self.raw_handle())
-        args = [_edn_form(query), db, *(to_query_input(value) for value in inputs)]
+        args = [_edn_form(query), db, *(self._query_input(value) for value in inputs)]
         return to_python(_BINDINGS.core_invoke("q", args))
 
     def explain(self, query, *inputs, opts_edn=None):
         db = _BINDINGS.connection_db(self.raw_handle())
         opts = None if opts_edn is None else _edn_form(opts_edn)
-        args = [opts, _edn_form(query), db, *(to_query_input(value) for value in inputs)]
+        args = [opts, _edn_form(query), db, *(self._query_input(value) for value in inputs)]
         return to_python(_BINDINGS.core_invoke("explain", args))
 
     def transact(self, tx_data, tx_meta=None):

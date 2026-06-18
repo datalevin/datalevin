@@ -890,6 +890,13 @@ public final class Connection extends HandleResource {
         return ClojureRuntime.core("db", resource());
     }
 
+    private static Object queryInput(Object input) {
+        if (input instanceof Connection conn) {
+            return conn.db();
+        }
+        return ClojureCodec.runtimeInput(input);
+    }
+
     private Object store() {
         return ClojureRuntime.invoke("clojure.core",
                                      "get",
@@ -924,7 +931,7 @@ public final class Connection extends HandleResource {
                     : ClojureRuntime.core("q", queryForm);
         }
         if (inputCount == 1) {
-            Object input = ClojureCodec.runtimeInput(inputs.get(0));
+            Object input = queryInput(inputs.get(0));
             return includeDb ? ClojureRuntime.core("q", queryForm, db(), input)
                     : ClojureRuntime.core("q", queryForm, input);
         }
@@ -936,7 +943,7 @@ public final class Connection extends HandleResource {
             args[1] = db();
         }
         for (int i = 0; i < inputCount; i++) {
-            args[base + i] = ClojureCodec.runtimeInput(inputs.get(i));
+            args[base + i] = queryInput(inputs.get(i));
         }
         return ClojureRuntime.core("q", args);
     }
@@ -952,7 +959,7 @@ public final class Connection extends HandleResource {
                     : ClojureRuntime.core("explain", opts, queryForm);
         }
         if (inputCount == 1) {
-            Object input = ClojureCodec.runtimeInput(inputs.get(0));
+            Object input = queryInput(inputs.get(0));
             return includeDb ? ClojureRuntime.core("explain", opts, queryForm, db(), input)
                     : ClojureRuntime.core("explain", opts, queryForm, input);
         }
@@ -965,7 +972,7 @@ public final class Connection extends HandleResource {
             args[2] = db();
         }
         for (int i = 0; i < inputCount; i++) {
-            args[base + i] = ClojureCodec.runtimeInput(inputs.get(i));
+            args[base + i] = queryInput(inputs.get(i));
         }
         return ClojureRuntime.core("explain", args);
     }

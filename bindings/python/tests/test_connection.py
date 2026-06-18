@@ -22,6 +22,7 @@ pytestmark = pytest.mark.usefixtures("require_runtime")
 
 def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
     db_dir = tmp_path / "db"
+    other_dir = tmp_path / "other-db"
     with connect(
         str(db_dir),
         schema={
@@ -37,7 +38,10 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             ":status": schema_attr(value_type=":db.type/keyword"),
             ":friend": schema_attr(value_type=":db.type/ref"),
         },
-    ) as conn:
+    ) as conn, connect(
+        str(other_dir),
+        schema={":name": schema_attr(value_type=":db.type/string")},
+    ) as other_conn:
         assert repr(conn) == "<Connection open>"
         assert conn.closed() is False
 
@@ -65,6 +69,7 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
                 ),
             ]
         )
+        other_conn.transact([tx_entity(-1, {":name": "Cara"})])
         conn.unlisten(listener_key)
         async_report = conn.transact_async(
             [{":db/id": -3, ":bio": "Async transactions help ingestion"}]
@@ -120,6 +125,11 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             ":name",
             "Ada",
         ) == 1
+        assert conn.query(
+            "[:find [?name ...] :in $ $other :where "
+            "[$ ?e :name \"Ada\"] [$other ?x :name ?name]]",
+            other_conn,
+        ) == ["Cara"]
 
         explain = conn.explain("[:find ?e :where [?e :name _]]")
         assert ":plan" in explain

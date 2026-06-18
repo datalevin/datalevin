@@ -17,6 +17,7 @@ Status key:
 | --- | --- | --- | --- | --- |
 | Open local Datalog connection | Yes | Yes | Yes | Yes |
 | Query, pull, explain | Yes | Yes | Yes | Yes |
+| Multiple source databases in `q` / `explain` | Yes | Yes, pass `Connection` sources | Yes, pass `Connection` sources | Yes, pass `Connection` sources |
 | Synchronous transaction | Yes | Yes | Yes | Yes |
 | Async transaction | Yes | Yes, `CompletableFuture` | Yes, `Future` | Yes, `Promise` |
 | Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
@@ -46,6 +47,10 @@ JavaScript alternatives are:
 The Clojure transactable entity API lets an existing entity stage associative
 updates and be transacted later. Non-Clojure bindings expose lazy entity reads,
 but not staged mutation of entity objects. Use transaction maps/builders instead.
+
+For multiple source database queries in non-Clojure bindings, pass another
+`Connection` object as the source input corresponding to the extra `$` symbol.
+Direct DB snapshot access remains an interop/compatibility detail.
 
 ## KV
 
