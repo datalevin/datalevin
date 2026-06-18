@@ -358,10 +358,14 @@
    (when (ha-client-cache-prune-due? m-or-state now-ms)
      (schedule-ha-client-cache-prune! m-or-state protected-entry))))
 
+(defn- ha-kv-open-opts
+  []
+  {:wal? true})
+
 (defn ^:redef open-ha-client
   [uri db-name client-opts]
   (let [client (cl/new-client uri client-opts)]
-    (cl/open-database client db-name c/db-store-kv)
+    (cl/open-database client db-name c/db-store-kv (ha-kv-open-opts))
     client))
 
 (defn ^:redef ha-client-request
