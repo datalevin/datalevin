@@ -645,6 +645,7 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "del_list_items",
         "gc_tx_log_segments",
         "get_by_rank",
+        "get_entry_by_rank",
         "get_first",
         "get_first_n",
         "get_list",

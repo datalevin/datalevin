@@ -230,11 +230,40 @@ class KV(ResourceWrapper):
 
     def get_by_rank(self, dbi_name, rank, k_type=None, v_type=None, ignore_key=None):
         args = [self.raw_handle(), dbi_name, rank]
+        _reject_v_type_without_k_type(k_type, v_type, "get_by_rank")
+        if k_type is not None and v_type is not None:
+            return to_python(
+                _BINDINGS.kv_get_by_rank(
+                    self.raw_handle(),
+                    dbi_name,
+                    rank,
+                    k_type,
+                    v_type,
+                    True if ignore_key is None else bool(ignore_key),
+                )
+            )
         _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="get_by_rank")
         return to_python(_BINDINGS.core_invoke("get-by-rank", args))
 
+    def get_entry_by_rank(self, dbi_name, rank, k_type=None, v_type=None):
+        _require_k_type(k_type, "get_entry_by_rank")
+        _require_v_type(v_type, "get_entry_by_rank")
+        return to_python(_BINDINGS.kv_get_entry_by_rank(self.raw_handle(), dbi_name, rank, k_type, v_type))
+
     def sample_kv(self, dbi_name, n, k_type=None, v_type=None, ignore_key=None):
         args = [self.raw_handle(), dbi_name, n]
+        _reject_v_type_without_k_type(k_type, v_type, "sample_kv")
+        if k_type is not None and v_type is not None:
+            return to_python(
+                _BINDINGS.kv_sample(
+                    self.raw_handle(),
+                    dbi_name,
+                    n,
+                    k_type,
+                    v_type,
+                    True if ignore_key is None else bool(ignore_key),
+                )
+            )
         _append_typed_args(args, k_type=k_type, v_type=v_type, ignore_key=ignore_key, op="sample_kv")
         return to_python(_BINDINGS.core_invoke("sample-kv", args))
 

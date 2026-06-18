@@ -273,6 +273,7 @@ with open_kv("/tmp/dtlv-py-kv") as kv:
     )
     print(kv.get_range("items", [":all"], k_type=":long", v_type=":string"))
     print(kv.get_rank("items", 2, k_type=":long"))
+    print(kv.get_entry_by_rank("items", 1, k_type=":long", v_type=":string"))
     print(kv.get_first_n("items", 2, [":all"], k_type=":long", v_type=":string"))
 
     kv.open_list_dbi("tags")

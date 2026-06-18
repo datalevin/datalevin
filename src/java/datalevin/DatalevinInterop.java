@@ -977,6 +977,44 @@ public final class DatalevinInterop {
         return DatalevinForms.typeInput(value);
     }
 
+    public static Object kvGetByRank(Object kv,
+                                     String dbiName,
+                                     long rank,
+                                     Object kType,
+                                     Object vType,
+                                     boolean ignoreKey) {
+        return ClojureRuntime.core("get-by-rank",
+                                   runtimeArg(kv),
+                                   dbiName,
+                                   rank,
+                                   typeInput(kType),
+                                   typeInput(vType),
+                                   ignoreKey);
+    }
+
+    public static Object kvGetEntryByRank(Object kv,
+                                          String dbiName,
+                                          long rank,
+                                          Object kType,
+                                          Object vType) {
+        return kvGetByRank(kv, dbiName, rank, kType, vType, false);
+    }
+
+    public static List<?> kvSample(Object kv,
+                                   String dbiName,
+                                   long n,
+                                   Object kType,
+                                   Object vType,
+                                   boolean ignoreKey) {
+        return ResultSupport.sequence(ClojureRuntime.core("sample-kv",
+                                                          runtimeArg(kv),
+                                                          dbiName,
+                                                          n,
+                                                          typeInput(kType),
+                                                          typeInput(vType),
+                                                          ignoreKey));
+    }
+
     public static void kvVisitList(Object kv,
                                    String listName,
                                    Consumer<Object> visitor,

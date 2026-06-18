@@ -426,6 +426,47 @@ class InteropBindings {
     );
   }
 
+  async kvGetByRank(handle, dbiName, rank, kType, vType, ignoreKey) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvGetByRank",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      await toJava(rank),
+      await toJava(kType),
+      await toJava(vType),
+      Boolean(ignoreKey)
+    );
+  }
+
+  async kvGetEntryByRank(handle, dbiName, rank, kType, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvGetEntryByRank",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      await toJava(rank),
+      await toJava(kType),
+      await toJava(vType)
+    );
+  }
+
+  async kvSample(handle, dbiName, n, kType, vType, ignoreKey) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvSample",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      await toJava(n),
+      await toJava(kType),
+      await toJava(vType),
+      Boolean(ignoreKey)
+    );
+  }
+
   async kvVisitList(handle, listName, visitor, key, kType, vType) {
     const cls = await classes();
     return callJavaMethod(

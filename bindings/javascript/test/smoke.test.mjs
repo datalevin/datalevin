@@ -346,6 +346,10 @@ test(
         ["b", "beta"]
       );
       assert.deepEqual(
+        await kv.getEntryByRank("items", 1, { kType: ":string", vType: ":string" }),
+        ["b", "beta"]
+      );
+      assert.deepEqual(
         await kv.getFirst("items", [":all"], { kType: ":string", vType: ":string" }),
         ["a", "alpha"]
       );
@@ -772,6 +776,14 @@ test(
       );
       await assert.rejects(
         async () => kv.getByRank("items", 0, { ignoreKey: true }),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.getEntryByRank("items", 0),
+        TypeError
+      );
+      await assert.rejects(
+        async () => kv.getEntryByRank("items", 0, { kType: ":string" }),
         TypeError
       );
     } finally {

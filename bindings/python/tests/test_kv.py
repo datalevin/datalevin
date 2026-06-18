@@ -47,6 +47,7 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
         assert kv.get_rank("items", "b", ":string") == 1
         assert kv.get_by_rank("items", 1, ":string", ":string") == "beta"
         assert kv.get_by_rank("items", 1, ":string", ":string", False) == ["b", "beta"]
+        assert kv.get_entry_by_rank("items", 1, ":string", ":string") == ["b", "beta"]
         assert kv.get_first("items", [":all"], ":string", ":string") == ["a", "alpha"]
         assert kv.get_first_n("items", 2, [":all"], ":string", ":string") == [
             ["a", "alpha"],
@@ -133,6 +134,10 @@ def test_kv_argument_validation(tmp_path) -> None:
             kv.list_range_count("items", [":all"], None)
         with pytest.raises(ValueError):
             kv.get_by_rank("items", 0, ignore_key=True)
+        with pytest.raises(ValueError):
+            kv.get_entry_by_rank("items", 0)
+        with pytest.raises(ValueError):
+            kv.get_entry_by_rank("items", 0, ":string")
 
 
 def test_kv_list_functional_operations(tmp_path) -> None:

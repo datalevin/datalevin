@@ -204,6 +204,38 @@ class InteropBindings:
     def key_value_re_index(self, handle, opts=None):
         return call_java(classes().interop.keyValueReIndex, handle, to_java(opts))
 
+    def kv_get_by_rank(self, handle, dbi_name, rank, k_type, v_type, ignore_key):
+        return call_java(
+            classes().interop.kvGetByRank,
+            handle,
+            dbi_name,
+            int(rank),
+            to_java(k_type),
+            to_java(v_type),
+            bool(ignore_key),
+        )
+
+    def kv_get_entry_by_rank(self, handle, dbi_name, rank, k_type, v_type):
+        return call_java(
+            classes().interop.kvGetEntryByRank,
+            handle,
+            dbi_name,
+            int(rank),
+            to_java(k_type),
+            to_java(v_type),
+        )
+
+    def kv_sample(self, handle, dbi_name, n, k_type, v_type, ignore_key):
+        return call_java(
+            classes().interop.kvSample,
+            handle,
+            dbi_name,
+            int(n),
+            to_java(k_type),
+            to_java(v_type),
+            bool(ignore_key),
+        )
+
     def kv_visit_list(self, handle, list_name, visitor, key, k_type, v_type):
         return call_java(classes().interop.kvVisitList, handle, list_name, visitor, to_java(key), k_type, v_type)
 

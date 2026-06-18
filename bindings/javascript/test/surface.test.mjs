@@ -156,6 +156,7 @@ test("public surface stays importable without starting the JVM", () => {
     "delListItems",
     "gcTxLogSegments",
     "getByRank",
+    "getEntryByRank",
     "getFirst",
     "getFirstN",
     "getList",

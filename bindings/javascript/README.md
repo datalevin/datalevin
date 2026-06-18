@@ -292,6 +292,10 @@ try {
     vType: ":string"
   }));
   console.log(await kv.getRank("items", 2, { kType: ":long" }));
+  console.log(await kv.getEntryByRank("items", 1, {
+    kType: ":long",
+    vType: ":string"
+  }));
   console.log(await kv.getFirstN("items", 2, [":all"], {
     kType: ":long",
     vType: ":string"

@@ -298,12 +298,44 @@ export class KV extends ResourceWrapper {
 
   async getByRank(dbiName, rank, { kType = null, vType = null, ignoreKey = null } = {}) {
     const args = [this.rawHandle(), dbiName, rank];
+    rejectVTypeWithoutKType(kType, vType, "getByRank");
+    if (hasValue(kType) && hasValue(vType)) {
+      return toJsResult(
+        await _BINDINGS.kvGetByRank(
+          this.rawHandle(),
+          dbiName,
+          rank,
+          kType,
+          vType,
+          hasValue(ignoreKey) ? Boolean(ignoreKey) : true
+        )
+      );
+    }
     await appendTypedArgs(args, { kType, vType, ignoreKey }, "getByRank");
     return toJsResult(await _BINDINGS.coreInvoke("get-by-rank", args));
   }
 
+  async getEntryByRank(dbiName, rank, { kType = null, vType = null } = {}) {
+    requireKType(kType, "getEntryByRank");
+    requireVType(vType, "getEntryByRank");
+    return toJsResult(await _BINDINGS.kvGetEntryByRank(this.rawHandle(), dbiName, rank, kType, vType));
+  }
+
   async sampleKv(dbiName, n, { kType = null, vType = null, ignoreKey = null } = {}) {
     const args = [this.rawHandle(), dbiName, n];
+    rejectVTypeWithoutKType(kType, vType, "sampleKv");
+    if (hasValue(kType) && hasValue(vType)) {
+      return toJsResult(
+        await _BINDINGS.kvSample(
+          this.rawHandle(),
+          dbiName,
+          n,
+          kType,
+          vType,
+          hasValue(ignoreKey) ? Boolean(ignoreKey) : true
+        )
+      );
+    }
     await appendTypedArgs(args, { kType, vType, ignoreKey }, "sampleKv");
     return toJsResult(await _BINDINGS.coreInvoke("sample-kv", args));
   }
