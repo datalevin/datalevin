@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 import clojure.lang.Keyword;
@@ -189,6 +190,30 @@ public final class Datalevin {
                                                              Map<?, ?> txMeta) {
         Objects.requireNonNull(conn, "conn");
         return conn.transactAsync(txData, txMeta);
+    }
+
+    /**
+     * Registers a transaction listener with an auto-generated key.
+     */
+    public static Object listen(Connection conn, Consumer<Map<?, ?>> listener) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.listen(listener);
+    }
+
+    /**
+     * Registers or replaces a transaction listener under {@code key}.
+     */
+    public static Object listen(Connection conn, Object key, Consumer<Map<?, ?>> listener) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.listen(key, listener);
+    }
+
+    /**
+     * Removes a transaction listener by key.
+     */
+    public static void unlisten(Connection conn, Object key) {
+        Objects.requireNonNull(conn, "conn");
+        conn.unlisten(key);
     }
 
     /**

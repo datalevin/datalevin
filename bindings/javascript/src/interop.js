@@ -204,6 +204,35 @@ class InteropBindings {
     );
   }
 
+  async connectionListen(handle, keyOrListener, listener = null) {
+    const cls = await classes();
+    if (hasValue(listener)) {
+      return callJavaMethod(
+        cls.interop,
+        "connectionListen",
+        await unwrapInteropHandle(handle),
+        await toJava(keyOrListener),
+        listener
+      );
+    }
+    return callJavaMethod(
+      cls.interop,
+      "connectionListen",
+      await unwrapInteropHandle(handle),
+      keyOrListener
+    );
+  }
+
+  async connectionUnlisten(handle, key) {
+    const cls = await classes();
+    await callJavaMethod(
+      cls.interop,
+      "connectionUnlisten",
+      await unwrapInteropHandle(handle),
+      await toJava(key)
+    );
+  }
+
   async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
     const cls = await classes();
     return callJavaMethod(

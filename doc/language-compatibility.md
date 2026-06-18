@@ -19,6 +19,7 @@ Status key:
 | Query, pull, explain | Yes | Yes | Yes | Yes |
 | Synchronous transaction | Yes | Yes | Yes | Yes |
 | Async transaction | Yes | Yes, `CompletableFuture` | Yes, `Future` | Yes, `Promise` |
+| Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
 | Datalog transaction callback | Yes, `with-transaction` | Yes, `withTransaction` | Yes, `with_transaction` | No |
 | Transaction entity maps/forms | Yes | Yes, maps and `Tx` builders | Yes, dictionaries/lists and helpers | Yes, objects/arrays and helpers |
 | Transactable existing entity objects | Yes | No | No | No |

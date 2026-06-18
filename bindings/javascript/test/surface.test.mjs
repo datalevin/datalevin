@@ -137,6 +137,7 @@ test("public surface stays importable without starting the JVM", () => {
     "fulltextDatoms",
     "gcTxLogSegments",
     "indexRange",
+    "listen",
     "listSnapshots",
     "openTxLog",
     "reIndex",
@@ -144,7 +145,8 @@ test("public surface stays importable without starting the JVM", () => {
     "searchDatoms",
     "seekDatoms",
     "txLogWatermarks",
-    "transactAsync"
+    "transactAsync",
+    "unlisten"
   ]) {
     assert.equal(typeof datalevin.Connection.prototype[method], "function");
   }

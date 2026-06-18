@@ -81,6 +81,14 @@ class InteropBindings:
             to_java(tx_meta),
         )
 
+    def connection_listen(self, handle, key_or_listener, listener=None):
+        if listener is None:
+            return call_java(classes().interop.connectionListen, handle, key_or_listener)
+        return call_java(classes().interop.connectionListen, handle, to_java(key_or_listener), listener)
+
+    def connection_unlisten(self, handle, key):
+        call_java(classes().interop.connectionUnlisten, handle, to_java(key))
+
     def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
         return call_java(
             classes().interop.connectionDatoms,

@@ -1,6 +1,6 @@
-import { toEdnForm, toJava, toQueryInput } from "./convert.js";
+import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
 import { _BINDINGS } from "./interop.js";
-import { callJavaMethod } from "./jvm.js";
+import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
 import { toJsResult } from "./result.js";
 
@@ -37,6 +37,36 @@ function fetchLimit(limit, offset = 0) {
   return Math.max(limit, 0) + Math.max(offset ?? 0, 0);
 }
 
+let listenerProxyEventLoopDepth = 0;
+let listenerProxyEventLoopPrevious = false;
+
+async function retainListenerProxyEventLoop() {
+  const bridge = await javaBridgeModule();
+  if (listenerProxyEventLoopDepth === 0) {
+    listenerProxyEventLoopPrevious = bridge.config.runEventLoopWhenInterfaceProxyIsActive;
+    bridge.config.runEventLoopWhenInterfaceProxyIsActive = true;
+  }
+  listenerProxyEventLoopDepth += 1;
+  return () => {
+    listenerProxyEventLoopDepth -= 1;
+    if (listenerProxyEventLoopDepth === 0) {
+      bridge.config.runEventLoopWhenInterfaceProxyIsActive = listenerProxyEventLoopPrevious;
+    }
+  };
+}
+
+async function createConsumerProxy(fn) {
+  if (typeof fn !== "function") {
+    throw new TypeError("callback must be a function.");
+  }
+  const { newProxy } = await javaBridgeModule();
+  return newProxy("java.util.function.Consumer", {
+    accept: async (value) => {
+      await fn(await toJs(value));
+    }
+  });
+}
+
 export class Connection extends ResourceWrapper {
   constructor(handle, { owned = true } = {}) {
     super(
@@ -45,6 +75,20 @@ export class Connection extends ResourceWrapper {
       (rawHandle) => _BINDINGS.connectionClosed(rawHandle),
       "connection"
     );
+    this._listenerProxies = new Map();
+  }
+
+  async close() {
+    this._resetListenerProxies();
+    await super.close();
+  }
+
+  _resetListenerProxies() {
+    for (const { proxy, release } of this._listenerProxies.values()) {
+      proxy.reset?.();
+      release?.();
+    }
+    this._listenerProxies.clear();
   }
 
   async schema() {
@@ -173,6 +217,35 @@ export class Connection extends ResourceWrapper {
   async transactAsync(txData, txMeta = null) {
     const future = await _BINDINGS.connectionTransactAsync(this.rawHandle(), txData, txMeta);
     return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
+  }
+
+  async listen(callback, key = null) {
+    const proxy = await createConsumerProxy(callback);
+    let registeredKey;
+    try {
+      registeredKey = hasValue(key)
+        ? await toJsResult(await _BINDINGS.connectionListen(this.rawHandle(), key, proxy), { bridge: true })
+        : await toJsResult(await _BINDINGS.connectionListen(this.rawHandle(), proxy), { bridge: true });
+    } catch (error) {
+      proxy.reset?.();
+      throw error;
+    }
+    const previous = this._listenerProxies.get(registeredKey);
+    previous?.proxy.reset?.();
+    previous?.release?.();
+    this._listenerProxies.set(registeredKey, {
+      proxy,
+      release: await retainListenerProxyEventLoop()
+    });
+    return registeredKey;
+  }
+
+  async unlisten(key) {
+    await _BINDINGS.connectionUnlisten(this.rawHandle(), key);
+    const existing = this._listenerProxies.get(key);
+    existing?.proxy.reset?.();
+    existing?.release?.();
+    this._listenerProxies.delete(key);
   }
 
   async fillDb(datoms) {

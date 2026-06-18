@@ -10,6 +10,7 @@ import clojure.lang.PersistentVector;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collection;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
@@ -140,6 +141,25 @@ final class DatalevinForms {
             converted.add(envFlagInput(flag));
         }
         return PersistentHashSet.create(converted);
+    }
+
+    static Object txReportOutput(Object report) {
+        if (!(report instanceof Map<?, ?> map)) {
+            return ClojureCodec.bridgeOutput(report);
+        }
+
+        Object txData = map.get(ClojureCodec.keyword(":tx-data"));
+        Object tempids = map.get(ClojureCodec.keyword(":tempids"));
+        Object txMeta = map.get(ClojureCodec.keyword(":tx-meta"));
+
+        LinkedHashMap<Object, Object> result = new LinkedHashMap<>();
+        result.put(ClojureCodec.keyword(":tx-data"),
+                   ClojureCodec.bridgeOutput(txData == null ? PersistentVector.EMPTY : txData));
+        result.put(ClojureCodec.keyword(":tempids"),
+                   ClojureCodec.bridgeOutput(tempids == null ? PersistentArrayMap.EMPTY : tempids));
+        result.put(ClojureCodec.keyword(":tx-id"), ClojureCodec.bridgeOutput(txReportId(txData)));
+        result.put(ClojureCodec.keyword(":tx-meta"), ClojureCodec.bridgeOutput(txMeta));
+        return result;
     }
 
     static Object udfDescriptorInput(Map<?, ?> descriptor) {
@@ -493,6 +513,13 @@ final class DatalevinForms {
             return ClojureRuntime.readEdn(literal.value());
         }
         return ClojureCodec.runtimeInput(flag);
+    }
+
+    private static Object txReportId(Object txData) {
+        if (txData instanceof Collection<?> collection && !collection.isEmpty()) {
+            return ClojureRuntime.datom("datom-tx", collection.iterator().next());
+        }
+        return null;
     }
 
     private static Object txVector(Collection<?> collection) {

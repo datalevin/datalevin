@@ -41,6 +41,9 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert repr(conn) == "<Connection open>"
         assert conn.closed() is False
 
+        reports = []
+        listener_key = conn.listen(reports.append, key="test-listener")
+        assert listener_key == "test-listener"
         conn.transact(
             [
                 tx_entity(
@@ -62,6 +65,7 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
                 ),
             ]
         )
+        conn.unlisten(listener_key)
         async_report = conn.transact_async(
             [{":db/id": -3, ":bio": "Async transactions help ingestion"}]
         ).result(timeout=10)
@@ -70,6 +74,9 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             [{":db/id": -4, ":bio": "Top-level async helper"}],
         ).result(timeout=10)
 
+        assert len(reports) == 1
+        assert reports[0][":tx-data"]
+        assert reports[0][":tx-meta"] is None
         assert ":name" in conn.schema()
         assert isinstance(conn.opts(), dict)
         assert conn.entid([":name", "Ada"]) == 1

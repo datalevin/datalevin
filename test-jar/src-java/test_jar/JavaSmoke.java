@@ -39,6 +39,18 @@ public final class JavaSmoke {
                         .entity(Tx.entity(-1).put("name", "Alice").put("age", 30))
                         .entity(Tx.entity(-2).put("name", "Bob").put("age", 25)));
 
+                List<Map<?, ?>> reports = new ArrayList<>();
+                Object listenerKey = conn.listen("test-listener", reports::add);
+                if (!"test-listener".equals(listenerKey)) {
+                    throw new IllegalStateException("Unexpected listener key: " + listenerKey);
+                }
+                conn.transact(List.of(Map.of(":db/id", -3L, "name", "Cara", "age", 22L)));
+                conn.unlisten(listenerKey);
+                conn.transact(List.of(Map.of(":db/id", -4L, "name", "Drew", "age", 28L)));
+                if (reports.size() != 1 || !reports.get(0).containsKey(Datalevin.kw("tx-data"))) {
+                    throw new IllegalStateException("Unexpected listener reports: " + reports);
+                }
+
                 DatalogQuery adultsQuery = Datalevin.query()
                         .findAll("?name")
                         .whereDatom(Datalevin.var("e"), "name", Datalevin.var("name"))

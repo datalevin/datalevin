@@ -7,6 +7,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Objects;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Consumer;
 import java.util.function.Function;
 
 /**
@@ -594,6 +595,39 @@ public final class Connection extends HandleResource {
                                       txData == null ? null : txData.buildForm(),
                                       ClojureCodec.runtimeInput(txMeta));
         return txReportFuture(future);
+    }
+
+    /**
+     * Registers a transaction listener with an auto-generated key.
+     *
+     * <p>The listener receives a bridge-safe transaction report whenever
+     * {@code transact} applies a transaction to this connection.
+     */
+    public Object listen(Consumer<Map<?, ?>> listener) {
+        Objects.requireNonNull(listener, "listener");
+        Consumer<Object> wrapped = report -> listener.accept((Map<?, ?>) report);
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("listen!",
+                                                             resource(),
+                                                             ClojureFns.txReportConsumer(wrapped)));
+    }
+
+    /**
+     * Registers or replaces a transaction listener under {@code key}.
+     */
+    public Object listen(Object key, Consumer<Map<?, ?>> listener) {
+        Objects.requireNonNull(listener, "listener");
+        Consumer<Object> wrapped = report -> listener.accept((Map<?, ?>) report);
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("listen!",
+                                                             resource(),
+                                                             ClojureCodec.runtimeInput(key),
+                                                             ClojureFns.txReportConsumer(wrapped)));
+    }
+
+    /**
+     * Removes the transaction listener registered under {@code key}.
+     */
+    public void unlisten(Object key) {
+        ClojureRuntime.core("unlisten!", resource(), ClojureCodec.runtimeInput(key));
     }
 
     /**

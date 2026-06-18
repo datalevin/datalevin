@@ -254,6 +254,32 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Registers a transaction listener with an auto-generated key.
+     */
+    public static Object connectionListen(Object conn, Consumer<Object> listener) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("listen!",
+                                                             rawResource(conn),
+                                                             ClojureFns.txReportConsumer(listener)));
+    }
+
+    /**
+     * Registers or replaces a transaction listener under {@code key}.
+     */
+    public static Object connectionListen(Object conn, Object key, Consumer<Object> listener) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("listen!",
+                                                             rawResource(conn),
+                                                             ClojureCodec.runtimeInput(key),
+                                                             ClojureFns.txReportConsumer(listener)));
+    }
+
+    /**
+     * Removes a transaction listener by key.
+     */
+    public static void connectionUnlisten(Object conn, Object key) {
+        ClojureRuntime.core("unlisten!", rawResource(conn), ClojureCodec.runtimeInput(key));
+    }
+
+    /**
      * Returns bridge-safe datoms from a raw connection handle.
      */
     public static Object connectionDatoms(Object conn,

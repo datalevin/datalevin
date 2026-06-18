@@ -88,6 +88,13 @@ class FakeInteropBindings:
         self.last_transact_async = (conn, tx_data, tx_meta)
         return "TX_FUTURE"
 
+    def connection_listen(self, conn, key_or_listener, listener=None):
+        self.last_connection_listen = (conn, key_or_listener, listener)
+        return "LISTENER_KEY" if listener is None else key_or_listener
+
+    def connection_unlisten(self, conn, key):
+        self.last_connection_unlisten = (conn, key)
+
     def connection_with_transaction(self, conn, fn):
         self.last_connection_with_transaction = conn
         return fn(connection_module.Connection("TX_CONN", owned=False))
@@ -499,6 +506,10 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert init_conn.with_transaction(lambda tx: tx.raw_handle()) == "TX_CONN"
     assert fake.last_connection_with_transaction == "INIT_CONN"
     assert interop_module.with_transaction(init_conn, lambda tx: tx.raw_handle()) == "TX_CONN"
+    assert init_conn.listen(lambda _report: None) == "LISTENER_KEY"
+    assert fake.last_connection_listen[0] == "INIT_CONN"
+    init_conn.unlisten("LISTENER_KEY")
+    assert fake.last_connection_unlisten == ("INIT_CONN", "LISTENER_KEY")
     assert callable(interop_module.transact_async)
     backing_kv = interop_module.datalog_kv(init_conn)
     assert backing_kv.raw_handle() == "DATALOG_KV"
@@ -749,6 +760,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "fulltext_datoms",
         "gc_tx_log_segments",
         "index_range",
+        "listen",
         "list_snapshots",
         "open_tx_log",
         "re_index",
@@ -757,6 +769,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "seek_datoms",
         "tx_log_watermarks",
         "transact_async",
+        "unlisten",
         "with_transaction",
     ]:
         assert callable(getattr(connection_module.Connection, method))

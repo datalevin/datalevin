@@ -122,6 +122,9 @@ test(
       assert.equal(String(conn), "<Connection open>");
       assert.equal(await conn.closed(), false);
 
+      const reports = [];
+      const listenerKey = await conn.listen((report) => reports.push(report), "test-listener");
+      assert.equal(listenerKey, "test-listener");
       const tx = await conn.transact([
         txEntity(-1, {
           ":name": "Ada",
@@ -135,6 +138,7 @@ test(
           ":status": await keyword(":draft")
         })
       ]);
+      await conn.unlisten(listenerKey);
       const asyncTx = await conn.transactAsync([
         { ":db/id": -3, ":bio": "Async transactions help ingestion" }
       ]);
@@ -167,6 +171,9 @@ test(
 
       assert.equal(Array.isArray(tx[":tx-data"]), true);
       assert.equal(tx[":tx-data"].length, 7);
+      assert.equal(reports.length, 1);
+      assert.equal(Array.isArray(reports[0][":tx-data"]), true);
+      assert.equal(reports[0][":tx-meta"], null);
       assert.equal(Array.isArray(asyncTx[":tx-data"]), true);
       assert.equal(Array.isArray(topAsyncTx[":tx-data"]), true);
       assert.equal(":name" in await conn.schema(), true);

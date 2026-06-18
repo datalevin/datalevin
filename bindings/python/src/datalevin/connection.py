@@ -5,9 +5,11 @@ from __future__ import annotations
 from concurrent.futures import Future
 from threading import Thread
 
+import jpype
+
 from ._convert import to_edn_form, to_java, to_python, to_query_input
 from ._interop import _BINDINGS
-from ._java import call_java
+from ._java import call_java, classes
 from ._resource import ResourceWrapper
 
 
@@ -43,12 +45,31 @@ def _python_future(java_future):
     return future
 
 
+class _PythonConsumer:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def accept(self, value):
+        self._fn(to_python(value))
+
+
+def _consumer_proxy(fn):
+    if not callable(fn):
+        raise TypeError("callback must be callable.")
+    return jpype.JProxy(classes().consumer_type, inst=_PythonConsumer(fn))
+
+
 class Connection(ResourceWrapper):
     """Thin Python wrapper over a raw Datalevin connection handle."""
 
     def __init__(self, handle, *, owned: bool = True) -> None:
         close_fn = _BINDINGS.close_connection if owned else lambda _handle: None
         super().__init__(handle, close_fn, _BINDINGS.connection_closed, "connection")
+        self._listeners = {}
+
+    def close(self) -> None:
+        self._listeners.clear()
+        super().close()
 
     def schema(self):
         return to_python(_BINDINGS.core_invoke("schema", [self.raw_handle()]))
@@ -123,6 +144,19 @@ class Connection(ResourceWrapper):
         return _python_future(
             _BINDINGS.connection_transact_async(self.raw_handle(), tx_data, tx_meta)
         )
+
+    def listen(self, callback, key=None):
+        proxy = _consumer_proxy(callback)
+        if key is None:
+            registered_key = to_python(_BINDINGS.connection_listen(self.raw_handle(), proxy))
+        else:
+            registered_key = to_python(_BINDINGS.connection_listen(self.raw_handle(), key, proxy))
+        self._listeners[registered_key] = proxy
+        return registered_key
+
+    def unlisten(self, key) -> None:
+        _BINDINGS.connection_unlisten(self.raw_handle(), key)
+        self._listeners.pop(key, None)
 
     def fill_db(self, datoms):
         _BINDINGS.fill_db(self.raw_handle(), datoms)

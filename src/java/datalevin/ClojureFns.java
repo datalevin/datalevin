@@ -39,6 +39,16 @@ final class ClojureFns {
         };
     }
 
+    static AFn txReportConsumer(Consumer<Object> consumer) {
+        return new AFn() {
+            @Override
+            public Object invoke(Object report) {
+                consumer.accept(DatalevinForms.txReportOutput(report));
+                return null;
+            }
+        };
+    }
+
     static AFn biFunction(BiFunction<Object, Object, ?> fn) {
         return new AFn() {
             @Override
