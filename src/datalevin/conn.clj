@@ -184,9 +184,9 @@
   [dir schema opts]
   {:pre [(or (nil? schema) (map? schema))]}
   (vld/validate-schema schema)
-  (let [[store-opts runtime-opts] (split-runtime-opts opts)]
+  (let [[_ runtime-opts] (split-runtime-opts opts)]
     (if-let [dir-key (shared-local-store-key dir)]
-      (let [store (acquire-shared-local-store dir schema store-opts)]
+      (let [store (acquire-shared-local-store dir schema opts)]
         (cond-> (db/new-db store)
           (some? runtime-opts) (db/with-runtime-opts runtime-opts)))
       (db/empty-db dir schema opts))))

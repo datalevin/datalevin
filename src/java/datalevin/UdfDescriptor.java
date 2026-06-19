@@ -37,6 +37,20 @@ public final class UdfDescriptor {
     }
 
     /**
+     * Creates a full-text analyzer descriptor for {@code id}.
+     */
+    public static UdfDescriptor analyzer(String id) {
+        return of("analyzer", id);
+    }
+
+    /**
+     * Creates a full-text query analyzer descriptor for {@code id}.
+     */
+    public static UdfDescriptor queryAnalyzer(String id) {
+        return of("query-analyzer", id);
+    }
+
+    /**
      * Creates a Java-backed descriptor with the given UDF kind and id.
      */
     public static UdfDescriptor of(String kind, String id) {

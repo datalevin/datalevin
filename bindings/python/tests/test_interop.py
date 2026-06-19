@@ -1,8 +1,19 @@
 from __future__ import annotations
 
+import re
+
 import pytest
 
-from datalevin import api_info, connect, create_udf_registry, exec_json, interop, udf_descriptor
+from datalevin import (
+    api_info,
+    connect,
+    create_udf_registry,
+    exec_json,
+    interop,
+    schema_attr,
+    search_domain,
+    udf_descriptor,
+)
 from datalevin._convert import to_python
 
 
@@ -129,3 +140,57 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
 
         assert registry.registered(query_descriptor) is False
         assert registry.registered(tx_descriptor) is False
+
+
+def test_udf_registry_supports_fulltext_analyzers(tmp_path) -> None:
+    registry = create_udf_registry()
+    analyzer_descriptor = udf_descriptor(":text/hashtags", kind=":analyzer")
+    query_descriptor = udf_descriptor(":text/plain-query", kind=":query-analyzer")
+
+    @registry.analyzer_udf(":text/hashtags")
+    def hashtag_analyzer(text):
+        return [
+            [match.group(0)[1:], pos, match.start()]
+            for pos, match in enumerate(re.finditer(r"#\w+", text))
+        ]
+
+    @registry.query_analyzer_udf(":text/plain-query")
+    def plain_query_analyzer(text):
+        return [[token, pos, pos] for pos, token in enumerate(text.split())]
+
+    with connect(
+        str(tmp_path / "fulltext-udf"),
+        schema={
+            ":text": schema_attr(
+                value_type=":db.type/string",
+                fulltext=True,
+                extra={":db.fulltext/autoDomain": True},
+            )
+        },
+        opts={
+            ":runtime-opts": {":udf-registry": registry},
+            ":search-domains": {
+                "text": search_domain(
+                    index_position=True,
+                    extra={
+                        ":analyzer": analyzer_descriptor,
+                        ":query-analyzer": query_descriptor,
+                    },
+                )
+            },
+        },
+    ) as conn:
+        conn.transact(
+            [
+                {":db/id": 1, ":text": "alpha #needle"},
+                {":db/id": 2, ":text": "needle without hash"},
+            ]
+        )
+
+        assert conn.query(
+            "[:find [?e ...] :in $ ?q "
+            ":where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+            "needle",
+        ) == [1]
+        assert registry.registered(analyzer_descriptor) is True
+        assert registry.registered(query_descriptor) is True

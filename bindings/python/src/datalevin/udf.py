@@ -59,6 +59,20 @@ class UdfRegistry:
 
         return decorator
 
+    def analyzer_udf(self, udf_id: str):
+        def decorator(fn):
+            self.register(udf_descriptor(udf_id, kind=":analyzer"), fn)
+            return fn
+
+        return decorator
+
+    def query_analyzer_udf(self, udf_id: str):
+        def decorator(fn):
+            self.register(udf_descriptor(udf_id, kind=":query-analyzer"), fn)
+            return fn
+
+        return decorator
+
 
 def _keyword_string(value) -> str:
     text = str(value)

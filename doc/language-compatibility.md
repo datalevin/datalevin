@@ -95,6 +95,7 @@ outlive the callback.
 | Capability | Clojure | Java | Python | JavaScript |
 | --- | --- | --- | --- | --- |
 | Full-text search through Datalog schema/options | Yes | Yes | Yes | Yes |
+| Full-text custom analyzer/query analyzer through Datalog search-domain UDFs | Yes | Yes | Yes | Yes |
 | Vector search through Datalog schema/options | Yes | Yes | Yes | Yes |
 | Idoc schema/options | Yes | Yes | Yes | Yes |
 | Search/vector/idoc option builders | N/A, native maps | Yes | Yes | Yes |
@@ -114,6 +115,7 @@ outlive the callback.
 | Query UDF calls | Yes | Yes | Yes | Yes |
 | Predicate UDF calls | Yes | Yes | Yes | Yes |
 | Transaction UDF registration | Yes | Yes | Yes | Yes |
+| Analyzer/query-analyzer UDF registration | Yes | Yes | Yes | Yes |
 | Keyword helper | N/A, native keyword syntax | Yes | Yes | Yes |
 | Symbol helper | N/A, native symbol syntax | Yes | Yes | Yes |
 | EDN read/write helpers | Yes | Yes | Yes | Yes |

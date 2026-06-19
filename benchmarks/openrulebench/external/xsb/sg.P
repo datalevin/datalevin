@@ -1,0 +1,42 @@
+%% Same Generation benchmark for XSB Prolog
+%% Usage: xsb -e "['sg'], run_sg_ff."
+
+:- table sg/2.
+
+%% SG rules with tabling
+sg(X, X) :- parent(_, X).
+sg(X, Y) :- parent(PX, X), parent(PY, Y), sg(PX, PY).
+
+%% Load parent facts from file
+load_parents(File) :-
+    see(File),
+    read_parents,
+    seen.
+
+read_parents :-
+    read(Term),
+    (Term == end_of_file -> true
+    ; assert(Term), read_parents).
+
+%% Benchmark: SG with both arguments free
+run_sg_ff :-
+    cputime(Start),
+    findall((X,Y), sg(X,Y), Results),
+    cputime(End),
+    Time is End - Start,
+    length(Results, Count),
+    format('SG-FF: ~w results in ~3f seconds~n', [Count, Time]).
+
+%% Benchmark: SG with first argument bound
+run_sg_bf(Start) :-
+    cputime(T1),
+    findall(Y, sg(Start, Y), Results),
+    cputime(T2),
+    Time is T2 - T1,
+    length(Results, Count),
+    format('SG-BF: ~w results in ~3f seconds~n', [Count, Time]).
+
+%% Clean up for next run
+cleanup :-
+    abolish_all_tables,
+    retractall(parent(_,_)).

@@ -107,6 +107,14 @@ export class UdfRegistry {
   async txUdf(id, fn, options = {}) {
     return this.register(udfDescriptor(id, { ...options, kind: ":tx-fn" }), fn);
   }
+
+  async analyzerUdf(id, fn, options = {}) {
+    return this.register(udfDescriptor(id, { ...options, kind: ":analyzer" }), fn);
+  }
+
+  async queryAnalyzerUdf(id, fn, options = {}) {
+    return this.register(udfDescriptor(id, { ...options, kind: ":query-analyzer" }), fn);
+  }
 }
 
 export async function createUdfRegistry() {

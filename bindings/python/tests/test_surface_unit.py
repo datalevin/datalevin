@@ -647,6 +647,8 @@ def test_udf_descriptor_helper() -> None:
         ":udf/version": "v1",
     }
     assert callable(getattr(udf_module.UdfRegistry, "predicate_udf"))
+    assert callable(getattr(udf_module.UdfRegistry, "analyzer_udf"))
+    assert callable(getattr(udf_module.UdfRegistry, "query_analyzer_udf"))
 
 
 def test_kv_public_surface_includes_richer_operations() -> None:

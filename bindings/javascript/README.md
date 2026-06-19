@@ -188,7 +188,10 @@ const report = await conn.transactAsync([
 
 Use `createUdfRegistry()` and `udfDescriptor()` for runtime UDFs. Pass the
 registry in connection runtime options, then call the descriptor from query with
-Datalevin's `udf` function.
+Datalevin's `udf` function. Fulltext analyzers use the same route with
+`registry.analyzerUdf()` or `registry.queryAnalyzerUdf()` and descriptors in
+`searchDomain({ extra: { ":analyzer": ... } })`. Analyzer functions return
+`[term, position, offset]` triples.
 
 ```js
 import { connect, createUdfRegistry, udfDescriptor } from "datalevin-node";
@@ -207,6 +210,78 @@ try {
     descriptor,
     41
   );
+} finally {
+  await conn.close();
+}
+```
+
+## Fulltext Analyzer UDF Example
+
+Use analyzer UDFs when a Datalog fulltext domain needs host-language tokenizing.
+The document analyzer runs while transactions and re-indexing update the
+fulltext index; the query analyzer runs during `fulltext` query evaluation.
+
+```js
+import {
+  connect,
+  createUdfRegistry,
+  schemaAttr,
+  searchDomain,
+  udfDescriptor
+} from "datalevin-node";
+
+const registry = await createUdfRegistry();
+const analyzer = udfDescriptor(":text/hashtags", { kind: ":analyzer" });
+const queryAnalyzer = udfDescriptor(":text/plain-query", { kind: ":query-analyzer" });
+
+await registry.analyzerUdf(":text/hashtags", (text) => {
+  const tokens = [];
+  const pattern = /#\w+/g;
+  const source = String(text);
+  let match;
+  while ((match = pattern.exec(source)) !== null) {
+    tokens.push([match[0].slice(1), tokens.length, match.index]);
+  }
+  return tokens;
+});
+
+await registry.queryAnalyzerUdf(":text/plain-query", (text) => (
+  String(text).trim().split(/\s+/).filter(Boolean)
+    .map((token, position) => [token, position, position])
+));
+
+const conn = await connect("/tmp/dtlv-js-fulltext-udf", {
+  schema: {
+    ":text": schemaAttr({
+      valueType: ":db.type/string",
+      fulltext: true,
+      extra: { ":db.fulltext/autoDomain": true }
+    })
+  },
+  opts: {
+    ":runtime-opts": { ":udf-registry": registry },
+    ":search-domains": {
+      text: searchDomain({
+        indexPosition: true,
+        extra: {
+          ":analyzer": analyzer,
+          ":query-analyzer": queryAnalyzer
+        }
+      })
+    }
+  }
+});
+
+try {
+  await conn.transact([
+    { ":db/id": 1, ":text": "alpha #needle" },
+    { ":db/id": 2, ":text": "needle without hash" }
+  ]);
+
+  console.log(await conn.query(
+    "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+    "needle"
+  ));
 } finally {
   await conn.close();
 }

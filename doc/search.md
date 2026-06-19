@@ -197,11 +197,27 @@ The search feature can be customized at indexing time and at query time.
 #### Custom analyzer
 
 When creating the search engine, an `:analyzer` option can be used to supply
-an analyzer function that takes a document as string, and output a list of `[term
-position offset]`. `:query-analyzer` option is for analyzing query.
+an analyzer function that takes a document as a string and outputs a list of
+`[term position offset]` triples. `:query-analyzer` option is for analyzing
+query.
+
+For Datalog search domains, `:analyzer` and `:query-analyzer` may also be UDF
+descriptors or registered UDF id keywords. This is the route used by Java,
+Python, and JavaScript custom analyzers: register a UDF with kind `:analyzer`
+or `:query-analyzer`, pass the registry in `:runtime-opts :udf-registry`, and
+put the descriptor in the search-domain option map.
+
+Analyzer UDFs receive the document string during fulltext indexing, including
+indexing performed by transaction, re-index, and DB open/recovery paths. Query
+analyzer UDFs receive the query string during `fulltext` query evaluation. Both
+must return a sequence of `[term position offset]` triples, where `term` is a
+string and `position` and `offset` are non-negative integers. The UDF registry is
+runtime state; the descriptor can be stored or passed in options, but the
+callable implementation must be registered in the process that performs the
+indexing or query.
 
 Many common utility functions for creating analyzers are also provided in
-`datalevin.search-utils`  namespace: stemming, stop words, regular expression,
+`datalevin.search-utils` namespace: stemming, stop words, regular expression,
 ngrams, prefix, and so on.
 
 #### Search options

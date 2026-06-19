@@ -87,6 +87,9 @@ def to_python(value):
     if isinstance(value, byte_array_type):
         return bytes(value)
 
+    if isinstance(value, cls.string_type):
+        return str(value)
+
     if isinstance(value, cls.uuid):
         return py_uuid.UUID(str(value))
 

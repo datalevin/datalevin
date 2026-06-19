@@ -113,16 +113,35 @@ final class ClojureFns {
         Objects.requireNonNull(fn, "fn");
         final boolean txFn = isTxFnDescriptor(descriptor);
         return new AFn() {
+            private Object invokeValues(List<?> values) {
+                Object result = fn.invoke(values);
+                return txFn
+                        ? DatalevinForms.txDataInput(result)
+                        : ClojureCodec.runtimeInput(result);
+            }
+
+            @Override
+            public Object invoke() {
+                return invokeValues(List.of());
+            }
+
+            @Override
+            public Object invoke(Object arg1) {
+                return invokeValues(List.of(arg1));
+            }
+
+            @Override
+            public Object invoke(Object arg1, Object arg2) {
+                return invokeValues(List.of(arg1, arg2));
+            }
+
             @Override
             public Object applyTo(ISeq args) {
                 ArrayList<Object> values = new ArrayList<>();
                 for (ISeq xs = args; xs != null; xs = xs.next()) {
                     values.add(xs.first());
                 }
-                Object result = fn.invoke(values);
-                return txFn
-                        ? DatalevinForms.txDataInput(result)
-                        : ClojureCodec.runtimeInput(result);
+                return invokeValues(values);
             }
         };
     }

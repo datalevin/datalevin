@@ -123,6 +123,8 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.LlamaEmbedder, "function");
   assert.equal(typeof datalevin.LlamaGenerator, "function");
   assert.equal(typeof datalevin.SearchEngine, "function");
+  assert.equal(typeof datalevin.UdfRegistry.prototype.analyzerUdf, "function");
+  assert.equal(typeof datalevin.UdfRegistry.prototype.queryAnalyzerUdf, "function");
   assert.equal(typeof datalevin.SearchIndexWriter, "function");
   assert.equal(typeof datalevin.VectorIndex, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");

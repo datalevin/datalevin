@@ -10,6 +10,8 @@ import datalevin.PullSelector;
 import datalevin.RangeSpec;
 import datalevin.Schema;
 import datalevin.Tx;
+import datalevin.UdfDescriptor;
+import datalevin.UdfRegistry;
 import datalevin.VectorIndex;
 
 import java.io.IOException;
@@ -82,7 +84,7 @@ public final class JavaSmoke {
                 }
 
                 List<?> keyed = conn.queryKeyed(keyedQuery);
-                if (keyed.size() != 2) {
+                if (keyed.size() != 4) {
                     throw new IllegalStateException("Unexpected keyed query fields: " + keyed);
                 }
                 @SuppressWarnings("unchecked")
@@ -95,6 +97,65 @@ public final class JavaSmoke {
                 Map<?, ?> alice = conn.pull(selector, Datalevin.listOf(":name", "Alice"));
                 if (!"Alice".equals(alice.get(Datalevin.kw("name")))) {
                     throw new IllegalStateException("Unexpected pull result: " + alice);
+                }
+            }
+
+            UdfRegistry registry = Datalevin.udfRegistry();
+            UdfDescriptor analyzerDescriptor = Datalevin.analyzerUdf("text/hashtags");
+            UdfDescriptor queryDescriptor = Datalevin.queryAnalyzerUdf("text/plain-query");
+            registry.analyzer("text/hashtags", udfArgs -> {
+                String text = (String) udfArgs.get(0);
+                List<List<Object>> tokens = new ArrayList<>();
+                int searchFrom = 0;
+                while (searchFrom < text.length()) {
+                    int start = text.indexOf('#', searchFrom);
+                    if (start < 0) {
+                        break;
+                    }
+                    int end = start + 1;
+                    while (end < text.length() && Character.isLetterOrDigit(text.charAt(end))) {
+                        end++;
+                    }
+                    if (end > start + 1) {
+                        tokens.add(List.of(text.substring(start + 1, end), tokens.size(), start));
+                    }
+                    searchFrom = Math.max(end, start + 1);
+                }
+                return tokens;
+            });
+            registry.queryAnalyzer("text/plain-query", udfArgs -> {
+                String text = (String) udfArgs.get(0);
+                List<List<Object>> tokens = new ArrayList<>();
+                for (String token : text.split("\\s+")) {
+                    if (!token.isBlank()) {
+                        tokens.add(List.of(token, tokens.size(), tokens.size()));
+                    }
+                }
+                return tokens;
+            });
+            try (Connection conn = Datalevin.createConn(
+                    dir.resolve("fulltext-udf").toString(),
+                    Datalevin.schema().attr("text", Schema.attribute()
+                            .valueType(Schema.ValueType.STRING)
+                            .fulltext(true)
+                            .fulltextAutoDomain(true)),
+                    Map.of(
+                            ":runtime-opts", Map.of(":udf-registry", registry),
+                            ":search-domains", Map.of(
+                                    "text",
+                                    Datalevin.searchDomain()
+                                            .indexPosition(true)
+                                            .prop("analyzer", analyzerDescriptor)
+                                            .prop("query-analyzer", queryDescriptor)
+                                            .build())))) {
+                conn.transact(List.of(
+                        Map.of(":db/id", 1L, "text", "alpha #needle"),
+                        Map.of(":db/id", 2L, "text", "needle without hash")));
+                Object matches = conn.query(
+                        "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+                        "needle");
+                if (!List.of(1L).equals(matches)) {
+                    throw new IllegalStateException("Unexpected analyzer UDF result: " + matches);
                 }
             }
 

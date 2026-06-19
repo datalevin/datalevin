@@ -175,7 +175,10 @@ report = future.result(timeout=10)
 
 Use `create_udf_registry()` and `udf_descriptor()` for runtime UDFs. Pass the
 registry in connection runtime options, then call the descriptor from query with
-Datalevin's `udf` function.
+Datalevin's `udf` function. Fulltext analyzers use the same route with
+`registry.analyzer_udf()` or `registry.query_analyzer_udf()` and descriptors in
+`search_domain(extra={":analyzer": ...})`. Analyzer functions return
+`[term, position, offset]` triples.
 
 ```python
 from datalevin import connect, create_udf_registry, udf_descriptor
@@ -197,6 +200,71 @@ with connect(
         descriptor,
         41,
     )
+```
+
+## Fulltext Analyzer UDF Example
+
+Use analyzer UDFs when a Datalog fulltext domain needs host-language tokenizing.
+The document analyzer runs while transactions and re-indexing update the
+fulltext index; the query analyzer runs during `fulltext` query evaluation.
+
+```python
+import re
+
+from datalevin import (
+    connect,
+    create_udf_registry,
+    schema_attr,
+    search_domain,
+    udf_descriptor,
+)
+
+registry = create_udf_registry()
+analyzer = udf_descriptor(":text/hashtags", kind=":analyzer")
+query_analyzer = udf_descriptor(":text/plain-query", kind=":query-analyzer")
+
+@registry.analyzer_udf(":text/hashtags")
+def hashtags(text):
+    return [
+        [match.group(0)[1:], pos, match.start()]
+        for pos, match in enumerate(re.finditer(r"#\w+", text))
+    ]
+
+@registry.query_analyzer_udf(":text/plain-query")
+def plain_query(text):
+    return [[token, pos, pos] for pos, token in enumerate(text.split())]
+
+with connect(
+    "/tmp/dtlv-py-fulltext-udf",
+    schema={
+        ":text": schema_attr(
+            value_type=":db.type/string",
+            fulltext=True,
+            extra={":db.fulltext/autoDomain": True},
+        )
+    },
+    opts={
+        ":runtime-opts": {":udf-registry": registry},
+        ":search-domains": {
+            "text": search_domain(
+                index_position=True,
+                extra={
+                    ":analyzer": analyzer,
+                    ":query-analyzer": query_analyzer,
+                },
+            )
+        },
+    },
+) as conn:
+    conn.transact([
+        {":db/id": 1, ":text": "alpha #needle"},
+        {":db/id": 2, ":text": "needle without hash"},
+    ])
+
+    assert conn.query(
+        "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+        "needle",
+    ) == [1]
 ```
 
 ## Datalog-Backed KV Example

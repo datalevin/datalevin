@@ -100,6 +100,70 @@ test(
 );
 
 test(
+  "UDF registry supports fulltext analyzers",
+  { skip: !runtimeAvailable, timeout: 30000 },
+  async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "dtlv-js-fulltext-udf-"));
+    const registry = await createUdfRegistry();
+    const analyzerDescriptor = udfDescriptor(":text/hashtags", { kind: ":analyzer" });
+    const queryDescriptor = udfDescriptor(":text/plain-query", { kind: ":query-analyzer" });
+
+    await registry.analyzerUdf(":text/hashtags", (text) => {
+      const tokens = [];
+      const pattern = /#\w+/g;
+      let match;
+      const source = String(text);
+      while ((match = pattern.exec(source)) !== null) {
+        tokens.push([match[0].slice(1), tokens.length, match.index]);
+      }
+      return tokens;
+    });
+    await registry.queryAnalyzerUdf(":text/plain-query", (text) => (
+      String(text).trim().split(/\s+/).filter(Boolean).map((token, position) => [token, position, position])
+    ));
+
+    const conn = await connect(dir, {
+      schema: {
+        ":text": schemaAttr({
+          valueType: ":db.type/string",
+          fulltext: true,
+          extra: { ":db.fulltext/autoDomain": true }
+        })
+      },
+      opts: {
+        ":runtime-opts": { ":udf-registry": registry },
+        ":search-domains": {
+          text: searchDomain({
+            indexPosition: true,
+            extra: {
+              ":analyzer": analyzerDescriptor,
+              ":query-analyzer": queryDescriptor
+            }
+          })
+        }
+      }
+    });
+
+    try {
+      await conn.transact([
+        { ":db/id": 1, ":text": "alpha #needle" },
+        { ":db/id": 2, ":text": "needle without hash" }
+      ]);
+
+      const matches = await conn.query(
+        "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+        "needle"
+      );
+      assert.deepEqual(matches.map(intValue), [1]);
+      assert.equal(await registry.registered(analyzerDescriptor), true);
+      assert.equal(await registry.registered(queryDescriptor), true);
+    } finally {
+      await conn.close();
+    }
+  }
+);
+
+test(
   "connection methods cover common local flow",
   { skip: !runtimeAvailable, timeout: 30000 },
   async () => {

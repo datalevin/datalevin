@@ -654,6 +654,20 @@ public final class Datalevin {
     }
 
     /**
+     * Creates a full-text analyzer UDF descriptor.
+     */
+    public static UdfDescriptor analyzerUdf(String id) {
+        return UdfDescriptor.analyzer(id);
+    }
+
+    /**
+     * Creates a full-text query analyzer UDF descriptor.
+     */
+    public static UdfDescriptor queryAnalyzerUdf(String id) {
+        return UdfDescriptor.queryAnalyzer(id);
+    }
+
+    /**
      * Normalizes a UDF descriptor into the raw Clojure form expected by
      * Datalevin.
      */

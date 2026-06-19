@@ -17,6 +17,7 @@
    [datalevin.spill :as sp]
    [datalevin.sparselist :as sl]
    [datalevin.analyzer :as a]
+   [datalevin.udf :as udf]
    [datalevin.remote :as r]
    [datalevin.constants :as c]
    [datalevin.bits :as b]
@@ -1210,6 +1211,80 @@
                    :include-text?   false
                    :search-opts     default-search-opts})
 
+(def ^:private analyzer-udf-kinds
+  {:analyzer       #{:analyzer}
+   :query-analyzer #{:analyzer :query-analyzer}})
+
+(defn- analyzer-udf-reference?
+  [x]
+  (or (udf/descriptor? x) (keyword? x)))
+
+(defn- analyzer-token-int?
+  [x]
+  (and (integer? x) (<= 0 (long x) Integer/MAX_VALUE)))
+
+(defn- analyzer-token
+  [udf-desc token]
+  (let [items (try
+                (vec token)
+                (catch Exception e
+                  (raise "Analyzer UDF returned a non-sequential token"
+                         e
+                         {:descriptor udf-desc
+                          :token      token})))]
+    (when-not (= 3 (count items))
+      (raise "Analyzer UDF token must be [term position offset]"
+             {:descriptor udf-desc
+              :token      token}))
+    (let [[term position offset] items]
+      (when-not (string? term)
+        (raise "Analyzer UDF token term must be a string"
+               {:descriptor udf-desc
+                :token      token}))
+      (when-not (analyzer-token-int? position)
+        (raise "Analyzer UDF token position must be a non-negative integer"
+               {:descriptor udf-desc
+                :token      token}))
+      (when-not (analyzer-token-int? offset)
+        (raise "Analyzer UDF token offset must be a non-negative integer"
+               {:descriptor udf-desc
+                :token      token}))
+      [term (int position) (int offset)])))
+
+(defn- analyzer-result
+  [udf-desc result]
+  (mapv #(analyzer-token udf-desc %) (or result [])))
+
+(defn- resolve-analyzer-udf
+  [udf-registry domain k value]
+  (let [udf-desc (udf/descriptor-or-registered udf-registry
+                                                (analyzer-udf-kinds k)
+                                                value)
+        callable (udf/materialize udf-registry
+                                  {:feature :fulltext-analyzer
+                                   :domain  domain
+                                   :kind    k}
+                                  udf-desc)]
+    (fn [text]
+      (analyzer-result udf-desc (callable text)))))
+
+(defn- resolve-analyzer-option
+  [udf-registry domain k value]
+  (if (analyzer-udf-reference? value)
+    (resolve-analyzer-udf udf-registry domain k value)
+    value))
+
+(defn- resolve-analyzer-options
+  [{:keys [domain udf-registry] :as opts}]
+  (-> opts
+      (cond-> (contains? opts :analyzer)
+        (update :analyzer
+                #(resolve-analyzer-option udf-registry domain :analyzer %)))
+      (cond-> (contains? opts :query-analyzer)
+        (update :query-analyzer
+                #(resolve-analyzer-option udf-registry domain :query-analyzer %)))
+      (dissoc :udf-registry)))
+
 (defn new-search-engine*
   ([lmdb]
    (new-search-engine* lmdb nil))
@@ -1219,7 +1294,15 @@
                  index-position? (default-opts :index-position?)
                  include-text?   (default-opts :include-text?)
                  search-opts     (default-opts :search-opts)
-                 domain          c/default-domain}}]
+                 domain          c/default-domain}
+          :as   opts}]
+   (let [opts (resolve-analyzer-options (assoc opts :domain domain))
+         {:keys [analyzer query-analyzer index-position? include-text?
+                 search-opts]
+          :or   {analyzer        (default-opts :analyzer)
+                 index-position? (default-opts :index-position?)
+                 include-text?   (default-opts :include-text?)
+                 search-opts     (default-opts :search-opts)}} opts]
    (let [terms-dbi     (str domain "/" c/terms)
          docs-dbi      (str domain "/" c/docs)
          positions-dbi (str domain "/" c/positions)
@@ -1242,7 +1325,7 @@
                        (AtomicInteger. max-term)
                        index-position?
                        include-text?
-                       search-opts)))))
+                       search-opts))))))
 
 (defn new-search-engine
   ([lmdb]
@@ -1356,7 +1439,13 @@
           :or   {domain          c/default-domain
                  analyzer        a/en-analyzer
                  index-position? false
-                 include-text?   false}}]
+                 include-text?   false}
+          :as   opts}]
+   (let [opts (resolve-analyzer-options (assoc opts :domain domain))
+         {:keys [analyzer index-position? include-text?]
+          :or   {analyzer        a/en-analyzer
+                 index-position? false
+                 include-text?   false}} opts]
    (let [terms-dbi     (str domain "/" c/terms)
          docs-dbi      (str domain "/" c/docs)
          positions-dbi (str domain "/" c/positions)
@@ -1373,7 +1462,7 @@
                     index-position?
                     include-text?
                     (FastList.)
-                    (HashMap.)))))
+                    (HashMap.))))))
 
 
 

@@ -806,17 +806,18 @@
 
 ;; ----------------------------------------------------------------------------
 
-(defn- open-store
-  [dir schema opts]
-  (if (r/dtlv-uri? dir)
-    (r/open dir schema opts)
-    (s/open dir schema opts)))
-
 (defn- split-runtime-opts
   [opts]
   (if (map? opts)
     [(dissoc opts :runtime-opts) (:runtime-opts opts)]
     [opts nil]))
+
+(defn- open-store
+  [dir schema opts]
+  (if (r/dtlv-uri? dir)
+    (let [[store-opts _] (split-runtime-opts opts)]
+      (r/open dir schema store-opts))
+    (s/open dir schema opts)))
 
 (defn new-db
   ([^IStore store] (new-db store nil))
@@ -861,8 +862,8 @@
   ([dir schema opts]
    {:pre [(or (nil? schema) (map? schema))]}
    (vld/validate-schema schema)
-   (let [[store-opts runtime-opts] (split-runtime-opts opts)]
-     (cond-> (new-db (open-store dir schema store-opts))
+   (let [[_ runtime-opts] (split-runtime-opts opts)]
+     (cond-> (new-db (open-store dir schema opts))
        (some? runtime-opts) (with-runtime-opts runtime-opts)))))
 
 (def coerce-inst prepare/coerce-inst)
@@ -985,8 +986,8 @@
    {:pre [(or (nil? schema) (map? schema))]}
    (vld/validate-datom-list datoms)
    (vld/validate-schema schema)
-   (let [[store-opts runtime-opts] (split-runtime-opts opts)
-         ^Store store              (open-store dir schema store-opts)]
+   (let [[_ runtime-opts] (split-runtime-opts opts)
+         ^Store store    (open-store dir schema opts)]
      (quick-fill store datoms)
      (cond-> (new-db store)
        (some? runtime-opts) (with-runtime-opts runtime-opts)))))

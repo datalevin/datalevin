@@ -22,6 +22,7 @@ class JavaClasses:
     linked_hash_map: object
     linked_hash_set: object
     array_list: object
+    string_type: object
     uuid: object
     instant: object
     date: object
@@ -54,6 +55,7 @@ def classes() -> JavaClasses:
         linked_hash_map=jpype.JClass("java.util.LinkedHashMap"),
         linked_hash_set=jpype.JClass("java.util.LinkedHashSet"),
         array_list=jpype.JClass("java.util.ArrayList"),
+        string_type=jpype.JClass("java.lang.String"),
         uuid=jpype.JClass("java.util.UUID"),
         instant=jpype.JClass("java.time.Instant"),
         date=jpype.JClass("java.util.Date"),

@@ -60,6 +60,20 @@ public final class UdfRegistry {
     }
 
     /**
+     * Registers a full-text analyzer implementation.
+     */
+    public UdfRegistry analyzer(String id, UdfFunction fn) {
+        return register(UdfDescriptor.analyzer(id), fn);
+    }
+
+    /**
+     * Registers a full-text query analyzer implementation.
+     */
+    public UdfRegistry queryAnalyzer(String id, UdfFunction fn) {
+        return register(UdfDescriptor.queryAnalyzer(id), fn);
+    }
+
+    /**
      * Unregisters a UDF implementation.
      */
     public UdfRegistry unregister(UdfDescriptor descriptor) {

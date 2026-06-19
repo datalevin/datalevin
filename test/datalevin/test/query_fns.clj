@@ -553,6 +553,55 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-fulltext-analyzer-udf
+  (let [dir             (u/tmp-dir (str "fulltext-analyzer-udf-"
+                                        (UUID/randomUUID)))
+        analyzer-desc   {:udf/lang :test
+                         :udf/kind :analyzer
+                         :udf/id   :hashtag-analyzer}
+        query-desc      {:udf/lang :test
+                         :udf/kind :query-analyzer
+                         :udf/id   :plain-query-analyzer}
+        analyzer        (fn [^String text]
+                          (let [matcher (re-matcher #"#\w+" text)]
+                            (loop [pos 0
+                                   out []]
+                              (if (.find matcher)
+                                (recur (inc pos)
+                                       (conj out [(subs (.group matcher) 1)
+                                                  pos
+                                                  (.start matcher)]))
+                                out))))
+        query-analyzer  (fn [^String text]
+                          (->> (str/split text #"\s+")
+                               (remove str/blank?)
+                               (map-indexed (fn [pos token]
+                                              [token pos pos]))
+                               vec))
+        registry        (doto (udf/create-registry)
+                          (udf/register! analyzer-desc analyzer)
+                          (udf/register! query-desc query-analyzer))
+        db              (-> (d/empty-db
+                              dir
+                              {:text {:db/valueType           :db.type/string
+                                      :db/fulltext            true
+                                      :db.fulltext/autoDomain true}}
+                              {:runtime-opts {:udf-registry registry}
+                               :search-domains
+                               {"text" {:index-position? true
+                                        :analyzer analyzer-desc
+                                        :query-analyzer query-desc}}})
+                            (d/db-with
+                              [{:db/id 1 :text "alpha #needle"}
+                               {:db/id 2 :text "needle without hash"}]))]
+    (is (= #{[1 :text "alpha #needle"]}
+           (d/q '[:find ?e ?a ?v
+                  :in $ ?q
+                  :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]
+                db "needle")))
+    (d/close-db db)
+    (u/delete-files dir)))
+
 (deftest test-query-fns
   (testing "predicate without free variables"
     (is (= (d/q '[:find ?x

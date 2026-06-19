@@ -62,6 +62,13 @@
  * }
  * }</pre>
  *
+ * <p>Fulltext analyzer parity uses the same registry route. Register analyzer
+ * implementations with {@link datalevin.UdfRegistry#analyzer} or
+ * {@link datalevin.UdfRegistry#queryAnalyzer}, then put
+ * {@link datalevin.Datalevin#analyzerUdf} or
+ * {@link datalevin.Datalevin#queryAnalyzerUdf} descriptors in a search-domain
+ * option map.
+ *
  * <p>For bulk load, use Datom-shaped input with {@link datalevin.Datalevin#initDb}
  * and {@link datalevin.Connection#fillDb}:
  *

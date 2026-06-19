@@ -2699,10 +2699,15 @@
     (or search-domains0 {}) schema))
 
 (defn- init-engines
-  [lmdb domains]
+  [lmdb domains runtime-opts]
   (reduce-kv
     (fn [m domain opts]
-      (assoc m domain (s/new-search-engine lmdb opts)))
+      (assoc m domain
+             (s/new-search-engine
+               lmdb
+               (cond-> opts
+                 (:udf-registry runtime-opts)
+                 (assoc :udf-registry (:udf-registry runtime-opts))))))
     {} domains))
 
 (defn- listed-vector-domains
@@ -3171,7 +3176,15 @@
            (transact-opts lmdb opts4))
          (ensure-open-last-modified! lmdb)
          (if shared-store
-           (let [wrapper (with-open-opts shared-store store-opts)]
+           (let [runtime-opts (:runtime-opts opts4)
+                 wrapper      (with-open-opts
+                                shared-store
+                                store-opts
+                                (cond-> {}
+                                  (:udf-registry runtime-opts)
+                                  (assoc :search-engines
+                                         (init-engines lmdb s-domains
+                                                       runtime-opts))))]
              (when dir-key
                (locking shared-local-stores
                  (swap! shared-local-stores
@@ -3185,7 +3198,8 @@
            (let [e-providers (init-embedding-providers dir e-domains
                                                        embedding-providers)
                  store (->Store lmdb
-                                (init-engines lmdb s-domains)
+                                (init-engines lmdb s-domains
+                                              (:runtime-opts opts4))
                                 (init-indices lmdb v-domains)
                                 (init-embedding-indices lmdb e-domains)
                                 (init-idoc-indices lmdb i-domains)
@@ -3263,28 +3277,32 @@
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different
   in-memory opts. This does not persist opts back into LMDB."
-  [^Store old new-opts]
-  (let [schema* (schema old)]
-    (->Store (.-lmdb old)
-             (.-search-engines old)
-             (.-vector-indices old)
-             (.-embedding-indices old)
-             (store-idoc-indices old)
-             (.-embedding-providers old)
-             (.-counts old)
-             (store-visible-opts new-opts)
-             schema*
-             (schema->rschema schema*)
-             (init-attrs schema*)
-             (init-max-aid schema*)
-             (max-gt old)
-             (max-tx old)
-             (init-state-sync-ms (.-lmdb old))
-             (.-scheduled-sampling old)
-             (.-write-txn old)
-             (.-sampling-lock old)
-             false
-             (.-shared-dir-key old))))
+  ([^Store old new-opts]
+   (with-open-opts old new-opts nil))
+  ([^Store old new-opts {:keys [search-engines vector-indices
+                                embedding-indices idoc-indices
+                                embedding-providers]}]
+   (let [schema* (schema old)]
+     (->Store (.-lmdb old)
+              (or search-engines (.-search-engines old))
+              (or vector-indices (.-vector-indices old))
+              (or embedding-indices (.-embedding-indices old))
+              (or idoc-indices (store-idoc-indices old))
+              (or embedding-providers (.-embedding-providers old))
+              (.-counts old)
+              (store-visible-opts new-opts)
+              schema*
+              (schema->rschema schema*)
+              (init-attrs schema*)
+              (init-max-aid schema*)
+              (max-gt old)
+              (max-tx old)
+              (init-state-sync-ms (.-lmdb old))
+              (.-scheduled-sampling old)
+              (.-write-txn old)
+              (.-sampling-lock old)
+              false
+              (.-shared-dir-key old)))))
 
 (defn- close-store-resources!
   [^Store this]

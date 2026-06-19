@@ -105,6 +105,83 @@ try (Connection conn = Datalevin.createConn(
 }
 ```
 
+Fulltext analyzers use the same registry route. Register an analyzer and query
+analyzer, then put their descriptors in a Datalog search-domain option map. Each
+analyzer returns `[term, position, offset]` triples.
+
+```java
+import datalevin.Connection;
+import datalevin.Datalevin;
+import datalevin.Schema;
+import datalevin.UdfDescriptor;
+import datalevin.UdfRegistry;
+
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
+UdfRegistry searchRegistry = Datalevin.udfRegistry();
+UdfDescriptor analyzer = Datalevin.analyzerUdf("text/hashtags");
+UdfDescriptor queryAnalyzer = Datalevin.queryAnalyzerUdf("text/plain-query");
+
+searchRegistry.analyzer("text/hashtags", args -> {
+    String text = (String) args.get(0);
+    List<List<Object>> tokens = new ArrayList<>();
+    int searchFrom = 0;
+    while (searchFrom < text.length()) {
+        int start = text.indexOf('#', searchFrom);
+        if (start < 0) {
+            break;
+        }
+        int end = start + 1;
+        while (end < text.length() && Character.isLetterOrDigit(text.charAt(end))) {
+            end++;
+        }
+        if (end > start + 1) {
+            tokens.add(List.of(text.substring(start + 1, end), tokens.size(), start));
+        }
+        searchFrom = Math.max(end, start + 1);
+    }
+    return tokens;
+});
+
+searchRegistry.queryAnalyzer("text/plain-query", args -> {
+    String text = (String) args.get(0);
+    List<List<Object>> tokens = new ArrayList<>();
+    for (String token : text.split("\\s+")) {
+        if (!token.isBlank()) {
+            tokens.add(List.of(token, tokens.size(), tokens.size()));
+        }
+    }
+    return tokens;
+});
+
+try (Connection conn = Datalevin.createConn(
+        "/tmp/dtlv-java-fulltext-udf",
+        Datalevin.schema()
+                .attr("text", Schema.attribute()
+                        .valueType(Schema.ValueType.STRING)
+                        .fulltext(true)
+                        .fulltextAutoDomain(true)),
+        Map.of(
+                ":runtime-opts", Map.of(":udf-registry", searchRegistry),
+                ":search-domains", Map.of(
+                        "text",
+                        Datalevin.searchDomain()
+                                .indexPosition(true)
+                                .prop("analyzer", analyzer)
+                                .prop("query-analyzer", queryAnalyzer)
+                                .build())))) {
+    conn.transact(List.of(
+            Map.of(":db/id", 1L, "text", "alpha #needle"),
+            Map.of(":db/id", 2L, "text", "needle without hash")));
+
+    Object matchingIds = conn.query(
+            "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
+            "needle");
+}
+```
+
 ## Datalog Quick Start
 
 ```java

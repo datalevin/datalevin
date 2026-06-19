@@ -1,0 +1,51 @@
+%% Transitive Closure benchmark for XSB Prolog
+%% Usage: xsb -e "['tc'], run_tc_ff."
+
+:- table tc/2.
+
+%% TC rules with tabling for efficient memoization
+tc(A, B) :- edge(A, B).
+tc(A, B) :- edge(A, X), tc(X, B).
+
+%% Load edge facts from file
+load_edges(File) :-
+    see(File),
+    read_edges,
+    seen.
+
+read_edges :-
+    read(Term),
+    (Term == end_of_file -> true
+    ; assert(Term), read_edges).
+
+%% Benchmark: TC with both arguments free
+run_tc_ff :-
+    cputime(Start),
+    findall((A,B), tc(A,B), Results),
+    cputime(End),
+    Time is End - Start,
+    length(Results, Count),
+    format('TC-FF: ~w results in ~3f seconds~n', [Count, Time]).
+
+%% Benchmark: TC with first argument bound
+run_tc_bf(Start) :-
+    cputime(T1),
+    findall(B, tc(Start, B), Results),
+    cputime(T2),
+    Time is T2 - T1,
+    length(Results, Count),
+    format('TC-BF: ~w results in ~3f seconds~n', [Count, Time]).
+
+%% Benchmark: TC with second argument bound
+run_tc_fb(End) :-
+    cputime(T1),
+    findall(A, tc(A, End), Results),
+    cputime(T2),
+    Time is T2 - T1,
+    length(Results, Count),
+    format('TC-FB: ~w results in ~3f seconds~n', [Count, Time]).
+
+%% Clean up for next run
+cleanup :-
+    abolish_all_tables,
+    retractall(edge(_,_)).
