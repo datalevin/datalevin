@@ -247,12 +247,39 @@ class InteropBindings:
     def kv_visit_list(self, handle, list_name, visitor, key, k_type, v_type):
         return call_java(classes().interop.kvVisitList, handle, list_name, visitor, to_java(key), k_type, v_type)
 
+    def kv_visit_list_raw(self, handle, list_name, visitor, key, k_type):
+        return call_java(classes().interop.kvVisitListRaw, handle, list_name, visitor, to_java(key), k_type)
+
     def kv_visit_list_range(self, handle, list_name, visitor, k_range, k_type, v_range, v_type):
         return call_java(classes().interop.kvVisitListRange, handle, list_name, visitor, k_range, k_type, v_range, v_type)
+
+    def kv_visit_list_range_raw(self, handle, list_name, visitor, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvVisitListRangeRaw,
+            handle,
+            list_name,
+            visitor,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
 
     def kv_list_range_filter(self, handle, list_name, predicate, k_range, k_type, v_range, v_type):
         return call_java(
             classes().interop.kvListRangeFilter,
+            handle,
+            list_name,
+            predicate,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
+    def kv_list_range_filter_raw(self, handle, list_name, predicate, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeFilterRaw,
             handle,
             list_name,
             predicate,
@@ -274,6 +301,18 @@ class InteropBindings:
             v_type,
         )
 
+    def kv_list_range_filter_count_raw(self, handle, list_name, predicate, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeFilterCountRaw,
+            handle,
+            list_name,
+            predicate,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
     def kv_list_range_keep(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
         return call_java(
             classes().interop.kvListRangeKeep,
@@ -286,9 +325,33 @@ class InteropBindings:
             v_type,
         )
 
+    def kv_list_range_keep_raw(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeKeepRaw,
+            handle,
+            list_name,
+            fn,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
     def kv_list_range_some(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
         return call_java(
             classes().interop.kvListRangeSome,
+            handle,
+            list_name,
+            fn,
+            k_range,
+            k_type,
+            v_range,
+            v_type,
+        )
+
+    def kv_list_range_some_raw(self, handle, list_name, fn, k_range, k_type, v_range, v_type):
+        return call_java(
+            classes().interop.kvListRangeSomeRaw,
             handle,
             list_name,
             fn,

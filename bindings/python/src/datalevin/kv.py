@@ -6,7 +6,7 @@ import jpype
 
 from ._convert import to_edn_form, to_java, to_python
 from ._interop import _BINDINGS
-from ._java import classes
+from ._java import call_java, classes
 from ._resource import ResourceWrapper
 
 
@@ -61,6 +61,56 @@ def _append_typed_args(args, *, k_type=None, v_type=None, ignore_key=None, op):
         args.append(bool(ignore_key))
 
 
+class RawBuffer:
+    """Raw buffer supplied to raw KV callbacks."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def raw_handle(self):
+        return self._handle
+
+    def bytes(self) -> bytes:
+        return to_python(call_java(self._handle.bytes))
+
+    def read(self, value_type=":data"):
+        if value_type is None:
+            return to_python(call_java(self._handle.read))
+        return to_python(call_java(self._handle.read, to_java(value_type)))
+
+
+class RawKV:
+    """Raw key/value pair supplied to raw KV range callbacks."""
+
+    def __init__(self, handle) -> None:
+        self._handle = handle
+
+    def raw_handle(self):
+        return self._handle
+
+    def key(self) -> RawBuffer:
+        return RawBuffer(call_java(self._handle.key))
+
+    def value(self) -> RawBuffer:
+        return RawBuffer(call_java(self._handle.value))
+
+    def key_bytes(self) -> bytes:
+        return to_python(call_java(self._handle.keyBytes))
+
+    def value_bytes(self) -> bytes:
+        return to_python(call_java(self._handle.valueBytes))
+
+    def read_key(self, value_type=":data"):
+        if value_type is None:
+            return to_python(call_java(self._handle.readKey))
+        return to_python(call_java(self._handle.readKey, to_java(value_type)))
+
+    def read_value(self, value_type=":data"):
+        if value_type is None:
+            return to_python(call_java(self._handle.readValue))
+        return to_python(call_java(self._handle.readValue, to_java(value_type)))
+
+
 class _PythonConsumer:
     def __init__(self, fn) -> None:
         self._fn = fn
@@ -93,6 +143,38 @@ class _PythonBiFunction:
         return to_java(self._fn(to_python(key), to_python(value)))
 
 
+class _PythonRawBufferConsumer:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def accept(self, value):
+        self._fn(RawBuffer(value))
+
+
+class _PythonRawKVConsumer:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def accept(self, value):
+        self._fn(RawKV(value))
+
+
+class _PythonRawKVPredicate:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def test(self, value):
+        return bool(self._fn(RawKV(value)))
+
+
+class _PythonRawKVFunction:
+    def __init__(self, fn) -> None:
+        self._fn = fn
+
+    def apply(self, value):
+        return to_java(self._fn(RawKV(value)))
+
+
 def _consumer_proxy(fn):
     return jpype.JProxy(classes().consumer_type, inst=_PythonConsumer(fn))
 
@@ -107,6 +189,22 @@ def _bi_predicate_proxy(fn):
 
 def _bi_function_proxy(fn):
     return jpype.JProxy(classes().bi_function_type, inst=_PythonBiFunction(fn))
+
+
+def _raw_buffer_consumer_proxy(fn):
+    return jpype.JProxy(classes().consumer_type, inst=_PythonRawBufferConsumer(fn))
+
+
+def _raw_kv_consumer_proxy(fn):
+    return jpype.JProxy(classes().consumer_type, inst=_PythonRawKVConsumer(fn))
+
+
+def _raw_kv_predicate_proxy(fn):
+    return jpype.JProxy(classes().predicate_type, inst=_PythonRawKVPredicate(fn))
+
+
+def _raw_kv_function_proxy(fn):
+    return jpype.JProxy(classes().function_type, inst=_PythonRawKVFunction(fn))
 
 
 class KV(ResourceWrapper):
@@ -423,6 +521,17 @@ class KV(ResourceWrapper):
             v_type,
         )
 
+    def visit_list_raw(self, list_name, visitor, key, k_type):
+        _require_callable(visitor, "visit_list_raw")
+        _require_k_type(k_type, "visit_list_raw")
+        _BINDINGS.kv_visit_list_raw(
+            self.raw_handle(),
+            list_name,
+            _raw_buffer_consumer_proxy(visitor),
+            to_java(key),
+            k_type,
+        )
+
     def visit_list_range(self, list_name, visitor, k_range, k_type, v_range, v_type):
         if k_range is None:
             raise ValueError("k_range is required for KV visit_list_range().")
@@ -435,6 +544,24 @@ class KV(ResourceWrapper):
             self.raw_handle(),
             list_name,
             _bi_consumer_proxy(visitor),
+            to_edn_form(k_range),
+            k_type,
+            to_edn_form(v_range),
+            v_type,
+        )
+
+    def visit_list_range_raw(self, list_name, visitor, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV visit_list_range_raw().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV visit_list_range_raw().")
+        _require_callable(visitor, "visit_list_range_raw")
+        _require_k_type(k_type, "visit_list_range_raw")
+        _require_v_type(v_type, "visit_list_range_raw")
+        _BINDINGS.kv_visit_list_range_raw(
+            self.raw_handle(),
+            list_name,
+            _raw_kv_consumer_proxy(visitor),
             to_edn_form(k_range),
             k_type,
             to_edn_form(v_range),
@@ -465,6 +592,30 @@ class KV(ResourceWrapper):
             offset,
         )
 
+    def list_range_filter_raw(self, list_name, predicate, k_range, k_type, v_range, v_type, limit=None, offset=None):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_filter_raw().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_filter_raw().")
+        _require_callable(predicate, "list_range_filter_raw")
+        _require_k_type(k_type, "list_range_filter_raw")
+        _require_v_type(v_type, "list_range_filter_raw")
+        return _slice_page(
+            to_python(
+                _BINDINGS.kv_list_range_filter_raw(
+                    self.raw_handle(),
+                    list_name,
+                    _raw_kv_predicate_proxy(predicate),
+                    to_edn_form(k_range),
+                    k_type,
+                    to_edn_form(v_range),
+                    v_type,
+                )
+            ),
+            limit,
+            offset,
+        )
+
     def list_range_filter_count(self, list_name, predicate, k_range, k_type, v_range, v_type):
         if k_range is None:
             raise ValueError("k_range is required for KV list_range_filter_count().")
@@ -478,6 +629,26 @@ class KV(ResourceWrapper):
                 self.raw_handle(),
                 list_name,
                 _bi_predicate_proxy(predicate),
+                to_edn_form(k_range),
+                k_type,
+                to_edn_form(v_range),
+                v_type,
+            )
+        )
+
+    def list_range_filter_count_raw(self, list_name, predicate, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_filter_count_raw().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_filter_count_raw().")
+        _require_callable(predicate, "list_range_filter_count_raw")
+        _require_k_type(k_type, "list_range_filter_count_raw")
+        _require_v_type(v_type, "list_range_filter_count_raw")
+        return to_python(
+            _BINDINGS.kv_list_range_filter_count_raw(
+                self.raw_handle(),
+                list_name,
+                _raw_kv_predicate_proxy(predicate),
                 to_edn_form(k_range),
                 k_type,
                 to_edn_form(v_range),
@@ -509,6 +680,30 @@ class KV(ResourceWrapper):
             offset,
         )
 
+    def list_range_keep_raw(self, list_name, fn, k_range, k_type, v_range, v_type, limit=None, offset=None):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_keep_raw().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_keep_raw().")
+        _require_callable(fn, "list_range_keep_raw")
+        _require_k_type(k_type, "list_range_keep_raw")
+        _require_v_type(v_type, "list_range_keep_raw")
+        return _slice_page(
+            to_python(
+                _BINDINGS.kv_list_range_keep_raw(
+                    self.raw_handle(),
+                    list_name,
+                    _raw_kv_function_proxy(fn),
+                    to_edn_form(k_range),
+                    k_type,
+                    to_edn_form(v_range),
+                    v_type,
+                )
+            ),
+            limit,
+            offset,
+        )
+
     def list_range_some(self, list_name, fn, k_range, k_type, v_range, v_type):
         if k_range is None:
             raise ValueError("k_range is required for KV list_range_some().")
@@ -522,6 +717,26 @@ class KV(ResourceWrapper):
                 self.raw_handle(),
                 list_name,
                 _bi_function_proxy(fn),
+                to_edn_form(k_range),
+                k_type,
+                to_edn_form(v_range),
+                v_type,
+            )
+        )
+
+    def list_range_some_raw(self, list_name, fn, k_range, k_type, v_range, v_type):
+        if k_range is None:
+            raise ValueError("k_range is required for KV list_range_some_raw().")
+        if v_range is None:
+            raise ValueError("v_range is required for KV list_range_some_raw().")
+        _require_callable(fn, "list_range_some_raw")
+        _require_k_type(k_type, "list_range_some_raw")
+        _require_v_type(v_type, "list_range_some_raw")
+        return to_python(
+            _BINDINGS.kv_list_range_some_raw(
+                self.raw_handle(),
+                list_name,
+                _raw_kv_function_proxy(fn),
                 to_edn_form(k_range),
                 k_type,
                 to_edn_form(v_range),

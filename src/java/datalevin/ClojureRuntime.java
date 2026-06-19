@@ -40,6 +40,7 @@ final class ClojureRuntime {
         require("datalevin.datom");
         require("datalevin.interface");
         require("datalevin.json-api");
+        require("datalevin.lmdb");
         require("datalevin.udf");
     }
 

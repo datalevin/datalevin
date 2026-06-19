@@ -47,7 +47,7 @@ export {
   writeEdn
 } from "./interop.js";
 export { interop } from "./raw.js";
-export { KV, KVTransaction } from "./kv.js";
+export { KV, KVTransaction, RawBuffer, RawKV } from "./kv.js";
 export { LlamaEmbedder, LlamaGenerator } from "./llm.js";
 export { SearchEngine, SearchIndexWriter } from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";

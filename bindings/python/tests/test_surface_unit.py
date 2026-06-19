@@ -670,11 +670,15 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "list_range",
         "list_range_count",
         "list_range_filter",
+        "list_range_filter_raw",
         "list_range_filter_count",
+        "list_range_filter_count_raw",
         "list_range_first",
         "list_range_first_n",
         "list_range_keep",
+        "list_range_keep_raw",
         "list_range_some",
+        "list_range_some_raw",
         "list_snapshots",
         "new_search_engine",
         "new_vector_index",
@@ -691,10 +695,18 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "transaction",
         "tx_log_watermarks",
         "visit_list",
+        "visit_list_raw",
         "visit_list_range",
+        "visit_list_range_raw",
         "with_transaction",
     ]:
         assert callable(getattr(kv_module.KV, method))
+    assert callable(getattr(datalevin.RawBuffer, "read"))
+    assert callable(getattr(datalevin.RawBuffer, "bytes"))
+    assert callable(getattr(datalevin.RawKV, "read_key"))
+    assert callable(getattr(datalevin.RawKV, "read_value"))
+    assert callable(getattr(datalevin.RawKV, "key_bytes"))
+    assert callable(getattr(datalevin.RawKV, "value_bytes"))
     assert callable(getattr(datalevin.KVTransaction, "abort"))
     assert callable(getattr(datalevin.KVTransaction, "active"))
     assert callable(getattr(datalevin.KVTransaction, "commit"))

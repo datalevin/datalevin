@@ -236,6 +236,78 @@ public final class JavaSmoke {
                     throw new IllegalStateException("Unexpected visit-list-range result: " + ranged);
                 }
 
+                List<Object> rawVisited = new ArrayList<>();
+                kv.visitListRaw("list", raw -> rawVisited.add(raw.read(KVType.LONG)), "a", KVType.STRING);
+                if (!List.of(1L, 2L, 3L).equals(rawVisited)) {
+                    throw new IllegalStateException("Unexpected raw visit-list result: " + rawVisited);
+                }
+
+                List<List<Object>> rawRanged = new ArrayList<>();
+                kv.visitListRangeRaw(
+                        "list",
+                        raw -> rawRanged.add(List.of(raw.readKey(KVType.STRING), raw.readValue(KVType.LONG))),
+                        RangeSpec.closed("a", "b"),
+                        KVType.STRING,
+                        RangeSpec.closed(2L, 4L),
+                        KVType.LONG);
+                if (!List.of(List.of("a", 2L), List.of("a", 3L), List.of("b", 4L)).equals(rawRanged)) {
+                    throw new IllegalStateException("Unexpected raw visit-list-range result: " + rawRanged);
+                }
+
+                List<?> rawFiltered = kv.listRangeFilterRaw(
+                        "list",
+                        raw -> "b".equals(raw.readKey(KVType.STRING))
+                                && ((Long) raw.readValue(KVType.LONG)) >= 4L,
+                        RangeSpec.all(),
+                        KVType.STRING,
+                        RangeSpec.all(),
+                        KVType.LONG,
+                        null,
+                        null);
+                if (!List.of(List.of("b", 4L), List.of("b", 5L)).equals(rawFiltered)) {
+                    throw new IllegalStateException("Unexpected raw list-range-filter result: " + rawFiltered);
+                }
+
+                List<?> rawKept = kv.listRangeKeepRaw(
+                        "list",
+                        raw -> ((Long) raw.readValue(KVType.LONG)) >= 3L
+                                ? raw.readKey(KVType.STRING) + ":" + raw.readValue(KVType.LONG)
+                                : null,
+                        RangeSpec.all(),
+                        KVType.STRING,
+                        RangeSpec.all(),
+                        KVType.LONG,
+                        null,
+                        null);
+                if (!List.of("a:3", "b:4", "b:5").equals(rawKept)) {
+                    throw new IllegalStateException("Unexpected raw list-range-keep result: " + rawKept);
+                }
+
+                Object rawSome = kv.listRangeSomeRaw(
+                        "list",
+                        raw -> ((Long) raw.readValue(KVType.LONG)) == 5L
+                                ? raw.readKey(KVType.STRING) + ":" + raw.readValue(KVType.LONG)
+                                : null,
+                        RangeSpec.all(),
+                        KVType.STRING,
+                        RangeSpec.all(),
+                        KVType.LONG);
+                if (!"b:5".equals(rawSome)) {
+                    throw new IllegalStateException("Unexpected raw list-range-some result: " + rawSome);
+                }
+
+                long rawFilterCount = kv.listRangeFilterCountRaw(
+                        "list",
+                        raw -> "a".equals(raw.readKey(KVType.STRING))
+                                && ((Long) raw.readValue(KVType.LONG)) >= 2L,
+                        RangeSpec.all(),
+                        KVType.STRING,
+                        RangeSpec.all(),
+                        KVType.LONG);
+                if (rawFilterCount != 2L) {
+                    throw new IllegalStateException("Unexpected raw list-range-filter-count result: " + rawFilterCount);
+                }
+
                 try (VectorIndex index = Datalevin.newVectorIndex(kv, Datalevin.vectorOptions(2))) {
                     index.addVec("vec-1", List.of(1.0, 0.0));
                     index.addVec("vec-2", List.of(0.0, 1.0));

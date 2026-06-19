@@ -11,6 +11,7 @@ import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
 import java.util.function.Function;
+import java.util.function.Predicate;
 
 /**
  * Handle for a local key-value store.
@@ -304,6 +305,30 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Visits the raw value buffers in the list associated with {@code key}.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitListRaw(String listName,
+                             Consumer<RawBuffer> visitor,
+                             Object key,
+                             String kType) {
+        visitListRawInternal(listName, visitor, key, kType);
+    }
+
+    /**
+     * Visits the raw value buffers in the list associated with {@code key}.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitListRaw(String listName,
+                             Consumer<RawBuffer> visitor,
+                             Object key,
+                             KVType kType) {
+        visitListRawInternal(listName, visitor, key, kType);
+    }
+
+    /**
      * Returns the number of items in the list associated with {@code key}.
      */
     public long listCount(String listName, Object key, String kType) {
@@ -476,6 +501,62 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Returns decoded list-backed key-value pairs whose raw key/value satisfies {@code predicate}.
+     */
+    public List<?> listRangeFilterRaw(String listName,
+                                      Predicate<RawKV> predicate,
+                                      List<?> kRange,
+                                      String kType,
+                                      List<?> vRange,
+                                      String vType,
+                                      Integer limit,
+                                      Integer offset) {
+        return listRangeFilterRawInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns decoded list-backed key-value pairs whose raw key/value satisfies {@code predicate}.
+     */
+    public List<?> listRangeFilterRaw(String listName,
+                                      Predicate<RawKV> predicate,
+                                      RangeSpec kRange,
+                                      String kType,
+                                      RangeSpec vRange,
+                                      String vType,
+                                      Integer limit,
+                                      Integer offset) {
+        return listRangeFilterRawInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns decoded list-backed key-value pairs whose raw key/value satisfies {@code predicate}.
+     */
+    public List<?> listRangeFilterRaw(String listName,
+                                      Predicate<RawKV> predicate,
+                                      List<?> kRange,
+                                      KVType kType,
+                                      List<?> vRange,
+                                      KVType vType,
+                                      Integer limit,
+                                      Integer offset) {
+        return listRangeFilterRawInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns decoded list-backed key-value pairs whose raw key/value satisfies {@code predicate}.
+     */
+    public List<?> listRangeFilterRaw(String listName,
+                                      Predicate<RawKV> predicate,
+                                      RangeSpec kRange,
+                                      KVType kType,
+                                      RangeSpec vRange,
+                                      KVType vType,
+                                      Integer limit,
+                                      Integer offset) {
+        return listRangeFilterRawInternal(listName, predicate, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
      * Returns the truthy results of applying {@code fn} to list-backed key-values in the given ranges.
      */
     public List<?> listRangeKeep(String listName,
@@ -532,6 +613,62 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Returns truthy results of applying {@code fn} to raw list-backed key-values.
+     */
+    public List<?> listRangeKeepRaw(String listName,
+                                    Function<RawKV, ?> fn,
+                                    List<?> kRange,
+                                    String kType,
+                                    List<?> vRange,
+                                    String vType,
+                                    Integer limit,
+                                    Integer offset) {
+        return listRangeKeepRawInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns truthy results of applying {@code fn} to raw list-backed key-values.
+     */
+    public List<?> listRangeKeepRaw(String listName,
+                                    Function<RawKV, ?> fn,
+                                    RangeSpec kRange,
+                                    String kType,
+                                    RangeSpec vRange,
+                                    String vType,
+                                    Integer limit,
+                                    Integer offset) {
+        return listRangeKeepRawInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns truthy results of applying {@code fn} to raw list-backed key-values.
+     */
+    public List<?> listRangeKeepRaw(String listName,
+                                    Function<RawKV, ?> fn,
+                                    List<?> kRange,
+                                    KVType kType,
+                                    List<?> vRange,
+                                    KVType vType,
+                                    Integer limit,
+                                    Integer offset) {
+        return listRangeKeepRawInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
+     * Returns truthy results of applying {@code fn} to raw list-backed key-values.
+     */
+    public List<?> listRangeKeepRaw(String listName,
+                                    Function<RawKV, ?> fn,
+                                    RangeSpec kRange,
+                                    KVType kType,
+                                    RangeSpec vRange,
+                                    KVType vType,
+                                    Integer limit,
+                                    Integer offset) {
+        return listRangeKeepRawInternal(listName, fn, kRange, kType, vRange, vType, limit, offset);
+    }
+
+    /**
      * Returns the first truthy result of applying {@code fn} to list-backed key-values in the given ranges.
      */
     public Object listRangeSome(String listName,
@@ -577,6 +714,54 @@ public class KV extends HandleResource {
                                 RangeSpec vRange,
                                 KVType vType) {
         return listRangeSomeInternal(listName, fn, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the first truthy result of applying {@code fn} to raw list-backed key-values.
+     */
+    public Object listRangeSomeRaw(String listName,
+                                   Function<RawKV, ?> fn,
+                                   List<?> kRange,
+                                   String kType,
+                                   List<?> vRange,
+                                   String vType) {
+        return listRangeSomeRawInternal(listName, fn, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the first truthy result of applying {@code fn} to raw list-backed key-values.
+     */
+    public Object listRangeSomeRaw(String listName,
+                                   Function<RawKV, ?> fn,
+                                   RangeSpec kRange,
+                                   String kType,
+                                   RangeSpec vRange,
+                                   String vType) {
+        return listRangeSomeRawInternal(listName, fn, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the first truthy result of applying {@code fn} to raw list-backed key-values.
+     */
+    public Object listRangeSomeRaw(String listName,
+                                   Function<RawKV, ?> fn,
+                                   List<?> kRange,
+                                   KVType kType,
+                                   List<?> vRange,
+                                   KVType vType) {
+        return listRangeSomeRawInternal(listName, fn, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the first truthy result of applying {@code fn} to raw list-backed key-values.
+     */
+    public Object listRangeSomeRaw(String listName,
+                                   Function<RawKV, ?> fn,
+                                   RangeSpec kRange,
+                                   KVType kType,
+                                   RangeSpec vRange,
+                                   KVType vType) {
+        return listRangeSomeRawInternal(listName, fn, kRange, kType, vRange, vType);
     }
 
     /**
@@ -628,6 +813,54 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Returns the count of raw list-backed key-values that satisfy {@code predicate}.
+     */
+    public long listRangeFilterCountRaw(String listName,
+                                        Predicate<RawKV> predicate,
+                                        List<?> kRange,
+                                        String kType,
+                                        List<?> vRange,
+                                        String vType) {
+        return listRangeFilterCountRawInternal(listName, predicate, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the count of raw list-backed key-values that satisfy {@code predicate}.
+     */
+    public long listRangeFilterCountRaw(String listName,
+                                        Predicate<RawKV> predicate,
+                                        RangeSpec kRange,
+                                        String kType,
+                                        RangeSpec vRange,
+                                        String vType) {
+        return listRangeFilterCountRawInternal(listName, predicate, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the count of raw list-backed key-values that satisfy {@code predicate}.
+     */
+    public long listRangeFilterCountRaw(String listName,
+                                        Predicate<RawKV> predicate,
+                                        List<?> kRange,
+                                        KVType kType,
+                                        List<?> vRange,
+                                        KVType vType) {
+        return listRangeFilterCountRawInternal(listName, predicate, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Returns the count of raw list-backed key-values that satisfy {@code predicate}.
+     */
+    public long listRangeFilterCountRaw(String listName,
+                                        Predicate<RawKV> predicate,
+                                        RangeSpec kRange,
+                                        KVType kType,
+                                        RangeSpec vRange,
+                                        KVType vType) {
+        return listRangeFilterCountRawInternal(listName, predicate, kRange, kType, vRange, vType);
+    }
+
+    /**
      * Visits list-backed key-values in the given ranges.
      */
     public void visitListRange(String listName,
@@ -673,6 +906,62 @@ public class KV extends HandleResource {
                                RangeSpec vRange,
                                KVType vType) {
         visitListRangeInternal(listName, visitor, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Visits raw list-backed key-values in the given ranges.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitListRangeRaw(String listName,
+                                  Consumer<RawKV> visitor,
+                                  List<?> kRange,
+                                  String kType,
+                                  List<?> vRange,
+                                  String vType) {
+        visitListRangeRawInternal(listName, visitor, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Visits raw list-backed key-values in the given ranges.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitListRangeRaw(String listName,
+                                  Consumer<RawKV> visitor,
+                                  RangeSpec kRange,
+                                  String kType,
+                                  RangeSpec vRange,
+                                  String vType) {
+        visitListRangeRawInternal(listName, visitor, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Visits raw list-backed key-values in the given ranges.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitListRangeRaw(String listName,
+                                  Consumer<RawKV> visitor,
+                                  List<?> kRange,
+                                  KVType kType,
+                                  List<?> vRange,
+                                  KVType vType) {
+        visitListRangeRawInternal(listName, visitor, kRange, kType, vRange, vType);
+    }
+
+    /**
+     * Visits raw list-backed key-values in the given ranges.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitListRangeRaw(String listName,
+                                  Consumer<RawKV> visitor,
+                                  RangeSpec kRange,
+                                  KVType kType,
+                                  RangeSpec vRange,
+                                  KVType vType) {
+        visitListRangeRawInternal(listName, visitor, kRange, kType, vRange, vType);
     }
 
     /**
@@ -1310,6 +1599,20 @@ public class KV extends HandleResource {
                      typeArg(vType));
     }
 
+    private void visitListRawInternal(String listName,
+                                      Consumer<RawBuffer> visitor,
+                                      Object key,
+                                      Object kType) {
+        ClojureRuntime.core("visit-list",
+                            resource(),
+                            listName,
+                            ClojureFns.rawBufferConsumer(visitor),
+                            ClojureCodec.runtimeInput(key),
+                            typeArg(kType),
+                            null,
+                            true);
+    }
+
     private long listCountInternal(String listName, Object key, Object kType) {
         return ClojureCodec.javaLong(ClojureRuntime.core("list-count",
                                                          resource(),
@@ -1391,6 +1694,25 @@ public class KV extends HandleResource {
                                   offset);
     }
 
+    private List<?> listRangeFilterRawInternal(String listName,
+                                               Predicate<RawKV> predicate,
+                                               Object kRange,
+                                               Object kType,
+                                               Object vRange,
+                                               Object vType,
+                                               Integer limit,
+                                               Integer offset) {
+        return page(ResultSupport.sequence(runListRangeRawFnOp("list-range-filter",
+                                                               listName,
+                                                               ClojureFns.rawKvPredicate(predicate),
+                                                               rangeArg(kRange),
+                                                               typeArg(kType),
+                                                               rangeArg(vRange),
+                                                               typeArg(vType))),
+                    limit,
+                    offset);
+    }
+
     private List<?> listRangeKeepInternal(String listName,
                                           BiFunction<Object, Object, ?> fn,
                                           Object kRange,
@@ -1409,6 +1731,25 @@ public class KV extends HandleResource {
                                 offset);
     }
 
+    private List<?> listRangeKeepRawInternal(String listName,
+                                             Function<RawKV, ?> fn,
+                                             Object kRange,
+                                             Object kType,
+                                             Object vRange,
+                                             Object vType,
+                                             Integer limit,
+                                             Integer offset) {
+        return page(ResultSupport.sequence(runListRangeRawFnOp("list-range-keep",
+                                                               listName,
+                                                               ClojureFns.rawKvFunction(fn),
+                                                               rangeArg(kRange),
+                                                               typeArg(kType),
+                                                               rangeArg(vRange),
+                                                               typeArg(vType))),
+                    limit,
+                    offset);
+    }
+
     private Object listRangeSomeInternal(String listName,
                                          BiFunction<Object, Object, ?> fn,
                                          Object kRange,
@@ -1422,6 +1763,21 @@ public class KV extends HandleResource {
                                 typeArg(kType),
                                 rangeArg(vRange),
                                 typeArg(vType));
+    }
+
+    private Object listRangeSomeRawInternal(String listName,
+                                            Function<RawKV, ?> fn,
+                                            Object kRange,
+                                            Object kType,
+                                            Object vRange,
+                                            Object vType) {
+        return runListRangeRawFnOp("list-range-some",
+                                   listName,
+                                   ClojureFns.rawKvFunction(fn),
+                                   rangeArg(kRange),
+                                   typeArg(kType),
+                                   rangeArg(vRange),
+                                   typeArg(vType));
     }
 
     private long listRangeFilterCountInternal(String listName,
@@ -1439,6 +1795,21 @@ public class KV extends HandleResource {
                                                       typeArg(vType)));
     }
 
+    private long listRangeFilterCountRawInternal(String listName,
+                                                 Predicate<RawKV> predicate,
+                                                 Object kRange,
+                                                 Object kType,
+                                                 Object vRange,
+                                                 Object vType) {
+        return ClojureCodec.javaLong(runListRangeRawFnOp("list-range-filter-count",
+                                                         listName,
+                                                         ClojureFns.rawKvPredicate(predicate),
+                                                         rangeArg(kRange),
+                                                         typeArg(kType),
+                                                         rangeArg(vRange),
+                                                         typeArg(vType)));
+    }
+
     private void visitListRangeInternal(String listName,
                                         BiConsumer<Object, Object> visitor,
                                         Object kRange,
@@ -1452,6 +1823,21 @@ public class KV extends HandleResource {
                          typeArg(kType),
                          rangeArg(vRange),
                          typeArg(vType));
+    }
+
+    private void visitListRangeRawInternal(String listName,
+                                           Consumer<RawKV> visitor,
+                                           Object kRange,
+                                           Object kType,
+                                           Object vRange,
+                                           Object vType) {
+        runListRangeRawFnOp("visit-list-range",
+                            listName,
+                            ClojureFns.rawKvConsumer(visitor),
+                            rangeArg(kRange),
+                            typeArg(kType),
+                            rangeArg(vRange),
+                            typeArg(vType));
     }
 
     private Object listRangeFirstInternal(String listName,
@@ -1682,6 +2068,16 @@ public class KV extends HandleResource {
                                     Object vRange,
                                     Object vType) {
         return ClojureRuntime.core(op, resource(), listName, fn, kRange, kType, vRange, vType, false);
+    }
+
+    private Object runListRangeRawFnOp(String op,
+                                       String listName,
+                                       Object fn,
+                                       Object kRange,
+                                       Object kType,
+                                       Object vRange,
+                                       Object vType) {
+        return ClojureRuntime.core(op, resource(), listName, fn, kRange, kType, vRange, vType, true);
     }
 
     private List<?> runListRangeFilter(String listName,

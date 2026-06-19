@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from datalevin import open_kv
+from datalevin import RawBuffer, RawKV, open_kv
 
 
 pytestmark = pytest.mark.usefixtures("require_runtime")
@@ -196,6 +196,65 @@ def test_kv_list_functional_operations(tmp_path) -> None:
         assert kv.list_range_some(
             "list",
             lambda key, value: [key, value] if value == 3 else None,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == ["b", 3]
+
+        raw_values = []
+        kv.visit_list_raw(
+            "list",
+            lambda raw: raw_values.append((isinstance(raw, RawBuffer), raw.read(":long"), len(raw.bytes()) > 0)),
+            "a",
+            ":string",
+        )
+        assert raw_values == [(True, 1, True), (True, 2, True)]
+
+        raw_pairs = []
+        kv.visit_list_range_raw(
+            "list",
+            lambda raw: raw_pairs.append(
+                [isinstance(raw, RawKV), raw.read_key(":string"), raw.read_value(":long"), len(raw.key_bytes()) > 0]
+            ),
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        )
+        assert raw_pairs == [[True, "a", 1, True], [True, "a", 2, True], [True, "b", 3, True]]
+
+        assert kv.list_range_filter_raw(
+            "list",
+            lambda raw: raw.read_value(":long") >= 2,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == [["a", 2], ["b", 3]]
+        assert kv.list_range_filter_count_raw(
+            "list",
+            lambda raw: raw.read_key(":string") == "a",
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == 2
+        assert kv.list_range_keep_raw(
+            "list",
+            lambda raw: f"{raw.read_key(':string')}:{raw.read_value(':long')}"
+            if raw.read_value(":long") > 1
+            else None,
+            [":all"],
+            ":string",
+            [":all"],
+            ":long",
+        ) == ["a:2", "b:3"]
+        assert kv.list_range_some_raw(
+            "list",
+            lambda raw: [raw.read_key(":string"), raw.read_value(":long")]
+            if raw.read_value(":long") == 3
+            else None,
             [":all"],
             ":string",
             [":all"],

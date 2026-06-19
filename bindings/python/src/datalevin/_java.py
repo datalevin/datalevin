@@ -32,6 +32,7 @@ class JavaClasses:
     set_type: object
     collection_type: object
     function_type: object
+    predicate_type: object
     consumer_type: object
     bi_consumer_type: object
     bi_function_type: object
@@ -63,6 +64,7 @@ def classes() -> JavaClasses:
         set_type=jpype.JClass("java.util.Set"),
         collection_type=jpype.JClass("java.util.Collection"),
         function_type=jpype.JClass("java.util.function.Function"),
+        predicate_type=jpype.JClass("java.util.function.Predicate"),
         consumer_type=jpype.JClass("java.util.function.Consumer"),
         bi_consumer_type=jpype.JClass("java.util.function.BiConsumer"),
         bi_function_type=jpype.JClass("java.util.function.BiFunction"),

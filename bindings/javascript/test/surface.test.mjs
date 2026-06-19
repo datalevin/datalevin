@@ -118,6 +118,8 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.Entity, "function");
   assert.equal(typeof datalevin.KV, "function");
   assert.equal(typeof datalevin.KVTransaction, "function");
+  assert.equal(typeof datalevin.RawBuffer, "function");
+  assert.equal(typeof datalevin.RawKV, "function");
   assert.equal(typeof datalevin.LlamaEmbedder, "function");
   assert.equal(typeof datalevin.LlamaGenerator, "function");
   assert.equal(typeof datalevin.SearchEngine, "function");
@@ -172,11 +174,15 @@ test("public surface stays importable without starting the JVM", () => {
     "listRange",
     "listRangeCount",
     "listRangeFilter",
+    "listRangeFilterRaw",
     "listRangeFilterCount",
+    "listRangeFilterCountRaw",
     "listRangeFirst",
     "listRangeFirstN",
     "listRangeKeep",
+    "listRangeKeepRaw",
     "listRangeSome",
+    "listRangeSomeRaw",
     "listSnapshots",
     "newSearchEngine",
     "newVectorIndex",
@@ -192,10 +198,18 @@ test("public surface stays importable without starting the JVM", () => {
     "transaction",
     "txLogWatermarks",
     "visitList",
+    "visitListRaw",
     "visitListRange",
+    "visitListRangeRaw",
     "withTransaction"
   ]) {
     assert.equal(typeof datalevin.KV.prototype[method], "function");
+  }
+  for (const method of ["bytes", "rawHandle", "read"]) {
+    assert.equal(typeof datalevin.RawBuffer.prototype[method], "function");
+  }
+  for (const method of ["key", "keyBytes", "rawHandle", "readKey", "readValue", "value", "valueBytes"]) {
+    assert.equal(typeof datalevin.RawKV.prototype[method], "function");
   }
   for (const method of ["abort", "active", "close", "commit"]) {
     assert.equal(typeof datalevin.KVTransaction.prototype[method], "function");

@@ -9,6 +9,8 @@ import {
   DatalevinJavaError,
   Entity,
   KVTransaction,
+  RawBuffer,
+  RawKV,
   apiInfo,
   connect,
   createUdfRegistry,
@@ -632,6 +634,62 @@ test(
       );
       assert.deepEqual(
         (await kv.listRangeSome("list", (key, value) => intValue(value) === 3 ? [key, intValue(value)] : null, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map((value) => typeof value === "bigint" ? intValue(value) : value),
+        ["b", 3]
+      );
+
+      const rawValues = [];
+      await kv.visitListRaw("list", async (raw) => {
+        rawValues.push([raw instanceof RawBuffer, intValue(await raw.read(":long")), (await raw.bytes()).length > 0]);
+      }, "a", { kType: ":string" });
+      assert.deepEqual(rawValues, [[true, 1, true], [true, 2, true]]);
+
+      const rawPairs = [];
+      await kv.visitListRangeRaw("list", async (raw) => {
+        rawPairs.push([
+          raw instanceof RawKV,
+          await raw.readKey(":string"),
+          intValue(await raw.readValue(":long")),
+          (await raw.keyBytes()).length > 0
+        ]);
+      }, [":all"], { kType: ":string", vRange: [":all"], vType: ":long" });
+      assert.deepEqual(rawPairs, [[true, "a", 1, true], [true, "a", 2, true], [true, "b", 3, true]]);
+
+      assert.deepEqual(
+        (await kv.listRangeFilterRaw("list", async (raw) => intValue(await raw.readValue(":long")) >= 2, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })).map(([key, value]) => [key, intValue(value)]),
+        [["a", 2], ["b", 3]]
+      );
+      assert.equal(
+        intValue(await kv.listRangeFilterCountRaw("list", async (raw) => await raw.readKey(":string") === "a", [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        })),
+        2
+      );
+      assert.deepEqual(
+        await kv.listRangeKeepRaw("list", async (raw) => {
+          const value = intValue(await raw.readValue(":long"));
+          return value > 1 ? `${await raw.readKey(":string")}:${value}` : null;
+        }, [":all"], {
+          kType: ":string",
+          vRange: [":all"],
+          vType: ":long"
+        }),
+        ["a:2", "b:3"]
+      );
+      assert.deepEqual(
+        (await kv.listRangeSomeRaw("list", async (raw) => {
+          const value = intValue(await raw.readValue(":long"));
+          return value === 3 ? [await raw.readKey(":string"), value] : null;
+        }, [":all"], {
           kType: ":string",
           vRange: [":all"],
           vType: ":long"

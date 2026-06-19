@@ -17,6 +17,7 @@ import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
+import java.util.function.Predicate;
 
 /**
  * Small bridge-oriented interop layer for non-Java bindings.
@@ -1057,6 +1058,21 @@ public final class DatalevinInterop {
                             false);
     }
 
+    public static void kvVisitListRaw(Object kv,
+                                      String listName,
+                                      Consumer<RawBuffer> visitor,
+                                      Object key,
+                                      Object kType) {
+        ClojureRuntime.core("visit-list",
+                            runtimeArg(kv),
+                            listName,
+                            ClojureFns.rawBufferConsumer(visitor),
+                            ClojureCodec.runtimeInput(key),
+                            typeInput(kType),
+                            null,
+                            true);
+    }
+
     public static void kvVisitListRange(Object kv,
                                         String listName,
                                         BiConsumer<Object, Object> visitor,
@@ -1073,6 +1089,24 @@ public final class DatalevinInterop {
                             rangeInput(vRange, vType),
                             typeInput(vType),
                             false);
+    }
+
+    public static void kvVisitListRangeRaw(Object kv,
+                                           String listName,
+                                           Consumer<RawKV> visitor,
+                                           Object kRange,
+                                           Object kType,
+                                           Object vRange,
+                                           Object vType) {
+        ClojureRuntime.core("visit-list-range",
+                            runtimeArg(kv),
+                            listName,
+                            ClojureFns.rawKvConsumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            rangeInput(vRange, vType),
+                            typeInput(vType),
+                            true);
     }
 
     public static List<?> kvListRangeFilter(Object kv,
@@ -1093,6 +1127,24 @@ public final class DatalevinInterop {
                                                           false));
     }
 
+    public static List<?> kvListRangeFilterRaw(Object kv,
+                                               String listName,
+                                               Predicate<RawKV> predicate,
+                                               Object kRange,
+                                               Object kType,
+                                               Object vRange,
+                                               Object vType) {
+        return ResultSupport.sequence(ClojureRuntime.core("list-range-filter",
+                                                          runtimeArg(kv),
+                                                          listName,
+                                                          ClojureFns.rawKvPredicate(predicate),
+                                                          rangeInput(kRange, kType),
+                                                          typeInput(kType),
+                                                          rangeInput(vRange, vType),
+                                                          typeInput(vType),
+                                                          true));
+    }
+
     public static long kvListRangeFilterCount(Object kv,
                                               String listName,
                                               BiPredicate<Object, Object> predicate,
@@ -1109,6 +1161,24 @@ public final class DatalevinInterop {
                                                          rangeInput(vRange, vType),
                                                          typeInput(vType),
                                                          false));
+    }
+
+    public static long kvListRangeFilterCountRaw(Object kv,
+                                                 String listName,
+                                                 Predicate<RawKV> predicate,
+                                                 Object kRange,
+                                                 Object kType,
+                                                 Object vRange,
+                                                 Object vType) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("list-range-filter-count",
+                                                         runtimeArg(kv),
+                                                         listName,
+                                                         ClojureFns.rawKvPredicate(predicate),
+                                                         rangeInput(kRange, kType),
+                                                         typeInput(kType),
+                                                         rangeInput(vRange, vType),
+                                                         typeInput(vType),
+                                                         true));
     }
 
     public static List<?> kvListRangeKeep(Object kv,
@@ -1129,6 +1199,24 @@ public final class DatalevinInterop {
                                                           false));
     }
 
+    public static List<?> kvListRangeKeepRaw(Object kv,
+                                             String listName,
+                                             Function<RawKV, ?> fn,
+                                             Object kRange,
+                                             Object kType,
+                                             Object vRange,
+                                             Object vType) {
+        return ResultSupport.sequence(ClojureRuntime.core("list-range-keep",
+                                                          runtimeArg(kv),
+                                                          listName,
+                                                          ClojureFns.rawKvFunction(fn),
+                                                          rangeInput(kRange, kType),
+                                                          typeInput(kType),
+                                                          rangeInput(vRange, vType),
+                                                          typeInput(vType),
+                                                          true));
+    }
+
     public static Object kvListRangeSome(Object kv,
                                          String listName,
                                          BiFunction<Object, Object, ?> fn,
@@ -1145,6 +1233,24 @@ public final class DatalevinInterop {
                                    rangeInput(vRange, vType),
                                    typeInput(vType),
                                    false);
+    }
+
+    public static Object kvListRangeSomeRaw(Object kv,
+                                            String listName,
+                                            Function<RawKV, ?> fn,
+                                            Object kRange,
+                                            Object kType,
+                                            Object vRange,
+                                            Object vType) {
+        return ClojureRuntime.core("list-range-some",
+                                   runtimeArg(kv),
+                                   listName,
+                                   ClojureFns.rawKvFunction(fn),
+                                   rangeInput(kRange, kType),
+                                   typeInput(kType),
+                                   rangeInput(vRange, vType),
+                                   typeInput(vType),
+                                   true);
     }
 
     public static LlamaEmbedder newLlamaEmbedder(String modelPath,

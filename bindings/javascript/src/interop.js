@@ -510,11 +510,39 @@ class InteropBindings {
     );
   }
 
+  async kvVisitListRaw(handle, listName, visitor, key, kType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitListRaw",
+      await unwrapInteropHandle(handle),
+      listName,
+      visitor,
+      await toJava(key),
+      await toJava(kType)
+    );
+  }
+
   async kvVisitListRange(handle, listName, visitor, kRange, kType, vRange, vType) {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
       "kvVisitListRange",
+      await unwrapInteropHandle(handle),
+      listName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvVisitListRangeRaw(handle, listName, visitor, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitListRangeRaw",
       await unwrapInteropHandle(handle),
       listName,
       visitor,
@@ -540,11 +568,41 @@ class InteropBindings {
     );
   }
 
+  async kvListRangeFilterRaw(handle, listName, predicate, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeFilterRaw",
+      await unwrapInteropHandle(handle),
+      listName,
+      predicate,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
   async kvListRangeFilterCount(handle, listName, predicate, kRange, kType, vRange, vType) {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
       "kvListRangeFilterCount",
+      await unwrapInteropHandle(handle),
+      listName,
+      predicate,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeFilterCountRaw(handle, listName, predicate, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeFilterCountRaw",
       await unwrapInteropHandle(handle),
       listName,
       predicate,
@@ -570,11 +628,41 @@ class InteropBindings {
     );
   }
 
+  async kvListRangeKeepRaw(handle, listName, fn, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeKeepRaw",
+      await unwrapInteropHandle(handle),
+      listName,
+      fn,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
   async kvListRangeSome(handle, listName, fn, kRange, kType, vRange, vType) {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
       "kvListRangeSome",
+      await unwrapInteropHandle(handle),
+      listName,
+      fn,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vRange),
+      await toJava(vType)
+    );
+  }
+
+  async kvListRangeSomeRaw(handle, listName, fn, kRange, kType, vRange, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvListRangeSomeRaw",
       await unwrapInteropHandle(handle),
       listName,
       fn,

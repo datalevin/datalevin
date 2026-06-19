@@ -46,7 +46,7 @@ from .errors import (
     DatalevinJavaError,
     DatalevinJvmError,
 )
-from .kv import KV, KVTransaction
+from .kv import KV, KVTransaction, RawBuffer, RawKV
 from .llm import LlamaEmbedder, LlamaGenerator, new_llama_embedder, new_llama_generator
 from .search import SearchEngine, SearchIndexWriter
 from .udf import UdfRegistry, create_udf_registry, udf_descriptor
@@ -66,6 +66,8 @@ __all__ = [
     "LlamaGenerator",
     "SearchEngine",
     "SearchIndexWriter",
+    "RawBuffer",
+    "RawKV",
     "UdfRegistry",
     "VectorIndex",
     "api_info",

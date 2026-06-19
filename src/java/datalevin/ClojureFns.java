@@ -3,6 +3,7 @@ package datalevin;
 import clojure.lang.AFn;
 import clojure.lang.ISeq;
 
+import java.nio.ByteBuffer;
 import java.util.Arrays;
 import java.util.ArrayList;
 import java.util.List;
@@ -12,6 +13,8 @@ import java.util.function.Consumer;
 import java.util.function.BiConsumer;
 import java.util.function.BiFunction;
 import java.util.function.BiPredicate;
+import java.util.function.Function;
+import java.util.function.Predicate;
 
 final class ClojureFns {
 
@@ -64,6 +67,44 @@ final class ClojureFns {
             public Object invoke(Object key, Object value) {
                 consumer.accept(key, value);
                 return null;
+            }
+        };
+    }
+
+    static AFn rawBufferConsumer(Consumer<RawBuffer> consumer) {
+        return new AFn() {
+            @Override
+            public Object invoke(Object value) {
+                consumer.accept(new RawBuffer((ByteBuffer) value));
+                return null;
+            }
+        };
+    }
+
+    static AFn rawKvConsumer(Consumer<RawKV> consumer) {
+        return new AFn() {
+            @Override
+            public Object invoke(Object rawKv) {
+                consumer.accept(new RawKV(rawKv));
+                return null;
+            }
+        };
+    }
+
+    static AFn rawKvPredicate(Predicate<RawKV> predicate) {
+        return new AFn() {
+            @Override
+            public Object invoke(Object rawKv) {
+                return predicate.test(new RawKV(rawKv));
+            }
+        };
+    }
+
+    static AFn rawKvFunction(Function<RawKV, ?> fn) {
+        return new AFn() {
+            @Override
+            public Object invoke(Object rawKv) {
+                return ClojureCodec.runtimeInput(fn.apply(new RawKV(rawKv)));
             }
         };
     }
