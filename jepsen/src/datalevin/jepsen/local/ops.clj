@@ -606,6 +606,15 @@
                   unavailable-sentinel))
               unavailable-sentinel)))))))
 
+(defn- node-ha-open-opts
+  [{:keys [remote? base-opts node-ha-opt-overrides]} logical-node node]
+  (if (and (not remote?) (map? base-opts) node)
+    (lcluster/node-ha-opts
+      base-opts
+      node
+      (get node-ha-opt-overrides logical-node))
+    {}))
+
 (defn open-leader-conn!
   [{:keys [remote-cluster? transport-failure? clusters] :as deps} test schema]
   (let [cluster-id (:datalevin/cluster-id test)
@@ -655,11 +664,16 @@
                              :authoritative-snapshot snapshot})))
 
           :else
-          (let [leader-uri (lcluster/db-uri (get-in @clusters [cluster-id :node-by-name leader-node :endpoint])
+          (let [cluster    (get @clusters cluster-id)
+                node       (get-in cluster [:node-by-name leader-node])
+                leader-uri (lcluster/db-uri (:endpoint node)
                                             (:db-name test))
+                open-opts  (node-ha-open-opts cluster leader-node node)
                 outcome    (try
                              {:conn (lcluster/create-conn-with-timeout! leader-uri
-                                                                       schema)}
+                                                                       schema
+                                                                       open-opts
+                                                                       cluster-timeout-ms)}
                              (catch Throwable e
                                {:error e}))]
             (if-let [conn (:conn outcome)]
@@ -685,13 +699,17 @@
   (let [cluster-id (:datalevin/cluster-id test)
         deadline   (+ (now-ms) cluster-timeout-ms)]
     (loop []
-      (let [node        (get-in @clusters [cluster-id :node-by-name logical-node])
+      (let [cluster     (get @clusters cluster-id)
+            node        (get-in cluster [:node-by-name logical-node])
             endpoint    (:endpoint node)
+            open-opts   (node-ha-open-opts cluster logical-node node)
             outcome     (if (string? endpoint)
                           (try
                             {:conn (lcluster/create-conn-with-timeout!
                                     (lcluster/db-uri endpoint (:db-name test))
-                                    schema)}
+                                    schema
+                                    open-opts
+                                    cluster-timeout-ms)}
                             (catch Throwable e
                               {:error e}))
                           {:error (ex-info "Missing Jepsen node endpoint"

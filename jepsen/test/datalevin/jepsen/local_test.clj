@@ -100,6 +100,29 @@
     (is (= {:pool-size 1 :time-out 10000}
            (:client-opts opts)))))
 
+(deftest local-node-conn-open-uses-node-ha-opts-test
+  (let [cluster {:remote? false
+                 :base-opts {:wal? true
+                             :ha-mode :consensus-lease
+                             :db-identity "db-test"
+                             :ha-control-plane
+                             {:backend :sofa-jraft
+                              :group-id "test-group"
+                              :voters []}}
+                 :node-ha-opt-overrides
+                 {"n1" {:ha-lease-timeout-ms 1234}}}
+        node    {:logical-node "n1"
+                 :node-id 1
+                 :endpoint "127.0.0.1:19000"
+                 :peer-id "127.0.0.1:19001"}
+        opts    (#'lops/node-ha-open-opts cluster "n1" node)]
+    (is (= true (:wal? opts)))
+    (is (= :consensus-lease (:ha-mode opts)))
+    (is (= 1 (:ha-node-id opts)))
+    (is (= "127.0.0.1:19001"
+           (get-in opts [:ha-control-plane :local-peer-id])))
+    (is (= 1234 (:ha-lease-timeout-ms opts)))))
+
 (defn- local-ops-test-deps
   [db-name server]
   {:clusters (atom {:test-cluster {:db-name db-name
