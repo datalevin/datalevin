@@ -14,6 +14,11 @@
 (def java-source-dir (str java-release-dir "/sources"))
 (def javadoc-dir (str java-release-dir "/javadoc"))
 (def java-local-repo (str java-release-dir "/m2"))
+(def java-server-release-dir "target/java-server-release")
+(def java-server-artifact-dir (str java-server-release-dir "/classes"))
+(def java-server-source-dir (str java-server-release-dir "/sources"))
+(def java-server-javadoc-dir (str java-server-release-dir "/javadoc"))
+(def java-server-local-repo (str java-server-release-dir "/m2"))
 (def java-central-dir "target/java-central")
 (def java-central-staging-dir (str java-central-dir "/staging"))
 (def embedded-release-dir "target/embedded-release")
@@ -31,6 +36,7 @@
                           second)
                  "dev"))
 (def java-lib 'org.datalevin/datalevin-java)
+(def java-server-lib 'org.datalevin/datalevin-java-server)
 (def embedded-lib 'org.datalevin/datalevin-embedded)
 (def clojure-runtime-lib 'org.clojure/clojure)
 (def javacpp-lib 'org.bytedeco/javacpp)
@@ -38,6 +44,12 @@
 (def java-pom-file (format "target/datalevin-java-%s.pom" version))
 (def java-source-jar-file (format "target/datalevin-java-%s-sources.jar" version))
 (def java-javadoc-jar-file (format "target/datalevin-java-%s-javadoc.jar" version))
+(def java-server-jar-file (format "target/datalevin-java-server-%s.jar" version))
+(def java-server-pom-file (format "target/datalevin-java-server-%s.pom" version))
+(def java-server-source-jar-file
+  (format "target/datalevin-java-server-%s-sources.jar" version))
+(def java-server-javadoc-jar-file
+  (format "target/datalevin-java-server-%s-javadoc.jar" version))
 (def embedded-jar-file (format "target/datalevin-embedded-%s.jar" version))
 (def embedded-pom-file (format "target/datalevin-embedded-%s.pom" version))
 (def runtime-jar-file (format "target/datalevin-runtime-%s.jar" version))
@@ -60,16 +72,29 @@
    "datalevin/server"
    "datalevin/main.clj"
    "datalevin/mcp.clj"
-   "datalevin/server.clj"])
+   "datalevin/server.clj"
+   "datalevin/DatalevinServer.java"])
 (def release-runtime-class-excludes
   ["datalevin/ha"
-   "datalevin/server"])
+   "datalevin/server"
+   "datalevin/DatalevinServer.class"])
 (def runtime-excluded-deps
   release-runtime-excluded-deps)
 (def runtime-source-excludes
   release-runtime-source-excludes)
 (def runtime-class-excludes
   release-runtime-class-excludes)
+(def java-server-source-includes
+  ["datalevin/ha"
+   "datalevin/ha.clj"
+   "datalevin/server"
+   "datalevin/server.clj"])
+(def java-server-java-source-includes
+  ["datalevin/DatalevinServer.java"
+   "datalevin/ha"])
+(def java-server-class-includes
+  ["datalevin/DatalevinServer.class"
+   "datalevin/ha"])
 (def runtime-native-libs
   {"linux-x86_64" 'org.clojars.huahaiy/dtlvnative-linux-x86_64
    "linux-arm64" 'org.clojars.huahaiy/dtlvnative-linux-arm64
@@ -124,6 +149,13 @@
          javacpp-lib
          {:mvn/version "1.5.13"}))
 (def java-pom-deps release-pom-deps)
+(def java-server-pom-deps
+  (merge
+    {java-lib {:mvn/version version}}
+    (select-keys runtime-deps
+                 '[com.alipay.sofa/jraft-core
+                   org.bouncycastle/bcpkix-jdk15on
+                   org.bouncycastle/bcprov-jdk15on])))
 (def embedded-pom-deps release-pom-deps)
 (def developers
   [{:id "huahaiy"
@@ -145,6 +177,24 @@
   [root paths]
   (doseq [path paths]
     (b/delete {:path (str root "/" path)})))
+
+(defn- copy-path-under-root!
+  [src-root target-root path]
+  (let [src    (File. (str src-root "/" path))
+        target (File. (str target-root "/" path))]
+    (when (.exists src)
+      (if (.isDirectory src)
+        (b/copy-dir {:src-dirs   [(.getPath src)]
+                     :target-dir (.getPath target)})
+        (do
+          (.mkdirs (.getParentFile target))
+          (b/copy-file {:src    (.getPath src)
+                        :target (.getPath target)}))))))
+
+(defn- copy-paths-under-root!
+  [src-root target-root paths]
+  (doseq [path paths]
+    (copy-path-under-root! src-root target-root path)))
 
 (def ^:private trimmed-runtime-forbidden-requires
   ["[datalevin.ha"
@@ -254,12 +304,17 @@
 
 (defn clean-java [_]
   (doseq [path [java-release-dir
+                java-server-release-dir
                 embedded-release-dir
                 java-central-dir
                 java-jar-file
                 java-pom-file
                 java-source-jar-file
                 java-javadoc-jar-file
+                java-server-jar-file
+                java-server-pom-file
+                java-server-source-jar-file
+                java-server-javadoc-jar-file
                 embedded-jar-file
                 embedded-pom-file
                 runtime-dir
@@ -271,6 +326,15 @@
   (->> (cons class-dir (:classpath-roots basis))
        distinct
        (str/join File/pathSeparator)))
+
+(defn- java-api-source-files []
+  (->> (.listFiles (File. "src/java/datalevin"))
+       (filter #(.isFile ^File %))
+       (filter #(str/ends-with? (.getName ^File %) ".java"))
+       (remove #(= "DatalevinServer.java" (.getName ^File %)))
+       (map #(.getPath ^File %))
+       sort
+       vec))
 
 (defn- run-process! [command-args]
   (let [{:keys [exit out err]} (b/process {:command-args command-args
@@ -288,14 +352,15 @@
   (compile-java nil)
   (b/delete {:path javadoc-dir})
   (run-process!
-    ["javadoc"
-     "--release" "21"
-     "-quiet"
-     "-notimestamp"
-     "-d" javadoc-dir
-     "-classpath" (java-classpath)
-     "-sourcepath" "src/java"
-     "datalevin"])
+    (into
+      ["javadoc"
+       "--release" "21"
+       "-quiet"
+       "-notimestamp"
+       "-d" javadoc-dir
+       "-classpath" (java-classpath)
+       "-sourcepath" "src/java"]
+      (java-api-source-files)))
   (println "Generated Javadoc in" javadoc-dir)
   {:javadoc-dir javadoc-dir})
 
@@ -404,6 +469,16 @@
      :description "A simple, fast and versatile Datalog database"
      :deps        java-pom-deps}))
 
+(defn- write-java-server-poms! []
+  (write-pom-files!
+    java-server-artifact-dir
+    java-server-lib
+    java-server-pom-file
+    {:title       (name java-server-lib)
+     :description (str "Datalevin Java add-on for embedding an in-process "
+                       "Datalevin server")
+     :deps        java-server-pom-deps}))
+
 (defn- write-embedded-poms! []
   (write-pom-files!
     embedded-artifact-dir
@@ -455,6 +530,15 @@
   (copy-bundled-native-payloads! java-artifact-dir)
   (write-java-poms!))
 
+(defn- prep-java-server-artifact! []
+  (compile-java nil)
+  (b/delete {:path java-server-artifact-dir})
+  (copy-paths-under-root! "src" java-server-artifact-dir
+                          java-server-source-includes)
+  (copy-paths-under-root! class-dir java-server-artifact-dir
+                          java-server-class-includes)
+  (write-java-server-poms!))
+
 (defn- prep-embedded-artifact! []
   (prep-trimmed-artifact! embedded-artifact-dir)
   (copy-bundled-native-payloads! embedded-artifact-dir)
@@ -485,6 +569,65 @@
           :jar-file  java-source-jar-file})
   (println "Generated Java sources jar at" java-source-jar-file)
   {:source-jar java-source-jar-file})
+
+(defn java-server-jar [_]
+  (prep-java-server-artifact!)
+  (b/jar {:class-dir java-server-artifact-dir
+          :jar-file  java-server-jar-file
+          :manifest  {"Automatic-Module-Name" "datalevin.server"
+                      "Implementation-Title"  "Datalevin Java Server"
+                      "Implementation-Version" version}})
+  (println "Generated Java server jar at" java-server-jar-file)
+  {:jar-file java-server-jar-file
+   :pom-file java-server-pom-file})
+
+(defn java-server-source-jar [_]
+  (b/delete {:path java-server-source-dir})
+  (copy-paths-under-root! "src" java-server-source-dir
+                          java-server-source-includes)
+  (copy-paths-under-root! "src/java" java-server-source-dir
+                          java-server-java-source-includes)
+  (b/jar {:class-dir java-server-source-dir
+          :jar-file  java-server-source-jar-file})
+  (println "Generated Java server sources jar at" java-server-source-jar-file)
+  {:source-jar java-server-source-jar-file})
+
+(defn java-server-javadoc [_]
+  (compile-java nil)
+  (b/delete {:path java-server-javadoc-dir})
+  (run-process!
+    ["javadoc"
+     "--release" "21"
+     "-quiet"
+     "-notimestamp"
+     "-d" java-server-javadoc-dir
+     "-classpath" (java-classpath)
+     "-sourcepath" "src/java"
+     "src/java/datalevin/DatalevinServer.java"])
+  (println "Generated Java server Javadoc in" java-server-javadoc-dir)
+  {:javadoc-dir java-server-javadoc-dir})
+
+(defn java-server-javadoc-jar [_]
+  (java-server-javadoc nil)
+  (b/delete {:path java-server-javadoc-jar-file})
+  (run-process!
+    ["jar"
+     "--create"
+     "--file" java-server-javadoc-jar-file
+     "-C" java-server-javadoc-dir
+     "."])
+  (println "Generated Java server Javadoc jar at" java-server-javadoc-jar-file)
+  {:javadoc-dir java-server-javadoc-dir
+   :javadoc-jar java-server-javadoc-jar-file})
+
+(defn java-server-release [_]
+  (java-server-jar nil)
+  (java-server-source-jar nil)
+  (java-server-javadoc-jar nil)
+  {:jar-file     java-server-jar-file
+   :pom-file     java-server-pom-file
+   :source-jar   java-server-source-jar-file
+   :javadoc-jar  java-server-javadoc-jar-file})
 
 (defn java-release [_]
   (clean-java nil)
@@ -561,6 +704,32 @@
    :source-jar  java-source-jar-file
    :javadoc-jar java-javadoc-jar-file
    :local-repo  java-local-repo})
+
+(defn install-java-server [_]
+  (java-server-release nil)
+  (install-artifact! java-server-local-repo
+                     java-server-lib
+                     java-server-jar-file
+                     (format "datalevin-java-server-%s.jar" version))
+  (install-artifact! java-server-local-repo
+                     java-server-lib
+                     java-server-pom-file
+                     (format "datalevin-java-server-%s.pom" version))
+  (install-artifact! java-server-local-repo
+                     java-server-lib
+                     java-server-source-jar-file
+                     (format "datalevin-java-server-%s-sources.jar" version))
+  (install-artifact! java-server-local-repo
+                     java-server-lib
+                     java-server-javadoc-jar-file
+                     (format "datalevin-java-server-%s-javadoc.jar" version))
+  (write-metadata! java-server-local-repo java-server-lib)
+  (println "Installed Java server release artifacts in" java-server-local-repo)
+  {:jar-file    java-server-jar-file
+   :pom-file    java-server-pom-file
+   :source-jar  java-server-source-jar-file
+   :javadoc-jar java-server-javadoc-jar-file
+   :local-repo  java-server-local-repo})
 
 (defn embedded-jar [_]
   (prep-embedded-artifact!)
@@ -680,40 +849,65 @@
     (spit (str artifact "." extension)
           (str (digest-file algorithm artifact) "\n"))))
 
-(defn- central-artifact-dir []
+(defn- central-artifact-dir
+  ([]
+   (central-artifact-dir java-lib))
+  ([lib-sym]
   (str java-central-staging-dir
        "/"
-       (str/replace (namespace java-lib) "." "/")
+       (str/replace (namespace lib-sym) "." "/")
        "/"
-       (name java-lib)
+       (name lib-sym)
        "/"
-       version))
+       version)))
 
 (defn- bundle-artifacts!
   [{:keys [sign?]}]
   (java-release nil)
-  (let [artifact-dir (central-artifact-dir)
-        artifacts    [{:src java-jar-file
-                       :name (format "datalevin-java-%s.jar" version)}
-                      {:src java-pom-file
-                       :name (format "datalevin-java-%s.pom" version)}
-                      {:src java-source-jar-file
-                       :name (format "datalevin-java-%s-sources.jar" version)}
-                      {:src java-javadoc-jar-file
-                       :name (format "datalevin-java-%s-javadoc.jar" version)}]]
+  (java-server-release nil)
+  (let [artifact-groups [{:lib       java-lib
+                          :artifacts [{:src  java-jar-file
+                                       :name (format "datalevin-java-%s.jar"
+                                                     version)}
+                                      {:src  java-pom-file
+                                       :name (format "datalevin-java-%s.pom"
+                                                     version)}
+                                      {:src  java-source-jar-file
+                                       :name (format "datalevin-java-%s-sources.jar"
+                                                     version)}
+                                      {:src  java-javadoc-jar-file
+                                       :name (format "datalevin-java-%s-javadoc.jar"
+                                                     version)}]}
+                         {:lib       java-server-lib
+                          :artifacts [{:src  java-server-jar-file
+                                       :name (format "datalevin-java-server-%s.jar"
+                                                     version)}
+                                      {:src  java-server-pom-file
+                                       :name (format "datalevin-java-server-%s.pom"
+                                                     version)}
+                                      {:src  java-server-source-jar-file
+                                       :name (format "datalevin-java-server-%s-sources.jar"
+                                                     version)}
+                                      {:src  java-server-javadoc-jar-file
+                                       :name (format "datalevin-java-server-%s-javadoc.jar"
+                                                     version)}]}]]
     (b/delete {:path java-central-dir})
-    (.mkdirs (File. artifact-dir))
-    (doseq [{:keys [src name]} artifacts]
-      (b/copy-file {:src src
-                    :target (str artifact-dir "/" name)}))
-    (let [artifact-paths (->> artifacts
-                              (mapv #(str artifact-dir "/" (:name %))))
+    (let [artifact-paths (vec
+                           (mapcat
+                             (fn [{:keys [lib artifacts]}]
+                               (let [artifact-dir (central-artifact-dir lib)]
+                                 (.mkdirs (File. artifact-dir))
+                                 (doseq [{:keys [src name]} artifacts]
+                                   (b/copy-file {:src    src
+                                                 :target (str artifact-dir "/" name)}))
+                                 (mapv #(str artifact-dir "/" (:name %)) artifacts)))
+                             artifact-groups))
           files-to-hash  (if sign?
                            (into artifact-paths (map sign-artifact! artifact-paths))
                            artifact-paths)]
       (doseq [artifact files-to-hash]
         (write-checksums! artifact))
-      {:artifact-dir artifact-dir
+      {:artifact-dir (central-artifact-dir)
        :artifacts    artifact-paths})))
 
 (defn- zip-directory!

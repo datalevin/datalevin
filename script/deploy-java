@@ -6,8 +6,8 @@ usage() {
   cat <<'EOF'
 Usage: ./script/deploy-java [--automatic|--user-managed] [--dry-run] [--no-sign]
 
-Build the org.datalevin/datalevin-java Maven Central bundle and upload it to
-the Sonatype Central Publisher Portal.
+Build the org.datalevin/datalevin-java and org.datalevin/datalevin-java-server
+Maven Central bundle and upload it to the Sonatype Central Publisher Portal.
 
 Options:
   --automatic     Upload with publishingType=AUTOMATIC. This is the default.

@@ -3,7 +3,8 @@
 This document covers the release flow for packages outside the existing
 Clojars embedded/core deploy script:
 
-- `org.datalevin/datalevin-java` to Maven Central
+- `org.datalevin/datalevin-java` and `org.datalevin/datalevin-java-server` to
+  Maven Central
 - `datalevin-node` to npm
 - `datalevin` to PyPI or TestPyPI
 

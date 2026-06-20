@@ -90,6 +90,19 @@ dependencies {
 }
 ```
 
+To embed a Datalevin server in a Java process, add the server add-on artifact:
+
+```xml
+<dependency>
+  <groupId>org.datalevin</groupId>
+  <artifactId>datalevin-java-server</artifactId>
+  <version>0.10.18</version>
+</dependency>
+```
+
+`datalevin-java-server` depends on `datalevin-java` and provides
+`datalevin.DatalevinServer` for in-process server lifecycle management.
+
 See the [Java example](../examples/java/README.md) for a Datalog quick start.
 
 ## JavaScript Library

@@ -353,6 +353,10 @@ final class ClojureRuntime {
         REQUIRE.invoke(Clojure.read(ns));
     }
 
+    static void requireNamespace(String ns) {
+        require(ns);
+    }
+
     private static IFn lookup(String ns, String name) {
         return VARS.computeIfAbsent(ns + "/" + name, ignored -> Clojure.var(ns, name));
     }
