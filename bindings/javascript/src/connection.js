@@ -99,6 +99,15 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("opts", [this.rawHandle()]));
   }
 
+  async datalogIndexCacheLimit(limit = null) {
+    if (hasValue(limit)) {
+      return toJsResult(
+        await callJavaMethod(this.rawHandle(), "datalogIndexCacheLimit", await toJava(limit))
+      );
+    }
+    return toJsResult(await callJavaMethod(this.rawHandle(), "datalogIndexCacheLimit"));
+  }
+
   async updateSchema(schemaUpdate, { delAttrs = null, renameMap = null } = {}) {
     const args = [
       this.rawHandle(),

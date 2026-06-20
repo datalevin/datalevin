@@ -136,6 +136,7 @@ test("public surface stays importable without starting the JVM", () => {
     "copy",
     "createSnapshot",
     "datalogKv",
+    "datalogIndexCacheLimit",
     "datoms",
     "entityMap",
     "fulltextDatoms",

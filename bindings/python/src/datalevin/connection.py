@@ -83,6 +83,12 @@ class Connection(ResourceWrapper):
     def opts(self):
         return to_python(_BINDINGS.core_invoke("opts", [self.raw_handle()]))
 
+    def datalog_index_cache_limit(self, limit=None):
+        db = _BINDINGS.connection_db(self.raw_handle())
+        if limit is not None:
+            _BINDINGS.core_invoke("datalog-index-cache-limit", [db, int(limit)])
+        return to_python(_BINDINGS.core_invoke("datalog-index-cache-limit", [db]))
+
     def update_schema(self, schema_update, del_attrs=None, rename_map=None):
         args = [self.raw_handle(), _BINDINGS.schema(schema_update) if schema_update is not None else None]
         if rename_map is not None:

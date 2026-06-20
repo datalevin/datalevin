@@ -84,6 +84,20 @@ class FakeInteropBindings:
         self.last_datalog_kv = conn
         return "DATALOG_KV"
 
+    def connection_db(self, conn):
+        self.last_connection_db = conn
+        return "DB"
+
+    def core_invoke(self, function: str, args=None):
+        self.core_calls = getattr(self, "core_calls", [])
+        self.core_calls.append((function, list(args or ())))
+        self.last_core_invoke = (function, list(args or ()))
+        if function == "datalog-index-cache-limit":
+            if len(args or ()) > 1:
+                self.cache_limit = int(args[1])
+            return getattr(self, "cache_limit", 512)
+        return {"function": function, "args": list(args or ())}
+
     def connection_transact_async(self, conn, tx_data, tx_meta=None):
         self.last_transact_async = (conn, tx_data, tx_meta)
         return "TX_FUTURE"
@@ -499,6 +513,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
+    assert init_conn.datalog_index_cache_limit() == 512
+    assert fake.last_connection_db == "INIT_CONN"
+    assert fake.last_core_invoke == ("datalog-index-cache-limit", ["DB"])
+    assert init_conn.datalog_index_cache_limit(16) == 16
+    assert fake.core_calls[-2:] == [
+        ("datalog-index-cache-limit", ["DB", 16]),
+        ("datalog-index-cache-limit", ["DB"]),
+    ]
     assert interop_module.fill_db(init_conn, [(3, ":name", "Cara")]) is init_conn
     assert fake.last_fill_db == (init_conn, [(3, ":name", "Cara")])
     assert interop_module.re_index(init_conn, opts={":backup?": False}) is init_conn

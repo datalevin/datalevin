@@ -258,6 +258,9 @@ test(
       assert.equal(Array.isArray(topAsyncTx[":tx-data"]), true);
       assert.equal(":name" in await conn.schema(), true);
       assert.equal(typeof await conn.opts(), "object");
+      assert.equal(intValue(await conn.datalogIndexCacheLimit()), 512);
+      assert.equal(intValue(await conn.datalogIndexCacheLimit(16)), 16);
+      assert.equal(intValue(await conn.datalogIndexCacheLimit()), 16);
       assert.equal(intValue(await conn.entid([":name", "Ada"])), 1);
       assert.equal(intValue(await entity.id()), 1);
       assert.equal(intValue(await entity.get(":db/id")), 1);

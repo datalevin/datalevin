@@ -84,6 +84,9 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert reports[0][":tx-meta"] is None
         assert ":name" in conn.schema()
         assert isinstance(conn.opts(), dict)
+        assert conn.datalog_index_cache_limit() == 512
+        assert conn.datalog_index_cache_limit(16) == 16
+        assert conn.datalog_index_cache_limit() == 16
         assert conn.entid([":name", "Ada"]) == 1
         entity = conn.entity(1)
         assert entity.id == 1

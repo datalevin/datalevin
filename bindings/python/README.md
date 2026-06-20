@@ -295,6 +295,8 @@ print(conn.rseek_datoms(":ave", ":name", "Bob", limit=5))
 print(conn.index_range(":name", "A", "C"))
 print(conn.count_datoms(None, ":name", "Ada"))
 print(conn.fulltext_datoms("database", opts={":top": 5}))
+print(conn.datalog_index_cache_limit())
+conn.datalog_index_cache_limit(1024)
 ```
 
 ## Bulk Load Example
