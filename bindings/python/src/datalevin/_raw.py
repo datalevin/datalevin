@@ -62,6 +62,9 @@ class RawInterop:
     def connection_transact_async(self, handle, tx_data, tx_meta=None):
         return _BINDINGS.connection_transact_async(handle, tx_data, tx_meta)
 
+    def connection_tx_data_to_simulated_report(self, handle, tx_data):
+        return _BINDINGS.connection_tx_data_to_simulated_report(handle, tx_data)
+
     def connection_datoms(self, handle, index, c1=None, c2=None, c3=None, limit=None):
         return _BINDINGS.connection_datoms(handle, index, c1, c2, c3, limit)
 

@@ -102,6 +102,10 @@ class FakeInteropBindings:
         self.last_transact_async = (conn, tx_data, tx_meta)
         return "TX_FUTURE"
 
+    def connection_tx_data_to_simulated_report(self, conn, tx_data):
+        self.last_simulated_report = (conn, tx_data)
+        return {":tx-data": [("datom", 1, ":name", "Ada", 1, True)], ":tempids": {}}
+
     def connection_listen(self, conn, key_or_listener, listener=None):
         self.last_connection_listen = (conn, key_or_listener, listener)
         return "LISTENER_KEY" if listener is None else key_or_listener
@@ -508,6 +512,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         "re_index",
         "search_index_writer",
         "symbol",
+        "tx_data_to_simulated_report",
         "write_edn",
     ]:
         assert callable(getattr(interop_module, helper))
@@ -528,6 +533,10 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert init_conn.with_transaction(lambda tx: tx.raw_handle()) == "TX_CONN"
     assert fake.last_connection_with_transaction == "INIT_CONN"
     assert interop_module.with_transaction(init_conn, lambda tx: tx.raw_handle()) == "TX_CONN"
+    assert init_conn.tx_data_to_simulated_report([{":db/id": -1, ":name": "Ada"}])[":tx-data"]
+    assert fake.last_simulated_report == ("INIT_CONN", [{":db/id": -1, ":name": "Ada"}])
+    assert interop_module.tx_data_to_simulated_report(init_conn, [{":db/id": -2, ":name": "Bob"}])[":tx-data"]
+    assert fake.last_simulated_report == ("INIT_CONN", [{":db/id": -2, ":name": "Bob"}])
     assert init_conn.listen(lambda _report: None) == "LISTENER_KEY"
     assert fake.last_connection_listen[0] == "INIT_CONN"
     init_conn.unlisten("LISTENER_KEY")

@@ -193,6 +193,24 @@ public final class Datalevin {
     }
 
     /**
+     * Applies raw transaction data against {@code conn}'s current database
+     * value without committing and returns the simulated transaction report.
+     */
+    public static Map<?, ?> txDataToSimulatedReport(Connection conn, Object txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.txDataToSimulatedReport(txData);
+    }
+
+    /**
+     * Applies typed transaction data against {@code conn}'s current database
+     * value without committing and returns the simulated transaction report.
+     */
+    public static Map<?, ?> txDataToSimulatedReport(Connection conn, TxData txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.txDataToSimulatedReport(txData);
+    }
+
+    /**
      * Registers a transaction listener with an auto-generated key.
      */
     public static Object listen(Connection conn, Consumer<Map<?, ?>> listener) {

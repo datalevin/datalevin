@@ -35,6 +35,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.startJvm, "function");
   assert.equal(typeof datalevin.symbol, "function");
   assert.equal(typeof datalevin.transactAsync, "function");
+  assert.equal(typeof datalevin.txDataToSimulatedReport, "function");
   assert.equal(typeof datalevin.txAdd, "function");
   assert.equal(typeof datalevin.txEntity, "function");
   assert.equal(typeof datalevin.txRetract, "function");
@@ -151,6 +152,7 @@ test("public surface stays importable without starting the JVM", () => {
     "seekDatoms",
     "txLogWatermarks",
     "transactAsync",
+    "txDataToSimulatedReport",
     "unlisten"
   ]) {
     assert.equal(typeof datalevin.Connection.prototype[method], "function");

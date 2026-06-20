@@ -228,6 +228,13 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
   }
 
+  async txDataToSimulatedReport(txData) {
+    return toJsResult(
+      await _BINDINGS.connectionTxDataToSimulatedReport(this.rawHandle(), txData),
+      { bridge: true }
+    );
+  }
+
   async listen(callback, key = null) {
     const proxy = await createConsumerProxy(callback);
     let registeredKey;

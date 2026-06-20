@@ -297,6 +297,7 @@ print(conn.count_datoms(None, ":name", "Ada"))
 print(conn.fulltext_datoms("database", opts={":top": 5}))
 print(conn.datalog_index_cache_limit())
 conn.datalog_index_cache_limit(1024)
+print(conn.tx_data_to_simulated_report([{":db/id": -1, ":name": "Dry Run"}]))
 ```
 
 ## Bulk Load Example

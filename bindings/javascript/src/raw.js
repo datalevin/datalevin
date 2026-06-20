@@ -75,6 +75,10 @@ class RawInterop {
     return _BINDINGS.connectionEntity(resourceHandle(handle), eid);
   }
 
+  async connectionTxDataToSimulatedReport(handle, txData) {
+    return _BINDINGS.connectionTxDataToSimulatedReport(resourceHandle(handle), txData);
+  }
+
   async entityIs(value) {
     return _BINDINGS.entityIs(value);
   }

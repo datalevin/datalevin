@@ -240,6 +240,9 @@ test(
         "[:find [?name ...] :in $ $other :where [$ ?e :name \"Ada\"] [$other ?x :name ?name]]",
         otherConn
       );
+      const simulated = await conn.txDataToSimulatedReport([
+        txEntity(-100, { ":name": "Sim", ":bio": "Simulated only" })
+      ]);
       const explain = await conn.explain("[:find ?e :where [?e :name _]]");
 
       await conn.updateSchema({
@@ -315,6 +318,8 @@ test(
       assert.deepEqual([...namesFromString].sort(), ["Ada", "Bob"]);
       assert.equal(intValue(entidFromForm), 1);
       assert.deepEqual(namesFromOtherSource, ["Cara"]);
+      assert.equal(Array.isArray(simulated[":tx-data"]), true);
+      assert.equal(await conn.query("[:find ?e . :where [?e :name \"Sim\"]]"), null);
       assert.equal(":plan" in explain, true);
       assert.equal(":age" in await conn.schema(), false);
     } finally {

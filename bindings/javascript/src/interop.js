@@ -204,6 +204,16 @@ class InteropBindings {
     );
   }
 
+  async connectionTxDataToSimulatedReport(handle, txData) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionTxDataToSimulatedReport",
+      await unwrapInteropHandle(handle),
+      await toJava(txData)
+    );
+  }
+
   async connectionListen(handle, keyOrListener, listener = null) {
     const cls = await classes();
     if (hasValue(listener)) {
@@ -1278,6 +1288,10 @@ export async function fillDb(conn, datoms) {
 
 export async function transactAsync(conn, txData, txMeta = null) {
   return conn.transactAsync(txData, txMeta);
+}
+
+export async function txDataToSimulatedReport(conn, txData) {
+  return conn.txDataToSimulatedReport(txData);
 }
 
 export async function datalogKv(conn) {

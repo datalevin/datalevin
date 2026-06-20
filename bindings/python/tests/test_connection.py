@@ -133,6 +133,11 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             "[$ ?e :name \"Ada\"] [$other ?x :name ?name]]",
             other_conn,
         ) == ["Cara"]
+        simulated = conn.tx_data_to_simulated_report([
+            tx_entity(-100, {":name": "Sim", ":bio": "Simulated only"})
+        ])
+        assert simulated[":tx-data"]
+        assert conn.query('[:find ?e . :where [?e :name "Sim"]]') is None
 
         explain = conn.explain("[:find ?e :where [?e :name _]]")
         assert ":plan" in explain

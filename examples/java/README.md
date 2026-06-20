@@ -192,6 +192,9 @@ import datalevin.PullSelector;
 import datalevin.Schema;
 import datalevin.Tx;
 
+import java.util.List;
+import java.util.Map;
+
 try (Connection conn = Datalevin.createConn(
         "/tmp/dtlv-java",
         Datalevin.schema()
@@ -219,6 +222,8 @@ try (Connection conn = Datalevin.createConn(
 
     System.out.println(conn.queryCollection(adultsQuery, String.class));
     System.out.println(conn.pull(selector, Datalevin.listOf(Datalevin.kw("person/name"), "Alice")));
+    System.out.println(conn.txDataToSimulatedReport(List.of(
+            Map.of(":db/id", -3L, "person/name", "Dry Run", "person/age", 40L))));
 }
 ```
 
