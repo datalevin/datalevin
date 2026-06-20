@@ -91,6 +91,8 @@ outlive the callback.
 | Tx log GC | Yes | Yes | Yes | Yes |
 | Open/inspect tx log | Yes | Yes | Yes | Yes |
 | Remote client open/close | Yes | Yes | Yes | Yes |
+| Remote replica status | Yes | Yes | Yes | Yes |
+| Remote HA membership admin | Yes | Yes | Yes | Yes |
 
 ## Search, Vector, and Idoc
 

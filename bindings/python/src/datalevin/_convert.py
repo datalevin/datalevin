@@ -75,13 +75,20 @@ def to_java(value):
 def to_python(value):
     """Recursively convert Java results into Python-native values."""
 
+    if isinstance(value, JBoolean):
+        return bool(value)
+
+    if is_java_object(value):
+        cls = classes()
+        if isinstance(value, cls.boolean_type):
+            return bool(value.booleanValue())
+
     if value is None or isinstance(value, (bool, int, float, str, bytes)):
         return value
 
     if not is_java_object(value):
         return value
 
-    cls = classes()
     byte_array_type = jpype.JArray(JByte)
 
     if isinstance(value, byte_array_type):

@@ -67,6 +67,16 @@ class Client(ResourceWrapper):
     def list_databases_in_use(self):
         return to_python(_BINDINGS.client_invoke("list-databases-in-use", [self.raw_handle()]))
 
+    def replica_status(self, db_name):
+        return to_python(
+            _BINDINGS.client_invoke("replica-status", [self.raw_handle(), db_name])
+        )
+
+    def ha_update_membership(self, db_name, spec):
+        return to_python(
+            _BINDINGS.client_invoke("ha-update-membership!", [self.raw_handle(), db_name, spec])
+        )
+
     def create_user(self, username, password) -> None:
         _BINDINGS.client_invoke("create-user", [self.raw_handle(), username, password])
 

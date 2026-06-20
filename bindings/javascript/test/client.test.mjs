@@ -83,6 +83,9 @@ test(
       assert.equal(typeof openInfo, "object");
       assert.equal((await client.listDatabases()).includes(dbName), true);
       assert.equal((await client.listDatabasesInUse()).includes(dbName), true);
+      const replicaStatus = await client.replicaStatus(dbName);
+      assert.equal(replicaStatus[":db-name"], dbName);
+      assert.equal(replicaStatus[":replica-running?"], false);
 
       await client.closeDatabase(dbName);
       await client.openDatabase(dbName, "datalog");

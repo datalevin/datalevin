@@ -491,6 +491,10 @@ try {
 
   console.log(info);
   console.log(await client.listDatabases());
+  console.log(await client.replicaStatus("demo"));
+
+  // For consensus HA databases, operator membership changes are available as:
+  // await client.haUpdateMembership("demo", { ":ha-members": [...], ... });
 } finally {
   if (opened) {
     await client.closeDatabase("demo");

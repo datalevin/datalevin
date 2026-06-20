@@ -435,6 +435,10 @@ try:
 
     print(info)
     print(client.list_databases())
+    print(client.replica_status("demo"))
+
+    # For consensus HA databases, operator membership changes are available as:
+    # client.ha_update_membership("demo", {":ha-members": [...], ...})
 finally:
     if opened:
         client.close_database("demo")

@@ -378,6 +378,19 @@ def test_client_wrapper_delegates_to_bindings(monkeypatch) -> None:
         ],
     }
 
+    assert client.replica_status("main") == {
+        "function": "replica-status",
+        "args": ["HANDLE", "main"],
+    }
+    spec = {
+        ":ha-members": [{":node-id": 1, ":endpoint": "dtlv://node-a:8898/main"}],
+        ":clear-leases?": True,
+    }
+    assert client.ha_update_membership("main", spec) == {
+        "function": "ha-update-membership!",
+        "args": ["HANDLE", "main", spec],
+    }
+
     client.create_database("main", "kv")
     assert fake.client_calls[-1] == ("create-database", ["HANDLE", "main", "dbtype:kv"])
 

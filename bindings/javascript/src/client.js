@@ -81,6 +81,18 @@ export class Client extends ResourceWrapper {
     return toJsResult(await _BINDINGS.clientInvoke("list-databases-in-use", [this.rawHandle()]));
   }
 
+  async replicaStatus(dbName) {
+    return toJsResult(
+      await _BINDINGS.clientInvoke("replica-status", [this.rawHandle(), dbName])
+    );
+  }
+
+  async haUpdateMembership(dbName, spec) {
+    return toJsResult(
+      await _BINDINGS.clientInvoke("ha-update-membership!", [this.rawHandle(), dbName, spec])
+    );
+  }
+
   async createUser(username, password) {
     await _BINDINGS.clientInvoke("create-user", [this.rawHandle(), username, password]);
   }

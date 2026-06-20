@@ -273,6 +273,10 @@ try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost",
     try {
         System.out.println(client.openDatabaseInfo("demo", DatabaseType.DATALOG, null, null));
         System.out.println(client.listDatabases());
+        System.out.println(client.replicaStatus("demo"));
+
+        // For consensus HA databases, operator membership changes are available as:
+        // client.haUpdateMembership("demo", Map.of(":ha-members", List.of(...)));
     } finally {
         client.closeDatabase("demo");
         client.dropDatabase("demo");

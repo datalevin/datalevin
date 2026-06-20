@@ -26,6 +26,7 @@ class JavaClasses:
     uuid: object
     instant: object
     date: object
+    boolean_type: object
     big_integer: object
     big_decimal: object
     map_type: object
@@ -59,6 +60,7 @@ def classes() -> JavaClasses:
         uuid=jpype.JClass("java.util.UUID"),
         instant=jpype.JClass("java.time.Instant"),
         date=jpype.JClass("java.util.Date"),
+        boolean_type=jpype.JClass("java.lang.Boolean"),
         big_integer=jpype.JClass("java.math.BigInteger"),
         big_decimal=jpype.JClass("java.math.BigDecimal"),
         map_type=jpype.JClass("java.util.Map"),
@@ -90,6 +92,8 @@ def is_java_object(value) -> bool:
 
     if value is None or not jpype.isJVMStarted():
         return False
+    if isinstance(value, jpype.JObject):
+        return True
     module = type(value).__module__
     return (
         module.startswith("jpype")
