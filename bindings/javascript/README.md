@@ -320,6 +320,7 @@ console.log(await conn.countDatoms({ attr: ":name", value: "Ada" }));
 console.log(await conn.fulltextDatoms("database", { opts: { ":top": 5 } }));
 console.log(await conn.datalogIndexCacheLimit());
 await conn.datalogIndexCacheLimit(1024);
+console.log(await conn.txDataToSimulatedReport([{ ":db/id": -1, ":name": "Dry Run" }]));
 ```
 
 ## Bulk Load Example
@@ -490,6 +491,10 @@ try {
 
   console.log(info);
   console.log(await client.listDatabases());
+  console.log(await client.replicaStatus("demo"));
+
+  // For consensus HA databases, operator membership changes are available as:
+  // await client.haUpdateMembership("demo", { ":ha-members": [...], ... });
 } finally {
   if (opened) {
     await client.closeDatabase("demo");

@@ -153,6 +153,24 @@ public final class Client extends HandleResource {
     }
 
     /**
+     * Returns async read-replica status for an open database.
+     */
+    public Map<?, ?> replicaStatus(String dbName) {
+        return (Map<?, ?>) ClojureRuntime.client("replica-status", resource(), dbName);
+    }
+
+    /**
+     * Applies an operator-driven consensus HA membership update to an open
+     * database.
+     */
+    public Map<?, ?> haUpdateMembership(String dbName, Map<?, ?> spec) {
+        return (Map<?, ?>) ClojureRuntime.client("ha-update-membership!",
+                                                resource(),
+                                                dbName,
+                                                DatalevinForms.optionsInput(spec));
+    }
+
+    /**
      * Creates a user account.
      */
     public void createUser(String username, String password) {

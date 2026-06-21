@@ -242,6 +242,11 @@ the control-plane Raft log by committing a new authoritative membership hash:
             {:peer-id "node-c-new:9098" :promotable? true :ha-node-id 3}]}})
 ```
 
+The same operation is exposed as `client.haUpdateMembership("app", spec)` in
+Java and JavaScript, and as `client.ha_update_membership("app", spec)` in
+Python. Use normal language maps/objects for `spec`; keyword-like string keys
+such as `":ha-members"` are accepted by the non-Clojure bindings.
+
 The request validates the proposed `:ha-members` and control-plane `:voters`,
 optionally replaces the Raft voter set, persists the new HA options on the
 target server, CAS-updates the authoritative membership hash, clears existing
@@ -380,6 +385,9 @@ Replica status is available from the client:
 
 (cl/replica-status client "app")
 ```
+
+The same status call is exposed as `client.replicaStatus("app")` in Java and
+JavaScript, and as `client.replica_status("app")` in Python.
 
 The returned map includes `:replica/read-only?`, `:replica/source`,
 `:replica/id`, `:replica-applied-lsn`, `:replica-source-durable-lsn`,

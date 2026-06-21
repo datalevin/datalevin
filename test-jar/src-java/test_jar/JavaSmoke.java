@@ -93,6 +93,18 @@ public final class JavaSmoke {
                     throw new IllegalStateException("Unexpected keyed query result: " + keyed);
                 }
 
+                Map<?, ?> simulated = Datalevin.txDataToSimulatedReport(
+                        conn,
+                        List.of(Map.of(":db/id", -5L, "name", "Sim", "age", 99L)));
+                if (!simulated.containsKey(Datalevin.kw("tx-data"))
+                        || ((List<?>) simulated.get(Datalevin.kw("tx-data"))).isEmpty()) {
+                    throw new IllegalStateException("Unexpected simulated report: " + simulated);
+                }
+                Object simulatedEntity = conn.query("[:find ?e . :where [?e :name \"Sim\"]]");
+                if (simulatedEntity != null) {
+                    throw new IllegalStateException("Simulated transaction was committed: " + simulatedEntity);
+                }
+
                 PullSelector selector = Datalevin.pull().attr("name").attr("age");
                 Map<?, ?> alice = conn.pull(selector, Datalevin.listOf(":name", "Alice"));
                 if (!"Alice".equals(alice.get(Datalevin.kw("name")))) {
@@ -168,6 +180,15 @@ public final class JavaSmoke {
                 Object tx = DatalevinInterop.txData(List.of(
                         Map.of(":db/id", -1L, "name", "Ivy")));
                 DatalevinInterop.coreInvoke("transact!", List.of(rawConn, tx));
+                @SuppressWarnings("unchecked")
+                Map<Object, Object> simulated = (Map<Object, Object>)
+                        DatalevinInterop.connectionTxDataToSimulatedReport(
+                                rawConn,
+                                List.of(Map.of(":db/id", -2L, "name", "Sim")));
+                if (!simulated.containsKey(Datalevin.kw("tx-data"))
+                        || ((List<?>) simulated.get(Datalevin.kw("tx-data"))).isEmpty()) {
+                    throw new IllegalStateException("Unexpected interop simulated report: " + simulated);
+                }
                 Object db = DatalevinInterop.connectionDb(rawConn);
                 @SuppressWarnings("unchecked")
                 List<Object> names = (List<Object>) DatalevinInterop.coreInvoke(

@@ -35,6 +35,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.startJvm, "function");
   assert.equal(typeof datalevin.symbol, "function");
   assert.equal(typeof datalevin.transactAsync, "function");
+  assert.equal(typeof datalevin.txDataToSimulatedReport, "function");
   assert.equal(typeof datalevin.txAdd, "function");
   assert.equal(typeof datalevin.txEntity, "function");
   assert.equal(typeof datalevin.txRetract, "function");
@@ -129,6 +130,24 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.VectorIndex, "function");
   assert.equal(typeof datalevin.UdfRegistry, "function");
   assert.equal(typeof datalevin.Client, "function");
+  for (const method of [
+    "clientId",
+    "closeDatabase",
+    "createDatabase",
+    "disconnect",
+    "disconnectClient",
+    "disconnected",
+    "dropDatabase",
+    "haUpdateMembership",
+    "listDatabases",
+    "listDatabasesInUse",
+    "openDatabase",
+    "querySystem",
+    "replicaStatus",
+    "showClients"
+  ]) {
+    assert.equal(typeof datalevin.Client.prototype[method], "function");
+  }
   assert.equal(typeof datalevin.Entity.prototype.touch, "function");
   assert.equal(typeof datalevin.Connection.prototype.fillDb, "function");
   for (const method of [
@@ -151,6 +170,7 @@ test("public surface stays importable without starting the JVM", () => {
     "seekDatoms",
     "txLogWatermarks",
     "transactAsync",
+    "txDataToSimulatedReport",
     "unlisten"
   ]) {
     assert.equal(typeof datalevin.Connection.prototype[method], "function");

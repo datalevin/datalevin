@@ -29,6 +29,20 @@ dependencies {
 The published artifact is a self-contained Datalevin Java runtime from Maven
 Central. The current runtime requires Java 21+.
 
+To embed a Datalevin server in the same JVM, add the server add-on artifact as
+well:
+
+```xml
+<dependency>
+  <groupId>org.datalevin</groupId>
+  <artifactId>datalevin-java-server</artifactId>
+  <version>0.10.18</version>
+</dependency>
+```
+
+The server artifact depends on `datalevin-java`, so Maven and Gradle will pull
+in the base Java API transitively.
+
 ## Data Style
 
 Use the typed Java builders as the canonical style for schemas, transactions,
@@ -192,6 +206,9 @@ import datalevin.PullSelector;
 import datalevin.Schema;
 import datalevin.Tx;
 
+import java.util.List;
+import java.util.Map;
+
 try (Connection conn = Datalevin.createConn(
         "/tmp/dtlv-java",
         Datalevin.schema()
@@ -219,6 +236,8 @@ try (Connection conn = Datalevin.createConn(
 
     System.out.println(conn.queryCollection(adultsQuery, String.class));
     System.out.println(conn.pull(selector, Datalevin.listOf(Datalevin.kw("person/name"), "Alice")));
+    System.out.println(conn.txDataToSimulatedReport(List.of(
+            Map.of(":db/id", -3L, "person/name", "Dry Run", "person/age", 40L))));
 }
 ```
 
@@ -268,6 +287,10 @@ try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost",
     try {
         System.out.println(client.openDatabaseInfo("demo", DatabaseType.DATALOG, null, null));
         System.out.println(client.listDatabases());
+        System.out.println(client.replicaStatus("demo"));
+
+        // For consensus HA databases, operator membership changes are available as:
+        // client.haUpdateMembership("demo", Map.of(":ha-members", List.of(...)));
     } finally {
         client.closeDatabase("demo");
         client.dropDatabase("demo");
@@ -280,6 +303,26 @@ store options like `:embedding-opts`, `:embedding-domains`, and remote
 `:openai-compatible` embedding providers can be supplied directly to
 `Datalevin.createConn(dir, schema, opts)`.
 
+## In-Process Server
+
+Use `DatalevinServer` from the `datalevin-java-server` artifact when a Java
+process needs to host a Datalevin server directly:
+
+```java
+import datalevin.DatalevinServer;
+
+import java.util.Map;
+
+try (DatalevinServer server = DatalevinServer.create(Map.of(
+        "host", "127.0.0.1",
+        "port", 8898,
+        "root", "/tmp/datalevin-server",
+        "verbose", true))) {
+    server.start();
+    // Connect with Datalevin.newClient("dtlv://datalevin:datalevin@localhost").
+}
+```
+
 ## More Examples
 
 This directory also contains four runnable Java entrypoints:
@@ -287,6 +330,7 @@ This directory also contains four runnable Java entrypoints:
 - `DatalogQuickStart.java`: local Datalog connection, schema, transact, query, and pull.
 - `KVQuickStart.java`: local KV store, typed DBI operations, list DBIs, and range scans.
 - `ClientQuickStart.java`: remote admin client usage against a running Datalevin server.
+- `ServerQuickStart.java`: in-process Datalevin server lifecycle using `DatalevinServer`.
 - `InteropQuickStart.java`: raw-handle bridge usage with `DatalevinInterop`.
 
 ## Run From The Repo
@@ -305,6 +349,7 @@ javac --release 21 -cp "$(clojure -Spath):target/classes" -d target/example-clas
 java -cp "$(clojure -Spath):target/classes:target/example-classes" DatalogQuickStart
 java -cp "$(clojure -Spath):target/classes:target/example-classes" KVQuickStart
 java -cp "$(clojure -Spath):target/classes:target/example-classes" InteropQuickStart
+java -cp "$(clojure -Spath):target/classes:target/example-classes" ServerQuickStart
 ```
 
 `ClientQuickStart` needs a running Datalevin server. By default it connects to
@@ -333,7 +378,10 @@ To generate Javadoc:
 ```bash
 clojure -T:build javadoc
 clojure -T:build javadoc-jar
+clojure -T:build java-server-javadoc-jar
 ```
 
 This writes HTML docs to `target/java-release/javadoc/` and a Javadoc jar to
-`target/datalevin-java-<version>-javadoc.jar`.
+`target/datalevin-java-<version>-javadoc.jar`. Server wrapper docs are written
+to `target/java-server-release/javadoc/` and
+`target/datalevin-java-server-<version>-javadoc.jar`.

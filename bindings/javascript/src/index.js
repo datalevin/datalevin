@@ -37,6 +37,7 @@ export {
   startJvm,
   symbol,
   transactAsync,
+  txDataToSimulatedReport,
   txAdd,
   txEntity,
   txRetract,

@@ -20,6 +20,7 @@ Status key:
 | Multiple source databases in `q` / `explain` | Yes | Yes, pass `Connection` sources | Yes, pass `Connection` sources | Yes, pass `Connection` sources |
 | Synchronous transaction | Yes | Yes | Yes | Yes |
 | Async transaction | Yes | Yes, `CompletableFuture` | Yes, `Future` | Yes, `Promise` |
+| Simulated transaction report from tx data | Yes | Yes | Yes | Yes |
 | Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
 | Datalog transaction callback | Yes, `with-transaction` | Yes, `withTransaction` | Yes, `with_transaction` | No |
 | Transaction entity maps/forms | Yes | Yes, maps and `Tx` builders | Yes, dictionaries/lists and helpers | Yes, objects/arrays and helpers |
@@ -90,6 +91,8 @@ outlive the callback.
 | Tx log GC | Yes | Yes | Yes | Yes |
 | Open/inspect tx log | Yes | Yes | Yes | Yes |
 | Remote client open/close | Yes | Yes | Yes | Yes |
+| Remote replica status | Yes | Yes | Yes | Yes |
+| Remote HA membership admin | Yes | Yes | Yes | Yes |
 
 ## Search, Vector, and Idoc
 

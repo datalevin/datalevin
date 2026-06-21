@@ -157,6 +157,11 @@ class Connection(ResourceWrapper):
             _BINDINGS.connection_transact_async(self.raw_handle(), tx_data, tx_meta)
         )
 
+    def tx_data_to_simulated_report(self, tx_data):
+        return to_python(
+            _BINDINGS.connection_tx_data_to_simulated_report(self.raw_handle(), tx_data)
+        )
+
     def listen(self, callback, key=None):
         proxy = _consumer_proxy(callback)
         if key is None:

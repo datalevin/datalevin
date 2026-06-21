@@ -297,6 +297,7 @@ print(conn.count_datoms(None, ":name", "Ada"))
 print(conn.fulltext_datoms("database", opts={":top": 5}))
 print(conn.datalog_index_cache_limit())
 conn.datalog_index_cache_limit(1024)
+print(conn.tx_data_to_simulated_report([{":db/id": -1, ":name": "Dry Run"}]))
 ```
 
 ## Bulk Load Example
@@ -434,6 +435,10 @@ try:
 
     print(info)
     print(client.list_databases())
+    print(client.replica_status("demo"))
+
+    # For consensus HA databases, operator membership changes are available as:
+    # client.ha_update_membership("demo", {":ha-members": [...], ...})
 finally:
     if opened:
         client.close_database("demo")

@@ -52,6 +52,9 @@ def test_remote_python_surface_works_against_live_server(live_server) -> None:
         open_info = client.open_database(db_name, "datalog", schema=SCHEMA, info=True)
         assert isinstance(open_info, dict)
         assert db_name in client.list_databases_in_use()
+        replica_status = client.replica_status(db_name)
+        assert replica_status[":db-name"] == db_name
+        assert replica_status[":replica-running?"] is False
 
         with connect(
             live_server.database_uri(db_name),

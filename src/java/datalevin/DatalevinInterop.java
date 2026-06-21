@@ -255,6 +255,17 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Applies transaction data against a raw connection's current database
+     * value without committing and returns a bridge-safe simulated report.
+     */
+    public static Object connectionTxDataToSimulatedReport(Object conn, Object txData) {
+        Object report = ClojureRuntime.core("tx-data->simulated-report",
+                                            connectionDb(conn),
+                                            DatalevinForms.txDataInput(txData));
+        return DatalevinForms.txReportOutput(report);
+    }
+
+    /**
      * Registers a transaction listener with an auto-generated key.
      */
     public static Object connectionListen(Object conn, Consumer<Object> listener) {

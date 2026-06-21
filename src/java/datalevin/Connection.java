@@ -549,6 +549,26 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Applies raw transaction data against this connection's current database
+     * value without committing and returns the simulated transaction report.
+     */
+    public Map<?, ?> txDataToSimulatedReport(Object txData) {
+        return (Map<?, ?>) ClojureRuntime.core("tx-data->simulated-report",
+                                               db(),
+                                               DatalevinForms.txDataInput(txData));
+    }
+
+    /**
+     * Applies typed transaction data against this connection's current database
+     * value without committing and returns the simulated transaction report.
+     */
+    public Map<?, ?> txDataToSimulatedReport(TxData txData) {
+        return (Map<?, ?>) ClojureRuntime.core("tx-data->simulated-report",
+                                               db(),
+                                               txData == null ? null : txData.buildForm());
+    }
+
+    /**
      * Transacts raw transaction data asynchronously.
      *
      * <p>The returned {@link CompletableFuture} completes with the transaction

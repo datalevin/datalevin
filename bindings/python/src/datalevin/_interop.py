@@ -81,6 +81,13 @@ class InteropBindings:
             to_java(tx_meta),
         )
 
+    def connection_tx_data_to_simulated_report(self, handle, tx_data):
+        return call_java(
+            classes().interop.connectionTxDataToSimulatedReport,
+            handle,
+            to_java(tx_data),
+        )
+
     def connection_listen(self, handle, key_or_listener, listener=None):
         if listener is None:
             return call_java(classes().interop.connectionListen, handle, key_or_listener)
@@ -1005,6 +1012,12 @@ def transact_async(conn: Connection, tx_data, tx_meta=None):
     return conn.transact_async(tx_data, tx_meta)
 
 
+def tx_data_to_simulated_report(conn: Connection, tx_data):
+    """Return a simulated transaction report without committing tx_data."""
+
+    return conn.tx_data_to_simulated_report(tx_data)
+
+
 def datalog_kv(conn: Connection) -> KV:
     """Return the borrowed KV handle backing a Datalog connection."""
 
@@ -1119,6 +1132,7 @@ __all__ = [
     "symbol",
     "transact_async",
     "tx_add",
+    "tx_data_to_simulated_report",
     "tx_entity",
     "tx_retract",
     "tx_retract_entity",

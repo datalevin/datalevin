@@ -1,7 +1,8 @@
 # Java Release
 
-This document covers the manual release flow for the `org.datalevin/datalevin-java`
-artifact.
+This document covers the manual release flow for the
+`org.datalevin/datalevin-java` and
+`org.datalevin/datalevin-java-server` artifacts.
 
 ## Prerequisites
 
@@ -17,6 +18,14 @@ The Java release bundle includes:
 - `datalevin-java-<version>.pom`
 - `datalevin-java-<version>-sources.jar`
 - `datalevin-java-<version>-javadoc.jar`
+- `datalevin-java-server-<version>.jar`
+- `datalevin-java-server-<version>.pom`
+- `datalevin-java-server-<version>-sources.jar`
+- `datalevin-java-server-<version>-javadoc.jar`
+
+`datalevin-java-server` is an additive server runtime artifact. Its POM depends
+on `datalevin-java` and adds the server/HA classes and dependencies needed to
+embed a Datalevin server in a Java process.
 
 These are assembled by [`build.clj`](../build.clj) via the
 `central-java-bundle` task.
@@ -93,4 +102,5 @@ should become browseable on `javadoc.io` at:
 
 ```text
 https://javadoc.io/doc/org.datalevin/datalevin-java
+https://javadoc.io/doc/org.datalevin/datalevin-java-server
 ```
