@@ -47,6 +47,26 @@
   [endpoint db-name]
   (str (admin-uri endpoint) "/" db-name))
 
+(def ^:private ha-open-gap-errors
+  #{:ha/txlog-gap
+    :ha/txlog-gap-unresolved
+    :ha/follower-snapshot-bootstrap-failed})
+
+(defn transient-ha-open-failure?
+  [e]
+  (boolean
+    (some
+      (fn [cause]
+        (let [data       (ex-data cause)
+              nested     (:data data)
+              gap-error  (:gap-error nested)]
+          (or (= :txlog/not-enabled (:type data))
+              (contains? ha-open-gap-errors (:error data))
+              (contains? ha-open-gap-errors (:error nested))
+              (= :txlog/not-enabled (get-in gap-error [:data :type]))
+              (contains? ha-open-gap-errors (get-in gap-error [:data :error])))))
+      (take-while some? (iterate ex-cause e)))))
+
 (defn- port-block-count
   []
   (inc (quot (- default-port-limit default-port-base) port-block-size)))
@@ -495,7 +515,8 @@
           conn
           (let [e (:error outcome)]
             (if (and (< (now-ms) deadline)
-                     (transport-failure? e))
+                     (or (transport-failure? e)
+                         (transient-ha-open-failure? e)))
               (do
                 (Thread/sleep (long leader-connect-retry-sleep-ms))
                 (recur))

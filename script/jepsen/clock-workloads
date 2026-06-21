@@ -105,6 +105,7 @@ Environment overrides:
   DTLV_JEPSEN_CLOCK_MAX_WRITES_PER_KEY
   DTLV_JEPSEN_CLOCK_MIN_TXN_LENGTH
   DTLV_JEPSEN_CLOCK_MAX_TXN_LENGTH
+  DTLV_JEPSEN_CLOCK_HARD_TIMEOUT_S
   DTLV_JEPSEN_PORT_RETRY_COUNT
   DTLV_JEPSEN_PORT_RETRY_DELAY_S
 EOF
@@ -312,6 +313,14 @@ log_dir="$repo_root/tmp/jepsen-${nemesis_alias}-workloads/$run_id"
 stream_logs="${DTLV_JEPSEN_CLOCK_STREAM_LOGS:-0}"
 port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
+hard_timeout_s="${DTLV_JEPSEN_CLOCK_HARD_TIMEOUT_S:-180}"
+timeout_bin=""
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin="gtimeout"
+fi
 
 mkdir -p "$log_dir"
 
@@ -378,7 +387,16 @@ for workload in "${selected_workloads[@]}"; do
     "$extra_args_display"
   printf '    log: %s\n' "$log_file"
 
-  if run_jepsen "$log_file" "${cmd[@]}"; then
+  wrapped_cmd=("${cmd[@]}")
+  if [[ -n "$hard_timeout_s" && "$hard_timeout_s" != "0" ]]; then
+    if [[ -n "$timeout_bin" ]]; then
+      wrapped_cmd=("$timeout_bin" "$hard_timeout_s" "${wrapped_cmd[@]}")
+    else
+      printf '    warning: timeout command not found; running without hard timeout\n' >&2
+    fi
+  fi
+
+  if run_jepsen "$log_file" "${wrapped_cmd[@]}"; then
     results_file="$(latest_results_file "$workload" || true)"
     if [[ -n "${results_file:-}" && "$results_file" != "$before_results" ]]; then
       if summary_output="$(print_result_summary "$results_file")"; then
@@ -410,8 +428,13 @@ for workload in "${selected_workloads[@]}"; do
         status=1
       fi
     else
-      printf '    status: command failed (exit %d), see %s\n' "$run_exit" "$log_file"
-      summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+      if [[ "$run_exit" -eq 124 ]]; then
+        printf '    status: hard timeout after %ss, see %s\n' "$hard_timeout_s" "$log_file"
+        summaries+=("$workload hard-timeout timeout=${hard_timeout_s}s log=$log_file")
+      else
+        printf '    status: command failed (exit %d), see %s\n' "$run_exit" "$log_file"
+        summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+      fi
       status=1
     fi
   fi

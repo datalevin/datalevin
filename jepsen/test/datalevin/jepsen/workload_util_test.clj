@@ -5,6 +5,7 @@
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
+   [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.jepsen.workload.register :as register]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [datalevin.jepsen.workload.util :as workload.util]
@@ -85,6 +86,20 @@
                  (fn [conn]
                    [:ok conn]))))
         (is (= 2 @attempts))))))
+
+(deftest rejoin-bootstrap-retries-transient-gap-during-bootstrap-wait-test
+  (let [attempts (atom 0)]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0]
+      (let [result (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
+                    1000
+                    (fn [timeout-ms]
+                      (if (= 1 (swap! attempts inc))
+                        (throw (ex-info
+                                "Txn-log is not enabled for this LMDB"
+                                {:type :txlog/not-enabled}))
+                        {:timeout-ms timeout-ms})))]
+        (is (<= 1 (long (:timeout-ms result)) 1000)))
+      (is (= 2 @attempts)))))
 
 (deftest register-initialization-retries-transient-ha-error-test
   (let [attempts             (atom 0)

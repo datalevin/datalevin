@@ -375,7 +375,7 @@
 
           (< (System/currentTimeMillis) deadline)
           (do
-            (Thread/sleep wal-gap-retry-sleep-ms)
+            (Thread/sleep (long wal-gap-retry-sleep-ms))
             (recur gc-results cleanup-state))
 
           :else
@@ -462,6 +462,63 @@
     ;; what the restarted follower will actually require on resume.
     (long (max effective-lsn runtime-lsn resume-lsn))))
 
+(def ^:private bootstrap-gap-errors
+  #{:ha/txlog-gap
+    :ha/txlog-source-behind
+    :ha/txlog-gap-unresolved
+    :ha/follower-snapshot-resume-failed
+    :ha/follower-snapshot-bootstrap-failed})
+
+(defn- retryable-bootstrap-gap-error?
+  [e]
+  (boolean
+   (some
+    (fn [cause]
+      (let [data      (ex-data cause)
+            nested    (:data data)
+            gap-error (:gap-error nested)]
+        (or (= :txlog/not-enabled (:type data))
+            (contains? bootstrap-gap-errors (:error data))
+            (contains? bootstrap-gap-errors (:error nested))
+            (= :txlog/not-enabled (get-in gap-error [:data :type]))
+            (contains? bootstrap-gap-errors
+                       (get-in gap-error [:data :error])))))
+    (take-while some? (iterate ex-cause e)))))
+
+(defn- with-retrying-bootstrap-gap!
+  [timeout-ms f]
+  (let [timeout-ms (long timeout-ms)
+        deadline   (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (let [remaining-ms (long (max 1 (- deadline
+                                          (System/currentTimeMillis))))
+            outcome      (try
+                           {:ok? true
+                            :value (f remaining-ms)}
+                           (catch Throwable e
+                             {:ok? false
+                              :error e}))]
+        (if (:ok? outcome)
+          (:value outcome)
+          (let [e (:error outcome)]
+            (if (and (< (System/currentTimeMillis) deadline)
+                     (retryable-bootstrap-gap-error? e))
+              (do
+                (Thread/sleep (long wal-gap-retry-sleep-ms))
+                (recur))
+              (throw e))))))))
+
+(defn- restart-and-wait-for-follower-bootstrap!
+  [cluster-id logical-node required-snapshot-lsn timeout-ms]
+  (with-retrying-bootstrap-gap!
+    timeout-ms
+    (fn [remaining-ms]
+      (local/restart-node! cluster-id logical-node)
+      (local/wait-for-follower-bootstrap! cluster-id
+                                         logical-node
+                                         required-snapshot-lsn
+                                         remaining-ms))))
+
 (defn- force-snapshot-bootstrap!
   [test key-count]
   (let [cluster-id (:datalevin/cluster-id test)
@@ -528,13 +585,12 @@
         (wait-for-real-wal-gap! cluster-id
                                 source-nodes
                                 follower-next-lsn)
-        _                 (local/restart-node! cluster-id logical-node)
         bootstrap-state
         (try
-          (local/wait-for-follower-bootstrap! cluster-id
-                                             logical-node
-                                             required-snapshot-lsn
-                                             converge-timeout-ms)
+          (restart-and-wait-for-follower-bootstrap! cluster-id
+                                                    logical-node
+                                                    required-snapshot-lsn
+                                                    converge-timeout-ms)
           (catch clojure.lang.ExceptionInfo e
             (let [last-state    (:last-state (ex-data e))
                   applied-lsn   (long (or (:ha-local-last-applied-lsn last-state)

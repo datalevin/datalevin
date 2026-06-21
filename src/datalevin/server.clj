@@ -51,7 +51,8 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.util.concurrent Executors Executor ExecutorService Future
     ConcurrentLinkedQueue ConcurrentHashMap CountDownLatch Semaphore TimeUnit
-    LinkedBlockingQueue]
+    LinkedBlockingQueue ThreadPoolExecutor
+    ThreadPoolExecutor$CallerRunsPolicy ArrayBlockingQueue]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -268,6 +269,31 @@
     (.shutdownNow es)
     (when-not (.awaitTermination es 5000 TimeUnit/MILLISECONDS)
       (log/warn label "did not terminate after forced shutdown"))))
+
+(defn- default-worker-thread-count
+  []
+  (let [cpus (.availableProcessors (Runtime/getRuntime))]
+    (-> (* 4 cpus)
+        (max 16)
+        (min 128))))
+
+(defn- bounded-worker-executor
+  [worker-threads worker-queue-size]
+  (let [threads    (long (or worker-threads (default-worker-thread-count)))
+        queue-size (long (or worker-queue-size (* 4 threads)))]
+    (when-not (pos? threads)
+      (u/raise "Server worker thread count must be positive"
+               {:worker-threads worker-threads}))
+    (when-not (pos? queue-size)
+      (u/raise "Server worker queue size must be positive"
+               {:worker-queue-size worker-queue-size}))
+    (ThreadPoolExecutor.
+      threads
+      threads
+      0
+      TimeUnit/MILLISECONDS
+      (ArrayBlockingQueue. queue-size)
+      (ThreadPoolExecutor$CallerRunsPolicy.))))
 
 (deftype Server [^AtomicBoolean running
                  ^int port
@@ -2289,7 +2315,8 @@
 
 (defn create
   "Create a Datalevin server. Initially not running, call `start` to run."
-  [{:keys [host port root idle-timeout verbose]
+  [{:keys [host port root idle-timeout verbose
+           worker-threads worker-queue-size]
     :as   opts
     :or   {host         default-bind-host
            port         8898
@@ -2317,7 +2344,8 @@
                              selector
                              (ConcurrentLinkedQueue.)
                              (Executors/newSingleThreadExecutor)
-                             (Executors/newCachedThreadPool) ; with-txn may be many
+                             (bounded-worker-executor worker-threads
+                                                      worker-queue-size)
                              sys-conn
                              clients
                              dbs)]

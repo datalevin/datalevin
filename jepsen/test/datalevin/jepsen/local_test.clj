@@ -6,6 +6,7 @@
    [datalevin.core :as d]
    [datalevin.interface :as i]
    [datalevin.jepsen.local :as local]
+   [datalevin.jepsen.local.cluster :as lcluster]
    [datalevin.jepsen.local.ops :as lops]
    [datalevin.kv :as kv]
    [datalevin.server :as srv]
@@ -122,6 +123,36 @@
     (is (= "127.0.0.1:19001"
            (get-in opts [:ha-control-plane :local-peer-id])))
     (is (= 1234 (:ha-lease-timeout-ms opts)))))
+
+(deftest transient-ha-open-failure-detects-gap-errors-test
+  (is (lcluster/transient-ha-open-failure?
+       (ex-info "Txn-log is not enabled for this LMDB"
+                {:type :txlog/not-enabled})))
+  (is (lcluster/transient-ha-open-failure?
+       (ex-info "snapshot bootstrap failed"
+                {:error :ha/follower-snapshot-bootstrap-failed
+                 :data {:gap-error
+                        {:data {:type :txlog/not-enabled}}}})))
+  (is (not (lcluster/transient-ha-open-failure?
+            (ex-info "not a HA gap" {:error :unrelated})))))
+
+(deftest open-ha-conn-retries-transient-ha-gap-open-failure-test
+  (let [attempts (atom 0)]
+    (with-redefs [d/create-conn
+                  (fn [_uri _schema _opts]
+                    (if (= 1 (swap! attempts inc))
+                      (throw (ex-info "Txn-log is not enabled for this LMDB"
+                                      {:type :txlog/not-enabled}))
+                      ::conn))]
+      (is (= ::conn
+             (#'lcluster/open-ha-conn!
+              {:transport-failure? (constantly false)}
+              {:endpoint "127.0.0.1:19000"}
+              "db"
+              nil
+              {:wal? true}
+              1000)))
+      (is (= 2 @attempts)))))
 
 (defn- local-ops-test-deps
   [db-name server]

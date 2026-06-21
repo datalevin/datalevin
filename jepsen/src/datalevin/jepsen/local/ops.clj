@@ -680,7 +680,8 @@
               conn
               (let [e (:error outcome)]
                 (if (and (< (now-ms) deadline)
-                         (transport-failure? e))
+                         (or (transport-failure? e)
+                             (lcluster/transient-ha-open-failure? e)))
                   (do
                     (Thread/sleep (long leader-connect-retry-sleep-ms))
                     (recur))
@@ -719,7 +720,8 @@
           conn
           (let [e (:error outcome)]
             (if (and (< (now-ms) deadline)
-                     (transport-failure? e))
+                     (or (transport-failure? e)
+                         (lcluster/transient-ha-open-failure? e)))
               (do
                 (Thread/sleep (long leader-connect-retry-sleep-ms))
                 (recur))
