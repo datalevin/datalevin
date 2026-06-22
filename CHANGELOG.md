@@ -21,6 +21,7 @@
   [#372](https://github.com/datalevin/datalevin/issues/372).
 
 ### Improved
+- [KV] Spill no longer uses a finalizer.
 - [Lib] Java, Python, JS API parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 
