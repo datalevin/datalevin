@@ -56,8 +56,11 @@
       (dotimes [i (.size tuples)]
         (let [x (.get tuples i)
               k (key-fn x)]
-          (.putIfAbsent res k (FastList.))
-          (.add ^List (.get res k) x))))
+          (if-let [^List l (.get res k)]
+            (.add l x)
+            (let [^List nl (FastList.)]
+              (.add nl x)
+              (.put res k nl))))))
     res))
 
 (defn- attr-keys

@@ -21,9 +21,10 @@
   [#372](https://github.com/datalevin/datalevin/issues/372).
 
 ### Improved
-- [KV] Spill no longer uses a finalizer.
 - [Lib] Java, Python, JS API parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
+- [KV] spill no longer uses a finalizer.
+- [Datalog] reduce allocation per tuple.
 
 ## 0.10.18 (2026-05-27)
 ### Fixed
