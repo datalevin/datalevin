@@ -201,12 +201,15 @@
 (defn- persist-ha-local-bootstrap-floor!
   [m applied-lsn]
   (when-let [kv-store (store/raw-local-kv-store m)]
-    (i/transact-kv kv-store
-                   c/kv-info
-                   [[:put c/wal-local-payload-lsn (long applied-lsn)]
-                    [:put c/ha-local-applied-lsn (long applied-lsn)]]
-                   :keyword
-                   :data))
+    (let [existing-payload-lsn (long (store/read-ha-local-payload-lsn kv-store))
+          payload-lsn (long (max (long applied-lsn)
+                                 existing-payload-lsn))]
+      (i/transact-kv kv-store
+                     c/kv-info
+                     [[:put c/wal-local-payload-lsn payload-lsn]
+                      [:put c/ha-local-applied-lsn (long applied-lsn)]]
+                     :keyword
+                     :data)))
   (long applied-lsn))
 
 (defn- summarize-bootstrap-replay

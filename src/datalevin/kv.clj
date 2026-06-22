@@ -2198,6 +2198,7 @@
           (txlog-replay-dbi! lmdb dbi-name @info-v))))))
 
 (declare append-payload-lsn-row)
+(declare append-monotonic-payload-lsn-row)
 (declare align-runtime-txlog-payload-floor!)
 
 (defn- replay-avg-row?
@@ -2357,7 +2358,10 @@
                     :normalized normalized})))
           (i/transact-kv
            lmdb
-           (append-payload-lsn-row normalized (long lsn))))))))
+           (append-monotonic-payload-lsn-row
+            lmdb
+            normalized
+            (long lsn))))))))
 
 (defn- txlog-replay-record!
   [lmdb state record]
@@ -2371,8 +2375,10 @@
           :marker-revision (long @(:marker-revision state))}
          append-res
          (:rows record))
-        rows (-> (normalize-txlog-replay-avg-rows lmdb rows record)
-                 (append-payload-lsn-row (:lsn record)))]
+        rows (append-monotonic-payload-lsn-row
+              lmdb
+              (normalize-txlog-replay-avg-rows lmdb rows record)
+              (:lsn record))]
     (maybe-run-storage-fault-lmdb! lmdb
                                    :txlog-replay
                                    {:lsn (:lsn record)
@@ -2659,6 +2665,28 @@
                   nil))
               0)))))
 
+(defn- persisted-local-payload-lsn
+  [lmdb]
+  (long
+   (or (try
+         (i/get-value lmdb
+                      c/kv-info
+                      c/wal-local-payload-lsn
+                      :keyword
+                      :data)
+         (catch Throwable _
+           nil))
+       0)))
+
+(defn- payload-marker-lsn
+  [lmdb lsn]
+  (long (max (long lsn)
+             (long (persisted-local-payload-lsn lmdb)))))
+
+(defn- append-monotonic-payload-lsn-row
+  [lmdb rows lsn]
+  (append-payload-lsn-row rows (payload-marker-lsn lmdb lsn)))
+
 (defn- persisted-runtime-floor-lsn
   [lmdb]
   (long
@@ -2847,12 +2875,17 @@
               (rows-vector (or (:rows incoming) (:ops incoming))))))))
 
 (defn- assert-skipped-replay-record-matches-local!
-  [state record expected-lsn]
+  [lmdb state record expected-lsn]
   (let [record-lsn (long (:lsn record))
         local-record (txlog-record-at-lsn state record-lsn)
         local-term (some-> (:ha-term local-record) long)
-        incoming-term (some-> (:ha-term record) long)]
+        incoming-term (some-> (:ha-term record) long)
+        local-payload-lsn (long (persisted-local-payload-lsn lmdb))
+        materialized-without-local-wal?
+        (and (nil? local-record)
+             (<= record-lsn local-payload-lsn))]
     (when (and (or (some? local-term) (some? incoming-term))
+               (not materialized-without-local-wal?)
                (not (and local-record
                          (comparable-txlog-record? local-record record))))
       (raise "Follower replay found divergent local txn-log record"
@@ -2860,6 +2893,7 @@
               :error :ha/txlog-divergent-local-record
               :expected-lsn expected-lsn
               :record-lsn record-lsn
+              :local-payload-lsn local-payload-lsn
               :local-record (some-> local-record
                                     txlog-record-replay-summary)
               :incoming-record (txlog-record-replay-summary record)}))))
@@ -2914,6 +2948,7 @@
              (if (< record-lsn expected-lsn)
                (do
                  (assert-skipped-replay-record-matches-local!
+                  lmdb
                   state
                   record
                   expected-lsn)
@@ -2953,7 +2988,10 @@
                           (long @(:marker-revision state))
                           append-res)
                          rows
-                         (append-payload-lsn-row materialized-rows record-lsn)]
+                     (append-monotonic-payload-lsn-row
+                      lmdb
+                      materialized-rows
+                      record-lsn)]
                      (when marker-entry
                        (.add ^FastList rows (:row marker-entry)))
                      (apply-lmdb-after-txlog-append! lmdb state rows)
@@ -3016,7 +3054,10 @@
                                 (:commit-marker? state)
                                 (long @(:marker-revision state))
                                 append-res)
-                  commit-rows (append-payload-lsn-row nil (:lsn append-res))
+                  commit-rows (append-monotonic-payload-lsn-row
+                               lmdb
+                               nil
+                               (:lsn append-res))
                   _ (when marker-entry
                       (.add ^FastList commit-rows (:row marker-entry)))]
               (let [status
