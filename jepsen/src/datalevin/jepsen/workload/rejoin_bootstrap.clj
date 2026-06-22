@@ -234,15 +234,17 @@
       ::cas-failed)))
 
 (defn- leader-register-values
-  [test key-count]
-  (workload.util/with-retrying-leader-conn
-    test
-    schema
-    converge-timeout-ms
-    (fn [conn]
-      (register-values-from-rows
+  ([test key-count]
+   (leader-register-values test key-count converge-timeout-ms))
+  ([test key-count timeout-ms]
+   (workload.util/with-retrying-leader-conn
+     test
+     schema
+     timeout-ms
+     (fn [conn]
+       (register-values-from-rows
         (d/q register-rows-query @conn)
-        key-count))))
+        key-count)))))
 
 (defn- write-register-batch-with-rolls!
   [test key-count start-value n sleep-ms timeout-ms]
@@ -634,21 +636,20 @@
                :copy-pin-cleanup copy-pin-cleanup
                :gc-results gc-results}}))
 
-(defn- convergence-result
-  [test key-count]
+(defn- post-bootstrap-convergence-result
+  [test key-count bootstrap-result timeout-ms]
   (let [cluster-id        (:datalevin/cluster-id test)
-        bootstrap-result  (force-snapshot-bootstrap! test key-count)
         restarted-nodes   (:restarted-nodes bootstrap-result)
         restarted-set     (set restarted-nodes)
         {:keys [leader]}  (local/wait-for-single-leader! cluster-id
-                                                         converge-timeout-ms)
-        expected-values   (leader-register-values test key-count)
+                                                         timeout-ms)
+        expected-values   (leader-register-values test key-count timeout-ms)
         target-lsn        (local/effective-local-lsn cluster-id leader)
         _                 (try
                             (local/wait-for-live-nodes-at-least-lsn!
                              cluster-id
                              target-lsn
-                             converge-timeout-ms)
+                             timeout-ms)
                             (catch clojure.lang.ExceptionInfo e
                               (when-not (= "Timed out waiting for live nodes to catch up"
                                            (ex-message e))
@@ -657,7 +658,7 @@
                             test
                             key-count
                             expected-values
-                            converge-timeout-ms
+                            timeout-ms
                             (fn [test logical-node key-count]
                               ((if (contains? restarted-set logical-node)
                                  remote-node-register-state
@@ -670,6 +671,28 @@
      :caught-up? true
      :restarted-nodes restarted-nodes
      :nodes live-node-state}))
+
+(defn- retrying-post-bootstrap-convergence-result
+  ([test key-count bootstrap-result]
+   (retrying-post-bootstrap-convergence-result test
+                                               key-count
+                                               bootstrap-result
+                                               post-bootstrap-convergence-result))
+  ([test key-count bootstrap-result post-converge-fn]
+   (with-retrying-bootstrap-gap!
+     converge-timeout-ms
+     (fn [remaining-ms]
+       (post-converge-fn test
+                         key-count
+                         bootstrap-result
+                         remaining-ms)))))
+
+(defn- convergence-result
+  [test key-count]
+  (let [bootstrap-result (force-snapshot-bootstrap! test key-count)]
+    (retrying-post-bootstrap-convergence-result test
+                                                key-count
+                                                bootstrap-result)))
 
 (defn- ensure-converged!
   [test key-count]

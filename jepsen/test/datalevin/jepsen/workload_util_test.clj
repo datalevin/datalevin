@@ -101,6 +101,33 @@
         (is (<= 1 (long (:timeout-ms result)) 1000)))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-transient-gap-during-post-bootstrap-converge-test
+  (let [attempts         (atom 0)
+        test             {:datalevin/cluster-id ::post-bootstrap-converge-retry
+                          :db-name "post-bootstrap-converge-retry"}
+        bootstrap-result {:restarted-nodes ["n2"]}
+        result           {:leader "n1"
+                          :caught-up? true
+                          :restarted-nodes ["n2"]}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  rejoin-bootstrap/converge-timeout-ms 1000]
+      (is (= result
+             (#'rejoin-bootstrap/retrying-post-bootstrap-convergence-result
+              test
+              2
+              bootstrap-result
+              (fn [actual-test actual-key-count actual-bootstrap timeout-ms]
+                (is (= test actual-test))
+                (is (= 2 actual-key-count))
+                (is (= bootstrap-result actual-bootstrap))
+                (is (<= 1 (long timeout-ms) 1000))
+                (if (= 1 (swap! attempts inc))
+                  (throw (ex-info
+                          "Txn-log is not enabled for this LMDB"
+                          {:type :txlog/not-enabled}))
+                  result)))))
+      (is (= 2 @attempts)))))
+
 (deftest register-initialization-retries-transient-ha-error-test
   (let [attempts             (atom 0)
         initialized-clusters @#'register/initialized-clusters]
