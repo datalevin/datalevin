@@ -1416,11 +1416,10 @@
             (is (some? state))
             (is (= 15 (long @(:next-lsn state))))
             (is (= :transacted
-                   (i/transact-kv db
-                                  c/kv-info
-                                  [[:put c/wal-local-payload-lsn 15]]
-                                  :keyword
-                                  :data)))
+                   (kv/transact-kv-without-txlog!
+                    db
+                    [[:put c/kv-info c/wal-local-payload-lsn
+                      15 :keyword :data]])))
             (let [res (kv/mirror-replayed-txlog-record!
                        db
                        {:lsn 16
@@ -1431,6 +1430,68 @@
               (is (= 17 (long @(:next-lsn state))))
               (is (= :ok
                      (d/get-value db "a" :replayed)))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-replay-skips-record-covered-by-persisted-payload-floor
+  (let [dir  (u/tmp-dir (str "wal-replay-skip-payload-floor-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (dotimes [i 13]
+            (is (= :transacted
+                   (d/transact-kv db [[:put "a" i i]]))))
+          (let [state (txlog/state db)]
+            (is (some? state))
+            (is (= 15 (long @(:next-lsn state))))
+            (is (= :transacted
+                   (kv/transact-kv-without-txlog!
+                    db
+                    [[:put c/kv-info c/wal-local-payload-lsn
+                      15 :keyword :data]])))
+            (#'kv/align-runtime-txlog-payload-floor! db)
+            (is (= 16 (long @(:next-lsn state))))
+            (is (empty? (kv/open-tx-log db 15 15)))
+            (let [res (kv/mirror-replayed-txlog-record!
+                       db
+                       {:lsn 15
+                        :ha-term 7
+                        :rows [[:put "a" :covered :ok]]})]
+              (is (= 15 (long (:lsn res))))
+              (is (:skipped? res))
+              (is (= 16 (long @(:next-lsn state))))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-direct-replay-preserves-higher-payload-floor
+  (let [dir  (u/tmp-dir (str "wal-direct-replay-payload-floor-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (kv/transact-kv-without-txlog!
+                  db
+                  [[:put c/kv-info c/wal-local-payload-lsn
+                    15 :keyword :data]])))
+          (kv/replay-txlog-rows! db [[:put "a" :covered :ok]] 14)
+          (is (= 15
+                 (i/get-value db
+                              c/kv-info
+                              c/wal-local-payload-lsn
+                              :keyword
+                              :data)))
+          (is (= :ok
+                 (d/get-value db "a" :covered)))
           (finally
             (d/close-kv db))))
       (finally

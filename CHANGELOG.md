@@ -2,8 +2,12 @@
 
 ## WIP
 ### Added
-- `datalog-kv` function to return the underlying DLMDB instance for a Datalog
-  DB.
+- [Datalog ]`datalog-kv` function to return the underlying DLMDB instance for a
+  Datalog DB.
+- [Lib] Release Datalevin server as a Java library
+  `org.datalevin:datalevin-java-server` to Maven Central, for in-process
+  server use.
+
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
   [#369](https://github.com/datalevin/datalevin/issues/369).
@@ -17,8 +21,8 @@
   [#372](https://github.com/datalevin/datalevin/issues/372).
 
 ### Improved
-- Java, Python, JS API parity with Clojure.
-- [WAL] handle more edge cases.
+- [Lib] Java, Python, JS API parity with Clojure.
+- [WAL] handle more WAL and HA edge cases.
 
 ## 0.10.18 (2026-05-27)
 ### Fixed
