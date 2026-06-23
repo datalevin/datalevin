@@ -21,6 +21,7 @@
   (:import
    [java.util Iterator List UUID NoSuchElementException Map Set Collection]
    [java.io DataInput DataOutput]
+   [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
    [javax.management NotificationEmitter NotificationListener Notification]
    [com.sun.management GarbageCollectionNotificationInfo]
@@ -67,6 +68,43 @@
   (disk-count [this] "The number of items reside on disk")
   (spill [this] "Spill to disk"))
 
+(defonce ^Cleaner cleaner (Cleaner/create))
+
+(defn- close-spill-resources!
+  [disk spill-dir]
+  (let [db  @disk
+        dir @spill-dir]
+    (vreset! disk nil)
+    (vreset! spill-dir nil)
+    (when db
+      (try
+        (i/close-kv db)
+        (catch Throwable _)))
+    (when dir
+      (try
+        (u/delete-files dir)
+        (catch Throwable _)))))
+
+(defn- spill-cleanup-action
+  [disk spill-dir]
+  (reify Runnable
+    (run [_] (close-spill-resources! disk spill-dir))))
+
+(defn- register-spill-cleanup!
+  [referent cleanable disk spill-dir]
+  (vreset! cleanable
+           (.register cleaner
+                      referent
+                      (spill-cleanup-action disk spill-dir))))
+
+(defn- clean-spill!
+  [cleanable disk spill-dir]
+  (if-let [^Cleaner$Cleanable c @cleanable]
+    (do
+      (vreset! cleanable nil)
+      (.clean c))
+    (close-spill-resources! disk spill-dir)))
+
 (declare ->SVecSeq ->RSVecSeq)
 
 (deftype SpillableVector [^long spill-threshold
@@ -74,6 +112,7 @@
                           spill-dir
                           ^FastList memory
                           disk
+                          cleanable
                           total
                           ^:unsynchronized-mutable meta]
   ISpillable
@@ -84,10 +123,13 @@
     (if @disk (i/entries @disk c/tmp-dbi) 0))
 
   (spill [this]
-    (let [dir (str spill-root "dtlv-spill-vec-" (UUID/randomUUID))]
-      (vreset! spill-dir dir)
-      (vreset! disk (l/open-kv dir {:temp? true}))
-      (i/open-dbi @disk c/tmp-dbi {:key-size Long/BYTES}))
+    (when-not @disk
+      (let [dir (str spill-root "dtlv-spill-vec-" (UUID/randomUUID))
+            db  (l/open-kv dir {:temp? true})]
+        (vreset! spill-dir dir)
+        (vreset! disk db)
+        (register-spill-cleanup! this cleanable disk spill-dir)
+        (i/open-dbi db c/tmp-dbi {:key-size Long/BYTES})))
     this)
 
   List
@@ -186,8 +228,7 @@
   (empty [this]
     (.clear memory)
     (when @disk
-      (i/close-kv @disk)
-      (vreset! disk nil))
+      (clean-spill! cleanable disk spill-dir))
     this)
 
   (equiv [this other]
@@ -241,14 +282,7 @@
 
   Object
 
-  (toString [this] (str (into [] this)))
-
-  ;; TODO migrate to cleaner API when dropping Java 8 support
-  ;; as finalizer API is scheduled to be removed in future JVM
-  (finalize ^void [_]
-    (when @disk
-      (i/close-kv @disk)
-      (u/delete-files @spill-dir))))
+  (toString [this] (str (into [] this))))
 
 (deftype SVecSeq [^SpillableVector v
                   ^long i]
@@ -315,6 +349,7 @@
                                                  (volatile! nil)
                                                  (FastList. (count vs))
                                                  (volatile! nil)
+                                                 (volatile! nil)
                                                  (volatile! 0)
                                                  nil)]
      (doseq [v vs] (.cons svec v))
@@ -347,6 +382,7 @@
                        spill-dir
                        ^UnifiedMap memory
                        disk
+                       cleanable
                        ^:unsynchronized-mutable meta]
   ISpillable
 
@@ -355,10 +391,13 @@
   (disk-count ^long [_] (if @disk (i/entries @disk c/tmp-dbi) 0))
 
   (spill [this]
-    (let [dir (str spill-root "dtlv-spill-map-" (UUID/randomUUID))]
-      (vreset! spill-dir dir)
-      (vreset! disk (l/open-kv dir {:temp? true}))
-      (i/open-dbi @disk c/tmp-dbi {:key-size Integer/BYTES}))
+    (when-not @disk
+      (let [dir (str spill-root "dtlv-spill-map-" (UUID/randomUUID))
+            db  (l/open-kv dir {:temp? true})]
+        (vreset! spill-dir dir)
+        (vreset! disk db)
+        (register-spill-cleanup! this cleanable disk spill-dir)
+        (i/open-dbi db c/tmp-dbi {:key-size Integer/BYTES})))
     this)
 
   IPersistentMap
@@ -401,8 +440,7 @@
   (empty [this]
     (.clear memory)
     (when @disk
-      (i/close-kv @disk)
-      (vreset! disk nil))
+      (clean-spill! cleanable disk spill-dir))
     this)
 
   MapEquivalence
@@ -489,12 +527,7 @@
 
   Object
 
-  (toString [this] (str (into {} this)))
-
-  (finalize ^void [_]
-    (when @disk
-      (i/close-kv @disk)
-      (u/delete-files @spill-dir))))
+  (toString [this] (str (into {} this))))
 
 (defn new-spillable-map
   ([] (new-spillable-map nil nil))
@@ -507,6 +540,7 @@
                              spill-root
                              (volatile! nil)
                              (UnifiedMap.)
+                             (volatile! nil)
                              (volatile! nil)
                              nil)]
      (doseq [[k v] m] (assoc smap k v))
@@ -590,9 +624,7 @@
 
   Object
 
-  (toString [_] (str (into #{} (keys impl))))
-
-  (finalize ^void [_] (.finalize impl)))
+  (toString [_] (str (into #{} (keys impl)))))
 
 (defn new-spillable-set
   ([] (new-spillable-set nil nil))
@@ -605,6 +637,7 @@
                              spill-root
                              (volatile! nil)
                              (UnifiedMap.)
+                             (volatile! nil)
                              (volatile! nil)
                              nil)]
      (doseq [e s] (.put impl e c/slash))
