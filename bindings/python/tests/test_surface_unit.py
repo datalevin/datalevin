@@ -96,6 +96,8 @@ class FakeInteropBindings:
             if len(args or ()) > 1:
                 self.cache_limit = int(args[1])
             return getattr(self, "cache_limit", 512)
+        if function == "max-eid":
+            return 42
         return {"function": function, "args": list(args or ())}
 
     def connection_transact_async(self, conn, tx_data, tx_meta=None):
@@ -519,6 +521,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
     for helper in [
         "keyword",
+        "max_eid",
         "new_search_engine",
         "new_vector_index",
         "read_edn",
@@ -534,6 +537,10 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert init_conn.datalog_index_cache_limit() == 512
     assert fake.last_connection_db == "INIT_CONN"
     assert fake.last_core_invoke == ("datalog-index-cache-limit", ["DB"])
+    assert init_conn.max_eid() == 42
+    assert fake.last_core_invoke == ("max-eid", ["DB"])
+    assert interop_module.max_eid(init_conn) == 42
+    assert fake.last_core_invoke == ("max-eid", ["DB"])
     assert init_conn.datalog_index_cache_limit(16) == 16
     assert fake.core_calls[-2:] == [
         ("datalog-index-cache-limit", ["DB", 16]),
@@ -820,6 +827,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "index_range",
         "listen",
         "list_snapshots",
+        "max_eid",
         "open_tx_log",
         "re_index",
         "rseek_datoms",

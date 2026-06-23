@@ -108,6 +108,10 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await callJavaMethod(this.rawHandle(), "datalogIndexCacheLimit"));
   }
 
+  async maxEid() {
+    return toJsResult(await callJavaMethod(this.rawHandle(), "maxEid"));
+  }
+
   async updateSchema(schemaUpdate, { delAttrs = null, renameMap = null } = {}) {
     const args = [
       this.rawHandle(),

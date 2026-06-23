@@ -21,6 +21,7 @@ import {
   initDb,
   interop,
   keyword,
+  maxEid,
   newSearchEngine,
   newVectorIndex,
   openKv,
@@ -261,6 +262,8 @@ test(
       assert.equal(Array.isArray(topAsyncTx[":tx-data"]), true);
       assert.equal(":name" in await conn.schema(), true);
       assert.equal(typeof await conn.opts(), "object");
+      assert.equal(intValue(await conn.maxEid()), 4);
+      assert.equal(intValue(await maxEid(conn)), 4);
       assert.equal(intValue(await conn.datalogIndexCacheLimit()), 512);
       assert.equal(intValue(await conn.datalogIndexCacheLimit(16)), 16);
       assert.equal(intValue(await conn.datalogIndexCacheLimit()), 16);

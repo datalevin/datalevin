@@ -22,6 +22,7 @@ export {
   initDb,
   jvmStarted,
   keyword,
+  maxEid,
   newClient,
   newLlamaEmbedder,
   newLlamaGenerator,

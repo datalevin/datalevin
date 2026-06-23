@@ -10,6 +10,7 @@ from datalevin import (
     fill_db,
     init_db,
     keyword,
+    max_eid,
     schema_attr,
     transact_async,
     tx_entity,
@@ -84,6 +85,8 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert reports[0][":tx-meta"] is None
         assert ":name" in conn.schema()
         assert isinstance(conn.opts(), dict)
+        assert conn.max_eid() == 4
+        assert max_eid(conn) == 4
         assert conn.datalog_index_cache_limit() == 512
         assert conn.datalog_index_cache_limit(16) == 16
         assert conn.datalog_index_cache_limit() == 16

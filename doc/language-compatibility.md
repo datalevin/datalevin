@@ -31,6 +31,7 @@ Status key:
 | Full-text datom reads | Yes | Yes | Yes | Yes |
 | Bulk load: `init-db` / `fill-db` | Yes | Yes | Yes | Yes |
 | Datalog-backed KV access | Yes | Yes | Yes | Yes |
+| Highest allocated entity id: `max-eid` / `maxEid` / `max_eid` | Yes | Yes | Yes | Yes |
 | Datalog index cache limit getter/setter | Yes | Yes | Yes | Yes |
 | Re-index Datalog store | Yes | Yes | Yes | Yes |
 

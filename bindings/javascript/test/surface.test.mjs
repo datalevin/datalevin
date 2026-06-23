@@ -20,6 +20,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.interop, "function");
   assert.equal(typeof datalevin.jvmStarted, "function");
   assert.equal(typeof datalevin.keyword, "function");
+  assert.equal(typeof datalevin.maxEid, "function");
   assert.equal(typeof datalevin.newClient, "function");
   assert.equal(typeof datalevin.newLlamaEmbedder, "function");
   assert.equal(typeof datalevin.newLlamaGenerator, "function");
@@ -163,6 +164,7 @@ test("public surface stays importable without starting the JVM", () => {
     "indexRange",
     "listen",
     "listSnapshots",
+    "maxEid",
     "openTxLog",
     "reIndex",
     "rseekDatoms",

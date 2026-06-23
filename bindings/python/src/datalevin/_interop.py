@@ -1027,6 +1027,12 @@ def datalog_kv(conn: Connection) -> KV:
     return KV(_BINDINGS.connection_datalog_kv(handle), owned=False)
 
 
+def max_eid(conn: Connection):
+    """Return the highest allocated entity id for a connection."""
+
+    return conn.max_eid()
+
+
 def re_index(target, opts=None, *, schema=None):
     """Rebuild indexes for a Connection, KV, or SearchEngine wrapper."""
 
@@ -1118,6 +1124,7 @@ __all__ = [
     "init_db",
     "jvm_started",
     "keyword",
+    "max_eid",
     "new_client",
     "new_vector_index",
     "open_kv",

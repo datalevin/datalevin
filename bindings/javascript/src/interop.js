@@ -1285,6 +1285,10 @@ export async function datalogKv(conn) {
   return conn.datalogKv();
 }
 
+export async function maxEid(conn) {
+  return conn.maxEid();
+}
+
 export async function reIndex(target, opts = null, options = {}) {
   if (typeof target?.reIndex !== "function") {
     throw new TypeError("target must provide reIndex().");
