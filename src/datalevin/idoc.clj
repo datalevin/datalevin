@@ -875,64 +875,6 @@
   ^Lock [^IdocIndex index]
   (.writeLock ^ReentrantReadWriteLock (.-state-lock index)))
 
-(defn- add-doc-state!
-  [^IdocIndex index doc-id doc-ref]
-  (let [^Lock lock (state-write-lock index)]
-    (.lock lock)
-    (try
-      (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
-      (b/bitmap-add (.-all-doc-ids index) (int doc-id))
-      (finally
-        (.unlock lock)))))
-
-(defn- update-doc-ref!
-  [^IdocIndex index doc-id doc-ref]
-  (let [^Lock lock (state-write-lock index)]
-    (.lock lock)
-    (try
-      (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
-      (finally
-        (.unlock lock)))))
-
-(defn- add-docs-state!
-  [^IdocIndex index ^FastList doc-id-refs]
-  (when-not (.isEmpty doc-id-refs)
-    (let [^Lock lock (state-write-lock index)]
-      (.lock lock)
-      (try
-        (loop [i 0
-               n (.size doc-id-refs)]
-          (when (< i n)
-            (let [doc-id  (.get doc-id-refs i)
-                  doc-ref (.get doc-id-refs (unchecked-inc-int i))]
-              (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
-              (b/bitmap-add (.-all-doc-ids index) (int doc-id))
-              (recur (unchecked-add-int i 2) n))))
-        (finally
-          (.unlock lock))))))
-
-(defn- remove-doc-state!
-  [^IdocIndex index doc-id]
-  (let [^Lock lock (state-write-lock index)]
-    (.lock lock)
-    (try
-      (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
-      (b/bitmap-del (.-all-doc-ids index) (int doc-id))
-      (finally
-        (.unlock lock)))))
-
-(defn- remove-docs-state!
-  [^IdocIndex index ^FastList doc-ids]
-  (when-not (.isEmpty doc-ids)
-    (let [^Lock lock (state-write-lock index)]
-      (.lock lock)
-      (try
-        (doseq [doc-id doc-ids]
-          (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
-          (b/bitmap-del (.-all-doc-ids index) (int doc-id)))
-        (finally
-          (.unlock lock))))))
-
 (defn doc-ref-by-id
   [^IdocIndex index doc-id]
   (let [^Lock lock (state-read-lock index)]
@@ -1100,23 +1042,30 @@
   ([^IdocIndex index path ^FastList txs]
    (ensure-path-id index path txs nil))
   ([^IdocIndex index path ^FastList txs ^FastList state-actions]
-  (let [^ConcurrentHashMap path-cache (.-path-cache index)
-        cached                        (.get path-cache path)]
-    (if cached
-      cached
-      (if-let [pid (get-path-id index path)]
-        pid
-        (let [pid      (.incrementAndGet ^AtomicInteger (.-max-path index))
-              path-dbi (.-path-dict-dbi index)]
-          (.add txs (l/kv-tx :put path-dbi path pid :string :int))
-          (let [segs (decode-path path)]
-            (if state-actions
-              (add-state-action! state-actions
-                                 [index :cache-path path pid segs])
-              (do
-                (cache-path! index path pid segs)
-                (update-pattern-cache! index segs pid))))
-          pid))))))
+   (ensure-path-id index path txs state-actions nil))
+  ([^IdocIndex index path ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths]
+   (let [^ConcurrentHashMap path-cache (.-path-cache index)
+         cached                        (.get path-cache path)]
+     (if cached
+       cached
+       (if-let [pid (or (when pending-paths
+                          (.get pending-paths path))
+                        (get-path-id index path))]
+         pid
+         (let [pid      (.incrementAndGet ^AtomicInteger (.-max-path index))
+               path-dbi (.-path-dict-dbi index)]
+           (when pending-paths
+             (.put pending-paths path pid))
+           (.add txs (l/kv-tx :put path-dbi path pid :string :int))
+           (let [segs (decode-path path)]
+             (if state-actions
+               (add-state-action! state-actions
+                                  [index :cache-path path pid segs])
+               (do
+                 (cache-path! index path pid segs)
+                 (update-pattern-cache! index segs pid))))
+           pid))))))
 
 (defn- commit-idoc-plan!
   [^IdocIndex index res ^FastList txs ^FastList state-actions]
@@ -1125,26 +1074,50 @@
     (apply-state-actions! state-actions))
   res)
 
+(defn- planned-doc-id
+  [^IdocIndex index doc-ref ^HashMap pending-doc-ids]
+  (or (when pending-doc-ids
+        (.get pending-doc-ids doc-ref))
+      (get-value (.-lmdb index) (.-doc-ref-dbi index)
+                 doc-ref :data :int)))
+
+(defn- planned-path-id
+  [^IdocIndex index path ^HashMap pending-paths]
+  (or (when pending-paths
+        (.get pending-paths path))
+      (get-path-id index path)))
+
 (defn add-doc-plan!
-  [^IdocIndex index ^FastList txs ^FastList state-actions
-   doc-ref doc check-exist?]
-  (if (and check-exist?
-           (get-value (.-lmdb index) (.-doc-ref-dbi index)
-                      doc-ref :data :int))
-    :doc-exists
-    (let [doc-id      (.incrementAndGet ^AtomicInteger (.-max-doc index))
-          index-dbi   (.-doc-index-dbi index)
-          doc-ref-dbi (.-doc-ref-dbi index)]
-      ;; TODO: if doc-ref ever exceeds LMDB key size, fall back to a :g ref.
-      (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-      (add-state-action! state-actions [index :add-doc doc-id doc-ref])
-      (doseq [[path values] (doc->path-values-mutable doc)
-              :let          [pid (ensure-path-id index path txs
-                                                 state-actions)]]
-        (doseq [v    values
-                :let [idx (indexable-key pid v)]]
-          (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int))))
-      :doc-added)))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    doc-ref doc check-exist?]
+   (add-doc-plan! index txs state-actions (HashMap.) (HashMap.)
+                  doc-ref doc check-exist?))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths doc-ref doc check-exist?]
+   (add-doc-plan! index txs state-actions pending-paths nil
+                  doc-ref doc check-exist?))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids
+    doc-ref doc check-exist?]
+   (if (and check-exist?
+            (planned-doc-id index doc-ref pending-doc-ids))
+     :doc-exists
+     (let [doc-id      (.incrementAndGet ^AtomicInteger (.-max-doc index))
+           index-dbi   (.-doc-index-dbi index)
+           doc-ref-dbi (.-doc-ref-dbi index)]
+       ;; TODO: if doc-ref ever exceeds LMDB key size, fall back to a :g ref.
+       (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
+       (when pending-doc-ids
+         (.put pending-doc-ids doc-ref doc-id))
+       (add-state-action! state-actions [index :add-doc doc-id doc-ref])
+       (doseq [[path values] (doc->path-values-mutable doc)
+               :let          [pid (ensure-path-id index path txs
+                                                  state-actions
+                                                  pending-paths)]]
+         (doseq [v    values
+                 :let [idx (indexable-key pid v)]]
+           (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int))))
+       :doc-added))))
 
 (defn add-doc
   ([index doc-ref doc] (add-doc index doc-ref doc true))
@@ -1162,35 +1135,49 @@
             (r/get-values lmdb doc-ref-dbi (map first docs) :data :int true))))
 
 (defn add-docs-plan!
-  [^IdocIndex index ^FastList txs ^FastList state-actions docs check-exist?]
-  (when (seq docs)
-    (let [lmdb        (.-lmdb index)
-          index-dbi   (.-doc-index-dbi index)
-          doc-ref-dbi (.-doc-ref-dbi index)
-          doc-ref-ids (when check-exist?
-                        (remote-doc-ref-ids lmdb doc-ref-dbi docs))
-          idx->ids    (HashMap.)]
-      (doseq [[doc-ref doc] docs]
-        (when-not (and check-exist?
-                       (if doc-ref-ids
-                         (get doc-ref-ids doc-ref)
-                         (get-value lmdb doc-ref-dbi doc-ref :data :int)))
-          (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
-            (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-            (add-state-action! state-actions [index :add-doc doc-id doc-ref])
-            (doseq [[path values] (doc->path-values-mutable doc)
-                    :let          [pid (ensure-path-id index path txs
-                                                       state-actions)]]
-              (doseq [v    values
-                      :let [idx (indexable-key pid v)
-                            ^List ids (or (.get idx->ids idx)
-                                          (let [ids (FastList.)]
-                                            (.put idx->ids idx ids)
-                                            ids))]]
-                (.add ids doc-id))))))
-      (doseq [[idx ids] idx->ids]
-        (.add txs (l/kv-tx :put-list index-dbi idx ids :avg :int)))
-      :docs-added)))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions docs check-exist?]
+   (add-docs-plan! index txs state-actions (HashMap.) (HashMap.)
+                   docs check-exist?))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths docs check-exist?]
+   (add-docs-plan! index txs state-actions pending-paths nil
+                   docs check-exist?))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids docs check-exist?]
+   (when (seq docs)
+     (let [lmdb        (.-lmdb index)
+           index-dbi   (.-doc-index-dbi index)
+           doc-ref-dbi (.-doc-ref-dbi index)
+           doc-ref-ids (when check-exist?
+                         (remote-doc-ref-ids lmdb doc-ref-dbi docs))
+           idx->ids    (HashMap.)]
+       (doseq [[doc-ref doc] docs]
+         (when-not (and check-exist?
+                        (or (when pending-doc-ids
+                              (.get pending-doc-ids doc-ref))
+                            (if doc-ref-ids
+                              (get doc-ref-ids doc-ref)
+                              (get-value lmdb doc-ref-dbi
+                                         doc-ref :data :int))))
+           (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
+             (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
+             (when pending-doc-ids
+               (.put pending-doc-ids doc-ref doc-id))
+             (add-state-action! state-actions [index :add-doc doc-id doc-ref])
+             (doseq [[path values] (doc->path-values-mutable doc)
+                     :let          [pid (ensure-path-id index path txs
+                                                        state-actions
+                                                        pending-paths)]]
+               (doseq [v    values
+                       :let [idx (indexable-key pid v)
+                             ^List ids (or (.get idx->ids idx)
+                                           (let [ids (FastList.)]
+                                             (.put idx->ids idx ids)
+                                             ids))]]
+                 (.add ids doc-id))))))
+       (doseq [[idx ids] idx->ids]
+         (.add txs (l/kv-tx :put-list index-dbi idx ids :avg :int)))
+       :docs-added))))
 
 (defn add-docs
   ([index docs] (add-docs index docs true))
@@ -1202,19 +1189,23 @@
      (commit-idoc-plan! index res txs state-actions))))
 
 (defn remove-doc-plan!
-  [^IdocIndex index ^FastList txs ^FastList state-actions doc-ref doc]
-  (when-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
-                               doc-ref :data :int)]
-    (let [index-dbi (.-doc-index-dbi index)]
-      (doseq [[path values] (doc->path-values-mutable doc)
-              :let          [pid (get-path-id index path)]]
-        (when pid
-          (doseq [v    values
-                  :let [idx (indexable-key pid v)]]
-            (.add txs (l/kv-tx :del-list index-dbi idx [doc-id] :avg :int)))))
-      (.add txs (l/kv-tx :del (.-doc-ref-dbi index) doc-ref :data))
-      (add-state-action! state-actions [index :remove-doc doc-id])
-      :doc-removed)))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions doc-ref doc]
+   (remove-doc-plan! index txs state-actions nil nil doc-ref doc))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids doc-ref doc]
+   (when-let [doc-id (planned-doc-id index doc-ref pending-doc-ids)]
+     (let [index-dbi (.-doc-index-dbi index)]
+       (doseq [[path values] (doc->path-values-mutable doc)
+               :let          [pid (planned-path-id index path pending-paths)]]
+         (when pid
+           (doseq [v    values
+                   :let [idx (indexable-key pid v)]]
+             (.add txs (l/kv-tx :del-list index-dbi idx [doc-id] :avg :int)))))
+       (.add txs (l/kv-tx :del (.-doc-ref-dbi index) doc-ref :data))
+       (when pending-doc-ids
+         (.remove pending-doc-ids doc-ref))
+       (add-state-action! state-actions [index :remove-doc doc-id])
+       :doc-removed))))
 
 (defn remove-doc
   [^IdocIndex index doc-ref doc]
@@ -1224,32 +1215,40 @@
     (commit-idoc-plan! index res txs state-actions)))
 
 (defn remove-docs-plan!
-  [^IdocIndex index ^FastList txs ^FastList state-actions docs]
-  (when (seq docs)
-    (let [lmdb           (.-lmdb index)
-          index-dbi      (.-doc-index-dbi index)
-          doc-ref-dbi    (.-doc-ref-dbi index)
-          doc-ref-ids    (remote-doc-ref-ids lmdb doc-ref-dbi docs)
-          idx->ids       (HashMap.)]
-      (doseq [[doc-ref doc] docs]
-        (when-let [doc-id (if doc-ref-ids
-                            (get doc-ref-ids doc-ref)
-                            (get-value lmdb doc-ref-dbi doc-ref :data :int))]
-          (doseq [[path values] (doc->path-values-mutable doc)
-                  :let          [pid (get-path-id index path)]]
-            (when pid
-              (doseq [v    values
-                      :let [idx (indexable-key pid v)
-                            ^List ids (or (.get idx->ids idx)
-                                          (let [ids (FastList.)]
-                                            (.put idx->ids idx ids)
-                                            ids))]]
-                (.add ids doc-id))))
-          (.add txs (l/kv-tx :del doc-ref-dbi doc-ref :data))
-          (add-state-action! state-actions [index :remove-doc doc-id])))
-      (doseq [[idx ids] idx->ids]
-        (.add txs (l/kv-tx :del-list index-dbi idx ids :avg :int)))
-      :docs-removed)))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions docs]
+   (remove-docs-plan! index txs state-actions nil nil docs))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids docs]
+   (when (seq docs)
+     (let [lmdb           (.-lmdb index)
+           index-dbi      (.-doc-index-dbi index)
+           doc-ref-dbi    (.-doc-ref-dbi index)
+           doc-ref-ids    (remote-doc-ref-ids lmdb doc-ref-dbi docs)
+           idx->ids       (HashMap.)]
+       (doseq [[doc-ref doc] docs]
+         (when-let [doc-id (or (when pending-doc-ids
+                                 (.get pending-doc-ids doc-ref))
+                               (if doc-ref-ids
+                                 (get doc-ref-ids doc-ref)
+                                 (get-value lmdb doc-ref-dbi
+                                            doc-ref :data :int)))]
+           (doseq [[path values] (doc->path-values-mutable doc)
+                   :let          [pid (planned-path-id index path pending-paths)]]
+             (when pid
+               (doseq [v    values
+                       :let [idx (indexable-key pid v)
+                             ^List ids (or (.get idx->ids idx)
+                                           (let [ids (FastList.)]
+                                             (.put idx->ids idx ids)
+                                             ids))]]
+                 (.add ids doc-id))))
+           (.add txs (l/kv-tx :del doc-ref-dbi doc-ref :data))
+           (when pending-doc-ids
+             (.remove pending-doc-ids doc-ref))
+           (add-state-action! state-actions [index :remove-doc doc-id])))
+       (doseq [[idx ids] idx->ids]
+         (.add txs (l/kv-tx :del-list index-dbi idx ids :avg :int)))
+       :docs-removed))))
 
 (defn remove-docs
   [^IdocIndex index docs]
@@ -1259,43 +1258,55 @@
     (commit-idoc-plan! index res txs state-actions)))
 
 (defn update-doc-plan!
-  [^IdocIndex index ^FastList txs ^FastList state-actions
-   old-ref old-doc new-ref new-doc]
-  (if-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
-                             old-ref :data :int)]
-    (if (and (= old-ref new-ref) (= old-doc new-doc))
-      :doc-updated
-      (let [tx-count          (.size txs)
-            index-dbi         (.-doc-index-dbi index)
-            doc-ref-dbi       (.-doc-ref-dbi index)
-            ^Set empty-set    (Collections/emptySet)
-            [old-map new-map] (diff-path-values old-doc new-doc)]
-        (when-not (= old-ref new-ref)
-          (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
-          (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (add-state-action! state-actions
-                             [index :update-doc-ref doc-id new-ref]))
-        (doseq [[path old-vals] old-map
-                :let            [^Set new-vals (or (.get ^HashMap new-map path)
-                                                   empty-set)]]
-          (when-let [pid (get-path-id index path)]
-            (doseq [v old-vals]
-              (when-not (.contains new-vals v)
-                (let [idx (indexable-key pid v)]
-                  (.add txs (l/kv-tx :del-list index-dbi idx [doc-id]
-                                     :avg :int)))))))
-        (doseq [[path new-vals] new-map
-                :let            [^Set old-vals (or (.get ^HashMap old-map path)
-                                                   empty-set)]]
-          (let [pid (ensure-path-id index path txs state-actions)]
-            (doseq [v new-vals]
-              (when-not (.contains old-vals v)
-                (let [idx (indexable-key pid v)]
-                  (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int)))))))
-        (when (< tx-count (.size txs))
-          (add-state-action! state-actions [index :invalidate]))
-        :doc-updated))
-    :doc-missing))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    old-ref old-doc new-ref new-doc]
+   (update-doc-plan! index txs state-actions (HashMap.) (HashMap.)
+                     old-ref old-doc new-ref new-doc))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths old-ref old-doc new-ref new-doc]
+   (update-doc-plan! index txs state-actions pending-paths nil
+                     old-ref old-doc new-ref new-doc))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids
+    old-ref old-doc new-ref new-doc]
+   (if-let [doc-id (planned-doc-id index old-ref pending-doc-ids)]
+     (if (and (= old-ref new-ref) (= old-doc new-doc))
+       :doc-updated
+       (let [tx-count          (.size txs)
+             index-dbi         (.-doc-index-dbi index)
+             doc-ref-dbi       (.-doc-ref-dbi index)
+             ^Set empty-set    (Collections/emptySet)
+             [old-map new-map] (diff-path-values old-doc new-doc)]
+         (when-not (= old-ref new-ref)
+           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
+           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
+           (when pending-doc-ids
+             (.remove pending-doc-ids old-ref)
+             (.put pending-doc-ids new-ref doc-id))
+           (add-state-action! state-actions
+                              [index :update-doc-ref doc-id new-ref]))
+         (doseq [[path old-vals] old-map
+                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
+                                                    empty-set)]]
+           (when-let [pid (planned-path-id index path pending-paths)]
+             (doseq [v old-vals]
+               (when-not (.contains new-vals v)
+                 (let [idx (indexable-key pid v)]
+                   (.add txs (l/kv-tx :del-list index-dbi idx [doc-id]
+                                      :avg :int)))))))
+         (doseq [[path new-vals] new-map
+                 :let            [^Set old-vals (or (.get ^HashMap old-map path)
+                                                    empty-set)]]
+           (let [pid (ensure-path-id index path txs state-actions
+                                     pending-paths)]
+             (doseq [v new-vals]
+               (when-not (.contains old-vals v)
+                 (let [idx (indexable-key pid v)]
+                   (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int)))))))
+         (when (< tx-count (.size txs))
+           (add-state-action! state-actions [index :invalidate]))
+         :doc-updated))
+     :doc-missing)))
 
 (defn update-doc
   [^IdocIndex index old-ref old-doc new-ref new-doc]
@@ -1335,46 +1346,66 @@
                     {:segment seg :path segments})))))]
     (step doc segments)))
 
+(defn patch-doc-plan!
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    old-ref old-doc new-ref new-doc patch]
+   (patch-doc-plan! index txs state-actions (HashMap.) (HashMap.)
+                    old-ref old-doc new-ref new-doc patch))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths old-ref old-doc new-ref new-doc {:keys [paths]}]
+   (patch-doc-plan! index txs state-actions pending-paths nil
+                    old-ref old-doc new-ref new-doc {:paths paths}))
+  ([^IdocIndex index ^FastList txs ^FastList state-actions
+    ^HashMap pending-paths ^HashMap pending-doc-ids
+    old-ref old-doc new-ref new-doc {:keys [paths]}]
+   (if-let [doc-id (planned-doc-id index old-ref pending-doc-ids)]
+     (if (and (= old-ref new-ref) (= old-doc new-doc))
+       :doc-updated
+       (let [tx-count       (.size txs)
+             index-dbi      (.-doc-index-dbi index)
+             doc-ref-dbi    (.-doc-ref-dbi index)
+             ^Set empty-set (Collections/emptySet)
+             paths          (or paths [])
+             old-map        (patch-path-values-mutable old-doc paths)
+             new-map        (patch-path-values-mutable new-doc paths)]
+         (when-not (= old-ref new-ref)
+           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
+           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
+           (when pending-doc-ids
+             (.remove pending-doc-ids old-ref)
+             (.put pending-doc-ids new-ref doc-id))
+           (add-state-action! state-actions
+                              [index :update-doc-ref doc-id new-ref]))
+         (doseq [[path old-vals] old-map
+                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
+                                                    empty-set)]]
+           (when-let [pid (planned-path-id index path pending-paths)]
+             (doseq [v old-vals]
+               (when-not (.contains new-vals v)
+                 (let [idx (indexable-key pid v)]
+                   (.add txs (l/kv-tx :del-list index-dbi idx [doc-id]
+                                      :avg :int)))))))
+         (doseq [[path new-vals] new-map
+                 :let            [^Set old-vals (or (.get ^HashMap old-map path)
+                                                    empty-set)]]
+           (let [pid (ensure-path-id index path txs state-actions
+                                     pending-paths)]
+             (doseq [v new-vals]
+               (when-not (.contains old-vals v)
+                 (let [idx (indexable-key pid v)]
+                   (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int)))))))
+         (when (< tx-count (.size txs))
+           (add-state-action! state-actions [index :invalidate]))
+         :doc-updated))
+     :doc-missing)))
+
 (defn patch-doc
-  [^IdocIndex index old-ref old-doc new-ref new-doc {:keys [paths]}]
-  (if-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
-                             old-ref :data :int)]
-    (if (and (= old-ref new-ref) (= old-doc new-doc))
-      :doc-updated
-      (let [txs            (FastList.)
-            lmdb           (.-lmdb index)
-            index-dbi      (.-doc-index-dbi index)
-            doc-ref-dbi    (.-doc-ref-dbi index)
-            ^Set empty-set (Collections/emptySet)
-            paths          (or paths [])
-            old-map        (patch-path-values-mutable old-doc paths)
-            new-map        (patch-path-values-mutable new-doc paths)]
-        (when-not (= old-ref new-ref)
-          (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
-          (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (update-doc-ref! index doc-id new-ref))
-        (doseq [[path old-vals] old-map
-                :let            [^Set new-vals (or (.get ^HashMap new-map path)
-                                                   empty-set)]]
-          (when-let [pid (get-path-id index path)]
-            (doseq [v old-vals]
-              (when-not (.contains new-vals v)
-                (let [idx (indexable-key pid v)]
-                  (.add txs (l/kv-tx :del-list index-dbi idx [doc-id]
-                                     :avg :int)))))))
-        (doseq [[path new-vals] new-map
-                :let            [^Set old-vals (or (.get ^HashMap old-map path)
-                                                   empty-set)]]
-          (let [pid (ensure-path-id index path txs)]
-            (doseq [v new-vals]
-              (when-not (.contains old-vals v)
-                (let [idx (indexable-key pid v)]
-                  (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int)))))))
-        (when-not (.isEmpty txs)
-          (transact-kv lmdb txs)
-          (invalidate-range-cache! index))
-        :doc-updated))
-    :doc-missing))
+  [^IdocIndex index old-ref old-doc new-ref new-doc patch]
+  (let [txs           (FastList.)
+        state-actions (FastList.)
+        res           (patch-doc-plan! index txs state-actions
+                                       old-ref old-doc new-ref new-doc patch)]
+    (commit-idoc-plan! index res txs state-actions)))
 
 ;; query evaluation
 

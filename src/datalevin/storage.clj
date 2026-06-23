@@ -1259,9 +1259,22 @@
       :d (remove-vec index (nth op 1)))))
 
 (defn idoc-index
-  [idoc-indices id-ds]
+  [idoc-indices id-ds txs]
   (let [updates (volatile! {})
-        others  (FastList.)]
+        others  (FastList.)
+        state-actions (FastList.)
+        path-plans (IdentityHashMap.)
+        doc-plans  (IdentityHashMap.)
+        path-plan  (fn [index]
+                     (or (.get path-plans index)
+                         (let [m (HashMap.)]
+                           (.put path-plans index m)
+                           m)))
+        doc-plan   (fn [index]
+                     (or (.get doc-plans index)
+                         (let [m (HashMap.)]
+                           (.put doc-plans index m)
+                           m)))]
     (doseq [res  id-ds
             :let [op     (peek res)
                   d      (nth op 1)
@@ -1274,7 +1287,9 @@
         (:g :r)
         (.add others res)))
     (doseq [[domain ops] @updates
-            :let         [index (idoc-indices domain)]]
+            :let         [index (idoc-indices domain)
+                          pending-paths (path-plan index)
+                          pending-doc-ids (doc-plan index)]]
       (doseq [[_ {:keys [a d]}] ops]
         (if (and (= 1 (count a)) (= 1 (count d)))
           (let [old-d   (nth (first d) 1)
@@ -1285,12 +1300,21 @@
                 new-doc (peek new-d)
                 patch   (some-> (meta (first a)) :idoc/patch)
                 res     (if patch
-                          (idoc/patch-doc index old-ref old-doc new-ref new-doc
-                                          patch)
-                          (idoc/update-doc index old-ref old-doc new-ref new-doc))]
+                          (idoc/patch-doc-plan!
+                            index txs state-actions
+                            pending-paths pending-doc-ids
+                            old-ref old-doc new-ref new-doc patch)
+                          (idoc/update-doc-plan!
+                            index txs state-actions
+                            pending-paths pending-doc-ids
+                            old-ref old-doc new-ref new-doc))]
             (when (= res :doc-missing)
-              (idoc/remove-doc index old-ref old-doc)
-              (idoc/add-doc index new-ref new-doc false)))
+              (idoc/remove-doc-plan! index txs state-actions
+                                     pending-paths pending-doc-ids
+                                     old-ref old-doc)
+              (idoc/add-doc-plan! index txs state-actions
+                                  pending-paths pending-doc-ids
+                                  new-ref new-doc false)))
           (let [adds (mapv (fn [op]
                              (let [d (nth op 1)]
                                [d (peek d)]))
@@ -1299,16 +1323,25 @@
                              (let [d (nth op 1)]
                                [d (peek d)]))
                            d)]
-            (idoc/add-docs index adds false)
-            (idoc/remove-docs index rems)))))
+            (idoc/add-docs-plan! index txs state-actions
+                                 pending-paths pending-doc-ids adds false)
+            (idoc/remove-docs-plan! index txs state-actions
+                                    pending-paths pending-doc-ids rems)))))
     (doseq [res  others
             :let [op     (peek res)
                   d      (nth op 1)
                   domain (nth res 0)
-                  index  (idoc-indices domain)]]
+                  index  (idoc-indices domain)
+                  pending-paths (path-plan index)
+                  pending-doc-ids (doc-plan index)]]
       (case (nth op 0)
-        :g (idoc/add-doc index [:g (nth d 0)] (peek d) false)
-        :r (idoc/remove-doc index [:g (nth d 0)] (peek d))))))
+        :g (idoc/add-doc-plan! index txs state-actions
+                               pending-paths pending-doc-ids
+                               [:g (nth d 0)] (peek d) false)
+        :r (idoc/remove-doc-plan! index txs state-actions
+                                  pending-paths pending-doc-ids
+                                  [:g (nth d 0)] (peek d))))
+    state-actions))
 
 (defn e-sample*
   [^Store store a aid]
@@ -2331,8 +2364,9 @@
   (fulltext-index search-engines ft-ds)
   (vector-index vector-indices vi-ds)
   (embedding-index embedding-indices em-ds)
-  (idoc-index idoc-indices id-ds)
-  (transact-kv lmdb txs))
+  (let [idoc-state-actions (idoc-index idoc-indices id-ds txs)]
+    (transact-kv lmdb txs)
+    (idoc/apply-state-actions! idoc-state-actions)))
 
 (defn vpred
   [v]

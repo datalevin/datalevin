@@ -45,6 +45,10 @@
             row))
         ops))
 
+(defn- txlog-record-has-dbi?
+  [record dbi-name]
+  (some #(= dbi-name (nth % 1 nil)) (:ops record)))
+
 (defn- copy-snapshot-files-to-env!
   [snapshot-path env-dir]
   (doseq [^java.io.File f (or (u/list-files snapshot-path) [])
@@ -357,10 +361,36 @@
       (d/update-schema conn
                        {:doc/idoc {:db/valueType :db.type/idoc
                                    :db/domain "profiles"}})
-      (d/transact! conn [{:db/id 1
-                          :doc/idoc {:status "active"}}])
+      (let [lmdb (.-lmdb ^Store (conn-store conn))
+            txlog-count-before (count (kv/open-tx-log lmdb 1))]
+        (d/transact! conn [{:db/id 1
+                            :doc/idoc {:status "active"}}
+                           {:db/id 2
+                            :doc/idoc {:status "active"}}])
+        (let [records            (vec (kv/open-tx-log lmdb 1))
+              new-records        (drop txlog-count-before records)
+              idoc-write-records (filter #(or (txlog-record-has-dbi?
+                                                % "profiles/doc-ref")
+                                               (txlog-record-has-dbi?
+                                                % "profiles/doc-index")
+                                               (txlog-record-has-dbi?
+                                                % "profiles/path-dict"))
+                                          new-records)
+              record             (first idoc-write-records)]
+          (is (= 1 (count idoc-write-records)))
+          (is (txlog-record-has-dbi? record c/eav))
+          (is (txlog-record-has-dbi? record "profiles/doc-ref"))
+          (is (txlog-record-has-dbi? record "profiles/doc-index"))
+          (is (txlog-record-has-dbi? record "profiles/path-dict"))))
       (is (= {:status "active"}
              (:doc/idoc (d/entity @conn 1))))
+      (is (= #{1 2}
+             (set (d/q '[:find [?e ...]
+                         :in $ ?query
+                         :where
+                         [(idoc-match $ :doc/idoc ?query)
+                          [[?e ?a ?v]]]]
+                       @conn {:status "active"}))))
       (let [index (get (s/store-idoc-indices (conn-store conn)) "profiles")]
         (is (instance? SpillableMap (.-doc-refs ^IdocIndex index))))
       (let [lmdb (.-lmdb ^Store (conn-store conn))
