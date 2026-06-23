@@ -21,6 +21,8 @@
   [#372](https://github.com/datalevin/datalevin/issues/372).
 
 ### Improved
+- [Datalog] Coerce java.time.Instant to Date
+  [#373](https://github.com/datalevin/datalevin/issues/373). [Thx @xfthhxk]
 - [Lib] Java, Python, JS API parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.

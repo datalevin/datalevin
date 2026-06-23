@@ -1,5 +1,5 @@
 import { DatalevinError } from "./errors.js";
-import { _BINDINGS } from "./interop.js";
+import { CONNECTION_WITH_TRANSACTION_UNSUPPORTED, _BINDINGS } from "./interop.js";
 import { toJava } from "./convert.js";
 import { callJavaMethod } from "./jvm.js";
 import { toJsResult } from "./result.js";
@@ -228,9 +228,7 @@ class RawInterop {
   }
 
   async connectionWithTransaction(handle, fn) {
-    throw new DatalevinError(
-      "Connection withTransaction is not exposed by the Node binding because Java interface callbacks deadlock when the callback calls back into Datalevin. Use transact() for a single Datalog transaction, or KV withTransaction for explicit KV transactions."
-    );
+    throw new DatalevinError(CONNECTION_WITH_TRANSACTION_UNSUPPORTED);
   }
 
   async connectionReIndex(handle, schema = null, opts = null) {

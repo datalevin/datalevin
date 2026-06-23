@@ -1,5 +1,9 @@
 import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
+import { DatalevinError } from "./errors.js";
 import { callJavaMethod, classes, javaBridgeModule, jvmStarted, startJvm } from "./jvm.js";
+
+export const CONNECTION_WITH_TRANSACTION_UNSUPPORTED =
+  "Connection withTransaction is not exposed by the JavaScript binding because Java interface callbacks deadlock when the callback calls back into Datalevin. Use transact() for a single Datalog transaction, or KV withTransaction for explicit KV transactions.";
 
 async function unwrapInteropHandle(value) {
   if (typeof value?.rawHandle === "function") {
@@ -377,23 +381,6 @@ class InteropBindings {
       await unwrapInteropHandle(handle),
       hasValue(retainFloorLsn) ? await toJava(retainFloorLsn) : null
     );
-  }
-
-  async connectionWithTransaction(handle, fn) {
-    const cls = await classes();
-    const proxy = await createFunctionProxy(fn);
-    try {
-      return await withInterfaceProxyEventLoop(async () => (
-        callJavaMethod(
-          cls.interop,
-          "connectionWithTransaction",
-          await unwrapInteropHandle(handle),
-          proxy
-        )
-      ));
-    } finally {
-      proxy.reset?.();
-    }
   }
 
   async connectionReIndex(handle, schema = null, opts = null) {
@@ -1306,6 +1293,12 @@ export async function reIndex(target, opts = null, options = {}) {
 }
 
 export async function withTransaction(target, fn) {
+  if (target?.constructor?.name === "Connection" &&
+      typeof target.rawHandle === "function" &&
+      typeof target.transact === "function" &&
+      typeof target.query === "function") {
+    throw new DatalevinError(CONNECTION_WITH_TRANSACTION_UNSUPPORTED);
+  }
   if (typeof target?.withTransaction !== "function") {
     throw new TypeError("target must provide withTransaction().");
   }

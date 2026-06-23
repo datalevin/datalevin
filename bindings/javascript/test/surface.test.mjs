@@ -297,3 +297,22 @@ test("public surface stays importable without starting the JVM", () => {
     assert.equal(typeof datalevin.VectorIndex.prototype[method], "function");
   }
 });
+
+test("top-level withTransaction explains unsupported Connection targets", async () => {
+  const conn = new datalevin.Connection({}, { owned: false });
+  const explainsUnsupportedConnectionTransaction = (error) => {
+    assert.equal(error instanceof datalevin.DatalevinError, true);
+    assert.match(error.message, /Java interface callbacks deadlock/);
+    assert.match(error.message, /Use transact\(\)/);
+    return true;
+  };
+
+  await assert.rejects(
+    () => datalevin.withTransaction(conn, async () => null),
+    explainsUnsupportedConnectionTransaction
+  );
+  await assert.rejects(
+    () => datalevin.interop().connectionWithTransaction({}, async () => null),
+    explainsUnsupportedConnectionTransaction
+  );
+});
