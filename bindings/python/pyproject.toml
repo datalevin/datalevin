@@ -29,6 +29,7 @@ classifiers = [
 [project.optional-dependencies]
 dev = [
   "pytest>=8",
+  "setuptools>=69",
 ]
 
 [tool.setuptools]

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 import json
 
 import pytest
@@ -766,6 +767,7 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
+    assert issubclass(datalevin.Entity, Mapping)
     assert callable(getattr(connection_module.Connection, "fill_db"))
     assert callable(getattr(datalevin.Entity, "touch"))
     assert callable(getattr(datalevin.SearchEngine, "add_doc"))

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import pytest
 
 from datalevin import (
@@ -92,11 +94,18 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert conn.datalog_index_cache_limit() == 16
         assert conn.entid([":name", "Ada"]) == 1
         entity = conn.entity(1)
+        assert isinstance(entity, Mapping)
         assert entity.id == 1
         assert entity[":db/id"] == 1
         assert entity.get(":name") == "Ada"
         assert entity[":name"] == "Ada"
         assert ":name" in entity
+        assert {":name", ":bio", ":status", ":friend"}.issubset(entity.keys())
+        assert "Ada" in entity.values()
+        entity_items = dict(entity.items())
+        assert entity_items[":name"] == "Ada"
+        assert isinstance(entity_items[":friend"], Entity)
+        assert dict(entity)[":name"] == "Ada"
         assert entity.get(":missing", "fallback") == "fallback"
         friend = entity.get(":friend")
         assert isinstance(friend, Entity)

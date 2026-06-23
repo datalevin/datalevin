@@ -23,7 +23,7 @@ def to_java(value):
     if value is None or isinstance(value, (float, str)):
         return value
     if isinstance(value, bool):
-        return JBoolean(value)
+        return classes().boolean_type.TRUE if value else classes().boolean_type.FALSE
     if is_java_object(value):
         return value
 
