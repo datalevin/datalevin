@@ -386,6 +386,81 @@
           (d/close conn))
         (u/delete-files dir)))))
 
+(deftest test-idoc-match-concurrent-read-write-sidecar-state
+  (let [dir    (u/tmp-dir (str "test-idoc-concurrent-sidecar-"
+                               (UUID/randomUUID)))
+        schema {:doc/idoc {:db/valueType :db.type/idoc
+                           :db/domain    "profiles"}}
+        conn   (d/create-conn dir schema)
+        stop?  (promise)]
+    (try
+      (d/transact! conn
+                   (mapv (fn [i]
+                           {:db/id    i
+                            :doc/idoc {:status "active" :n i}})
+                         (range 1 21)))
+      (let [query     '[:find [?e ...]
+                        :in $ ?query
+                        :where
+                        [(idoc-match $ :doc/idoc ?query)
+                         [[?e ?a ?v]]]]
+            errors    (atom [])
+            record!   (fn [^Throwable t]
+                        (swap! errors conj t)
+                        (deliver stop? true))
+            read-once #(do (d/q query @conn {}) nil)
+            readers   (doall
+                        (for [_ (range 4)]
+                          (future
+                            (try
+                              (while (not (realized? stop?))
+                                (read-once))
+                              :done
+                              (catch Throwable t
+                                (record! t)
+                                :error)))))
+            writer    (future
+                        (try
+                          (dotimes [i 40]
+                            (d/transact!
+                              conn
+                              [{:db/id    1
+                                :doc/idoc {:status (if (even? i)
+                                                     "active"
+                                                     "inactive")
+                                           :n      i}}])
+                            (let [eid (+ 1000 i)]
+                              (d/transact!
+                                conn
+                                [{:db/id    eid
+                                  :doc/idoc {:status "active" :n i}}])
+                              (when (pos? i)
+                                (d/transact!
+                                  conn
+                                  [[:db/retractEntity (dec eid)]]))))
+                          :done
+                          (catch Throwable t
+                            (record! t)
+                            :error)))]
+        (let [writer-result (deref writer 30000 ::timeout)]
+          (deliver stop? true)
+          (when (= ::timeout writer-result)
+            (future-cancel writer))
+          (let [reader-results (doall
+                                 (map #(deref % 30000 ::timeout) readers))]
+            (doseq [[reader result] (map vector readers reader-results)
+                    :when (= ::timeout result)]
+              (future-cancel reader))
+            (is (not= ::timeout writer-result))
+            (is (not-any? #{::timeout} reader-results))
+            (is (empty? @errors)
+                (pr-str (mapv str @errors))))))
+      (finally
+        (deliver stop? true)
+        (when-not (d/closed? conn)
+          (d/close conn))
+        (u/delete-files dir)))))
+
 (deftest test-idoc-match-nil-candidate-subexpressions
   (let [dir    (u/tmp-dir (str "test-idoc-nil-candidates-"
                                (UUID/randomUUID)))

@@ -36,7 +36,6 @@
    [datalevin.utl LikeFSM LRUCache]
    [org.eclipse.collections.impl.list.mutable FastList]
    [datalevin.idoc IdocIndex]
-   [datalevin.spill SpillableMap]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.db DB]))
@@ -499,26 +498,25 @@
         emit      (make-emit-fn lmdb aid->attr needed)]
     (if (clojure.core/nil? idoc/*trace*)
       (let [res (FastList.)]
-        (idoc/ids-iterate
+        (idoc/ids-iterate-doc-refs
+          index
           ids
-          (fn [doc-id]
-            (let [doc-ref (.get ^SpillableMap (.-doc-refs index) doc-id)]
-              (when doc-ref
-                (cond
-                  exact?
-                  (.add res (emit doc-ref))
+          (fn [doc-id doc-ref]
+            (cond
+              exact?
+              (.add res (emit doc-ref))
 
-                  verify?
-                  (if (idoc/ids-contains? verify doc-id)
-                    (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                      (when (idoc/matches-doc? index doc query)
-                        (.add res (emit doc-ref))))
-                    (.add res (emit doc-ref)))
+              verify?
+              (if (idoc/ids-contains? verify doc-id)
+                (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+                  (when (idoc/matches-doc? index doc query)
+                    (.add res (emit doc-ref))))
+                (.add res (emit doc-ref)))
 
-                  :else
-                  (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                    (when (idoc/matches-doc? index doc query)
-                      (.add res (emit doc-ref)))))))))
+              :else
+              (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+                (when (idoc/matches-doc? index doc query)
+                  (.add res (emit doc-ref)))))))
         res)
       (let [start        (System/nanoTime)
             cand-count   (idoc/ids-count ids)
@@ -526,36 +524,35 @@
             doc-fetches  (volatile! 0)
             match-count  (volatile! 0)
             res          (FastList.)]
-        (idoc/ids-iterate
+        (idoc/ids-iterate-doc-refs
+          index
           ids
-          (fn [doc-id]
-            (let [doc-ref (.get ^SpillableMap (.-doc-refs index) doc-id)]
-              (when doc-ref
-                (cond
-                  exact?
-                  (do
-                    (vswap! match-count long-inc)
-                    (.add res (emit doc-ref)))
+          (fn [doc-id doc-ref]
+            (cond
+              exact?
+              (do
+                (vswap! match-count long-inc)
+                (.add res (emit doc-ref)))
 
-                  verify?
-                  (if (idoc/ids-contains? verify doc-id)
-                    (do
-                      (vswap! doc-fetches long-inc)
-                      (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                        (when (idoc/matches-doc? index doc query)
-                          (vswap! match-count long-inc)
-                          (.add res (emit doc-ref)))))
-                    (do
+              verify?
+              (if (idoc/ids-contains? verify doc-id)
+                (do
+                  (vswap! doc-fetches long-inc)
+                  (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+                    (when (idoc/matches-doc? index doc query)
                       (vswap! match-count long-inc)
-                      (.add res (emit doc-ref))))
+                      (.add res (emit doc-ref)))))
+                (do
+                  (vswap! match-count long-inc)
+                  (.add res (emit doc-ref))))
 
-                  :else
-                  (do
-                    (vswap! doc-fetches long-inc)
-                    (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                      (when (idoc/matches-doc? index doc query)
-                        (vswap! match-count long-inc)
-                        (.add res (emit doc-ref))))))))))
+              :else
+              (do
+                (vswap! doc-fetches long-inc)
+                (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+                  (when (idoc/matches-doc? index doc query)
+                    (vswap! match-count long-inc)
+                    (.add res (emit doc-ref))))))))
         (idoc/*trace* {:event           :idoc-match-domain
                        :domain          domain
                        :candidate-count cand-count

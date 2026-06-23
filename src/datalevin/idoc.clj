@@ -28,6 +28,7 @@
    [java.util IdentityHashMap HashSet HashMap Collections List Map$Entry Set]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
+   [java.util.concurrent.locks Lock ReentrantReadWriteLock]
    [datalevin.spill SpillableMap]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.math BigDecimal BigInteger]
@@ -791,6 +792,7 @@
                     path-dict-dbi
                     ^SpillableMap doc-refs
                     ^RoaringBitmap all-doc-ids
+                    ^ReentrantReadWriteLock state-lock
                     ^AtomicInteger max-doc
                     ^AtomicInteger max-path
                     path-cache
@@ -824,6 +826,7 @@
                  path-dict-dbi
                  doc-refs
                  all-doc-ids
+                 (ReentrantReadWriteLock.)
                  (AtomicInteger. max-doc)
                  (AtomicInteger. max-path)
                  path-cache
@@ -845,6 +848,7 @@
                (.-path-dict-dbi old)
                (.-doc-refs old)
                (.-all-doc-ids old)
+               (.-state-lock old)
                (.-max-doc old)
                (.-max-path old)
                (.-path-cache old)
@@ -862,6 +866,121 @@
   (let [^ConcurrentHashMap range-cache (.-range-cache index)]
     (when-not (.isEmpty range-cache)
       (.clear range-cache))))
+
+(defn- state-read-lock
+  ^Lock [^IdocIndex index]
+  (.readLock ^ReentrantReadWriteLock (.-state-lock index)))
+
+(defn- state-write-lock
+  ^Lock [^IdocIndex index]
+  (.writeLock ^ReentrantReadWriteLock (.-state-lock index)))
+
+(defn- add-doc-state!
+  [^IdocIndex index doc-id doc-ref]
+  (let [^Lock lock (state-write-lock index)]
+    (.lock lock)
+    (try
+      (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
+      (b/bitmap-add (.-all-doc-ids index) (int doc-id))
+      (finally
+        (.unlock lock)))))
+
+(defn- update-doc-ref!
+  [^IdocIndex index doc-id doc-ref]
+  (let [^Lock lock (state-write-lock index)]
+    (.lock lock)
+    (try
+      (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
+      (finally
+        (.unlock lock)))))
+
+(defn- add-docs-state!
+  [^IdocIndex index ^FastList doc-id-refs]
+  (when-not (.isEmpty doc-id-refs)
+    (let [^Lock lock (state-write-lock index)]
+      (.lock lock)
+      (try
+        (loop [i 0
+               n (.size doc-id-refs)]
+          (when (< i n)
+            (let [doc-id  (.get doc-id-refs i)
+                  doc-ref (.get doc-id-refs (unchecked-inc-int i))]
+              (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
+              (b/bitmap-add (.-all-doc-ids index) (int doc-id))
+              (recur (unchecked-add-int i 2) n))))
+        (finally
+          (.unlock lock))))))
+
+(defn- remove-doc-state!
+  [^IdocIndex index doc-id]
+  (let [^Lock lock (state-write-lock index)]
+    (.lock lock)
+    (try
+      (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
+      (b/bitmap-del (.-all-doc-ids index) (int doc-id))
+      (finally
+        (.unlock lock)))))
+
+(defn- remove-docs-state!
+  [^IdocIndex index ^FastList doc-ids]
+  (when-not (.isEmpty doc-ids)
+    (let [^Lock lock (state-write-lock index)]
+      (.lock lock)
+      (try
+        (doseq [doc-id doc-ids]
+          (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
+          (b/bitmap-del (.-all-doc-ids index) (int doc-id)))
+        (finally
+          (.unlock lock))))))
+
+(defn doc-ref-by-id
+  [^IdocIndex index doc-id]
+  (let [^Lock lock (state-read-lock index)]
+    (.lock lock)
+    (try
+      (.get ^SpillableMap (.-doc-refs index) doc-id)
+      (finally
+        (.unlock lock)))))
+
+(declare ids-iterate)
+
+(def ^:private ^:const doc-ref-read-batch-size 512)
+
+(defn ids-iterate-doc-refs
+  [^IdocIndex index ids f]
+  (let [batch-ids  (FastList.)
+        batch-refs (FastList.)
+        flush!     (fn []
+                     (when-not (.isEmpty batch-ids)
+                       (.clear batch-refs)
+                       (let [^Lock lock (state-read-lock index)]
+                         (.lock lock)
+                         (try
+                           (dotimes [i (.size batch-ids)]
+                             (let [doc-id  (.get batch-ids i)
+                                   doc-ref (.get ^SpillableMap
+                                                 (.-doc-refs index)
+                                                 doc-id)]
+                               (when doc-ref
+                                 (.add batch-refs doc-id)
+                                 (.add batch-refs doc-ref))))
+                           (finally
+                             (.unlock lock))))
+                       (loop [i 0
+                              n (.size batch-refs)]
+                         (when (< i n)
+                           (f (.get batch-refs i)
+                              (.get batch-refs (unchecked-inc-int i)))
+                           (recur (unchecked-add-int i 2) n)))
+                       (.clear batch-ids)
+                       (.clear batch-refs)))]
+    (ids-iterate
+      ids
+      (fn [doc-id]
+        (.add batch-ids doc-id)
+        (when (<= (long doc-ref-read-batch-size) (long (.size batch-ids)))
+          (flush!))))
+    (flush!)))
 
 (defn- cache-path!
   ([^IdocIndex index path ^long pid] (cache-path! index path pid nil))
@@ -924,8 +1043,63 @@
           (cache-path! index path pid))
         pid))))
 
+(defn- add-state-action!
+  [^FastList state-actions action]
+  (when state-actions
+    (.add state-actions action)))
+
+(defn apply-state-actions!
+  [^FastList state-actions]
+  (when (and state-actions (not (.isEmpty state-actions)))
+    (let [^IdentityHashMap by-index (IdentityHashMap.)]
+      (doseq [action state-actions]
+        (let [^IdocIndex index (nth action 0)
+              ^FastList actions (or (.get by-index index)
+                                     (let [actions (FastList.)]
+                                       (.put by-index index actions)
+                                       actions))]
+          (.add actions action)))
+      (doseq [^Map$Entry entry (.entrySet by-index)]
+        (let [^IdocIndex index (.getKey entry)
+              ^FastList actions (.getValue entry)
+              ^Lock lock (state-write-lock index)]
+          (.lock lock)
+          (try
+            (doseq [action actions]
+              (case (nth action 1)
+                :add-doc
+                (let [doc-id  (nth action 2)
+                      doc-ref (nth action 3)]
+                  (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
+                  (b/bitmap-add (.-all-doc-ids index) (int doc-id)))
+
+                :update-doc-ref
+                (let [doc-id  (nth action 2)
+                      doc-ref (nth action 3)]
+                  (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref))
+
+                :remove-doc
+                (let [doc-id (nth action 2)]
+                  (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
+                  (b/bitmap-del (.-all-doc-ids index) (int doc-id)))
+
+                :cache-path
+                (let [path (nth action 2)
+                      pid  (long (nth action 3))
+                      segs (nth action 4)]
+                  (cache-path! index path pid segs)
+                  (update-pattern-cache! index segs pid))
+
+                :invalidate
+                nil))
+            (finally
+              (.unlock lock)))
+          (invalidate-range-cache! index))))))
+
 (defn- ensure-path-id
-  [^IdocIndex index path ^FastList txs]
+  ([^IdocIndex index path ^FastList txs]
+   (ensure-path-id index path txs nil))
+  ([^IdocIndex index path ^FastList txs ^FastList state-actions]
   (let [^ConcurrentHashMap path-cache (.-path-cache index)
         cached                        (.get path-cache path)]
     (if cached
@@ -936,33 +1110,50 @@
               path-dbi (.-path-dict-dbi index)]
           (.add txs (l/kv-tx :put path-dbi path pid :string :int))
           (let [segs (decode-path path)]
-            (cache-path! index path pid segs)
-            (update-pattern-cache! index segs pid))
-          pid)))))
+            (if state-actions
+              (add-state-action! state-actions
+                                 [index :cache-path path pid segs])
+              (do
+                (cache-path! index path pid segs)
+                (update-pattern-cache! index segs pid))))
+          pid))))))
+
+(defn- commit-idoc-plan!
+  [^IdocIndex index res ^FastList txs ^FastList state-actions]
+  (when-not (.isEmpty txs)
+    (transact-kv (.-lmdb index) txs)
+    (apply-state-actions! state-actions))
+  res)
+
+(defn add-doc-plan!
+  [^IdocIndex index ^FastList txs ^FastList state-actions
+   doc-ref doc check-exist?]
+  (if (and check-exist?
+           (get-value (.-lmdb index) (.-doc-ref-dbi index)
+                      doc-ref :data :int))
+    :doc-exists
+    (let [doc-id      (.incrementAndGet ^AtomicInteger (.-max-doc index))
+          index-dbi   (.-doc-index-dbi index)
+          doc-ref-dbi (.-doc-ref-dbi index)]
+      ;; TODO: if doc-ref ever exceeds LMDB key size, fall back to a :g ref.
+      (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
+      (add-state-action! state-actions [index :add-doc doc-id doc-ref])
+      (doseq [[path values] (doc->path-values-mutable doc)
+              :let          [pid (ensure-path-id index path txs
+                                                 state-actions)]]
+        (doseq [v    values
+                :let [idx (indexable-key pid v)]]
+          (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int))))
+      :doc-added)))
 
 (defn add-doc
   ([index doc-ref doc] (add-doc index doc-ref doc true))
   ([^IdocIndex index doc-ref doc check-exist?]
-   (if (and check-exist?
-            (get-value (.-lmdb index) (.-doc-ref-dbi index)
-                       doc-ref :data :int))
-     :doc-exists
-     (let [txs            (FastList.)
-           doc-id         (.incrementAndGet ^AtomicInteger (.-max-doc index))
-           index-dbi      (.-doc-index-dbi index)
-           doc-ref-dbi    (.-doc-ref-dbi index)]
-       ;; TODO: if doc-ref ever exceeds LMDB key size, fall back to a :g ref.
-       (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-       (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
-       (b/bitmap-add (.-all-doc-ids index) (int doc-id))
-       (doseq [[path values] (doc->path-values-mutable doc)
-               :let          [pid (ensure-path-id index path txs)]]
-         (doseq [v    values
-                 :let [idx (indexable-key pid v)]]
-           (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int))))
-       (transact-kv (.-lmdb index) txs)
-       (invalidate-range-cache! index)
-       :doc-added))))
+   (let [txs           (FastList.)
+         state-actions (FastList.)
+         res           (add-doc-plan! index txs state-actions
+                                      doc-ref doc check-exist?)]
+     (commit-idoc-plan! index res txs state-actions))))
 
 (defn- remote-doc-ref-ids
   [lmdb doc-ref-dbi docs]
@@ -970,48 +1161,51 @@
     (zipmap (map first docs)
             (r/get-values lmdb doc-ref-dbi (map first docs) :data :int true))))
 
+(defn add-docs-plan!
+  [^IdocIndex index ^FastList txs ^FastList state-actions docs check-exist?]
+  (when (seq docs)
+    (let [lmdb        (.-lmdb index)
+          index-dbi   (.-doc-index-dbi index)
+          doc-ref-dbi (.-doc-ref-dbi index)
+          doc-ref-ids (when check-exist?
+                        (remote-doc-ref-ids lmdb doc-ref-dbi docs))
+          idx->ids    (HashMap.)]
+      (doseq [[doc-ref doc] docs]
+        (when-not (and check-exist?
+                       (if doc-ref-ids
+                         (get doc-ref-ids doc-ref)
+                         (get-value lmdb doc-ref-dbi doc-ref :data :int)))
+          (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
+            (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
+            (add-state-action! state-actions [index :add-doc doc-id doc-ref])
+            (doseq [[path values] (doc->path-values-mutable doc)
+                    :let          [pid (ensure-path-id index path txs
+                                                       state-actions)]]
+              (doseq [v    values
+                      :let [idx (indexable-key pid v)
+                            ^List ids (or (.get idx->ids idx)
+                                          (let [ids (FastList.)]
+                                            (.put idx->ids idx ids)
+                                            ids))]]
+                (.add ids doc-id))))))
+      (doseq [[idx ids] idx->ids]
+        (.add txs (l/kv-tx :put-list index-dbi idx ids :avg :int)))
+      :docs-added)))
+
 (defn add-docs
   ([index docs] (add-docs index docs true))
   ([^IdocIndex index docs check-exist?]
-   (when (seq docs)
-     (let [txs            (FastList.)
-           lmdb           (.-lmdb index)
-           index-dbi      (.-doc-index-dbi index)
-           doc-ref-dbi    (.-doc-ref-dbi index)
-           doc-ref-ids    (when check-exist?
-                            (remote-doc-ref-ids lmdb doc-ref-dbi docs))
-           idx->ids       (HashMap.)]
-       (doseq [[doc-ref doc] docs]
-         (when-not (and check-exist?
-                        (if doc-ref-ids
-                          (get doc-ref-ids doc-ref)
-                          (get-value lmdb doc-ref-dbi doc-ref :data :int)))
-           (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
-             (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-             (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
-             (b/bitmap-add (.-all-doc-ids index) (int doc-id))
-             (doseq [[path values] (doc->path-values-mutable doc)
-                     :let          [pid (ensure-path-id index path txs)]]
-               (doseq [v    values
-                       :let [idx (indexable-key pid v)
-                             ^List ids (or (.get idx->ids idx)
-                                           (let [ids (FastList.)]
-                                             (.put idx->ids idx ids)
-                                             ids))]]
-                 (.add ids doc-id))))))
-       (doseq [[idx ids] idx->ids]
-         (.add txs (l/kv-tx :put-list index-dbi idx ids :avg :int)))
-       (when-not (.isEmpty txs)
-         (transact-kv lmdb txs)
-         (invalidate-range-cache! index))
-       :docs-added))))
+   (let [txs           (FastList.)
+         state-actions (FastList.)
+         res           (add-docs-plan! index txs state-actions
+                                       docs check-exist?)]
+     (commit-idoc-plan! index res txs state-actions))))
 
-(defn remove-doc
-  [^IdocIndex index doc-ref doc]
+(defn remove-doc-plan!
+  [^IdocIndex index ^FastList txs ^FastList state-actions doc-ref doc]
   (when-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
                                doc-ref :data :int)]
-    (let [txs            (FastList.)
-          index-dbi      (.-doc-index-dbi index)]
+    (let [index-dbi (.-doc-index-dbi index)]
       (doseq [[path values] (doc->path-values-mutable doc)
               :let          [pid (get-path-id index path)]]
         (when pid
@@ -1019,17 +1213,20 @@
                   :let [idx (indexable-key pid v)]]
             (.add txs (l/kv-tx :del-list index-dbi idx [doc-id] :avg :int)))))
       (.add txs (l/kv-tx :del (.-doc-ref-dbi index) doc-ref :data))
-      (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
-      (b/bitmap-del (.-all-doc-ids index) (int doc-id))
-      (transact-kv (.-lmdb index) txs)
-      (invalidate-range-cache! index)
+      (add-state-action! state-actions [index :remove-doc doc-id])
       :doc-removed)))
 
-(defn remove-docs
-  [^IdocIndex index docs]
+(defn remove-doc
+  [^IdocIndex index doc-ref doc]
+  (let [txs           (FastList.)
+        state-actions (FastList.)
+        res           (remove-doc-plan! index txs state-actions doc-ref doc)]
+    (commit-idoc-plan! index res txs state-actions)))
+
+(defn remove-docs-plan!
+  [^IdocIndex index ^FastList txs ^FastList state-actions docs]
   (when (seq docs)
-    (let [txs            (FastList.)
-          lmdb           (.-lmdb index)
+    (let [lmdb           (.-lmdb index)
           index-dbi      (.-doc-index-dbi index)
           doc-ref-dbi    (.-doc-ref-dbi index)
           doc-ref-ids    (remote-doc-ref-ids lmdb doc-ref-dbi docs)
@@ -1049,23 +1246,26 @@
                                             ids))]]
                 (.add ids doc-id))))
           (.add txs (l/kv-tx :del doc-ref-dbi doc-ref :data))
-          (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
-          (b/bitmap-del (.-all-doc-ids index) (int doc-id))))
+          (add-state-action! state-actions [index :remove-doc doc-id])))
       (doseq [[idx ids] idx->ids]
         (.add txs (l/kv-tx :del-list index-dbi idx ids :avg :int)))
-      (when-not (.isEmpty txs)
-        (transact-kv lmdb txs)
-        (invalidate-range-cache! index))
       :docs-removed)))
 
-(defn update-doc
-  [^IdocIndex index old-ref old-doc new-ref new-doc]
+(defn remove-docs
+  [^IdocIndex index docs]
+  (let [txs           (FastList.)
+        state-actions (FastList.)
+        res           (remove-docs-plan! index txs state-actions docs)]
+    (commit-idoc-plan! index res txs state-actions)))
+
+(defn update-doc-plan!
+  [^IdocIndex index ^FastList txs ^FastList state-actions
+   old-ref old-doc new-ref new-doc]
   (if-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
                              old-ref :data :int)]
     (if (and (= old-ref new-ref) (= old-doc new-doc))
       :doc-updated
-      (let [txs               (FastList.)
-            lmdb              (.-lmdb index)
+      (let [tx-count          (.size txs)
             index-dbi         (.-doc-index-dbi index)
             doc-ref-dbi       (.-doc-ref-dbi index)
             ^Set empty-set    (Collections/emptySet)
@@ -1073,7 +1273,8 @@
         (when-not (= old-ref new-ref)
           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (.put ^SpillableMap (.-doc-refs index) doc-id new-ref))
+          (add-state-action! state-actions
+                             [index :update-doc-ref doc-id new-ref]))
         (doseq [[path old-vals] old-map
                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
                                                    empty-set)]]
@@ -1086,16 +1287,23 @@
         (doseq [[path new-vals] new-map
                 :let            [^Set old-vals (or (.get ^HashMap old-map path)
                                                    empty-set)]]
-          (let [pid (ensure-path-id index path txs)]
+          (let [pid (ensure-path-id index path txs state-actions)]
             (doseq [v new-vals]
               (when-not (.contains old-vals v)
                 (let [idx (indexable-key pid v)]
                   (.add txs (l/kv-tx :put index-dbi idx doc-id :avg :int)))))))
-        (when-not (.isEmpty txs)
-          (transact-kv lmdb txs)
-          (invalidate-range-cache! index))
+        (when (< tx-count (.size txs))
+          (add-state-action! state-actions [index :invalidate]))
         :doc-updated))
     :doc-missing))
+
+(defn update-doc
+  [^IdocIndex index old-ref old-doc new-ref new-doc]
+  (let [txs           (FastList.)
+        state-actions (FastList.)
+        res           (update-doc-plan! index txs state-actions
+                                        old-ref old-doc new-ref new-doc)]
+    (commit-idoc-plan! index res txs state-actions)))
 
 (defn- get-path-strict
   [doc segments]
@@ -1144,7 +1352,7 @@
         (when-not (= old-ref new-ref)
           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (.put ^SpillableMap (.-doc-refs index) doc-id new-ref))
+          (update-doc-ref! index doc-id new-ref))
         (doseq [[path old-vals] old-map
                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
                                                    empty-set)]]
@@ -1619,7 +1827,12 @@
 
 (defn- all-doc-ids
   [^IdocIndex index]
-  (.clone ^RoaringBitmap (.-all-doc-ids index)))
+  (let [^Lock lock (state-read-lock index)]
+    (.lock lock)
+    (try
+      (.clone ^RoaringBitmap (.-all-doc-ids index))
+      (finally
+        (.unlock lock)))))
 
 (defn- and-candidate-ids
   [candidates]

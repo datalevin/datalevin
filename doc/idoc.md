@@ -252,7 +252,8 @@ when the path traverses arrays.
 * **Index structure** (per idoc domain):
   * **doc-ref map**: `datom-ref -> doc-id` (doc-ref is datom or a giant datom id).
     idoc also keeps a spillable in-memory reverse map, `doc-id -> datom-ref`,
-    for query emission.
+    for query emission. Access to the reverse map and document-id bitmap is
+    synchronized per idoc index.
   * **path dictionary**: `path -> path-id` with stable numeric ids.
   * **inverted index**: `(path-id, typed-value) -> [doc-id ...]`.
 * **Indexing**: During transactions, idoc indices are updated synchronously.
