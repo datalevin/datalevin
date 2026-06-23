@@ -382,6 +382,54 @@
           (d/close conn))
         (u/delete-files dir)))))
 
+(deftest test-idoc-match-nil-candidate-subexpressions
+  (let [dir    (u/tmp-dir (str "test-idoc-nil-candidates-"
+                               (UUID/randomUUID)))
+        schema {:doc/idoc {:db/valueType :db.type/idoc
+                           :db/domain    "profiles"}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (d/transact! conn
+                   [{:db/id    1
+                     :doc/idoc {:status  "active"
+                                :deleted false
+                                :a       1
+                                :b       {:x 1}}}
+                    {:db/id    2
+                     :doc/idoc {:status  "active"
+                                :deleted true
+                                :a       2}}
+                    {:db/id    3
+                     :doc/idoc {:status  "inactive"
+                                :deleted false
+                                :a       1}}])
+      (let [match-eids (fn [query]
+                         (set (d/q '[:find [?e ...]
+                                      :in $ ?query
+                                      :where
+                                      [(idoc-match $ :doc/idoc ?query)
+                                       [[?e ?a ?v]]]]
+                                    @conn
+                                    query)))]
+        (is (= #{1}
+               (match-eids {:status  "active"
+                            :deleted [:not true]})))
+        (is (= #{1 2}
+               (match-eids [:or {:a 2}
+                            [:not {:status "inactive"}]])))
+        (is (= #{1}
+               (match-eids {:a 1
+                            :b {}})))
+        (is (= #{1 2}
+               (match-eids {:status "active"
+                            :empty  [:and]})))
+        (is (= #{}
+               (match-eids {:status "active"
+                            :empty  [:or]}))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-ways-to-create-conn-1
   (let [dir  (u/tmp-dir (str "test-" (UUID/randomUUID)))
         conn (d/create-conn dir)]

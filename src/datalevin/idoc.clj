@@ -1622,12 +1622,23 @@
   [^IdocIndex index]
   (.clone ^RoaringBitmap (.-all-doc-ids index)))
 
+(defn- and-candidate-ids
+  [candidates]
+  (when-let [candidates (not-empty (filterv some? candidates))]
+    (b/bitmaps-and candidates)))
+
+(defn- or-candidate-ids
+  [candidates]
+  (let [candidates (vec candidates)]
+    (when (and (seq candidates) (every? some? candidates))
+      (b/bitmaps-or candidates))))
+
 (defn- ids-for-expr
   [^IdocIndex index format expr ctx-path]
   (cond
     (map? expr)
     (when-not (empty? expr) ;; empty query matches all documents
-      (b/bitmaps-and
+      (and-candidate-ids
         (map+ (fn [[k v]]
                 (let [k'   (normalize-seg format k)
                       path (conj (or ctx-path []) k')]
@@ -1638,10 +1649,10 @@
     (let [[op & rest] expr]
       (case op
         :and (when-not (empty? rest)
-               (b/bitmaps-and
+               (and-candidate-ids
                  (map+ #(ids-for-expr index format % ctx-path) rest)))
         :or  (when-not (empty? rest)
-               (b/bitmaps-or
+               (or-candidate-ids
                  (map+ #(ids-for-expr index format % ctx-path) rest)))
         :not nil
         (raise "Unknown idoc logical operator" {:op op})))
