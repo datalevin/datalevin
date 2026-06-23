@@ -20,6 +20,7 @@
     :refer [open-dbi open-list-dbi get-value visit transact-kv]]
    [datalevin.remote :as r]
    [datalevin.lmdb :as l]
+   [datalevin.spill :as sp]
    [datalevin.util :as u :refer [raise map+]]
    [jsonista.core :as json]
    [nextjournal.markdown :as md])
@@ -27,7 +28,7 @@
    [java.util IdentityHashMap HashSet HashMap Collections List Map$Entry Set]
    [java.util.concurrent ConcurrentHashMap]
    [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
-   [org.eclipse.collections.impl.map.mutable.primitive IntObjectHashMap]
+   [datalevin.spill SpillableMap]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.math BigDecimal BigInteger]
    [org.roaringbitmap RoaringBitmap]))
@@ -749,14 +750,15 @@
 
 (defn- init-doc-refs
   [lmdb doc-ref-dbi]
-  (let [doc-refs    (IntObjectHashMap.)
+  (let [doc-refs    (sp/new-spillable-map)
         all-doc-ids (RoaringBitmap.)
         max-id      (volatile! 0)
         load        (fn [kv]
                       (let [ref (b/read-buffer (l/k kv) :data)
                             did (b/read-buffer (l/v kv) :int)]
-                        (when (< ^int @max-id ^int did) (vreset! max-id did))
-                        (.put doc-refs (int did) ref)
+                        (when (< ^int @max-id ^int did)
+                          (vreset! max-id did))
+                        (.put ^SpillableMap doc-refs did ref)
                         (b/bitmap-add all-doc-ids (int did))))]
     (visit lmdb doc-ref-dbi load [:all-back])
     [@max-id doc-refs all-doc-ids]))
@@ -787,7 +789,7 @@
                     doc-ref-dbi
                     doc-index-dbi
                     path-dict-dbi
-                    doc-refs
+                    ^SpillableMap doc-refs
                     ^RoaringBitmap all-doc-ids
                     ^AtomicInteger max-doc
                     ^AtomicInteger max-path
@@ -802,17 +804,18 @@
 
 (defn new-idoc-index
   [lmdb {:keys [domain format] :as _opts}]
-  (let [[doc-ref-dbi doc-index-dbi path-dict-dbi] (open-dbis lmdb domain)
-        max-path                          (init-paths lmdb path-dict-dbi)
-        [max-doc doc-refs all-doc-ids]    (init-doc-refs lmdb doc-ref-dbi)
-        path-cache                        (ConcurrentHashMap.)
-        path-seg-cache                    (ConcurrentHashMap.)
-        pattern-cache                     (ConcurrentHashMap.)
-        path-trie                         (new-path-trie)
-        paths-loaded                      (AtomicBoolean. false)
-        paths-lock                        (Object.)
-        range-cache                       (ConcurrentHashMap.)
-        index-version                     (AtomicLong. 0)]
+  (let [[doc-ref-dbi doc-index-dbi path-dict-dbi]
+        (open-dbis lmdb domain)
+        max-path                       (init-paths lmdb path-dict-dbi)
+        [max-doc doc-refs all-doc-ids] (init-doc-refs lmdb doc-ref-dbi)
+        path-cache                     (ConcurrentHashMap.)
+        path-seg-cache                 (ConcurrentHashMap.)
+        pattern-cache                  (ConcurrentHashMap.)
+        path-trie                      (new-path-trie)
+        paths-loaded                   (AtomicBoolean. false)
+        paths-lock                     (Object.)
+        range-cache                    (ConcurrentHashMap.)
+        index-version                  (AtomicLong. 0)]
     (->IdocIndex lmdb
                  domain
                  format
@@ -944,13 +947,13 @@
             (get-value (.-lmdb index) (.-doc-ref-dbi index)
                        doc-ref :data :int))
      :doc-exists
-     (let [txs         (FastList.)
-           doc-id      (.incrementAndGet ^AtomicInteger (.-max-doc index))
-           index-dbi   (.-doc-index-dbi index)
-           doc-ref-dbi (.-doc-ref-dbi index)]
+     (let [txs            (FastList.)
+           doc-id         (.incrementAndGet ^AtomicInteger (.-max-doc index))
+           index-dbi      (.-doc-index-dbi index)
+           doc-ref-dbi    (.-doc-ref-dbi index)]
        ;; TODO: if doc-ref ever exceeds LMDB key size, fall back to a :g ref.
        (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-       (.put ^IntObjectHashMap (.-doc-refs index) (int doc-id) doc-ref)
+       (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
        (b/bitmap-add (.-all-doc-ids index) (int doc-id))
        (doseq [[path values] (doc->path-values-mutable doc)
                :let          [pid (ensure-path-id index path txs)]]
@@ -971,14 +974,13 @@
   ([index docs] (add-docs index docs true))
   ([^IdocIndex index docs check-exist?]
    (when (seq docs)
-     (let [txs         (FastList.)
-           lmdb        (.-lmdb index)
-           index-dbi   (.-doc-index-dbi index)
-           doc-ref-dbi (.-doc-ref-dbi index)
-           doc-refs    (.-doc-refs index)
-           doc-ref-ids (when check-exist?
-                         (remote-doc-ref-ids lmdb doc-ref-dbi docs))
-           idx->ids    (HashMap.)]
+     (let [txs            (FastList.)
+           lmdb           (.-lmdb index)
+           index-dbi      (.-doc-index-dbi index)
+           doc-ref-dbi    (.-doc-ref-dbi index)
+           doc-ref-ids    (when check-exist?
+                            (remote-doc-ref-ids lmdb doc-ref-dbi docs))
+           idx->ids       (HashMap.)]
        (doseq [[doc-ref doc] docs]
          (when-not (and check-exist?
                         (if doc-ref-ids
@@ -986,7 +988,7 @@
                           (get-value lmdb doc-ref-dbi doc-ref :data :int)))
            (let [doc-id (.incrementAndGet ^AtomicInteger (.-max-doc index))]
              (.add txs (l/kv-tx :put doc-ref-dbi doc-ref doc-id :data :int))
-             (.put ^IntObjectHashMap doc-refs (int doc-id) doc-ref)
+             (.put ^SpillableMap (.-doc-refs index) doc-id doc-ref)
              (b/bitmap-add (.-all-doc-ids index) (int doc-id))
              (doseq [[path values] (doc->path-values-mutable doc)
                      :let          [pid (ensure-path-id index path txs)]]
@@ -1008,8 +1010,8 @@
   [^IdocIndex index doc-ref doc]
   (when-let [doc-id (get-value (.-lmdb index) (.-doc-ref-dbi index)
                                doc-ref :data :int)]
-    (let [txs       (FastList.)
-          index-dbi (.-doc-index-dbi index)]
+    (let [txs            (FastList.)
+          index-dbi      (.-doc-index-dbi index)]
       (doseq [[path values] (doc->path-values-mutable doc)
               :let          [pid (get-path-id index path)]]
         (when pid
@@ -1017,7 +1019,7 @@
                   :let [idx (indexable-key pid v)]]
             (.add txs (l/kv-tx :del-list index-dbi idx [doc-id] :avg :int)))))
       (.add txs (l/kv-tx :del (.-doc-ref-dbi index) doc-ref :data))
-      (.remove ^IntObjectHashMap (.-doc-refs index) (int doc-id))
+      (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
       (b/bitmap-del (.-all-doc-ids index) (int doc-id))
       (transact-kv (.-lmdb index) txs)
       (invalidate-range-cache! index)
@@ -1026,13 +1028,12 @@
 (defn remove-docs
   [^IdocIndex index docs]
   (when (seq docs)
-    (let [txs         (FastList.)
-          lmdb        (.-lmdb index)
-          index-dbi   (.-doc-index-dbi index)
-          doc-ref-dbi (.-doc-ref-dbi index)
-          doc-refs    (.-doc-refs index)
-          doc-ref-ids (remote-doc-ref-ids lmdb doc-ref-dbi docs)
-          idx->ids    (HashMap.)]
+    (let [txs            (FastList.)
+          lmdb           (.-lmdb index)
+          index-dbi      (.-doc-index-dbi index)
+          doc-ref-dbi    (.-doc-ref-dbi index)
+          doc-ref-ids    (remote-doc-ref-ids lmdb doc-ref-dbi docs)
+          idx->ids       (HashMap.)]
       (doseq [[doc-ref doc] docs]
         (when-let [doc-id (if doc-ref-ids
                             (get doc-ref-ids doc-ref)
@@ -1048,7 +1049,7 @@
                                             ids))]]
                 (.add ids doc-id))))
           (.add txs (l/kv-tx :del doc-ref-dbi doc-ref :data))
-          (.remove ^IntObjectHashMap doc-refs (int doc-id))
+          (.remove ^SpillableMap (.-doc-refs index) (int doc-id))
           (b/bitmap-del (.-all-doc-ids index) (int doc-id))))
       (doseq [[idx ids] idx->ids]
         (.add txs (l/kv-tx :del-list index-dbi idx ids :avg :int)))
@@ -1067,13 +1068,12 @@
             lmdb              (.-lmdb index)
             index-dbi         (.-doc-index-dbi index)
             doc-ref-dbi       (.-doc-ref-dbi index)
-            doc-refs          (.-doc-refs index)
             ^Set empty-set    (Collections/emptySet)
             [old-map new-map] (diff-path-values old-doc new-doc)]
         (when-not (= old-ref new-ref)
           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (.put ^IntObjectHashMap doc-refs (int doc-id) new-ref))
+          (.put ^SpillableMap (.-doc-refs index) doc-id new-ref))
         (doseq [[path old-vals] old-map
                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
                                                    empty-set)]]
@@ -1137,7 +1137,6 @@
             lmdb           (.-lmdb index)
             index-dbi      (.-doc-index-dbi index)
             doc-ref-dbi    (.-doc-ref-dbi index)
-            doc-refs       (.-doc-refs index)
             ^Set empty-set (Collections/emptySet)
             paths          (or paths [])
             old-map        (patch-path-values-mutable old-doc paths)
@@ -1145,7 +1144,7 @@
         (when-not (= old-ref new-ref)
           (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
           (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
-          (.put ^IntObjectHashMap doc-refs (int doc-id) new-ref))
+          (.put ^SpillableMap (.-doc-refs index) doc-id new-ref))
         (doseq [[path old-vals] old-map
                 :let            [^Set new-vals (or (.get ^HashMap new-map path)
                                                    empty-set)]]

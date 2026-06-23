@@ -15,6 +15,8 @@
    [datalevin.txlog :as txlog]
    [datalevin.util :as u])
   (:import
+   [datalevin.idoc IdocIndex]
+   [datalevin.spill SpillableMap]
    [datalevin.db DB]
    [datalevin.storage Store]
    [java.nio ByteBuffer]
@@ -359,14 +361,16 @@
                           :doc/idoc {:status "active"}}])
       (is (= {:status "active"}
              (:doc/idoc (d/entity @conn 1))))
+      (let [index (get (s/store-idoc-indices (conn-store conn)) "profiles")]
+        (is (instance? SpillableMap (.-doc-refs ^IdocIndex index))))
       (let [lmdb (.-lmdb ^Store (conn-store conn))
             ops  (txlog-ops lmdb)]
         (is (some? (txlog-dbi-registration-op ops
-                                              :put
-                                              "profiles/doc-ref")))
+                                               :put
+                                               "profiles/doc-ref")))
         (is (some? (txlog-dbi-registration-op ops
-                                              :put
-                                              "profiles/doc-index")))
+                                               :put
+                                               "profiles/doc-index")))
         (is (some? (txlog-dbi-registration-op ops
                                               :put
                                               "profiles/path-dict"))))

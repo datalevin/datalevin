@@ -34,9 +34,9 @@
    [java.util List]
    [java.nio.charset StandardCharsets]
    [datalevin.utl LikeFSM LRUCache]
-   [org.eclipse.collections.impl.map.mutable.primitive IntObjectHashMap]
    [org.eclipse.collections.impl.list.mutable FastList]
    [datalevin.idoc IdocIndex]
+   [datalevin.spill SpillableMap]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
    [datalevin.db DB]))
@@ -489,10 +489,9 @@
     (or (:db/domain props) (u/keyword->string attr))))
 
 (defn- idoc-match-domain
-  [^Store store index query domain ^ints needed]
+  [^Store store ^IdocIndex index query domain ^ints needed]
   (let [{:keys [ids exact? verify]} (idoc/candidate-ids* index query)
 
-        doc-refs  (.-doc-refs ^IdocIndex index)
         lmdb      (.-lmdb store)
         aid->attr (attrs store)
         verify?   (and (clojure.core/not exact?)
@@ -503,7 +502,7 @@
         (idoc/ids-iterate
           ids
           (fn [doc-id]
-            (let [doc-ref (.get ^IntObjectHashMap doc-refs (int doc-id))]
+            (let [doc-ref (.get ^SpillableMap (.-doc-refs index) doc-id)]
               (when doc-ref
                 (cond
                   exact?
@@ -530,7 +529,7 @@
         (idoc/ids-iterate
           ids
           (fn [doc-id]
-            (let [doc-ref (.get ^IntObjectHashMap doc-refs (int doc-id))]
+            (let [doc-ref (.get ^SpillableMap (.-doc-refs index) doc-id)]
               (when doc-ref
                 (cond
                   exact?
