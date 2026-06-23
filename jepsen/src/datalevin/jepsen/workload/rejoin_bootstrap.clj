@@ -477,10 +477,14 @@
    (some
     (fn [cause]
       (let [data      (ex-data cause)
+            err-data  (:err-data data)
             nested    (:data data)
-            gap-error (:gap-error nested)]
+            gap-error (or (:gap-error nested)
+                          (:gap-error err-data))]
         (or (= :txlog/not-enabled (:type data))
+            (= :txlog/not-enabled (:type err-data))
             (contains? bootstrap-gap-errors (:error data))
+            (contains? bootstrap-gap-errors (:error err-data))
             (contains? bootstrap-gap-errors (:error nested))
             (= :txlog/not-enabled (get-in gap-error [:data :type]))
             (contains? bootstrap-gap-errors
@@ -636,6 +640,19 @@
                :copy-pin-cleanup copy-pin-cleanup
                :gc-results gc-results}}))
 
+(defn- retrying-force-snapshot-bootstrap!
+  ([test key-count]
+   (retrying-force-snapshot-bootstrap!
+    test
+    key-count
+    (fn [test key-count _timeout-ms]
+      (force-snapshot-bootstrap! test key-count))))
+  ([test key-count bootstrap-fn]
+   (with-retrying-bootstrap-gap!
+     converge-timeout-ms
+     (fn [remaining-ms]
+       (bootstrap-fn test key-count remaining-ms)))))
+
 (defn- post-bootstrap-convergence-result
   [test key-count bootstrap-result timeout-ms]
   (let [cluster-id        (:datalevin/cluster-id test)
@@ -689,7 +706,7 @@
 
 (defn- convergence-result
   [test key-count]
-  (let [bootstrap-result (force-snapshot-bootstrap! test key-count)]
+  (let [bootstrap-result (retrying-force-snapshot-bootstrap! test key-count)]
     (retrying-post-bootstrap-convergence-result test
                                                 key-count
                                                 bootstrap-result)))

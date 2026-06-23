@@ -101,6 +101,42 @@
         (is (<= 1 (long (:timeout-ms result)) 1000)))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-transient-gap-under-remote-error-data-test
+  (let [attempts (atom 0)]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0]
+      (let [result (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
+                    1000
+                    (fn [timeout-ms]
+                      (if (= 1 (swap! attempts inc))
+                        (throw (ex-info
+                                "Request to Datalevin server failed"
+                                {:err-data {:type :txlog/not-enabled}}))
+                        {:timeout-ms timeout-ms})))]
+        (is (<= 1 (long (:timeout-ms result)) 1000)))
+      (is (= 2 @attempts)))))
+
+(deftest rejoin-bootstrap-retries-transient-gap-during-forced-bootstrap-test
+  (let [attempts (atom 0)
+        test     {:datalevin/cluster-id ::force-bootstrap-retry
+                  :db-name "force-bootstrap-retry"}
+        result   {:restarted-nodes ["n2"]}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  rejoin-bootstrap/converge-timeout-ms 1000]
+      (is (= result
+             (#'rejoin-bootstrap/retrying-force-snapshot-bootstrap!
+              test
+              2
+              (fn [actual-test actual-key-count timeout-ms]
+                (is (= test actual-test))
+                (is (= 2 actual-key-count))
+                (is (<= 1 (long timeout-ms) 1000))
+                (if (= 1 (swap! attempts inc))
+                  (throw (ex-info
+                          "Txn-log is not enabled for this LMDB"
+                          {:type :txlog/not-enabled}))
+                  result)))))
+      (is (= 2 @attempts)))))
+
 (deftest rejoin-bootstrap-retries-transient-gap-during-post-bootstrap-converge-test
   (let [attempts         (atom 0)
         test             {:datalevin/cluster-id ::post-bootstrap-converge-retry
