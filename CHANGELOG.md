@@ -19,6 +19,8 @@
 - [Datalog] Retracting and reasserting entities with ref-component composite
   tuple identities no longer creates partial `[nil ...]` tuple values
   [#372](https://github.com/datalevin/datalevin/issues/372).
+- [DLMDB] fix stale MP_PAD during page split
+  [#375](https://github.com/datalevin/datalevin/issues/375).
 
 ### Improved
 - [Datalog] Coerce java.time.Instant to Date
@@ -27,6 +29,7 @@
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
 - [Datalog] reduce allocation per tuple.
+- update deps.
 
 ## 0.10.18 (2026-05-27)
 ### Fixed
