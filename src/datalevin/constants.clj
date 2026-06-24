@@ -785,6 +785,14 @@ Set to 0 for strict check-on-every-call behavior."}
   query-plan-cache-size 1024)
 
 (def ^{:dynamic true
+       :doc     "Limit of the number of wildcard path patterns held in each idoc index cache"}
+  idoc-pattern-cache-size 1024)
+
+(def ^{:dynamic true
+       :doc     "Limit of the number of range scans held in each idoc index cache"}
+  idoc-range-cache-size 1024)
+
+(def ^{:dynamic true
        :doc     "Size below which the initial plan will execute during planning,
 above which, the same number of items will be sampled instead"}
   init-exec-size-threshold 500)

@@ -30,6 +30,7 @@
    [java.util.concurrent.atomic AtomicBoolean AtomicInteger AtomicLong]
    [java.util.concurrent.locks Lock ReentrantReadWriteLock]
    [datalevin.spill SpillableMap]
+   [datalevin.utl LRUCache]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.math BigDecimal BigInteger]
    [org.roaringbitmap RoaringBitmap]))
@@ -797,11 +798,11 @@
                     ^AtomicInteger max-path
                     path-cache
                     path-seg-cache
-                    pattern-cache
+                    ^LRUCache pattern-cache
                     path-trie
                     ^AtomicBoolean paths-loaded
                     paths-lock
-                    range-cache
+                    ^LRUCache range-cache
                     ^AtomicLong index-version])
 
 (defn new-idoc-index
@@ -812,11 +813,11 @@
         [max-doc doc-refs all-doc-ids] (init-doc-refs lmdb doc-ref-dbi)
         path-cache                     (ConcurrentHashMap.)
         path-seg-cache                 (ConcurrentHashMap.)
-        pattern-cache                  (ConcurrentHashMap.)
+        pattern-cache                  (LRUCache. (int c/idoc-pattern-cache-size))
         path-trie                      (new-path-trie)
         paths-loaded                   (AtomicBoolean. false)
         paths-lock                     (Object.)
-        range-cache                    (ConcurrentHashMap.)
+        range-cache                    (LRUCache. (int c/idoc-range-cache-size))
         index-version                  (AtomicLong. 0)]
     (->IdocIndex lmdb
                  domain
@@ -863,9 +864,7 @@
 (defn- invalidate-range-cache!
   [^IdocIndex index]
   (.incrementAndGet ^AtomicLong (.-index-version index))
-  (let [^ConcurrentHashMap range-cache (.-range-cache index)]
-    (when-not (.isEmpty range-cache)
-      (.clear range-cache))))
+  (.clear ^LRUCache (.-range-cache index)))
 
 (defn- state-read-lock
   ^Lock [^IdocIndex index]
@@ -1468,13 +1467,11 @@
 
 (defn- update-pattern-cache!
   [^IdocIndex index segs ^long pid]
-  (let [^ConcurrentHashMap pattern-cache (.-pattern-cache index)]
-    (when-not (.isEmpty pattern-cache)
-      (doseq [^Map$Entry entry (.entrySet pattern-cache)]
-        (let [pattern (.getKey entry)]
-          (when (match-path? pattern segs)
-            (.put pattern-cache pattern
-                  (conj (.getValue entry) pid))))))))
+  (let [^LRUCache pattern-cache (.-pattern-cache index)]
+    (doseq [pattern (.keys pattern-cache)]
+      (when (match-path? pattern segs)
+        (when-let [cached (.get pattern-cache pattern)]
+          (.put pattern-cache pattern (conj cached pid)))))))
 
 (defn- path-expr? [x] (or (keyword? x) (string? x) (vector? x)))
 
@@ -1661,7 +1658,7 @@
 
 (defn- matching-path-ids
   [^IdocIndex index path]
-  (let [^ConcurrentHashMap pattern-cache (.-pattern-cache index)]
+  (let [^LRUCache pattern-cache (.-pattern-cache index)]
     (if-let [cached (.get pattern-cache path)]
       cached
       (do
@@ -1743,7 +1740,7 @@
       (raise "Range bounds must have the same type" {:lo lo :hi hi}))
     (when (identical? vt :data)
       (raise "Range predicates do not support :data values" {:value (or lo hi)}))
-    (let [^ConcurrentHashMap range-cache (.-range-cache index)
+    (let [^LRUCache range-cache          (.-range-cache index)
           ^AtomicLong index-version      (.-index-version index)
 
           version   (.get index-version)

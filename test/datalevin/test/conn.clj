@@ -20,6 +20,7 @@
   (:import
    [datalevin.idoc IdocIndex]
    [datalevin.spill SpillableMap]
+   [datalevin.utl LRUCache]
    [datalevin.db DB]
    [datalevin.storage Store]
    [java.nio ByteBuffer]
@@ -959,6 +960,42 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest test-idoc-match-caches-are-bounded
+  (binding [c/idoc-pattern-cache-size 2
+            c/idoc-range-cache-size   2]
+    (let [dir    (u/tmp-dir (str "test-idoc-cache-bounds-"
+                                 (UUID/randomUUID)))
+          schema {:doc/idoc {:db/valueType :db.type/idoc
+                             :db/domain    "profiles"}}
+          conn   (d/create-conn dir schema)]
+      (try
+        (d/transact!
+          conn
+          [{:db/id 1
+            :doc/idoc (into {}
+                            (for [i (range 8)]
+                              [(keyword (str "facts" i)) {:v i}]))}])
+        (let [match-eids (fn [query]
+                           (set (d/q '[:find [?e ...]
+                                        :in $ ?query
+                                        :where
+                                        [(idoc-match $ :doc/idoc ?query)
+                                         [[?e ?a ?v]]]]
+                                      @conn
+                                      query)))]
+          (doseq [i (range 8)]
+            (is (= #{1}
+                   (match-eids
+                     (list '>= [(keyword (str "facts" i)) :?] 0))))))
+        (let [index (get (s/store-idoc-indices (conn-store conn)) "profiles")]
+          (is (<= (count (.keys ^LRUCache (.-pattern-cache ^IdocIndex index)))
+                  c/idoc-pattern-cache-size))
+          (is (<= (count (.keys ^LRUCache (.-range-cache ^IdocIndex index)))
+                  c/idoc-range-cache-size)))
+        (finally
+          (d/close conn)
+          (u/delete-files dir))))))
 
 (deftest test-ways-to-create-conn-1
   (let [dir  (u/tmp-dir (str "test-" (UUID/randomUUID)))
