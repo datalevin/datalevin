@@ -14,17 +14,21 @@
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
    [datalevin.lmdb :as lmdb]
+   [datalevin.search :as search]
+   [datalevin.sparselist :as sl]
    [datalevin.storage :as s]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u])
   (:import
    [datalevin.idoc IdocIndex]
+   [datalevin.sparselist SparseIntArrayList]
    [datalevin.spill SpillableMap]
    [datalevin.utl LRUCache]
    [datalevin.db DB]
    [datalevin.storage Store]
    [java.nio ByteBuffer]
-   [java.util Arrays Date Random UUID]))
+   [java.util Arrays Date Random UUID]
+   [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
 
 (use-fixtures :each db-fixture)
 
@@ -837,6 +841,27 @@
     (is (:pass? result)
         (pr-str (select-keys result
                              [:seed :num-tests :fail :result :shrunk])))))
+
+(deftest test-search-query-term-info-uses-off-heap-bitmap
+  (let [dir             (u/tmp-dir (str "test-search-offheap-term-info-"
+                                        (UUID/randomUUID)))
+        db              (d/open-kv dir)
+        engine          (d/new-search-engine db {:index-position? true})
+        query-term-info (deref #'search/query-term-info)]
+    (try
+      (dotimes [i 8]
+        (d/add-doc engine (inc i) (str "alpha beta " i)))
+      (is (= #{1 2 3 4 5 6 7 8}
+             (set (d/search engine "alpha" {:top 10}))))
+      (let [[_ _ sl] (query-term-info engine "alpha")
+            indices  (.-indices ^SparseIntArrayList sl)]
+        (is (instance? ImmutableRoaringBitmap indices))
+        (is (= 8 (sl/size sl)))
+        (is (= 1 (sl/get sl 1)))
+        (is (= 1 (sl/get sl 8))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files dir)))))
 
 (deftest test-idoc-match-concurrent-read-write-sidecar-state
   (let [dir    (u/tmp-dir (str "test-idoc-concurrent-sidecar-"

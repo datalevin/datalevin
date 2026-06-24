@@ -539,6 +539,10 @@
     (sl/deserialize sl bf)
     sl))
 
+(defn- get-sparse-list-off-heap
+  [bf]
+  (sl/deserialize-off-heap bf))
+
 (defn- get-tuple-sizes
   [^ByteBuffer bf ^long c ^long post-v]
   (let [ss (volatile! [])]
@@ -1039,6 +1043,7 @@
      :ints           (i/get-ints bf)
      :bitmap         (get-bitmap bf)
      :term-info      [(get-int bf) (.getFloat bf) (get-sparse-list bf)]
+     :query-term-info [(get-int bf) (.getFloat bf) (get-sparse-list-off-heap bf)]
      :doc-info       [(get-int bf) (get-short bf) (i/get-ints bf)]
      :pos-info       [(i/get-sorted-ints bf) (i/get-sorted-ints bf)]
      (if (vector? v-type)

@@ -18,7 +18,8 @@
    [java.io Writer DataInput DataOutput]
    [java.nio ByteBuffer]
    [datalevin.utl GrowingIntArray]
-   [org.roaringbitmap RoaringBitmap]))
+   [org.roaringbitmap ImmutableBitmapDataProvider RoaringBitmap]
+   [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
 
 (defprotocol ISparseIntArrayList
   (contains-index? [this index] "return true if containing index")
@@ -30,7 +31,7 @@
   (serialize [this bf] "serialize to a bytebuffer")
   (deserialize [this bf] "serialize from a bytebuffer"))
 
-(deftype SparseIntArrayList [^RoaringBitmap indices
+(deftype SparseIntArrayList [^ImmutableBitmapDataProvider indices
                              ^GrowingIntArray items]
   ISparseIntArrayList
   (contains-index? [_ index]
@@ -41,7 +42,8 @@
       (.get items (dec (.rank indices index)))))
 
   (set [this index item]
-    (let [index (int index)]
+    (let [indices ^RoaringBitmap indices
+          index   (int index)]
       (if (.contains indices index)
         (.set items (dec (.rank indices index)) item)
         (do (.add indices index)
@@ -49,8 +51,9 @@
     this)
 
   (remove [this index]
-    (.remove items (dec (.rank indices index)))
-    (.remove indices index)
+    (let [indices ^RoaringBitmap indices]
+      (.remove items (dec (.rank indices index)))
+      (.remove indices index))
     this)
 
   (size [_] (.getCardinality indices))
@@ -64,7 +67,7 @@
 
   (deserialize [_ bf]
     (.addAll items (i/get-ints bf))
-    (.deserialize indices ^ByteBuffer bf))
+    (.deserialize ^RoaringBitmap indices ^ByteBuffer bf))
 
   Object
   (equals [_ other]
@@ -134,6 +137,19 @@
          (set ssl (first ks) (first vs))
          (recur (next ks) (next vs))))
      ssl)) )
+
+(defn deserialize-off-heap
+  "Deserialize a read-only sparse list with its bitmap backed by direct memory."
+  ^SparseIntArrayList [^ByteBuffer bf]
+  (let [items  (GrowingIntArray.)
+        _      (.addAll items (i/get-ints bf))
+        order  (.order bf)
+        src    (doto (.slice bf) (.order order))
+        direct (doto (ByteBuffer/allocateDirect (.remaining src))
+                 (.order order))]
+    (.put direct src)
+    (.flip direct)
+    (->SparseIntArrayList (ImmutableRoaringBitmap. direct) items)))
 
 (defmethod print-method SparseIntArrayList
   [^SparseIntArrayList s ^Writer w]

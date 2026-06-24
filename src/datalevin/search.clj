@@ -39,8 +39,9 @@
    [org.eclipse.collections.impl.set.mutable.primitive IntHashSet]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.list.mutable.primitive IntArrayList]
-   [org.roaringbitmap RoaringBitmap FastAggregation FastRankRoaringBitmap
-    PeekableIntIterator]))
+   [org.roaringbitmap ImmutableBitmapDataProvider RoaringBitmap
+    PeekableIntIterator]
+   [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
 
 (defn- collect-terms
   [result]
@@ -156,7 +157,7 @@
 
   (get-tf [_ did]
     (.get ^GrowingIntArray (.-items sl)
-          (dec (.rank ^FastRankRoaringBitmap (.-indices sl) did)))))
+          (dec (.rank ^ImmutableBitmapDataProvider (.-indices sl) did)))))
 
 (defn- candidate-comp
   [^Candidate a ^Candidate b]
@@ -217,32 +218,50 @@
      (.toArray ~'lst ^"[Ldatalevin.search.Candidate;"
                (make-array Candidate (.size ~'lst)))))
 
+(defn- bitmap-provider->roaring
+  ^RoaringBitmap [bm]
+  (cond
+    (instance? RoaringBitmap bm)
+    (doto (RoaringBitmap.) (.or ^RoaringBitmap bm))
+
+    (instance? ImmutableRoaringBitmap bm)
+    (.toRoaringBitmap ^ImmutableRoaringBitmap bm)
+
+    (instance? ImmutableBitmapDataProvider bm)
+    (let [result (RoaringBitmap.)
+          iter   (.getIntIterator ^ImmutableBitmapDataProvider bm)]
+      (while (.hasNext iter) (.add result (.next iter)))
+      result)
+
+    :else
+    (RoaringBitmap.)))
+
 (defn- prefix-union-bm
-  ^RoaringBitmap [^"[Lorg.roaringbitmap.RoaringBitmap;" rbms ^long z]
+  ^RoaringBitmap [^"[Lorg.roaringbitmap.ImmutableBitmapDataProvider;" rbms
+                  ^long z]
   (let [limit    (min (alength rbms) (int z))
-        union-bm ^RoaringBitmap (.clone ^RoaringBitmap (aget rbms 0))]
+        union-bm (bitmap-provider->roaring (aget rbms 0))]
     (loop [i (int 1)]
       (if (< i limit)
         (do
-          (.or union-bm ^RoaringBitmap (aget rbms i))
+          (.or union-bm (bitmap-provider->roaring (aget rbms i)))
           (recur (unchecked-inc-int i)))
         union-bm))))
 
 (defn- first-candidates
   [{:keys [tids rbms rsls bbm]} ^RoaringBitmap result tao n]
-  (let [rbms     ^"[Lorg.roaringbitmap.RoaringBitmap;" rbms
+  (let [rbms     ^"[Lorg.roaringbitmap.ImmutableBitmapDataProvider;" rbms
         z        (inc (- ^long n ^long tao))
         union-bm (prefix-union-bm rbms z)]
     (candidate-array
       (dotimes [i (count tids)]
         (let [tid  (nth tids i)
-              bm   ^FastRankRoaringBitmap (aget rbms i)
-              bm'  (let [iter-bm (.clone bm)]
-                     (doto ^FastRankRoaringBitmap iter-bm
-                       (.and ^RoaringBitmap bbm)
-                       (.and ^RoaringBitmap union-bm)
-                       (.andNot result)))
-              iter (.getIntIterator ^FastRankRoaringBitmap bm')]
+              bm   (aget rbms i)
+              bm'  (doto (bitmap-provider->roaring bm)
+                     (.and ^RoaringBitmap bbm)
+                     (.and ^RoaringBitmap union-bm)
+                     (.andNot result))
+              iter (.getIntIterator ^RoaringBitmap bm')]
           (when (.hasNext ^PeekableIntIterator iter)
             (.add lst (Candidate. tid (nth rsls i) iter))))))))
 
@@ -581,10 +600,6 @@
            :req req
            :tokens (persistent! tokens))))
 
-(defn- clone-bm
-  [^RoaringBitmap bm]
-  (doto (RoaringBitmap.) (.or bm)))
-
 (defn- term-bm
   [tmid bms term]
   (if-let [tid (tmid term)]
@@ -595,7 +610,7 @@
   [tmid bms ^AtomicInteger max-doc query]
   (cond
     (string? query)
-    (term-bm tmid bms query)
+    (bitmap-provider->roaring (term-bm tmid bms query))
 
     (identical? query :empty)
     (RoaringBitmap.)
@@ -610,10 +625,7 @@
                             0 (u/long-inc (.get max-doc)))
 
         :and
-        (let [^RoaringBitmap acc
-              (if (string? first-arg)
-                (clone-bm (term-bm tmid bms first-arg))
-                (boolean-bm tmid bms max-doc first-arg))
+        (let [^RoaringBitmap acc (boolean-bm tmid bms max-doc first-arg)
               cnt (count query)]
           (loop [i 2]
             (if (< i cnt)
@@ -624,10 +636,7 @@
               acc)))
 
         :or
-        (let [^RoaringBitmap acc
-              (if (string? first-arg)
-                (clone-bm (term-bm tmid bms first-arg))
-                (boolean-bm tmid bms max-doc first-arg))
+        (let [^RoaringBitmap acc (boolean-bm tmid bms max-doc first-arg)
               cnt (count query)]
           (loop [i 2]
             (if (< i cnt)
@@ -666,7 +675,8 @@
                  :wqs wqs
                  :tmid tmid
                  :tids (persistent! rtids)
-                 :rbms (into-array RoaringBitmap (persistent! rbms))
+                 :rbms (into-array ImmutableBitmapDataProvider
+                                   (persistent! rbms))
                  :rsls (persistent! rsls)
                  :bms bms
                  :tms (persistent! tms)
@@ -954,16 +964,8 @@
   [^SearchEngine engine term]
   (wrap-cache
     engine [:query-term-info term]
-    (when-let [[id mw ^SparseIntArrayList sl] (get-term-info engine term)]
-      (let [indices (.-indices sl)]
-        [id
-         mw
-         (if (instance? FastRankRoaringBitmap indices)
-           sl
-           (sl/->SparseIntArrayList
-             (doto (FastRankRoaringBitmap.)
-               (.or ^RoaringBitmap indices))
-             (.-items sl)))]))))
+    (get-value (.-lmdb engine) (.-terms-dbi engine) term
+               :string :query-term-info)))
 
 (defn- term-id->term-info
   [^SearchEngine engine term-id]
