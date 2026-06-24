@@ -3,6 +3,9 @@
    [clojure.string :as str]
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest is use-fixtures]]
+   [clojure.test.check :as tc]
+   [clojure.test.check.generators :as gen]
+   [clojure.test.check.properties :as prop]
    [datalevin.binding.cpp :as cpp]
    [datalevin.conn :as dc]
    [datalevin.core :as d]
@@ -20,7 +23,7 @@
    [datalevin.db DB]
    [datalevin.storage Store]
    [java.nio ByteBuffer]
-   [java.util Arrays Date UUID]))
+   [java.util Arrays Date Random UUID]))
 
 (use-fixtures :each db-fixture)
 
@@ -48,6 +51,363 @@
 (defn- txlog-record-has-dbi?
   [record dbi-name]
   (some #(= dbi-name (nth % 1 nil)) (:ops record)))
+
+(def ^:private idoc-fulltext-fuzz-statuses
+  ["active" "inactive" "archived"])
+
+(def ^:private idoc-fulltext-fuzz-tags
+  ["red" "blue" "green" "gold"])
+
+(def ^:private idoc-fulltext-fuzz-tokens
+  ["alpha" "bravo" "charlie" "delta" "echo"])
+
+(defn- idoc-fulltext-schema
+  []
+  {:doc/idoc {:db/valueType :db.type/idoc
+              :db/domain    "profiles"}
+   :doc/text {:db/valueType           :db.type/string
+              :db/fulltext            true
+              :db.fulltext/autoDomain true}})
+
+(defn- idoc-fulltext-opts
+  []
+  {:wal?                      true
+   :wal-durability-profile    :strict
+   :snapshot-bootstrap-force? false
+   :search-domains            {"doc/text" {:index-position? true}}})
+
+(def ^:private idoc-fulltext-idoc-q
+  '[:find [?e ...]
+    :in $ ?query
+    :where
+    [(idoc-match $ :doc/idoc ?query)
+     [[?e ?a ?v]]]])
+
+(def ^:private idoc-fulltext-token-q
+  '[:find [?e ...]
+    :in $ ?token
+    :where
+    [(fulltext $ :doc/text ?token)
+     [[?e ?a ?v]]]])
+
+(def ^:private idoc-fulltext-combined-q
+  '[:find [?e ...]
+    :in $ ?query ?token
+    :where
+    [(idoc-match $ :doc/idoc ?query)
+     [[?e ?ia ?iv]]]
+    [(fulltext $ :doc/text ?token)
+     [[?e ?ta ?tv]]]])
+
+(defn- pick
+  [^Random rng xs]
+  (nth xs (.nextInt rng (count xs))))
+
+(defn- idoc-fulltext-doc
+  [^Random rng step eid]
+  (let [tag-a (pick rng idoc-fulltext-fuzz-tags)
+        tag-b (pick rng idoc-fulltext-fuzz-tags)]
+    {:status (pick rng idoc-fulltext-fuzz-statuses)
+     :tags   (vec (distinct [tag-a tag-b]))
+     :entity eid
+     :step   step}))
+
+(defn- idoc-fulltext-text
+  [^Random rng step eid]
+  (str (pick rng idoc-fulltext-fuzz-tokens) " "
+       (pick rng idoc-fulltext-fuzz-tokens) " "
+       (pick rng idoc-fulltext-fuzz-tokens) " "
+       "entity-" eid " step-" step))
+
+(defn- idoc-fulltext-upsert-action
+  [^Random rng step eid]
+  (let [doc  (idoc-fulltext-doc rng step eid)
+        text (idoc-fulltext-text rng step eid)]
+    {:action :upsert
+     :eid    eid
+     :doc    doc
+     :text   text
+     :tx     [{:db/id eid :doc/idoc doc :doc/text text}]}))
+
+(defn- idoc-fulltext-retract-action
+  [eid {:keys [doc text]}]
+  {:action :retract
+   :eid    eid
+   :tx     [[:db/retract eid :doc/idoc doc]
+            [:db/retract eid :doc/text text]]})
+
+(defn- idoc-fulltext-fuzz-actions
+  [^Random rng step oracle]
+  (let [n (inc (.nextInt rng 4))]
+    (loop [actions []
+           oracle' oracle
+           seen    #{}]
+      (if (= n (count actions))
+        [actions oracle']
+        (let [eid       (inc (.nextInt rng 12))
+              existing  (get oracle' eid)
+              retract?  (and existing (< (.nextInt rng 5) 2))
+              action    (if retract?
+                          (idoc-fulltext-retract-action eid existing)
+                          (idoc-fulltext-upsert-action rng step eid))
+              oracle'' (if retract?
+                         (dissoc oracle' eid)
+                         (assoc oracle' eid
+                                {:doc (:doc action) :text (:text action)}))]
+          (if (seen eid)
+            (recur actions oracle' seen)
+            (recur (conj actions action) oracle'' (conj seen eid))))))))
+
+(defn- text-has-token?
+  [text token]
+  (some #{token} (str/split text #"\s+")))
+
+(defn- expected-idoc-fulltext-status
+  [oracle status]
+  (->> oracle
+       (keep (fn [[eid {:keys [doc]}]]
+               (when (= status (:status doc)) eid)))
+       set))
+
+(defn- expected-idoc-fulltext-tag
+  [oracle tag]
+  (->> oracle
+       (keep (fn [[eid {:keys [doc]}]]
+               (when (some #{tag} (:tags doc)) eid)))
+       set))
+
+(defn- expected-idoc-fulltext-token
+  [oracle token]
+  (->> oracle
+       (keep (fn [[eid {:keys [text]}]]
+               (when (text-has-token? text token) eid)))
+       set))
+
+(defn- expected-idoc-fulltext-combined
+  [oracle status token]
+  (->> oracle
+       (keep (fn [[eid {:keys [doc text]}]]
+               (when (and (= status (:status doc))
+                          (text-has-token? text token))
+                 eid)))
+       set))
+
+(defn- verify-idoc-fulltext-oracle!
+  [db oracle seed step]
+  (doseq [status idoc-fulltext-fuzz-statuses]
+    (is (= (expected-idoc-fulltext-status oracle status)
+           (set (d/q idoc-fulltext-idoc-q db {:status status})))
+        (pr-str {:seed seed :step step :status status})))
+  (doseq [tag idoc-fulltext-fuzz-tags]
+    (is (= (expected-idoc-fulltext-tag oracle tag)
+           (set (d/q idoc-fulltext-idoc-q db {:tags tag})))
+        (pr-str {:seed seed :step step :tag tag})))
+  (doseq [token idoc-fulltext-fuzz-tokens]
+    (is (= (expected-idoc-fulltext-token oracle token)
+           (set (d/q idoc-fulltext-token-q db token)))
+        (pr-str {:seed seed :step step :token token}))))
+
+(defn- verify-idoc-fulltext-combined!
+  [db oracle seed step status token]
+  (is (= (expected-idoc-fulltext-combined oracle status token)
+         (set (d/q idoc-fulltext-combined-q db {:status status} token)))
+      (pr-str {:seed seed :step step :status status :token token})))
+
+(defn- idoc-fulltext-query-mismatch
+  [query expected actual details]
+  (when-not (= expected actual)
+    (assoc details :query query :expected expected :actual actual)))
+
+(defn- idoc-fulltext-probe-mismatch
+  [db oracle status tag token]
+  (or
+    (idoc-fulltext-query-mismatch
+      :idoc-status
+      (expected-idoc-fulltext-status oracle status)
+      (set (d/q idoc-fulltext-idoc-q db {:status status}))
+      {:status status})
+    (idoc-fulltext-query-mismatch
+      :idoc-tag
+      (expected-idoc-fulltext-tag oracle tag)
+      (set (d/q idoc-fulltext-idoc-q db {:tags tag}))
+      {:tag tag})
+    (idoc-fulltext-query-mismatch
+      :fulltext-token
+      (expected-idoc-fulltext-token oracle token)
+      (set (d/q idoc-fulltext-token-q db token))
+      {:token token})
+    (idoc-fulltext-query-mismatch
+      :combined-status-token
+      (expected-idoc-fulltext-combined oracle status token)
+      (set (d/q idoc-fulltext-combined-q db {:status status} token))
+      {:status status :token token})))
+
+(defn- idoc-fulltext-full-mismatch
+  [db oracle]
+  (or
+    (some (fn [status]
+            (idoc-fulltext-query-mismatch
+              :idoc-status
+              (expected-idoc-fulltext-status oracle status)
+              (set (d/q idoc-fulltext-idoc-q db {:status status}))
+              {:status status}))
+          idoc-fulltext-fuzz-statuses)
+    (some (fn [tag]
+            (idoc-fulltext-query-mismatch
+              :idoc-tag
+              (expected-idoc-fulltext-tag oracle tag)
+              (set (d/q idoc-fulltext-idoc-q db {:tags tag}))
+              {:tag tag}))
+          idoc-fulltext-fuzz-tags)
+    (some (fn [token]
+            (idoc-fulltext-query-mismatch
+              :fulltext-token
+              (expected-idoc-fulltext-token oracle token)
+              (set (d/q idoc-fulltext-token-q db token))
+              {:token token}))
+          idoc-fulltext-fuzz-tokens)
+    (some (fn [[status token]]
+            (idoc-fulltext-query-mismatch
+              :combined-status-token
+              (expected-idoc-fulltext-combined oracle status token)
+              (set (d/q idoc-fulltext-combined-q db {:status status} token))
+              {:status status :token token}))
+          (for [status idoc-fulltext-fuzz-statuses
+                token  idoc-fulltext-fuzz-tokens]
+            [status token]))))
+
+(defn- throw-idoc-fulltext-mismatch!
+  [db oracle context mismatch-fn]
+  (when-let [mismatch (mismatch-fn db oracle)]
+    (throw
+      (ex-info "idoc/fulltext query mismatch"
+               (merge context mismatch)))))
+
+(defn- idoc-fulltext-apply-property-action
+  [{:keys [oracle tx]} {:keys [op eid doc text]}]
+  (case op
+    :upsert
+    {:oracle (assoc oracle eid {:doc doc :text text})
+     :tx     (conj tx {:db/id eid :doc/idoc doc :doc/text text})}
+
+    :retract
+    (let [{old-doc :doc old-text :text} (get oracle eid)]
+      {:oracle (dissoc oracle eid)
+       :tx     (conj tx
+                     [:db/retract eid :doc/idoc (or old-doc doc)]
+                     [:db/retract eid :doc/text (or old-text text)])})
+
+    :retract-entity
+    {:oracle (dissoc oracle eid)
+     :tx     (conj tx [:db/retractEntity eid])}))
+
+(defn- idoc-fulltext-property-batch-result
+  [oracle actions]
+  (reduce idoc-fulltext-apply-property-action
+          {:oracle oracle :tx []}
+          actions))
+
+(defn- distinct-actions-by-eid
+  [actions]
+  (second
+    (reduce (fn [[seen acc] {:keys [eid] :as action}]
+              (if (seen eid)
+                [seen acc]
+                [(conj seen eid) (conj acc action)]))
+            [#{} []]
+            actions)))
+
+(def ^:private idoc-fulltext-property-action-gen
+  (gen/let [op      (gen/frequency [[6 (gen/return :upsert)]
+                                    [2 (gen/return :retract)]
+                                    [1 (gen/return :retract-entity)]])
+            eid     (gen/choose 1 18)
+            status  (gen/elements idoc-fulltext-fuzz-statuses)
+            tags    (gen/vector
+                      (gen/elements idoc-fulltext-fuzz-tags) 1 3)
+            tokens  (gen/vector
+                      (gen/elements idoc-fulltext-fuzz-tokens) 1 5)
+            tier    (gen/elements ["free" "pro" "enterprise"])
+            score   (gen/choose 0 1000)
+            active? gen/boolean]
+    (let [doc  {:status  status
+                :tags    (vec (distinct tags))
+                :entity  eid
+                :profile {:tier   tier
+                          :score  score
+                          :active active?}
+                :flags   [active? (not active?)]}
+          text (str/join " "
+                         (conj tokens
+                               (str "entity-" eid)
+                               status
+                               tier))]
+      {:op op :eid eid :doc doc :text text})))
+
+(def ^:private idoc-fulltext-property-actions-gen
+  (gen/fmap distinct-actions-by-eid
+            (gen/vector idoc-fulltext-property-action-gen 1 6)))
+
+(def ^:private idoc-fulltext-property-batch-gen
+  (gen/let [actions idoc-fulltext-property-actions-gen
+            status  (gen/elements idoc-fulltext-fuzz-statuses)
+            tag     (gen/elements idoc-fulltext-fuzz-tags)
+            token   (gen/elements idoc-fulltext-fuzz-tokens)]
+    {:actions actions
+     :status  status
+     :tag     tag
+     :token   token}))
+
+(def ^:private idoc-fulltext-property-scenario-gen
+  (gen/vector idoc-fulltext-property-batch-gen 1 24))
+
+(defn- run-idoc-fulltext-property-scenario!
+  [scenario]
+  (let [dir  (u/tmp-dir (str "test-idoc-fulltext-property-"
+                             (UUID/randomUUID)))
+        opts (idoc-fulltext-opts)
+        conn (d/create-conn dir (idoc-fulltext-schema) opts)]
+    (try
+      (let [final-oracle
+            (loop [step    0
+                   oracle  {}
+                   batches scenario]
+              (if (seq batches)
+                (let [{:keys [actions status tag token] :as batch} (first batches)
+                      {:keys [oracle tx]} (idoc-fulltext-property-batch-result
+                                            oracle actions)
+                      context {:step    step
+                               :batch   batch
+                               :tx-data tx}]
+                  (try
+                    (d/transact! conn tx)
+                    (throw-idoc-fulltext-mismatch!
+                      @conn oracle context
+                      #(idoc-fulltext-probe-mismatch
+                         %1 %2 status tag token))
+                    (catch Throwable t
+                      (throw
+                        (ex-info "idoc/fulltext property scenario failed"
+                                 (assoc context :oracle oracle)
+                                 t))))
+                  (recur (inc step) oracle (rest batches)))
+                oracle))]
+        (throw-idoc-fulltext-mismatch!
+          @conn final-oracle {:step :final}
+          idoc-fulltext-full-mismatch)
+        (d/close conn)
+        (let [conn2 (d/create-conn dir nil opts)]
+          (try
+            (throw-idoc-fulltext-mismatch!
+              @conn2 final-oracle {:step :reopen}
+              idoc-fulltext-full-mismatch)
+            (finally
+              (d/close conn2)))))
+      true
+      (finally
+        (when-not (d/closed? conn)
+          (d/close conn))
+        (u/delete-files dir)))))
 
 (defn- copy-snapshot-files-to-env!
   [snapshot-path env-dir]
@@ -415,6 +775,67 @@
         (when-not (d/closed? conn)
           (d/close conn))
         (u/delete-files dir)))))
+
+(deftest test-idoc-and-fulltext-fuzz-in-same-tx
+  (doseq [seed [7 29 113]]
+    (let [dir    (u/tmp-dir (str "test-idoc-fulltext-fuzz-"
+                                 seed "-"
+                                 (UUID/randomUUID)))
+          schema (idoc-fulltext-schema)
+          opts   (idoc-fulltext-opts)
+          conn   (d/create-conn dir schema opts)
+          rng    (Random. seed)]
+      (try
+        (let [final-oracle
+              (loop [step   0
+                     oracle {}]
+                (if (< step 16)
+                  (let [[actions oracle'] (idoc-fulltext-fuzz-actions
+                                            rng step oracle)
+                        tx-data           (mapcat :tx actions)
+                        status            (pick rng
+                                                idoc-fulltext-fuzz-statuses)
+                        token             (pick rng
+                                                idoc-fulltext-fuzz-tokens)]
+                    (try
+                      (d/transact! conn tx-data)
+                      (verify-idoc-fulltext-oracle! @conn oracle' seed step)
+                      (verify-idoc-fulltext-combined!
+                        @conn oracle' seed step status token)
+                      (catch Throwable t
+                        (throw
+                          (ex-info "idoc/fulltext fuzz transaction failed"
+                                   {:seed    seed
+                                    :step    step
+                                    :actions actions}
+                                   t))))
+                    (recur (inc step) oracle'))
+                  oracle))]
+          (d/close conn)
+          (let [conn2 (d/create-conn dir nil opts)]
+            (try
+              (verify-idoc-fulltext-oracle! @conn2 final-oracle seed :reopen)
+              (doseq [status idoc-fulltext-fuzz-statuses
+                      token  idoc-fulltext-fuzz-tokens]
+                (verify-idoc-fulltext-combined!
+                  @conn2 final-oracle seed :reopen status token))
+              (finally
+                (d/close conn2)))))
+        (finally
+          (when-not (d/closed? conn)
+            (d/close conn))
+          (u/delete-files dir))))))
+
+(deftest test-idoc-and-fulltext-property-in-same-tx
+  (let [result (tc/quick-check
+                 40
+                 (prop/for-all [scenario idoc-fulltext-property-scenario-gen]
+                   (run-idoc-fulltext-property-scenario! scenario))
+                 {:seed     375
+                  :max-size 40})]
+    (is (:pass? result)
+        (pr-str (select-keys result
+                             [:seed :num-tests :fail :result :shrunk])))))
 
 (deftest test-idoc-match-concurrent-read-write-sidecar-state
   (let [dir    (u/tmp-dir (str "test-idoc-concurrent-sidecar-"
