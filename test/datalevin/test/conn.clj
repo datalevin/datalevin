@@ -2,7 +2,7 @@
   (:require
    [clojure.string :as str]
    [datalevin.test.core :as tdc :refer [db-fixture]]
-   [clojure.test :refer [deftest is use-fixtures]]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [clojure.test.check :as tc]
    [clojure.test.check.generators :as gen]
    [clojure.test.check.properties :as prop]
@@ -862,6 +862,55 @@
       (finally
         (d/close-kv db)
         (u/delete-files dir)))))
+
+(defn- parallel-add-doc-errors
+  [engine docs]
+  (let [start   (promise)
+        workers (doall
+                  (for [[doc-ref doc-text] docs]
+                    (future
+                      @start
+                      (try
+                        (d/add-doc engine doc-ref doc-text)
+                        nil
+                        (catch Throwable t
+                          {:doc-ref doc-ref
+                           :type    (class t)
+                           :message (.getMessage t)})))))]
+    (deliver start true)
+    (doall (remove nil? (map deref workers)))))
+
+(deftest test-search-add-doc-parallel-does-not-throw
+  (testing "distinct document refs"
+    (let [dir    (u/tmp-dir (str "test-search-parallel-add-docs-"
+                                 (UUID/randomUUID)))
+          db     (d/open-kv dir)
+          engine (d/new-search-engine db {:index-position? true})
+          docs   (mapv (fn [i] [i (str "alpha beta " i)]) (range 64))]
+      (try
+        (let [errors (parallel-add-doc-errors engine docs)]
+          (is (empty? errors) (pr-str errors))
+          (is (= 64 (d/doc-count engine)))
+          (is (= (set (map first docs))
+                 (set (d/search engine "alpha" {:top 100})))))
+        (finally
+          (d/close-kv db)
+          (u/delete-files dir)))))
+  (testing "same document ref replacement"
+    (let [dir    (u/tmp-dir (str "test-search-parallel-replace-doc-"
+                                 (UUID/randomUUID)))
+          db     (d/open-kv dir)
+          engine (d/new-search-engine db {:index-position? true})
+          docs   (mapv (fn [i] [:shared (str "alpha beta " i)])
+                       (range 32))]
+      (try
+        (let [errors (parallel-add-doc-errors engine docs)]
+          (is (empty? errors) (pr-str errors))
+          (is (= 1 (d/doc-count engine)))
+          (is (= [:shared] (d/search engine "alpha" {:top 10}))))
+        (finally
+          (d/close-kv db)
+          (u/delete-files dir))))))
 
 (deftest test-idoc-match-concurrent-read-write-sidecar-state
   (let [dir    (u/tmp-dir (str "test-idoc-concurrent-sidecar-"
