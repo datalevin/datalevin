@@ -408,65 +408,24 @@
           (raise "Idoc patch :dec requires an integer" {:value current}))
         (dec ^long n)))))
 
-(defn- assoc-in-idoc
-  [doc path value]
-  (letfn [(step [node segs ctx]
-            (if (empty? segs)
-              value
-              (let [seg  (first segs)
-                    rest (rest segs)]
-                (cond
-                  (integer? seg)
-                  (let [v   (cond
-                              (vector? node) node
-                              (nil? node)
-                              (raise "Idoc patch path expects vector"
-                                     {:path path :segment seg})
-                              :else
-                              (raise "Idoc patch path expects vector"
-                                     {:path path :segment seg}))
-                        idx (long seg)]
-                    (when (or (neg? idx) (>= idx (count v)))
-                      (raise "Idoc patch index out of bounds"
-                             {:path path :segment seg :size (count v)}))
-                    (assoc v idx (step (nth v idx) rest (conj ctx seg))))
-
-                  (or (keyword? seg) (string? seg))
-                  (let [m (cond
-                            (nil? node) {}
-                            (map? node) node
-                            :else       (raise "Idoc patch path expects map"
-                                               {:path path :segment seg}))]
-                    (assoc m seg (step (get m seg) rest (conj ctx seg))))
-
-                  :else
-                  (raise
-                    "Idoc patch path segment must be keyword, string, or integer"
-                    {:path path :segment seg})))))]
-    (step doc path [])))
-
-(defn- update-in-idoc
+(defn- update-in-idoc*
   [doc path f]
-  (letfn [(step [node segs ctx]
+  (letfn [(step [node segs]
             (if (empty? segs)
               (f node)
               (let [seg  (first segs)
                     rest (rest segs)]
                 (cond
                   (integer? seg)
-                  (let [v   (cond
-                              (vector? node) node
-                              (nil? node)
-                              (raise "Idoc patch path expects vector"
-                                     {:path path :segment seg})
-                              :else
+                  (let [v   (if (vector? node)
+                              node
                               (raise "Idoc patch path expects vector"
                                      {:path path :segment seg}))
                         idx (long seg)]
                     (when (or (neg? idx) (>= idx (count v)))
                       (raise "Idoc patch index out of bounds"
                              {:path path :segment seg :size (count v)}))
-                    (assoc v idx (step (nth v idx) rest (conj ctx seg))))
+                    (assoc v idx (step (nth v idx) rest)))
 
                   (or (keyword? seg) (string? seg))
                   (let [m (cond
@@ -474,13 +433,21 @@
                             (map? node) node
                             :else       (raise "Idoc patch path expects map"
                                                {:path path :segment seg}))]
-                    (assoc m seg (step (get m seg) rest (conj ctx seg))))
+                    (assoc m seg (step (get m seg) rest)))
 
                   :else
                   (raise
                     "Idoc patch path segment must be keyword, string, or integer"
                     {:path path :segment seg})))))]
-    (step doc path [])))
+    (step doc path)))
+
+(defn- assoc-in-idoc
+  [doc path value]
+  (update-in-idoc* doc path (constantly value)))
+
+(defn- update-in-idoc
+  [doc path f]
+  (update-in-idoc* doc path f))
 
 (defn- unset-in-idoc
   [doc path]
@@ -1315,9 +1282,23 @@
                                         old-ref old-doc new-ref new-doc)]
     (commit-idoc-plan! index res txs state-actions)))
 
-(defn- get-path-strict
-  [doc segments]
-  (letfn [(step [node segs]
+(defn- get-path*
+  [doc segments strict?]
+  (letfn [(strict-miss [seg]
+            (cond
+              (integer? seg)
+              (raise "Idoc patch path expects vector"
+                     {:segment seg :path segments})
+
+              (or (keyword? seg) (string? seg))
+              (raise "Idoc patch path expects map"
+                     {:segment seg :path segments})
+
+              :else
+              (raise
+                "Idoc patch path segment must be keyword, string, or integer"
+                {:segment seg :path segments})))
+          (step [node segs]
             (if (empty? segs)
               node
               (let [seg  (first segs)
@@ -1325,25 +1306,33 @@
                 (cond
                   (nil? node) nil
 
-                  (integer? seg)
-                  (if (vector? node)
+                  (vector? node)
+                  (if (integer? seg)
                     (if (and (<= 0 (long seg)) (< (long seg) (count node)))
                       (step (nth node (long seg)) rest)
                       nil)
-                    (raise "Idoc patch path expects vector"
-                           {:segment seg :path segments}))
+                    (if strict?
+                      (strict-miss seg)
+                      (let [vals (keep #(step % segs) node)]
+                        (when (seq vals) (vec vals)))))
 
-                  (or (keyword? seg) (string? seg))
-                  (if (map? node)
+                  (and strict? (integer? seg))
+                  (strict-miss seg)
+
+                  (map? node)
+                  (if (or (not strict?) (keyword? seg) (string? seg))
                     (step (get node seg) rest)
-                    (raise "Idoc patch path expects map"
-                           {:segment seg :path segments}))
+                    (strict-miss seg))
 
-                  :else
-                  (raise
-                    "Idoc patch path segment must be keyword, string, or integer"
-                    {:segment seg :path segments})))))]
+                  strict?
+                  (strict-miss seg)
+
+                  :else nil))))]
     (step doc segments)))
+
+(defn- get-path-strict
+  [doc segments]
+  (get-path* doc segments true))
 
 (defn patch-doc-plan!
   ([^IdocIndex index ^FastList txs ^FastList state-actions
@@ -1606,27 +1595,7 @@
 
 (defn get-path
   [doc segments]
-  (letfn [(step [node segs]
-            (if (empty? segs)
-              node
-              (let [seg  (first segs)
-                    rest (rest segs)]
-                (cond
-                  (nil? node) nil
-
-                  (vector? node)
-                  (if (integer? seg)
-                    (if (and (<= 0 (long seg)) (< (long seg) (count node)))
-                      (step (nth node (long seg)) rest)
-                      nil)
-                    (let [vals (keep #(step % segs) node)]
-                      (when (seq vals) (vec vals))))
-
-                  (map? node)
-                  (step (get node seg) rest)
-
-                  :else nil))))]
-    (step doc segments)))
+  (get-path* doc segments false))
 
 (defn- values-for-path
   [format doc path]
