@@ -38,6 +38,12 @@
 
 (def ^:dynamic *plan-cache* (LRUCache. c/query-result-cache-size))
 
+(def ^:private ^:const ^long collection-input-plugin-threshold
+  128)
+
+(def ^:private ^:const ^long collection-input-materialize-threshold
+  100000)
+
 (defn- or-join-execute-link
   [db sources rules tuples clause bound-var bound-idx free-vars tgt-attr]
   (qresolve/or-join-execute-link db sources rules tuples clause bound-var
@@ -95,6 +101,98 @@
        (= 'or-join (first clause))
        (some #(= % s) (tree-seq sequential? seq (second clause)))))
 
+(defn- find-var-symbols
+  [parsed-q]
+  (set (dp/find-vars (:qfind parsed-q))))
+
+(defn- with-var-symbols
+  [parsed-q]
+  (set (map :symbol (:qwith parsed-q))))
+
+(defn- scalar-coll-bind-var
+  [qin]
+  (when (instance? BindColl qin)
+    (let [binding (:binding qin)]
+      (when (instance? BindScalar binding)
+        (:variable binding)))))
+
+(defn- small-distinct-coll-values
+  [value]
+  (when (u/seqable? value)
+    (let [values (vec (take (inc collection-input-plugin-threshold) value))]
+      (when (and (seq values)
+                 (<= (long (count values)) collection-input-plugin-threshold)
+                 (apply distinct? values))
+        values))))
+
+(defn- variable-ref-count
+  ^long [form sym]
+  (let [n (volatile! 0)]
+    (w/postwalk
+      (fn [e]
+        (when (and (instance? Variable e)
+                   (= sym (:symbol e)))
+          (vswap! n (fn [^long x] (unchecked-inc x))))
+        e)
+      form)
+    (long @n)))
+
+(defn- pattern-value-form-idx
+  ^long [form]
+  (+ (if (and (seq form) (qu/source? (first form))) 1 0) 2))
+
+(defn- pattern-form
+  [form]
+  (if (and (seq form) (qu/source? (first form)))
+    (subvec form 1)
+    form))
+
+(defn- value-pattern-for-var?
+  [parsed-clause orig-clause sym]
+  (and (instance? Pattern parsed-clause)
+       (vector? orig-clause)
+       (let [pattern (:pattern parsed-clause)
+             idx     (pattern-value-form-idx orig-clause)]
+         (and (<= 3 (count pattern))
+              (< idx (count orig-clause))
+              (= sym (nth orig-clause idx))
+              (let [a (nth pattern 1)
+                    v (nth pattern 2)]
+                (and (instance? Constant a)
+                     (keyword? (:value a))
+                     (instance? Variable v)
+                     (= sym (:symbol v))))))))
+
+(defn- collection-input-candidate
+  [parsed-q inputs input-idx qin]
+  (when-let [v (scalar-coll-bind-var qin)]
+    (let [sym (:symbol v)]
+      (when-let [values (small-distinct-coll-values (nth inputs input-idx))]
+        (when (and (= 1 (count values))
+                   (not (contains? (find-var-symbols parsed-q) sym))
+                   (not (contains? (with-var-symbols parsed-q) sym))
+                   (not (some #(or-join-var? % sym) (:qorig-where parsed-q)))
+                   (= 1 (variable-ref-count (:qwhere parsed-q) sym)))
+          (let [matches (keep-indexed
+                          (fn [clause-idx [parsed-clause orig-clause]]
+                            (when (value-pattern-for-var?
+                                    parsed-clause orig-clause sym)
+                              clause-idx))
+                          (map vector (:qwhere parsed-q)
+                               (:qorig-where parsed-q)))]
+            (when (= 1 (count matches))
+              {:input-idx  input-idx
+               :clause-idx (first matches)
+               :values     values})))))))
+
+(defn- expand-collection-input-pattern
+  [orig-clause values]
+  (let [idx      (pattern-value-form-idx orig-clause)
+        branches (map #(assoc orig-clause idx %) values)]
+    (if (= 1 (count branches))
+      (first branches)
+      (apply list 'or branches))))
+
 (defn- not-join-clause?
   [clause]
   (and (sequential? clause)
@@ -144,7 +242,7 @@
                  all-vars-used?)
         orig-clause))))
 
-(defn- plugin-inputs*
+(defn- plugin-scalar-inputs
   [parsed-q inputs]
   (let [qins    (:qin parsed-q)
         finds   (tree-seq sequential? seq (:qorig-find parsed-q))
@@ -180,6 +278,30 @@
             :qin (u/remove-idxs rm-idxs qins))
      (u/remove-idxs rm-idxs inputs)]))
 
+(defn- plugin-collection-inputs
+  [parsed-q inputs]
+  (loop [parsed-q parsed-q
+         inputs   inputs]
+    (if-let [{:keys [^long input-idx ^long clause-idx values]}
+             (first (keep-indexed
+                      #(collection-input-candidate parsed-q inputs %1 %2)
+                      (:qin parsed-q)))]
+      (let [qorig-where (assoc (:qorig-where parsed-q) clause-idx
+                               (expand-collection-input-pattern
+                                 (nth (:qorig-where parsed-q) clause-idx)
+                                 values))]
+        (recur (assoc parsed-q
+                      :qorig-where qorig-where
+                      :qwhere (dp/parse-where qorig-where)
+                      :qin (u/remove-idxs #{input-idx} (:qin parsed-q)))
+               (u/remove-idxs #{input-idx} inputs)))
+      [parsed-q inputs])))
+
+(defn- plugin-inputs*
+  [parsed-q inputs]
+  (let [[parsed-q inputs] (plugin-scalar-inputs parsed-q inputs)]
+    (plugin-collection-inputs parsed-q inputs)))
+
 (defn plugin-inputs
   "optimization that plugs simple value inputs into where clauses"
   [parsed-q inputs]
@@ -194,6 +316,73 @@
                        (mapv #(:source (meta %)) ins) ", got: " cv
                        {:error :query/inputs :expected ins :got inputs})
       :else     (plugin-inputs* parsed-q inputs))))
+
+(defn- rel-for-var
+  [context sym]
+  (when (qu/binding-var? sym)
+    (some #(when (contains? (:attrs %) sym) %)
+          (:rels context))))
+
+(defn- small-bound-relation?
+  [context sym]
+  (when-let [rel (rel-for-var context sym)]
+    (let [n (.size ^List (:tuples rel))]
+      (and (pos? n)
+           (<= n collection-input-materialize-threshold)))))
+
+(defn- pattern-var-symbol
+  [x]
+  (when (instance? Variable x)
+    (:symbol x)))
+
+(defn- materializable-input-bound-pattern
+  [context]
+  (let [{:keys [parsed-q sources]} context
+        qwhere (:qwhere parsed-q)]
+    (first
+      (keep-indexed
+        (fn [clause-idx [parsed-clause orig-clause]]
+          (when (and (instance? Pattern parsed-clause)
+                     (vector? orig-clause))
+            (let [pattern (:pattern parsed-clause)
+                  e-sym   (pattern-var-symbol (first pattern))
+                  v-sym   (when (<= 3 (count pattern))
+                            (pattern-var-symbol (nth pattern 2)))
+                  attr    (second pattern)
+                  e-bound? (small-bound-relation? context e-sym)
+                  v-bound? (small-bound-relation? context v-sym)]
+              (when (and (instance? Constant attr)
+                         (keyword? (:value attr))
+                         (or e-bound? v-bound?)
+                         (not (and e-bound? v-bound?)))
+                (when-let [source (get sources
+                                       (clause-source-symbol
+                                         (:source parsed-clause)))]
+                  (when (db/-searchable? source)
+                    {:clause-idx clause-idx
+                     :source     source
+                     :pattern    (pattern-form orig-clause)}))))))
+        (map vector qwhere
+             (:qorig-where parsed-q))))))
+
+(defn materialize-input-bound-patterns
+  "Materialize patterns constrained by small input-bound relations as indexed
+   lookup relations before planning, so downstream clauses can use bounded
+   entity/value relations instead of scanning large intermediates."
+  [context]
+  (loop [context context]
+    (if-let [{:keys [^long clause-idx source pattern]}
+             (materializable-input-bound-pattern context)]
+      (let [rel (qresolve/lookup-pattern
+                  (assoc context :rels-bound-cache (volatile! {}))
+                  source pattern)]
+        (recur (-> context
+                   (update :rels qresolve/collapse-rels rel)
+                   (update-in [:parsed-q :qwhere]
+                              #(u/remove-idxs #{clause-idx} %))
+                   (update-in [:parsed-q :qorig-where]
+                              #(u/remove-idxs #{clause-idx} %)))))
+      context)))
 
 (defn- var-symbol
   [v]
@@ -281,11 +470,13 @@
       {:counts @counts :kinds @kinds :protected @protected})))
 
 (defn unused-var-replacements
-  [parsed-q]
+  ([parsed-q]
+   (unused-var-replacements parsed-q nil))
+  ([parsed-q bound-vars]
   (let [find-vars (set (dp/find-vars (:qfind parsed-q)))
         with-vars (set (map :symbol (or (:qwith parsed-q) [])))
         in-vars   (set (map :symbol (dp/collect-vars-distinct (:qin parsed-q))))
-        used      (set/union find-vars with-vars in-vars)
+        used      (set/union find-vars with-vars in-vars (set bound-vars))
         {:keys [counts kinds protected]}
         (collect-var-usage (:qwhere parsed-q))]
     (into {}
@@ -297,7 +488,7 @@
                       [sym (if (contains? kind :binding)
                              '_
                              (qu/placeholder-sym sym))]))))
-          counts)))
+          counts))))
 
 (defn- replace-unused-vars-form
   [form replacements]
@@ -316,7 +507,8 @@
 
 (defn rewrite-unused-vars
   [{:keys [parsed-q] :as context}]
-  (let [replacements (unused-var-replacements parsed-q)]
+  (let [rel-vars     (mapcat (comp keys :attrs) (:rels context))
+        replacements (unused-var-replacements parsed-q rel-vars)]
     (if (empty? replacements)
       context
       (let [qorig-where  (mapv #(replace-unused-vars-form % replacements)

@@ -204,6 +204,44 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-collection-binding-value-lookups
+  (let [dir (u/tmp-dir (str "test-q-in-coll-lookup-" (UUID/randomUUID)))
+        db  (-> (d/empty-db dir)
+                (d/db-with [{:db/id 10 :country/name "Canada"}
+                            {:db/id 11 :country/name "Japan"}
+                            {:db/id 12 :country/name "USA"}
+                            {:db/id 20
+                             :artist/name "A"
+                             :artist/country 10}
+                            {:db/id 21
+                             :artist/name "B"
+                             :artist/country 11}
+                            {:db/id 22
+                             :artist/name "C"
+                             :artist/country 12}]))
+        issue-q '[:find [(pull ?a [:artist/name]) ...]
+                  :in $ [?c ...]
+                  :where
+                  [?a :artist/country ?country]
+                  [?country :country/name ?c]]
+        chained-q '[:find [?name ...]
+                    :in $ [?c ...]
+                    :where
+                    [?a :artist/country ?country]
+                    [?country :country/name ?c]
+                    [?a :artist/name ?name]]
+        countries ["Canada" "Japan"]]
+    (try
+      (is (= #{{:artist/name "A"} {:artist/name "B"}}
+             (set (d/q issue-q db countries))))
+      (is (empty? (:late-clauses (d/explain {} issue-q db countries))))
+
+      (is (= #{"A" "B"} (set (d/q chained-q db countries))))
+      (is (empty? (:late-clauses (d/explain {} chained-q db countries))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest test-bindings
   (let [dir (u/tmp-dir (str "test-instant-" (UUID/randomUUID)))
         db  (-> (d/empty-db dir)

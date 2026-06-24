@@ -25,12 +25,14 @@
 ### Improved
 - [Datalog] Coerce java.time.Instant to Date
   [#373](https://github.com/datalevin/datalevin/issues/373). [Thx @xfthhxk]
+- [Datalog] Collection bindings optimization
+  [#214](https://github.com/datalevin/datalevin/issues/214).
+- [Datalog] reduce allocation per tuple.
 - [Lib] Fuller Java, Python, JS API parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
 - [Search] Reduce heap pressure for large posting list
   [#356](https://github.com/datalevin/datalevin/issues/356).
-- [Datalog] reduce allocation per tuple.
 - update deps.
 
 ## 0.10.18 (2026-05-27)

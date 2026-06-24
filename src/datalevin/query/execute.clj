@@ -39,6 +39,9 @@
 
 (def ^:private plugin-inputs qo/plugin-inputs)
 
+(def ^:private materialize-input-bound-patterns
+  qo/materialize-input-bound-patterns)
+
 (def ^:private rewrite-unused-vars qo/rewrite-unused-vars)
 
 (defn- build-explain
@@ -332,6 +335,7 @@
           (binding [built-ins/*udf-db* udf-db]
             (-> (qplan/make-context parsed-q true)
                 (qresolve/resolve-ins inputs)
+                (materialize-input-bound-patterns)
                 (resolve-redudants)
                 (rules/rewrite)
                 (rewrite-unused-vars)
@@ -372,6 +376,7 @@
     (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)]
       (-> (qplan/make-context parsed-q false)
           (qresolve/resolve-ins inputs)
+          (materialize-input-bound-patterns)
           (resolve-redudants)
           (rules/rewrite)
           (rewrite-unused-vars)
