@@ -5,23 +5,23 @@
          com.cognitect/transit-clj                     {:mvn/version "1.1.357"}
          com.github.clj-easy/graal-build-time          {:mvn/version "1.0.5"}
          com.taoensso/nippy                            {:mvn/version "3.7.0-beta1"}
-         com.github.luben/zstd-jni                     {:mvn/version "1.5.7-8"}
+        com.github.luben/zstd-jni                     {:mvn/version "1.5.7-11"}
          com.taoensso/timbre                           {:mvn/version "6.5.0"}
-         me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.11"}
+        me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.14"}
          metosin/jsonista                              {:mvn/version "1.0.0"}
          io.github.nextjournal/markdown                {:mvn/version "0.7.225"}
          nrepl/bencode                                 {:mvn/version "1.2.0"}
-         org.babashka/sci                              {:mvn/version "0.12.51"}
+        org.babashka/sci                              {:mvn/version "0.13.53"}
          org.clojure/tools.cli                         {:mvn/version "1.4.256"}
-         org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.3"}
-         org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.3"}
-         org.clojars.huahaiy/dtlvnative-linux-x86_64   {:mvn/version "0.18.3"}
-         org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version "0.18.3"}
+         org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.7"}
+         org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.7"}
+         org.clojars.huahaiy/dtlvnative-linux-x86_64   {:mvn/version "0.18.7"}
+         org.clojars.huahaiy/dtlvnative-windows-x86_64 {:mvn/version "0.18.7"}
          org.eclipse.collections/eclipse-collections   {:mvn/version "13.0.0"}
          org.roaringbitmap/RoaringBitmap               {:mvn/version "1.6.14"}
          org.bouncycastle/bcpkix-jdk15on               {:mvn/version "1.70"}
          org.bouncycastle/bcprov-jdk15on               {:mvn/version "1.70"}
-         com.alipay.sofa/jraft-core                    {:mvn/version "1.4.0"
+        com.alipay.sofa/jraft-core                    {:mvn/version "1.4.1"
                                                         :exclusions [org.rocksdb/rocksdbjni]}
          }
 

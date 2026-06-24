@@ -103,13 +103,29 @@ public class VecIdx {
         expectNoError(error, "Fail to load index from buffer");
     }
 
+    private static void reserveOne(DTLV.usearch_index_t index,
+            PointerPointer<BytePointer> error) {
+        error.put(0, (BytePointer) null);
+        long size = DTLV.usearch_size(index, error);
+        expectNoError(error, "Fail to get index size");
+
+        error.put(0, (BytePointer) null);
+        long capacity = DTLV.usearch_capacity(index, error);
+        expectNoError(error, "Fail to get index capacity");
+
+        if (size >= capacity) {
+            long requested = capacity <= 0 ? 1 : Math.max(size + 1, capacity * 2);
+
+            error.put(0, (BytePointer) null);
+            DTLV.usearch_reserve(index, requested, error);
+            expectNoError(error, "Fail to reserve capacity");
+        }
+    }
+
     public static void addDouble(DTLV.usearch_index_t index, long key, double[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);
-
-        error.put(0, (BytePointer) null);
-        DTLV.usearch_reserve(index, 1, error);
-        expectNoError(error, "Fail to reserve capacity");
+        reserveOne(index, error);
 
         DoublePointer vecPtr = new DoublePointer(vector);
         error.put(0, (BytePointer) null);
@@ -120,10 +136,7 @@ public class VecIdx {
     public static void addFloat(DTLV.usearch_index_t index, long key, float[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);
-
-        error.put(0, (BytePointer) null);
-        DTLV.usearch_reserve(index, 1, error);
-        expectNoError(error, "Fail to reserve capacity");
+        reserveOne(index, error);
 
         FloatPointer vecPtr = new FloatPointer(vector);
         error.put(0, (BytePointer) null);
@@ -134,10 +147,7 @@ public class VecIdx {
     public static void addShort(DTLV.usearch_index_t index, long key, short[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);
-
-        error.put(0, (BytePointer) null);
-        DTLV.usearch_reserve(index, 1, error);
-        expectNoError(error, "Fail to reserve capacity");
+        reserveOne(index, error);
 
         ShortPointer vecPtr = new ShortPointer(vector);
         error.put(0, (BytePointer) null);
@@ -148,10 +158,7 @@ public class VecIdx {
     public static void addInt8(DTLV.usearch_index_t index, long key, byte[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);
-
-        error.put(0, (BytePointer) null);
-        DTLV.usearch_reserve(index, 1, error);
-        expectNoError(error, "Fail to reserve capacity");
+        reserveOne(index, error);
 
         BytePointer vecPtr = new BytePointer(vector);
         error.put(0, (BytePointer) null);
@@ -162,9 +169,7 @@ public class VecIdx {
     public static void addByte(DTLV.usearch_index_t index, long key, byte[] vector) {
 
         PointerPointer<BytePointer> error = new PointerPointer<>(1);
-        error.put(0, (BytePointer) null);
-        DTLV.usearch_reserve(index, 1, error);
-        expectNoError(error, "Fail to reserve capacity");
+        reserveOne(index, error);
 
         BytePointer vecPtr = new BytePointer(vector);
         error.put(0, (BytePointer) null);
