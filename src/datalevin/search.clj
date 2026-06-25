@@ -290,8 +290,9 @@
     -0.1
     (nth (.top pq) 0)))
 
-(declare doc-ref->id remove-doc* add-doc* hydrate-query display-xf score-docs
-         get-rawtext new-search-engine* parse-query* parse-query get-pos-info)
+(declare doc-ref->id remove-doc* add-doc* hydrate-query display-xf
+         cached-search-results score-docs get-rawtext new-search-engine*
+         parse-query* parse-query get-pos-info)
 
 (defprotocol IPositions
   (cur-pos [this] "return the current position, or nil if there is no more")
@@ -711,11 +712,69 @@
         (transient [])
         (range n 0 -1)))))
 
-(def default-search-opts {:display             :refs
-                          :top                 10
-                          :proximity-expansion 2
-                          :proximity-max-dist  45
-                          :doc-filter          (constantly true)})
+(def default-search-opts {:display             c/default-display
+                          :top                 c/default-top
+                          :offset              0
+                          :paging-cache-pages  c/default-search-paging-cache-pages
+                          :proximity-expansion c/default-proximity-expansion
+                          :proximity-max-dist  c/default-proximity-max-dist
+                          :doc-filter          c/default-doc-filter})
+
+(defn- search-page-value
+  [k v]
+  (when-not (integer? v)
+    (u/raise "Search pagination option must be an integer"
+             {:option k :value v}))
+  (let [v (long v)]
+    (when-not (<= 0 v Integer/MAX_VALUE)
+      (u/raise "Search pagination option must be a non-negative integer"
+               {:option k :value v}))
+    v))
+
+(defn- search-option
+  [opts search-opts k default]
+  (cond
+    (contains? opts k)        (get opts k)
+    (contains? search-opts k) (get search-opts k)
+    :else                    default))
+
+(defn- search-page
+  [opts search-opts]
+  (let [opts        (or opts {})
+        search-opts (or search-opts {})
+        limit?      (or (contains? opts :limit)
+                        (contains? search-opts :limit))
+        offset      (search-page-value
+                      :offset
+                      (search-option opts search-opts :offset
+                                     (:offset default-search-opts)))
+        limit       (search-page-value
+                      (if limit? :limit :top)
+                      (if limit?
+                        (search-option opts search-opts :limit
+                                       (:top default-search-opts))
+                        (search-option opts search-opts :top
+                                       (:top default-search-opts))))
+        cache-pages (search-page-value
+                      :paging-cache-pages
+                      (search-option
+                        opts search-opts :paging-cache-pages
+                        (:paging-cache-pages default-search-opts)))
+        page-end    (+ ^long offset ^long limit)
+        cache-top   (if limit?
+                      (* ^long limit ^long cache-pages)
+                      page-end)
+        top         (max ^long page-end ^long cache-top)]
+    (when (< Integer/MAX_VALUE ^long top)
+      (u/raise "Search pagination window exceeds maximum"
+               {:offset              offset
+                :limit               limit
+                :paging-cache-pages  cache-pages
+                :top                 top
+                :max                 Integer/MAX_VALUE}))
+    {:offset offset
+     :limit  limit
+     :top    top}))
 
 (deftype SearchEngine [lmdb
                        analyzer
@@ -765,31 +824,39 @@
 
   (search [this query]
     (.search this query {}))
-  (search [this query {:keys [display top proximity-expansion
+  (search [this query {:keys [display proximity-expansion
                               proximity-max-dist doc-filter]
-                       :or   {display (:display search-opts)
-                              top     (:top search-opts)
+                       :or   {display (or (:display search-opts)
+                                          (:display default-search-opts))
                               proximity-expansion
-                              (:proximity-expansion search-opts)
+                              (or (:proximity-expansion search-opts)
+                                  (:proximity-expansion default-search-opts))
                               proximity-max-dist
-                              (:proximity-max-dist search-opts)
+                              (or (:proximity-max-dist search-opts)
+                                  (:proximity-max-dist default-search-opts))
                               doc-filter
-                              (:doc-filter search-opts)}}]
+                              (or (:doc-filter search-opts)
+                                  (:doc-filter default-search-opts))}
+                       :as   opts}]
     (when-let [context (some-> {:engine this :max-doc max-doc}
                                (parse-query query-analyzer query)
                                required-terms
                                hydrate-query
                                setup-env)]
-      (let [{:keys [tms req]} context
-            n                 (count req)]
+      (let [{:keys [tms]}     context
+            {:keys [offset limit top]}
+            (search-page opts search-opts)
+            offset            (long offset)
+            limit             (long limit)
+            top               (long top)]
         (sequence
-          (display-xf this doc-filter display tms)
-          (if (zero? n)
-            (all-docs context top)
-            (let [result  (RoaringBitmap.)
-                  scoring (score-docs context n norms result)]
-              (tiered-scoring top scoring this proximity-expansion
-                              proximity-max-dist result n)))))))
+          (comp (drop offset)
+                (take limit)
+                (display-xf this doc-filter display tms))
+          (if (zero? limit)
+            []
+            (cached-search-results this context top proximity-expansion
+                                   proximity-max-dist))))))
 
   IAdmin
   (re-index [this opts]
@@ -953,6 +1020,26 @@
         (proximity-scoring engine max-dist tids wqs norms pq0 pq))
       (tf-idf-scoring context result tao n pq norms))))
 
+(defn- raw-search-results
+  [^SearchEngine engine {:keys [req] :as context} top proximity-expansion
+   proximity-max-dist]
+  (let [n (count req)]
+    (if (zero? n)
+      (all-docs context top)
+      (let [result  (RoaringBitmap.)
+            scoring (score-docs context n (.-norms engine) result)]
+        (tiered-scoring top scoring engine proximity-expansion
+                        proximity-max-dist result n)))))
+
+(defn- cached-search-results
+  [^SearchEngine engine {:keys [query phrases] :as context} top
+   proximity-expansion proximity-max-dist]
+  (wrap-cache
+    engine [:search-results query phrases top proximity-expansion
+            proximity-max-dist]
+    (raw-search-results engine context top proximity-expansion
+                        proximity-max-dist)))
+
 (defn- get-term-info
   [^SearchEngine engine term]
   (wrap-cache
@@ -1030,7 +1117,8 @@
     (.remove norms doc-id)
     (transact-kv (.-lmdb engine) txs)
     (.remove cache [:doc-ref->id doc-ref])
-    (.remove cache [:doc-ref->term-ids doc-ref]))
+    (.remove cache [:doc-ref->term-ids doc-ref])
+    (.clear cache))
   :doc-removed)
 
 (defn- add-doc*
@@ -1046,6 +1134,7 @@
         unique          (.size new-terms)
         doc-id          (.incrementAndGet ^AtomicInteger (.-max-doc engine))
         term-set        (IntHashSet.)
+        ^LRUCache cache (.-cache engine)
         txs             (FastList.)]
     (when include-text? (.add txs (l/kv-tx :put (.-rawtext-dbi engine) doc-id
                                            doc-text :int :string)))
@@ -1066,7 +1155,7 @@
 
             term-info
             [tid (add-max-weight mw tf unique) (sl/set sl doc-id tf)]]
-        (.remove ^LRUCache (.-cache engine) [:query-term-info term])
+        (.remove cache [:query-term-info term])
         (.add txs (l/kv-tx :put terms-dbi term term-info :string :term-info))
         (if index-position?
           (let [pos-info [(.toArray positions) (.toArray offsets)]]
@@ -1077,7 +1166,8 @@
           doc-info [doc-id unique term-ar]]
       (.add txs (l/kv-tx :put (.-docs-dbi engine) doc-ref doc-info
                          :data :doc-info))
-      (transact-kv (.-lmdb engine) txs)))
+      (transact-kv (.-lmdb engine) txs)
+      (.clear cache)))
   :doc-added)
 
 (defn- hydrate-query*

@@ -282,6 +282,10 @@
   "default `search` function `:top` option value is `10`"
   10)
 
+(def ^:const default-search-paging-cache-pages
+  "default `search` function `:paging-cache-pages` option value is `10`"
+  10)
+
 (def ^:const default-proximity-expansion
   "default `search` function `:proximity-expansion` option value is `2`"
   2)

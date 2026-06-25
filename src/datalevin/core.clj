@@ -2179,7 +2179,17 @@ to `[:or \"word1\" \"word2\" \"word3\"]` when using the default analyzer.
       `[doc-ref doc-text [term1 [offset ...]] [term2 [...]] ...]`,
       ordered by relevance, if search engine option `:index-position?`
       and `:include-text?` are both `true`.
-  * `:top` is an integer (default 10), the number of results desired.
+  * `:top` is a non-negative integer (default 10), the number of results
+    desired when `:limit` is not supplied.
+  * `:limit` is a non-negative integer page size. When supplied, it overrides
+    `:top` as the number of returned results.
+  * `:offset` is a non-negative integer (default 0), the number of ranked
+    results to skip before returning the page.
+  * `:paging-cache-pages` is a non-negative integer (default 10), the number of
+    `:limit`-sized pages to score and cache as one top-k window. When `:limit`
+    is supplied, the search engine scores and caches
+    `max(:offset + :limit, :limit * :paging-cache-pages)` candidates. When
+    `:limit` is not supplied, it scores `:offset + :top` candidates.
   * `:doc-filter` is a boolean function that takes a `doc-ref` and
     determines whether or not to include the corresponding document in the
     results (default is `(constantly true)`)

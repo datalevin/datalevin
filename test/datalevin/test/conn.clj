@@ -863,6 +863,43 @@
         (d/close-kv db)
         (u/delete-files dir)))))
 
+(deftest test-search-pagination
+  (let [dir    (u/tmp-dir (str "test-search-pagination-"
+                               (UUID/randomUUID)))
+        db     (d/open-kv dir)
+        engine (d/new-search-engine db {:index-position? true})]
+    (try
+      (dotimes [i 8]
+        (d/add-doc engine (inc i) (str "alpha beta " i)))
+      (let [all-results (vec (d/search engine "alpha" {:top 8}))
+            window      (vec (d/search engine "alpha" {:top 5}))
+            page        (vec (d/search engine "alpha"
+                                       {:limit 3 :offset 2}))
+            one-window-page
+            (vec (d/search engine "alpha"
+                           {:limit              3
+                            :offset             2
+                            :paging-cache-pages 1}))
+            score-page  (vec (d/search engine "alpha"
+                                       {:display :refs+scores
+                                        :limit   3
+                                        :offset  2}))
+            score-window
+            (vec (d/search engine "alpha"
+                           {:display :refs+scores
+                            :top     8}))]
+        (is (= 8 (count all-results)))
+        (is (= (subvec all-results 2 5) page))
+        (is (= (subvec window 2 5) one-window-page))
+        (is (= (subvec score-window 2 5) score-page))
+        (is (empty? (d/search engine "alpha" {:limit 0 :offset 2}))))
+      (d/search engine "alpha" {:limit 3})
+      (d/add-doc engine 9 "alpha alpha alpha alpha")
+      (is (= 9 (first (d/search engine "alpha" {:limit 3}))))
+      (finally
+        (d/close-kv db)
+        (u/delete-files dir)))))
+
 (defn- parallel-add-doc-errors
   [engine docs]
   (let [start   (promise)
