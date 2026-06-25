@@ -82,8 +82,12 @@
 
 (defn- navize-pulled-entity-seq [db-val entities]
   (with-meta entities
-    {`cp/nav (fn [_coll _k v]
-               (e/entity db-val (:db/id v)))}))
+    {`cp/nav (fn [coll k v]
+               (let [v (or v
+                           (when (integer? k)
+                             (nth (sort-by :db/id coll) k nil)))]
+                 (when v
+                   (e/entity db-val (:db/id v)))))}))
 
 (defn- datafy-entity-seq [db-val entities]
   (with-meta entities
