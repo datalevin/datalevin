@@ -8,13 +8,18 @@
    [datalevin.interpret :as i]
    [datalevin.udf :as udf]
    [datalevin.util :as u]
-   [datalevin.constants :as c :refer [tx0]])
+   [datalevin.constants :as c :refer [tx0]]
+   [inter-fn-host])
   (:import
    [java.util UUID]))
 
 (use-fixtures :each db-fixture)
 
 (defn testing-fn []  "test-value")
+
+(i/definterfn host-var-tx [_db tempid]
+  [{:db/id      tempid
+    :node/value (inter-fn-host/testing-fn)}])
 
 (deftest test-fn
   (let [dir                (u/tmp-dir (str "test-fn-" (UUID/randomUUID)))
@@ -67,6 +72,30 @@
 
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-db-ident-inter-fn-host-var
+  (let [dir  (u/tmp-dir (str "inter-fn-host-var-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir {}
+               {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (d/transact! conn [{:db/ident :add-host-var-node
+                          :db/fn    host-var-tx}])
+      (d/close conn)
+      (let [conn' (d/create-conn
+                    dir {}
+                    {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+        (try
+          (let [{:keys [db-after tempids]}
+                (d/transact! conn' [[:add-host-var-node -1]])]
+            (is (= "test-value"
+                   (:node/value (d/entity db-after (tempids -1))))))
+          (finally
+            (d/close conn'))))
+      (finally
+        (when-not (d/closed? conn)
+          (d/close conn))
+        (u/delete-files dir)))))
 
 (deftest test-db-ident-fn
   (let [dir     (u/tmp-dir (str "skip-" (UUID/randomUUID)))

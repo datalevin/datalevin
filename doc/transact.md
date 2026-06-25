@@ -154,9 +154,12 @@ runtime, so it cannot be used in native image, which has a closed world
 assumption.  This way of defining a function is also necessary when a function
 needs to be passed over the wire to servers or babashka. The source code of the
 function will be interpreted by [sci](https://github.com/babashka/sci) instead,
-so there's currently some limitations, e.g. except for built-in ones, normal
-Clojure vars are not accessible. We will address these limitations in the
-future.
+so there are some limitations. In addition to built-in Datalevin functions and
+whitelisted Clojure forms, an `inter-fn` can call public vars from already
+loaded application namespaces by fully qualified symbol. Those namespaces and
+vars must be available anywhere the stored source is later compiled or thawed,
+such as a server process. `clojure.*`, `datalevin.*`, and Java/class-like
+namespaces are not auto-exposed this way.
 
 `:db.fn/call` is another way to call a transaction function, which does not
 store the function in the database, so this is usable in embedded mode, where

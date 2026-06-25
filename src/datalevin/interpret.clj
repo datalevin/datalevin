@@ -104,7 +104,7 @@
             x))))
     x))
 
-(declare ctx inter-fn-ctx)
+(declare ctx inter-fn-ctx inter-fn-namespaces inter-fn-classes)
 
 (defn ^:no-doc eval-fn [ctx form]
   (sci/eval-form ctx (if (coll? form)
@@ -436,6 +436,89 @@
   (or (fn-source-form? x)
       (literal-let-source-form? x)))
 
+(defn- host-var-namespace?
+  [ns-part]
+  (and ns-part
+       (not (s/starts-with? ns-part "clojure."))
+       (not (s/starts-with? ns-part "datalevin."))
+       (not (class-like-namespace? ns-part))))
+
+(defn- host-var-symbol?
+  [sym]
+  (let [ns-part (namespace sym)]
+    (and (qualified-symbol? sym)
+         (host-var-namespace? ns-part)
+         (not (contains? allowed-inter-fn-host-symbols sym))
+         (not (contains? allowed-inter-fn-interop-symbols sym))
+         (not (interop-symbol? sym)))))
+
+(defn- host-var-symbols
+  [form]
+  (letfn [(collect [form acc]
+            (cond
+              (symbol? form)
+              (if (host-var-symbol? form)
+                (conj acc form)
+                acc)
+
+              (seq? form)
+              (if (quote-form? form)
+                acc
+                (reduce (fn [acc x] (collect x acc)) acc form))
+
+              (map? form)
+              (reduce-kv (fn [acc k v]
+                           (collect v (collect k acc)))
+                         acc
+                         form)
+
+              (coll? form)
+              (reduce (fn [acc x] (collect x acc)) acc form)
+
+              :else acc))]
+    (collect form #{})))
+
+(defn- resolve-public-host-var
+  [sym]
+  (when-let [ns (some-> sym namespace symbol find-ns)]
+    (get (ns-publics ns) (symbol (name sym)))))
+
+(defn- host-var-namespace-map
+  [[ns-sym syms]]
+  (let [sci-ns (sci/create-ns ns-sym)]
+    [ns-sym
+     (reduce
+       (fn [m sym]
+         (let [var-sym (symbol (name sym))
+               v       (or (resolve-public-host-var sym)
+                           (u/raise
+                             "Cannot resolve host var for inter-fn " sym
+                             {:type   :datalevin/unresolved-inter-fn-host-var
+                              :symbol sym}))]
+           (assoc m var-sym
+                  (sci/new-var (symbol v) v
+                               (assoc (meta v)
+                                      :sci.impl/built-in true
+                                      :ns sci-ns)))))
+       {}
+       syms)]))
+
+(defn- host-var-namespaces
+  [src]
+  (into {}
+        (map host-var-namespace-map)
+        (group-by (comp symbol namespace) (host-var-symbols src))))
+
+(defn- inter-fn-context
+  [src]
+  (let [host-namespaces (host-var-namespaces src)]
+    (if (seq host-namespaces)
+      (sci/init {:namespaces (merge-with merge
+                                         (inter-fn-namespaces)
+                                         host-namespaces)
+                 :classes    inter-fn-classes})
+      inter-fn-ctx)))
+
 (defn ^:no-doc validate-inter-fn-source!
   [src]
   (when-not (inter-fn-source-form? src)
@@ -450,7 +533,7 @@
   [src]
   (let [src (validate-inter-fn-source! src)]
     (with-meta
-      (sci/eval-form inter-fn-ctx src)
+      (sci/eval-form (inter-fn-context src) src)
       {:type   :datalevin/inter-fn
        :source src})))
 
@@ -469,7 +552,8 @@
   sent over the wire if the database is on a remote server or as a
   babashka pod. It runs in an interpreter.
 
-  Symbols referred in inter-fn needs to be fully-qualified."
+  Symbols referred in inter-fn need to be fully-qualified. Public vars from
+  loaded application namespaces can be called by qualified symbol."
   [_args & _body]
   `(compile-inter-fn-source ~(save-env (keys &env) &form)))
 

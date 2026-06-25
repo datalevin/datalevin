@@ -498,7 +498,10 @@ a Clojure interpreter, i.e. [sci](https://github.com/borkdude/sci) based on a
 white list. The serialized `inter-fn` sandbox does not allow host file I/O,
 namespace mutation, dynamic eval/load, thread/agent APIs, or Java interop,
 except for bounded `Thread/sleep`/`java.lang.Thread/sleep` calls of at most
-1000 ms for compatibility with slow transaction-function tests.
+1000 ms for compatibility with slow transaction-function tests. An `inter-fn`
+may also call public vars from application namespaces that are already loaded
+in the server process when referenced by fully qualified symbol; those helpers
+run as trusted host Clojure code and must exist on the server classpath.
 Descriptor-backed `:db/udf` works differently: only the descriptor crosses the
 wire, and the server resolves it against its own runtime registry or resolver.
 

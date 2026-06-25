@@ -379,11 +379,10 @@ reach as soon as we can. We may adjust the priorities based on feedback.
 * 1.0.0 ~~As a document database with automatic path indexing; WAL mode;
   transaction log access API;  read-only replicas; high availability; JSON API;
   library for Java, Python, and JavaScript;~~ Book.
-* 2.0.0 TTL; extensible storage/query for arbitrary data; data compression.
-  provenance annotation; incremental view maintenance.
-* 3.0.0 Sharding, data distribution.
-* 4.0.0 Extended rule syntax to handle complex analytical workload capable of
-  implementing ML algorithms in DB.
+* 2.0.0 TTL; extensible storage/query for arbitrary data; data compression;
+  provenance annotation; incremental view maintenance; extended rule syntax to
+  be able to implementing ML algorithms in DB.
+* 3.0.0 Sharding and data distribution.
 
 ## :arrows_clockwise: Contact
 
