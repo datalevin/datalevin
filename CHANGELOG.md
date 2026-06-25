@@ -4,6 +4,8 @@
 ### Added
 - [Datalog ]`datalog-kv` function to return the underlying DLMDB instance for a
   Datalog DB.
+- [Search] `:limit` and `:offset` search option
+  [#318](https://github.com/datalevin/datalevin/issues/318).
 - [Lib] Release Datalevin server as a Java library
   `org.datalevin:datalevin-java-server` to Maven Central, for in-process
   server use.

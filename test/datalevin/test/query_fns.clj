@@ -550,6 +550,14 @@
       (is (= #{1 2} (set (keys scores))))
       (is (every? number? (vals scores)))
       (is (> (scores 1) (scores 2))))
+    (let [all-results (vec (d/fulltext-datoms db "red"
+                                              {:top     2
+                                               :domains ["text"]}))
+          page        (vec (d/fulltext-datoms db "red"
+                                              {:limit   1
+                                               :offset  1
+                                               :domains ["text"]}))]
+      (is (= (subvec all-results 1 2) page)))
     (d/close-db db)
     (u/delete-files dir)))
 

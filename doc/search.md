@@ -77,6 +77,10 @@ involves only a few functions: `new-search-engine`, `add-doc`, `remove-doc`, and
 (d/search engine "red")
 ;=> (1 2)
 
+;; paginate ranked results with :limit and :offset
+(d/search engine "red" {:limit 1 :offset 1})
+;=> (2)
+
 ;; ask for the ranking scores as well
 (d/search engine "red" {:display :refs+scores})
 ;; => returns [doc-ref score] pairs ordered by relevance
@@ -116,6 +120,15 @@ for easy destructuring. With other `:display` values, `fulltext` returns:
 
 The query is the same as that of the standalone search engine, so you can use
 the same search expression.
+
+The search option map supports `:top`, `:limit`, and `:offset`. `:top`
+defaults to `10` and remains the result count when `:limit` is not supplied.
+When `:limit` is supplied, it is the page size and `:offset` skips that many
+ranked results before returning the page. Datalevin scores and caches a top-k
+window of `max(:offset + :limit, :limit * :paging-cache-pages)` candidates, so
+normal page-by-page access reuses the same ranked window. `:paging-cache-pages`
+defaults to `10`. When `:limit` is not supplied, Datalevin scores
+`:offset + :top` candidates.
 
 ```Clojure
 (let [db (-> (d/empty-db "/tmp/mydb"
@@ -226,6 +239,10 @@ In `search` and `fulltext` functions, an option map can be passed as the
 last argument at run time to customize search. It can have these keys:
 
 * `:top`  is the number of results desired, default is 10
+* `:limit` is a page size that overrides `:top` for returned result count
+* `:offset` skips ranked results before returning the page
+* `:paging-cache-pages` is the number of `:limit`-sized pages to cache as a
+top-k window for paged search, default is 10
 * `:proximity-expansion` is the expansion factor for proximity search, default
 is 2,
 * `:proximity-max-dist` is max distance considered for proximity search, default
