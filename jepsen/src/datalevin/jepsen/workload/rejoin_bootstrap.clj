@@ -139,6 +139,13 @@
          :ready? (and (= (long key-count) (count values))
                       (every? integer? values))}))))
 
+(defn- register-state-reader
+  [cluster-id restarted-set logical-node]
+  (if (and (true? (:remote? (local/cluster-state cluster-id)))
+           (contains? restarted-set logical-node))
+    remote-node-register-state
+    in-process-node-register-state))
+
 (defn- wait-for-expected-registers-on-live-nodes!
   [test key-count expected-values timeout-ms node-state-fn]
   (let [cluster-id (:datalevin/cluster-id test)
@@ -677,9 +684,9 @@
                             expected-values
                             timeout-ms
                             (fn [test logical-node key-count]
-                              ((if (contains? restarted-set logical-node)
-                                 remote-node-register-state
-                                 in-process-node-register-state)
+                              ((register-state-reader cluster-id
+                                                      restarted-set
+                                                      logical-node)
                                test
                                logical-node
                                key-count)))]

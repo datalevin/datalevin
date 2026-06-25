@@ -164,6 +164,31 @@
                   result)))))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-register-state-reader-selection-test
+  (let [cluster-id  ::register-state-reader-selection
+        live-reader @#'rejoin-bootstrap/in-process-node-register-state
+        remote-reader @#'rejoin-bootstrap/remote-node-register-state]
+    (with-redefs [local/cluster-state
+                  (fn [actual-cluster-id]
+                    (is (= cluster-id actual-cluster-id))
+                    {:remote? false})]
+      (is (identical? live-reader
+                      (#'rejoin-bootstrap/register-state-reader
+                       cluster-id #{"n2"} "n1")))
+      (is (identical? live-reader
+                      (#'rejoin-bootstrap/register-state-reader
+                       cluster-id #{"n2"} "n2"))))
+    (with-redefs [local/cluster-state
+                  (fn [actual-cluster-id]
+                    (is (= cluster-id actual-cluster-id))
+                    {:remote? true})]
+      (is (identical? live-reader
+                      (#'rejoin-bootstrap/register-state-reader
+                       cluster-id #{"n2"} "n1")))
+      (is (identical? remote-reader
+                      (#'rejoin-bootstrap/register-state-reader
+                       cluster-id #{"n2"} "n2"))))))
+
 (deftest register-initialization-retries-transient-ha-error-test
   (let [attempts             (atom 0)
         initialized-clusters @#'register/initialized-clusters]
