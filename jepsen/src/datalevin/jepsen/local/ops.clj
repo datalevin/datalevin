@@ -57,18 +57,25 @@
 
 (defn- store-open?
   [store]
-  (cond
-    (nil? store) false
-    (instance? Store store) (not (i/closed? store))
-    :else (not (i/closed-kv? store))))
+  (try
+    (cond
+      (nil? store) false
+      (instance? Store store) (not (i/closed? store))
+      :else (not (i/closed-kv? store)))
+    (catch Throwable _
+      false)))
+
+(defn- state-lmdb
+  [state]
+  (let [store (:store state)]
+    (if (instance? Store store)
+      (.-lmdb ^Store store)
+      store)))
 
 (defn- local-watermarks
   [server db-name]
   (when-let [state (db-state server db-name)]
-    (let [store (:store state)
-          lmdb  (if (instance? Store store)
-                  (.-lmdb ^Store store)
-                  store)]
+    (let [lmdb (state-lmdb state)]
       (when (store-open? lmdb)
         (try
           (kv/txlog-watermarks lmdb)
@@ -77,10 +84,7 @@
 
 (defn- local-ha-persisted-lsn
   [state]
-  (let [store (:store state)
-        lmdb  (if (instance? Store store)
-                (.-lmdb ^Store store)
-                store)]
+  (let [lmdb (state-lmdb state)]
     (long
      (or (try
            (i/get-value lmdb c/kv-info c/ha-local-applied-lsn
@@ -91,10 +95,7 @@
 
 (defn- local-snapshot-lsn
   [state]
-  (let [store (:store state)
-        lmdb  (if (instance? Store store)
-                (.-lmdb ^Store store)
-                store)]
+  (let [lmdb (state-lmdb state)]
     (long
      (or (try
            (i/get-value lmdb c/kv-info c/wal-snapshot-current-lsn
@@ -836,17 +837,31 @@
              (get node-ha-opt-overrides logical-node)))))
 
 (defn with-node-kv-store
-  [{:keys [clusters]} cluster-id logical-node f]
-  (let [{:keys [db-name node-by-name] :as cluster} (get @clusters cluster-id)
-        node      (get node-by-name logical-node)
-        endpoint  (:endpoint node)
-        open-opts (node-kv-open-opts cluster logical-node node)
-        kv-store (r/open-kv (lcluster/db-uri endpoint db-name)
-                            open-opts)]
-    (try
-      (f kv-store)
-      (finally
-        (i/close-kv kv-store)))))
+  [{:keys [clusters remote-cluster?]} cluster-id logical-node f]
+  (if (remote-cluster? cluster-id)
+    (let [{:keys [db-name node-by-name] :as cluster} (get @clusters cluster-id)
+          node      (get node-by-name logical-node)
+          endpoint  (:endpoint node)
+          open-opts (node-kv-open-opts cluster logical-node node)
+          kv-store  (r/open-kv (lcluster/db-uri endpoint db-name)
+                               open-opts)]
+      (try
+        (f kv-store)
+        (finally
+          (i/close-kv kv-store))))
+    (let [{:keys [db-name servers]} (get @clusters cluster-id)
+          server                    (get servers logical-node)]
+      (with-live-store-read-access
+        server
+        db-name
+        (fn []
+          (let [lmdb (some-> (db-state server db-name) state-lmdb)]
+            (if (store-open? lmdb)
+              (f lmdb)
+              (u/raise "Cannot access KV store on unavailable Jepsen node"
+                       {:cluster-id cluster-id
+                        :logical-node logical-node
+                        :db-name db-name}))))))))
 
 (defn assoc-opt-on-node!
   [deps cluster-id logical-node k v]

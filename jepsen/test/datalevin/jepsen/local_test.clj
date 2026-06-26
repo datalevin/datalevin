@@ -9,6 +9,7 @@
    [datalevin.jepsen.local.cluster :as lcluster]
    [datalevin.jepsen.local.ops :as lops]
    [datalevin.kv :as kv]
+   [datalevin.remote :as r]
    [datalevin.server :as srv]
    [datalevin.util :as u])
   (:import
@@ -159,6 +160,27 @@
   {:clusters (atom {:test-cluster {:db-name db-name
                                    :servers {"n1" server}}})
    :remote-cluster? (constantly false)})
+
+(deftest local-with-node-kv-store-uses-live-server-store-test
+  (let [dir      (u/tmp-dir (str "jepsen-local-with-node-kv-store-"
+                                 (UUID/randomUUID)))
+        db-name  "local-with-node-kv-store"
+        kv-store (d/open-kv dir {:wal? true})
+        server   (ha-test-server {db-name {:store kv-store}})]
+    (try
+      (with-redefs [r/open-kv
+                    (fn [& _]
+                      (throw (ex-info "remote open-kv should not be used"
+                                      {})))]
+        (is (identical? kv-store
+                        (lops/with-node-kv-store
+                         (local-ops-test-deps db-name server)
+                         :test-cluster
+                         "n1"
+                         identity))))
+      (finally
+        (d/close-kv kv-store)
+        (u/delete-files dir)))))
 
 (deftest gc-txlog-segments-on-node-allows-expected-skip-test
   (let [db-name "gc-skip-test"
