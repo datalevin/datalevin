@@ -14,6 +14,7 @@
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
    [datalevin.lmdb :as lmdb]
+   [datalevin.main :as main]
    [datalevin.search :as search]
    [datalevin.sparselist :as sl]
    [datalevin.storage :as s]
@@ -519,6 +520,47 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest test-auto-dump-load-mixed-datalog-and-kv
+  (let [src       (u/tmp-dir (str "test-auto-dump-mixed-src-"
+                                  (UUID/randomUUID)))
+        dst       (u/tmp-dir (str "test-auto-dump-mixed-dst-"
+                                  (UUID/randomUUID)))
+        dump-dir  (u/tmp-dir (str "test-auto-dump-mixed-file-"
+                                  (UUID/randomUUID)))
+        dump-file (str dump-dir u/+separator+ "dump.edn")
+        schema    {:person/name {:db/valueType :db.type/string
+                                 :db/unique    :db.unique/identity}}]
+    (try
+      (u/create-dirs dump-dir)
+      (let [conn (d/create-conn src schema)]
+        (try
+          (d/transact! conn [{:person/name "Ada"}])
+          (let [kv (d/datalog-kv conn)]
+            (d/open-dbi kv "app-state")
+            (d/transact-kv kv "app-state" [[:put "theme" "dark"]]
+                           :string :string))
+          (finally
+            (d/close conn))))
+      (main/dump src dump-file nil false false false)
+      (main/load dst dump-file nil false)
+      (let [conn (d/create-conn dst)]
+        (try
+          (is (= #{["Ada"]}
+                 (d/q '[:find ?name
+                        :where [_ :person/name ?name]]
+                      @conn)))
+          (let [kv (d/datalog-kv conn)]
+            (d/open-dbi kv "app-state")
+            (is (= "dark"
+                   (d/get-value kv "app-state" "theme"
+                                :string :string true))))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files src)
+        (u/delete-files dst)
+        (u/delete-files dump-dir)))))
 
 (deftest test-kv-wal-opt-in-defaults-to-relaxed
   (let [dir (u/tmp-dir (str "test-kv-wal-relaxed-"

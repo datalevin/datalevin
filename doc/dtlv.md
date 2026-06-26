@@ -200,13 +200,14 @@ $ dtlv help dump
   Optional options:
       -a --all        All of the sub-databases
       -f --file PATH  Write to the specified target file instead of stdout
-      -g --datalog    Dump as a Datalog database
+      -g --datalog    Dump as a Datalog database only
       -n --nippy      Dump database in nippy binary format
       -l --list       List the names of sub-databases instead of the content
   Optional arguments:
       Name(s) of sub-database(s)
 
   Examples:
+      dtlv -d /data/companydb dump
       dtlv -d /data/companydb -l dump
       dtlv -d /data/companydb -g dump
       dtlv -d /data/companydb -f ~/sales-data dump sales
@@ -220,13 +221,14 @@ $ dtlv help load
       -d --dir  PATH  Path to the target database directory
   Optional option:
       -f --file PATH  Load from the specified source file instead of stdin
-      -g --datalog    Load a Datalog database
+      -g --datalog    Load a Datalog database only
       -n --nippy      Load a database in nippy binary format
   Optional argument:
       Name of the single sub-database to load the data into, useful when loading
       data into a sub-database with a name different from the original name
 
   Examples:
+      dtlv -d /data/companydb -f ~/company-data load
       dtlv -d /data/companydb -f ~/sales-data load new-sales
       dtlv -d /data/companydb -f ~/sales-data -g load
 ```

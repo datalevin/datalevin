@@ -100,13 +100,14 @@
   Optional options:
       -a --all        All of the sub-databases
       -f --file PATH  Write to the specified target file instead of stdout
-      -g --datalog    Dump as a Datalog database
+      -g --datalog    Dump as a Datalog database only
       -n --nippy      Dump database in nippy binary format
       -l --list       List the names of sub-databases instead of the content
   Optional arguments:
       Name(s) of sub-database(s)
 
   Examples:
+      dtlv -d /data/companydb dump
       dtlv -d /data/companydb -l dump
       dtlv -d /data/companydb -g dump
       dtlv -d /data/companydb -f ~/sales-data dump sales
@@ -120,13 +121,14 @@
       -d --dir  PATH  Path to the target database directory
   Optional option:
       -f --file PATH  Load from the specified source file instead of stdin
-      -g --datalog    Load a Datalog database
+      -g --datalog    Load a Datalog database only
       -n --nippy      Load a database in nippy binary format
   Optional argument:
       Name of the single sub-database to load the data into, useful when loading
       data into a sub-database with a name different from the original name
 
   Examples:
+      dtlv -d /data/companydb -f ~/company-data load
       dtlv -d /data/companydb -f ~/sales-data load new-sales
       dtlv -d /data/companydb -f ~/sales-data -g load")
 
@@ -405,6 +407,10 @@
   If `all?` is true, will dump raw data of all the key-value sub-databases,
   unless `datalog?` is true.
 
+  If no mode or sub-database is specified, dump mode is auto-detected. Datalog
+  databases are dumped as Datalog data plus user key-value sub-databases; pure
+  key-value databases are dumped as raw key-value data.
+
   If `nippy?` is true, dump is in nippy binary format, and `dest-file` must be
   given.
 
@@ -433,14 +439,14 @@
          (seq dbis) (let [lmdb (l/open-kv src-dir)]
                       (doseq [dbi dbis] (l/dump-dbi lmdb dbi d))
                       (if/close-kv lmdb))
-         :else      (binding [*out* o] (println dump-help))))
+         :else      (dump/dump-auto src-dir d)))
      (when w (.flush w) (.close w))
      (when d (.flush d) (.close d)))))
 
-(defn- dtlv-dump [{:keys [dir all file datalog list]} arguments]
+(defn- dtlv-dump [{:keys [dir all file datalog list nippy]} arguments]
   (assert dir (s/join \newline ["Missing data directory path." dump-help]))
   (try
-    (dump dir file arguments list datalog all)
+    (dump dir file arguments list datalog all nippy)
     (catch Throwable e
       (st/print-cause-trace e)
       (exit 1 (str "Dump error: " (.getMessage e)))))
@@ -450,8 +456,8 @@
   "Load content into the database at data directory path `dir`,
   from `src-file` if given, or from stdin.
 
-  If `datalog?` is true, the content are expected to be schema and datoms,
-  otherwise they are expected to be key-value data.
+  If `datalog?` is true, the content are expected to be schema and datoms.
+  If neither `datalog?` nor `dbi` is specified, the input format is auto-detected.
 
   If `nippy?` is true, load a nippy binary file, `src-file` must be given.
 
@@ -470,15 +476,17 @@
        dbi      (let [lmdb (l/open-kv dir)]
                   (l/load-dbi lmdb dbi in nippy?)
                   (if/close-kv lmdb))
-       :else    (let [lmdb (l/open-kv dir)]
-                  (l/load-all lmdb in nippy?)
-                  (if/close-kv lmdb)))
+       :else    (if nippy?
+                  (let [lmdb (l/open-kv dir)]
+                    (l/load-all lmdb in true)
+                    (if/close-kv lmdb))
+                  (dump/load-auto dir in {} {})))
      (when f (.close f)))))
 
-(defn- dtlv-load [{:keys [dir file datalog]} arguments]
+(defn- dtlv-load [{:keys [dir file datalog nippy]} arguments]
   (assert dir (s/join \newline ["Missing data directory path." load-help]))
   (try
-    (load dir file (first arguments) datalog)
+    (load dir file (first arguments) datalog nippy)
     (catch Throwable e
       (st/print-cause-trace e)
       (exit 1 (str "Load error: " (.getMessage e)))))

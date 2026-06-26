@@ -23,7 +23,7 @@
    [datalevin.interface
     :refer [close-kv list-dbis entries get-range open-dbi transact-kv clear-dbi
             env-dir copy open-transact-kv close-transact-kv abort-transact-kv
-            stat env-opts]])
+            stat env-opts dbi-opts]])
   (:import
    [datalevin.async IAsyncWork]
    [datalevin.cpp Util]
@@ -256,6 +256,15 @@
      (nippy/freeze-to-out! data-output (nippy-dbi lmdb dbi))
      (dump-dbi lmdb dbi))))
 
+(defn dump-dbi-section
+  [lmdb dbi]
+  (p/pprint {:datalevin.dump/section :kv
+             :dbi                    dbi
+             :entries                (entries lmdb dbi)
+             :opts                   (dbi-opts lmdb dbi)})
+  (doseq [[k v] (get-range lmdb dbi [:all] :raw :raw)]
+    (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))
+
 (defn dump-all
   ([lmdb]
    (dump-dbi lmdb c/kv-info)
@@ -270,6 +279,13 @@
 
 (defn- load-kv [dbi [k v]]
   (kv-tx :put dbi (b/decode-base64 k) (b/decode-base64 v) :raw :raw))
+
+(defn load-dbi-section
+  [lmdb {:keys [dbi entries opts]} read-form]
+  (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
+  (transact-kv lmdb (->> (repeatedly read-form)
+                         (take entries)
+                         (map #(load-kv dbi %)))))
 
 (defn load-dbi
   ([lmdb dbi in nippy?]
@@ -295,6 +311,8 @@
      (catch Exception e
        (u/raise "Error loading raw data: " (ex-message e) {})))))
 
+(declare load-all-forms)
+
 (defn load-all
   ([lmdb in nippy?]
    (if nippy?
@@ -305,26 +323,30 @@
   ([lmdb in]
    (try
      (with-open [^PushbackReader r in]
-       (let [read-form #(edn/read {:eof ::EOF} r)
-             load-dbi  (fn [[ms vs]]
-                         (doseq [{:keys [dbi]} (butlast ms)]
-                           (open-dbi lmdb dbi))
-                         (let [{:keys [dbi entries]} (last ms)]
-                           (open-dbi lmdb dbi)
-                           (->> vs
-                                (take entries)
-                                (map #(load-kv dbi %)))))]
-         (transact-kv lmdb (->> (repeatedly read-form)
-                                (take-while #(not= ::EOF %))
-                                (partition-by map?)
-                                (partition 2 2 nil)
-                                (mapcat load-dbi)))))
+       (let [read-form #(edn/read {:eof ::EOF} r)]
+         (load-all-forms lmdb (take-while #(not= ::EOF %)
+                                          (repeatedly read-form)))))
      (catch IOException e
        (u/raise "IO error while loading raw data: " (ex-message e) {}))
      (catch RuntimeException e
        (u/raise "Parse error while loading raw data: " (ex-message e) {}))
      (catch Exception e
        (u/raise "Error loading raw data: " (ex-message e) {})))))
+
+(defn load-all-forms
+  [lmdb forms]
+  (let [load-dbi (fn [[ms vs]]
+                   (doseq [{:keys [dbi opts]} (butlast ms)]
+                     (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi)))
+                   (let [{:keys [dbi entries opts]} (last ms)]
+                     (if opts (open-dbi lmdb dbi opts) (open-dbi lmdb dbi))
+                     (->> vs
+                          (take entries)
+                          (map #(load-kv dbi %)))))]
+    (transact-kv lmdb (->> forms
+                           (partition-by map?)
+                           (partition 2 2 nil)
+                           (mapcat load-dbi)))))
 
 (defn clear [lmdb]
   (doseq [dbi (set (list-dbis lmdb)) ] (clear-dbi lmdb dbi)))
