@@ -35,6 +35,8 @@
 - [Lib] Fuller Java, Python, JS API parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
+- Able to dump/load mixed KV and DL databases
+  [#348](https://github.com/datalevin/datalevin/issues/348).
 - [Search] Reduce heap pressure for large posting list
   [#356](https://github.com/datalevin/datalevin/issues/356).
 - update deps.
