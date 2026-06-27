@@ -493,12 +493,12 @@ public final class DatalevinInterop {
      * milliseconds.
      */
     public static Object keyValueWithTransaction(Object kv,
-                                                 long timeoutMs,
+                                                 Long timeoutMs,
                                                  Function<Object, Object> fn) {
         Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
         return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-kv-fn",
                                                              rawResource(kv),
-                                                             Long.valueOf(timeoutMs),
+                                                             timeoutMs,
                                                              wrapped));
     }
 
@@ -517,12 +517,12 @@ public final class DatalevinInterop {
      * in milliseconds.
      */
     public static Object connectionWithTransaction(Object conn,
-                                                   long timeoutMs,
+                                                   Long timeoutMs,
                                                    Function<Object, Object> fn) {
         Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
         return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-fn",
                                                              rawResource(conn),
-                                                             Long.valueOf(timeoutMs),
+                                                             timeoutMs,
                                                              wrapped));
     }
 

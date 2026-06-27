@@ -205,6 +205,60 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- follower-read-node
+  [test]
+  (let [cluster-id  (:datalevin/cluster-id test)
+        leader      (:leader (local/wait-for-single-leader! cluster-id))
+        live-nodes  (-> (local/cluster-state cluster-id) :live-nodes sort vec)
+        followers   (->> live-nodes
+                         (remove #{leader})
+                         (filter (fn [logical-node]
+                                   (= :follower
+                                      (:ha-role
+                                       (local/node-diagnostics cluster-id
+                                                               logical-node)))))
+                         vec)]
+    (or (when (seq followers)
+          (rand-nth followers))
+        leader)))
+
+(defn- complete-op
+  [op result]
+  (cond
+    (= ::cas-failed result)
+    (assoc op
+           :type :fail
+           :error :cas-failed)
+
+    (= ::unsupported result)
+    (assoc op
+           :type :fail
+           :error [:unsupported-client-op (:f op)])
+
+    :else
+    (assoc op
+           :type :ok
+           :value result)))
+
+(defn- execute-read-op!
+  [test op]
+  (let [read-node (follower-read-node test)]
+    (local/with-node-conn
+      test
+      read-node
+      schema
+      (fn [conn]
+        (assoc (complete-op op (execute-op! conn op))
+               :datalevin/read-node read-node)))))
+
+(defn- execute-leader-op!
+  [test op]
+  (local/with-leader-conn
+    test
+    schema
+    (fn [conn]
+      (complete-op op (execute-op! conn op)))))
+
 (defn- register-checker
   []
   (independent/checker
@@ -251,26 +305,9 @@
   (invoke! [this test op]
     (try
       (ensure-registers-initialized! test key-count)
-      (local/with-leader-conn
-        test
-        schema
-        (fn [conn]
-          (let [result (execute-op! conn op)]
-            (cond
-              (= ::cas-failed result)
-              (assoc op
-                     :type :fail
-                     :error :cas-failed)
-
-              (= ::unsupported result)
-              (assoc op
-                     :type :fail
-                     :error [:unsupported-client-op (:f op)])
-
-              :else
-              (assoc op
-                     :type :ok
-                     :value result)))))
+      (if (= :read (:f op))
+        (execute-read-op! test op)
+        (execute-leader-op! test op))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 

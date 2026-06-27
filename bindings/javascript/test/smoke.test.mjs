@@ -50,6 +50,10 @@ function intValue(value) {
   return typeof value === "bigint" ? Number(value) : value;
 }
 
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 after(() => {
   if (jvmStarted()) {
     setImmediate(() => process.exit(process.exitCode ?? 0));
@@ -524,6 +528,26 @@ test(
           ignoreKey: true
         });
       }), "gamma-2");
+      await assert.rejects(
+        () => kv.withTransaction(async (txKv) => {
+          await txKv.transact([[":put", "timeout", "discard"]], {
+            dbiName: "items",
+            kType: ":string",
+            vType: ":string"
+          });
+          await sleep(100);
+        }, { timeoutMs: 10 }),
+        (error) => {
+          assert.equal(error instanceof DatalevinError, true);
+          assert.equal(error.typeName, "transaction/timeout");
+          return true;
+        }
+      );
+      assert.equal(await kv.getValue("items", "timeout", {
+        kType: ":string",
+        vType: ":string",
+        ignoreKey: true
+      }), null);
       const explicitTx = await kv.beginTransaction();
       assert.equal(explicitTx instanceof KVTransaction, true);
       assert.equal(explicitTx.active(), true);

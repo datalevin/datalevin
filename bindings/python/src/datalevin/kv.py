@@ -9,6 +9,8 @@ from ._interop import _BINDINGS
 from ._java import call_java, classes
 from ._resource import ResourceWrapper
 
+_TIMEOUT_MISSING = object()
+
 
 def _slice_page(items, limit=None, offset=None):
     start = 0 if offset is None else max(offset, 0)
@@ -235,7 +237,9 @@ class KV(ResourceWrapper):
     def transaction(self):
         return self.begin_transaction()
 
-    def with_transaction(self, fn, timeout_ms=None):
+    def with_transaction(self, fn, timeout_ms=_TIMEOUT_MISSING):
+        if timeout_ms is _TIMEOUT_MISSING:
+            return to_python(_BINDINGS.key_value_with_transaction(self.raw_handle(), fn))
         return to_python(_BINDINGS.key_value_with_transaction(self.raw_handle(), fn, timeout_ms))
 
     def search_index_writer(self, opts=None):

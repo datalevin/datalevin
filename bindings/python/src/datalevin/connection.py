@@ -12,6 +12,8 @@ from ._interop import _BINDINGS
 from ._java import call_java, classes
 from ._resource import ResourceWrapper
 
+_TIMEOUT_MISSING = object()
+
 
 def _edn_form(value):
     if isinstance(value, str):
@@ -105,7 +107,9 @@ class Connection(ResourceWrapper):
     def clear(self) -> None:
         _BINDINGS.core_invoke("clear", [self.raw_handle()])
 
-    def with_transaction(self, fn, timeout_ms=None):
+    def with_transaction(self, fn, timeout_ms=_TIMEOUT_MISSING):
+        if timeout_ms is _TIMEOUT_MISSING:
+            return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn))
         return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn, timeout_ms))
 
     def entid(self, eid):

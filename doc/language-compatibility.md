@@ -23,6 +23,7 @@ Status key:
 | Simulated transaction report from tx data | Yes | Yes | Yes | Yes |
 | Transaction listeners: `listen!` / `unlisten!` | Yes | Yes | Yes | Yes |
 | Datalog transaction callback | Yes, `with-transaction` | Yes, `withTransaction` | Yes, `with_transaction` | No |
+| Datalog transaction callback timeout | Yes | Yes | Yes | N/A |
 | Transaction entity maps/forms | Yes | Yes, maps and `Tx` builders | Yes, dictionaries/lists and helpers | Yes, objects/arrays and helpers |
 | Transactable existing entity objects | Yes | No | No | No |
 | Lazy entity reads | Yes | Yes | Yes | Yes |
@@ -72,6 +73,7 @@ Direct DB snapshot access remains an interop/compatibility detail.
 | Stats, copy, sync | Yes | Yes | Yes | Yes |
 | Runtime env flag read/mutation | Yes | Yes | Yes | Yes |
 | KV transaction callback | Yes, `with-transaction-kv` | Yes, `withTransaction` | Yes, `with_transaction` | Yes, `withTransaction` |
+| KV transaction callback timeout | Yes | Yes | Yes | Yes |
 | Explicit KV begin/commit/abort | Partial, lower-level storage primitives | Yes, `KVTransaction` | Yes, `KVTransaction` | Yes, `KVTransaction` |
 | KV re-index | Yes | Yes | Yes | Yes |
 
@@ -87,6 +89,7 @@ outlive the callback.
 | --- | --- | --- | --- | --- |
 | Copy/backup | Yes | Yes | Yes | Yes |
 | Sync | Yes | Yes | Yes | Yes |
+| Default explicit transaction timeout getter/setter | Yes | Yes | Yes | Yes |
 | Snapshot creation/listing | Yes | Yes | Yes | Yes |
 | Tx log watermarks | Yes | Yes | Yes | Yes |
 | Tx log GC | Yes | Yes | Yes | Yes |

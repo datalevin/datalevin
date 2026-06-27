@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from ._interop import _BINDINGS
 
+_MISSING = object()
+
 
 class RawInterop:
     """Expose raw `DatalevinInterop` operations for advanced callers."""
@@ -104,7 +106,9 @@ class RawInterop:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
 
-    def connection_with_transaction(self, handle, fn, timeout_ms=None):
+    def connection_with_transaction(self, handle, fn, timeout_ms=_MISSING):
+        if timeout_ms is _MISSING:
+            return _BINDINGS.connection_with_transaction(handle, fn)
         return _BINDINGS.connection_with_transaction(handle, fn, timeout_ms)
 
     def connection_re_index(self, handle, schema=None, opts=None):
@@ -128,7 +132,9 @@ class RawInterop:
     def key_value_abort_transaction(self, tx):
         return _BINDINGS.key_value_abort_transaction(tx)
 
-    def key_value_with_transaction(self, handle, fn, timeout_ms=None):
+    def key_value_with_transaction(self, handle, fn, timeout_ms=_MISSING):
+        if timeout_ms is _MISSING:
+            return _BINDINGS.key_value_with_transaction(handle, fn)
         return _BINDINGS.key_value_with_transaction(handle, fn, timeout_ms)
 
     def key_value_re_index(self, handle, opts=None):
@@ -182,8 +188,8 @@ class RawInterop:
     def write_edn(self, value):
         return _BINDINGS.write_edn(value)
 
-    def explicit_transaction_timeout(self, timeout_ms=None):
-        args = [] if timeout_ms is None else [timeout_ms]
+    def explicit_transaction_timeout(self, timeout_ms=_MISSING):
+        args = [] if timeout_ms is _MISSING else [timeout_ms]
         return _BINDINGS.core_invoke("explicit-transaction-timeout", args)
 
     def set_explicit_transaction_timeout(self, timeout_ms):

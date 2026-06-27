@@ -99,6 +99,16 @@ public class KV extends HandleResource {
      */
     @SuppressWarnings("unchecked")
     public <T> T withTransaction(long timeoutMs, Function<KV, T> fn) {
+        return withTransaction(Long.valueOf(timeoutMs), fn);
+    }
+
+    /**
+     * Runs {@code fn} inside a single KV write transaction with an optional
+     * timeout in milliseconds. {@code null} disables the default timeout for
+     * this call.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(Long timeoutMs, Function<KV, T> fn) {
         Objects.requireNonNull(fn, "fn");
         Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
         return (T) ClojureRuntime.core("with-transaction-kv-fn",

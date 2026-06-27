@@ -96,7 +96,14 @@ async function resolveExplicitTransactionTimeout(option) {
   if (option !== NO_TIMEOUT_OPTION) {
     return option;
   }
-  return toJsResult(await _BINDINGS.coreInvoke("explicit-transaction-timeout", []));
+  try {
+    return toJsResult(await _BINDINGS.coreInvoke("explicit-transaction-timeout", []));
+  } catch (error) {
+    if (/unbound fn: #'datalevin\.core\/explicit-transaction-timeout/.test(String(error?.message))) {
+      return null;
+    }
+    throw error;
+  }
 }
 
 function transactionTimeoutError(timeoutMs) {

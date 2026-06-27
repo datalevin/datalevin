@@ -341,6 +341,16 @@ public final class Datalevin {
     }
 
     /**
+     * Runs {@code fn} inside a single KV write transaction with an optional
+     * timeout in milliseconds. {@code null} disables the default timeout for
+     * this call.
+     */
+    public static <T> T withTransaction(KV kv, Long timeoutMs, Function<KV, T> fn) {
+        Objects.requireNonNull(kv, "kv");
+        return kv.withTransaction(timeoutMs, fn);
+    }
+
+    /**
      * Sets or clears LMDB environment flags for a KV store.
      */
     public static void setEnvFlags(KV kv, Collection<?> flags, boolean onOff) {
@@ -370,6 +380,18 @@ public final class Datalevin {
      */
     public static <T> T withTransaction(Connection conn,
                                         long timeoutMs,
+                                        Function<Connection, T> fn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.withTransaction(timeoutMs, fn);
+    }
+
+    /**
+     * Runs {@code fn} inside a single Datalog write transaction with an
+     * optional timeout in milliseconds. {@code null} disables the default
+     * timeout for this call.
+     */
+    public static <T> T withTransaction(Connection conn,
+                                        Long timeoutMs,
                                         Function<Connection, T> fn) {
         Objects.requireNonNull(conn, "conn");
         return conn.withTransaction(timeoutMs, fn);

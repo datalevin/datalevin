@@ -11,6 +11,14 @@ from ._java import call_java, classes
 from ._jvm import jvm_started, start_jvm
 from .errors import DatalevinError
 
+_TIMEOUT_MISSING = object()
+
+
+def _timeout_arg(timeout_ms):
+    if timeout_ms is None:
+        return None
+    return jpype.JLong(timeout_ms)
+
 
 class InteropBindings:
     """Thin wrapper around the Datalevin JVM bridge."""
@@ -177,15 +185,15 @@ class InteropBindings:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return call_java(classes().interop.connectionGcTxLogSegments, handle, retain_floor_lsn)
 
-    def connection_with_transaction(self, handle, fn, timeout_ms=None):
+    def connection_with_transaction(self, handle, fn, timeout_ms=_TIMEOUT_MISSING):
         from .connection import Connection
 
         proxy = jpype.JProxy(
             classes().function_type,
             inst=_PythonFunction(lambda tx: fn(Connection(tx, owned=False))),
         )
-        if timeout_ms is not None:
-            return call_java(classes().interop.connectionWithTransaction, handle, int(timeout_ms), proxy)
+        if timeout_ms is not _TIMEOUT_MISSING:
+            return call_java(classes().interop.connectionWithTransaction, handle, _timeout_arg(timeout_ms), proxy)
         return call_java(classes().interop.connectionWithTransaction, handle, proxy)
 
     def connection_re_index(self, handle, schema=None, opts=None):
@@ -209,15 +217,15 @@ class InteropBindings:
     def key_value_abort_transaction(self, tx):
         return call_java(classes().interop.keyValueAbortTransaction, tx)
 
-    def key_value_with_transaction(self, handle, fn, timeout_ms=None):
+    def key_value_with_transaction(self, handle, fn, timeout_ms=_TIMEOUT_MISSING):
         from .kv import KV
 
         proxy = jpype.JProxy(
             classes().function_type,
             inst=_PythonFunction(lambda tx: fn(KV(tx, owned=False))),
         )
-        if timeout_ms is not None:
-            return call_java(classes().interop.keyValueWithTransaction, handle, int(timeout_ms), proxy)
+        if timeout_ms is not _TIMEOUT_MISSING:
+            return call_java(classes().interop.keyValueWithTransaction, handle, _timeout_arg(timeout_ms), proxy)
         return call_java(classes().interop.keyValueWithTransaction, handle, proxy)
 
     def key_value_re_index(self, handle, opts=None):
@@ -1056,9 +1064,11 @@ def re_index(target, opts=None, *, schema=None):
     return target.re_index(opts, schema=schema) if schema is not None else target.re_index(opts)
 
 
-def with_transaction(target, fn, timeout_ms=None):
+def with_transaction(target, fn, timeout_ms=_MISSING):
     """Run a callback inside a KV or Datalog write transaction."""
 
+    if timeout_ms is _MISSING:
+        return target.with_transaction(fn)
     return target.with_transaction(fn, timeout_ms=timeout_ms)
 
 

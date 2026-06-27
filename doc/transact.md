@@ -154,6 +154,13 @@ The default timeout is unset. It can be changed with
 the transaction when control returns to the macro. Code that ignores
 interruption can still run until it returns.
 
+Java exposes `withTransaction(timeoutMs, fn)` and
+`setExplicitTransactionTimeout(...)`; Python exposes
+`with_transaction(fn, timeout_ms=...)` and `set_explicit_transaction_timeout`;
+JavaScript exposes KV `withTransaction(fn, { timeoutMs })` and
+`setExplicitTransactionTimeout`. JavaScript Datalog transaction callbacks remain
+unsupported because the Node JVM bridge can deadlock on callback re-entry.
+
 Datalog functions such as `transact!` use `with-transaction` internally.
 
 ## Transaction Functions in Datalog Store
