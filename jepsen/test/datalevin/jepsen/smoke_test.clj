@@ -160,6 +160,12 @@
            :nodes ["n1" "n2" "n3"]}
     :schema register/schema
     :final-generator? true}
+   {:label :register-follower-reads
+    :builder register/follower-read-workload
+    :opts {:key-count 4
+           :nodes ["n1" "n2" "n3"]}
+    :schema register/schema
+    :final-generator? true}
    {:label :tx-fn-register
     :builder tx-fn-register/workload
     :opts {:key-count 4
@@ -342,6 +348,18 @@
     :opts {:db-name "smoke"
            :control-backend :sofa-jraft
            :workload :register
+           :rate 10
+           :time-limit 5
+           :key-count 4
+           :nodes ["n1" "n2" "n3"]
+           :nemesis []}
+    :expected {:nodes ["n1" "n2" "n3"]
+               :control-backend :sofa-jraft
+               :nemesis-faults []}}
+   {:label :register-follower-reads
+    :opts {:db-name "smoke"
+           :control-backend :sofa-jraft
+           :workload :register-follower-reads
            :rate 10
            :time-limit 5
            :key-count 4

@@ -240,7 +240,7 @@
            :type :ok
            :value result)))
 
-(defn- execute-read-op!
+(defn- execute-follower-read-op!
   [test op]
   (let [read-node (follower-read-node test)]
     (local/with-node-conn
@@ -305,8 +305,30 @@
   (invoke! [this test op]
     (try
       (ensure-registers-initialized! test key-count)
+      (execute-leader-op! test op)
+      (catch Throwable e
+        (workload.util/assoc-exception-op op e (op-error e)))))
+
+  (teardown! [this _test]
+    this)
+
+  (close! [_this _test]
+    nil))
+
+(defrecord FollowerReadClient [node key-count]
+  client/Client
+  (open! [this _test node]
+    (assoc this :node node))
+
+  (setup! [this test]
+    (ensure-registers-initialized! test key-count)
+    this)
+
+  (invoke! [this test op]
+    (try
+      (ensure-registers-initialized! test key-count)
       (if (= :read (:f op))
-        (execute-read-op! test op)
+        (execute-follower-read-op! test op)
         (execute-leader-op! test op))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
@@ -317,15 +339,23 @@
   (close! [_this _test]
     nil))
 
-(defn workload
-  [opts]
+(defn- build-workload
+  [opts client-factory]
   (let [key-count (long (:key-count opts 8))
         worker-count (long (or (:concurrency opts)
                                (count (or (seq (:nodes opts))
                                           local/default-nodes))))
         per-key-limit (long (or (:max-writes-per-key opts) 32))]
-    {:client (->Client nil key-count)
+    {:client (client-factory key-count)
      :generator (register-generator key-count worker-count per-key-limit)
      :final-generator (final-read-generator key-count)
      :checker (register-checker)
      :schema schema}))
+
+(defn workload
+  [opts]
+  (build-workload opts #(->Client nil %)))
+
+(defn follower-read-workload
+  [opts]
+  (build-workload opts #(->FollowerReadClient nil %)))

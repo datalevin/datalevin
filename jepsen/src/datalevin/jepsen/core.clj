@@ -58,6 +58,7 @@
    :snapshot-db-identity-rejoin degraded-rejoin/db-identity-workload
    :snapshot-manifest-corruption-rejoin degraded-rejoin/manifest-corruption-workload
    :register register/workload
+   :register-follower-reads register/follower-read-workload
    :udf-readiness udf-readiness/workload
    :witness-topology witness-topology/workload
    :tx-fn-register tx-fn-register/workload})
