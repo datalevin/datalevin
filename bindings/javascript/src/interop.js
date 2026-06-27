@@ -1458,6 +1458,9 @@ export function idocAttr({ format = null, domain = null, extra = null, ...schema
 
 export function searchOptions({
   top = null,
+  limit = null,
+  offset = null,
+  pagingCachePages = null,
   display = null,
   domains = null,
   proximityExpansion = null,
@@ -1468,6 +1471,15 @@ export function searchOptions({
   const opts = {};
   if (top !== null && top !== undefined) {
     opts[":top"] = top;
+  }
+  if (limit !== null && limit !== undefined) {
+    opts[":limit"] = limit;
+  }
+  if (offset !== null && offset !== undefined) {
+    opts[":offset"] = offset;
+  }
+  if (pagingCachePages !== null && pagingCachePages !== undefined) {
+    opts[":paging-cache-pages"] = pagingCachePages;
   }
   if (display !== null && display !== undefined) {
     opts[":display"] = keywordValue(display);

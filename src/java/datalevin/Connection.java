@@ -861,6 +861,20 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Returns datoms found by the fulltext query using typed Datalevin fulltext
+     * options.
+     */
+    public List<?> fulltextDatoms(String query, RetrievalOptions opts) {
+        if (opts == null) {
+            return fulltextDatoms(query);
+        }
+        return ResultSupport.sequence(ClojureRuntime.core("fulltext-datoms",
+                                                          db(),
+                                                          query,
+                                                          opts.buildForm()));
+    }
+
+    /**
      * Copies the Datalog database to {@code dest}.
      */
     public void copy(String dest) {

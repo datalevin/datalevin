@@ -37,6 +37,28 @@ function fetchLimit(limit, offset = 0) {
   return Math.max(limit, 0) + Math.max(offset ?? 0, 0);
 }
 
+function fulltextOpts(opts = null, { limit = null, offset = 0, pagingCachePages = null } = {}) {
+  const mapOpts = opts instanceof Map;
+  const merged = mapOpts ? new Map(opts) : (hasValue(opts) ? { ...opts } : {});
+  const put = (key, value) => {
+    if (mapOpts) {
+      merged.set(key, value);
+    } else {
+      merged[key] = value;
+    }
+  };
+  if (hasValue(limit)) {
+    put(":limit", Math.max(limit, 0));
+  }
+  if (offset) {
+    put(":offset", Math.max(offset, 0));
+  }
+  if (hasValue(pagingCachePages)) {
+    put(":paging-cache-pages", pagingCachePages);
+  }
+  return (mapOpts ? merged.size === 0 : Object.keys(merged).length === 0) ? null : merged;
+}
+
 let listenerProxyEventLoopDepth = 0;
 let listenerProxyEventLoopPrevious = false;
 
@@ -358,15 +380,15 @@ export class Connection extends ResourceWrapper {
     return sliceRows(rows, { limit, offset });
   }
 
-  async fulltextDatoms(query, { opts = null, limit = null, offset = 0 } = {}) {
-    const result = hasValue(opts)
-      ? await callJavaMethod(this.rawHandle(), "fulltextDatoms", query, await toJava(opts))
+  async fulltextDatoms(query, { opts = null, limit = null, offset = 0, pagingCachePages = null } = {}) {
+    const searchOpts = fulltextOpts(opts, { limit, offset, pagingCachePages });
+    const result = hasValue(searchOpts)
+      ? await callJavaMethod(this.rawHandle(), "fulltextDatoms", query, await toJava(searchOpts))
       : await callJavaMethod(this.rawHandle(), "fulltextDatoms", query);
-    const rows = await toJsResult(
+    return toJsResult(
       result,
       { bridge: true }
     );
-    return sliceRows(rows, { limit, offset });
   }
 
   async copy(dest, { compact = null } = {}) {

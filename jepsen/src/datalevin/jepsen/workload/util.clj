@@ -279,11 +279,9 @@
                                      sample-keys)}]
          (cond-> (merge result failure-summary)
            only-ignorable?
-           (assoc :valid? true
-                  :base-valid? (:valid? result)
+           (assoc :base-valid? (:valid? result)
                   :adjusted-valid? :ignorable-empty-graph)
 
            only-disruption?
-           (assoc :valid? true
-                  :base-valid? (:valid? result)
+           (assoc :base-valid? (:valid? result)
                   :adjusted-valid? :disruption-only-empty-graph)))))))

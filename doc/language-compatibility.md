@@ -103,6 +103,7 @@ outlive the callback.
 | Capability | Clojure | Java | Python | JavaScript |
 | --- | --- | --- | --- | --- |
 | Full-text search through Datalog schema/options | Yes | Yes | Yes | Yes |
+| Full-text search pagination: `:limit`, `:offset`, `:paging-cache-pages` | Yes | Yes | Yes | Yes |
 | Full-text custom analyzer/query analyzer through Datalog search-domain UDFs | Yes | Yes | Yes | Yes |
 | Vector search through Datalog schema/options | Yes | Yes | Yes | Yes |
 | Idoc schema/options | Yes | Yes | Yes | Yes |

@@ -863,6 +863,9 @@ def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
 def search_options(
     *,
     top=None,
+    limit=None,
+    offset=None,
+    paging_cache_pages=None,
     display=None,
     domains=None,
     proximity_expansion=None,
@@ -875,6 +878,12 @@ def search_options(
     opts = {}
     if top is not None:
         opts[":top"] = top
+    if limit is not None:
+        opts[":limit"] = limit
+    if offset is not None:
+        opts[":offset"] = offset
+    if paging_cache_pages is not None:
+        opts[":paging-cache-pages"] = paging_cache_pages
     if display is not None:
         opts[":display"] = _keyword_value(display)
     if domains is not None:

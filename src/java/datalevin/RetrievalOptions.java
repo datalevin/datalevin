@@ -61,6 +61,30 @@ public final class RetrievalOptions {
     }
 
     /**
+     * Sets {@code :limit}.
+     */
+    public RetrievalOptions limit(long limit) {
+        props.put(Datalevin.kw("limit"), limit);
+        return this;
+    }
+
+    /**
+     * Sets {@code :offset}.
+     */
+    public RetrievalOptions offset(long offset) {
+        props.put(Datalevin.kw("offset"), offset);
+        return this;
+    }
+
+    /**
+     * Sets {@code :paging-cache-pages}.
+     */
+    public RetrievalOptions pagingCachePages(long pages) {
+        props.put(Datalevin.kw("paging-cache-pages"), pages);
+        return this;
+    }
+
+    /**
      * Sets {@code :display}.
      */
     public RetrievalOptions display(String display) {

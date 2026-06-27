@@ -34,6 +34,17 @@ def _fetch_limit(limit, offset=0):
     return max(limit, 0) + max(offset or 0, 0)
 
 
+def _fulltext_opts(opts=None, limit=None, offset=0, paging_cache_pages=None):
+    merged = dict(opts or {})
+    if limit is not None:
+        merged[":limit"] = max(limit, 0)
+    if offset:
+        merged[":offset"] = max(offset, 0)
+    if paging_cache_pages is not None:
+        merged[":paging-cache-pages"] = paging_cache_pages
+    return merged or None
+
+
 def _python_future(java_future):
     future = Future()
 
@@ -242,9 +253,14 @@ class Connection(ResourceWrapper):
         rows = to_python(_BINDINGS.connection_index_range(self.raw_handle(), attr, start, end))
         return _slice_rows(rows, limit, offset)
 
-    def fulltext_datoms(self, query, opts=None, limit=None, offset=0):
-        rows = to_python(_BINDINGS.connection_fulltext_datoms(self.raw_handle(), query, opts))
-        return _slice_rows(rows, limit, offset)
+    def fulltext_datoms(self, query, opts=None, limit=None, offset=0, paging_cache_pages=None):
+        return to_python(
+            _BINDINGS.connection_fulltext_datoms(
+                self.raw_handle(),
+                query,
+                _fulltext_opts(opts, limit, offset, paging_cache_pages),
+            )
+        )
 
     def copy(self, dest, compact=None) -> None:
         _BINDINGS.connection_copy(self.raw_handle(), dest, compact)

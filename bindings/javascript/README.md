@@ -317,7 +317,7 @@ console.log(await conn.seekDatoms(":ave", { c1: ":name", c2: "Ada", limit: 5 }))
 console.log(await conn.rseekDatoms(":ave", { c1: ":name", c2: "Bob", limit: 5 }));
 console.log(await conn.indexRange(":name", "A", "C"));
 console.log(await conn.countDatoms({ attr: ":name", value: "Ada" }));
-console.log(await conn.fulltextDatoms("database", { opts: { ":top": 5 } }));
+console.log(await conn.fulltextDatoms("database", { opts: searchOptions({ limit: 5, offset: 10 }) }));
 console.log(await conn.datalogIndexCacheLimit());
 await conn.datalogIndexCacheLimit(1024);
 console.log(await conn.txDataToSimulatedReport([{ ":db/id": -1, ":name": "Dry Run" }]));

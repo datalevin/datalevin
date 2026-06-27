@@ -733,8 +733,9 @@
                                :start-time "20260329T2215"}
                               (history/history history)
                               nil)]
-    (is (true? (:valid? result))
+    (is (= :unknown (:valid? result))
         (pr-str result))
+    (is (= :unknown (:base-valid? result)))
     (is (= :ignorable-empty-graph
            (:adjusted-valid? result)))))
 

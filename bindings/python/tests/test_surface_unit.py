@@ -468,8 +468,18 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         ":db/idocFormat": ":json",
         ":db/domain": "profiles",
     }
-    assert interop_module.search_options(top=5, display="refs+scores", domains=["docs"]) == {
+    assert interop_module.search_options(
+        top=5,
+        limit=2,
+        offset=4,
+        paging_cache_pages=3,
+        display="refs+scores",
+        domains=["docs"],
+    ) == {
         ":top": 5,
+        ":limit": 2,
+        ":offset": 4,
+        ":paging-cache-pages": 3,
         ":display": ":refs+scores",
         ":domains": ["docs"],
     }

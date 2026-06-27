@@ -73,8 +73,18 @@ test("public surface stays importable without starting the JVM", () => {
     ":db/idocFormat": ":json",
     ":db/domain": "profiles"
   });
-  assert.deepEqual(datalevin.searchOptions({ top: 5, display: "refs+scores", domains: ["docs"] }), {
+  assert.deepEqual(datalevin.searchOptions({
+    top: 5,
+    limit: 2,
+    offset: 4,
+    pagingCachePages: 3,
+    display: "refs+scores",
+    domains: ["docs"]
+  }), {
     ":top": 5,
+    ":limit": 2,
+    ":offset": 4,
+    ":paging-cache-pages": 3,
     ":display": ":refs+scores",
     ":domains": ["docs"]
   });

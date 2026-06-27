@@ -257,6 +257,56 @@
                   :value [[:r 3 nil]
                           [:append 2 1]]})))))
 
+(defn- empty-transaction-graph-checker
+  []
+  (reify checker/Checker
+    (check [_ _test _history _opts]
+      {:valid? :unknown
+       :anomalies {:empty-transaction-graph true}})))
+
+(deftest wrap-empty-graph-checker-preserves-unknown-for-ignorable-history-test
+  (let [wrapped (workload.util/wrap-empty-graph-checker
+                 (empty-transaction-graph-checker)
+                 (fn [op]
+                   (= :txn (:f op)))
+                 [:f :error]
+                 workload.util/append-graph-ignorable-micro-op-txn?)
+        result  (checker/check
+                 wrapped
+                 {}
+                 (history/history
+                  [{:type :ok
+                    :f :txn
+                    :value [[:r 1 []]]}])
+                 nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :unknown (:base-valid? result)))
+    (is (= :ignorable-empty-graph (:adjusted-valid? result)))))
+
+(deftest wrap-empty-graph-checker-preserves-unknown-for-disruption-only-history-test
+  (let [wrapped (workload.util/wrap-empty-graph-checker
+                 (empty-transaction-graph-checker)
+                 (fn [op]
+                   (= :txn (:f op)))
+                 [:f :error])
+        result  (checker/check
+                 wrapped
+                 {:datalevin/nemesis-faults [:node-kill]}
+                 (history/history
+                  [{:type :fail
+                    :f :txn
+                    :error "Timeout in making request"
+                    :value [[:append 1 1]
+                            [:r 1 []]]}])
+                 nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :unknown (:base-valid? result)))
+    (is (= :disruption-only-empty-graph (:adjusted-valid? result)))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= [{:f :txn
+             :error "Timeout in making request"}]
+           (:disruption-failure-samples result)))))
+
 (defn- exact-state-checker-result
   [checker-f expected-value-f op]
   (checker/check
