@@ -1668,13 +1668,56 @@
         (is (= :ok (:type probe-op)))
         (is (map? (:value probe-op)))
         (is (= 3 (count (get-in probe-op [:value :nodes]))))
+        (is (= 3 (count (get-in probe-op [:value :writes]))))
         (is (<= (count (filter (fn [[_ {:keys [status]}]]
                                  (= :admitted status))
                                (get-in probe-op [:value :nodes])))
-                1)))
+                1))
+        (let [written   (->> (get-in probe-op [:value :writes])
+                             (keep (fn [[node {:keys [status]}]]
+                                     (when (= :written status)
+                                       node)))
+                             sort
+                             vec)
+              survivors (get-in probe-op [:value :survivors :nodes])]
+          (is (= :ok (get-in probe-op [:value :survivors :status]))
+              (pr-str probe-op))
+          (is (= 1 (count written)) (pr-str probe-op))
+          (is (= written survivors) (pr-str probe-op))))
       (finally
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
+
+(deftest fencing-checker-fails-on-write-based-split-brain-smoke-test
+  (let [checker (:checker (fencing/workload {}))
+        probe   {:probe-id "probe-1"
+                 :authoritative-leader "n1"
+                 :nodes {"n1" {:status :admitted}
+                         "n2" {:status :rejected}
+                         "n3" {:status :rejected}}
+                 :writes {"n1" {:status :written}
+                          "n2" {:status :written}
+                          "n3" {:status :rejected}}
+                 :survivors {:status :ok
+                             :nodes ["n1" "n2"]
+                             :rows [{:id "probe-1/n1"
+                                     :node "n1"
+                                     :value 1}
+                                    {:id "probe-1/n2"
+                                     :node "n2"
+                                     :value 2}]}}
+        result  (checker/check
+                 checker
+                 {}
+                 (history/history
+                  [{:type :ok
+                    :f :probe
+                    :value probe}])
+                 nil)]
+    (is (false? (:valid? result)) (pr-str result))
+    (is (= 1 (:write-split-brain-count result)))
+    (is (= 1 (:survivor-split-brain-count result)))
+    (is (zero? (:split-brain-count result)))))
 
 (deftest parse-nemesis-spec-smoke-test
   (is (= [:node-kill]
