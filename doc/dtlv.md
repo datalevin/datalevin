@@ -90,9 +90,10 @@ datalog-index-cache-limitdatom                 datom-a               datom-e
 datom-v               datom?                datoms                db
 db?                   del-list-items        dir                   doc-count
 doc-indexed?          drop-dbi              empty-db              entid
-entity                entity-db             entries               explain
-fill-db               fulltext-datoms       get-conn              get-first
-get-first-n           get-list              get-range             get-some
+entity                entity-db             entries               explicit-transaction-timeout
+explain               fill-db               fulltext-datoms       get-conn
+get-first             get-first-n           get-list              get-range
+get-some
 get-value             hexify-string         in-list?              index-range
 init-db               k                     key-range             key-range-count
 key-range-list-count  list-count            list-dbis             list-range
@@ -105,8 +106,9 @@ range-filter-count    range-keep            range-seq             range-some
 re-index              read-buffer           read-csv              remove-doc
 reset-conn!           resolve-tempid        retract               rseek-datoms
 schema                search                search-datoms         search-index-writer
-seek-datoms           stat                  sync                  tempid
-touch                 transact              transact!             transact-async
+seek-datoms           set-explicit-transaction-timeout!
+stat                  sync                  tempid                touch
+transact              transact!             transact-async
 transact-kv           transact-kv-async     tx-data->simulated-reportunhexify-string
 unlisten!             update-schema         v                     visit
 visit-key-range       visit-list            visit-list-range      with-conn

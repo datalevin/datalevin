@@ -138,6 +138,22 @@ client/server, or babashka pod. For usage examples, see tests in
 Rollback from within the transaction can be done with `abort-transact-kv` and
 `abort-transact`.
 
+Explicit transactions can be given a timeout:
+
+```clojure
+(d/with-transaction [conn1 conn {:timeout-ms 5000}]
+  ...)
+
+(d/with-transaction-kv [kv1 kv {:timeout-ms 5000}]
+  ...)
+```
+
+The default timeout is unset. It can be changed with
+`explicit-transaction-timeout` or `set-explicit-transaction-timeout!`; pass
+`nil` to disable it. The timeout interrupts the transaction thread and aborts
+the transaction when control returns to the macro. Code that ignores
+interruption can still run until it returns.
+
 Datalog functions such as `transact!` use `with-transaction` internally.
 
 ## Transaction Functions in Datalog Store

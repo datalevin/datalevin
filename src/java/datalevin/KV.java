@@ -94,6 +94,20 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Runs {@code fn} inside a single KV write transaction with a timeout in
+     * milliseconds.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(long timeoutMs, Function<KV, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return (T) ClojureRuntime.core("with-transaction-kv-fn",
+                                       resource(),
+                                       timeoutMs,
+                                       wrapped);
+    }
+
+    /**
      * Creates a full-text search engine over this KV store.
      */
     public SearchEngine newSearchEngine() {

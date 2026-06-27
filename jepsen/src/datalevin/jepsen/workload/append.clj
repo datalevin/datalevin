@@ -54,13 +54,14 @@
 
 (defn- execute-txn!
   [conn micro-ops]
-  (let [[_ realized] (simulate-txn @conn micro-ops)
-        tx-data      (->> micro-ops
-                          (filter append-op?)
-                          (mapv append-tx-datum))]
-    (when (seq tx-data)
-      (d/transact! conn tx-data))
-    realized))
+  (d/with-transaction [tx-conn conn]
+    (let [[_ realized] (simulate-txn @tx-conn micro-ops)
+          tx-data      (->> micro-ops
+                            (filter append-op?)
+                            (mapv append-tx-datum))]
+      (when (seq tx-data)
+        (d/transact! tx-conn tx-data))
+      realized)))
 
 (defrecord Client [node]
   client/Client

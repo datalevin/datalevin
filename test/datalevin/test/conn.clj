@@ -1288,6 +1288,51 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-with-transaction-kv-times-out
+  (let [dir (u/tmp-dir (str "with-tx-kv-timeout-test-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [db (d/open-kv dir {:wal? false})]
+        (try
+          (d/open-dbi db "a")
+          (is (thrown-with-msg?
+               Exception
+               #"Explicit transaction timed out"
+               (d/with-transaction-kv [tx db {:timeout-ms 50}]
+                 (d/transact-kv tx [[:put "a" :k :v]])
+                 (Thread/sleep 500))))
+          (is (nil? (d/get-value db "a" :k)))
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :after :ok]])))
+          (is (= :ok (d/get-value db "a" :after)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-explicit-transaction-timeout-default
+  (let [dir      (u/tmp-dir (str "explicit-tx-timeout-default-test-"
+                                 (UUID/randomUUID)))
+        previous (d/explicit-transaction-timeout)]
+    (try
+      (let [db (d/open-kv dir {:wal? false})]
+        (try
+          (d/open-dbi db "a")
+          (d/set-explicit-transaction-timeout! 50)
+          (is (= 50 (d/explicit-transaction-timeout)))
+          (is (thrown-with-msg?
+               Exception
+               #"Explicit transaction timed out"
+               (d/with-transaction-kv [tx db]
+                 (d/transact-kv tx [[:put "a" :k :v]])
+                 (Thread/sleep 500))))
+          (is (nil? (d/get-value db "a" :k)))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (d/set-explicit-transaction-timeout! previous)
+        (u/delete-files dir)))))
+
 (deftest test-with-transaction-kv-evaluates-db-once
   (let [dir (u/tmp-dir (str "with-tx-kv-eval-once-test-"
                             (UUID/randomUUID)))]
@@ -1324,6 +1369,33 @@
                (d/with-transaction [tx conn]
                  (d/transact! tx [{:db/id 1 :name "partial"}])
                  (throw (ex-info "boom" {})))))
+          (is (empty?
+               (d/q '[:find [?e ...]
+                      :where [?e :name "partial"]]
+                    @conn)))
+          (d/transact! conn [{:db/id 2 :name "after"}])
+          (is (= #{2}
+                 (set (d/q '[:find [?e ...]
+                             :where [?e :name "after"]]
+                           @conn))))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-with-transaction-times-out
+  (let [dir    (u/tmp-dir (str "with-tx-timeout-test-"
+                               (UUID/randomUUID)))
+        schema {:name {:db/valueType :db.type/string}}]
+    (try
+      (let [conn (d/create-conn dir schema {:wal? false})]
+        (try
+          (is (thrown-with-msg?
+               Exception
+               #"Explicit transaction timed out"
+               (d/with-transaction [tx conn {:timeout-ms 50}]
+                 (d/transact! tx [{:db/id 1 :name "partial"}])
+                 (Thread/sleep 500))))
           (is (empty?
                (d/q '[:find [?e ...]
                       :where [?e :name "partial"]]

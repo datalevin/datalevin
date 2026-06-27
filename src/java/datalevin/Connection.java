@@ -124,6 +124,20 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Runs {@code fn} inside a single Datalevin write transaction with a
+     * timeout in milliseconds.
+     */
+    @SuppressWarnings("unchecked")
+    public <T> T withTransaction(long timeoutMs, Function<Connection, T> fn) {
+        Objects.requireNonNull(fn, "fn");
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return (T) ClojureRuntime.core("with-transaction-fn",
+                                       resource(),
+                                       timeoutMs,
+                                       wrapped);
+    }
+
+    /**
      * Rebuilds this Datalog database index and returns this handle.
      */
     public Connection reIndex() {

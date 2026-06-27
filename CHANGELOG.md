@@ -9,6 +9,8 @@
 - [Lib] Release Datalevin server as a Java library
   `org.datalevin:datalevin-java-server` to Maven Central, for in-process
   server use.
+- [KV] `with-kv` for one-off txn in KV store
+  [#261](https://github.com/datalevin/datalevin/issues/261).
 
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable

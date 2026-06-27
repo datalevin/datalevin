@@ -261,6 +261,12 @@
 
   `body` should refer to `conn`.
 
+  The binding vector can include an optional opts map. `:timeout-ms` sets a
+  timeout for the user body in milliseconds. Nil disables the timeout. A timeout
+  interrupts the transaction thread and aborts the transaction when control
+  returns to the macro; non-interruptible user code can still run until it
+  returns.
+
   Example:
 
           (with-transaction [cn conn]
@@ -270,8 +276,11 @@
                   ^long now (q query @cn 1)]
               (transact! cn [{:db/id 1 :counter (inc now)}])
               (q query @cn 1))) "
-  [[conn orig-conn] & body]
-  `(let [orig-conn# ~orig-conn]
+  [[conn orig-conn opts] & body]
+  `(let [orig-conn#        ~orig-conn
+         tx-timeout-opt#   (l/explicit-transaction-timeout-option ~opts)
+         tx-timeout-ms#    (l/explicit-transaction-timeout-ms-from-option
+                            tx-timeout-opt#)]
      (locking orig-conn#
        (let [db#  ^DB (deref orig-conn#)
              s#   (.-store db#)
@@ -281,28 +290,58 @@
            (if (instance? DatalogStore s#)
              (locking (l/write-txn s#)
                (let [res#    (if (l/writing? s#)
-                               (let [~conn orig-conn#]
-                                 ~@body)
+                               (let [watchdog# (volatile! nil)]
+                                 (try
+                                   (vreset!
+                                    watchdog#
+                                    (l/start-explicit-transaction-watchdog!
+                                     tx-timeout-ms#))
+                                   (let [res# (let [~conn orig-conn#]
+                                                ~@body)]
+                                     (l/cancel-explicit-transaction-watchdog!
+                                      @watchdog#)
+                                     (l/assert-explicit-transaction-live!
+                                      @watchdog#)
+                                     res#)
+                                   (catch Throwable t#
+                                     (l/throw-explicit-transaction-failure!
+                                      @watchdog# t#))
+                                   (finally
+                                     (l/cancel-explicit-transaction-watchdog!
+                                      @watchdog#))))
                                (let [s1# (r/open-transact s#)
                                      w#  #(let [~conn
                                                 (atom (db/transfer db# s1#)
                                                       :meta (meta orig-conn#))]
-                                            ~@body)]
+                                            ~@body)
+                                     watchdog# (volatile! nil)]
                                  (try
+                                   (vreset!
+                                    watchdog#
+                                    (l/start-explicit-transaction-watchdog!
+                                     tx-timeout-ms#))
                                    (let [res# (u/repeat-try-catch
                                                ~c/+in-tx-overflow-times+
                                                l/resized? (w#))]
+                                     (l/cancel-explicit-transaction-watchdog!
+                                      @watchdog#)
+                                     (l/assert-explicit-transaction-live!
+                                      @watchdog#)
                                      (r/close-transact s#)
                                      res#)
                                    (catch Throwable t#
                                      (abort-open-datalog-transaction! s# t#)
-                                     (throw t#)))))
+                                     (l/throw-explicit-transaction-failure!
+                                      @watchdog# t#))
+                                   (finally
+                                     (l/cancel-explicit-transaction-watchdog!
+                                      @watchdog#)))))
                      new-db# (db/carry-runtime-opts (db/new-db s#) db#)]
                  (reset! orig-conn# new-db#)
                  res#))
              (let [kv#     (.-lmdb ^Store s#)
                    s1#     (volatile! nil)
-                   res1#   (l/with-transaction-kv [kv1# kv#]
+                   res1#   (l/with-transaction-kv [kv1# kv# tx-timeout-opt#]
                              (let [conn1# (atom (db/transfer
                                                   db# (s/transfer s# kv1#))
                                                 :meta (meta orig-conn#))

@@ -322,15 +322,39 @@ Only usable for debug output.
 (u/import-macro conn/with-conn)
 (u/import-macro conn/with-kv)
 
+(def ^{:arglists '([]
+                   [timeout-ms])
+       :doc      "Get or set the default timeout, in milliseconds, for explicit
+  transactions created by [[with-transaction]] and [[with-transaction-kv]].
+
+  Nil means no default timeout. A per-call `:timeout-ms` option in the macro
+  binding vector overrides this default."}
+  explicit-transaction-timeout
+  (fn
+    ([] (l/explicit-transaction-timeout))
+    ([timeout-ms] (l/set-explicit-transaction-timeout! timeout-ms))))
+
+(def ^{:arglists '([timeout-ms])
+       :doc      "Set the default timeout, in milliseconds, for explicit
+  transactions created by [[with-transaction]] and [[with-transaction-kv]].
+  Pass nil to disable the default timeout."}
+  set-explicit-transaction-timeout! l/set-explicit-transaction-timeout!)
+
 (defn ^:no-doc with-transaction-fn
-  [conn f]
-  (conn/with-transaction [tx-conn conn]
-    (.apply ^java.util.function.Function f tx-conn)))
+  ([conn f]
+   (conn/with-transaction [tx-conn conn]
+     (.apply ^java.util.function.Function f tx-conn)))
+  ([conn timeout-ms f]
+   (conn/with-transaction [tx-conn conn {:timeout-ms timeout-ms}]
+     (.apply ^java.util.function.Function f tx-conn))))
 
 (defn ^:no-doc with-transaction-kv-fn
-  [kv f]
-  (l/with-transaction-kv [tx-kv kv]
-    (.apply ^java.util.function.Function f tx-kv)))
+  ([kv f]
+   (l/with-transaction-kv [tx-kv kv]
+     (.apply ^java.util.function.Function f tx-kv)))
+  ([kv timeout-ms f]
+   (l/with-transaction-kv [tx-kv kv {:timeout-ms timeout-ms}]
+     (.apply ^java.util.function.Function f tx-kv))))
 
 (defn ^:no-doc begin-kv-transaction
   [kv]

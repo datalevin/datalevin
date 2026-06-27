@@ -8,8 +8,10 @@
    datalevin.interpret/inter-fn hooks.datalevin/inter-fn
    datalevin.interpret/definterfn hooks.datalevin/definterfn
    datalevin.conn/with-conn hooks.datalevin/with-binding
+   datalevin.conn/with-kv hooks.datalevin/with-binding
    datalevin.conn/with-transaction hooks.datalevin/with-binding
    datalevin.core/with-conn hooks.datalevin/with-binding
+   datalevin.core/with-kv hooks.datalevin/with-binding
    datalevin.core/with-transaction hooks.datalevin/with-binding
    datalevin.core/with-transaction-kv hooks.datalevin/with-binding
    datalevin.lmdb/with-transaction-kv hooks.datalevin/with-binding

@@ -30,7 +30,8 @@
    [clojure.lang IPersistentVector]
    [java.io Writer PushbackReader FileOutputStream FileInputStream DataOutputStream
     DataInputStream IOException]
-   [java.lang RuntimeException]))
+   [java.lang RuntimeException]
+   [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]))
 
 (defprotocol IBuffer
   (put-key [this data k-type] "put data in key buffer")
@@ -386,6 +387,109 @@
 
 (defn resized? [e] (:resized (ex-data e)))
 
+(defonce ^:private explicit-transaction-timeout-ms* (atom nil))
+
+(defn- normalize-explicit-transaction-timeout-ms
+  [timeout-ms]
+  (cond
+    (nil? timeout-ms) nil
+    (and (integer? timeout-ms) (pos? ^long timeout-ms)) (long timeout-ms)
+    :else (u/raise "Explicit transaction timeout must be nil or a positive "
+                   "integer of milliseconds"
+                   {:timeout-ms timeout-ms})))
+
+(defn explicit-transaction-timeout
+  "Return the default timeout, in milliseconds, for explicit transactions.
+  Nil means no default timeout."
+  []
+  @explicit-transaction-timeout-ms*)
+
+(defn set-explicit-transaction-timeout!
+  "Set the default timeout, in milliseconds, for explicit transactions.
+  Pass nil to disable the default timeout."
+  [timeout-ms]
+  (reset! explicit-transaction-timeout-ms*
+          (normalize-explicit-transaction-timeout-ms timeout-ms)))
+
+(defn ^:no-doc explicit-transaction-timeout-option
+  [opts]
+  {::timeout-ms
+   (normalize-explicit-transaction-timeout-ms
+    (cond
+      (nil? opts) @explicit-transaction-timeout-ms*
+      (map? opts) (cond
+                    (contains? opts ::timeout-ms) (::timeout-ms opts)
+                    (contains? opts :timeout-ms)  (:timeout-ms opts)
+                    :else @explicit-transaction-timeout-ms*)
+      :else opts))})
+
+(defn ^:no-doc explicit-transaction-timeout-ms-from-option
+  [timeout-option]
+  (::timeout-ms timeout-option))
+
+(defn ^:no-doc start-explicit-transaction-watchdog!
+  [timeout-ms]
+  (when-let [timeout-ms (normalize-explicit-transaction-timeout-ms timeout-ms)]
+    (let [timeout-ms (long timeout-ms)
+          thread     (Thread/currentThread)
+          timed-out? (volatile! false)
+          deadline   (unchecked-add
+                      (System/nanoTime)
+                      (unchecked-multiply timeout-ms 1000000))
+          future     (.schedule
+                      ^ScheduledExecutorService (u/get-scheduler)
+                      ^Runnable
+                      (fn []
+                        (vreset! timed-out? true)
+                        (.interrupt thread))
+                      ^long timeout-ms
+                      TimeUnit/MILLISECONDS)]
+      {:timeout-ms timeout-ms
+       :timed-out? timed-out?
+       :deadline   deadline
+       :future     future})))
+
+(defn ^:no-doc cancel-explicit-transaction-watchdog!
+  [watchdog]
+  (when-let [future (:future watchdog)]
+    (.cancel ^ScheduledFuture future false)))
+
+(defn ^:no-doc explicit-transaction-timed-out?
+  [watchdog]
+  (boolean
+   (and watchdog
+        (or @(:timed-out? watchdog)
+            (>= (System/nanoTime) ^long (:deadline watchdog))))))
+
+(defn ^:no-doc explicit-transaction-timeout-error?
+  [e]
+  (= :transaction/timeout (:type (ex-data e))))
+
+(defn ^:no-doc explicit-transaction-timeout-error
+  ([watchdog]
+   (explicit-transaction-timeout-error watchdog nil))
+  ([watchdog cause]
+   (Thread/interrupted)
+   (ex-info (str "Explicit transaction timed out after "
+                 (:timeout-ms watchdog)
+                 " ms")
+            {:type       :transaction/timeout
+             :timeout-ms (:timeout-ms watchdog)}
+            cause)))
+
+(defn ^:no-doc assert-explicit-transaction-live!
+  [watchdog]
+  (when (explicit-transaction-timed-out? watchdog)
+    (throw (explicit-transaction-timeout-error watchdog))))
+
+(defn ^:no-doc throw-explicit-transaction-failure!
+  [watchdog throwable]
+  (if (explicit-transaction-timed-out? watchdog)
+    (if (explicit-transaction-timeout-error? throwable)
+      (throw throwable)
+      (throw (explicit-transaction-timeout-error watchdog throwable)))
+    (throw throwable)))
+
 (defn abort-open-transaction-kv!
   [db primary]
   (try
@@ -418,14 +522,23 @@
 
   `body` should refer to `db`.
 
+  The binding vector can include an optional opts map. `:timeout-ms` sets a
+  timeout for the user body in milliseconds. Nil disables the timeout. A timeout
+  interrupts the transaction thread and aborts the transaction when control
+  returns to the macro; non-interruptible user code can still run until it
+  returns.
+
   Example:
 
           (with-transaction-kv [kv lmdb]
             (let [^long now (get-value kv \"a\" :counter)]
               (transact-kv kv [[:put \"a\" :counter (inc now)]])
               (get-value kv \"a\" :counter)))"
-  [[db orig-db] & body]
-  `(let [orig-db# ~orig-db]
+  [[db orig-db opts] & body]
+  `(let [orig-db#         ~orig-db
+         tx-timeout-opt#  (explicit-transaction-timeout-option ~opts)
+         tx-timeout-ms#   (explicit-transaction-timeout-ms-from-option
+                           tx-timeout-opt#)]
      (locking (write-txn orig-db#)
        (let [writing#   (writing? orig-db#)
              opened?#   (volatile! false)
@@ -433,20 +546,37 @@
          (u/repeat-try-catch
              ~c/+in-tx-overflow-times+
              condition#
-           (try
-             (vreset! opened?# false)
-             (let [res# (let [~db (if writing#
-                                    orig-db#
-                                    (let [db# (open-transact-kv orig-db#)]
-                                      (vreset! opened?# true)
-                                      db#))]
-                          (u/repeat-try-catch
-                              ~c/+in-tx-overflow-times+
-                              condition#
-                            ~@body))]
-               (when (and (not writing#) @opened?#)
-                 (close-transact-kv orig-db#))
-               res#)
+             (try
+               (vreset! opened?# false)
+               (let [watchdog# (volatile! nil)
+                     res#      (try
+                                 (vreset! watchdog#
+                                          (start-explicit-transaction-watchdog!
+                                           tx-timeout-ms#))
+                                 (let [res# (let [~db (if writing#
+                                                        orig-db#
+                                                        (let [db# (open-transact-kv
+                                                                   orig-db#)]
+                                                          (vreset! opened?# true)
+                                                          db#))]
+                                              (u/repeat-try-catch
+                                                  ~c/+in-tx-overflow-times+
+                                                  condition#
+                                                ~@body))]
+                                   (cancel-explicit-transaction-watchdog!
+                                    @watchdog#)
+                                   (assert-explicit-transaction-live!
+                                    @watchdog#)
+                                   res#)
+                                 (catch Throwable t#
+                                   (throw-explicit-transaction-failure!
+                                    @watchdog# t#))
+                                 (finally
+                                   (cancel-explicit-transaction-watchdog!
+                                    @watchdog#)))]
+                 (when (and (not writing#) @opened?#)
+                   (close-transact-kv orig-db#))
+                 res#)
              (catch Throwable t#
                (when (and (not writing#) @opened?#)
                  (abort-open-transaction-kv! orig-db# t#))
