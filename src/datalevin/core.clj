@@ -320,6 +320,7 @@ Only usable for debug output.
 (u/import-macro l/with-transaction-kv)
 (u/import-macro conn/with-transaction)
 (u/import-macro conn/with-conn)
+(u/import-macro conn/with-kv)
 
 (defn ^:no-doc with-transaction-fn
   [conn f]

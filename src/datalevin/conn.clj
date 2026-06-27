@@ -996,6 +996,33 @@
      (r/open-kv dir opts)
      (l/open-kv dir opts))))
 
+(defmacro with-kv
+  "Evaluate body with an opened KV database, then close it.
+
+  If the KV database does not exist, this will create it. The KV handle is
+  closed at the end of this call. If a KV database needs to be kept open, use
+  `open-kv` and hold onto the returned handle. See also [[open-kv]].
+
+  `spec` is a vector of an identifier of the KV handle, a path or dtlv URI
+  string, and an optional option map.
+
+  Example:
+
+          (with-kv [db \"my-data-path\"]
+            ;; body)
+
+          (with-kv [db \"my-data-path\" {:wal? true}]
+            ;; body)
+  "
+  [spec & body]
+  `(let [r#    (list ~@(rest spec))
+         dir#  (first r#)
+         opts# (second r#)
+         db#   (open-kv dir# opts#)]
+     (try
+       (let [~(first spec) db#] ~@body)
+       (finally (i/close-kv db#)))))
+
 (defn clear
   "Close the Datalog database, then clear all data, including schema."
   [conn]

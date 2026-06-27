@@ -1457,6 +1457,32 @@
       (is (= 2 (count (d/datoms @conn :eav)))))
     (u/delete-files dir)))
 
+(deftest test-with-kv
+  (let [dir       (u/tmp-dir (str "with-kv-test-" (UUID/randomUUID)))
+        db-ref    (atom nil)
+        error-ref (atom nil)]
+    (try
+      (is (= :done
+             (d/with-kv [db dir]
+               (reset! db-ref db)
+               (d/open-dbi db "state")
+               (d/transact-kv db "state" [[:put "k" "v"]] :string :string)
+               (is (= "v" (d/get-value db "state" "k" :string :string true)))
+               :done)))
+      (is (d/closed-kv? @db-ref))
+      (d/with-kv [db dir]
+        (d/open-dbi db "state")
+        (is (= "v" (d/get-value db "state" "k" :string :string true))))
+      (is (thrown-with-msg?
+            clojure.lang.ExceptionInfo
+            #"boom"
+            (d/with-kv [db dir]
+              (reset! error-ref db)
+              (throw (ex-info "boom" {})))))
+      (is (d/closed-kv? @error-ref))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-relaxed-transact-uses-queued-path
   (let [conn  (d/create-conn nil
                              {:k {:db/valueType :db.type/long}}

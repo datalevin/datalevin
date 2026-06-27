@@ -110,7 +110,8 @@ touch                 transact              transact!             transact-async
 transact-kv           transact-kv-async     tx-data->simulated-reportunhexify-string
 unlisten!             update-schema         v                     visit
 visit-key-range       visit-list            visit-list-range      with-conn
-with-transaction      with-transaction-kv   write                 write-csv
+with-kv               with-transaction      with-transaction-kv   write
+write-csv
 
 In namespace datalevin.interpret
 
