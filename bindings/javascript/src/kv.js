@@ -1,8 +1,11 @@
 import { toEdnForm, toJava, toJs } from "./convert.js";
+import { DatalevinError } from "./errors.js";
 import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
 import { toJsResult } from "./result.js";
+
+const NO_TIMEOUT_OPTION = Symbol("no-timeout-option");
 
 function slicePage(items, limit = null, offset = null) {
   const start = offset === null || offset === undefined ? 0 : Math.max(offset, 0);
@@ -48,6 +51,59 @@ function requireCallback(fn, methodName) {
   if (typeof fn !== "function") {
     throw new TypeError(`callback is required for KV ${methodName}().`);
   }
+}
+
+function normalizeTimeoutMs(value, methodName) {
+  if (!hasValue(value)) {
+    return null;
+  }
+  const timeoutMs = Number(value);
+  if (!Number.isInteger(timeoutMs) || timeoutMs <= 0) {
+    throw new TypeError(`timeoutMs for KV ${methodName}() must be a positive integer.`);
+  }
+  return timeoutMs;
+}
+
+function timeoutOption(options, methodName) {
+  if (!hasValue(options)) {
+    return NO_TIMEOUT_OPTION;
+  }
+  if (typeof options === "number") {
+    return normalizeTimeoutMs(options, methodName);
+  }
+  if (typeof options === "object") {
+    if (Object.prototype.hasOwnProperty.call(options, "timeoutMs")) {
+      return normalizeTimeoutMs(options.timeoutMs, methodName);
+    }
+    if (Object.prototype.hasOwnProperty.call(options, "timeout_ms")) {
+      return normalizeTimeoutMs(options.timeout_ms, methodName);
+    }
+  }
+  return NO_TIMEOUT_OPTION;
+}
+
+function withTransactionArgs(first, second) {
+  if (typeof first === "function") {
+    return { fn: first, timeoutOption: timeoutOption(second, "withTransaction") };
+  }
+  if (typeof second === "function") {
+    return { fn: second, timeoutOption: timeoutOption(first, "withTransaction") };
+  }
+  throw new TypeError("fn must be a function.");
+}
+
+async function resolveExplicitTransactionTimeout(option) {
+  if (option !== NO_TIMEOUT_OPTION) {
+    return option;
+  }
+  return toJsResult(await _BINDINGS.coreInvoke("explicit-transaction-timeout", []));
+}
+
+function transactionTimeoutError(timeoutMs) {
+  return new DatalevinError(`Explicit transaction timed out after ${timeoutMs} ms`, {
+    typeName: "transaction/timeout",
+    data: { timeoutMs }
+  });
 }
 
 function requireRange(value, rangeName, methodName) {
@@ -222,13 +278,24 @@ export class KV extends ResourceWrapper {
     return this.beginTransaction();
   }
 
-  async withTransaction(fn) {
-    if (typeof fn !== "function") {
-      throw new TypeError("fn must be a function.");
-    }
+  async withTransaction(fnOrOptions, maybeFnOrOptions = null) {
+    const { fn, timeoutOption } = withTransactionArgs(fnOrOptions, maybeFnOrOptions);
+    const timeoutMs = await resolveExplicitTransactionTimeout(timeoutOption);
     const tx = await this.beginTransaction();
+    let timeoutId = null;
     try {
-      const result = await fn(tx);
+      const body = Promise.resolve().then(() => fn(tx));
+      const result = hasValue(timeoutMs)
+        ? await Promise.race([
+            body,
+            new Promise((_, reject) => {
+              timeoutId = setTimeout(
+                () => reject(transactionTimeoutError(timeoutMs)),
+                timeoutMs
+              );
+            })
+          ])
+        : await body;
       if (tx.active()) {
         await tx.commit();
       }
@@ -238,6 +305,10 @@ export class KV extends ResourceWrapper {
         await tx.abort();
       }
       throw error;
+    } finally {
+      if (timeoutId !== null) {
+        clearTimeout(timeoutId);
+      }
     }
   }
 

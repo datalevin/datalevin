@@ -11,6 +11,9 @@
   server use.
 - [KV] `with-kv` for one-off txn in KV store
   [#261](https://github.com/datalevin/datalevin/issues/261).
+- Add time-out for explicit transactions
+  [#162](https://github.com/datalevin/datalevin/issues/162).
+
 
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
@@ -31,6 +34,8 @@
   [#373](https://github.com/datalevin/datalevin/issues/373). [Thx @xfthhxk]
 - [Datalog] Collection bindings optimization
   [#214](https://github.com/datalevin/datalevin/issues/214).
+- [Datalog] Expose clojure vars to `inter-fn`
+  [#215](https://github.com/datalevin/datalevin/issues/215).
 - [Datalog] reduce allocation per tuple.
 - [Datalog] fully implement datafy
   [#292](https://github.com/datalevin/datalevin/issues/292).

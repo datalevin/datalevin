@@ -1289,6 +1289,17 @@ export async function maxEid(conn) {
   return conn.maxEid();
 }
 
+export async function explicitTransactionTimeout(timeoutMs = undefined) {
+  const args = hasValue(timeoutMs) ? [timeoutMs] : [];
+  return toJsResult(await _BINDINGS.coreInvoke("explicit-transaction-timeout", args));
+}
+
+export async function setExplicitTransactionTimeout(timeoutMs) {
+  return toJsResult(
+    await _BINDINGS.coreInvoke("set-explicit-transaction-timeout!", [timeoutMs])
+  );
+}
+
 export async function reIndex(target, opts = null, options = {}) {
   if (typeof target?.reIndex !== "function") {
     throw new TypeError("target must provide reIndex().");
@@ -1296,7 +1307,7 @@ export async function reIndex(target, opts = null, options = {}) {
   return target.reIndex(opts, options);
 }
 
-export async function withTransaction(target, fn) {
+export async function withTransaction(target, fnOrOptions, maybeFnOrOptions = null) {
   if (target?.constructor?.name === "Connection" &&
       typeof target.rawHandle === "function" &&
       typeof target.transact === "function" &&
@@ -1306,7 +1317,7 @@ export async function withTransaction(target, fn) {
   if (typeof target?.withTransaction !== "function") {
     throw new TypeError("target must provide withTransaction().");
   }
-  return target.withTransaction(fn);
+  return target.withTransaction(fnOrOptions, maybeFnOrOptions);
 }
 
 export async function keyword(value) {

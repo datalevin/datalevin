@@ -376,6 +376,38 @@ public final class Datalevin {
     }
 
     /**
+     * Returns the default timeout in milliseconds for explicit transactions, or
+     * {@code null} when no default timeout is set.
+     */
+    public static Long explicitTransactionTimeout() {
+        return longOrNull(ClojureRuntime.core("explicit-transaction-timeout"));
+    }
+
+    /**
+     * Sets or clears the default timeout in milliseconds for explicit
+     * transactions.
+     */
+    public static Long explicitTransactionTimeout(Long timeoutMs) {
+        return setExplicitTransactionTimeout(timeoutMs);
+    }
+
+    /**
+     * Sets the default timeout in milliseconds for explicit transactions.
+     */
+    public static Long setExplicitTransactionTimeout(long timeoutMs) {
+        return setExplicitTransactionTimeout(Long.valueOf(timeoutMs));
+    }
+
+    /**
+     * Sets or clears the default timeout in milliseconds for explicit
+     * transactions.
+     */
+    public static Long setExplicitTransactionTimeout(Long timeoutMs) {
+        return longOrNull(ClojureRuntime.core("set-explicit-transaction-timeout!",
+                                              timeoutMs));
+    }
+
+    /**
      * Creates a batched full-text search index writer for {@code kv}.
      */
     public static SearchIndexWriter searchIndexWriter(KV kv) {
@@ -926,5 +958,12 @@ public final class Datalevin {
             return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms, dir));
         }
         return new Connection(ClojureRuntime.core("conn-from-datoms", normalizedDatoms));
+    }
+
+    private static Long longOrNull(Object value) {
+        if (value == null) {
+            return null;
+        }
+        return Long.valueOf(((Number) value).longValue());
     }
 }

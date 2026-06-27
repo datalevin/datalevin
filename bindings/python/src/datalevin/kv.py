@@ -235,8 +235,8 @@ class KV(ResourceWrapper):
     def transaction(self):
         return self.begin_transaction()
 
-    def with_transaction(self, fn):
-        return to_python(_BINDINGS.key_value_with_transaction(self.raw_handle(), fn))
+    def with_transaction(self, fn, timeout_ms=None):
+        return to_python(_BINDINGS.key_value_with_transaction(self.raw_handle(), fn, timeout_ms))
 
     def search_index_writer(self, opts=None):
         from .search import SearchIndexWriter

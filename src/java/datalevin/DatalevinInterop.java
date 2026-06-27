@@ -489,12 +489,40 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Runs a function inside a single KV write transaction with a timeout in
+     * milliseconds.
+     */
+    public static Object keyValueWithTransaction(Object kv,
+                                                 long timeoutMs,
+                                                 Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawKv -> fn.apply(new KV(rawKv, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-kv-fn",
+                                                             rawResource(kv),
+                                                             Long.valueOf(timeoutMs),
+                                                             wrapped));
+    }
+
+    /**
      * Runs a function inside a single Datalog write transaction.
      */
     public static Object connectionWithTransaction(Object conn, Function<Object, Object> fn) {
         Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
         return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-fn",
                                                              rawResource(conn),
+                                                             wrapped));
+    }
+
+    /**
+     * Runs a function inside a single Datalog write transaction with a timeout
+     * in milliseconds.
+     */
+    public static Object connectionWithTransaction(Object conn,
+                                                   long timeoutMs,
+                                                   Function<Object, Object> fn) {
+        Function<Object, Object> wrapped = rawConn -> fn.apply(new Connection(rawConn, false));
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("with-transaction-fn",
+                                                             rawResource(conn),
+                                                             Long.valueOf(timeoutMs),
                                                              wrapped));
     }
 

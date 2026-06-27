@@ -105,8 +105,8 @@ class Connection(ResourceWrapper):
     def clear(self) -> None:
         _BINDINGS.core_invoke("clear", [self.raw_handle()])
 
-    def with_transaction(self, fn):
-        return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn))
+    def with_transaction(self, fn, timeout_ms=None):
+        return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn, timeout_ms))
 
     def entid(self, eid):
         db = _BINDINGS.connection_db(self.raw_handle())

@@ -12,6 +12,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.embeddingAttr, "function");
   assert.equal(typeof datalevin.embeddingOptions, "function");
   assert.equal(typeof datalevin.execJson, "function");
+  assert.equal(typeof datalevin.explicitTransactionTimeout, "function");
   assert.equal(typeof datalevin.fillDb, "function");
   assert.equal(typeof datalevin.fulltextAttr, "function");
   assert.equal(typeof datalevin.idocAttr, "function");
@@ -33,6 +34,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.searchIndexWriter, "function");
   assert.equal(typeof datalevin.searchDomain, "function");
   assert.equal(typeof datalevin.searchOptions, "function");
+  assert.equal(typeof datalevin.setExplicitTransactionTimeout, "function");
   assert.equal(typeof datalevin.startJvm, "function");
   assert.equal(typeof datalevin.symbol, "function");
   assert.equal(typeof datalevin.transactAsync, "function");

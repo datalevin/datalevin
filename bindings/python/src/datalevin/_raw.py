@@ -104,8 +104,8 @@ class RawInterop:
     def connection_gc_tx_log_segments(self, handle, retain_floor_lsn=None):
         return _BINDINGS.connection_gc_tx_log_segments(handle, retain_floor_lsn)
 
-    def connection_with_transaction(self, handle, fn):
-        return _BINDINGS.connection_with_transaction(handle, fn)
+    def connection_with_transaction(self, handle, fn, timeout_ms=None):
+        return _BINDINGS.connection_with_transaction(handle, fn, timeout_ms)
 
     def connection_re_index(self, handle, schema=None, opts=None):
         return _BINDINGS.connection_re_index(handle, schema, opts)
@@ -128,8 +128,8 @@ class RawInterop:
     def key_value_abort_transaction(self, tx):
         return _BINDINGS.key_value_abort_transaction(tx)
 
-    def key_value_with_transaction(self, handle, fn):
-        return _BINDINGS.key_value_with_transaction(handle, fn)
+    def key_value_with_transaction(self, handle, fn, timeout_ms=None):
+        return _BINDINGS.key_value_with_transaction(handle, fn, timeout_ms)
 
     def key_value_re_index(self, handle, opts=None):
         return _BINDINGS.key_value_re_index(handle, opts)
@@ -181,6 +181,13 @@ class RawInterop:
 
     def write_edn(self, value):
         return _BINDINGS.write_edn(value)
+
+    def explicit_transaction_timeout(self, timeout_ms=None):
+        args = [] if timeout_ms is None else [timeout_ms]
+        return _BINDINGS.core_invoke("explicit-transaction-timeout", args)
+
+    def set_explicit_transaction_timeout(self, timeout_ms):
+        return _BINDINGS.core_invoke("set-explicit-transaction-timeout!", [timeout_ms])
 
     def keyword(self, value: str):
         return _BINDINGS.keyword(value)

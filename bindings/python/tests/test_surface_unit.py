@@ -99,6 +99,13 @@ class FakeInteropBindings:
             return getattr(self, "cache_limit", 512)
         if function == "max-eid":
             return 42
+        if function == "explicit-transaction-timeout":
+            if args:
+                self.explicit_transaction_timeout = args[0]
+            return getattr(self, "explicit_transaction_timeout", None)
+        if function == "set-explicit-transaction-timeout!":
+            self.explicit_transaction_timeout = args[0]
+            return self.explicit_transaction_timeout
         return {"function": function, "args": list(args or ())}
 
     def connection_transact_async(self, conn, tx_data, tx_meta=None):
@@ -116,8 +123,9 @@ class FakeInteropBindings:
     def connection_unlisten(self, conn, key):
         self.last_connection_unlisten = (conn, key)
 
-    def connection_with_transaction(self, conn, fn):
+    def connection_with_transaction(self, conn, fn, timeout_ms=None):
         self.last_connection_with_transaction = conn
+        self.last_connection_with_transaction_timeout = timeout_ms
         return fn(connection_module.Connection("TX_CONN", owned=False))
 
     def datom(self, e, attr, value, tx=None, added=None):
@@ -155,8 +163,9 @@ class FakeInteropBindings:
         self.last_kv_abort_transaction = tx
         return ":aborted"
 
-    def key_value_with_transaction(self, kv, fn):
+    def key_value_with_transaction(self, kv, fn, timeout_ms=None):
         self.last_kv_with_transaction = kv
+        self.last_kv_with_transaction_timeout = timeout_ms
         return fn(kv_module.KV("KV_TX", owned=False))
 
     def key_value_re_index(self, kv, opts=None):
@@ -542,6 +551,12 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_core_invoke == ("max-eid", ["DB"])
     assert interop_module.max_eid(init_conn) == 42
     assert fake.last_core_invoke == ("max-eid", ["DB"])
+    assert interop_module.explicit_transaction_timeout() is None
+    assert fake.last_core_invoke == ("explicit-transaction-timeout", [])
+    assert interop_module.explicit_transaction_timeout(400) == 400
+    assert fake.last_core_invoke == ("explicit-transaction-timeout", [400])
+    assert interop_module.set_explicit_transaction_timeout(None) is None
+    assert fake.last_core_invoke == ("set-explicit-transaction-timeout!", [None])
     assert init_conn.datalog_index_cache_limit(16) == 16
     assert fake.core_calls[-2:] == [
         ("datalog-index-cache-limit", ["DB", 16]),
@@ -553,7 +568,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_connection_re_index == ("INIT_CONN", None, {":backup?": False})
     assert init_conn.with_transaction(lambda tx: tx.raw_handle()) == "TX_CONN"
     assert fake.last_connection_with_transaction == "INIT_CONN"
+    assert fake.last_connection_with_transaction_timeout is None
+    assert init_conn.with_transaction(lambda tx: tx.raw_handle(), timeout_ms=250) == "TX_CONN"
+    assert fake.last_connection_with_transaction_timeout == 250
     assert interop_module.with_transaction(init_conn, lambda tx: tx.raw_handle()) == "TX_CONN"
+    assert interop_module.with_transaction(
+        init_conn, lambda tx: tx.raw_handle(), timeout_ms=300
+    ) == "TX_CONN"
+    assert fake.last_connection_with_transaction_timeout == 300
     assert init_conn.tx_data_to_simulated_report([{":db/id": -1, ":name": "Ada"}])[":tx-data"]
     assert fake.last_simulated_report == ("INIT_CONN", [{":db/id": -1, ":name": "Ada"}])
     assert interop_module.tx_data_to_simulated_report(init_conn, [{":db/id": -2, ":name": "Bob"}])[":tx-data"]
@@ -580,6 +602,11 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert fake.last_kv_abort_transaction == "KV_TX"
     assert kv.with_transaction(lambda tx: tx.raw_handle()) == "KV_TX"
     assert fake.last_kv_with_transaction == "KV"
+    assert fake.last_kv_with_transaction_timeout is None
+    assert kv.with_transaction(lambda tx: tx.raw_handle(), timeout_ms=125) == "KV_TX"
+    assert fake.last_kv_with_transaction_timeout == 125
+    assert interop_module.with_transaction(kv, lambda tx: tx.raw_handle(), timeout_ms=175) == "KV_TX"
+    assert fake.last_kv_with_transaction_timeout == 175
     assert kv.re_index(opts={":backup?": False}) is kv
     assert fake.last_kv_re_index == ("KV", {":backup?": False})
     engine = interop_module.new_search_engine(kv, opts={":include-text?": True})
@@ -767,6 +794,8 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
+    assert callable(getattr(datalevin, "explicit_transaction_timeout"))
+    assert callable(getattr(datalevin, "set_explicit_transaction_timeout"))
     assert issubclass(datalevin.Entity, Mapping)
     assert callable(getattr(connection_module.Connection, "fill_db"))
     assert callable(getattr(datalevin.Entity, "touch"))
