@@ -79,6 +79,7 @@
                     (f ::conn)))]
         (is (= [:ok ::conn]
                (workload.util/with-retrying-leader-conn
+                 :setup
                  {:db-name "retry-test"}
                  {}
                  1000
@@ -86,6 +87,18 @@
                  (fn [conn]
                    [:ok conn]))))
         (is (= 2 @attempts))))))
+
+(deftest with-retrying-leader-conn-rejects-op-path-purpose-test
+  (is (thrown-with-msg?
+        clojure.lang.ExceptionInfo
+        #"idempotent setup/bootstrap paths"
+        (workload.util/with-retrying-leader-conn
+          :operation
+          {:db-name "op-path-retry"}
+          {}
+          1000
+          (fn [_conn]
+            :should-not-run)))))
 
 (deftest rejoin-bootstrap-retries-transient-gap-during-bootstrap-wait-test
   (let [attempts (atom 0)]

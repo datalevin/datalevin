@@ -197,6 +197,7 @@
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
           (workload.util/with-retrying-leader-conn
+            :setup
             test
             schema
             (local/workload-setup-timeout-ms cluster-id
@@ -245,6 +246,7 @@
    (leader-register-values test key-count converge-timeout-ms))
   ([test key-count timeout-ms]
    (workload.util/with-retrying-leader-conn
+     :bootstrap
      test
      schema
      timeout-ms
@@ -256,6 +258,7 @@
 (defn- write-register-batch-with-rolls!
   [test key-count start-value n sleep-ms timeout-ms]
   (workload.util/with-retrying-leader-conn
+    :bootstrap
     test
     schema
     timeout-ms

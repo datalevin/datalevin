@@ -344,6 +344,7 @@
                             cluster-id
                             default-setup-timeout-ms)
                 setup-lsn  (workload.util/with-retrying-leader-conn
+                             :setup
                              test
                              schema
                              timeout-ms

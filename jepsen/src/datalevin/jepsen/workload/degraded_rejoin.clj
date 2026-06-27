@@ -136,6 +136,7 @@
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
           (workload.util/with-retrying-leader-conn
+            :setup
             test
             schema
             (local/workload-setup-timeout-ms cluster-id
@@ -154,6 +155,7 @@
 (defn- leader-register-values
   [test key-count]
   (workload.util/with-retrying-leader-conn
+    :bootstrap
     test
     schema
     converge-timeout-ms
@@ -165,6 +167,7 @@
 (defn- write-register-batch-with-rolls!
   [test key-count start-value n sleep-ms]
   (workload.util/with-retrying-leader-conn
+    :bootstrap
     test
     schema
     converge-timeout-ms
@@ -365,6 +368,7 @@
                              (try
                                (local/restart-node! cluster-id degraded-node)
                                (let [_             (workload.util/with-retrying-leader-conn
+                                                     :bootstrap
                                                      test
                                                      schema
                                                      converge-timeout-ms
@@ -389,6 +393,7 @@
                              (fn []
                                (local/restart-node! cluster-id degraded-node)
                                (let [_             (workload.util/with-retrying-leader-conn
+                                                     :bootstrap
                                                      test
                                                      schema
                                                      converge-timeout-ms
@@ -403,6 +408,7 @@
                                    converge-timeout-ms
                                    key-count)))))
         _                (workload.util/with-retrying-leader-conn
+                           :bootstrap
                            test
                            schema
                            converge-timeout-ms

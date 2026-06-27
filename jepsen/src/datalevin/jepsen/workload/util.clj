@@ -156,6 +156,9 @@
 
 (def ^:private leader-conn-retry-sleep-ms 250)
 
+(def ^:private retrying-leader-conn-purposes
+  #{:setup :bootstrap})
+
 (def ^:dynamic *with-leader-conn* local/with-leader-conn)
 
 (defn retryable-leader-conn-error?
@@ -172,15 +175,38 @@
                (some #(str/includes? message %)
                      retryable-leader-failure-markers))))))
 
+(defn- valid-retrying-leader-conn-purpose!
+  [purpose]
+  (when-not (contains? retrying-leader-conn-purposes purpose)
+    (throw (ex-info
+             (str "with-retrying-leader-conn is only for idempotent "
+                  "setup/bootstrap paths; do not use it from Jepsen "
+                  "operation invoke paths")
+             {:purpose purpose
+              :allowed-purposes retrying-leader-conn-purposes})))
+  purpose)
+
 (defn with-retrying-leader-conn
-  ([test schema timeout-ms f]
+  "Retries broad HA/transport leader-connection failures while running f.
+
+  This helper deliberately accepts only idempotent setup/bootstrap purposes.
+  Do not use it for client operation paths: a substring-classified timeout can
+  be an indeterminate write, and retrying that write can double-apply it."
+  ([_test _schema _timeout-ms _f]
+   (throw (ex-info
+            (str "with-retrying-leader-conn requires an explicit :setup "
+                 "or :bootstrap purpose")
+            {:allowed-purposes retrying-leader-conn-purposes})))
+  ([purpose test schema timeout-ms f]
    (with-retrying-leader-conn
+     purpose
      test
      schema
      timeout-ms
      leader-conn-retry-sleep-ms
      f))
-  ([test schema timeout-ms retry-sleep-ms f]
+  ([purpose test schema timeout-ms retry-sleep-ms f]
+   (valid-retrying-leader-conn-purpose! purpose)
    (let [deadline (+ (System/currentTimeMillis) (long timeout-ms))]
      (loop []
        (let [result (try

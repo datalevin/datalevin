@@ -197,6 +197,7 @@
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
           (workload.util/with-retrying-leader-conn
+            :setup
             test
             schema
             (local/workload-setup-timeout-ms cluster-id
