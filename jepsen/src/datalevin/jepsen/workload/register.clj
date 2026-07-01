@@ -253,8 +253,9 @@
                :datalevin/read-node read-node)))))
 
 (defn- execute-leader-op!
-  [test op]
-  (local/with-leader-conn
+  [client test op]
+  (workload.util/with-cached-leader-conn
+    client
     test
     schema
     (fn [conn]
@@ -297,7 +298,8 @@
 (defrecord Client [node key-count]
   client/Client
   (open! [this _test node]
-    (assoc this :node node))
+    (workload.util/attach-cached-leader-conn
+      (assoc this :node node)))
 
   (setup! [this test]
     (ensure-registers-initialized! test key-count)
@@ -306,20 +308,21 @@
   (invoke! [this test op]
     (try
       (ensure-registers-initialized! test key-count)
-      (execute-leader-op! test op)
+      (execute-leader-op! this test op)
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)
 
-  (close! [_this _test]
-    nil))
+  (close! [this _test]
+    (workload.util/close-cached-leader-conn! this)))
 
 (defrecord FollowerReadClient [node key-count]
   client/Client
   (open! [this _test node]
-    (assoc this :node node))
+    (workload.util/attach-cached-leader-conn
+      (assoc this :node node)))
 
   (setup! [this test]
     (ensure-registers-initialized! test key-count)
@@ -330,15 +333,15 @@
       (ensure-registers-initialized! test key-count)
       (if (= :read (:f op))
         (execute-follower-read-op! test op)
-        (execute-leader-op! test op))
+        (execute-leader-op! this test op))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 
   (teardown! [this _test]
     this)
 
-  (close! [_this _test]
-    nil))
+  (close! [this _test]
+    (workload.util/close-cached-leader-conn! this)))
 
 (defn- build-workload
   [opts client-factory]

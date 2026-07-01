@@ -334,7 +334,8 @@
 (defrecord Client [node key-count payload-bytes]
   client/Client
   (open! [this _test node]
-    (assoc this :node node))
+    (workload.util/attach-cached-leader-conn
+      (assoc this :node node)))
 
   (setup! [this test]
     (ensure-giants-initialized! test key-count payload-bytes)
@@ -343,7 +344,8 @@
   (invoke! [this test op]
     (try
       (ensure-giants-initialized! test key-count payload-bytes)
-      (local/with-leader-conn
+      (workload.util/with-cached-leader-conn
+        this
         test
         schema
         (fn [conn]
@@ -371,8 +373,8 @@
   (teardown! [this _test]
     this)
 
-  (close! [_this _test]
-    nil))
+  (close! [this _test]
+    (workload.util/close-cached-leader-conn! this)))
 
 (defn workload
   [opts]

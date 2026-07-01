@@ -2,7 +2,6 @@
   (:require
    [datalevin.core :as d]
    [datalevin.interpret :as i]
-   [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.client :as client]))
@@ -205,14 +204,16 @@
 (defrecord Client [node]
   client/Client
   (open! [this _test node]
-    (assoc this :node node))
+    (workload.util/attach-cached-leader-conn
+      (assoc this :node node)))
 
   (setup! [this _test]
     this)
 
   (invoke! [this test op]
     (try
-      (local/with-leader-conn
+      (workload.util/with-cached-leader-conn
+        this
         test
         schema
         (fn [conn]
@@ -231,8 +232,8 @@
   (teardown! [this _test]
     this)
 
-  (close! [_this _test]
-    nil))
+  (close! [this _test]
+    (workload.util/close-cached-leader-conn! this)))
 
 (defn workload
   [opts]

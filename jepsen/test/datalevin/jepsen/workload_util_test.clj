@@ -100,6 +100,86 @@
           (fn [_conn]
             :should-not-run)))))
 
+(deftest with-cached-leader-conn-reuses-open-connection-test
+  (let [opens  (atom 0)
+        client (workload.util/attach-cached-leader-conn {})]
+    (binding [workload.util/*open-leader-conn*
+              (fn [_test _schema]
+                [:conn (swap! opens inc)])]
+      (is (= [:ok [:conn 1]]
+             (workload.util/with-cached-leader-conn
+               client
+               {:db-name "cached-leader"}
+               {}
+               (fn [conn]
+                 [:ok conn]))))
+      (is (= [:ok [:conn 1]]
+             (workload.util/with-cached-leader-conn
+               client
+               {:db-name "cached-leader"}
+               {}
+               (fn [conn]
+                 [:ok conn]))))
+      (is (= 1 @opens)))))
+
+(deftest with-cached-leader-conn-clears-stale-conn-without-retry-test
+  (let [opens  (atom 0)
+        bodies (atom 0)
+        client (workload.util/attach-cached-leader-conn {})]
+    (with-redefs [local/transport-failure? (constantly false)]
+      (binding [workload.util/*open-leader-conn*
+                (fn [_test _schema]
+                  [:conn (swap! opens inc)])]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"HA write admission rejected"
+             (workload.util/with-cached-leader-conn
+               client
+               {:db-name "cached-leader"}
+               {}
+               (fn [_conn]
+                 (swap! bodies inc)
+                 (throw (ex-info
+                         "Request to Datalevin server failed: \"HA write admission rejected\""
+                         {:err-data {:error :ha/write-rejected
+                                     :retryable? true}}))))))
+        (is (= 1 @opens))
+        (is (= 1 @bodies))
+        (is (= [:ok [:conn 2]]
+               (workload.util/with-cached-leader-conn
+                 client
+                 {:db-name "cached-leader"}
+                 {}
+                 (fn [conn]
+                   [:ok conn]))))
+        (is (= 2 @opens))
+        (is (= 1 @bodies))))))
+
+(deftest with-cached-leader-conn-clears-closed-client-conn-test
+  (let [opens  (atom 0)
+        client (workload.util/attach-cached-leader-conn {})]
+    (with-redefs [local/transport-failure? (constantly false)]
+      (binding [workload.util/*open-leader-conn*
+                (fn [_test _schema]
+                  [:conn (swap! opens inc)])]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"This client is closed"
+             (workload.util/with-cached-leader-conn
+               client
+               {:db-name "cached-leader"}
+               {}
+               (fn [_conn]
+                 (throw (ex-info "This client is closed" {}))))))
+        (is (= [:ok [:conn 2]]
+               (workload.util/with-cached-leader-conn
+                 client
+                 {:db-name "cached-leader"}
+                 {}
+                 (fn [conn]
+                   [:ok conn]))))
+        (is (= 2 @opens))))))
+
 (deftest rejoin-bootstrap-retries-transient-gap-during-bootstrap-wait-test
   (let [attempts (atom 0)]
     (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0]

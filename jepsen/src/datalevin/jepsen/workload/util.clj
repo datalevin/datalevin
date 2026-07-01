@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.util
   (:require
    [clojure.string :as str]
+   [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
    [jepsen.checker :as checker]))
 
@@ -145,6 +146,82 @@
                   :error error)
      (some? detail)
      (assoc :value detail))))
+
+(def ^:private cached-leader-conn-key
+  ::cached-leader-conn)
+
+(def ^:private stale-cached-leader-conn-markers
+  ["HA write admission rejected"
+   "Replica is read-only"
+   "This client is closed"
+   "Connection is closed"
+   "Timeout in making request"
+   "Unable to connect to server:"
+   "Connection refused"])
+
+(def ^:dynamic *open-leader-conn*
+  local/open-leader-conn!)
+
+(defn attach-cached-leader-conn
+  [client]
+  (assoc client cached-leader-conn-key (atom nil)))
+
+(defn- close-conn!
+  [conn]
+  (when conn
+    (try
+      (d/close conn)
+      (catch Throwable _
+        nil))))
+
+(defn close-cached-leader-conn!
+  [client]
+  (when-let [conn* (get client cached-leader-conn-key)]
+    (when-let [conn @conn*]
+      (reset! conn* nil)
+      (close-conn! conn))))
+
+(defn- stale-cached-leader-conn-error?
+  [e]
+  (let [data     (ex-data e)
+        err-data (or (:err-data data) data)
+        message  (ex-message e)]
+    (boolean
+      (or (local/transport-failure? e)
+          (contains? #{:ha/write-rejected
+                       :ha/read-rejected
+                       :ha/pinned-request-failed}
+                     (:error err-data))
+          (and (string? message)
+               (some #(str/includes? message %)
+                     stale-cached-leader-conn-markers))))))
+
+(defn- cached-leader-conn!
+  [conn* test schema]
+  (or @conn*
+      (locking conn*
+        (or @conn*
+            (let [conn (*open-leader-conn* test schema)]
+              (reset! conn* conn)
+              conn)))))
+
+(defn with-cached-leader-conn
+  "Runs f with a per-client leader connection.
+
+  The operation body is never retried. If a cached connection appears stale, it
+  is closed and cleared for the next operation, while the current operation's
+  exception is still reported to Jepsen."
+  [client test schema f]
+  (let [conn* (or (get client cached-leader-conn-key)
+                  (throw (ex-info
+                          "Jepsen client is missing cached leader connection state"
+                          {})))]
+    (try
+      (f (cached-leader-conn! conn* test schema))
+      (catch Throwable e
+        (when (stale-cached-leader-conn-error? e)
+          (close-cached-leader-conn! client))
+        (throw e)))))
 
 (def ^:private retryable-leader-failure-markers
   ["HA write admission rejected"
