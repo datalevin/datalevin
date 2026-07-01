@@ -18,6 +18,8 @@
    [datalevin.lmdb :as l]
    [datalevin.interpret :as i]
    [datalevin.protocol :as p]
+   [datalevin.bits :as b]
+   [datalevin.csv :as csv]
    [datalevin.datom :as dd]
    [datalevin.db :as db]
    [datalevin.interface :as if]
@@ -46,7 +48,7 @@
 
 (def stdin (PushbackInputStream. System/in))
 
-(defn- write [v]
+(defn- write-response [v]
   (bencode/write-bencode System/out v)
   (.flush System/out))
 
@@ -82,6 +84,15 @@
 ;; uuid -> vector index
 (defonce ^:private indices (atom {}))
 
+;; uuid -> embedding provider
+(defonce ^:private embedding-providers (atom {}))
+
+;; uuid -> LLM provider
+(defonce ^:private llm-providers (atom {}))
+
+;; uuid -> search index writer
+(defonce ^:private search-writers (atom {}))
+
 ;; exposed functions
 
 (defn pod-fn [fn-name args & body]
@@ -102,6 +113,39 @@
 
 (defn- get-index [{:keys [::index]}] (get @indices index))
 
+(defn- get-embedding-provider [{:keys [::embedding-provider]}]
+  (get @embedding-providers embedding-provider))
+
+(defn- get-llm-provider [{:keys [::llm-provider]}]
+  (get @llm-providers llm-provider))
+
+(defn- get-search-writer [{:keys [::search-writer]}]
+  (get @search-writers search-writer))
+
+(defn- db-ref
+  ([db]
+   (db-ref db false))
+  ([db writing?]
+   (let [id (UUID/randomUUID)]
+     (swap! (if writing? wdl-dbs dl-dbs) assoc id db)
+     (cond-> {::db id}
+       writing? (assoc :writing? true)))))
+
+(defn- rp->res
+  ([rp]
+   (rp->res rp false))
+  ([rp include-dbs?]
+   (cond-> {:tx-data (:tx-data rp)
+            :tempids (:tempids rp)
+            :tx-meta (:tx-meta rp)}
+     include-dbs?
+     (assoc :db-before (db-ref (:db-before rp))
+            :db-after (db-ref (:db-after rp))))))
+
+(defn- embedding-result
+  [xs]
+  (mapv vec xs))
+
 (defn entid [dl eid] (when-let [d (get-db dl)] (d/entid d eid)))
 
 (defn entity [{:keys [::db] :as dl} eid]
@@ -109,24 +153,94 @@
     (let [^Entity e (d/touch (d/entity d eid))]
       (assoc @(.-cache e) :db/id (.-eid e) :db-name db))))
 
+(defn- entity-id
+  [ent]
+  (or (:db/id ent)
+      (when (instance? Entity ent)
+        (.-eid ^Entity ent))
+      (u/raise "Entity must have :db/id" {:entity ent})))
+
+(defn add
+  [ent attr value]
+  (if (instance? Entity ent)
+    (d/add ent attr value)
+    [:db/add (entity-id ent) attr value]))
+
+(defn retract
+  ([ent attr]
+   (if (instance? Entity ent)
+     (d/retract ent attr)
+     [:db.fn/retractAttribute (entity-id ent) attr]))
+  ([ent attr value]
+   (if (instance? Entity ent)
+     (d/retract ent attr value)
+     [:db/retract (entity-id ent) attr value])))
+
+(defn entity-db
+  [ent]
+  (cond
+    (instance? Entity ent)
+    (db-ref (d/entity-db ent))
+
+    (:db-name ent)
+    {::db (:db-name ent)}
+
+    :else
+    (u/raise "Entity must have :db-name" {:entity ent})))
+
 (defn touch [{:keys [db-name db/id]}]
   (when-let [d (get @dl-dbs db-name)]
     (let [^Entity e (d/touch (d/entity d id))]
       (assoc @(.-cache e) :db/id id :db-name db-name))))
 
-(defn pull [dl selector eid]
-  (when-let [d (get-db dl)]
-    (d/pull d selector eid)))
+(defn pull
+  ([dl selector eid]
+   (when-let [d (get-db dl)]
+     (d/pull d selector eid)))
+  ([dl selector eid opts]
+   (when-let [d (get-db dl)]
+     (d/pull d selector eid opts))))
 
-(defn pull-many [dl selector eids]
-  (when-let [d (get-db dl)]
-    (d/pull-many d selector eids)))
+(defn pull-many
+  ([dl selector eids]
+   (when-let [d (get-db dl)]
+     (d/pull-many d selector eids)))
+  ([dl selector eids opts]
+   (when-let [d (get-db dl)]
+     (d/pull-many d selector eids opts))))
 
 (defn q [q & inputs]
   (apply d/q q (w/postwalk #(if (::db %) (get-db %) %) inputs)))
 
 (defn explain [opts q & inputs]
   (apply d/explain opts q (w/postwalk #(if (::db %) (get-db %) %) inputs)))
+
+(defn datom
+  ([e a v] [e a v])
+  ([e a v tx] [e a v tx])
+  ([e a v tx added] [e a v tx added]))
+
+(defn datom?
+  [x]
+  (or (dd/datom? x)
+      (and (vector? x)
+           (<= 3 (count x) 5))))
+
+(defn datom-e
+  [d]
+  (if (dd/datom? d) (dd/datom-e d) (nth d 0)))
+
+(defn datom-a
+  [d]
+  (if (dd/datom? d) (dd/datom-a d) (nth d 1)))
+
+(defn datom-v
+  [d]
+  (if (dd/datom? d) (dd/datom-v d) (nth d 2)))
+
+(defn- ->datom
+  [d]
+  (if (dd/datom? d) d (apply dd/datom d)))
 
 (defn empty-db
   ([] (empty-db nil nil))
@@ -144,14 +258,82 @@
 
 (defn init-db
   ([datoms]
-   (init-db datoms nil nil))
+   (init-db datoms nil nil nil))
   ([datoms dir]
-   (init-db datoms dir nil))
+   (init-db datoms dir nil nil))
   ([datoms dir schema]
-   (let [db (d/init-db (map #(apply dd/datom %) datoms) dir schema)
-         id (UUID/randomUUID)]
+   (init-db datoms dir schema nil))
+  ([datoms dir schema opts]
+   (let [id (UUID/randomUUID)
+         db (d/init-db (map ->datom datoms)
+                       dir
+                       schema
+                       (if opts
+                         (assoc opts :db-name id)
+                         {:db-name id}))]
      (swap! dl-dbs assoc id db)
      {::db id})))
+
+(defn fill-db
+  [{:keys [::db writing?] :as dl} datoms]
+  (when-let [old-db (get-db dl)]
+    (let [db' (d/fill-db old-db (map ->datom datoms))
+          dbs (if writing? wdl-dbs dl-dbs)]
+      (swap! dbs assoc db db')
+      (cond-> {::db db}
+        writing? (assoc :writing? true)))))
+
+(defn conn-from-datoms
+  ([datoms]
+   (conn-from-datoms datoms nil nil nil))
+  ([datoms dir]
+   (conn-from-datoms datoms dir nil nil))
+  ([datoms dir schema]
+   (conn-from-datoms datoms dir schema nil))
+  ([datoms dir schema opts]
+   (let [id   (UUID/randomUUID)
+         conn (d/conn-from-datoms
+                (map ->datom datoms)
+                dir
+                schema
+                (if opts
+                  (assoc opts :db-name id)
+                  {:db-name id}))]
+     (swap! dl-dbs assoc id @conn)
+     (swap! dl-conns assoc id conn)
+     {::conn id})))
+
+(defn tempid
+  ([part] (d/tempid part))
+  ([part x] (d/tempid part x)))
+
+(defn resolve-tempid
+  [db tempids tempid]
+  (d/resolve-tempid db tempids tempid))
+
+(defn squuid
+  ([] (d/squuid))
+  ([msec] (d/squuid msec)))
+
+(defn squuid-time-millis
+  [uuid]
+  (d/squuid-time-millis uuid))
+
+(defn hexify-string
+  [s]
+  (d/hexify-string s))
+
+(defn unhexify-string
+  [s]
+  (d/unhexify-string s))
+
+(defn explicit-transaction-timeout
+  ([] (d/explicit-transaction-timeout))
+  ([timeout-ms] (d/explicit-transaction-timeout timeout-ms)))
+
+(defn set-explicit-transaction-timeout!
+  [timeout-ms]
+  (d/set-explicit-transaction-timeout! timeout-ms))
 
 (defn close-db [dl] (when-let [d (get-db dl)] (d/close-db d)))
 
@@ -266,12 +448,6 @@
   ([cn tx-data tx-meta]
    (when-let [c (get-cn cn)] (d/transact c tx-data tx-meta))))
 
-(defn- rp->res
-  [rp]
-  {:tx-data (:tx-data rp)
-   :tempids (:tempids rp)
-   :tx-meta (:tx-meta rp)})
-
 (defn transact-async*
   [cn tx-data tx-meta]
   (when-let [c (get-cn cn)]
@@ -306,6 +482,68 @@
                   (throw e)))]
        (rp->res rp)))))
 
+(defn with
+  ([dl tx-data]
+   (with dl tx-data {} false))
+  ([dl tx-data tx-meta]
+   (with dl tx-data tx-meta false))
+  ([dl tx-data tx-meta simulated?]
+   (when-let [d (get-db dl)]
+     (rp->res (d/with d tx-data tx-meta simulated?) true))))
+
+(defn db-with
+  [dl tx-data]
+  (when-let [d (get-db dl)]
+    (db-ref (d/db-with d tx-data))))
+
+(defn tx-data->simulated-report
+  [dl tx-data]
+  (when-let [d (get-db dl)]
+    (rp->res (d/tx-data->simulated-report d tx-data) true)))
+
+(defn reset-conn!
+  ([cn dl]
+   (reset-conn! cn dl nil))
+  ([{:keys [::conn]} dl tx-meta]
+   (when-let [c (get-cn {::conn conn})]
+     (when-let [d (get-db dl)]
+       (let [db' (d/reset-conn! c d tx-meta)]
+         (swap! dl-dbs assoc conn db')
+         {::db conn})))))
+
+(defn- callback-fn
+  [callback]
+  (cond
+    (ifn? callback)
+    callback
+
+    (::inter-fn callback)
+    (or (ns-resolve 'pod.huahaiy.datalevin (symbol (::inter-fn callback)))
+        (u/raise "Pod function not found: " (::inter-fn callback)
+                 {:callback callback}))
+
+    (symbol? callback)
+    (or (ns-resolve 'pod.huahaiy.datalevin callback)
+        (u/raise "Pod function not found: " callback
+                 {:callback callback}))
+
+    :else
+    (u/raise "Callback must be a function, pod function token, or symbol"
+             {:callback callback})))
+
+(defn listen!
+  ([cn callback]
+   (listen! cn (rand) callback))
+  ([cn key callback]
+   (when-let [c (get-cn cn)]
+     (let [f (callback-fn callback)]
+       (d/listen! c key #(f (rp->res % true)))))))
+
+(defn unlisten!
+  [cn key]
+  (when-let [c (get-cn cn)]
+    (d/unlisten! c key)))
+
 (defn db [{:keys [::conn] :as cn}]
   (when-let [c (get-cn cn)]
     (let [db       (d/db c)
@@ -316,11 +554,34 @@
       (swap! dbs assoc conn db)
       ref)))
 
+(defn opts [cn] (when-let [c (get-cn cn)] (d/opts c)))
+
 (defn schema [cn] (when-let [c (get-cn cn)] (d/schema c)))
 
 (defn update-schema
-  [cn schema-update]
-  (when-let [c (get-cn cn)] (d/update-schema c schema-update)))
+  ([cn schema-update]
+   (when-let [c (get-cn cn)] (d/update-schema c schema-update)))
+  ([cn schema-update del-attrs]
+   (when-let [c (get-cn cn)] (d/update-schema c schema-update del-attrs)))
+  ([cn schema-update del-attrs rename-map]
+   (when-let [c (get-cn cn)]
+     (d/update-schema c schema-update del-attrs rename-map))))
+
+(defn secondary-index-status
+  [cn]
+  (when-let [c (get-cn cn)] (d/secondary-index-status c)))
+
+(defn process-secondary-index-jobs!
+  ([cn]
+   (when-let [c (get-cn cn)] (d/process-secondary-index-jobs! c)))
+  ([cn opts]
+   (when-let [c (get-cn cn)] (d/process-secondary-index-jobs! c opts))))
+
+(defn wait-for-secondary-index
+  ([cn]
+   (when-let [c (get-cn cn)] (d/wait-for-secondary-index c)))
+  ([cn opts]
+   (when-let [c (get-cn cn)] (d/wait-for-secondary-index c opts))))
 
 (defn get-conn
   ([dir]
@@ -347,6 +608,32 @@
      (swap! kv-dbs assoc id db)
      {::kv-db id})))
 
+(defn datalog-kv
+  [{:keys [writing?] :as conn-or-db}]
+  (when-let [kv (or (some-> (get-cn conn-or-db) d/datalog-kv)
+                    (some-> (get-db conn-or-db) d/datalog-kv))]
+    (let [id  (UUID/randomUUID)
+          dbs (if writing? wkv-dbs kv-dbs)]
+      (swap! dbs assoc id kv)
+      (cond-> {::kv-db id}
+        writing? (assoc :writing? true)))))
+
+(defn k [kv] (l/k kv))
+
+(defn v [kv] (l/v kv))
+
+(defn put-buffer
+  ([bf x]
+   (b/put-buffer bf x))
+  ([bf x x-type]
+   (b/put-buffer bf x x-type)))
+
+(defn read-buffer
+  ([bf]
+   (b/read-buffer bf))
+  ([bf v-type]
+   (b/read-buffer bf v-type)))
+
 (defn close-kv [db] (when-let [d (get-kv db)] (d/close-kv d)))
 
 (defn closed-kv? [db] (when-let [d (get-kv db)] (d/closed-kv? d)))
@@ -359,9 +646,11 @@
   ([db dbi-name opts]
    (when-let [d (get-kv db)] (d/open-dbi d dbi-name opts) nil)))
 
-(defn clear-dbi [db] (when-let [d (get-kv db)] (d/clear-dbi d)))
+(defn clear-dbi [db dbi-name]
+  (when-let [d (get-kv db)] (d/clear-dbi d dbi-name)))
 
-(defn drop-dbi [db] (when-let [d (get-kv db)] (d/drop-dbi d)))
+(defn drop-dbi [db dbi-name]
+  (when-let [d (get-kv db)] (d/drop-dbi d dbi-name)))
 
 (defn list-dbis [db] (when-let [d (get-kv db)] (d/list-dbis d)))
 
@@ -421,6 +710,19 @@
 (defn abort-transact-kv [{:keys [::kv-db]}]
   (when-let [d (get @wkv-dbs kv-db)]
     (d/abort-transact-kv d)))
+
+(defn begin-kv-transaction
+  [db]
+  (open-transact-kv db))
+
+(defn commit-kv-transaction
+  [db]
+  (close-transact-kv db))
+
+(defn abort-kv-transaction
+  [db]
+  (abort-transact-kv db)
+  (close-transact-kv db))
 
 (defn open-transact [{:keys [::conn] :as cn}]
   (when-let [c (get @dl-conns conn)]
@@ -552,6 +854,30 @@
   ([db dbi-name k-range k-type v-type ignore-key?]
    (when-let [d (get-kv db)]
      (into [] (d/get-range d dbi-name k-range k-type v-type ignore-key?)))))
+
+(defn- realize-range-seq
+  [^java.lang.AutoCloseable rs]
+  (with-open [rs rs]
+    (into [] cat rs)))
+
+(defn range-seq
+  ([db dbi-name k-range]
+   (when-let [d (get-kv db)]
+     (realize-range-seq (d/range-seq d dbi-name k-range))))
+  ([db dbi-name k-range k-type]
+   (when-let [d (get-kv db)]
+     (realize-range-seq (d/range-seq d dbi-name k-range k-type))))
+  ([db dbi-name k-range k-type v-type]
+   (when-let [d (get-kv db)]
+     (realize-range-seq (d/range-seq d dbi-name k-range k-type v-type))))
+  ([db dbi-name k-range k-type v-type ignore-key?]
+   (when-let [d (get-kv db)]
+     (realize-range-seq
+       (d/range-seq d dbi-name k-range k-type v-type ignore-key?))))
+  ([db dbi-name k-range k-type v-type ignore-key? opts]
+   (when-let [d (get-kv db)]
+     (realize-range-seq
+       (d/range-seq d dbi-name k-range k-type v-type ignore-key? opts)))))
 
 (defn key-range
   ([db dbi-name k-range]
@@ -798,6 +1124,26 @@
        (swap! engines assoc id engine)
        {::engine id}))))
 
+(defn search-index-writer
+  ([db]
+   (search-index-writer db nil))
+  ([db opts]
+   (when-let [d (get-kv db)]
+     (let [writer (d/search-index-writer d opts)
+           id     (UUID/randomUUID)]
+       (swap! search-writers assoc id writer)
+       {::search-writer id}))))
+
+(defn write
+  [writer doc-ref doc-text]
+  (when-let [w (get-search-writer writer)]
+    (d/write w doc-ref doc-text)))
+
+(defn commit
+  [writer]
+  (when-let [w (get-search-writer writer)]
+    (d/commit w)))
+
 (defn add-doc
   ([engine doc-ref doc-text]
    (add-doc engine doc-ref doc-text true))
@@ -885,18 +1231,211 @@
          :else                       (do (swap! kv-dbs assoc db e1)
                                          {::kv-db db}))))))
 
+(defn new-embedding-provider
+  ([provider-spec]
+   (new-embedding-provider provider-spec nil))
+  ([provider-spec opts]
+   (let [provider (d/new-embedding-provider provider-spec opts)
+         id       (UUID/randomUUID)]
+     (swap! embedding-providers assoc id provider)
+     {::embedding-provider id})))
+
+(defn embedding-metadata
+  [provider]
+  (when-let [p (get-embedding-provider provider)]
+    (d/embedding-metadata p)))
+
+(defn embedding-dimensions
+  [provider]
+  (when-let [p (get-embedding-provider provider)]
+    (d/embedding-dimensions p)))
+
+(defn embed-text
+  ([provider text]
+   (embed-text provider text nil))
+  ([provider text opts]
+   (when-let [p (get-embedding-provider provider)]
+     (vec (d/embed-text p text opts)))))
+
+(defn embed-texts
+  ([provider texts]
+   (embed-texts provider texts nil))
+  ([provider texts opts]
+   (when-let [p (get-embedding-provider provider)]
+     (embedding-result (d/embed-texts p texts opts)))))
+
+(defn token-count
+  ([provider item]
+   (token-count provider item nil))
+  ([provider item opts]
+   (when-let [p (get-embedding-provider provider)]
+     (d/token-count p item opts))))
+
+(defn token-counts
+  ([provider items]
+   (token-counts provider items nil))
+  ([provider items opts]
+   (when-let [p (get-embedding-provider provider)]
+     (d/token-counts p items opts))))
+
+(defn truncate-item
+  ([provider item max-tokens]
+   (truncate-item provider item max-tokens nil))
+  ([provider item max-tokens opts]
+   (when-let [p (get-embedding-provider provider)]
+     (d/truncate-item p item max-tokens opts))))
+
+(defn truncate-text
+  ([provider text max-tokens]
+   (truncate-text provider text max-tokens nil))
+  ([provider text max-tokens opts]
+   (when-let [p (get-embedding-provider provider)]
+     (d/truncate-text p text max-tokens opts))))
+
+(defn close-embedding-provider
+  [provider]
+  (let [[old _] (swap-vals! embedding-providers dissoc (::embedding-provider provider))]
+    (when-let [p (get old (::embedding-provider provider))]
+      (d/close-embedding-provider p))))
+
+(defn new-llm-provider
+  ([provider-spec]
+   (new-llm-provider provider-spec nil))
+  ([provider-spec opts]
+   (let [provider (d/new-llm-provider provider-spec opts)
+         id       (UUID/randomUUID)]
+     (swap! llm-providers assoc id provider)
+     {::llm-provider id})))
+
+(defn llm-metadata
+  [provider]
+  (when-let [p (get-llm-provider provider)]
+    (d/llm-metadata p)))
+
+(defn llm-context-size
+  [provider]
+  (when-let [p (get-llm-provider provider)]
+    (d/llm-context-size p)))
+
+(defn generate-text
+  ([provider prompt max-tokens]
+   (generate-text provider prompt max-tokens nil))
+  ([provider prompt max-tokens opts]
+   (when-let [p (get-llm-provider provider)]
+     (d/generate-text p prompt max-tokens opts))))
+
+(defn summarize-text
+  ([provider text max-tokens]
+   (summarize-text provider text max-tokens nil))
+  ([provider text max-tokens opts]
+   (when-let [p (get-llm-provider provider)]
+     (d/summarize-text p text max-tokens opts))))
+
+(defn llm-token-count
+  ([provider text]
+   (llm-token-count provider text nil))
+  ([provider text opts]
+   (when-let [p (get-llm-provider provider)]
+     (d/llm-token-count p text opts))))
+
+(defn close-llm-provider
+  [provider]
+  (let [[old _] (swap-vals! llm-providers dissoc (::llm-provider provider))]
+    (when-let [p (get old (::llm-provider provider))]
+      (d/close-llm-provider p))))
+
+(defn read-csv
+  [input & opts]
+  (mapv vec (apply csv/read-csv input opts)))
+
+(defn write-csv
+  [writer data & opts]
+  (if (nil? writer)
+    (let [w (java.io.StringWriter.)]
+      (apply csv/write-csv w data opts)
+      (str w))
+    (apply csv/write-csv writer data opts)))
+
+(defmacro with-conn
+  [spec & body]
+  `(let [r#      (list ~@(rest spec))
+         dir#    (first r#)
+         schema# (second r#)
+         opts#   (second (rest r#))
+         conn#   (get-conn dir# schema# opts#)]
+     (try
+       (let [~(first spec) conn#] ~@body)
+       (finally (close conn#)))))
+
+(defmacro with-kv
+  [spec & body]
+  `(let [r#    (list ~@(rest spec))
+         dir#  (first r#)
+         opts# (second r#)
+         db#   (open-kv dir# opts#)]
+     (try
+       (let [~(first spec) db#] ~@body)
+       (finally (close-kv db#)))))
+
+(defn- apply-resource-fn
+  [f resource]
+  (if (instance? java.util.function.Function f)
+    (.apply ^java.util.function.Function f resource)
+    (f resource)))
+
+(defn with-transaction-kv-fn
+  ([kv f]
+   (let [tx-kv (open-transact-kv kv)]
+     (try
+       (let [res (apply-resource-fn f tx-kv)]
+         (close-transact-kv kv)
+         res)
+       (catch Throwable t
+         (try
+           (abort-transact-kv kv)
+           (catch Throwable abort-error
+             (.addSuppressed t abort-error)))
+         (throw t)))))
+  ([kv _timeout-ms f]
+   (with-transaction-kv-fn kv f)))
+
+(defn with-transaction-fn
+  ([cn f]
+   (let [tx-cn (open-transact cn)]
+     (try
+       (let [res (apply-resource-fn f tx-cn)]
+         (close-transact cn)
+         res)
+       (catch Throwable t
+         (try
+           (abort-transact cn)
+           (catch Throwable abort-error
+             (.addSuppressed t abort-error)))
+         (throw t)))))
+  ([cn _timeout-ms f]
+   (with-transaction-fn cn f)))
+
 ;; pods
 
 (def ^:private exposed-vars
   {'pod-fn                    pod-fn
    'entid                     entid
    'entity                    entity
+   'add                       add
+   'retract                   retract
+   'entity-db                 entity-db
    'touch                     touch
    'pull                      pull
    'pull-many                 pull-many
+   'datom                     datom
+   'datom?                    datom?
+   'datom-e                   datom-e
+   'datom-a                   datom-a
+   'datom-v                   datom-v
    'empty-db                  empty-db
    'db?                       db?
    'init-db                   init-db
+   'fill-db                   fill-db
    'close-db                  close-db
    'datoms                    datoms
    'search-datoms             search-datoms
@@ -910,6 +1449,7 @@
    'index-range               index-range
    'conn?                     conn?
    'conn-from-db              conn-from-db
+   'conn-from-datoms          conn-from-datoms
    'create-conn               create-conn
    'close                     close
    'datalog-index-cache-limit datalog-index-cache-limit
@@ -917,14 +1457,37 @@
    'transact!                 transact!
    'transact                  transact
    'transact-async*           transact-async*
+   'with                      with
+   'db-with                   db-with
+   'tx-data->simulated-report tx-data->simulated-report
+   'reset-conn!               reset-conn!
+   'listen!                   listen!
+   'unlisten!                 unlisten!
    'db                        db
+   'opts                      opts
    'schema                    schema
    'update-schema             update-schema
+   'secondary-index-status    secondary-index-status
+   'process-secondary-index-jobs! process-secondary-index-jobs!
+   'wait-for-secondary-index  wait-for-secondary-index
    'get-conn                  get-conn
    'clear                     clear
    'q                         q
    'explain                   explain
+   'tempid                    tempid
+   'resolve-tempid            resolve-tempid
+   'squuid                    squuid
+   'squuid-time-millis        squuid-time-millis
+   'hexify-string             hexify-string
+   'unhexify-string           unhexify-string
+   'explicit-transaction-timeout explicit-transaction-timeout
+   'set-explicit-transaction-timeout! set-explicit-transaction-timeout!
    'open-kv                   open-kv
+   'datalog-kv                datalog-kv
+   'k                         k
+   'v                         v
+   'put-buffer                put-buffer
+   'read-buffer               read-buffer
    'close-kv                  close-kv
    'closed-kv?                closed-kv?
    'dir                       dir
@@ -946,6 +1509,9 @@
    'get-env-flags             get-env-flags
    'close-transact-kv         close-transact-kv
    'abort-transact-kv         abort-transact-kv
+   'begin-kv-transaction      begin-kv-transaction
+   'commit-kv-transaction     commit-kv-transaction
+   'abort-kv-transaction      abort-kv-transaction
    'open-transact             open-transact
    'close-transact            close-transact
    'abort-transact            abort-transact
@@ -958,8 +1524,10 @@
    'get-first                 get-first
    'get-first-n               get-first-n
    'get-range                 get-range
+   'range-seq                 range-seq
    'key-range                 key-range
    'key-range-count           key-range-count
+   'key-range-list-count      key-range-list-count
    'visit-key-range           visit-key-range
    'range-count               range-count
    'get-some                  get-some
@@ -985,6 +1553,9 @@
    'list-range-filter-count   list-range-filter-count
    'visit-list-range          visit-list-range
    'new-search-engine         new-search-engine
+   'search-index-writer       search-index-writer
+   'write                     write
+   'commit                    commit
    'add-doc                   add-doc
    'remove-doc                remove-doc
    'clear-docs                clear-docs
@@ -1001,6 +1572,25 @@
    'vector-checkpoint-state   vector-checkpoint-state
    'search-vec                search-vec
    're-index                  re-index
+   'new-embedding-provider    new-embedding-provider
+   'embedding-metadata        embedding-metadata
+   'embedding-dimensions      embedding-dimensions
+   'embed-text                embed-text
+   'embed-texts               embed-texts
+   'token-count               token-count
+   'token-counts              token-counts
+   'truncate-item             truncate-item
+   'truncate-text             truncate-text
+   'close-embedding-provider  close-embedding-provider
+   'new-llm-provider          new-llm-provider
+   'llm-metadata              llm-metadata
+   'llm-context-size          llm-context-size
+   'generate-text             generate-text
+   'summarize-text            summarize-text
+   'llm-token-count           llm-token-count
+   'close-llm-provider        close-llm-provider
+   'read-csv                  read-csv
+   'write-csv                 write-csv
    })
 
 (def ^:private lookup
@@ -1059,6 +1649,55 @@
                   (catch Throwable abort-error#
                     (.addSuppressed t# abort-error#)))
                 (throw t#)))))"}
+     {"name" "with-conn"
+      "code"
+      "(defmacro with-conn
+          [spec & body]
+          `(let [r#      (list ~@(rest spec))
+                 dir#    (first r#)
+                 schema# (second r#)
+                 opts#   (second (rest r#))
+                 conn#   (get-conn dir# schema# opts#)]
+             (try
+               (let [~(first spec) conn#] ~@body)
+               (finally (close conn#)))))"}
+     {"name" "with-kv"
+      "code"
+      "(defmacro with-kv
+          [spec & body]
+          `(let [r#    (list ~@(rest spec))
+                 dir#  (first r#)
+                 opts# (second r#)
+                 db#   (open-kv dir# opts#)]
+             (try
+               (let [~(first spec) db#] ~@body)
+               (finally (close-kv db#)))))"}
+     {"name" "with-transaction-fn"
+      "code"
+      "(defn with-transaction-fn
+          ([conn f]
+           (with-transaction [tx-conn conn]
+             (if (instance? java.util.function.Function f)
+               (.apply ^java.util.function.Function f tx-conn)
+               (f tx-conn))))
+          ([conn timeout-ms f]
+           (with-transaction [tx-conn conn {:timeout-ms timeout-ms}]
+             (if (instance? java.util.function.Function f)
+               (.apply ^java.util.function.Function f tx-conn)
+               (f tx-conn)))))"}
+     {"name" "with-transaction-kv-fn"
+      "code"
+      "(defn with-transaction-kv-fn
+          ([kv f]
+           (with-transaction-kv [tx-kv kv]
+             (if (instance? java.util.function.Function f)
+               (.apply ^java.util.function.Function f tx-kv)
+               (f tx-kv))))
+          ([kv timeout-ms f]
+           (with-transaction-kv [tx-kv kv {:timeout-ms timeout-ms}]
+             (if (instance? java.util.function.Function f)
+               (.apply ^java.util.function.Function f tx-kv)
+               (f tx-kv)))))"}
      {"name" "transact-async"
       "code"
       "(defn transact-async
@@ -1096,11 +1735,11 @@
               id (or (some-> message (get "id") read-string) "unknown")]
           (case op
             :describe
-            (do (write {"format"     "transit+json"
-                        "namespaces" [{"name" "pod.huahaiy.datalevin"
-                                       "vars" (all-vars)}]
-                        "id"         id
-                        "ops"        {"shutdown" {}}})
+            (do (write-response {"format"     "transit+json"
+                                  "namespaces" [{"name" "pod.huahaiy.datalevin"
+                                                 "vars" (all-vars)}]
+                                  "id"         id
+                                  "ops"        {"shutdown" {}}})
                 (recur))
             :invoke
             (do (try
@@ -1117,7 +1756,7 @@
                             reply {"value"  value
                                    "id"     id
                                    "status" ["done"]}]
-                        (write reply))
+                        (write-response reply))
                       (throw (ex-info (str "Var not found: " var) {}))))
                   (catch Throwable e
                     (let [edata (ex-data e)
@@ -1130,14 +1769,18 @@
                                  "status"     ["done" "error"]}]
                       (when-not (:resized edata)
                         (binding [*out* *err*] (println e)))
-                      (write reply))))
+                      (write-response reply))))
                 (recur))
             :shutdown
             (do (doseq [conn (vals @dl-conns)] (d/close conn))
                 (doseq [db (vals @kv-dbs)] (d/close-kv db))
+                (doseq [provider (vals @embedding-providers)]
+                  (d/close-embedding-provider provider))
+                (doseq [provider (vals @llm-providers)]
+                  (d/close-llm-provider provider))
                 (System/exit 0))
             (do
-              (write {"err" (str "unknown op:" (name op))})
+              (write-response {"err" (str "unknown op:" (name op))})
               (recur))))))))
 
 (defn -main [& _]

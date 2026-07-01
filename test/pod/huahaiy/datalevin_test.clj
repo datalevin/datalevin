@@ -36,6 +36,16 @@
         (pd/abort-transact-kv db))
       (is (= [1 2] (pd/get-value lmdb "a" 1 :data :data false))))
 
+    (testing "explicit abort alias cleans up"
+      (let [db (pd/begin-kv-transaction lmdb)]
+        (pd/transact-kv db [[:put "a" 1 4]])
+        (pd/abort-kv-transaction db))
+      (is (= [1 2] (pd/get-value lmdb "a" 1 :data :data false)))
+      (let [db (pd/begin-kv-transaction lmdb)]
+        (pd/transact-kv db [[:put "a" 1 5]])
+        (pd/commit-kv-transaction db))
+      (is (= [1 5] (pd/get-value lmdb "a" 1 :data :data false))))
+
     (pd/close-kv lmdb)
     (u/delete-files dir)))
 
@@ -107,6 +117,29 @@
 
     (pd/close conn)
     (u/delete-files dir)))
+
+(deftest with-resource-helper-test
+  (let [dir1 (u/tmp-dir (str "pod-with-conn-test-" (UUID/randomUUID)))
+        dir2 (u/tmp-dir (str "pod-with-kv-test-" (UUID/randomUUID)))]
+    (try
+      #_{:clj-kondo/ignore [:unresolved-symbol]}
+      (pd/with-conn [conn dir1]
+        (pd/transact! conn [{:db/id 1 :name "Ada"}])
+        (is (= "Ada" (pd/q '[:find ?name .
+                             :in $
+                             :where [1 :name ?name]]
+                           (pd/db conn)))))
+      #_{:clj-kondo/ignore [:unresolved-symbol]}
+      (pd/with-kv [kv dir2]
+        (pd/open-dbi kv "a")
+        (pd/with-transaction-kv-fn
+          kv
+          (fn [tx-kv]
+            (pd/transact-kv tx-kv "a" [[:put "x" "y"]] :string :string)))
+        (is (= "y" (pd/get-value kv "a" "x" :string :string true))))
+      (finally
+        (u/delete-files dir1)
+        (u/delete-files dir2)))))
 
 (pd/defpodfn age [birthday today]
   (quot (-  (.getTime today) (.getTime birthday))
@@ -226,7 +259,12 @@
       (is (= (:age e) 19))
       (is (= (:aka e) #{"X" "Y"}))
       (is (= true (contains? e :age)))
-      (is (= false (contains? e :not-found))))
+      (is (= false (contains? e :not-found)))
+      (is (pd/db? (pd/entity-db e)))
+      (pd/transact! conn [(pd/add e :age 20)])
+      (is (= 20 (:age (pd/entity (pd/db conn) 1))))
+      (pd/transact! conn [(pd/retract (pd/entity (pd/db conn) 1) :age 20)])
+      (is (nil? (:age (pd/entity (pd/db conn) 1)))))
     (pd/close conn)
     (u/delete-files dir)))
 
@@ -293,6 +331,8 @@
         test-db (pd/init-db datoms dir schema)]
     (is (= {:name "Petr" :aka ["Devil" "Tupen"]}
            (pd/pull test-db '[:name :aka] 1)))
+    (is (= {:name "Petr"}
+           (pd/pull test-db '[:name] 1 {})))
 
     (is (= {:name "Matthew" :father {:db/id 3} :db/id 6}
            (pd/pull test-db '[:name :father :db/id] 6)))
@@ -313,6 +353,71 @@
     (is (= datoms res))
     (pd/close-db db)
     (u/delete-files dir)))
+
+(deftest parity-utility-test
+  (let [d1 (pd/datom 1 :name "Ada")]
+    (is (pd/datom? d1))
+    (is (= 1 (pd/datom-e d1)))
+    (is (= :name (pd/datom-a d1)))
+    (is (= "Ada" (pd/datom-v d1)))
+    (is (neg? (pd/tempid :db.part/user)))
+    (is (= 42 (pd/resolve-tempid nil {-1 42} -1)))
+    (is (= "6869" (pd/hexify-string "hi")))
+    (is (= "hi" (pd/unhexify-string "6869")))
+    (let [uuid (pd/squuid)]
+      (is (uuid? uuid))
+      (is (integer? (pd/squuid-time-millis uuid)))))
+  (let [rows [["name" "age"] ["Ada" "37"]]]
+    (is (= rows (pd/read-csv (pd/write-csv nil rows))))))
+
+(deftest conn-from-datoms-and-fill-db-test
+  (let [dir1 (u/tmp-dir (str "pod-conn-from-datoms-" (UUID/randomUUID)))
+        conn (pd/conn-from-datoms [[1 :name "Ada"]] dir1 nil
+                                  {:closed-schema? false})
+        dir2 (u/tmp-dir (str "pod-fill-db-" (UUID/randomUUID)))
+        db   (pd/empty-db dir2)]
+    (try
+      (is (= false (:closed-schema? (pd/opts conn))))
+      (is (= "Ada" (:name (pd/entity (pd/db conn) 1))))
+      (let [db' (pd/fill-db db [[2 :name "Grace"]])]
+        (is (= "Grace" (:name (pd/entity db' 2)))))
+      (finally
+        (pd/close conn)
+        (pd/close-db db)
+        (u/delete-files dir1)
+        (u/delete-files dir2)))))
+
+(deftest db-value-parity-test
+  (let [dir  (u/tmp-dir (str "pod-db-value-parity-" (UUID/randomUUID)))
+        db   (pd/empty-db dir)
+        conn (pd/create-conn nil)]
+    (try
+      (let [db1    (pd/db-with db [{:db/id 1 :name "Ada"}])
+            report (pd/with db1 [[:db/add 1 :age 37]])
+            db2    (:db-after report)
+            sim    (pd/tx-data->simulated-report db1
+                                                  [[:db/add 1 :age 37]])]
+        (is (= "Ada" (pd/q '[:find ?name .
+                             :in $ ?e
+                             :where [?e :name ?name]]
+                           db1 1)))
+        (is (= 37 (pd/q '[:find ?age .
+                          :in $ ?e
+                          :where [?e :age ?age]]
+                        db2 1)))
+        (is (= 37 (pd/q '[:find ?age .
+                          :in $ ?e
+                          :where [?e :age ?age]]
+                        (:db-after sim) 1)))
+        (pd/reset-conn! conn db2)
+        (is (= 37 (pd/q '[:find ?age .
+                          :in $ ?e
+                          :where [?e :age ?age]]
+                        (pd/db conn) 1))))
+      (finally
+        (pd/close conn)
+        (pd/close-db db)
+        (u/delete-files dir)))))
 
 (deftest schema-test
   (let [dir   (u/tmp-dir (str "pod-schema-test-" (UUID/randomUUID)))
@@ -355,8 +460,34 @@
     (is (= [[#inst "1989-11-09T00:00:00.000-00:00" "The fall of the Berlin Wall"]
             [#inst "1991-12-25T00:00:00.000-00:00" "USSR broke apart"]]
            (pd/get-range db date-table [:closed (Date. 0) (Date.)] :instant)))
+    (is (= [[#inst "1989-11-09T00:00:00.000-00:00" "The fall of the Berlin Wall"]
+            [#inst "1991-12-25T00:00:00.000-00:00" "USSR broke apart"]]
+           (pd/range-seq db date-table [:closed (Date. 0) (Date.)] :instant)))
+    (pd/open-dbi db "scratch")
+    (pd/transact-kv db "scratch" [[:put "x" "y"]] :string :string)
+    (is (= "y" (pd/get-value db "scratch" "x" :string :string true)))
+    (pd/clear-dbi db "scratch")
+    (is (nil? (pd/get-value db "scratch" "x" :string :string true)))
+    (pd/drop-dbi db "scratch")
     (pd/close-kv db)
     (u/delete-files dir)))
+
+(deftest datalog-kv-test
+  (let [dir  (u/tmp-dir (str "pod-datalog-kv-test-" (UUID/randomUUID)))
+        conn (pd/create-conn dir)]
+    (try
+      (let [kv (pd/datalog-kv conn)]
+        (is (= dir (pd/dir kv)))
+        (pd/open-dbi kv "app-state")
+        (pd/transact-kv kv "app-state" [[:put "k" "v"]] :string :string)
+        (is (= "v" (pd/get-value kv "app-state" "k"
+                                 :string :string true)))
+        (let [db-kv (pd/datalog-kv (pd/db conn))]
+          (is (= "v" (pd/get-value db-kv "app-state" "k"
+                                   :string :string true)))))
+      (finally
+        (pd/close conn)
+        (u/delete-files dir)))))
 
 ;; (def sum (volatile! 0))
 
@@ -374,6 +505,7 @@
     (pd/put-list-items lmdb "list" "c" [3 6 9] :string :long)
 
     (is (= (pd/entries lmdb "list") 10))
+    (is (= 10 (pd/key-range-list-count lmdb "list" [:all] :string)))
 
     (is (= [["a" 1] ["a" 2] ["a" 3] ["a" 4] ["b" 5] ["b" 6] ["b" 7]
             ["c" 3] ["c" 6] ["c" 9]]
@@ -522,6 +654,19 @@
              (second (second results)))))
     (is (= [[1 [["red" [10 39]]]] [2 [["red" [40]]]]]
            (pd/search engine "red" {:display :offsets})))
+    (pd/close-kv lmdb)
+    (u/delete-files dir)))
+
+(deftest search-index-writer-test
+  (let [dir    (u/tmp-dir (str "pod-search-writer-test-" (UUID/randomUUID)))
+        lmdb   (pd/open-kv dir)
+        writer (pd/search-index-writer lmdb)]
+    (pd/write writer :doc/a "red fox")
+    (pd/write writer :doc/b "blue whale")
+    (pd/commit writer)
+    (let [engine (pd/new-search-engine lmdb)]
+      (is (= [:doc/a] (pd/search engine "red")))
+      (is (= [:doc/b] (pd/search engine "blue"))))
     (pd/close-kv lmdb)
     (u/delete-files dir)))
 
