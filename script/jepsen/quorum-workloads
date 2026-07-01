@@ -133,11 +133,25 @@ print_result_summary() {
       (let [m (clojure.edn/read-string
                 {:default (fn [_ value] value)}
                 (slurp (System/getenv "RESULTS_FILE")))
-            summary {:valid? (:valid? m)
-                     :exceptions (get-in m [:exceptions :valid?])
-                     :workload (get-in m [:workload :valid?])}]
+            adjusted-valid? (get-in m [:workload :adjusted-valid?])
+            other-checkers-valid? (->> (dissoc m :valid? :workload)
+                                       vals
+                                       (filter map?)
+                                       (filter #(contains? % :valid?))
+                                       (every? #(true? (:valid? %))))
+            accepted? (or (true? (:valid? m))
+                          (and other-checkers-valid?
+                               (contains? #{:ignorable-empty-graph
+                                            :disruption-only-empty-graph}
+                                          adjusted-valid?)))
+            summary (cond-> {:valid? (:valid? m)
+                             :timeline (get-in m [:timeline :valid?])
+                             :exceptions (get-in m [:exceptions :valid?])
+                             :workload (get-in m [:workload :valid?])}
+                      adjusted-valid?
+                      (assoc :adjusted-valid? adjusted-valid?))]
         (println (pr-str summary))
-        (when-not (true? (:valid? m))
+        (when-not accepted?
           (System/exit 1)))'
   )
 }

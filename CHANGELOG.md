@@ -2,8 +2,13 @@
 
 ## WIP
 ### Added
-- [Datalog ]`datalog-kv` function to return the underlying DLMDB instance for a
+- [Datalog]`datalog-kv` function to return the underlying DLMDB instance for a
   Datalog DB.
+- [Datalog] schema now allows attribute predicates, i.e. `:db.attr/preds` to
+  enforce attribute conditions automatically.
+- [Datalog] `:db/ensure` special form in transaction data, takes a predicate and
+  arguments, and use `:db-after` to ensure post conditions are met, otherwise
+  abort the transaction.
 - [Search] `:limit` and `:offset` search option
   [#318](https://github.com/datalevin/datalevin/issues/318).
 - [Lib] Release Datalevin server as a Java library
@@ -13,7 +18,6 @@
   [#261](https://github.com/datalevin/datalevin/issues/261).
 - Add time-out for explicit transactions
   [#162](https://github.com/datalevin/datalevin/issues/162).
-
 
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
