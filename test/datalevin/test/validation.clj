@@ -10,6 +10,10 @@
 
 (use-fixtures :each db-fixture)
 
+(defn- coerced-inst-ms
+  ^long [v]
+  (.getTime ^Date (prepare/coerce-inst v)))
+
 (deftest test-with-validation
   (let [dir (u/tmp-dir (str "query-or-" (UUID/randomUUID)))
         db  (d/empty-db dir {:profile { :db/valueType :db.type/ref }
@@ -60,18 +64,18 @@
 
 (deftest coerce-inst-test
   (is (instance? Date (prepare/coerce-inst 1000)))
-  (is (= 1000 (.getTime (prepare/coerce-inst 1000))))
+  (is (= 1000 (coerced-inst-ms 1000)))
 
   (is (instance? Date (prepare/coerce-inst (Date. 1000))))
-  (is (= 1000 (.getTime (prepare/coerce-inst (Date. 1000)))))
+  (is (= 1000 (coerced-inst-ms (Date. 1000))))
 
   (is (instance? Date (prepare/coerce-inst (java.sql.Date. 1000))))
-  (is (= 1000 (.getTime (prepare/coerce-inst (java.sql.Date. 1000)))))
+  (is (= 1000 (coerced-inst-ms (java.sql.Date. 1000))))
 
   (is (instance? Date (prepare/coerce-inst (java.sql.Timestamp. 1000))))
-  (is (= 1000 (.getTime (prepare/coerce-inst (java.sql.Timestamp. 1000)))))
+  (is (= 1000 (coerced-inst-ms (java.sql.Timestamp. 1000))))
 
   (is (instance? Date (prepare/coerce-inst (java.time.Instant/ofEpochMilli 1000))))
-  (is (= 1000 (.getTime (prepare/coerce-inst (java.time.Instant/ofEpochMilli 1000)))))
+  (is (= 1000 (coerced-inst-ms (java.time.Instant/ofEpochMilli 1000))))
 
   (is (thrown-with-msg? Throwable #"Expect java.util.Date" (prepare/coerce-inst "1970-01-01T00:00:01.000-00:00"))))
