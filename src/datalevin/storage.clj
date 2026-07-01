@@ -115,6 +115,8 @@
              (identical? :db.type/ref v)) [:db.type/ref]
         (and (identical? :db/isComponent k)
              (true? v))                   [:db/isComponent]
+        (and (identical? :db.attr/preds k)
+             (some? v))                   [:db.attr/preds]
         :else                             []))))
 
 (defn attr-tuples
@@ -135,6 +137,7 @@
    :db.cardinality/many => #{attr ...}
    :db.type/ref         => #{attr ...}
    :db/isComponent      => #{attr ...}
+   :db.attr/preds       => #{attr ...}
    :db.type/tuple       => #{attr ...}
    :db/tupleAttr        => #{attr ...}
    :db/tupleType        => #{attr ...}

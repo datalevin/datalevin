@@ -222,7 +222,9 @@
         v         (if (txcommon/ref? db a)
                     (txcommon/entid-strict db v)
                     v)
+        props     ((schema store) a)
         v'        (coreprep/correct-value store a v)
+        _         (vld/validate-attr-preds e a v' props)
         meta*     (meta ent)
         new-datom (cond-> (datom e a v' tx)
                     meta* (with-meta meta*))
@@ -260,7 +262,9 @@
   [report db store entity e a nv ^Datom old-datom]
   (let [tx        (current-tx report)
         _         (validate-installed-callable-write report db e a nv entity)
+        props     ((schema store) a)
         nv'       (coreprep/correct-value store a nv)
+        _         (vld/validate-attr-preds e a nv' props)
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]
@@ -425,6 +429,13 @@
                 ent                 (with-meta [:db/add e a doc]
                                       {:idoc/patch {:paths paths}})]
             [(transact-add report ent) entities]))))))
+
+(defn- handle-ensure
+  [report entity entities]
+  (vld/validate-ensure-arity (count entity) entity)
+  (let [[_ pred & args] entity]
+    (vld/validate-ensure-predicate pred entity)
+    [(update report ::ensures conjv [pred args entity]) entities]))
 
 (defn- handle-ref-tempid-value
   [report db tempids entity entities es tx-time]
@@ -615,6 +626,9 @@
       (identical? op :db.fn/call)
       [report (concat (txprep/handle-fn-call db entity) entities)]
 
+      (identical? op :db/ensure)
+      (handle-ensure report entity entities)
+
       (and (keyword? op) (not (txprep/builtin-fn? op)))
       [report (txprep/handle-custom-tx-fn db store entity entities)]
 
@@ -764,5 +778,8 @@
                      :tx-data (:tx-data ptx)
                      :tempids (:tempids ptx))
         (seq (:new-attributes ptx))
-        (assoc :new-attributes (:new-attributes ptx))))
+        (assoc :new-attributes (:new-attributes ptx))
+
+        (seq (:ensures ptx))
+        (assoc ::ensures (:ensures ptx))))
     (execute-tx-loop initial-report initial-es tx-time)))

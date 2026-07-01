@@ -17,6 +17,40 @@
 
 (defn testing-fn []  "test-value")
 
+(defn user-name?
+  [s]
+  (<= 3 (count s) 15))
+
+(defn has-at?
+  [s]
+  (boolean (re-find #"@" s)))
+
+(defn short-string?
+  [s]
+  (<= (count s) 5))
+
+(defn truthy-string?
+  [_]
+  :truthy)
+
+(defn account-open?
+  [db eid]
+  (= :open (:account/status (d/entity db eid))))
+
+(defn account-balance?
+  [db eid expected]
+  (= expected (:account/balance (d/entity db eid))))
+
+(defn account-open-and-unlocked?
+  [db eid]
+  (let [e (d/entity db eid)]
+    (and (= :open (:account/status e))
+         (not (:account/locked? e)))))
+
+(defn ensure-throws
+  [_db _eid]
+  (throw (ex-info "ensure exploded" {})))
+
 (i/definterfn host-var-tx [_db tempid]
   [{:db/id      tempid
     :node/value (inter-fn-host/testing-fn)}])
@@ -33,6 +67,167 @@
     (is (= (:node/value e) "test-value"))
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-db-attr-preds
+  (let [dir    (u/tmp-dir (str "attr-preds-" (UUID/randomUUID)))
+        schema {:user/name   {:db/valueType   :db.type/string
+                              :db.attr/preds 'datalevin.test.transact/user-name?}
+                :user/email  {:db/valueType   :db.type/string
+                              :db/cardinality :db.cardinality/many
+                              :db.attr/preds ['datalevin.test.transact/has-at?
+                                              'datalevin.test.transact/short-string?]}
+                :user/truthy {:db/valueType   :db.type/string
+                              :db.attr/preds 'datalevin.test.transact/truthy-string?}}
+        conn   (d/create-conn
+                 dir schema
+                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (d/transact! conn [{:db/id 1
+                          :user/name "alice"
+                          :user/email ["a@b"]}])
+      (is (= "alice" (:user/name (d/entity @conn 1))))
+      (is (thrown-with-msg?
+            Exception
+            #"failed pred datalevin.test.transact/user-name\?"
+            (d/transact! conn [{:db/id 2 :user/name "al"}])))
+      (is (thrown-with-msg?
+            Exception
+            #"failed pred datalevin.test.transact/short-string\?"
+            (d/transact! conn [{:db/id 3 :user/email ["abcdef@"]}])))
+      (try
+        (d/transact! conn [{:db/id 4 :user/truthy "anything"}])
+        (is false "truthy, non-true predicate returns should fail")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :transact/attr-pred (:error (ex-data e))))
+          (is (= :truthy (:db.error/pred-return (ex-data e))))
+          (is (= 'datalevin.test.transact/truthy-string?
+                 (:predicate (ex-data e))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-db-attr-preds-schema-validation
+  (let [dir1 (u/tmp-dir (str "attr-preds-schema-empty-" (UUID/randomUUID)))
+        dir2 (u/tmp-dir (str "attr-preds-schema-unqualified-" (UUID/randomUUID)))]
+    (try
+      (is (thrown-with-msg?
+            Exception
+            #":db.attr/preds cannot be empty"
+            (d/create-conn dir1 {:bad/attr {:db.attr/preds []}})))
+      (is (thrown-with-msg?
+            Exception
+            #":db.attr/preds entries must be qualified symbols"
+            (d/create-conn dir2 {:bad/attr {:db.attr/preds ['unqualified?]}})))
+      (finally
+        (when (u/file-exists dir1) (u/delete-files dir1))
+        (when (u/file-exists dir2) (u/delete-files dir2))))))
+
+(deftest test-db-attr-preds-not-retroactive-but-upserts-validate
+  (let [dir    (u/tmp-dir (str "attr-preds-upsert-" (UUID/randomUUID)))
+        schema {:user/name {:db/valueType :db.type/string
+                            :db/unique    :db.unique/identity}
+                :user/age  {:db/valueType :db.type/long}}
+        conn   (d/create-conn
+                 dir schema
+                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (d/transact! conn [{:db/id 1 :user/name "legacy"}])
+      (d/update-schema
+        conn
+        {:user/name {:db/valueType   :db.type/string
+                     :db/unique      :db.unique/identity
+                     :db.attr/preds 'datalevin.test.transact/has-at?}})
+      (is (= "legacy" (:user/name (d/entity @conn 1))))
+      (is (thrown-with-msg?
+            Exception
+            #"failed pred datalevin.test.transact/has-at\?"
+            (d/transact! conn [{:user/name "legacy"
+                                :user/age  42}])))
+      (d/transact! conn [[:db/add 1 :user/name "a@b"]])
+      (is (= "a@b" (:user/name (d/entity @conn 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-db-ensure
+  (let [dir    (u/tmp-dir (str "ensure-" (UUID/randomUUID)))
+        schema {:account/status  {:db/valueType :db.type/keyword}
+                :account/balance {:db/valueType :db.type/long}
+                :account/locked? {:db/valueType :db.type/boolean}}
+        conn   (d/create-conn
+                 dir schema
+                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+    (try
+      (let [report (d/transact!
+                     conn
+                     [{:db/id           "acct"
+                       :account/status  :open
+                       :account/balance 10}
+                      [:db/ensure
+                       'datalevin.test.transact/account-open?
+                       "acct"]
+                      [:db/ensure account-balance? "acct" 10]])
+            eid    (get (:tempids report) "acct")]
+        (is (some? eid))
+        (is (= :open (:account/status (d/entity @conn eid))))
+        (is (not-any? #(= :db/ensure (:a %)) (:tx-data report))))
+
+      (binding [c/*use-prepare-path* true]
+        (let [report (d/transact!
+                       conn
+                       [{:db/id "prep" :account/status :open}
+                        [:db/ensure account-open? "prep"]])
+              eid    (get (:tempids report) "prep")]
+          (is (= :open (:account/status (d/entity @conn eid))))))
+
+      (let [dir-auto  (u/tmp-dir (str "ensure-auto-time-"
+                                      (UUID/randomUUID)))
+            conn-auto (d/create-conn
+                        dir-auto schema
+                        {:auto-entity-time? true
+                         :kv-opts {:flags (conj c/default-env-flags
+                                                :nosync)}})]
+        (try
+          (let [report (d/transact!
+                         conn-auto
+                         [{:db/id "auto" :account/status :open}
+                          [:db/ensure account-open? "auto"]])
+                eid    (get (:tempids report) "auto")]
+            (is (= :open (:account/status (d/entity @conn-auto eid)))))
+          (finally
+            (d/close conn-auto)
+            (u/delete-files dir-auto))))
+
+      (is (thrown-with-msg?
+            Exception
+            #":db/ensure failed"
+            (d/transact!
+              conn
+              [{:db/id "bad" :account/status :open}
+               [:db/ensure account-open-and-unlocked? "bad"]
+               [:db/add "bad" :account/locked? true]])))
+      (is (empty? (d/q '[:find ?e
+                         :where [?e :account/locked? true]]
+                       @conn)))
+
+      (is (thrown-with-msg?
+            Exception
+            #"ensure exploded"
+            (d/transact!
+              conn
+              [{:db/id "boom" :account/status :open :account/balance 99}
+               [:db/ensure ensure-throws "boom"]])))
+      (is (empty? (d/q '[:find ?e
+                         :where [?e :account/balance 99]]
+                       @conn)))
+
+      (is (thrown-with-msg?
+            Exception
+            #"could not resolve tempid argument"
+            (d/transact! conn [[:db/ensure account-open? "missing"]])))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest test-db-fn
   (let [dir     (u/tmp-dir (str "skip-" (UUID/randomUUID)))

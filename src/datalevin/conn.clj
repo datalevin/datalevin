@@ -945,7 +945,7 @@
       (assert (active-conn-structural? c))
       (dotimes [i n]
         (let [^TxReport report (aget reports i)]
-          (db/commit-prepared-tx-data! @c (:tx-data report)))))))
+          (db/commit-prepared-tx-data! @c (:tx-data report) report))))))
 
 (defn- run-sync-queued-dl-batch!
   [conn ^FastList requests]
