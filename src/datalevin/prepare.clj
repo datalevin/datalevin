@@ -38,6 +38,7 @@
      db-after       ; DB snapshot after applying all datoms (with updated indexes)
      tempids        ; map: tempid -> resolved eid
      new-attributes ; vector of attrs added in this tx
+     ensures        ; vector of :db/ensure forms collected during tx processing
      tx-redundant   ; vector of redundant (no-op) datoms
      side-index-ops ; map: {:ft [...] :vec [...] :idoc [...] :gt [...]}
      touch-summary  ; set of touched attr keywords (for cache invalidation)
@@ -110,6 +111,7 @@
       (:db-after report)
       (:tempids report)
       (:new-attributes report)
+      (:datalevin.db.tx.execute/ensures report)
       nil   ; tx-redundant not needed externally
       nil   ; side-index-ops (future)
       nil   ; touch-summary (future)

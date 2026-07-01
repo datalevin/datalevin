@@ -26,16 +26,16 @@ Pick the operating mode that matches your goal:
 * remote multi-host run: production-like process, network, disk, and rejoin
   behavior
 
-Compile Java first so `../target/classes` exists:
+Compile the Java helpers in the Jepsen subproject:
 
 ```bash
-clojure -T:build compile-java
+cd jepsen
+lein javac
 ```
 
 Smoke-test the Jepsen subproject itself:
 
 ```bash
-cd jepsen
 lein test
 ```
 
@@ -251,10 +251,11 @@ Raw fault keywords:
 
 ## Command Reference
 
-Compile Datalevin's Java sources first so `../target/classes` is available:
+Compile the Java helpers in the Jepsen subproject:
 
 ```bash
-clojure -T:build compile-java
+cd jepsen
+lein javac
 ```
 
 Run the Jepsen subproject smoke test:

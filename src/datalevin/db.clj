@@ -1097,6 +1097,48 @@
   ^Boolean [x]
   (txprep/tempid? x))
 
+(def ^:private tx-ensures-key
+  ::txexec/ensures)
+
+(defn- report-ensures
+  [report]
+  (when report
+    (seq (get report tx-ensures-key))))
+
+(defn- resolve-ensure-pred
+  [pred entity]
+  (vld/validate-ensure-predicate pred entity)
+  (let [callable (if (symbol? pred)
+                   (requiring-resolve pred)
+                   pred)
+        callable (if (var? callable) @callable callable)]
+    (if (ifn? callable)
+      callable
+      (vld/validate-ensure-predicate callable entity))))
+
+(defn- resolve-ensure-arg
+  [tempids arg entity]
+  (cond
+    (identical? :db/current-tx arg)
+    (get tempids :db/current-tx)
+
+    (tempid? arg)
+    (if (contains? tempids arg)
+      (get tempids arg)
+      (vld/validate-ensure-tempid arg entity))
+
+    :else
+    arg))
+
+(defn- run-report-ensures!
+  [db report]
+  (doseq [[pred args entity] (report-ensures report)]
+    (let [tempids       (:tempids report)
+          resolved-args (mapv #(resolve-ensure-arg tempids % entity) args)
+          callable      (resolve-ensure-pred pred entity)
+          result        (apply callable db resolved-args)]
+      (vld/validate-ensure-result result pred resolved-args entity))))
+
 (defn installed-udf-descriptor
   ([db target]
    (installed-udf-descriptor db nil target))
@@ -1109,9 +1151,12 @@
   ([initial-report initial-es tx-time simulated?]
    (let [report (txexec/local-transact-tx-data
                   initial-report initial-es tx-time)]
-     (when-not simulated?
-       (commit-prepared-tx-data! (:db-after report) (:tx-data report) report))
-     report)))
+     (if simulated?
+       report
+       (assoc report
+              :db-after
+              (commit-prepared-tx-data!
+                (:db-after report) (:tx-data report) report))))))
 
 (defn- committed-client-op-response
   [report last-modified-ms]
@@ -1154,22 +1199,49 @@
   ([^DB db tx-data]
    (commit-prepared-tx-data! db tx-data nil))
   ([^DB db tx-data report]
-  (let [store (.-store db)]
-    (if (instance? Store store)
-      (let [embedding-plan    (s/prepare-embedding-plan ^Store store tx-data)
-            last-modified-ms  (System/currentTimeMillis)
-            extra-kv-tx       (some-> report
-                                      (committed-client-op-response
-                                        last-modified-ms))
-            commit-opts       (cond-> {:last-modified-ms last-modified-ms}
-                                extra-kv-tx
-                                (assoc :extra-kv-txs [extra-kv-tx]))]
-        (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
-                                  commit-opts)
-        (s/mark-state-current! ^Store store last-modified-ms))
-      (load-datoms store tx-data))
-    (invalidate-cache store tx-data (last-modified store))
-    db)))
+   (let [store   (.-store db)
+         ensures (report-ensures report)]
+     (if (and ensures
+              (instance? Store store)
+              (not (l/writing? (.-lmdb ^Store store))))
+       (let [kv              (.-lmdb ^Store store)
+             prepared-store  (volatile! nil)
+             prepared-db     (volatile! nil)]
+         (l/with-transaction-kv [kv1 kv]
+           (let [store1 ^Store (s/transfer ^Store store kv1)
+                 db1    ^DB    (transfer db store1)
+                 db2    ^DB    (commit-prepared-tx-data!
+                                 db1 tx-data report)]
+             (vreset! prepared-store (.-store db2))
+             (vreset! prepared-db db2)))
+         (let [new-store ^Store (s/transfer ^Store @prepared-store kv)]
+           (carry-runtime-opts
+             (transfer ^DB @prepared-db new-store)
+             db)))
+       (do
+         (if (instance? Store store)
+           (let [embedding-plan    (s/prepare-embedding-plan ^Store store
+                                                              tx-data)
+                 last-modified-ms  (System/currentTimeMillis)
+                 extra-kv-tx       (some-> report
+                                           (committed-client-op-response
+                                             last-modified-ms))
+                 commit-opts       (cond-> {:last-modified-ms last-modified-ms}
+                                     extra-kv-tx
+                                     (assoc :extra-kv-txs [extra-kv-tx]))]
+             (s/load-datoms-with-plan! ^Store store tx-data embedding-plan
+                                       commit-opts)
+             (when ensures
+               (run-report-ensures! (transfer (:db-after report) store)
+                                    report))
+             (s/mark-state-current! ^Store store last-modified-ms))
+           (do
+             (load-datoms store tx-data)
+             (when ensures
+               (run-report-ensures! (transfer (:db-after report) store)
+                                    report))))
+         (invalidate-cache store tx-data (last-modified store))
+         db)))))
 
 (defn- remote-tx-result
   [res]
@@ -1214,6 +1286,7 @@
        (not (reverse-ref? attr))
        (not (ref? db attr))
        (not (-is-attr? db attr :db/unique))
+       (not (:db.attr/preds props))
        (not (tuple-attr? db attr))
        (not (tuple-type? db attr))
        (not (tuple-types? db attr))

@@ -862,6 +862,32 @@
 
 (def tuple-props #{:db/tupleAttrs :db/tupleTypes :db/tupleType})
 
+(defn- normalize-attr-preds
+  [preds]
+  (cond
+    (nil? preds)      nil
+    (symbol? preds)   [preds]
+    (sequential? preds) preds
+    :else             nil))
+
+(defn- validate-attr-preds-schema
+  [a preds]
+  (let [preds'  (normalize-attr-preds preds)
+        ex-data {:error     :schema/validation
+                 :attribute a
+                 :key       :db.attr/preds
+                 :value     preds}]
+    (when-not preds'
+      (u/raise a " :db.attr/preds must be a qualified symbol or a sequential collection of qualified symbols"
+               ex-data))
+    (when (empty? preds')
+      (u/raise a " :db.attr/preds cannot be empty" ex-data))
+    (doseq [pred preds']
+      (when-not (qualified-symbol? pred)
+        (u/raise a " :db.attr/preds entries must be qualified symbols, got: "
+                 pred
+                 (assoc ex-data :predicate pred))))))
+
 (def ^:private embedding-metric-types
   #{:cosine :dot-product :euclidean :haversine :divergence :pearson
     :jaccard :hamming :tanimoto :sorensen :custom})
@@ -1067,6 +1093,9 @@
                          (:db.embedding/autoDomain kv)
                          #{true false})
 
+    (when (some? (:db.attr/preds kv))
+      (validate-attr-preds-schema a (:db.attr/preds kv)))
+
     (when (contains? kv :db.embedding/domains)
       (validate-embedding-domain-list a (:db.embedding/domains kv)))
 
@@ -1205,6 +1234,33 @@
         (u/raise "Invalid data, expecting" vt " got " v {:input v}))
     vt))
 
+(defn- resolve-attr-pred
+  [pred]
+  (let [resolved (requiring-resolve pred)
+        callable (if (var? resolved) @resolved resolved)]
+    (when-not (ifn? callable)
+      (u/raise "Attribute predicate " pred " does not resolve to a callable value"
+               {:error     :schema/validation
+                :key       :db.attr/preds
+                :predicate pred
+                :resolved  resolved}))
+    callable))
+
+(defn validate-attr-preds
+  "Validate a normalized attribute value against :db.attr/preds."
+  [e a v props]
+  (doseq [pred (normalize-attr-preds (:db.attr/preds props))]
+    (let [pred-return ((resolve-attr-pred pred) v)]
+      (when-not (true? pred-return)
+        (u/raise "Entity " e " attribute " a " value " v
+                 " failed pred " pred
+                 {:error                :transact/attr-pred
+                  :entity               e
+                  :attribute            a
+                  :value                v
+                  :predicate            pred
+                  :db.error/pred-return pred-return})))))
+
 ;; ---- Transaction form validators ----
 
 (defn validate-tempid-op
@@ -1213,6 +1269,50 @@
   (when (and tempid? (not (identical? op :db/add)))
     (u/raise "Can't use tempid in '" entity "'. Tempids are allowed in :db/add only"
              {:error :transact/syntax, :op entity})))
+
+(defn validate-ensure-arity
+  "Validate :db/ensure arity: expected predicate and at least one argument."
+  [argc entity]
+  (when (< (long argc) 3)
+    (u/raise "Bad arity for :db/ensure, expected predicate and at least one argument: "
+             entity
+             {:error :transact/syntax
+              :operation :db/ensure
+              :tx-data entity})))
+
+(defn validate-ensure-predicate
+  "Validate that :db/ensure predicate is directly callable or a qualified symbol."
+  [pred entity]
+  (when-not (or (ifn? pred)
+                (var? pred)
+                (qualified-symbol? pred))
+    (u/raise ":db/ensure predicate must be a function, var, or qualified symbol: "
+             pred
+             {:error :transact/syntax
+              :operation :db/ensure
+              :predicate pred
+              :tx-data entity})))
+
+(defn validate-ensure-tempid
+  "Validate that a :db/ensure tempid argument resolved."
+  [arg entity]
+  (u/raise ":db/ensure could not resolve tempid argument " arg
+           {:error :transact/syntax
+            :operation :db/ensure
+            :tempid arg
+            :tx-data entity}))
+
+(defn validate-ensure-result
+  "Validate that :db/ensure predicate returned truthy."
+  [result pred args entity]
+  (when-not result
+    (u/raise ":db/ensure failed for predicate " pred " with args " args
+             {:error     :transact/ensure
+              :operation :db/ensure
+              :predicate pred
+              :args      args
+              :result    result
+              :tx-data   entity})))
 
 (defn validate-cas-value
   "Validate CAS compare-and-swap: existing value must match expected old value.
@@ -1311,7 +1411,7 @@
 (defn validate-tx-op
   "Validate that the operation is a known transaction operation."
   [op entity]
-  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
+  (u/raise "Unknown operation at " entity ", expected :db/add, :db/retract, :db/ensure, :db.fn/call, :db.fn/retractAttribute, :db.fn/retractEntity or an ident corresponding to an installed transaction function (e.g. {:db/ident <keyword> :db/fn <Ifn>} or {:db/ident <keyword> :db/udf <descriptor>}, usage of :db/ident requires {:db/unique :db.unique/identity} in schema)"
            {:error :transact/syntax, :operation op, :tx-data entity}))
 
 (defn validate-tx-entity-type

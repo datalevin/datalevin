@@ -211,7 +211,7 @@ ensure_java_classes() {
   fi
 
   (
-    cd "$repo_root"
+    cd "$jepsen_dir"
     lein javac
   )
 }

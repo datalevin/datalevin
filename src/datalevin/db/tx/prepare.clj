@@ -12,7 +12,7 @@
   (:require
    [datalevin.constants :refer [e0 tx0 emax txmax]]
    [datalevin.db.tx.common :as txcommon]
-   [datalevin.interface :refer [av-first-e ea-first-v opts]]
+   [datalevin.interface :refer [av-first-e ea-first-v opts schema]]
    [datalevin.prepare :as coreprep]
    [datalevin.datom :as d :refer [datom?]]
    [datalevin.udf :as udf]
@@ -96,30 +96,37 @@
 
 (defn resolve-upserts
   "Returns [entity' upserts]. Upsert attributes that resolve to existing entities
-   are removed from entity, rest are kept in entity for insertion. No validation
-   is performed."
+   are removed from entity, rest are kept in entity for insertion. Performs the
+   validations needed for removed unique identity values."
   [db entity]
   (if-some [idents (not-empty (txcommon/attrs-by db :db.unique/identity))]
     (let [store   (:store db)
+          schema  (schema store)
+          upsert-value
+          (fn [a v]
+            (if (txcommon/ref? db a)
+              (when-not (tempid? v)
+                (txcommon/entid db v))
+              (coreprep/correct-value store a v)))
+          validate-upsert-preds
+          (fn [a v]
+            (vld/validate-attr-preds (:db/id entity) a v (schema a)))
           resolve (fn [a v]
-                    (cond
-                      (not (txcommon/ref? db a))
-                      (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
-                                           (d/datom e0 a v tx0)
-                                           (d/datom emax a v txmax))))
-                          (av-first-e store a v))
-
-                      (not (tempid? v))
-                      (let [rv (txcommon/entid db v)]
-                        (or (:e (sf (.subSet ^TreeSortedSet (:avet db)
-                                             (d/datom e0 a rv tx0)
-                                             (d/datom emax a rv txmax))))
-                            (av-first-e store a rv)))))
+                    (when-some [v' (upsert-value a v)]
+                      (when-some [e (or (:e (sf (.subSet
+                                                 ^TreeSortedSet (:avet db)
+                                                 (d/datom e0 a v' tx0)
+                                                 (d/datom emax a v' txmax))))
+                                       (av-first-e store a v'))]
+                        [e v'])))
           split   (fn [a vs]
                     (reduce
                       (fn [acc v]
-                        (if-some [e (resolve a v)]
-                          (update acc 1 assoc v e)
+                        (vld/validate-val v entity)
+                        (if-some [[e v'] (resolve a v)]
+                          (do
+                            (validate-upsert-preds a v')
+                            (update acc 1 assoc v e))
                           (update acc 0 conj v)))
                       [[] {}] vs))]
       (reduce-kv
@@ -138,12 +145,11 @@
                  (seq upsert) (assoc a upsert))])
 
             :else
-            (let [v' (if (txcommon/ref? db a)
-                       v
-                       (coreprep/correct-value store a v))]
-              (if-some [e (resolve a v')]
-                [entity' (assoc upserts a {v e})]
-                [(assoc entity' a v) upserts]))))
+            (if-some [[e v'] (resolve a v)]
+              (do
+                (validate-upsert-preds a v')
+                [entity' (assoc upserts a {v e})])
+              [(assoc entity' a v) upserts])))
         [{} {}]
         entity))
     [entity nil]))
@@ -157,6 +163,7 @@
     :db.fn/cas
     :db/cas
     :db.fn/patchIdoc
+    :db/ensure
     :db/add
     :db/retract
     :db.fn/retractAttribute
@@ -337,7 +344,8 @@
     (sequential? entity)
     (let [[op e _ _] entity]
       (if (or (identical? op :db/retractEntity)
-              (identical? op :db.fn/retractEntity))
+              (identical? op :db.fn/retractEntity)
+              (identical? op :db/ensure))
         [entity]
         [entity [:db/add e :db/updated-at tx-time]]))
 

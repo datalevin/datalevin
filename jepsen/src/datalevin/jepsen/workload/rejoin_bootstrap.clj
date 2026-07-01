@@ -349,11 +349,25 @@
   [follower-next-lsn gc-results]
   (boolean (seq (realized-wal-gap-sources follower-next-lsn gc-results))))
 
+(defn- min-source-snapshot-lsn
+  [snapshots source-nodes]
+  (apply min
+         (map (fn [source-node]
+                (long (or (get-in snapshots
+                                  [source-node
+                                   :snapshot
+                                   :applied-lsn])
+                          0)))
+              source-nodes)))
+
 (defn- wait-for-real-wal-gap!
-  [cluster-id source-nodes follower-next-lsn]
-  (let [deadline (+ (System/currentTimeMillis) wal-gap-gc-timeout-ms)]
+  [test key-count source-nodes follower-next-lsn start-value]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) wal-gap-gc-timeout-ms)]
     (loop [best-results {}
-           best-cleanup {}]
+           best-cleanup {}
+           next-start-value (long start-value)
+           extension-phases []]
       (let [cleanup-results (into {}
                                  (map (fn [logical-node]
                                         [logical-node
@@ -379,16 +393,47 @@
                              best-cleanup
                              cleanup-results)]
         (cond
-          (wal-gap-realized? follower-next-lsn attempt-results)
-          {:gc-results attempt-results
+          (wal-gap-realized? follower-next-lsn gc-results)
+          {:gc-results gc-results
            :realized-source-nodes
-           (realized-wal-gap-sources follower-next-lsn attempt-results)
-           :copy-pin-cleanup cleanup-results}
+           (realized-wal-gap-sources follower-next-lsn gc-results)
+           :copy-pin-cleanup cleanup-state
+           :extension-phases extension-phases}
 
           (< (System/currentTimeMillis) deadline)
-          (do
+          (let [remaining-ms (max 1
+                                  (- deadline
+                                     (System/currentTimeMillis)))
+                leader-lsn   (long
+                               (write-register-batch-with-rolls!
+                                test
+                                key-count
+                                next-start-value
+                                wal-gap-writes-per-batch
+                                wal-gap-write-sleep-ms
+                                remaining-ms))
+                _            (local/wait-for-at-least-nodes-at-least-lsn!
+                              cluster-id
+                              source-nodes
+                              leader-lsn
+                              1
+                              converge-timeout-ms)
+                snapshots    (local/create-snapshots-on-nodes!
+                              cluster-id
+                              source-nodes)
+                phase        {:leader-lsn leader-lsn
+                              :start-value next-start-value
+                              :write-count wal-gap-writes-per-batch
+                              :snapshots snapshots
+                              :snapshot-lsn
+                              (min-source-snapshot-lsn snapshots
+                                                       source-nodes)}]
             (Thread/sleep (long wal-gap-retry-sleep-ms))
-            (recur gc-results cleanup-state))
+            (recur gc-results
+                   cleanup-state
+                   (unchecked-add (long next-start-value)
+                                  (long wal-gap-writes-per-batch))
+                   (conj extension-phases phase)))
 
           :else
           (throw
@@ -400,6 +445,7 @@
                       (realized-wal-gap-sources follower-next-lsn gc-results)
                       :gc-results gc-results
                       :copy-pin-cleanup cleanup-state
+                      :extension-phases extension-phases
                       :last-gc-results attempt-results})))))))
 
 (defn- choose-bootstrap-target!
@@ -565,14 +611,8 @@
                                                                   converge-timeout-ms))
         snapshot-1        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)
-        min-snapshot-lsn  (apply min
-                                 (map (fn [source-node]
-                                        (long (or (get-in snapshot-1
-                                                          [source-node
-                                                           :snapshot
-                                                           :applied-lsn])
-                                                  0)))
-                                      source-nodes))
+        min-snapshot-lsn  (min-source-snapshot-lsn snapshot-1
+                                                   source-nodes)
         phase-2-target-lsn (long (max (unchecked-inc follower-next-lsn)
                                       (+ min-snapshot-lsn
                                          wal-gap-writes-per-batch)))
@@ -589,18 +629,15 @@
         snapshot-2        (local/create-snapshots-on-nodes! cluster-id
                                                             source-nodes)
         required-snapshot-lsn
-        (apply min
-               (map (fn [source-node]
-                      (long (or (get-in snapshot-2
-                                        [source-node
-                                         :snapshot
-                                         :applied-lsn])
-                                0)))
-                    source-nodes))
-        {:keys [gc-results realized-source-nodes copy-pin-cleanup]}
-        (wait-for-real-wal-gap! cluster-id
+        (min-source-snapshot-lsn snapshot-2
+                                 source-nodes)
+        {:keys [gc-results realized-source-nodes copy-pin-cleanup
+                extension-phases]}
+        (wait-for-real-wal-gap! test
+                                key-count
                                 source-nodes
-                                follower-next-lsn)
+                                follower-next-lsn
+                                (:next-start-value phase-2))
         bootstrap-state
         (try
           (restart-and-wait-for-follower-bootstrap! cluster-id
@@ -645,7 +682,8 @@
                :phase-1 phase-1
                :phase-2 phase-2
                :snapshots {:initial snapshot-1
-                           :latest snapshot-2}
+                            :latest snapshot-2}
+               :extension-phases extension-phases
                :realized-source-nodes realized-source-nodes
                :copy-pin-cleanup copy-pin-cleanup
                :gc-results gc-results}}))

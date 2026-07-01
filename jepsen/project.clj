@@ -28,8 +28,8 @@
                  [org.slf4j/slf4j-api "2.0.7"]
                  [ch.qos.logback/logback-classic "1.4.4"]]
   :source-paths ["src" "../src"]
-  :java-source-paths ["src/java"]
-  :resource-paths ["resources" "../resources" "../target/classes"]
+  :java-source-paths ["src/java" "../src/java"]
+  :resource-paths ["resources" "../resources"]
   :test-paths ["test"]
   :main datalevin.jepsen.cli
   :repl-options {:init-ns datalevin.jepsen.cli}
@@ -42,4 +42,5 @@
              "--add-opens=java.base/java.lang=ALL-UNNAMED"
              "--add-opens=java.base/java.util=ALL-UNNAMED"
              "--add-opens=java.base/java.nio=ALL-UNNAMED"
-             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"])
+             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]
+  :javac-options ["--release" "21"])
