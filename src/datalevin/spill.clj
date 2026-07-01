@@ -68,7 +68,11 @@
   (disk-count [this] "The number of items reside on disk")
   (spill [this] "Spill to disk"))
 
-(defonce ^Cleaner cleaner (Cleaner/create))
+(defonce cleaner (delay (Cleaner/create)))
+
+(defn- ^Cleaner spill-cleaner
+  []
+  @cleaner)
 
 (defn- close-spill-resources!
   [disk spill-dir]
@@ -93,7 +97,7 @@
 (defn- register-spill-cleanup!
   [referent cleanable disk spill-dir]
   (vreset! cleanable
-           (.register cleaner
+           (.register (spill-cleaner)
                       referent
                       (spill-cleanup-action disk spill-dir))))
 
