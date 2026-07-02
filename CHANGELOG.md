@@ -43,7 +43,7 @@
 - [Datalog] reduce allocation per tuple.
 - [Datalog] fully implement datafy
   [#292](https://github.com/datalevin/datalevin/issues/292).
-- [Lib] Fuller Java, Python, JS API parity with Clojure.
+- [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
 - Able to dump/load mixed KV and DL databases

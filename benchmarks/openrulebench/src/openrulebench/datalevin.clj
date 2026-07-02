@@ -63,19 +63,19 @@
 
 ;; Same Generation Rules (OpenRuleBench spec)
 ;; sg(X, X) :- par(_, X).              -- reflexive: any node with a parent
-;; sg(X, Y) :- par(X, A), sg(A, B), par(Y, B).  -- recursive (propagates UP)
+;; sg(X, Y) :- par(PX, X), par(PY, Y), sg(PX, PY).  -- children of same-gen parents
 ;; Note: par(X,A) means X is parent of A, but our data has [child :parent parent]
-;; So [?a :parent ?x] means par(?x, ?a)
+;; So [?x :parent ?px] means par(?px, ?x)
 (def sg-rules
   '[;; Base: any node with a parent is same-gen with itself
     [(sg ?x ?y)
      [?x :parent _]
      [(identity ?x) ?y]]
-    ;; Recursive: parents of same-gen nodes are same-gen
+    ;; Recursive: children of same-gen parents are same-gen
     [(sg ?x ?y)
-     [?a :parent ?x]
-     [?b :parent ?y]
-     (sg ?a ?b)]])
+     [?x :parent ?px]
+     [?y :parent ?py]
+     (sg ?px ?py)]])
 
 ;; JOIN1 Rules (OpenRuleBench spec)
 ;; 5-way join with intermediate duplicate elimination

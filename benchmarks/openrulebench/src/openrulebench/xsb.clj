@@ -34,7 +34,7 @@ count_tc(N) :- findall(1, tc(_, _), L), length(L, N).
 :- table sg/2.
 
 sg(X, X) :- parent(_, X).
-sg(X, Y) :- parent(X, A), sg(A, B), parent(Y, B).
+sg(X, Y) :- parent(PX, X), parent(PY, Y), sg(PX, PY).
 
 bench :- sg(_, _), fail.
 bench.

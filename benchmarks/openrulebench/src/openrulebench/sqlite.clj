@@ -27,9 +27,9 @@
   "WITH RECURSIVE sg(x, y) AS (
      SELECT DISTINCT child, child FROM parent
      UNION
-     SELECT DISTINCT p1.parent, p2.parent
+     SELECT DISTINCT p1.child, p2.child
      FROM parent p1, parent p2, sg
-     WHERE p1.child = sg.x AND p2.child = sg.y
+     WHERE p1.parent = sg.x AND p2.parent = sg.y
    )
    SELECT x, y FROM sg;")
 

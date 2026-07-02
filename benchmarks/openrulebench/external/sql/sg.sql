@@ -21,21 +21,21 @@ WITH RECURSIVE sg AS (
     -- Recursive case: children of same-gen parents are same-gen
     SELECT p1.child_node AS x, p2.child_node AS y
     FROM parent p1
-    JOIN parent p2 ON p1.parent_node != p2.parent_node
-    JOIN sg s ON p1.parent_node = s.x AND p2.parent_node = s.y
+    JOIN sg s ON p1.parent_node = s.x
+    JOIN parent p2 ON p2.parent_node = s.y
 )
 SELECT COUNT(*) AS sg_count FROM sg;
 
 -- SG with first argument bound
 WITH RECURSIVE sg_from AS (
-    -- Base case: node is same-gen as itself
-    SELECT 0 AS y
+    -- Base case: everyone with a parent is same-gen with themselves
+    SELECT DISTINCT child_node AS x, child_node AS y
+    FROM parent
     UNION
-    -- Recursive case
-    SELECT p2.child_node AS y
+    -- Recursive case: children of same-gen parents are same-gen
+    SELECT p1.child_node AS x, p2.child_node AS y
     FROM parent p1
-    JOIN parent p2 ON p1.parent_node != p2.parent_node
-    JOIN sg_from s ON p1.child_node = 0 AND p2.parent_node = s.y
-    WHERE p1.child_node = 0
+    JOIN sg_from s ON p1.parent_node = s.x
+    JOIN parent p2 ON p2.parent_node = s.y
 )
-SELECT COUNT(*) AS sg_from_count FROM sg_from;
+SELECT COUNT(*) AS sg_from_count FROM sg_from WHERE x = 0;

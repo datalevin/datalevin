@@ -27,7 +27,7 @@
 ;; =============================================================================
 ;; Same Generation Rules (OpenRuleBench spec)
 ;; sg(X, X) :- par(_, X).              -- reflexive: any node with a parent
-;; sg(X, Y) :- par(X, A), sg(A, B), par(Y, B).  -- recursive (propagates UP)
+;; sg(X, Y) :- par(PX, X), par(PY, Y), sg(PX, PY).  -- children of same-gen parents
 ;; =============================================================================
 
 (def sg-rules
@@ -40,9 +40,9 @@
 
      ::sg-recursive
      [:what
-      [?a ::parent ?x]
-      [?b ::parent ?y]
-      [?a ::sg ?b]
+      [?x ::parent ?px]
+      [?y ::parent ?py]
+      [?px ::sg ?py]
       :then
       (o/insert! ?x ::sg ?y)]}))
 
