@@ -33,6 +33,19 @@
 
 (defrecord Clause [attr val var range count pred])
 
+(def ^:dynamic *resolver-mode*
+  "Controls host function resolution for query predicates/functions.
+
+  :embedded preserves same-process Datalevin behavior and may resolve host vars.
+  :server-safe is for client/server queries and only allows built-in query
+  functions, query context values that are not used as call targets, and UDFs
+  reached through the built-in udf function."
+  :embedded)
+
+(defn server-safe-resolver?
+  []
+  (= :server-safe *resolver-mode*))
+
 (declare resolve-clause)
 
 (defn solve-rule
@@ -508,23 +521,65 @@
 
 (defonce pod-fns (atom {}))
 
+(defn- disallowed-server-query-function!
+  [f]
+  (raise "Server query cannot call unregistered function or predicate '" f
+         {:error :query/where :var f :resolver-mode *resolver-mode*}))
+
+(defn- resolve-built-in-query-fn
+  [f]
+  (get built-ins/query-fns f))
+
+(defn- validate-server-safe-apply!
+  [f args]
+  (when (and (server-safe-resolver?) (= 'apply f))
+    (let [target (first args)]
+      (when-not (and (symbol? target)
+                     (not= 'apply target)
+                     (contains? built-ins/query-fns target))
+        (disallowed-server-query-function! target)))))
+
 (defn resolve-pred
   [f context]
-  (let [fun (if (fn? f)
-              f
-              (or (get built-ins/query-fns f)
-                  (context-resolve-val context f)
-                  (dot-form f)
-                  (resolve-sym f)
-                  (when (nil? (rel-with-attr context f))
-                    (raise "Unknown function or predicate '" f
-                           {:error :query/where :var f}))))]
+  (let [fun (cond
+              (fn? f)
+              (if (server-safe-resolver?)
+                (disallowed-server-query-function! f)
+                f)
+
+              (resolve-built-in-query-fn f)
+              (resolve-built-in-query-fn f)
+
+              (and (not (server-safe-resolver?))
+                   (context-resolve-val context f))
+              (context-resolve-val context f)
+
+              (and (server-safe-resolver?)
+                   (rel-with-attr context f))
+              (disallowed-server-query-function! f)
+
+              (and (server-safe-resolver?)
+                   (or (qualified-symbol? f) (dot-form f)))
+              (disallowed-server-query-function! f)
+
+              (and (not (server-safe-resolver?))
+                   (dot-form f))
+              (dot-form f)
+
+              (and (not (server-safe-resolver?))
+                   (resolve-sym f))
+              (resolve-sym f)
+
+              :else
+              (raise "Unknown function or predicate '" f
+                     {:error :query/where :var f}))]
     (if-let [s (:pod.huahaiy.datalevin/inter-fn fun)]
       (@pod-fns s)
       fun)))
 
 (defn -call-fn
   [context rel f args]
+  (validate-server-safe-apply! f args)
   (let [sources              (:sources context)
         attrs                (:attrs rel)
         len                  (count args)
@@ -537,10 +592,14 @@
           (symbol? arg)
           (if-some [source (get sources arg)]
             (aset static-args i source)
-            (if-some [fn-val (or (get built-ins/query-fns arg)
-                                 (resolve-sym arg))]
+            (if-some [fn-val (or (resolve-built-in-query-fn arg)
+                                 (when-not (server-safe-resolver?)
+                                   (resolve-sym arg)))]
               (aset static-args i fn-val)
-              (aset tuples-args i (get attrs arg))))
+              (if (contains? attrs arg)
+                (aset tuples-args i (get attrs arg))
+                (when (server-safe-resolver?)
+                  (disallowed-server-query-function! arg)))))
 
           (list? arg)
           (aset tuples-args i (-call-fn context rel (first arg) (rest arg)))

@@ -431,6 +431,13 @@ In server mode, the equivalent runtime registry or resolver must be installed in
 the server process when databases are opened or reopened. Client-local runtime
 registries are not consulted for remote transaction execution.
 
+Remote Datalog queries use a server-safe function resolver. Query predicates and
+functions sent over `:q` or `:explain` may use built-in query functions and the
+`udf` query function, but they do not resolve arbitrary fully qualified Clojure
+symbols, reflective dot forms, or function values supplied by the client. Custom
+server-side query predicates should be registered as UDFs with kind
+`:query-fn` or `:predicate` and called through `udf`.
+
 Stored Clojure `:db/fn` transaction functions defined with `inter-fn` continue
 to work as before. Non-Clojure or host-managed UDFs should use `:db/udf`, where
 the database stores only a descriptor such as:

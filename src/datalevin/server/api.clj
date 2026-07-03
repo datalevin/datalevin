@@ -16,6 +16,7 @@
    [datalevin.dump :as dump]
    [datalevin.interface :as i]
    [datalevin.query :as q]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.search :as sc]
    [datalevin.util :as u]
    [datalevin.vector :as v])
@@ -35,7 +36,8 @@
   (let [[db-name query inputs] args
         db                     (get-db server db-name writing?)
         inputs                 (replace {:remote-db-placeholder db} inputs)
-        data                   (apply q/q query inputs)]
+        data                   (binding [qresolve/*resolver-mode* :server-safe]
+                                 (apply q/q query inputs))]
     (write-or-copy-result! write-message copy-out skey data)))
 
 (defn pull
@@ -58,7 +60,8 @@
   (let [[db-name opts query inputs] args
         db                        (get-db server db-name writing?)
         inputs                    (replace {:remote-db-placeholder db} inputs)
-        data                      (apply q/explain opts query inputs)]
+        data                      (binding [qresolve/*resolver-mode* :server-safe]
+                                    (apply q/explain opts query inputs))]
     (write-message skey {:type :command-complete :result data})))
 
 (defn fulltext-datoms

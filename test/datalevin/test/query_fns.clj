@@ -5,6 +5,7 @@
    [clojure.string :as str]
    [datalevin.util :as u]
    [datalevin.core :as d]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.udf :as udf])
   (:import [clojure.lang ExceptionInfo]
            [java.util UUID]))
@@ -160,6 +161,86 @@
                 descriptor)))
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-server-safe-query-resolver-mode
+  (let [dir        (u/tmp-dir (str "query-server-safe-" (UUID/randomUUID)))
+        schema     {:email {:db/valueType :db.type/string}}
+        descriptor {:udf/lang :test
+                    :udf/kind :query-fn
+                    :udf/id   :normalize-email}
+        registry   (doto (udf/create-registry)
+                     (udf/register! descriptor str/lower-case))
+        conn       (d/create-conn
+                     dir schema
+                     {:runtime-opts {:udf-registry registry}})]
+    (try
+      (d/transact! conn [{:db/id 1 :email "A@B.COM"}])
+      (binding [qresolve/*resolver-mode* :server-safe]
+        (is (= "a@b.com"
+               (d/q '[:find ?email .
+                      :in $
+                      :where
+                      [?e :email ?raw]
+                      [(udf :normalize-email ?raw) ?email]]
+                    @conn)))
+        (is (= 6
+               (d/q '[:find ?n .
+                      :in ?nums
+                      :where
+                      [(apply + ?nums) ?n]]
+                    [1 2 3])))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered function"
+              (d/q '[:find ?email .
+                     :in $
+                     :where
+                     [?e :email ?raw]
+                     [(clojure.string/lower-case ?raw) ?email]]
+                   @conn)))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered function"
+              (d/q '[:find ?e .
+                     :in $
+                     :where
+                     [?e :email ?raw]
+                     [(.endsWith ?raw "COM")]]
+                   @conn)))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered function"
+              (d/q '[:find ?email .
+                     :in $ ?f
+                     :where
+                     [?e :email ?raw]
+                     [(?f ?raw) ?email]]
+                   @conn
+                   str/lower-case)))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered aggregate function"
+              (d/q '[:find (clojure.core/count ?raw) .
+                     :in $
+                     :where
+                     [?e :email ?raw]]
+                   @conn)))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered aggregate function"
+              (d/q '[:find (aggregate ?f ?raw) .
+                     :in $ ?f
+                     :where
+                     [?e :email ?raw]]
+                   @conn
+                   count)))
+        (is (thrown-with-msg?
+              ExceptionInfo #"Server query cannot call unregistered function"
+              (d/q '[:find ?email .
+                     :in $ ?f
+                     :where
+                     [?e :email ?raw]
+                     [(apply ?f [?raw]) ?email]]
+                   @conn
+                   str/lower-case))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest test-like-fn
   (let [dir (u/tmp-dir (str "fns-test-" (UUID/randomUUID)))

@@ -30,16 +30,38 @@
     (get-in context [:sources (.-symbol var)]))
   PlainSymbol
   (-context-resolve [var _]
-    (or (get built-ins/aggregates (.-symbol var))
-        (qresolve/resolve-sym (.-symbol var))))
+    (let [sym (.-symbol var)]
+      (or (get built-ins/aggregates sym)
+          (when-not (qresolve/server-safe-resolver?)
+            (qresolve/resolve-sym sym))
+          (when (qresolve/server-safe-resolver?)
+            (u/raise
+              "Server query cannot call unregistered aggregate function '" sym
+              {:error :query/where
+               :var sym
+               :resolver-mode qresolve/*resolver-mode*})))))
   Constant
   (-context-resolve [var _]
     (.-value var)))
 
+(defn- resolve-aggregate-fn
+  [element context]
+  (let [fn-expr (:fn element)
+        f       (-context-resolve fn-expr context)]
+    (when (and (qresolve/server-safe-resolver?)
+               (instance? Variable fn-expr))
+      (let [sym (.-symbol ^Variable fn-expr)]
+        (u/raise
+          "Server query cannot call unregistered aggregate function '" sym
+          {:error :query/where
+           :var sym
+           :resolver-mode qresolve/*resolver-mode*})))
+    f))
+
 (defn- compute-aggregate
   "Compute an aggregate over tuples at the given tuple index."
   [element context tuples tuple-idx]
-  (let [f    (-context-resolve (:fn element) context)
+  (let [f    (resolve-aggregate-fn element context)
         args (mapv #(-context-resolve % context)
                    (butlast (:args element)))
         vals (map #(nth % tuple-idx) tuples)]

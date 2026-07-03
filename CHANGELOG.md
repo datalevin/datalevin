@@ -19,6 +19,10 @@
 - Add time-out for explicit transactions
   [#162](https://github.com/datalevin/datalevin/issues/162).
 
+### Changed
+- [Server] Only built-ins functions and registered UDF can be resolved in query
+  in order to prevent arbitrary code execution on server.
+
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
   [#369](https://github.com/datalevin/datalevin/issues/369).
