@@ -44,6 +44,22 @@
      touch-summary  ; set of touched attr keywords (for cache invalidation)
      stats])        ; optional: per-stage timing/counters map
 
+(def ^:private ->PreparedTx* ->PreparedTx)
+
+(defn ->PreparedTx
+  "Positional constructor for PreparedTx.
+
+  Accepts the current 9-field shape and the previous 8-field shape, where
+  stats was absent."
+  ([tx-data db-after tempids new-attributes ensures tx-redundant side-index-ops
+    touch-summary]
+   (->PreparedTx* tx-data db-after tempids new-attributes ensures tx-redundant
+                  side-index-ops touch-summary nil))
+  ([tx-data db-after tempids new-attributes ensures tx-redundant side-index-ops
+    touch-summary stats]
+   (->PreparedTx* tx-data db-after tempids new-attributes ensures tx-redundant
+                  side-index-ops touch-summary stats)))
+
 ;; ---- Constructor ----
 
 (defn make-prepare-ctx
