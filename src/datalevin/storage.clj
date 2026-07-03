@@ -441,9 +441,7 @@
                           (when (and (or (nil? pred) (pred v))
                                      (or (nil? fidx)
                                          (= v (aget tuple (int fidx)))))
-                            (.add ^FastList (aget vs aj) v)
-                            (when-not (aget skips gi)
-                              (.add ^FastList (aget vs aj) v)))))
+                            (.add ^FastList (aget vs aj) v))))
                       (recur (lmdb/has-next-val iter) gi (int a) true))
                     (recur (lmdb/has-next-val iter) gi pa false)))
                 :else :done))))
@@ -488,8 +486,11 @@
 
 (defn- single-attrs?
   [schema attrs-v]
-  (not-any? #(identical? (-> % schema :db/cardinality) :db.cardinality/many)
-            (mapv first attrs-v)))
+  (let [attrs (mapv first attrs-v)]
+    (and (apply distinct? attrs)
+         (not-any? #(identical? (-> % schema :db/cardinality)
+                                :db.cardinality/many)
+                   attrs))))
 
 (defn- ea->r
   [schema lmdb e a]

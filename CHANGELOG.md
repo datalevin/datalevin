@@ -30,6 +30,8 @@
 - [Datalog] Retracting and reasserting entities with ref-component composite
   tuple identities no longer creates partial `[nil ...]` tuple values
   [#372](https://github.com/datalevin/datalevin/issues/372).
+- [Datalog] Duplicate attribute clauses return empty results
+  [#376](https://github.com/datalevin/datalevin/issues/376).
 - [DLMDB] fix stale MP_PAD during page split
   [#375](https://github.com/datalevin/datalevin/issues/375).
 

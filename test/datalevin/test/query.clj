@@ -118,6 +118,43 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-duplicate-attr-merge-scan
+  (let [dir (u/tmp-dir (str "test-duplicate-attr-merge-scan-"
+                            (UUID/randomUUID)))
+        db  (-> (d/empty-db dir)
+                (d/db-with [{:db/id 1 :name "Ann" :email "a@x"}
+                            {:db/id 2 :name "Bob"}]))]
+    (is (= #{[1]}
+           (d/q '[:find ?e
+                  :where
+                  [?e :name ?x]
+                  [?e :email ?y]]
+                db)))
+    (is (= #{[1] [2]}
+           (d/q '[:find ?e
+                  :where
+                  [?e :name ?x]
+                  [?e :name ?z]]
+                db)))
+    (doseq [query ['[:find ?e
+                     :where
+                     [?e :name ?x]
+                     [?e :email ?y]
+                     [?e :name ?z]]
+                   '[:find ?e
+                     :where
+                     [?e :name ?x]
+                     [?e :name ?z]
+                     [?e :email ?y]]
+                   '[:find ?e
+                     :where
+                     [?e :email ?y]
+                     [?e :name ?x]
+                     [?e :name ?z]]]]
+      (is (= #{[1]} (d/q query db))))
+    (d/close-db db)
+    (u/delete-files dir)))
+
 
 (deftest test-q-many
   (let [dir (u/tmp-dir (str "test-query-" (UUID/randomUUID)))
