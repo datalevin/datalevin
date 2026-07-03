@@ -36,6 +36,8 @@
   [#372](https://github.com/datalevin/datalevin/issues/372).
 - [Datalog] Duplicate attribute clauses return empty results
   [#376](https://github.com/datalevin/datalevin/issues/376).
+- [Datalog] `tx-data->simulated-report` leaks into connection
+  [#377](https://github.com/datalevin/datalevin/issues/377).
 - [DLMDB] fix stale MP_PAD during page split
   [#375](https://github.com/datalevin/datalevin/issues/375).
 

@@ -1454,7 +1454,7 @@
   (vld/validate-tx-data-shape tx-data)
   (let [initial-report (map->TxReport
                          {:db-before db
-                          :db-after  db
+                          :db-after  (transfer db (.-store ^DB db))
                           :tx-data   []
                           :tempids   {}
                           :tx-meta   nil})]

@@ -142,6 +142,30 @@
             (d/close conn)
             (u/delete-files dir)))))))
 
+(deftest issue-377-simulated-report-does-not-leak-upsert-lookups
+  (let [dir    (u/tmp-dir (str "issue-377-" (UUID/randomUUID)))
+        schema {:id   {:db/unique :db.unique/identity}
+                :name {:db/valueType :db.type/string}}
+        conn   (d/get-conn dir schema)]
+    (try
+      (d/transact! conn [{:id "a" :name "Ann"}])
+      (let [db     @conn
+            report (d/tx-data->simulated-report
+                     db
+                     [{:id "b" :name "Bob"}])]
+        (is (= #{[2 :id "b"] [2 :name "Bob"]}
+               (set (map (juxt :e :a :v) (:tx-data report)))))
+        (is (= 2 (d/entid (:db-after report) [:id "b"])))
+        (is (nil? (d/entid db [:id "b"])))
+        (is (nil? (d/entid @conn [:id "b"])))
+        (is (empty? (into {} (d/entity @conn 2))))
+        (is (= #{[1 "Ann"]}
+               (d/q '[:find ?e ?name :where [?e :name ?name]]
+                    @conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest issue-366-stale-cursor-after-reader-close
   (let [dir    (u/tmp-dir (str "stale-reader-cursor-" (UUID/randomUUID)))
         schema {:name {:db/valueType   :db.type/string
