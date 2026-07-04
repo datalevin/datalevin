@@ -7,6 +7,8 @@ import pytest
 from datalevin import (
     Database,
     Entity,
+    analyze,
+    cardinality,
     connect,
     datalog_kv,
     datom,
@@ -91,6 +93,10 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert isinstance(conn.opts(), dict)
         assert conn.max_eid() == 4
         assert max_eid(conn) == 4
+        assert conn.cardinality(":status") == 2
+        assert cardinality(conn, ":status") == 2
+        assert conn.analyze(":status") == ":done"
+        assert analyze(conn) == ":done"
         assert conn.datalog_index_cache_limit() == 512
         assert conn.datalog_index_cache_limit(16) == 16
         assert conn.datalog_index_cache_limit() == 16
@@ -153,6 +159,8 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
         assert simulated[":tx-data"]
         assert isinstance(simulated[":db-after"], Database)
         assert simulated[":db-after"].entid([":name", "Sim"]) == 5
+        assert simulated[":db-after"].cardinality(":name") == 2
+        assert simulated[":db-after"].analyze(":name") == ":done"
         assert simulated[":db-after"].pull([":name", ":bio"], [":name", "Sim"]) == {
             ":name": "Sim",
             ":bio": "Simulated only",

@@ -340,6 +340,20 @@ public final class Schema {
         }
 
         /**
+         * Sets {@code :db.idoc/indexedPaths}.
+         */
+        public Attribute idocIndexedPaths(Object... paths) {
+            return vectorProp("db.idoc/indexedPaths", paths);
+        }
+
+        /**
+         * Sets {@code :db.idoc/excludedPaths}.
+         */
+        public Attribute idocExcludedPaths(Object... paths) {
+            return vectorProp("db.idoc/excludedPaths", paths);
+        }
+
+        /**
          * Sets {@code :db/domain}.
          */
         public Attribute domain(String domain) {
@@ -419,6 +433,14 @@ public final class Schema {
         private Attribute stringVectorProp(String key, String... values) {
             ArrayList<Object> items = new ArrayList<>(values.length);
             for (String value : values) {
+                items.add(value);
+            }
+            return vectorProp(key, items.toArray());
+        }
+
+        private Attribute vectorProp(String key, Object... values) {
+            ArrayList<Object> items = new ArrayList<>(values.length);
+            for (Object value : values) {
                 items.add(value);
             }
             props.put(Datalevin.kw(key), PersistentVector.create(items));

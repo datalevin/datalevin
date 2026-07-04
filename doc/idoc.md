@@ -24,6 +24,12 @@ optional idoc format and a domain name:
 * `:db/domain` -- optional idoc domain. If absent, the attribute name is used as
   the domain. If specified, the values of this attribute will be added to the
   domain. Domain allows scoped search of idocs.
+* `:db.idoc/indexedPaths` -- optional collection of path prefix selectors to
+  index for this attribute's domain. If absent, all paths are indexed. A
+  selector can be a keyword, string, or vector path. For example, `:profile`
+  indexes leaf paths such as `[:profile :age]` and `[:profile :name]`.
+* `:db.idoc/excludedPaths` -- optional collection of path prefix selectors to
+  omit from this attribute's domain. Excluded paths win over included paths.
 
 ```clojure
 (def schema
@@ -35,6 +41,17 @@ optional idoc format and a domain name:
               :db/idocFormat  :markdown}
    :doc/many {:db/valueType   :db.type/idoc
               :db/cardinality :db.cardinality/many}})
+```
+
+The same path controls can be supplied as store options. `:idoc-opts` applies
+defaults to every idoc domain, and `:idoc-domains` overrides a named domain:
+
+```clojure
+(d/create-conn
+  dir schema
+  {:idoc-domains
+   {"profiles" {:indexed-paths [:status :profile]
+                :excluded-paths [[:profile :raw]]}}})
 ```
 
 ### Transact idoc values
@@ -257,7 +274,9 @@ when the path traverses arrays.
   * **path dictionary**: `path -> path-id` with stable numeric ids.
   * **inverted index**: `(path-id, typed-value) -> [doc-id ...]`.
 * **Indexing**: During transactions, idoc indices are updated synchronously.
-  There is no multi-step indexing process.
+  There is no multi-step indexing process. If selective path indexing is
+  configured, only selected leaf paths are entered in the path dictionary and
+  inverted index.
 * **Large values**: Values that exceed the index key size are indexed by a
   truncated prefix (same scheme used by core indices). This can introduce
   extra candidates, but exact matches are verified against the full document

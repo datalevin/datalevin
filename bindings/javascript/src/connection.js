@@ -135,6 +135,17 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await callJavaMethod(this.rawHandle(), "maxEid"));
   }
 
+  async cardinality(attr) {
+    return toJsResult(await callJavaMethod(this.rawHandle(), "cardinality", await toJava(attr)));
+  }
+
+  async analyze(attr = null) {
+    if (hasValue(attr)) {
+      return toJsResult(await callJavaMethod(this.rawHandle(), "analyze", await toJava(attr)));
+    }
+    return toJsResult(await callJavaMethod(this.rawHandle(), "analyze"));
+  }
+
   async updateSchema(schemaUpdate, { delAttrs = null, renameMap = null } = {}) {
     const args = [
       this.rawHandle(),

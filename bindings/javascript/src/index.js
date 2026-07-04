@@ -9,7 +9,9 @@ export {
   DatalevinJvmError
 } from "./errors.js";
 export {
+  analyze,
   apiInfo,
+  cardinality,
   connect,
   datom,
   datalogKv,
@@ -20,6 +22,7 @@ export {
   fillDb,
   fulltextAttr,
   idocAttr,
+  idocDomain,
   idocOptions,
   initDb,
   jvmStarted,

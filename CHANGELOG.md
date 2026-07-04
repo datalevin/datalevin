@@ -3,61 +3,63 @@
 ## WIP
 ### Added
 - [Datalog]`datalog-kv` function to return the underlying DLMDB instance for a
-  Datalog DB.
+Datalog DB.
 - [Datalog] schema now allows attribute predicates, i.e. `:db.attr/preds` to
-  enforce attribute conditions automatically.
+enforce attribute conditions automatically.
 - [Datalog] `:db/ensure` special form in transaction data, takes a predicate and
-  arguments, and use `:db-after` to ensure post conditions are met, otherwise
-  abort the transaction.
+arguments, and use `:db-after` to ensure post conditions are met, otherwise
+abort the transaction.
+- [Document] options for selective path indexing for idoc, `:indexed-paths` and
+  `:excluded-paths`.
 - [Search] `:limit` and `:offset` search option
-  [#318](https://github.com/datalevin/datalevin/issues/318).
+[#318](https://github.com/datalevin/datalevin/issues/318).
 - [Lib] Release Datalevin server as a Java library
-  `org.datalevin:datalevin-java-server` to Maven Central, for in-process
-  server use.
+`org.datalevin:datalevin-java-server` to Maven Central, for in-process
+server use.
 - [KV] `with-kv` for one-off txn in KV store
-  [#261](https://github.com/datalevin/datalevin/issues/261).
+[#261](https://github.com/datalevin/datalevin/issues/261).
 - Add time-out for explicit transactions
-  [#162](https://github.com/datalevin/datalevin/issues/162).
+[#162](https://github.com/datalevin/datalevin/issues/162).
 
 ### Changed
-- [Server] Only built-ins functions and registered UDF can be resolved in query
-  in order to prevent arbitrary code execution on server.
+- [Server] Only built-ins functions and registered UDF can be resolved in query,
+in order to prevent arbitrary code execution on server.
 
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
-  [#369](https://github.com/datalevin/datalevin/issues/369).
+[#369](https://github.com/datalevin/datalevin/issues/369).
 - [Datalog] `dump` handle `:json/null` correctly
-  [#370](https://github.com/datalevin/datalevin/issues/370).
+[#370](https://github.com/datalevin/datalevin/issues/370).
 - [Datalog] `fill-db` refreshes read caches after bulk load, and the query
-  optimizer verifies zero cardinality estimates before pruning
-  [#371](https://github.com/datalevin/datalevin/issues/371).
+optimizer verifies zero cardinality estimates before pruning
+[#371](https://github.com/datalevin/datalevin/issues/371).
 - [Datalog] Retracting and reasserting entities with ref-component composite
-  tuple identities no longer creates partial `[nil ...]` tuple values
-  [#372](https://github.com/datalevin/datalevin/issues/372).
+tuple identities no longer creates partial `[nil ...]` tuple values
+[#372](https://github.com/datalevin/datalevin/issues/372).
 - [Datalog] Duplicate attribute clauses return empty results
-  [#376](https://github.com/datalevin/datalevin/issues/376).
+[#376](https://github.com/datalevin/datalevin/issues/376).
 - [Datalog] `tx-data->simulated-report` leaks into connection
-  [#377](https://github.com/datalevin/datalevin/issues/377).
+[#377](https://github.com/datalevin/datalevin/issues/377).
 - [DLMDB] fix stale MP_PAD during page split
-  [#375](https://github.com/datalevin/datalevin/issues/375).
+[#375](https://github.com/datalevin/datalevin/issues/375).
 
 ### Improved
 - [Datalog] Coerce java.time.Instant to Date
-  [#373](https://github.com/datalevin/datalevin/issues/373). [Thx @xfthhxk]
+[#373](https://github.com/datalevin/datalevin/issues/373). [Thx @xfthhxk]
 - [Datalog] Collection bindings optimization
-  [#214](https://github.com/datalevin/datalevin/issues/214).
+[#214](https://github.com/datalevin/datalevin/issues/214).
 - [Datalog] Expose clojure vars to `inter-fn`
-  [#215](https://github.com/datalevin/datalevin/issues/215).
+[#215](https://github.com/datalevin/datalevin/issues/215).
 - [Datalog] reduce allocation per tuple.
 - [Datalog] fully implement datafy
-  [#292](https://github.com/datalevin/datalevin/issues/292).
+[#292](https://github.com/datalevin/datalevin/issues/292).
 - [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
 - Able to dump/load mixed KV and DL databases
-  [#348](https://github.com/datalevin/datalevin/issues/348).
+[#348](https://github.com/datalevin/datalevin/issues/348).
 - [Search] Reduce heap pressure for large posting list
-  [#356](https://github.com/datalevin/datalevin/issues/356).
+[#356](https://github.com/datalevin/datalevin/issues/356).
 - update deps.
 
 ## 0.10.18 (2026-05-27)
@@ -73,104 +75,104 @@
 
 ### Added
 - [Server] High availability (HA) cluster with Raft consensus based auto
-  roll-over and promotion. Details in [doc](doc/ha.md).
+roll-over and promotion. Details in [doc](doc/ha.md).
 - [Server] Operator-driven HA static membership updates via
-  `datalevin.client/ha-update-membership!`, including authoritative
-  membership-hash CAS update, optional control-plane voter replacement, and
-  lease clearing.
+`datalevin.client/ha-update-membership!`, including authoritative
+membership-hash CAS update, optional control-plane voter replacement, and
+lease clearing.
 - [Test] HA implementation comes with an extensive Jepsen test suite to validate
-  correctness [#252](https://github.com/datalevin/datalevin/issues/252). Details
-  in [doc](jepsen/README.md).
+correctness [#252](https://github.com/datalevin/datalevin/issues/252). Details
+in [doc](jepsen/README.md).
 - [Server] Non-HA asynchronous read only replicas, This provides a simple
-  primary/read-only replica topology without automatic promotion, fencing, or
-  quorum. Details in [doc](doc/server.md#non-ha-async-read-replicas)
-  [#72](https://github.com/datalevin/datalevin/issues/72).
+primary/read-only replica topology without automatic promotion, fencing, or
+quorum. Details in [doc](doc/server.md#non-ha-async-read-replicas)
+[#72](https://github.com/datalevin/datalevin/issues/72).
 - [API] JSON API. [#182](https://github.com/datalevin/datalevin/issues/182)
 - [Lib] Release a lean embedded-use-only jar
-  `org.datalevin/datalevin-embedded:0.10.16` to **Clojars**. This jar does not
-  contain code for server/HA/CLI/pod and related dependencies.
+`org.datalevin/datalevin-embedded:0.10.16` to **Clojars**. This jar does not
+contain code for server/HA/CLI/pod and related dependencies.
 - [Lib] Release Datalevin as a Java library
-  `org.datalevin:datalevin-java:0.10.16` to **Maven Central**, for embedded use.
+`org.datalevin:datalevin-java:0.10.16` to **Maven Central**, for embedded use.
 - [Lib] Release Datalevin as a Python library `datalevin` to **PyPI**, for embedded
-  use.
+use.
 - [Lib] Release Datalevin as a JavaScript Node.js library `datalevin-node` to
-  **npm**, for embedded use.
+**npm**, for embedded use.
 - [Datalog] Allow registering a `:db/udf` to specify a user-defined function.
-  This feature is language-agnostic, resolves in the runtime environment, and
-  does not persist in DB. So a UDF can be written in Java, Python, or
-  JavaScript, in addition to Clojure.
+This feature is language-agnostic, resolves in the runtime environment, and
+does not persist in DB. So a UDF can be written in Java, Python, or
+JavaScript, in addition to Clojure.
 - [AI] Built-in stdio based MCP server. Details in [doc](doc/mcp.md).
 - [AI] Built-in trimmed down llama.cpp that supports CPU only inference for text
-  embedding and text generation. With a compatible OCR-capable generation model,
-  the same generation path can be used for OCR. Models need to be downloaded
-  separately.
+embedding and text generation. With a compatible OCR-capable generation model,
+the same generation path can be used for OCR. Models need to be downloaded
+separately.
 - [Datalog] Allow `:db/embedding true` property for string attributes, which
-  will use an embedding model to embed the texts into vectors and index them.
-  A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
-  Hugging Face on first use. This small 384-dimensional model is sufficient for
-  short text snippets embedding. For large and complex text passages, user
-  should download a larger model in GGUF format, or use an OpenAI-compatible
-  external LLM provider instead.
+will use an embedding model to embed the texts into vectors and index them.
+A default embedding model `multilingual-e5-small-Q8_0.gguf` is downloaded from
+Hugging Face on first use. This small 384-dimensional model is sufficient for
+short text snippets embedding. For large and complex text passages, user
+should download a larger model in GGUF format, or use an OpenAI-compatible
+external LLM provider instead.
 - [Datalog] For embedding-enabled datoms, `embedding-neighbors` built-in
-  function returns `[e, a, v]` based on vector similarity. Details in
-  [doc](doc/vector.md).
+function returns `[e, a, v]` based on vector similarity. Details in
+[doc](doc/vector.md).
 - [Datalog] Fulltext, vector, and embedding secondary indexes can opt into
-  asynchronous indexing with `:indexing-mode :async`. Async jobs are durably
-  committed with the source transaction, processed by the in-process worker, and
-  retried with bounded backoff and worker leases so stalled jobs can be
-  reclaimed. Details in [doc](doc/search.md) and [doc](doc/vector.md).
+asynchronous indexing with `:indexing-mode :async`. Async jobs are durably
+committed with the source transaction, processed by the in-process worker, and
+retried with bounded backoff and worker leases so stalled jobs can be
+reclaimed. Details in [doc](doc/search.md) and [doc](doc/vector.md).
 - [Search] `:display :refs+scores` to show relevance score.
 - [Async] A semaphore to limit the number of async jobs in backlog. Will
-  block if the backlog is full (max of 4098 and 1024 * cores).
+block if the backlog is full (max of 4098 and 1024 * cores).
 - clj-kondo config [#357](https://github.com/datalevin/datalevin/issues/357).
 - [KV] Add a registry to track cached reader txn with its thread, so the
-  corresponding reader slot can be released when the thread is gone. This
-  handles the often lamented reader slot exhaustion problem.
+corresponding reader slot can be released when the thread is gone. This
+handles the often lamented reader slot exhaustion problem.
 
 ### Changed
 - [Datalog] The default write mode for embedded store is returned to `:wal?
-  false`, as it is safe and fast. `:wal? true` is opt in. However, once opted
-  in, the default is `:wal-durability-profile :relaxed`, so as to meet user's
-  expectation of enhanced throughput. Consensus-lease HA continues to force
-  `:wal? true` and default to `:wal-durability-profile :strict`.
+false`, as it is safe and fast. `:wal? true` is opt in. However, once opted
+in, the default is `:wal-durability-profile :relaxed`, so as to meet user's
+expectation of enhanced throughput. Consensus-lease HA continues to force
+`:wal? true` and default to `:wal-durability-profile :strict`.
 
 ### Fixed
 - [WAL] DB startup slow down in WAL mode
-  [#360](https://github.com/datalevin/datalevin/issues/360)
+[#360](https://github.com/datalevin/datalevin/issues/360)
 - [Datalog] Handle `false` value correctly in query
-  [#358](https://github.com/datalevin/datalevin/issues/358)
+[#358](https://github.com/datalevin/datalevin/issues/358)
 - [Datalog] Occasional stale DB meta data
-  [#362](https://github.com/datalevin/datalevin/issues/362)
+[#362](https://github.com/datalevin/datalevin/issues/362)
 - [Datalog] Do not pushdown `missing?`.
 - [KV] Leaking buffers of closed read only transactions
-  [#366](https://github.com/datalevin/datalevin/issues/366)
+[#366](https://github.com/datalevin/datalevin/issues/366)
 
 ### Improved
 - [KV] nippy uses `ByteBuffer` internals that we contributed to gain about 17%-30%
-  speedup.
+speedup.
 - [KV] Harden virtual threads handling in reads by adding `:notls` in default
 env config.
 - [KV] Don't accidentally depends on glibc 2.35 on Linux [Thx @baibhavbista].
 - [WAL] Enable multiple processes working with the same DB in WAL mode
 - [Search] Reduce query/update/delete memory allocation.
-  [#361](https://github.com/datalevin/datalevin/issues/361).
+[#361](https://github.com/datalevin/datalevin/issues/361).
 
 ## 0.10.7 (2026-03-03)
 
 ### Added
 - [WAL] Write Ahead Log (WAL) write mode, default in Datalog store, explicitly
-  set in KV store with `wal? true` option. Details are in [doc](doc/wal.md).
+set in KV store with `wal? true` option. Details are in [doc](doc/wal.md).
 - [WAL] WAL related functions:
-  - `open-tx-log` for WAL log access.
-    [#106](https://github.com/datalevin/datalevin/issues/106)
-  - `txlog-watermarks`  returns WAL status.
-  - `create-snapshot!` for create/rotate LMDB snapshots.
-  - `list-snapshots` list the snapshots and metadata.
-  - `gc-txlog-segments!` perform log garbage collection.
+- `open-tx-log` for WAL log access.
+[#106](https://github.com/datalevin/datalevin/issues/106)
+- `txlog-watermarks`  returns WAL status.
+- `create-snapshot!` for create/rotate LMDB snapshots.
+- `list-snapshots` list the snapshots and metadata.
+- `gc-txlog-segments!` perform log garbage collection.
 - [KV] `:inmemory` mode, where the env resides entirely in memory and all data is
-  lost on close. It has even faster write speed than `:nosync`.
+lost on close. It has even faster write speed than `:nosync`.
 - [Datalog] Support atomic migration from default EDN blob to a specific data
-  type when `update-schema`.
+type when `update-schema`.
 - [Platform] Support FreeBSD on AMD64 [Thx @markusalbertgraf].
 
 ### Improved
@@ -178,46 +180,46 @@ env config.
 - [Datalog] `fulltext` function honors `:display` option.
 - [Datalog] Optimizer coverage for certain cases of `not-join`.
 - [Datalog] Giants DBI is compressed when the value is greater than
-  `datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
+`datalevin.constants/*giants-zstd-threshold*`, default is 1024 bytes.
 - [Server] Reduce the number of network round trips needed for operations
-  [#350](https://github.com/juji-io/datalevin/issues/350).
+[#350](https://github.com/juji-io/datalevin/issues/350).
 
 ### Fixed
 - [Datalog] correct free vars when `not-join` is in rules
-  [#354](https://github.com/juji-io/datalevin/issues/354).
+[#354](https://github.com/juji-io/datalevin/issues/354).
 - [KV] Stale prefix-compression cache cross transactions and size inflation bug
-  [#355](https://github.com/juji-io/datalevin/issues/355).
+[#355](https://github.com/juji-io/datalevin/issues/355).
 
 ## 0.10.5 (2026-02-08)
 
 ### Added
 - [Server] When server starts, it checks a `DATALEVIN_DEFAULT_PASSWORD`
-  environment variable to set the default password for the `datalevin` root user
-  [#351](https://github.com/juji-io/datalevin/issues/351).
+environment variable to set the default password for the `datalevin` root user
+[#351](https://github.com/juji-io/datalevin/issues/351).
 - [Datalog] `:db.fn/patchIdoc` transaction function to directly update values in
-  idoc.
+idoc.
 
 ### Improved
 - [Datalog] Selective cache invalidation, so we don't throw away whole cache on
-  transaction.
+transaction.
 - [Datalog] Rewrite unused variables so that the query engine does not waste
-  resources to resolve them.
+resources to resolve them.
 - [Datalog] Enhance speed of `idoc-match` by using bitmaps for doc id set
-  operations.
+operations.
 - [Datalog] Optimize performance of `idoc-match`, `vec-neighbors` and `fulltext`
-  query function by returning tuples that only contain needed values.
+query function by returning tuples that only contain needed values.
 
 ## 0.10.4 (2026-02-03)
 
 ### Added
 - [Datalog] Document database feature (idoc) supports storage and query of EDN,
-  JSON and Markdown documents
-  [#169](https://github.com/juji-io/datalevin/issues/169). Details in
-  [doc](https://github.com/datalevin/datalevin/blob/master/doc/idoc.md)
+JSON and Markdown documents
+[#169](https://github.com/juji-io/datalevin/issues/169). Details in
+[doc](https://github.com/datalevin/datalevin/blob/master/doc/idoc.md)
 
 ### Improved
 - [Datalog] Batch and sort input tuples so index scans can take advantage of
-  DLMDB's forward seek optimization, resulting in about 12% query speedup.
+DLMDB's forward seek optimization, resulting in about 12% query speedup.
 - [Datalog] Improve handling of cyclic rules.
 - [Datalog] Cache bound values in rule resolution context.
 
@@ -225,9 +227,9 @@ env config.
 
 ### Improved
 - [Datalog] Faster hash join execution using bitmap based sideway information
-  passing (SIP) for `:_ref` type of hash join.
+passing (SIP) for `:_ref` type of hash join.
 - [Datalog] More robust link ratio calculation using empirical-Bayes shrinkage
-  and skew‑aware upper‑bound correction.
+and skew‑aware upper‑bound correction.
 - [Benchmark] Added SQLite to JOB benchmark.
 
 ## 0.10.2 (2026-01-24)
@@ -240,100 +242,100 @@ env config.
 
 ### Changed
 - [KV] KV storage is now [DLMDB](https://github.com/huahaiy/dlmdb), which has
-  additional features of counted DB
-  [#337](https://github.com/juji-io/datalevin/issues/337), prefix compression,
-  dupsort iterator optimizations and other improvements.
+additional features of counted DB
+[#337](https://github.com/juji-io/datalevin/issues/337), prefix compression,
+dupsort iterator optimizations and other improvements.
 - [KV] Default Env flag is now `#{:nordahead}`
 - [KV] Default DBI flag is now `#{:create :counted :prefix-compression}`
 - [KV] Default `:max-readers` is now 1024.
 - [Datalog] Rewritten rule engine. Implemented a bottom-up SNE approach with
-  magic set rewrites that solves OOM problem with the old engine
-  [#170](https://github.com/juji-io/datalevin/issues/170), and this can be
-  orders of magnitude faster than Datomic in recursive rule resolution, see
-  [benchmark](benchmarks/math-bench).
+magic set rewrites that solves OOM problem with the old engine
+[#170](https://github.com/juji-io/datalevin/issues/170), and this can be
+orders of magnitude faster than Datomic in recursive rule resolution, see
+[benchmark](benchmarks/math-bench).
 - [Datalog] Removed VAE index. This may reduce DB size by 30% and cut write time
-  by 50% for datasets with heavy `:db.type/ref` presence (e.g. JOB benchmark
-  DB). VAE was only used in entity retraction and the replacement solution is
-  less than 10% slower.
+by 50% for datasets with heavy `:db.type/ref` presence (e.g. JOB benchmark
+DB). VAE was only used in entity retraction and the replacement solution is
+less than 10% slower.
 - [Platform] Native dependencies are mostly statically compiled and bundled in the
-  release jars (with exception of libc, as glibc is much faster than musl).
+release jars (with exception of libc, as glibc is much faster than musl).
 - [Platform] Drop support for Intel macOS.
 - [Platform] Minimal Java version is now 21.
 
 ### Added
 - [Platform] Automatically upgrade DB from version 0.9.27 onwards when opening
-  the DB. The migration may take a while, and it needs Internet access to
-  download old uberjar. [#276](https://github.com/juji-io/datalevin/issues/276)
+the DB. The migration may take a while, and it needs Internet access to
+download old uberjar. [#276](https://github.com/juji-io/datalevin/issues/276)
 - [KV] Random access and rank lookup functions in O(log n) time for
-  `:counted` DBIs (default).
-      - `get-rank`, return the rank (0-based) of the key.
-      - `get-by-rank`, return the key/value at the given rank.
+`:counted` DBIs (default).
+- `get-rank`, return the rank (0-based) of the key.
+- `get-by-rank`, return the key/value at the given rank.
 - [KV] Sampling function `sample-kv` in O(log n) time for `:counted` DBIs
-  (default). [#325](https://github.com/juji-io/datalevin/issues/325)
+(default). [#325](https://github.com/juji-io/datalevin/issues/325)
 - [Datalog] Add `:new-attributes` to transaction report.
-  [#301](https://github.com/juji-io/datalevin/issues/301).
+[#301](https://github.com/juji-io/datalevin/issues/301).
 - [Datalog] `:order-by` now accepts column indices (0-based) in addition to
-  variable names, e.g. `:order-by [2 :desc 1 :asc]`, useful for sorting by
-  aggregation results in `:find`.
+variable names, e.g. `:order-by [2 :desc 1 :asc]`, useful for sorting by
+aggregation results in `:find`.
 - [Datalog] `:find` now allows arithmetic expression over aggregations, e.g. `(+
-  sum(?x) sum(?y))`.
+sum(?x) sum(?y))`.
 - [Datalog] Add `:having` clauses, similar to SQL `HAVING`. This allows
-  conditions to be applied to results of aggregations, e.g. `:having [(pos? (sum
-  ?x))] [(< (sum ?y) 100)]`.
+conditions to be applied to results of aggregations, e.g. `:having [(pos? (sum
+?x))] [(< (sum ?y) 100)]`.
 - [Datalog] Optimizer now includes `or-join` as potential links between
-  entities.
+entities.
 - [Datalog] Optimizer now considers hash join as an alternative to `:_ref` and
-  `:val-eq` joins when the number of input tuples is greater than
-  `datalevin.constants/hash-join-min-input-size` (default 20000). This enhances
-  query robustness, as hash join handles inaccuracy in cardinality estimation
-  better.
+`:val-eq` joins when the number of input tuples is greater than
+`datalevin.constants/hash-join-min-input-size` (default 20000). This enhances
+query robustness, as hash join handles inaccuracy in cardinality estimation
+better.
 - [Datalog] Add `apply` as a query function
-  [#344](https://github.com/juji-io/datalevin/issues/344).
+[#344](https://github.com/juji-io/datalevin/issues/344).
 - [Benchmark] [LDBC-SNB-bench](benchmarks/LDBC-SNB-bench) that compares
-  Datalevin with Neo4j on graph queries.
+Datalevin with Neo4j on graph queries.
 
 ### Improved
 - [Datalog] 40% less DB footprint due to VAE index removal and prefix
-  compression.
+compression.
 - [Datalog] Cut query planning time in half due to faster range counting and
-  sampling of DLMDB.
+sampling of DLMDB.
 - [Datalog] Reduced query execution time due to optimizer improvements and
-  faster DLMDB iterators.
+faster DLMDB iterators.
 - [Datalog] More robust query execution: added error handling, timeout and
-  back pressure to query execution pipeline; Pipelining now uses its own thread
-  pool.
+back pressure to query execution pipeline; Pipelining now uses its own thread
+pool.
 - [Platform] Deps update. Upgrade to GraalVM 25.
 
 ### Fixed
 - [KV] Enable virtual threads usage by not reusing read only transactions
-  [#326](https://github.com/juji-io/datalevin/issues/326).
+[#326](https://github.com/juji-io/datalevin/issues/326).
 - [Server] Segfault due to sampler reading a closed DB.
-  [#347](https://github.com/juji-io/datalevin/issues/347)
+[#347](https://github.com/juji-io/datalevin/issues/347)
 - [Server] Faster code path for `pull` and `pull-many` on server
-  [#322](https://github.com/juji-io/datalevin/issues/322).
+[#322](https://github.com/juji-io/datalevin/issues/322).
 - [Datalog] Unify, not overwrite, in function binding
-  [#232](https://github.com/juji-io/datalevin/issues/232).
+[#232](https://github.com/juji-io/datalevin/issues/232).
 - [Datalog] Support nested `q` as a query function
-  [#323](https://github.com/juji-io/datalevin/issues/323).
+[#323](https://github.com/juji-io/datalevin/issues/323).
 - [Datalog] Run query in the invoking thread when in write tx
-  [#331](https://github.com/juji-io/datalevin/issues/331).
+[#331](https://github.com/juji-io/datalevin/issues/331).
 - [Datalog] Handle lookup ref in type coercion
-  [#338](https://github.com/juji-io/datalevin/issues/338).
+[#338](https://github.com/juji-io/datalevin/issues/338).
 - [Datalog] Handle idents in tuple refs
-  [#340](https://github.com/juji-io/datalevin/issues/340).
+[#340](https://github.com/juji-io/datalevin/issues/340).
 - [Datalog] Do not unify `_`
-  [#341](https://github.com/juji-io/datalevin/issues/341).
+[#341](https://github.com/juji-io/datalevin/issues/341).
 - [Vector] Handle `:display :refs+dists` in `vec-neighbors`
-  [#327](https://github.com/juji-io/datalevin/issues/327).
+[#327](https://github.com/juji-io/datalevin/issues/327).
 - [Async] Run callback in worker thread
-  [#329](https://github.com/juji-io/datalevin/issues/329).
+[#329](https://github.com/juji-io/datalevin/issues/329).
 
 
 ## 0.9.27 (2025-11-19)
 
 ## Added
 - [KV] Write a `VERSION` file, otherwise the same as 0.9.22. This is to allow
-  automatic migration from 0.9.27 to 0.10.0 and onwards.
+automatic migration from 0.9.27 to 0.10.0 and onwards.
 
 ## 0.9.22 (2025-03-18)
 
@@ -342,53 +344,53 @@ env config.
 
 ### Improved
 - [Vector] Defer closing of vector indices until after async executor is
-  shutdown to avoid segment fault due to trying to save a closed index.
+shutdown to avoid segment fault due to trying to save a closed index.
 
 ## 0.9.21 (2025-03-18)
 
 ### Added
 - [Vector] `new-vector-index` function creates an on-disk index for equal-length
-  dense numeric vectors to allow similarity search, and related functions
-  `close-vector-index`, `clear-vector-index` and `vector-index-info`. Vector
-  indexing is implemented with [usearch](https://github.com/unum-cloud/usearch).
+dense numeric vectors to allow similarity search, and related functions
+`close-vector-index`, `clear-vector-index` and `vector-index-info`. Vector
+indexing is implemented with [usearch](https://github.com/unum-cloud/usearch).
 - [Vector] Corresponding `add-vec`, `remove-vec`, and `search-vec` functions to
-  work with vector index. Similar to full-text search, vector search also
-  support domain semantics to allow grouping of vectors into domains.
+work with vector index. Similar to full-text search, vector search also
+support domain semantics to allow grouping of vectors into domains.
 - [Doc] [Vector doc](doc/vector.md). **Note**, you may need to install some
-  native dependencies on your system to load Datalevin: OpenMP and Vector Math.
+native dependencies on your system to load Datalevin: OpenMP and Vector Math.
 - [Datalog] New data type `:db.type/vec`, for which a vector index is
-  automatically created for them to allow a query function `vec-neighbors` to
-  return the datoms with neighboring vector values.
-  [#145](https://github.com/juji-io/datalevin/issues/145)
+automatically created for them to allow a query function `vec-neighbors` to
+return the datoms with neighboring vector values.
+[#145](https://github.com/juji-io/datalevin/issues/145)
 
 ###  Fixed
 - [Datalog] Handle pathological case of redundant clauses about the same
-  attribute. [#319](https://github.com/juji-io/datalevin/issues/319)
+attribute. [#319](https://github.com/juji-io/datalevin/issues/319)
 - [Datalog] Correctly handle certain case of attribute without value.
-  [#320](https://github.com/juji-io/datalevin/issues/320)
+[#320](https://github.com/juji-io/datalevin/issues/320)
 
 ### Improved
 - [Datalog] Limit the time for counting datoms during planning with a dynamic
-  var `datalevin.constants/range-count-time-budget` in milliseconds, default
-  is 10; another dynamic var `datalevin.constants/range-count-iteration-step`
-  determines after how many loop iterations to take a time measure, default
-  is 1000.
+var `datalevin.constants/range-count-time-budget` in milliseconds, default
+is 10; another dynamic var `datalevin.constants/range-count-iteration-step`
+determines after how many loop iterations to take a time measure, default
+is 1000.
 - [Datalog] Same for sampling with `sample-time-budget` and
-  `sample-iteratioin-step`, defaults are 2 milliseconds and 20000, respectively.
+`sample-iteratioin-step`, defaults are 2 milliseconds and 20000, respectively.
 - [Datalog] Reduce the exhaustive plan space to P(n, 2).
 - [Datalog] Add `:parsing-time` for query parsing and `:building-time` for query
-  graph building to `explain` results.
+graph building to `explain` results.
 - [Search] Dump data to file when `re-index` to save memory.
 - [KV] Periodically flush to disk, with an interval set by dynamic var
-  `datalevin.constants/lmdb-sync-interval` in seconds, default is 300. This also
-  cleans up dead readers.
+`datalevin.constants/lmdb-sync-interval` in seconds, default is 300. This also
+cleans up dead readers.
 - [KV] Remove the semaphore for preventing "Environment maxreaders limit
-  reached" error, as it hurts read performance. User should be careful with
-  functions such as `pmap` and `future`for parallel read operation, as they use
-  unbounded thread pools. User can use a semaphore to limit the number of read
-  threads in flight, or use a bounded thread pool. If needed, `:max-readers` KV
-  option can also be set to increase the limit (default is now doubled to
-  256).
+reached" error, as it hurts read performance. User should be careful with
+functions such as `pmap` and `future`for parallel read operation, as they use
+unbounded thread pools. User can use a semaphore to limit the number of read
+threads in flight, or use a bounded thread pool. If needed, `:max-readers` KV
+option can also be set to increase the limit (default is now doubled to
+256).
 - [Doc] Add `built-ins` namespace for query functions to cljdoc.
 
 ## 0.9.20 (2025-02-19)
@@ -400,50 +402,50 @@ env config.
 
 ### Added
 - [Search] Boolean search expression.
-  [#104](https://github.com/juji-io/datalevin/issues/104)
-  [#310](https://github.com/juji-io/datalevin/issues/310)
+[#104](https://github.com/juji-io/datalevin/issues/104)
+[#310](https://github.com/juji-io/datalevin/issues/310)
 - [Search] Phrase search. [#311](https://github.com/juji-io/datalevin/issues/311)
 - [Datalog] `analyze` function to collect statistics that helps with query
-  planner.
+planner.
 - [Datalog] `max-eid` function to return the current maximal entity id.
 - [Benchmark] [write-bench](benchmarks/write-bench) that compares Datalevin with
-  SQLite on transaction performance, and studies Datalevin KV write
-  performance under various conditions.
+SQLite on transaction performance, and studies Datalevin KV write
+performance under various conditions.
 
 ### Fixed
 - [Datalog] `and` in `or-join` exception
-  [#304](https://github.com/juji-io/datalevin/issues/304)
+[#304](https://github.com/juji-io/datalevin/issues/304)
 - [Datalog] `and` join exception.
-  [#305](https://github.com/juji-io/datalevin/issues/305)
+[#305](https://github.com/juji-io/datalevin/issues/305)
 - [Datalog] Validation of negative doubles
-  [#308](https://github.com/juji-io/datalevin/issues/308)
+[#308](https://github.com/juji-io/datalevin/issues/308)
 - [Datalog] `seek-datom` and `rseek-datom` broken for `:eav` index
 
 ### Improved
 - [Datalog] `fill-db` no longer creates a new DB, to reduce chance of user
-  errors. [#306](https://github.com/juji-io/datalevin/issues/306)
+errors. [#306](https://github.com/juji-io/datalevin/issues/306)
 - [Datalog] Added arity to `seek-datoms` and `rseek-datoms` to specify the
-  number of datoms desired. [Thx @jeremy302]
-  [#312](https://github.com/juji-io/datalevin/issues/312)
+number of datoms desired. [Thx @jeremy302]
+[#312](https://github.com/juji-io/datalevin/issues/312)
 - [Datalog] `datoms` function takes an extra `n` argument as well.
 - [Datalog] Faster attribute size count by selecting different counters based on
-  cardinality.
+cardinality.
 - [Datalog] Sort by cardinality when picking minimal attribute.
 - [KV] Prevent "MDB_READERS_FULL: Environment maxreaders limit reached" error
-  when running hundreds of concurrent reading threads.
+when running hundreds of concurrent reading threads.
 - [Async] Resepct individual callback of each async call.
 
 ## 0.9.18 (2025-01-20)
 
 ### Added
 - [KV] `set-env-flags` and `get-env-flags`, so users may change the env flags
-  after the DB is open. This is useful for adjusting transaction durability
-  settings on the fly.
+after the DB is open. This is useful for adjusting transaction durability
+settings on the fly.
 
 ### Fixed
 - [Platform] Clojure compiler adds `java.util.SequencedCollection` automatically
-  when compiled on JDK 21 and above, which does not exist in earlier JDK.
-  Compile library with JDK 17 instead.
+when compiled on JDK 21 and above, which does not exist in earlier JDK.
+Compile library with JDK 17 instead.
 - [KV] Type validation and coercion for `:bytes`.
 
 ### Improved
@@ -468,41 +470,41 @@ env config.
 
 ### Added
 - [KV] `transanct-kv-async` function to return a future and transact in batches
-  to enhance write throughput (2.5X or more higher throughput in heavy write
-  condition compared with `transact-kv`). Batch size is automatically adjusted
-  to the write workload: the higher the load, the larger the batch. Howver,
-  manual batching of transaction data is still helpful, as the effects of
-  automatic batching and manual batching add up.
-  [#256](https://github.com/juji-io/datalevin/issues/256)
+to enhance write throughput (2.5X or more higher throughput in heavy write
+condition compared with `transact-kv`). Batch size is automatically adjusted
+to the write workload: the higher the load, the larger the batch. Howver,
+manual batching of transaction data is still helpful, as the effects of
+automatic batching and manual batching add up.
+[#256](https://github.com/juji-io/datalevin/issues/256)
 
 ### Fixed
 - [Datalog] Upsert fails on entity with unique composite tuple
-  [#299](https://github.com/juji-io/datalevin/issues/299)
+[#299](https://github.com/juji-io/datalevin/issues/299)
 
 ### Improved
 - [Datalog] Both `transact` and `transact-async` are also changed to use the
-  same adaptive batching transaction mechanism to enhance write throughout.
+same adaptive batching transaction mechanism to enhance write throughout.
 - [Datalog] Reduce default `sample-processing-interval` to 10 seconds, so
-  samples are more up to date. Each invocation will do less work, or no work
-  , based on a change ratio, controlled by a dynamic var `sample-change-ratio`,
-  default is `0.1`, i.e. resample if 10 percent of an attribute's values
-  changed.
+samples are more up to date. Each invocation will do less work, or no work
+, based on a change ratio, controlled by a dynamic var `sample-change-ratio`,
+default is `0.1`, i.e. resample if 10 percent of an attribute's values
+changed.
 - [Datalog] Port applicable fixes from Datascript up to 1.7.4.
 - [KV] Consolidated LMDB bindings to a single binding using JavaCPP. Removed
-  both LMDBJava and Graalvm native image specific bindings. This eases
-  maintenance, enhances performance, and makes it easier to add native
-  dependencies. [#35](https://github.com/juji-io/datalevin/issues/35).
+both LMDBJava and Graalvm native image specific bindings. This eases
+maintenance, enhances performance, and makes it easier to add native
+dependencies. [#35](https://github.com/juji-io/datalevin/issues/35).
 - [KV] Pushed all LMDB iterators, counters, sampler, and comparator
-  implementation down to C code.
-  [#279](https://github.com/juji-io/datalevin/issues/279).
+implementation down to C code.
+[#279](https://github.com/juji-io/datalevin/issues/279).
 - [KV] Now it is optional to add `--add-opens` JVM options to open modules for
-  Java 11 and above. If these JVM options are not set, Datalevin will use a
-  safer but slower default option instead of throwing exceptions. It is still
-  recommended to add these JVM options to get optimal performance. For now,
-  native image uses only the safer option.
+Java 11 and above. If these JVM options are not set, Datalevin will use a
+safer but slower default option instead of throwing exceptions. It is still
+recommended to add these JVM options to get optimal performance. For now,
+native image uses only the safer option.
 - [Native] Datalevin library jar can now be used directly to compile GraalVM
-  native image. There's no longer a need for a GraalVM specific Datalevin
-  library, nor GraalVM version restriction.
+native image. There's no longer a need for a GraalVM specific Datalevin
+library, nor GraalVM version restriction.
 - [Native] Upgrade to the latest version of GraalVM .
 - [Server] Handle rare cases of exceptions in event loop.
 
@@ -511,76 +513,79 @@ env config.
 ### Added
 - [KV] `get-first-n` to return first `n` key-values in a key range.
 - [KV] `list-range-first-n` to return first `n` key-values in a key-value range
-  of a list DBI. [#298](https://github.com/juji-io/datalevin/issues/298)
+of a list DBI. [#298](https://github.com/juji-io/datalevin/issues/298)
 
 ### Fixed
 - [Datalog] Exception in or-join. [#295](https://github.com/juji-io/datalevin/issues/295)
 
 ### Improved
 - [Datalog] Faster `init-db`, `fill-db`, `re-index` and `load` by writing in
-  `:nosync` mode and syncing only at the end.
+`:nosync` mode and syncing only at the end.
 - [Datalog] Push down nested predicates as well.
 - [Datalog] Remove `c/plan-space-reduction-threshold`, always use `P(n, 3)`
-  instead, as only initial 2 joins have accurate size estimation, so larger plan
-  space for later steps is not really beneficial. This change improves JOB.
+instead, as only initial 2 joins have accurate size estimation, so larger plan
+space for later steps is not really beneficial. This change improves JOB.
 - [Datalog] Many small code optimizations to improve query speed about 10%.
 
 ## 0.9.13 (2024-11-09)
 
 ### Fixed
 - [Datalog] Repeated cardinality many attributes for the same entity.
-  [#284](https://github.com/juji-io/datalevin/issues/284)
+[#284](https://github.com/juji-io/datalevin/issues/284)
 - [Datalog] Apply type coercion according to scheam to ensure correct storage of
-  values. [#285](https://github.com/juji-io/datalevin/issues/285)
+values. [#285](https://github.com/juji-io/datalevin/issues/285)
 - [Datalog] Correct query caching when referenced content may have changed.
-  [#288](https://github.com/juji-io/datalevin/issues/288)
-  [Thx @andersmurphy]
+[#288](https://github.com/juji-io/datalevin/issues/288)
+[Thx @andersmurphy]
 - [Pod] Typos in search code.
-  [#291](https://github.com/juji-io/datalevin/issues/291)
+[#291](https://github.com/juji-io/datalevin/issues/291)
 
 ### Improved
 - [Pod] Consistent `entity` behavior in pod as in JVM.
-  [#283](https://github.com/juji-io/datalevin/issues/283)
+[#283](https://github.com/juji-io/datalevin/issues/283)
 - [Datalog] Allow `:offset 0`.
 - [Datalog] Implement `empty` on Datom so it can be walked.
-  [#286](https://github.com/juji-io/datalevin/issues/286)
+[#286](https://github.com/juji-io/datalevin/issues/286)
 - [Datalog] Query functions resolve their arguments recursively.
-  [#287](https://github.com/juji-io/datalevin/issues/287)
+[#287](https://github.com/juji-io/datalevin/issues/287)
 - [Native] Remove `:aot` to avoid potential dependency conflict.
 
 ## 0.9.12 (2024-10-08)
 
 ### Added
 - [Datalog] `:offset` and `:limit` support,
-  [#126](https://github.com/juji-io/datalevin/issues/126),
-  [#117](https://github.com/juji-io/datalevin/issues/117)
+[#126](https://github.com/juji-io/datalevin/issues/126),
+[#117](https://github.com/juji-io/datalevin/issues/117)
 - [Datalog] `:order-by` support,
-  [#116](https://github.com/juji-io/datalevin/issues/116)
+[#116](https://github.com/juji-io/datalevin/issues/116)
 - [Datalog] `count-datoms` function to return the number of datoms of a pattern
 - [Datalog] `cardinality` function to return the number of unique values of an
-  attribute
+attribute
 
 ### Improved
 - [KV] Added version number to kv-info, in preparation for auto-migration.
 - [Datalog] Cache query results by default, can use dynamic var `q/*cache?*` to
-  turn it off.
+turn it off.
 
 ## 0.9.11 (2024-10-04)
 
 ### Fixed
-- [Datalog] Empty results after querying empty database before transact. [#269](https://github.com/juji-io/datalevin/issues/269)
+- [Datalog] Empty results after querying empty database before transact.
+[#269](https://github.com/juji-io/datalevin/issues/269)
 - [Datalog] Handle multiple variables assigned to the same cardinality many
-  attribute. [#272](https://github.com/juji-io/datalevin/issues/272)
-- [Datalog] Return maps regression. [#273](https://github.com/juji-io/datalevin/issues/273)
-- [Datalog] Regression in dealing with non-existent attributes. [#274](https://github.com/juji-io/datalevin/issues/274)
+attribute. [#272](https://github.com/juji-io/datalevin/issues/272)
+- [Datalog] Return maps regression.
+[#273](https://github.com/juji-io/datalevin/issues/273)
+- [Datalog] Regression in dealing with non-existent attributes.
+[#274](https://github.com/juji-io/datalevin/issues/274)
 
 ### Changed
 - [KV] Change default write option to be the safest, the same as LMDB
-  defaults, i.e. synchronous flush to disk when commit.
+defaults, i.e. synchronous flush to disk when commit.
 
 ### Added
 - [KV] Expose `sync` function to force a synchronous flush to disk, useful
-  when non-default flags for writes are used.
+when non-default flags for writes are used.
 - [Pod] added `clear` to bb pod.
 
 ### Improved
@@ -601,7 +606,8 @@ env config.
 - [Datalog] Planner: multiple predicates turned ranges.
 - [Datalog] Planner: missing range turned predicates.
 - [Datalog] Planner: need to first try target var to find index for :ref plan.
-- [Datalog] Planner: fail to unify with existing vars in certain cases. [#263](https://github.com/juji-io/datalevin/issues/263)
+- [Datalog] Planner: fail to unify with existing vars in certain cases.
+[#263](https://github.com/juji-io/datalevin/issues/263)
 - [Datalog] Planner: skip initial attribute when it does not have a var.
 - [Datalog] Planner: target var may be already bound for link step.
 - [Datalog] Planner: missing bound var in merge scan.
@@ -610,43 +616,44 @@ env config.
 
 ### Improved
 - [Datalog] Planner: execute initial step if result size is small during
-  planning, controlled by dynamic var `init-exec-size-threshold` (default 1000),
-  above which, the same number of samples are collected instead. These
-  significantly improved subsequent join size estimation, as these initial steps
-  hugely impact the final plan.
+planning, controlled by dynamic var `init-exec-size-threshold` (default 1000),
+above which, the same number of samples are collected instead. These
+significantly improved subsequent join size estimation, as these initial steps
+hugely impact the final plan.
 - [Datalog] Planner: search full plan space initially, until the number of plans
-  considered in a step reaches `plan-space-reduction-threshold` (default 990),
-  then greedy search is performed in later stages, as these later ones have less
-  impact on performance. This provides a good balance between planning time and
-  plan quality, while avoiding potential out of memory issue during planning.
+considered in a step reaches `plan-space-reduction-threshold` (default 990),
+then greedy search is performed in later stages, as these later ones have less
+impact on performance. This provides a good balance between planning time and
+plan quality, while avoiding potential out of memory issue during planning.
 - [Datalog] Planner: do parallel processing whenever appropriate during planning
-  and execution (regular JVM only).
+and execution (regular JVM only).
 - [LMDB] Lock env when creating a read only txn to have safer concurrent reads.
 
 ### Changed
 - [Datalog] maintain an estimated total size and a representative sample of
-  entity ids for each attribute, processed periodically according to
-  `sample-processing-interval`(default 3600 seconds).
+entity ids for each attribute, processed periodically according to
+`sample-processing-interval`(default 3600 seconds).
 - [Datalog] reduce default `*fill-db-batch-size*` to 1 million datoms.
-- [KV] throw exception when transacting `nil`, [#267](https://github.com/juji-io/datalevin/issues/267)
+- [KV] throw exception when transacting `nil`,
+[#267](https://github.com/juji-io/datalevin/issues/267)
 
 ## 0.9.8 (2024-06-29)
 
 ### Fixed
 - [Datalog] Planner: column attributes should be a set of equivalent attribute
-  and variable.
+and variable.
 - [Datalog] Planner: convert ranges back to correct predicates.
 - [Datalog] Handle `like`, `in` within complex logic expressions.
 
 ### Improved
 - [Datalog] Optimize `not`, `and` and `or` logic functions that involve only
-  one variable.
+one variable.
 
 ## 0.9.7 (2024-06-23)
 
 ### Fixed
 - [Datalog] Handle bounded entity IDs in reverse reference and value equality
-  scans, [#260](https://github.com/juji-io/datalevin/issues/260)
+scans, [#260](https://github.com/juji-io/datalevin/issues/260)
 ### Improved
 - [Datalog] Added `:result` to `explain` result map.
 
@@ -654,25 +661,25 @@ env config.
 
 ### Added
 - [Datalog] `like` function similar to LIKE operator in SQL: `(like input
-  pattern)` or `(like input pattern opts)`. Match pattern accepts wildcards `%`
-  and `_`. `opts` map has key `:escape` that takes an escape character, default
-  is `\!`. Pattern is compiled into a finite state machine that does non-greedy
-  (lazy) matching, as oppose to the default in Clojure/Java regex. This function
-  is further optimized by rewritten into index scan range boundary for patterns
-  that have non-wildcard prefix. Similarly, `not-like` function is provided.
+pattern)` or `(like input pattern opts)`. Match pattern accepts wildcards `%`
+and `_`. `opts` map has key `:escape` that takes an escape character, default
+is `\!`. Pattern is compiled into a finite state machine that does non-greedy
+(lazy) matching, as oppose to the default in Clojure/Java regex. This function
+is further optimized by rewritten into index scan range boundary for patterns
+that have non-wildcard prefix. Similarly, `not-like` function is provided.
 - [Datalog] `in` function that is similar to IN operator in SQL: `(in input
-  coll)` which is optimized as index scan boundaries. Similarly, `not-in`.
+coll)` which is optimized as index scan boundaries. Similarly, `not-in`.
 - [Datalog] `fill-db` function to bulk-load a collection of trusted datoms,
-  `*fill-db-batch-size*` dynamic var to control the batch size (default 4
-  million datoms). The same var also control `init-db` batch size.
+`*fill-db-batch-size*` dynamic var to control the batch size (default 4
+million datoms). The same var also control `init-db` batch size.
 - `read-csv` function, a drop-in replacement for `clojure.data.csv/read-csv`.
-  This CSV parser is about 1.5X faster and is more robust in handling quoted
-  content.
+This CSV parser is about 1.5X faster and is more robust in handling quoted
+content.
 - Same `write-csv` for completeness.
 
 ### Fixed
 - [Datalog] Wrong variable may be returned when bounded variables are
-  involved. [#259](https://github.com/juji-io/datalevin/issues/259)
+involved. [#259](https://github.com/juji-io/datalevin/issues/259)
 
 ### Changed
 - [KV] Change default initial DB size to 1 GiB.
@@ -689,10 +696,11 @@ env config.
 
 ### Fixed
 - [Datalog] planner generates incorrect step when bound variable is involved in
-  certain cases.
+certain cases.
 - [Datalog] `explain` throws when zero result is determined prior to actual
-  planning. [Thx @aldebogdanov]
-- [Datalog] regression in staged entity transactions for refs, [#244](https://github.com/juji-io/datalevin/issues/244), [Thx @den1k]
+planning. [Thx @aldebogdanov]
+- [Datalog] regression in staged entity transactions for refs,
+[#244](https://github.com/juji-io/datalevin/issues/244), [Thx @den1k]
 ### Improved
 - [Datalog] added query graph to `explain` result map.
 
@@ -701,7 +709,7 @@ env config.
 ### Added
 - [Datalog] `explain` function to show query plan.
 - [Platform] Embedded library for Linux on Aarch64, which is crossed compiled
-  using zig.
+using zig.
 ### Fixed
 - [KV] Broken embedded library on Windows.
 ### Improved
@@ -711,34 +719,37 @@ env config.
 
 ## 0.9.3 (2024-03-13)
 
-[DB Upgrade](https://github.com/juji-io/datalevin/blob/master/doc/upgrade.md) is required.
+[DB Upgrade](https://github.com/juji-io/datalevin/blob/master/doc/upgrade.md) is
+required.
 
 ### Added
 - [Datalog] Query optimizer to improve query performance, particularly for
-  complex queries. See [details](doc/query.md). [#11](https://github.com/juji-io/datalevin/issues/11)
+complex queries. See [details](doc/query.md).
+[#11](https://github.com/juji-io/datalevin/issues/11)
 - [Datalog] More space efficient storage format, leveraging LMDB's
-  dupsort feature, resulting in about 20% space reduction and faster counting of
-  data entries.
+dupsort feature, resulting in about 20% space reduction and faster counting of
+data entries.
 - [Datalog] `search-datoms` function to lookup datoms without having to specify
-  an index.
-- [KV] Expose LMDB dupsort feature, i.e. B+ trees of B+ trees, [#181](https://github.com/juji-io/datalevin/issues/181), as the
-  following functions that work only for dbi opened with `open-list-dbi`:
-    * `put-list-items`
-    * `del-list-items`
-    * `visit-list`
-    * `get-list`
-    * `list-count`
-    * `key-range-list-count`
-    * `in-list?`
-    * `list-range`
-    * `list-range-count`
-    * `list-range-filter`
-    * `list-range-first`
-    * `list-range-some`
-    * `list-range-keep`
-    * `list-range-filter-count`
-    * `visit-list-range`
-    * `operate-list-val-range`
+an index.
+- [KV] Expose LMDB dupsort feature, i.e. B+ trees of B+ trees,
+[#181](https://github.com/juji-io/datalevin/issues/181), as the
+following functions that work only for dbi opened with `open-list-dbi`:
+* `put-list-items`
+* `del-list-items`
+* `visit-list`
+* `get-list`
+* `list-count`
+* `key-range-list-count`
+* `in-list?`
+* `list-range`
+* `list-range-count`
+* `list-range-filter`
+* `list-range-first`
+* `list-range-some`
+* `list-range-keep`
+* `list-range-filter-count`
+* `visit-list-range`
+* `operate-list-val-range`
 - [KV] `key-range` function that returns a range of keys only.
 - [KV] `key-range-count` function that returns the number of keys in a range.
 - [KV] `visit-key-range` function that visit keys in a range for side effects.
@@ -748,24 +759,24 @@ env config.
 ### Changed
 - [Datalog] Change VEA index back to VAE.
 - [Datalog] `:eavt`, `:avet` and `:vaet` are no longer accepted as index names,
-  use `:eav`, `:ave` and `:vae` instead. Otherwise, it's misleading, as we don't
-  store tx id.
+use `:eav`, `:ave` and `:vae` instead. Otherwise, it's misleading, as we don't
+store tx id.
 - [KV] Change default write setting from `:mapasync` to `:nometasync`, so
-  that the database is more crash resilient. In case of system crash, only the
-  last transaction might be lost, but the database will not be corrupted. [#228](https://github.com/juji-io/datalevin/issues/228)
+that the database is more crash resilient. In case of system crash, only the
+last transaction might be lost, but the database will not be corrupted. [#228](https://github.com/juji-io/datalevin/issues/228)
 - [KV] Upgrade LMDB to the latest version, now tracking mdb.master branch,
-  as it includes important fixes for dupsort, such as
-  https://bugs.openldap.org/show_bug.cgi?id=9723
+as it includes important fixes for dupsort, such as
+https://bugs.openldap.org/show_bug.cgi?id=9723
 - [KV] `datalevin/kv-info` dbi to keep meta information about the databases, as
-  well as information about each dbi, as flags, key-size, etc. [#184](https://github.com/juji-io/datalevin/issues/184)
+well as information about each dbi, as flags, key-size, etc. [#184](https://github.com/juji-io/datalevin/issues/184)
 - [KV] Functions that take a predicate have a new argument `raw-pred?` to
-  indicate whether the predicate takes a raw KV object (default), or a pair of
-  decoded values of k and v (more convenient).
+indicate whether the predicate takes a raw KV object (default), or a pair of
+decoded values of k and v (more convenient).
 
 ### Improved
 - [Datalog] Query results is now spillable to disk. [#166](https://github.com/juji-io/datalevin/issues/166)
 - [Search] Functions in `search-utils` namespace are now compiled instead of
-  being interpreted to improve performance.
+being interpreted to improve performance.
 
 ## 0.8.29 (2024-02-23)
 ### Improved
@@ -777,7 +788,7 @@ env config.
 - [Datalog] Concurrent writes of large data values.
 ### Added
 - [Datalog] `:closed-schema?` option to allow declared attributes only, default
-  is `false`. [Thx @andersmurphy]
+is `false`. [Thx @andersmurphy]
 ### Improved
 - [Datalog] ported applicable improvements from Datascript up to 1.6.3
 
@@ -791,18 +802,18 @@ env config.
 ## 0.8.25 (2023-12-14)
 ### Added
 - [Datalog] Add `:db.fulltext/autoDomain` boolean property to attribute schema,
-  default is `false`. When `true`, a search domain
-  specific for this attribute will be created, with a domain name same as
-  attribute name, e.g. "my/attribute". This enables the same `fulltext` function syntax as
-  Datomic, i.e. `(fulltext $ :my/attribute ?search)`.
+default is `false`. When `true`, a search domain
+specific for this attribute will be created, with a domain name same as
+attribute name, e.g. "my/attribute". This enables the same `fulltext` function syntax as
+Datomic, i.e. `(fulltext $ :my/attribute ?search)`.
 - [Search] Add `:search-opts` option to `new-search-engine` option argument,
-  specifying default options passed to `search` function.
+specifying default options passed to `search` function.
 
 ## 0.8.24 (2023-12-12)
 ### Added
 - [Datalog] Add `:db.fulltext/domains` property to attribute schema, [#176](https://github.com/juji-io/datalevin/issues/176)
 - [Datalog] Add `:search-domains` to connection option map, a map from domain
-  names to search engine option maps.
+names to search engine option maps.
 - [Datalog] Add `:domains` option to `fulltext` built-in function option map
 ### Fixed
 - [Datalog] Removed problematic caching in pull api implementation
@@ -823,13 +834,13 @@ env config.
 ## 0.8.21 (2023-10-31)
 ### Fixed
 - [All] Do not interfere with the default print-methods of regular expression, byte
-  array and big integer. [#230](https://github.com/juji-io/datalevin/issues/230)
+array and big integer. [#230](https://github.com/juji-io/datalevin/issues/230)
 
 
 ## 0.8.20 (2023-10-02)
 ### Fixed
 - [Datalog] `:xform` in pull expression not called for `:cardinality/one` ref
-  attributes, [#224](https://github.com/juji-io/datalevin/issues/224). [Thx @dvingo]
+attributes, [#224](https://github.com/juji-io/datalevin/issues/224). [Thx @dvingo]
 - [Datalog] `:validate-data?` does not recognize homogeneous tuple data type, [#227](https://github.com/juji-io/datalevin/issues/227).
 - [All] BigDec decoding out of range error for some values in JVM 8. [#225](https://github.com/juji-io/datalevin/issues/225).
 ### Improved
@@ -850,12 +861,12 @@ env config.
 ## 0.8.17 (2023-07-02)
 ### Added
 - [main] Added an `--nippy` option to dump/load database in nippy binary
-  format, which handles some data anomalies, e.g. keywords with space in
-  them, non-printable data, etc., and produces smaller dump file, [#216](https://github.com/juji-io/datalevin/issues/216)
+format, which handles some data anomalies, e.g. keywords with space in
+them, non-printable data, etc., and produces smaller dump file, [#216](https://github.com/juji-io/datalevin/issues/216)
 ### Improved
 - [KV] More robust bigdec data type encoding on more platforms
 - [All] Create a backup db directory `dtlv-re-index-<unix-timestamp>` inside the
-  system temp directory when `re-index`, [#213](https://github.com/juji-io/datalevin/issues/213)
+system temp directory when `re-index`, [#213](https://github.com/juji-io/datalevin/issues/213)
 - [Search] Graceful avoidance of proximity scoring when positions are not indexed
 
 ## 0.8.16 (2023-05-10)
@@ -865,26 +876,26 @@ env config.
 ## 0.8.15 (2023-05-08)
 ### Added
 - [Search] Consider term proximity in relevance when `:index-position?` search
-  engine option is `true`. [#203](https://github.com/juji-io/datalevin/issues/203)
+engine option is `true`. [#203](https://github.com/juji-io/datalevin/issues/203)
 - [Search] `:proximity-expansion` search option (default `2`) can be used to
-  adjust the search quality vs. time trade-off: the bigger the number, the
-  higher is the quality, but the longer is the search time.
+adjust the search quality vs. time trade-off: the bigger the number, the
+higher is the quality, but the longer is the search time.
 - [Search] `:proximity-max-dist` search option (default `45`) can be used to
-  control the maximal distance between terms that would still be considered as
-  belonging to the same span.
+control the maximal distance between terms that would still be considered as
+belonging to the same span.
 - [Search] `create-stemming-token-filter` function to create stemmers, which
-  uses Snowball stemming library that supports many languages. [#209](https://github.com/juji-io/datalevin/issues/209)
+uses Snowball stemming library that supports many languages. [#209](https://github.com/juji-io/datalevin/issues/209)
 - [Search] `create-stop-words-token-filter` function to take a customized stop
-  words predicate.
+words predicate.
 - [KV, Datalog, Search] `re-index` function that dump and load data with new
-  settings. Should only be called when no other threads or programs are
-  accessing the database. [#179](https://github.com/juji-io/datalevin/issues/179)
+settings. Should only be called when no other threads or programs are
+accessing the database. [#179](https://github.com/juji-io/datalevin/issues/179)
 ### Fixed
 - [KV] More strict type check for transaction data, throw when transacting
-  un-thawable data. [#208](https://github.com/juji-io/datalevin/issues/208)
+un-thawable data. [#208](https://github.com/juji-io/datalevin/issues/208)
 ### Changed
 - [Main] Remove `*datalevin-data-readers*` dynamic var, use Clojure's
-  `*data-readers*` instead.
+`*data-readers*` instead.
 
 ## 0.8.14 (2023-04-28)
 ### Fixed
@@ -898,40 +909,40 @@ env config.
 
 ### Improved
 - [Datalog] Disable cache during transaction, save memory and avoid disrupting
-  concurrent write processes.
+concurrent write processes.
 - [Native] upgrade GraalVM to 22.3.2
 - [Lib] update deps.
 
 ## 0.8.12 (2023-04-03)
 ### Fixed
 - [KV] When `open-kv`, don't grow `:mapsize` when it is the same as the current
-  size.
+size.
 - [Server] automatically reopen DBs for a client that is previously removed from
-  the server.
+the server.
 
 
 ## 0.8.11 (2023-04-02)
 ### Added
 - [Search] `:include-text?` option to store original text. [#178](https://github.com/juji-io/datalevin/issues/178).
 - [Search] `:texts` and `:texts+offsets` keys to `:display` option of `search`
-  function, to return original text in search results.
+function, to return original text in search results.
 ### Improved
 - [Main] more robust `dump` and `load` of Datalog DB on Windows.
 
 ## 0.8.10 (2023-04-01)
 ### Added
 - [KV] `:max-readers` option to specify the maximal number of concurrent readers
-  allowed for the db file. Default is 126.
+allowed for the db file. Default is 126.
 - [KV] `max-dbs` option to specify the maximal number of sub-databases (DBI)
-  allowed for the db file. Default is 128. It may induce slowness if too big a
-  number of DBIs are created, as a linear scan is used to look up a DBI.
+allowed for the db file. Default is 128. It may induce slowness if too big a
+number of DBIs are created, as a linear scan is used to look up a DBI.
 ### Fixed
 - [Datalog] `clear` after db is resized.
 
 ## 0.8.9 (2023-03-28)
 ### Fixed
 - [KV] transacting data more than one order of magnitude larger than the
-  initial map size in one transaction. [#196](https://github.com/juji-io/datalevin/issues/196)
+initial map size in one transaction. [#196](https://github.com/juji-io/datalevin/issues/196)
 
 ## 0.8.8 (2023-03-21)
 ### Improved
@@ -942,36 +953,36 @@ env config.
 ## 0.8.7 (2023-03-21)
 ### Added
 - [Datalog] `datalog-index-cache-limit` function to get/set the limit of Datalog
-  index cache. Helpful to disable cache when bulk transacting data. [#195](https://github.com/juji-io/datalevin/issues/195)
+index cache. Helpful to disable cache when bulk transacting data. [#195](https://github.com/juji-io/datalevin/issues/195)
 - [Server] `:idle-timeout` option when creating the server, in ms, default is 24
-  hours. [#122](https://github.com/juji-io/datalevin/issues/122)
+hours. [#122](https://github.com/juji-io/datalevin/issues/122)
 ### Fixed
 - [Datalog] error when Clojure collections are used as lookup refs. [#194](https://github.com/juji-io/datalevin/issues/194)
 
 ## 0.8.6 (2023-03-10)
 ### Fixed
 - [Datalog] correctly handle retracting then transacting the same datom in the
-  same transaction. [#192](https://github.com/juji-io/datalevin/issues/192)
+same transaction. [#192](https://github.com/juji-io/datalevin/issues/192)
 - [Datalog] error deleting entities that were previously transacted as part of
-  some EDN data. [#191](https://github.com/juji-io/datalevin/issues/191).
+some EDN data. [#191](https://github.com/juji-io/datalevin/issues/191).
 ### Improved
 - [Lib] update deps.
 
 ## 0.8.5 (2023-02-13)
 ### Added
 - [KV] added tuple data type that accepts a vector of scalar values. This
-  supports range queries, i.e. having expected ordering by first element, then
-  second element, and so on. This is useful, for example, as path keys for
-  indexing content inside documents. When used in keys, the same 511 bytes
-  limitation applies.
+supports range queries, i.e. having expected ordering by first element, then
+second element, and so on. This is useful, for example, as path keys for
+indexing content inside documents. When used in keys, the same 511 bytes
+limitation applies.
 - [Datalog] added heterogeneous tuple `:db/tupleTypes` and homogeneous tuples
-  `:db/tupleType` type. Unlike Datomic, the number of elements in a tuple are
-  not limited to 8, as long as they fit inside a 496 bytes buffer. In addition,
-  instead of using `nil` to indicate minimal value like in Datomic, one can use
-  `:db.value/sysMin` or `:db.value/sysMax` to indicate minimal or maximal
-  values, useful for range queries. [#167](https://github.com/juji-io/datalevin/issues/167)
- - [Main] dynamic var `*datalevin-data-readers*` to support loading custom tag
-   literals. (thx @respatialized)
+`:db/tupleType` type. Unlike Datomic, the number of elements in a tuple are
+not limited to 8, as long as they fit inside a 496 bytes buffer. In addition,
+instead of using `nil` to indicate minimal value like in Datomic, one can use
+`:db.value/sysMin` or `:db.value/sysMax` to indicate minimal or maximal
+values, useful for range queries. [#167](https://github.com/juji-io/datalevin/issues/167)
+- [Main] dynamic var `*datalevin-data-readers*` to support loading custom tag
+literals. (thx @respatialized)
 ### Fixed
 - [Main] dump and load big integers.
 ### Improved
@@ -984,7 +995,7 @@ large transactions.
 ## 0.8.4 (2023-01-20)
 ### Fixed
 - [Datalog] error when large `:db/fulltext` value is added then removed in the
-  same transaction.
+same transaction.
 
 ## 0.8.2 (2023-01-19)
 ### Fixed
@@ -1001,20 +1012,20 @@ large transactions.
 
 ### Changed
 - [Search] **Breaking** search index storage format change. Data re-indexing is
-  necessary.
+necessary.
 ### Improved
 - [Search] significant indexing speed and space usage improvement: for default
-  setting, 5X faster bulk load speed; 2 orders of magnitude faster
-  `remove-doc` and 10X disk space reduction; when term positions and offsets are
-  indexed: 3X faster bulk load and 40 percent space reduction.
+setting, 5X faster bulk load speed; 2 orders of magnitude faster
+`remove-doc` and 10X disk space reduction; when term positions and offsets are
+indexed: 3X faster bulk load and 40 percent space reduction.
 - [Search] added caching for term and document index access, resulting in 5
-  percent query speed improvement on average, 35 percent improvement at median.
+percent query speed improvement on average, 35 percent improvement at median.
 ### Added
 - [Search] `:index-position?` option to indicate whether to record term
-  positions inside documents, default `false`.
+positions inside documents, default `false`.
 - [Search] `:check-exist?` argument to `add-doc`indicate whether to check the
-  existence of the document in the index, default `true`. Set it to `false` when
-  importing data to improve ingestion speed.
+existence of the document in the index, default `true`. Set it to `false` when
+importing data to improve ingestion speed.
 ### Fixed
 - [Datalog] increasing indexing time problem for `:db/fulltext` values. [#151](https://github.com/juji-io/datalevin/issues/151)
 - [Search] error when indexing huge documents.
@@ -1022,8 +1033,8 @@ large transactions.
 ### Removed
 - [Search] `doc-refs` function.
 - [Search] `search-index-writer` as well as related `write` and
-  `commit`functions for client/server, as it makes little sense to bulk load
-  documents across network.
+`commit`functions for client/server, as it makes little sense to bulk load
+documents across network.
 
 ## 0.7.12 (2023-01-11)
 ### Fixed
@@ -1040,23 +1051,31 @@ large transactions.
 
 ## 0.7.9 (2023-01-09)
 ### Improved
-- [Datalog] moved entity and transaction ids from 32 bits to 64 bits integers, supporting much larger DB. [#144](https://github.com/juji-io/datalevin/issues/144)
-- [Datalog] wrapped `transact!` inside `with-transaction` to ensure ACID and improved performance
-- [Native] updated to the latest Graalvm 22.3.0. [#174](https://github.com/juji-io/datalevin/issues/174)
+- [Datalog] moved entity and transaction ids from 32 bits to 64 bits integers,
+supporting much larger DB.
+[#144](https://github.com/juji-io/datalevin/issues/144)
+- [Datalog] wrapped `transact!` inside `with-transaction` to ensure ACID and
+improved performance
+- [Native] updated to the latest Graalvm 22.3.0.
+[#174](https://github.com/juji-io/datalevin/issues/174)
 
 ## 0.7.8 (2023-01-04)
 ### Fixed
-- [KV] `get-range` regression when results are used in `sequence`. [#172](https://github.com/juji-io/datalevin/issues/172)
+- [KV] `get-range` regression when results are used in `sequence`.
+[#172](https://github.com/juji-io/datalevin/issues/172)
 ### Improved
 - [Datalog] Ported all applicable Datascript improvements since 0.8.13 up to now
-  (1.4.0). Notably, added composite tuples feature, new pull implementation,
-  many bug fixes and performance improvements. [#3](https://github.com/juji-io/datalevin/issues/3), [#57](https://github.com/juji-io/datalevin/issues/57), [#168](https://github.com/juji-io/datalevin/issues/168)
+(1.4.0). Notably, added composite tuples feature, new pull implementation,
+many bug fixes and performance improvements.
+[#3](https://github.com/juji-io/datalevin/issues/3),
+[#57](https://github.com/juji-io/datalevin/issues/57),
+[#168](https://github.com/juji-io/datalevin/issues/168)
 - bump deps
 
 ## 0.7.6 (2022-12-16)
 ### Fixed
 - [Server] error when granting permission to a db created by `create-database`
-  instead of being created by opening a connection URI
+instead of being created by opening a connection URI
 ### Improved
 - [Datalog] avoid printing all datoms when print a db
 - [Doc] clarify that `db-name` is unique on the server. (thx @dvingo)
@@ -1083,19 +1102,21 @@ large transactions.
 
 ## 0.7.0
 
-[DB Upgrade](https://github.com/juji-io/datalevin/blob/master/doc/upgrade.md) is required.
+[DB Upgrade](https://github.com/juji-io/datalevin/blob/master/doc/upgrade.md) is
+required.
 
 ### Added
 - [Platform] embedded library support for Apple Silicon.
 - [KV] A new range function `range-seq` that has similar signature as
-  `get-range`, but returns a `Seqable`, which lazily reads data items into
-  memory in batches (controlled by `:batch-size` option). It should be used
-  inside `with-open` for proper cleanup. [#108](https://github.com/juji-io/datalevin/issues/108)
+`get-range`, but returns a `Seqable`, which lazily reads data items into
+memory in batches (controlled by `:batch-size` option). It should be used
+inside `with-open` for proper cleanup.
+[#108](https://github.com/juji-io/datalevin/issues/108)
 - [KV] The existent eager range functions, `get-range` and `range-filter`, now
-  automatically spill to disk when memory pressure is high. The results, though
-  mutable, still implement `IPersistentVector`, so there is no API level
-  change. The spill-to-disk behavior is controlled by `spill-opts` option map
-  when opening the db, allowing `:spill-threshold` and `:spill-root` options.
+automatically spill to disk when memory pressure is high. The results, though
+mutable, still implement `IPersistentVector`, so there is no API level
+change. The spill-to-disk behavior is controlled by `spill-opts` option map
+when opening the db, allowing `:spill-threshold` and `:spill-root` options.
 ### Improved
 - [KV] write performance improvement
 ### Changed
@@ -1111,7 +1132,7 @@ large transactions.
 ## 0.6.28
 ### Improved
 - [Native] Add github action runner image ubuntu-20.04 to avoid using too new a
-  glibc version (2.32) that does not exist on most people's machines.
+glibc version (2.32) that does not exist on most people's machines.
 
 ## 0.6.27
 ### Fixed
@@ -1120,8 +1141,8 @@ large transactions.
 ## 0.6.26
 ### Added
 - [KV] `with-transaction-kv` macro to expose explicit transactions for KV
-  database. This allows arbitrary code within a transaction to achieve
-  atomicity, e.g. to implement compare-and-swap semantics, etc, [#110](https://github.com/juji-io/datalevin/issues/110)
+database. This allows arbitrary code within a transaction to achieve
+atomicity, e.g. to implement compare-and-swap semantics, etc, [#110](https://github.com/juji-io/datalevin/issues/110)
 - [Datalog] `with-transaction` macro, the same as the above for Datalog database
 - [KV]`abort-transact-kv` function to rollback writes from within an explicit KV transaction.
 - [Datalog] `abort-transact` function, same for Datalog transaction.
@@ -1133,7 +1154,7 @@ large transactions.
 ## 0.6.22
 ### Added
 - [Datalog] `fulltext-datoms` function that return datoms found by full
-  text search query, [#157](https://github.com/juji-io/datalevin/issues/157)
+text search query, [#157](https://github.com/juji-io/datalevin/issues/157)
 ### Fixed
 - [Search] Don't throw for blank search query, return `nil` instead, [#158](https://github.com/juji-io/datalevin/issues/158)
 - [Datalog] Correctly handle transacting empty string as a full text value, [#159](https://github.com/juji-io/datalevin/issues/159)
@@ -1147,15 +1168,15 @@ large transactions.
 ## 0.6.20
 ### Added
 - [Pod] `entity` and `touch` function to babashka pod, these return regular
-  maps, as the `Entity` type does not exist in a babashka script. [#148](https://github.com/juji-io/datalevin/issues/148) (thx
-  @ngrunwald)
+maps, as the `Entity` type does not exist in a babashka script. [#148](https://github.com/juji-io/datalevin/issues/148) (thx
+@ngrunwald)
 - [Datalog] `:timeout` option to terminate on deadline for query/pull. [#150](https://github.com/juji-io/datalevin/issues/150) (thx
-  @cgrand).
+@cgrand).
 
 ## 0.6.19
 ### Changed
 - [Datalog] Entity equality requires DB identity in order to better support
-  reactive applications, [#146](https://github.com/juji-io/datalevin/issues/146) (thx @den1k)
+reactive applications, [#146](https://github.com/juji-io/datalevin/issues/146) (thx @den1k)
 ### Improved
 - bump deps
 
@@ -1170,19 +1191,19 @@ large transactions.
 ### Added
 - [Datalog] `tx-data->simulated-report` to obtain a transaction report without actually persisting the changes. (thx @TheExGenesis)
 - [KV] Support `:bigint` and `:bigdec` data types, corresponding to
-  `java.math.BigInteger` and `java.math.BigDecimal`, respectively.
+`java.math.BigInteger` and `java.math.BigDecimal`, respectively.
 - [Datalog] Support `:db.type/bigdec` and `:db.type/bigint`, correspondingly, [#138](https://github.com/juji-io/datalevin/issues/138).
 ### Improved
- - Better documentation so that cljdoc can build successfully. (thx @lread)
+- Better documentation so that cljdoc can build successfully. (thx @lread)
 
 ## 0.6.16
 ### Added
 - [Datalog] Additional arity to `update-schema` to allow renaming attributes. [#131](https://github.com/juji-io/datalevin/issues/131)
 - [Search] `clear-docs` function to wipe out search index, as it might be faster
-  to rebuild search index than updating individual documents sometimes. [#132](https://github.com/juji-io/datalevin/issues/132)
+to rebuild search index than updating individual documents sometimes. [#132](https://github.com/juji-io/datalevin/issues/132)
 - `datalevin.constants/*data-serializable-classes*` dynamic var, which can be
-  used for `binding` if additional Java classes are to be serialized as part of
-  the default `:data` data type. [#134](https://github.com/juji-io/datalevin/issues/134)
+used for `binding` if additional Java classes are to be serialized as part of
+the default `:data` data type. [#134](https://github.com/juji-io/datalevin/issues/134)
 ### Improved
 - [Datalog] Allow passing option map as `:kv-opts` to underlying KV store when `create-conn`
 - bump deps
@@ -1212,14 +1233,14 @@ large transactions.
 - Schema update regression. [#124](https://github.com/juji-io/datalevin/issues/124)
 ### Added
 - `:domain` option to `new-search-engine`, so multiple search engines can
-  coexist in the same `dir`, each with its own domain, a string. [#112](https://github.com/juji-io/datalevin/issues/112)
+coexist in the same `dir`, each with its own domain, a string. [#112](https://github.com/juji-io/datalevin/issues/112)
 
 ## 0.6.12
 ### Fixed
 - Server failure to update max-eid regression, [#123](https://github.com/juji-io/datalevin/issues/123)
 ### Added
 - Added an arity to `update-schema` to allow removal of attributes if they are
-  not associated with any datoms, [#99](https://github.com/juji-io/datalevin/issues/99)
+not associated with any datoms, [#99](https://github.com/juji-io/datalevin/issues/99)
 
 ## 0.6.11
 ### Fixed
@@ -1236,7 +1257,7 @@ large transactions.
 - Entity retraction not removing `:db/updated-at` datom, [#113](https://github.com/juji-io/datalevin/issues/113)
 ### Added
 - `datalevin.search-utils` namespace with some utility functions to customize
-  search, [#105](https://github.com/juji-io/datalevin/issues/105) (thx @ngrunwald)
+search, [#105](https://github.com/juji-io/datalevin/issues/105) (thx @ngrunwald)
 
 ## 0.6.8
 ## Fixed
@@ -1268,8 +1289,8 @@ large transactions.
 ### Added
 - Option to pass an analyzer to search engine, [#102](https://github.com/juji-io/datalevin/issues/102)
 - `:auto-entity-time?` Datalog DB creation option, so entities can optionally have
-  `:db/created-at` and `:db/updated-at` values added and maintained
-  automatically by the system during transaction, [#86](https://github.com/juji-io/datalevin/issues/86)
+`:db/created-at` and `:db/updated-at` values added and maintained
+automatically by the system during transaction, [#86](https://github.com/juji-io/datalevin/issues/86)
 ### Improved
 - Dependency bump
 
@@ -1294,19 +1315,19 @@ large transactions.
 ### Added
 - Built-in full-text search engine, [#27](https://github.com/juji-io/datalevin/issues/27)
 - Key-value database `visit` function to do arbitrary things upon seeing a
-  value in a range
+value in a range
 
 ### Fixed
 - [**breaking**]`:instant` handles dates before 1970 correctly, [#94](https://github.com/juji-io/datalevin/issues/94). The storage
-  format of `:instant` type has been changed. For existing Datalog DB containing
-  `:db.type/instant`, dumping as a Datalog DB using the old version of dtlv, then
-  loading the data is required; For existing key-value DB containing `:instant`
-  type, specify `:instant-pre-06` instead to read the data back in, then write
-  them out as `:instant` to upgrade to the current format.
+format of `:instant` type has been changed. For existing Datalog DB containing
+`:db.type/instant`, dumping as a Datalog DB using the old version of dtlv, then
+loading the data is required; For existing key-value DB containing `:instant`
+type, specify `:instant-pre-06` instead to read the data back in, then write
+them out as `:instant` to upgrade to the current format.
 
 ### Improved
 - Improve read performance by adding a cursor pool and switch to a more
-  lightweight transaction pool
+lightweight transaction pool
 - Dependency bump
 
 ## 0.5.31
@@ -1344,7 +1365,7 @@ large transactions.
 - Handle scalar result in remote queries
 ### Improved
 - Server asks client to reconnect if the server is restarted and client
-  reconnects automatically when doing next request
+reconnects automatically when doing next request
 
 ## 0.5.23
 ### Improved
@@ -1356,7 +1377,7 @@ large transactions.
 - Automatically maintain the required number of open connections, [#68](https://github.com/juji-io/datalevin/issues/68)
 ### Added
 - Options to specify the number of connections in the client connection pool
-  and to set the time-out for server requests
+and to set the time-out for server requests
 
 ## 0.4.44
 ### Fixed
@@ -1369,8 +1390,8 @@ large transactions.
 ## 0.5.19
 ### Improved
 - Remove client immediately when `disconnect` message is received, clean up
-  resources afterwards, so a logically correct number of clients can be obtained
-  in the next API call on slow machines.
+resources afterwards, so a logically correct number of clients can be obtained
+in the next API call on slow machines.
 
 ## 0.5.18
 ### Fixed
@@ -1383,7 +1404,7 @@ large transactions.
 - JVM library is now Java 8 compatible, [#69](https://github.com/juji-io/datalevin/issues/69)
 ### Improved
 - Auto switch to local transaction preparation if something is wrong with remote
-  preparation (e.g. problem with serialization)
+preparation (e.g. problem with serialization)
 
 ## 0.5.16
 ### Improved
@@ -1401,7 +1422,7 @@ large transactions.
 ## 0.5.14
 ### Added
 - `DTLV_LIB_EXTRACT_DIR` environment variable to allow customization of native
-  libraries extraction location.
+libraries extraction location.
 ### Improved
 - Use clj-easy/graal-build-time, in anticipation of GraalVM 22.
 
@@ -1413,15 +1434,15 @@ large transactions.
 ## 0.5.10
 ### Added
 - Release artifact `org.clojars.huahaiy/datalevin-native` on clojars, for
-  depending on Datalevin while compiling GraalVM native image. User
-  no longer needs to manually compile Datalevin C libraries.
+depending on Datalevin while compiling GraalVM native image. User
+no longer needs to manually compile Datalevin C libraries.
 
 ## 0.5.9
 ### Improved
 - Only check to refersh db cache at user facing namespaces, so internal db
-  calls work with a consistent db view
+calls work with a consistent db view
 - Replace unnecessary expensive calls such as `db/-search` or `db/-datoms` with
-  cheaper calls to improve remote store access speed.
+cheaper calls to improve remote store access speed.
 - documentation
 
 ## 0.5.8
@@ -1446,7 +1467,7 @@ large transactions.
 
 ### Added
 - Transparent networked client/server mode with role based access control. [#46](https://github.com/juji-io/datalevin/issues/46)
-  and [#61](https://github.com/juji-io/datalevin/issues/61)
+and [#61](https://github.com/juji-io/datalevin/issues/61)
 - `dtlv exec` takes input from stdin when no argument is given.
 ### Improved
 - When open db, throw exception when lacking proper file permission
@@ -1537,17 +1558,17 @@ large transactions.
 
 ### Changed
 - [**Breaking**] Removed AEV index, as it is not used in query. This reduces storage
-  and improves write speed.
+and improves write speed.
 - [**Breaking**] Change VAE index to VEA, in preparation for new query engine. Now
-  all indices have the same order, just rotated, so merge join is more likely.
+all indices have the same order, just rotated, so merge join is more likely.
 - [**Breaking**] Change `open-lmdb` and `close-lmdb` to `open-kv` and `close-kv`,
-  `lmdb/transact` to `lmdb/transact-kv`, so they are consistent, easier to
-  remember, and distinct from functions in `datalevin.core`.
+`lmdb/transact` to `lmdb/transact-kv`, so they are consistent, easier to
+remember, and distinct from functions in `datalevin.core`.
 
 ### Added
 - GraalVM native image specific LMDB wrapper. This wrapper allocates buffer
-  memory in C and uses our own C comparator instead of doing these work in Java,
-  so it is faster.
+memory in C and uses our own C comparator instead of doing these work in Java,
+so it is faster.
 - Native command line shell, `dtlv`
 
 ## 0.3.17
@@ -1561,8 +1582,8 @@ large transactions.
 ## 0.3.15
 ### Changed
 - Changed default LMDB write behavior to use writable memory map and
-  asynchronous msync, significantly improved write speed for small transactions
-  (240X improvement for writing one datom at a time).
+asynchronous msync, significantly improved write speed for small transactions
+(240X improvement for writing one datom at a time).
 
 ## 0.3.14
 ### Fixed
@@ -1625,8 +1646,8 @@ large transactions.
 
 ### Changed
 - [**Breaking**] Change argument order of `core/create-conn`, `db/empty-db`
-  etc., and put `dir` in front, since it is more likely to be specified than
-  `schema` in real use, so users don't have to put `nil` for `schema`.
+etc., and put `dir` in front, since it is more likely to be specified than
+`schema` in real use, so users don't have to put `nil` for `schema`.
 
 ## 0.2.19
 ### Fixed

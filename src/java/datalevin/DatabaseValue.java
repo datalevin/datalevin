@@ -55,6 +55,27 @@ public final class DatabaseValue {
         return DatalevinInterop.databasePullMany(this, selector, eids);
     }
 
+    /**
+     * Returns the number of distinct values for the given attribute.
+     */
+    public long cardinality(Object attr) {
+        return DatalevinInterop.databaseCardinality(this, attr);
+    }
+
+    /**
+     * Collects query-planner statistics for all attributes.
+     */
+    public Object analyze() {
+        return DatalevinInterop.databaseAnalyze(this);
+    }
+
+    /**
+     * Collects query-planner statistics for the given attribute.
+     */
+    public Object analyze(Object attr) {
+        return DatalevinInterop.databaseAnalyze(this, attr);
+    }
+
     @Override
     public String toString() {
         return "<Database>";

@@ -86,6 +86,14 @@ class InteropBindings:
             to_java(eids),
         )
 
+    def database_cardinality(self, db, attr):
+        return call_java(classes().interop.databaseCardinality, db, to_java(attr))
+
+    def database_analyze(self, db, attr=None):
+        if attr is None:
+            return call_java(classes().interop.databaseAnalyze, db)
+        return call_java(classes().interop.databaseAnalyze, db, to_java(attr))
+
     def entity_is(self, value) -> bool:
         if value is None:
             return False
@@ -872,7 +880,15 @@ def vector_attr(*, domains=None, extra=None, **schema_kwargs):
     return schema_attr(value_type=":db.type/vec", extra=merged, **schema_kwargs)
 
 
-def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
+def idoc_attr(
+    *,
+    format=None,
+    domain=None,
+    indexed_paths=None,
+    excluded_paths=None,
+    extra=None,
+    **schema_kwargs,
+):
     """Build an indexed-document schema attribute."""
 
     merged = {}
@@ -880,6 +896,10 @@ def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
         merged[":db/idocFormat"] = _keyword_value(format)
     if domain is not None:
         merged[":db/domain"] = domain
+    if indexed_paths is not None:
+        merged[":db.idoc/indexedPaths"] = list(indexed_paths)
+    if excluded_paths is not None:
+        merged[":db.idoc/excludedPaths"] = list(excluded_paths)
     if extra:
         merged.update(extra)
     return schema_attr(value_type=":db.type/idoc", extra=merged, **schema_kwargs)
@@ -1010,6 +1030,19 @@ def embedding_options(
     return opts
 
 
+def idoc_domain(*, indexed_paths=None, excluded_paths=None, extra=None):
+    """Build an idoc domain/default option map."""
+
+    opts = {}
+    if indexed_paths is not None:
+        opts[":indexed-paths"] = list(indexed_paths)
+    if excluded_paths is not None:
+        opts[":excluded-paths"] = list(excluded_paths)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
 def idoc_options(*, domains=None, extra=None):
     """Build idoc-match query options."""
 
@@ -1077,6 +1110,18 @@ def max_eid(conn: Connection):
     """Return the highest allocated entity id for a connection."""
 
     return conn.max_eid()
+
+
+def cardinality(conn: Connection, attr):
+    """Return the number of distinct values for attr in a connection."""
+
+    return conn.cardinality(attr)
+
+
+def analyze(conn: Connection, attr=None):
+    """Collect query-planner statistics for a connection."""
+
+    return conn.analyze(attr)
 
 
 def explicit_transaction_timeout(timeout_ms=_MISSING):
@@ -1182,6 +1227,7 @@ __all__ = [
     "fill_db",
     "fulltext_attr",
     "idoc_attr",
+    "idoc_domain",
     "idoc_options",
     "init_db",
     "jvm_started",

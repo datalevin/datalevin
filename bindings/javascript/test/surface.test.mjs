@@ -4,7 +4,9 @@ import test from "node:test";
 import * as datalevin from "../src/index.js";
 
 test("public surface stays importable without starting the JVM", () => {
+  assert.equal(typeof datalevin.analyze, "function");
   assert.equal(typeof datalevin.apiInfo, "function");
+  assert.equal(typeof datalevin.cardinality, "function");
   assert.equal(typeof datalevin.connect, "function");
   assert.equal(typeof datalevin.createUdfRegistry, "function");
   assert.equal(typeof datalevin.datom, "function");
@@ -68,10 +70,24 @@ test("public surface stays importable without starting the JVM", () => {
     ":db/valueType": ":db.type/vec",
     ":db.vec/domains": ["vectors"]
   });
-  assert.deepEqual(datalevin.idocAttr({ format: "json", domain: "profiles" }), {
+  assert.deepEqual(datalevin.idocAttr({
+    format: "json",
+    domain: "profiles",
+    indexedPaths: [":status", [":profile", ":age"]],
+    excludedPaths: [":raw"]
+  }), {
     ":db/valueType": ":db.type/idoc",
     ":db/idocFormat": ":json",
-    ":db/domain": "profiles"
+    ":db/domain": "profiles",
+    ":db.idoc/indexedPaths": [":status", [":profile", ":age"]],
+    ":db.idoc/excludedPaths": [":raw"]
+  });
+  assert.deepEqual(datalevin.idocDomain({
+    indexedPaths: [":status"],
+    excludedPaths: [[":profile", ":raw"]]
+  }), {
+    ":indexed-paths": [":status"],
+    ":excluded-paths": [[":profile", ":raw"]]
   });
   assert.deepEqual(datalevin.searchOptions({
     top: 5,
@@ -162,8 +178,12 @@ test("public surface stays importable without starting the JVM", () => {
     assert.equal(typeof datalevin.Client.prototype[method], "function");
   }
   assert.equal(typeof datalevin.Entity.prototype.touch, "function");
+  assert.equal(typeof datalevin.Database.prototype.analyze, "function");
+  assert.equal(typeof datalevin.Database.prototype.cardinality, "function");
   assert.equal(typeof datalevin.Connection.prototype.fillDb, "function");
   for (const method of [
+    "analyze",
+    "cardinality",
     "countDatoms",
     "copy",
     "createSnapshot",

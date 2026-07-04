@@ -209,6 +209,25 @@ class InteropBindings {
     );
   }
 
+  async databaseCardinality(db, attr) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databaseCardinality",
+      await unwrapInteropHandle(db),
+      await toJava(attr)
+    );
+  }
+
+  async databaseAnalyze(db, attr = null) {
+    const cls = await classes();
+    const rawDb = await unwrapInteropHandle(db);
+    if (attr === null || attr === undefined) {
+      return callJavaMethod(cls.interop, "databaseAnalyze", rawDb);
+    }
+    return callJavaMethod(cls.interop, "databaseAnalyze", rawDb, await toJava(attr));
+  }
+
   async entityIs(value) {
     if (value === null || value === undefined || (typeof value !== "object" && typeof value !== "function")) {
       return false;
@@ -1341,6 +1360,14 @@ export async function maxEid(conn) {
   return conn.maxEid();
 }
 
+export async function cardinality(conn, attr) {
+  return conn.cardinality(attr);
+}
+
+export async function analyze(conn, attr = null) {
+  return conn.analyze(attr);
+}
+
 export async function explicitTransactionTimeout(timeoutMs = undefined) {
   const args = hasValue(timeoutMs) ? [timeoutMs] : [];
   return toJsResult(await _BINDINGS.coreInvoke("explicit-transaction-timeout", args));
@@ -1494,13 +1521,26 @@ export function vectorAttr({ domains = null, extra = null, ...schemaProps } = {}
   return schemaAttr({ valueType: ":db.type/vec", extra: merged, ...schemaProps });
 }
 
-export function idocAttr({ format = null, domain = null, extra = null, ...schemaProps } = {}) {
+export function idocAttr({
+  format = null,
+  domain = null,
+  indexedPaths = null,
+  excludedPaths = null,
+  extra = null,
+  ...schemaProps
+} = {}) {
   const merged = {};
   if (format !== null && format !== undefined) {
     merged[":db/idocFormat"] = keywordValue(format);
   }
   if (domain !== null && domain !== undefined) {
     merged[":db/domain"] = domain;
+  }
+  if (indexedPaths !== null && indexedPaths !== undefined) {
+    merged[":db.idoc/indexedPaths"] = [...indexedPaths];
+  }
+  if (excludedPaths !== null && excludedPaths !== undefined) {
+    merged[":db.idoc/excludedPaths"] = [...excludedPaths];
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(merged, extra);
@@ -1653,6 +1693,20 @@ export function embeddingOptions({
   }
   if (indexingMode !== null && indexingMode !== undefined) {
     opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function idocDomain({ indexedPaths = null, excludedPaths = null, extra = null } = {}) {
+  const opts = {};
+  if (indexedPaths !== null && indexedPaths !== undefined) {
+    opts[":indexed-paths"] = [...indexedPaths];
+  }
+  if (excludedPaths !== null && excludedPaths !== undefined) {
+    opts[":excluded-paths"] = [...excludedPaths];
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(opts, extra);

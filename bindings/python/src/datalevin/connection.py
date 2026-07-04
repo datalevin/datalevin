@@ -127,6 +127,14 @@ class Connection(ResourceWrapper):
         db = _BINDINGS.connection_db(self.raw_handle())
         return to_python(_BINDINGS.core_invoke("max-eid", [db]))
 
+    def cardinality(self, attr):
+        db = _BINDINGS.connection_db(self.raw_handle())
+        return to_python(_BINDINGS.database_cardinality(db, attr))
+
+    def analyze(self, attr=None):
+        db = _BINDINGS.connection_db(self.raw_handle())
+        return to_python(_BINDINGS.database_analyze(db, attr))
+
     def update_schema(self, schema_update, del_attrs=None, rename_map=None):
         args = [self.raw_handle(), _BINDINGS.schema(schema_update) if schema_update is not None else None]
         if rename_map is not None:
