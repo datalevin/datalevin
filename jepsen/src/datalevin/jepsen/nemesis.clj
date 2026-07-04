@@ -3,7 +3,10 @@
    [datalevin.jepsen.local :as local]
    [jepsen.generator :as gen]
    [jepsen.net.proto :as net.proto]
-   [jepsen.nemesis :as n]))
+   [jepsen.nemesis :as n])
+  (:import
+   [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+    TimeUnit TimeoutException]))
 
 (def ^:private default-failover-interval-s 10)
 (def ^:private default-kill-interval-s 10)
@@ -213,6 +216,50 @@
   [op error]
   (info-op op {:status :error
                :error error}))
+
+(defn- call-with-timeout-ms
+  [timeout-ms f]
+  (let [executor (Executors/newSingleThreadExecutor
+                  (reify ThreadFactory
+                    (newThread [_ runnable]
+                      (doto (Thread. runnable
+                                     (str "datalevin-jepsen-nemesis-timeout-"
+                                          (System/nanoTime)))
+                        (.setDaemon true)))))
+        task     (.submit executor
+                          ^Callable
+                          (reify Callable
+                            (call [_]
+                              (f))))]
+    (try
+      {:status :completed
+       :value (.get task (long timeout-ms) TimeUnit/MILLISECONDS)}
+      (catch TimeoutException _
+        (.cancel task true)
+        {:status :timeout})
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.cancel task true)
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.shutdownNow executor)))))
+
+(defn- final-leader-stabilization
+  [cluster-id]
+  (let [result (call-with-timeout-ms
+                default-final-leader-stabilize-timeout-ms
+                #(local/maybe-wait-for-single-leader
+                  cluster-id
+                  default-final-leader-stabilize-timeout-ms))]
+    (if (= :timeout (:status result))
+      {:leader nil
+       :status :leader-timeout}
+      (if-let [leader (:leader (:value result))]
+        {:leader leader}
+        {:leader nil
+         :status :leader-unavailable}))))
 
 (defn- maybe-wait-for-replacement-leader
   [cluster-id old-leader timeout-ms]
@@ -449,13 +496,7 @@
                 (info-op op :noop))
 
               :stabilize-leader
-              (if-let [{leader :leader}
-                       (local/maybe-wait-for-single-leader
-                        cluster-id
-                        default-final-leader-stabilize-timeout-ms)]
-                (info-op op {:leader leader})
-                (info-op op {:leader nil
-                             :status :leader-unavailable}))
+              (info-op op (final-leader-stabilization cluster-id))
 
               :pause-leader
               (if (seq @paused-nodes)

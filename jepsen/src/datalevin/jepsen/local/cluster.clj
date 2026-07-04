@@ -74,6 +74,12 @@
               (contains? ha-open-gap-errors (get-in gap-error [:data :error])))))
       (take-while some? (iterate ex-cause e)))))
 
+(defn- retryable-admin-open-failure?
+  [transport-failure? e]
+  (or (and (ifn? transport-failure?)
+           (transport-failure? e))
+      (transient-ha-open-failure? e)))
+
 (defn- port-block-count
   []
   (inc (quot (- default-port-limit default-port-base) port-block-size)))
@@ -918,12 +924,25 @@
                            (update-in [cluster-id :live-nodes] conj logical-node))))
               true)
             (catch Throwable e
-              (safe-stop-server! server)
-              (wait-for-node-store-released! deps
-                                             cluster-id
-                                             logical-node
-                                             (or setup-timeout-ms cluster-timeout-ms))
-              (throw e))))))))
+              (if (retryable-admin-open-failure? transport-failure? e)
+                (do
+                  (swap! clusters
+                         (fn [clusters*]
+                           (-> clusters*
+                               (assoc-in [cluster-id :servers logical-node] server)
+                               (assoc-in [cluster-id :admin-conns logical-node] nil)
+                               (update-in [cluster-id :stopped-node-info] dissoc logical-node)
+                               (update-in [cluster-id :paused-node-info] dissoc logical-node)
+                               (update-in [cluster-id :paused-nodes] disj logical-node)
+                               (update-in [cluster-id :live-nodes] conj logical-node))))
+                  true)
+                (do
+                  (safe-stop-server! server)
+                  (wait-for-node-store-released! deps
+                                                 cluster-id
+                                                 logical-node
+                                                 (or setup-timeout-ms cluster-timeout-ms))
+                  (throw e))))))))))
 
 (defn pause-node!
   [{:keys [clusters remote-deps node-diagnostics effective-local-lsn] :as deps}

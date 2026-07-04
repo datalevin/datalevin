@@ -15,6 +15,7 @@
   (:import
    [datalevin.db DB]
    [datalevin.server Server]
+   [java.net ServerSocket]
    [java.util UUID]
    [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]))
@@ -68,6 +69,15 @@
          :reason :timeout
          :timeout-ms timeout-ms
          :output (process-output process)}))))
+
+(defn- reserve-ports
+  [n]
+  (let [sockets (repeatedly n #(ServerSocket. 0))]
+    (try
+      (mapv #(.getLocalPort ^ServerSocket %) sockets)
+      (finally
+        (doseq [^ServerSocket socket sockets]
+          (.close socket))))))
 
 (deftest node-kv-open-opts-includes-node-ha-opts-test
   (let [cluster {:base-opts
@@ -163,6 +173,102 @@
               {:wal? true}
               1000)))
       (is (= 2 @attempts)))))
+
+(defn- restart-node-test-cluster
+  [node]
+  {:db-name "restart-node-test"
+   :base-opts
+   {:wal? true
+    :ha-mode :consensus-lease
+    :ha-members [{:node-id (:node-id node)
+                  :endpoint (:endpoint node)}]
+    :ha-control-plane
+    {:backend :sofa-jraft
+     :group-id "restart-node-test"
+     :voters [{:peer-id (:peer-id node)
+               :ha-node-id (:node-id node)
+               :promotable? true}]}}
+   :node-by-name {"n1" node}
+   :node-ha-opt-overrides {}
+   :control-backend :sofa-jraft
+   :remote? false
+   :verbose? false
+   :setup-timeout-ms 1000
+   :servers {}
+   :admin-conns {}
+   :live-nodes #{}
+   :paused-nodes #{"n1"}
+   :paused-node-info {"n1" {:paused? true}}
+   :stopped-node-info {"n1" {:stopped? true}}})
+
+(deftest restart-node-keeps-server-live-after-retryable-admin-open-failure-test
+  (let [dir                 (u/tmp-dir (str "jepsen-restart-retryable-open-"
+                                            (UUID/randomUUID)))
+        [endpoint-port
+         peer-port]         (reserve-ports 2)
+        node                {:logical-node "n1"
+                             :node-id 1
+                             :port endpoint-port
+                             :endpoint (str "127.0.0.1:" endpoint-port)
+                             :peer-id (str "127.0.0.1:" peer-port)
+                             :root (str dir u/+separator+ "n1")}
+        clusters            (atom {::cluster (restart-node-test-cluster node)})
+        attempts            (atom 0)]
+    (try
+      (with-redefs [d/create-conn
+                    (fn [& _]
+                      (swap! attempts inc)
+                      (throw (ex-info "Timeout in making request"
+                                      {:phase :open-conn
+                                       :timeout-ms 50})))]
+        (is (true?
+             (lcluster/restart-node!
+              {:clusters clusters
+               :transport-failure? (constantly true)}
+              ::cluster
+              "n1")))
+        (is (instance? Server (get-in @clusters [::cluster :servers "n1"])))
+        (is (nil? (get-in @clusters [::cluster :admin-conns "n1"])))
+        (is (contains? (get-in @clusters [::cluster :live-nodes]) "n1"))
+        (is (not (contains? (get-in @clusters [::cluster :paused-nodes]) "n1")))
+        (is (not (contains? (get-in @clusters [::cluster :paused-node-info]) "n1")))
+        (is (not (contains? (get-in @clusters [::cluster :stopped-node-info]) "n1")))
+        (is (<= 1 @attempts)))
+      (finally
+        (when-let [server (get-in @clusters [::cluster :servers "n1"])]
+          (srv/stop server))
+        (u/delete-files dir)))))
+
+(deftest restart-node-stops-server-after-nonretryable-admin-open-failure-test
+  (let [dir                 (u/tmp-dir (str "jepsen-restart-nonretryable-open-"
+                                            (UUID/randomUUID)))
+        [endpoint-port
+         peer-port]         (reserve-ports 2)
+        node                {:logical-node "n1"
+                             :node-id 1
+                             :port endpoint-port
+                             :endpoint (str "127.0.0.1:" endpoint-port)
+                             :peer-id (str "127.0.0.1:" peer-port)
+                             :root (str dir u/+separator+ "n1")}
+        clusters            (atom {::cluster (restart-node-test-cluster node)})]
+    (try
+      (with-redefs [d/create-conn
+                    (fn [& _]
+                      (throw (ex-info "nonretryable admin open" {:error :bad-config})))]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"nonretryable admin open"
+             (lcluster/restart-node!
+              {:clusters clusters
+               :transport-failure? (constantly false)}
+              ::cluster
+              "n1")))
+        (is (nil? (get-in @clusters [::cluster :servers "n1"])))
+        (is (not (contains? (get-in @clusters [::cluster :live-nodes]) "n1"))))
+      (finally
+        (when-let [server (get-in @clusters [::cluster :servers "n1"])]
+          (srv/stop server))
+        (u/delete-files dir)))))
 
 (defn- local-ops-test-deps
   [db-name server]

@@ -2,7 +2,8 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.jepsen.local :as local]
-   [datalevin.jepsen.nemesis :as nemesis]))
+   [datalevin.jepsen.nemesis :as nemesis]
+   [jepsen.nemesis :as jn]))
 
 (deftest restore-quorum-nodes-retries-pending-nodes-test
   (testing "restore-quorum retries nodes that fail a prior restart round"
@@ -71,3 +72,37 @@
            (vec (#'nemesis/final-phase-ops
                  {:clock-skew? true
                   :failover? true}))))))
+
+(deftest clock-skew-final-stabilize-is-hard-bounded-test
+  (testing "stabilize-leader returns when the leader probe blocks past its deadline"
+    (let [started? (promise)
+          nemesis  (:nemesis (nemesis/nemesis-package
+                              {:faults [:clock-skew-mixed]}))
+          result   (with-redefs-fn
+                     {#'datalevin.jepsen.nemesis/default-final-leader-stabilize-timeout-ms
+                      50
+                      #'datalevin.jepsen.local/maybe-wait-for-single-leader
+                      (fn [_cluster-id _timeout-ms]
+                        (deliver started? true)
+                        (Thread/sleep 10000)
+                        {:leader "n1"})}
+                     (fn []
+                       (let [started-ms (System/currentTimeMillis)
+                             op         (jn/invoke!
+                                         nemesis
+                                         {:datalevin/cluster-id :cluster}
+                                         {:type :info
+                                          :process :nemesis
+                                          :f :stabilize-leader})
+                             elapsed-ms (- (System/currentTimeMillis)
+                                           started-ms)]
+                         {:op op
+                          :elapsed-ms elapsed-ms})))]
+      (is (deref started? 500 false))
+      (is (= {:type :info
+              :process :nemesis
+              :f :stabilize-leader
+              :value {:leader nil
+                      :status :leader-timeout}}
+             (:op result)))
+      (is (< (:elapsed-ms result) 1000)))))

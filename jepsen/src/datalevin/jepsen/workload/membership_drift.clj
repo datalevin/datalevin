@@ -192,6 +192,32 @@
     (fn [conn]
       (write-register-pairs! conn pairs))))
 
+(defn- retryable-restart-error?
+  [e]
+  (or (local/transport-failure? e)
+      (workload.util/retryable-leader-conn-error? e)))
+
+(defn- restart-node-with-retry!
+  [test logical-node timeout-ms]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop []
+      (let [result (try
+                     (local/restart-node! cluster-id logical-node)
+                     {:ok? true}
+                     (catch Throwable e
+                       {:ok? false
+                        :error e}))]
+        (if (:ok? result)
+          true
+          (let [e (:error result)]
+            (if (and (< (System/currentTimeMillis) deadline)
+                     (retryable-restart-error? e))
+              (do
+                (Thread/sleep 250)
+                (recur))
+              (throw e))))))))
+
 (defn- drifted-ha-members
   [members target-node-id]
   (mapv (fn [member]
@@ -323,7 +349,9 @@
     (try
       (local/override-node-ha-opts! cluster-id drifted-node
                                     {:ha-members drifted-members})
-      (let [_ (local/restart-node! cluster-id drifted-node)
+      (let [_ (restart-node-with-retry! test
+                                        drifted-node
+                                        converge-timeout-ms)
             mismatch-state (wait-for-membership-hash-mismatch!
                             test
                             drifted-node
@@ -336,7 +364,9 @@
             _ (local/stop-node! cluster-id drifted-node)
             _ (local/clear-node-ha-opts-override!
                cluster-id drifted-node)
-            _ (local/restart-node! cluster-id drifted-node)
+            _ (restart-node-with-retry! test
+                                        drifted-node
+                                        converge-timeout-ms)
             leader-after (:leader (local/wait-for-single-leader!
                                    cluster-id
                                    converge-timeout-ms))
@@ -448,7 +478,9 @@
          drifted-node
          :ha-members
          original-members)
-        (local/restart-node! cluster-id drifted-node)
+        (restart-node-with-retry! test
+                                  drifted-node
+                                  live-converge-timeout-ms)
         (let [leader-after-restart (:leader (local/wait-for-single-leader!
                                              cluster-id
                                              live-converge-timeout-ms))
