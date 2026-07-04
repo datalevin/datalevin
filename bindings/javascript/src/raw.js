@@ -1,4 +1,3 @@
-import { DatalevinError } from "./errors.js";
 import { CONNECTION_WITH_TRANSACTION_UNSUPPORTED, _BINDINGS } from "./interop.js";
 import { toJava } from "./convert.js";
 import { callJavaMethod } from "./jvm.js";
@@ -66,13 +65,32 @@ class RawInterop {
   }
 
   async connectionDb(handle) {
-    throw new DatalevinError(
-      "Raw database values are not exposed by the Node binding. Use Connection query/pull/entity methods instead."
-    );
+    const { Database } = await import("./database.js");
+    return new Database(await _BINDINGS.connectionDb(resourceHandle(handle)));
   }
 
   async connectionEntity(handle, eid) {
     return _BINDINGS.connectionEntity(resourceHandle(handle), eid);
+  }
+
+  async databaseEntid(db, eid) {
+    return _BINDINGS.databaseEntid(resourceHandle(db), eid);
+  }
+
+  async databaseEntity(db, eid) {
+    return _BINDINGS.databaseEntity(resourceHandle(db), eid);
+  }
+
+  async databaseEntityMap(db, eid) {
+    return toJsResult(await _BINDINGS.databaseEntityMap(resourceHandle(db), eid), { bridge: true });
+  }
+
+  async databasePull(db, selector, eid) {
+    return toJsResult(await _BINDINGS.databasePull(resourceHandle(db), selector, eid), { bridge: true });
+  }
+
+  async databasePullMany(db, selector, eids) {
+    return toJsResult(await _BINDINGS.databasePullMany(resourceHandle(db), selector, eids), { bridge: true });
   }
 
   async connectionTxDataToSimulatedReport(handle, txData) {

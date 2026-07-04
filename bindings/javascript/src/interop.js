@@ -144,7 +144,7 @@ class InteropBindings {
 
   async connectionDb(handle) {
     const cls = await classes();
-    return callJavaMethod(cls.interop, "connectionDb", handle);
+    return callJavaMethod(cls.interop, "connectionDbBridge", handle);
   }
 
   async connectionEntity(handle, eid) {
@@ -154,6 +154,58 @@ class InteropBindings {
       "connectionEntity",
       await unwrapInteropHandle(handle),
       await toJava(eid)
+    );
+  }
+
+  async databaseEntid(db, eid) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databaseEntid",
+      await unwrapInteropHandle(db),
+      await toJava(eid)
+    );
+  }
+
+  async databaseEntity(db, eid) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databaseEntity",
+      await unwrapInteropHandle(db),
+      await toJava(eid)
+    );
+  }
+
+  async databaseEntityMap(db, eid) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databaseEntityMap",
+      await unwrapInteropHandle(db),
+      await toJava(eid)
+    );
+  }
+
+  async databasePull(db, selector, eid) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databasePull",
+      await unwrapInteropHandle(db),
+      selector,
+      await toJava(eid)
+    );
+  }
+
+  async databasePullMany(db, selector, eids) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databasePullMany",
+      await unwrapInteropHandle(db),
+      selector,
+      await toJava(eids)
     );
   }
 
@@ -212,7 +264,7 @@ class InteropBindings {
     const cls = await classes();
     return callJavaMethod(
       cls.interop,
-      "connectionTxDataToSimulatedReport",
+      "connectionTxDataToSimulatedReportBridge",
       await unwrapInteropHandle(handle),
       await toJava(txData)
     );

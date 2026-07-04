@@ -43,6 +43,7 @@ from ._jvm import jvm_started, start_jvm
 from ._raw import interop
 from .client import Client
 from .connection import Connection
+from .database import Database
 from .entity import Entity
 from .errors import (
     DatalevinConfigurationError,
@@ -59,6 +60,7 @@ from .vector import VectorIndex
 __all__ = [
     "Client",
     "Connection",
+    "Database",
     "DatalevinConfigurationError",
     "Entity",
     "DatalevinError",

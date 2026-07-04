@@ -5,6 +5,7 @@ from collections.abc import Mapping
 import pytest
 
 from datalevin import (
+    Database,
     Entity,
     connect,
     datalog_kv,
@@ -16,6 +17,7 @@ from datalevin import (
     schema_attr,
     transact_async,
     tx_entity,
+    tx_retract,
 )
 from datalevin.errors import DatalevinJavaError
 
@@ -149,7 +151,23 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             tx_entity(-100, {":name": "Sim", ":bio": "Simulated only"})
         ])
         assert simulated[":tx-data"]
+        assert isinstance(simulated[":db-after"], Database)
+        assert simulated[":db-after"].entid([":name", "Sim"]) == 5
+        assert simulated[":db-after"].pull([":name", ":bio"], [":name", "Sim"]) == {
+            ":name": "Sim",
+            ":bio": "Simulated only",
+        }
         assert conn.query('[:find ?e . :where [?e :name "Sim"]]') is None
+        retracted = conn.tx_data_to_simulated_report([
+            tx_retract([":name", "Ada"], ":bio", "Ada builds database systems")
+        ])
+        assert retracted[":db-after"].pull([":name", ":bio"], [":name", "Ada"]) == {
+            ":name": "Ada",
+        }
+        assert conn.pull([":name", ":bio"], [":name", "Ada"]) == {
+            ":name": "Ada",
+            ":bio": "Ada builds database systems",
+        }
 
         explain = conn.explain("[:find ?e :where [?e :name _]]")
         assert ":plan" in explain

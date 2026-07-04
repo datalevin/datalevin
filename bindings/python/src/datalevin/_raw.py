@@ -43,6 +43,21 @@ class RawInterop:
     def connection_entity(self, handle, eid):
         return _BINDINGS.connection_entity(handle, eid)
 
+    def database_entid(self, db, eid):
+        return _BINDINGS.database_entid(db, eid)
+
+    def database_entity(self, db, eid):
+        return _BINDINGS.database_entity(db, eid)
+
+    def database_entity_map(self, db, eid):
+        return _BINDINGS.database_entity_map(db, eid)
+
+    def database_pull(self, db, selector, eid):
+        return _BINDINGS.database_pull(db, selector, eid)
+
+    def database_pull_many(self, db, selector, eids):
+        return _BINDINGS.database_pull_many(db, selector, eids)
+
     def entity_is(self, value):
         return _BINDINGS.entity_is(value)
 

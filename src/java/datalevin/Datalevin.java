@@ -211,6 +211,75 @@ public final class Datalevin {
     }
 
     /**
+     * Resolves an entity id or lookup ref against a database value,
+     * such as {@code :db-after} from a simulated transaction report.
+     */
+    public static Object entid(Object db, Object eid) {
+        Objects.requireNonNull(db, "db");
+        return ClojureRuntime.core("entid", db, DatalevinForms.lookupRefInput(eid));
+    }
+
+    /**
+     * Returns a touched entity map from a database value.
+     */
+    public static Object entity(Object db, Object eid) {
+        Objects.requireNonNull(db, "db");
+        Object entity = ClojureRuntime.core("entity", db, DatalevinForms.lookupRefInput(eid));
+        if (entity == null) {
+            return null;
+        }
+        return ClojureRuntime.core("touch", entity);
+    }
+
+    /**
+     * Returns a bridge-safe touched entity map from a database value.
+     */
+    public static Map<?, ?> entityMap(Object db, Object eid) {
+        Objects.requireNonNull(db, "db");
+        Object entity = ClojureRuntime.core("entity", db, DatalevinForms.lookupRefInput(eid));
+        if (entity == null) {
+            return null;
+        }
+        return (Map<?, ?>) ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", entity));
+    }
+
+    /**
+     * Pulls one entity from a database value using a raw selector.
+     */
+    public static Map<?, ?> pull(Object db, Object selector, Object eid) {
+        Objects.requireNonNull(db, "db");
+        return (Map<?, ?>) ClojureRuntime.core("pull",
+                                              db,
+                                              DatalevinForms.pullSelectorInput(selector),
+                                              DatalevinForms.lookupRefInput(eid));
+    }
+
+    /**
+     * Pulls one entity from a database value using a typed selector.
+     */
+    public static Map<?, ?> pull(Object db, PullSelector selector, Object eid) {
+        return pull(db, (Object) selector, eid);
+    }
+
+    /**
+     * Pulls many entities from a database value using a raw selector.
+     */
+    public static List<?> pullMany(Object db, Object selector, List<?> eids) {
+        Objects.requireNonNull(db, "db");
+        return (List<?>) ClojureRuntime.core("pull-many",
+                                            db,
+                                            DatalevinForms.pullSelectorInput(selector),
+                                            DatalevinForms.entityIdsInput(eids));
+    }
+
+    /**
+     * Pulls many entities from a database value using a typed selector.
+     */
+    public static List<?> pullMany(Object db, PullSelector selector, List<?> eids) {
+        return pullMany(db, (Object) selector, eids);
+    }
+
+    /**
      * Registers a transaction listener with an auto-generated key.
      */
     public static Object listen(Connection conn, Consumer<Map<?, ?>> listener) {

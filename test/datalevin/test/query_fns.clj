@@ -5,6 +5,7 @@
    [clojure.string :as str]
    [datalevin.util :as u]
    [datalevin.core :as d]
+   [datalevin.interpret :as i]
    [datalevin.query.resolve :as qresolve]
    [datalevin.udf :as udf])
   (:import [clojure.lang ExceptionInfo]
@@ -170,6 +171,8 @@
                     :udf/id   :normalize-email}
         registry   (doto (udf/create-registry)
                      (udf/register! descriptor str/lower-case))
+        safe-fn    (i/inter-fn [s]
+                     (clojure.core/str s "!"))
         conn       (d/create-conn
                      dir schema
                      {:runtime-opts {:udf-registry registry}})]
@@ -189,6 +192,14 @@
                       :where
                       [(apply + ?nums) ?n]]
                     [1 2 3])))
+        (is (= "A@B.COM!"
+               (d/q '[:find ?email .
+                      :in $ ?f
+                      :where
+                      [?e :email ?raw]
+                      [(?f ?raw) ?email]]
+                    @conn
+                    safe-fn)))
         (is (thrown-with-msg?
               ExceptionInfo #"Server query cannot call unregistered function"
               (d/q '[:find ?email .

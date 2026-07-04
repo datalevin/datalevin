@@ -38,8 +38,8 @@
 
   :embedded preserves same-process Datalevin behavior and may resolve host vars.
   :server-safe is for client/server queries and only allows built-in query
-  functions, query context values that are not used as call targets, and UDFs
-  reached through the built-in udf function."
+  functions, sandboxed inter-fn values, query context values that are not used
+  as call targets, and UDFs reached through the built-in udf function."
   :embedded)
 
 (defn server-safe-resolver?
@@ -530,6 +530,10 @@
   [f]
   (get built-ins/query-fns f))
 
+(defn- inter-fn?
+  [f]
+  (= (:type (meta f)) :datalevin/inter-fn))
+
 (defn- validate-server-safe-apply!
   [f args]
   (when (and (server-safe-resolver?) (= 'apply f))
@@ -542,6 +546,9 @@
 (defn resolve-pred
   [f context]
   (let [fun (cond
+              (inter-fn? f)
+              f
+
               (fn? f)
               (if (server-safe-resolver?)
                 (disallowed-server-query-function! f)

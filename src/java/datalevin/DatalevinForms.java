@@ -14,6 +14,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.function.Function;
 
 /**
  * Datalevin-specific input and form shaping on top of the shared runtime and
@@ -144,15 +145,33 @@ final class DatalevinForms {
     }
 
     static Object txReportOutput(Object report) {
+        return txReportOutput(report, false);
+    }
+
+    static Object txReportOutput(Object report, boolean includeDbValues) {
+        return txReportOutput(report, includeDbValues, Function.identity());
+    }
+
+    static Object txReportOutput(Object report,
+                                 boolean includeDbValues,
+                                 Function<Object, Object> dbValueOutput) {
         if (!(report instanceof Map<?, ?> map)) {
             return ClojureCodec.bridgeOutput(report);
         }
 
+        Object dbBefore = map.get(ClojureCodec.keyword(":db-before"));
+        Object dbAfter = map.get(ClojureCodec.keyword(":db-after"));
         Object txData = map.get(ClojureCodec.keyword(":tx-data"));
         Object tempids = map.get(ClojureCodec.keyword(":tempids"));
         Object txMeta = map.get(ClojureCodec.keyword(":tx-meta"));
 
         LinkedHashMap<Object, Object> result = new LinkedHashMap<>();
+        if (includeDbValues) {
+            result.put(ClojureCodec.keyword(":db-before"),
+                       dbBefore == null ? null : dbValueOutput.apply(dbBefore));
+            result.put(ClojureCodec.keyword(":db-after"),
+                       dbAfter == null ? null : dbValueOutput.apply(dbAfter));
+        }
         result.put(ClojureCodec.keyword(":tx-data"),
                    ClojureCodec.bridgeOutput(txData == null ? PersistentVector.EMPTY : txData));
         result.put(ClojureCodec.keyword(":tempids"),

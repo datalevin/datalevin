@@ -11,7 +11,7 @@ Build and publish the Datalevin Node.js package.
 Options:
   --dry-run       Build the package tarball and stop before npm publish.
   --skip-install  Skip npm dependency installation.
-  --skip-tests    Skip node --test and package smoke tests.
+  --skip-tests    Skip node --test --test-force-exit and package smoke tests.
   --tag <tag>     Publish under a non-default npm dist-tag.
   --otp <code>    Pass a one-time password to npm publish.
   --provenance    Publish with npm provenance. This only works from supported CI.
@@ -110,7 +110,7 @@ fi
 
 if [[ "$skip_tests" != true ]]; then
   echo "Running JavaScript tests..."
-  node --test
+  node --test --test-force-exit
 fi
 
 echo "Dry-running npm pack..."

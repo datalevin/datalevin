@@ -4,6 +4,7 @@
    [datalevin.client :as cl]
    [datalevin.constants :as c]
    [datalevin.core :as d]
+   [datalevin.interpret :as i]
    [datalevin.server :as srv]
    [datalevin.test.core :as tc]
    [datalevin.util :as u])
@@ -55,6 +56,15 @@
                           [?e :name ?name]
                           [(str ?name "!") ?out]]
                         @conn)))
+            (is (= "Ada!"
+                   (d/q '[:find ?out .
+                          :in $ ?f
+                          :where
+                          [?e :name ?name]
+                          [(?f ?name) ?out]]
+                        @conn
+                        (i/inter-fn [s]
+                          (clojure.core/str s "!")))))
             (is (thrown-with-msg?
                   ExceptionInfo #"Server query cannot call unregistered function"
                   (d/q '[:find ?out .

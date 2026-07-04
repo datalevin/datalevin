@@ -165,10 +165,68 @@ public final class DatalevinInterop {
     }
 
     /**
-     * Returns the raw immutable database value for a connection handle.
+     * Returns the raw database value for a connection handle.
      */
     public static Object connectionDb(Object conn) {
         return ClojureRuntime.core("db", rawResource(conn));
+    }
+
+    /**
+     * Returns a bridge-safe database value handle for a connection handle.
+     */
+    public static DatabaseValue connectionDbBridge(Object conn) {
+        return new DatabaseValue(connectionDb(conn));
+    }
+
+    /**
+     * Resolves an entity id or lookup ref against a database value.
+     */
+    public static Object databaseEntid(Object db, Object eid) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("entid",
+                                                             rawResource(db),
+                                                             DatalevinForms.lookupRefInput(eid)));
+    }
+
+    /**
+     * Returns a Java handle for a lazy entity id or lookup ref against an
+     * database value.
+     */
+    public static LazyEntity databaseEntity(Object db, Object eid) {
+        Object entity = ClojureRuntime.core("entity",
+                                            rawResource(db),
+                                            DatalevinForms.lookupRefInput(eid));
+        return entity == null ? null : new LazyEntity(entity);
+    }
+
+    /**
+     * Returns a touched entity map for an entity id or lookup ref against an
+     * database value.
+     */
+    public static Object databaseEntityMap(Object db, Object eid) {
+        Object entity = ClojureRuntime.core("entity",
+                                            rawResource(db),
+                                            DatalevinForms.lookupRefInput(eid));
+        return entity == null ? null : ClojureCodec.bridgeOutput(ClojureRuntime.core("touch", entity));
+    }
+
+    /**
+     * Pulls one entity from a database value.
+     */
+    public static Object databasePull(Object db, Object selector, Object eid) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("pull",
+                                                             rawResource(db),
+                                                             DatalevinForms.pullSelectorInput(selector),
+                                                             DatalevinForms.lookupRefInput(eid)));
+    }
+
+    /**
+     * Pulls many entities from a database value.
+     */
+    public static Object databasePullMany(Object db, Object selector, List<?> eids) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("pull-many",
+                                                             rawResource(db),
+                                                             DatalevinForms.pullSelectorInput(selector),
+                                                             DatalevinForms.entityIdsInput(eids)));
     }
 
     /**
@@ -262,7 +320,19 @@ public final class DatalevinInterop {
         Object report = ClojureRuntime.core("tx-data->simulated-report",
                                             connectionDb(conn),
                                             DatalevinForms.txDataInput(txData));
-        return DatalevinForms.txReportOutput(report);
+        return DatalevinForms.txReportOutput(report, true);
+    }
+
+    /**
+     * Applies transaction data against a raw connection's current database
+     * value without committing and returns a bridge-safe simulated report whose
+     * database values are wrapped in Java handles.
+     */
+    public static Object connectionTxDataToSimulatedReportBridge(Object conn, Object txData) {
+        Object report = ClojureRuntime.core("tx-data->simulated-report",
+                                            connectionDb(conn),
+                                            DatalevinForms.txDataInput(txData));
+        return DatalevinForms.txReportOutput(report, true, DatabaseValue::new);
     }
 
     /**
@@ -1526,6 +1596,9 @@ public final class DatalevinInterop {
         }
         if (value instanceof LazyEntity entity) {
             return entity.handle();
+        }
+        if (value instanceof DatabaseValue db) {
+            return db.handle();
         }
         if (value instanceof UdfRegistry registry) {
             return registry.rawHandle();

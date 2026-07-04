@@ -51,7 +51,7 @@ jobs:
 
       - name: Run JavaScript tests
         working-directory: bindings/javascript
-        run: node --test
+        run: node --test --test-force-exit
 
       - name: Dry-run npm package and enforce size budget
         working-directory: bindings/javascript

@@ -93,6 +93,7 @@ public final class JavaSmoke {
                     throw new IllegalStateException("Unexpected keyed query result: " + keyed);
                 }
 
+                PullSelector selector = Datalevin.pull().attr("name").attr("age");
                 Map<?, ?> simulated = Datalevin.txDataToSimulatedReport(
                         conn,
                         List.of(Map.of(":db/id", -5L, "name", "Sim", "age", 99L)));
@@ -100,12 +101,20 @@ public final class JavaSmoke {
                         || ((List<?>) simulated.get(Datalevin.kw("tx-data"))).isEmpty()) {
                     throw new IllegalStateException("Unexpected simulated report: " + simulated);
                 }
+                Object simulatedDb = simulated.get(Datalevin.kw("db-after"));
+                Map<?, ?> simulatedPull = Datalevin.pull(
+                        simulatedDb,
+                        selector,
+                        Datalevin.listOf(":name", "Sim"));
+                if (!"Sim".equals(simulatedPull.get(Datalevin.kw("name")))
+                        || !Long.valueOf(99L).equals(simulatedPull.get(Datalevin.kw("age")))) {
+                    throw new IllegalStateException("Unexpected simulated pull result: " + simulatedPull);
+                }
                 Object simulatedEntity = conn.query("[:find ?e . :where [?e :name \"Sim\"]]");
                 if (simulatedEntity != null) {
                     throw new IllegalStateException("Simulated transaction was committed: " + simulatedEntity);
                 }
 
-                PullSelector selector = Datalevin.pull().attr("name").attr("age");
                 Map<?, ?> alice = conn.pull(selector, Datalevin.listOf(":name", "Alice"));
                 if (!"Alice".equals(alice.get(Datalevin.kw("name")))) {
                     throw new IllegalStateException("Unexpected pull result: " + alice);
@@ -188,6 +197,17 @@ public final class JavaSmoke {
                 if (!simulated.containsKey(Datalevin.kw("tx-data"))
                         || ((List<?>) simulated.get(Datalevin.kw("tx-data"))).isEmpty()) {
                     throw new IllegalStateException("Unexpected interop simulated report: " + simulated);
+                }
+                Object simulatedDb = simulated.get(Datalevin.kw("db-after"));
+                @SuppressWarnings("unchecked")
+                Map<Object, Object> simulatedPull = (Map<Object, Object>)
+                        DatalevinInterop.databasePull(
+                                simulatedDb,
+                                DatalevinInterop.readEdn("[:name]"),
+                                List.of(DatalevinInterop.keyword("name"), "Sim"));
+                if (!"Sim".equals(simulatedPull.get(Datalevin.kw("name")))) {
+                    throw new IllegalStateException(
+                            "Unexpected interop simulated pull result: " + simulatedPull);
                 }
                 Object db = DatalevinInterop.connectionDb(rawConn);
                 @SuppressWarnings("unchecked")

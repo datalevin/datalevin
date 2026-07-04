@@ -61,6 +61,31 @@ class InteropBindings:
     def connection_entity(self, handle, eid):
         return call_java(classes().interop.connectionEntity, handle, to_java(eid))
 
+    def database_entid(self, db, eid):
+        return call_java(classes().interop.databaseEntid, db, to_java(eid))
+
+    def database_entity(self, db, eid):
+        return call_java(classes().interop.databaseEntity, db, to_java(eid))
+
+    def database_entity_map(self, db, eid):
+        return call_java(classes().interop.databaseEntityMap, db, to_java(eid))
+
+    def database_pull(self, db, selector, eid):
+        return call_java(
+            classes().interop.databasePull,
+            db,
+            selector,
+            to_java(eid),
+        )
+
+    def database_pull_many(self, db, selector, eids):
+        return call_java(
+            classes().interop.databasePullMany,
+            db,
+            selector,
+            to_java(eids),
+        )
+
     def entity_is(self, value) -> bool:
         if value is None:
             return False

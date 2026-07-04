@@ -156,12 +156,21 @@
         (is (= #{[2 :id "b"] [2 :name "Bob"]}
                (set (map (juxt :e :a :v) (:tx-data report)))))
         (is (= 2 (d/entid (:db-after report) [:id "b"])))
+        (is (= {:id "b" :name "Bob"}
+               (d/pull (:db-after report) [:id :name] [:id "b"])))
         (is (nil? (d/entid db [:id "b"])))
         (is (nil? (d/entid @conn [:id "b"])))
         (is (empty? (into {} (d/entity @conn 2))))
         (is (= #{[1 "Ann"]}
                (d/q '[:find ?e ?name :where [?e :name ?name]]
                     @conn))))
+      (let [report (d/tx-data->simulated-report
+                     @conn
+                     [[:db/retract [:id "a"] :name "Ann"]])]
+        (is (= {:id "a"}
+               (d/pull (:db-after report) [:id :name] [:id "a"])))
+        (is (= {:id "a" :name "Ann"}
+               (d/pull @conn [:id :name] [:id "a"]))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

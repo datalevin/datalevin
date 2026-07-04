@@ -15,7 +15,7 @@
    [clojure.data]
    [clojure.set]
    [datalevin.client-op :as cop]
-   [datalevin.constants :as c :refer [e0 tx0 emax txmax v0 vmax]]
+   [datalevin.constants :as c :refer [e0 emax v0 vmax]]
    [datalevin.datom :as d :refer [datom datom?]]
    [datalevin.db.tx.common :as txcommon]
    [datalevin.db.tx.execute :as txexec]
@@ -445,6 +445,105 @@
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
 
+(defn- tx-cache-empty?
+  [db]
+  (and (.isEmpty ^TreeSortedSet (:eavt db))
+       (.isEmpty ^TreeSortedSet (:avet db))))
+
+(defn- tx-cache-active?
+  [db]
+  (and (not (tx-cache-empty? db))
+       (> (long (:max-tx db)) (long (or (max-tx (:store db)) 0)))))
+
+(defn- tx-cache-e-datoms
+  [db e]
+  (filter #(= e (.-e ^Datom %)) (:eavt db)))
+
+(defn- tx-cache-bounded-datoms
+  [^TreeSortedSet datoms cmp start-datom end-datom]
+  (let [[start-datom end-datom] (if (pos? (long (cmp start-datom end-datom)))
+                                  [end-datom start-datom]
+                                  [start-datom end-datom])]
+    (.subSet datoms start-datom end-datom)))
+
+(defn- cmp-attrs-by-aid
+  [schema a b]
+  (let [aid-a (:db/aid (schema a))
+        aid-b (:db/aid (schema b))]
+    (if (and aid-a aid-b)
+      (Long/compare (long aid-a) (long aid-b))
+      (d/nil-cmp a b))))
+
+(defn- cmp-datoms-eavt-schema
+  [schema ^Datom d1 ^Datom d2]
+  (u/combine-cmp
+    (Long/compare (.-e d1) (.-e d2))
+    (cmp-attrs-by-aid schema (.-a d1) (.-a d2))
+    (d/nil-cmp-type (.-v d1) (.-v d2))
+    (Long/compare (d/datom-tx d1) (d/datom-tx d2))))
+
+(defn- cmp-datoms-avet-schema
+  [schema ^Datom d1 ^Datom d2]
+  (u/combine-cmp
+    (cmp-attrs-by-aid schema (.-a d1) (.-a d2))
+    (d/nil-cmp-type (.-v d1) (.-v d2))
+    (Long/compare (.-e d1) (.-e d2))
+    (Long/compare (d/datom-tx d1) (d/datom-tx d2))))
+
+(defn- tx-cache-range-datoms
+  [db index start-datom end-datom]
+  (case index
+    :eav (let [e (.-e ^Datom start-datom)]
+           (if (and (some? e) (= e (.-e ^Datom end-datom)))
+             (tx-cache-e-datoms db e)
+             (tx-cache-bounded-datoms
+               (:eavt db) d/cmp-datoms-eavt start-datom end-datom)))
+    :ave (tx-cache-bounded-datoms
+           (:avet db) d/cmp-datoms-avet start-datom end-datom)
+    nil))
+
+(defn- tx-cache-index-comparator
+  [db index]
+  (let [schema (-schema db)]
+    (case index
+      :eav #(cmp-datoms-eavt-schema schema %1 %2)
+      :ave #(cmp-datoms-avet-schema schema %1 %2)
+      nil)))
+
+(defn- datom-eav-key
+  [^Datom datom]
+  [(.-e datom) (.-a datom) (.-v datom)])
+
+(defn- merge-tx-cache-datoms
+  [db index base cached]
+  (let [cached    (vec cached)
+        retracted (into #{} (comp (remove d/datom-added)
+                                  (map datom-eav-key))
+                        cached)
+        additions (filter d/datom-added cached)]
+    (sort (tx-cache-index-comparator db index)
+          (concat (if (seq retracted)
+                    (remove #(contains? retracted (datom-eav-key %)) base)
+                    base)
+                  additions))))
+
+(defn- with-tx-cache-range
+  [db index start-datom end-datom base]
+  (if-not (tx-cache-active? db)
+    base
+    (if-let [cached (seq (tx-cache-range-datoms db index start-datom end-datom))]
+      (merge-tx-cache-datoms db index base cached)
+      base)))
+
+(defn- with-tx-cache-e-datoms
+  [db e base]
+  (if-not (tx-cache-active? db)
+    base
+    (let [cached (tx-cache-e-datoms db e)]
+      (if (seq cached)
+        (merge-tx-cache-datoms db :eav base cached)
+        base))))
+
 (defrecord-updatable DB [^IStore store
                          ^long max-eid
                          ^long max-tx
@@ -667,7 +766,11 @@
              (components->pattern db index c1 c2 c3 emax vmax)
              n)))
 
-  (-e-datoms [db e] (wrap-cache store [:e-datoms e] (e-datoms store e)))
+  (-e-datoms
+    [db e]
+    (if (tx-cache-empty? db)
+      (wrap-cache store [:e-datoms e] (e-datoms store e))
+      (with-tx-cache-e-datoms db e (e-datoms store e))))
 
   (-av-datoms
     [db attr v]
@@ -675,9 +778,13 @@
 
   (-range-datoms
     [db index start-datom end-datom]
-    (wrap-cache
-        store [:range-datoms index start-datom end-datom]
-      (slice store index start-datom end-datom)))
+    (if (tx-cache-empty? db)
+      (wrap-cache
+          store [:range-datoms index start-datom end-datom]
+        (slice store index start-datom end-datom))
+      (with-tx-cache-range
+        db index start-datom end-datom
+        (slice store index start-datom end-datom))))
 
   (-seek-datoms
     [db index c1 c2 c3]
@@ -1145,6 +1252,14 @@
   ([db allowed target]
    (txprep/installed-udf-descriptor db allowed target)))
 
+(defn- mark-simulated-tx-cache!
+  [report]
+  (let [db (:db-after report)]
+    (doseq [datom (:tx-data report)]
+      (.add ^TreeSortedSet (:eavt db) datom)
+      (.add ^TreeSortedSet (:avet db) datom))
+    report))
+
 (defn- local-transact-tx-data
   ([initial-report initial-es tx-time]
    (local-transact-tx-data initial-report initial-es tx-time false))
@@ -1152,7 +1267,7 @@
    (let [report (txexec/local-transact-tx-data
                   initial-report initial-es tx-time)]
      (if simulated?
-       report
+       (mark-simulated-tx-cache! report)
        (assoc report
               :db-after
               (commit-prepared-tx-data!
@@ -1442,7 +1557,8 @@
                                            %)))
                            :tx-data tx-data
                            :tempids tempids)
-              (seq new-attributes) (assoc :new-attributes new-attributes))))
+              (seq new-attributes) (assoc :new-attributes new-attributes)
+              simulated? mark-simulated-tx-cache!)))
         (catch Exception e
           (throw e)))
       (let [entities (prepare-entities db initial-es tx-time)]

@@ -349,9 +349,10 @@ Query result caching tracks the registry generation, so updating a registered
 UDF takes effect on subsequent queries.
 
 In client/server mode, remote `:q` and `:explain` requests use a server-safe
-resolver. They can call built-in query functions and registered/installed UDFs,
-but they do not resolve arbitrary fully qualified Clojure symbols, reflective
-dot forms, or function values supplied by the client.
+resolver. They can call built-in query functions, registered/installed UDFs, and
+sandboxed `inter-fn` values supplied as query inputs, but they do not resolve
+arbitrary fully qualified Clojure symbols, reflective dot forms, or raw function
+values supplied by the client.
 
 ## Benchmarks
 

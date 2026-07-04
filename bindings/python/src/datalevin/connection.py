@@ -58,6 +58,27 @@ def _python_future(java_future):
     return future
 
 
+def _java_map_get(m, key):
+    if isinstance(m, dict):
+        return m.get(key)
+    return call_java(m.get, _BINDINGS.keyword(key))
+
+
+def _tx_report_to_python(report):
+    from .database import Database
+
+    result = {}
+    db_before = _java_map_get(report, ":db-before")
+    db_after = _java_map_get(report, ":db-after")
+    if db_before is not None:
+        result[":db-before"] = Database(db_before)
+    if db_after is not None:
+        result[":db-after"] = Database(db_after)
+    for key in (":tx-data", ":tempids", ":tx-id", ":tx-meta"):
+        result[key] = to_python(_java_map_get(report, key))
+    return result
+
+
 class _PythonConsumer:
     def __init__(self, fn) -> None:
         self._fn = fn
@@ -177,7 +198,7 @@ class Connection(ResourceWrapper):
         )
 
     def tx_data_to_simulated_report(self, tx_data):
-        return to_python(
+        return _tx_report_to_python(
             _BINDINGS.connection_tx_data_to_simulated_report(self.raw_handle(), tx_data)
         )
 

@@ -7,6 +7,7 @@ import { after, test } from "node:test";
 import {
   DatalevinError,
   DatalevinJavaError,
+  Database,
   Entity,
   KVTransaction,
   RawBuffer,
@@ -31,6 +32,7 @@ import {
   searchIndexWriter,
   transactAsync,
   txEntity,
+  txRetract,
   udfDescriptor,
   withTransaction
 } from "../src/index.js";
@@ -54,8 +56,12 @@ function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function runningInNodeTestWorker() {
+  return process.env.NODE_TEST_CONTEXT !== undefined;
+}
+
 after(() => {
-  if (jvmStarted()) {
+  if (jvmStarted() && !runningInNodeTestWorker()) {
     setImmediate(() => process.exit(process.exitCode ?? 0));
   }
 });
@@ -248,6 +254,9 @@ test(
       const simulated = await conn.txDataToSimulatedReport([
         txEntity(-100, { ":name": "Sim", ":bio": "Simulated only" })
       ]);
+      const retracted = await conn.txDataToSimulatedReport([
+        txRetract([":name", "Ada"], ":bio", "Ada builds database systems")
+      ]);
       const explain = await conn.explain("[:find ?e :where [?e :name _]]");
 
       await conn.updateSchema({
@@ -303,6 +312,21 @@ test(
           .some((row) => row[2] === "Async transactions help ingestion"),
         true
       );
+      assert.equal(Array.isArray(simulated[":tx-data"]), true);
+      assert.equal(simulated[":db-after"] instanceof Database, true);
+      assert.equal(intValue(await simulated[":db-after"].entid([":name", "Sim"])), 5);
+      assert.deepEqual(await simulated[":db-after"].pull([":name", ":bio"], [":name", "Sim"]), {
+        ":name": "Sim",
+        ":bio": "Simulated only"
+      });
+      assert.equal(await conn.query("[:find ?e . :where [?e :name \"Sim\"]]"), null);
+      assert.deepEqual(await retracted[":db-after"].pull([":name", ":bio"], [":name", "Ada"]), {
+        ":name": "Ada"
+      });
+      assert.deepEqual(await conn.pull([":name", ":bio"], [":name", "Ada"]), {
+        ":name": "Ada",
+        ":bio": "Ada builds database systems"
+      });
       assert.equal(await conn.reIndex(), conn);
       const namesAfterReIndex = await conn.query("[:find [?name ...] :where [?e :name ?name]]");
       assert.deepEqual(
@@ -325,8 +349,6 @@ test(
       assert.deepEqual([...namesFromString].sort(), ["Ada", "Bob"]);
       assert.equal(intValue(entidFromForm), 1);
       assert.deepEqual(namesFromOtherSource, ["Cara"]);
-      assert.equal(Array.isArray(simulated[":tx-data"]), true);
-      assert.equal(await conn.query("[:find ?e . :where [?e :name \"Sim\"]]"), null);
       assert.equal(":plan" in explain, true);
       assert.equal(":age" in await conn.schema(), false);
     } finally {
@@ -1071,7 +1093,15 @@ test(
       }
     });
     try {
-      await assert.rejects(async () => raw.connectionDb(conn), DatalevinError);
+      await raw.coreInvoke("transact!", [
+        conn,
+        await raw.txData([{ ":db/id": 1, ":name": "Ada" }])
+      ]);
+
+      const db = await raw.connectionDb(conn);
+      assert.equal(db instanceof Database, true);
+      assert.equal(intValue(await toJs(await raw.databaseEntid(db, 1))), 1);
+      assert.deepEqual(await raw.databasePull(db, await raw.readEdn("[:name]"), 1), { ":name": "Ada" });
     } finally {
       await raw.closeConnection(conn);
     }

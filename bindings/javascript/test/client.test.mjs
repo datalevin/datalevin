@@ -46,6 +46,10 @@ async function ignoreErrors(action) {
   }
 }
 
+function runningInNodeTestWorker() {
+  return process.env.NODE_TEST_CONTEXT !== undefined;
+}
+
 let liveServer = null;
 
 before(async () => {
@@ -59,7 +63,7 @@ after(async () => {
     await liveServer.stop();
     liveServer = null;
   }
-  if (jvmStarted()) {
+  if (jvmStarted() && !runningInNodeTestWorker()) {
     setImmediate(() => process.exit(process.exitCode ?? 0));
   }
 });

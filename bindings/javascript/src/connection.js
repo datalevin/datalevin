@@ -1,4 +1,5 @@
 import { toEdnForm, toJava, toJs, toQueryInput } from "./convert.js";
+import { txReportToJs } from "./database.js";
 import { _BINDINGS } from "./interop.js";
 import { callJavaMethod, javaBridgeModule } from "./jvm.js";
 import { ResourceWrapper } from "./resource.js";
@@ -255,10 +256,7 @@ export class Connection extends ResourceWrapper {
   }
 
   async txDataToSimulatedReport(txData) {
-    return toJsResult(
-      await _BINDINGS.connectionTxDataToSimulatedReport(this.rawHandle(), txData),
-      { bridge: true }
-    );
+    return txReportToJs(await _BINDINGS.connectionTxDataToSimulatedReport(this.rawHandle(), txData));
   }
 
   async listen(callback, key = null) {
