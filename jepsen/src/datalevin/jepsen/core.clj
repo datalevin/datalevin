@@ -71,6 +71,9 @@
        (mapcat datalevin.nemesis/expand-fault)
        vec))
 
+(def ^:private nemesis-option-keys
+  [:pause-resume-delay-s])
+
 (def supported-nemeses
   datalevin.nemesis/supported-faults)
 
@@ -180,6 +183,8 @@
         rate           (double (:rate opts))
         time-limit     (:time-limit opts)
         nemesis-faults (:nemesis opts)
+        nemesis-opts   (assoc (select-keys opts nemesis-option-keys)
+                         :faults nemesis-faults)
         _              (validate-nemesis-compatibility!
                         (assoc opts :control-backend control-backend))
         _              (validate-remote-runner! config
@@ -187,7 +192,7 @@
                                                nemesis-faults
                                                topology)
         {:keys [nemesis generator final-generator]}
-        (datalevin.nemesis/nemesis-package {:faults nemesis-faults})
+        (datalevin.nemesis/nemesis-package nemesis-opts)
         workload-final-generator
         (:final-generator workload)
         client-gen     (->> (:generator workload)
@@ -418,8 +423,10 @@
         rate           (double (:rate opts))
         time-limit     (:time-limit opts)
         nemesis-faults (:nemesis opts)
+        nemesis-opts   (assoc (select-keys opts nemesis-option-keys)
+                         :faults nemesis-faults)
         {:keys [nemesis generator final-generator]}
-        (datalevin.nemesis/nemesis-package {:faults nemesis-faults})
+        (datalevin.nemesis/nemesis-package nemesis-opts)
         workload-final-generator
         (:final-generator workload)
         client-gen     (->> (:generator workload)

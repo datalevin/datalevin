@@ -134,6 +134,15 @@
                 {:error :ha/follower-snapshot-bootstrap-failed
                  :data {:gap-error
                         {:data {:type :txlog/not-enabled}}}})))
+  (is (lcluster/transient-ha-open-failure?
+       (ex-info "Request to Datalevin server failed: \"HA read admission rejected\""
+                {:type :start-sampling
+                 :err-data {:error :ha/read-rejected
+                            :retryable? true}})))
+  (is (not (lcluster/transient-ha-open-failure?
+            (ex-info "retryable but unrelated"
+                     {:err-data {:error :unrelated
+                                 :retryable? true}}))))
   (is (not (lcluster/transient-ha-open-failure?
             (ex-info "not a HA gap" {:error :unrelated})))))
 

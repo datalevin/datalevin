@@ -48,6 +48,7 @@ Environment overrides:
   DTLV_JEPSEN_PAUSE_MULTI_FENCING_TIME_LIMIT
   DTLV_JEPSEN_PAUSE_MULTI_REJOIN_RATE
   DTLV_JEPSEN_PAUSE_MULTI_REJOIN_TIME_LIMIT
+  DTLV_JEPSEN_PAUSE_MULTI_PAUSE_RESUME_DELAY_S
   DTLV_JEPSEN_PAUSE_MULTI_ACCOUNT_BALANCE
   DTLV_JEPSEN_PAUSE_MULTI_MAX_TRANSFER
   DTLV_JEPSEN_PAUSE_MULTI_MAX_WRITES_PER_KEY
@@ -102,7 +103,8 @@ print_result_summary() {
             accepted? (or (true? (:valid? m))
                           (and other-checkers-valid?
                                (contains? #{:ignorable-empty-graph
-                                            :disruption-only-empty-graph}
+                                            :disruption-only-empty-graph
+                                            :disruption-only-converge}
                                           adjusted-valid?)))
             summary (cond-> {:valid? (:valid? m)
                              :timeline (get-in m [:timeline :valid?])
@@ -224,6 +226,8 @@ common_args=(
   sofa-jraft
   --nemesis
   pause-multi
+  --pause-resume-delay-s
+  "${DTLV_JEPSEN_PAUSE_MULTI_PAUSE_RESUME_DELAY_S:-2}"
 )
 
 status=0

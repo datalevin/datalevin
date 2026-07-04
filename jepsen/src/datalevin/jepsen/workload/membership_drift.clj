@@ -148,9 +148,12 @@
     (when-not (contains? @initialized-clusters cluster-id)
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
-          (local/with-leader-conn
+          (workload.util/with-retrying-leader-conn
+            :setup
             test
             schema
+            (local/workload-setup-timeout-ms cluster-id
+                                             default-setup-timeout-ms)
             (fn [conn]
               (ensure-registers! conn key-count)))
           (wait-for-initial-registers! test key-count)
@@ -158,9 +161,11 @@
 
 (defn- leader-register-values
   [test key-count]
-  (local/with-leader-conn
+  (workload.util/with-retrying-leader-conn
+    :bootstrap
     test
     schema
+    converge-timeout-ms
     (fn [conn]
       (register-values-from-rows
        (d/q register-rows-query @conn)
@@ -176,6 +181,16 @@
   (mapv (fn [[k v]]
           (clojure.lang.MapEntry. (long k) (long v)))
         pairs))
+
+(defn- write-register-pairs-on-leader!
+  [test pairs timeout-ms]
+  (workload.util/with-retrying-leader-conn
+    :bootstrap
+    test
+    schema
+    timeout-ms
+    (fn [conn]
+      (write-register-pairs! conn pairs))))
 
 (defn- drifted-ha-members
   [members target-node-id]
@@ -287,11 +302,10 @@
                                 [:node-by-name drifted-node :node-id])
         original-members (get-in (local/cluster-state cluster-id)
                                  [:base-opts :ha-members])
-        _ (local/with-leader-conn
-            test
-            schema
-            (fn [conn]
-              (write-register-pairs! conn baseline-writes)))
+        _ (write-register-pairs-on-leader!
+           test
+           baseline-writes
+           live-converge-timeout-ms)
         baseline-target-lsn (local/effective-local-lsn cluster-id leader-before)
         _ (local/wait-for-live-nodes-at-least-lsn!
            cluster-id
@@ -376,11 +390,10 @@
                                 [:node-by-name drifted-node :node-id])
         original-members (get-in (local/cluster-state cluster-id)
                                  [:base-opts :ha-members])
-        _ (local/with-leader-conn
-            test
-            schema
-            (fn [conn]
-              (write-register-pairs! conn baseline-writes)))
+        _ (write-register-pairs-on-leader!
+           test
+           baseline-writes
+           converge-timeout-ms)
         baseline-target-lsn (local/effective-local-lsn cluster-id leader-before)
         _ (local/wait-for-live-nodes-at-least-lsn!
            cluster-id
@@ -444,12 +457,10 @@
                  (distinct [leader-after-restart drifted-node])
                  baseline-target-lsn
                  live-converge-timeout-ms)
-              _ (local/with-node-conn
-                  test
-                  leader-after-restart
-                  schema
-                  (fn [conn]
-                    (write-register-pairs! conn recovered-writes)))
+              _ (write-register-pairs-on-leader!
+                 test
+                 recovered-writes
+                 live-converge-timeout-ms)
               leader-after (:leader (local/wait-for-single-leader!
                                      cluster-id
                                      live-converge-timeout-ms))

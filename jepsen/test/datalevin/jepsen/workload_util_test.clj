@@ -2,9 +2,11 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.conn :as conn]
+   [datalevin.core :as d]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
+   [datalevin.jepsen.workload.membership-drift :as membership-drift]
    [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.jepsen.workload.register :as register]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
@@ -57,6 +59,10 @@
             (ex-info "Request to Datalevin server failed: \"HA write admission rejected\""
                      {:error :ha/write-rejected
                       :retryable? true}))))
+    (is (true?
+          (workload.util/retryable-leader-conn-error?
+            (ex-info "Request to Datalevin server failed: \"HA read admission rejected\""
+                     {}))))
     (is (true?
           (workload.util/retryable-leader-conn-error?
             (ex-info "Request to Datalevin server failed: \"Timed out waiting for durable LSN\""
@@ -154,6 +160,34 @@
                    [:ok conn]))))
         (is (= 2 @opens))
         (is (= 1 @bodies))))))
+
+(deftest with-cached-leader-conn-clears-ha-read-rejection-test
+  (let [opens  (atom 0)
+        client (workload.util/attach-cached-leader-conn {})]
+    (with-redefs [local/transport-failure? (constantly false)]
+      (binding [workload.util/*open-leader-conn*
+                (fn [_test _schema]
+                  [:conn (swap! opens inc)])]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo
+             #"HA read admission rejected"
+             (workload.util/with-cached-leader-conn
+               client
+               {:db-name "cached-leader"}
+               {}
+               (fn [_conn]
+                 (throw (ex-info
+                         "Request to Datalevin server failed: \"HA read admission rejected\""
+                         {:err-data {:error :ha/read-rejected
+                                     :retryable? true}}))))))
+        (is (= [:ok [:conn 2]]
+               (workload.util/with-cached-leader-conn
+                 client
+                 {:db-name "cached-leader"}
+                 {}
+                 (fn [conn]
+                   [:ok conn]))))
+        (is (= 2 @opens))))))
 
 (deftest with-cached-leader-conn-clears-closed-client-conn-test
   (let [opens  (atom 0)
@@ -257,6 +291,120 @@
                   result)))))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-ha-read-rejection-during-post-bootstrap-converge-test
+  (let [attempts         (atom 0)
+        test             {:datalevin/cluster-id ::post-bootstrap-read-reject-retry
+                          :db-name "post-bootstrap-read-reject-retry"}
+        bootstrap-result {:restarted-nodes ["n2"]}
+        result           {:leader "n3"
+                          :caught-up? true
+                          :restarted-nodes ["n2"]}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  rejoin-bootstrap/converge-timeout-ms 1000]
+      (is (= result
+             (#'rejoin-bootstrap/retrying-post-bootstrap-convergence-result
+              test
+              2
+              bootstrap-result
+              (fn [actual-test actual-key-count actual-bootstrap timeout-ms]
+                (is (= test actual-test))
+                (is (= 2 actual-key-count))
+                (is (= bootstrap-result actual-bootstrap))
+                (is (<= 1 (long timeout-ms) 1000))
+                (if (= 1 (swap! attempts inc))
+                  (throw (ex-info
+                          "Request to Datalevin server failed: \"HA read admission rejected\""
+                          {:type :start-sampling
+                           :writing? false
+                           :err-data {:error :ha/read-rejected
+                                      :reason :not-leader
+                                      :retryable? true}}))
+                  result)))))
+      (is (= 2 @attempts)))))
+
+(deftest rejoin-bootstrap-checker-classifies-disrupted-converge-read-rejection-test
+  (let [result (checker/check
+                (#'rejoin-bootstrap/rejoin-checker)
+                {:datalevin/nemesis-faults [:leader-failover
+                                             :follower-rejoin]}
+                (history/history
+                 [{:process 0
+                   :type :fail
+                   :f :converge
+                   :error "Request to Datalevin server failed: \"HA read admission rejected\""
+                   :value {:message "Request to Datalevin server failed: \"HA read admission rejected\""
+                           :server-message "HA read admission rejected"
+                           :err-data {:error :ha/read-rejected
+                                      :reason :not-leader
+                                      :retryable? true}}}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 0 (:converge-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:mismatch-count result)))))
+
+(deftest rejoin-bootstrap-local-leader-values-avoid-remote-read-test
+  (let [cluster-id ::local-leader-values
+        test       {:datalevin/cluster-id cluster-id
+                    :db-name "local-leader-values"}]
+    (with-redefs [local/cluster-state
+                  (fn [actual-cluster-id]
+                    (is (= cluster-id actual-cluster-id))
+                    {:remote? false})
+                  local/wait-for-single-leader!
+                  (fn [actual-cluster-id timeout-ms]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= 1000 timeout-ms))
+                    {:leader "n1"})
+                  local/local-query
+                  (fn [actual-cluster-id logical-node query]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    (is (= @#'rejoin-bootstrap/register-rows-query query))
+                    [[0 7] [1 8]])]
+      (binding [workload.util/*with-leader-conn*
+                (fn [& _]
+                  (throw (ex-info "remote leader read should not be used" {})))]
+        (is (= [7 8]
+               (#'rejoin-bootstrap/leader-register-values
+                test
+                2
+                1000)))))))
+
+(deftest rejoin-bootstrap-local-leader-values-retry-unavailable-read-test
+  (let [cluster-id ::local-leader-values-retry
+        attempts   (atom 0)
+        test       {:datalevin/cluster-id cluster-id
+                    :db-name "local-leader-values-retry"}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  local/cluster-state (fn [_cluster-id]
+                                        {:remote? false})
+                  local/wait-for-single-leader!
+                  (fn [actual-cluster-id _timeout-ms]
+                    (is (= cluster-id actual-cluster-id))
+                    {:leader "n1"})
+                  local/node-diagnostics
+                  (fn [actual-cluster-id logical-node]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    {:ha-role :leader})
+                  local/local-query
+                  (fn [actual-cluster-id logical-node query]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    (is (= @#'rejoin-bootstrap/register-rows-query query))
+                    (if (= 1 (swap! attempts inc))
+                      ::local/unavailable
+                      [[0 11] [1 12]]))]
+      (is (= [11 12]
+             (#'rejoin-bootstrap/leader-register-values
+              test
+              2
+              1000)))
+      (is (= 2 @attempts)))))
+
 (deftest rejoin-bootstrap-register-state-reader-selection-test
   (let [cluster-id  ::register-state-reader-selection
         live-reader @#'rejoin-bootstrap/in-process-node-register-state
@@ -313,6 +461,30 @@
       (is (contains? @initialized-clusters ::register-retry))
       (finally
         (reset! initialized-clusters #{})))))
+
+(deftest membership-drift-leader-register-values-retries-transient-ha-read-test
+  (let [attempts (atom 0)
+        test     {:datalevin/cluster-id ::membership-drift-read-retry
+                  :db-name "membership-drift-read-retry"}
+        db       (d/db-with
+                  (d/empty-db nil membership-drift/schema)
+                  [{:register/key 0 :register/value 7}
+                   {:register/key 1 :register/value 8}])]
+    (with-redefs [local/transport-failure? (constantly false)]
+      (binding [workload.util/*with-leader-conn*
+                (fn [_test _schema f]
+                  (if (= 1 (swap! attempts inc))
+                    (throw (ex-info
+                            "Request to Datalevin server failed: \"HA read admission rejected\""
+                            {:type :start-sampling
+                             :writing? false
+                             :err-data {:error :ha/read-rejected
+                                        :reason :not-leader
+                                        :retryable? true}}))
+                    (f (delay db))))]
+        (is (= [7 8]
+               (#'membership-drift/leader-register-values test 2)))
+        (is (= 2 @attempts))))))
 
 (deftest history-safe-bounds-unbounded-collections-test
   (let [result (workload.util/history-safe {:values (range)})
@@ -428,6 +600,29 @@
     (is (= 0 (:mismatch-count result)))
     (is (= 0 (:failure-count result)))
     (is (= 1 (:indeterminate-count result)))))
+
+(deftest internal-checker-ignores-ha-read-rejection-during-disruption-test
+  (let [op     {:f :tx-fn-after-add
+                :internal/case-id 15}
+        result (checker/check
+                (#'internal/internal-checker)
+                {:datalevin/nemesis-faults [:clock-skew-pause
+                                             :leader-failover]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :fail
+                         :error "Request to Datalevin server failed: \"HA read admission rejected\"")
+                  {:process 1
+                   :type :ok
+                   :f :probe
+                   :value {}}])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 0 (:mismatch-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
 
 (deftest identity-upsert-checker-ignores-indeterminate-ops-test
   (let [op     {:f :upsert-same-tempid

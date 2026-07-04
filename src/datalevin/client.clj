@@ -814,6 +814,18 @@
                    (long (or round-retry-after-ms 0))))]
     (long (min delay-ms (long remaining-ms)))))
 
+(defn- retry-context-with-attempt-timeout
+  [retry-context remaining-ms]
+  (let [attempt-timeout-ms
+        (long
+          (max 1
+               (min (long remaining-ms)
+                    (long (or (:time-out retry-context)
+                              c/default-connection-timeout)))))]
+    (assoc retry-context
+           :time-out attempt-timeout-ms
+           :ha-write-retry-timeout-ms attempt-timeout-ms)))
+
 (defn ^:no-doc sync-ha-routing!
   [source-client target-client]
   (when (and source-client target-client)
@@ -897,11 +909,47 @@
 (def ^:private ha-datalog-retry-request-types
   #{:assoc-opt
     :assoc-opts
+    :opts
+    :closed?
+    :last-modified
+    :schema
+    :rschema
     :set-schema
     :init-max-eid
+    :max-tx
+    :datom-count
+    :fetch
+    :populated?
+    :size
+    :head
+    :tail
+    :slice
+    :rslice
+    :start-sampling
+    :stop-sampling
+    :analyze
+    :e-datoms
+    :e-first-datom
+    :av-datoms
+    :av-first-datom
+    :av-first-e
+    :ea-first-datom
+    :ea-first-v
+    :v-datoms
+    :size-filter
+    :head-filter
+    :tail-filter
+    :slice-filter
+    :rslice-filter
+    :q
+    :pull
+    :pull-many
+    :explain
+    :fulltext-datoms
     :del-attr
     :rename-attr
     :load-datoms
+    :db-info
     :tx-data
     :tx-data+db-info
     :open-transact
@@ -982,6 +1030,22 @@
   (when-let [^ConcurrentHashMap cache (.get ha-retry-clients client)]
     (.get cache endpoint)))
 
+(defn- retry-client-timeout-mismatch?
+  [retry-client retry-context]
+  (and (instance? Client retry-client)
+       (let [expected-timeout-ms
+             (long (or (:time-out retry-context)
+                       c/default-connection-timeout))
+             expected-retry-timeout-ms
+             (long (or (:ha-write-retry-timeout-ms retry-context)
+                       (derived-default-ha-write-retry-timeout-ms
+                         expected-timeout-ms)))
+             settings (client-ha-write-retry-settings retry-client)]
+         (or (not= expected-timeout-ms
+                   (long (.-time-out ^Client retry-client)))
+             (not= expected-retry-timeout-ms
+                   (long (:ha-write-retry-timeout-ms settings)))))))
+
 (defn- cache-retry-client!
   [client endpoint retry-client]
   (let [^ConcurrentHashMap cache (retry-client-cache client)]
@@ -1023,7 +1087,8 @@
     (if base-client
       (locking (retry-client-cache base-client)
         (if-let [cached (cached-retry-client base-client endpoint)]
-          (if (retry-client-disconnected? cached)
+          (if (or (retry-client-timeout-mismatch? cached retry-context)
+                  (retry-client-disconnected? cached))
             (do
               (evict-retry-client! base-client endpoint disconnect-fn)
               (let [retry-client (-> (new-client-fn retry-context host port)
@@ -1115,57 +1180,67 @@
             last-err     err-data
             attempts     []]
        (if-let [{:keys [endpoint host port]} (first remaining)]
-         (let [outcome (attempt-ha-endpoint-request
-                         req retry-context host port
-                         request-fn disconnect-fn new-client-fn)]
-           (cond
-             (= :success (:kind outcome))
-             (do
-               (on-success-endpoint! endpoint)
-               (:result outcome))
+         (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
+           (if (<= remaining-ms 0)
+             (raise-normal-request-error
+               req last-message last-err
+               {:ha-retry-attempts attempts
+                :ha-retry-rounds round})
+             (let [attempt-context
+                   (retry-context-with-attempt-timeout retry-context
+                                                       remaining-ms)
+                   outcome
+                   (attempt-ha-endpoint-request
+                     req attempt-context host port
+                     request-fn disconnect-fn new-client-fn)]
+               (cond
+                 (= :success (:kind outcome))
+                 (do
+                   (on-success-endpoint! endpoint)
+                   (:result outcome))
 
-             (= :exception (:kind outcome))
-             (recur round
-                    (rest remaining)
-                    round-order
-                    seen
-                    round-retry-after-ms
-                    last-message
-                    last-err
-                    (conj attempts
-                          {:endpoint endpoint
-                           :type :exception
-                           :message (ex-message (:exception outcome))}))
+                 (= :exception (:kind outcome))
+                 (recur round
+                        (rest remaining)
+                        round-order
+                        seen
+                        round-retry-after-ms
+                        last-message
+                        last-err
+                        (conj attempts
+                              {:endpoint endpoint
+                               :type :exception
+                               :message (ex-message (:exception outcome))}))
 
-             :else
-             (let [retry-err     (:err-data outcome)
-                   retry-message (:message outcome)]
-               (if (retryable-ha-reject? retry-err)
-                 (let [[extra seen']
-                       (collect-ha-retry-endpoints
-                         seen
-                         (:ha-retry-endpoints retry-err))
-                       round-order'
-                       (into round-order extra)]
-                   (recur round
-                          (concat (rest remaining) extra)
-                          round-order'
-                          seen'
-                          (merge-ha-retry-after-ms
-                            round-retry-after-ms retry-err)
-                          retry-message
-                          retry-err
-                          (conj attempts
-                                {:endpoint endpoint
-                                 :type :error-response
-                                 :reason (:reason retry-err)})))
-                 (raise-normal-request-error
-                   req retry-message retry-err
-                   {:ha-retry-attempts
-                    (conj attempts
-                          {:endpoint endpoint
-                           :type :error-response
-                           :reason (:reason retry-err)})})))))
+                 :else
+                 (let [retry-err     (:err-data outcome)
+                       retry-message (:message outcome)]
+                   (if (retryable-ha-reject? retry-err)
+                     (let [[extra seen']
+                           (collect-ha-retry-endpoints
+                             seen
+                             (:ha-retry-endpoints retry-err))
+                           round-order'
+                           (into round-order extra)]
+                       (recur round
+                              (concat (rest remaining) extra)
+                              round-order'
+                              seen'
+                              (merge-ha-retry-after-ms
+                                round-retry-after-ms retry-err)
+                              retry-message
+                              retry-err
+                              (conj attempts
+                                    {:endpoint endpoint
+                                     :type :error-response
+                                     :reason (:reason retry-err)})))
+                     (raise-normal-request-error
+                       req retry-message retry-err
+                       {:ha-retry-attempts
+                        (conj attempts
+                              {:endpoint endpoint
+                               :type :error-response
+                               :reason (:reason retry-err)})})))))))
          (let [remaining-ms (- deadline-ms (System/currentTimeMillis))]
            (if (or (empty? round-order)
                    (<= remaining-ms 0))

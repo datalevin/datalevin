@@ -33,6 +33,7 @@
 
 (def ^:private expected-write-failure-markers
   ["HA write admission rejected"
+   "HA control command timed out"
    "Timed out waiting for single leader"
    "Timeout in making request"
    "Unable to connect to server:"
@@ -130,6 +131,7 @@
                     (some-> (:error err-data) name))]
     (or transport?
         (= :ha/write-rejected (:error err-data))
+        (= :ha/control-timeout (:error err-data))
         (and (string? message)
              (some #(str/includes? message %)
                    expected-write-failure-markers)))))

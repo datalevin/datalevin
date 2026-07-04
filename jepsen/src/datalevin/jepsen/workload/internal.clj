@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.workload.internal
   (:require
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.interpret :as i]
    [datalevin.jepsen.local :as local]
@@ -177,6 +178,35 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- error-message
+  [error]
+  (cond
+    (string? error)
+    error
+
+    (keyword? error)
+    (name error)
+
+    (vector? error)
+    (some error-message error)
+
+    (map? error)
+    (or (error-message (:message error))
+        (error-message (:error error)))
+
+    (some? error)
+    (str error)
+
+    :else
+    nil))
+
+(defn- expected-internal-disruption-failure?
+  [test error]
+  (or (local/expected-disruption-write-failure? test error)
+      (and (local/write-disruption-fault-active? test)
+           (some-> (error-message error)
+                   (str/includes? "HA read admission rejected")))))
+
 (defn- build-op
   [case-id]
   (let [f (or (some-> (System/getenv "DTLV_JEPSEN_INTERNAL_OP")
@@ -222,7 +252,7 @@
             disruption-failures
             (->> terminal
                  (filter (fn [{:keys [error]}]
-                           (local/expected-disruption-write-failure?
+                           (expected-internal-disruption-failure?
                              test
                              error)))
                  vec)
