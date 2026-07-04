@@ -288,6 +288,66 @@
                   result)))))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-local-leader-values-avoid-remote-read-test
+  (let [cluster-id ::local-leader-values
+        test       {:datalevin/cluster-id cluster-id
+                    :db-name "local-leader-values"}]
+    (with-redefs [local/cluster-state
+                  (fn [actual-cluster-id]
+                    (is (= cluster-id actual-cluster-id))
+                    {:remote? false})
+                  local/wait-for-single-leader!
+                  (fn [actual-cluster-id timeout-ms]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= 1000 timeout-ms))
+                    {:leader "n1"})
+                  local/local-query
+                  (fn [actual-cluster-id logical-node query]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    (is (= @#'rejoin-bootstrap/register-rows-query query))
+                    [[0 7] [1 8]])]
+      (binding [workload.util/*with-leader-conn*
+                (fn [& _]
+                  (throw (ex-info "remote leader read should not be used" {})))]
+        (is (= [7 8]
+               (#'rejoin-bootstrap/leader-register-values
+                test
+                2
+                1000)))))))
+
+(deftest rejoin-bootstrap-local-leader-values-retry-unavailable-read-test
+  (let [cluster-id ::local-leader-values-retry
+        attempts   (atom 0)
+        test       {:datalevin/cluster-id cluster-id
+                    :db-name "local-leader-values-retry"}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  local/cluster-state (fn [_cluster-id]
+                                        {:remote? false})
+                  local/wait-for-single-leader!
+                  (fn [actual-cluster-id _timeout-ms]
+                    (is (= cluster-id actual-cluster-id))
+                    {:leader "n1"})
+                  local/node-diagnostics
+                  (fn [actual-cluster-id logical-node]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    {:ha-role :leader})
+                  local/local-query
+                  (fn [actual-cluster-id logical-node query]
+                    (is (= cluster-id actual-cluster-id))
+                    (is (= "n1" logical-node))
+                    (is (= @#'rejoin-bootstrap/register-rows-query query))
+                    (if (= 1 (swap! attempts inc))
+                      ::local/unavailable
+                      [[0 11] [1 12]]))]
+      (is (= [11 12]
+             (#'rejoin-bootstrap/leader-register-values
+              test
+              2
+              1000)))
+      (is (= 2 @attempts)))))
+
 (deftest rejoin-bootstrap-register-state-reader-selection-test
   (let [cluster-id  ::register-state-reader-selection
         live-reader @#'rejoin-bootstrap/in-process-node-register-state

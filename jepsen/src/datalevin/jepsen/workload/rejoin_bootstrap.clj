@@ -86,6 +86,36 @@
            second
            long))
 
+(defn- local-leader-register-values
+  [test key-count timeout-ms]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-unavailable nil]
+      (let [remaining-ms    (long (max 1 (- deadline
+                                            (System/currentTimeMillis))))
+            {:keys [leader]} (local/wait-for-single-leader! cluster-id
+                                                            remaining-ms)
+            rows            (local/local-query cluster-id
+                                               leader
+                                               register-rows-query)]
+        (if (= ::local/unavailable rows)
+          (if (< (System/currentTimeMillis) deadline)
+            (do
+              (Thread/sleep
+                (long (min wal-gap-retry-sleep-ms
+                           (max 1
+                                (- deadline
+                                   (System/currentTimeMillis))))))
+              (recur {:leader leader
+                      :node-diagnostics (node-diagnostics cluster-id
+                                                          leader)}))
+            (throw
+              (ex-info "Unable to read register values from local Jepsen leader"
+                       (merge {:cluster-id cluster-id
+                               :timeout-ms timeout-ms}
+                              last-unavailable))))
+          (register-values-from-rows rows key-count))))))
+
 (defn- ensure-registers!
   [conn key-count]
   (let [present (set (d/q '[:find [?key ...]
@@ -245,15 +275,18 @@
   ([test key-count]
    (leader-register-values test key-count converge-timeout-ms))
   ([test key-count timeout-ms]
-   (workload.util/with-retrying-leader-conn
-     :bootstrap
-     test
-     schema
-     timeout-ms
-     (fn [conn]
-       (register-values-from-rows
-        (d/q register-rows-query @conn)
-        key-count)))))
+   (let [cluster-id (:datalevin/cluster-id test)]
+     (if (true? (:remote? (local/cluster-state cluster-id)))
+       (workload.util/with-retrying-leader-conn
+         :bootstrap
+         test
+         schema
+         timeout-ms
+         (fn [conn]
+           (register-values-from-rows
+            (d/q register-rows-query @conn)
+            key-count)))
+       (local-leader-register-values test key-count timeout-ms)))))
 
 (defn- write-register-batch-with-rolls!
   [test key-count start-value n sleep-ms timeout-ms]
