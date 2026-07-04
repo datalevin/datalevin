@@ -86,6 +86,14 @@ class InteropBindings:
             to_java(eids),
         )
 
+    def database_cardinality(self, db, attr):
+        return call_java(classes().interop.databaseCardinality, db, to_java(attr))
+
+    def database_analyze(self, db, attr=None):
+        if attr is None:
+            return call_java(classes().interop.databaseAnalyze, db)
+        return call_java(classes().interop.databaseAnalyze, db, to_java(attr))
+
     def entity_is(self, value) -> bool:
         if value is None:
             return False
@@ -1077,6 +1085,18 @@ def max_eid(conn: Connection):
     """Return the highest allocated entity id for a connection."""
 
     return conn.max_eid()
+
+
+def cardinality(conn: Connection, attr):
+    """Return the number of distinct values for attr in a connection."""
+
+    return conn.cardinality(attr)
+
+
+def analyze(conn: Connection, attr=None):
+    """Collect query-planner statistics for a connection."""
+
+    return conn.analyze(attr)
 
 
 def explicit_transaction_timeout(timeout_ms=_MISSING):

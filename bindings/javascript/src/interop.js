@@ -209,6 +209,25 @@ class InteropBindings {
     );
   }
 
+  async databaseCardinality(db, attr) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "databaseCardinality",
+      await unwrapInteropHandle(db),
+      await toJava(attr)
+    );
+  }
+
+  async databaseAnalyze(db, attr = null) {
+    const cls = await classes();
+    const rawDb = await unwrapInteropHandle(db);
+    if (attr === null || attr === undefined) {
+      return callJavaMethod(cls.interop, "databaseAnalyze", rawDb);
+    }
+    return callJavaMethod(cls.interop, "databaseAnalyze", rawDb, await toJava(attr));
+  }
+
   async entityIs(value) {
     if (value === null || value === undefined || (typeof value !== "object" && typeof value !== "function")) {
       return false;
@@ -1339,6 +1358,14 @@ export async function datalogKv(conn) {
 
 export async function maxEid(conn) {
   return conn.maxEid();
+}
+
+export async function cardinality(conn, attr) {
+  return conn.cardinality(attr);
+}
+
+export async function analyze(conn, attr = null) {
+  return conn.analyze(attr);
 }
 
 export async function explicitTransactionTimeout(timeoutMs = undefined) {

@@ -58,6 +58,12 @@ class RawInterop:
     def database_pull_many(self, db, selector, eids):
         return _BINDINGS.database_pull_many(db, selector, eids)
 
+    def database_cardinality(self, db, attr):
+        return _BINDINGS.database_cardinality(db, attr)
+
+    def database_analyze(self, db, attr=None):
+        return _BINDINGS.database_analyze(db, attr)
+
     def entity_is(self, value):
         return _BINDINGS.entity_is(value)
 

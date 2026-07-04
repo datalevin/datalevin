@@ -1,5 +1,6 @@
 import { CONNECTION_WITH_TRANSACTION_UNSUPPORTED, _BINDINGS } from "./interop.js";
 import { toJava } from "./convert.js";
+import { DatalevinError } from "./errors.js";
 import { callJavaMethod } from "./jvm.js";
 import { toJsResult } from "./result.js";
 
@@ -91,6 +92,14 @@ class RawInterop {
 
   async databasePullMany(db, selector, eids) {
     return toJsResult(await _BINDINGS.databasePullMany(resourceHandle(db), selector, eids), { bridge: true });
+  }
+
+  async databaseCardinality(db, attr) {
+    return toJsResult(await _BINDINGS.databaseCardinality(resourceHandle(db), attr), { bridge: true });
+  }
+
+  async databaseAnalyze(db, attr = null) {
+    return toJsResult(await _BINDINGS.databaseAnalyze(resourceHandle(db), attr), { bridge: true });
   }
 
   async connectionTxDataToSimulatedReport(handle, txData) {

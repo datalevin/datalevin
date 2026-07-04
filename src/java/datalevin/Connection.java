@@ -197,6 +197,31 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Returns the number of distinct values for an attribute in this database.
+     */
+    public long cardinality(Object attr) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("cardinality",
+                                                         db(),
+                                                         DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Collects query-planner statistics for all attributes in this database.
+     */
+    public Object analyze() {
+        return ClojureRuntime.core("analyze", db());
+    }
+
+    /**
+     * Collects query-planner statistics for one attribute in this database.
+     */
+    public Object analyze(Object attr) {
+        return ClojureRuntime.core("analyze",
+                                   db(),
+                                   DatalevinForms.datalogAttrInput(attr));
+    }
+
+    /**
      * Returns the current datalog index cache limit.
      */
     public long datalogIndexCacheLimit() {

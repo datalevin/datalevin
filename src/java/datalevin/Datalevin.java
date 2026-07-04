@@ -280,6 +280,35 @@ public final class Datalevin {
     }
 
     /**
+     * Returns the number of distinct values for an attribute in a database
+     * value.
+     */
+    public static long cardinality(Object db, Object attr) {
+        Objects.requireNonNull(db, "db");
+        return ClojureCodec.javaLong(ClojureRuntime.core("cardinality",
+                                                         db,
+                                                         DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Collects query-planner statistics for all attributes in a database value.
+     */
+    public static Object analyze(Object db) {
+        Objects.requireNonNull(db, "db");
+        return ClojureRuntime.core("analyze", db);
+    }
+
+    /**
+     * Collects query-planner statistics for one attribute in a database value.
+     */
+    public static Object analyze(Object db, Object attr) {
+        Objects.requireNonNull(db, "db");
+        return ClojureRuntime.core("analyze",
+                                   db,
+                                   DatalevinForms.datalogAttrInput(attr));
+    }
+
+    /**
      * Registers a transaction listener with an auto-generated key.
      */
     public static Object listen(Connection conn, Consumer<Map<?, ?>> listener) {

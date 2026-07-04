@@ -230,6 +230,33 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Returns the number of distinct values for an attribute in a database
+     * value.
+     */
+    public static long databaseCardinality(Object db, Object attr) {
+        return ClojureCodec.javaLong(ClojureRuntime.core("cardinality",
+                                                         rawResource(db),
+                                                         DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
+     * Collects query-planner statistics for all attributes in a database value.
+     */
+    public static Object databaseAnalyze(Object db) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("analyze",
+                                                             rawResource(db)));
+    }
+
+    /**
+     * Collects query-planner statistics for one attribute in a database value.
+     */
+    public static Object databaseAnalyze(Object db, Object attr) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("analyze",
+                                                             rawResource(db),
+                                                             DatalevinForms.datalogAttrInput(attr)));
+    }
+
+    /**
      * Returns a Java handle for a lazy entity id or lookup ref.
      */
     public static LazyEntity connectionEntity(Object conn, Object eid) {

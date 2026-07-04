@@ -12,7 +12,9 @@ import {
   KVTransaction,
   RawBuffer,
   RawKV,
+  analyze,
   apiInfo,
+  cardinality,
   connect,
   createUdfRegistry,
   datom,
@@ -277,6 +279,10 @@ test(
       assert.equal(typeof await conn.opts(), "object");
       assert.equal(intValue(await conn.maxEid()), 4);
       assert.equal(intValue(await maxEid(conn)), 4);
+      assert.equal(intValue(await conn.cardinality(":status")), 2);
+      assert.equal(intValue(await cardinality(conn, ":status")), 2);
+      assert.equal(await conn.analyze(":status"), ":done");
+      assert.equal(await analyze(conn), ":done");
       assert.equal(intValue(await conn.datalogIndexCacheLimit()), 512);
       assert.equal(intValue(await conn.datalogIndexCacheLimit(16)), 16);
       assert.equal(intValue(await conn.datalogIndexCacheLimit()), 16);
@@ -315,6 +321,8 @@ test(
       assert.equal(Array.isArray(simulated[":tx-data"]), true);
       assert.equal(simulated[":db-after"] instanceof Database, true);
       assert.equal(intValue(await simulated[":db-after"].entid([":name", "Sim"])), 5);
+      assert.equal(intValue(await simulated[":db-after"].cardinality(":name")), 2);
+      assert.equal(await simulated[":db-after"].analyze(":name"), ":done");
       assert.deepEqual(await simulated[":db-after"].pull([":name", ":bio"], [":name", "Sim"]), {
         ":name": "Sim",
         ":bio": "Simulated only"
@@ -1102,6 +1110,8 @@ test(
       assert.equal(db instanceof Database, true);
       assert.equal(intValue(await toJs(await raw.databaseEntid(db, 1))), 1);
       assert.deepEqual(await raw.databasePull(db, await raw.readEdn("[:name]"), 1), { ":name": "Ada" });
+      assert.equal(intValue(await raw.databaseCardinality(db, ":name")), 1);
+      assert.equal(await raw.databaseAnalyze(db, ":name"), ":done");
     } finally {
       await raw.closeConnection(conn);
     }

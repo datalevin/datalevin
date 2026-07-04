@@ -804,10 +804,14 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
+    assert callable(getattr(datalevin, "analyze"))
+    assert callable(getattr(datalevin, "cardinality"))
     assert callable(getattr(datalevin, "explicit_transaction_timeout"))
     assert callable(getattr(datalevin, "set_explicit_transaction_timeout"))
     assert issubclass(datalevin.Entity, Mapping)
     assert callable(getattr(connection_module.Connection, "fill_db"))
+    assert callable(getattr(datalevin.Database, "analyze"))
+    assert callable(getattr(datalevin.Database, "cardinality"))
     assert callable(getattr(datalevin.Entity, "touch"))
     assert callable(getattr(datalevin.SearchEngine, "add_doc"))
     assert callable(getattr(datalevin.SearchEngine, "clear_docs"))
@@ -857,6 +861,8 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(datalevin.VectorIndex, "search_vec"))
     assert callable(getattr(datalevin.VectorIndex, "vec_indexed"))
     for method in [
+        "analyze",
+        "cardinality",
         "count_datoms",
         "copy",
         "create_snapshot",
