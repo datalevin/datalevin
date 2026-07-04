@@ -1,6 +1,8 @@
 (ns datalevin.test.server-dispatch
   (:require
    [clojure.test :refer [deftest is testing]]
+   [datalevin.client :as client]
+   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.interface :as i]
    [datalevin.server.handlers :as handlers]
@@ -79,6 +81,62 @@
       (finally
         (db/remove-cache store)))))
 
+(deftest ha-read-admission-rejects-non-leader-consensus-state-test
+  (let [store (fake-store (str "/tmp/dtlv-test-cache-"
+                               (java.util.UUID/randomUUID))
+                          12
+                          2)
+        deps  {:db-state (fn [_ _]
+                           {:ha-authority ::authority
+                            :ha-role :follower
+                            :ha-node-id 2
+                            :ha-authority-owner-node-id 1
+                            :ha-authority-lease
+                            {:leader-endpoint "127.0.0.1:19001"}
+                            :ha-members
+                            [{:node-id 1
+                              :endpoint "127.0.0.1:19001"}
+                             {:node-id 2
+                              :endpoint "127.0.0.1:19002"}]})}]
+    (try
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo
+           #"HA read admission rejected"
+           (#'handlers/ensure-ha-read-floor!
+            deps ::server "db" false {} store)))
+      (finally
+        (db/remove-cache store)))))
+
+(deftest ha-read-admission-allows-fresh-local-owner-leader-test
+  (let [store (fake-store (str "/tmp/dtlv-test-cache-"
+                               (java.util.UUID/randomUUID))
+                          12
+                          2)
+        now   (System/currentTimeMillis)
+        deps  {:db-state (fn [_ _]
+                           {:ha-authority ::authority
+                            :ha-role :leader
+                            :ha-node-id 1
+                            :ha-authority-owner-node-id 1
+                            :ha-authority-read-ok? true
+                            :ha-last-authority-refresh-ms now
+                            :ha-lease-renew-ms 1000
+                            :ha-lease-timeout-ms 3000
+                            :ha-lease-local-deadline-ms (+ now 3000)
+                            :ha-authority-lease
+                            {:leader-endpoint "127.0.0.1:19001"}
+                            :ha-members
+                            [{:node-id 1
+                              :endpoint "127.0.0.1:19001"}]})}]
+    (try
+      (db/refresh-cache store 1)
+      (db/cache-put store :sentinel :stale)
+      (#'handlers/ensure-ha-read-floor!
+       deps ::server "db" false {:ha-read-min-tx 12} store)
+      (is (nil? (db/cache-get store :sentinel)))
+      (finally
+        (db/remove-cache store)))))
+
 (deftest ha-read-floor-does-not-refresh-non-ha-cache-test
   (let [store     (fake-store (str "/tmp/dtlv-test-cache-"
                                    (java.util.UUID/randomUUID))
@@ -93,6 +151,15 @@
       (is (= :stale (db/cache-get store :sentinel)))
       (finally
         (db/remove-cache store)))))
+
+(deftest ha-datalog-read-retry-requests-open-retry-target-test
+  (is (= c/db-store-datalog
+         (#'client/request-db-type {:type :q
+                                    :args ["db" '[:find ?e :where [?e :x 1]]
+                                           []]})))
+  (is (= c/db-store-datalog
+         (#'client/request-db-type {:type :db-info
+                                    :args ["db"]}))))
 
 (deftest ha-read-floor-rejects-before-cache-refresh-test
   (let [store     (fake-store (str "/tmp/dtlv-test-cache-"

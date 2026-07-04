@@ -542,6 +542,8 @@
             (contains? bootstrap-gap-errors (:error data))
             (contains? bootstrap-gap-errors (:error err-data))
             (contains? bootstrap-gap-errors (:error nested))
+            (and (= :ha/read-rejected (:error err-data))
+                 (true? (:retryable? err-data)))
             (= :txlog/not-enabled (get-in gap-error [:data :type]))
             (contains? bootstrap-gap-errors
                        (get-in gap-error [:data :error])))))

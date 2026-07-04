@@ -257,6 +257,37 @@
                   result)))))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-ha-read-rejection-during-post-bootstrap-converge-test
+  (let [attempts         (atom 0)
+        test             {:datalevin/cluster-id ::post-bootstrap-read-reject-retry
+                          :db-name "post-bootstrap-read-reject-retry"}
+        bootstrap-result {:restarted-nodes ["n2"]}
+        result           {:leader "n3"
+                          :caught-up? true
+                          :restarted-nodes ["n2"]}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  rejoin-bootstrap/converge-timeout-ms 1000]
+      (is (= result
+             (#'rejoin-bootstrap/retrying-post-bootstrap-convergence-result
+              test
+              2
+              bootstrap-result
+              (fn [actual-test actual-key-count actual-bootstrap timeout-ms]
+                (is (= test actual-test))
+                (is (= 2 actual-key-count))
+                (is (= bootstrap-result actual-bootstrap))
+                (is (<= 1 (long timeout-ms) 1000))
+                (if (= 1 (swap! attempts inc))
+                  (throw (ex-info
+                          "Request to Datalevin server failed: \"HA read admission rejected\""
+                          {:type :start-sampling
+                           :writing? false
+                           :err-data {:error :ha/read-rejected
+                                      :reason :not-leader
+                                      :retryable? true}}))
+                  result)))))
+      (is (= 2 @attempts)))))
+
 (deftest rejoin-bootstrap-register-state-reader-selection-test
   (let [cluster-id  ::register-state-reader-selection
         live-reader @#'rejoin-bootstrap/in-process-node-register-state

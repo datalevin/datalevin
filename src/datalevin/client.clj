@@ -897,11 +897,47 @@
 (def ^:private ha-datalog-retry-request-types
   #{:assoc-opt
     :assoc-opts
+    :opts
+    :closed?
+    :last-modified
+    :schema
+    :rschema
     :set-schema
     :init-max-eid
+    :max-tx
+    :datom-count
+    :fetch
+    :populated?
+    :size
+    :head
+    :tail
+    :slice
+    :rslice
+    :start-sampling
+    :stop-sampling
+    :analyze
+    :e-datoms
+    :e-first-datom
+    :av-datoms
+    :av-first-datom
+    :av-first-e
+    :ea-first-datom
+    :ea-first-v
+    :v-datoms
+    :size-filter
+    :head-filter
+    :tail-filter
+    :slice-filter
+    :rslice-filter
+    :q
+    :pull
+    :pull-many
+    :explain
+    :fulltext-datoms
     :del-attr
     :rename-attr
     :load-datoms
+    :db-info
     :tx-data
     :tx-data+db-info
     :open-transact

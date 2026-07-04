@@ -18,6 +18,7 @@
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.ha :as dha]
+   [datalevin.ha.authority :as ha-auth]
    [datalevin.ha.control :as ctrl]
    [datalevin.interface :as i]
    [datalevin.kv :as kv]
@@ -196,34 +197,91 @@
       (:ha-role state)
       (:replica/read-only? state)))
 
+(defn- ha-read-admission-error
+  [db-name state]
+  (when (:ha-authority state)
+    (let [now-ms            (System/currentTimeMillis)
+          now-nanos         (System/nanoTime)
+          local-node-id     (:ha-node-id state)
+          owner-node-id     (:ha-authority-owner-node-id state)
+          owner-endpoint    (get-in state [:ha-authority-lease
+                                           :leader-endpoint])
+          common-meta       {:error :ha/read-rejected
+                             :db-name db-name
+                             :ha-role (:ha-role state)
+                             :ha-node-id local-node-id
+                             :ha-authoritative-leader-node-id owner-node-id
+                             :ha-authoritative-leader-endpoint owner-endpoint
+                             :ha-retry-endpoints
+                             (ha-read-retry-endpoints state)
+                             :retryable? true}
+          deadline-nanos    (:ha-lease-local-deadline-nanos state)
+          deadline-ms       (:ha-lease-local-deadline-ms state)]
+      (cond
+        (not= :leader (:ha-role state))
+        (assoc common-meta :reason :not-leader)
+
+        (not (ha-auth/ha-authority-read-fresh? state now-ms))
+        (let [details (ha-auth/ha-authority-read-failure-details state
+                                                                 now-ms)]
+          (merge common-meta details {:reason (:reason details)}))
+
+        (true? (:ha-clock-skew-paused? state))
+        (assoc common-meta
+               :reason :clock-skew-paused
+               :ha-clock-skew-last-result (:ha-clock-skew-last-result state))
+
+        (not= local-node-id owner-node-id)
+        (assoc common-meta
+               :reason :owner-mismatch)
+
+        (or (and (integer? deadline-nanos)
+                 (>= (long now-nanos) (long deadline-nanos)))
+            (and (not (integer? deadline-nanos))
+                 (integer? deadline-ms)
+                 (>= (long now-ms) (long deadline-ms))))
+        (assoc common-meta
+               :reason :lease-expired
+               :lease-until-ms (:ha-lease-until-ms state)
+               :lease-local-deadline-ms deadline-ms
+               :lease-local-deadline-nanos deadline-nanos
+               :ha-authority-now-ms (:ha-authority-now-ms state)
+               :now-ms now-ms
+               :now-nanos now-nanos)
+
+        :else
+        nil))))
+
 (defn- ensure-ha-read-floor!
   [deps server db-name writing? message dt-store]
-  (when-let [min-tx (and (not writing?) (ha-read-min-tx message))]
-    (let [min-tx (long min-tx)
-          max-tx (durable-dt-store-max-tx dt-store)
-          store-max-tx (dt-store-max-tx dt-store)]
-      (when (< max-tx min-tx)
-        (let [state (db-state deps server db-name)]
-          (u/raise "HA read floor not satisfied"
-                   {:error :ha/read-rejected
-                    :reason :read-floor-not-satisfied
-                    :retryable? true
-                    :indeterminate? true
-                    :db-name db-name
-                    :ha-read-min-tx min-tx
-                    :ha-local-max-tx max-tx
-                    :ha-local-store-max-tx store-max-tx
-                    :ha-role (:ha-role state)
-                    :ha-node-id (:ha-node-id state)
-                    :ha-authoritative-leader-node-id
-                    (:ha-authority-owner-node-id state)
-                    :ha-authoritative-leader-endpoint
-                    (get-in state [:ha-authority-lease :leader-endpoint])
-                    :ha-retry-endpoints
-                    (ha-read-retry-endpoints state)})))
-      (let [state (db-state deps server db-name)]
-        (when (ha-runtime-read-state? state)
-          (db/refresh-cache dt-store))))))
+  (when-not writing?
+    (when-let [state (db-state deps server db-name)]
+      (when-let [err (ha-read-admission-error db-name state)]
+        (u/raise "HA read admission rejected" err))
+      (when-let [min-tx (ha-read-min-tx message)]
+        (let [min-tx       (long min-tx)
+              max-tx       (durable-dt-store-max-tx dt-store)
+              store-max-tx (dt-store-max-tx dt-store)]
+          (when (< max-tx min-tx)
+            (u/raise "HA read floor not satisfied"
+                     {:error :ha/read-rejected
+                      :reason :read-floor-not-satisfied
+                      :retryable? true
+                      :indeterminate? true
+                      :db-name db-name
+                      :ha-read-min-tx min-tx
+                      :ha-local-max-tx max-tx
+                      :ha-local-store-max-tx store-max-tx
+                      :ha-role (:ha-role state)
+                      :ha-node-id (:ha-node-id state)
+                      :ha-authoritative-leader-node-id
+                      (:ha-authority-owner-node-id state)
+                      :ha-authoritative-leader-endpoint
+                      (get-in state [:ha-authority-lease :leader-endpoint])
+                      :ha-retry-endpoints
+                      (ha-read-retry-endpoints state)}))))
+      (when (ha-runtime-read-state? state)
+        (db/refresh-cache dt-store)))))
 
 (defn- kv-store
   [deps server skey db-name writing?]
