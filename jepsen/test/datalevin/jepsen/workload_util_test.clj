@@ -834,6 +834,54 @@
            (:op result)))
     (is (< (:elapsed-ms result) 1000))))
 
+(deftest tx-fn-register-read-is-bounded-test
+  (let [started? (promise)
+        cluster-id ::tx-fn-register-read-is-bounded
+        read-op   {:type :invoke
+                   :f :read
+                   :value (first {0 nil})}
+        blocking-conn
+        (reify clojure.lang.IDeref
+          (deref [_]
+            (deliver started? true)
+            (Thread/sleep 10000)
+            nil))
+        initialized-clusters
+        (var-get #'tx-fn-register/initialized-clusters)
+        original-initialized-clusters @initialized-clusters
+        client   (workload.util/attach-cached-leader-conn
+                  (tx-fn-register/->Client "n1" 1 128))
+        result   (try
+                   (swap! initialized-clusters conj cluster-id)
+                   (with-redefs-fn
+                    {#'workload.util/*open-leader-conn*
+                     (fn [_test _schema]
+                       blocking-conn)
+                     #'d/close
+                     (fn [_conn]
+                       nil)}
+                    (fn []
+                      (binding [tx-fn-register/*read-timeout-ms* 50]
+                        (let [started-ms (System/currentTimeMillis)
+                              op         (client/invoke!
+                                          client
+                                          {:datalevin/cluster-id cluster-id}
+                                          read-op)
+                              elapsed-ms (- (System/currentTimeMillis)
+                                            started-ms)]
+                          {:op op
+                           :elapsed-ms elapsed-ms}))))
+                   (finally
+                     (reset! initialized-clusters
+                             original-initialized-clusters)))]
+    (is (deref started? 500 false))
+    (is (= (assoc read-op
+                  :type :info
+                  :error :read-timeout
+                  :txreg/timeout-ms 50)
+           (:op result)))
+    (is (< (:elapsed-ms result) 1000))))
+
 (deftest tx-fn-register-write-reports-requested-value-test
   (let [txs (atom [])]
     (with-redefs [conn/transact! (fn

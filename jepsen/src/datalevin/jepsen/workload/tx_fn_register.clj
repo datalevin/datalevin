@@ -11,7 +11,10 @@
    [jepsen.generator :as gen]
    [jepsen.independent :as independent]
    [knossos.model :as model]
-   [taoensso.timbre :as log]))
+   [taoensso.timbre :as log])
+  (:import
+   [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+    TimeUnit TimeoutException]))
 
 (def schema
   {:txreg/key     {:db/valueType :db.type/long
@@ -24,6 +27,7 @@
 (def ^:private tx-fn-padding
   (apply str (repeat 512 "tx-fn-register-padding-")))
 (def ^:private default-setup-timeout-ms 15000)
+(def ^:dynamic *read-timeout-ms* 10000)
 (defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private txreg-rows-query
   '[:find ?key ?version ?payload
@@ -438,6 +442,83 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- call-with-timeout-ms
+  [timeout-ms f]
+  (let [executor (Executors/newSingleThreadExecutor
+                  (reify ThreadFactory
+                    (newThread [_ runnable]
+                      (doto (Thread. runnable
+                                     (str "datalevin-jepsen-txreg-read-timeout-"
+                                          (System/nanoTime)))
+                        (.setDaemon true)))))
+        bound-f  (bound-fn* f)
+        task     (.submit executor
+                          ^Callable
+                          (reify Callable
+                            (call [_]
+                              (bound-f))))]
+    (try
+      {:status :completed
+       :value (.get task (long timeout-ms) TimeUnit/MILLISECONDS)}
+      (catch TimeoutException _
+        (.cancel task true)
+        {:status :timeout})
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.cancel task true)
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.shutdownNow executor)))))
+
+(defn- result-op
+  [op result]
+  (cond
+    (= ::cas-failed result)
+    (assoc op
+           :type :fail
+           :error :cas-failed)
+
+    (= ::unsupported result)
+    (assoc op
+           :type :fail
+           :error [:unsupported-client-op (:f op)])
+
+    :else
+    (assoc op
+           :type :ok
+           :value (:tuple result)
+           :txreg/payload-valid? (:payload-valid? result)
+           :txreg/payload-bytes (:payload-bytes result))))
+
+(defn- invoke-with-cached-leader-conn!
+  [client test payload-bytes op]
+  (workload.util/with-cached-leader-conn
+    client
+    test
+    schema
+    (fn [conn]
+      (result-op op (execute-op! conn payload-bytes op)))))
+
+(defn- invoke-read-with-timeout
+  [test payload-bytes op]
+  (let [timeout-ms *read-timeout-ms*
+        result     (call-with-timeout-ms
+                    timeout-ms
+                    (fn []
+                      (let [conn (workload.util/*open-leader-conn* test schema)]
+                        (try
+                          (result-op op (execute-op! conn payload-bytes op))
+                          (finally
+                            (d/close conn))))))]
+    (if (= :timeout (:status result))
+      (assoc op
+             :type :info
+             :error :read-timeout
+             :txreg/timeout-ms timeout-ms)
+      (:value result))))
+
 (defn- payload-checker
   [payload-bytes]
   (reify checker/Checker
@@ -508,29 +589,9 @@
   (invoke! [this test op]
     (try
       (ensure-txreg-initialized! test key-count payload-bytes)
-      (workload.util/with-cached-leader-conn
-        this
-        test
-        schema
-        (fn [conn]
-          (let [result (execute-op! conn payload-bytes op)]
-            (cond
-              (= ::cas-failed result)
-              (assoc op
-                     :type :fail
-                     :error :cas-failed)
-
-              (= ::unsupported result)
-              (assoc op
-                     :type :fail
-                     :error [:unsupported-client-op (:f op)])
-
-              :else
-              (assoc op
-                     :type :ok
-                     :value (:tuple result)
-                     :txreg/payload-valid? (:payload-valid? result)
-                     :txreg/payload-bytes (:payload-bytes result))))))
+      (if (= :read (:f op))
+        (invoke-read-with-timeout test payload-bytes op)
+        (invoke-with-cached-leader-conn! this test payload-bytes op))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 
