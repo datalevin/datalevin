@@ -52,15 +52,22 @@
     :ha/txlog-gap-unresolved
     :ha/follower-snapshot-bootstrap-failed})
 
+(def ^:private ha-open-admission-errors
+  #{:ha/read-rejected
+    :ha/write-rejected
+    :ha/pinned-request-failed})
+
 (defn transient-ha-open-failure?
   [e]
   (boolean
     (some
       (fn [cause]
         (let [data       (ex-data cause)
+              err-data   (or (:err-data data) data)
               nested     (:data data)
               gap-error  (:gap-error nested)]
           (or (= :txlog/not-enabled (:type data))
+              (contains? ha-open-admission-errors (:error err-data))
               (contains? ha-open-gap-errors (:error data))
               (contains? ha-open-gap-errors (:error nested))
               (= :txlog/not-enabled (get-in gap-error [:data :type]))

@@ -152,6 +152,7 @@
 
 (def ^:private stale-cached-leader-conn-markers
   ["HA write admission rejected"
+   "HA read admission rejected"
    "Replica is read-only"
    "This client is closed"
    "Connection is closed"
@@ -225,6 +226,7 @@
 
 (def ^:private retryable-leader-failure-markers
   ["HA write admission rejected"
+   "HA read admission rejected"
    "Timed out waiting for durable LSN"
    "Timed out waiting for single leader"
    "Timeout in making request"

@@ -69,6 +69,10 @@
     :validate [(partial every? core/supported-nemeses)
                (str "Supported faults: " supported-nemesis-labels)]]
 
+   [nil "--pause-resume-delay-s SECONDS" "Seconds to leave pause nemeses active before resuming nodes"
+    :parse-fn parse-long
+    :validate [pos? "Must be a positive integer"]]
+
    ["-r" "--rate HZ" "Approximate request rate"
     :default 20
     :parse-fn read-string

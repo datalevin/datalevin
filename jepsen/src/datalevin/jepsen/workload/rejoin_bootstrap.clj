@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.workload.rejoin-bootstrap
   (:require
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
@@ -828,6 +829,46 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- error-message
+  [error]
+  (cond
+    (string? error)
+    error
+
+    (keyword? error)
+    (name error)
+
+    (vector? error)
+    (some error-message error)
+
+    (map? error)
+    (or (error-message (:message error))
+        (error-message (:server-message error))
+        (error-message (:error error)))
+
+    (some? error)
+    (str error)
+
+    :else
+    nil))
+
+(defn- ha-read-admission-rejection?
+  [error]
+  (or (and (map? error)
+           (let [err-data (or (:err-data error) error)]
+             (and (= :ha/read-rejected (:error err-data))
+                  (true? (:retryable? err-data)))))
+      (some-> (error-message error)
+              (str/includes? "HA read admission rejected"))))
+
+(defn- expected-converge-disruption-failure?
+  [test {:keys [error value]}]
+  (or (local/expected-disruption-write-failure? test error)
+      (local/expected-disruption-write-failure? test value)
+      (and (local/write-disruption-fault-active? test)
+           (or (ha-read-admission-rejection? error)
+               (ha-read-admission-rejection? value)))))
+
 (defn- mismatched-nodes
   [snapshot]
   (->> (:nodes snapshot)
@@ -844,7 +885,7 @@
 (defn- rejoin-checker
   []
   (reify checker/Checker
-    (check [_ _test history _opts]
+    (check [_ test history _opts]
       (let [converge-oks     (->> history
                                   (filter (fn [{:keys [type f value]}]
                                             (and (= :ok type)
@@ -860,18 +901,44 @@
                                            {:type type
                                             :error error
                                             :value value})))
+            disruption-failures
+            (->> converge-failures
+                 (filter #(expected-converge-disruption-failure? test %))
+                 vec)
+            unexpected-failures
+            (->> converge-failures
+                 (remove #(expected-converge-disruption-failure? test %))
+                 vec)
             mismatches       (->> converge-oks
                                   (mapcat mismatched-nodes)
-                                  vec)]
-        {:valid? (boolean
-                  (and (seq converge-oks)
-                       (empty? converge-failures)
-                       (empty? mismatches)))
-         :converge-count (count converge-oks)
-         :failure-count (count converge-failures)
-         :failure-samples (vec (take sample-limit converge-failures))
-         :mismatch-count (count mismatches)
-         :mismatch-samples (vec (take sample-limit mismatches))}))))
+                                  vec)
+            valid?           (cond
+                               (and (seq converge-oks)
+                                    (empty? unexpected-failures)
+                                    (empty? mismatches))
+                               true
+
+                               (and (empty? converge-oks)
+                                    (seq disruption-failures)
+                                    (empty? unexpected-failures)
+                                    (empty? mismatches))
+                               :unknown
+
+                               :else
+                               false)
+            adjusted-valid?  (when (= :unknown valid?)
+                               :disruption-only-converge)]
+        (cond-> {:valid? valid?
+                 :converge-count (count converge-oks)
+                 :failure-count (count unexpected-failures)
+                 :failure-samples (vec (take sample-limit unexpected-failures))
+                 :disruption-failure-count (count disruption-failures)
+                 :disruption-failure-samples
+                 (vec (take sample-limit disruption-failures))
+                 :mismatch-count (count mismatches)
+                 :mismatch-samples (vec (take sample-limit mismatches))}
+          adjusted-valid?
+          (assoc :adjusted-valid? adjusted-valid?))))))
 
 (defrecord Client [node key-count]
   client/Client
