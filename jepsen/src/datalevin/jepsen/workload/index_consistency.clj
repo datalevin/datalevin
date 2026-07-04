@@ -1,11 +1,15 @@
 (ns datalevin.jepsen.workload.index-consistency
   (:require
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
-   [jepsen.generator :as gen]))
+   [jepsen.generator :as gen])
+  (:import
+   [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+    TimeUnit TimeoutException]))
 
 (def schema
   {:index/case  {:db/valueType :db.type/long}
@@ -16,6 +20,8 @@
    :index/ref   {:db/valueType :db.type/ref}
    :index/tags  {:db/valueType :db.type/string
                  :db/cardinality :db.cardinality/many}})
+
+(def ^:private final-probe-timeout-ms 30000)
 
 (defn- case-prefix
   [case-id]
@@ -433,6 +439,70 @@
                                  case-id)))
               txns)))))
 
+(defn- call-with-timeout-ms
+  [timeout-ms f]
+  (let [executor (Executors/newSingleThreadExecutor
+                  (reify ThreadFactory
+                    (newThread [_ runnable]
+                      (doto (Thread. runnable
+                                     (str "datalevin-jepsen-index-probe-timeout-"
+                                          (System/nanoTime)))
+                        (.setDaemon true)))))
+        task     (.submit executor
+                          ^Callable
+                          (reify Callable
+                            (call [_]
+                              (f))))]
+    (try
+      {:status :completed
+       :value (.get task (long timeout-ms) TimeUnit/MILLISECONDS)}
+      (catch TimeoutException _
+        (.cancel task true)
+        {:status :timeout})
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.cancel task true)
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.shutdownNow executor)))))
+
+(defn- final-probe-timeout-op?
+  [op]
+  (and (= :probe (:f op))
+       (= :info (:type op))
+       (= :probe-timeout (:error op))))
+
+(defn- error-message
+  [error]
+  (cond
+    (string? error)
+    error
+
+    (keyword? error)
+    (name error)
+
+    (vector? error)
+    (some error-message error)
+
+    (map? error)
+    (or (error-message (:message error))
+        (error-message (:error error)))
+
+    (some? error)
+    (str error)
+
+    :else
+    nil))
+
+(defn- expected-index-disruption-failure?
+  [test error]
+  (or (local/expected-disruption-write-failure? test error)
+      (and (local/write-disruption-fault-active? test)
+           (some-> (error-message error)
+                   (str/includes? "HA read admission rejected")))))
+
 (defn- op-error
   [e]
   (if (= :transact/cas (:error (ex-data e)))
@@ -455,10 +525,17 @@
   (reify checker/Checker
     (check [_ test history _opts]
       (let [terminal-history (filter (comp #{:ok :fail :info} :type) history)
+            probe-timeouts
+            (->> terminal-history
+                 (filter (fn [{:keys [f]}]
+                           (= :probe f)))
+                 (filter final-probe-timeout-op?)
+                 vec)
             probe-terminal
             (->> terminal-history
                  (filter (fn [{:keys [f]}]
                            (= :probe f)))
+                 (remove final-probe-timeout-op?)
                  vec)
             successful-probes
             (->> probe-terminal
@@ -479,9 +556,7 @@
             disruption-failures
             (->> terminal
                  (filter (fn [{:keys [error]}]
-                           (local/expected-disruption-write-failure?
-                             test
-                             error)))
+                           (expected-index-disruption-failure? test error)))
                  vec)
             indeterminate
             (->> terminal
@@ -563,6 +638,7 @@
          :transient-mismatch-samples
          (vec (take 10 transient-mismatches))
          :probe-count (count successful-probes)
+         :probe-timeout-count (count probe-timeouts)
          :probe-failure-count (count probe-failures)
          :probe-failure-samples
          (vec (take 10
@@ -587,15 +663,26 @@
         test
         schema
         (fn [conn]
-          (let [value (execute-op! conn op)]
-            (if (and (vector? value)
-                     (= :unsupported-client-op (first value)))
+          (let [result (if (= :probe (:f op))
+                         (call-with-timeout-ms
+                          final-probe-timeout-ms
+                          #(execute-op! conn op))
+                         {:status :completed
+                          :value (execute-op! conn op)})]
+            (if (= :timeout (:status result))
               (assoc op
-                     :type :fail
-                     :error value)
-              (assoc op
-                     :type :ok
-                     :value value)))))
+                     :type :info
+                     :error :probe-timeout
+                     :value {:timeout-ms final-probe-timeout-ms})
+              (let [value (:value result)]
+                (if (and (vector? value)
+                         (= :unsupported-client-op (first value)))
+                  (assoc op
+                         :type :fail
+                         :error value)
+                  (assoc op
+                         :type :ok
+                         :value value)))))))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 

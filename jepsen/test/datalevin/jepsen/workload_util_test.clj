@@ -13,6 +13,7 @@
    [datalevin.jepsen.workload.util :as workload.util]
    [datalevin.jepsen.local :as local]
    [jepsen.checker :as checker]
+   [jepsen.client :as client]
    [jepsen.history :as history]))
 
 (deftest assoc-exception-op-classifies-indeterminate-errors-test
@@ -486,6 +487,25 @@
                (#'membership-drift/leader-register-values test 2)))
         (is (= 2 @attempts))))))
 
+(deftest membership-drift-restart-retries-transient-open-timeout-test
+  (let [attempts (atom 0)
+        test     {:datalevin/cluster-id ::membership-drift-restart-retry
+                  :db-name "membership-drift-restart-retry"}]
+    (with-redefs [local/transport-failure? (constantly false)
+                  local/restart-node!
+                  (fn [_cluster-id _logical-node]
+                    (if (= 1 (swap! attempts inc))
+                      (throw (ex-info "Timeout in making request"
+                                      {:phase :open-conn
+                                       :timeout-ms 250}))
+                      true))]
+      (is (true?
+           (#'membership-drift/restart-node-with-retry!
+            test
+            "n1"
+            1000)))
+      (is (= 2 @attempts)))))
+
 (deftest history-safe-bounds-unbounded-collections-test
   (let [result (workload.util/history-safe {:values (range)})
         values (:values result)]
@@ -731,6 +751,88 @@
     (is (= 0 (:mismatch-count result)))
     (is (= 1 (:transient-mismatch-count result)))
     (is (= 0 (:probe-mismatch-count result)))))
+
+(deftest index-consistency-checker-ignores-ha-read-rejection-during-disruption-test
+  (let [op     {:f :tag-swap
+                :index/case-id 13}
+        result (checker/check
+                (#'index-consistency/index-consistency-checker)
+                {:datalevin/nemesis-faults [:clock-skew-pause
+                                             :leader-failover]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :fail
+                         :error (str "Request to Datalevin server failed: "
+                                     "\"HA read admission rejected\""))
+                  {:process 1
+                   :type :ok
+                   :f :probe
+                   :value {13 (first
+                               (#'index-consistency/expected-states op))}}])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 0 (:mismatch-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
+
+(deftest index-consistency-checker-ignores-final-probe-timeout-test
+  (let [op     {:f :ref-create
+                :index/case-id 8}
+        result (checker/check
+                (#'index-consistency/index-consistency-checker)
+                {}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :ok
+                         :value (#'index-consistency/expected-states op))
+                  {:process 0
+                   :type :info
+                   :f :probe
+                   :error :probe-timeout
+                   :value {:timeout-ms 50}}])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 1 (:probe-timeout-count result)))
+    (is (= 0 (:probe-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
+
+(deftest index-consistency-final-probe-is-bounded-test
+  (let [started? (promise)
+        blocking-conn
+        (reify clojure.lang.IDeref
+          (deref [_]
+            (deliver started? true)
+            (Thread/sleep 10000)
+            nil))
+        client   (workload.util/attach-cached-leader-conn
+                  (index-consistency/->Client "n1"))
+        result   (with-redefs-fn
+                   {#'datalevin.jepsen.workload.index-consistency/final-probe-timeout-ms
+                    50}
+                   (fn []
+                     (binding [workload.util/*open-leader-conn*
+                               (fn [_test _schema]
+                                 blocking-conn)]
+                       (let [started-ms (System/currentTimeMillis)
+                             op         (client/invoke!
+                                         client
+                                         {}
+                                         {:type :invoke
+                                          :f :probe})
+                             elapsed-ms (- (System/currentTimeMillis)
+                                           started-ms)]
+                         {:op op
+                          :elapsed-ms elapsed-ms}))))]
+    (is (deref started? 500 false))
+    (is (= {:type :info
+            :f :probe
+            :error :probe-timeout
+            :value {:timeout-ms 50}}
+           (:op result)))
+    (is (< (:elapsed-ms result) 1000))))
 
 (deftest tx-fn-register-write-reports-requested-value-test
   (let [txs (atom [])]
