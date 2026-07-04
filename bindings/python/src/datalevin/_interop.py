@@ -880,7 +880,15 @@ def vector_attr(*, domains=None, extra=None, **schema_kwargs):
     return schema_attr(value_type=":db.type/vec", extra=merged, **schema_kwargs)
 
 
-def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
+def idoc_attr(
+    *,
+    format=None,
+    domain=None,
+    indexed_paths=None,
+    excluded_paths=None,
+    extra=None,
+    **schema_kwargs,
+):
     """Build an indexed-document schema attribute."""
 
     merged = {}
@@ -888,6 +896,10 @@ def idoc_attr(*, format=None, domain=None, extra=None, **schema_kwargs):
         merged[":db/idocFormat"] = _keyword_value(format)
     if domain is not None:
         merged[":db/domain"] = domain
+    if indexed_paths is not None:
+        merged[":db.idoc/indexedPaths"] = list(indexed_paths)
+    if excluded_paths is not None:
+        merged[":db.idoc/excludedPaths"] = list(excluded_paths)
     if extra:
         merged.update(extra)
     return schema_attr(value_type=":db.type/idoc", extra=merged, **schema_kwargs)
@@ -1013,6 +1025,19 @@ def embedding_options(
         opts[":metric-type"] = _keyword_value(metric_type)
     if indexing_mode is not None:
         opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if extra:
+        opts.update(extra)
+    return opts
+
+
+def idoc_domain(*, indexed_paths=None, excluded_paths=None, extra=None):
+    """Build an idoc domain/default option map."""
+
+    opts = {}
+    if indexed_paths is not None:
+        opts[":indexed-paths"] = list(indexed_paths)
+    if excluded_paths is not None:
+        opts[":excluded-paths"] = list(excluded_paths)
     if extra:
         opts.update(extra)
     return opts
@@ -1202,6 +1227,7 @@ __all__ = [
     "fill_db",
     "fulltext_attr",
     "idoc_attr",
+    "idoc_domain",
     "idoc_options",
     "init_db",
     "jvm_started",

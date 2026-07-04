@@ -22,6 +22,7 @@ export {
   fillDb,
   fulltextAttr,
   idocAttr,
+  idocDomain,
   idocOptions,
   initDb,
   jvmStarted,

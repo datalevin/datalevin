@@ -1521,13 +1521,26 @@ export function vectorAttr({ domains = null, extra = null, ...schemaProps } = {}
   return schemaAttr({ valueType: ":db.type/vec", extra: merged, ...schemaProps });
 }
 
-export function idocAttr({ format = null, domain = null, extra = null, ...schemaProps } = {}) {
+export function idocAttr({
+  format = null,
+  domain = null,
+  indexedPaths = null,
+  excludedPaths = null,
+  extra = null,
+  ...schemaProps
+} = {}) {
   const merged = {};
   if (format !== null && format !== undefined) {
     merged[":db/idocFormat"] = keywordValue(format);
   }
   if (domain !== null && domain !== undefined) {
     merged[":db/domain"] = domain;
+  }
+  if (indexedPaths !== null && indexedPaths !== undefined) {
+    merged[":db.idoc/indexedPaths"] = [...indexedPaths];
+  }
+  if (excludedPaths !== null && excludedPaths !== undefined) {
+    merged[":db.idoc/excludedPaths"] = [...excludedPaths];
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(merged, extra);
@@ -1680,6 +1693,20 @@ export function embeddingOptions({
   }
   if (indexingMode !== null && indexingMode !== undefined) {
     opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(opts, extra);
+  }
+  return opts;
+}
+
+export function idocDomain({ indexedPaths = null, excludedPaths = null, extra = null } = {}) {
+  const opts = {};
+  if (indexedPaths !== null && indexedPaths !== undefined) {
+    opts[":indexed-paths"] = [...indexedPaths];
+  }
+  if (excludedPaths !== null && excludedPaths !== undefined) {
+    opts[":excluded-paths"] = [...excludedPaths];
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(opts, extra);

@@ -70,10 +70,24 @@ test("public surface stays importable without starting the JVM", () => {
     ":db/valueType": ":db.type/vec",
     ":db.vec/domains": ["vectors"]
   });
-  assert.deepEqual(datalevin.idocAttr({ format: "json", domain: "profiles" }), {
+  assert.deepEqual(datalevin.idocAttr({
+    format: "json",
+    domain: "profiles",
+    indexedPaths: [":status", [":profile", ":age"]],
+    excludedPaths: [":raw"]
+  }), {
     ":db/valueType": ":db.type/idoc",
     ":db/idocFormat": ":json",
-    ":db/domain": "profiles"
+    ":db/domain": "profiles",
+    ":db.idoc/indexedPaths": [":status", [":profile", ":age"]],
+    ":db.idoc/excludedPaths": [":raw"]
+  });
+  assert.deepEqual(datalevin.idocDomain({
+    indexedPaths: [":status"],
+    excludedPaths: [[":profile", ":raw"]]
+  }), {
+    ":indexed-paths": [":status"],
+    ":excluded-paths": [[":profile", ":raw"]]
   });
   assert.deepEqual(datalevin.searchOptions({
     top: 5,

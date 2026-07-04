@@ -98,6 +98,9 @@
 (def ^:private embedding-schema-keys
   [:db/embedding :db.embedding/domains :db.embedding/autoDomain])
 
+(def ^:private idoc-index-schema-keys
+  [:db.idoc/indexedPaths :db.idoc/excludedPaths])
+
 (defn- populated-attribute?
   [store attr]
   (let [low-datom  (d/datom c/e0 attr c/v0)
@@ -114,6 +117,16 @@
       (u/raise "Embedding schema changes require an explicit rebuild"
                {:attribute attr :key k}))))
 
+(defn- validate-idoc-index-schema-change
+  [store attr old-props new-props]
+  (when-let [k (some (fn [k]
+                       (when (not= (get old-props k) (get new-props k))
+                         k))
+                     idoc-index-schema-keys)]
+    (when (populated-attribute? store attr)
+      (u/raise "Idoc path indexing schema changes require an explicit rebuild"
+               {:attribute attr :key k}))))
+
 (defn validate-schema-mutation
   "Validate schema attribute changes (cardinality, value type, uniqueness)."
   [store lmdb attr old-props new-props]
@@ -124,7 +137,8 @@
       :db/valueType   (validate-value-type-change store attr v' v)
       :db/unique      (validate-uniqueness-change store lmdb attr v' v)
       :pass-through))
-  (validate-embedding-schema-change store attr old-props new-props))
+  (validate-embedding-schema-change store attr old-props new-props)
+  (validate-idoc-index-schema-change store attr old-props new-props))
 
 (def ^:private boolean-opts
   #{:validate-data? :auto-entity-time? :closed-schema? :background-sampling?
@@ -1046,7 +1060,71 @@
                  {:error :store/validation
                   :option :vector-domains
                   :domain domain}))
-      (validate-vector-domain-config* :vector-domains domain config)))
+              (validate-vector-domain-config* :vector-domains domain config)))
+  opts)
+
+(defn- validate-idoc-path-selector
+  [where k selector]
+  (let [segments (cond
+                   (keyword? selector) [selector]
+                   (string? selector)  [selector]
+                   (vector? selector)  selector
+                   :else nil)]
+    (when-not segments
+      (u/raise "Idoc path selector must be a keyword, string, or vector"
+               {:error :store/validation
+                :where where
+                :key k
+                :selector selector}))
+    (doseq [seg segments]
+      (when-not (or (keyword? seg) (string? seg))
+        (u/raise "Idoc path selector segments must be keywords or strings"
+                 {:error :store/validation
+                  :where where
+                  :key k
+                  :selector selector
+                  :segment seg})))))
+
+(defn- validate-idoc-path-selectors
+  [where k selectors]
+  (when-not (sequential? selectors)
+    (u/raise "Idoc path selector option must be a sequential collection"
+             {:error :store/validation
+              :where where
+              :key k
+              :value selectors}))
+  (doseq [selector selectors]
+    (validate-idoc-path-selector where k selector)))
+
+(defn- validate-idoc-domain-config*
+  [where domain config]
+  (when-not (map? config)
+    (u/raise "Idoc domain config must be a map"
+             {:error :store/validation
+              :where where
+              :domain domain
+              :config config}))
+  (doseq [k [:indexed-paths :excluded-paths]]
+    (when (contains? config k)
+      (validate-idoc-path-selectors where k (get config k)))))
+
+(defn validate-idoc-options
+  [opts]
+  (when-let [idoc-opts (:idoc-opts opts)]
+    (validate-idoc-domain-config* :idoc-opts nil idoc-opts))
+  (when-let [idoc-domains (:idoc-domains opts)]
+    (when-not (map? idoc-domains)
+      (u/raise "Option :idoc-domains expects a map"
+               {:error :store/validation
+                :option :idoc-domains
+                :value idoc-domains}))
+    (doseq [[domain config] idoc-domains]
+      (when-not (and (string? domain) (not (s/blank? domain)))
+        (u/raise "Idoc domain names must be non-blank strings"
+                 {:error :store/validation
+                  :option :idoc-domains
+                  :domain domain}))
+      (validate-idoc-domain-config* :idoc-domains domain config)))
   opts)
 
 (defn validate-secondary-index-worker-options
@@ -1089,6 +1167,8 @@
                          #{true false})
     (validate-schema-key a :db/embedding (:db/embedding kv)
                          #{true false})
+    (validate-schema-key a :db/idocFormat (:db/idocFormat kv)
+                         #{:edn :json :markdown})
     (validate-schema-key a :db.embedding/autoDomain
                          (:db.embedding/autoDomain kv)
                          #{true false})
@@ -1098,6 +1178,16 @@
 
     (when (contains? kv :db.embedding/domains)
       (validate-embedding-domain-list a (:db.embedding/domains kv)))
+
+    (doseq [k [:db.idoc/indexedPaths :db.idoc/excludedPaths]]
+      (when (contains? kv k)
+        (when-not (identical? (:db/valueType kv) :db.type/idoc)
+          (u/raise "Bad attribute specification for idoc path indexing"
+                   {:error     :schema/validation
+                    :attribute a
+                    :key       k
+                    :valueType (:db/valueType kv)}))
+        (validate-idoc-path-selectors :schema k (get kv k))))
 
     (when (and (:db/embedding kv)
                (not (identical? (:db/valueType kv) :db.type/string)))

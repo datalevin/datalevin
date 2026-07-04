@@ -195,6 +195,10 @@ Only usable for debug output.
 
    * `:search-opts` is the default options passed to [[fulltext]] function for the default search domains in case `:search-domains` above is not specified.
 
+   * `:idoc-domains`, an option map from idoc domain names to idoc option maps. Supported idoc domain options include `:indexed-paths` and `:excluded-paths`, each a collection of keyword, string, or vector path prefix selectors.
+
+   * `:idoc-opts`, default idoc options applied to idoc domains when `:idoc-domains` does not override them.
+
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
@@ -285,6 +289,10 @@ Only usable for debug output.
    * `:search-domains`, an option map from domain names to search option maps of those domains, which will be passed to the corresponding full-text search engines. See [[new-search-engine]]
 
    * `:search-opts` is the default options passed to [[fulltext]] function for the default search domains in case `:search-domains` above is not specified.
+
+   * `:idoc-domains`, an option map from idoc domain names to idoc option maps. Supported idoc domain options include `:indexed-paths` and `:excluded-paths`, each a collection of keyword, string, or vector path prefix selectors.
+
+   * `:idoc-opts`, default idoc options applied to idoc domains when `:idoc-domains` does not override them.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
@@ -723,6 +731,10 @@ Only usable for debug output.
 
    * `:search-opts` is the default options passed to [[fulltext]] function for the default search domains in case `:search-domains` above is not specified.
 
+   * `:idoc-domains`, an option map from idoc domain names to idoc option maps. Supported idoc domain options include `:indexed-paths` and `:excluded-paths`, each a collection of keyword, string, or vector path prefix selectors.
+
+   * `:idoc-opts`, default idoc options applied to idoc domains when `:idoc-domains` does not override them.
+
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 
    * `:wal?`, a boolean, enabling WAL mode for the underlying KV store.
@@ -763,6 +775,10 @@ Only usable for debug output.
    * `:search-domains`, an option map from domain names to search option maps of those domains, which will be passed to the corresponding full-text search engines. [[new-search-engine]]
 
    * `:search-opts` is the default options passed to [[fulltext]] function for the default search domains in case `:search-domains` above is not specified.
+
+   * `:idoc-domains`, an option map from idoc domain names to idoc option maps. Supported idoc domain options include `:indexed-paths` and `:excluded-paths`, each a collection of keyword, string, or vector path prefix selectors.
+
+   * `:idoc-opts`, default idoc options applied to idoc domains when `:idoc-domains` does not override them.
 
    * `:kv-opts`, an option map that will be passed to the underlying kV store
 

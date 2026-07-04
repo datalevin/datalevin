@@ -823,6 +823,68 @@
           (d/close conn))
         (u/delete-files dir)))))
 
+(deftest test-idoc-selective-path-indexing-domain-options
+  (let [dir    (u/tmp-dir (str "test-idoc-selective-path-indexing-"
+                               (UUID/randomUUID)))
+        schema {:doc/idoc {:db/valueType :db.type/idoc
+                           :db/domain    "profiles"}}
+        opts   {:idoc-domains
+                {"profiles" {:indexed-paths [:status :profile]
+                             :excluded-paths [[:profile :secret]]}}}
+        conn   (d/create-conn dir schema opts)
+        q      '[:find [?e ...]
+                 :in $ ?query
+                 :where
+                 [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]]
+    (try
+      (d/transact! conn [{:db/id 1
+                          :doc/idoc {:status  "active"
+                                     :profile {:age 30
+                                               :secret "hidden"}
+                                     :tags    ["a"]}}
+                         {:db/id 2
+                          :doc/idoc {:status  "inactive"
+                                     :profile {:age 40
+                                               :secret "hidden"}
+                                     :tags    ["b"]}}])
+      (is (= #{1} (set (d/q q @conn {:status "active"}))))
+      (is (= #{1} (set (d/q q @conn {:profile {:age 30}}))))
+      (is (empty? (d/q q @conn {:profile {:secret "hidden"}})))
+      (is (empty? (d/q q @conn {:tags "a"})))
+      (let [store    (conn-store conn)
+            lmdb     (.-lmdb ^Store store)
+            index    (get (s/store-idoc-indices store) "profiles")
+            path-dbi (.-path-dict-dbi ^IdocIndex index)
+            path-id  #(i/get-value lmdb path-dbi % :string :int)]
+        (is (some? (path-id "/:status")))
+        (is (some? (path-id "/:profile/:age")))
+        (is (nil? (path-id "/:profile/:secret")))
+        (is (nil? (path-id "/:tags"))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-idoc-selective-path-indexing-schema-options
+  (let [dir    (u/tmp-dir (str "test-idoc-selective-schema-path-indexing-"
+                               (UUID/randomUUID)))
+        schema {:doc/idoc {:db/valueType :db.type/idoc
+                           :db/domain "profiles"
+                           :db.idoc/indexedPaths [:status]}}
+        conn   (d/create-conn dir schema)
+        q      '[:find [?e ...]
+                 :in $ ?query
+                 :where
+                 [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]]
+    (try
+      (d/transact! conn [{:db/id 1
+                          :doc/idoc {:status "active"
+                                     :profile {:age 30}}}])
+      (is (= #{1} (set (d/q q @conn {:status "active"}))))
+      (is (empty? (d/q q @conn {:profile {:age 30}})))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-idoc-and-fulltext-fuzz-in-same-tx
   (doseq [seed [7 29 113]]
     (let [dir    (u/tmp-dir (str "test-idoc-fulltext-fuzz-"

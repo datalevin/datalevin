@@ -463,10 +463,24 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         ":db/valueType": ":db.type/vec",
         ":db.vec/domains": ["vectors"],
     }
-    assert interop_module.idoc_attr(format="json", domain="profiles") == {
+    assert interop_module.idoc_attr(
+        format="json",
+        domain="profiles",
+        indexed_paths=[":status", [":profile", ":age"]],
+        excluded_paths=[":raw"],
+    ) == {
         ":db/valueType": ":db.type/idoc",
         ":db/idocFormat": ":json",
         ":db/domain": "profiles",
+        ":db.idoc/indexedPaths": [":status", [":profile", ":age"]],
+        ":db.idoc/excludedPaths": [":raw"],
+    }
+    assert interop_module.idoc_domain(
+        indexed_paths=[":status"],
+        excluded_paths=[[":profile", ":raw"]],
+    ) == {
+        ":indexed-paths": [":status"],
+        ":excluded-paths": [[":profile", ":raw"]],
     }
     assert interop_module.search_options(
         top=5,

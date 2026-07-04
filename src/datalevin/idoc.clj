@@ -69,6 +69,16 @@
       (raise "Markdown header normalizes to empty string" {:header s}))
     (keyword s)))
 
+(defn- normalize-seg
+  [format seg]
+  (if (identical? format :markdown)
+    (cond
+      (and (keyword? seg) (#{:? :*} seg)) seg
+      (keyword? seg)                      (normalize-header (subs (str seg) 1))
+      (string? seg)                       (normalize-header seg)
+      :else                               seg)
+    seg))
+
 (defn- ensure-map
   [m path ctx]
   (if (empty? path)
@@ -535,6 +545,57 @@
         (str acc "/" (encode-string-seg seg))))
     "" segments))
 
+(defn- path-selector->segments
+  [selector k]
+  (let [segments (cond
+                   (keyword? selector) [selector]
+                   (string? selector)  [selector]
+                   (vector? selector)  selector
+                   :else
+                   (raise "Idoc path selector must be a keyword, string, or vector"
+                          {:key k :selector selector}))]
+    (doseq [seg segments]
+      (when-not (or (keyword? seg) (string? seg))
+        (raise "Idoc path selector segments must be keywords or strings"
+               {:key k :selector selector :segment seg})))
+    segments))
+
+(defn- normalize-selector
+  [format selector k]
+  (mapv #(normalize-seg format %) (path-selector->segments selector k)))
+
+(defn- compile-path-prefixes
+  [format k selectors]
+  (when (some? selectors)
+    (when-not (sequential? selectors)
+      (raise "Idoc path selector option must be a sequential collection"
+             {:key k :value selectors}))
+    (vec (distinct (map #(encode-path (normalize-selector format % k))
+                        selectors)))))
+
+(defn compile-path-filter
+  [format {:keys [indexed-paths excluded-paths]}]
+  (let [included (compile-path-prefixes format :indexed-paths indexed-paths)
+        excluded (compile-path-prefixes format :excluded-paths excluded-paths)]
+    (when (or (some? included) (seq excluded))
+      {:included included
+       :excluded (or excluded [])})))
+
+(defn- path-prefix-match?
+  [prefix path]
+  (or (empty? prefix)
+      (= prefix path)
+      (str/starts-with? path (str prefix "/"))))
+
+(defn- indexed-path?
+  [path-filter path]
+  (if-not path-filter
+    true
+    (let [{:keys [included excluded]} path-filter]
+      (and (or (nil? included)
+               (some #(path-prefix-match? % path) included))
+           (not-any? #(path-prefix-match? % path) excluded)))))
+
 (defn- decode-string-seg
   [s]
   (let [s (if (str/starts-with? s "%3A")
@@ -619,17 +680,19 @@
 
 (defn- doc->path-values-mutable
   ([doc] (doc->path-values-mutable doc []))
-  ([doc path0]
+  ([doc path0] (doc->path-values-mutable doc path0 nil))
+  ([doc path0 path-filter]
    (letfn [(append-seg [^String path seg]
              (if (keyword? seg)
                (str path "/:" (subs (str seg) 1))
                (str path "/" (encode-string-seg seg))))
            (add-leaf [^HashMap acc ^String path v]
-             (let [^HashSet s (or (.get acc path)
-                                  (let [s (HashSet.)]
-                                    (.put acc path s)
-                                    s))]
-               (.add s v))
+             (when (indexed-path? path-filter path)
+               (let [^HashSet s (or (.get acc path)
+                                    (let [s (HashSet.)]
+                                      (.put acc path s)
+                                      s))]
+                 (.add s v)))
              acc)
            (walk [^HashMap acc node ^String path]
              (cond
@@ -653,17 +716,19 @@
 
 (defn- diff-path-values
   ([old new] (diff-path-values old new []))
-  ([old new path0]
+  ([old new path0] (diff-path-values old new path0 nil))
+  ([old new path0 path-filter]
    (letfn [(append-seg [^String path seg]
              (if (keyword? seg)
                (str path "/:" (subs (str seg) 1))
                (str path "/" (encode-string-seg seg))))
            (add-leaf [^HashMap acc ^String path v]
-             (let [^HashSet s (or (.get acc path)
-                                  (let [s (HashSet.)]
-                                    (.put acc path s)
-                                    s))]
-               (.add s v))
+             (when (indexed-path? path-filter path)
+               (let [^HashSet s (or (.get acc path)
+                                    (let [s (HashSet.)]
+                                      (.put acc path s)
+                                      s))]
+                 (.add s v)))
              acc)
            (collect! [^HashMap acc node ^String path]
              (cond
@@ -701,13 +766,15 @@
 (declare get-path-strict update-pattern-cache!)
 
 (defn- patch-path-values-mutable
-  [doc paths]
+  ([doc paths] (patch-path-values-mutable doc paths nil))
+  ([doc paths path-filter]
   (reduce
     (fn [^HashMap acc {:keys [path]}]
       (if-let [node (get-path-strict doc path)]
-        (merge-path-values! acc (doc->path-values-mutable node path))
+        (merge-path-values! acc
+                            (doc->path-values-mutable node path path-filter))
         acc))
-    (HashMap.) paths))
+    (HashMap.) paths)))
 
 ;; Path ids are append-only and stored in the path-dict DBI.
 
@@ -755,6 +822,7 @@
 (deftype IdocIndex [lmdb
                     domain
                     format
+                    path-filter
                     doc-ref-dbi
                     doc-index-dbi
                     path-dict-dbi
@@ -773,9 +841,11 @@
                     ^AtomicLong index-version])
 
 (defn new-idoc-index
-  [lmdb {:keys [domain format] :as _opts}]
+  [lmdb {:keys [domain format] :as opts}]
   (let [[doc-ref-dbi doc-index-dbi path-dict-dbi]
         (open-dbis lmdb domain)
+        format                         (or format default-format)
+        path-filter                    (compile-path-filter format opts)
         max-path                       (init-paths lmdb path-dict-dbi)
         [max-doc doc-refs all-doc-ids] (init-doc-refs lmdb doc-ref-dbi)
         path-cache                     (ConcurrentHashMap.)
@@ -789,6 +859,7 @@
     (->IdocIndex lmdb
                  domain
                  format
+                 path-filter
                  doc-ref-dbi
                  doc-index-dbi
                  path-dict-dbi
@@ -811,6 +882,7 @@
   (->IdocIndex lmdb
                (.-domain old)
                (.-format old)
+               (.-path-filter old)
                (.-doc-ref-dbi old)
                (.-doc-index-dbi old)
                (.-path-dict-dbi old)
@@ -1076,7 +1148,8 @@
        (when pending-doc-ids
          (.put pending-doc-ids doc-ref doc-id))
        (add-state-action! state-actions [index :add-doc doc-id doc-ref])
-       (doseq [[path values] (doc->path-values-mutable doc)
+       (doseq [[path values] (doc->path-values-mutable doc []
+                                                       (.-path-filter index))
                :let          [pid (ensure-path-id index path txs
                                                   state-actions
                                                   pending-paths)]]
@@ -1130,7 +1203,8 @@
              (when pending-doc-ids
                (.put pending-doc-ids doc-ref doc-id))
              (add-state-action! state-actions [index :add-doc doc-id doc-ref])
-             (doseq [[path values] (doc->path-values-mutable doc)
+             (doseq [[path values] (doc->path-values-mutable doc []
+                                                             (.-path-filter index))
                      :let          [pid (ensure-path-id index path txs
                                                         state-actions
                                                         pending-paths)]]
@@ -1161,7 +1235,8 @@
     ^HashMap pending-paths ^HashMap pending-doc-ids doc-ref doc]
    (when-let [doc-id (planned-doc-id index doc-ref pending-doc-ids)]
      (let [index-dbi (.-doc-index-dbi index)]
-       (doseq [[path values] (doc->path-values-mutable doc)
+       (doseq [[path values] (doc->path-values-mutable doc []
+                                                       (.-path-filter index))
                :let          [pid (planned-path-id index path pending-paths)]]
          (when pid
            (doseq [v    values
@@ -1198,7 +1273,8 @@
                                  (get doc-ref-ids doc-ref)
                                  (get-value lmdb doc-ref-dbi
                                             doc-ref :data :int)))]
-           (doseq [[path values] (doc->path-values-mutable doc)
+           (doseq [[path values] (doc->path-values-mutable doc []
+                                                           (.-path-filter index))
                    :let          [pid (planned-path-id index path pending-paths)]]
              (when pid
                (doseq [v    values
@@ -1242,7 +1318,8 @@
              index-dbi         (.-doc-index-dbi index)
              doc-ref-dbi       (.-doc-ref-dbi index)
              ^Set empty-set    (Collections/emptySet)
-             [old-map new-map] (diff-path-values old-doc new-doc)]
+             [old-map new-map] (diff-path-values old-doc new-doc []
+                                                  (.-path-filter index))]
          (when-not (= old-ref new-ref)
            (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
            (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
@@ -1354,8 +1431,10 @@
              doc-ref-dbi    (.-doc-ref-dbi index)
              ^Set empty-set (Collections/emptySet)
              paths          (or paths [])
-             old-map        (patch-path-values-mutable old-doc paths)
-             new-map        (patch-path-values-mutable new-doc paths)]
+             old-map        (patch-path-values-mutable old-doc paths
+                                                        (.-path-filter index))
+             new-map        (patch-path-values-mutable new-doc paths
+                                                        (.-path-filter index))]
          (when-not (= old-ref new-ref)
            (.add txs (l/kv-tx :del doc-ref-dbi old-ref :data))
            (.add txs (l/kv-tx :put doc-ref-dbi new-ref doc-id :data :int))
@@ -1401,16 +1480,6 @@
   "Optional tracing hook for idoc-match. When bound, it is called with a map
   of trace data after each domain scan."
   nil)
-
-(defn- normalize-seg
-  [format seg]
-  (if (identical? format :markdown)
-    (cond
-      (and (keyword? seg) (#{:? :*} seg)) seg
-      (keyword? seg)                      (normalize-header (subs (str seg) 1))
-      (string? seg)                       (normalize-header seg)
-      :else                               seg)
-    seg))
 
 (defn- normalize-path
   [format segments]

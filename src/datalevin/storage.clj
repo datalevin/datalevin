@@ -520,11 +520,11 @@
          init-idoc-domains init-idoc-indices store-idoc-indices)
 
 (defn- merge-missing-idoc-indices
-  [lmdb idoc-indices schema]
+  [lmdb idoc-indices schema opts]
   (let [missing (into {}
                       (remove (fn [[domain _]]
                                 (contains? idoc-indices domain)))
-                      (init-idoc-domains schema))]
+                      (init-idoc-domains schema opts))]
     (if (seq missing)
       (merge idoc-indices (init-idoc-indices lmdb missing))
       idoc-indices)))
@@ -570,7 +570,7 @@
             (set! attrs (init-attrs schema*))
             (set! max-aid (init-max-aid schema*))
             (set! idoc-indices
-                  (merge-missing-idoc-indices lmdb idoc-indices schema*))
+                  (merge-missing-idoc-indices lmdb idoc-indices schema* opts))
             (mark-state-current! this last-modified-ms)))))
     this)
 
@@ -660,7 +660,7 @@
       (set! attrs (init-attrs schema))
       (set! max-aid (init-max-aid schema))
       (set! idoc-indices
-            (merge-missing-idoc-indices lmdb idoc-indices schema))
+            (merge-missing-idoc-indices lmdb idoc-indices schema opts))
       (mark-state-current! this (init-state-sync-ms lmdb)))
     schema)
 
@@ -2914,20 +2914,57 @@
     {}
     domains))
 
+(defn- idoc-schema-domain-opts
+  [props]
+  (cond-> {}
+    (contains? props :db.idoc/indexedPaths)
+    (assoc :indexed-paths (:db.idoc/indexedPaths props))
+
+    (contains? props :db.idoc/excludedPaths)
+    (assoc :excluded-paths (:db.idoc/excludedPaths props))))
+
+(defn- merge-idoc-path-option
+  [a b]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    :else (vec (distinct (concat a b)))))
+
+(defn- merge-idoc-domain-opts
+  [a b]
+  (-> (merge a b)
+      (assoc :indexed-paths
+             (merge-idoc-path-option (:indexed-paths a)
+                                     (:indexed-paths b)))
+      (assoc :excluded-paths
+             (merge-idoc-path-option (:excluded-paths a)
+                                     (:excluded-paths b)))))
+
 (defn- init-idoc-domains
-  [schema]
-  (reduce-kv
-    (fn [dms attr {:keys [db/valueType db/domain db/idocFormat]}]
-      (if (identical? valueType :db.type/idoc)
-        (let [domain (or domain (u/keyword->string attr))
-              fmt    (or idocFormat :edn)
-              prior  (get dms domain)]
-          (cond
-            (nil? prior) (assoc dms domain {:domain domain :format fmt})
-            (= (:format prior) fmt) dms
-            :else (assoc dms domain (assoc prior :format :mixed))))
-        dms))
-    {} schema))
+  [schema opts]
+  (let [default-opts (:idoc-opts opts)
+        domain-opts  (:idoc-domains opts)]
+    (reduce-kv
+      (fn [dms attr {:keys [db/valueType db/domain db/idocFormat] :as props}]
+        (if (identical? valueType :db.type/idoc)
+          (let [domain      (or domain (u/keyword->string attr))
+                fmt         (or idocFormat :edn)
+                prior       (get dms domain)
+                schema-opts (idoc-schema-domain-opts props)
+                opts        (merge default-opts
+                                   schema-opts
+                                   (get domain-opts domain))
+                opts        (assoc opts :domain domain :format fmt)]
+            (cond
+              (nil? prior) (assoc dms domain opts)
+              (= (:format prior) fmt)
+              (assoc dms domain (merge-idoc-domain-opts prior opts))
+              :else
+              (assoc dms domain
+                     (merge-idoc-domain-opts prior (assoc opts :format :mixed)))))
+          dms))
+      {}
+      schema)))
 
 (defn- init-idoc-indices
   [lmdb domains]
@@ -3157,6 +3194,7 @@
            _         (vld/validate-search-options opts3)
            _         (vld/validate-vector-options opts3)
            _         (vld/validate-embedding-options opts3)
+           _         (vld/validate-idoc-options opts3)
            _         (when (= "1" (System/getenv "DTLV_DEBUG_STORAGE_OPEN"))
                        (prn :storage-open
                             {:dir dir
@@ -3200,7 +3238,7 @@
                                              embedding-opts
                                              embedding-domains
                                              embedding-providers)
-           i-domains (init-idoc-domains schema)]
+           i-domains (init-idoc-domains schema opts3)]
        (let [opts4       (cond-> opts3
                            (seq e-domains)
                            (assoc :embedding-opts (merge default-embedding-opts
