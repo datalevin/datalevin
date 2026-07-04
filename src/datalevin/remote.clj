@@ -305,6 +305,10 @@
   (let [tx (.get read-floor-tx)]
     (when (pos? tx) tx)))
 
+(defn- background-sampling?
+  [open-db-info]
+  (not (false? (get-in @open-db-info [:opts :background-sampling?]))))
+
 (defn- datalog-request
   [^AtomicLong read-floor-tx client call args writing?]
   (binding [cl/*ha-read-min-tx* (when-not writing?
@@ -449,7 +453,8 @@
                      [db-name e] writing?))
 
   (start-sampling [_]
-    (when (.compareAndSet sampling-started? false true)
+    (when (and (background-sampling? open-db-info)
+               (.compareAndSet sampling-started? false true))
       (try
         (datalog-request read-floor-tx client :start-sampling
                          [db-name] writing?)
