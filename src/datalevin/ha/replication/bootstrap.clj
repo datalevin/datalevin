@@ -23,6 +23,7 @@
    [taoensso.timbre :as log])
   (:import
    [datalevin.interface IStore]
+   [java.nio.channels ClosedByInterruptException]
    [java.util UUID]))
 
 (def ^:private long-max2 hu/long-max2)
@@ -41,6 +42,13 @@
   snap/recover-ha-local-snapshot-install!)
 (def ^:private close-ha-local-store! snap/close-ha-local-store!)
 (def ^:private open-ha-store-dbis! snap/open-ha-store-dbis!)
+
+(defn- interrupted-error?
+  [e]
+  (boolean
+   (some #(or (instance? InterruptedException %)
+              (instance? ClosedByInterruptException %))
+         (take-while some? (iterate ex-cause e)))))
 
 (defn normalize-ha-bootstrap-retry-state
   [candidate-m fallback-m reopen-info]
@@ -406,42 +414,68 @@
               (catch Exception e
                 (let [log-context {:db-name (some-> store i/db-name)
                                    :env-dir env-dir}]
-                  (try
-                    (recover-ha-local-snapshot-install! env-dir)
-                    (log/warn e
-                              "HA follower snapshot install failed; restored local store"
-                              log-context)
-                    (let [restored-store (open-ha-store-dbis!
-                                          (st/open env-dir nil open-opts))
-                          restored-db (db/new-db restored-store)]
+                  (if (interrupted-error? e)
+                    (do
+                      (.interrupt (Thread/currentThread))
+                      (log/debug
+                        "HA follower snapshot install interrupted; local store will recover on reopen"
+                        (assoc log-context
+                               :install-message (ex-message e)
+                               :install-data (ex-data e)))
                       {:ok? false
                        :state (-> m
-                                  store/clear-ha-local-store-transient-state
-                                  (assoc :store restored-store
-                                         :dt-db restored-db))
-                       :error {:error :ha/follower-snapshot-install-failed
-                               :message (ex-message e)
-                               :data (ex-data e)}})
-                    (catch Exception restore-e
-                      (log/error restore-e
-                                 "HA follower snapshot install restore failed"
-                                 (merge log-context
-                                        {:install-message (ex-message e)
-                                         :install-data (ex-data e)}))
-                      {:ok? false
-                       :state (-> m
-                                  ;; Preserve the closed store handle so the next
-                                  ;; renew step can recover and reopen from its
-                                  ;; original env dir instead of getting stuck with
-                                  ;; no local store at all.
                                   store/clear-ha-local-store-transient-state
                                   (assoc :store store
                                          :dt-db nil))
-                       :error {:error :ha/follower-snapshot-install-restore-failed
+                       :error {:error :ha/follower-snapshot-install-interrupted
                                :message (ex-message e)
-                               :data (merge (or (ex-data e) {})
-                                            {:restore-message (ex-message restore-e)
-                                             :restore-data (ex-data restore-e)})}})))))))))))
+                               :data (ex-data e)}})
+                    (try
+                      (recover-ha-local-snapshot-install! env-dir)
+                      (log/warn e
+                                "HA follower snapshot install failed; restored local store"
+                                log-context)
+                      (let [restored-store (open-ha-store-dbis!
+                                            (st/open env-dir nil open-opts))
+                            restored-db (db/new-db restored-store)]
+                        {:ok? false
+                         :state (-> m
+                                    store/clear-ha-local-store-transient-state
+                                    (assoc :store restored-store
+                                           :dt-db restored-db))
+                         :error {:error :ha/follower-snapshot-install-failed
+                                 :message (ex-message e)
+                                 :data (ex-data e)}})
+                      (catch Exception restore-e
+                        (when (interrupted-error? restore-e)
+                          (.interrupt (Thread/currentThread)))
+                        (if (interrupted-error? restore-e)
+                          (log/debug
+                            "HA follower snapshot install restore interrupted; local store will recover on reopen"
+                            (merge log-context
+                                   {:install-message (ex-message e)
+                                    :install-data (ex-data e)
+                                    :restore-message (ex-message restore-e)
+                                    :restore-data (ex-data restore-e)}))
+                          (log/error restore-e
+                                     "HA follower snapshot install restore failed"
+                                     (merge log-context
+                                            {:install-message (ex-message e)
+                                             :install-data (ex-data e)})))
+                        {:ok? false
+                         :state (-> m
+                                    ;; Preserve the closed store handle so the next
+                                    ;; renew step can recover and reopen from its
+                                    ;; original env dir instead of getting stuck with
+                                    ;; no local store at all.
+                                    store/clear-ha-local-store-transient-state
+                                    (assoc :store store
+                                           :dt-db nil))
+                         :error {:error :ha/follower-snapshot-install-restore-failed
+                                 :message (ex-message e)
+                                 :data (merge (or (ex-data e) {})
+                                              {:restore-message (ex-message restore-e)
+                                               :restore-data (ex-data restore-e)})}}))))))))))))
 
 (defn bootstrap-ha-follower-from-snapshot*
   [{:keys [normalize-ha-bootstrap-retry-state
@@ -549,10 +583,17 @@
                           ;; is already queryable.
                           (long local-payload-lsn)
                           install-target-lsn
-                          (cap-lsn-to-authority
-                           lease
-                           (long (max materialized-floor-lsn
-                                      manifest-txlog-lsn)))
+                          ;; The authority lease can lag a leader's copied
+                          ;; snapshot metadata. Never clamp the installed floor
+                          ;; below rows already materialized in the copied
+                          ;; payload, or bootstrap will try to replay records
+                          ;; that are already queryable in the snapshot.
+                          (long-max2
+                           materialized-floor-lsn
+                           (cap-lsn-to-authority
+                            lease
+                            (long-max2 materialized-floor-lsn
+                                       manifest-txlog-lsn)))
                           {:keys [state installed-lsn replayed-last-term]
                            :as replay}
                           (reconcile-installed-snapshot-state

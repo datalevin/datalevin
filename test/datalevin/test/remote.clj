@@ -41,6 +41,13 @@
                       :opts {:background-sampling? false}})]
       (i/start-sampling disabled)
       (is (empty? @calls)))
+    (let [ha-store (remote-store
+                     "ha"
+                     client
+                     {:max-tx 0
+                      :opts {:ha-mode :consensus-lease}})]
+      (i/start-sampling ha-store)
+      (is (empty? @calls)))
     (let [enabled (remote-store
                     "enabled"
                     client

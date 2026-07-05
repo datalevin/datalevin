@@ -2,13 +2,14 @@
   (:require
    [clojure.edn :as edn]
    [clojure.java.io :as io]
-   [clojure.test :refer [deftest is testing]]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.integration-harness :as harness]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.local.remote :as lremote]
    [datalevin.jepsen.remote :as remote]
    [datalevin.jepsen.remote-node :as remote-node]
+   [datalevin.jepsen.test-support :as test-support]
    [datalevin.jepsen.workload.witness-topology :as witness-topology]
    [jepsen.control :as control]
    [jepsen.db :as jdb]
@@ -17,6 +18,8 @@
    [java.io StringWriter]
    [java.net ServerSocket]
    [java.util UUID]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (defn- node
   [logical-node node-id]

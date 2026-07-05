@@ -1,6 +1,6 @@
 (ns datalevin.jepsen.workload-util-test
   (:require
-   [clojure.test :refer [deftest is testing]]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.conn :as conn]
    [datalevin.core :as d]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
@@ -9,12 +9,15 @@
    [datalevin.jepsen.workload.membership-drift :as membership-drift]
    [datalevin.jepsen.workload.rejoin-bootstrap :as rejoin-bootstrap]
    [datalevin.jepsen.workload.register :as register]
+   [datalevin.jepsen.test-support :as test-support]
    [datalevin.jepsen.workload.tx-fn-register :as tx-fn-register]
    [datalevin.jepsen.workload.util :as workload.util]
    [datalevin.jepsen.local :as local]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
    [jepsen.history :as history]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (deftest assoc-exception-op-classifies-indeterminate-errors-test
   (testing "transport and timeout failures are reported as info"

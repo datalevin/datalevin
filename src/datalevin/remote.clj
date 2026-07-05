@@ -307,7 +307,9 @@
 
 (defn- background-sampling?
   [open-db-info]
-  (not (false? (get-in @open-db-info [:opts :background-sampling?]))))
+  (let [opts (:opts @open-db-info)]
+    (and (not= :consensus-lease (:ha-mode opts))
+         (not (false? (:background-sampling? opts))))))
 
 (defn- datalog-request
   [^AtomicLong read-floor-tx client call args writing?]

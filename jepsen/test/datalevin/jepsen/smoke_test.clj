@@ -1,12 +1,13 @@
 (ns datalevin.jepsen.smoke-test
   (:require
    [clojure.string :as str]
-   [clojure.test :refer [deftest is testing]]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.core :as d]
    [datalevin.jepsen.core :as core]
    [datalevin.jepsen.integration-harness :as harness]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.nemesis :as nemesis]
+   [datalevin.jepsen.test-support :as test-support]
    [datalevin.jepsen.workload.append :as append]
    [datalevin.jepsen.workload.append-cas :as append-cas]
    [datalevin.jepsen.workload.bank :as bank]
@@ -34,6 +35,8 @@
    [datalevin.util :as u])
   (:import
    [java.util UUID]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (defn- assert-workload-shape!
   [workload {:keys [schema final-generator? nodes control-nodes

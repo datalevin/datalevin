@@ -177,6 +177,12 @@
    :message (ex-message e)
    :data (ex-data e)})
 
+(defn- authority-read-interrupted?
+  [e]
+  (boolean
+   (some #(instance? InterruptedException %)
+         (take-while some? (iterate ex-cause e)))))
+
 (defn apply-authority-read-failure
   [m error]
   (assoc m
@@ -294,7 +300,13 @@
        (catch Exception e
          (let [error (authority-read-error e)
                failed-m (apply-authority-read-failure m error)]
-           (log/warn e "HA read-lease failed"
-                     {:db-name db-name
-                      :ha-role (:ha-role m)})
+           (if (authority-read-interrupted? e)
+             (do
+               (.interrupt (Thread/currentThread))
+               (log/debug "HA read-lease interrupted"
+                          {:db-name db-name
+                           :ha-role (:ha-role m)}))
+             (log/warn e "HA read-lease failed"
+                       {:db-name db-name
+                        :ha-role (:ha-role m)}))
            failed-m))))))

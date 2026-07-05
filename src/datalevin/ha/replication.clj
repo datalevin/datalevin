@@ -2037,11 +2037,17 @@
             (try
               (unpin-ha-remote-store-backup-floor! remote-store pin-id)
               (catch Exception e
-                (log/debug e
-                           "Best-effort HA snapshot-copy backup pin cleanup failed"
-                           {:db-name db-name
+                (let [data {:db-name db-name
                             :source-endpoint endpoint
-                            :pin-id pin-id}))))
+                            :pin-id pin-id}]
+                  (if (ha-replica-floor-transport-failure? e)
+                    (log/debug
+                      "Best-effort HA snapshot-copy backup pin cleanup skipped because the source endpoint is unavailable"
+                      (assoc data :message (ex-message e)))
+                    (log/debug
+                      e
+                      "Best-effort HA snapshot-copy backup pin cleanup failed"
+                      data))))))
           {:copy-meta copy-meta})
         (finally
           (close-ha-snapshot-remote-store! remote-store))))

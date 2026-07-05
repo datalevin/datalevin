@@ -162,10 +162,13 @@
                              (record-op! op))
             pre-fault-lsn  (local/node-progress-lsn cluster-id
                                                    leader-before)
+            pre-fault-quorum (inc (quot (count (:nodes test-map)) 2))
             _              (when (pos? (long (or pre-fault-lsn 0)))
-                             (local/wait-for-live-nodes-at-least-lsn!
+                             (local/wait-for-at-least-nodes-at-least-lsn!
                               cluster-id
+                              (:nodes test-map)
                               pre-fault-lsn
+                              pre-fault-quorum
                               local-history-convergence-timeout-ms))
             failover-op    (jn/invoke! nemesis
                                        test-map

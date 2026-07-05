@@ -1,7 +1,10 @@
 (ns datalevin.jepsen.init-cache-test
   (:require
-   [clojure.test :refer [deftest is]]
-   [datalevin.jepsen.init-cache :as init-cache]))
+   [clojure.test :refer [deftest is use-fixtures]]
+   [datalevin.jepsen.init-cache :as init-cache]
+   [datalevin.jepsen.test-support :as test-support]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (deftest release-cluster-removes-cluster-id-from-all-registered-caches-test
   (let [cluster-id "cluster-a"

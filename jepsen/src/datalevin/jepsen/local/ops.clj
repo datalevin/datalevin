@@ -65,12 +65,29 @@
     (catch Throwable _
       false)))
 
+(defn- dbi-not-open?
+  [dbi-name e]
+  (str/includes? (or (ex-message e) "")
+                 (str "DBI " dbi-name " is not open")))
+
+(defn- ensure-kv-info-dbi-open!
+  [lmdb]
+  (when (store-open? lmdb)
+    (try
+      (i/get-dbi lmdb c/kv-info false)
+      (catch Throwable e
+        (if (dbi-not-open? c/kv-info e)
+          (i/open-dbi lmdb c/kv-info)
+          (throw e)))))
+  lmdb)
+
 (defn- state-lmdb
   [state]
   (let [store (:store state)]
-    (if (instance? Store store)
-      (.-lmdb ^Store store)
-      store)))
+    (ensure-kv-info-dbi-open!
+     (if (instance? Store store)
+       (.-lmdb ^Store store)
+       store))))
 
 (defn- local-watermarks
   [server db-name]
@@ -857,7 +874,7 @@
         (fn []
           (let [lmdb (some-> (db-state server db-name) state-lmdb)]
             (if (store-open? lmdb)
-              (f lmdb)
+              (f (ensure-kv-info-dbi-open! lmdb))
               (u/raise "Cannot access KV store on unavailable Jepsen node"
                        {:cluster-id cluster-id
                         :logical-node logical-node

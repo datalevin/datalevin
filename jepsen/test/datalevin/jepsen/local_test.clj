@@ -2,12 +2,13 @@
   (:require
    [clojure.edn :as edn]
    [clojure.java.io :as io]
-   [clojure.test :refer [deftest is]]
+   [clojure.test :refer [deftest is use-fixtures]]
    [datalevin.core :as d]
    [datalevin.interface :as i]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.local.cluster :as lcluster]
    [datalevin.jepsen.local.ops :as lops]
+   [datalevin.jepsen.test-support :as test-support]
    [datalevin.kv :as kv]
    [datalevin.remote :as r]
    [datalevin.server :as srv]
@@ -19,6 +20,8 @@
    [java.util UUID]
    [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (defn- current-java-bin
   []

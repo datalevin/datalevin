@@ -1,9 +1,12 @@
 (ns datalevin.jepsen.nemesis-test
   (:require
-   [clojure.test :refer [deftest is testing]]
+   [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.nemesis :as nemesis]
+   [datalevin.jepsen.test-support :as test-support]
    [jepsen.nemesis :as jn]))
+
+(use-fixtures :once test-support/quiet-logs-fixture)
 
 (deftest restore-quorum-nodes-retries-pending-nodes-test
   (testing "restore-quorum retries nodes that fail a prior restart round"
