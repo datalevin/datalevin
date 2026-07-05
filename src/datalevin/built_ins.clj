@@ -1146,6 +1146,7 @@
    'variance       aggregate-variance
    'stddev         aggregate-stddev
    'distinct       set
+   'vec            clojure.core/vec
    'min            aggregate-min
    'max            aggregate-max
    'rand           aggregate-rand

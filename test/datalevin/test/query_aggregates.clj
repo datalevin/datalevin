@@ -88,6 +88,22 @@
                           [10 15 20 35 75]))
              23.53720459187964)))
 
+    (testing "vec aggregate"
+      (let [heads (ffirst (d/q '[:find (vec ?heads)
+                                 :with ?monster
+                                 :in [[?monster ?heads]]]
+                               monsters))]
+        (is (vector? heads))
+        (is (= {3 1, 1 3} (frequencies heads))))
+      (let [groups (into {}
+                         (d/q '[:find ?color (vec ?x)
+                                :in [[?color ?x]]]
+                              [[:red 1] [:red 2] [:blue 7]
+                               [:red 3] [:blue 8]]))]
+        (is (every? vector? (vals groups)))
+        (is (= {1 1, 2 1, 3 1} (frequencies (groups :red))))
+        (is (= {7 1, 8 1} (frequencies (groups :blue))))))
+
     (testing "Custom aggregates"
       (let [data   [[:red 1]  [:red 2] [:red 3] [:red 4] [:red 5]
                     [:blue 7] [:blue 8]]

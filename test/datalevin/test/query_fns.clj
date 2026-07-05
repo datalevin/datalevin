@@ -200,6 +200,13 @@
                       [(?f ?raw) ?email]]
                     @conn
                     safe-fn)))
+        (let [emails (d/q '[:find (vec ?raw) .
+                            :in $
+                            :where
+                            [?e :email ?raw]]
+                          @conn)]
+          (is (vector? emails))
+          (is (= ["A@B.COM"] emails)))
         (is (thrown-with-msg?
               ExceptionInfo #"Server query cannot call unregistered function"
               (d/q '[:find ?email .
