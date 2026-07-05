@@ -2009,6 +2009,28 @@
             (.unlock read-lock))))
       (f))))
 
+(defn with-db-runtime-store-read-access-timeout
+  "Run `f` while holding the runtime-store read lock for `db-name`, returning
+  `timeout-value` if the lock cannot be acquired within `timeout-ms`.
+
+  This is intended for best-effort diagnostics and probes that must respect an
+  outer deadline instead of parking behind a queued runtime store swap."
+  [^Server server db-name timeout-ms timeout-value f]
+  (let [dbs (.-dbs server)]
+    (if (and db-name (.containsKey ^ConcurrentHashMap dbs db-name))
+      (let [^ReentrantReadWriteLock lock (get-runtime-access-lock server db-name)
+            read-lock                    (.readLock lock)
+            acquired?                    (.tryLock read-lock
+                                                   (long timeout-ms)
+                                                   TimeUnit/MILLISECONDS)]
+        (if acquired?
+          (try
+            (f)
+            (finally
+              (.unlock read-lock)))
+          timeout-value))
+      (f))))
+
 (defn- message-runtime-db-name
   [{:keys [args db-name]}]
   (when-let [db-name (or db-name (nth args 0 nil))]

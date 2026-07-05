@@ -12,7 +12,8 @@
    [clojure.lang ExceptionInfo]
    [datalevin.server Server]
    [java.util UUID]
-   [java.util.concurrent ThreadPoolExecutor]))
+   [java.util.concurrent ConcurrentHashMap ThreadPoolExecutor]
+   [java.util.concurrent.locks ReentrantReadWriteLock]))
 
 (deftest server-worker-executor-is-bounded-test
   (let [port   (tc/allocate-port)
@@ -30,6 +31,44 @@
         (is (= 3 (.getMaximumPoolSize executor)))
         (is (= 5 (.remainingCapacity (.getQueue executor)))))
       (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
+
+(deftest runtime-store-read-access-timeout-test
+  (let [port   (tc/allocate-port)
+        dir    (u/tmp-dir (str "runtime-store-read-timeout-test-"
+                               (UUID/randomUUID)))
+        db-name (str "runtime-store-read-timeout-"
+                     (UUID/randomUUID))
+        ^Server server (binding [c/*db-background-sampling?* false]
+                         (srv/create {:port port
+                                      :root dir}))
+        ^ReentrantReadWriteLock lock (ReentrantReadWriteLock. true)
+        write-lock (.writeLock lock)
+        called? (atom false)]
+    (try
+      (.put ^ConcurrentHashMap (.-dbs server)
+            db-name
+            {:runtime-access-lock lock})
+      (.lock write-lock)
+      (let [result
+            (future
+              (srv/with-db-runtime-store-read-access-timeout
+               server
+               db-name
+               25
+               ::timeout
+               (fn []
+                 (reset! called? true)
+                 ::ran)))]
+        (try
+          (is (= ::timeout (deref result 1000 ::hung)))
+          (is (false? @called?))
+          (finally
+            (future-cancel result))))
+      (finally
+        (when (.isWriteLockedByCurrentThread lock)
+          (.unlock write-lock))
         (srv/stop server)
         (u/delete-files dir)))))
 

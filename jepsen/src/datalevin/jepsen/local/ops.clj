@@ -20,8 +20,11 @@
 (def ^:private cluster-timeout-ms 10000)
 (def ^:private conn-client-opts {:pool-size 1 :time-out cluster-timeout-ms})
 (def ^:private leader-connect-retry-sleep-ms 250)
+(def ^:private local-store-read-lock-timeout-ms 100)
 (def ^:private unavailable-sentinel
   :datalevin.jepsen.local/unavailable)
+(def ^:private read-lock-unavailable
+  :datalevin.jepsen.local/read-lock-unavailable)
 
 (defn- now-ms
   []
@@ -50,9 +53,14 @@
     (get (.-dbs ^Server server) db-name)))
 
 (defn- with-live-store-read-access
-  [server db-name f]
+  [server db-name timeout-value f]
   (if server
-    (srv/with-db-runtime-store-read-access server db-name f)
+    (srv/with-db-runtime-store-read-access-timeout
+     server
+     db-name
+     local-store-read-lock-timeout-ms
+     timeout-value
+     f)
     (f)))
 
 (defn- store-open?
@@ -161,6 +169,7 @@
       (with-live-store-read-access
         server
         db-name
+        0
         (fn []
           (if-let [state (db-state server db-name)]
             (let [txlog-lsn     (long (or (:last-applied-lsn
@@ -192,6 +201,7 @@
       (with-live-store-read-access
         server
         db-name
+        0
         (fn []
           (if-let [state (db-state server db-name)]
             (let [txlog-lsn     (long (or (:last-applied-lsn
@@ -614,6 +624,7 @@
       (with-live-store-read-access
         server
         db-name
+        unavailable-sentinel
         (fn []
           (if (nil? server)
             unavailable-sentinel
@@ -823,6 +834,7 @@
       (with-live-store-read-access
         server
         db-name
+        nil
         (fn []
           (when-let [state (db-state server db-name)]
             (let [store (:store state)
@@ -868,17 +880,26 @@
           (i/close-kv kv-store))))
     (let [{:keys [db-name servers]} (get @clusters cluster-id)
           server                    (get servers logical-node)]
-      (with-live-store-read-access
-        server
-        db-name
-        (fn []
-          (let [lmdb (some-> (db-state server db-name) state-lmdb)]
-            (if (store-open? lmdb)
-              (f (ensure-kv-info-dbi-open! lmdb))
-              (u/raise "Cannot access KV store on unavailable Jepsen node"
-                       {:cluster-id cluster-id
-                        :logical-node logical-node
-                        :db-name db-name}))))))))
+      (let [result
+            (with-live-store-read-access
+              server
+              db-name
+              read-lock-unavailable
+              (fn []
+                (let [lmdb (some-> (db-state server db-name) state-lmdb)]
+                  (if (store-open? lmdb)
+                    (f (ensure-kv-info-dbi-open! lmdb))
+                    (u/raise "Cannot access KV store on unavailable Jepsen node"
+                             {:cluster-id cluster-id
+                              :logical-node logical-node
+                              :db-name db-name})))))]
+        (if (= read-lock-unavailable result)
+          (u/raise "Timed out waiting for Jepsen node KV store read access"
+                   {:cluster-id cluster-id
+                    :logical-node logical-node
+                    :db-name db-name
+                    :timeout-ms local-store-read-lock-timeout-ms})
+          result)))))
 
 (defn assoc-opt-on-node!
   [deps cluster-id logical-node k v]
