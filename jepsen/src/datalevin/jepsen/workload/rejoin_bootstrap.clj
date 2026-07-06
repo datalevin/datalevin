@@ -170,6 +170,49 @@
          :ready? (and (= (long key-count) (count values))
                       (every? integer? values))}))))
 
+(defn- open-register-stores-on-live-nodes!
+  [test timeout-ms]
+  (let [cluster-id (:datalevin/cluster-id test)
+        deadline   (+ (System/currentTimeMillis) (long timeout-ms))]
+    (loop [last-errors nil]
+      (let [live-nodes (-> (local/cluster-state cluster-id) :live-nodes sort)
+            results    (into {}
+                             (map (fn [logical-node]
+                                    [logical-node
+                                     (try
+                                       (local/with-node-conn
+                                         test
+                                         logical-node
+                                         schema
+                                         (fn [conn]
+                                           (d/q register-rows-query @conn)
+                                           :open))
+                                       (catch Throwable e
+                                         e))]))
+                             live-nodes)
+            failures   (into {}
+                             (keep (fn [[logical-node result]]
+                                     (when (instance? Throwable result)
+                                       [logical-node
+                                        {:message (ex-message result)
+                                         :class   (-> result class str)}])))
+                             results)]
+        (cond
+          (empty? failures)
+          :open
+
+          (< (System/currentTimeMillis) deadline)
+          (do
+            (Thread/sleep 250)
+            (recur failures))
+
+          :else
+          (throw (ex-info "Timed out opening register stores on live nodes"
+                          {:cluster-id cluster-id
+                           :timeout-ms timeout-ms
+                           :failures failures
+                           :previous-failures last-errors})))))))
+
 (defn- register-state-reader
   [cluster-id restarted-set logical-node]
   (if (and (true? (:remote? (local/cluster-state cluster-id)))
@@ -223,16 +266,22 @@
 
 (defn- ensure-registers-initialized!
   [test key-count]
-  (let [cluster-id (:datalevin/cluster-id test)]
+  (let [cluster-id  (:datalevin/cluster-id test)
+        timeout-ms  (local/workload-setup-timeout-ms
+                     cluster-id
+                     default-setup-timeout-ms)]
     (when-not (contains? @initialized-clusters cluster-id)
       (locking initialized-clusters
         (when-not (contains? @initialized-clusters cluster-id)
+          ;; Followers must have opened the Datalog store before the initial
+          ;; register tx; HA txlog catch-up alone does not prove the logical DB
+          ;; view has replayed that tx.
+          (open-register-stores-on-live-nodes! test timeout-ms)
           (workload.util/with-retrying-leader-conn
             :setup
             test
             schema
-            (local/workload-setup-timeout-ms cluster-id
-                                             default-setup-timeout-ms)
+            timeout-ms
             (fn [conn]
               (ensure-registers! conn key-count)))
           (wait-for-registers-visible-on-live-nodes! test key-count)
