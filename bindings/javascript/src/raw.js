@@ -130,6 +130,12 @@ class RawInterop {
     return callJavaMethod(resourceHandle(handle), "datalogKV");
   }
 
+  async connectionTransact(handle, txData, txMeta = null) {
+    return toJsResult(
+      await _BINDINGS.connectionTransact(resourceHandle(handle), txData, txMeta)
+    );
+  }
+
   async connectionTransactAsync(handle, txData, txMeta = null) {
     const future = await _BINDINGS.connectionTransactAsync(resourceHandle(handle), txData, txMeta);
     return toJsResult(await callJavaMethod(future, "get"), { bridge: true });

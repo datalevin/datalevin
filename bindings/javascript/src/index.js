@@ -43,6 +43,7 @@ export {
   setExplicitTransactionTimeout,
   startJvm,
   symbol,
+  transact,
   transactAsync,
   txDataToSimulatedReport,
   txAdd,

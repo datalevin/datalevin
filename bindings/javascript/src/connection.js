@@ -254,11 +254,9 @@ export class Connection extends ResourceWrapper {
   }
 
   async transact(txData, txMeta = null) {
-    const args = [this.rawHandle(), await _BINDINGS.txData(txData)];
-    if (txMeta !== null && txMeta !== undefined) {
-      args.push(await toJava(txMeta));
-    }
-    return toJsResult(await _BINDINGS.coreInvoke("transact!", args));
+    return toJsResult(
+      await _BINDINGS.connectionTransact(this.rawHandle(), txData, txMeta)
+    );
   }
 
   async transactAsync(txData, txMeta = null) {

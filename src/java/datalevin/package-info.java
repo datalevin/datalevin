@@ -38,8 +38,9 @@
  * }
  * }</pre>
  *
- * <p>For async ingestion workloads, use
- * {@link datalevin.Connection#transactAsync}, which returns a
+ * <p>{@link datalevin.Connection#transact} uses Datalevin's async transaction
+ * batching path and waits for commit. For non-blocking ingestion workloads,
+ * use {@link datalevin.Connection#transactAsync}, which returns a
  * {@link java.util.concurrent.CompletableFuture} containing the transaction
  * report.
  *

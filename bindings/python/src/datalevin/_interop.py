@@ -114,6 +114,14 @@ class InteropBindings:
     def connection_datalog_kv(self, handle):
         return call_java(classes().interop.connectionDatalogKv, handle)
 
+    def connection_transact(self, handle, tx_data, tx_meta=None):
+        return call_java(
+            classes().interop.connectionTransact,
+            handle,
+            to_java(tx_data),
+            to_java(tx_meta),
+        )
+
     def connection_transact_async(self, handle, tx_data, tx_meta=None):
         return call_java(
             classes().interop.connectionTransactAsync,
@@ -1085,6 +1093,12 @@ def tx_retract_entity(entity_id):
     return [":db/retractEntity", entity_id]
 
 
+def transact(conn: Connection, tx_data, tx_meta=None):
+    """Run an async Datalevin transaction and block until it commits."""
+
+    return conn.transact(tx_data, tx_meta)
+
+
 def transact_async(conn: Connection, tx_data, tx_meta=None):
     """Start an async transaction and return a concurrent.futures.Future."""
 
@@ -1245,6 +1259,7 @@ __all__ = [
     "search_options",
     "start_jvm",
     "symbol",
+    "transact",
     "transact_async",
     "tx_add",
     "tx_data_to_simulated_report",

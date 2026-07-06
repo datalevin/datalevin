@@ -162,13 +162,17 @@
                              (record-op! op))
             pre-fault-lsn  (local/node-progress-lsn cluster-id
                                                    leader-before)
-            pre-fault-quorum (inc (quot (count (:nodes test-map)) 2))
-            _              (when (pos? (long (or pre-fault-lsn 0)))
-                             (local/wait-for-at-least-nodes-at-least-lsn!
+            pre-fault-survivors (vec (remove #{leader-before}
+                                             (:nodes test-map)))
+            ;; The synthetic history records pre-ops as completed before the
+            ;; failover. A quorum that includes the old leader is not enough:
+            ;; after killing that leader, any survivor may be promoted.
+            _              (when (and (pos? (long (or pre-fault-lsn 0)))
+                                      (seq pre-fault-survivors))
+                             (local/wait-for-nodes-at-least-lsn!
                               cluster-id
-                              (:nodes test-map)
+                              pre-fault-survivors
                               pre-fault-lsn
-                              pre-fault-quorum
                               local-history-convergence-timeout-ms))
             failover-op    (jn/invoke! nemesis
                                        test-map

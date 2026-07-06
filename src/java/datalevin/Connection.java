@@ -554,47 +554,35 @@ public final class Connection extends HandleResource {
     }
 
     /**
-     * Transacts raw transaction data and returns the transaction report.
+     * Transacts raw transaction data through Datalevin's async batching path
+     * and returns the transaction report after the transaction commits.
      */
     public Map<?, ?> transact(Object txData) {
-        return (Map<?, ?>) ClojureRuntime.core("transact!",
-                                               resource(),
-                                               DatalevinForms.txDataInput(txData));
+        return blockingAsyncTransact(DatalevinForms.txDataInput(txData), null);
     }
 
     /**
-     * Transacts typed transaction data and returns the transaction report.
+     * Transacts typed transaction data through Datalevin's async batching path
+     * and returns the transaction report after the transaction commits.
      */
     public Map<?, ?> transact(TxData txData) {
-        return (Map<?, ?>) ClojureRuntime.core("transact!",
-                                               resource(),
-                                               txData == null ? null : txData.buildForm());
+        return blockingAsyncTransact(txData == null ? null : txData.buildForm(), null);
     }
 
     /**
-     * Transacts raw transaction data with optional transaction metadata.
+     * Transacts raw transaction data with optional transaction metadata through
+     * Datalevin's async batching path.
      */
     public Map<?, ?> transact(Object txData, Map<?, ?> txMeta) {
-        if (txMeta == null) {
-            return transact(txData);
-        }
-        return (Map<?, ?>) ClojureRuntime.core("transact!",
-                                              resource(),
-                                              DatalevinForms.txDataInput(txData),
-                                              ClojureCodec.runtimeInput(txMeta));
+        return blockingAsyncTransact(DatalevinForms.txDataInput(txData), txMeta);
     }
 
     /**
-     * Transacts typed transaction data with optional transaction metadata.
+     * Transacts typed transaction data with optional transaction metadata
+     * through Datalevin's async batching path.
      */
     public Map<?, ?> transact(TxData txData, Map<?, ?> txMeta) {
-        if (txMeta == null) {
-            return transact(txData);
-        }
-        return (Map<?, ?>) ClojureRuntime.core("transact!",
-                                              resource(),
-                                              txData == null ? null : txData.buildForm(),
-                                              ClojureCodec.runtimeInput(txMeta));
+        return blockingAsyncTransact(txData == null ? null : txData.buildForm(), txMeta);
     }
 
     /**
@@ -1070,6 +1058,16 @@ public final class Connection extends HandleResource {
             }
         });
         return result;
+    }
+
+    private Map<?, ?> blockingAsyncTransact(Object txData, Map<?, ?> txMeta) {
+        Object future = txMeta == null
+                ? ClojureRuntime.core("transact", resource(), txData)
+                : ClojureRuntime.core("transact",
+                                      resource(),
+                                      txData,
+                                      ClojureCodec.runtimeInput(txMeta));
+        return (Map<?, ?>) ClojureRuntime.deref(future);
     }
 
     private static void requireShape(DatalogQuery query,

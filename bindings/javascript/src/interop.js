@@ -279,6 +279,17 @@ class InteropBindings {
     );
   }
 
+  async connectionTransact(handle, txData, txMeta = null) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionTransact",
+      await unwrapInteropHandle(handle),
+      await toJava(txData),
+      hasValue(txMeta) ? await toJava(txMeta) : null
+    );
+  }
+
   async connectionTxDataToSimulatedReport(handle, txData) {
     const cls = await classes();
     return callJavaMethod(
@@ -1342,6 +1353,10 @@ export async function initDb(datoms, { dir = null, schema = null, opts = null } 
 export async function fillDb(conn, datoms) {
   await _BINDINGS.fillDb(conn, datoms);
   return conn;
+}
+
+export async function transact(conn, txData, txMeta = null) {
+  return conn.transact(txData, txMeta);
 }
 
 export async function transactAsync(conn, txData, txMeta = null) {

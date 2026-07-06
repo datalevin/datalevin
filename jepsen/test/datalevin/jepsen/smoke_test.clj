@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.smoke-test
   (:require
+   [clojure.java.io :as io]
    [clojure.string :as str]
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.core :as d]
@@ -34,7 +35,8 @@
    [jepsen.tests.cycle.append :as cycle.append]
    [datalevin.util :as u])
   (:import
-   [java.util UUID]))
+   [java.util UUID]
+   [java.util.concurrent TimeUnit]))
 
 (use-fixtures :once test-support/quiet-logs-fixture)
 
@@ -631,14 +633,152 @@
 (deftest datalevin-test-remote-rejects-unsupported-nemesis-smoke-test
   (assert-remote-accepts-leader-disk-full-nemesis))
 
-(deftest append-local-history-failover-checker-smoke-test
+(def ^:private isolated-smoke-child-property
+  "datalevin.jepsen.smoke.child")
+
+(def ^:private isolated-smoke-inline-property
+  "datalevin.jepsen.smoke.inline")
+
+(def ^:private isolated-smoke-timeout-property
+  "datalevin.jepsen.smoke.fork.timeout.ms")
+
+(def ^:private default-isolated-smoke-timeout-ms 600000)
+
+(def ^:private isolated-smoke-child-jvm-opts
+  ["-Djava.awt.headless=true"
+   "-Dclojure.compiler.direct-linking=true"
+   "--enable-native-access=ALL-UNNAMED"
+   "--add-opens=java.base/java.lang=ALL-UNNAMED"
+   "--add-opens=java.base/java.util=ALL-UNNAMED"
+   "--add-opens=java.base/java.nio=ALL-UNNAMED"
+   "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"])
+
+(defn- current-java-bin
+  []
+  (.getPath (io/file (System/getProperty "java.home") "bin" "java")))
+
+(defn- isolated-smoke-child?
+  []
+  (Boolean/getBoolean isolated-smoke-child-property))
+
+(defn- isolated-smoke-inline?
+  []
+  (Boolean/getBoolean isolated-smoke-inline-property))
+
+(defn- isolated-smoke-timeout-ms
+  []
+  (if-let [value (System/getProperty isolated-smoke-timeout-property)]
+    (try
+      (Long/parseLong value)
+      (catch NumberFormatException e
+        (throw (ex-info "Invalid isolated smoke test timeout"
+                        {:property isolated-smoke-timeout-property
+                         :value value}
+                        e))))
+    default-isolated-smoke-timeout-ms))
+
+(defn- isolated-smoke-child-form
+  [test-name]
+  (let [test-sym (symbol "datalevin.jepsen.smoke-test"
+                         (name test-name))]
+    (pr-str
+     `(do
+        (System/setProperty ~isolated-smoke-child-property "true")
+        (require 'clojure.test)
+        (require 'datalevin.jepsen.smoke-test)
+        (let [test-var#       (or (resolve '~test-sym)
+                                  (throw
+                                   (ex-info
+                                    "Unable to resolve isolated smoke test"
+                                    {:test '~test-sym})))
+              failures#       (atom 0)
+              default-report# clojure.test/report]
+          (binding [clojure.test/report
+                    (fn [m#]
+                      (when (#{:fail :error} (:type m#))
+                        (swap! failures# inc))
+                      (default-report# m#))]
+            (clojure.test/test-vars [test-var#]))
+          (flush)
+          (shutdown-agents)
+          (System/exit (if (zero? @failures#) 0 1)))))))
+
+(defn- isolated-smoke-child-command
+  [test-name]
+  (vec
+   (concat
+    [(current-java-bin)]
+    isolated-smoke-child-jvm-opts
+    ["-cp" (System/getProperty "java.class.path")
+     "clojure.main"
+     "-e" (isolated-smoke-child-form test-name)])))
+
+(defn- process-output
+  [output-future]
+  (try
+    (deref output-future 1000 "")
+    (catch Throwable _
+      "")))
+
+(defn- run-isolated-smoke-test!
+  [test-name]
+  (let [cmd             (isolated-smoke-child-command test-name)
+        timeout-ms      (isolated-smoke-timeout-ms)
+        process-builder (ProcessBuilder. ^java.util.List (mapv str cmd))]
+    (.directory process-builder (io/file (System/getProperty "user.dir")))
+    (.redirectErrorStream process-builder true)
+    (let [process       (.start process-builder)
+          output-future (future
+                          (slurp (.getInputStream process)
+                                 :encoding "UTF-8"))
+          finished?     (.waitFor process
+                                   (long timeout-ms)
+                                   TimeUnit/MILLISECONDS)]
+      (if finished?
+        {:exit   (.exitValue process)
+         :output @output-future}
+        (do
+          (.destroy process)
+          (when-not (.waitFor process 2 TimeUnit/SECONDS)
+            (.destroyForcibly process))
+          {:timeout? true
+           :timeout-ms timeout-ms
+           :output (process-output output-future)})))))
+
+(defn- isolated-smoke-failure-message
+  [test-name {:keys [exit output timeout? timeout-ms]}]
+  (str "Isolated smoke test " test-name
+       (if timeout?
+         (str " timed out after " timeout-ms " ms")
+         (str " exited with status " exit))
+       "\n\n" output))
+
+(defn- assert-isolated-smoke-test!
+  [test-name]
+  (let [{:keys [exit timeout?] :as result}
+        (run-isolated-smoke-test! test-name)]
+    (is (and (not timeout?)
+             (zero? (long exit)))
+        (isolated-smoke-failure-message test-name result))))
+
+(defmacro defisolatedtest
+  [name & body]
+  (let [name-with-meta (with-meta name (assoc (meta name) :isolated true))]
+    `(deftest ~name-with-meta
+       (if (or (isolated-smoke-child?)
+               (isolated-smoke-inline?))
+         (do ~@body)
+         (assert-isolated-smoke-test! '~name)))))
+
+(defisolatedtest append-local-history-failover-checker-smoke-test
   (let [append-checker
         (workload.util/wrap-empty-graph-checker
          (cycle.append/checker {:max-plot-bytes 0})
          (fn [op]
            (= :txn (:f op)))
          [:f :error])
-        {:keys [checker-result failover-op stabilize-op]}
+        {:keys [checker-result failover-op history leader-before leader-after
+                stabilize-op]}
         (harness/run-local-history-failover-check!
          "append-local-history-smoke"
          :append
@@ -656,7 +796,10 @@
            :value [[:r 0 nil]
                    [:append 1 11]]}])]
     (is (true? (:valid? checker-result))
-        (pr-str checker-result))
+        (pr-str {:checker-result checker-result
+                 :history history
+                 :leader-before leader-before
+                 :leader-after leader-after}))
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
@@ -742,7 +885,7 @@
     (is (= :ignorable-empty-graph
            (:adjusted-valid? result)))))
 
-(deftest register-local-history-failover-checker-smoke-test
+(defisolatedtest register-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "register-local-history-smoke"
@@ -764,7 +907,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest identity-upsert-local-history-failover-checker-smoke-test
+(defisolatedtest identity-upsert-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "identity-upsert-local-history-smoke"
@@ -787,7 +930,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest index-consistency-local-history-failover-checker-smoke-test
+(defisolatedtest index-consistency-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "index-consistency-local-history-smoke"
@@ -807,7 +950,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest append-cas-local-history-failover-checker-smoke-test
+(defisolatedtest append-cas-local-history-failover-checker-smoke-test
   (let [append-cas-checker
         (workload.util/wrap-empty-graph-checker
          (cycle.append/checker
@@ -838,7 +981,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest internal-local-history-failover-checker-smoke-test
+(defisolatedtest internal-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "internal-local-history-smoke"
@@ -861,7 +1004,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest tx-fn-register-local-history-failover-checker-smoke-test
+(defisolatedtest tx-fn-register-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "tx-fn-register-local-history-smoke"
@@ -884,7 +1027,7 @@
     (is (string? (get-in failover-op [:value :stopped])))
     (is (string? (get-in stabilize-op [:value :leader])))))
 
-(deftest bank-local-history-failover-checker-smoke-test
+(defisolatedtest bank-local-history-failover-checker-smoke-test
   (let [{:keys [checker-result failover-op stabilize-op]}
         (harness/run-local-history-failover-check!
          "bank-local-history-smoke"
@@ -919,7 +1062,7 @@
         (pr-str result))
     (is (zero? (:read-count result)))))
 
-(deftest bank-client-transfer-smoke-test
+(defisolatedtest bank-client-transfer-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "bank-smoke"
                   :control-backend :sofa-jraft
@@ -965,7 +1108,7 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest register-client-smoke-test
+(defisolatedtest register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "register-smoke"
                   :control-backend :sofa-jraft
@@ -1019,7 +1162,7 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest giant-values-client-smoke-test
+(defisolatedtest giant-values-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "giant-values-smoke"
                   :control-backend :sofa-jraft
@@ -1077,7 +1220,7 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest tx-fn-register-client-smoke-test
+(defisolatedtest tx-fn-register-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "tx-fn-register-smoke"
                   :control-backend :sofa-jraft
@@ -1135,7 +1278,7 @@
         (doseq [node (:nodes test-map)]
           (jdb/teardown! db test-map node))))))
 
-(deftest rejoin-bootstrap-client-converges-follower-smoke-test
+(defisolatedtest rejoin-bootstrap-client-converges-follower-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         workload (rejoin-bootstrap/workload {:key-count 4
                                              :nodes ["n1" "n2" "n3"]})
@@ -1247,7 +1390,7 @@
                 values-by-node)
         (pr-str value))))
 
-(deftest degraded-rejoin-client-recovers-follower-smoke-test
+(defisolatedtest degraded-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-degraded-rejoin-exercise!
          "degraded-rejoin-smoke"
@@ -1255,7 +1398,7 @@
                                     :nodes ["n1" "n2" "n3"]}))]
     (assert-degraded-rejoin-exercise! exercise-op)))
 
-(deftest snapshot-db-identity-rejoin-client-recovers-follower-smoke-test
+(defisolatedtest snapshot-db-identity-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-degraded-rejoin-exercise!
          "snapshot-db-identity-rejoin-smoke"
@@ -1263,7 +1406,7 @@
                                                 :nodes ["n1" "n2" "n3"]}))]
     (assert-degraded-rejoin-exercise! exercise-op)))
 
-(deftest snapshot-checksum-rejoin-client-recovers-follower-smoke-test
+(defisolatedtest snapshot-checksum-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-degraded-rejoin-exercise!
          "snapshot-checksum-rejoin-smoke"
@@ -1271,7 +1414,7 @@
                                              :nodes ["n1" "n2" "n3"]}))]
     (assert-degraded-rejoin-exercise! exercise-op)))
 
-(deftest snapshot-manifest-corruption-rejoin-client-recovers-follower-smoke-test
+(defisolatedtest snapshot-manifest-corruption-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-degraded-rejoin-exercise!
          "snapshot-manifest-corruption-rejoin-smoke"
@@ -1280,7 +1423,7 @@
            :nodes ["n1" "n2" "n3"]}))]
     (assert-degraded-rejoin-exercise! exercise-op)))
 
-(deftest snapshot-copy-corruption-rejoin-client-recovers-follower-smoke-test
+(defisolatedtest snapshot-copy-corruption-rejoin-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-degraded-rejoin-exercise!
          "snapshot-copy-corruption-rejoin-smoke"
@@ -1346,7 +1489,7 @@
                 values-by-node)
         (pr-str value))))
 
-(deftest membership-drift-client-recovers-follower-smoke-test
+(defisolatedtest membership-drift-client-recovers-follower-smoke-test
   (let [exercise-op
         (run-membership-drift-exercise!
          "membership-drift-smoke"
@@ -1386,7 +1529,7 @@
                 matched-nodes)
         (pr-str value))))
 
-(deftest membership-drift-live-client-recovers-leader-smoke-test
+(defisolatedtest membership-drift-live-client-recovers-leader-smoke-test
   (let [exercise-op
         (run-membership-drift-exercise!
          "membership-drift-live-smoke"
@@ -1441,7 +1584,7 @@
                 values-by-node)
         (pr-str value))))
 
-(deftest witness-topology-client-retains-quorum-smoke-test
+(defisolatedtest witness-topology-client-retains-quorum-smoke-test
   (let [exercise-op
         (run-witness-topology-exercise!
          "witness-topology-smoke"
@@ -1498,7 +1641,7 @@
                 values-by-node)
         (pr-str value))))
 
-(deftest fencing-retry-client-recovers-after-hook-failure-smoke-test
+(defisolatedtest fencing-retry-client-recovers-after-hook-failure-smoke-test
   (let [exercise-op
         (run-fencing-retry-exercise!
          "fencing-retry-smoke"
@@ -1601,7 +1744,7 @@
         (and (= :ha/write-rejected (:error err-data))
              (= :udf-not-ready (:reason err-data))))))
 
-(deftest udf-readiness-client-smoke-test
+(defisolatedtest udf-readiness-client-smoke-test
   (let [exercise-op
         (run-udf-readiness-exercise!
          "udf-readiness-smoke"
@@ -1649,7 +1792,7 @@
     (is (false? (:valid? lagging-result)))
     (is (= 1 (:mismatch-count lagging-result)))))
 
-(deftest fencing-client-smoke-test
+(defisolatedtest fencing-client-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "fencing-smoke"
                   :control-backend :sofa-jraft
@@ -2080,7 +2223,7 @@
       (assert-datalevin-test-map! (core/datalevin-test opts)
                                   expected))))
 
-(deftest clock-skew-failover-startup-elects-single-leader-smoke-test
+(defisolatedtest clock-skew-failover-startup-elects-single-leader-smoke-test
   (let [cluster-id (str (UUID/randomUUID))
         test-map {:db-name "clock-skew-failover-startup-smoke"
                   :schema append/schema

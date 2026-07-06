@@ -39,6 +39,13 @@ Smoke-test the Jepsen subproject itself:
 lein test
 ```
 
+The heavier tests in `datalevin.jepsen.smoke-test` fork one JVM per test var.
+This keeps SOFA JRaft's process-wide executor threads from accumulating across
+the whole namespace run. Override the per-test fork timeout with the
+`datalevin.jepsen.smoke.fork.timeout.ms` system property. Set
+`datalevin.jepsen.smoke.inline=true` only when debugging a single smoke test
+inside one JVM.
+
 Fastest local failover check:
 
 ```bash

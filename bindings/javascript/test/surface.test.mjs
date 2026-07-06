@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import * as datalevin from "../src/index.js";
+import { _BINDINGS } from "../src/interop.js";
 
 test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.analyze, "function");
@@ -39,6 +40,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.setExplicitTransactionTimeout, "function");
   assert.equal(typeof datalevin.startJvm, "function");
   assert.equal(typeof datalevin.symbol, "function");
+  assert.equal(typeof datalevin.transact, "function");
   assert.equal(typeof datalevin.transactAsync, "function");
   assert.equal(typeof datalevin.txDataToSimulatedReport, "function");
   assert.equal(typeof datalevin.txAdd, "function");
@@ -203,6 +205,7 @@ test("public surface stays importable without starting the JVM", () => {
     "searchDatoms",
     "seekDatoms",
     "txLogWatermarks",
+    "transact",
     "transactAsync",
     "txDataToSimulatedReport",
     "unlisten"
@@ -329,6 +332,41 @@ test("public surface stays importable without starting the JVM", () => {
     "vecIndexed"
   ]) {
     assert.equal(typeof datalevin.VectorIndex.prototype[method], "function");
+  }
+});
+
+test("transact uses the blocking async transaction bridge", async () => {
+  const original = _BINDINGS.connectionTransact;
+  const calls = [];
+  _BINDINGS.connectionTransact = async (handle, txData, txMeta = null) => {
+    calls.push({ handle, txData, txMeta });
+    return { ":tx-data": ["ok"], ":tx-meta": txMeta };
+  };
+
+  try {
+    const conn = new datalevin.Connection("CONN", { owned: false });
+    const txData = [{ ":db/id": -1, ":name": "Ada" }];
+    const txMeta = { ":source": "surface" };
+
+    assert.deepEqual(await conn.transact(txData, txMeta), {
+      ":tx-data": ["ok"],
+      ":tx-meta": txMeta
+    });
+    assert.deepEqual(await datalevin.transact(conn, txData), {
+      ":tx-data": ["ok"],
+      ":tx-meta": null
+    });
+    assert.deepEqual(await datalevin.interop().connectionTransact(conn, txData, txMeta), {
+      ":tx-data": ["ok"],
+      ":tx-meta": txMeta
+    });
+    assert.deepEqual(calls, [
+      { handle: "CONN", txData, txMeta },
+      { handle: "CONN", txData, txMeta: null },
+      { handle: "CONN", txData, txMeta }
+    ]);
+  } finally {
+    _BINDINGS.connectionTransact = original;
   }
 });
 

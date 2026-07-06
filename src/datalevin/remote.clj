@@ -311,6 +311,16 @@
     (and (not= :consensus-lease (:ha-mode opts))
          (not (false? (:background-sampling? opts))))))
 
+(def ^:private sampling-open-info? ::sampling-open-info?)
+
+(defn- sampling-open-info
+  [db-info]
+  (when-let [opts (not-empty
+                    (select-keys (:opts db-info)
+                                 [:ha-mode :background-sampling?]))]
+    {sampling-open-info? true
+     :opts opts}))
+
 (defn- merge-client-sampling-opts
   [db-info opts]
   (let [sampling-opts (select-keys opts [:ha-mode :background-sampling?])]
@@ -557,9 +567,11 @@
                      [db-name query opts] writing?))
 
   (db-info [_]
-    (if-let [cached @open-db-info]
+    (if-let [cached (let [cached @open-db-info]
+                      (when-not (get cached sampling-open-info?)
+                        cached))]
       (do
-        (vreset! open-db-info nil)
+        (vreset! open-db-info (sampling-open-info cached))
         (update-read-floor-tx! read-floor-tx (:max-tx cached))
         cached)
       (let [info (datalog-request read-floor-tx client :db-info

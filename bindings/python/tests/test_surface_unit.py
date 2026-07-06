@@ -85,6 +85,10 @@ class FakeInteropBindings:
         self.last_datalog_kv = conn
         return "DATALOG_KV"
 
+    def connection_transact(self, conn, tx_data, tx_meta=None):
+        self.last_transact = (conn, tx_data, tx_meta)
+        return {":tx-data": [("datom", 1, ":name", "Ada", 1, True)], ":tx-meta": tx_meta}
+
     def connection_db(self, conn):
         self.last_connection_db = conn
         return "DB"
@@ -568,6 +572,12 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         assert callable(getattr(interop_module, helper))
     assert init_conn.fill_db([(2, ":name", "Bob")]) is init_conn
     assert fake.last_fill_db == ("INIT_CONN", [(2, ":name", "Bob")])
+    tx_data = [{":db/id": -1, ":name": "Ada"}]
+    tx_meta = {":source": "surface"}
+    assert init_conn.transact(tx_data, tx_meta)[":tx-data"]
+    assert fake.last_transact == ("INIT_CONN", tx_data, tx_meta)
+    assert interop_module.transact(init_conn, tx_data)[":tx-data"]
+    assert fake.last_transact == ("INIT_CONN", tx_data, None)
     assert init_conn.datalog_index_cache_limit() == 512
     assert fake.last_connection_db == "INIT_CONN"
     assert fake.last_core_invoke == ("datalog-index-cache-limit", ["DB"])
@@ -822,6 +832,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(datalevin, "cardinality"))
     assert callable(getattr(datalevin, "explicit_transaction_timeout"))
     assert callable(getattr(datalevin, "set_explicit_transaction_timeout"))
+    assert callable(getattr(datalevin, "transact"))
     assert issubclass(datalevin.Entity, Mapping)
     assert callable(getattr(connection_module.Connection, "fill_db"))
     assert callable(getattr(datalevin.Database, "analyze"))
@@ -895,6 +906,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
         "search_datoms",
         "seek_datoms",
         "tx_log_watermarks",
+        "transact",
         "transact_async",
         "unlisten",
         "with_transaction",

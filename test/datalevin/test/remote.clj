@@ -79,5 +79,8 @@
                              nil
                              {:ha-mode :consensus-lease}
                              false)]
+      (is (= {:max-tx 0
+              :opts {:ha-mode :consensus-lease}}
+             (remote/db-info store)))
       (i/start-sampling store)
       (is (= [:open] (mapv :type @calls))))))

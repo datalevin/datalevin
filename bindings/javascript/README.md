@@ -174,6 +174,9 @@ try {
 
 ## Async Transaction Example
 
+`transact()` uses Datalevin's async transaction batching path and waits until
+the transaction commits before returning the report.
+
 Use `transactAsync()` for ingestion and application-server workloads that
 benefit from Datalevin's async transaction batching. It returns a normal
 JavaScript `Promise`.

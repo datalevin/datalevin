@@ -174,6 +174,42 @@ public final class Datalevin {
     }
 
     /**
+     * Transacts raw transaction data through Datalevin's async batching path
+     * and returns the transaction report after the transaction commits.
+     */
+    public static Map<?, ?> transact(Connection conn, Object txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transact(txData);
+    }
+
+    /**
+     * Transacts typed transaction data through Datalevin's async batching path
+     * and returns the transaction report after the transaction commits.
+     */
+    public static Map<?, ?> transact(Connection conn, TxData txData) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transact(txData);
+    }
+
+    /**
+     * Transacts raw transaction data with optional transaction metadata through
+     * Datalevin's async batching path.
+     */
+    public static Map<?, ?> transact(Connection conn, Object txData, Map<?, ?> txMeta) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transact(txData, txMeta);
+    }
+
+    /**
+     * Transacts typed transaction data with optional transaction metadata
+     * through Datalevin's async batching path.
+     */
+    public static Map<?, ?> transact(Connection conn, TxData txData, Map<?, ?> txMeta) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.transact(txData, txMeta);
+    }
+
+    /**
      * Transacts raw transaction data asynchronously on {@code conn}.
      */
     public static CompletableFuture<Map<?, ?>> transactAsync(Connection conn, Object txData) {

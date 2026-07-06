@@ -7,7 +7,7 @@ from threading import Thread
 
 import jpype
 
-from ._convert import to_edn_form, to_java, to_python, to_query_input
+from ._convert import to_edn_form, to_python, to_query_input
 from ._interop import _BINDINGS
 from ._java import call_java, classes
 from ._resource import ResourceWrapper
@@ -193,10 +193,9 @@ class Connection(ResourceWrapper):
         return to_python(_BINDINGS.core_invoke("explain", args))
 
     def transact(self, tx_data, tx_meta=None):
-        args = [self.raw_handle(), _BINDINGS.tx_data(tx_data)]
-        if tx_meta is not None:
-            args.append(to_java(tx_meta))
-        return to_python(_BINDINGS.core_invoke("transact!", args))
+        return to_python(
+            _BINDINGS.connection_transact(self.raw_handle(), tx_data, tx_meta)
+        )
 
     def transact_async(self, tx_data, tx_meta=None):
         """Start an async transaction and return a concurrent.futures.Future."""
