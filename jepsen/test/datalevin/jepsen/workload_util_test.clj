@@ -326,6 +326,35 @@
                   result)))))
       (is (= 2 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-closed-lmdb-during-post-bootstrap-converge-test
+  (let [attempts         (atom 0)
+        test             {:datalevin/cluster-id ::post-bootstrap-lmdb-closed-retry
+                          :db-name "post-bootstrap-lmdb-closed-retry"}
+        bootstrap-result {:restarted-nodes ["n2"]}
+        result           {:leader "n1"
+                          :caught-up? true
+                          :restarted-nodes ["n2"]}]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0
+                  rejoin-bootstrap/converge-timeout-ms 1000]
+      (is (= result
+             (#'rejoin-bootstrap/retrying-post-bootstrap-convergence-result
+              test
+              2
+              bootstrap-result
+              (fn [actual-test actual-key-count actual-bootstrap timeout-ms]
+                (is (= test actual-test))
+                (is (= 2 actual-key-count))
+                (is (= bootstrap-result actual-bootstrap))
+                (is (<= 1 (long timeout-ms) 1000))
+                (case (swap! attempts inc)
+                  1 (throw (ex-info "LMDB env is closed."
+                                    {:type :lmdb/closed}))
+                  2 (throw (ex-info "Request to Datalevin server failed"
+                                    {:err-data
+                                     {:message "LMDB env is closed."}}))
+                  result)))))
+      (is (= 3 @attempts)))))
+
 (deftest rejoin-bootstrap-checker-classifies-disrupted-converge-read-rejection-test
   (let [result (checker/check
                 (#'rejoin-bootstrap/rejoin-checker)

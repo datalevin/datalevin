@@ -561,6 +561,15 @@
     :ha/follower-snapshot-resume-failed
     :ha/follower-snapshot-bootstrap-failed})
 
+(def ^:private bootstrap-transient-error-types
+  #{:txlog/not-enabled
+    :lmdb/closed})
+
+(defn- lmdb-closed-message?
+  [message]
+  (and (string? message)
+       (str/includes? message "LMDB env is closed")))
+
 (defn- retryable-bootstrap-gap-error?
   [e]
   (boolean
@@ -570,17 +579,23 @@
             err-data  (:err-data data)
             nested    (:data data)
             gap-error (or (:gap-error nested)
-                          (:gap-error err-data))]
-        (or (= :txlog/not-enabled (:type data))
-            (= :txlog/not-enabled (:type err-data))
+                          (:gap-error err-data))
+            message    (ex-message cause)]
+        (or (contains? bootstrap-transient-error-types (:type data))
+            (contains? bootstrap-transient-error-types (:type err-data))
+            (contains? bootstrap-transient-error-types (:type nested))
             (contains? bootstrap-gap-errors (:error data))
             (contains? bootstrap-gap-errors (:error err-data))
             (contains? bootstrap-gap-errors (:error nested))
             (and (= :ha/read-rejected (:error err-data))
                  (true? (:retryable? err-data)))
-            (= :txlog/not-enabled (get-in gap-error [:data :type]))
+            (contains? bootstrap-transient-error-types
+                       (get-in gap-error [:data :type]))
             (contains? bootstrap-gap-errors
-                       (get-in gap-error [:data :error])))))
+                       (get-in gap-error [:data :error]))
+            (lmdb-closed-message? message)
+            (lmdb-closed-message? (:message data))
+            (lmdb-closed-message? (:message err-data)))))
     (take-while some? (iterate ex-cause e)))))
 
 (defn- with-retrying-bootstrap-gap!

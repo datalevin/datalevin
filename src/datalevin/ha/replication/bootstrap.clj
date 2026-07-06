@@ -30,6 +30,12 @@
 (def ^:private long-max4 hu/long-max4)
 (def ^:private long-min2 hu/long-min2)
 
+(defn- interrupted-message?
+  [message]
+  (and (string? message)
+       (or (s/includes? message "java.lang.InterruptedException")
+           (s/includes? message "java.nio.channels.ClosedByInterruptException"))))
+
 (def ^:private sync-ha-snapshot-install-target!
   snap/sync-ha-snapshot-install-target!)
 (def ^:private copy-dir-contents! snap/copy-dir-contents!)
@@ -45,10 +51,12 @@
 
 (defn- interrupted-error?
   [e]
-  (boolean
-   (some #(or (instance? InterruptedException %)
-              (instance? ClosedByInterruptException %))
-         (take-while some? (iterate ex-cause e)))))
+  (let [chain (take-while some? (iterate ex-cause e))]
+    (boolean
+     (some #(or (instance? InterruptedException %)
+                (instance? ClosedByInterruptException %)
+                (interrupted-message? (ex-message %)))
+           chain))))
 
 (defn normalize-ha-bootstrap-retry-state
   [candidate-m fallback-m reopen-info]
@@ -447,9 +455,11 @@
                                  :message (ex-message e)
                                  :data (ex-data e)}})
                       (catch Exception restore-e
-                        (when (interrupted-error? restore-e)
+                        (when (or (interrupted-error? e)
+                                  (interrupted-error? restore-e))
                           (.interrupt (Thread/currentThread)))
-                        (if (interrupted-error? restore-e)
+                        (if (or (interrupted-error? e)
+                                (interrupted-error? restore-e))
                           (log/debug
                             "HA follower snapshot install restore interrupted; local store will recover on reopen"
                             (merge log-context

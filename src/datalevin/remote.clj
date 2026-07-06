@@ -311,6 +311,13 @@
     (and (not= :consensus-lease (:ha-mode opts))
          (not (false? (:background-sampling? opts))))))
 
+(defn- merge-client-sampling-opts
+  [db-info opts]
+  (let [sampling-opts (select-keys opts [:ha-mode :background-sampling?])]
+    (cond-> db-info
+      (and (map? db-info) (seq sampling-opts))
+      (update :opts #(merge (or % {}) sampling-opts)))))
+
 (defn- datalog-request
   [^AtomicLong read-floor-tx client call args writing?]
   (binding [cl/*ha-read-min-tx* (when-not writing?
@@ -694,7 +701,9 @@
      (if-let [db-name (cl/parse-db uri)]
        (let [store (or (get (cl/parse-query uri) "store")
                        c/db-store-datalog)
-             db-info (cl/open-database client db-name store schema opts true)]
+             db-info (merge-client-sampling-opts
+                       (cl/open-database client db-name store schema opts true)
+                       opts)]
          (->DatalogStore uri-str db-name client
                          (cl/dedicated-transaction-client client)
                          (volatile! :remote-dl-mutex) false

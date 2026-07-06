@@ -49,6 +49,14 @@
                         :time-out 2500}}
          (#'repl/ha-snapshot-remote-open-opts 2500))))
 
+(deftest snapshot-bootstrap-recognizes-wrapped-interrupt-test
+  (is (true?
+       (#'boot/interrupted-error?
+        (ex-info
+         (str "Fail to open database: #error {\n"
+              " :via [{:type java.nio.channels.ClosedByInterruptException}]}")
+         {})))))
+
 (deftest snapshot-bootstrap-keeps-copied-payload-floor-above-stale-lease-test
   (let [reconcile-calls (atom [])
         resume-next-lsns (atom [])
