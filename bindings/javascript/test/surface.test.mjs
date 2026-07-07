@@ -5,6 +5,7 @@ import * as datalevin from "../src/index.js";
 import { _BINDINGS } from "../src/interop.js";
 
 test("public surface stays importable without starting the JVM", () => {
+  assert.equal(typeof datalevin.abortTransact, "function");
   assert.equal(typeof datalevin.analyze, "function");
   assert.equal(typeof datalevin.apiInfo, "function");
   assert.equal(typeof datalevin.cardinality, "function");
@@ -205,6 +206,7 @@ test("public surface stays importable without starting the JVM", () => {
     "searchDatoms",
     "seekDatoms",
     "txLogWatermarks",
+    "abortTransact",
     "transact",
     "transactAsync",
     "txDataToSimulatedReport",
@@ -335,7 +337,7 @@ test("public surface stays importable without starting the JVM", () => {
   }
 });
 
-test("transact uses the blocking async transaction bridge", async () => {
+test("transact uses the blocking transaction bridge", async () => {
   const original = _BINDINGS.connectionTransact;
   const calls = [];
   _BINDINGS.connectionTransact = async (handle, txData, txMeta = null) => {
@@ -367,6 +369,26 @@ test("transact uses the blocking async transaction bridge", async () => {
     ]);
   } finally {
     _BINDINGS.connectionTransact = original;
+  }
+});
+
+test("abortTransact uses the Datalog abort bridge", async () => {
+  const original = _BINDINGS.connectionAbortTransact;
+  const calls = [];
+  _BINDINGS.connectionAbortTransact = async (handle) => {
+    calls.push(handle);
+    return null;
+  };
+
+  try {
+    const conn = new datalevin.Connection("CONN", { owned: false });
+
+    assert.equal(await conn.abortTransact(), null);
+    assert.equal(await datalevin.abortTransact(conn), null);
+    assert.equal(await datalevin.interop().connectionAbortTransact(conn), null);
+    assert.deepEqual(calls, ["CONN", "CONN", "CONN"]);
+  } finally {
+    _BINDINGS.connectionAbortTransact = original;
   }
 });
 

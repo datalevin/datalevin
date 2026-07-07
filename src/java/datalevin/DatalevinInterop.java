@@ -322,22 +322,29 @@ public final class DatalevinInterop {
     }
 
     /**
-     * Runs a Datalevin async transaction and blocks until it commits, returning
-     * a bridge-safe transaction report.
+     * Aborts the active explicit Datalog transaction for a connection handle.
+     */
+    public static Object connectionAbortTransact(Object conn) {
+        return ClojureCodec.bridgeOutput(ClojureRuntime.core("abort-transact", rawResource(conn)));
+    }
+
+    /**
+     * Runs a Datalevin transaction and returns a bridge-safe transaction
+     * report.
      */
     public static Object connectionTransact(Object conn,
                                             Object txData,
                                             Map<?, ?> txMeta) {
         Object rawConn = rawResource(conn);
-        Object future = txMeta == null
-                ? ClojureRuntime.core("transact",
+        Object report = txMeta == null
+                ? ClojureRuntime.core("transact!",
                                       rawConn,
                                       DatalevinForms.txDataInput(txData))
-                : ClojureRuntime.core("transact",
+                : ClojureRuntime.core("transact!",
                                       rawConn,
                                       DatalevinForms.txDataInput(txData),
                                       ClojureCodec.runtimeInput(txMeta));
-        return DatalevinForms.txReportOutput(ClojureRuntime.deref(future));
+        return DatalevinForms.txReportOutput(report);
     }
 
     /**

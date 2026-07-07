@@ -132,6 +132,9 @@ class RawInterop:
             return _BINDINGS.connection_with_transaction(handle, fn)
         return _BINDINGS.connection_with_transaction(handle, fn, timeout_ms)
 
+    def connection_abort_transact(self, handle):
+        return _BINDINGS.connection_abort_transact(handle)
+
     def connection_re_index(self, handle, schema=None, opts=None):
         return _BINDINGS.connection_re_index(handle, schema, opts)
 

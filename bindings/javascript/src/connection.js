@@ -264,6 +264,10 @@ export class Connection extends ResourceWrapper {
     return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
   }
 
+  async abortTransact() {
+    return toJsResult(await _BINDINGS.connectionAbortTransact(this.rawHandle()));
+  }
+
   async txDataToSimulatedReport(txData) {
     return txReportToJs(await _BINDINGS.connectionTxDataToSimulatedReport(this.rawHandle(), txData));
   }

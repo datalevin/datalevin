@@ -9,6 +9,7 @@ export {
   DatalevinJvmError
 } from "./errors.js";
 export {
+  abortTransact,
   analyze,
   apiInfo,
   cardinality,

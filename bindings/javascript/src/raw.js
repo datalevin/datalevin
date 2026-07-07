@@ -141,6 +141,10 @@ class RawInterop {
     return toJsResult(await callJavaMethod(future, "get"), { bridge: true });
   }
 
+  async connectionAbortTransact(handle) {
+    return toJsResult(await _BINDINGS.connectionAbortTransact(resourceHandle(handle)));
+  }
+
   async connectionDatoms(handle, index, c1 = null, c2 = null, c3 = null, limit = null) {
     const args = [resourceHandle(handle), "datoms", await toJava(index), await toJava(c1), await toJava(c2), await toJava(c3)];
     if (hasValue(limit)) {

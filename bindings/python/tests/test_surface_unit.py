@@ -132,6 +132,10 @@ class FakeInteropBindings:
         self.last_connection_with_transaction_timeout = timeout_ms
         return fn(connection_module.Connection("TX_CONN", owned=False))
 
+    def connection_abort_transact(self, conn):
+        self.last_connection_abort_transact = conn
+        return None
+
     def datom(self, e, attr, value, tx=None, added=None):
         return ("datom", e, attr, value, tx, added)
 
@@ -560,6 +564,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     for helper in [
         "keyword",
         "max_eid",
+        "abort_transact",
         "new_search_engine",
         "new_vector_index",
         "read_edn",
@@ -610,6 +615,10 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         init_conn, lambda tx: tx.raw_handle(), timeout_ms=300
     ) == "TX_CONN"
     assert fake.last_connection_with_transaction_timeout == 300
+    assert init_conn.abort_transact() is None
+    assert fake.last_connection_abort_transact == "INIT_CONN"
+    assert interop_module.abort_transact(init_conn) is None
+    assert fake.last_connection_abort_transact == "INIT_CONN"
     assert init_conn.tx_data_to_simulated_report([{":db/id": -1, ":name": "Ada"}])[":tx-data"]
     assert fake.last_simulated_report == ("INIT_CONN", [{":db/id": -1, ":name": "Ada"}])
     assert interop_module.tx_data_to_simulated_report(init_conn, [{":db/id": -2, ":name": "Bob"}])[":tx-data"]
@@ -828,6 +837,7 @@ def test_kv_public_surface_includes_richer_operations() -> None:
 
 
 def test_connection_public_surface_includes_bulk_load_operations() -> None:
+    assert callable(getattr(datalevin, "abort_transact"))
     assert callable(getattr(datalevin, "analyze"))
     assert callable(getattr(datalevin, "cardinality"))
     assert callable(getattr(datalevin, "explicit_transaction_timeout"))
@@ -886,6 +896,7 @@ def test_connection_public_surface_includes_bulk_load_operations() -> None:
     assert callable(getattr(datalevin.VectorIndex, "search_vec"))
     assert callable(getattr(datalevin.VectorIndex, "vec_indexed"))
     for method in [
+        "abort_transact",
         "analyze",
         "cardinality",
         "count_datoms",

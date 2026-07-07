@@ -148,6 +148,16 @@ public final class Connection extends HandleResource {
     }
 
     /**
+     * Aborts the current explicit Datalog transaction.
+     *
+     * <p>This is only meaningful from inside {@link #withTransaction}; it
+     * discards writes made in the active explicit transaction.
+     */
+    public Object abortTransact() {
+        return ClojureRuntime.core("abort-transact", resource());
+    }
+
+    /**
      * Rebuilds this Datalog database index and returns this handle.
      */
     public Connection reIndex() {
@@ -554,35 +564,33 @@ public final class Connection extends HandleResource {
     }
 
     /**
-     * Transacts raw transaction data through Datalevin's async batching path
-     * and returns the transaction report after the transaction commits.
+     * Transacts raw transaction data and returns the transaction report after
+     * the transaction commits.
      */
     public Map<?, ?> transact(Object txData) {
-        return blockingAsyncTransact(DatalevinForms.txDataInput(txData), null);
+        return blockingTransact(DatalevinForms.txDataInput(txData), null);
     }
 
     /**
-     * Transacts typed transaction data through Datalevin's async batching path
-     * and returns the transaction report after the transaction commits.
+     * Transacts typed transaction data and returns the transaction report after
+     * the transaction commits.
      */
     public Map<?, ?> transact(TxData txData) {
-        return blockingAsyncTransact(txData == null ? null : txData.buildForm(), null);
+        return blockingTransact(txData == null ? null : txData.buildForm(), null);
     }
 
     /**
-     * Transacts raw transaction data with optional transaction metadata through
-     * Datalevin's async batching path.
+     * Transacts raw transaction data with optional transaction metadata.
      */
     public Map<?, ?> transact(Object txData, Map<?, ?> txMeta) {
-        return blockingAsyncTransact(DatalevinForms.txDataInput(txData), txMeta);
+        return blockingTransact(DatalevinForms.txDataInput(txData), txMeta);
     }
 
     /**
-     * Transacts typed transaction data with optional transaction metadata
-     * through Datalevin's async batching path.
+     * Transacts typed transaction data with optional transaction metadata.
      */
     public Map<?, ?> transact(TxData txData, Map<?, ?> txMeta) {
-        return blockingAsyncTransact(txData == null ? null : txData.buildForm(), txMeta);
+        return blockingTransact(txData == null ? null : txData.buildForm(), txMeta);
     }
 
     /**
@@ -1060,14 +1068,13 @@ public final class Connection extends HandleResource {
         return result;
     }
 
-    private Map<?, ?> blockingAsyncTransact(Object txData, Map<?, ?> txMeta) {
-        Object future = txMeta == null
-                ? ClojureRuntime.core("transact", resource(), txData)
-                : ClojureRuntime.core("transact",
-                                      resource(),
-                                      txData,
-                                      ClojureCodec.runtimeInput(txMeta));
-        return (Map<?, ?>) ClojureRuntime.deref(future);
+    private Map<?, ?> blockingTransact(Object txData, Map<?, ?> txMeta) {
+        return txMeta == null
+                ? (Map<?, ?>) ClojureRuntime.core("transact!", resource(), txData)
+                : (Map<?, ?>) ClojureRuntime.core("transact!",
+                                                  resource(),
+                                                  txData,
+                                                  ClojureCodec.runtimeInput(txMeta));
     }
 
     private static void requireShape(DatalogQuery query,

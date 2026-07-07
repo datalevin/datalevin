@@ -152,6 +152,11 @@ class Connection(ResourceWrapper):
             return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn))
         return to_python(_BINDINGS.connection_with_transaction(self.raw_handle(), fn, timeout_ms))
 
+    def abort_transact(self):
+        """Abort the current explicit Datalog transaction."""
+
+        return to_python(_BINDINGS.connection_abort_transact(self.raw_handle()))
+
     def entid(self, eid):
         db = _BINDINGS.connection_db(self.raw_handle())
         return to_python(_BINDINGS.core_invoke("entid", [db, _BINDINGS.lookup_ref(eid)]))

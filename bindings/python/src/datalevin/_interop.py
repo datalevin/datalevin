@@ -237,6 +237,9 @@ class InteropBindings:
             return call_java(classes().interop.connectionWithTransaction, handle, _timeout_arg(timeout_ms), proxy)
         return call_java(classes().interop.connectionWithTransaction, handle, proxy)
 
+    def connection_abort_transact(self, handle):
+        return call_java(classes().interop.connectionAbortTransact, handle)
+
     def connection_re_index(self, handle, schema=None, opts=None):
         return call_java(classes().interop.connectionReIndex, handle, to_java(schema), to_java(opts))
 
@@ -1094,7 +1097,7 @@ def tx_retract_entity(entity_id):
 
 
 def transact(conn: Connection, tx_data, tx_meta=None):
-    """Run an async Datalevin transaction and block until it commits."""
+    """Run a Datalevin transaction and block until it commits."""
 
     return conn.transact(tx_data, tx_meta)
 
@@ -1103,6 +1106,12 @@ def transact_async(conn: Connection, tx_data, tx_meta=None):
     """Start an async transaction and return a concurrent.futures.Future."""
 
     return conn.transact_async(tx_data, tx_meta)
+
+
+def abort_transact(conn: Connection):
+    """Abort the current explicit Datalog transaction for conn."""
+
+    return conn.abort_transact()
 
 
 def tx_data_to_simulated_report(conn: Connection, tx_data):
@@ -1261,6 +1270,7 @@ __all__ = [
     "symbol",
     "transact",
     "transact_async",
+    "abort_transact",
     "tx_add",
     "tx_data_to_simulated_report",
     "tx_entity",

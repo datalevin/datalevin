@@ -174,8 +174,8 @@ public final class Datalevin {
     }
 
     /**
-     * Transacts raw transaction data through Datalevin's async batching path
-     * and returns the transaction report after the transaction commits.
+     * Transacts raw transaction data and returns the transaction report after
+     * the transaction commits.
      */
     public static Map<?, ?> transact(Connection conn, Object txData) {
         Objects.requireNonNull(conn, "conn");
@@ -183,8 +183,8 @@ public final class Datalevin {
     }
 
     /**
-     * Transacts typed transaction data through Datalevin's async batching path
-     * and returns the transaction report after the transaction commits.
+     * Transacts typed transaction data and returns the transaction report after
+     * the transaction commits.
      */
     public static Map<?, ?> transact(Connection conn, TxData txData) {
         Objects.requireNonNull(conn, "conn");
@@ -192,8 +192,7 @@ public final class Datalevin {
     }
 
     /**
-     * Transacts raw transaction data with optional transaction metadata through
-     * Datalevin's async batching path.
+     * Transacts raw transaction data with optional transaction metadata.
      */
     public static Map<?, ?> transact(Connection conn, Object txData, Map<?, ?> txMeta) {
         Objects.requireNonNull(conn, "conn");
@@ -201,8 +200,7 @@ public final class Datalevin {
     }
 
     /**
-     * Transacts typed transaction data with optional transaction metadata
-     * through Datalevin's async batching path.
+     * Transacts typed transaction data with optional transaction metadata.
      */
     public static Map<?, ?> transact(Connection conn, TxData txData, Map<?, ?> txMeta) {
         Objects.requireNonNull(conn, "conn");
@@ -529,6 +527,14 @@ public final class Datalevin {
                                         Function<Connection, T> fn) {
         Objects.requireNonNull(conn, "conn");
         return conn.withTransaction(timeoutMs, fn);
+    }
+
+    /**
+     * Aborts the current explicit Datalog transaction.
+     */
+    public static Object abortTransact(Connection conn) {
+        Objects.requireNonNull(conn, "conn");
+        return conn.abortTransact();
     }
 
     /**

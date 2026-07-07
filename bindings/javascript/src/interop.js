@@ -290,6 +290,15 @@ class InteropBindings {
     );
   }
 
+  async connectionAbortTransact(handle) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "connectionAbortTransact",
+      await unwrapInteropHandle(handle)
+    );
+  }
+
   async connectionTxDataToSimulatedReport(handle, txData) {
     const cls = await classes();
     return callJavaMethod(
@@ -1361,6 +1370,10 @@ export async function transact(conn, txData, txMeta = null) {
 
 export async function transactAsync(conn, txData, txMeta = null) {
   return conn.transactAsync(txData, txMeta);
+}
+
+export async function abortTransact(conn) {
+  return conn.abortTransact();
 }
 
 export async function txDataToSimulatedReport(conn, txData) {

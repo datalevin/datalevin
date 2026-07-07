@@ -1,6 +1,7 @@
 """Datalevin Python bindings over the JVM interop bridge."""
 
 from ._interop import (
+    abort_transact,
     analyze,
     api_info,
     cardinality,
@@ -80,6 +81,7 @@ __all__ = [
     "RawKV",
     "UdfRegistry",
     "VectorIndex",
+    "abort_transact",
     "analyze",
     "api_info",
     "cardinality",
