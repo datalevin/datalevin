@@ -580,6 +580,98 @@ export class KV extends ResourceWrapper {
     return toJsResult(await _BINDINGS.coreInvoke("key-range-count", args));
   }
 
+  async visit(dbiName, visitor, keyRange, { kType = null, vType = null } = {}) {
+    requireRange(keyRange, "keyRange", "visit");
+    requireCallback(visitor, "visit");
+    requireKType(kType, "visit");
+    requireVType(vType, "visit");
+    const normalizedRange = await toEdnForm(keyRange);
+    await withJavaProxy(
+      "java.util.function.BiConsumer",
+      {
+        accept: async (key, value) => {
+          await visitor(await toJs(key), await toJs(value));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisit(
+        this.rawHandle(),
+        dbiName,
+        proxy,
+        normalizedRange,
+        kType,
+        vType
+      )
+    );
+  }
+
+  async visitRaw(dbiName, visitor, keyRange, { kType = null, vType = null } = {}) {
+    requireRange(keyRange, "keyRange", "visitRaw");
+    requireCallback(visitor, "visitRaw");
+    requireKType(kType, "visitRaw");
+    requireVType(vType, "visitRaw");
+    const normalizedRange = await toEdnForm(keyRange);
+    await withJavaProxy(
+      "java.util.function.Consumer",
+      {
+        accept: async (value) => {
+          await visitor(new RawKV(value));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisitRaw(
+        this.rawHandle(),
+        dbiName,
+        proxy,
+        normalizedRange,
+        kType,
+        vType
+      )
+    );
+  }
+
+  async visitKeyRange(dbiName, visitor, keyRange, { kType = null } = {}) {
+    requireRange(keyRange, "keyRange", "visitKeyRange");
+    requireCallback(visitor, "visitKeyRange");
+    requireKType(kType, "visitKeyRange");
+    const normalizedRange = await toEdnForm(keyRange);
+    await withJavaProxy(
+      "java.util.function.Consumer",
+      {
+        accept: async (key) => {
+          await visitor(await toJs(key));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisitKeyRange(
+        this.rawHandle(),
+        dbiName,
+        proxy,
+        normalizedRange,
+        kType
+      )
+    );
+  }
+
+  async visitKeyRangeRaw(dbiName, visitor, keyRange, { kType = null } = {}) {
+    requireRange(keyRange, "keyRange", "visitKeyRangeRaw");
+    requireCallback(visitor, "visitKeyRangeRaw");
+    requireKType(kType, "visitKeyRangeRaw");
+    const normalizedRange = await toEdnForm(keyRange);
+    await withJavaProxy(
+      "java.util.function.Consumer",
+      {
+        accept: async (value) => {
+          await visitor(new RawBuffer(value));
+        }
+      },
+      async (proxy) => _BINDINGS.kvVisitKeyRangeRaw(
+        this.rawHandle(),
+        dbiName,
+        proxy,
+        normalizedRange,
+        kType
+      )
+    );
+  }
+
   async rangeCount(dbiName, keyRange, { kType = null } = {}) {
     if (keyRange === null || keyRange === undefined) {
       throw new TypeError("keyRange is required for KV rangeCount().");

@@ -66,6 +66,34 @@ def test_kv_methods_cover_named_and_list_dbis(tmp_path) -> None:
             ["b", "beta"],
             ["c", "gamma"],
         ]
+        visited_items = []
+        kv.visit("items", lambda key, value: visited_items.append([key, value]), [":at-least", "b"], ":string", ":string")
+        assert visited_items == [["b", "beta"], ["c", "gamma"]]
+
+        raw_items = []
+        kv.visit_raw(
+            "items",
+            lambda raw: raw_items.append(
+                [isinstance(raw, RawKV), raw.read_key(":string"), raw.read_value(":string"), len(raw.key_bytes()) > 0]
+            ),
+            [":closed", "a", "b"],
+            ":string",
+            ":string",
+        )
+        assert raw_items == [[True, "a", "alpha", True], [True, "b", "beta", True]]
+
+        visited_keys = []
+        kv.visit_key_range("items", visited_keys.append, [":closed", "a", "c"], ":string")
+        assert visited_keys == ["a", "b", "c"]
+
+        raw_keys = []
+        kv.visit_key_range_raw(
+            "items",
+            lambda raw: raw_keys.append([isinstance(raw, RawBuffer), raw.read(":string"), len(raw.bytes()) > 0]),
+            [":closed", "b", "c"],
+            ":string",
+        )
+        assert raw_keys == [[True, "b", True], [True, "c", True]]
         assert kv.get_range("blob-keys", [":closed", b"\x00\x01", b"\x00\x02"], ":bytes", ":bytes") == [
             [b"\x00\x01", b"\x07\x08"],
             [b"\x00\x02", b"\x09\x0a"],

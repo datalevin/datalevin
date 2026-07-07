@@ -1204,6 +1204,66 @@ public final class DatalevinInterop {
                                                           ignoreKey));
     }
 
+    public static void kvVisit(Object kv,
+                               String dbiName,
+                               BiConsumer<Object, Object> visitor,
+                               Object kRange,
+                               Object kType,
+                               Object vType) {
+        ClojureRuntime.core("visit",
+                            runtimeArg(kv),
+                            dbiName,
+                            ClojureFns.biConsumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            typeInput(vType),
+                            false);
+    }
+
+    public static void kvVisitRaw(Object kv,
+                                  String dbiName,
+                                  Consumer<RawKV> visitor,
+                                  Object kRange,
+                                  Object kType,
+                                  Object vType) {
+        ClojureRuntime.core("visit",
+                            runtimeArg(kv),
+                            dbiName,
+                            ClojureFns.rawKvConsumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            typeInput(vType),
+                            true);
+    }
+
+    public static void kvVisitKeyRange(Object kv,
+                                       String dbiName,
+                                       Consumer<Object> visitor,
+                                       Object kRange,
+                                       Object kType) {
+        ClojureRuntime.core("visit-key-range",
+                            runtimeArg(kv),
+                            dbiName,
+                            ClojureFns.consumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            false);
+    }
+
+    public static void kvVisitKeyRangeRaw(Object kv,
+                                          String dbiName,
+                                          Consumer<RawBuffer> visitor,
+                                          Object kRange,
+                                          Object kType) {
+        ClojureRuntime.core("visit-key-range",
+                            runtimeArg(kv),
+                            dbiName,
+                            ClojureFns.rawBufferConsumer(visitor),
+                            rangeInput(kRange, kType),
+                            typeInput(kType),
+                            true);
+    }
+
     public static void kvVisitList(Object kv,
                                    String listName,
                                    Consumer<Object> visitor,

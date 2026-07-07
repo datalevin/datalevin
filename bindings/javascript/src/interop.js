@@ -584,6 +584,60 @@ class InteropBindings {
     );
   }
 
+  async kvVisit(handle, dbiName, visitor, kRange, kType, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisit",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vType)
+    );
+  }
+
+  async kvVisitRaw(handle, dbiName, visitor, kRange, kType, vType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitRaw",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType),
+      await toJava(vType)
+    );
+  }
+
+  async kvVisitKeyRange(handle, dbiName, visitor, kRange, kType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitKeyRange",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType)
+    );
+  }
+
+  async kvVisitKeyRangeRaw(handle, dbiName, visitor, kRange, kType) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.interop,
+      "kvVisitKeyRangeRaw",
+      await unwrapInteropHandle(handle),
+      dbiName,
+      visitor,
+      await toJava(kRange),
+      await toJava(kType)
+    );
+  }
+
   async kvVisitList(handle, listName, visitor, key, kType, vType) {
     const cls = await classes();
     return callJavaMethod(

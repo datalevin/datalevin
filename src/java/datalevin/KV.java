@@ -1346,6 +1346,102 @@ public class KV extends HandleResource {
     }
 
     /**
+     * Visits decoded key-values in the given key range.
+     */
+    public void visit(String dbi,
+                      BiConsumer<Object, Object> visitor,
+                      List<?> kRange,
+                      String kType,
+                      String vType) {
+        visitInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits decoded key-values in the given key range.
+     */
+    public void visit(String dbi,
+                      BiConsumer<Object, Object> visitor,
+                      RangeSpec kRange,
+                      String kType,
+                      String vType) {
+        visitInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits decoded key-values in the given key range.
+     */
+    public void visit(String dbi,
+                      BiConsumer<Object, Object> visitor,
+                      List<?> kRange,
+                      KVType kType,
+                      KVType vType) {
+        visitInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits decoded key-values in the given key range.
+     */
+    public void visit(String dbi,
+                      BiConsumer<Object, Object> visitor,
+                      RangeSpec kRange,
+                      KVType kType,
+                      KVType vType) {
+        visitInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits raw key-values in the given key range.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitRaw(String dbi,
+                         Consumer<RawKV> visitor,
+                         List<?> kRange,
+                         String kType,
+                         String vType) {
+        visitRawInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits raw key-values in the given key range.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitRaw(String dbi,
+                         Consumer<RawKV> visitor,
+                         RangeSpec kRange,
+                         String kType,
+                         String vType) {
+        visitRawInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits raw key-values in the given key range.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitRaw(String dbi,
+                         Consumer<RawKV> visitor,
+                         List<?> kRange,
+                         KVType kType,
+                         KVType vType) {
+        visitRawInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
+     * Visits raw key-values in the given key range.
+     *
+     * <p>Decode or copy the supplied raw key/value during the callback.
+     */
+    public void visitRaw(String dbi,
+                         Consumer<RawKV> visitor,
+                         RangeSpec kRange,
+                         KVType kType,
+                         KVType vType) {
+        visitRawInternal(dbi, visitor, kRange, kType, vType);
+    }
+
+    /**
      * Returns the key-value entry at the given rank with explicit types.
      */
     public Object getEntryByRank(String dbi, long rank, String kType, String vType) {
@@ -1385,6 +1481,94 @@ public class KV extends HandleResource {
      */
     public List<?> keyRange(String dbi, RangeSpec kRange, KVType kType, Integer limit, Integer offset) {
         return keyRangeInternal(dbi, kRange, kType, limit, offset);
+    }
+
+    /**
+     * Visits decoded keys in the given range.
+     */
+    public void visitKeyRange(String dbi,
+                              Consumer<Object> visitor,
+                              List<?> kRange,
+                              String kType) {
+        visitKeyRangeInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits decoded keys in the given range.
+     */
+    public void visitKeyRange(String dbi,
+                              Consumer<Object> visitor,
+                              RangeSpec kRange,
+                              String kType) {
+        visitKeyRangeInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits decoded keys in the given range.
+     */
+    public void visitKeyRange(String dbi,
+                              Consumer<Object> visitor,
+                              List<?> kRange,
+                              KVType kType) {
+        visitKeyRangeInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits decoded keys in the given range.
+     */
+    public void visitKeyRange(String dbi,
+                              Consumer<Object> visitor,
+                              RangeSpec kRange,
+                              KVType kType) {
+        visitKeyRangeInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits raw key buffers in the given range.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitKeyRangeRaw(String dbi,
+                                 Consumer<RawBuffer> visitor,
+                                 List<?> kRange,
+                                 String kType) {
+        visitKeyRangeRawInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits raw key buffers in the given range.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitKeyRangeRaw(String dbi,
+                                 Consumer<RawBuffer> visitor,
+                                 RangeSpec kRange,
+                                 String kType) {
+        visitKeyRangeRawInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits raw key buffers in the given range.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitKeyRangeRaw(String dbi,
+                                 Consumer<RawBuffer> visitor,
+                                 List<?> kRange,
+                                 KVType kType) {
+        visitKeyRangeRawInternal(dbi, visitor, kRange, kType);
+    }
+
+    /**
+     * Visits raw key buffers in the given range.
+     *
+     * <p>Decode or copy the supplied buffer during the callback.
+     */
+    public void visitKeyRangeRaw(String dbi,
+                                 Consumer<RawBuffer> visitor,
+                                 RangeSpec kRange,
+                                 KVType kType) {
+        visitKeyRangeRawInternal(dbi, visitor, kRange, kType);
     }
 
     /**
@@ -1862,6 +2046,56 @@ public class KV extends HandleResource {
                             typeArg(kType),
                             rangeArg(vRange),
                             typeArg(vType));
+    }
+
+    private void visitInternal(String dbi,
+                               BiConsumer<Object, Object> visitor,
+                               Object kRange,
+                               Object kType,
+                               Object vType) {
+        runVisitRange(dbi,
+                      ClojureFns.biConsumer(visitor),
+                      rangeArg(kRange),
+                      typeArg(kType),
+                      typeArg(vType));
+    }
+
+    private void visitRawInternal(String dbi,
+                                  Consumer<RawKV> visitor,
+                                  Object kRange,
+                                  Object kType,
+                                  Object vType) {
+        ClojureRuntime.core("visit",
+                            resource(),
+                            dbi,
+                            ClojureFns.rawKvConsumer(visitor),
+                            rangeArg(kRange),
+                            typeArg(kType),
+                            typeArg(vType),
+                            true);
+    }
+
+    private void visitKeyRangeInternal(String dbi,
+                                       Consumer<Object> visitor,
+                                       Object kRange,
+                                       Object kType) {
+        runVisitKeyRange(dbi,
+                         ClojureFns.consumer(visitor),
+                         rangeArg(kRange),
+                         typeArg(kType));
+    }
+
+    private void visitKeyRangeRawInternal(String dbi,
+                                          Consumer<RawBuffer> visitor,
+                                          Object kRange,
+                                          Object kType) {
+        ClojureRuntime.core("visit-key-range",
+                            resource(),
+                            dbi,
+                            ClojureFns.rawBufferConsumer(visitor),
+                            rangeArg(kRange),
+                            typeArg(kType),
+                            true);
     }
 
     private Object listRangeFirstInternal(String listName,

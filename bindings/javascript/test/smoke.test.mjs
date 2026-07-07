@@ -567,6 +567,36 @@ test(
       );
       assert.equal(intValue(await kv.keyRangeCount("items", [":all"], { kType: ":string" })), 3);
       assert.equal(intValue(await kv.rangeCount("items", [":all"], { kType: ":string" })), 3);
+
+      const visitedItems = [];
+      await kv.visit("items", (key, value) => {
+        visitedItems.push([key, value]);
+      }, [":at-least", "b"], { kType: ":string", vType: ":string" });
+      assert.deepEqual(visitedItems, [["b", "beta"], ["c", "gamma"]]);
+
+      const rawItems = [];
+      await kv.visitRaw("items", async (raw) => {
+        rawItems.push([
+          raw instanceof RawKV,
+          await raw.readKey(":string"),
+          await raw.readValue(":string"),
+          (await raw.keyBytes()).length > 0
+        ]);
+      }, [":closed", "a", "b"], { kType: ":string", vType: ":string" });
+      assert.deepEqual(rawItems, [[true, "a", "alpha", true], [true, "b", "beta", true]]);
+
+      const visitedKeys = [];
+      await kv.visitKeyRange("items", (key) => {
+        visitedKeys.push(key);
+      }, [":closed", "a", "c"], { kType: ":string" });
+      assert.deepEqual(visitedKeys, ["a", "b", "c"]);
+
+      const rawKeys = [];
+      await kv.visitKeyRangeRaw("items", async (raw) => {
+        rawKeys.push([raw instanceof RawBuffer, await raw.read(":string"), (await raw.bytes()).length > 0]);
+      }, [":closed", "b", "c"], { kType: ":string" });
+      assert.deepEqual(rawKeys, [[true, "b", true], [true, "c", true]]);
+
       assert.equal(await kv.withTransaction(async (txKv) => {
         await txKv.transact([[":put", "d", "delta"]], {
           dbiName: "items",

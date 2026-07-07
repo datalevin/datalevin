@@ -307,6 +307,18 @@ class InteropBindings:
             bool(ignore_key),
         )
 
+    def kv_visit(self, handle, dbi_name, visitor, k_range, k_type, v_type):
+        return call_java(classes().interop.kvVisit, handle, dbi_name, visitor, k_range, k_type, v_type)
+
+    def kv_visit_raw(self, handle, dbi_name, visitor, k_range, k_type, v_type):
+        return call_java(classes().interop.kvVisitRaw, handle, dbi_name, visitor, k_range, k_type, v_type)
+
+    def kv_visit_key_range(self, handle, dbi_name, visitor, k_range, k_type):
+        return call_java(classes().interop.kvVisitKeyRange, handle, dbi_name, visitor, k_range, k_type)
+
+    def kv_visit_key_range_raw(self, handle, dbi_name, visitor, k_range, k_type):
+        return call_java(classes().interop.kvVisitKeyRangeRaw, handle, dbi_name, visitor, k_range, k_type)
+
     def kv_visit_list(self, handle, list_name, visitor, key, k_type, v_type):
         return call_java(classes().interop.kvVisitList, handle, list_name, visitor, to_java(key), k_type, v_type)
 

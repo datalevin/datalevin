@@ -818,10 +818,14 @@ def test_kv_public_surface_includes_richer_operations() -> None:
         "sync",
         "transaction",
         "tx_log_watermarks",
+        "visit",
+        "visit_key_range",
+        "visit_key_range_raw",
         "visit_list",
         "visit_list_raw",
         "visit_list_range",
         "visit_list_range_raw",
+        "visit_raw",
         "with_transaction",
     ]:
         assert callable(getattr(kv_module.KV, method))

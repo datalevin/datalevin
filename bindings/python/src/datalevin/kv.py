@@ -431,6 +431,62 @@ class KV(ResourceWrapper):
             args.append(_BINDINGS.kv_type(k_type))
         return to_python(_BINDINGS.core_invoke("key-range-count", args))
 
+    def visit(self, dbi_name, visitor, key_range, k_type, v_type):
+        if key_range is None:
+            raise ValueError("key_range is required for KV visit().")
+        _require_callable(visitor, "visit")
+        _require_k_type(k_type, "visit")
+        _require_v_type(v_type, "visit")
+        _BINDINGS.kv_visit(
+            self.raw_handle(),
+            dbi_name,
+            _bi_consumer_proxy(visitor),
+            to_edn_form(key_range),
+            k_type,
+            v_type,
+        )
+
+    def visit_raw(self, dbi_name, visitor, key_range, k_type, v_type):
+        if key_range is None:
+            raise ValueError("key_range is required for KV visit_raw().")
+        _require_callable(visitor, "visit_raw")
+        _require_k_type(k_type, "visit_raw")
+        _require_v_type(v_type, "visit_raw")
+        _BINDINGS.kv_visit_raw(
+            self.raw_handle(),
+            dbi_name,
+            _raw_kv_consumer_proxy(visitor),
+            to_edn_form(key_range),
+            k_type,
+            v_type,
+        )
+
+    def visit_key_range(self, dbi_name, visitor, key_range, k_type):
+        if key_range is None:
+            raise ValueError("key_range is required for KV visit_key_range().")
+        _require_callable(visitor, "visit_key_range")
+        _require_k_type(k_type, "visit_key_range")
+        _BINDINGS.kv_visit_key_range(
+            self.raw_handle(),
+            dbi_name,
+            _consumer_proxy(visitor),
+            to_edn_form(key_range),
+            k_type,
+        )
+
+    def visit_key_range_raw(self, dbi_name, visitor, key_range, k_type):
+        if key_range is None:
+            raise ValueError("key_range is required for KV visit_key_range_raw().")
+        _require_callable(visitor, "visit_key_range_raw")
+        _require_k_type(k_type, "visit_key_range_raw")
+        _BINDINGS.kv_visit_key_range_raw(
+            self.raw_handle(),
+            dbi_name,
+            _raw_buffer_consumer_proxy(visitor),
+            to_edn_form(key_range),
+            k_type,
+        )
+
     def range_count(self, dbi_name, key_range, k_type=None):
         if key_range is None:
             raise ValueError("key_range is required for KV range_count().")
