@@ -888,12 +888,10 @@
                    (with-redefs-fn
                     {#'workload.util/*open-leader-conn*
                      (fn [_test _schema]
-                       blocking-conn)
-                     #'d/close
-                     (fn [_conn]
-                       nil)}
+                       blocking-conn)}
                     (fn []
-                      (binding [tx-fn-register/*read-timeout-ms* 50]
+                      (binding [tx-fn-register/*close-conn!* (fn [_conn] nil)
+                                tx-fn-register/*read-timeout-ms* 50]
                         (let [started-ms (System/currentTimeMillis)
                               op         (client/invoke!
                                           client
@@ -910,6 +908,64 @@
     (is (= (assoc read-op
                   :type :info
                   :error :read-timeout
+                  :txreg/timeout-ms 50)
+           (:op result)))
+    (is (< (:elapsed-ms result) 1000))))
+
+(deftest tx-fn-register-write-is-bounded-and-closes-conn-test
+  (let [started? (promise)
+        closed?  (promise)
+        cluster-id ::tx-fn-register-write-is-bounded
+        write-op {:type :invoke
+                  :f :write
+                  :value (first {0 29})}
+        blocking-conn ::blocking-conn
+        initialized-clusters
+        (var-get #'tx-fn-register/initialized-clusters)
+        original-initialized-clusters @initialized-clusters
+        client   (tx-fn-register/->Client "n1" 1 128)
+        transact (fn
+                   ([_conn _tx]
+                    (deliver started? true)
+                    (Thread/sleep 10000)
+                    {:tx-data []})
+                   ([_conn _tx _tx-meta]
+                    (deliver started? true)
+                    (Thread/sleep 10000)
+                    {:tx-data []}))
+        result   (try
+                   (swap! initialized-clusters conj cluster-id)
+                   (with-redefs-fn
+                    {#'workload.util/*open-leader-conn*
+                     (fn [_test _schema]
+                       blocking-conn)
+                     #'d/transact!
+                     transact
+                     #'conn/transact!
+                     transact}
+                    (fn []
+                      (binding [tx-fn-register/*close-conn!*
+                                (fn [conn]
+                                  (when (= blocking-conn conn)
+                                    (deliver closed? true)))
+                                tx-fn-register/*op-timeout-ms* 50]
+                        (let [started-ms (System/currentTimeMillis)
+                              op         (client/invoke!
+                                          client
+                                          {:datalevin/cluster-id cluster-id}
+                                          write-op)
+                              elapsed-ms (- (System/currentTimeMillis)
+                                            started-ms)]
+                          {:op op
+                           :elapsed-ms elapsed-ms}))))
+                   (finally
+                     (reset! initialized-clusters
+                             original-initialized-clusters)))]
+    (is (deref started? 500 false))
+    (is (deref closed? 500 false))
+    (is (= (assoc write-op
+                  :type :info
+                  :error :op-timeout
                   :txreg/timeout-ms 50)
            (:op result)))
     (is (< (:elapsed-ms result) 1000))))

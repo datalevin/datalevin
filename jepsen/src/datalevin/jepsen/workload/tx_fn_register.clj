@@ -27,7 +27,9 @@
 (def ^:private tx-fn-padding
   (apply str (repeat 512 "tx-fn-register-padding-")))
 (def ^:private default-setup-timeout-ms 15000)
+(def ^:dynamic *close-conn!* d/close)
 (def ^:dynamic *read-timeout-ms* 10000)
+(def ^:dynamic *op-timeout-ms* 10000)
 (defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private txreg-rows-query
   '[:find ?key ?version ?payload
@@ -442,13 +444,35 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- close-conn-quietly!
+  [conn]
+  (when conn
+    (try
+      (*close-conn!* conn)
+      (catch Throwable _
+        nil))))
+
+(defn- async-close-conn-quietly!
+  [conn]
+  (when conn
+    (let [close! (bound-fn []
+                   (close-conn-quietly! conn))]
+      (.start
+       (doto (Thread.
+              (reify Runnable
+                (run [_]
+                  (close!)))
+              (str "datalevin-jepsen-txreg-close-timeout-"
+                   (System/nanoTime)))
+         (.setDaemon true))))))
+
 (defn- call-with-timeout-ms
   [timeout-ms f]
   (let [executor (Executors/newSingleThreadExecutor
                   (reify ThreadFactory
                     (newThread [_ runnable]
                       (doto (Thread. runnable
-                                     (str "datalevin-jepsen-txreg-read-timeout-"
+                                     (str "datalevin-jepsen-txreg-op-timeout-"
                                           (System/nanoTime)))
                         (.setDaemon true)))))
         bound-f  (bound-fn* f)
@@ -492,31 +516,38 @@
            :txreg/payload-valid? (:payload-valid? result)
            :txreg/payload-bytes (:payload-bytes result))))
 
-(defn- invoke-with-cached-leader-conn!
-  [client test payload-bytes op]
-  (workload.util/with-cached-leader-conn
-    client
-    test
-    schema
-    (fn [conn]
-      (result-op op (execute-op! conn payload-bytes op)))))
+(defn- timeout-ms-for-op
+  [op]
+  (if (= :read (:f op))
+    *read-timeout-ms*
+    *op-timeout-ms*))
 
-(defn- invoke-read-with-timeout
+(defn- timeout-error-for-op
+  [op]
+  (if (= :read (:f op))
+    :read-timeout
+    :op-timeout))
+
+(defn- invoke-with-fresh-leader-conn-timeout
   [test payload-bytes op]
-  (let [timeout-ms *read-timeout-ms*
+  (let [timeout-ms (timeout-ms-for-op op)
+        conn*      (atom nil)
         result     (call-with-timeout-ms
                     timeout-ms
                     (fn []
                       (let [conn (workload.util/*open-leader-conn* test schema)]
+                        (reset! conn* conn)
                         (try
                           (result-op op (execute-op! conn payload-bytes op))
                           (finally
-                            (d/close conn))))))]
+                            (close-conn-quietly! conn))))))]
     (if (= :timeout (:status result))
-      (assoc op
-             :type :info
-             :error :read-timeout
-             :txreg/timeout-ms timeout-ms)
+      (do
+        (async-close-conn-quietly! @conn*)
+        (assoc op
+               :type :info
+               :error (timeout-error-for-op op)
+               :txreg/timeout-ms timeout-ms))
       (:value result))))
 
 (defn- payload-checker
@@ -579,8 +610,7 @@
 (defrecord Client [node key-count payload-bytes]
   client/Client
   (open! [this _test node]
-    (workload.util/attach-cached-leader-conn
-      (assoc this :node node)))
+    (assoc this :node node))
 
   (setup! [this test]
     (ensure-txreg-initialized! test key-count payload-bytes)
@@ -589,9 +619,7 @@
   (invoke! [this test op]
     (try
       (ensure-txreg-initialized! test key-count payload-bytes)
-      (if (= :read (:f op))
-        (invoke-read-with-timeout test payload-bytes op)
-        (invoke-with-cached-leader-conn! this test payload-bytes op))
+      (invoke-with-fresh-leader-conn-timeout test payload-bytes op)
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 
@@ -599,7 +627,7 @@
     this)
 
   (close! [this _test]
-    (workload.util/close-cached-leader-conn! this)))
+    this))
 
 (defn workload
   [opts]

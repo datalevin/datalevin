@@ -53,6 +53,7 @@ Environment overrides:
   DTLV_JEPSEN_ASYMMETRIC_MAX_WRITES_PER_KEY
   DTLV_JEPSEN_ASYMMETRIC_MIN_TXN_LENGTH
   DTLV_JEPSEN_ASYMMETRIC_MAX_TXN_LENGTH
+  DTLV_JEPSEN_ASYMMETRIC_HARD_TIMEOUT_S
   DTLV_JEPSEN_SKIP_JAVAC
   DTLV_JEPSEN_PORT_RETRY_COUNT
   DTLV_JEPSEN_PORT_RETRY_DELAY_S
@@ -244,6 +245,14 @@ log_dir="$repo_root/tmp/jepsen-asymmetric-workloads/$run_id"
 stream_logs="${DTLV_JEPSEN_ASYMMETRIC_STREAM_LOGS:-0}"
 port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
+hard_timeout_s="${DTLV_JEPSEN_ASYMMETRIC_HARD_TIMEOUT_S:-180}"
+timeout_bin=""
+
+if command -v timeout >/dev/null 2>&1; then
+  timeout_bin="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  timeout_bin="gtimeout"
+fi
 
 mkdir -p "$log_dir"
 ensure_java_classes
@@ -302,8 +311,17 @@ for workload in "${selected_workloads[@]}"; do
     cmd+=("${extra_args[@]}")
   fi
 
+  wrapped_cmd=("${cmd[@]}")
+  if [[ -n "$hard_timeout_s" && "$hard_timeout_s" != "0" ]]; then
+    if [[ -n "$timeout_bin" ]]; then
+      wrapped_cmd=("$timeout_bin" "$hard_timeout_s" "${wrapped_cmd[@]}")
+    else
+      printf '    warning: timeout command not found; running without hard timeout\n' >&2
+    fi
+  fi
+
   run_exit=0
-  if run_jepsen "$log_file" "${cmd[@]}"; then
+  if run_jepsen "$log_file" "${wrapped_cmd[@]}"; then
     run_exit=0
   else
     run_exit=$?
@@ -335,7 +353,11 @@ for workload in "${selected_workloads[@]}"; do
 
   if [[ "$run_exit" -ne 0 ]]; then
     status=1
-    summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+    if [[ "$run_exit" -eq 124 ]]; then
+      summaries+=("$workload hard-timeout timeout=${hard_timeout_s}s log=$log_file")
+    else
+      summaries+=("$workload command-failed exit=$run_exit log=$log_file")
+    fi
     continue
   fi
 
