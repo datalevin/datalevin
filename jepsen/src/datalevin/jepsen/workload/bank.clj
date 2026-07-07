@@ -7,7 +7,10 @@
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
    [jepsen.client :as client]
-   [taoensso.timbre :as log]))
+   [taoensso.timbre :as log])
+  (:import
+   [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+    TimeUnit TimeoutException]))
 
 (def schema
   {:bank/id {:db/valueType :db.type/long
@@ -46,6 +49,9 @@
 
 (defonce ^:private initialized-clusters (init-cache/cluster-cache))
 (def ^:private default-setup-timeout-ms 15000)
+(def ^:dynamic *close-conn!* d/close)
+(def ^:dynamic *read-timeout-ms* 10000)
+(def ^:dynamic *op-timeout-ms* 10000)
 (def ^:private tx-fn-query
   '[:find ?fn .
     :where
@@ -238,8 +244,130 @@
 
 (defn- op-error
   [e]
-  (or (ex-message e)
-      (.getName (class e))))
+  (let [data     (ex-data e)
+        err-data (or (:err-data data) data)]
+    (cond
+      (= :ha/read-rejected (:error err-data))
+      :ha/read-rejected
+
+      (when-some [message (ex-message e)]
+        (re-find #"HA read admission rejected" message))
+      :ha/read-rejected
+
+      :else
+      (or (ex-message e)
+          (.getName (class e))))))
+
+(defn- read-rejection-op?
+  [op error]
+  (and (= :read-all (:f op))
+       (= :ha/read-rejected error)))
+
+(defn- assoc-bank-exception-op
+  [op e]
+  (let [error (op-error e)]
+    (if (read-rejection-op? op error)
+      (assoc op
+             :type :info
+             :error error)
+      (workload.util/assoc-exception-op op e error))))
+
+(defn- close-conn-quietly!
+  [conn]
+  (when conn
+    (try
+      (*close-conn!* conn)
+      (catch Throwable _
+        nil))))
+
+(defn- async-close-conn-quietly!
+  [conn]
+  (when conn
+    (let [close! (bound-fn []
+                   (close-conn-quietly! conn))]
+      (.start
+       (doto (Thread.
+              (reify Runnable
+                (run [_]
+                  (close!)))
+              (str "datalevin-jepsen-bank-close-timeout-"
+                   (System/nanoTime)))
+         (.setDaemon true))))))
+
+(defn- call-with-timeout-ms
+  [timeout-ms f]
+  (let [executor (Executors/newSingleThreadExecutor
+                  (reify ThreadFactory
+                    (newThread [_ runnable]
+                      (doto (Thread. runnable
+                                     (str "datalevin-jepsen-bank-op-timeout-"
+                                          (System/nanoTime)))
+                        (.setDaemon true)))))
+        bound-f  (bound-fn* f)
+        task     (.submit executor
+                          ^Callable
+                          (reify Callable
+                            (call [_]
+                              (bound-f))))]
+    (try
+      {:status :completed
+       :value (.get task (long timeout-ms) TimeUnit/MILLISECONDS)}
+      (catch TimeoutException _
+        (.cancel task true)
+        {:status :timeout})
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.cancel task true)
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.shutdownNow executor)))))
+
+(defn- complete-op
+  [op value]
+  (if (and (vector? value)
+           (= :unsupported-client-op (first value)))
+    (assoc op
+           :type :fail
+           :error value)
+    (assoc op
+           :type :ok
+           :value value)))
+
+(defn- timeout-ms-for-op
+  [op]
+  (if (= :read-all (:f op))
+    *read-timeout-ms*
+    *op-timeout-ms*))
+
+(defn- timeout-error-for-op
+  [op]
+  (if (= :read-all (:f op))
+    :read-timeout
+    :op-timeout))
+
+(defn- invoke-with-fresh-leader-conn-timeout
+  [test account-count op]
+  (let [timeout-ms (timeout-ms-for-op op)
+        conn*      (atom nil)
+        result     (call-with-timeout-ms
+                    timeout-ms
+                    (fn []
+                      (let [conn (workload.util/*open-leader-conn* test schema)]
+                        (reset! conn* conn)
+                        (try
+                          (complete-op op (execute-op! conn account-count op))
+                          (finally
+                            (close-conn-quietly! conn))))))]
+    (if (= :timeout (:status result))
+      (do
+        (async-close-conn-quietly! @conn*)
+        (assoc op
+               :type :info
+               :error (timeout-error-for-op op)
+               :bank/timeout-ms timeout-ms))
+      (:value result))))
 
 (defn- balances-invalid-reason
   [balances expected-count expected-total]
@@ -318,8 +446,7 @@
 (defrecord Client [node account-count initial-balance]
   client/Client
   (open! [this _test node]
-    (workload.util/attach-cached-leader-conn
-      (assoc this :node node)))
+    (assoc this :node node))
 
   (setup! [this test]
     (ensure-bank-initialized! test account-count initial-balance)
@@ -327,28 +454,16 @@
 
   (invoke! [this test op]
     (try
-      (workload.util/with-cached-leader-conn
-        this
-        test
-        schema
-        (fn [conn]
-          (let [value (execute-op! conn account-count op)]
-            (if (and (vector? value)
-                     (= :unsupported-client-op (first value)))
-              (assoc op
-                     :type :fail
-                     :error value)
-              (assoc op
-                     :type :ok
-                     :value value)))))
+      (ensure-bank-initialized! test account-count initial-balance)
+      (invoke-with-fresh-leader-conn-timeout test account-count op)
       (catch Throwable e
-        (workload.util/assoc-exception-op op e (op-error e)))))
+        (assoc-bank-exception-op op e))))
 
   (teardown! [this _test]
     this)
 
   (close! [this _test]
-    (workload.util/close-cached-leader-conn! this)))
+    this))
 
 (defn workload
   [opts]

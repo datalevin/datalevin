@@ -3,6 +3,7 @@
    [clojure.test :refer [deftest is testing use-fixtures]]
    [datalevin.conn :as conn]
    [datalevin.core :as d]
+   [datalevin.jepsen.workload.bank :as bank]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
@@ -865,6 +866,80 @@
             :value {:timeout-ms 50}}
            (:op result)))
     (is (< (:elapsed-ms result) 1000))))
+
+(deftest bank-read-all-is-bounded-test
+  (let [started? (promise)
+        cluster-id ::bank-read-all-is-bounded
+        read-op   {:type :invoke
+                   :f :read-all}
+        blocking-conn
+        (reify clojure.lang.IDeref
+          (deref [_]
+            (deliver started? true)
+            (Thread/sleep 10000)
+            nil))
+        initialized-clusters
+        (var-get #'bank/initialized-clusters)
+        original-initialized-clusters @initialized-clusters
+        client   (bank/->Client "n1" 4 100)
+        result   (try
+                   (swap! initialized-clusters conj cluster-id)
+                   (with-redefs-fn
+                    {#'workload.util/*open-leader-conn*
+                     (fn [_test _schema]
+                       blocking-conn)}
+                    (fn []
+                      (binding [bank/*close-conn!* (fn [_conn] nil)
+                                bank/*read-timeout-ms* 50]
+                        (let [started-ms (System/currentTimeMillis)
+                              op         (client/invoke!
+                                          client
+                                          {:datalevin/cluster-id cluster-id}
+                                          read-op)
+                              elapsed-ms (- (System/currentTimeMillis)
+                                            started-ms)]
+                          {:op op
+                           :elapsed-ms elapsed-ms}))))
+                   (finally
+                     (reset! initialized-clusters
+                             original-initialized-clusters)))]
+    (is (deref started? 500 false))
+    (is (= (assoc read-op
+                  :type :info
+                  :error :read-timeout
+                  :bank/timeout-ms 50)
+           (:op result)))
+    (is (< (:elapsed-ms result) 1000))))
+
+(deftest bank-read-all-ha-read-rejection-is-info-test
+  (let [cluster-id ::bank-read-all-ha-read-rejection
+        read-op   {:type :invoke
+                   :f :read-all}
+        rejection (ex-info
+                   "Request to Datalevin server failed: \"HA read admission rejected\""
+                   {:err-data {:error :ha/read-rejected}})
+        initialized-clusters
+        (var-get #'bank/initialized-clusters)
+        original-initialized-clusters @initialized-clusters
+        client   (bank/->Client "n1" 4 100)
+        result   (try
+                   (swap! initialized-clusters conj cluster-id)
+                   (with-redefs-fn
+                    {#'workload.util/*open-leader-conn*
+                     (fn [_test _schema]
+                       (throw rejection))}
+                    (fn []
+                      (client/invoke!
+                       client
+                       {:datalevin/cluster-id cluster-id}
+                       read-op)))
+                   (finally
+                     (reset! initialized-clusters
+                             original-initialized-clusters)))]
+    (is (= (assoc read-op
+                  :type :info
+                  :error :ha/read-rejected)
+           result))))
 
 (deftest tx-fn-register-read-is-bounded-test
   (let [started? (promise)
