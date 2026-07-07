@@ -154,9 +154,19 @@
         schema {:account/status  {:db/valueType :db.type/keyword}
                 :account/balance {:db/valueType :db.type/long}
                 :account/locked? {:db/valueType :db.type/boolean}}
+        descriptor {:udf/lang :test
+                    :udf/kind :predicate
+                    :udf/id   :account/open?}
+        installed-descriptor {:udf/lang :test
+                              :udf/kind :predicate
+                              :udf/id   :account/installed-open?}
+        registry (doto (udf/create-registry)
+                   (udf/register! descriptor account-open?)
+                   (udf/register! installed-descriptor account-open?))
         conn   (d/create-conn
                  dir schema
-                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+                 {:runtime-opts {:udf-registry registry}
+                  :kv-opts      {:flags (conj c/default-env-flags :nosync)}})]
     (try
       (let [report (d/transact!
                      conn
@@ -166,17 +176,29 @@
                       [:db/ensure
                        'datalevin.test.transact/account-open?
                        "acct"]
-                      [:db/ensure account-balance? "acct" 10]])
+                      [:db/ensure account-balance? "acct" 10]
+                      [:db/ensure descriptor "acct"]
+                      [:db/ensure :account/open? "acct"]])
             eid    (get (:tempids report) "acct")]
         (is (some? eid))
         (is (= :open (:account/status (d/entity @conn eid))))
         (is (not-any? #(= :db/ensure (:a %)) (:tx-data report))))
 
+      (let [report (d/transact!
+                     conn
+                     [{:db/ident :account/installed-open?
+                       :db/udf   installed-descriptor}
+                      {:db/id "installed" :account/status :open}
+                      [:db/ensure :account/installed-open? "installed"]])
+            eid    (get (:tempids report) "installed")]
+        (is (= :open (:account/status (d/entity @conn eid)))))
+
       (binding [c/*use-prepare-path* true]
         (let [report (d/transact!
                        conn
                        [{:db/id "prep" :account/status :open}
-                        [:db/ensure account-open? "prep"]])
+                        [:db/ensure account-open? "prep"]
+                        [:db/ensure :account/open? "prep"]])
               eid    (get (:tempids report) "prep")]
           (is (= :open (:account/status (d/entity @conn eid))))))
 

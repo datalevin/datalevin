@@ -17,12 +17,70 @@ function descriptorKey(descriptor) {
   ].join("\u0000");
 }
 
-async function createProxy(fn) {
+function materializeJavaArgs(args) {
+  if (Array.isArray(args)) {
+    return args;
+  }
+  if (typeof args?.toArraySync === "function") {
+    try {
+      const items = args.toArraySync();
+      return Array.isArray(items) ? items : Array.from(items);
+    } catch {
+      // Fall through to iterator traversal below.
+    }
+  }
+
+  const items = [];
+  const iterator = args.iteratorSync();
+  while (iterator.hasNextSync()) {
+    items.push(iterator.nextSync());
+  }
+  return items;
+}
+
+async function txUdfArgsToJs(args) {
+  if (Array.isArray(args)) {
+    if (args.length === 0) {
+      return args;
+    }
+    const convertedTail = await Promise.all(args.slice(1).map((value) => toJs(value)));
+    return [args[0], ...convertedTail];
+  }
+
+  if (typeof args?.sizeSync === "function" && typeof args?.getSync === "function") {
+    const size = Number(args.sizeSync());
+    if (size === 0) {
+      return [];
+    }
+    const values = [null];
+    for (let index = 1; index < size; index += 1) {
+      values.push(await toJs(args.getSync(index)));
+    }
+    return values;
+  }
+
+  const values = materializeJavaArgs(args);
+  if (values.length === 0) {
+    return values;
+  }
+  const convertedTail = await Promise.all(values.slice(1).map((value) => toJs(value)));
+  return [values[0], ...convertedTail];
+}
+
+async function udfArgsToJs(args, descriptor) {
+  if (descriptor[":udf/kind"] !== ":tx-fn") {
+    const jsArgs = await toJs(args);
+    return Array.isArray(jsArgs) ? jsArgs : [jsArgs];
+  }
+
+  return txUdfArgsToJs(args);
+}
+
+async function createProxy(fn, descriptor) {
   const { newProxy } = await javaBridgeModule();
   return newProxy("datalevin.UdfFunction", {
     invoke: async (args) => {
-      const jsArgs = await toJs(args);
-      const values = Array.isArray(jsArgs) ? jsArgs : [jsArgs];
+      const values = await udfArgsToJs(args, descriptor);
       const result = await fn(...values);
       return toJava(result === undefined ? null : result);
     }
@@ -75,7 +133,7 @@ export class UdfRegistry {
     }
 
     const normalized = udfDescriptor(descriptor);
-    const proxy = await createProxy(fn);
+    const proxy = await createProxy(fn, normalized);
     await _BINDINGS.registerUdf(this._handle, normalized, proxy);
     this._proxies.set(descriptorKey(normalized), proxy);
     return fn;

@@ -1212,16 +1212,36 @@
   (when report
     (seq (get report tx-ensures-key))))
 
+(defn- ensure-udf-reference?
+  [pred]
+  (or (udf/descriptor? pred) (keyword? pred)))
+
+(defn- ensure-udf-context
+  [db]
+  {:db        db
+   :kind      :predicate
+   :embedded? true
+   :store     (:store db)})
+
+(defn- resolve-ensure-udf
+  [db pred]
+  (let [registry   (udf-registry db)
+        descriptor (or (txprep/installed-udf-descriptor db :predicate pred)
+                       (udf/descriptor-or-registered registry :predicate pred))]
+    (udf/materialize registry (ensure-udf-context db) descriptor)))
+
 (defn- resolve-ensure-pred
-  [pred entity]
+  [db pred entity]
   (vld/validate-ensure-predicate pred entity)
-  (let [callable (if (symbol? pred)
-                   (requiring-resolve pred)
-                   pred)
-        callable (if (var? callable) @callable callable)]
-    (if (ifn? callable)
-      callable
-      (vld/validate-ensure-predicate callable entity))))
+  (if (ensure-udf-reference? pred)
+    (resolve-ensure-udf db pred)
+    (let [callable (if (symbol? pred)
+                     (requiring-resolve pred)
+                     pred)
+          callable (if (var? callable) @callable callable)]
+      (if (ifn? callable)
+        callable
+        (vld/validate-ensure-predicate callable entity)))))
 
 (defn- resolve-ensure-arg
   [tempids arg entity]
@@ -1242,7 +1262,7 @@
   (doseq [[pred args entity] (report-ensures report)]
     (let [tempids       (:tempids report)
           resolved-args (mapv #(resolve-ensure-arg tempids % entity) args)
-          callable      (resolve-ensure-pred pred entity)
+          callable      (resolve-ensure-pred db pred entity)
           result        (apply callable db resolved-args)]
       (vld/validate-ensure-result result pred resolved-args entity))))
 

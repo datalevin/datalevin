@@ -106,11 +106,16 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
     def inc(value):
         return value + 1
 
+    @registry.predicate_udf(":score/high?")
+    def high_score(score):
+        return score >= 10
+
     @registry.tx_udf(":person/bootstrap")
     def bootstrap(db, name):
         return [{":db/id": -1, ":name": name, ":score": 10}]
 
     query_descriptor = udf_descriptor(":math/inc")
+    predicate_descriptor = udf_descriptor(":score/high?", kind=":predicate")
     tx_descriptor = udf_descriptor(":person/bootstrap", kind=":tx-fn")
 
     with connect(
@@ -125,20 +130,29 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
         opts={":runtime-opts": {":udf-registry": registry}},
     ) as conn:
         conn.transact([[":db.fn/call", tx_descriptor, "Ada"]])
+        conn.transact([{":db/id": -1, ":name": "Bob", ":score": 3}])
 
         assert conn.query(
             "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
             query_descriptor,
             9,
         ) == 10
-        assert conn.query("[:find [?name ...] :where [?e :name ?name]]") == ["Ada"]
+        assert conn.query(
+            "[:find [?name ...] :in $ ?pred "
+            ":where [?e :name ?name] [?e :score ?score] [(udf ?pred ?score)]]",
+            predicate_descriptor,
+        ) == ["Ada"]
+        assert sorted(conn.query("[:find [?name ...] :where [?e :name ?name]]")) == ["Ada", "Bob"]
         assert registry.registered(query_descriptor) is True
+        assert registry.registered(predicate_descriptor) is True
         assert registry.registered(tx_descriptor) is True
 
         registry.unregister(query_descriptor)
+        registry.unregister(predicate_descriptor)
         registry.unregister(tx_descriptor)
 
         assert registry.registered(query_descriptor) is False
+        assert registry.registered(predicate_descriptor) is False
         assert registry.registered(tx_descriptor) is False
 
 

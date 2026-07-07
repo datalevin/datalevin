@@ -243,6 +243,22 @@ client/server mode, atomic transaction UDFs execute on the server, so the
 server process must have the corresponding runtime registry or resolver
 configured. See [server](server.md).
 
+`:db/ensure` can use predicate UDFs for transaction assertions from non-Clojure
+runtimes. Use `:udf/kind :predicate`; the transaction engine invokes the
+predicate with `db-after` followed by the resolved `:db/ensure` arguments. The
+predicate can be an inline descriptor map, a registered UDF id keyword, or an
+installed `:db/udf` ident. Any falsey return aborts the transaction.
+
+```clojure
+(def open-account? {:udf/lang :java
+                    :udf/kind :predicate
+                    :udf/id   :account/open?})
+
+(d/transact! conn [{:db/id "acct" :account/status :open}
+                   [:db/ensure open-account? "acct"]
+                   [:db/ensure :account/open? "acct"]])
+```
+
 For usage examples, see tests in `datalevin.test.transact`.
 
 ## Bulk Load Data into Datalog Store

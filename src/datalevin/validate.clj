@@ -1371,12 +1371,15 @@
               :tx-data entity})))
 
 (defn validate-ensure-predicate
-  "Validate that :db/ensure predicate is directly callable or a qualified symbol."
+  "Validate that :db/ensure predicate is directly callable, a qualified
+  symbol, or a UDF descriptor/id."
   [pred entity]
   (when-not (or (ifn? pred)
                 (var? pred)
-                (qualified-symbol? pred))
-    (u/raise ":db/ensure predicate must be a function, var, or qualified symbol: "
+                (qualified-symbol? pred)
+                (udf/descriptor? pred)
+                (keyword? pred))
+    (u/raise ":db/ensure predicate must be a function, var, qualified symbol, UDF descriptor, or registered UDF id: "
              pred
              {:error :transact/syntax
               :operation :db/ensure
