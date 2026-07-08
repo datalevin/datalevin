@@ -383,6 +383,54 @@ final class DatalevinForms {
                                     ClojureCodec.runtimeInput(added));
     }
 
+    static boolean datomIs(Object value) {
+        if (ClojureCodec.isDatom(value)) {
+            return true;
+        }
+        if (value instanceof Map<?, ?> map) {
+            return datomMapValue(map, "e") != MISSING
+                    && datomMapValue(map, "a") != MISSING
+                    && datomMapValue(map, "v") != MISSING;
+        }
+        List<?> values = toList(value);
+        return values != null && values.size() >= 3 && values.size() <= 5;
+    }
+
+    static Object datomE(Object datom) {
+        return datomField(datom, "e", 0, "datom-e");
+    }
+
+    static Object datomA(Object datom) {
+        return datomField(datom, "a", 1, "datom-a");
+    }
+
+    static Object datomV(Object datom) {
+        return datomField(datom, "v", 2, "datom-v");
+    }
+
+    static Object datomTx(Object datom) {
+        return datomField(datom, "tx", 3, "datom-tx");
+    }
+
+    static Object datomAdded(Object datom) {
+        return datomField(datom, "added", 4, "datom-added");
+    }
+
+    private static Object datomField(Object datom, String key, int index, String function) {
+        if (ClojureCodec.isDatom(datom)) {
+            return ClojureRuntime.datom(function, datom);
+        }
+        if (datom instanceof Map<?, ?> map) {
+            Object value = datomMapValue(map, key);
+            return value == MISSING ? null : value;
+        }
+        List<?> values = toList(datom);
+        if (values != null) {
+            return index < values.size() ? values.get(index) : null;
+        }
+        throw new IllegalArgumentException("Expected Datom, datom map, or datom vector, got: " + datom);
+    }
+
     static Object datalogIndexInput(Object index) {
         if (index instanceof Keyword) {
             return index;

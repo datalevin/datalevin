@@ -1022,6 +1022,50 @@ public final class Datalevin {
     }
 
     /**
+     * Returns true if {@code value} is a raw Datom or datom-shaped data.
+     */
+    public static boolean datomIs(Object value) {
+        return DatalevinForms.datomIs(value);
+    }
+
+    /**
+     * Returns the entity id of a raw Datom or datom-shaped value.
+     */
+    public static Object datomE(Object datom) {
+        return DatalevinForms.datomE(datom);
+    }
+
+    /**
+     * Returns the attribute of a raw Datom or datom-shaped value.
+     */
+    public static Object datomA(Object datom) {
+        return DatalevinForms.datomA(datom);
+    }
+
+    /**
+     * Returns the value of a raw Datom or datom-shaped value.
+     */
+    public static Object datomV(Object datom) {
+        return DatalevinForms.datomV(datom);
+    }
+
+    /**
+     * Returns the transaction id of a raw Datom or datom-shaped value, or null
+     * when absent.
+     */
+    public static Object datomTx(Object datom) {
+        return DatalevinForms.datomTx(datom);
+    }
+
+    /**
+     * Returns the assertion flag of a raw Datom or datom-shaped value, or null
+     * when absent.
+     */
+    public static Object datomAdded(Object datom) {
+        return DatalevinForms.datomAdded(datom);
+    }
+
+    /**
      * Creates an ordered string-keyed map from alternating key and value pairs.
      */
     public static LinkedHashMap<String, Object> mapOf(Object... keyValues) {

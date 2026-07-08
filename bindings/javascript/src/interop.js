@@ -16,6 +16,20 @@ function hasValue(value) {
   return value !== null && value !== undefined;
 }
 
+function datomMapValue(value, key) {
+  return value?.[`:${key}`] ?? value?.[key] ?? null;
+}
+
+function datomField(value, key, index) {
+  if (Array.isArray(value)) {
+    return index < value.length ? value[index] : null;
+  }
+  if (value !== null && typeof value === "object") {
+    return datomMapValue(value, key);
+  }
+  throw new TypeError("Expected datom-shaped array or object.");
+}
+
 async function normalizeInteropArgs(args = []) {
   const normalized = [];
   for (const arg of args) {
@@ -898,6 +912,73 @@ class InteropBindings {
       await unwrapInteropHandle(kv),
       hasValue(opts) ? await toJava(opts) : null
     );
+  }
+
+  async searchUtilsCreateAnalyzer(opts = null) {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "createAnalyzer", await toJava(opts ?? {}));
+  }
+
+  async searchUtilsLowerCaseTokenFilter() {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "lowerCaseTokenFilter");
+  }
+
+  async searchUtilsUnaccentTokenFilter() {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "unaccentTokenFilter");
+  }
+
+  async searchUtilsCreateStopWordsTokenFilter(stopWordsOrPredicate) {
+    const cls = await classes();
+    return callJavaMethod(
+      cls.searchUtils,
+      "createStopWordsTokenFilter",
+      await toJava(stopWordsOrPredicate)
+    );
+  }
+
+  async searchUtilsEnStopWordsTokenFilter() {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "enStopWordsTokenFilter");
+  }
+
+  async searchUtilsPrefixTokenFilter() {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "prefixTokenFilter");
+  }
+
+  async searchUtilsCreateNgramTokenFilter(minGramSize, maxGramSize = null) {
+    const cls = await classes();
+    if (!hasValue(maxGramSize)) {
+      return callJavaMethod(cls.searchUtils, "createNgramTokenFilter", await toJava(minGramSize));
+    }
+    return callJavaMethod(
+      cls.searchUtils,
+      "createNgramTokenFilter",
+      await toJava(minGramSize),
+      await toJava(maxGramSize)
+    );
+  }
+
+  async searchUtilsCreateMinLengthTokenFilter(minLength) {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "createMinLengthTokenFilter", await toJava(minLength));
+  }
+
+  async searchUtilsCreateMaxLengthTokenFilter(maxLength) {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "createMaxLengthTokenFilter", await toJava(maxLength));
+  }
+
+  async searchUtilsCreateStemmingTokenFilter(language) {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "createStemmingTokenFilter", language);
+  }
+
+  async searchUtilsCreateRegexpTokenizer(pattern) {
+    const cls = await classes();
+    return callJavaMethod(cls.searchUtils, "createRegexpTokenizer", pattern);
   }
 
   async searchWrite(writer, docRef, docText) {
@@ -1838,6 +1919,37 @@ export function datom(e, attr, value, tx = undefined, added = undefined) {
     return [e, attr, value, tx];
   }
   return [e, attr, value];
+}
+
+export function datomIs(value) {
+  if (Array.isArray(value)) {
+    return value.length >= 3 && value.length <= 5;
+  }
+  return value !== null
+    && typeof value === "object"
+    && datomMapValue(value, "e") !== null
+    && datomMapValue(value, "a") !== null
+    && datomMapValue(value, "v") !== null;
+}
+
+export function datomE(value) {
+  return datomField(value, "e", 0);
+}
+
+export function datomA(value) {
+  return datomField(value, "a", 1);
+}
+
+export function datomV(value) {
+  return datomField(value, "v", 2);
+}
+
+export function datomTx(value) {
+  return datomField(value, "tx", 3);
+}
+
+export function datomAdded(value) {
+  return datomField(value, "added", 4);
 }
 
 export async function openKv(dir, opts = null) {

@@ -18,6 +18,7 @@
  * schema helpers on {@link datalevin.Schema.Attribute} and the option builders
  * returned by {@link datalevin.Datalevin#searchOptions},
  * {@link datalevin.Datalevin#searchDomain},
+ * {@link datalevin.SearchUtils},
  * {@link datalevin.Datalevin#vectorOptions},
  * {@link datalevin.Datalevin#embeddingOptions}, and
  * {@link datalevin.Datalevin#idocOptions}.

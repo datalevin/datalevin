@@ -303,6 +303,7 @@ export async function classes() {
     return {
       datalevin: load("datalevin.Datalevin"),
       interop: load("datalevin.DatalevinInterop"),
+      searchUtils: load("datalevin.SearchUtils"),
       udfFunction: load("datalevin.UdfFunction"),
       datalevinException: load("datalevin.DatalevinException"),
       linkedHashMap: load("java.util.LinkedHashMap"),

@@ -6,6 +6,77 @@ from ._convert import to_python
 from ._interop import _BINDINGS
 
 
+def create_analyzer(opts=None, *, tokenizer=None, token_filters=None):
+    """Create a Datalevin search analyzer from JVM search-utils helpers."""
+
+    merged = dict(opts or {})
+    if tokenizer is not None:
+        merged[":tokenizer"] = tokenizer
+    if token_filters is not None:
+        merged[":token-filters"] = list(token_filters)
+    return _BINDINGS.search_utils_create_analyzer(merged)
+
+
+def lower_case_token_filter():
+    """Return the Datalevin lower-case token filter."""
+
+    return _BINDINGS.search_utils_lower_case_token_filter()
+
+
+def unaccent_token_filter():
+    """Return the Datalevin unaccent token filter."""
+
+    return _BINDINGS.search_utils_unaccent_token_filter()
+
+
+def create_stop_words_token_filter(stop_words_or_predicate):
+    """Create a Datalevin stop-words token filter."""
+
+    return _BINDINGS.search_utils_create_stop_words_token_filter(stop_words_or_predicate)
+
+
+def en_stop_words_token_filter():
+    """Return the Datalevin English stop-words token filter."""
+
+    return _BINDINGS.search_utils_en_stop_words_token_filter()
+
+
+def prefix_token_filter():
+    """Return the Datalevin prefix token filter."""
+
+    return _BINDINGS.search_utils_prefix_token_filter()
+
+
+def create_ngram_token_filter(min_gram_size, max_gram_size=None):
+    """Create a Datalevin ngram token filter."""
+
+    return _BINDINGS.search_utils_create_ngram_token_filter(min_gram_size, max_gram_size)
+
+
+def create_min_length_token_filter(min_length):
+    """Create a Datalevin minimum-length token filter."""
+
+    return _BINDINGS.search_utils_create_min_length_token_filter(min_length)
+
+
+def create_max_length_token_filter(max_length):
+    """Create a Datalevin maximum-length token filter."""
+
+    return _BINDINGS.search_utils_create_max_length_token_filter(max_length)
+
+
+def create_stemming_token_filter(language: str):
+    """Create a Datalevin Snowball stemming token filter."""
+
+    return _BINDINGS.search_utils_create_stemming_token_filter(language)
+
+
+def create_regexp_tokenizer(pattern: str):
+    """Create a Datalevin regexp tokenizer from a Java regular-expression string."""
+
+    return _BINDINGS.search_utils_create_regexp_tokenizer(pattern)
+
+
 class SearchEngine:
     """KV-backed full-text search engine."""
 

@@ -3,6 +3,66 @@ import util from "node:util";
 import { _BINDINGS } from "./interop.js";
 import { toJsResult } from "./result.js";
 
+export async function createAnalyzer(options = {}) {
+  const {
+    tokenizer = null,
+    tokenFilters = null,
+    extra = null,
+    ...opts
+  } = options ?? {};
+  const merged = { ...opts };
+  if (tokenizer !== null && tokenizer !== undefined) {
+    merged[":tokenizer"] = tokenizer;
+  }
+  if (tokenFilters !== null && tokenFilters !== undefined) {
+    merged[":token-filters"] = [...tokenFilters];
+  }
+  if (extra !== null && extra !== undefined) {
+    Object.assign(merged, extra);
+  }
+  return _BINDINGS.searchUtilsCreateAnalyzer(merged);
+}
+
+export async function lowerCaseTokenFilter() {
+  return _BINDINGS.searchUtilsLowerCaseTokenFilter();
+}
+
+export async function unaccentTokenFilter() {
+  return _BINDINGS.searchUtilsUnaccentTokenFilter();
+}
+
+export async function createStopWordsTokenFilter(stopWordsOrPredicate) {
+  return _BINDINGS.searchUtilsCreateStopWordsTokenFilter(stopWordsOrPredicate);
+}
+
+export async function enStopWordsTokenFilter() {
+  return _BINDINGS.searchUtilsEnStopWordsTokenFilter();
+}
+
+export async function prefixTokenFilter() {
+  return _BINDINGS.searchUtilsPrefixTokenFilter();
+}
+
+export async function createNgramTokenFilter(minGramSize, maxGramSize = null) {
+  return _BINDINGS.searchUtilsCreateNgramTokenFilter(minGramSize, maxGramSize);
+}
+
+export async function createMinLengthTokenFilter(minLength) {
+  return _BINDINGS.searchUtilsCreateMinLengthTokenFilter(minLength);
+}
+
+export async function createMaxLengthTokenFilter(maxLength) {
+  return _BINDINGS.searchUtilsCreateMaxLengthTokenFilter(maxLength);
+}
+
+export async function createStemmingTokenFilter(language) {
+  return _BINDINGS.searchUtilsCreateStemmingTokenFilter(language);
+}
+
+export async function createRegexpTokenizer(pattern) {
+  return _BINDINGS.searchUtilsCreateRegexpTokenizer(pattern);
+}
+
 export class SearchEngine {
   constructor(handle) {
     this._handle = handle;

@@ -16,14 +16,24 @@ import {
   apiInfo,
   cardinality,
   connect,
+  createAnalyzer,
+  createRegexpTokenizer,
+  createStopWordsTokenFilter,
   createUdfRegistry,
   datom,
+  datomA,
+  datomAdded,
+  datomE,
+  datomIs,
+  datomTx,
+  datomV,
   datalogKv,
   execJson,
   fillDb,
   initDb,
   interop,
   keyword,
+  lowerCaseTokenFilter,
   maxEid,
   newSearchEngine,
   newVectorIndex,
@@ -35,6 +45,7 @@ import {
   transactAsync,
   txEntity,
   txRetract,
+  unaccentTokenFilter,
   udfDescriptor,
   withTransaction
 } from "../src/index.js";
@@ -353,7 +364,25 @@ test(
         { ":name": "Ada" },
         { ":name": "Bob" }
       ]);
-      assert.equal((await conn.datoms(":eav", { c1: 1, c2: ":name", limit: 1 }))[0][":v"], "Ada");
+      const constructedDatom = datom(9, ":name", "Dana", 7, false);
+      assert.equal(datomIs(constructedDatom), true);
+      assert.deepEqual(
+        [
+          datomE(constructedDatom),
+          datomA(constructedDatom),
+          datomV(constructedDatom),
+          datomTx(constructedDatom),
+          datomAdded(constructedDatom)
+        ],
+        [9, ":name", "Dana", 7, false]
+      );
+      const firstDatom = (await conn.datoms(":eav", { c1: 1, c2: ":name", limit: 1 }))[0];
+      assert.equal(firstDatom[":v"], "Ada");
+      assert.equal(datomIs(firstDatom), true);
+      assert.equal(intValue(datomE(firstDatom)), 1);
+      assert.equal(datomA(firstDatom), ":name");
+      assert.equal(datomV(firstDatom), "Ada");
+      assert.equal(datomAdded(firstDatom), true);
       assert.equal((await conn.seekDatoms(":eav", { c1: 1, c2: ":name", limit: 1 }))[0][":v"], "Ada");
       assert.equal((await conn.rseekDatoms(":ave", { c1: ":name", c2: "Bob", limit: 1 }))[0][":v"], "Bob");
       assert.equal((await conn.searchDatoms({ attr: ":name", value: "Ada" }))[0][":v"], "Ada");
@@ -985,6 +1014,25 @@ test(
       assert.equal(intValue(await engine.docCount()), 0);
       await engine.close();
       assert.equal(await engine.closed(), true);
+
+      const analyzer = await createAnalyzer({
+        tokenizer: await createRegexpTokenizer("\\s+"),
+        tokenFilters: [
+          await lowerCaseTokenFilter(),
+          await unaccentTokenFilter(),
+          await createStopWordsTokenFilter(["pizza"])
+        ]
+      });
+      const custom = await newSearchEngine(kv, searchDomain({
+        domain: "custom",
+        includeText: true,
+        extra: { ":analyzer": analyzer, ":query-analyzer": analyzer }
+      }));
+      await custom.addDoc("accent", "Café pizza");
+      await custom.addDoc("plain", "Cafe pasta");
+      assert.deepEqual(new Set(await custom.search("cafe")), new Set(["accent", "plain"]));
+      assert.equal(await custom.search("pizza"), null);
+      await custom.close();
     } finally {
       await kv.close();
     }

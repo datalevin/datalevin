@@ -258,6 +258,24 @@ class RawInterop:
     def datom(self, e, attr, value, tx=None, added=None):
         return _BINDINGS.datom(e, attr, value, tx, added)
 
+    def datom_is(self, value):
+        return _BINDINGS.datom_is(value)
+
+    def datom_e(self, value):
+        return _BINDINGS.datom_e(value)
+
+    def datom_a(self, value):
+        return _BINDINGS.datom_a(value)
+
+    def datom_v(self, value):
+        return _BINDINGS.datom_v(value)
+
+    def datom_tx(self, value):
+        return _BINDINGS.datom_tx(value)
+
+    def datom_added(self, value):
+        return _BINDINGS.datom_added(value)
+
     def tx_data(self, tx_data):
         return _BINDINGS.tx_data(tx_data)
 

@@ -1114,6 +1114,50 @@ public final class DatalevinInterop {
     }
 
     /**
+     * Returns true if value is a raw Datom or datom-shaped bridge data.
+     */
+    public static boolean datomIs(Object value) {
+        return DatalevinForms.datomIs(value);
+    }
+
+    /**
+     * Returns the entity id of a raw Datom or datom-shaped bridge value.
+     */
+    public static Object datomE(Object datom) {
+        return ClojureCodec.bridgeOutput(DatalevinForms.datomE(datom));
+    }
+
+    /**
+     * Returns the attribute of a raw Datom or datom-shaped bridge value.
+     */
+    public static Object datomA(Object datom) {
+        return ClojureCodec.bridgeOutput(DatalevinForms.datomA(datom));
+    }
+
+    /**
+     * Returns the value of a raw Datom or datom-shaped bridge value.
+     */
+    public static Object datomV(Object datom) {
+        return ClojureCodec.bridgeOutput(DatalevinForms.datomV(datom));
+    }
+
+    /**
+     * Returns the transaction id of a raw Datom or datom-shaped bridge value,
+     * or null when absent.
+     */
+    public static Object datomTx(Object datom) {
+        return ClojureCodec.bridgeOutput(DatalevinForms.datomTx(datom));
+    }
+
+    /**
+     * Returns the assertion flag of a raw Datom or datom-shaped bridge value,
+     * or null when absent.
+     */
+    public static Object datomAdded(Object datom) {
+        return ClojureCodec.bridgeOutput(DatalevinForms.datomAdded(datom));
+    }
+
+    /**
      * Normalizes datom input into the raw Clojure form expected by Datalevin.
      */
     public static Object datoms(Object datoms) {

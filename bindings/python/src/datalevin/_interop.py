@@ -472,6 +472,48 @@ class InteropBindings:
         handle = kv.raw_handle() if callable(getattr(kv, "raw_handle", None)) else kv
         return call_java(classes().interop.searchIndexWriter, handle, to_java(opts))
 
+    def search_utils_create_analyzer(self, opts=None):
+        return call_java(classes().search_utils.createAnalyzer, to_java(opts or {}))
+
+    def search_utils_lower_case_token_filter(self):
+        return call_java(classes().search_utils.lowerCaseTokenFilter)
+
+    def search_utils_unaccent_token_filter(self):
+        return call_java(classes().search_utils.unaccentTokenFilter)
+
+    def search_utils_create_stop_words_token_filter(self, stop_words_or_predicate):
+        return call_java(
+            classes().search_utils.createStopWordsTokenFilter,
+            to_java(stop_words_or_predicate),
+        )
+
+    def search_utils_en_stop_words_token_filter(self):
+        return call_java(classes().search_utils.enStopWordsTokenFilter)
+
+    def search_utils_prefix_token_filter(self):
+        return call_java(classes().search_utils.prefixTokenFilter)
+
+    def search_utils_create_ngram_token_filter(self, min_gram_size, max_gram_size=None):
+        if max_gram_size is None:
+            return call_java(classes().search_utils.createNgramTokenFilter, min_gram_size)
+        return call_java(
+            classes().search_utils.createNgramTokenFilter,
+            min_gram_size,
+            max_gram_size,
+        )
+
+    def search_utils_create_min_length_token_filter(self, min_length):
+        return call_java(classes().search_utils.createMinLengthTokenFilter, min_length)
+
+    def search_utils_create_max_length_token_filter(self, max_length):
+        return call_java(classes().search_utils.createMaxLengthTokenFilter, max_length)
+
+    def search_utils_create_stemming_token_filter(self, language: str):
+        return call_java(classes().search_utils.createStemmingTokenFilter, language)
+
+    def search_utils_create_regexp_tokenizer(self, pattern: str):
+        return call_java(classes().search_utils.createRegexpTokenizer, pattern)
+
     def search_write(self, writer, doc_ref, doc_text):
         handle = writer.raw_handle() if callable(getattr(writer, "raw_handle", None)) else writer
         return call_java(classes().interop.searchWrite, handle, to_java(doc_ref), doc_text)
@@ -697,6 +739,24 @@ class InteropBindings:
         if tx is not None:
             return call_java(classes().interop.datom, to_java(e), to_java(attr), to_java(value), to_java(tx))
         return call_java(classes().interop.datom, to_java(e), to_java(attr), to_java(value))
+
+    def datom_is(self, value) -> bool:
+        return bool(call_java(classes().interop.datomIs, to_java(value)))
+
+    def datom_e(self, datom):
+        return call_java(classes().interop.datomE, to_java(datom))
+
+    def datom_a(self, datom):
+        return call_java(classes().interop.datomA, to_java(datom))
+
+    def datom_v(self, datom):
+        return call_java(classes().interop.datomV, to_java(datom))
+
+    def datom_tx(self, datom):
+        return call_java(classes().interop.datomTx, to_java(datom))
+
+    def datom_added(self, datom):
+        return call_java(classes().interop.datomAdded, to_java(datom))
 
     def tx_data(self, tx_data):
         if tx_data is None:
@@ -1199,6 +1259,42 @@ def datom(e, attr, value, tx=_MISSING, added=_MISSING):
     return (e, attr, value)
 
 
+def datom_is(value) -> bool:
+    """Return true if value is a Datom or datom-shaped data."""
+
+    return _BINDINGS.datom_is(value)
+
+
+def datom_e(value):
+    """Return the entity id of a Datom or datom-shaped value."""
+
+    return to_python(_BINDINGS.datom_e(value))
+
+
+def datom_a(value):
+    """Return the attribute of a Datom or datom-shaped value."""
+
+    return to_python(_BINDINGS.datom_a(value))
+
+
+def datom_v(value):
+    """Return the value of a Datom or datom-shaped value."""
+
+    return to_python(_BINDINGS.datom_v(value))
+
+
+def datom_tx(value):
+    """Return the transaction id of a Datom or datom-shaped value, or None."""
+
+    return to_python(_BINDINGS.datom_tx(value))
+
+
+def datom_added(value):
+    """Return the assertion flag of a Datom or datom-shaped value, or None."""
+
+    return to_python(_BINDINGS.datom_added(value))
+
+
 def _attr_key(attr):
     if isinstance(attr, str) and attr.startswith(":"):
         return attr
@@ -1255,6 +1351,12 @@ __all__ = [
     "api_info",
     "connect",
     "datom",
+    "datom_a",
+    "datom_added",
+    "datom_e",
+    "datom_is",
+    "datom_tx",
+    "datom_v",
     "datalog_kv",
     "embedding_attr",
     "embedding_options",

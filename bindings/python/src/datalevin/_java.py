@@ -17,6 +17,7 @@ class JavaClasses:
 
     datalevin: object
     interop: object
+    search_utils: object
     json_api: object
     udf_function: object
     linked_hash_map: object
@@ -51,6 +52,7 @@ def classes() -> JavaClasses:
     return JavaClasses(
         datalevin=jpype.JClass("datalevin.Datalevin"),
         interop=jpype.JClass("datalevin.DatalevinInterop"),
+        search_utils=jpype.JClass("datalevin.SearchUtils"),
         json_api=jpype.JClass("datalevin.JSONApi"),
         udf_function=jpype.JClass("datalevin.UdfFunction"),
         linked_hash_map=jpype.JClass("java.util.LinkedHashMap"),

@@ -3,6 +3,7 @@ package datalevin;
 import clojure.java.api.Clojure;
 import clojure.lang.ArraySeq;
 import clojure.lang.IFn;
+import clojure.lang.Var;
 
 import java.util.Collections;
 import java.util.LinkedHashMap;
@@ -355,6 +356,14 @@ final class ClojureRuntime {
 
     static void requireNamespace(String ns) {
         require(ns);
+    }
+
+    static Object varValue(String ns, String name) {
+        try {
+            return ((Var) Clojure.var(ns, name)).deref();
+        } catch (RuntimeException e) {
+            throw translateException(e);
+        }
     }
 
     private static IFn lookup(String ns, String name) {

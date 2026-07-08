@@ -12,6 +12,12 @@ from datalevin import (
     connect,
     datalog_kv,
     datom,
+    datom_a,
+    datom_added,
+    datom_e,
+    datom_is,
+    datom_tx,
+    datom_v,
     fill_db,
     init_db,
     keyword,
@@ -126,7 +132,14 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             {":name": "Ada"},
             {":name": "Bob"},
         ]
-        assert conn.datoms(":eav", 1, ":name", limit=1)[0][":v"] == "Ada"
+        first_datom = conn.datoms(":eav", 1, ":name", limit=1)[0]
+        assert first_datom[":v"] == "Ada"
+        assert datom_is(first_datom) is True
+        assert datom_e(first_datom) == 1
+        assert datom_a(first_datom) == ":name"
+        assert datom_v(first_datom) == "Ada"
+        assert datom_tx(first_datom) is not None
+        assert datom_added(first_datom) is True
         assert conn.seek_datoms(":eav", 1, ":name", limit=1)[0][":v"] == "Ada"
         assert conn.rseek_datoms(":ave", ":name", "Bob", limit=1)[0][":v"] == "Bob"
         assert conn.search_datoms(attr=":name", value="Ada")[0][":e"] == 1

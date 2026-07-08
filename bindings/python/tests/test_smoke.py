@@ -7,12 +7,17 @@ import pytest
 from datalevin import (
     api_info,
     connect,
+    create_analyzer,
+    create_regexp_tokenizer,
+    create_stop_words_token_filter,
+    lower_case_token_filter,
     new_search_engine,
     new_vector_index,
     open_kv,
     re_index,
     search_domain,
     search_index_writer,
+    unaccent_token_filter,
     with_transaction,
 )
 pytestmark = pytest.mark.usefixtures("require_runtime")
@@ -127,6 +132,28 @@ def test_search_index_writer_commits_to_kv_index(tmp_path: Path) -> None:
         assert engine.doc_indexed("doc-3") is False
         assert engine.clear_docs() is engine
         assert engine.doc_count() == 0
+
+        analyzer = create_analyzer(
+            tokenizer=create_regexp_tokenizer(r"\s+"),
+            token_filters=[
+                lower_case_token_filter(),
+                unaccent_token_filter(),
+                create_stop_words_token_filter(["pizza"]),
+            ],
+        )
+        custom = new_search_engine(
+            kv,
+            search_domain(
+                domain="custom",
+                include_text=True,
+                extra={":analyzer": analyzer, ":query-analyzer": analyzer},
+            ),
+        )
+        custom.add_doc("accent", "Café pizza")
+        custom.add_doc("plain", "Cafe pasta")
+        assert set(custom.search("cafe")) == {"accent", "plain"}
+        assert custom.search("pizza") is None
+        custom.close()
 
 
 def test_standalone_vector_index(tmp_path: Path) -> None:

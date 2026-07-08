@@ -15,6 +15,12 @@ export {
   cardinality,
   connect,
   datom,
+  datomA,
+  datomAdded,
+  datomE,
+  datomIs,
+  datomTx,
+  datomV,
   datalogKv,
   embeddingAttr,
   embeddingOptions,
@@ -59,6 +65,20 @@ export {
 export { interop } from "./raw.js";
 export { KV, KVTransaction, RawBuffer, RawKV } from "./kv.js";
 export { LlamaEmbedder, LlamaGenerator } from "./llm.js";
-export { SearchEngine, SearchIndexWriter } from "./search.js";
+export {
+  SearchEngine,
+  SearchIndexWriter,
+  createAnalyzer,
+  createMaxLengthTokenFilter,
+  createMinLengthTokenFilter,
+  createNgramTokenFilter,
+  createRegexpTokenizer,
+  createStemmingTokenFilter,
+  createStopWordsTokenFilter,
+  enStopWordsTokenFilter,
+  lowerCaseTokenFilter,
+  prefixTokenFilter,
+  unaccentTokenFilter
+} from "./search.js";
 export { UdfRegistry, createUdfRegistry, udfDescriptor } from "./udf.js";
 export { VectorIndex } from "./vector.js";

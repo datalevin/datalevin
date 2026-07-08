@@ -139,6 +139,24 @@ class FakeInteropBindings:
     def datom(self, e, attr, value, tx=None, added=None):
         return ("datom", e, attr, value, tx, added)
 
+    def datom_is(self, value):
+        return isinstance(value, (tuple, list)) and 3 <= len(value) <= 5
+
+    def datom_e(self, value):
+        return value[0]
+
+    def datom_a(self, value):
+        return value[1]
+
+    def datom_v(self, value):
+        return value[2]
+
+    def datom_tx(self, value):
+        return value[3] if len(value) > 3 else None
+
+    def datom_added(self, value):
+        return value[4] if len(value) > 4 else None
+
     def close_connection(self, handle):
         self.conn_closed.add(handle)
 
@@ -212,6 +230,46 @@ class FakeInteropBindings:
     def search_index_writer(self, kv, opts=None):
         self.last_search_writer = (kv, opts)
         return "SEARCH_WRITER"
+
+    def search_utils_create_analyzer(self, opts=None):
+        self.last_search_utils_create_analyzer = opts
+        return "ANALYZER"
+
+    def search_utils_lower_case_token_filter(self):
+        return "LOWER_FILTER"
+
+    def search_utils_unaccent_token_filter(self):
+        return "UNACCENT_FILTER"
+
+    def search_utils_create_stop_words_token_filter(self, stop_words_or_predicate):
+        self.last_search_utils_stop_words = stop_words_or_predicate
+        return "STOP_FILTER"
+
+    def search_utils_en_stop_words_token_filter(self):
+        return "EN_STOP_FILTER"
+
+    def search_utils_prefix_token_filter(self):
+        return "PREFIX_FILTER"
+
+    def search_utils_create_ngram_token_filter(self, min_gram_size, max_gram_size=None):
+        self.last_search_utils_ngram = (min_gram_size, max_gram_size)
+        return "NGRAM_FILTER"
+
+    def search_utils_create_min_length_token_filter(self, min_length):
+        self.last_search_utils_min_length = min_length
+        return "MIN_FILTER"
+
+    def search_utils_create_max_length_token_filter(self, max_length):
+        self.last_search_utils_max_length = max_length
+        return "MAX_FILTER"
+
+    def search_utils_create_stemming_token_filter(self, language):
+        self.last_search_utils_stemming = language
+        return "STEM_FILTER"
+
+    def search_utils_create_regexp_tokenizer(self, pattern):
+        self.last_search_utils_regexp = pattern
+        return "REGEXP_TOKENIZER"
 
     def search_write(self, writer, doc_ref, doc_text):
         self.last_search_write = (writer, doc_ref, doc_text)
@@ -560,7 +618,14 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert init_conn.raw_handle() == "INIT_CONN"
     assert fake.last_init_db == ([(1, ":name", "Ada")], "/tmp/init", {":name": {}}, None)
 
-    assert interop_module.datom(1, ":name", "Ada") == (1, ":name", "Ada")
+    datom_value = interop_module.datom(1, ":name", "Ada", 2, True)
+    assert datom_value == (1, ":name", "Ada", 2, True)
+    assert interop_module.datom_is(datom_value) is True
+    assert interop_module.datom_e(datom_value) == 1
+    assert interop_module.datom_a(datom_value) == ":name"
+    assert interop_module.datom_v(datom_value) == "Ada"
+    assert interop_module.datom_tx(datom_value) == 2
+    assert interop_module.datom_added(datom_value) is True
     for helper in [
         "keyword",
         "max_eid",
@@ -679,6 +744,34 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert writer.commit() == ":transacted"
     assert fake.last_search_commit == "SEARCH_WRITER"
     assert writer.closed() is True
+    tokenizer = search_module.create_regexp_tokenizer(r"\s+")
+    lower_filter = search_module.lower_case_token_filter()
+    stop_filter = search_module.create_stop_words_token_filter(["and", "the"])
+    prefix_filter = search_module.prefix_token_filter()
+    assert tokenizer == "REGEXP_TOKENIZER"
+    assert lower_filter == "LOWER_FILTER"
+    assert stop_filter == "STOP_FILTER"
+    assert search_module.unaccent_token_filter() == "UNACCENT_FILTER"
+    assert search_module.en_stop_words_token_filter() == "EN_STOP_FILTER"
+    assert prefix_filter == "PREFIX_FILTER"
+    assert search_module.create_ngram_token_filter(2) == "NGRAM_FILTER"
+    assert fake.last_search_utils_ngram == (2, None)
+    assert search_module.create_ngram_token_filter(2, 4) == "NGRAM_FILTER"
+    assert fake.last_search_utils_ngram == (2, 4)
+    assert search_module.create_min_length_token_filter(3) == "MIN_FILTER"
+    assert fake.last_search_utils_min_length == 3
+    assert search_module.create_max_length_token_filter(8) == "MAX_FILTER"
+    assert fake.last_search_utils_max_length == 8
+    assert search_module.create_stemming_token_filter("english") == "STEM_FILTER"
+    assert fake.last_search_utils_stemming == "english"
+    assert search_module.create_analyzer(tokenizer=tokenizer, token_filters=[lower_filter, stop_filter]) == "ANALYZER"
+    assert fake.last_search_utils_create_analyzer == {
+        ":tokenizer": "REGEXP_TOKENIZER",
+        ":token-filters": ["LOWER_FILTER", "STOP_FILTER"],
+    }
+    assert callable(datalevin.create_analyzer)
+    assert callable(datalevin.create_regexp_tokenizer)
+    assert callable(datalevin.lower_case_token_filter)
     index = interop_module.new_vector_index(kv, opts={":dimensions": 2})
     assert index.raw_handle() == "VECTOR_INDEX"
     assert fake.last_vector_index == (kv, {":dimensions": 2})

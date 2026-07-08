@@ -1,4 +1,13 @@
-import { CONNECTION_WITH_TRANSACTION_UNSUPPORTED, _BINDINGS } from "./interop.js";
+import {
+  CONNECTION_WITH_TRANSACTION_UNSUPPORTED,
+  _BINDINGS,
+  datomA,
+  datomAdded,
+  datomE,
+  datomIs,
+  datomTx,
+  datomV
+} from "./interop.js";
 import { toJava } from "./convert.js";
 import { DatalevinError } from "./errors.js";
 import { callJavaMethod } from "./jvm.js";
@@ -466,6 +475,30 @@ class RawInterop {
 
   async datom(e, attr, value, tx = undefined, added = undefined) {
     return datomTuple(e, attr, value, tx, added);
+  }
+
+  async datomIs(value) {
+    return datomIs(value);
+  }
+
+  async datomE(value) {
+    return datomE(value);
+  }
+
+  async datomA(value) {
+    return datomA(value);
+  }
+
+  async datomV(value) {
+    return datomV(value);
+  }
+
+  async datomTx(value) {
+    return datomTx(value);
+  }
+
+  async datomAdded(value) {
+    return datomAdded(value);
   }
 
   async txData(txData) {
