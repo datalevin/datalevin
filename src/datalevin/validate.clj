@@ -879,10 +879,16 @@
 (defn- normalize-attr-preds
   [preds]
   (cond
-    (nil? preds)      nil
-    (symbol? preds)   [preds]
+    (nil? preds)        nil
+    (or (symbol? preds)
+        (keyword? preds)
+        (udf/descriptor? preds)) [preds]
     (sequential? preds) preds
-    :else             nil))
+    :else               nil))
+
+(defn- attr-pred-udf-ref?
+  [pred]
+  (or (keyword? pred) (udf/descriptor? pred)))
 
 (defn- validate-attr-preds-schema
   [a preds]
@@ -892,13 +898,26 @@
                  :key       :db.attr/preds
                  :value     preds}]
     (when-not preds'
-      (u/raise a " :db.attr/preds must be a qualified symbol or a sequential collection of qualified symbols"
+      (u/raise a " :db.attr/preds must be a qualified symbol, predicate UDF descriptor map, registered UDF keyword id, or a sequential collection of those"
                ex-data))
     (when (empty? preds')
       (u/raise a " :db.attr/preds cannot be empty" ex-data))
     (doseq [pred preds']
-      (when-not (qualified-symbol? pred)
-        (u/raise a " :db.attr/preds entries must be qualified symbols, got: "
+      (cond
+        (symbol? pred)
+        (when-not (qualified-symbol? pred)
+          (u/raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
+                   pred
+                   (assoc ex-data :predicate pred)))
+
+        (udf/descriptor? pred)
+        (udf/ensure-kind pred :predicate)
+
+        (keyword? pred)
+        nil
+
+        :else
+        (u/raise a " :db.attr/preds entries must be qualified symbols, predicate UDF descriptor maps, or registered UDF keyword ids, got: "
                  pred
                  (assoc ex-data :predicate pred))))))
 
@@ -1325,31 +1344,41 @@
     vt))
 
 (defn- resolve-attr-pred
-  [pred]
-  (let [resolved (requiring-resolve pred)
-        callable (if (var? resolved) @resolved resolved)]
+  [pred resolve-udf]
+  (let [callable (if (attr-pred-udf-ref? pred)
+                   (if resolve-udf
+                     (resolve-udf pred)
+                     (u/raise "Attribute predicate UDF " pred
+                              " requires a UDF resolver"
+                              {:error     :schema/validation
+                               :key       :db.attr/preds
+                               :predicate pred}))
+                   (let [resolved (requiring-resolve pred)]
+                     (if (var? resolved) @resolved resolved)))]
     (when-not (ifn? callable)
       (u/raise "Attribute predicate " pred " does not resolve to a callable value"
                {:error     :schema/validation
                 :key       :db.attr/preds
                 :predicate pred
-                :resolved  resolved}))
+                :resolved  callable}))
     callable))
 
 (defn validate-attr-preds
   "Validate a normalized attribute value against :db.attr/preds."
-  [e a v props]
-  (doseq [pred (normalize-attr-preds (:db.attr/preds props))]
-    (let [pred-return ((resolve-attr-pred pred) v)]
-      (when-not (true? pred-return)
-        (u/raise "Entity " e " attribute " a " value " v
-                 " failed pred " pred
-                 {:error                :transact/attr-pred
-                  :entity               e
-                  :attribute            a
-                  :value                v
-                  :predicate            pred
-                  :db.error/pred-return pred-return})))))
+  ([e a v props]
+   (validate-attr-preds e a v props nil))
+  ([e a v props resolve-udf]
+   (doseq [pred (normalize-attr-preds (:db.attr/preds props))]
+     (let [pred-return ((resolve-attr-pred pred resolve-udf) v)]
+       (when-not (true? pred-return)
+         (u/raise "Entity " e " attribute " a " value " v
+                  " failed pred " pred
+                  {:error                :transact/attr-pred
+                   :entity               e
+                   :attribute            a
+                   :value                v
+                   :predicate            pred
+                   :db.error/pred-return pred-return}))))))
 
 ;; ---- Transaction form validators ----
 

@@ -28,6 +28,8 @@
 (def *last-auto-tempid
   (volatile! 0))
 
+(declare resolve-attr-pred-udf)
+
 (deftype AutoTempid [id]
   Object
   (toString [d] (str "#datalevin/AutoTempid [" id "]")))
@@ -110,7 +112,9 @@
               (coreprep/correct-value store a v)))
           validate-upsert-preds
           (fn [a v]
-            (vld/validate-attr-preds (:db/id entity) a v (schema a)))
+            (vld/validate-attr-preds
+              (:db/id entity) a v (schema a)
+              #(resolve-attr-pred-udf db %)))
           resolve (fn [a v]
                     (when-some [v' (upsert-value a v)]
                       (when-some [e (or (:e (sf (.subSet
@@ -209,6 +213,22 @@
          (if allowed
            (udf/ensure-kind descriptor allowed)
            descriptor))))))
+
+(defn- attr-pred-udf-context
+  [db]
+  {:db        db
+   :kind      :predicate
+   :embedded? true
+   :store     (:store db)
+   :use       :db.attr/preds})
+
+(defn resolve-attr-pred-udf
+  [db pred]
+  (let [registry   (txcommon/udf-registry db)
+        descriptor (or (installed-udf-descriptor db :predicate pred)
+                       (udf/descriptor-or-registered
+                         registry :predicate pred))]
+    (udf/materialize registry (attr-pred-udf-context db) descriptor)))
 
 (defn- wrap-tx-udf
   [db descriptor]

@@ -52,6 +52,7 @@ async function txUdfArgsToJs(args) {
     if (size === 0) {
       return [];
     }
+
     const values = [null];
     for (let index = 1; index < size; index += 1) {
       values.push(await toJs(args.getSync(index)));

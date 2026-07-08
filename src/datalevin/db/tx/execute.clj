@@ -224,7 +224,8 @@
                     v)
         props     ((schema store) a)
         v'        (coreprep/correct-value store a v)
-        _         (vld/validate-attr-preds e a v' props)
+        _         (vld/validate-attr-preds e a v' props
+                                           #(txprep/resolve-attr-pred-udf db %))
         meta*     (meta ent)
         new-datom (cond-> (datom e a v' tx)
                     meta* (with-meta meta*))
@@ -264,7 +265,8 @@
         _         (validate-installed-callable-write report db e a nv entity)
         props     ((schema store) a)
         nv'       (coreprep/correct-value store a nv)
-        _         (vld/validate-attr-preds e a nv' props)
+        _         (vld/validate-attr-preds e a nv' props
+                                           #(txprep/resolve-attr-pred-udf db %))
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]

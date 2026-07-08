@@ -87,10 +87,15 @@ test(
     const registry = await createUdfRegistry();
     const queryDescriptor = udfDescriptor(":math/inc");
     const predicateDescriptor = udfDescriptor(":score/high?", { kind: ":predicate" });
+    const attrPredicateDescriptor = udfDescriptor(":score/guarded?", {
+      kind: ":predicate",
+      lang: ":javascript"
+    });
     const txDescriptor = udfDescriptor(":person/bootstrap", { kind: ":tx-fn" });
 
     await registry.queryUdf(":math/inc", (value) => Number(value) + 1);
     await registry.predicateUdf(":score/high?", (score) => Number(score) >= 10);
+    await registry.register(attrPredicateDescriptor, (score) => Number(score) >= 10);
     await registry.txUdf(":person/bootstrap", (_db, name) => [
       { ":db/id": -1, ":name": String(name), ":score": 10 }
     ]);
@@ -101,7 +106,11 @@ test(
           valueType: ":db.type/string",
           unique: ":db.unique/identity"
         }),
-        ":score": schemaAttr({ valueType: ":db.type/long" })
+        ":score": schemaAttr({ valueType: ":db.type/long" }),
+        ":guarded-score": schemaAttr({
+          valueType: ":db.type/long",
+          extra: { ":db.attr/preds": attrPredicateDescriptor }
+        })
       },
       opts: { ":runtime-opts": { ":udf-registry": registry } }
     });
@@ -109,9 +118,15 @@ test(
     try {
       await conn.transact([[":db.fn/call", txDescriptor, "Ada"]]);
       await conn.transact([{ ":db/id": -1, ":name": "Bob", ":score": 3 }]);
+      await conn.transact([{ ":db/id": -2, ":guarded-score": 11 }]);
+      await assert.rejects(
+        () => conn.transact([{ ":db/id": -3, ":guarded-score": 3 }]),
+        /failed pred/
+      );
 
       assert.equal(await registry.registered(queryDescriptor), true);
       assert.equal(await registry.registered(predicateDescriptor), true);
+      assert.equal(await registry.registered(attrPredicateDescriptor), true);
       assert.equal(await registry.registered(txDescriptor), true);
       assert.equal(
         intValue(await conn.query(
@@ -135,9 +150,11 @@ test(
 
       await registry.unregister(queryDescriptor);
       await registry.unregister(predicateDescriptor);
+      await registry.unregister(attrPredicateDescriptor);
       await registry.unregister(txDescriptor);
       assert.equal(await registry.registered(queryDescriptor), false);
       assert.equal(await registry.registered(predicateDescriptor), false);
+      assert.equal(await registry.registered(attrPredicateDescriptor), false);
       assert.equal(await registry.registered(txDescriptor), false);
     } finally {
       await conn.close();

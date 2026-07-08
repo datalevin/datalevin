@@ -106,6 +106,43 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-db-attr-preds-udf
+  (let [dir       (u/tmp-dir (str "attr-preds-udf-" (UUID/randomUUID)))
+        registry  (udf/create-registry)
+        high-desc {:udf/lang :clojure
+                   :udf/kind :predicate
+                   :udf/id   :score/high?}
+        even-desc {:udf/lang :clojure
+                   :udf/kind :predicate
+                   :udf/id   :score/even?}
+        schema    {:score/high {:db/valueType   :db.type/long
+                                 :db.attr/preds high-desc}
+                   :score/even {:db/valueType   :db.type/long
+                                 :db.attr/preds :score/even?}}
+        conn      (do
+                    (udf/register! registry high-desc #(<= 10 (long %)))
+                    (udf/register! registry even-desc #(even? (long %)))
+                    (d/create-conn
+                      dir schema
+                      {:kv-opts     {:flags (conj c/default-env-flags :nosync)}
+                       :runtime-opts {:udf-registry registry}}))]
+    (try
+      (d/transact! conn [{:db/id      1
+                          :score/high 12
+                          :score/even 4}])
+      (is (= 12 (:score/high (d/entity @conn 1))))
+      (is (thrown-with-msg?
+            Exception
+            #"failed pred"
+            (d/transact! conn [{:db/id 2 :score/high 9}])))
+      (is (thrown-with-msg?
+            Exception
+            #"failed pred :score/even\?"
+            (d/transact! conn [{:db/id 3 :score/even 5}])))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-db-attr-preds-schema-validation
   (let [dir1 (u/tmp-dir (str "attr-preds-schema-empty-" (UUID/randomUUID)))
         dir2 (u/tmp-dir (str "attr-preds-schema-unqualified-" (UUID/randomUUID)))]

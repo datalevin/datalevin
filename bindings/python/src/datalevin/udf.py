@@ -6,7 +6,7 @@ import jpype
 
 from ._convert import to_java, to_python
 from ._interop import _BINDINGS
-from ._java import classes
+from ._java import classes, is_java_object
 
 
 class _PythonUdfFunction:
@@ -14,8 +14,25 @@ class _PythonUdfFunction:
         self._fn = fn
 
     def invoke(self, args):
-        python_args = [to_python(arg) for arg in args]
+        python_args = [_udf_arg_to_python(arg, index) for index, arg in enumerate(args)]
         return to_java(self._fn(*python_args))
+
+
+def _java_class_name(value):
+    if not is_java_object(value):
+        return None
+    try:
+        return str(value.getClass().getName())
+    except Exception:
+        return None
+
+
+def _udf_arg_to_python(arg, index: int):
+    if index == 0 and _java_class_name(arg) == "datalevin.db.DB":
+        from .database import Database
+
+        return Database(arg)
+    return to_python(arg)
 
 
 class UdfRegistry:

@@ -10,6 +10,7 @@ from datalevin import (
     create_udf_registry,
     exec_json,
     interop,
+    keyword,
     schema_attr,
     search_domain,
     udf_descriptor,
@@ -110,6 +111,22 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
     def high_score(score):
         return score >= 10
 
+    attr_predicate_descriptor = udf_descriptor(
+        ":score/guarded?", kind=":predicate", lang=":python"
+    )
+    ensure_descriptor = udf_descriptor(
+        ":score/ensure-guarded?", kind=":predicate", lang=":python"
+    )
+
+    def guarded_score(score):
+        return score >= 10
+
+    def ensure_guarded_score(db, eid):
+        return db.entity_map(eid)[":guarded-score"] == 11
+
+    registry.register(attr_predicate_descriptor, guarded_score)
+    registry.register(ensure_descriptor, ensure_guarded_score)
+
     @registry.tx_udf(":person/bootstrap")
     def bootstrap(db, name):
         return [{":db/id": -1, ":name": name, ":score": 10}]
@@ -126,11 +143,31 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
                 ":db/unique": ":db.unique/identity",
             },
             ":score": {":db/valueType": ":db.type/long"},
+            ":guarded-score": schema_attr(
+                value_type=":db.type/long",
+                extra={":db.attr/preds": attr_predicate_descriptor},
+            ),
         },
         opts={":runtime-opts": {":udf-registry": registry}},
     ) as conn:
         conn.transact([[":db.fn/call", tx_descriptor, "Ada"]])
         conn.transact([{":db/id": -1, ":name": "Bob", ":score": 3}])
+        conn.transact([{":db/id": -2, ":guarded-score": 11}])
+        with pytest.raises(Exception, match="failed pred"):
+            conn.transact([{":db/id": -3, ":guarded-score": 3}])
+        conn.transact(
+            [
+                {":db/id": -4, ":guarded-score": 11},
+                [keyword(":db/ensure"), ensure_descriptor, -4],
+            ]
+        )
+        with pytest.raises(Exception, match=":db/ensure failed"):
+            conn.transact(
+                [
+                    {":db/id": -5, ":guarded-score": 12},
+                    [keyword(":db/ensure"), ensure_descriptor, -5],
+                ]
+            )
 
         assert conn.query(
             "[:find ?v . :in $ ?desc ?n :where [(udf ?desc ?n) ?v]]",
@@ -145,14 +182,20 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
         assert sorted(conn.query("[:find [?name ...] :where [?e :name ?name]]")) == ["Ada", "Bob"]
         assert registry.registered(query_descriptor) is True
         assert registry.registered(predicate_descriptor) is True
+        assert registry.registered(attr_predicate_descriptor) is True
+        assert registry.registered(ensure_descriptor) is True
         assert registry.registered(tx_descriptor) is True
 
         registry.unregister(query_descriptor)
         registry.unregister(predicate_descriptor)
+        registry.unregister(attr_predicate_descriptor)
+        registry.unregister(ensure_descriptor)
         registry.unregister(tx_descriptor)
 
         assert registry.registered(query_descriptor) is False
         assert registry.registered(predicate_descriptor) is False
+        assert registry.registered(attr_predicate_descriptor) is False
+        assert registry.registered(ensure_descriptor) is False
         assert registry.registered(tx_descriptor) is False
 
 

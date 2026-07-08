@@ -551,7 +551,7 @@ final class DatalevinForms {
             Object value = list.get(i);
             if (i == 0 && op != null) {
                 converted.add(ClojureCodec.keyword(op));
-            } else if (i == 1 && ":db.fn/call".equals(op)) {
+            } else if (i == 1 && (":db.fn/call".equals(op) || ":db/ensure".equals(op))) {
                 converted.add(callableTargetInput(value));
             } else if (i == 1) {
                 converted.add(lookupRefInput(value));
