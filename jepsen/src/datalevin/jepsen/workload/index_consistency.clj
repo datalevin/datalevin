@@ -550,6 +550,18 @@
                            (and (= :ok type)
                                 (map? value))))
                  vec)
+            probe-disruption-failures
+            (->> probe-failures
+                 (filter (fn [{:keys [error value]}]
+                           (or (expected-index-disruption-failure?
+                                 test
+                                 error)
+                               (expected-index-disruption-failure?
+                                 test
+                                 value))))
+                 vec)
+            unexpected-probe-failures
+            (remove (set probe-disruption-failures) probe-failures)
             final-probe (peek successful-probes)
             completed  (filter (comp some? :index/case-id) history)
             terminal   (filter (comp #{:ok :fail :info} :type) completed)
@@ -614,13 +626,32 @@
             probe-valid?
             (or (empty? probe-terminal)
                 (and (seq successful-probes)
-                     (empty? probe-failures)
-                     (empty? probe-mismatches)))]
-        {:valid?           (and (empty? mismatches)
-                                probe-valid?
-                                (pos? (+ (count oks)
-                                         (count disruption-failures))))
-         :ok-count         (count oks)
+                     (empty? unexpected-probe-failures)
+                     (empty? probe-mismatches)))
+            workload-observed? (pos? (+ (count oks)
+                                         (count disruption-failures)))
+            benign-workload? (or workload-observed?
+                                 (empty? checked-terminal))
+            valid? (cond
+                     (and (empty? mismatches)
+                          probe-valid?
+                          workload-observed?)
+                     true
+
+                     (and (empty? mismatches)
+                          benign-workload?
+                          (seq probe-disruption-failures)
+                          (empty? unexpected-probe-failures)
+                          (empty? successful-probes)
+                          (empty? probe-mismatches))
+                     :unknown
+
+                     :else
+                     false)
+            adjusted-valid? (when (= :unknown valid?)
+                              :disruption-only-converge)]
+        (cond-> {:valid?           valid?
+                 :ok-count         (count oks)
          :failure-count    (count failures)
          :indeterminate-count (count indeterminate)
          :indeterminate-samples
@@ -640,12 +671,22 @@
          :probe-count (count successful-probes)
          :probe-timeout-count (count probe-timeouts)
          :probe-failure-count (count probe-failures)
+         :probe-disruption-failure-count
+         (count probe-disruption-failures)
+         :probe-disruption-failure-samples
+         (vec (take 10
+                    (map #(select-keys % [:type :error])
+                         probe-disruption-failures)))
+         :probe-unexpected-failure-count
+         (count unexpected-probe-failures)
          :probe-failure-samples
          (vec (take 10
                     (map #(select-keys % [:type :error])
                          probe-failures)))
          :probe-mismatch-count (count probe-mismatches)
-         :probe-mismatch-samples (vec (take 10 probe-mismatches))}))))
+         :probe-mismatch-samples (vec (take 10 probe-mismatches))}
+          adjusted-valid?
+          (assoc :adjusted-valid? adjusted-valid?))))))
 
 (defrecord Client [node]
   client/Client

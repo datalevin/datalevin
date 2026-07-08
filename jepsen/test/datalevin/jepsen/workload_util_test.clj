@@ -677,6 +677,56 @@
     (is (= 1 (:disruption-failure-count result)))
     (is (= 0 (:probe-mismatch-count result)))))
 
+(deftest internal-checker-classifies-disrupted-final-probe-test
+  (let [op     {:f :lookup-ref-same
+                :internal/case-id 16}
+        result (checker/check
+                (#'internal/internal-checker)
+                {:datalevin/nemesis-faults [:clock-skew-mixed]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :ok
+                         :value (:value (#'internal/expected-outcome op)))
+                  {:process 1
+                   :type :fail
+                   :f :probe
+                   :error "Timed out waiting for single leader"}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 1 (:probe-failure-count result)))
+    (is (= 1 (:probe-disruption-failure-count result)))
+    (is (= 0 (:probe-unexpected-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
+
+(deftest internal-checker-classifies-disrupted-final-probe-without-terminal-ops-test
+  (let [op     {:f :lookup-ref-same
+                :internal/case-id 17}
+        result (checker/check
+                (#'internal/internal-checker)
+                {:datalevin/nemesis-faults [:clock-skew-mixed]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :invoke)
+                  {:process 1
+                   :type :invoke
+                   :f :probe}
+                  {:process 1
+                   :type :fail
+                   :f :probe
+                   :error "Timed out waiting for single leader"}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 0 (:ok-count result)))
+    (is (= 0 (:disruption-failure-count result)))
+    (is (= 1 (:probe-failure-count result)))
+    (is (= 1 (:probe-disruption-failure-count result)))
+    (is (= 0 (:probe-unexpected-failure-count result)))
+    (is (= 0 (:mismatch-count result)))))
+
 (deftest identity-upsert-checker-ignores-indeterminate-ops-test
   (let [op     {:f :upsert-same-tempid
                 :identity/case-id 1}
@@ -709,6 +759,29 @@
     (is (= 0 (:mismatch-count result)))
     (is (= 0 (:failure-count result)))
     (is (= 1 (:disruption-failure-count result)))))
+
+(deftest identity-upsert-checker-classifies-disrupted-final-probe-test
+  (let [op     {:f :upsert-same-tempid
+                :identity/case-id 3}
+        result (checker/check
+                (#'identity-upsert/identity-upsert-checker)
+                {:datalevin/nemesis-faults [:clock-skew-mixed]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :ok
+                         :value (#'identity-upsert/expected-states op))
+                  {:process 1
+                   :type :fail
+                   :f :probe
+                   :error "Timed out waiting for single leader"}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 1 (:probe-failure-count result)))
+    (is (= 1 (:probe-disruption-failure-count result)))
+    (is (= 0 (:probe-unexpected-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
 
 (deftest identity-upsert-checker-ignores-closed-client-during-failover-test
   (let [op     {:f :string-tempid-upsert-ref
@@ -830,6 +903,29 @@
     (is (true? (:valid? result)) (pr-str result))
     (is (= 1 (:probe-timeout-count result)))
     (is (= 0 (:probe-failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
+
+(deftest index-consistency-checker-classifies-disrupted-final-probe-test
+  (let [op     {:f :ref-create
+                :index/case-id 9}
+        result (checker/check
+                (#'index-consistency/index-consistency-checker)
+                {:datalevin/nemesis-faults [:clock-skew-mixed]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :ok
+                         :value (#'index-consistency/expected-states op))
+                  {:process 1
+                   :type :fail
+                   :f :probe
+                   :error "Timed out waiting for single leader"}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 1 (:probe-failure-count result)))
+    (is (= 1 (:probe-disruption-failure-count result)))
+    (is (= 0 (:probe-unexpected-failure-count result)))
     (is (= 0 (:probe-mismatch-count result)))))
 
 (deftest index-consistency-final-probe-is-bounded-test
