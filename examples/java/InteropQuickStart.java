@@ -14,21 +14,21 @@ public final class InteropQuickStart {
         Path dir = Files.createTempDirectory("datalevin-java-interop-quickstart");
 
         Map<Object, Object> schema = Map.of(
-                DatalevinInterop.keyword("person/name"),
+                DatalevinInterop.keyword(":person/name"),
                 Map.of(DatalevinInterop.keyword(":db/valueType"), DatalevinInterop.keyword(":db.type/string"),
                        DatalevinInterop.keyword(":db/unique"), DatalevinInterop.keyword(":db.unique/identity")),
-                DatalevinInterop.keyword("person/age"),
+                DatalevinInterop.keyword(":person/age"),
                 Map.of(DatalevinInterop.keyword(":db/valueType"), DatalevinInterop.keyword(":db.type/long")));
 
         Object conn = DatalevinInterop.createConnection(dir.toString(), schema, null);
         try {
             Object tx = DatalevinInterop.txData(List.of(
                     Map.of(DatalevinInterop.keyword(":db/id"), -1L,
-                           DatalevinInterop.keyword("person/name"), "Ivy",
-                           DatalevinInterop.keyword("person/age"), 41L),
+                           DatalevinInterop.keyword(":person/name"), "Ivy",
+                           DatalevinInterop.keyword(":person/age"), 41L),
                     Map.of(DatalevinInterop.keyword(":db/id"), -2L,
-                           DatalevinInterop.keyword("person/name"), "Noah",
-                           DatalevinInterop.keyword("person/age"), 29L)));
+                           DatalevinInterop.keyword(":person/name"), "Noah",
+                           DatalevinInterop.keyword(":person/age"), 29L)));
 
             DatalevinInterop.coreInvoke("transact!", List.of(conn, tx));
 
@@ -38,7 +38,7 @@ public final class InteropQuickStart {
                     List.of(db,
                             DatalevinInterop.readEdn("[:person/name :person/age]"),
                             DatalevinInterop.lookupRef(
-                                    List.of(DatalevinInterop.keyword("person/name"), "Ivy"))));
+                                    List.of(DatalevinInterop.keyword(":person/name"), "Ivy"))));
             Object names = DatalevinInterop.coreInvoke(
                     "q",
                     List.of(DatalevinInterop.readEdn(

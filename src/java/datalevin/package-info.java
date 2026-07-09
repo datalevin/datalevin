@@ -7,7 +7,9 @@
  * exposes a smaller raw-handle surface with direct Clojure runtime values.
  *
  * <p>The canonical Java style is to use the typed builders for schemas,
- * transactions, queries, pull selectors, and rules. Use
+ * transactions, queries, pull selectors, and rules. Use colon-prefixed strings
+ * such as {@code ":person/name"} when a Java string represents a Datalevin
+ * keyword; legacy unprefixed strings are still accepted. Use
  * {@link datalevin.Datalevin#kw}, {@link datalevin.Datalevin#sym},
  * {@link datalevin.Datalevin#readEdn}, and
  * {@link datalevin.Datalevin#writeEdn} when explicit EDN values are needed.
@@ -28,13 +30,13 @@
  * <pre>{@code
  * try (Connection conn = Datalevin.createConn("/tmp/example",
  *         Datalevin.schema()
- *             .attr("name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
+ *             .attr(":name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
  *     conn.transact(Datalevin.tx()
- *         .entity(Tx.entity(-1).put("name", "Alice")));
+ *         .entity(Tx.entity(-1).put(":name", "Alice")));
  *
  *     List<String> names = conn.queryCollection(Datalevin.query()
  *         .findAll("?name")
- *         .whereDatom(Datalevin.var("e"), "name", Datalevin.var("name")),
+ *         .whereDatom(Datalevin.var("e"), ":name", Datalevin.var("name")),
  *         String.class);
  * }
  * }</pre>
@@ -76,11 +78,11 @@
  *
  * <pre>{@code
  * try (Connection conn = Datalevin.initDb(
- *         Datalevin.listOf(Datalevin.datom(1, "name", "Alice")),
+ *         Datalevin.listOf(Datalevin.datom(1, ":name", "Alice")),
  *         "/tmp/example-bulk",
  *         Datalevin.schema()
- *             .attr("name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
- *     conn.fillDb(Datalevin.listOf(Datalevin.datom(2, "name", "Bob")));
+ *             .attr(":name", Schema.attribute().valueType(Schema.ValueType.STRING)))) {
+ *     conn.fillDb(Datalevin.listOf(Datalevin.datom(2, ":name", "Bob")));
  * }
  * }</pre>
  *

@@ -50,25 +50,28 @@ queries, pull selectors, and rules. Use `Datalevin.kw(...)`,
 `Datalevin.sym(...)`, `Datalevin.readEdn(...)`, and
 `Datalevin.writeEdn(...)` when explicit EDN values are needed. Use
 `Datalevin.edn(...)` to mark raw EDN text for APIs that accept an EDN form.
+When a Java string represents a Datalevin keyword, prefer the same
+colon-prefixed spelling used by the Python and JavaScript bindings, for example
+`:person/name`; legacy unprefixed strings remain accepted for compatibility.
 
 Search, vector, embedding, and idoc maps have typed helpers as well:
 
 ```java
 Map<Object, Object> schema = Datalevin.schema()
-        .attr("doc/text", Schema.attribute()
+        .attr(":doc/text", Schema.attribute()
                 .valueType(Schema.ValueType.STRING)
                 .fulltext(true)
                 .fulltextDomains("docs")
                 .fulltextAutoDomain(true))
-        .attr("doc/body", Schema.attribute()
+        .attr(":doc/body", Schema.attribute()
                 .valueType(Schema.ValueType.STRING)
                 .embedding(true)
                 .embeddingDomains("docs")
                 .embeddingAutoDomain(true))
-        .attr("doc/vec", Schema.attribute()
+        .attr(":doc/vec", Schema.attribute()
                 .valueType(Schema.ValueType.VEC)
                 .vectorDomains("docs"))
-        .attr("doc/json", Schema.attribute()
+        .attr(":doc/json", Schema.attribute()
                 .valueType(Schema.ValueType.IDOC)
                 .idocFormat(Schema.IdocFormat.JSON)
                 .domain("profiles"))
@@ -173,7 +176,7 @@ searchRegistry.queryAnalyzer("text/plain-query", args -> {
 try (Connection conn = Datalevin.createConn(
         "/tmp/dtlv-java-fulltext-udf",
         Datalevin.schema()
-                .attr("text", Schema.attribute()
+                .attr(":text", Schema.attribute()
                         .valueType(Schema.ValueType.STRING)
                         .fulltext(true)
                         .fulltextAutoDomain(true)),
@@ -187,8 +190,8 @@ try (Connection conn = Datalevin.createConn(
                                 .prop("query-analyzer", queryAnalyzer)
                                 .build())))) {
     conn.transact(List.of(
-            Map.of(":db/id", 1L, "text", "alpha #needle"),
-            Map.of(":db/id", 2L, "text", "needle without hash")));
+            Map.of(":db/id", 1L, ":text", "alpha #needle"),
+            Map.of(":db/id", 2L, ":text", "needle without hash")));
 
     Object matchingIds = conn.query(
             "[:find [?e ...] :in $ ?q :where [(fulltext $ :text ?q) [[?e ?a ?v]]]]",
@@ -212,32 +215,32 @@ import java.util.Map;
 try (Connection conn = Datalevin.createConn(
         "/tmp/dtlv-java",
         Datalevin.schema()
-                .attr("person/name",
+                .attr(":person/name",
                         Schema.attribute()
                                 .valueType(Schema.ValueType.STRING)
                                 .unique(Schema.Unique.IDENTITY))
-                .attr("person/age",
+                .attr(":person/age",
                         Schema.attribute()
                                 .valueType(Schema.ValueType.LONG)))) {
 
     conn.transact(Datalevin.tx()
-            .entity(Tx.entity(-1).put("person/name", "Alice").put("person/age", 30))
-            .entity(Tx.entity(-2).put("person/name", "Bob").put("person/age", 25)));
+            .entity(Tx.entity(-1).put(":person/name", "Alice").put(":person/age", 30))
+            .entity(Tx.entity(-2).put(":person/name", "Bob").put(":person/age", 25)));
 
     DatalogQuery adultsQuery = Datalevin.query()
             .findAll("?name")
-            .whereDatom(Datalevin.var("e"), "person/name", Datalevin.var("name"))
-            .whereDatom(Datalevin.var("e"), "person/age", Datalevin.var("age"))
+            .whereDatom(Datalevin.var("e"), ":person/name", Datalevin.var("name"))
+            .whereDatom(Datalevin.var("e"), ":person/age", Datalevin.var("age"))
             .wherePredicate(">=", Datalevin.var("age"), 30);
 
     PullSelector selector = Datalevin.pull()
-            .attr("person/name")
-            .attr("person/age");
+            .attr(":person/name")
+            .attr(":person/age");
 
     System.out.println(conn.queryCollection(adultsQuery, String.class));
-    System.out.println(conn.pull(selector, Datalevin.listOf(Datalevin.kw("person/name"), "Alice")));
+    System.out.println(conn.pull(selector, Datalevin.listOf(Datalevin.kw(":person/name"), "Alice")));
     System.out.println(conn.txDataToSimulatedReport(List.of(
-            Map.of(":db/id", -3L, "person/name", "Dry Run", "person/age", 40L))));
+            Map.of(":db/id", -3L, ":person/name", "Dry Run", ":person/age", 40L))));
 }
 ```
 
