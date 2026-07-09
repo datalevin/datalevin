@@ -279,6 +279,89 @@
         (d/close-db db)
         (u/delete-files dir)))))
 
+(deftest test-late-clauses-sort-by-dependencies
+  (let [dir (u/tmp-dir (str "test-q-late-sort-" (UUID/randomUUID)))
+        db  (-> (d/empty-db dir)
+                (d/db-with [{:db/id 1
+                             :name  "Ivan"
+                             :age   15
+                             :flag  :active}
+                            {:db/id 2
+                             :name  "Bob"
+                             :age   37
+                             :flag  :inactive}
+                            {:db/id 3
+                             :name  "Oleg"
+                             :age   21}]))
+        q   '[:find [?v ...]
+              :with ?e
+              :where
+              [(= ?a :name)]
+              [(string? ?v)]
+              [?e ?a ?v]]
+        q2  '[:find [?n ...]
+              :with ?e ?a ?age ?s
+              :where
+              [?e :name ?n]
+              [(= ?s "Ivan!")]
+              [(str ?n "!") ?s]
+              [(= ?a :age)]
+              [?e ?a ?age]]
+        q3  '[:find [?label ...]
+              :with ?e ?a ?age ?base
+              :where
+              [(= ?label "Ivan-15!")]
+              [(str ?base "!") ?label]
+              [(str ?n "-" ?age) ?base]
+              [(= ?a :age)]
+              [?e ?a ?age]
+              [?e :name ?n]]
+        q4  '[:find [?n ...]
+              :with ?e ?a
+              :where
+              (not [?e :flag :inactive])
+              [(= ?a :name)]
+              [?e ?a ?n]]
+        q5  '[:find [?n ...]
+              :with ?e ?a
+              :where
+              (not-join [?e]
+                (not [?e :age 37]))
+              [(= ?a :name)]
+              [?e ?a ?n]]]
+    (try
+      (is (= #{"Ivan" "Bob" "Oleg"} (set (d/q q db))))
+      (is (= '[[?e ?a ?v] [(= ?a :name)] [(string? ?v)]]
+             (:late-clauses (d/explain {} q db))))
+
+      (is (= #{"Ivan"} (set (d/q q2 db))))
+      (is (= '[[(str ?n "!") ?s] [(= ?s "Ivan!")]
+               [?e ?a ?age] [(= ?a :age)]]
+             (:late-clauses (d/explain {} q2 db))))
+
+      (is (= #{"Ivan-15!"} (set (d/q q3 db))))
+      (is (= '[[?e ?a ?age]
+               [(str ?n "-" ?age) ?base]
+               [(str ?base "!") ?label]
+               [(= ?label "Ivan-15!")]
+               [(= ?a :age)]]
+             (:late-clauses (d/explain {} q3 db))))
+
+      (is (= #{"Ivan" "Oleg"} (set (d/q q4 db))))
+      (is (= '[[?e ?a ?n]
+               (not [?e :flag :inactive])
+               [(= ?a :name)]]
+             (:late-clauses (d/explain {} q4 db))))
+
+      (is (= #{"Bob"} (set (d/q q5 db))))
+      (is (= '[[?e ?a ?n]
+               (not-join [?e] (not [?e :age 37]))
+               [(= ?a :name)]]
+             (:late-clauses (d/explain {} q5 db))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest test-bindings
   (let [dir (u/tmp-dir (str "test-instant-" (UUID/randomUUID)))
         db  (-> (d/empty-db dir)

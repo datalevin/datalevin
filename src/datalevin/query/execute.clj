@@ -44,6 +44,8 @@
 
 (def ^:private rewrite-unused-vars qo/rewrite-unused-vars)
 
+(declare sort-planned-late-clauses)
+
 (defn- build-explain
   []
   (when qplan/*explain*
@@ -58,7 +60,8 @@
       qo/build-graph
       ((fn [c] (build-explain) c))
       qo/build-plan
-      qo/plan-not-joins))
+      qo/plan-not-joins
+      sort-planned-late-clauses))
 
 (defn execute-plan
   [{:keys [plan sources] :as context}]
@@ -77,6 +80,88 @@
                    (map+ #(apply qplan/execute-steps context %))
                    (sort-by #(count (:tuples %)))))))
 
+(defn- strip-clause-source
+  [clause]
+  (if (and (sequential? clause) (qu/source? (first clause)))
+    (next clause)
+    clause))
+
+(defn- clause-vars
+  [form]
+  (into #{} (filter qu/binding-var?) (qu/collect-vars form)))
+
+(defn- late-clause-deps
+  [clause]
+  (let [clause (strip-clause-source clause)
+        head   (when (sequential? clause) (first clause))]
+    (cond
+      (and (sequential? clause) (sequential? head))
+      {:requires (clause-vars head)
+       :provides (clause-vars (second clause))}
+
+      (= 'not head)
+      {:requires-any (clause-vars (next clause))}
+
+      (= 'not-join head)
+      {:requires (clause-vars (second clause))}
+
+      (= 'or-join head)
+      (let [vars-form (second clause)
+            req-form  (when (and (sequential? vars-form)
+                                 (sequential? (first vars-form)))
+                        (first vars-form))]
+        {:requires (clause-vars req-form)
+         :provides (clause-vars vars-form)})
+
+      :else
+      {:provides (clause-vars clause)})))
+
+(defn- late-clause-ready?
+  [bound {:keys [requires requires-any]}]
+  (and (every? bound requires)
+       (or (empty? requires-any)
+           (some bound requires-any))))
+
+(defn- sort-late-clauses
+  [initial-bound clauses]
+  (let [entries (mapv #(assoc (late-clause-deps %) :clause %) clauses)]
+    (loop [bound initial-bound
+           todo  entries
+           acc   []]
+      (if (empty? todo)
+        (mapv :clause acc)
+        (if-let [idx (first (keep-indexed
+                              (fn [i entry]
+                                (when (late-clause-ready? bound entry) i))
+                              todo))]
+          (let [entry (nth todo idx)]
+            (recur (into bound (:provides entry))
+                   (u/vec-remove todo idx)
+                   (conj acc entry)))
+          (mapv :clause (into acc todo)))))))
+
+(defn- planned-step-vars
+  [step]
+  (clause-vars (:cols step)))
+
+(defn- planned-bound-vars
+  [{:keys [plan] :as context}]
+  (reduce
+    into
+    (qresolve/bound-vars context)
+    (for [[_src components] plan
+          plans components
+          :let [step (some-> plans last :steps last)]
+          :when step]
+      (planned-step-vars step))))
+
+(defn- sort-planned-late-clauses
+  [{:keys [late-clauses] :as context}]
+  (cond-> context
+    (seq late-clauses)
+    (assoc :late-clauses
+           (sort-late-clauses (planned-bound-vars context) late-clauses))))
+
 (defn- plan-explain
   []
   (when qplan/*explain*
@@ -94,7 +179,9 @@
         (as-> context c
           (do (plan-explain) c)
           (if run? (execute-plan c) c)
-          (if run? (reduce qresolve/resolve-clause c (:late-clauses c)) c))))))
+          (if run?
+            (reduce qresolve/resolve-clause c (:late-clauses c))
+            c))))))
 
 (defn -collect-tuples
   [acc rel ^long len copy-map]

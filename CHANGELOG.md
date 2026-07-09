@@ -53,6 +53,7 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 - [Datalog] Expose clojure vars to `inter-fn`
 [#215](https://github.com/datalevin/datalevin/issues/215).
 - [Datalog] reduce allocation per tuple.
+- [Datalog] topological sort of late clauses based on bounded variables.
 - [Datalog] fully implement datafy
 [#292](https://github.com/datalevin/datalevin/issues/292).
 - [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.

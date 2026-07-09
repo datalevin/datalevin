@@ -281,12 +281,22 @@ In addition to patterns and single variable predicates, Datalevin supports
 complex clauses, such as `and`, `or`, `not`, `not-join`, multi-variable
 predicates, function bindings, as well as rules. We are gradually expanding the
 coverage of the optimizer to handle more clause types. Right now, `or-join`
-and easy-case `not-join` are optimized. Other complex clauses are deferred
-until the
-indices access clauses have produced intermediate result. Heuristics and
-variable dependencies are considered to reorder these complex clauses to
-optimize performance. Rules are executed last, see [rules](rules.md) for details
-of the rule engine.
+and easy-case `not-join` are optimized into the query plan. Other complex
+clauses are deferred as late clauses until the index access plan has produced
+intermediate results.
+
+Late clauses are ordered during planning by variable dependencies. The planner
+starts with variables bound by query inputs and by the planned index access
+components, then repeatedly chooses the earliest late clause whose required
+variables are available. Deferred patterns and function bindings can make new
+variables available to later late clauses, which avoids running predicates or
+dependent clauses before their inputs are bound. The ordering is stable among
+clauses that are ready at the same time, and clauses whose dependencies cannot
+be satisfied are left in their original order so normal validation errors remain
+clear. The planned order is visible in `explain` under `:late-clauses`.
+
+Rules are resolved by the rule engine when their rule clauses are reached; see
+[rules](rules.md) for details of the rule engine.
 
 ## Runtime UDFs in Queries
 
