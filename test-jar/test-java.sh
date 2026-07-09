@@ -28,6 +28,6 @@ java --add-opens=java.base/java.nio=ALL-UNNAMED \
 (
     cd "$repo_root"
     CLIENT_QUICKSTART_CLASSPATH="$client_quickstart_classpath" \
-        clojure -Sdeps '{:paths ["../dtlvtest/test"]}' \
-        -M:test -m datalevin.client-quickstart-check
+        clojure -Sdeps '{:paths ["src" "target/classes" "test-jar/src"]}' \
+        -M:test -m test-jar.client-quickstart-check
 )
