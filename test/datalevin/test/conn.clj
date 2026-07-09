@@ -645,6 +645,32 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-datalog-ha-open-metadata-does-not-consume-replicated-wal
+  (let [dir  (u/tmp-dir (str "test-datalog-ha-open-metadata-wal-"
+                             (UUID/randomUUID)))
+        opts (test-ha-opts (str dir u/+separator+ "ha-control-raft"))]
+    (try
+      (let [conn (d/create-conn dir nil opts)]
+        (try
+          (let [records (vec (kv/open-tx-log
+                              (.-lmdb ^Store (conn-store conn))
+                              1))]
+            (is (seq records))
+            (is (not-any? #(txlog-record-has-dbi? % c/opts) records)))
+          (finally
+            (d/close conn))))
+      (let [conn (d/create-conn dir nil opts)]
+        (try
+          (let [records (vec (kv/open-tx-log
+                              (.-lmdb ^Store (conn-store conn))
+                              1))]
+            (is (seq records))
+            (is (not-any? #(txlog-record-has-dbi? % c/opts) records)))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-datalog-ha-rejects-relaxed-wal
   (let [dir (u/tmp-dir (str "test-datalog-ha-relaxed-"
                             (UUID/randomUUID)))]

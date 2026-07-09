@@ -239,12 +239,15 @@
   (long (or (get-value lmdb c/meta :last-modified :attr :long) 0)))
 
 (defn- ensure-open-last-modified!
-  [lmdb]
-  (when-not (get-value lmdb c/meta :last-modified :attr :long)
-    (transact-kv
-      lmdb
-      [(lmdb/kv-tx :put c/meta :last-modified
-                   (System/currentTimeMillis) :attr :long)])))
+  ([lmdb]
+   (ensure-open-last-modified! lmdb false))
+  ([lmdb raw?]
+   (when-not (get-value lmdb c/meta :last-modified :attr :long)
+     (let [tx-data [(lmdb/kv-tx :put c/meta :last-modified
+                                 (System/currentTimeMillis) :attr :long)]]
+       (if raw?
+         (kv/transact-kv-without-txlog! lmdb tx-data)
+         (transact-kv lmdb tx-data))))))
 
 (defn e-aid-v->datom
   [store e-aid-v]
@@ -3221,6 +3224,8 @@
                                                   :ha-fencing-hook
                                                   :wal?
                                                   :kv-opts])}))
+           raw-open-metadata? (or raw-persist-open-opts?
+                                  (= :consensus-lease (:ha-mode opts3)))
            _         (sync-wal-runtime-opts! lmdb opts3)
            _         (when (and (not opened-with-wal?)
                                 (true? (:wal? opts3)))
@@ -3247,10 +3252,10 @@
                                   :embedding-domains e-domains))
              store-opts  (store-visible-opts opts4)
              dir-key     (shared-local-store-key dir)]
-         (if raw-persist-open-opts?
+         (if raw-open-metadata?
            (transact-opts-raw lmdb opts4)
            (transact-opts lmdb opts4))
-         (ensure-open-last-modified! lmdb)
+         (ensure-open-last-modified! lmdb raw-open-metadata?)
          (if shared-store
            (let [runtime-opts (:runtime-opts opts4)
                  wrapper      (with-open-opts
