@@ -110,7 +110,9 @@ outlive the callback.
 | Search/vector/idoc option builders | N/A, native maps | Yes | Yes | Yes |
 | Standalone KV search engine | Yes | Yes | Yes | Yes |
 | Standalone vector index | Yes | Yes | Yes | Yes |
-| Local llama.cpp embedder/generator handles/providers | Yes, providers | Yes | Yes | Yes |
+| Built-in embedding provider option maps, including OpenAI-compatible | Yes, native maps | Yes | Yes | Yes |
+| Local llama.cpp embedder/generator handles | Yes, providers | Yes | Yes | Yes |
+| Custom in-process embedding provider objects | Yes | No | No | No |
 | Search index writer: create, write, commit | Yes | Yes | Yes | Yes |
 | Search engine re-index | Yes | Yes | Yes | Yes |
 

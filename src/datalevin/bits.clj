@@ -476,6 +476,18 @@
     (instance? Byte x) 1
     :else              (alength ^bytes (serialize x))))
 
+(def ^:private ^bytes min-indexed-bytes
+  ;; Indexed byte values are followed by a separator and a giant-value flag.
+  ;; The lower bound must sort before legal values beginning with 0x00 bytes.
+  (byte-array c/+val-bytes-wo-hdr+))
+
+(def ^:private ^bytes max-indexed-bytes
+  ;; Use one byte past the non-giant payload limit so sysMax is encoded in the
+  ;; same shape as a giant value with gmax, above every legal byte value.
+  (let [ba (byte-array (inc c/+val-bytes-wo-hdr+))]
+    (Arrays/fill ba (unchecked-byte 0xFF))
+    ba))
+
 (defmacro wrap-extrema
   [v vmin vmax b]
   `(if (keyword? ~v)
@@ -532,6 +544,10 @@
 (defn- bigdec-bytes
   [v]
   (wrap-extrema v c/min-bytes c/max-bytes (encode-bigdec v)))
+
+(defn- bytes-bytes
+  [v]
+  (wrap-extrema v min-indexed-bytes max-indexed-bytes v))
 
 (defn- get-sparse-list
   [bf]
@@ -780,8 +796,10 @@
     :db.type/string  (string-bytes v)
     :db.type/bigint  (bigint-bytes v)
     :db.type/bigdec  (bigdec-bytes v)
-    :db.type/bytes   (wrap-extrema v c/min-bytes c/max-bytes v)
-    (if (vector? t) (tuple-bytes v t) (data-bytes v))))
+    :db.type/bytes   (bytes-bytes v)
+    (if (vector? t)
+      (tuple-bytes v t)
+      (data-bytes v))))
 
 (defn- val-header
   [v t]

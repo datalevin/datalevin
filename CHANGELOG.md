@@ -28,6 +28,8 @@ in order to prevent arbitrary code execution on server.
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable
 [#369](https://github.com/datalevin/datalevin/issues/369).
+- [KV] correct min and max bytes sentinel
+[#379](https://github.com/datalevin/datalevin/issues/379).
 - [Datalog] `dump` handle `:json/null` correctly
 [#370](https://github.com/datalevin/datalevin/issues/370).
 - [Datalog] `fill-db` refreshes read caches after bulk load, and the query

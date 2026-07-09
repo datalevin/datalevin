@@ -775,7 +775,33 @@
                          byte-arrays
                          (map :v (:tx-data (d/with db ents))))))
         (d/close-db db)
-        (u/delete-files dir)))))
+        (u/delete-files dir))))
+    (testing "leading zero bytes remain visible through range scans"
+      (let [conn (d/create-conn nil {:v {:db/valueType :db.type/bytes}})]
+        (try
+          (d/transact! conn [{:db/id 1 :v (byte-array [0 0 0 5])}
+                             {:db/id 2 :v (byte-array [5 0 0 0])}
+                             {:db/id 3 :v (byte-array [0])}
+                             {:db/id 4 :v (byte-array [0 0])}])
+          (let [db (d/db conn)
+                b1 (byte-array [0 0 0 5])]
+            (is (java.util.Arrays/equals ^bytes b1 ^bytes (:v (d/pull db '[:v] 1))))
+            (is (java.util.Arrays/equals ^bytes b1 ^bytes (:v (d/entity db 1))))
+            (is (= [1] (mapv dd/datom-e (d/datoms db :eav 1 :v))))
+            (is (= [1]
+                   (mapv dd/datom-e (d/search-datoms db 1 :v nil))))
+            (is (= [1 2 3 4]
+                   (vec (sort (map dd/datom-e (d/datoms db :ave :v))))))
+            (is (= 4 (d/count-datoms db nil :v nil)))
+            (is (= [1 2 3 4]
+                   (vec (sort (d/q '[:find [?e ...] :where [?e :v]] db)))))
+            (is (= [1]
+                   (vec (sort (d/q '[:find [?e ...]
+                                      :in $ ?v
+                                      :where [?e :v ?v]]
+                                    db b1))))))
+          (finally
+            (d/close conn))))))
 
 
 (deftest issue-127-test
