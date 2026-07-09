@@ -120,7 +120,14 @@ opts = {
     ":search-domains": {"docs": search_domain(index_position=True)},
     ":search-opts": search_options(top=5, display="refs+scores"),
     ":vector-opts": vector_options(dimensions=384, metric_type="cosine"),
-    ":embedding-opts": embedding_options(provider="default", metric_type="cosine"),
+    ":embedding-opts": embedding_options(
+        provider="openai-compatible",
+        model="text-embedding-3-small",
+        base_url="https://api.openai.com/v1",
+        api_key_env="OPENAI_API_KEY",
+        request_dimensions=1536,
+        metric_type="cosine",
+    ),
 }
 ```
 
@@ -180,7 +187,7 @@ Use `create_udf_registry()` and `udf_descriptor()` for runtime UDFs. Pass the
 registry in connection runtime options, then call the descriptor from query with
 Datalevin's `udf` function. Fulltext analyzers use the same route with
 `registry.analyzer_udf()` or `registry.query_analyzer_udf()` and descriptors in
-`search_domain(extra={":analyzer": ...})`. Analyzer functions return
+`search_domain(analyzer=..., query_analyzer=...)`. Analyzer functions return
 `[term, position, offset]` triples.
 
 ```python
@@ -243,7 +250,7 @@ with connect(
         ":text": schema_attr(
             value_type=":db.type/string",
             fulltext=True,
-            extra={":db.fulltext/autoDomain": True},
+            fulltext_auto_domain=True,
         )
     },
     opts={
@@ -251,10 +258,8 @@ with connect(
         ":search-domains": {
             "text": search_domain(
                 index_position=True,
-                extra={
-                    ":analyzer": analyzer,
-                    ":query-analyzer": query_analyzer,
-                },
+                analyzer=analyzer,
+                query_analyzer=query_analyzer,
             )
         },
     },
@@ -452,13 +457,13 @@ finally:
 
 ## Embedding Search Options
 
-Python bindings pass Datalevin option maps through unchanged, so newer store
-features such as `:embedding-opts`, `:embedding-domains`, and remote
-`:openai-compatible` embedding providers are available directly from
-`connect()`:
+Python bindings include helper builders for newer store features such as
+`:embedding-opts`, `:embedding-domains`, and remote `:openai-compatible`
+embedding providers. Raw Datalevin option maps are still passed through when
+needed:
 
 ```python
-from datalevin import connect
+from datalevin import connect, embedding_options
 
 with connect(
     "/tmp/dtlv-py-embed",
@@ -475,14 +480,14 @@ with connect(
         },
     },
     opts={
-        ":embedding-opts": {
-            ":provider": ":openai-compatible",
-            ":model": "text-embedding-3-small",
-            ":base-url": "https://api.openai.com/v1",
-            ":api-key-env": "OPENAI_API_KEY",
-            ":request-dimensions": 1536,
-            ":metric-type": ":cosine",
-        }
+        ":embedding-opts": embedding_options(
+            provider="openai-compatible",
+            model="text-embedding-3-small",
+            base_url="https://api.openai.com/v1",
+            api_key_env="OPENAI_API_KEY",
+            request_dimensions=1536,
+            metric_type="cosine",
+        )
     },
 ) as conn:
     pass

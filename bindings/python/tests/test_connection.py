@@ -46,7 +46,7 @@ def test_connection_methods_cover_common_local_flow(tmp_path) -> None:
             ":bio": schema_attr(
                 value_type=":db.type/string",
                 fulltext=True,
-                extra={":db.fulltext/autoDomain": True},
+                fulltext_auto_domain=True,
             ),
             ":status": schema_attr(value_type=":db.type/keyword"),
             ":friend": schema_attr(value_type=":db.type/ref"),

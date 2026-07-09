@@ -3,6 +3,7 @@ package datalevin;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Objects;
 
@@ -62,6 +63,19 @@ public final class Tx {
                 Datalevin.kw("db/retractEntity"),
                 DatalevinForms.lookupRefInput(entityId)
         ));
+    }
+
+    /**
+     * Creates a {@code :db/ensure} transaction form.
+     */
+    public static List<Object> ensure(Object predicate, Object... args) {
+        ArrayList<Object> values = new ArrayList<>(args.length + 2);
+        values.add(Datalevin.kw("db/ensure"));
+        values.add(ClojureCodec.runtimeInput(predicate));
+        for (Object arg : args) {
+            values.add(ClojureCodec.runtimeInput(arg));
+        }
+        return PersistentVector.create(values);
     }
 
     /**

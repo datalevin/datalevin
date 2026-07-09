@@ -131,6 +131,22 @@ public final class RetrievalOptions {
     }
 
     /**
+     * Sets {@code :analyzer}.
+     */
+    public RetrievalOptions analyzer(Object analyzer) {
+        props.put(Datalevin.kw("analyzer"), ClojureCodec.runtimeInput(analyzer));
+        return this;
+    }
+
+    /**
+     * Sets {@code :query-analyzer}.
+     */
+    public RetrievalOptions queryAnalyzer(Object analyzer) {
+        props.put(Datalevin.kw("query-analyzer"), ClojureCodec.runtimeInput(analyzer));
+        return this;
+    }
+
+    /**
      * Sets {@code :indexing-mode}.
      */
     public RetrievalOptions indexingMode(String mode) {
@@ -215,6 +231,22 @@ public final class RetrievalOptions {
     }
 
     /**
+     * Sets {@code :endpoint}.
+     */
+    public RetrievalOptions endpoint(String endpoint) {
+        props.put(Datalevin.kw("endpoint"), endpoint);
+        return this;
+    }
+
+    /**
+     * Sets {@code :api-key}.
+     */
+    public RetrievalOptions apiKey(String apiKey) {
+        props.put(Datalevin.kw("api-key"), apiKey);
+        return this;
+    }
+
+    /**
      * Sets {@code :api-key-env}.
      */
     public RetrievalOptions apiKeyEnv(String apiKeyEnv) {
@@ -223,10 +255,50 @@ public final class RetrievalOptions {
     }
 
     /**
+     * Sets {@code :headers}.
+     */
+    public RetrievalOptions headers(Map<?, ?> headers) {
+        props.put(Datalevin.kw("headers"), new LinkedHashMap<>(headers));
+        return this;
+    }
+
+    /**
+     * Sets {@code :timeout-ms}.
+     */
+    public RetrievalOptions timeoutMs(long timeoutMs) {
+        props.put(Datalevin.kw("timeout-ms"), timeoutMs);
+        return this;
+    }
+
+    /**
+     * Sets {@code :query-prefix}.
+     */
+    public RetrievalOptions queryPrefix(String queryPrefix) {
+        props.put(Datalevin.kw("query-prefix"), queryPrefix);
+        return this;
+    }
+
+    /**
+     * Sets {@code :document-prefix}.
+     */
+    public RetrievalOptions documentPrefix(String documentPrefix) {
+        props.put(Datalevin.kw("document-prefix"), documentPrefix);
+        return this;
+    }
+
+    /**
      * Sets {@code :request-dimensions}.
      */
     public RetrievalOptions requestDimensions(long requestDimensions) {
         props.put(Datalevin.kw("request-dimensions"), requestDimensions);
+        return this;
+    }
+
+    /**
+     * Sets {@code :embedding-metadata}.
+     */
+    public RetrievalOptions embeddingMetadata(Map<?, ?> metadata) {
+        props.put(Datalevin.kw("embedding-metadata"), new LinkedHashMap<>(metadata));
         return this;
     }
 

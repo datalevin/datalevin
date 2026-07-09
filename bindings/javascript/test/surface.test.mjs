@@ -62,6 +62,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.txDataToSimulatedReport, "function");
   assert.equal(typeof datalevin.txAdd, "function");
   assert.equal(typeof datalevin.txEntity, "function");
+  assert.equal(typeof datalevin.txEnsure, "function");
   assert.equal(typeof datalevin.txRetract, "function");
   assert.equal(typeof datalevin.txRetractEntity, "function");
   assert.equal(typeof datalevin.udfDescriptor, "function");
@@ -70,9 +71,41 @@ test("public surface stays importable without starting the JVM", () => {
   assert.equal(typeof datalevin.vectorOptions, "function");
   assert.equal(typeof datalevin.withTransaction, "function");
   assert.equal(typeof datalevin.writeEdn, "function");
-  assert.deepEqual(datalevin.schemaAttr({ valueType: ":db.type/string", unique: ":db.unique/identity" }), {
+  const attrPred = { ":udf/lang": ":javascript", ":udf/kind": ":predicate", ":udf/id": ":score/high?" };
+  const analyzer = { ":udf/lang": ":javascript", ":udf/kind": ":analyzer", ":udf/id": ":text/hashtags" };
+  const queryAnalyzer = {
+    ":udf/lang": ":javascript",
+    ":udf/kind": ":query-analyzer",
+    ":udf/id": ":text/plain-query"
+  };
+  assert.deepEqual(datalevin.schemaAttr({
+    valueType: ":db.type/string",
+    unique: ":db.unique/identity",
+    attrPreds: attrPred,
+    fulltextDomains: ["docs"],
+    fulltextAutoDomain: true,
+    embedding: true,
+    embeddingDomains: ["embed"],
+    embeddingAutoDomain: true,
+    vectorDomains: ["vectors"],
+    idocFormat: "json",
+    idocDomain: "profiles",
+    idocIndexedPaths: [":status"],
+    idocExcludedPaths: [[":profile", ":raw"]]
+  }), {
     ":db/valueType": ":db.type/string",
-    ":db/unique": ":db.unique/identity"
+    ":db/unique": ":db.unique/identity",
+    ":db.attr/preds": attrPred,
+    ":db.fulltext/domains": ["docs"],
+    ":db.fulltext/autoDomain": true,
+    ":db/embedding": true,
+    ":db.embedding/domains": ["embed"],
+    ":db.embedding/autoDomain": true,
+    ":db.vec/domains": ["vectors"],
+    ":db/idocFormat": ":json",
+    ":db/domain": "profiles",
+    ":db.idoc/indexedPaths": [":status"],
+    ":db.idoc/excludedPaths": [[":profile", ":raw"]]
   });
   assert.deepEqual(datalevin.fulltextAttr({ domains: ["docs"], autoDomain: true }), {
     ":db/valueType": ":db.type/string",
@@ -115,25 +148,33 @@ test("public surface stays importable without starting the JVM", () => {
     offset: 4,
     pagingCachePages: 3,
     display: "refs+scores",
-    domains: ["docs"]
+    domains: ["docs"],
+    analyzer,
+    queryAnalyzer
   }), {
     ":top": 5,
     ":limit": 2,
     ":offset": 4,
     ":paging-cache-pages": 3,
     ":display": ":refs+scores",
-    ":domains": ["docs"]
+    ":domains": ["docs"],
+    ":analyzer": analyzer,
+    ":query-analyzer": queryAnalyzer
   });
   assert.deepEqual(datalevin.searchDomain({
     domain: "docs",
     indexPosition: true,
     includeText: true,
-    indexingMode: "async"
+    indexingMode: "async",
+    analyzer,
+    queryAnalyzer
   }), {
     ":domain": "docs",
     ":index-position?": true,
     ":include-text?": true,
-    ":indexing-mode": ":async"
+    ":indexing-mode": ":async",
+    ":analyzer": analyzer,
+    ":query-analyzer": queryAnalyzer
   });
   assert.deepEqual(datalevin.vectorOptions({ dimensions: 384, metricType: "cosine" }), {
     ":dimensions": 384,
@@ -142,15 +183,35 @@ test("public surface stays importable without starting the JVM", () => {
   assert.deepEqual(datalevin.embeddingOptions({
     provider: "openai-compatible",
     model: "text-embedding-3-small",
+    baseUrl: "https://api.openai.com/v1",
+    endpoint: "https://embed.internal/v1/embeddings",
+    apiKey: "secret-key",
     apiKeyEnv: "OPENAI_API_KEY",
+    headers: { "X-Trace": "1" },
+    timeoutMs: 3210,
+    queryPrefix: "query: ",
+    documentPrefix: "passage: ",
     requestDimensions: 1536,
-    metricType: "cosine"
+    embeddingMetadata: { ":source": "surface-test" },
+    dimensions: 1536,
+    metricType: "cosine",
+    indexingMode: "async"
   }), {
     ":provider": ":openai-compatible",
     ":model": "text-embedding-3-small",
+    ":base-url": "https://api.openai.com/v1",
+    ":endpoint": "https://embed.internal/v1/embeddings",
+    ":api-key": "secret-key",
     ":api-key-env": "OPENAI_API_KEY",
+    ":headers": { "X-Trace": "1" },
+    ":timeout-ms": 3210,
+    ":query-prefix": "query: ",
+    ":document-prefix": "passage: ",
     ":request-dimensions": 1536,
-    ":metric-type": ":cosine"
+    ":embedding-metadata": { ":source": "surface-test" },
+    ":dimensions": 1536,
+    ":metric-type": ":cosine",
+    ":indexing-mode": ":async"
   });
   assert.deepEqual(datalevin.idocOptions({ domains: ["profiles"] }), {
     ":domains": ["profiles"]
@@ -159,6 +220,7 @@ test("public surface stays importable without starting the JVM", () => {
   assert.deepEqual(datalevin.txAdd(1, "name", "Ada"), [":db/add", 1, ":name", "Ada"]);
   assert.deepEqual(datalevin.txRetract(1, ":name", "Ada"), [":db/retract", 1, ":name", "Ada"]);
   assert.deepEqual(datalevin.txRetractEntity(1), [":db/retractEntity", 1]);
+  assert.deepEqual(datalevin.txEnsure(":score/high?", -1, 10), [":db/ensure", ":score/high?", -1, 10]);
   assert.deepEqual(datalevin.udfDescriptor("math/inc"), {
     ":udf/lang": ":java",
     ":udf/kind": ":query-fn",

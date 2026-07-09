@@ -62,6 +62,15 @@ public final class TxData {
     }
 
     /**
+     * Adds a {@code :db/ensure} form.
+     */
+    public TxData ensure(Object predicate, Object... args) {
+        cachedForm = null;
+        items.add(Tx.ensure(predicate, args));
+        return this;
+    }
+
+    /**
      * Adds a raw transaction item.
      */
     public TxData raw(Object txItem) {

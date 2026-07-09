@@ -265,6 +265,14 @@ public final class Schema {
         }
 
         /**
+         * Sets {@code :db.attr/preds}.
+         */
+        public Attribute attrPreds(Object preds) {
+            props.put(Datalevin.kw("db.attr/preds"), ClojureCodec.runtimeInput(preds));
+            return this;
+        }
+
+        /**
          * Sets {@code :db/index}.
          */
         public Attribute index(boolean enabled) {

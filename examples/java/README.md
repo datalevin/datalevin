@@ -88,7 +88,11 @@ Map<String, Object> opts = Map.of(
                 .metricType("cosine")
                 .build(),
         ":embedding-opts", Datalevin.embeddingOptions()
-                .provider("default")
+                .provider("openai-compatible")
+                .model("text-embedding-3-small")
+                .baseUrl("https://api.openai.com/v1")
+                .apiKeyEnv("OPENAI_API_KEY")
+                .requestDimensions(1536)
                 .metricType("cosine")
                 .build());
 ```
@@ -301,10 +305,10 @@ try (Client client = Datalevin.newClient("dtlv://datalevin:datalevin@localhost",
 }
 ```
 
-The Java wrapper also passes raw Datalevin option maps through unchanged, so
-store options like `:embedding-opts`, `:embedding-domains`, and remote
-`:openai-compatible` embedding providers can be supplied directly to
-`Datalevin.createConn(dir, schema, opts)`.
+The Java wrapper also includes typed builders such as
+`Datalevin.embeddingOptions()` for store options like `:embedding-opts`,
+`:embedding-domains`, and remote `:openai-compatible` embedding providers.
+Raw Datalevin option maps are still passed through when needed.
 
 ## In-Process Server
 

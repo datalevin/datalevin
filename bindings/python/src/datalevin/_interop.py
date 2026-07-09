@@ -880,6 +880,17 @@ def schema_attr(
     tuple_type=None,
     tuple_types=None,
     tuple_attrs=None,
+    attr_preds=None,
+    fulltext_domains=None,
+    fulltext_auto_domain=None,
+    embedding=None,
+    embedding_domains=None,
+    embedding_auto_domain=None,
+    vector_domains=None,
+    idoc_format=None,
+    idoc_domain=None,
+    idoc_indexed_paths=None,
+    idoc_excluded_paths=None,
     extra=None,
 ):
     """Build one schema attribute map using the public Python data convention."""
@@ -907,6 +918,28 @@ def schema_attr(
         spec[":db/tupleTypes"] = list(tuple_types)
     if tuple_attrs is not None:
         spec[":db/tupleAttrs"] = list(tuple_attrs)
+    if attr_preds is not None:
+        spec[":db.attr/preds"] = attr_preds
+    if fulltext_domains is not None:
+        spec[":db.fulltext/domains"] = list(fulltext_domains)
+    if fulltext_auto_domain is not None:
+        spec[":db.fulltext/autoDomain"] = bool(fulltext_auto_domain)
+    if embedding is not None:
+        spec[":db/embedding"] = bool(embedding)
+    if embedding_domains is not None:
+        spec[":db.embedding/domains"] = list(embedding_domains)
+    if embedding_auto_domain is not None:
+        spec[":db.embedding/autoDomain"] = bool(embedding_auto_domain)
+    if vector_domains is not None:
+        spec[":db.vec/domains"] = list(vector_domains)
+    if idoc_format is not None:
+        spec[":db/idocFormat"] = _keyword_value(idoc_format)
+    if idoc_domain is not None:
+        spec[":db/domain"] = idoc_domain
+    if idoc_indexed_paths is not None:
+        spec[":db.idoc/indexedPaths"] = list(idoc_indexed_paths)
+    if idoc_excluded_paths is not None:
+        spec[":db.idoc/excludedPaths"] = list(idoc_excluded_paths)
     if extra:
         spec.update(extra)
     return spec
@@ -999,6 +1032,8 @@ def search_options(
     proximity_expansion=None,
     proximity_max_dist=None,
     indexing_mode=None,
+    analyzer=None,
+    query_analyzer=None,
     extra=None,
 ):
     """Build full-text query/default options."""
@@ -1022,12 +1057,25 @@ def search_options(
         opts[":proximity-max-dist"] = proximity_max_dist
     if indexing_mode is not None:
         opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if analyzer is not None:
+        opts[":analyzer"] = analyzer
+    if query_analyzer is not None:
+        opts[":query-analyzer"] = query_analyzer
     if extra:
         opts.update(extra)
     return opts
 
 
-def search_domain(*, domain=None, index_position=None, include_text=None, indexing_mode=None, extra=None):
+def search_domain(
+    *,
+    domain=None,
+    index_position=None,
+    include_text=None,
+    indexing_mode=None,
+    analyzer=None,
+    query_analyzer=None,
+    extra=None,
+):
     """Build a full-text domain option map."""
 
     opts = {}
@@ -1039,6 +1087,10 @@ def search_domain(*, domain=None, index_position=None, include_text=None, indexi
         opts[":include-text?"] = bool(include_text)
     if indexing_mode is not None:
         opts[":indexing-mode"] = _keyword_value(indexing_mode)
+    if analyzer is not None:
+        opts[":analyzer"] = analyzer
+    if query_analyzer is not None:
+        opts[":query-analyzer"] = query_analyzer
     if extra:
         opts.update(extra)
     return opts
@@ -1085,8 +1137,16 @@ def embedding_options(
     provider=None,
     model=None,
     base_url=None,
+    endpoint=None,
+    api_key=None,
     api_key_env=None,
+    headers=None,
+    timeout_ms=None,
+    query_prefix=None,
+    document_prefix=None,
     request_dimensions=None,
+    embedding_metadata=None,
+    dimensions=None,
     metric_type=None,
     indexing_mode=None,
     extra=None,
@@ -1100,10 +1160,26 @@ def embedding_options(
         opts[":model"] = model
     if base_url is not None:
         opts[":base-url"] = base_url
+    if endpoint is not None:
+        opts[":endpoint"] = endpoint
+    if api_key is not None:
+        opts[":api-key"] = api_key
     if api_key_env is not None:
         opts[":api-key-env"] = api_key_env
+    if headers is not None:
+        opts[":headers"] = dict(headers)
+    if timeout_ms is not None:
+        opts[":timeout-ms"] = timeout_ms
+    if query_prefix is not None:
+        opts[":query-prefix"] = query_prefix
+    if document_prefix is not None:
+        opts[":document-prefix"] = document_prefix
     if request_dimensions is not None:
         opts[":request-dimensions"] = request_dimensions
+    if embedding_metadata is not None:
+        opts[":embedding-metadata"] = dict(embedding_metadata)
+    if dimensions is not None:
+        opts[":dimensions"] = dimensions
     if metric_type is not None:
         opts[":metric-type"] = _keyword_value(metric_type)
     if indexing_mode is not None:
@@ -1166,6 +1242,12 @@ def tx_retract_entity(entity_id):
     """Build a :db/retractEntity transaction form."""
 
     return [":db/retractEntity", entity_id]
+
+
+def tx_ensure(predicate, *args):
+    """Build a :db/ensure transaction form."""
+
+    return [":db/ensure", predicate, *args]
 
 
 def transact(conn: Connection, tx_data, tx_meta=None):
@@ -1388,6 +1470,7 @@ __all__ = [
     "tx_add",
     "tx_data_to_simulated_report",
     "tx_entity",
+    "tx_ensure",
     "tx_retract",
     "tx_retract_entity",
     "vector_attr",

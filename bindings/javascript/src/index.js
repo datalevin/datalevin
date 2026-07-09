@@ -55,6 +55,7 @@ export {
   txDataToSimulatedReport,
   txAdd,
   txEntity,
+  txEnsure,
   txRetract,
   txRetractEntity,
   vectorAttr,

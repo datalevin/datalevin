@@ -146,7 +146,8 @@ def test_search_index_writer_commits_to_kv_index(tmp_path: Path) -> None:
             search_domain(
                 domain="custom",
                 include_text=True,
-                extra={":analyzer": analyzer, ":query-analyzer": analyzer},
+                analyzer=analyzer,
+                query_analyzer=analyzer,
             ),
         )
         custom.add_doc("accent", "Café pizza")

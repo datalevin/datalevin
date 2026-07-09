@@ -145,7 +145,7 @@ def test_udf_registry_supports_inline_query_and_tx_functions(tmp_path) -> None:
             ":score": {":db/valueType": ":db.type/long"},
             ":guarded-score": schema_attr(
                 value_type=":db.type/long",
-                extra={":db.attr/preds": attr_predicate_descriptor},
+                attr_preds=attr_predicate_descriptor,
             ),
         },
         opts={":runtime-opts": {":udf-registry": registry}},
@@ -221,7 +221,7 @@ def test_udf_registry_supports_fulltext_analyzers(tmp_path) -> None:
             ":text": schema_attr(
                 value_type=":db.type/string",
                 fulltext=True,
-                extra={":db.fulltext/autoDomain": True},
+                fulltext_auto_domain=True,
             )
         },
         opts={
@@ -229,10 +229,8 @@ def test_udf_registry_supports_fulltext_analyzers(tmp_path) -> None:
             ":search-domains": {
                 "text": search_domain(
                     index_position=True,
-                    extra={
-                        ":analyzer": analyzer_descriptor,
-                        ":query-analyzer": query_descriptor,
-                    },
+                    analyzer=analyzer_descriptor,
+                    query_analyzer=query_descriptor,
                 )
             },
         },

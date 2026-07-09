@@ -1590,6 +1590,17 @@ export function schemaAttr({
   tupleType = null,
   tupleTypes = null,
   tupleAttrs = null,
+  attrPreds = null,
+  fulltextDomains = null,
+  fulltextAutoDomain = null,
+  embedding = null,
+  embeddingDomains = null,
+  embeddingAutoDomain = null,
+  vectorDomains = null,
+  idocFormat = null,
+  idocDomain = null,
+  idocIndexedPaths = null,
+  idocExcludedPaths = null,
   extra = null,
   ...props
 } = {}) {
@@ -1626,6 +1637,39 @@ export function schemaAttr({
   }
   if (tupleAttrs !== null && tupleAttrs !== undefined) {
     spec[":db/tupleAttrs"] = [...tupleAttrs];
+  }
+  if (attrPreds !== null && attrPreds !== undefined) {
+    spec[":db.attr/preds"] = attrPreds;
+  }
+  if (fulltextDomains !== null && fulltextDomains !== undefined) {
+    spec[":db.fulltext/domains"] = [...fulltextDomains];
+  }
+  if (fulltextAutoDomain !== null && fulltextAutoDomain !== undefined) {
+    spec[":db.fulltext/autoDomain"] = Boolean(fulltextAutoDomain);
+  }
+  if (embedding !== null && embedding !== undefined) {
+    spec[":db/embedding"] = Boolean(embedding);
+  }
+  if (embeddingDomains !== null && embeddingDomains !== undefined) {
+    spec[":db.embedding/domains"] = [...embeddingDomains];
+  }
+  if (embeddingAutoDomain !== null && embeddingAutoDomain !== undefined) {
+    spec[":db.embedding/autoDomain"] = Boolean(embeddingAutoDomain);
+  }
+  if (vectorDomains !== null && vectorDomains !== undefined) {
+    spec[":db.vec/domains"] = [...vectorDomains];
+  }
+  if (idocFormat !== null && idocFormat !== undefined) {
+    spec[":db/idocFormat"] = keywordValue(idocFormat);
+  }
+  if (idocDomain !== null && idocDomain !== undefined) {
+    spec[":db/domain"] = idocDomain;
+  }
+  if (idocIndexedPaths !== null && idocIndexedPaths !== undefined) {
+    spec[":db.idoc/indexedPaths"] = [...idocIndexedPaths];
+  }
+  if (idocExcludedPaths !== null && idocExcludedPaths !== undefined) {
+    spec[":db.idoc/excludedPaths"] = [...idocExcludedPaths];
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(spec, extra);
@@ -1721,6 +1765,8 @@ export function searchOptions({
   proximityExpansion = null,
   proximityMaxDist = null,
   indexingMode = null,
+  analyzer = null,
+  queryAnalyzer = null,
   extra = null
 } = {}) {
   const opts = {};
@@ -1751,6 +1797,12 @@ export function searchOptions({
   if (indexingMode !== null && indexingMode !== undefined) {
     opts[":indexing-mode"] = keywordValue(indexingMode);
   }
+  if (analyzer !== null && analyzer !== undefined) {
+    opts[":analyzer"] = analyzer;
+  }
+  if (queryAnalyzer !== null && queryAnalyzer !== undefined) {
+    opts[":query-analyzer"] = queryAnalyzer;
+  }
   if (extra !== null && extra !== undefined) {
     Object.assign(opts, extra);
   }
@@ -1762,6 +1814,8 @@ export function searchDomain({
   indexPosition = null,
   includeText = null,
   indexingMode = null,
+  analyzer = null,
+  queryAnalyzer = null,
   extra = null
 } = {}) {
   const opts = {};
@@ -1776,6 +1830,12 @@ export function searchDomain({
   }
   if (indexingMode !== null && indexingMode !== undefined) {
     opts[":indexing-mode"] = keywordValue(indexingMode);
+  }
+  if (analyzer !== null && analyzer !== undefined) {
+    opts[":analyzer"] = analyzer;
+  }
+  if (queryAnalyzer !== null && queryAnalyzer !== undefined) {
+    opts[":query-analyzer"] = queryAnalyzer;
   }
   if (extra !== null && extra !== undefined) {
     Object.assign(opts, extra);
@@ -1829,8 +1889,16 @@ export function embeddingOptions({
   provider = null,
   model = null,
   baseUrl = null,
+  endpoint = null,
+  apiKey = null,
   apiKeyEnv = null,
+  headers = null,
+  timeoutMs = null,
+  queryPrefix = null,
+  documentPrefix = null,
   requestDimensions = null,
+  embeddingMetadata = null,
+  dimensions = null,
   metricType = null,
   indexingMode = null,
   extra = null
@@ -1845,11 +1913,35 @@ export function embeddingOptions({
   if (baseUrl !== null && baseUrl !== undefined) {
     opts[":base-url"] = baseUrl;
   }
+  if (endpoint !== null && endpoint !== undefined) {
+    opts[":endpoint"] = endpoint;
+  }
+  if (apiKey !== null && apiKey !== undefined) {
+    opts[":api-key"] = apiKey;
+  }
   if (apiKeyEnv !== null && apiKeyEnv !== undefined) {
     opts[":api-key-env"] = apiKeyEnv;
   }
+  if (headers !== null && headers !== undefined) {
+    opts[":headers"] = { ...headers };
+  }
+  if (timeoutMs !== null && timeoutMs !== undefined) {
+    opts[":timeout-ms"] = timeoutMs;
+  }
+  if (queryPrefix !== null && queryPrefix !== undefined) {
+    opts[":query-prefix"] = queryPrefix;
+  }
+  if (documentPrefix !== null && documentPrefix !== undefined) {
+    opts[":document-prefix"] = documentPrefix;
+  }
   if (requestDimensions !== null && requestDimensions !== undefined) {
     opts[":request-dimensions"] = requestDimensions;
+  }
+  if (embeddingMetadata !== null && embeddingMetadata !== undefined) {
+    opts[":embedding-metadata"] = { ...embeddingMetadata };
+  }
+  if (dimensions !== null && dimensions !== undefined) {
+    opts[":dimensions"] = dimensions;
   }
   if (metricType !== null && metricType !== undefined) {
     opts[":metric-type"] = keywordValue(metricType);
@@ -1906,6 +1998,10 @@ export function txRetract(entityId, attr, value) {
 
 export function txRetractEntity(entityId) {
   return [":db/retractEntity", entityId];
+}
+
+export function txEnsure(predicate, ...args) {
+  return [":db/ensure", predicate, ...args];
 }
 
 export function datom(e, attr, value, tx = undefined, added = undefined) {

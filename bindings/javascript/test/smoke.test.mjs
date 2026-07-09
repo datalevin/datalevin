@@ -120,7 +120,7 @@ test(
         ":score": schemaAttr({ valueType: ":db.type/long" }),
         ":guarded-score": schemaAttr({
           valueType: ":db.type/long",
-          extra: { ":db.attr/preds": attrPredicateDescriptor }
+          attrPreds: attrPredicateDescriptor
         })
       },
       opts: { ":runtime-opts": { ":udf-registry": registry } }
@@ -201,7 +201,7 @@ test(
         ":text": schemaAttr({
           valueType: ":db.type/string",
           fulltext: true,
-          extra: { ":db.fulltext/autoDomain": true }
+          fulltextAutoDomain: true
         })
       },
       opts: {
@@ -209,10 +209,8 @@ test(
         ":search-domains": {
           text: searchDomain({
             indexPosition: true,
-            extra: {
-              ":analyzer": analyzerDescriptor,
-              ":query-analyzer": queryDescriptor
-            }
+            analyzer: analyzerDescriptor,
+            queryAnalyzer: queryDescriptor
           })
         }
       }
@@ -252,7 +250,7 @@ test(
         ":bio": schemaAttr({
           valueType: ":db.type/string",
           fulltext: true,
-          extra: { ":db.fulltext/autoDomain": true }
+          fulltextAutoDomain: true
         }),
         ":status": schemaAttr({ valueType: ":db.type/keyword" }),
         ":friend": schemaAttr({ valueType: ":db.type/ref" })
@@ -1026,7 +1024,8 @@ test(
       const custom = await newSearchEngine(kv, searchDomain({
         domain: "custom",
         includeText: true,
-        extra: { ":analyzer": analyzer, ":query-analyzer": analyzer }
+        analyzer,
+        queryAnalyzer: analyzer
       }));
       await custom.addDoc("accent", "Café pizza");
       await custom.addDoc("plain", "Cafe pasta");

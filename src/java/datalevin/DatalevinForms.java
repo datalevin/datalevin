@@ -738,8 +738,11 @@ final class DatalevinForms {
     private static IPersistentMap keywordMap(Map<?, ?> map, boolean keywordizeColonValues) {
         IPersistentMap result = PersistentArrayMap.EMPTY;
         for (Map.Entry<?, ?> entry : map.entrySet()) {
-            result = result.assoc(keywordFromAttr(entry.getKey()),
-                                  keywordValue(entry.getValue(), keywordizeColonValues));
+            Object key = keywordFromAttr(entry.getKey());
+            Object value = rawOptionValueKey(key)
+                    ? ClojureCodec.runtimeInput(entry.getValue())
+                    : keywordValue(entry.getValue(), keywordizeColonValues);
+            result = result.assoc(key, value);
         }
         return result;
     }
@@ -748,9 +751,14 @@ final class DatalevinForms {
         IPersistentMap result = PersistentArrayMap.EMPTY;
         for (Map.Entry<?, ?> entry : map.entrySet()) {
             Object key = keywordFromAttr(entry.getKey());
-            Object value = domainOptionsKey(key)
-                    ? domainOptionsMap(entry.getValue())
-                    : keywordValue(entry.getValue(), true);
+            Object value;
+            if (domainOptionsKey(key)) {
+                value = domainOptionsMap(entry.getValue());
+            } else if (rawOptionValueKey(key)) {
+                value = ClojureCodec.runtimeInput(entry.getValue());
+            } else {
+                value = keywordValue(entry.getValue(), true);
+            }
             result = result.assoc(key, value);
         }
         return result;
@@ -1020,6 +1028,11 @@ final class DatalevinForms {
         return ":search-domains".equals(name)
                 || ":vector-domains".equals(name)
                 || ":embedding-domains".equals(name);
+    }
+
+    private static boolean rawOptionValueKey(Object key) {
+        String name = key instanceof Keyword ? key.toString() : String.valueOf(key);
+        return ":headers".equals(name);
     }
 
     private static String domainName(Object key) {

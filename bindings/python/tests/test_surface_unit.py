@@ -509,9 +509,41 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
 
     assert interop_module.exec_json("ping", {"count": 1}) == {"status": "ok"}
     assert fake.last_request == {"op": "ping", "args": {"count": 1}}
-    assert interop_module.schema_attr(value_type=":db.type/string", unique=":db.unique/identity") == {
+    attr_pred = {":udf/lang": ":python", ":udf/kind": ":predicate", ":udf/id": ":score/high?"}
+    analyzer = {":udf/lang": ":python", ":udf/kind": ":analyzer", ":udf/id": ":text/hashtags"}
+    query_analyzer = {
+        ":udf/lang": ":python",
+        ":udf/kind": ":query-analyzer",
+        ":udf/id": ":text/plain-query",
+    }
+    assert interop_module.schema_attr(
+        value_type=":db.type/string",
+        unique=":db.unique/identity",
+        attr_preds=attr_pred,
+        fulltext_domains=["docs"],
+        fulltext_auto_domain=True,
+        embedding=True,
+        embedding_domains=["embed"],
+        embedding_auto_domain=True,
+        vector_domains=["vectors"],
+        idoc_format="json",
+        idoc_domain="profiles",
+        idoc_indexed_paths=[":status"],
+        idoc_excluded_paths=[[":profile", ":raw"]],
+    ) == {
         ":db/valueType": ":db.type/string",
         ":db/unique": ":db.unique/identity",
+        ":db.attr/preds": attr_pred,
+        ":db.fulltext/domains": ["docs"],
+        ":db.fulltext/autoDomain": True,
+        ":db/embedding": True,
+        ":db.embedding/domains": ["embed"],
+        ":db.embedding/autoDomain": True,
+        ":db.vec/domains": ["vectors"],
+        ":db/idocFormat": ":json",
+        ":db/domain": "profiles",
+        ":db.idoc/indexedPaths": [":status"],
+        ":db.idoc/excludedPaths": [[":profile", ":raw"]],
     }
     assert interop_module.fulltext_attr(domains=["docs"], auto_domain=True) == {
         ":db/valueType": ":db.type/string",
@@ -555,6 +587,8 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         paging_cache_pages=3,
         display="refs+scores",
         domains=["docs"],
+        analyzer=analyzer,
+        query_analyzer=query_analyzer,
     ) == {
         ":top": 5,
         ":limit": 2,
@@ -562,17 +596,23 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
         ":paging-cache-pages": 3,
         ":display": ":refs+scores",
         ":domains": ["docs"],
+        ":analyzer": analyzer,
+        ":query-analyzer": query_analyzer,
     }
     assert interop_module.search_domain(
         domain="docs",
         index_position=True,
         include_text=True,
         indexing_mode="async",
+        analyzer=analyzer,
+        query_analyzer=query_analyzer,
     ) == {
         ":domain": "docs",
         ":index-position?": True,
         ":include-text?": True,
         ":indexing-mode": ":async",
+        ":analyzer": analyzer,
+        ":query-analyzer": query_analyzer,
     }
     assert interop_module.vector_options(dimensions=384, metric_type="cosine") == {
         ":dimensions": 384,
@@ -581,15 +621,35 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert interop_module.embedding_options(
         provider="openai-compatible",
         model="text-embedding-3-small",
+        base_url="https://api.openai.com/v1",
+        endpoint="https://embed.internal/v1/embeddings",
+        api_key="secret-key",
         api_key_env="OPENAI_API_KEY",
+        headers={"X-Trace": "1"},
+        timeout_ms=3210,
+        query_prefix="query: ",
+        document_prefix="passage: ",
         request_dimensions=1536,
+        embedding_metadata={":source": "surface-test"},
+        dimensions=1536,
         metric_type="cosine",
+        indexing_mode="async",
     ) == {
         ":provider": ":openai-compatible",
         ":model": "text-embedding-3-small",
+        ":base-url": "https://api.openai.com/v1",
+        ":endpoint": "https://embed.internal/v1/embeddings",
+        ":api-key": "secret-key",
         ":api-key-env": "OPENAI_API_KEY",
+        ":headers": {"X-Trace": "1"},
+        ":timeout-ms": 3210,
+        ":query-prefix": "query: ",
+        ":document-prefix": "passage: ",
         ":request-dimensions": 1536,
+        ":embedding-metadata": {":source": "surface-test"},
+        ":dimensions": 1536,
         ":metric-type": ":cosine",
+        ":indexing-mode": ":async",
     }
     assert interop_module.idoc_options(domains=["profiles"]) == {
         ":domains": ["profiles"],
@@ -598,6 +658,7 @@ def test_exec_json_and_public_factories(monkeypatch) -> None:
     assert interop_module.tx_add(1, "name", "Ada") == [":db/add", 1, ":name", "Ada"]
     assert interop_module.tx_retract(1, ":name", "Ada") == [":db/retract", 1, ":name", "Ada"]
     assert interop_module.tx_retract_entity(1) == [":db/retractEntity", 1]
+    assert interop_module.tx_ensure(":score/high?", -1, 10) == [":db/ensure", ":score/high?", -1, 10]
 
     conn_opts = {
         ":embedding-opts": {
