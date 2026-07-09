@@ -474,7 +474,12 @@
                     current-state
                     expected-state
                     :ha-follower-loop-running?))
-            (drep/apply-ha-follower-txlog-record! expected-state record)
+            (if-let [with-store-swap (:with-db-runtime-store-swap-fn deps)]
+              (with-store-swap
+                server
+                db-name
+                #(drep/apply-ha-follower-txlog-record! expected-state record))
+              (drep/apply-ha-follower-txlog-record! expected-state record))
             (u/raise "HA follower replay aborted because follower state changed"
                      {:error :ha/follower-stale-state
                       :db-name db-name

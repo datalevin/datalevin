@@ -4,8 +4,11 @@
    [clojure.test :refer [deftest is]]
    [datalevin.ha.authority :as authority]
    [datalevin.ha.control :as ctrl]
+   [datalevin.ha.replication :as repl]
    [datalevin.server.ha :as server-ha]
-   [datalevin.util :as u]))
+   [datalevin.util :as u])
+  (:import
+   [java.util.concurrent Semaphore]))
 
 (def apply-state-command #'ctrl/apply-state-command)
 
@@ -91,3 +94,50 @@
          raft-dir
          (str root u/+separator+ "ha-control" u/+separator+)))
     (is (str/includes? raft-dir (u/hexify-string db-name)))))
+
+(deftest follower-replay-apply-uses-runtime-store-swap-test
+  (let [running?       (Object.)
+        authority      (Object.)
+        state          {:ha-role :follower
+                        :ha-authority authority
+                        :ha-node-id 1
+                        :ha-db-identity "dbid"
+                        :ha-membership-hash "hash"
+                        :ha-follower-loop-running? running?}
+        admission-lock (Object.)
+        replay-lock    (Semaphore. 1)
+        in-swap?       (atom false)
+        applied-in-swap? (atom false)
+        deps           {:get-lock-fn
+                        (fn [_server db-name]
+                          (is (= "db" db-name))
+                          replay-lock)
+                        :db-write-admission-lock-fn
+                        (fn [_server db-name]
+                          (is (= "db" db-name))
+                          admission-lock)
+                        :dbs-fn
+                        (fn [_server]
+                          {"db" state})
+                        :with-db-runtime-store-swap-fn
+                        (fn [_server db-name f]
+                          (is (= "db" db-name))
+                          (reset! in-swap? true)
+                          (try
+                            (f)
+                            (finally
+                              (reset! in-swap? false))))}]
+    (with-redefs [repl/apply-ha-follower-txlog-record!
+                  (fn [expected-state record]
+                    (is (identical? state expected-state))
+                    (is (= {:lsn 7} record))
+                    (reset! applied-in-swap? @in-swap?)
+                    (assoc expected-state :applied-lsn (:lsn record)))]
+      (is (= (assoc state :applied-lsn 7)
+             (#'server-ha/ha-follower-apply-record-with-guard
+              deps
+              ::server
+              "db"
+              state
+              {:lsn 7})))
+      (is (true? @applied-in-swap?)))))
