@@ -9,6 +9,34 @@
   [op]
   (contains? #{:ok :fail :info} (:type op)))
 
+(def ^:private indeterminate-error-codes
+  #{:ha/client-op-timeout
+    :ha/control-timeout
+    :ha/write-indeterminate})
+
+(def ^:private indeterminate-error-types
+  #{:txlog/commit-timeout})
+
+(def ^:private indeterminate-error-markers
+  ["HA control command timed out"
+   "HA write commit confirmation failed"
+   "Timed out waiting for durable LSN"
+   "Timed out waiting for HA client op replay"])
+
+(defn- indeterminate-error-data?
+  [data]
+  (boolean
+    (or (true? (:indeterminate? data))
+        (contains? indeterminate-error-codes (:error data))
+        (contains? indeterminate-error-types (:type data)))))
+
+(defn- indeterminate-error-message?
+  [message]
+  (and (string? message)
+       (boolean
+         (some #(str/includes? message %)
+               indeterminate-error-markers))))
+
 (defn indeterminate-exception?
   [e]
   (or (local/transport-failure? e)
@@ -16,8 +44,9 @@
        (some
         (fn [cause]
           (let [data (ex-data cause)]
-            (or (true? (:indeterminate? data))
-                (true? (:indeterminate? (:err-data data))))))
+            (or (indeterminate-error-data? data)
+                (indeterminate-error-data? (:err-data data))
+                (indeterminate-error-message? (ex-message cause)))))
         (take-while some? (iterate ex-cause e))))))
 
 (defn exception-result-type

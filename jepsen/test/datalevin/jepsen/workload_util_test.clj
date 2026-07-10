@@ -45,7 +45,69 @@
                   error
                   :ha/write-indeterminate)]
       (is (= :info (:type result)))
-      (is (= :ha/write-indeterminate (:error result))))))
+      (is (= :ha/write-indeterminate (:error result)))))
+
+  (testing "HA control command timeouts are reported as info"
+    (let [op     {:type :invoke :f :cas}
+          error  (ex-info
+                   "Request to Datalevin server failed: \"HA control command timed out\""
+                   {:err-data {:error :ha/control-timeout
+                               :command :renew-lease}})
+          result (workload.util/assoc-exception-op op error :control-timeout)]
+      (is (= :info (:type result)))
+      (is (= :control-timeout (:error result)))))
+
+  (testing "wrapped HA control timeout messages are reported as info"
+    (let [op     {:type :invoke :f :write}
+          error  (ex-info
+                   "Request to Datalevin server failed: \"HA control command timed out\""
+                   {})
+          result (workload.util/assoc-exception-op op error :control-timeout)]
+      (is (= :info (:type result)))))
+
+  (testing "durable commit wait timeouts are reported as info"
+    (let [op     {:type :invoke :f :write}
+          error  (ex-info
+                   "Request to Datalevin server failed: \"Timed out waiting for durable LSN\""
+                   {:err-data {:type :txlog/commit-timeout
+                               :lsn 42}})
+          result (workload.util/assoc-exception-op op error :commit-timeout)]
+      (is (= :info (:type result))))))
+
+(deftest register-checker-allows-indeterminate-cas-outcome-test
+  (let [history [{:index 0
+                  :time 100
+                  :type :invoke
+                  :process 1
+                  :f :cas
+                  :value (clojure.lang.MapEntry. 0 [0 3])}
+                 {:index 1
+                  :time 200
+                  :type :info
+                  :process 1
+                  :f :cas
+                  :value (clojure.lang.MapEntry. 0 [0 3])
+                  :error :control-timeout}
+                 {:index 2
+                  :time 300
+                  :type :invoke
+                  :process 0
+                  :f :read
+                  :value (clojure.lang.MapEntry. 0 nil)}
+                 {:index 3
+                  :time 400
+                  :type :ok
+                  :process 0
+                  :f :read
+                  :value (clojure.lang.MapEntry. 0 3)}]
+        result  (checker/check
+                 (#'register/register-checker)
+                 {:name "register-indeterminate-cas-smoke"
+                  :start-time "20260710T000000"}
+                 (history/history history)
+                 nil)]
+    (is (true? (get-in result [:results 0 :linearizable :valid?]))
+        (pr-str result))))
 
 (deftest exception-detail-sanitizes-history-unsafe-values-test
   (let [opaque (Object.)
