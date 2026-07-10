@@ -5,6 +5,24 @@
    [openrulebench.data :as data]
    [odoyle.rules :as o]))
 
+(defn insert-pair!
+  "Insert a binary relation tuple using the tuple itself as fact id.
+   O'Doyle values are single-valued per id+attr, so [x rel y] is not enough
+   to represent a many-valued binary relation."
+  [rel from to]
+  (let [id [rel from to]]
+    (o/insert! id rel true)
+    (o/insert! id ::from from)
+    (o/insert! id ::to to)))
+
+(defn insert-pair
+  [session rel from to]
+  (let [id [rel from to]]
+    (-> session
+        (o/insert id rel true)
+        (o/insert id ::from from)
+        (o/insert id ::to to))))
+
 ;; =============================================================================
 ;; Transitive Closure Rules
 ;; =============================================================================
@@ -13,38 +31,64 @@
   (o/ruleset
     {::tc-base
      [:what
-      [?a ::edge ?b]
+      [?edge ::edge true]
+      [?edge ::from ?a]
+      [?edge ::to ?b]
       :then
-      (o/insert! ?a ::tc ?b)]
+      (insert-pair! ::tc ?a ?b)]
 
      ::tc-recursive
      [:what
-      [?a ::edge ?x]
-      [?x ::tc ?b]
+      [?edge ::edge true]
+      [?edge ::from ?a]
+      [?edge ::to ?x]
+      [?tc ::tc true]
+      [?tc ::from ?x]
+      [?tc ::to ?b]
       :then
-      (o/insert! ?a ::tc ?b)]}))
+      (insert-pair! ::tc ?a ?b)]
+
+     ::tc-query
+     [:what
+      [?tc ::tc true]
+      [?tc ::from ?a]
+      [?tc ::to ?b]]}))
 
 ;; =============================================================================
 ;; Same Generation Rules (OpenRuleBench spec)
-;; sg(X, X) :- par(_, X).              -- reflexive: any node with a parent
-;; sg(X, Y) :- par(PX, X), par(PY, Y), sg(PX, PY).  -- children of same-gen parents
+;; sg(X, Y) :- sib(X, Y).
+;; sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
 ;; =============================================================================
 
 (def sg-rules
   (o/ruleset
-    {::sg-reflexive
+    {::sg-base
      [:what
-      [?x ::parent ?p]
+      [?sib ::sib true]
+      [?sib ::from ?x]
+      [?sib ::to ?y]
       :then
-      (o/insert! ?x ::sg ?x)]
+      (insert-pair! ::sg ?x ?y)]
 
      ::sg-recursive
      [:what
-      [?x ::parent ?px]
-      [?y ::parent ?py]
-      [?px ::sg ?py]
+      [?par1 ::par true]
+      [?par1 ::from ?x]
+      [?par1 ::to ?z]
+      [?sg ::sg true]
+      [?sg ::from ?z]
+      [?sg ::to ?z1]
+      [?par2 ::par true]
+      [?par2 ::from ?y]
+      [?par2 ::to ?z1]
       :then
-      (o/insert! ?x ::sg ?y)]}))
+      (insert-pair! ::sg ?x ?y)]
+
+     ::sg-query
+     [:what
+      [?sg ::sg true]
+      [?sg ::from ?x]
+      [?sg ::to ?y]]}))
 
 ;; =============================================================================
 ;; Session Creation
@@ -52,15 +96,20 @@
 
 (defn create-tc-session [edges]
   (reduce (fn [session [from to]]
-            (o/insert session from ::edge to))
+            (insert-pair session ::edge from to))
           (reduce o/add-rule (o/->session) tc-rules)
           edges))
 
-(defn create-sg-session [edges]
-  (reduce (fn [session [parent child]]
-            (o/insert session child ::parent parent))
-          (reduce o/add-rule (o/->session) sg-rules)
-          edges))
+(defn create-sg-session [{:keys [par sib]}]
+  (let [session (reduce o/add-rule (o/->session) sg-rules)
+        session (reduce (fn [s [from to]]
+                          (insert-pair s ::par from to))
+                        session
+                        par)]
+    (reduce (fn [s [from to]]
+              (insert-pair s ::sib from to))
+            session
+            sib)))
 
 (defn fire-session [session]
   (loop [s session
@@ -77,10 +126,10 @@
 ;; =============================================================================
 
 (defn query-tc-all [session]
-  (o/query-all session ::tc-base))
+  (o/query-all session ::tc-query))
 
 (defn query-sg-all [session]
-  (o/query-all session ::sg-reflexive))
+  (o/query-all session ::sg-query))
 
 ;; =============================================================================
 ;; Benchmark Runners with Timeout
@@ -93,7 +142,9 @@
     (try
       (let [result (deref fut timeout-ms ::timeout)]
         (if (= result ::timeout)
-          {:status :timeout}
+          (do
+            (future-cancel fut)
+            {:status :timeout})
           {:status :ok :result result}))
       (catch Exception _ {:status :error}))))
 
@@ -120,11 +171,11 @@
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
-  (let [edges (data/generate-sg-instance (keyword instance-name))
+  (let [relations (data/generate-sg-instance (keyword instance-name))
         _ (System/gc)
         start (core/now-ms)
         outcome (run-with-timeout
-                  #(let [session (-> (create-sg-session edges) fire-session)]
+                  #(let [session (-> (create-sg-session relations) fire-session)]
                      (query-sg-all session)))
         end (core/now-ms)]
     (if (= :ok (:status outcome))

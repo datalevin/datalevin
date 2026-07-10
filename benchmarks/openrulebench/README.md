@@ -1,15 +1,17 @@
 # OpenRuleBench for Datalevin
 
-Benchmarks comparing Datalevin's Datalog engine against other rule engines and deductive systems.
-
-This benchmark suite implements tests from [OpenRuleBench](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf), the standard benchmark for comparing rule engines.
+Benchmarks for comparing Datalevin's Datalog engine with rule engines,
+recursive SQL systems, and deductive systems. The suite follows the
+[OpenRuleBench](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf)
+workloads where practical, and also includes a non-standard `tiny` TC/SG scale
+for local development runs when the standard `small` case is too large.
 
 ## Benchmarks
 
 | Benchmark | Type | Description | Sizes |
 |-----------|------|-------------|-------|
-| **TC** | Synthetic | Transitive closure on random graphs | 50K, 125K, 250K, 500K, 1M edges |
-| **SG** | Synthetic | Same generation on random graphs | Same as TC |
+| **TC** | Synthetic | Transitive closure on random graphs | 1K, 50K, 125K, 250K, 500K, 1M edges |
+| **SG** | Synthetic | Same generation over random `par`/`sib` relations | 1K, 6K, 24K, 48K facts |
 | **Join1** | Synthetic | 5-way join with intermediate results | 10K, 50K, 250K tuples |
 | **DBLP** | Real-world | Publication data (4-way self-join) | 2K, 8K, 64K papers |
 | **LUBM** | Semantic | University domain (type inference) | 1, 10, 50 universities |
@@ -19,18 +21,67 @@ This benchmark suite implements tests from [OpenRuleBench](https://www3.cs.stony
 ```bash
 cd benchmarks/openrulebench
 
-# Run default benchmarks (quick)
+# Run the configured default benchmarks
 ./bench.clj
 
-# Run specific benchmarks
-./bench.clj tc:small tc:medium sg:small
+# Run a tiny local comparison between Datalevin and Clara
+./bench.clj --systems datalevin,clara tc:tiny sg:tiny
+
+# Run selected OpenRuleBench standard cases
+./bench.clj --systems datalevin,clara tc:small sg:small
 
 # Run all OpenRuleBench benchmarks
 ./bench.clj all
 
-# Run stress tests (requires >8GB heap)
+# Run stress tests
 ./bench.clj stress
 ```
+
+The Datalevin runner uses the in-memory KV store for generated benchmark
+databases. Datalevin and Clara are both run with `-J-Xmx8g`.
+
+## Current Results
+
+Environment for these runs: Clojure `1.12.5`, Clara Rules `0.24.0`,
+O'Doyle Rules `1.3.1`, OpenJDK `21.0.11`, macOS arm64, `-J-Xmx8g`.
+
+### Tiny TC/SG
+
+These are non-standard local development instances. `tc:tiny` uses 100 nodes
+and 1,000 edges; `sg:tiny` uses 100 nodes, 500 `par` facts, and 500 `sib` facts.
+Datalevin and Clara produced the same result counts.
+
+| Benchmark | Datalevin | Clara | O'Doyle | Result count |
+|-----------|-----------|-------|---------|--------------|
+| `tc:tiny` | 96.73 ms | 575.02 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `sg:tiny` | 149.11 ms | 521.58 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+
+### Small Runs
+
+`tc:small` is the OpenRuleBench TC small graph: 1,000 nodes and 50,000 edges.
+`sg:small` is the OpenRuleBench SG small shape: 1,000 nodes, 3,000 `par` facts,
+and 3,000 `sib` facts.
+
+| Benchmark | Datalevin | Clara | O'Doyle | Result count |
+|-----------|-----------|-------|---------|--------------|
+| `tc:small` | 63,813.62 ms | OOM after about 6m45s | not run | 1,000,000 for Datalevin |
+| `sg:small` | 10,912.35 ms | 41,923.70 ms | not run | 869,923 for Datalevin/Clara |
+
+Correctness was checked for both Datalevin and Clara TC/SG rules against
+independent fixed-point references. The corrected SG reference uses the
+OpenRuleBench rule shape: `sg(X,Y) :- sib(X,Y)` and
+`sg(X,Y) :- par(X,Z), sg(Z,Z1), par(Y,Z1)`. Clara's current benchmark
+implementation uses private process-wide seen sets, so it is intended for the
+sequential benchmark harness.
+
+O'Doyle requires tuple ids such as `[::sg x y]` to represent many-valued binary
+relations; a simpler `[x ::sg y]` encoding overwrites values for the same `x`.
+With the corrected tuple representation, a small custom SG sanity case passes,
+but both `tc:tiny` and `sg:tiny` hit the benchmark's 60 second timeout.
+
+Timing scope is not identical across systems: Datalevin timings measure the
+query after data load and `analyze`, while Clara timings include session
+creation, fact insertion, rule firing, and querying.
 
 ## ORE 2015 OWL-RL Benchmark (Realistic Reasoning)
 
@@ -72,21 +123,33 @@ tc(A, B) :- edge(A, X), tc(X, B).
 
 | Instance | Nodes | Edges |
 |----------|-------|-------|
+| tiny | 100 | 1,000 |
 | small | 1,000 | 50,000 |
 | medium | 1,000 | 125,000 |
 | large | 2,000 | 250,000 |
 | xlarge | 2,000 | 500,000 |
 | xxlarge | 2,000 | 1,000,000 |
 
+`tiny` is a non-standard development scale for local comparisons when the
+OpenRuleBench `small` instance is too large for a system or heap size.
+
 ### Same Generation (SG)
 
-Find nodes at the same depth in a tree:
+Find same-generation pairs from base `sib` and `par` relations:
 ```
-sg(X, X) :- parent(_, X).
-sg(X, Y) :- parent(PX, X), parent(PY, Y), sg(PX, PY).
+sg(X, Y) :- sib(X, Y).
+sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
 ```
 
-Uses the same instances as TC.
+| Instance | Nodes | `par` facts | `sib` facts | Total facts |
+|----------|-------|-------------|-------------|-------------|
+| tiny | 100 | 500 | 500 | 1,000 |
+| small | 1,000 | 3,000 | 3,000 | 6,000 |
+| medium | 1,000 | 12,000 | 12,000 | 24,000 |
+| large | 1,000 | 24,000 | 24,000 | 48,000 |
+
+`tiny` and `large` are local development extensions; the OpenRuleBench paper
+reports SG sizes of 6,000 and 24,000 base facts.
 
 ### Join1 (5-Way Join)
 
@@ -147,6 +210,8 @@ Tests type inference with university domain ontology:
 | System | Category | Description |
 |--------|----------|-------------|
 | **Datalevin** | Deductive (Datalog) | Bottom-up with tabling |
+| **Clara Rules** | Production rule engine | Rete-style forward chaining |
+| **O'Doyle Rules** | Production rule engine | EAV-style forward chaining |
 | **SQLite** | SQL | Recursive CTE baseline |
 | **PostgreSQL** | SQL | Recursive CTE (optional) |
 | **XSB** | Deductive (Tabled Prolog) | Reference implementation |
@@ -155,8 +220,8 @@ Tests type inference with university domain ontology:
 ## Requirements
 
 ### Required
-- Clojure 1.12+
-- Java 11+
+- Clojure 1.12+; benchmark aliases currently pin Clojure `1.12.5`
+- Java 17+
 
 ### Optional External Systems
 
@@ -209,20 +274,6 @@ openrulebench/
     └── lubm/                 # LUBM OWL (generated)
 ```
 
-## Expected Results
-
-Deductive systems (Datalevin, XSB) significantly outperform production rule engines (Clara, Drools) on recursive queries:
-
-| Benchmark | Datalevin | SQLite | XSB |
-|-----------|-----------|--------|-----|
-| TC small | ~50ms | ~200ms | ~20ms |
-| TC medium | ~200ms | ~1s | ~100ms |
-| SG small | ~100ms | ~500ms | ~50ms |
-
-**Why?**
-- Deductive systems use tabling/memoization to avoid redundant computation
-- Production rule engines use forward-chaining without query optimization
-- For recursive Datalog, deductive systems are 10-100x faster
 
 ## References
 

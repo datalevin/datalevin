@@ -33,8 +33,8 @@ count_tc(N) :- findall(1, tc(_, _), L), length(L, N).
   "% Same Generation (OpenRuleBench spec)
 :- table sg/2.
 
-sg(X, X) :- parent(_, X).
-sg(X, Y) :- parent(PX, X), parent(PY, Y), sg(PX, PY).
+sg(X, Y) :- sib(X, Y).
+sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
 
 bench :- sg(_, _), fail.
 bench.
@@ -61,13 +61,15 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
 
 (defn write-sg-files
   "Write Prolog data and program files for SG benchmark."
-  [edges dir]
+  [{:keys [par sib]} dir]
   (let [data-file (str dir "/data.P")
         prog-file (str dir "/sg.P")]
-    ;; Write parent facts (edges are [parent child])
+    ;; Write par/sib facts
     (with-open [w (io/writer data-file)]
-      (doseq [[p c] edges]
-        (.write w (str "parent(" p ", " c ").\n"))))
+      (doseq [[a b] par]
+        (.write w (str "par(" a ", " b ").\n")))
+      (doseq [[a b] sib]
+        (.write w (str "sib(" a ", " b ").\n"))))
     ;; Write program
     (spit prog-file (str ":- consult('" data-file "').\n" sg-program))
     prog-file))
@@ -124,10 +126,10 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
-  (let [edges (data/generate-sg-instance (keyword instance-name))
+  (let [relations (data/generate-sg-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-xsb-sg-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-sg-files edges dir)
+        prog-file (write-sg-files relations dir)
         _ (System/gc)
         start (core/now-ms)
         ;; First materialize (bench), then count

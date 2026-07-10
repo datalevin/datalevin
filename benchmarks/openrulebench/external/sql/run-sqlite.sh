@@ -72,9 +72,10 @@ run_sg_benchmark() {
     local data_size=$1
     local query_type=$2
 
-    local csv_file="$DATA_DIR/sg-${data_size}.csv"
+    local par_file="$DATA_DIR/sg-${data_size}-par.csv"
+    local sib_file="$DATA_DIR/sg-${data_size}-sib.csv"
 
-    if [ ! -f "$csv_file" ]; then
+    if [ ! -f "$par_file" ] || [ ! -f "$sib_file" ]; then
         echo "---	" | tr -d '\n'
         return
     fi
@@ -83,25 +84,46 @@ run_sg_benchmark() {
     sqlite3 "$DB_FILE" <<EOF
 .mode csv
 .headers on
-CREATE TABLE parent (parent_node INTEGER, child_node INTEGER);
-.import $csv_file parent
-DELETE FROM parent WHERE parent_node = 'from';
-CREATE INDEX idx_parent ON parent(parent_node);
-CREATE INDEX idx_child ON parent(child_node);
+CREATE TABLE par (a INTEGER, b INTEGER);
+CREATE TABLE sib (a INTEGER, b INTEGER);
+.import $par_file par
+.import $sib_file sib
+DELETE FROM par WHERE a = 'from';
+DELETE FROM sib WHERE a = 'from';
+CREATE INDEX idx_par_a ON par(a);
+CREATE INDEX idx_par_b ON par(b);
+CREATE INDEX idx_sib_a ON sib(a);
+CREATE INDEX idx_sib_b ON sib(b);
 EOF
 
     start_time=$(python3 -c "import time; print(time.time() * 1000)")
 
-    sqlite3 "$DB_FILE" <<EOF
+    case "$query_type" in
+        ff)
+            sqlite3 "$DB_FILE" <<EOF
 WITH RECURSIVE sg AS (
-    SELECT DISTINCT child_node AS x, child_node AS y FROM parent
+    SELECT a AS x, b AS y FROM sib
     UNION
-    SELECT p1.child_node, p2.child_node
-    FROM parent p1, parent p2, sg s
-    WHERE p1.parent_node = s.x AND p2.parent_node = s.y
+    SELECT p1.a, p2.a
+    FROM par p1, sg s, par p2
+    WHERE p1.b = s.x AND p2.b = s.y
 )
 SELECT COUNT(*) FROM sg;
 EOF
+            ;;
+        bf)
+            sqlite3 "$DB_FILE" <<EOF
+WITH RECURSIVE sg AS (
+    SELECT a AS x, b AS y FROM sib
+    UNION
+    SELECT p1.a, p2.a
+    FROM par p1, sg s, par p2
+    WHERE p1.b = s.x AND p2.b = s.y
+)
+SELECT COUNT(*) FROM sg WHERE x = 0;
+EOF
+            ;;
+    esac
 
     end_time=$(python3 -c "import time; print(time.time() * 1000)")
     elapsed=$(python3 -c "print(f'{$end_time - $start_time:.1f}')")

@@ -34,11 +34,11 @@
 ;; Same Generation using recursive CTE
 (def sg-query
   "WITH RECURSIVE sg(x, y) AS (
-     SELECT DISTINCT child, child FROM parent
+     SELECT a, b FROM sib
      UNION
-     SELECT DISTINCT p1.child, p2.child
-     FROM parent p1, parent p2, sg
-     WHERE p1.parent = sg.x AND p2.parent = sg.y
+     SELECT DISTINCT p1.a, p2.a
+     FROM par p1, sg, par p2
+     WHERE p1.b = sg.x AND p2.b = sg.y
    )
    SELECT x, y FROM sg;")
 
@@ -88,23 +88,34 @@
   (execute! conn "ANALYZE edge"))
 
 (defn setup-sg-table!
-  "Create and populate parent table for SG benchmark."
-  [^Connection conn edges]
-  ;; edges are [parent child]
-  (execute! conn "DROP TABLE IF EXISTS parent")
-  (execute! conn "CREATE TABLE parent (child INTEGER, parent INTEGER)")
+  "Create and populate par/sib tables for SG benchmark."
+  [^Connection conn {:keys [par sib]}]
+  (execute! conn "DROP TABLE IF EXISTS par")
+  (execute! conn "DROP TABLE IF EXISTS sib")
+  (execute! conn "CREATE TABLE par (a INTEGER, b INTEGER)")
+  (execute! conn "CREATE TABLE sib (a INTEGER, b INTEGER)")
   ;; Batch insert
-  (let [ps (.prepareStatement conn "INSERT INTO parent VALUES (?, ?)")]
-    (doseq [[p c] edges]
-      (.setLong ps 1 c)  ; child
-      (.setLong ps 2 p)  ; parent
+  (let [ps (.prepareStatement conn "INSERT INTO par VALUES (?, ?)")]
+    (doseq [[a b] par]
+      (.setLong ps 1 a)
+      (.setLong ps 2 b)
+      (.addBatch ps))
+    (.executeBatch ps)
+    (.close ps))
+  (let [ps (.prepareStatement conn "INSERT INTO sib VALUES (?, ?)")]
+    (doseq [[a b] sib]
+      (.setLong ps 1 a)
+      (.setLong ps 2 b)
       (.addBatch ps))
     (.executeBatch ps)
     (.close ps))
   ;; Create indexes and analyze
-  (execute! conn "CREATE INDEX idx_parent_child ON parent(child)")
-  (execute! conn "CREATE INDEX idx_parent_parent ON parent(parent)")
-  (execute! conn "ANALYZE parent"))
+  (execute! conn "CREATE INDEX idx_par_a ON par(a)")
+  (execute! conn "CREATE INDEX idx_par_b ON par(b)")
+  (execute! conn "CREATE INDEX idx_sib_a ON sib(a)")
+  (execute! conn "CREATE INDEX idx_sib_b ON sib(b)")
+  (execute! conn "ANALYZE par")
+  (execute! conn "ANALYZE sib"))
 
 ;; =============================================================================
 ;; Benchmark Runners
@@ -134,11 +145,11 @@
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
-  (let [edges (data/generate-sg-instance (keyword instance-name))]
+  (let [relations (data/generate-sg-instance (keyword instance-name))]
     (try
       (let [conn (get-connection)]
         (try
-          (setup-sg-table! conn edges)
+          (setup-sg-table! conn relations)
           (System/gc)
           (let [[rows time-ms] (core/time-once (query-rows conn sg-query))]
             {:system "postgresql"

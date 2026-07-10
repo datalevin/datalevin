@@ -2,7 +2,7 @@
   "Datalevin benchmarks for OpenRuleBench.
    Implements standard OpenRuleBench benchmarks:
    - TC (Transitive Closure): Random graphs
-   - SG (Same Generation): Random graphs
+   - SG (Same Generation): Random par/sib relations
    - Join1: 5-way join benchmark
    - DBLP: Real-world publication data (4-way self-join)
    - LUBM: Semantic university benchmark (type inference)"
@@ -11,9 +11,7 @@
    [openrulebench.data :as data]
    [openrulebench.dblp :as dblp]
    [openrulebench.lubm :as lubm]
-   [datalevin.core :as d])
-  (:import
-   [java.util UUID]))
+   [datalevin.core :as d]))
 
 ;; =============================================================================
 ;; Schemas
@@ -26,9 +24,11 @@
 
 (def sg-schema
   "Schema for same-generation benchmark.
-   [child :parent parent] - child entity has parent as value."
-  {:parent {:db/valueType   :db.type/ref
-            :db/cardinality :db.cardinality/many}})
+   OpenRuleBench uses par(X,Y) and sib(X,Y) as base relations."
+  {:par {:db/valueType   :db.type/ref
+         :db/cardinality :db.cardinality/many}
+   :sib {:db/valueType   :db.type/ref
+         :db/cardinality :db.cardinality/many}})
 
 (def join1-schema
   "Schema for JOIN1 benchmark.
@@ -62,20 +62,17 @@
      (tc ?x ?b)]])
 
 ;; Same Generation Rules (OpenRuleBench spec)
-;; sg(X, X) :- par(_, X).              -- reflexive: any node with a parent
-;; sg(X, Y) :- par(PX, X), par(PY, Y), sg(PX, PY).  -- children of same-gen parents
-;; Note: par(X,A) means X is parent of A, but our data has [child :parent parent]
-;; So [?x :parent ?px] means par(?px, ?x)
+;; sg(X, Y) :- sib(X, Y).
+;; sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
 (def sg-rules
-  '[;; Base: any node with a parent is same-gen with itself
+  '[;; Base: siblings are same-generation
     [(sg ?x ?y)
-     [?x :parent _]
-     [(identity ?x) ?y]]
-    ;; Recursive: children of same-gen parents are same-gen
+     [?x :sib ?y]]
+    ;; Recursive: nodes with same-generation par-successors are same-generation
     [(sg ?x ?y)
-     [?x :parent ?px]
-     [?y :parent ?py]
-     (sg ?px ?py)]])
+     [?x :par ?z]
+     (sg ?z ?z1)
+     [?y :par ?z1]]])
 
 ;; JOIN1 Rules (OpenRuleBench spec)
 ;; 5-way join with intermediate duplicate elimination
@@ -105,45 +102,41 @@
 ;; Database Setup
 ;; =============================================================================
 
+(def db-opts
+  "Use Datalevin's in-memory KV store for generated benchmark databases."
+  {:kv-opts {:inmemory? true}})
+
+(defn create-benchmark-conn
+  "Create an in-memory Datalevin connection loaded with benchmark datoms."
+  [schema datoms]
+  (let [conn (d/create-conn nil schema db-opts)]
+    (d/transact! conn datoms)
+    conn))
+
 (defn create-tc-db
   "Create a database with edge data for TC benchmark."
   [edges]
-  (let [dir (str "/tmp/openrulebench-tc-" (UUID/randomUUID))
-        conn (d/create-conn dir tc-schema)]
-    (d/transact! conn (data/edges->datoms edges))
-    conn))
+  (create-benchmark-conn tc-schema (data/edges->datoms edges)))
 
 (defn create-sg-db
-  "Create a database with parent-child data for SG benchmark."
-  [edges]
-  (let [dir (str "/tmp/openrulebench-sg-" (UUID/randomUUID))
-        conn (d/create-conn dir sg-schema)]
-    (d/transact! conn (data/edges->parent-datoms edges))
-    conn))
+  "Create a database with par/sib data for SG benchmark."
+  [relations]
+  (create-benchmark-conn sg-schema (data/sg->datoms relations)))
 
 (defn create-join1-db
   "Create a database with JOIN1 relations."
   [relations]
-  (let [dir (str "/tmp/openrulebench-join1-" (UUID/randomUUID))
-        conn (d/create-conn dir join1-schema)]
-    (d/transact! conn (data/join1->datoms relations))
-    conn))
+  (create-benchmark-conn join1-schema (data/join1->datoms relations)))
 
 (defn create-dblp-db
   "Create a database with DBLP EAV data."
   [datoms]
-  (let [dir (str "/tmp/openrulebench-dblp-" (UUID/randomUUID))
-        conn (d/create-conn dir dblp-schema)]
-    (d/transact! conn datoms)
-    conn))
+  (create-benchmark-conn dblp-schema datoms))
 
 (defn create-lubm-db
   "Create a database with LUBM university data."
   [datoms]
-  (let [dir (str "/tmp/openrulebench-lubm-" (UUID/randomUUID))
-        conn (d/create-conn dir lubm/lubm-schema)]
-    (d/transact! conn datoms)
-    conn))
+  (create-benchmark-conn lubm/lubm-schema datoms))
 
 ;; =============================================================================
 ;; Query Functions
@@ -225,7 +218,7 @@
 
 (defn run-tc-benchmark
   "Run TC benchmark on an instance. Returns result map.
-   Instance can be: small, medium, large, xlarge, xxlarge (OpenRuleBench)."
+   Instance can be: tiny, small, medium, large, xlarge, xxlarge."
   [instance-name]
   (let [instance-key (keyword instance-name)
         edges (data/generate-tc-instance instance-key)
@@ -244,11 +237,11 @@
 
 (defn run-sg-benchmark
   "Run SG benchmark on an instance. Returns result map.
-   Instance can be: small, medium, large, xlarge, xxlarge (OpenRuleBench)."
+   Instance can be: tiny, small, medium, large."
   [instance-name]
   (let [instance-key (keyword instance-name)
-        edges (data/generate-sg-instance instance-key)
-        conn (create-sg-db edges)
+        relations (data/generate-sg-instance instance-key)
+        conn (create-sg-db relations)
         db (d/db conn)
         _ (d/analyze db)
         _ (System/gc)
@@ -332,7 +325,7 @@
 
 (def default-benchmarks
   "Default benchmarks: benchmark-type:instance-size
-   Uses OpenRuleBench standard sizes: small, medium, large"
+   Uses OpenRuleBench standard sizes where available."
   ["tc:small" "tc:medium" "sg:small" "join1:small"])
 
 (defn parse-benchmark

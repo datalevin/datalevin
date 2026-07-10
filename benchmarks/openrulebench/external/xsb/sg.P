@@ -4,19 +4,19 @@
 :- table sg/2.
 
 %% SG rules with tabling
-sg(X, X) :- parent(_, X).
-sg(X, Y) :- parent(PX, X), parent(PY, Y), sg(PX, PY).
+sg(X, Y) :- sib(X, Y).
+sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
 
-%% Load parent facts from file
-load_parents(File) :-
+%% Load par/sib facts from file
+load_sg(File) :-
     see(File),
-    read_parents,
+    read_sg,
     seen.
 
-read_parents :-
+read_sg :-
     read(Term),
     (Term == end_of_file -> true
-    ; assert(Term), read_parents).
+    ; assert(Term), read_sg).
 
 %% Benchmark: SG with both arguments free
 run_sg_ff :-
@@ -39,4 +39,5 @@ run_sg_bf(Start) :-
 %% Clean up for next run
 cleanup :-
     abolish_all_tables,
-    retractall(parent(_,_)).
+    retractall(par(_,_)),
+    retractall(sib(_,_)).

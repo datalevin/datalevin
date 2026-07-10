@@ -2,7 +2,7 @@
   "Data generation and loading for OpenRuleBench.
    Implements standard OpenRuleBench benchmark instances:
    - TC (Transitive Closure): Random graphs with 50K-1M edges
-   - SG (Same Generation): Same random graphs
+   - SG (Same Generation): Random par/sib relations
    - Join1: 5-way join benchmark
    - DBLP: Real-world publication data
    - LUBM: Semantic university benchmark"
@@ -38,25 +38,23 @@
             (recur edges)))))))
 
 ;; =============================================================================
-;; OpenRuleBench TC/SG Instances
-;; Sizes match OpenRuleBench paper: 50K, 125K, 250K, 500K, 1M edges
+;; OpenRuleBench TC Instances
+;; Standard sizes match OpenRuleBench paper: 50K, 125K, 250K, 500K, 1M edges.
+;; :tiny is a non-standard development scale for local comparisons.
 ;; =============================================================================
 
 (def tc-instances
-  "TC/SG benchmark instances (OpenRuleBench standard sizes)."
-  {:small   {:nodes 1000  :edges 50000}
+  "TC benchmark instances."
+  {:tiny    {:nodes 100   :edges 1000}
+   :small   {:nodes 1000  :edges 50000}
    :medium  {:nodes 1000  :edges 125000}
    :large   {:nodes 2000  :edges 250000}
    :xlarge  {:nodes 2000  :edges 500000}
    :xxlarge {:nodes 2000  :edges 1000000}})
 
-(def sg-instances
-  "SG uses same instances as TC."
-  tc-instances)
-
 (defn generate-tc-instance
   "Generate TC instance data. Returns seq of [from to] edges.
-   Instance can be :small, :medium, :large, :xlarge, :xxlarge
+   Instance can be :tiny, :small, :medium, :large, :xlarge, :xxlarge
    or a map with :nodes and :edges keys."
   ([instance-key]
    (generate-tc-instance instance-key {}))
@@ -70,12 +68,38 @@
                        {:instance instance-key :available (keys tc-instances)})))
      (generate-random-graph nodes edges :acyclic? acyclic?))))
 
+;; =============================================================================
+;; OpenRuleBench SG Instances
+;; OpenRuleBench SG uses two base relations, par and sib. The paper reports
+;; 6K and 24K SG data sizes; :tiny and :large are development extensions.
+;; =============================================================================
+
+(def sg-instances
+  "SG benchmark instances. Counts are total par+sib facts."
+  {:tiny  {:nodes 100  :par-facts 500   :sib-facts 500}
+   :small {:nodes 1000 :par-facts 3000  :sib-facts 3000}
+   :medium {:nodes 1000 :par-facts 12000 :sib-facts 12000}
+   :large {:nodes 1000 :par-facts 24000 :sib-facts 24000}})
+
 (defn generate-sg-instance
-  "Generate SG instance data. Same as TC instances."
+  "Generate SG instance data as {:par [...], :sib [...]}.
+   Instance can be :tiny, :small, :medium, :large, or a map with :nodes,
+   :par-facts, and :sib-facts keys."
   ([instance-key]
-   (generate-tc-instance instance-key))
+   (generate-sg-instance instance-key {}))
   ([instance-key opts]
-   (generate-tc-instance instance-key opts)))
+   (let [{:keys [nodes par-facts sib-facts]} (if (map? instance-key)
+                                               instance-key
+                                               (get sg-instances instance-key))
+         {:keys [acyclic?] :or {acyclic? false}} opts]
+     (when (nil? nodes)
+       (throw (ex-info (str "Unknown SG instance: " instance-key)
+                       {:instance instance-key :available (keys sg-instances)})))
+     {:par (generate-random-graph nodes par-facts
+                                  :seed 42
+                                  :acyclic? acyclic?)
+      :sib (generate-random-graph nodes sib-facts
+                                  :seed 43)})))
 
 ;; =============================================================================
 ;; Join1 Data Generation
@@ -124,14 +148,13 @@
           {:db/id from :edge to})
         edges))
 
-(defn edges->parent-datoms
-  "Convert parent-child edges to Datalevin datoms for SG benchmark.
-   Edge [parent, child] becomes {:db/id child :parent parent}
-   So [child :parent parent] in EAV - child has parent."
-  [edges]
-  (mapv (fn [[parent child]]
-          {:db/id child :parent parent})
-        edges))
+(defn sg->datoms
+  "Convert SG par/sib pairs to Datalevin datoms."
+  [{:keys [par sib]}]
+  (vec
+    (concat
+      (map (fn [[a b]] {:db/id a :par b}) par)
+      (map (fn [[a b]] {:db/id a :sib b}) sib))))
 
 (defn join1->datoms
   "Convert JOIN1 relations to Datalevin datoms.
@@ -159,6 +182,7 @@
   (count (:d1 j1)) ;; => 10000
 
   ;; List available instances
-  (keys tc-instances)  ;; => (:small :medium :large :xlarge :xxlarge)
+  (keys tc-instances)  ;; => (:tiny :small :medium :large :xlarge :xxlarge)
+  (keys sg-instances)  ;; => (:tiny :small :medium :large)
   (keys join1-instances) ;; => (:small :medium :large)
   )

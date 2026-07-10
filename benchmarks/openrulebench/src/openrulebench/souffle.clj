@@ -30,14 +30,17 @@ tc(a, b) :- edge(a, x), tc(x, b).
 
 (def sg-program
   "// Same Generation (OpenRuleBench spec)
-.decl parent(parent: number, child: number)
-.input parent
+.decl par(a: number, b: number)
+.input par
+
+.decl sib(a: number, b: number)
+.input sib
 
 .decl sg(x: number, y: number)
 .output sg
 
-sg(x, x) :- parent(_, x).
-sg(x, y) :- parent(x, a), sg(a, b), parent(y, b).
+sg(x, y) :- sib(x, y).
+sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
 ")
 
 ;; =============================================================================
@@ -59,13 +62,17 @@ sg(x, y) :- parent(x, a), sg(a, b), parent(y, b).
 
 (defn write-sg-files
   "Write Souffle data and program files for SG benchmark."
-  [edges dir]
-  (let [data-file (str dir "/parent.facts")
+  [{:keys [par sib]} dir]
+  (let [par-file (str dir "/par.facts")
+        sib-file (str dir "/sib.facts")
         prog-file (str dir "/sg.dl")]
-    ;; Write parent facts (tab-separated, edges are [parent child])
-    (with-open [w (io/writer data-file)]
-      (doseq [[p c] edges]
-        (.write w (str p "\t" c "\n"))))
+    ;; Write par/sib facts (tab-separated)
+    (with-open [w (io/writer par-file)]
+      (doseq [[a b] par]
+        (.write w (str a "\t" b "\n"))))
+    (with-open [w (io/writer sib-file)]
+      (doseq [[a b] sib]
+        (.write w (str a "\t" b "\n"))))
     ;; Write program
     (spit prog-file sg-program)
     prog-file))
@@ -116,10 +123,10 @@ sg(x, y) :- parent(x, a), sg(a, b), parent(y, b).
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
-  (let [edges (data/generate-sg-instance (keyword instance-name))
+  (let [relations (data/generate-sg-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-souffle-sg-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-sg-files edges dir)
+        prog-file (write-sg-files relations dir)
         _ (System/gc)
         [output-dir time-ms] (core/time-once (run-souffle prog-file dir))
         result-count (when output-dir (count-output output-dir "sg"))]

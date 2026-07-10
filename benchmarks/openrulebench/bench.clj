@@ -10,8 +10,11 @@
 ;;   ./bench.clj --systems datalevin # Run only Datalevin
 ;;   ./bench.clj --systems datalevin,sqlite tc:small
 ;;
-;; Benchmark sizes (OpenRuleBench standard):
-;;   TC/SG: small (50K edges), medium (125K), large (250K), xlarge (500K), xxlarge (1M)
+;; Benchmark sizes:
+;;   TC: tiny (1K edges, non-standard development scale),
+;;       small (50K edges), medium (125K), large (250K), xlarge (500K), xxlarge (1M)
+;;   SG: tiny (1K par+sib facts, non-standard development scale),
+;;       small (6K facts), medium (24K), large (48K, non-standard extension)
 ;;   Join1: small (10K tuples), medium (50K), large (250K)
 ;;   DBLP:  small (2K papers), medium (8K), large (64K)
 ;;   LUBM:  lubm-1 (1 uni, ~100K triples), lubm-10 (10 unis), lubm-50 (50 unis)
@@ -64,7 +67,7 @@
 (def datalevin-deps
   (str "{:paths [\"src\"]"
        " :deps {datalevin/datalevin {:local/root \"../..\"}"
-       "        org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       "        org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "        com.github.luben/zstd-jni {:mvn/version \"1.5.6-9\"}"
        "        com.taoensso/nippy {:mvn/version \"3.7.0-beta1\"}"
        "        com.cognitect/transit-clj {:mvn/version \"1.0.333\"}"
@@ -79,18 +82,18 @@
 
 (def clara-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
-       "        com.cerner/clara-rules {:mvn/version \"0.21.1\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
+       "        com.cerner/clara-rules {:mvn/version \"0.24.0\"}"
        "}}"))
 
 (def odoyle-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "        net.sekao/odoyle-rules {:mvn/version \"1.3.1\"}"
        "}}"))
 
 (def jvm-opts
-  ["-J-Xmx4g"
+  ["-J-Xmx8g"
    "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
    "-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"])
 
@@ -106,7 +109,7 @@
   "Full OpenRuleBench suite."
   [;; TC benchmarks (uniform random graphs)
    "tc:small" "tc:medium" "tc:large" "tc:xlarge"
-   ;; SG benchmarks (same random graphs)
+   ;; SG benchmarks (random par/sib relations)
    "sg:small" "sg:medium" "sg:large"
    ;; Join1 benchmarks (5-way join)
    "join1:small" "join1:medium" "join1:large"
@@ -137,7 +140,7 @@
 
 (defn run-clara [benchmarks]
   (apply run "clojure"
-         (concat ["-J-Xmx4g"]
+         (concat ["-J-Xmx8g"]
                  ["-Sdeps" clara-deps
                   "-M" "-m" "openrulebench.clara"]
                  benchmarks)))
@@ -155,24 +158,24 @@
 
 (def sqlite-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "        org.xerial/sqlite-jdbc {:mvn/version \"3.47.2.0\"}"
        "}}"))
 
 (def postgresql-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "        org.postgresql/postgresql {:mvn/version \"42.7.4\"}"
        "}}"))
 
 (def xsb-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "}}"))
 
 (def souffle-deps
   (str "{:paths [\"src\"]"
-       " :deps {org.clojure/clojure {:mvn/version \"1.12.0\"}"
+       " :deps {org.clojure/clojure {:mvn/version \"1.12.5\"}"
        "}}"))
 
 ;; =============================================================================
