@@ -225,7 +225,7 @@ echo "Running neo4j-admin import..."
   --relationships=IS_LOCATED_IN="$IMPORT_DIR/PERSON_IS_LOCATED_IN.rel.csv" \
   --relationships=HAS_MODERATOR="$IMPORT_DIR/HAS_MODERATOR.rel.csv" \
   --relationships=HAS_CREATOR="$IMPORT_DIR/HAS_CREATOR_POST.rel.csv" \
-  --relationships=CONTAINER_OF="$IMPORT_DIR/CONTAINER_OF.rel.csv" \
+  --relationships=IS_CONTAINED_IN="$IMPORT_DIR/IS_CONTAINED_IN.rel.csv" \
   --relationships=IS_LOCATED_IN="$IMPORT_DIR/POST_IS_LOCATED_IN.rel.csv" \
   --relationships=HAS_CREATOR="$IMPORT_DIR/HAS_CREATOR_COMMENT.rel.csv" \
   --relationships=IS_LOCATED_IN="$IMPORT_DIR/COMMENT_IS_LOCATED_IN.rel.csv" \

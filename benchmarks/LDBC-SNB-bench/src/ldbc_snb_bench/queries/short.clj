@@ -97,13 +97,13 @@
    :params      [:message-id]
    :rules       common/rule-root-post
    :query       '[:find ?forum-id ?forum-title ?moderator-id
-                  ?moderator-first-name ?moderator-last-name
-                  :in $ % ?message-id
-                  :where
-                  [?message :message/id ?message-id]
-                  (root-post ?message ?post)
-                  [?post :message/containerOf ?forum]
-                  [?forum :forum/id ?forum-id]
+                    ?moderator-first-name ?moderator-last-name
+                    :in $ % ?message-id
+                    :where
+                    [?message :message/id ?message-id]
+                    (root-post ?message ?post)
+                    [?post :message/isContainedIn ?forum]
+                    [?forum :forum/id ?forum-id]
                   [?forum :forum/title ?forum-title]
                   [?forum :forum/hasModerator ?moderator]
                   [?moderator :person/id ?moderator-id]

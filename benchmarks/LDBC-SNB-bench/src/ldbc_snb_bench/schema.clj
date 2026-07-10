@@ -131,7 +131,7 @@
    :message/hasTag       {:db/valueType   :db.type/ref
                           :db/cardinality :db.cardinality/many}  ; -> Tag
    :message/isLocatedIn  {:db/valueType :db.type/ref}  ; -> Place (country)
-   :message/containerOf  {:db/valueType :db.type/ref}  ; -> Forum (posts only)
+   :message/isContainedIn {:db/valueType :db.type/ref} ; Post -> Forum
    :message/replyOf      {:db/valueType :db.type/ref}  ; -> Message (comments only)
 
    ;; ============================================================

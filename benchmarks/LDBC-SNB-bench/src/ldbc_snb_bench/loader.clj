@@ -306,14 +306,15 @@
     (mapcat (fn [[creation-date _deletion-date explicitly-deleted id image-file location-ip
                   browser-used language content length creator-id forum-id country-id]]
               (when-not (explicitly-deleted? explicitly-deleted)
-                (let [eid (schema/message-eid (parse-long*  id))]
+                (let [eid (schema/message-eid (parse-long*  id))
+                      forum-eid (schema/forum-eid (parse-long* forum-id))]
                   (cond-> [(d/datom eid :message/id (parse-long*  id))
                            (d/datom eid :message/creationDate (parse-datetime creation-date))
                            (d/datom eid :message/locationIP location-ip)
                            (d/datom eid :message/browserUsed browser-used)
                            (d/datom eid :message/length (parse-long*  length))
                            (d/datom eid :message/hasCreator (schema/person-eid (parse-long*  creator-id)))
-                           (d/datom eid :message/containerOf (schema/forum-eid (parse-long*  forum-id)))
+                           (d/datom eid :message/isContainedIn forum-eid)
                            (d/datom eid :message/isLocatedIn (schema/place-eid (parse-long*  country-id)))]
                     (not-blank image-file) (conj (d/datom eid :message/imageFile image-file))
                     (not-blank language)   (conj (d/datom eid :message/language language))

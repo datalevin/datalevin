@@ -274,7 +274,7 @@ def main():
         explicit=True,
     )
     write_rels(
-        "CONTAINER_OF",
+        "IS_CONTAINED_IN",
         "dynamic/Post",
         [":START_ID(Post)", ":END_ID(Forum)"],
         lambda row, idx: (
