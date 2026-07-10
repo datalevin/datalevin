@@ -143,9 +143,9 @@
                   [?k :knows/person1 ?start]
                   [?k :knows/person2 ?friend]
 
-                  ;; messages created by friends in date range
-                  [?post :message/hasCreator ?friend]
-                  [?post :message/containerOf _]
+                    ;; messages created by friends in date range
+                    [?post :message/hasCreator ?friend]
+                    [_ :forum/containerOf ?post]
                   [(ldbc-snb-bench.queries.common/add-days
                      ?start-date ?duration-days) ?end-date]
                   [?post :message/creationDate ?date]
@@ -157,10 +157,10 @@
                   ;; Exclude tags that ANY friend used before start-date
                   (not-join [?tag-name]
                             [?inner-start :person/id ?person-id]
-                            [?k2 :knows/person1 ?inner-start]
-                            [?k2 :knows/person2 ?any-friend]
-                            [?other-post :message/hasCreator ?any-friend]
-                            [?other-post :message/containerOf _]
+                              [?k2 :knows/person1 ?inner-start]
+                              [?k2 :knows/person2 ?any-friend]
+                              [?other-post :message/hasCreator ?any-friend]
+                              [_ :forum/containerOf ?other-post]
                             [?other-post :message/creationDate ?d]
                             [(< ?d ?start-date)]
                             [?other-post :message/hasTag ?t]
@@ -192,9 +192,9 @@
                   [?membership :hasMember/joinDate ?join-date]
                   [(> ?join-date ?min-date)]
 
-                  ;; Posts created in forums
-                  [?post :message/hasCreator ?person]
-                  [?post :message/containerOf ?forum]
+                    ;; Posts created in forums
+                    [?post :message/hasCreator ?person]
+                    [?forum :forum/containerOf ?post]
                   [?forum :forum/id ?forum-id]
                   [?forum :forum/title ?forum-title]
                   :order-by [2 :desc 0 :asc]
@@ -219,10 +219,10 @@
                                 [(not= ?person ?start)]))
 
                   ;; Other tags created by friends together with tag-name
-                  [?tag :tag/name ?tag-name]
-                  [?post :message/hasTag ?tag]
-                  [?post :message/hasCreator ?person]
-                  [?post :message/containerOf _]
+                    [?tag :tag/name ?tag-name]
+                    [?post :message/hasTag ?tag]
+                    [?post :message/hasCreator ?person]
+                    [_ :forum/containerOf ?post]
                   [?post :message/hasTag ?other-tag]
                   [?other-tag :tag/name ?other-tag-name]
                   [(not= ?tag ?other-tag)]
@@ -395,28 +395,28 @@
      ;; - Post without matching tag: -1
      ;; - No posts: 0
      (or-join [?person ?start ?post ?score-contrib]
-              ;; Post with matching tag: +1 (dedupe multiple matching tags per post)
-              (and [?post :message/hasCreator ?person]
-                   [?post :message/containerOf _]
-                   [?post :message/hasTag ?tag]
-                   [?start :person/hasInterest ?tag]
+                ;; Post with matching tag: +1 (dedupe multiple matching tags per post)
+                (and [?post :message/hasCreator ?person]
+                     [_ :forum/containerOf ?post]
+                     [?post :message/hasTag ?tag]
+                     [?start :person/hasInterest ?tag]
                    (not-join [?post ?start ?tag]
                              [?post :message/hasTag ?tag2]
                              [?start :person/hasInterest ?tag2]
                              [(< ?tag2 ?tag)])
                    [(ground 1) ?score-contrib])
-              ;; Post without matching tag: -1
-              (and [?post :message/hasCreator ?person]
-                   [?post :message/containerOf _]
-                   (not-join [?post ?start]
+                ;; Post without matching tag: -1
+                (and [?post :message/hasCreator ?person]
+                     [_ :forum/containerOf ?post]
+                     (not-join [?post ?start]
                              [?post :message/hasTag ?t]
                              [?start :person/hasInterest ?t])
                    [(ground -1) ?score-contrib])
-              ;; Person with no posts: 0
-              (and (not-join [?person]
-                             [?p :message/hasCreator ?person]
-                             [?p :message/containerOf _])
-                   [(ground :no-post) ?post]
+                ;; Person with no posts: 0
+                (and (not-join [?person]
+                               [?p :message/hasCreator ?person]
+                               [_ :forum/containerOf ?p])
+                     [(ground :no-post) ?post]
                    [(ground 0) ?score-contrib]))
 
      :order-by [3 :desc ?person-id :asc]
@@ -483,10 +483,10 @@
                   [?tag :tag/hasType ?tagclass]
                   [?tag :tag/name ?tag-name]
 
-                  ;; Comments by friends replying to posts with those tags
-                  [?comment :message/hasCreator ?friend]
-                  [?comment :message/replyOf ?post]
-                  [?post :message/containerOf _]
+                    ;; Comments by friends replying to posts with those tags
+                    [?comment :message/hasCreator ?friend]
+                    [?comment :message/replyOf ?post]
+                    [_ :forum/containerOf ?post]
                   [?post :message/hasTag ?tag]
 
                   ;; Friend info

@@ -44,7 +44,7 @@
 
 (def rule-root-post
   '[[(root-post ?m ?post)
-     [?m :message/containerOf _]
+     [_ :forum/containerOf ?m]
      [(ground ?m) ?post]]
     [(root-post ?m ?post)
      [?m :message/replyOf ?parent]
@@ -97,13 +97,13 @@
   '[[(interaction-half-weight ?a ?b ?interaction ?half-weight)
      [?interaction :message/hasCreator ?a]
      [?interaction :message/replyOf ?post]
-     [?post :message/containerOf _]
+     [_ :forum/containerOf ?post]
      [?post :message/hasCreator ?b]
      [(ground 0.5) ?half-weight]]
     [(interaction-half-weight ?a ?b ?interaction ?half-weight)
      [?interaction :message/hasCreator ?b]
      [?interaction :message/replyOf ?post]
-     [?post :message/containerOf _]
+     [_ :forum/containerOf ?post]
      [?post :message/hasCreator ?a]
      [(ground 0.5) ?half-weight]]
     [(interaction-half-weight ?a ?b ?interaction ?half-weight)

@@ -276,12 +276,12 @@ def main():
     write_rels(
         "CONTAINER_OF",
         "dynamic/Post",
-        [":START_ID(Post)", ":END_ID(Forum)"],
+        [":START_ID(Forum)", ":END_ID(Post)"],
         lambda row, idx: (
             None
             if id_in(deleted_forum_ids, get_val(row, idx, "ContainerForumId"))
             else (
-                [get_val(row, idx, "id"), get_val(row, idx, "ContainerForumId")]
+                [get_val(row, idx, "ContainerForumId"), get_val(row, idx, "id")]
                 if non_blank(get_val(row, idx, "ContainerForumId"))
                 else None
             )

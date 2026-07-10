@@ -53,8 +53,8 @@ Datalevin and Clara produced the same result counts.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:tiny` | 96.73 ms | 575.02 ms | T/O at 60s | 10,000 for Datalevin/Clara |
-| `sg:tiny` | 149.11 ms | 521.58 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `tc:tiny` | 103.2 ms | 575.02 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `sg:tiny` | 75.78 ms | 521.58 ms | T/O at 60s | 10,000 for Datalevin/Clara |
 
 ### Small Runs
 
@@ -64,8 +64,8 @@ and 3,000 `sib` facts.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:small` | 63,813.62 ms | OOM after about 6m45s | not run | 1,000,000 for Datalevin |
-| `sg:small` | 10,912.35 ms | 41,923.70 ms | not run | 869,923 for Datalevin/Clara |
+| `tc:small` | 23,333.3 ms | OOM after about 6m45s | not run | 1,000,000 for Datalevin |
+| `sg:small` | 7,789.3 ms | 41,923.70 ms | not run | 869,923 for Datalevin/Clara |
 
 Correctness was checked for both Datalevin and Clara TC/SG rules against
 independent fixed-point references. The corrected SG reference uses the
@@ -73,6 +73,10 @@ OpenRuleBench rule shape: `sg(X,Y) :- sib(X,Y)` and
 `sg(X,Y) :- par(X,Z), sg(Z,Z1), par(Y,Z1)`. Clara's current benchmark
 implementation uses private process-wide seen sets, so it is intended for the
 sequential benchmark harness.
+
+The current Datalevin numbers include rule-engine handling for linear recursive
+EAV branches that streams recursive candidates directly into the seen set,
+avoiding materialization of large duplicate join products in TC/SG-style rules.
 
 O'Doyle requires tuple ids such as `[::sg x y]` to represent many-valued binary
 relations; a simpler `[x ::sg y]` encoding overwrites values for the same `x`.

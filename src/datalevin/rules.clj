@@ -23,6 +23,7 @@
    [datalevin.relation :as r])
   (:import
    [datalevin.db DB]
+   [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]
    [java.util List HashSet]))
 
@@ -492,39 +493,241 @@
                           (drop (inc best-idx) remaining))
                  (conj ordered best-clause)))))))
 
+(defn- delta-values-for-column
+  "Return distinct values in a delta column, or nil when the cap is exceeded."
+  [^List tuples ^long idx ^long limit]
+  (let [res (HashSet.)
+        n   (.size tuples)]
+    (loop [i 0]
+      (if (< i n)
+        (do
+          (.add res (aget ^objects (.get tuples i) idx))
+          (if (> (.size res) limit)
+            nil
+            (recur (unchecked-inc i))))
+        res))))
+
+(defn- intersect-hash-sets
+  [^HashSet a ^HashSet b]
+  (let [a-size (.size a)
+        b-size (.size b)
+        small  (if (< a-size b-size) a b)
+        large  (if (< a-size b-size) b a)
+        res    (HashSet. (min a-size b-size))]
+    (doseq [v small]
+      (when (.contains large v)
+        (.add res v)))
+    res))
+
+(defn- merge-delta-bound-set
+  [acc var ^HashSet values]
+  (if-let [^HashSet existing (get acc var)]
+    (assoc acc var (intersect-hash-sets existing values))
+    (assoc acc var values)))
+
 (defn- extract-delta-bound-values
-  "Pre-extract bound values from current rule's delta for all variables.
-   Returns a map of {var -> HashSet} for variables with multiple values,
-   or nil if delta is too large or empty."
-  [context rule-name]
-  (when-let [rel (get (:rule-rels context) rule-name)]
-    (let [^List tuples (:tuples rel)
-          threshold    (long c/rule-delta-index-threshold)]
-      (when (and tuples
-                 (pos? (.size tuples))
-                 (<= (.size tuples) threshold))
-        (let [attrs (:attrs rel)
-              n     (.size tuples)]
-          (reduce-kv
-            (fn [acc var idx]
-              (let [res (HashSet.)]
-                (dotimes [i n]
-                  (.add res (aget ^objects (.get tuples i) (int idx))))
-                (if (> (.size res) 1)
-                  (assoc acc var res)
-                  acc)))
-            {} attrs))))))
+  "Pre-extract bounded delta values for vars used as recursive call args.
+   The bound variables must be derived from the branch's rule-call arguments,
+   not from the caller rule's head vars."
+  [context branch]
+  (let [limit (long c/rule-delta-index-threshold)
+        res
+        (reduce
+          (fn [acc clause]
+            (if (and (sequential? clause) (rule-call? context clause))
+              (let [rname     (rule-head clause)
+                    rel       (get (:rule-rels context) rname)
+                    branches  (get (:rules context) rname)
+                    head-vars (when branches (rest (ffirst branches)))
+                    call-args (rule-args clause)
+                    ^List tuples (:tuples rel)]
+                (if (and tuples (pos? (.size tuples)) (seq head-vars))
+                  (reduce
+                    (fn [acc [head-var arg]]
+                      (if (qu/binding-var? arg)
+                        (if-let [idx ((:attrs rel) head-var)]
+                          (if-let [values (delta-values-for-column
+                                            tuples (long idx) limit)]
+                            (merge-delta-bound-set acc arg values)
+                            acc)
+                          acc)
+                        acc))
+                    acc (map vector head-vars call-args))
+                  acc))
+              acc))
+          {} (rest branch))]
+    (when (seq res) res)))
+
+(defn- distinct-vars?
+  [vars]
+  (= (count vars) (count (distinct vars))))
+
+(defn- simple-eav-clause?
+  [clause]
+  (and (vector? clause)
+       (= 3 (count clause))
+       (keyword? (second clause))
+       (qu/binding-var? (first clause))
+       (qu/binding-var? (nth clause 2))))
+
+(defn- eav-link-plan
+  [head-pos call-pos clause]
+  (let [[e attr v] clause
+        e-head     (head-pos e)
+        v-head     (head-pos v)
+        e-call     (call-pos e)
+        v-call     (call-pos v)]
+    (cond
+      (and (some? e-head) (nil? e-call) (some? v-call) (nil? v-head))
+      {:attr attr, :head-pos e-head, :call-pos v-call, :bound-side :v}
+
+      (and (some? v-head) (nil? v-call) (some? e-call) (nil? e-head))
+      {:attr attr, :head-pos v-head, :call-pos e-call, :bound-side :e})))
+
+(defn- linear-eav-branch-plan
+  [context branch]
+  (let [head       (first branch)
+        head-vars  (vec (rest head))
+        clauses    (vec (rest branch))
+        rule-calls (filterv #(and (sequential? %) (rule-call? context %))
+                            clauses)
+        eavs       (filterv simple-eav-clause? clauses)]
+    (when (and (seq head-vars)
+               (<= 1 (count eavs) 2)
+               (= 1 (count rule-calls))
+               (= (count clauses) (inc (count eavs)))
+               (every? qu/binding-var? head-vars)
+               (distinct-vars? head-vars))
+      (let [call      (first rule-calls)
+            rname     (rule-head call)
+            rel       (get (:rule-rels context) rname)
+            branches  (get (:rules context) rname)
+            rhead     (when branches (vec (rest (ffirst branches))))
+            call-args (vec (rule-args call))
+            source    (get-in context [:sources '$])]
+        (when (and rel
+                   source
+                   (db/-searchable? source)
+                   (= (count rhead) (count call-args))
+                   (every? qu/binding-var? call-args)
+                   (distinct-vars? call-args)
+                   (every? #(contains? (:attrs rel) %) rhead))
+          (let [rel-attrs     (:attrs rel)
+                call-rel-idxs (int-array
+                                (map (fn [v] (int (rel-attrs v))) rhead))
+                head-pos      (zipmap head-vars (range))
+                call-pos      (zipmap call-args (range))
+                eav-plans     (mapv #(eav-link-plan head-pos call-pos %) eavs)]
+            (when (and (= (count eavs) (count eav-plans))
+                       (every? some? eav-plans)
+                       (= (count eav-plans)
+                          (count (distinct (map :head-pos eav-plans)))))
+              (let [eav-heads    (set (map :head-pos eav-plans))
+                    head-sources
+                    (mapv
+                      (fn [idx head-var]
+                        (if-let [eav-idx
+                                 (first
+                                   (keep-indexed
+                                     (fn [i plan]
+                                       (when (= idx (:head-pos plan)) i))
+                                     eav-plans))]
+                          [:eav eav-idx]
+                          (when-let [call-idx (call-pos head-var)]
+                            [:call call-idx])))
+                      (range) head-vars)]
+                (when (and (= (count head-sources) (count head-vars))
+                           (every? some? head-sources)
+                           (or (seq eav-heads)
+                               (some #(= :call (first %)) head-sources)))
+                  {:db            source
+                   :delta-rel     rel
+                   :call-rel-idxs call-rel-idxs
+                   :head-vars     head-vars
+                   :head-sources  head-sources
+                   :eav-plans     eav-plans})))))))))
+
+(defn- eav-lookup-tuples
+  [^DB db {:keys [attr bound-side]} bound-value]
+  (case bound-side
+    :v (db/-search-tuples db [nil attr bound-value])
+    :e (db/-search-tuples db [bound-value attr nil])))
+
+(defn- add-fast-output!
+  [^FastList acc ^HashSet seen-set head-sources ^objects call-values
+   ^objects eav-values]
+  (let [n     (count head-sources)
+        tuple (object-array n)]
+    (dotimes [i n]
+      (let [[source idx] (nth head-sources i)]
+        (aset tuple i (case source
+                        :call (aget call-values (int idx))
+                        :eav  (aget eav-values (int idx))))))
+    (when (.add seen-set (r/wrap-array tuple))
+      (.add acc tuple))))
+
+(defn- eval-linear-eav-branch-with-dedup
+  [context branch ^HashSet seen-set]
+  (when-let [{:keys [^DB db ^Relation delta-rel ^ints call-rel-idxs head-vars
+                     head-sources eav-plans]}
+             (linear-eav-branch-plan context branch)]
+    (let [^List delta-tuples (:tuples delta-rel)
+          acc                (FastList.)
+          call-arity         (alength call-rel-idxs)
+          eav-count          (count eav-plans)]
+      (when (and delta-tuples (pos? (.size delta-tuples)))
+        (dotimes [i (.size delta-tuples)]
+          (let [^objects delta-tuple (.get delta-tuples i)
+                call-values          (object-array call-arity)]
+            (dotimes [j call-arity]
+              (aset call-values j
+                    (aget delta-tuple (aget call-rel-idxs j))))
+            (case eav-count
+              1
+              (let [plan0   (eav-plans 0)
+                    tuples0 ^List (eav-lookup-tuples
+                                    db plan0
+                                    (aget call-values (:call-pos plan0)))]
+                (when tuples0
+                  (dotimes [j (.size tuples0)]
+                    (let [eav-values (object-array
+                                       [(aget ^objects (.get tuples0 j) 0)])]
+                      (add-fast-output! acc seen-set head-sources call-values
+                                        eav-values)))))
+
+              2
+              (let [plan0   (eav-plans 0)
+                    plan1   (eav-plans 1)
+                    tuples0 ^List (eav-lookup-tuples
+                                    db plan0
+                                    (aget call-values (:call-pos plan0)))
+                    tuples1 ^List (eav-lookup-tuples
+                                    db plan1
+                                    (aget call-values (:call-pos plan1)))]
+                (when (and tuples0 tuples1)
+                  (dotimes [j (.size tuples0)]
+                    (let [v0 (aget ^objects (.get tuples0 j) 0)]
+                      (dotimes [k (.size tuples1)]
+                        (let [eav-values (object-array
+                                           [v0
+                                            (aget ^objects (.get tuples1 k) 0)])]
+                          (add-fast-output! acc seen-set head-sources
+                                            call-values eav-values))))))))))
+      (r/relation! (zipmap head-vars (range)) acc)))))
 
 (defn- eval-rule-body
   [context rule-name rule-branches resolve-fn]
-  (let [delta-bounds (extract-delta-bound-values context rule-name)
-        context      (cond-> (assoc context :current-rule rule-name)
-                       delta-bounds (assoc :delta-bound-values delta-bounds))]
+  (let [context (assoc context :current-rule rule-name)]
     (reduce
       (fn [rel branch]
-        (let [[[_ & args] & clauses] branch
+        (let [delta-bounds   (extract-delta-bound-values context branch)
+              branch-context (cond-> context
+                               delta-bounds
+                               (assoc :delta-bound-values delta-bounds))
+              [[_ & args] & clauses] branch
               ordered-clauses        (reorder-clauses clauses context)
-              body-res-context       (reduce resolve-fn context ordered-clauses)
+              body-res-context       (reduce resolve-fn branch-context
+                                             ordered-clauses)
               body-rel               (reduce j/hash-join (:rels body-res-context))
               projected-rel          (project-rule-result body-rel args)]
           (r/sum-rel rel projected-rel)))
@@ -533,19 +736,26 @@
 
 (defn- eval-rule-body-with-dedup
   [context rule-name rule-branches resolve-fn ^HashSet seen-set]
-  (let [delta-bounds (extract-delta-bound-values context rule-name)
-        context      (cond-> (assoc context :current-rule rule-name)
-                       delta-bounds (assoc :delta-bound-values delta-bounds))]
+  (let [context (assoc context :current-rule rule-name)]
     (reduce
       (fn [rel branch]
-        (let [[[_ & args] & clauses] branch
-              ordered-clauses        (reorder-clauses clauses context)
-              body-res-context       (reduce resolve-fn context ordered-clauses)
-              body-rel               (reduce j/hash-join (:rels body-res-context))
-              projected-rel          (project-rule-result body-rel args)
-              deduped-rel            (r/difference-with-seen! projected-rel
-                                                              seen-set)]
-          (r/sum-rel rel deduped-rel)))
+        (if-let [fast-rel (eval-linear-eav-branch-with-dedup
+                            context branch seen-set)]
+          (r/sum-rel rel fast-rel)
+          (let [delta-bounds   (extract-delta-bound-values context branch)
+                branch-context (cond-> context
+                                 delta-bounds
+                                 (assoc :delta-bound-values delta-bounds))
+                [[_ & args] & clauses] branch
+                ordered-clauses        (reorder-clauses clauses context)
+                body-res-context       (reduce resolve-fn branch-context
+                                               ordered-clauses)
+                body-rel               (reduce j/hash-join
+                                           (:rels body-res-context))
+                projected-rel          (project-rule-result body-rel args)
+                deduped-rel            (r/difference-with-seen! projected-rel
+                                                                seen-set)]
+            (r/sum-rel rel deduped-rel))))
       (empty-rel-for-rule rule-name (:rules context))
       rule-branches)))
 

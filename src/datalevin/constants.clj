@@ -44,9 +44,10 @@
   3)
 
 (def rule-delta-index-threshold
-  "Maximum delta size for using index probes in recursive rules.
-   When deltas are larger than this, hash joins are preferred."
-  100)
+  "Maximum distinct delta values per rule-call argument for index probes.
+   When a delta column has more distinct values than this, normal joins are
+   preferred for that argument."
+  10000)
 
 (def magic-explosion-factor
   "Factor by which magic seed can grow before falling back to non-magic.
