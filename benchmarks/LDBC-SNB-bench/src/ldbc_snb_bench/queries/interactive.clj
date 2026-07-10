@@ -145,7 +145,7 @@
 
                     ;; messages created by friends in date range
                     [?post :message/hasCreator ?friend]
-                    [_ :forum/containerOf ?post]
+                    [?post :message/isContainedIn _]
                   [(ldbc-snb-bench.queries.common/add-days
                      ?start-date ?duration-days) ?end-date]
                   [?post :message/creationDate ?date]
@@ -160,7 +160,7 @@
                               [?k2 :knows/person1 ?inner-start]
                               [?k2 :knows/person2 ?any-friend]
                               [?other-post :message/hasCreator ?any-friend]
-                              [_ :forum/containerOf ?other-post]
+                              [?other-post :message/isContainedIn _]
                             [?other-post :message/creationDate ?d]
                             [(< ?d ?start-date)]
                             [?other-post :message/hasTag ?t]
@@ -194,7 +194,7 @@
 
                     ;; Posts created in forums
                     [?post :message/hasCreator ?person]
-                    [?forum :forum/containerOf ?post]
+                    [?post :message/isContainedIn ?forum]
                   [?forum :forum/id ?forum-id]
                   [?forum :forum/title ?forum-title]
                   :order-by [2 :desc 0 :asc]
@@ -222,7 +222,7 @@
                     [?tag :tag/name ?tag-name]
                     [?post :message/hasTag ?tag]
                     [?post :message/hasCreator ?person]
-                    [_ :forum/containerOf ?post]
+                    [?post :message/isContainedIn _]
                   [?post :message/hasTag ?other-tag]
                   [?other-tag :tag/name ?other-tag-name]
                   [(not= ?tag ?other-tag)]
@@ -397,7 +397,7 @@
      (or-join [?person ?start ?post ?score-contrib]
                 ;; Post with matching tag: +1 (dedupe multiple matching tags per post)
                 (and [?post :message/hasCreator ?person]
-                     [_ :forum/containerOf ?post]
+                     [?post :message/isContainedIn _]
                      [?post :message/hasTag ?tag]
                      [?start :person/hasInterest ?tag]
                    (not-join [?post ?start ?tag]
@@ -407,7 +407,7 @@
                    [(ground 1) ?score-contrib])
                 ;; Post without matching tag: -1
                 (and [?post :message/hasCreator ?person]
-                     [_ :forum/containerOf ?post]
+                     [?post :message/isContainedIn _]
                      (not-join [?post ?start]
                              [?post :message/hasTag ?t]
                              [?start :person/hasInterest ?t])
@@ -415,7 +415,7 @@
                 ;; Person with no posts: 0
                 (and (not-join [?person]
                                [?p :message/hasCreator ?person]
-                               [_ :forum/containerOf ?p])
+                               [?p :message/isContainedIn _])
                      [(ground :no-post) ?post]
                    [(ground 0) ?score-contrib]))
 
@@ -486,7 +486,7 @@
                     ;; Comments by friends replying to posts with those tags
                     [?comment :message/hasCreator ?friend]
                     [?comment :message/replyOf ?post]
-                    [_ :forum/containerOf ?post]
+                    [?post :message/isContainedIn _]
                   [?post :message/hasTag ?tag]
 
                   ;; Friend info

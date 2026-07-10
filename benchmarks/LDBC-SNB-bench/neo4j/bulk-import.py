@@ -274,14 +274,14 @@ def main():
         explicit=True,
     )
     write_rels(
-        "CONTAINER_OF",
+        "IS_CONTAINED_IN",
         "dynamic/Post",
-        [":START_ID(Forum)", ":END_ID(Post)"],
+        [":START_ID(Post)", ":END_ID(Forum)"],
         lambda row, idx: (
             None
             if id_in(deleted_forum_ids, get_val(row, idx, "ContainerForumId"))
             else (
-                [get_val(row, idx, "ContainerForumId"), get_val(row, idx, "id")]
+                [get_val(row, idx, "id"), get_val(row, idx, "ContainerForumId")]
                 if non_blank(get_val(row, idx, "ContainerForumId"))
                 else None
             )

@@ -314,7 +314,7 @@
                            (d/datom eid :message/browserUsed browser-used)
                            (d/datom eid :message/length (parse-long*  length))
                            (d/datom eid :message/hasCreator (schema/person-eid (parse-long*  creator-id)))
-                           (d/datom forum-eid :forum/containerOf eid)
+                           (d/datom eid :message/isContainedIn forum-eid)
                            (d/datom eid :message/isLocatedIn (schema/place-eid (parse-long*  country-id)))]
                     (not-blank image-file) (conj (d/datom eid :message/imageFile image-file))
                     (not-blank language)   (conj (d/datom eid :message/language language))

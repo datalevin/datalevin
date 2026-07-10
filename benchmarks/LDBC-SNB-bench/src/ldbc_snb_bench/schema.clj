@@ -109,8 +109,6 @@
    :forum/hasModerator {:db/valueType :db.type/ref}  ; -> Person
    :forum/hasTag       {:db/valueType   :db.type/ref
                         :db/cardinality :db.cardinality/many}  ; -> Tag
-   :forum/containerOf  {:db/valueType   :db.type/ref
-                        :db/cardinality :db.cardinality/many}  ; -> Post
 
    ;; Forum membership (with joinDate)
    :hasMember/forum    {:db/valueType :db.type/ref}  ; -> Forum
@@ -133,6 +131,7 @@
    :message/hasTag       {:db/valueType   :db.type/ref
                           :db/cardinality :db.cardinality/many}  ; -> Tag
    :message/isLocatedIn  {:db/valueType :db.type/ref}  ; -> Place (country)
+   :message/isContainedIn {:db/valueType :db.type/ref} ; Post -> Forum
    :message/replyOf      {:db/valueType :db.type/ref}  ; -> Message (comments only)
 
    ;; ============================================================

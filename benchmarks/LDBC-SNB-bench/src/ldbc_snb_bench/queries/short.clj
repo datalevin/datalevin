@@ -102,7 +102,7 @@
                     :where
                     [?message :message/id ?message-id]
                     (root-post ?message ?post)
-                    [?forum :forum/containerOf ?post]
+                    [?post :message/isContainedIn ?forum]
                     [?forum :forum/id ?forum-id]
                   [?forum :forum/title ?forum-title]
                   [?forum :forum/hasModerator ?moderator]

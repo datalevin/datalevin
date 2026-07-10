@@ -129,7 +129,7 @@ WITH DISTINCT other, datetime($minDate) AS minDate
 MATCH (forum:Forum)-[member:HAS_MEMBER]->(other)
 WHERE member.joinDate > minDate
 WITH forum, collect(DISTINCT other) AS members
-OPTIONAL MATCH (forum)-[:CONTAINER_OF]->(post:Post)-[:HAS_CREATOR]->(memberPerson:Person)
+OPTIONAL MATCH (forum)<-[:IS_CONTAINED_IN]-(post:Post)-[:HAS_CREATOR]->(memberPerson:Person)
 WHERE memberPerson IN members
 WITH forum, count(DISTINCT post) AS postCount
 RETURN "IC5" AS query, forum.title, postCount
@@ -423,11 +423,11 @@ CALL {
 }
 CALL {
   WITH message
-  MATCH (forum:Forum)-[:CONTAINER_OF]->(message:Post)
+  MATCH (message:Post)-[:IS_CONTAINED_IN]->(forum:Forum)
   RETURN forum
   UNION ALL
   WITH message
-  MATCH (message:Comment)-[:REPLY_OF_COMMENT*0..]->(root:Comment)-[:REPLY_OF_POST]->(post:Post)<-[:CONTAINER_OF]-(forum:Forum)
+  MATCH (message:Comment)-[:REPLY_OF_COMMENT*0..]->(root:Comment)-[:REPLY_OF_POST]->(post:Post)-[:IS_CONTAINED_IN]->(forum:Forum)
   RETURN forum
 }
 MATCH (forum)-[:HAS_MODERATOR]->(moderator:Person)

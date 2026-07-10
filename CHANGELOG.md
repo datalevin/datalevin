@@ -52,10 +52,11 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 [#214](https://github.com/datalevin/datalevin/issues/214).
 - [Datalog] Expose clojure vars to `inter-fn`
 [#215](https://github.com/datalevin/datalevin/issues/215).
-- [Datalog] reduce allocation per tuple.
-- [Datalog] topological sort of late clauses based on bounded variables.
 - [Datalog] fully implement datafy
 [#292](https://github.com/datalevin/datalevin/issues/292).
+- [Datalog] reduce allocation per tuple.
+- [Datalog] topological sort of late clauses based on bounded variables.
+- [Datalog] fast path for linear recursive rules.
 - [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
