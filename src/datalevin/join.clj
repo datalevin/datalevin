@@ -88,8 +88,8 @@
         common-attrs (qu/intersect-keys attrs1 attrs2)
         keep-attrs1  (attr-keys attrs1)
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
-        keep-idxs1   (to-array (sort (vals attrs1)))
-        keep-idxs2   (to-array (->Eduction (map attrs2) keep-attrs2))
+        keep-idxs1   (int-array (sort (vals attrs1)))
+        keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
         key-fn1      (tuple-key-fn attrs1 common-attrs)
         key-fn2      (tuple-key-fn attrs2 common-attrs)
         attrs        (zipmap (concatv keep-attrs1 keep-attrs2) (range))]
@@ -128,8 +128,8 @@
         common-attrs (qu/intersect-keys attrs1 attrs2)
         keep-attrs1  (attr-keys attrs1)
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
-        keep-idxs1   (to-array (sort (vals attrs1)))
-        keep-idxs2   (to-array (->Eduction (map attrs2) keep-attrs2))
+        keep-idxs1   (int-array (sort (vals attrs1)))
+        keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
         key-fn1      (tuple-key-fn attrs1 common-attrs)
         key-fn2      (tuple-key-fn attrs2 common-attrs)]
     (when (and tuples1 tuples2)

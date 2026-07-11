@@ -220,7 +220,6 @@
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
-         _#     (s/maybe-ensure-current! store#)
          cache# (.get ^ConcurrentHashMap caches (dir store#))]
      (if-some [cached# (.get ^LRUCache cache# ~pattern)]
        cached#
@@ -569,7 +568,6 @@
   ITuples
   (-init-tuples
     [db out a v-ranges pred get-v?]
-    (s/maybe-ensure-current! store)
     (ave-tuples store out a v-ranges pred get-v?))
 
   (-init-tuples-list
@@ -580,7 +578,6 @@
 
   (-sample-init-tuples
     [db out a mcount v-ranges pred get-v?]
-    (s/maybe-ensure-current! store)
     (sample-ave-tuples store out a mcount v-ranges pred get-v?))
 
   (-sample-init-tuples-list
@@ -603,7 +600,6 @@
 
   (-eav-scan-v
     [db in out eid-idx attrs-v]
-    (s/maybe-ensure-current! store)
     (eav-scan-v store in out eid-idx attrs-v))
 
   (-eav-scan-v-list
@@ -614,7 +610,6 @@
 
   (-val-eq-scan-e
     [db in out v-idx attr]
-    (s/maybe-ensure-current! store)
     (val-eq-scan-e store in out v-idx attr))
 
   (-val-eq-scan-e-list
@@ -625,7 +620,6 @@
 
   (-val-eq-scan-e
     [db in out v-idx attr bound]
-    (s/maybe-ensure-current! store)
     (val-eq-scan-e store in out v-idx attr bound))
 
   (-val-eq-scan-e-list
@@ -636,7 +630,6 @@
 
   (-val-eq-filter-e
     [db in out v-idx attr f-idx]
-    (s/maybe-ensure-current! store)
     (val-eq-filter-e store in out v-idx attr f-idx))
 
   (-val-eq-filter-e-list
@@ -847,32 +840,28 @@
 ;;            :max-tx        max-tx}))))
 
 (defn db?
-  "Check if x is an instance of DB, also refresh its cache if it's stale.
-  Often used in the :pre condition of a DB access function"
+  "Check if x is an instance of DB.
+  For remote DBs, refresh the local cache when the server reports newer state.
+  Local DB cache freshness is maintained by local transaction invalidation."
   [x]
   (when (-searchable? x)
     (let [store  (.-store ^DB x)
           cache  (.get ^ConcurrentHashMap caches (dir store))]
-      (when (should-check-remote-cache? store cache)
-        (if (instance? DatalogStore store)
-          (let [{:keys [last-modified max-tx]} (r/db-info store)
-                target        (long (or last-modified 0))
-                cached-max-tx (cached-remote-cache-max-tx store)]
-            (if (or (nil? cache)
-                    (< ^long (.target ^LRUCache cache) ^long target)
-                    (and (some? max-tx)
-                         (some? cached-max-tx)
-                         (< (long cached-max-tx)
-                            (long max-tx))))
-              (refresh-cache store target max-tx)
-              (do
-                (mark-remote-cache-max-tx! store max-tx)
-                (mark-remote-cache-check! store))))
-          (let [target (long (or (last-modified store) 0))]
-            (mark-remote-cache-check! store)
-            (when (or (nil? cache)
-                      (< ^long (.target ^LRUCache cache) ^long target))
-              (refresh-cache store target))))))
+      (when (and (instance? DatalogStore store)
+                 (should-check-remote-cache? store cache))
+        (let [{:keys [last-modified max-tx]} (r/db-info store)
+              target        (long (or last-modified 0))
+              cached-max-tx (cached-remote-cache-max-tx store)]
+          (if (or (nil? cache)
+                  (< ^long (.target ^LRUCache cache) ^long target)
+                  (and (some? max-tx)
+                       (some? cached-max-tx)
+                       (< (long cached-max-tx)
+                          (long max-tx))))
+            (refresh-cache store target max-tx)
+            (do
+              (mark-remote-cache-max-tx! store max-tx)
+              (mark-remote-cache-check! store))))))
     true))
 
 (defn search-datoms [db e a v] (-search db [e a v]))

@@ -25,7 +25,7 @@
    [datalevin.db DB]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util List HashSet]))
+   [java.util List HashMap HashSet]))
 
 (defn parse-rules
   [rules]
@@ -584,6 +584,30 @@
       (and (some? v-head) (nil? v-call) (some? e-call) (nil? e-head))
       {:attr attr, :head-pos v-head, :call-pos e-call, :bound-side :e})))
 
+(def ^:private output-source-call 0)
+(def ^:private output-source-eav 1)
+
+(defn- compile-head-sources
+  [head-vars call-pos eav-plans]
+  (let [n        (count head-vars)
+        types    (long-array n)
+        idxs     (int-array n)
+        eav-mask (boolean-array n)]
+    (doseq [[i {:keys [head-pos]}] (map-indexed vector eav-plans)]
+      (aset eav-mask (int head-pos) true)
+      (aset types (int head-pos) output-source-eav)
+      (aset idxs (int head-pos) (int i)))
+    (loop [i 0]
+      (if (< i n)
+        (if (aget eav-mask i)
+          (recur (unchecked-inc i))
+          (let [head-var (nth head-vars i)]
+            (when-let [call-idx (call-pos head-var)]
+              (aset types i output-source-call)
+              (aset idxs i (int call-idx))
+              (recur (unchecked-inc i)))))
+        {:types types, :idxs idxs}))))
+
 (defn- linear-eav-branch-plan
   [context branch]
   (let [head       (first branch)
@@ -622,98 +646,152 @@
                        (every? some? eav-plans)
                        (= (count eav-plans)
                           (count (distinct (map :head-pos eav-plans)))))
-              (let [eav-heads    (set (map :head-pos eav-plans))
-                    head-sources
-                    (mapv
-                      (fn [idx head-var]
-                        (if-let [eav-idx
-                                 (first
-                                   (keep-indexed
-                                     (fn [i plan]
-                                       (when (= idx (:head-pos plan)) i))
-                                     eav-plans))]
-                          [:eav eav-idx]
-                          (when-let [call-idx (call-pos head-var)]
-                            [:call call-idx])))
-                      (range) head-vars)]
-                (when (and (= (count head-sources) (count head-vars))
-                           (every? some? head-sources)
-                           (or (seq eav-heads)
-                               (some #(= :call (first %)) head-sources)))
+              (let [head-source (compile-head-sources head-vars call-pos
+                                                      eav-plans)]
+                (when head-source
                   {:db            source
                    :delta-rel     rel
                    :call-rel-idxs call-rel-idxs
                    :head-vars     head-vars
-                   :head-sources  head-sources
+                   :head-types    (:types head-source)
+                   :head-idxs     (:idxs head-source)
                    :eav-plans     eav-plans})))))))))
 
-(defn- eav-lookup-tuples
-  [^DB db {:keys [attr bound-side]} bound-value]
-  (case bound-side
-    :v (db/-search-tuples db [nil attr bound-value])
-    :e (db/-search-tuples db [bound-value attr nil])))
+(defn- add-adjacency-value!
+  [^HashMap adjacency bound-value out-value]
+  (if-let [^FastList values (.get adjacency bound-value)]
+    (.add values out-value)
+    (let [values (FastList.)]
+      (.add values out-value)
+      (.put adjacency bound-value values))))
+
+(defn- build-eav-adjacency
+  [^DB db attr bound-side]
+  (let [adjacency (HashMap.)
+        tuples    ^List (db/-search-tuples db [nil attr nil])]
+    (when tuples
+      (let [bound-idx (case bound-side :e 0 :v 1)
+            out-idx   (case bound-side :e 1 :v 0)]
+        (dotimes [i (.size tuples)]
+          (let [^objects tuple (.get tuples i)]
+            (add-adjacency-value! adjacency
+                                  (aget tuple bound-idx)
+                                  (aget tuple out-idx))))))
+    adjacency))
+
+(defn- cached-eav-adjacency
+  [context ^DB db {:keys [attr bound-side]}]
+  (if-let [cache (:linear-eav-cache context)]
+    (let [k [db attr bound-side]]
+      (if (contains? @cache k)
+        (get @cache k)
+        (locking cache
+          (if (contains? @cache k)
+            (get @cache k)
+            (let [adjacency (build-eav-adjacency db attr bound-side)]
+              (swap! cache assoc k adjacency)
+              adjacency)))))
+    (build-eav-adjacency db attr bound-side)))
+
+(defn- cached-eav-adjacencies
+  [context ^DB db eav-plans]
+  (let [n (count eav-plans)
+        res (object-array n)]
+    (dotimes [i n]
+      (aset res i (cached-eav-adjacency context db (eav-plans i))))
+    res))
+
+(defn- eav-call-positions
+  [eav-plans]
+  (let [n   (count eav-plans)
+        res (int-array n)]
+    (dotimes [i n]
+      (aset res i (int (:call-pos (eav-plans i)))))
+    res))
+
+(defn- call-value
+  [^objects delta-tuple ^ints call-rel-idxs call-pos]
+  (aget delta-tuple (aget call-rel-idxs (int call-pos))))
+
+(defn- fill-fast-output!
+  [^objects scratch ^longs head-types ^ints head-idxs ^objects delta-tuple
+   ^ints call-rel-idxs eav0 eav1]
+  (dotimes [i (alength scratch)]
+    (let [idx (aget head-idxs i)]
+      (aset scratch i
+            (if (zero? (aget head-types i))
+              (call-value delta-tuple call-rel-idxs idx)
+              (if (zero? idx) eav0 eav1)))))
+  scratch)
+
+(defn- add-fast-output-with-probe!
+  [^FastList acc ^HashSet seen-set seen-lookup ^objects scratch
+   ^longs head-types ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs
+   eav0 eav1]
+  (fill-fast-output! scratch head-types head-idxs delta-tuple call-rel-idxs
+                     eav0 eav1)
+  (when-not (.contains seen-set (r/reset-array-lookup! seen-lookup scratch))
+    (let [tuple (aclone scratch)]
+      (.add seen-set (r/wrap-array tuple))
+      (.add acc tuple))))
 
 (defn- add-fast-output!
-  [^FastList acc ^HashSet seen-set head-sources ^objects call-values
-   ^objects eav-values]
-  (let [n     (count head-sources)
-        tuple (object-array n)]
-    (dotimes [i n]
-      (let [[source idx] (nth head-sources i)]
-        (aset tuple i (case source
-                        :call (aget call-values (int idx))
-                        :eav  (aget eav-values (int idx))))))
+  [^FastList acc ^HashSet seen-set ^objects scratch ^longs head-types
+   ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs eav0 eav1]
+  (fill-fast-output! scratch head-types head-idxs delta-tuple call-rel-idxs
+                     eav0 eav1)
+  (let [tuple (aclone scratch)]
     (when (.add seen-set (r/wrap-array tuple))
       (.add acc tuple))))
 
 (defn- eval-linear-eav-branch-with-dedup
   [context branch ^HashSet seen-set]
   (when-let [{:keys [^DB db ^Relation delta-rel ^ints call-rel-idxs head-vars
-                     head-sources eav-plans]}
+                     ^longs head-types ^ints head-idxs eav-plans]}
              (linear-eav-branch-plan context branch)]
     (let [^List delta-tuples (:tuples delta-rel)
           acc                (FastList.)
-          call-arity         (alength call-rel-idxs)
-          eav-count          (count eav-plans)]
+          eav-count          (count eav-plans)
+          ^objects eav-indexes
+          (cached-eav-adjacencies context db eav-plans)
+          ^ints eav-call-idxs
+          (eav-call-positions eav-plans)
+          output-scratch     (object-array (alength head-types))
+          seen-lookup        (r/array-lookup)]
       (when (and delta-tuples (pos? (.size delta-tuples)))
         (dotimes [i (.size delta-tuples)]
-          (let [^objects delta-tuple (.get delta-tuples i)
-                call-values          (object-array call-arity)]
-            (dotimes [j call-arity]
-              (aset call-values j
-                    (aget delta-tuple (aget call-rel-idxs j))))
+          (let [^objects delta-tuple (.get delta-tuples i)]
             (case eav-count
               1
-              (let [plan0   (eav-plans 0)
-                    tuples0 ^List (eav-lookup-tuples
-                                    db plan0
-                                    (aget call-values (:call-pos plan0)))]
-                (when tuples0
-                  (dotimes [j (.size tuples0)]
-                    (let [eav-values (object-array
-                                       [(aget ^objects (.get tuples0 j) 0)])]
-                      (add-fast-output! acc seen-set head-sources call-values
-                                        eav-values)))))
+              (let [values0  ^List (.get ^HashMap (aget eav-indexes 0)
+                                          (call-value
+                                            delta-tuple call-rel-idxs
+                                            (aget eav-call-idxs 0)))]
+                (when values0
+                  (dotimes [j (.size values0)]
+                    (add-fast-output-with-probe!
+                      acc seen-set seen-lookup output-scratch
+                      head-types head-idxs delta-tuple call-rel-idxs
+                      (.get values0 j) nil))))
 
               2
-              (let [plan0   (eav-plans 0)
-                    plan1   (eav-plans 1)
-                    tuples0 ^List (eav-lookup-tuples
-                                    db plan0
-                                    (aget call-values (:call-pos plan0)))
-                    tuples1 ^List (eav-lookup-tuples
-                                    db plan1
-                                    (aget call-values (:call-pos plan1)))]
-                (when (and tuples0 tuples1)
-                  (dotimes [j (.size tuples0)]
-                    (let [v0 (aget ^objects (.get tuples0 j) 0)]
-                      (dotimes [k (.size tuples1)]
-                        (let [eav-values (object-array
-                                           [v0
-                                            (aget ^objects (.get tuples1 k) 0)])]
-                          (add-fast-output! acc seen-set head-sources
-                                            call-values eav-values))))))))))
-      (r/relation! (zipmap head-vars (range)) acc)))))
+              (let [values0  ^List (.get ^HashMap (aget eav-indexes 0)
+                                          (call-value
+                                            delta-tuple call-rel-idxs
+                                            (aget eav-call-idxs 0)))
+                    values1  ^List (.get ^HashMap (aget eav-indexes 1)
+                                          (call-value
+                                            delta-tuple call-rel-idxs
+                                            (aget eav-call-idxs 1)))]
+                (when (and values0 values1)
+                  (dotimes [j (.size values0)]
+                    (let [v0 (.get values0 j)]
+                      (dotimes [k (.size values1)]
+                        (add-fast-output! acc seen-set output-scratch
+                                          head-types head-idxs delta-tuple
+                                          call-rel-idxs
+                                          v0 (.get values1 k)))))))))))
+      (r/relation! (zipmap head-vars (range)) acc))))
 
 (defn- eval-rule-body
   [context rule-name rule-branches resolve-fn]
@@ -1525,12 +1603,13 @@
                                              (.add (object-array [arg]))))))))
                   [] seed-indices)
 
-                clean-context
-                (assoc (select-keys context
-                                    [:sources :rule-rels :rules-deps
-                                     :magic-seeds])
-                       :rules-deps deps
-                       :rule-rels base-rule-rels)
+	                clean-context
+	                (assoc (select-keys context
+	                                    [:sources :rule-rels :rules-deps
+	                                     :magic-seeds])
+	                       :rules-deps deps
+	                       :rule-rels base-rule-rels
+	                       :linear-eav-cache (atom {}))
 
                 ;; Split branches into base (non-recursive) and recursive
                 base-branches-map

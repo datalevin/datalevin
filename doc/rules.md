@@ -66,6 +66,15 @@ T-stratification [3], we implements temporal elimination, an optimization that
 saves only the results of the last iteration of recursion, so that the recursive
 process can be optimized to avoid storing intermediate results.
 
+### Linear recursive EAV fast path
+
+For linear recursive EAV branches, the rule engine streams recursive candidates
+directly into the seen set, caches static EAV adjacency maps for the recursive
+stratum, precompiles output and lookup metadata into primitive arrays, and
+reduces temporary tuple allocation in the seen-set path. This avoids
+materialization of large duplicate join products and repeated store lookups in
+TC/SG-style rules.
+
 ## Benchmarks
 
 ### Math Genealogy Benchmark

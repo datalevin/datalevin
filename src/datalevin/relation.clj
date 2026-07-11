@@ -27,6 +27,30 @@
 
 (defn wrap-array [^objects a] (ArrayWrapper. a (Arrays/hashCode a)))
 
+(defprotocol IArrayLookup
+  (reset-lookup [this a]))
+
+(deftype ArrayLookup [^:unsynchronized-mutable ^objects a
+                      ^:unsynchronized-mutable ^int h]
+  IArrayLookup
+  (reset-lookup [this a']
+    (set! a a')
+    (set! h (Arrays/hashCode ^objects a'))
+    this)
+  Object
+  (hashCode [_] h)
+  (equals [_ that]
+    (and (instance? ArrayWrapper that)
+         (Arrays/equals a ^objects (.-a ^ArrayWrapper that)))))
+
+(defn array-lookup
+  []
+  (ArrayLookup. (object-array 0) 0))
+
+(defn reset-array-lookup!
+  [^ArrayLookup lookup ^objects a]
+  (reset-lookup lookup a))
+
 ;; attrs: {?e 0, ?v 1}
 ;; tuples is a list of objects: [ objects ... ]
 (defrecord Relation [attrs tuples])
@@ -51,7 +75,7 @@
      (System/arraycopy t1 0 res 0 l1)
      (System/arraycopy t2 0 res l1 l2)
      res))
-  ([^objects t1 ^objects idxs1 ^objects t2 ^objects idxs2]
+  ([^objects t1 ^ints idxs1 ^objects t2 ^ints idxs2]
    (let [l1  (alength idxs1)
          l2  (alength idxs2)
          res (object-array (+ l1 l2))]
@@ -279,8 +303,8 @@
   ([rel1 rel2]
    (let [attrs1 (keys (:attrs rel1))
          attrs2 (keys (:attrs rel2))
-         idxs1  (to-array (->Eduction (map (:attrs rel1)) attrs1))
-         idxs2  (to-array (->Eduction (map (:attrs rel2)) attrs2))]
+         idxs1  (int-array (->Eduction (map (:attrs rel1)) attrs1))
+         idxs2  (int-array (->Eduction (map (:attrs rel2)) attrs2))]
      (relation!
        (zipmap (u/concatv attrs1 attrs2) (range))
        (let [tuples1 ^List (:tuples rel1)
