@@ -198,14 +198,13 @@
     (if (or (nil? tuples) (zero? (.size tuples)))
       rel
       (assoc rel :tuples
-             (let [tset (HashSet.)
+             (let [size (.size tuples)
+                   tset (HashSet. size)
                    new  (FastList.)]
-               (dotimes [i (.size tuples)]
-                 (let [t  (.get tuples i)
-                       tw (wrap-array t)]
-                   (when-not (.contains tset tw)
-                     (.add new t)
-                     (.add tset tw))))
+               (dotimes [i size]
+                 (let [t (.get tuples i)]
+                   (when (.add tset (wrap-array t))
+                     (.add new t))))
                new)))))
 
 (defn sum-rel-dedupe
@@ -228,18 +227,14 @@
                la             (.size tuples-a)
                lb             (.size tuples-b)
                res            (FastList. (+ la lb))
-               seen           (HashSet.)]
+               seen           (HashSet. (int (+ la lb)))]
            (dotimes [i la]
-             (let [t  (.get tuples-a i)
-                   tw (wrap-array t)]
-               (when-not (.contains seen tw)
-                 (.add seen tw)
+             (let [t (.get tuples-a i)]
+               (when (.add seen (wrap-array t))
                  (.add res t))))
            (dotimes [i lb]
-             (let [t  (.get tuples-b i)
-                   tw (wrap-array t)]
-               (when-not (.contains seen tw)
-                 (.add seen tw)
+             (let [t (.get tuples-b i)]
+               (when (.add seen (wrap-array t))
                  (.add res t))))
            res))
 
@@ -266,20 +261,16 @@
              res            (FastList. (+ la lb))
              seen           (HashSet. (int (+ la lb)))]
          (dotimes [i la]
-           (let [t  (.get tuples-a i)
-                 tw (wrap-array t)]
-             (when-not (.contains seen tw)
-               (.add seen tw)
+           (let [t (.get tuples-a i)]
+             (when (.add seen (wrap-array t))
                (.add res t))))
          (dotimes [i lb]
            (let [^objects tuple-b (.get tuples-b i)
                  ^objects tuple   (object-array tlen)]
              (dotimes [j n]
                (aset tuple (aget idxs-a j) (aget tuple-b (aget idxs-b j))))
-             (let [tw (wrap-array tuple)]
-               (when-not (.contains seen tw)
-                 (.add seen tw)
-                 (.add res tuple)))))
+             (when (.add seen (wrap-array tuple))
+               (.add res tuple))))
          (relation! attrs-a res))
 
        :else
@@ -331,13 +322,18 @@
         ^List t2 (:tuples r2)]
     (if (.isEmpty t2)
       r1
-      (assoc r1 :tuples (let [s2         (HashSet.)
+      (assoc r1 :tuples (let [l1         (.size t1)
+                              l2         (.size t2)
+                              s2         (HashSet. l2)
+                              lookup     (array-lookup)
                               new-tuples (FastList.)]
-                          (dotimes [i (.size t2)]
+                          (dotimes [i l2]
                             (.add s2 (wrap-array (.get t2 i))))
-                          (dotimes [i (.size t1)]
+                          (dotimes [i l1]
                             (let [tuple (.get t1 i)]
-                              (when-not (.contains s2 (wrap-array tuple))
+                              (when-not (.contains s2
+                                                   (reset-array-lookup!
+                                                     lookup tuple))
                                 (.add new-tuples tuple))))
                           new-tuples)))))
 
@@ -348,12 +344,21 @@
   (let [^List t1 (:tuples r1)]
     (if (or (nil? t1) (.isEmpty t1))
       r1
-      (assoc r1 :tuples (let [new-tuples (FastList.)]
-                          (dotimes [i (.size t1)]
-                            (let [tuple (.get t1 i)
-                                  tw    (wrap-array tuple)]
-                              (when (.add seen-set tw)
-                                (.add new-tuples tuple))))
+      (assoc r1 :tuples (let [size       (.size t1)
+                              new-tuples (FastList.)]
+                          (if (.isEmpty seen-set)
+                            (dotimes [i size]
+                              (let [tuple (.get t1 i)]
+                                (when (.add seen-set (wrap-array tuple))
+                                  (.add new-tuples tuple))))
+                            (let [lookup (array-lookup)]
+                              (dotimes [i size]
+                                (let [tuple (.get t1 i)]
+                                  (when-not (.contains seen-set
+                                                       (reset-array-lookup!
+                                                         lookup tuple))
+                                    (.add seen-set (wrap-array tuple))
+                                    (.add new-tuples tuple))))))
                           new-tuples)))))
 
 (defn add-to-seen!
@@ -361,14 +366,16 @@
   [rel ^HashSet seen-set]
   (let [^List tuples (:tuples rel)]
     (when (and tuples (pos? (.size tuples)))
-      (dotimes [i (.size tuples)]
-        (.add seen-set (wrap-array (.get tuples i)))))
+      (let [size (.size tuples)]
+        (dotimes [i size]
+          (.add seen-set (wrap-array (.get tuples i))))))
     seen-set))
 
 (defn select-tuples
   [pred ^List tuples]
-  (let [res (FastList.)]
-    (dotimes [i (.size tuples)]
+  (let [size (.size tuples)
+        res  (FastList.)]
+    (dotimes [i size]
       (let [t (.get tuples i)]
         (when (pred t)
           (.add res t))))
