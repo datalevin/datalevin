@@ -55,6 +55,7 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 - [Datalog] fully implement datafy
 [#292](https://github.com/datalevin/datalevin/issues/292).
 - [Datalog] reduce allocation per tuple.
+- [Datalog] reduce allocation for multi-column hash joins.
 - [Datalog] topological sort of late clauses based on bounded variables.
 - [Datalog] fast path for linear recursive rules.
 - [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.

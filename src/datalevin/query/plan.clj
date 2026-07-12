@@ -351,13 +351,14 @@
 
 (defn cols->attrs
   [cols]
-  (reduce-kv
-    (fn [m i col]
-      (let [v (if (set? col)
-                (some #(when (symbol? %) %) col)
-                col)]
-        (assoc m v i)))
-    {} cols))
+  (persistent!
+    (reduce-kv
+      (fn [m i col]
+        (let [v (if (set? col)
+                  (some #(when (symbol? %) %) col)
+                  col)]
+          (assoc! m v i)))
+      (transient {}) cols)))
 
 (defn hash-join-execute
   [db in-cols tgt-steps ^List tuples]

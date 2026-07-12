@@ -35,19 +35,30 @@
         (resolve-eid (aget tuple idx)))
       (fn int-getter [^objects tuple] (aget tuple idx)))))
 
-(defn tuple-key-fn
+(defn- tuple-key-fns
   [attrs common-attrs]
   (let [n (count common-attrs)]
     (if (== n 1)
-      (getter-fn attrs (first common-attrs))
+      (let [getter (getter-fn attrs (first common-attrs))]
+        [getter getter])
       (let [^objects getters-arr (into-array Object common-attrs)]
         (dotimes [i n]
           (aset getters-arr i (getter-fn attrs (aget getters-arr i))))
-        (fn [tuple]
-          (let [^objects arr (object-array n)]
-            (dotimes [i n]
-              (aset arr i ((aget getters-arr i) tuple)))
-            (r/wrap-array arr)))))))
+        [(fn build-tuple-key [tuple]
+           (let [^objects arr (object-array n)]
+             (dotimes [i n]
+               (aset arr i ((aget getters-arr i) tuple)))
+             (r/wrap-array arr)))
+         (let [^objects scratch (object-array n)
+               lookup           (r/array-lookup)]
+           (fn lookup-tuple-key [tuple]
+             (dotimes [i n]
+               (aset scratch i ((aget getters-arr i) tuple)))
+             (r/reset-array-lookup! lookup scratch)))]))))
+
+(defn tuple-key-fn
+  [attrs common-attrs]
+  (first (tuple-key-fns attrs common-attrs)))
 
 (defn hash-tuples
   [key-fn ^List tuples]
@@ -90,8 +101,8 @@
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
         keep-idxs1   (int-array (sort (vals attrs1)))
         keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
-        key-fn1      (tuple-key-fn attrs1 common-attrs)
-        key-fn2      (tuple-key-fn attrs2 common-attrs)
+        [key-fn1 lookup-key-fn1] (tuple-key-fns attrs1 common-attrs)
+        [key-fn2 lookup-key-fn2] (tuple-key-fns attrs2 common-attrs)
         attrs        (zipmap (concatv keep-attrs1 keep-attrs2) (range))]
     (if (or (nil? tuples1) (nil? tuples2))
       (r/relation! attrs (FastList.))
@@ -102,7 +113,7 @@
                 ^HashMap hash (hash-tuples key-fn1 tuples1)]
             (dotimes [i (.size tuples2)]
               (let [^objects tuple2 (.get tuples2 i)]
-                (when-some [^List tuples1 (.get hash (key-fn2 tuple2))]
+                (when-some [^List tuples1 (.get hash (lookup-key-fn2 tuple2))]
                   (dotimes [j (.size tuples1)]
                     (.add acc (r/join-tuples (.get tuples1 j) keep-idxs1
                                              tuple2 keep-idxs2))))))
@@ -113,7 +124,7 @@
                 ^HashMap hash (hash-tuples key-fn2 tuples2)]
             (dotimes [i (.size tuples1)]
               (let [^objects tuple1 (.get tuples1 i)]
-                (when-some [^List tuples2 (.get hash (key-fn1 tuple1))]
+                (when-some [^List tuples2 (.get hash (lookup-key-fn1 tuple1))]
                   (dotimes [j (.size tuples2)]
                     (.add acc (r/join-tuples tuple1 keep-idxs1
                                              (.get tuples2 j) keep-idxs2))))))
@@ -130,14 +141,14 @@
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
         keep-idxs1   (int-array (sort (vals attrs1)))
         keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
-        key-fn1      (tuple-key-fn attrs1 common-attrs)
-        key-fn2      (tuple-key-fn attrs2 common-attrs)]
+        [key-fn1 lookup-key-fn1] (tuple-key-fns attrs1 common-attrs)
+        [key-fn2 lookup-key-fn2] (tuple-key-fns attrs2 common-attrs)]
     (when (and tuples1 tuples2)
       (if (< (.size tuples1) (.size tuples2))
         (let [^HashMap hash (hash-tuples key-fn1 tuples1)]
           (dotimes [i (.size tuples2)]
             (let [^objects tuple2 (.get tuples2 i)]
-              (when-some [^List tuples1 (.get hash (key-fn2 tuple2))]
+              (when-some [^List tuples1 (.get hash (lookup-key-fn2 tuple2))]
                 (dotimes [j (.size tuples1)]
                   (.add ^Collection sink
                         (r/join-tuples (.get tuples1 j) keep-idxs1
@@ -145,7 +156,7 @@
         (let [^HashMap hash (hash-tuples key-fn2 tuples2)]
           (dotimes [i (.size tuples1)]
             (let [^objects tuple1 (.get tuples1 i)]
-              (when-some [^List tuples2 (.get hash (key-fn1 tuple1))]
+              (when-some [^List tuples2 (.get hash (lookup-key-fn1 tuple1))]
                 (dotimes [j (.size tuples2)]
                   (.add ^Collection sink
                         (r/join-tuples tuple1 keep-idxs1
@@ -160,7 +171,7 @@
         attrs    (qu/intersect-keys attrs-a attrs-b)
         key-fn-b (tuple-key-fn attrs-b attrs)
         hash     ^HashMap (hash-tuples key-fn-b tuples-b)
-        key-fn-a (tuple-key-fn attrs-a attrs)]
+        key-fn-a (second (tuple-key-fns attrs-a attrs))]
     (assoc a :tuples (let [res (FastList.)]
                        (dotimes [i (.size ^List tuples-a)]
                          (let [t (.get ^List tuples-a i)]
