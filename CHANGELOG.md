@@ -1,6 +1,7 @@
 # Change Log
 
 ## WIP
+
 ### Added
 - [Datalog]`datalog-kv` function to return the underlying DLMDB instance for a
 Datalog DB.
@@ -24,6 +25,10 @@ server use.
 ### Changed
 - [Server] Only built-ins functions and registered UDF can be resolved in query,
 in order to prevent arbitrary code execution on server.
+- [Datalog] Composite tuple no longer stores as a nippy blob, it follows the
+  same storage as transacted tuples, avoiding potential range order problems.
+  Existing tuple storage is rewritten by the normal version migration. We also
+  now exclude `:bytes` as a valid tuple component.
 
 ### Fixed
 - [KV] Live-created DBIs are now WAL-recorded and replayable

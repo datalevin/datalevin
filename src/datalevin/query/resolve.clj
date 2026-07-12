@@ -162,9 +162,18 @@
                             :value   coll
                             :binding (dp/source binding)}))
                   (r/relation! attrs tuples))
-                (if (nil? (tuple-needed-indices (:binding binding)))
-                  (let [width (count (:bindings (:binding binding)))
-                        res   (FastList. size)]
+                (if-let [compact-attrs
+                         (compact-bindtuple-attrs (:binding binding))]
+                  (let [bindings (:bindings (:binding binding))
+                        width    (count bindings)
+                        ^ints src-idxs
+                        (int-array
+                          (keep-indexed
+                            (fn [i b]
+                              (when-not (instance? BindIgnore b) i))
+                            bindings))
+                        out-size (alength src-idxs)
+                        res      (FastList. size)]
                     (dotimes [i size]
                       (let [row (.get tuples i)]
                         (when-not (u/seqable? row)
@@ -180,11 +189,11 @@
                                  {:error   :query/binding
                                   :value   row
                                   :binding (dp/source (:binding binding))}))
-                        (let [tuple (object-array width)]
-                          (dotimes [j width]
-                            (aset tuple j (nth row j)))
+                        (let [tuple (object-array out-size)]
+                          (dotimes [j out-size]
+                            (aset tuple j (nth row (aget src-idxs j))))
                           (.add res tuple))))
-                    (r/relation! attrs res))
+                    (r/relation! compact-attrs res))
                   (transduce (map #(in->rel (:binding binding) %))
                              r/sum-rel coll))))))
         (transduce (map #(in->rel (:binding binding) %)) r/sum-rel coll))
@@ -434,15 +443,15 @@
 
 (defn matches-pattern?
   [pattern tuple]
-  (loop [tuple   tuple
-         pattern pattern]
-    (if (and tuple pattern)
-      (let [t (first tuple)
-            p (first pattern)]
-        (if (or (= p '_) (qu/free-var? p) (= t p))
-          (recur (next tuple) (next pattern))
-          false))
-      true)))
+  (let [n (min (count pattern) (count tuple))]
+    (loop [i 0]
+      (if (< i n)
+        (let [t (nth tuple i)
+              p (nth pattern i)]
+          (if (or (= p '_) (qu/free-var? p) (= t p))
+            (recur (unchecked-inc i))
+            false))
+        true))))
 
 (defn lookup-pattern-coll
   [coll pattern]

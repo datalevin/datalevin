@@ -13,8 +13,10 @@
    [datalevin.built-ins :as built-ins]
    [datalevin.parser :as dp]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
+   [java.util HashMap]
    [datalevin.parser Constant PlainSymbol SrcVar Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -158,21 +160,39 @@
 
 (defn- group-tuples
   [resultset ^ints group-idxs]
-  (if (zero? (alength group-idxs))
-    (when (seq resultset)
-      (list resultset))
-    (let [groups
-          (reduce
-            (fn [groups tuple]
-              (let [key (group-key tuple group-idxs)]
-                (if-let [bucket (get groups key)]
-                  (do
-                    (.add ^FastList bucket tuple)
-                    groups)
-                  (assoc! groups key (doto (FastList.) (.add tuple))))))
-            (transient {})
-            resultset)]
-      (vals (persistent! groups)))))
+  (let [n (alength group-idxs)]
+    (cond
+      (zero? n)
+      (when (seq resultset)
+        (list resultset))
+
+      (= 1 n)
+      (let [groups
+            (reduce
+              (fn [groups tuple]
+                (let [key (group-key tuple group-idxs)]
+                  (if-let [bucket (get groups key)]
+                    (do
+                      (.add ^FastList bucket tuple)
+                      groups)
+                    (assoc! groups key (doto (FastList.) (.add tuple))))))
+              (transient {})
+              resultset)]
+        (vals (persistent! groups)))
+
+      :else
+      (let [^HashMap groups (HashMap.)
+            ^objects scratch (object-array n)
+            lookup           (r/array-lookup)]
+        (doseq [tuple resultset]
+          (dotimes [i n]
+            (aset scratch i (nth tuple (aget group-idxs i))))
+          (if-let [^FastList bucket
+                   (.get groups (r/reset-array-lookup! lookup scratch))]
+            (.add bucket tuple)
+            (.put groups (r/wrap-array (aclone scratch))
+                  (doto (FastList.) (.add tuple)))))
+        (.values groups)))))
 
 (defn aggregate
   [find-elements context resultset]
