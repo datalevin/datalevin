@@ -32,6 +32,11 @@ existing databases when upgrading. Major version bumps may not require migration
  not, data migration is needed. Non-breaking version bumps do not require data
  migration.
 
+In general, Datalevin only supports newer versions opening databases created or
+previously opened by older versions. The reverse is not supported. For example,
+if a database has been opened by Datalevin 0.10.18, it may not be possible to
+open that database again with Datalevin 0.10.5.
+
 ## Automatic Data Migration
 
 For databases that is newer than version 0.9.27, a later version of Datalevin
