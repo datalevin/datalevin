@@ -177,22 +177,24 @@
   "Project body-rel to head-vars"
   [body-rel head-vars]
   (if (seq head-vars)
-    (let [attrs       (:attrs body-rel)
-          idxs-arr    (object-array (mapv attrs head-vars))
-          n           (alength idxs-arr)
-          tuples      ^List (:tuples body-rel)
+    (let [tuples      ^List (:tuples body-rel)
           m           (.size tuples)
           final-attrs (zipmap head-vars (range))]
-      (r/relation!
-        final-attrs
-        (let [res (FastList. m)]
-          (dotimes [i m]
-            (let [from ^objects (.get tuples i)
-                  to   (object-array n)]
-              (dotimes [j n]
-                (aset to j (aget from (aget idxs-arr j))))
-              (.add res to)))
-          res)))
+      (if (zero? m)
+        (r/relation! final-attrs (FastList.))
+        (let [attrs      (:attrs body-rel)
+              ^ints idxs (int-array (map attrs head-vars))
+              n          (alength idxs)]
+          (r/relation!
+            final-attrs
+            (let [res (FastList. m)]
+              (dotimes [i m]
+                (let [from ^objects (.get tuples i)
+                      to   (object-array n)]
+                  (dotimes [j n]
+                    (aset to j (aget from (aget idxs j))))
+                  (.add res to)))
+              res)))))
     body-rel))
 
 (defn- head-indices

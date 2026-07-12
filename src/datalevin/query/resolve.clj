@@ -162,8 +162,31 @@
                             :value   coll
                             :binding (dp/source binding)}))
                   (r/relation! attrs tuples))
-                (transduce (map #(in->rel (:binding binding) %))
-                           r/sum-rel coll)))))
+                (if (nil? (tuple-needed-indices (:binding binding)))
+                  (let [width (count (:bindings (:binding binding)))
+                        res   (FastList. size)]
+                    (dotimes [i size]
+                      (let [row (.get tuples i)]
+                        (when-not (u/seqable? row)
+                          (raise "Cannot bind value " row " to tuple "
+                                 (dp/source (:binding binding))
+                                 {:error   :query/binding
+                                  :value   row
+                                  :binding (dp/source (:binding binding))}))
+                        (when (< (count row) width)
+                          (raise "Not enough elements in a collection " row
+                                 " to bind tuple "
+                                 (dp/source (:binding binding))
+                                 {:error   :query/binding
+                                  :value   row
+                                  :binding (dp/source (:binding binding))}))
+                        (let [tuple (object-array width)]
+                          (dotimes [j width]
+                            (aset tuple j (nth row j)))
+                          (.add res tuple))))
+                    (r/relation! attrs res))
+                  (transduce (map #(in->rel (:binding binding) %))
+                             r/sum-rel coll))))))
         (transduce (map #(in->rel (:binding binding) %)) r/sum-rel coll))
 
       :else
@@ -652,6 +675,26 @@
       :else
       (conj v meta-map))))
 
+(defn- bind-scalar-tuples
+  [production out-var tuple-fn]
+  (let [attrs        (:attrs production)
+        attr-keys    (vec (keys attrs))
+        n            (count attr-keys)
+        ^ints idxs   (int-array (map attrs attr-keys))
+        ^List tuples (:tuples production)
+        size         (.size tuples)
+        res          (FastList. size)]
+    (dotimes [i size]
+      (let [^objects tuple (.get tuples i)
+            val            (tuple-fn tuple)]
+        (when-not (nil? val)
+          (let [^objects out (object-array (unchecked-inc n))]
+            (dotimes [j n]
+              (aset out j (aget tuple (aget idxs j))))
+            (aset out n val)
+            (.add res out)))))
+    (r/relation! (zipmap (conj attr-keys out-var) (range)) res)))
+
 (defn bind-by-fn
   [context clause]
   (let [[[f & args] out]     clause
@@ -680,8 +723,10 @@
                      (and (not (nil? val))
                           (= (aget tuple (int out-idx)) val))))
                  %)))
-          (let [tuple-fn (-call-fn context production f args')
-                rels     (for [tuple (:tuples production)
+          (let [tuple-fn (-call-fn context production f args')]
+            (if (instance? BindScalar binding)
+              (bind-scalar-tuples production out-var tuple-fn)
+              (let [rels (for [tuple (:tuples production)
                                :let  [val (tuple-fn tuple)]
                                :when (not (nil? val))]
                            (if needed
@@ -695,9 +740,9 @@
                                (r/relation! (:attrs production)
                                             (doto (FastList.) (.add tuple)))
                                (in->rel binding val))))]
-            (if (empty? rels)
-              (r/prod-rel production (empty-rel binding))
-              (reduce r/sum-rel rels))))]
+                (if (empty? rels)
+                  (r/prod-rel production (empty-rel binding))
+                  (reduce r/sum-rel rels))))))]
     (update context :rels collapse-rels new-rel)))
 
 (defn dynamic-lookup-attrs
