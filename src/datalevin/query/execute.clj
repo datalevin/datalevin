@@ -184,24 +184,25 @@
             c))))))
 
 (defn -collect-tuples
-  [acc rel ^long len copy-map]
-  (->Eduction
-    (comp
-      (map (fn [^objects t1]
-             (->Eduction
-               (map (fn [t2]
-                      (let [res (aclone t1)]
-                        (if (u/array? t2)
-                          (dotimes [i len]
-                            (when-some [idx (aget ^objects copy-map i)]
-                              (aset res i (aget ^objects t2 idx))))
-                          (dotimes [i len]
-                            (when-some [idx (aget ^objects copy-map i)]
-                              (aset res i (get t2 idx)))))
-                        res)))
-               (:tuples rel))))
-      cat)
-    acc))
+  [acc rel ^ints dst-idxs ^ints src-idxs]
+  (let [n (alength src-idxs)]
+    (->Eduction
+      (comp
+        (map (fn [^objects t1]
+               (->Eduction
+                 (map (fn [t2]
+                        (let [res (aclone t1)]
+                          (if (u/array? t2)
+                            (dotimes [i n]
+                              (aset res (aget dst-idxs i)
+                                    (aget ^objects t2 (aget src-idxs i))))
+                            (dotimes [i n]
+                              (aset res (aget dst-idxs i)
+                                    (get t2 (aget src-idxs i)))))
+                          res)))
+                 (:tuples rel))))
+        cat)
+      acc)))
 
 (defn -collect
   ([context symbols]
@@ -219,11 +220,17 @@
 
      (empty? keep-attrs) (recur acc (next rels) symbols)
 
-     :let [copy-map (to-array (map #(get keep-attrs %) symbols))
-           len      (count symbols)]
+     :let [copy-pairs (keep-indexed
+                        (fn [dst-idx sym]
+                          (when-some [src-idx (get keep-attrs sym)]
+                            [dst-idx src-idx]))
+                        symbols)
+           dst-idxs  (int-array (map first copy-pairs))
+           src-idxs  (int-array (map second copy-pairs))]
 
      :else
-     (recur (-collect-tuples acc rel len copy-map) (next rels) symbols))))
+     (recur (-collect-tuples acc rel dst-idxs src-idxs)
+            (next rels) symbols))))
 
 (defn collect
   [{:keys [result-set] :as context} symbols]

@@ -41,20 +41,43 @@
     (if (== n 1)
       (let [getter (getter-fn attrs (first common-attrs))]
         [getter getter])
-      (let [^objects getters-arr (into-array Object common-attrs)]
-        (dotimes [i n]
-          (aset getters-arr i (getter-fn attrs (aget getters-arr i))))
-        [(fn build-tuple-key [tuple]
-           (let [^objects arr (object-array n)]
-             (dotimes [i n]
-               (aset arr i ((aget getters-arr i) tuple)))
-             (r/wrap-array arr)))
-         (let [^objects scratch (object-array n)
-               lookup           (r/array-lookup)]
-           (fn lookup-tuple-key [tuple]
-             (dotimes [i n]
-               (aset scratch i ((aget getters-arr i) tuple)))
-             (r/reset-array-lookup! lookup scratch)))]))))
+      (let [^ints idxs        (int-array n)
+            ^booleans resolve (boolean-array n)
+            resolve?          (boolean
+                                (some #(contains? qu/*lookup-attrs* %)
+                                      common-attrs))]
+        (loop [i 0, common-attrs (seq common-attrs)]
+          (when common-attrs
+            (let [attr (first common-attrs)
+                  r?   (contains? qu/*lookup-attrs* attr)]
+              (aset idxs i (int (attrs attr)))
+              (when r? (aset resolve i true))
+              (recur (unchecked-inc i) (next common-attrs)))))
+        (if resolve?
+          [(fn build-resolved-tuple-key [^objects tuple]
+             (let [^objects arr (object-array n)]
+               (dotimes [i n]
+                 (let [v (aget tuple (aget idxs i))]
+                   (aset arr i (if (aget resolve i) (resolve-eid v) v))))
+               (r/wrap-array arr)))
+           (let [^objects scratch (object-array n)
+                 lookup           (r/array-lookup)]
+             (fn lookup-resolved-tuple-key [^objects tuple]
+               (dotimes [i n]
+                 (let [v (aget tuple (aget idxs i))]
+                   (aset scratch i (if (aget resolve i) (resolve-eid v) v))))
+               (r/reset-array-lookup! lookup scratch)))]
+          [(fn build-tuple-key [^objects tuple]
+             (let [^objects arr (object-array n)]
+               (dotimes [i n]
+                 (aset arr i (aget tuple (aget idxs i))))
+               (r/wrap-array arr)))
+           (let [^objects scratch (object-array n)
+                 lookup           (r/array-lookup)]
+             (fn lookup-tuple-key [^objects tuple]
+               (dotimes [i n]
+                 (aset scratch i (aget tuple (aget idxs i))))
+               (r/reset-array-lookup! lookup scratch)))])))))
 
 (defn tuple-key-fn
   [attrs common-attrs]
