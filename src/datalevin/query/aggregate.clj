@@ -139,25 +139,6 @@
   [elem]
   (not (or (dp/aggregate? elem) (dp/find-expr? elem))))
 
-(defn- group-key
-  [tuple ^ints group-idxs]
-  (let [n (alength group-idxs)]
-    (cond
-      (zero? n)
-      nil
-
-      (= 1 n)
-      (nth tuple (aget group-idxs 0))
-
-      :else
-      (persistent!
-       (loop [i   (int 0)
-              key (transient [])]
-         (if (< i n)
-           (recur (unchecked-inc-int i)
-                  (conj! key (nth tuple (aget group-idxs i))))
-           key))))))
-
 (defn- group-tuples
   [resultset ^ints group-idxs]
   (let [n (alength group-idxs)]
@@ -167,18 +148,14 @@
         (list resultset))
 
       (= 1 n)
-      (let [groups
-            (reduce
-              (fn [groups tuple]
-                (let [key (group-key tuple group-idxs)]
-                  (if-let [bucket (get groups key)]
-                    (do
-                      (.add ^FastList bucket tuple)
-                      groups)
-                    (assoc! groups key (doto (FastList.) (.add tuple))))))
-              (transient {})
-              resultset)]
-        (vals (persistent! groups)))
+      (let [^HashMap groups (HashMap.)
+            idx             (aget group-idxs 0)]
+        (doseq [tuple resultset]
+          (let [key (nth tuple idx)]
+            (if-let [^FastList bucket (.get groups key)]
+              (.add bucket tuple)
+              (.put groups key (doto (FastList.) (.add tuple))))))
+        (.values groups))
 
       :else
       (let [^HashMap groups (HashMap.)

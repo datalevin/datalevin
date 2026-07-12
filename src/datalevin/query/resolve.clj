@@ -956,15 +956,16 @@
 (defn or-join-build
   [sources rules ^List tuples clause bound-var bound-idx free-vars]
   (when (pos? (.size tuples))
-    (let [bound-vals     (let [s (HashSet.)]
-                           (dotimes [i (.size tuples)]
-                             (.add s (aget ^objects (.get tuples i) bound-idx)))
-                           (vec s))
-          bound-rel      (r/relation! {bound-var 0}
-                                      (let [fl (FastList.)]
-                                        (doseq [v bound-vals]
-                                          (.add fl (object-array [v])))
-                                        fl))
+    (let [bound-rel      (r/relation!
+                           {bound-var 0}
+                           (let [seen (HashSet.)
+                                 res  (FastList.)]
+                             (dotimes [i (.size tuples)]
+                               (let [v (aget ^objects (.get tuples i)
+                                             bound-idx)]
+                                 (when (.add seen v)
+                                   (.add res (object-array [v])))))
+                             res))
           or-context     {:sources sources
                           :rules   rules
                           :rels    [bound-rel]}

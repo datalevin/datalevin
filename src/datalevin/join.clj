@@ -90,11 +90,13 @@
       (dotimes [i (.size tuples)]
         (let [x (.get tuples i)
               k (key-fn x)]
-          (if-let [^List l (.get res k)]
-            (.add l x)
-            (let [^List nl (FastList.)]
-              (.add nl x)
-              (.put res k nl))))))
+          (if-let [bucket (.get res k)]
+            (if (u/array? bucket)
+              (.put res k (doto (FastList. 2)
+                            (.add bucket)
+                            (.add x)))
+              (.add ^List bucket x))
+            (.put res k x)))))
     res))
 
 (defn- attr-keys
@@ -136,10 +138,14 @@
                 ^HashMap hash (hash-tuples key-fn1 tuples1)]
             (dotimes [i (.size tuples2)]
               (let [^objects tuple2 (.get tuples2 i)]
-                (when-some [^List tuples1 (.get hash (lookup-key-fn2 tuple2))]
-                  (dotimes [j (.size tuples1)]
-                    (.add acc (r/join-tuples (.get tuples1 j) keep-idxs1
-                                             tuple2 keep-idxs2))))))
+                (when-some [bucket (.get hash (lookup-key-fn2 tuple2))]
+                  (if (u/array? bucket)
+                    (.add acc (r/join-tuples bucket keep-idxs1
+                                             tuple2 keep-idxs2))
+                    (let [^List tuples1 bucket]
+                      (dotimes [j (.size tuples1)]
+                        (.add acc (r/join-tuples (.get tuples1 j) keep-idxs1
+                                                 tuple2 keep-idxs2))))))))
             acc))
         (r/relation!
           attrs
@@ -147,10 +153,15 @@
                 ^HashMap hash (hash-tuples key-fn2 tuples2)]
             (dotimes [i (.size tuples1)]
               (let [^objects tuple1 (.get tuples1 i)]
-                (when-some [^List tuples2 (.get hash (lookup-key-fn1 tuple1))]
-                  (dotimes [j (.size tuples2)]
+                (when-some [bucket (.get hash (lookup-key-fn1 tuple1))]
+                  (if (u/array? bucket)
                     (.add acc (r/join-tuples tuple1 keep-idxs1
-                                             (.get tuples2 j) keep-idxs2))))))
+                                             bucket keep-idxs2))
+                    (let [^List tuples2 bucket]
+                      (dotimes [j (.size tuples2)]
+                        (.add acc (r/join-tuples tuple1 keep-idxs1
+                                                 (.get tuples2 j)
+                                                 keep-idxs2))))))))
             acc))))))
 
 (defn hash-join-into
@@ -171,19 +182,28 @@
         (let [^HashMap hash (hash-tuples key-fn1 tuples1)]
           (dotimes [i (.size tuples2)]
             (let [^objects tuple2 (.get tuples2 i)]
-              (when-some [^List tuples1 (.get hash (lookup-key-fn2 tuple2))]
-                (dotimes [j (.size tuples1)]
+              (when-some [bucket (.get hash (lookup-key-fn2 tuple2))]
+                (if (u/array? bucket)
                   (.add ^Collection sink
-                        (r/join-tuples (.get tuples1 j) keep-idxs1
-                                       tuple2 keep-idxs2)))))))
+                        (r/join-tuples bucket keep-idxs1 tuple2 keep-idxs2))
+                  (let [^List tuples1 bucket]
+                    (dotimes [j (.size tuples1)]
+                      (.add ^Collection sink
+                            (r/join-tuples (.get tuples1 j) keep-idxs1
+                                           tuple2 keep-idxs2)))))))))
         (let [^HashMap hash (hash-tuples key-fn2 tuples2)]
           (dotimes [i (.size tuples1)]
             (let [^objects tuple1 (.get tuples1 i)]
-              (when-some [^List tuples2 (.get hash (lookup-key-fn1 tuple1))]
-                (dotimes [j (.size tuples2)]
+              (when-some [bucket (.get hash (lookup-key-fn1 tuple1))]
+                (if (u/array? bucket)
                   (.add ^Collection sink
-                        (r/join-tuples tuple1 keep-idxs1
-                                       (.get tuples2 j) keep-idxs2)))))))))
+                        (r/join-tuples tuple1 keep-idxs1 bucket keep-idxs2))
+                  (let [^List tuples2 bucket]
+                    (dotimes [j (.size tuples2)]
+                      (.add ^Collection sink
+                            (r/join-tuples tuple1 keep-idxs1
+                                           (.get tuples2 j)
+                                           keep-idxs2)))))))))))
     sink))
 
 (defn subtract-rel
