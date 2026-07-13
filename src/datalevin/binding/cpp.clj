@@ -49,6 +49,7 @@
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
+   [org.eclipse.collections.impl.list.mutable FastList]
    [clojure.lang IObj]))
 
 (defn- version-file
@@ -724,32 +725,67 @@
       (put-tx dbi txn tx))))
 
 (defn- transact-prepared-ops*
-  [ops txn]
-  (doseq [op ops]
-    (let [^DBI dbi (nth op 0)
-          ^KVTxData tx (nth op 1)]
-      (put-tx dbi txn tx))))
+  [^objects ops txn]
+  (let [n (alength ops)]
+    (loop [i 0]
+      (when (< i n)
+        (let [^DBI dbi    (aget ops i)
+              ^KVTxData tx (aget ops (unchecked-inc i))]
+          (put-tx dbi txn tx)
+          (recur (+ i 2)))))))
 
 (defn- prepare-kvtx-ops
   [txs ^HashMap dbis dbi-name kt vt]
-  (let [out (transient [])]
-    (if dbi-name
-      (let [^DBI dbi (or (.get dbis dbi-name)
-                         (raise dbi-name " is not open" {}))
-            validate? (.-validate-data? dbi)]
-        (doseq [t txs]
-          (let [^KVTxData tx (l/->kv-tx-data t kt vt)]
-            (vld/validate-kv-tx-data tx validate?)
-            (conj! out [dbi tx]))))
-      (doseq [t txs]
-        (let [^KVTxData tx (l/->kv-tx-data t)
-              dbi-name* (.-dbi-name tx)
-              ^DBI dbi (or (.get dbis dbi-name*)
-                           (raise dbi-name* " is not open" {}))
+  (if (and (instance? java.util.List txs)
+           (instance? java.util.RandomAccess txs))
+    (let [^java.util.List tx-list txs
+          n                       (.size tx-list)
+          ^objects out            (object-array (* 2 n))]
+      (if dbi-name
+        (let [^DBI dbi (or (.get dbis dbi-name)
+                           (raise dbi-name " is not open" {}))
               validate? (.-validate-data? dbi)]
-          (vld/validate-kv-tx-data tx validate?)
-          (conj! out [dbi tx]))))
-    (persistent! out)))
+          (loop [i 0
+                 j 0]
+            (when (< i n)
+              (let [^KVTxData tx (l/->kv-tx-data (.get tx-list i) kt vt)]
+                (vld/validate-kv-tx-data tx validate?)
+                (aset out j dbi)
+                (aset out (unchecked-inc j) tx)
+                (recur (unchecked-inc i) (+ j 2))))))
+        (loop [i 0
+               j 0]
+          (when (< i n)
+            (let [^KVTxData tx (l/->kv-tx-data (.get tx-list i))
+                  dbi-name*     (.-dbi-name tx)
+                  ^DBI dbi      (or (.get dbis dbi-name*)
+                                    (raise dbi-name* " is not open" {}))
+                  validate?     (.-validate-data? dbi)]
+              (vld/validate-kv-tx-data tx validate?)
+              (aset out j dbi)
+              (aset out (unchecked-inc j) tx)
+              (recur (unchecked-inc i) (+ j 2))))))
+      out)
+    (let [^FastList out (FastList.)]
+      (if dbi-name
+        (let [^DBI dbi (or (.get dbis dbi-name)
+                           (raise dbi-name " is not open" {}))
+              validate? (.-validate-data? dbi)]
+          (doseq [t txs]
+            (let [^KVTxData tx (l/->kv-tx-data t kt vt)]
+              (vld/validate-kv-tx-data tx validate?)
+              (.add out dbi)
+              (.add out tx))))
+        (doseq [t txs]
+          (let [^KVTxData tx (l/->kv-tx-data t)
+                dbi-name*     (.-dbi-name tx)
+                ^DBI dbi      (or (.get dbis dbi-name*)
+                                  (raise dbi-name* " is not open" {}))
+                validate?     (.-validate-data? dbi)]
+            (vld/validate-kv-tx-data tx validate?)
+            (.add out dbi)
+            (.add out tx))))
+      (.toArray out))))
 
 (defn- kv-tx->row
   [^KVTxData tx]
@@ -1345,7 +1381,7 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [this dbi-name txs k-type v-type]
-    (let [^clojure.lang.IPersistentVector prepared-one-shot
+    (let [^objects prepared-one-shot
           (let [tx-open? (some? @write-txn)]
             (when-not tx-open?
               (prepare-kvtx-ops txs dbis dbi-name k-type v-type)))]

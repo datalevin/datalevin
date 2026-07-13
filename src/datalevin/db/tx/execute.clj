@@ -30,7 +30,28 @@
    [java.util SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
+(deftype ^:private TxStep [report entities])
+
 (defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
+
+(defn- cached-ea-first-datom
+  [db ^long e a]
+  (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
+                                  (datom e a nil tx0))]
+    (when-not (.isEmpty tail)
+      (let [^Datom d (.first tail)]
+        (when (and (== e (.-e d)) (= a (.-a d))) d)))))
+
+(defn- cached-eav-first-datom
+  [db ^long e a v]
+  (let [^SortedSet tail (.tailSet ^TreeSortedSet (:eavt db)
+                                  (datom e a v tx0))]
+    (when-not (.isEmpty tail)
+      (let [^Datom d (.first tail)]
+        (when (and (== e (.-e d))
+                   (= a (.-a d))
+                   (= v (.-v d)))
+          d)))))
 
 (defn- clear-tx-cache
   [db]
@@ -41,16 +62,19 @@
 
 (defn- validate-datom
   [db ^Datom datom]
-  (let [a       (.-a datom)
-        v       (.-v datom)
-        unique? (txcommon/is-attr? db a :db/unique)
-        found?  (fn []
-                  (or (not (.isEmpty
-                             (.subSet ^TreeSortedSet (:avet db)
-                                      (d/datom e0 a v tx0)
-                                      (d/datom emax a v txmax))))
-                      (av-first-e (:store db) a v)))]
-    (vld/validate-datom-unique unique? datom found?)))
+  (when (and (datom-added datom)
+             (txcommon/is-attr? db (.-a datom) :db/unique))
+    (let [a (.-a datom)
+          v (.-v datom)]
+      (vld/validate-datom-unique
+        true
+        datom
+        (fn []
+          (or (not (.isEmpty
+                     (.subSet ^TreeSortedSet (:avet db)
+                              (d/datom e0 a v tx0)
+                              (d/datom emax a v txmax))))
+              (av-first-e (:store db) a v)))))))
 
 (defn- current-tx
   {:inline (fn [report] `(-> ~report :db-before :max-tx long inc))}
@@ -139,15 +163,15 @@
     tuples))
 
 (defn- transact-report
-  [report datom]
+  [report ^Datom datom]
   (let [db      (:db-after report)
-        a       (:a datom)
+        a       (.-a datom)
         report' (-> report
                     (assoc :db-after (with-datom db datom))
                     (update :tx-data conj datom))]
     (if (txcommon/tuple-source? db a)
-      (let [e      (:e datom)
-            v      (if (datom-added datom) (:v datom) nil)
+      (let [e      (.-e datom)
+            v      (if (datom-added datom) (.-v datom) nil)
             queue  (or (-> report' ::queued-tuples (get e)) {})
             tuples (get (txcommon/attrs-by db :db/attrTuples) a)
             queue' (queue-tuples queue tuples report' db e a v)]
@@ -205,54 +229,53 @@
     nil))
 
 (defn- transact-add
-  [report [_ e a v tx :as ent]]
-  (vld/validate-attr a ent)
-  (vld/validate-val v ent)
-  (let [tx        (or tx (current-tx report))
-        db        (:db-after report)
-        store     (:store db)
-        report    (if (or (contains? (::new-attributes report) a)
-                          ((schema store) a))
-                    report
-                    (update report ::new-attributes u/conjv a))
-        e         (txcommon/entid-strict db e)
-        _         (validate-installed-callable-write report db e a v ent)
-        v         (if (txcommon/ref? db a)
-                    (txcommon/entid-strict db v)
-                    v)
-        props     ((schema store) a)
-        v'        (coreprep/correct-value-with-props
-                    (opts store) props a v)
-        _         (vld/validate-attr-preds e a v' props
-                                           #(txprep/resolve-attr-pred-udf db %))
-        meta*     (meta ent)
-        new-datom (cond-> (datom e a v' tx)
-                    meta* (with-meta meta*))
-        multival? (txcommon/multival? db a)
-        ^Datom old-datom
-        (if multival?
-          (or (sf (.subSet ^TreeSortedSet (:eavt db)
-                           (datom e a v' tx0)
-                           (datom e a v' txmax)))
-              (first (fetch (:store db) (datom e a v'))))
-          (or (sf (.subSet ^TreeSortedSet (:eavt db)
-                           (datom e a nil tx0)
-                           (datom e a nil txmax)))
-              (ea-first-datom (:store db) e a)))]
-    (cond
-      (nil? old-datom)
-      (transact-report report new-datom)
+  ([report [_ _ a _ _ :as ent]]
+   (let [store (:store (:db-after report))
+         props ((schema store) a)]
+     (transact-add report ent props (opts store))))
+  ([report [_ e a v tx :as ent] props store-opts]
+   (vld/validate-attr a ent)
+   (vld/validate-val v ent)
+   (let [tx        (or tx (current-tx report))
+         db        (:db-after report)
+         store     (:store db)
+         report    (if (or (contains? (::new-attributes report) a) props)
+                     report
+                     (update report ::new-attributes u/conjv a))
+         e         (txcommon/entid-strict db e)
+         _         (validate-installed-callable-write report db e a v ent)
+         ref?      (identical? (:db/valueType props) :db.type/ref)
+         v         (if ref? (txcommon/entid-strict db v) v)
+         v'        (coreprep/correct-value-with-props
+                     store-opts props a v)
+         _         (when (:db.attr/preds props)
+                     (vld/validate-attr-preds
+                       e a v' props #(txprep/resolve-attr-pred-udf db %)))
+         meta*     (meta ent)
+         new-datom (cond-> (datom e a v' tx)
+                     meta* (with-meta meta*))
+         multival? (identical? (:db/cardinality props)
+                               :db.cardinality/many)
+         ^Datom old-datom
+         (if multival?
+           (or (cached-eav-first-datom db e a v')
+               (first (fetch store (datom e a v'))))
+           (or (cached-ea-first-datom db e a)
+               (ea-first-datom store e a)))]
+     (cond
+       (nil? old-datom)
+       (transact-report report new-datom)
 
-      (= (.-v old-datom) v')
-      (if (some #(and (not (datom-added %)) (= % new-datom))
-                (:tx-data report))
-        (transact-report report new-datom)
-        (update report ::tx-redundant conjv new-datom))
+       (= (.-v old-datom) v')
+       (if (some #(and (not (datom-added %)) (= % new-datom))
+                 (:tx-data report))
+         (transact-report report new-datom)
+         (update report ::tx-redundant conjv new-datom))
 
-      :else
-      (let [report' (transact-report report
-                                     (datom e a (.-v old-datom) tx false))]
-        (transact-report report' new-datom)))))
+       :else
+       (let [report' (transact-report report
+                                      (datom e a (.-v old-datom) tx false))]
+         (transact-report report' new-datom))))))
 
 (defn- transact-retract-datom [report ^Datom d]
   (let [tx (current-tx report)]
@@ -265,8 +288,9 @@
         props     ((schema store) a)
         nv'       (coreprep/correct-value-with-props
                     (opts store) props a nv)
-        _         (vld/validate-attr-preds e a nv' props
-                                           #(txprep/resolve-attr-pred-udf db %))
+        _         (when (:db.attr/preds props)
+                    (vld/validate-attr-preds
+                      e a nv' props #(txprep/resolve-attr-pred-udf db %)))
         meta*     (meta entity)
         new-datom (cond-> (datom e a nv' tx)
                     meta* (with-meta meta*))]
@@ -452,9 +476,10 @@
          es]))))
 
 (defn- handle-tempid-entity
-  [initial-report report db store tempids entity entities initial-es tx-time]
+  [initial-report report db store tempids unique-identity? entity entities
+   initial-es tx-time]
   (let [[op e a v] entity
-        upserted-eid  (when (txcommon/is-attr? db a :db.unique/identity)
+        upserted-eid  (when unique-identity?
                         (or (:e (sf (.subSet
                                       ^TreeSortedSet (:avet db)
                                       (d/datom e0 a v tx0)
@@ -622,9 +647,16 @@
       (vld/validate-map-entity-id-syntax old-eid))))
 
 (defn- handle-sequential-entity
-  [initial-report report db store schema tempids entity entities initial-es
-   tx-time]
-  (let [[op e a v] entity]
+  [initial-report report db store schema store-opts tempids entity entities
+   initial-es tx-time]
+  (let [[op e a v]     entity
+        props          (schema a)
+        ref?           (identical? (:db/valueType props) :db.type/ref)
+        unique-identity? (identical? (:db/unique props)
+                                     :db.unique/identity)
+        tuple-attr?    (contains? props :db/tupleAttrs)
+        tuple-type?    (contains? props :db/tupleType)
+        tuple-types?   (contains? props :db/tupleTypes)]
     (cond+
       (identical? op :db.fn/call)
       [report (concat (txprep/handle-fn-call db entity) entities)]
@@ -648,23 +680,24 @@
       [(allocate-eid tx-time report e (current-tx report))
        (cons [op (current-tx report) a v] entities)]
 
-      (and (txcommon/ref? db a) (tx-id? v))
+      (and ref? (tx-id? v))
       [(allocate-eid tx-time report v (current-tx report))
        (cons [op e a (current-tx report)] entities)]
 
-      (and (txcommon/ref? db a) (txprep/tempid? v))
+      (and ref? (txprep/tempid? v))
       (handle-ref-tempid-value report db tempids entity entities
                                (cons entity entities) tx-time)
 
-      (and (txcommon/ref? db a) (sequential? v))
+      (and ref? (sequential? v))
       (let [resolved (txcommon/entid-strict db v)]
         [report (cons [op e a resolved] entities)])
 
       (txprep/tempid? e)
-      (handle-tempid-entity initial-report report db store tempids entity
-                            entities initial-es tx-time)
+      (handle-tempid-entity initial-report report db store tempids
+                            unique-identity? entity entities initial-es
+                            tx-time)
 
-      :let [upserted-eid (when (and (txcommon/is-attr? db a :db.unique/identity)
+      :let [upserted-eid (when (and unique-identity?
                                     (contains? (::reverse-tempids report) e)
                                     e)
                            (av-first-e store a v))]
@@ -673,14 +706,13 @@
       (handle-reverse-tempid-upsert initial-report report entity entities
                                     initial-es tx-time upserted-eid)
 
-      (and (txcommon/tuple-attr? db a) (not (::internal (meta entity))))
+      (and tuple-attr? (not (::internal (meta entity))))
       (handle-tuple-attr db store schema entity report entities)
 
-      :let [tuple-types (when (and (or (txcommon/tuple-type? db a)
-                                       (txcommon/tuple-types? db a))
+      :let [tuple-types (when (and (or tuple-type? tuple-types?)
                                    (not (::internal (meta entity))))
-                           (or (get-in schema [a :db/tupleTypes])
-                               (repeat (get-in schema [a :db/tupleType]))))
+                           (or (:db/tupleTypes props)
+                               (repeat (:db/tupleType props))))
             vs (when tuple-types
                  (partition 2 (interleave tuple-types v)))]
 
@@ -693,7 +725,7 @@
       [report (cons (handle-tuple-ref-idents db entity vs) entities)]
 
       (identical? op :db/add)
-      [(transact-add report entity) entities]
+      (TxStep. (transact-add report entity props store-opts) entities)
 
       (and (identical? op :db/retract) (some? v))
       (handle-retract-value report db store entity entities)
@@ -719,7 +751,8 @@
                             initial-es (repeat ::flush-tuples))
                           initial-es)
         store           (:store db)
-        schema          (schema store)]
+        schema          (schema store)
+        store-opts      (opts store)]
     (loop [report initial-report'
            es     initial-es']
       (cond+
@@ -745,10 +778,16 @@
 
         (sequential? entity)
         (let [result (handle-sequential-entity
-                       initial-report report db store schema tempids
-                       entity entities initial-es tx-time)]
-          (if (map? result)
+                       initial-report report db store schema store-opts
+                       tempids entity entities initial-es tx-time)]
+          (cond
+            (instance? TxStep result)
+            (recur (.-report ^TxStep result) (.-entities ^TxStep result))
+
+            (map? result)
             result
+
+            :else
             (let [[r' es'] result]
               (recur r' es'))))
 
