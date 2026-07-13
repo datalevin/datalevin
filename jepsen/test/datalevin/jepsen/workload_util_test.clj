@@ -822,6 +822,25 @@
     (is (= 0 (:failure-count result)))
     (is (= 1 (:disruption-failure-count result)))))
 
+(deftest identity-upsert-checker-ignores-ha-read-rejection-during-disruption-test
+  (let [op     {:f :upsert-two-tempids
+                :identity/case-id 5}
+        result (checker/check
+                (#'identity-upsert/identity-upsert-checker)
+                {:datalevin/nemesis-faults [:clock-skew-leader-fast]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :fail
+                         :error (str "Request to Datalevin server failed: "
+                                     "\"Request to Datalevin server failed: "
+                                     "\\\"HA read admission rejected\\\"\""))])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 0 (:mismatch-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 1 (:disruption-failure-count result)))))
+
 (deftest identity-upsert-checker-classifies-disrupted-final-probe-test
   (let [op     {:f :upsert-same-tempid
                 :identity/case-id 3}

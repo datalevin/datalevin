@@ -1,5 +1,6 @@
 (ns datalevin.jepsen.workload.identity-upsert
   (:require
+   [clojure.string :as str]
    [datalevin.core :as d]
    [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
@@ -258,6 +259,35 @@
     (or (ex-message e)
         (.getName (class e)))))
 
+(defn- error-message
+  [error]
+  (cond
+    (string? error)
+    error
+
+    (keyword? error)
+    (name error)
+
+    (vector? error)
+    (some error-message error)
+
+    (map? error)
+    (or (error-message (:message error))
+        (error-message (:error error)))
+
+    (some? error)
+    (str error)
+
+    :else
+    nil))
+
+(defn- expected-identity-disruption-failure?
+  [test error]
+  (or (local/expected-disruption-write-failure? test error)
+      (and (local/write-disruption-fault-active? test)
+           (some-> (error-message error)
+                   (str/includes? "HA read admission rejected")))))
+
 (defn- build-op
   [case-id]
   (let [f (rand-nth [:upsert-same-tempid
@@ -298,10 +328,10 @@
             probe-disruption-failures
             (->> probe-failures
                  (filter (fn [{:keys [error value]}]
-                           (or (local/expected-disruption-write-failure?
+                           (or (expected-identity-disruption-failure?
                                  test
                                  error)
-                               (local/expected-disruption-write-failure?
+                               (expected-identity-disruption-failure?
                                  test
                                  value))))
                  vec)
@@ -313,7 +343,7 @@
             disruption-failures
             (->> terminal
                  (filter (fn [{:keys [error]}]
-                           (local/expected-disruption-write-failure?
+                           (expected-identity-disruption-failure?
                              test
                              error)))
                  vec)
