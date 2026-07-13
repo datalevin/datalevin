@@ -911,6 +911,31 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-giant-idoc-patch-updates-false-index
+  (let [schema {:doc/idoc {:db/valueType :db.type/idoc
+                           :db/domain    "profiles"}}
+        conn   (d/create-conn nil schema
+                              {:wal? false
+                               :kv-opts {:inmemory? true :wal? false}})
+        big    (apply str (repeat (+ c/+val-bytes-wo-hdr+ 100) "x"))
+        q      '[:find [?e ...]
+                 :in $ ?query
+                 :where
+                 [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]]
+    (try
+      (d/transact! conn [{:db/id 1
+                          :doc/idoc {:active false :bio big}}])
+      (is (= [1] (d/q q @conn {:active false})))
+      (d/transact! conn
+                   [[:db.fn/patchIdoc 1 :doc/idoc
+                     [[:set [:active] true]]]])
+      (is (empty? (d/q q @conn {:active false})))
+      (is (= [1] (d/q q @conn {:active true})))
+      (d/transact! conn [[:db.fn/retractAttribute 1 :doc/idoc]])
+      (is (empty? (d/q q @conn {:active true})))
+      (finally
+        (d/close conn)))))
+
 (deftest test-idoc-and-fulltext-fuzz-in-same-tx
   (doseq [seed [7 29 113]]
     (let [dir    (u/tmp-dir (str "test-idoc-fulltext-fuzz-"

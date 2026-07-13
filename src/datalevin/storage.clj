@@ -1293,90 +1293,142 @@
            (add-vec index doc-ref vec-data))
       :d (remove-vec index (nth op 1)))))
 
+(defn- idoc-op-ref
+  [op]
+  (let [kind (nth op 0)
+        d    (nth op 1)]
+    (case kind
+      (:g :r) [:g (nth d 2)]
+      (:a :d) d)))
+
+(defn- plan-idoc-update!
+  [index txs state-actions pending-paths pending-doc-ids old-op new-op]
+  (let [old-d   (nth old-op 1)
+        new-d   (nth new-op 1)
+        old-ref (idoc-op-ref old-op)
+        new-ref (idoc-op-ref new-op)
+        old-doc (peek old-d)
+        new-doc (peek new-d)
+        patch   (some-> (meta new-op) :idoc/patch)
+        res     (if patch
+                  (idoc/patch-doc-plan!
+                    index txs state-actions
+                    pending-paths pending-doc-ids
+                    old-ref old-doc new-ref new-doc patch)
+                  (idoc/update-doc-plan!
+                    index txs state-actions
+                    pending-paths pending-doc-ids
+                    old-ref old-doc new-ref new-doc))]
+    (when (= res :doc-missing)
+      (idoc/remove-doc-plan! index txs state-actions
+                             pending-paths pending-doc-ids
+                             old-ref old-doc)
+      (idoc/add-doc-plan! index txs state-actions
+                          pending-paths pending-doc-ids
+                          new-ref new-doc false))))
+
+(defn- fast-idoc-update!
+  [idoc-indices ^FastList id-ds txs state-actions]
+  (when (= 2 (.size id-ds))
+    (let [res0    (.get id-ds 0)
+          res1    (.get id-ds 1)
+          domain0 (nth res0 0)
+          domain1 (nth res1 0)
+          op0     (peek res0)
+          op1     (peek res1)
+          kind0   (nth op0 0)
+          kind1   (nth op1 0)
+          [old-op new-op]
+          (cond
+            (and (or (identical? kind0 :d) (identical? kind0 :r))
+                 (or (identical? kind1 :a) (identical? kind1 :g)))
+            [op0 op1]
+
+            (and (or (identical? kind1 :d) (identical? kind1 :r))
+                 (or (identical? kind0 :a) (identical? kind0 :g)))
+            [op1 op0])]
+      (when (and old-op
+                 (= domain0 domain1)
+                 (let [old-d (nth old-op 1)
+                       new-d (nth new-op 1)]
+                   (and (= (nth old-d 0) (nth new-d 0))
+                        (= (nth old-d 1) (nth new-d 1)))))
+        (let [index (idoc-indices domain0)]
+          (plan-idoc-update! index txs state-actions
+                              (HashMap.) (HashMap.) old-op new-op))
+        true))))
+
 (defn idoc-index
   [idoc-indices id-ds txs]
-  (let [updates (volatile! {})
-        others  (FastList.)
-        state-actions (FastList.)
-        path-plans (IdentityHashMap.)
-        doc-plans  (IdentityHashMap.)
-        path-plan  (fn [index]
-                     (or (.get path-plans index)
-                         (let [m (HashMap.)]
-                           (.put path-plans index m)
-                           m)))
-        doc-plan   (fn [index]
-                     (or (.get doc-plans index)
-                         (let [m (HashMap.)]
-                           (.put doc-plans index m)
-                           m)))]
-    (doseq [res  id-ds
-            :let [op     (peek res)
-                  d      (nth op 1)
-                  domain (nth res 0)
-                  kind   (nth op 0)]]
-      (case kind
-        (:a :d)
-        (let [k [(nth d 0) (nth d 1)]]
-          (vswap! updates update-in [domain k kind] (fnil conj []) op))
-        (:g :r)
-        (.add others res)))
-    (doseq [[domain ops] @updates
-            :let         [index (idoc-indices domain)
-                          pending-paths (path-plan index)
-                          pending-doc-ids (doc-plan index)]]
-      (doseq [[_ {:keys [a d]}] ops]
-        (if (and (= 1 (count a)) (= 1 (count d)))
-          (let [old-d   (nth (first d) 1)
-                new-d   (nth (first a) 1)
-                old-ref old-d
-                new-ref new-d
-                old-doc (peek old-d)
-                new-doc (peek new-d)
-                patch   (some-> (meta (first a)) :idoc/patch)
-                res     (if patch
-                          (idoc/patch-doc-plan!
-                            index txs state-actions
-                            pending-paths pending-doc-ids
-                            old-ref old-doc new-ref new-doc patch)
-                          (idoc/update-doc-plan!
-                            index txs state-actions
-                            pending-paths pending-doc-ids
-                            old-ref old-doc new-ref new-doc))]
-            (when (= res :doc-missing)
-              (idoc/remove-doc-plan! index txs state-actions
-                                     pending-paths pending-doc-ids
-                                     old-ref old-doc)
-              (idoc/add-doc-plan! index txs state-actions
+  (let [state-actions (FastList.)]
+    (if (fast-idoc-update! idoc-indices id-ds txs state-actions)
+      state-actions
+      (let [updates (volatile! {})
+            path-plans (IdentityHashMap.)
+            doc-plans  (IdentityHashMap.)
+            path-plan  (fn [index]
+                         (or (.get path-plans index)
+                             (let [m (HashMap.)]
+                               (.put path-plans index m)
+                               m)))
+            doc-plan   (fn [index]
+                         (or (.get doc-plans index)
+                             (let [m (HashMap.)]
+                               (.put doc-plans index m)
+                               m)))]
+        (doseq [res  id-ds
+                :let [op     (peek res)
+                      d      (nth op 1)
+                      domain (nth res 0)
+                      kind   (nth op 0)]]
+          (case kind
+            (:a :g)
+            (let [k [(nth d 0) (nth d 1)]]
+              (vswap! updates update-in [domain k :a] (fnil conj []) op))
+            (:d :r)
+            (let [k [(nth d 0) (nth d 1)]]
+              (vswap! updates update-in [domain k :d] (fnil conj []) op))))
+        (doseq [[domain domain-ops] @updates
+                :let         [index (idoc-indices domain)
+                              pending-paths (path-plan index)
+                              pending-doc-ids (doc-plan index)]]
+          (doseq [[_ {:keys [a d]}] domain-ops
+                  :let              [na (count a)
+                                     nd (count d)]]
+            (cond
+              (and (= 1 na) (= 1 nd))
+              (plan-idoc-update! index txs state-actions
                                   pending-paths pending-doc-ids
-                                  new-ref new-doc false)))
-          (let [adds (mapv (fn [op]
-                             (let [d (nth op 1)]
-                               [d (peek d)]))
-                           a)
-                rems (mapv (fn [op]
-                             (let [d (nth op 1)]
-                               [d (peek d)]))
-                           d)]
-            (idoc/add-docs-plan! index txs state-actions
-                                 pending-paths pending-doc-ids adds false)
-            (idoc/remove-docs-plan! index txs state-actions
-                                    pending-paths pending-doc-ids rems)))))
-    (doseq [res  others
-            :let [op     (peek res)
-                  d      (nth op 1)
-                  domain (nth res 0)
-                  index  (idoc-indices domain)
-                  pending-paths (path-plan index)
-                  pending-doc-ids (doc-plan index)]]
-      (case (nth op 0)
-        :g (idoc/add-doc-plan! index txs state-actions
-                               pending-paths pending-doc-ids
-                               [:g (nth d 0)] (peek d) false)
-        :r (idoc/remove-doc-plan! index txs state-actions
-                                  pending-paths pending-doc-ids
-                                  [:g (nth d 0)] (peek d))))
-    state-actions))
+                                  (first d) (first a))
+
+              (and (= 1 na) (zero? nd))
+              (let [op  (first a)
+                    od  (nth op 1)]
+                (idoc/add-doc-plan! index txs state-actions
+                                    pending-paths pending-doc-ids
+                                    (idoc-op-ref op) (peek od) false))
+
+              (and (zero? na) (= 1 nd))
+              (let [op  (first d)
+                    od  (nth op 1)]
+                (idoc/remove-doc-plan! index txs state-actions
+                                       pending-paths pending-doc-ids
+                                       (idoc-op-ref op) (peek od)))
+
+              :else
+              (let [adds (mapv (fn [op]
+                                 (let [d (nth op 1)]
+                                   [(idoc-op-ref op) (peek d)]))
+                               a)
+                    rems (mapv (fn [op]
+                                 (let [d (nth op 1)]
+                                   [(idoc-op-ref op) (peek d)]))
+                               d)]
+                (idoc/add-docs-plan! index txs state-actions
+                                     pending-paths pending-doc-ids adds false)
+                (idoc/remove-docs-plan! index txs state-actions
+                                        pending-paths pending-doc-ids rems)))))
+        state-actions))))
 
 (defn e-sample*
   [^Store store a aid]
@@ -2264,7 +2316,7 @@
     (when (identical? vt :db.type/idoc)
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (let [op    (if giant?
-                      [:g [max-gt v]]
+                      [:g [e aid max-gt v]]
                       [:a [e aid v]])
               patch (some-> (meta d) :idoc/patch)
               op    (if patch (with-meta op {:idoc/patch patch}) op)]
@@ -2337,7 +2389,7 @@
       (let [domain (or (props :db/domain) (u/keyword->string attr))]
         (.add id-ds [domain
                      (if gt
-                       [:r [gt v]]
+                       [:r [e aid gt v]]
                        [:d [e aid v]])])))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
       (.add txs (DatomKVTxData. e ii false))
@@ -2379,8 +2431,8 @@
          em-ds  (FastList.)
          ;; durable async secondary index jobs
          em-jobs (FastList.)
-         ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-         ;; or [:r d [gt v]]
+         ;; idoc [:a d [e aid v]], [:d d [e aid v]],
+         ;; [:g d [e aid gt v]], or [:r d [e aid gt v]]
          id-ds  (FastList.)
          giants (HashMap.)
          attr-infos (HashMap.)]
