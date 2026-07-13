@@ -1429,7 +1429,8 @@
   (let [kind (nth op 0)
         d    (nth op 1)]
     (case kind
-      (:g :r) [:g (nth d 2)]
+      ;; Keep e and aid in giant refs so projected reads need not load the value.
+      (:g :r) [:g (nth d 2) (nth d 0) (nth d 1)]
       (:a :d) d)))
 
 (defn- plan-idoc-update!

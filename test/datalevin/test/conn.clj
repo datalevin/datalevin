@@ -925,11 +925,28 @@
         q      '[:find [?e ...]
                  :in $ ?query
                  :where
+                 [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]
+        q-attr '[:find [?a ...]
+                 :in $ ?query
+                 :where
+                 [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]
+        q-doc  '[:find [?v ...]
+                 :in $ ?query
+                 :where
                  [(idoc-match $ :doc/idoc ?query) [[?e ?a ?v]]]]]
     (try
-      (d/transact! conn [{:db/id 1
-                          :doc/idoc {:active false :bio big}}])
-      (is (= [1] (d/q q @conn {:active false})))
+      (let [doc {:active false :kind :entry :bio big}]
+        (d/transact! conn [{:db/id 1 :doc/idoc doc}])
+        (let [index (get (s/store-idoc-indices (conn-store conn)) "profiles")
+              ref   (-> ^SpillableMap (.-doc-refs ^IdocIndex index)
+                        seq first val)]
+          (is (= [:g 1] [(first ref) (nth ref 2)]))
+          (is (int? (nth ref 3))))
+        (is (= [1] (d/q q @conn {:active false})))
+        (is (= [:doc/idoc] (d/q q-attr @conn {:active false})))
+        (is (= [doc] (d/q q-doc @conn {:active false})))
+        (is (= [doc]
+               (d/q q-doc @conn {:active false :kind :entry}))))
       (d/transact! conn
                    [[:db.fn/patchIdoc 1 :doc/idoc
                      [[:set [:active] true]]]])

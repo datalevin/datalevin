@@ -173,23 +173,75 @@
      (aid->attr (nth doc-ref 1))
      (peek doc-ref)]))
 
+(defn- giant-doc-ref?
+  [doc-ref]
+  (clojure.core/and (vector? doc-ref)
+                    (clojure.core/identical? :g (first doc-ref))))
+
+(defn- rich-giant-doc-ref?
+  [doc-ref]
+  (clojure.core/and (giant-doc-ref? doc-ref)
+                    (clojure.core/< 3 (clojure.core/count doc-ref))))
+
 (defn- make-emit-fn
   "Create an emit function that produces tuples with only the needed indices.
    If needed is nil, produces full [e a v] tuples."
   [lmdb aid->attr ^ints needed]
   (if needed
-    (let [n (alength needed)]
-      (fn [doc-ref]
-        (let [^objects arr (object-array n)
-              [e a v]      (doc-ref->eav lmdb aid->attr doc-ref)]
-          (dotimes [j n]
-            (aset arr j (case (aget needed j)
-                          0 e
-                          1 a
-                          2 v)))
-          arr)))
-    (fn [doc-ref]
-      (object-array (doc-ref->eav lmdb aid->attr doc-ref)))))
+    (let [n            (alength needed)
+          needs-value? (loop [i 0]
+                         (cond
+                           (clojure.core/== i n) false
+                           (clojure.core/== 2 (aget needed i)) true
+                           :else (recur (clojure.core/inc i))))
+          needs-ref?   (loop [i 0]
+                         (cond
+                           (clojure.core/== i n) false
+                           (clojure.core/< (aget needed i) 2) true
+                           :else (recur (clojure.core/inc i))))]
+      (letfn [(emit [doc-ref value-provided? value]
+                (let [giant?      (giant-doc-ref? doc-ref)
+                      rich-giant? (rich-giant-doc-ref? doc-ref)
+                      datom        (when (clojure.core/and
+                                           giant?
+                                           (clojure.core/or
+                                             (clojure.core/and
+                                               needs-ref?
+                                               (clojure.core/not rich-giant?))
+                                             (clojure.core/and
+                                               needs-value?
+                                               (clojure.core/not
+                                                 value-provided?))))
+                                     (idx/gt->datom lmdb (second doc-ref)))
+                      ^objects arr (object-array n)]
+                  (dotimes [j n]
+                    (aset arr j (case (aget needed j)
+                                  0 (cond
+                                      rich-giant? (nth doc-ref 2)
+                                      giant?      (dd/datom-e datom)
+                                      :else       (nth doc-ref 0))
+                                  1 (cond
+                                      rich-giant? (aid->attr (nth doc-ref 3))
+                                      giant?      (dd/datom-a datom)
+                                      :else       (aid->attr (nth doc-ref 1)))
+                                  2 (if value-provided?
+                                      value
+                                      (if giant?
+                                        (dd/datom-v datom)
+                                        (peek doc-ref))))))
+                  arr))]
+        (fn
+          ([doc-ref] (emit doc-ref false nil))
+          ([doc-ref value] (emit doc-ref true value)))))
+    (fn
+      ([doc-ref]
+       (object-array (doc-ref->eav lmdb aid->attr doc-ref)))
+      ([doc-ref value]
+       (if (rich-giant-doc-ref? doc-ref)
+         (object-array [(nth doc-ref 2)
+                        (aid->attr (nth doc-ref 3))
+                        value])
+         (object-array (doc-ref->eav lmdb aid->attr doc-ref)))))))
 
 (defn- fulltext-doc-ref+extras
   [display result]
@@ -510,13 +562,13 @@
               (if (idoc/ids-contains? verify doc-id)
                 (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
                   (when (idoc/matches-doc? index doc query)
-                    (.add res (emit doc-ref))))
+                    (.add res (emit doc-ref doc))))
                 (.add res (emit doc-ref)))
 
               :else
               (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
                 (when (idoc/matches-doc? index doc query)
-                  (.add res (emit doc-ref)))))))
+                  (.add res (emit doc-ref doc)))))))
         res)
       (let [start        (System/nanoTime)
             cand-count   (idoc/ids-count ids)
@@ -541,7 +593,7 @@
                   (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
                     (when (idoc/matches-doc? index doc query)
                       (vswap! match-count long-inc)
-                      (.add res (emit doc-ref)))))
+                      (.add res (emit doc-ref doc)))))
                 (do
                   (vswap! match-count long-inc)
                   (.add res (emit doc-ref))))
@@ -552,7 +604,7 @@
                 (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
                   (when (idoc/matches-doc? index doc query)
                     (vswap! match-count long-inc)
-                    (.add res (emit doc-ref))))))))
+                    (.add res (emit doc-ref doc))))))))
         (idoc/*trace* {:event           :idoc-match-domain
                        :domain          domain
                        :candidate-count cand-count
