@@ -37,6 +37,10 @@
   [conn]
   (.-store ^DB @conn))
 
+(defn- conn-search-engine
+  [conn domain]
+  (get (.-search-engines ^Store (conn-store conn)) domain))
+
 (defn- conn-env-opts
   [conn]
   (i/env-opts (.-lmdb ^Store (conn-store conn))))
@@ -1017,6 +1021,89 @@
       (finally
         (d/close-kv db)
         (u/delete-files dir)))))
+
+(deftest test-batched-fulltext-secondary-index
+  (let [dir    (u/tmp-dir (str "test-batched-fulltext-secondary-index-"
+                               (UUID/randomUUID)))
+        n      1025
+        schema {:doc/text {:db/valueType        :db.type/string
+                           :db/fulltext          true
+                           :db.fulltext/domains ["docs"]}}
+        opts   {:wal? false
+                :kv-opts {:wal? false}
+                :search-domains
+                {"docs" {:index-position? true
+                         :include-text?   true}}}
+        text   (fn [i] (str "alpha beta document" i))
+        conn   (d/create-conn dir schema opts)]
+    (try
+      (d/transact! conn
+                   (mapv (fn [i]
+                           {:db/id i :doc/text (text i)})
+                         (range 1 (inc n))))
+      (let [engine (conn-search-engine conn "docs")]
+        (is (= n (i/doc-count engine)))
+        (is (= n (count (i/search engine "alpha" {:top n}))))
+        (is (= n (count (i/search engine {:phrase "alpha beta"}
+                                  {:top n}))))
+        (is (= "alpha beta document1"
+               (-> (i/search engine "document1" {:display :texts})
+                   first
+                   peek))))
+      (d/transact! conn
+                   (mapv (fn [i]
+                           {:db/id i
+                            :doc/text (str "gamma delta replacement" i)})
+                         (range 1 (inc n))))
+      (let [engine (conn-search-engine conn "docs")]
+        (is (empty? (i/search engine "alpha" {:top n})))
+        (is (= n (count (i/search engine "gamma" {:top n})))))
+      (d/transact! conn [[:db.fn/retractAttribute 2 :doc/text]
+                         [:db.fn/retractAttribute 3 :doc/text]])
+      (d/close conn)
+      (let [conn2 (d/create-conn dir nil opts)]
+        (try
+          (let [engine (conn-search-engine conn2 "docs")]
+            (is (= (- n 2) (i/doc-count engine)))
+            (is (empty? (i/search engine "alpha" {:top n})))
+            (is (= (- n 2)
+                   (count (i/search engine "gamma" {:top n}))))
+            (is (= 1 (count (i/search engine "replacement1"))))
+            (is (empty? (i/search engine "replacement2"))))
+          (finally
+            (d/close conn2))))
+      (finally
+        (when-not (d/closed? conn)
+          (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest test-batched-fulltext-delete-recomputes-max-weight
+  (let [schema {:doc/text {:db/valueType :db.type/string
+                           :db/fulltext   true}}
+        opts   {:wal? false
+                :kv-opts {:inmemory? true :wal? false}}
+        heavy  (str (str/join " " (repeat 10000 "alpha"))
+                    " bravo charlie delta echo foxtrot golf hotel india juliet")
+        conn   (d/create-conn nil schema opts)]
+    (try
+      (d/transact! conn [{:db/id 1 :doc/text heavy}
+                         {:db/id 2 :doc/text "alpha bravo charlie"}
+                         {:db/id 3 :doc/text "alpha bravo charlie delta"}])
+      (let [engine    (conn-search-engine conn c/default-domain)
+            term-info #((deref #'search/query-term-info) engine "alpha")]
+        (d/transact! conn [[:db.fn/retractAttribute 1 :doc/text]])
+        (let [[_ max-weight postings] (term-info)]
+          (is (< (Math/abs (- (double max-weight) (/ 1.0 3.0))) 1.0e-6))
+          (is (= 2 (sl/size postings))))
+        (d/transact! conn [{:db/id 1 :doc/text heavy}])
+        (d/transact! conn [[:db.fn/retractAttribute 1 :doc/text]
+                           [:db.fn/retractAttribute 3 :doc/text]])
+        (let [[_ max-weight postings] (term-info)]
+          (is (< (Math/abs (- (double max-weight) (/ 1.0 3.0))) 1.0e-6))
+          (is (= 1 (sl/size postings)))
+          (is (= 2 (-> (i/search engine "alpha" {:top 1}) ffirst)))))
+      (finally
+        (d/close conn)))))
 
 (deftest test-search-pagination
   (let [dir    (u/tmp-dir (str "test-search-pagination-"

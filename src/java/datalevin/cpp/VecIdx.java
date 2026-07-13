@@ -3,10 +3,44 @@ package datalevin.cpp;
 import org.bytedeco.javacpp.*;
 
 import java.nio.ByteBuffer;
+import java.util.List;
 
+import clojure.lang.RT;
 import datalevin.dtlvnative.DTLV;
 
 public class VecIdx {
+
+    public static double[] toDoubleArray(List<?> vector) {
+        int size = vector.size();
+        double[] result = new double[size];
+        for (int i = 0; i < size; i++)
+            result[i] = RT.doubleCast(vector.get(i));
+        return result;
+    }
+
+    public static float[] toFloatArray(List<?> vector) {
+        int size = vector.size();
+        float[] result = new float[size];
+        for (int i = 0; i < size; i++)
+            result[i] = RT.floatCast(vector.get(i));
+        return result;
+    }
+
+    public static short[] toShortArray(List<?> vector) {
+        int size = vector.size();
+        short[] result = new short[size];
+        for (int i = 0; i < size; i++)
+            result[i] = RT.shortCast(vector.get(i));
+        return result;
+    }
+
+    public static byte[] toByteArray(List<?> vector) {
+        int size = vector.size();
+        byte[] result = new byte[size];
+        for (int i = 0; i < size; i++)
+            result[i] = RT.byteCast(vector.get(i));
+        return result;
+    }
 
     static void expect(boolean mustTrue, String message) {
         if (mustTrue)

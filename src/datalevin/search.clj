@@ -30,7 +30,7 @@
    [datalevin.spill SpillableMap]
    [datalevin.interface IAdmin ISearchEngine]
    [datalevin.utl LRUCache]
-   [java.util ArrayList Map$Entry Arrays HashMap]
+   [java.util ArrayList List Map$Entry Arrays HashMap HashSet]
    [java.util.concurrent.atomic AtomicInteger]
    [java.io Writer FileOutputStream FileInputStream DataOutputStream
     DataInputStream]
@@ -73,7 +73,7 @@
     (if (< ^double mw w) w mw)))
 
 (defn- del-max-weight
-  [^SparseIntArrayList sl doc-id mw tf norm]
+  [^SparseIntArrayList sl ^IntShortHashMap norms doc-id mw tf norm]
   (let [norm-factor (double ^short norm)
         w           (/ ^double (tf* tf) norm-factor)]
     (if (<= ^double mw w)
@@ -90,7 +90,9 @@
                     tf' (.get items item-idx)]
                 (recur (if (= doc-id did)
                          max-w
-                         (let [candidate-w (/ ^double (tf* tf') norm-factor)]
+                         (let [candidate-w
+                               (/ ^double (tf* tf')
+                                  (double ^short (.get norms did)))]
                            (if (< max-w candidate-w) candidate-w max-w)))
                        (unchecked-inc-int item-idx)
                        iter))
@@ -1105,7 +1107,7 @@
         (when-let [tf (sl/get sl doc-id)]
           (.add txs (l/kv-tx :put terms-dbi term
                              [term-id
-                              (del-max-weight sl doc-id mw tf norm)
+                              (del-max-weight sl norms doc-id mw tf norm)
                               (sl/remove sl doc-id)]
                              :string :term-info))
           (.remove cache [:get-term-info term])
@@ -1169,6 +1171,247 @@
       (transact-kv (.-lmdb engine) txs)
       (.clear cache)))
   :doc-added)
+
+(deftype ^:private PendingTerm [^int id
+                                ^doubles max-weight
+                                ^SparseIntArrayList postings
+                                ^boolean fresh
+                                ^booleans recompute])
+
+(defn- pending-term!
+  [^SearchEngine engine ^HashMap pending-terms term create?]
+  (or (.get pending-terms term)
+      (when-let [pending
+                 (if-let [[tid mw postings] (get-term-info engine term)]
+                   (PendingTerm. tid (double-array [mw]) postings false
+                                 (boolean-array 1))
+                   (when create?
+                     (PendingTerm.
+                       (.incrementAndGet ^AtomicInteger (.-max-term engine))
+                       (double-array 1)
+                       (sl/sparse-arraylist)
+                       true
+                       (boolean-array 1))))]
+        (.put pending-terms term pending)
+        pending)))
+
+(defn- pending-max-weight
+  [^PendingTerm pending ^IntShortHashMap norms
+  ^IntShortHashMap added-norms]
+  (if (aget ^booleans (.-recompute pending) 0)
+    (let [^SparseIntArrayList postings (.-postings pending)
+          indices ^ImmutableBitmapDataProvider (.-indices postings)
+          items   ^GrowingIntArray (.-items postings)
+          ^PeekableIntIterator iter (.getIntIterator indices)]
+      (loop [max-weight 0.0
+             item-idx   0]
+        (if (.hasNext iter)
+          (let [doc-id (.next iter)
+                norm   (if (.containsKey added-norms doc-id)
+                         (.get added-norms doc-id)
+                         (.get norms doc-id))
+                weight (/ ^double (tf* (.get items item-idx))
+                          (double ^short norm))]
+            (recur (if (< max-weight weight) weight max-weight)
+                   (unchecked-inc-int item-idx)))
+          max-weight)))
+    (aget ^doubles (.-max-weight pending) 0)))
+
+(defn ^:no-doc add-docs
+  "Add a batch of unchecked `[doc-ref doc-text]` object arrays in one LMDB
+  transaction. Intended for synchronous secondary indexing."
+  [^SearchEngine engine ^List docs]
+  (locking (.-docs engine)
+    (let [terms-dbi       (.-terms-dbi engine)
+          positions-dbi   (.-positions-dbi engine)
+          terms           ^SpillableMap (.-terms engine)
+          docs-map        ^SpillableMap (.-docs engine)
+          norms           ^IntShortHashMap (.-norms engine)
+          index-position? (.-index-position? engine)
+          include-text?   (.-include-text? engine)
+          ^LRUCache cache (.-cache engine)
+          pending-terms   (HashMap.)
+          new-docs        (FastList.)
+          txs             (FastList.)]
+      (try
+        (dotimes [doc-idx (.size docs)]
+          (let [^objects entry (.get docs doc-idx)
+                doc-ref        (aget entry 0)
+                doc-text       (aget entry 1)]
+            (when-not (s/blank? doc-text)
+              (let [result    ((.-analyzer engine) doc-text)
+                    doc-terms ^HashMap (collect-terms result)
+                    unique    (.size doc-terms)
+                    doc-id    (.incrementAndGet
+                                ^AtomicInteger (.-max-doc engine))
+                    term-set  (IntHashSet.)]
+                (when include-text?
+                  (.add txs (l/kv-tx :put (.-rawtext-dbi engine) doc-id
+                                     doc-text :int :string)))
+                (doseq [^Map$Entry kv (.entrySet doc-terms)]
+                  (let [term (.getKey kv)
+                        [^IntArrayList positions ^IntArrayList offsets]
+                        (.getValue kv)
+                        tf (.size positions)
+                        ^PendingTerm pending
+                        (pending-term! engine pending-terms term true)
+                        tid (.-id pending)]
+                    (let [^doubles max-weight (.-max-weight pending)]
+                      (aset-double max-weight 0
+                                   (add-max-weight (aget max-weight 0)
+                                                   tf unique)))
+                    (sl/set (.-postings pending) doc-id tf)
+                    (if index-position?
+                      (let [pos-info [(.toArray positions) (.toArray offsets)]]
+                        (.add txs (l/kv-tx :put positions-dbi [doc-id tid]
+                                           pos-info :int-int :pos-info)))
+                      (.add term-set tid))))
+                (let [doc-info [doc-id unique (.toArray term-set)]]
+                  (.add txs (l/kv-tx :put (.-docs-dbi engine) doc-ref doc-info
+                                     :data :doc-info))
+                  (.add new-docs [doc-id doc-ref unique]))))))
+        (doseq [^Map$Entry kv (.entrySet pending-terms)]
+          (let [term                 (.getKey kv)
+                ^PendingTerm pending (.getValue kv)]
+            (.add txs (l/kv-tx :put terms-dbi term
+                               [(.-id pending)
+                                (aget ^doubles (.-max-weight pending) 0)
+                                (.-postings pending)]
+                               :string :term-info))))
+        (when-not (.isEmpty txs)
+          (transact-kv (.-lmdb engine) txs)
+          (doseq [^Map$Entry kv (.entrySet pending-terms)]
+            (let [^PendingTerm pending (.getValue kv)]
+              (when (.-fresh pending)
+                (.put terms (.-id pending) (.getKey kv)))))
+          (doseq [[doc-id doc-ref unique] new-docs]
+            (.put docs-map doc-id doc-ref)
+            (.put norms doc-id unique)))
+        :docs-added
+        (finally
+          (.clear cache))))))
+
+(defn ^:no-doc transact-docs
+  "Apply ordered `[:add|:delete doc-ref doc-text]` object arrays in one LMDB
+  transaction. Intended for synchronous secondary indexing."
+  [^SearchEngine engine ^List ops]
+  (locking (.-docs engine)
+    (let [terms-dbi       (.-terms-dbi engine)
+          positions-dbi   (.-positions-dbi engine)
+          rawtext-dbi     (.-rawtext-dbi engine)
+          terms           ^SpillableMap (.-terms engine)
+          docs-map        ^SpillableMap (.-docs engine)
+          norms           ^IntShortHashMap (.-norms engine)
+          index-position? (.-index-position? engine)
+          include-text?   (.-include-text? engine)
+          ^LRUCache cache (.-cache engine)
+          pending-terms   (HashMap.)
+          pending-doc-ids (HashMap.)
+          pending-doc-terms (HashMap.)
+          deleted-refs    (HashSet.)
+          added-norms     (IntShortHashMap.)
+          state-actions   (FastList.)
+          txs             (FastList.)]
+      (try
+        (letfn [(remove-term! [term doc-id]
+                  (when-let [^PendingTerm pending
+                             (pending-term! engine pending-terms term false)]
+                    (let [term-id  (.-id pending)
+                          postings (.-postings pending)]
+                      (when (sl/get postings doc-id)
+                        (sl/remove postings doc-id)
+                        (aset-boolean ^booleans (.-recompute pending) 0 true))
+                      (.add txs (l/kv-tx :del positions-dbi
+                                         [doc-id term-id] :int-int)))))]
+          (dotimes [op-idx (.size ops)]
+            (let [^objects entry (.get ops op-idx)
+                  kind           (aget entry 0)
+                  doc-ref        (aget entry 1)]
+              (if (identical? kind :add)
+                (let [doc-text (aget entry 2)]
+                  (when-not (s/blank? doc-text)
+                    (let [result    ((.-analyzer engine) doc-text)
+                          doc-terms ^HashMap (collect-terms result)
+                          unique    (.size doc-terms)
+                          doc-id    (.incrementAndGet
+                                      ^AtomicInteger (.-max-doc engine))
+                          term-set  (IntHashSet.)]
+                      (when include-text?
+                        (.add txs (l/kv-tx :put rawtext-dbi doc-id doc-text
+                                           :int :string)))
+                      (doseq [^Map$Entry kv (.entrySet doc-terms)]
+                        (let [term (.getKey kv)
+                              [^IntArrayList positions ^IntArrayList offsets]
+                              (.getValue kv)
+                              tf (.size positions)
+                              ^PendingTerm pending
+                              (pending-term! engine pending-terms term true)
+                              term-id (.-id pending)]
+                          (let [^doubles max-weight (.-max-weight pending)]
+                            (aset-double
+                              max-weight 0
+                              (add-max-weight (aget max-weight 0) tf unique)))
+                          (sl/set (.-postings pending) doc-id tf)
+                          (if index-position?
+                            (.add txs
+                                  (l/kv-tx :put positions-dbi [doc-id term-id]
+                                           [(.toArray positions)
+                                            (.toArray offsets)]
+                                           :int-int :pos-info))
+                            (.add term-set term-id))))
+                      (.add txs
+                            (l/kv-tx :put (.-docs-dbi engine) doc-ref
+                                     [doc-id unique (.toArray term-set)]
+                                     :data :doc-info))
+                      (.put pending-doc-ids doc-ref doc-id)
+                      (.put pending-doc-terms doc-ref
+                            (.toArray (.keySet doc-terms)))
+                      (.remove deleted-refs doc-ref)
+                      (.put added-norms doc-id unique)
+                      (.add state-actions [:add doc-id doc-ref unique]))))
+                (let [doc-id (when-not (.contains deleted-refs doc-ref)
+                               (or (.get pending-doc-ids doc-ref)
+                                   (doc-ref->id engine doc-ref)))]
+                  (when-not doc-id
+                    (u/raise "Document does not exist." {:doc-ref doc-ref}))
+                  (.add txs (l/kv-tx :del rawtext-dbi doc-id :int))
+                  (if-let [^objects doc-terms
+                           (.get pending-doc-terms doc-ref)]
+                    (dotimes [term-idx (alength doc-terms)]
+                      (remove-term! (aget doc-terms term-idx) doc-id))
+                    (doseq [term-id (doc-ref->term-ids engine doc-ref)]
+                      (when-let [term (terms term-id)]
+                        (remove-term! term doc-id))))
+                  (.add txs (l/kv-tx :del (.-docs-dbi engine) doc-ref :data))
+                  (.remove pending-doc-ids doc-ref)
+                  (.remove pending-doc-terms doc-ref)
+                  (.add deleted-refs doc-ref)
+                  (.add state-actions [:delete doc-id]))))))
+        (doseq [^Map$Entry kv (.entrySet pending-terms)]
+          (let [term                 (.getKey kv)
+                ^PendingTerm pending (.getValue kv)]
+            (.add txs (l/kv-tx :put terms-dbi term
+                               [(.-id pending)
+                                (pending-max-weight pending norms added-norms)
+                                (.-postings pending)]
+                               :string :term-info))))
+        (when-not (.isEmpty txs)
+          (transact-kv (.-lmdb engine) txs)
+          (doseq [^Map$Entry kv (.entrySet pending-terms)]
+            (let [^PendingTerm pending (.getValue kv)]
+              (when (.-fresh pending)
+                (.put terms (.-id pending) (.getKey kv)))))
+          (doseq [action state-actions]
+            (let [kind   (nth action 0)
+                  doc-id (nth action 1)]
+              (if (identical? kind :add)
+                (do (.put docs-map doc-id (nth action 2))
+                    (.put norms doc-id (nth action 3)))
+                (do (.remove docs-map doc-id)
+                    (.remove norms doc-id))))))
+        :docs-transacted
+        (finally
+          (.clear cache))))))
 
 (defn- hydrate-query*
   [^SearchEngine engine ^AtomicInteger max-doc tokens]

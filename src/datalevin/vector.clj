@@ -30,7 +30,7 @@
    [datalevin.interface IAdmin IVectorIndex]
    [java.io File FileOutputStream FileInputStream DataOutputStream
     DataInputStream]
-   [java.util Arrays Map]
+   [java.util ArrayList Arrays List Map]
    [java.util.concurrent.atomic AtomicLong]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [org.bytedeco.javacpp BytePointer]))
@@ -77,11 +77,17 @@
 
 (defn- ->array
   [quantization vec-data]
-  (case quantization
-    :double       (double-array vec-data)
-    :float        (float-array vec-data)
-    :float16      (short-array vec-data)
-    (:int8 :byte) (byte-array vec-data)))
+  (if (instance? List vec-data)
+    (case quantization
+      :double       (VecIdx/toDoubleArray ^List vec-data)
+      :float        (VecIdx/toFloatArray ^List vec-data)
+      :float16      (VecIdx/toShortArray ^List vec-data)
+      (:int8 :byte) (VecIdx/toByteArray ^List vec-data))
+    (case quantization
+      :double       (double-array vec-data)
+      :float        (float-array vec-data)
+      :float16      (short-array vec-data)
+      (:int8 :byte) (byte-array vec-data))))
 
 (defn- arr-len
   [quantization arr]
@@ -831,6 +837,136 @@
           new))
       (catch Exception e
         (u/raise "Unable to re-index vectors. " e {:dir (i/env-dir lmdb)})))))
+
+(defn- rollback-add-vecs!
+  [raw-index ^SpillableMap vecs lmdb vecs-dbi ^objects refs ^longs ids
+   applied n domain]
+  (let [applied        (long applied)
+        n              (long n)
+        rollback-error (volatile! nil)
+        rollback       (ArrayList. (int n))]
+    (dotimes [idx n]
+      (.add rollback
+            (l/kv-tx :del-list vecs-dbi (aget refs idx)
+                     [(aget ids idx)] :data :id)))
+    (try
+      (i/transact-kv lmdb rollback)
+      (catch Throwable e
+        (vreset! rollback-error e)))
+    (dotimes [idx applied]
+      (let [id (aget ids idx)]
+        (try
+          (remove-id raw-index id)
+          (catch Throwable e
+            (when-not @rollback-error
+              (vreset! rollback-error e)))
+          (finally
+            (.remove vecs id)))))
+    (when-let [e @rollback-error]
+      (throw (ex-info "Fail to rollback vector batch"
+                      {:domain domain :count n :applied applied}
+                      e)))))
+
+(def ^:private max-add-batch-size 4096)
+
+(defn add-vecs
+  "Add a batch of `[vec-ref vec-data]` pairs to a local vector index."
+  [index entries]
+  (if-not (instance? VectorIndex index)
+    (doseq [[vec-ref vec-data] entries]
+      (i/add-vec index vec-ref vec-data))
+    (let [^VectorIndex index index
+          ^List entries       (if (instance? List entries)
+                                entries
+                                (vec entries))
+          n                   (.size entries)
+          batch-size          (long max-add-batch-size)]
+      (cond
+        (zero? n) nil
+
+        (= 1 n)
+        (let [entry (.get entries 0)]
+          (i/add-vec index (nth entry 0) (nth entry 1)))
+
+        (> n batch-size)
+        (loop [start (long 0)]
+          (when (< start (long n))
+            (let [end (Math/min (long n) (+ start batch-size))]
+              (add-vecs index (.subList entries (int start) (int end)))
+              (recur end))))
+
+        :else
+        (let [dimensions   (.-dimensions index)
+              quantization (.-quantization index)
+              refs         (object-array n)
+              arrays       (object-array n)]
+          ;; Validate and convert every value before changing either index.
+          (dotimes [idx n]
+            (let [entry (.get entries idx)]
+              (aset refs idx (nth entry 0))
+              (aset arrays idx
+                    (vec->arr dimensions quantization (nth entry 1)))))
+          (let [lmdb        (.-lmdb index)
+                raw-index   (.-index index)
+                vecs-dbi    (.-vecs-dbi index)
+                vecs        (.-vecs index)
+                max-vec     (.-max-vec index)
+                domain      (.-domain index)
+                fname       (.-fname index)
+                vec-lock    (.-vec-lock index)
+                stats       (.-checkpoint-stats index)
+                wlock       (.writeLock vec-lock)
+                tx-lock     (l/write-txn lmdb)
+                ids         (long-array n)
+                txs         (ArrayList. (unchecked-inc-int n))]
+            (.lock wlock)
+            (try
+              (when @(.-closed? index)
+                (raise "Vector index is closed." {:domain domain}))
+              (dotimes [idx n]
+                (let [id (.incrementAndGet ^AtomicLong max-vec)]
+                  (aset-long ids idx id)
+                  (.add txs (l/kv-tx :put vecs-dbi (aget refs idx) id
+                                     :data :id))))
+              (let [commit-lsn (txn-log-next-lsn lmdb)
+                    meta-op    (replay-floor-put-tx lmdb domain commit-lsn)]
+                (when (some? meta-op)
+                  (.add txs meta-op)))
+              (i/transact-kv lmdb txs)
+              (let [applied (long-array 1)]
+                (try
+                  (dotimes [idx n]
+                    (let [vec-ref (aget refs idx)
+                          id      (aget ids idx)]
+                      (maybe-run-txn-log-vector-apply-failpoint!
+                       lmdb :add-vec
+                       {:domain domain :vec-ref vec-ref :vec-id id})
+                      (add raw-index quantization id (aget arrays idx))
+                      (.put ^SpillableMap vecs id vec-ref)
+                      (aset-long applied 0 (unchecked-inc-int idx))))
+                  (catch Throwable e
+                    (if (txn-log-enabled? lmdb)
+                      (let [idx     (min (aget applied 0) (dec n))
+                            vec-ref (aget refs idx)
+                            id      (aget ids idx)]
+                        (vector-commit-unknown!
+                         lmdb :add-vec
+                         {:domain domain :vec-ref vec-ref :vec-id id}
+                         e))
+                      (do
+                        (rollback-add-vecs!
+                         raw-index vecs lmdb vecs-dbi refs ids
+                         (aget applied 0) n domain)
+                        (throw
+                         (ex-info "Fail to add vector batch after LMDB apply"
+                                  {:domain domain :count n
+                                   :applied (aget applied 0)}
+                                  e)))))))
+              (finally
+                (.unlock wlock)))
+            (submit-async-vec-save!
+             (AsyncVecSave. tx-lock index lmdb domain stats fname vec-lock))
+            nil))))))
 
 (defn- get-ref
   [^VectorIndex index vec-filter vec-id _]

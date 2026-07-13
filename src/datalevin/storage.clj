@@ -1257,31 +1257,162 @@
                      {:v-idx v-idx :attr attr}))
           out)))))
 
+(defn- apply-fulltext-op!
+  [search-engines res]
+  (let [op (peek res)
+        d  (nth op 1)]
+    (doseq [domain (nth res 0)
+            :let   [engine (search-engines domain)]]
+      (case (nth op 0)
+        :a (add-doc engine d (peek d) false)
+        :d (remove-doc engine d)
+        :g (add-doc engine [:g (nth d 0)] (peek d) false)
+        :r (remove-doc engine [:g d])))))
+
+(defn- fulltext-entry
+  [ref text]
+  (let [entry (object-array 2)]
+    (aset entry 0 ref)
+    (aset entry 1 text)
+    entry))
+
+(defn- fulltext-op-entry
+  [kind ref text]
+  (let [entry (object-array 3)]
+    (aset entry 0 kind)
+    (aset entry 1 ref)
+    (aset entry 2 text)
+    entry))
+
+(def ^:private ^:const max-fulltext-batch-size 1024)
+
+(defn- add-fulltext-batches!
+  [engine ^FastList entries]
+  (let [n (long (.size entries))]
+    (loop [start (long 0)]
+      (when (< start n)
+        (let [end (long (min n (+ start max-fulltext-batch-size)))]
+          (s/add-docs engine (.subList entries (int start) (int end)))
+          (recur end))))))
+
+(defn- transact-fulltext-batches!
+  [engine ^FastList entries]
+  (let [n (long (.size entries))]
+    (loop [start (long 0)]
+      (when (< start n)
+        (let [end (long (min n (+ start max-fulltext-batch-size)))]
+          (s/transact-docs engine (.subList entries (int start) (int end)))
+          (recur end))))))
+
 (defn fulltext-index
   [search-engines ft-ds]
-  (doseq [res    ft-ds
-          :let   [op (peek res)
-                  d (nth op 1)]
-          domain (nth res 0)
-          :let   [engine (search-engines domain)]]
-    (case (nth op 0)
-      :a (add-doc engine d (peek d) false)
-      :d (remove-doc engine d)
-      :g (add-doc engine [:g (nth d 0)] (peek d) false)
-      :r (remove-doc engine [:g d]))))
+  (let [^FastList ft-ds ft-ds
+        n               (.size ft-ds)]
+    (if (= n 1)
+      (apply-fulltext-op! search-engines (.get ft-ds 0))
+      (let [add-only? (loop [idx 0]
+                        (if (< idx n)
+                          (let [op   (peek (.get ft-ds idx))
+                                kind (nth op 0)]
+                            (if (or (identical? kind :a)
+                                    (identical? kind :g))
+                              (recur (unchecked-inc-int idx))
+                              false))
+                          true))]
+        (if add-only?
+          (let [batches (IdentityHashMap.)]
+            (doseq [res    ft-ds
+                    :let   [op   (peek res)
+                            d    (nth op 1)
+                            kind (nth op 0)]
+                    domain (nth res 0)
+                    :let   [engine (search-engines domain)
+                            ^FastList entries
+                            (or (.get batches engine)
+                                (let [entries (FastList.)]
+                                  (.put batches engine entries)
+                                  entries))]]
+              (.add entries
+                    (fulltext-entry
+                      (if (identical? kind :g) [:g (nth d 0)] d)
+                      (peek d))))
+            (doseq [[engine entries] batches]
+              (add-fulltext-batches! engine entries)))
+          (let [batches (IdentityHashMap.)]
+            (doseq [res    ft-ds
+                    :let   [op   (peek res)
+                            d    (nth op 1)
+                            kind (nth op 0)]
+                    domain (nth res 0)
+                    :let   [engine (search-engines domain)
+                            ^FastList entries
+                            (or (.get batches engine)
+                                (let [entries (FastList.)]
+                                  (.put batches engine entries)
+                                  entries))]]
+              (.add entries
+                    (case kind
+                      :a (fulltext-op-entry :add d (peek d))
+                      :d (fulltext-op-entry :delete d nil)
+                      :g (fulltext-op-entry :add [:g (nth d 0)] (peek d))
+                      :r (fulltext-op-entry :delete [:g d] nil))))
+            (doseq [[engine entries] batches]
+              (transact-fulltext-batches! engine entries))))))))
+
+(defn- apply-vector-op!
+  [vector-indices res]
+  (let [op (peek res)
+        d  (nth op 1)]
+    (doseq [domain (nth res 0)
+            :let   [index (vector-indices domain)]]
+      (case (nth op 0)
+        :a (add-vec index d (peek d))
+        :d (remove-vec index d)
+        :g (add-vec index [:g (nth d 0)] (peek d))
+        :r (remove-vec index [:g d])))))
+
+(defn- vector-entry
+  [ref value]
+  (let [entry (object-array 2)]
+    (aset entry 0 ref)
+    (aset entry 1 value)
+    entry))
 
 (defn vector-index
   [vector-indices vi-ds]
-  (doseq [res    vi-ds
-          :let   [op (peek res)
-                  d (nth op 1)]
-          domain (nth res 0)
-          :let   [index (vector-indices domain)]]
-    (case (nth op 0)
-      :a (add-vec index d (peek d))
-      :d (remove-vec index d)
-      :g (add-vec index [:g (nth d 0)] (peek d))
-      :r (remove-vec index [:g d]))))
+  (let [^FastList vi-ds vi-ds
+        n               (.size vi-ds)]
+    (if (= n 1)
+      (apply-vector-op! vector-indices (.get vi-ds 0))
+      (let [add-only? (loop [idx 0]
+                        (if (< idx n)
+                          (let [op   (peek (.get vi-ds idx))
+                                kind (nth op 0)]
+                            (if (or (identical? kind :a)
+                                    (identical? kind :g))
+                              (recur (unchecked-inc-int idx))
+                              false))
+                          true))]
+        (if add-only?
+          (let [batches (IdentityHashMap.)]
+            (doseq [res    vi-ds
+                    :let   [op   (peek res)
+                            d    (nth op 1)
+                            kind (nth op 0)]
+                    domain (nth res 0)
+                    :let   [index   (vector-indices domain)
+                            ^FastList entries
+                            (or (.get batches index)
+                                (let [entries (FastList.)]
+                                  (.put batches index entries)
+                                  entries))]]
+              (.add entries (vector-entry
+                             (if (identical? kind :g) [:g (nth d 0)] d)
+                             (peek d))))
+            (doseq [[index entries] batches]
+              (v/add-vecs index entries)))
+          (doseq [res vi-ds]
+            (apply-vector-op! vector-indices res)))))))
 
 (defn embedding-index
   [embedding-indices em-ds]
