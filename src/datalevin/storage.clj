@@ -2393,13 +2393,16 @@
      (let [tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]
-       (doseq [[ordinal job] (map-indexed vector
-                                          (concat ft-jobs vi-jobs em-jobs))]
-         (.add txs (si/job-tx (assoc job
-                                     :tx tx-id
-                                     :ordinal ordinal
-                                     :created-ms modified-ms
-                                     :updated-ms modified-ms))))
+       (when (or (not (.isEmpty ft-jobs))
+                 (not (.isEmpty vi-jobs))
+                 (not (.isEmpty em-jobs)))
+         (doseq [[ordinal job] (map-indexed vector
+                                            (concat ft-jobs vi-jobs em-jobs))]
+           (.add txs (si/job-tx (assoc job
+                                       :tx tx-id
+                                       :ordinal ordinal
+                                       :created-ms modified-ms
+                                       :updated-ms modified-ms)))))
        (.add txs (lmdb/kv-tx :put c/meta :max-tx tx-id :attr :long))
        (.add txs (lmdb/kv-tx :put c/meta :last-modified
                               modified-ms
@@ -2419,10 +2422,14 @@
   "Commit a prepared datom KV plan."
   [lmdb search-engines vector-indices embedding-indices idoc-indices
    {:keys [txs ft-ds vi-ds em-ds id-ds]}]
-  (fulltext-index search-engines ft-ds)
-  (vector-index vector-indices vi-ds)
-  (embedding-index embedding-indices em-ds)
-  (let [idoc-state-actions (idoc-index idoc-indices id-ds txs)]
+  (when-not (.isEmpty ^FastList ft-ds)
+    (fulltext-index search-engines ft-ds))
+  (when-not (.isEmpty ^FastList vi-ds)
+    (vector-index vector-indices vi-ds))
+  (when-not (.isEmpty ^FastList em-ds)
+    (embedding-index embedding-indices em-ds))
+  (let [idoc-state-actions (when-not (.isEmpty ^FastList id-ds)
+                             (idoc-index idoc-indices id-ds txs))]
     (transact-kv lmdb txs)
     (idoc/apply-state-actions! idoc-state-actions)))
 

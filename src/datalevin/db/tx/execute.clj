@@ -309,10 +309,29 @@
                                      (datom e a (.-v old-datom) tx false))]
         (transact-report report' new-datom)))))
 
-(defn- retract-components [db datoms]
-  (into #{} (comp
-              (filter (fn [^Datom d] (txcommon/component? db (.-a d))))
-              (map (fn [^Datom d] [:db.fn/retractEntity (.-v d)]))) datoms))
+(defn- retract-components
+  ([db datoms]
+   (retract-components db #{} datoms))
+  ([db components datoms]
+   (reduce (fn [components ^Datom d]
+             (if (txcommon/component? db (.-a d))
+               (conj components [:db.fn/retractEntity (.-v d)])
+               components))
+           components
+           datoms)))
+
+(defn- dissoc-present
+  [m k]
+  (if (contains? m k) (dissoc m k) m))
+
+(defn- remove-auto-tempids
+  [tempids]
+  (if (reduce-kv (fn [_ k _]
+                   (if (txprep/auto-tempid? k) (reduced true) false))
+                 false
+                 tempids)
+    (u/removem txprep/auto-tempid? tempids)
+    tempids))
 
 (defn- check-value-tempids [report]
   (let [tx-data (:tx-data report)]
@@ -326,11 +345,11 @@
             unused      (reduce reduce-fn unused (::tx-redundant report))]
         (vld/validate-value-tempids (vals (persistent! unused)))
         (-> report
-            (dissoc ::value-tempids ::tx-redundant)
-            (assoc :tx-data tx-data)))
+            (dissoc-present ::value-tempids)
+            (dissoc-present ::tx-redundant)))
       (-> report
-          (dissoc ::value-tempids ::tx-redundant)
-          (assoc :tx-data tx-data)))))
+          (dissoc-present ::value-tempids)
+          (dissoc-present ::tx-redundant)))))
 
 (declare local-transact-tx-data)
 
@@ -369,15 +388,18 @@
 
 (defn- finalize-report
   [report]
-  (let [new-attrs (::new-attributes report)]
-    (cond-> (-> report
-                check-value-tempids
-                (dissoc ::upserted-tempids)
-                (dissoc ::reverse-tempids)
-                (dissoc ::new-attributes)
-                (update :tempids #(u/removem txprep/auto-tempid? %))
-                (update :tempids assoc :db/current-tx (current-tx report))
-                (update :db-after update :max-tx u/long-inc))
+  (let [new-attrs (::new-attributes report)
+        report    (check-value-tempids report)
+        report    (-> report
+                      (dissoc-present ::upserted-tempids)
+                      (dissoc-present ::reverse-tempids)
+                      (dissoc-present ::new-attributes))
+        tx-id     (current-tx report)
+        report    (update report :tempids
+                          #(assoc (remove-auto-tempids %)
+                                  :db/current-tx tx-id))
+        report    (update report :db-after update :max-tx u/long-inc)]
+    (cond-> report
       (seq new-attrs) (assoc :new-attributes new-attrs))))
 
 (defn- handle-flush-tuples
@@ -569,7 +591,7 @@
                                       ^TreeSortedSet (:eavt db)
                                       (datom e a v tx0)
                                       (datom e a v txmax)))
-                                (first (fetch (:store db) (datom e a v))))]
+                                (first (fetch store (datom e a v))))]
           [(transact-retract-datom report old-datom) entities]
           [report entities]))
       [report entities])))
@@ -578,32 +600,41 @@
   [report db store entity entities]
   (let [[_ e a _] entity]
     (if-some [e (txcommon/entid db e)]
-      (let [_      (vld/validate-attr a entity)
-            datoms (concatv
-                     (slice (:store db) :eav
-                            (datom e a c/v0)
-                            (datom e a c/vmax))
-                     (.subSet ^TreeSortedSet (:eavt db)
-                              (datom e a nil tx0)
-                              (datom e a nil txmax)))]
-        [(reduce transact-retract-datom report datoms)
-         (concat (retract-components db datoms) entities)])
+      (let [_       (vld/validate-attr a entity)
+            stored  (slice store :eav
+                           (datom e a c/v0)
+                           (datom e a c/vmax))
+            cached  (vec (.subSet ^TreeSortedSet (:eavt db)
+                                  (datom e a nil tx0)
+                                  (datom e a nil txmax)))
+            report' (reduce transact-retract-datom report stored)
+            report' (reduce transact-retract-datom report' cached)
+            components (retract-components db stored)
+            components (retract-components db components cached)]
+        [report' (if (seq components)
+                   (concat components entities)
+                   entities)])
       [report entities])))
 
 (defn- handle-retract-entity
   [report db store entity entities]
   (let [[_ e _ _] entity]
     (if-some [e (txcommon/entid db e)]
-      (let [e-datoms (concatv
-                       (e-datoms (:store db) e)
-                       (.subSet ^TreeSortedSet (:eavt db)
-                                (datom e nil nil tx0)
-                                (datom e nil nil txmax)))
-            v-datoms (v-datoms (:store db) e)]
-        [(reduce transact-retract-datom
-                 report
-                 (concat e-datoms v-datoms))
-         (concat (retract-components db e-datoms) entities)])
+      (let [stored-e-datoms (e-datoms store e)
+            cached-e-datoms (vec (.subSet ^TreeSortedSet (:eavt db)
+                                          (datom e nil nil tx0)
+                                          (datom e nil nil txmax)))
+            v-datoms        (v-datoms store e)
+            report'         (reduce transact-retract-datom
+                                    report stored-e-datoms)
+            report'         (reduce transact-retract-datom
+                                    report' cached-e-datoms)
+            report'         (reduce transact-retract-datom report' v-datoms)
+            components      (retract-components db stored-e-datoms)
+            components      (retract-components db components cached-e-datoms)]
+        [report' (if (seq components)
+                   (concat components entities)
+                   entities)])
       [report entities])))
 
 (defn- handle-map-entity

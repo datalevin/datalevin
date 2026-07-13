@@ -63,6 +63,8 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 - [Datalog] reduce allocation for multi-column hash joins.
 - [Datalog] topological sort of late clauses based on bounded variables.
 - [Datalog] fast path for linear recursive rules.
+- [Datalog] use primitive long in local transactions.
+- [Datalog] compile schema lookups into an array in transaction.
 - [Lib] Fuller Java, Python, JS API, and bb pods parity with Clojure.
 - [WAL] handle more WAL and HA edge cases.
 - [KV] spill no longer uses a finalizer.
