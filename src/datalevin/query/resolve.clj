@@ -144,6 +144,10 @@
       (empty? coll)
       (empty-rel binding)
 
+      (instance? BindScalar (:binding binding))
+      (r/relation! {(get-in binding [:binding :variable :symbol]) 0}
+                   (r/vertical-tuples coll))
+
       (and (instance? java.util.List coll)
            (instance? BindTuple (:binding binding)))
       (if-let [attrs (bindtuple-attrs (:binding binding))]
@@ -645,13 +649,34 @@
 
           :else
           (aset static-args i arg))))
-    (fn [^objects tuple]
-      (dotimes [i len]
-        (when-some [tuple-arg (aget tuples-args i)]
-          (aset static-args i (if (fn? tuple-arg)
-                                (tuple-arg tuple)
-                                (aget tuple tuple-arg)))))
-      (call static-args))))
+    (let [tuple-bindings
+          (into []
+                (keep-indexed
+                  (fn [i tuple-arg]
+                    (when (and (some? tuple-arg) (not (fn? tuple-arg)))
+                      [i tuple-arg])))
+                tuples-args)
+          nested-bindings
+          (into []
+                (keep-indexed
+                  (fn [i tuple-arg]
+                    (when (fn? tuple-arg) [i tuple-arg])))
+                tuples-args)
+          ^ints tuple-positions (int-array (map first tuple-bindings))
+          ^ints tuple-indexes   (int-array (map (comp int second)
+                                                tuple-bindings))
+          ^ints nested-positions (int-array (map first nested-bindings))
+          ^objects nested-fns    (object-array (map second nested-bindings))
+          tuple-count            (alength tuple-positions)
+          nested-count           (alength nested-positions)]
+      (fn [^objects tuple]
+        (dotimes [i tuple-count]
+          (aset static-args (aget tuple-positions i)
+                (aget tuple (aget tuple-indexes i))))
+        (dotimes [i nested-count]
+          (aset static-args (aget nested-positions i)
+                ((aget nested-fns i) tuple)))
+        (call static-args)))))
 
 (defn filter-by-pred
   [context clause]

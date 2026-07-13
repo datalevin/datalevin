@@ -12,14 +12,10 @@
   (:refer-clojure :exclude [update assoc])
   (:require
    [clojure.walk :as w]
-   [datalevin.bits :as b]
    [datalevin.built-ins :as built-ins]
-   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.inline :refer [update assoc]]
-   [datalevin.join :as j]
    [datalevin.parser :as dp]
-   [datalevin.pipe :as p]
    [datalevin.pull-api :as dpa]
    [datalevin.query.aggregate :as qagg]
    [datalevin.query-optimizer :as qo]
@@ -30,11 +26,11 @@
    [datalevin.rules :as rules]
    [datalevin.spill :as sp]
    [datalevin.timeout :as timeout]
-   [datalevin.util :as u :refer [cond+ raise concatv map+]])
+   [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
-   [java.util Collection Comparator List]
-   [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Function
-    Pattern Variable]
+   [java.util Comparator]
+   [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Pattern
+    Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private plugin-inputs qo/plugin-inputs)
@@ -383,29 +379,30 @@
                            e)) plan)
                :late-clauses late-clauses)))))
 
-(defn- order-comp
-  [tg idx di]
-  (if (identical? di :asc)
-    (fn [t1 t2] (compare (tg t1 idx) (tg t2 idx)))
-    (fn [t1 t2] (compare (tg t2 idx) (tg t1 idx)))))
-
 (defn- order-comps
   [tg find-vars order]
-  (let [pairs (partition-all 2 order)
-        idxs  (mapv (fn [v]
-                      (if (integer? v)
-                        v
-                        (u/index-of #(= v %) find-vars)))
-                    (into [] (map first) pairs))
-        comps (reverse (mapv #(order-comp tg %1 %2) idxs
-                             (into [] (map second) pairs)))]
+  (let [pairs     (vec (partition-all 2 order))
+        n         (count pairs)
+        idxs      (long-array n)
+        ascending (boolean-array n)]
+    (dotimes [i n]
+      (let [[v direction] (pairs i)]
+        (aset idxs i (long (if (integer? v)
+                             v
+                             (u/index-of #(= v %) find-vars))))
+        (aset ascending i (identical? direction :asc))))
     (reify Comparator
       (compare [_ t1 t2]
-        (loop [comps comps res (num 0)]
-          (if (not-empty comps)
-            (recur (next comps) (let [r ((first comps) t1 t2)]
-                                  (if (= 0 r) res r)))
-            res))))))
+        (loop [i 0]
+          (if (< i n)
+            (let [idx (aget idxs i)
+                  res (if (aget ascending i)
+                        (compare (tg t1 idx) (tg t2 idx))
+                        (compare (tg t2 idx) (tg t1 idx)))]
+              (if (zero? res)
+                (recur (unchecked-inc-int i))
+                res))
+            0))))))
 
 (defn- order-result
   [find-vars result order]
