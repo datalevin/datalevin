@@ -20,7 +20,7 @@
    [datalevin.validate :as vld])
   (:import
    [java.io Writer]
-   [java.util SortedSet]
+   [java.util ArrayList SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (defn- sf [^SortedSet s] (when-not (.isEmpty s) (.first s)))
@@ -298,54 +298,55 @@
       (vld/validate-custom-tx-fn-value fun op entity)
       (concat (apply fun db args) entities))))
 
+(defn- expand-multival?
+  [db a vs]
+  (and (or (txcommon/reverse-ref? a)
+           (txcommon/multival? db a))
+       (coll? vs)
+       (not (map? vs))
+       (not (and (= (count vs) 2)
+                 (txcommon/is-attr? db (first vs) :db.unique/identity)))))
+
 (defn maybe-wrap-multival
   [db a vs]
-  (cond
-    (not (or (txcommon/reverse-ref? a)
-             (txcommon/multival? db a)))
-    [vs]
+  (if (expand-multival? db a vs) vs [vs]))
 
-    (not (and (coll? vs) (not (map? vs))))
-    [vs]
-
-    (and (= (count vs) 2)
-         (txcommon/is-attr? db (first vs) :db.unique/identity))
-    [vs]
-
-    :else
-    vs))
+(defn- add-exploded-value!
+  [^ArrayList txs db eid a reverse? straight-a v]
+  (.add txs
+        (if (and (txcommon/ref? db straight-a) (map? v))
+          (assoc v (txcommon/reverse-ref a) eid)
+          (if reverse?
+            [:db/add v straight-a eid]
+            [:db/add eid straight-a v]))))
 
 (defn explode
   [db entity]
-  (let [eid  (:db/id entity)
-        a+vs (into []
-                   cat
-                   (reduce
-                     (fn [acc [a vs]]
-                       (update acc
-                               (if (txcommon/tuple-attr? db a) 1 0)
-                               conj
-                               [a vs]))
-                     [[] []]
-                     entity))]
-    (for [[a vs] a+vs
-          :when  (not (identical? a :db/id))
-          :let   [reverse?   (txcommon/reverse-ref? a)
-                  straight-a (if reverse?
-                               (txcommon/reverse-ref a)
-                               a)
-                  _          (when reverse?
-                               (vld/validate-reverse-ref-type
-                                 (txcommon/ref? db straight-a)
-                                 a
-                                 eid
-                                 vs))]
-          v      (maybe-wrap-multival db a vs)]
-      (if (and (txcommon/ref? db straight-a) (map? v))
-        (assoc v (txcommon/reverse-ref a) eid)
-        (if reverse?
-          [:db/add v straight-a eid]
-          [:db/add eid straight-a v])))))
+  (let [eid        (:db/id entity)
+        txs        (ArrayList. (count entity))
+        tuple-txs  (ArrayList.)]
+    (reduce-kv
+      (fn [_ a vs]
+        (when-not (identical? a :db/id)
+          (let [reverse?   (txcommon/reverse-ref? a)
+                straight-a (if reverse?
+                             (txcommon/reverse-ref a)
+                             a)
+                ^ArrayList target (if (txcommon/tuple-attr? db a)
+                                    tuple-txs
+                                    txs)]
+            (when reverse?
+              (vld/validate-reverse-ref-type
+                (txcommon/ref? db straight-a) a eid vs))
+            (if (expand-multival? db a vs)
+              (doseq [v vs]
+                (add-exploded-value! target db eid a reverse? straight-a v))
+              (add-exploded-value! target db eid a reverse? straight-a vs))))
+        nil)
+      nil
+      entity)
+    (.addAll txs tuple-txs)
+    txs))
 
 (def de-entity? (delay (resolve 'datalevin.entity/entity?)))
 (def de-entity->txs (delay (resolve 'datalevin.entity/->txs)))

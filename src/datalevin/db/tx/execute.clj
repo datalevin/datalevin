@@ -27,7 +27,7 @@
   (:import
    [datalevin.datom Datom]
    [datalevin.storage Store]
-   [java.util SortedSet]
+   [java.util List SortedSet]
    [org.eclipse.collections.impl.set.sorted.mutable TreeSortedSet]))
 
 (deftype ^:private TxStep [report entities])
@@ -333,6 +333,14 @@
     (u/removem txprep/auto-tempid? tempids)
     tempids))
 
+(defn- contains-map-entity?
+  ^Boolean [^List entities]
+  (loop [i 0]
+    (cond
+      (== i (.size entities)) false
+      (map? (.get entities i)) true
+      :else (recur (unchecked-inc i)))))
+
 (defn- check-value-tempids [report]
   (let [tx-data (:tx-data report)]
     (if-let [tempids (::value-tempids report)]
@@ -512,7 +520,9 @@
       (retry-with-tempid initial-report report initial-es e upserted-eid
                          tx-time)
       (let [eid (or upserted-eid allocated-eid (next-eid db))]
-        [(allocate-eid tx-time report e eid)
+        [(if allocated-eid
+           report
+           (allocate-eid tx-time report e eid))
          (cons [op eid a v] entities)]))))
 
 (defn- handle-reverse-tempid-upsert
@@ -667,6 +677,23 @@
            (concat (txprep/explode db
                                    (assoc entity' :db/id upserted-eid))
                    entities)]))
+
+      (txprep/tempid? old-eid)
+      (let [allocated-eid (get (:tempids report) old-eid)
+            eid           (or allocated-eid (next-eid db))
+            txs           (txprep/explode db (assoc entity :db/id eid))]
+        (cond
+          (.isEmpty ^List txs)
+          [report entities]
+
+          (contains-map-entity? txs)
+          [report (concat (txprep/explode db entity) entities)]
+
+          :else
+          [(if allocated-eid
+             report
+             (allocate-eid tx-time report old-eid eid))
+           (concat txs entities)]))
 
       (or (number? old-eid)
           (nil? old-eid)
