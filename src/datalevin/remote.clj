@@ -1147,7 +1147,8 @@
   (transact-kv [this dbi-name txs k-type]
     (.transact-kv this dbi-name txs k-type :data))
   (transact-kv [_ dbi-name txs k-type v-type]
-    (let [client-op-id   (when writing? (cop/new-client-op-id))
+    (let [txs            (l/expand-datom-kv-txs txs)
+          client-op-id   (when writing? (cop/new-client-op-id))
           client-op-hash (when client-op-id
                            (cop/request-hash
                             (cop/kv-request-payload db-name dbi-name txs

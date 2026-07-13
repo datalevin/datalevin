@@ -26,6 +26,7 @@
             stat env-opts dbi-opts]])
   (:import
    [datalevin.async IAsyncWork]
+   [datalevin.bits Indexable]
    [datalevin.cpp Util]
    [clojure.lang IPersistentVector]
    [java.io Writer PushbackReader FileOutputStream FileInputStream DataOutputStream
@@ -160,6 +161,8 @@
   IKVTxable
   (kv-txable? [_] true))
 
+(deftype ^:no-doc DatomKVTxData [^long e indexable ^boolean added?])
+
 (defmethod print-method KVTxData
   [^KVTxData d, ^Writer w]
   (.write w (pr-str [(.-op d) (.-dbi-name d) (.-k d) (.-v d) (.-kt d)
@@ -178,6 +181,47 @@
    (KVTxData. op dbi k v kt vt nil))
   ([op dbi k v kt vt f]
    (KVTxData. op dbi k v kt vt f)))
+
+(defn ^:no-doc datom-kv-txs?
+  [txs]
+  (if (instance? java.util.List txs)
+    (let [^java.util.List tx-list txs
+          n (.size tx-list)]
+      (loop [i 0]
+        (cond
+          (= i n) false
+          (instance? DatomKVTxData (.get tx-list i)) true
+          :else (recur (inc i)))))
+    (boolean (some #(instance? DatomKVTxData %) txs))))
+
+(defn ^:no-doc add-datom-kv-txs!
+  [^FastList out ^DatomKVTxData tx]
+  (let [^Long e (Long/valueOf (.-e tx))
+        ^Indexable source (.-indexable tx)
+        i       (Indexable. e (.-a source) (.-v source) (.-f source)
+                            (.-b source) (.-g source))]
+    (if (.-added? tx)
+      (do
+        (.add out (kv-tx :put c/ave i e :avg :id))
+        (.add out (kv-tx :put c/eav e i :id :avg)))
+      (do
+        (.add out (kv-tx :del-list c/ave i [e] :avg :id))
+        (.add out (kv-tx :del-list c/eav e [i] :id :avg)))))
+  out)
+
+(defn ^:no-doc expand-datom-kv-txs
+  [txs]
+  (if (datom-kv-txs? txs)
+    (let [^FastList out
+          (if (instance? java.util.Collection txs)
+            (FastList. (* 2 (.size ^java.util.Collection txs)))
+            (FastList.))]
+      (doseq [tx txs]
+        (if (instance? DatomKVTxData tx)
+          (add-datom-kv-txs! out tx)
+          (.add out tx)))
+      out)
+    txs))
 
 (defn ->kv-tx-data
   ([x]

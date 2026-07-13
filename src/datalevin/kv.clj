@@ -24,6 +24,7 @@
    [datalevin.util :as u :refer [raise]])
   (:import
    [datalevin.bits Retrieved]
+   [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (declare txlog-retention-state-map
@@ -2499,6 +2500,22 @@
        (.-op tx) dbi-name (.-k tx) (.-v tx)
        (.-kt tx) (.-vt tx) (.-flags tx)))))
 
+(defn- add-canonical-kvtx!
+  [^FastList out dbi-name t kt vt]
+  (if (instance? DatomKVTxData t)
+    (do
+      (when dbi-name
+        (raise "Internal datom transaction cannot use an explicit DBI"
+               {:dbi-name dbi-name}))
+      (l/add-datom-kv-txs! out t))
+    (let [tx (if (instance? datalevin.lmdb.KVTxData t)
+               t
+               (if dbi-name
+                 (l/->kv-tx-data t kt vt)
+                 (l/->kv-tx-data t)))]
+      (.add out (ensure-tx-dbi dbi-name tx))))
+  out)
+
 (defn- canonicalize-input-kvtxs
   [dbi-name txs kt vt]
   (letfn [(canonical-kvtx-list?
@@ -2526,20 +2543,9 @@
           (let [^java.util.List tx-list txs
                 n (.size tx-list)]
             (dotimes [i n]
-              (let [t (.get tx-list i)
-                    tx (if (instance? datalevin.lmdb.KVTxData t)
-                         t
-                         (if dbi-name
-                           (l/->kv-tx-data t kt vt)
-                           (l/->kv-tx-data t)))]
-                (.add out (ensure-tx-dbi dbi-name tx)))))
+              (add-canonical-kvtx! out dbi-name (.get tx-list i) kt vt)))
           (doseq [t txs]
-            (let [tx (if (instance? datalevin.lmdb.KVTxData t)
-                       t
-                       (if dbi-name
-                         (l/->kv-tx-data t kt vt)
-                         (l/->kv-tx-data t)))]
-              (.add out (ensure-tx-dbi dbi-name tx)))))
+            (add-canonical-kvtx! out dbi-name t kt vt)))
         out))))
 
 (def ^:private tl-single-row-fast-list
@@ -3002,15 +3008,17 @@
 
 (defn- transact-with-txlog!
   [lmdb state dbi-name txs k-type v-type]
-  (let [tx-data (canonicalize-input-kvtxs dbi-name txs k-type v-type)]
+  (let [datom-txs? (l/datom-kv-txs? txs)
+        tx-data    (canonicalize-input-kvtxs dbi-name txs k-type v-type)
+        lmdb-txs   (if datom-txs? txs tx-data)]
     (if (pos? (.size ^java.util.List tx-data))
       (if (write-txn-open? lmdb)
-        (let [res (i/transact-kv lmdb tx-data)]
+        (let [res (i/transact-kv lmdb lmdb-txs)]
           (txlog-add-pending! (i/kv-info lmdb) tx-data)
           res)
         (let [wdb (i/open-transact-kv lmdb)]
           (try
-            (let [res (i/transact-kv wdb tx-data)]
+            (let [res (i/transact-kv wdb lmdb-txs)]
               (when-not (= :transacted res)
                 (raise "Unexpected LMDB transactional write result"
                        {:type :txlog/unexpected-transact-result

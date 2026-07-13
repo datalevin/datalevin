@@ -58,7 +58,8 @@
    [datalevin.datom Datom]
    [datalevin.interface IStore]
    [datalevin.async IAsyncWork]
-   [datalevin.bits Retrieved Indexable]))
+   [datalevin.bits Retrieved Indexable]
+   [datalevin.lmdb DatomKVTxData]))
 
 (declare with-open-opts close-store-resources! release-shared-local-store!)
 (declare enqueue-secondary-index-work! enqueue-secondary-index-work-if-needed!)
@@ -2192,25 +2193,43 @@
        (enqueue-secondary-index-work! store))
      res)))
 
+(defn- write-attr-info
+  [^Store store ^HashMap attr-infos attr value insert?]
+  (or (.get attr-infos attr)
+      (let [schema (schema store)
+            props  (schema attr)
+            _      (when insert?
+                     (vld/validate-closed-schema
+                       schema (opts store) attr value))
+            props  (if insert?
+                     (or props (swap-attr store attr identity))
+                     props)
+            info   (object-array
+                     [props
+                      (value-type props)
+                      (:db/aid props)
+                      (:db/embedding props)
+                      (:db/fulltext props)])]
+        (when props (.put attr-infos attr info))
+        info)))
+
 (defn- insert-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
    ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants embedding-plan]
-  (let [schema (schema store)
-        opts   (opts store)
-        attr   (.-a d)
-        _      (vld/validate-closed-schema schema opts attr (.-v d))
-        e      (.-e d)
-        v      (.-v d)
-        props  (or (schema attr)
-                   (swap-attr store attr identity))
-        vt     (value-type props)
-        aid    (props :db/aid)
-        max-gt (max-gt store)
-        i      (b/indexable e aid v vt max-gt)
-        giant? (b/giant? i)]
-    (.add txs (lmdb/kv-tx :put c/ave i e :avg :id))
-    (.add txs (lmdb/kv-tx :put c/eav e i :id :avg))
+   ^FastList id-ds ^HashMap giants ^HashMap attr-infos embedding-plan]
+  (let [attr       (.-a d)
+        e          (.-e d)
+        v          (.-v d)
+        ^objects ai (write-attr-info store attr-infos attr v true)
+        props      (aget ai 0)
+        vt         (aget ai 1)
+        aid        (aget ai 2)
+        embedding? (aget ai 3)
+        fulltext?  (aget ai 4)
+        max-gt     (max-gt store)
+        i          (b/indexable nil aid v vt max-gt)
+        giant?     (b/giant? i)]
+    (.add txs (DatomKVTxData. e i true))
     (when giant?
       (.advance-max-gt store)
       (let [gd [e attr v]
@@ -2230,7 +2249,7 @@
                            :ref ref
                            :value v})
             (.add vi-ds [[domain] op])))))
-    (when (props :db/embedding)
+    (when embedding?
       (let [doc-ref     (if giant? [:g max-gt] [e aid v])
             domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
         (doseq [domain (embedding-attr-domains attr props)]
@@ -2250,7 +2269,7 @@
               patch (some-> (meta d) :idoc/patch)
               op    (if patch (with-meta op {:idoc/patch patch}) op)]
           (.add id-ds [domain op]))))
-    (when (props :db/fulltext)
+    (when fulltext?
       (let [text (str v)
             ref  (if giant? [:g max-gt] [e aid text])]
         (collect-fulltext store
@@ -2266,30 +2285,33 @@
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
    ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants]
-  (let [schema (schema store)
-        e      (.-e d)
-        attr   (.-a d)
-        v      (.-v d)
-        d-eav  [e attr v]
-        props  (schema attr)
-        vt     (value-type props)
-        aid    (props :db/aid)
-        i      ^Indexable (b/indexable e aid v vt c/g0)
-        gt-cur (.get giants d-eav)
-        gt     (when (b/giant? i)
-                 (or gt-cur
-                     (let [[_ ^Retrieved r]
-                           (nth
-                             (list-range
-                               (.-lmdb store) c/eav [:closed e e] :id
-                               [:closed
-                                i
-                                (Indexable. e aid v (.-f i) (.-b i) c/gmax)]
-                               :avg)
-                             0)]
-                       (.-g r))))]
-    (when (props :db/fulltext)
+   ^FastList id-ds ^HashMap giants ^HashMap attr-infos]
+  (let [e          (.-e d)
+        attr       (.-a d)
+        v          (.-v d)
+        ^objects ai (write-attr-info store attr-infos attr v false)
+        props      (aget ai 0)
+        vt         (aget ai 1)
+        aid        (aget ai 2)
+        embedding? (aget ai 3)
+        fulltext?  (aget ai 4)
+        i          ^Indexable (b/indexable nil aid v vt c/g0)
+        giant?     (b/giant? i)
+        d-eav      (when giant? [e attr v])
+        gt-cur     (when giant? (.get giants d-eav))
+        gt         (when giant?
+                     (or gt-cur
+                         (let [[_ ^Retrieved r]
+                               (nth
+                                (list-range
+                                 (.-lmdb store) c/eav [:closed e e] :id
+                                 [:closed
+                                  i
+                                  (Indexable. nil aid v (.-f i) (.-b i) c/gmax)]
+                                 :avg)
+                                0)]
+                           (.-g r))))]
+    (when fulltext?
       (let [text (str v)
             ref  (if gt [:g gt] [e aid text])]
         (collect-fulltext store
@@ -2301,7 +2323,7 @@
                           ref
                           :delete
                           (if gt [:r gt] [:d ref]))))
-    (when (props :db/embedding)
+    (when embedding?
       (let [doc-ref (if gt [:g gt] [e aid v])]
         (doseq [domain (embedding-attr-domains attr props)]
           (if (async-embedding-domain? store domain)
@@ -2317,9 +2339,8 @@
                      (if gt
                        [:r [gt v]]
                        [:d [e aid v]])])))
-    (let [ii (Indexable. e aid v (.-f i) (.-b i) (or gt c/normal))]
-      (.add txs (lmdb/kv-tx :del-list c/ave ii [e] :avg :id))
-      (.add txs (lmdb/kv-tx :del-list c/eav e [ii] :id :avg))
+    (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
+      (.add txs (DatomKVTxData. e ii false))
       (when gt
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
@@ -2344,7 +2365,9 @@
   ([^Store store datoms embedding-plan]
    (prepare-datoms-kv-plan store datoms embedding-plan nil nil))
   ([^Store store datoms embedding-plan extra-kv-txs last-modified-ms]
-   (let [txs    (FastList. (* 3 (count datoms)))
+   ;; Datom operations lead the batch so LMDB can select the primitive-EID
+   ;; executor once; generic giant, job, and metadata operations follow.
+   (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
          ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
          ;; or [:r d gt]
          ft-ds  (FastList.)
@@ -2359,13 +2382,14 @@
          ;; idoc [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
          ;; or [:r d [gt v]]
          id-ds  (FastList.)
-         giants (HashMap.)]
+         giants (HashMap.)
+         attr-infos (HashMap.)]
      (doseq [datom datoms]
        (if (d/datom-added datom)
          (insert-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds em-jobs
-                       id-ds giants embedding-plan)
+                       id-ds giants attr-infos embedding-plan)
          (delete-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds
-                       em-jobs id-ds giants)))
+                       em-jobs id-ds giants attr-infos)))
      (let [tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]

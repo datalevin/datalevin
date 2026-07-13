@@ -37,7 +37,7 @@
     DTLV$dtlv_key_rank_sample_iter]
    [datalevin.cpp BufVal Env Txn Dbi Cursor Stat Info Util Util$MapFullException
     UnsafeAccess]
-   [datalevin.lmdb RangeContext KVTxData]
+   [datalevin.lmdb DatomKVTxData RangeContext KVTxData]
    [datalevin.async IAsyncWork]
    [datalevin.utl BitOps]
    [java.util.concurrent TimeUnit ScheduledExecutorService ScheduledFuture
@@ -92,6 +92,10 @@
 
 (defprotocol ICloseableResource
   (close-resource! [_]))
+
+(definterface ^:private IIdBuffer
+  (^void putKeyId [^long id])
+  (^void putValId [^long id]))
 
 (deftype Pool [^ThreadLocal que]
   IPool
@@ -242,6 +246,18 @@
         (b/put-buffer bf x kt))
       (.flip bf)
       (.reset vp))))
+
+(defn- put-id-bufval
+  [^BufVal vp ^long id compressor ^ByteBuffer cbf]
+  (let [^ByteBuffer bf (.inBuf vp)]
+    (.clear bf)
+    (if compressor
+      (do (.clear cbf)
+          (.putLong cbf id)
+          (bf-compress compressor (.flip cbf) bf))
+      (.putLong bf id))
+    (.flip bf)
+    (.reset vp)))
 
 (deftype Rtx [^:unsynchronized-mutable lmdb
               ^Txn txn
@@ -408,6 +424,25 @@
       (catch Exception e
         (raise "Error putting r/w value buffer of "
                (.dbi-name this) ": " e {:value x :type t}))))
+
+  IIdBuffer
+  (putKeyId [this id]
+    (try
+      (put-id-bufval kp id (key-compressor lmdb) k-comp-bf)
+      (catch BufferOverflowException _
+        (raise "Key cannot be larger than 511 bytes." {:input id}))
+      (catch Exception e
+        (raise "Error putting r/w key buffer of "
+               (.dbi-name this) ": " e {:value id :type :id}))))
+  (putValId [this id]
+    (try
+      (put-id-bufval vp id (val-compressor lmdb) v-comp-bf)
+      (catch BufferOverflowException _
+        ;; Preserve the generic buffer-growth behavior on the exceptional path.
+        (.put-val this (Long/valueOf id) :id))
+      (catch Exception e
+        (raise "Error putting r/w value buffer of "
+               (.dbi-name this) ": " e {:value id :type :id}))))
 
   IDB
   (dbi [_] db)
@@ -705,6 +740,31 @@
                   ;; mdb_del may mutate the native key if value is missing
                   (.reset kp)))))
 
+(defn- put-datom-tx
+  [^DBI ave ^DBI eav txn ^DatomKVTxData tx]
+  (let [e (.-e tx)
+        i (.-indexable tx)]
+    (if (.-added? tx)
+      (do
+        (.put-key ave i :avg)
+        (.putValId ave e)
+        (.put ave txn)
+        (.putKeyId eav e)
+        (.put-val eav i :avg)
+        (.put eav txn))
+      (do
+        (let [^BufVal kp (.-kp ave)]
+          (.put-key ave i :avg)
+          (.putValId ave e)
+          (.del ave txn false)
+          ;; mdb_del may mutate the native key if value is missing
+          (.reset kp))
+        (let [^BufVal kp (.-kp eav)]
+          (.putKeyId eav e)
+          (.put-val eav i :avg)
+          (.del eav txn false)
+          (.reset kp))))))
+
 (defn- transact1*
   [txs ^DBI dbi txn kt vt]
   (let [validate? (.-validate-data? dbi)]
@@ -713,25 +773,110 @@
         (vld/validate-kv-tx-data tx validate?)
         (put-tx dbi txn tx)))))
 
+(defn- transact-datom-seq*
+  [xs ^HashMap dbis txn]
+  (loop [xs  (seq xs)
+         ave nil
+         eav nil]
+    (when xs
+      (let [t (first xs)]
+        (if (instance? DatomKVTxData t)
+          (let [^DBI ave* (or ave (.get dbis c/ave)
+                              (raise c/ave " is not open" {}))
+                ^DBI eav* (or eav (.get dbis c/eav)
+                              (raise c/eav " is not open" {}))]
+            (put-datom-tx ave* eav* txn t)
+            (recur (next xs) ave* eav*))
+          (let [^KVTxData tx (l/->kv-tx-data t)
+                dbi-name (.-dbi-name tx)
+                ^DBI dbi (or (.get dbis dbi-name)
+                             (raise dbi-name " is not open" {}))
+                validate? (.-validate-data? dbi)]
+            (vld/validate-kv-tx-data tx validate?)
+            (put-tx dbi txn tx)
+            (recur (next xs) ave eav)))))))
+
+(defn- transact-datom-list*
+  [^java.util.List txs ^HashMap dbis txn]
+  (let [n (.size txs)]
+    (loop [i   0
+           ave nil
+           eav nil]
+      (when (< i n)
+        (let [t (.get txs i)]
+          (if (instance? DatomKVTxData t)
+            (let [^DBI ave* (or ave (.get dbis c/ave)
+                                (raise c/ave " is not open" {}))
+                  ^DBI eav* (or eav (.get dbis c/eav)
+                                (raise c/eav " is not open" {}))]
+              (put-datom-tx ave* eav* txn t)
+              (recur (unchecked-inc i) ave* eav*))
+            (let [^KVTxData tx (l/->kv-tx-data t)
+                  dbi-name (.-dbi-name tx)
+                  ^DBI dbi (or (.get dbis dbi-name)
+                               (raise dbi-name " is not open" {}))
+                  validate? (.-validate-data? dbi)]
+              (vld/validate-kv-tx-data tx validate?)
+              (put-tx dbi txn tx)
+              (recur (unchecked-inc i) ave eav))))))))
+
 (defn- transact*
   [txs ^HashMap dbis txn]
-  (doseq [t txs]
-    (let [^KVTxData tx (l/->kv-tx-data t)
-          dbi-name (.-dbi-name tx)
-          ^DBI dbi (or (.get dbis dbi-name)
-                       (raise dbi-name " is not open" {}))
-          validate? (.-validate-data? dbi)]
-      (vld/validate-kv-tx-data tx validate?)
-      (put-tx dbi txn tx))))
+  (if (instance? java.util.List txs)
+    (let [^java.util.List tx-list txs]
+      (if (and (pos? (.size tx-list))
+               (instance? DatomKVTxData (.get tx-list 0)))
+        (transact-datom-list* tx-list dbis txn)
+        (doseq [t tx-list]
+          (let [^KVTxData tx (l/->kv-tx-data t)
+                dbi-name (.-dbi-name tx)
+                ^DBI dbi (or (.get dbis dbi-name)
+                             (raise dbi-name " is not open" {}))
+                validate? (.-validate-data? dbi)]
+            (vld/validate-kv-tx-data tx validate?)
+            (put-tx dbi txn tx)))))
+    (let [xs (seq txs)]
+      (if (instance? DatomKVTxData (first xs))
+        (transact-datom-seq* xs dbis txn)
+        (doseq [t xs]
+          (let [^KVTxData tx (l/->kv-tx-data t)
+                dbi-name (.-dbi-name tx)
+                ^DBI dbi (or (.get dbis dbi-name)
+                             (raise dbi-name " is not open" {}))
+                validate? (.-validate-data? dbi)]
+            (vld/validate-kv-tx-data tx validate?)
+            (put-tx dbi txn tx)))))))
+
+(defn- transact-prepared-datom-ops*
+  [^objects ops ^HashMap dbis txn]
+  (let [n (alength ops)]
+    (loop [i   0
+           ave nil
+           eav nil]
+      (when (< i n)
+        (let [^DBI dbi (aget ops i)
+              tx       (aget ops (unchecked-inc i))]
+          (if (instance? DatomKVTxData tx)
+            (let [^DBI ave* (or ave (.get dbis c/ave)
+                                (raise c/ave " is not open" {}))
+                  ^DBI eav* (or eav (.get dbis c/eav)
+                                (raise c/eav " is not open" {}))]
+              (put-datom-tx ave* eav* txn tx)
+              (recur (+ i 2) ave* eav*))
+            (do
+              (put-tx dbi txn ^KVTxData tx)
+              (recur (+ i 2) ave eav))))))))
 
 (defn- transact-prepared-ops*
-  [^objects ops txn]
+  [^objects ops ^HashMap dbis txn]
   (let [n (alength ops)]
-    (loop [i 0]
-      (when (< i n)
-        (let [^DBI dbi    (aget ops i)
-              ^KVTxData tx (aget ops (unchecked-inc i))]
-          (put-tx dbi txn tx)
+    (if (and (pos? n)
+             (instance? DatomKVTxData (aget ops 1)))
+      (transact-prepared-datom-ops* ops dbis txn)
+      (loop [i 0]
+        (when (< i n)
+          (put-tx ^DBI (aget ops i) txn
+                  ^KVTxData (aget ops (unchecked-inc i)))
           (recur (+ i 2)))))))
 
 (defn- prepare-kvtx-ops
@@ -753,18 +898,37 @@
                 (aset out j dbi)
                 (aset out (unchecked-inc j) tx)
                 (recur (unchecked-inc i) (+ j 2))))))
-        (loop [i 0
-               j 0]
-          (when (< i n)
-            (let [^KVTxData tx (l/->kv-tx-data (.get tx-list i))
-                  dbi-name*     (.-dbi-name tx)
-                  ^DBI dbi      (or (.get dbis dbi-name*)
-                                    (raise dbi-name* " is not open" {}))
-                  validate?     (.-validate-data? dbi)]
-              (vld/validate-kv-tx-data tx validate?)
-              (aset out j dbi)
-              (aset out (unchecked-inc j) tx)
-              (recur (unchecked-inc i) (+ j 2))))))
+        (if (and (pos? n)
+                 (instance? DatomKVTxData (.get tx-list 0)))
+          (loop [i 0
+                 j 0]
+            (when (< i n)
+              (let [t (.get tx-list i)]
+                (if (instance? DatomKVTxData t)
+                  (do
+                    (aset out j nil)
+                    (aset out (unchecked-inc j) t))
+                  (let [^KVTxData tx (l/->kv-tx-data t)
+                        dbi-name*     (.-dbi-name tx)
+                        ^DBI dbi      (or (.get dbis dbi-name*)
+                                          (raise dbi-name* " is not open" {}))
+                        validate?     (.-validate-data? dbi)]
+                    (vld/validate-kv-tx-data tx validate?)
+                    (aset out j dbi)
+                    (aset out (unchecked-inc j) tx)))
+                (recur (unchecked-inc i) (+ j 2)))))
+          (loop [i 0
+                 j 0]
+            (when (< i n)
+              (let [^KVTxData tx (l/->kv-tx-data (.get tx-list i))
+                    dbi-name*     (.-dbi-name tx)
+                    ^DBI dbi      (or (.get dbis dbi-name*)
+                                      (raise dbi-name* " is not open" {}))
+                    validate?     (.-validate-data? dbi)]
+                (vld/validate-kv-tx-data tx validate?)
+                (aset out j dbi)
+                (aset out (unchecked-inc j) tx)
+                (recur (unchecked-inc i) (+ j 2)))))))
       out)
     (let [^FastList out (FastList.)]
       (if dbi-name
@@ -776,15 +940,30 @@
               (vld/validate-kv-tx-data tx validate?)
               (.add out dbi)
               (.add out tx))))
-        (doseq [t txs]
-          (let [^KVTxData tx (l/->kv-tx-data t)
-                dbi-name*     (.-dbi-name tx)
-                ^DBI dbi      (or (.get dbis dbi-name*)
-                                  (raise dbi-name* " is not open" {}))
-                validate?     (.-validate-data? dbi)]
-            (vld/validate-kv-tx-data tx validate?)
-            (.add out dbi)
-            (.add out tx))))
+        (let [xs (seq txs)]
+          (if (instance? DatomKVTxData (first xs))
+            (doseq [t xs]
+              (if (instance? DatomKVTxData t)
+                (do
+                  (.add out nil)
+                  (.add out t))
+                (let [^KVTxData tx (l/->kv-tx-data t)
+                      dbi-name*     (.-dbi-name tx)
+                      ^DBI dbi      (or (.get dbis dbi-name*)
+                                        (raise dbi-name* " is not open" {}))
+                      validate?     (.-validate-data? dbi)]
+                  (vld/validate-kv-tx-data tx validate?)
+                  (.add out dbi)
+                  (.add out tx))))
+            (doseq [t xs]
+              (let [^KVTxData tx (l/->kv-tx-data t)
+                    dbi-name*     (.-dbi-name tx)
+                    ^DBI dbi      (or (.get dbis dbi-name*)
+                                      (raise dbi-name* " is not open" {}))
+                    validate?     (.-validate-data? dbi)]
+                (vld/validate-kv-tx-data tx validate?)
+                (.add out dbi)
+                (.add out tx))))))
       (.toArray out))))
 
 (defn- kv-tx->row
@@ -1397,7 +1576,7 @@
                                 (.-txn rtx))]
                 (try
                   (if prepared
-                    (transact-prepared-ops* prepared txn)
+                    (transact-prepared-ops* prepared dbis txn)
                     (if dbi
                       (transact1* txs dbi txn k-type v-type)
                       (transact* txs dbis txn)))
@@ -1423,7 +1602,7 @@
                       (throw e)
                       (raise "Fail to transact to LMDB: " e {}))))))]
         (if (Thread/holdsLock write-txn)
-          (do-transact nil)
+          (do-transact prepared-one-shot)
           (locking write-txn
             (do-transact prepared-one-shot))))))
 

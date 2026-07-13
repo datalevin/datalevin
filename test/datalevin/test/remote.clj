@@ -1,10 +1,15 @@
 (ns datalevin.test.remote
   (:require
    [clojure.test :refer [deftest is]]
+   [datalevin.bits :as b]
    [datalevin.client :as client]
+   [datalevin.constants :as c]
    [datalevin.interface :as i]
+   [datalevin.lmdb :as l]
    [datalevin.remote :as remote])
   (:import
+   [datalevin.bits Indexable]
+   [datalevin.lmdb DatomKVTxData KVTxData]
    [java.util.concurrent.atomic AtomicBoolean]))
 
 (defrecord FakeClient [calls]
@@ -29,6 +34,31 @@
   (disconnected? [_] false)
   (get-pool [_] nil)
   (get-id [_] nil))
+
+(deftest expand-datom-kv-txs-for-transport-test
+  (let [insert-avg (b/indexable nil 1 42 :db.type/long c/g0)
+        delete-avg (b/indexable nil 1 43 :db.type/long c/g0)
+        txs        [(DatomKVTxData. 1000 insert-avg true)
+                    (DatomKVTxData. 1001 delete-avg false)]
+        expanded   (l/expand-datom-kv-txs txs)
+        ^Indexable insert-i (.-k ^KVTxData (nth expanded 0))
+        ^Indexable delete-i (.-k ^KVTxData (nth expanded 2))]
+    (is (= 4 (count expanded)))
+    (is (every? #(instance? KVTxData %) expanded))
+    (is (= (assoc (b/pr-indexable insert-avg) 0 1000)
+           (b/pr-indexable insert-i)))
+    (is (= (assoc (b/pr-indexable delete-avg) 0 1001)
+           (b/pr-indexable delete-i)))
+    (is (= [[:put c/ave insert-i 1000 :avg :id]
+            [:put c/eav 1000 insert-i :id :avg]
+            [:del-list c/ave delete-i [1001] :avg :id]
+            [:del-list c/eav 1001 [delete-i] :id :avg]]
+           (mapv (fn [^KVTxData tx]
+                   [(.-op tx) (.-dbi-name tx) (.-k tx) (.-v tx)
+                    (.-kt tx) (.-vt tx)])
+                 expanded))))
+  (let [txs [(l/kv-tx :put "generic" 1 2 :long :long)]]
+    (is (identical? txs (l/expand-datom-kv-txs txs)))))
 
 (defn- remote-store
   [db-name client open-db-info]
