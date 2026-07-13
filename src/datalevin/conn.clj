@@ -890,15 +890,26 @@
   (combine [_] sync-queued-dl-tx-combine)
   (callback [_] nil))
 
+(defn- add-combined-tx-data!
+  [^FastList out tx-data]
+  (if (instance? java.util.Collection tx-data)
+    (.addAll out ^java.util.Collection tx-data)
+    (doseq [tx tx-data]
+      (.add out tx)))
+  out)
+
 (defn- dl-tx-combine
   [coll]
   (let [^AsyncDLTx fw (first coll)]
     (if (nil? (next coll))
       fw
-      (->AsyncDLTx (.-conn fw)
-                   (into [] (comp (map #(.-tx-data ^AsyncDLTx %)) cat) coll)
-                   (.-tx-meta fw)
-                   (.-cb fw)))))
+      (let [^FastList out (FastList.)]
+        (doseq [^AsyncDLTx work coll]
+          (add-combined-tx-data! out (.-tx-data work)))
+        (->AsyncDLTx (.-conn fw)
+                     out
+                     (.-tx-meta fw)
+                     (.-cb fw))))))
 
 (defn- sync-queued-dl-tx-combine
   [coll]

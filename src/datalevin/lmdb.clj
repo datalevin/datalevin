@@ -31,7 +31,8 @@
    [java.io Writer PushbackReader FileOutputStream FileInputStream DataOutputStream
     DataInputStream IOException]
    [java.lang RuntimeException]
-   [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]))
+   [java.util.concurrent ScheduledExecutorService ScheduledFuture TimeUnit]
+   [org.eclipse.collections.impl.list.mutable FastList]))
 
 (defprotocol IBuffer
   (put-key [this data k-type] "put data in key buffer")
@@ -624,15 +625,28 @@
   (combine [_] kv-tx-combine)
   (callback [_] cb))
 
+(defn- add-combined-kv-txs!
+  [^FastList out txs]
+  (if (instance? java.util.Collection txs)
+    (.addAll out ^java.util.Collection txs)
+    (doseq [tx txs]
+      (.add out tx)))
+  out)
+
 (defn- kv-tx-combine
   [coll]
   (let [^AsyncKVTx fw (first coll)]
-    (->AsyncKVTx (.-lmdb fw)
-                 (.-dbi-name fw)
-                 (into [] (comp (map #(.-txs ^AsyncKVTx %)) cat) coll)
-                 (.-k-type fw)
-                 (.-v-type fw)
-                 (.-cb fw))))
+    (if (nil? (next coll))
+      fw
+      (let [^FastList out (FastList.)]
+        (doseq [^AsyncKVTx work coll]
+          (add-combined-kv-txs! out (.-txs work)))
+        (->AsyncKVTx (.-lmdb fw)
+                     (.-dbi-name fw)
+                     out
+                     (.-k-type fw)
+                     (.-v-type fw)
+                     (.-cb fw))))))
 
 (defn transact-kv-async
   ([this txs] (transact-kv-async this nil txs))

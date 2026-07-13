@@ -104,12 +104,13 @@
   (if-some [idents (not-empty (txcommon/attrs-by db :db.unique/identity))]
     (let [store   (:store db)
           schema  (schema store)
+          options (opts store)
           upsert-value
           (fn [a v]
             (if (txcommon/ref? db a)
               (when-not (tempid? v)
                 (txcommon/entid db v))
-              (coreprep/correct-value store a v)))
+              (coreprep/correct-value-with-props options (schema a) a v)))
           validate-upsert-preds
           (fn [a v]
             (vld/validate-attr-preds

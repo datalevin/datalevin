@@ -15,8 +15,7 @@
    [datalevin.index :as idx]
    [datalevin.datom :as d]
    [datalevin.util :as u]
-   [datalevin.bits :as b]
-   [datalevin.validate :as vld])
+   [datalevin.bits :as b])
   (:import
    [datalevin.datom Datom]
    [java.util Date]))
@@ -186,11 +185,21 @@
   [store ^Datom datom]
   (correct-datom* datom (correct-value store (.-a datom) (.-v datom))))
 
+(defn ^:no-doc correct-value-with-props
+  "Validate and coerce a value using already-fetched store options and
+  attribute properties."
+  [store-opts props a v]
+  (let [vt (idx/value-type props)]
+    (if (identical? vt :db.type/idoc)
+      ((requiring-resolve 'datalevin.idoc/parse-value)
+       a props store-opts v)
+      (do
+        (or (not (store-opts :validate-data?))
+            (b/valid-data? v vt)
+            (u/raise "Invalid data, expecting" vt " got " v {:input v}))
+        (type-coercion vt v)))))
+
 (defn correct-value
   "Validate type and coerce value for an attribute."
   [store a v]
-  (let [props ((schema store) a)
-        vt    (idx/value-type props)]
-    (if (identical? vt :db.type/idoc)
-      ((requiring-resolve 'datalevin.idoc/parse-value) a props (opts store) v)
-      (type-coercion (vld/validate-type store a v) v))))
+  (correct-value-with-props (opts store) ((schema store) a) a v))

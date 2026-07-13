@@ -99,24 +99,22 @@
        (update :db-after advance-max-eid eid)))))
 
 (defn- with-datom
-  [db datom]
-  (let [v            (validate-datom db datom)
-        ^Datom datom (coreprep/correct-datom* datom v)
-        add          #(do (.add ^TreeSortedSet % datom) %)
-        del          #(do (.remove ^TreeSortedSet % datom) %)]
-    (if (datom-added datom)
-      (-> db
-          (update :eavt add)
-          (update :avet add)
-          (advance-max-eid (.-e datom)))
-      (if (.isEmpty
-            (.subSet ^TreeSortedSet (:eavt db)
-                     (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
-                     (d/datom (.-e datom) (.-a datom) (.-v datom) txmax)))
-        db
-        (-> db
-            (update :eavt del)
-            (update :avet del))))))
+  [db ^Datom datom]
+  (validate-datom db datom)
+  (if (datom-added datom)
+    (do
+      (.add ^TreeSortedSet (:eavt db) datom)
+      (.add ^TreeSortedSet (:avet db) datom)
+      (advance-max-eid db (.-e datom)))
+    (if (.isEmpty
+          (.subSet ^TreeSortedSet (:eavt db)
+                   (d/datom (.-e datom) (.-a datom) (.-v datom) tx0)
+                   (d/datom (.-e datom) (.-a datom) (.-v datom) txmax)))
+      db
+      (do
+        (.remove ^TreeSortedSet (:eavt db) datom)
+        (.remove ^TreeSortedSet (:avet db) datom)
+        db))))
 
 (declare effective-attr-value)
 
@@ -223,7 +221,8 @@
                     (txcommon/entid-strict db v)
                     v)
         props     ((schema store) a)
-        v'        (coreprep/correct-value store a v)
+        v'        (coreprep/correct-value-with-props
+                    (opts store) props a v)
         _         (vld/validate-attr-preds e a v' props
                                            #(txprep/resolve-attr-pred-udf db %))
         meta*     (meta ent)
@@ -264,7 +263,8 @@
   (let [tx        (current-tx report)
         _         (validate-installed-callable-write report db e a nv entity)
         props     ((schema store) a)
-        nv'       (coreprep/correct-value store a nv)
+        nv'       (coreprep/correct-value-with-props
+                    (opts store) props a nv)
         _         (vld/validate-attr-preds e a nv' props
                                            #(txprep/resolve-attr-pred-udf db %))
         meta*     (meta entity)
@@ -408,7 +408,8 @@
       (if (empty? ops)
         [report entities]
         (if many?
-          (let [old-v'    (coreprep/correct-value store a old-v)
+          (let [old-v'    (coreprep/correct-value-with-props
+                            (opts store) props a old-v)
                 old-datom (or (sf (.subSet ^TreeSortedSet (:eavt db)
                                            (datom e a old-v' tx0)
                                            (datom e a old-v' txmax)))
