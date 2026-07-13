@@ -144,6 +144,10 @@
       (empty? coll)
       (empty-rel binding)
 
+      (instance? BindScalar (:binding binding))
+      (r/relation! {(get-in binding [:binding :variable :symbol]) 0}
+                   (r/vertical-tuples coll))
+
       (and (instance? java.util.List coll)
            (instance? BindTuple (:binding binding)))
       (if-let [attrs (bindtuple-attrs (:binding binding))]
@@ -162,9 +166,18 @@
                             :value   coll
                             :binding (dp/source binding)}))
                   (r/relation! attrs tuples))
-                (if (nil? (tuple-needed-indices (:binding binding)))
-                  (let [width (count (:bindings (:binding binding)))
-                        res   (FastList. size)]
+                (if-let [compact-attrs
+                         (compact-bindtuple-attrs (:binding binding))]
+                  (let [bindings (:bindings (:binding binding))
+                        width    (count bindings)
+                        ^ints src-idxs
+                        (int-array
+                          (keep-indexed
+                            (fn [i b]
+                              (when-not (instance? BindIgnore b) i))
+                            bindings))
+                        out-size (alength src-idxs)
+                        res      (FastList. size)]
                     (dotimes [i size]
                       (let [row (.get tuples i)]
                         (when-not (u/seqable? row)
@@ -180,11 +193,11 @@
                                  {:error   :query/binding
                                   :value   row
                                   :binding (dp/source (:binding binding))}))
-                        (let [tuple (object-array width)]
-                          (dotimes [j width]
-                            (aset tuple j (nth row j)))
+                        (let [tuple (object-array out-size)]
+                          (dotimes [j out-size]
+                            (aset tuple j (nth row (aget src-idxs j))))
                           (.add res tuple))))
-                    (r/relation! attrs res))
+                    (r/relation! compact-attrs res))
                   (transduce (map #(in->rel (:binding binding) %))
                              r/sum-rel coll))))))
         (transduce (map #(in->rel (:binding binding) %)) r/sum-rel coll))
@@ -434,15 +447,15 @@
 
 (defn matches-pattern?
   [pattern tuple]
-  (loop [tuple   tuple
-         pattern pattern]
-    (if (and tuple pattern)
-      (let [t (first tuple)
-            p (first pattern)]
-        (if (or (= p '_) (qu/free-var? p) (= t p))
-          (recur (next tuple) (next pattern))
-          false))
-      true)))
+  (let [n (min (count pattern) (count tuple))]
+    (loop [i 0]
+      (if (< i n)
+        (let [t (nth tuple i)
+              p (nth pattern i)]
+          (if (or (= p '_) (qu/free-var? p) (= t p))
+            (recur (unchecked-inc i))
+            false))
+        true))))
 
 (defn lookup-pattern-coll
   [coll pattern]
@@ -636,13 +649,34 @@
 
           :else
           (aset static-args i arg))))
-    (fn [^objects tuple]
-      (dotimes [i len]
-        (when-some [tuple-arg (aget tuples-args i)]
-          (aset static-args i (if (fn? tuple-arg)
-                                (tuple-arg tuple)
-                                (aget tuple tuple-arg)))))
-      (call static-args))))
+    (let [tuple-bindings
+          (into []
+                (keep-indexed
+                  (fn [i tuple-arg]
+                    (when (and (some? tuple-arg) (not (fn? tuple-arg)))
+                      [i tuple-arg])))
+                tuples-args)
+          nested-bindings
+          (into []
+                (keep-indexed
+                  (fn [i tuple-arg]
+                    (when (fn? tuple-arg) [i tuple-arg])))
+                tuples-args)
+          ^ints tuple-positions (int-array (map first tuple-bindings))
+          ^ints tuple-indexes   (int-array (map (comp int second)
+                                                tuple-bindings))
+          ^ints nested-positions (int-array (map first nested-bindings))
+          ^objects nested-fns    (object-array (map second nested-bindings))
+          tuple-count            (alength tuple-positions)
+          nested-count           (alength nested-positions)]
+      (fn [^objects tuple]
+        (dotimes [i tuple-count]
+          (aset static-args (aget tuple-positions i)
+                (aget tuple (aget tuple-indexes i))))
+        (dotimes [i nested-count]
+          (aset static-args (aget nested-positions i)
+                ((aget nested-fns i) tuple)))
+        (call static-args)))))
 
 (defn filter-by-pred
   [context clause]
@@ -695,6 +729,63 @@
             (.add res out)))))
     (r/relation! (zipmap (conj attr-keys out-var) (range)) res)))
 
+(defn- compile-tuple-product
+  [left-attrs right-attrs]
+  (let [left-vars  (vec (keys left-attrs))
+        right-vars (vec (keys right-attrs))]
+    (object-array
+      [right-attrs
+       (zipmap (u/concatv left-vars right-vars) (range))
+       (int-array (map left-attrs left-vars))
+       (int-array (map right-attrs right-vars))])))
+
+(defn- append-tuple-product!
+  [^List res ^objects left-tuple bound-rel ^objects product-plan]
+  (let [^List right-tuples (:tuples bound-rel)
+        ^ints left-idxs    (aget product-plan 2)
+        ^ints right-idxs   (aget product-plan 3)
+        size               (.size right-tuples)]
+    (dotimes [i size]
+      (.add res (r/join-tuples left-tuple left-idxs
+                               (.get right-tuples i) right-idxs)))))
+
+(defn- bind-coll-tuples
+  [production binding needed tuple-fn]
+  (let [^List tuples (:tuples production)
+        size         (.size tuples)
+        initial-res  (FastList. size)]
+    (loop [i 0, ^objects product-plan nil, ^List res initial-res]
+      (if (< i size)
+        (let [tuple ^objects (.get tuples i)
+              val   (tuple-fn tuple)]
+          (if (nil? val)
+            (recur (unchecked-inc-int i) product-plan res)
+            (let [bound-rel (if needed
+                              (r/relation!
+                                (compact-bindtuple-attrs (:binding binding))
+                                val)
+                              (in->rel binding val))
+                  bound-attrs (:attrs bound-rel)]
+              (if (or (nil? product-plan)
+                      (= (aget product-plan 0) bound-attrs))
+                (let [plan (or product-plan
+                               (compile-tuple-product (:attrs production)
+                                                      bound-attrs))]
+                  (append-tuple-product! res tuple bound-rel plan)
+                  (recur (unchecked-inc-int i) plan res))
+                (let [joined (r/prod-rel
+                               (r/relation! (:attrs production)
+                                            (r/single-tuples tuple))
+                               bound-rel)
+                      merged (r/sum-rel
+                               (r/relation! (aget product-plan 1) res)
+                               joined)]
+                  (recur (unchecked-inc-int i)
+                         product-plan (:tuples merged)))))))
+        (if product-plan
+          (r/relation! (aget product-plan 1) res)
+          (r/prod-rel production (empty-rel binding)))))))
+
 (defn bind-by-fn
   [context clause]
   (let [[[f & args] out]     clause
@@ -726,23 +817,7 @@
           (let [tuple-fn (-call-fn context production f args')]
             (if (instance? BindScalar binding)
               (bind-scalar-tuples production out-var tuple-fn)
-              (let [rels (for [tuple (:tuples production)
-                               :let  [val (tuple-fn tuple)]
-                               :when (not (nil? val))]
-                           (if needed
-                             (r/prod-rel
-                               (r/relation! (:attrs production)
-                                            (doto (FastList.) (.add tuple)))
-                               (r/relation!
-                                 (compact-bindtuple-attrs (:binding binding))
-                                 val))
-                             (r/prod-rel
-                               (r/relation! (:attrs production)
-                                            (doto (FastList.) (.add tuple)))
-                               (in->rel binding val))))]
-                (if (empty? rels)
-                  (r/prod-rel production (empty-rel binding))
-                  (reduce r/sum-rel rels))))))]
+              (bind-coll-tuples production binding needed tuple-fn))))]
     (update context :rels collapse-rels new-rel)))
 
 (defn dynamic-lookup-attrs
@@ -947,15 +1022,16 @@
 (defn or-join-build
   [sources rules ^List tuples clause bound-var bound-idx free-vars]
   (when (pos? (.size tuples))
-    (let [bound-vals     (let [s (HashSet.)]
-                           (dotimes [i (.size tuples)]
-                             (.add s (aget ^objects (.get tuples i) bound-idx)))
-                           (vec s))
-          bound-rel      (r/relation! {bound-var 0}
-                                      (let [fl (FastList.)]
-                                        (doseq [v bound-vals]
-                                          (.add fl (object-array [v])))
-                                        fl))
+    (let [bound-rel      (r/relation!
+                           {bound-var 0}
+                           (let [seen (HashSet.)
+                                 res  (FastList.)]
+                             (dotimes [i (.size tuples)]
+                               (let [v (aget ^objects (.get tuples i)
+                                             bound-idx)]
+                                 (when (.add seen v)
+                                   (.add res (object-array [v])))))
+                             res))
           or-context     {:sources sources
                           :rules   rules
                           :rels    [bound-rel]}

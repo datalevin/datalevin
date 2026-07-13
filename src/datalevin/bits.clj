@@ -639,8 +639,7 @@
     (put-byte bf (unchecked-byte c))
     (if (known-size-types x-type)
       (dotimes [i c] (put-fixed bf (nth x i) hdr))
-      (let [c-1   ^long (dec c)
-            sizes (loop [ss [] i 0 cp (.position bf)]
+      (let [sizes (loop [ss [] i 0 cp (.position bf)]
                     (if (< i c)
                       (let [v (nth x i)]
                         (put-varied bf v hdr)
@@ -649,7 +648,10 @@
                           (when (< c/+tuple-max+ (- size 2))
                             (u/raise "The maximal tuple element size is
                               255 bytes" {:too-large v}))
-                          (when (< i c-1) (put-byte bf c/separator))
+                          ;; The final component also needs a separator so a
+                          ;; prefix sorts before a longer value; otherwise the
+                          ;; tuple trailer (0xFF) participates in comparison.
+                          (put-byte bf c/separator)
                           (recur (conj ss size) (inc i) (inc np))))
                       ss))]
         (put-byte bf c/truncator)
@@ -660,16 +662,19 @@
   [^ByteBuffer bf x x-type]
   (let [c (count x-type)]
     (put-byte bf (unchecked-byte c))
-    (let [c-1   ^long (dec c)
-          sizes (loop [ss [] i 0 cp (.position bf)]
+    (let [sizes (loop [ss [] i 0 cp (.position bf)]
                   (if (< i c)
                     (let [v     (nth x i)
                           t     (nth x-type i)
-                          hdr   (raw-header v t)
-                          known (known-size-types t)]
+                          nil?  (nil? v)
+                          hdr   (if nil? c/type-nil (raw-header v t))
+                          known (or nil? (known-size-types t))]
                       (put-byte bf hdr)
-                      (if known (put-fixed bf v hdr) (put-varied bf v hdr))
-                      (when (and (not known) (< i c-1))
+                      (when-not nil?
+                        (if known (put-fixed bf v hdr) (put-varied bf v hdr)))
+                      ;; Keep variable component framing independent of its
+                      ;; position in the tuple for component-wise byte order.
+                      (when-not known
                         (put-byte bf c/separator))
                       (let [np   (.position bf)
                             size (- np cp)]
@@ -704,7 +709,6 @@
   ([^ByteBuffer bf ^long outer-post-v]
    (let [hdr   (get-byte bf)
          c     (short (get-byte bf))
-         c-1   (dec c)
          tuple (volatile! [])]
      (if (known-size-types (header->type hdr))
        (dotimes [_ c] (vswap! tuple conj (get-value* bf hdr)))
@@ -716,13 +720,13 @@
                               (conj vs (+ ^long s (inc ^long (first vs)))))
                             '(0))
                           rest
-                          (map #(+ ^long % c 1 outer-post-v))
+                          (map #(+ ^long % c 2 outer-post-v))
                           vec)
              np      (.position bf)]
          (.position bf op)
          (dotimes [i c]
            (vswap! tuple conj (get-value* bf (nth post-vs i) hdr))
-           (when-not (= i c-1) (get-byte bf)))
+           (get-byte bf))
          (.position bf np)))
      @tuple)))
 
@@ -730,7 +734,6 @@
   ([bf] (get-hete-tuple bf 0))
   ([^ByteBuffer bf ^long outer-post-v]
    (let [c       (short (get-byte bf))
-         c-1     (dec c)
          tuple   (volatile! [])
          op      (.position bf)
          post-vs (->> (get-tuple-sizes bf c outer-post-v)
@@ -745,11 +748,12 @@
      (.position bf op)
      (dotimes [i c]
        (let [hdr    (get-byte bf)
-             known  (known-size-types (header->type hdr))
-             post-v (if (or known (= i c-1))
+             nil?   (= hdr c/type-nil)
+             known  (or nil? (known-size-types (header->type hdr)))
+             post-v (if known
                       (nth post-vs i)
                       (inc ^long (nth post-vs i)))]
-         (vswap! tuple conj (get-value* bf post-v hdr))
+         (vswap! tuple conj (if nil? nil (get-value* bf post-v hdr)))
          (when-not known (get-byte bf))))
      (.position bf np)
      @tuple)))

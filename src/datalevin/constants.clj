@@ -20,7 +20,7 @@
 
 (def version
   "Version number of Datalevin"
-  "0.10.18")
+  "1.0.0")
 
 (def version-file-name
   "Name of the file that stores version on disk"
@@ -172,6 +172,9 @@
 (def ^:no-doc ^:const type-symbol     (unchecked-byte 0xFC))
 (def ^:no-doc ^:const type-boolean    (unchecked-byte 0xFD))
 (def ^:no-doc ^:const type-bytes      (unchecked-byte 0xFE))
+(def ^:no-doc ^:const type-nil
+  "Tuple component marker that sorts before every non-nil component value."
+  (unchecked-byte 0x00))
 
 (def ^:no-doc ^:const false-value     (unchecked-byte 0x01))
 (def ^:no-doc ^:const true-value      (unchecked-byte 0x02))
@@ -351,6 +354,11 @@
     :db.type/long :db.type/double :db.type/float :db.type/ref
     :db.type/bigint :db.type/bigdec :db.type/instant :db.type/uuid
     :db.type/bytes :db.type/tuple :db.type/vec :db.type/idoc})
+
+(def ^:no-doc tuple-value-types
+  "Scalar value types supported as tuple components."
+  (disj datalog-value-types
+        :db.type/bytes :db.type/tuple :db.type/vec :db.type/idoc))
 
 (def ^:no-doc kv-value-types
   #{:keyword :symbol :string :boolean :long :double :float :instant :uuid

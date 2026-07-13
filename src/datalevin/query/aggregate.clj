@@ -13,8 +13,10 @@
    [datalevin.built-ins :as built-ins]
    [datalevin.parser :as dp]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
+   [java.util HashMap]
    [datalevin.parser Constant PlainSymbol SrcVar Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -58,29 +60,40 @@
            :resolver-mode qresolve/*resolver-mode*})))
     f))
 
+(defn- compile-aggregate
+  [element context]
+  [(resolve-aggregate-fn element context)
+   (mapv #(-context-resolve % context) (butlast (:args element)))])
+
+(defn- compile-aggregates
+  [find-elements context]
+  (into {}
+        (map (fn [element]
+               [element (compile-aggregate element context)]))
+        (dp/collect dp/aggregate? find-elements)))
+
 (defn- compute-aggregate
   "Compute an aggregate over tuples at the given tuple index."
-  [element context tuples tuple-idx]
-  (let [f    (resolve-aggregate-fn element context)
-        args (mapv #(-context-resolve % context)
-                   (butlast (:args element)))
+  [element aggregate-plans tuples tuple-idx]
+  (let [[f args] (aggregate-plans element)
         vals (map #(nth % tuple-idx) tuples)]
     (apply f (conj args vals))))
 
 (defn- eval-find-expr
   "Evaluate a FindExpr by computing its inner aggregates and applying the
   operator."
-  [expr context tuples var->idx]
+  [expr context tuples var->idx aggregate-plans]
   (let [op   (get built-ins/query-fns (:symbol (:fn expr)))
         args (mapv (fn [arg]
                      (cond
                        (dp/aggregate? arg)
                        (let [var-sym (-> arg :args last :symbol)
                              idx     (get var->idx var-sym)]
-                         (compute-aggregate arg context tuples idx))
+                         (compute-aggregate arg aggregate-plans tuples idx))
 
                        (dp/find-expr? arg)
-                       (eval-find-expr arg context tuples var->idx)
+                       (eval-find-expr arg context tuples var->idx
+                                       aggregate-plans)
 
                        :else
                        (-context-resolve arg context)))
@@ -104,8 +117,13 @@
 
 (defn -aggregate
   ([find-elements context tuples]
-   (-aggregate find-elements context tuples (build-var->idx find-elements)))
+   (-aggregate find-elements context tuples
+               (build-var->idx find-elements)
+               (compile-aggregates find-elements context)))
   ([find-elements context tuples var->idx]
+   (-aggregate find-elements context tuples var->idx
+               (compile-aggregates find-elements context)))
+  ([find-elements context tuples var->idx aggregate-plans]
    (let [first-tuple (first tuples)]
      (loop [elements  find-elements
             tuple-idx 0
@@ -118,13 +136,15 @@
              (dp/find-expr? elem)
              (recur (rest elements)
                     (+ tuple-idx num-vars)
-                    (conj result (eval-find-expr elem context tuples var->idx)))
+                    (conj result (eval-find-expr elem context tuples var->idx
+                                                 aggregate-plans)))
 
              (dp/aggregate? elem)
              (recur (rest elements)
                     (inc tuple-idx)
                     (conj result
-                          (compute-aggregate elem context tuples tuple-idx)))
+                          (compute-aggregate elem aggregate-plans tuples
+                                             tuple-idx)))
 
              :else
              (recur (rest elements)
@@ -137,48 +157,44 @@
   [elem]
   (not (or (dp/aggregate? elem) (dp/find-expr? elem))))
 
-(defn- group-key
-  [tuple ^ints group-idxs]
+(defn- group-tuples
+  [resultset ^ints group-idxs]
   (let [n (alength group-idxs)]
     (cond
       (zero? n)
-      nil
+      (when (seq resultset)
+        (list resultset))
 
       (= 1 n)
-      (nth tuple (aget group-idxs 0))
+      (let [^HashMap groups (HashMap.)
+            idx             (aget group-idxs 0)]
+        (doseq [tuple resultset]
+          (let [key (nth tuple idx)]
+            (if-let [^FastList bucket (.get groups key)]
+              (.add bucket tuple)
+              (.put groups key (doto (FastList.) (.add tuple))))))
+        (.values groups))
 
       :else
-      (persistent!
-       (loop [i   (int 0)
-              key (transient [])]
-         (if (< i n)
-           (recur (unchecked-inc-int i)
-                  (conj! key (nth tuple (aget group-idxs i))))
-           key))))))
-
-(defn- group-tuples
-  [resultset ^ints group-idxs]
-  (if (zero? (alength group-idxs))
-    (when (seq resultset)
-      (list resultset))
-    (let [groups
-          (reduce
-            (fn [groups tuple]
-              (let [key (group-key tuple group-idxs)]
-                (if-let [bucket (get groups key)]
-                  (do
-                    (.add ^FastList bucket tuple)
-                    groups)
-                  (assoc! groups key (doto (FastList.) (.add tuple))))))
-            (transient {})
-            resultset)]
-      (vals (persistent! groups)))))
+      (let [^HashMap groups (HashMap.)
+            ^objects scratch (object-array n)
+            lookup           (r/array-lookup)]
+        (doseq [tuple resultset]
+          (dotimes [i n]
+            (aset scratch i (nth tuple (aget group-idxs i))))
+          (if-let [^FastList bucket
+                   (.get groups (r/reset-array-lookup! lookup scratch))]
+            (.add bucket tuple)
+            (.put groups (r/wrap-array (aclone scratch))
+                  (doto (FastList.) (.add tuple)))))
+        (.values groups)))))
 
 (defn aggregate
   [find-elements context resultset]
   (let [^ints group-idxs (int-array (u/idxs-of groupable-elem? find-elements))
-        var->idx         (build-var->idx find-elements)]
-    (map #(-aggregate find-elements context % var->idx)
+        var->idx         (build-var->idx find-elements)
+        aggregate-plans  (compile-aggregates find-elements context)]
+    (map #(-aggregate find-elements context % var->idx aggregate-plans)
          (group-tuples resultset group-idxs))))
 
 (defn- find-aggregate-idx

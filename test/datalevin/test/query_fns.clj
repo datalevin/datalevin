@@ -946,6 +946,16 @@
                   [[:a :b :c] [:d :e :f]])
              #{[:a :c] [:d :f]}))
 
+      (is (= (d/q '[:find ?in ?x ?y
+                    :in [?in ...] ?f
+                    :where [(?f ?in) [[?x ?y]...]]]
+                  [1 2 3]
+                  (fn [^long x]
+                    (when (odd? x)
+                      [[x (* x 10)] [(- x) (* x 100)]])))
+             #{[1 1 10] [1 -1 100]
+               [3 3 30] [3 -3 300]}))
+
       (is (= (d/q '[:find ?in
                     :in [?in ...]
                     :where [(ground ?in) _]]

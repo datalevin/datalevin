@@ -85,6 +85,31 @@
 
 (defonce ^:private shared-local-stores (atom {}))
 
+(defn- infer-tuple-attr-types
+  "Add typed tuple encoding to composite attributes whose schema only declares
+  :db/tupleAttrs. Component types come from the source attributes. Attributes
+  with untyped or non-scalar sources retain the legacy :data encoding until
+  those source types are declared."
+  [old-schema schema-update]
+  (let [full-schema (merge old-schema schema-update)]
+    (reduce-kv
+      (fn [updates attr props]
+        (if (and (contains? props :db/tupleAttrs)
+                 (not (contains? props :db/tupleType))
+                 (not (contains? props :db/tupleTypes)))
+          (let [types (mapv #(get-in full-schema [% :db/valueType])
+                            (:db/tupleAttrs props))]
+            (if (and (< 1 (count types))
+                     (every? c/tuple-value-types types))
+              (assoc updates attr
+                     (assoc props
+                            :db/valueType :db.type/tuple
+                            :db/tupleTypes types))
+              updates))
+          updates))
+      (or schema-update {})
+      full-schema)))
+
 (defn- shared-local-store-key
   [dir]
   (when (and (string? dir) (not (remote/dtlv-uri? dir)))
@@ -643,29 +668,31 @@
   (rschema [_] rschema)
 
   (set-schema [this new-schema]
-    (when new-schema (vld/validate-schema new-schema))
-    (doseq [[attr new] new-schema
-            :let       [old (schema attr)]
-            :when      old]
-      (check this attr old new))
-    (doseq [[attr new] new-schema
-            :let       [old (schema attr)]
-            :when      old
-            :let       [old-vt (value-type old)
-                        new-vt (value-type new)]
-            :when      (and (identical? old-vt :data)
-                            (not (identical? new-vt :data)))]
-      ;; Re-encode stored values before persisting schema change.
-      (migrate-attr-values this attr new-vt))
-    (when (schema-update-required? schema new-schema)
-      (set! schema (init-schema lmdb new-schema))
-      (set! rschema (schema->rschema schema))
-      (set! attrs (init-attrs schema))
-      (set! max-aid (init-max-aid schema))
-      (set! idoc-indices
-            (merge-missing-idoc-indices lmdb idoc-indices schema opts))
-      (mark-state-current! this (init-state-sync-ms lmdb)))
-    schema)
+    (let [new-schema (infer-tuple-attr-types schema new-schema)]
+      (when (seq new-schema)
+        (vld/validate-schema (merge schema new-schema)))
+      (doseq [[attr new] new-schema
+              :let       [old (schema attr)]
+              :when      old]
+        (check this attr old new))
+      (doseq [[attr new] new-schema
+              :let       [old (schema attr)]
+              :when      old
+              :let       [old-vt (value-type old)
+                          new-vt (value-type new)]
+              :when      (and (identical? old-vt :data)
+                              (not (identical? new-vt :data)))]
+        ;; Re-encode stored values before persisting schema change.
+        (migrate-attr-values this attr new-vt))
+      (when (schema-update-required? schema new-schema)
+        (set! schema (init-schema lmdb new-schema))
+        (set! rschema (schema->rschema schema))
+        (set! attrs (init-attrs schema))
+        (set! max-aid (init-max-aid schema))
+        (set! idoc-indices
+              (merge-missing-idoc-indices lmdb idoc-indices schema opts))
+        (mark-state-current! this (init-state-sync-ms lmdb)))
+      schema))
 
   (attrs [_] attrs)
 
@@ -3299,6 +3326,9 @@
                                 (ReentrantReadWriteLock.)
                                 false
                                 dir-key)]
+             ;; Upgrade composite tuple attributes after the Store exists so
+             ;; legacy :data values can be re-encoded through set-schema.
+             (datalevin.interface/set-schema store nil)
              (when dir-key
                (locking shared-local-stores
                  (swap! shared-local-stores

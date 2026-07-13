@@ -17,6 +17,9 @@
         dir4 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
         dir5 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
         dir6 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
+        dir7 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
+        dir8 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
+        dir9 (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
         db   (d/empty-db
                dir
                {:year+session    {:db/tupleAttrs [:year :session]}
@@ -59,6 +62,22 @@
     (is (thrown-msg?
           "Bad attribute specification for :foo+bar: {:db/valueType :db.type/tuple} should also have :db/tupleAttrs, :db/tupleTypes, or :db/tupleType"
           (d/empty-db dir6 {:foo+bar {:db/valueType :db.type/tuple}})))
+
+    (is (thrown-with-msg?
+          ExceptionInfo #"unsupported tuple component type.*:source"
+          (d/empty-db dir7 {:source {:db/valueType :db.type/bytes}
+                            :t1     {:db/tupleAttrs [:source :other]}})))
+
+    (is (thrown-with-msg?
+          ExceptionInfo #"supported scalar tuple component type.*:db.type/bytes"
+          (d/empty-db dir8 {:t1 {:db/valueType :db.type/tuple
+                                 :db/tupleType :db.type/bytes}})))
+
+    (is (thrown-with-msg?
+          ExceptionInfo #"supported scalar tuple component types.*:db.type/bytes"
+          (d/empty-db dir9 {:t1 {:db/valueType  :db.type/tuple
+                                 :db/tupleTypes [:db.type/string
+                                                 :db.type/bytes]}})))
 
     (d/close-db db)
     (u/delete-files dir)))
@@ -355,6 +374,16 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-byte-source-schema-update-is-rejected
+  (let [dir  (u/tmp-dir (str "tuple-byte-source-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir {:a+b {:db/tupleAttrs [:a :b]}})]
+    (is (thrown-with-msg?
+          ExceptionInfo #"unsupported tuple component type.*:a.*:db.type/bytes"
+          (d/update-schema conn {:a {:db/valueType :db.type/bytes}})))
+    (d/close conn)
+    (u/delete-files dir)))
+
 (deftest test-indexes
   (let [dir (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
         db  (-> (d/empty-db dir {:a+b+c {:db/tupleAttrs [:a :b :c]}})
@@ -376,6 +405,67 @@
     (is (= [8 4]
            (mapv :e (d/index-range db :a+b+c ["A" "B" nil] ["A" "b" nil]))))
     (d/close-db db)
+    (u/delete-files dir)))
+
+(deftest test-composite-tuple-infers-component-types
+  (let [dir  (u/tmp-dir (str "typed-composite-tuples-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:order/sku      {:db/valueType :db.type/long}
+                :order/type     {:db/valueType :db.type/keyword}
+                :order/sku+type {:db/tupleAttrs [:order/sku :order/type]}})]
+    (is (= {:db/valueType :db.type/tuple
+            :db/tupleAttrs [:order/sku :order/type]
+            :db/tupleTypes [:db.type/long :db.type/keyword]}
+           (dissoc (get (d/schema conn) :order/sku+type) :db/aid)))
+
+    (d/transact! conn [{:db/id 1 :order/sku -10 :order/type :type/b}
+                       {:db/id 2 :order/sku -2 :order/type :type/z}
+                       {:db/id 3 :order/sku -2 :order/type :type/a}
+                       {:db/id 4 :order/sku 0 :order/type :type/m}
+                       {:db/id 5 :order/sku 10 :order/type :type/a}
+                       {:db/id 6 :order/sku -2}])
+
+    (let [db (d/db conn)]
+      (is (= [[-10 :type/b]
+              [-2 nil]
+              [-2 :type/a]
+              [-2 :type/z]
+              [0 :type/m]
+              [10 :type/a]]
+             (mapv :v (d/datoms db :ave :order/sku+type))))
+      (is (= [6 3 2 4]
+             (mapv :e
+                   (d/index-range db :order/sku+type
+                                  [-2 nil] [0 :type/m])))))
+    (d/close conn)
+    (u/delete-files dir)))
+
+(deftest test-composite-tuple-type-update-migrates-existing-values
+  (let [dir  (u/tmp-dir (str "migrate-composite-tuples-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:order/sku+type {:db/tupleAttrs [:order/sku :order/type]}})]
+    (d/transact! conn [{:db/id 1 :order/sku 10 :order/type :type/a}
+                       {:db/id 2 :order/sku -2 :order/type :type/z}
+                       {:db/id 3 :order/sku 0 :order/type :type/m}])
+
+    (d/update-schema conn
+                     {:order/sku  {:db/valueType :db.type/long}
+                      :order/type {:db/valueType :db.type/keyword}})
+
+    (is (= [:db.type/long :db.type/keyword]
+           (get-in (d/schema conn) [:order/sku+type :db/tupleTypes])))
+    (is (= [[-2 :type/z] [0 :type/m] [10 :type/a]]
+           (mapv :v (d/datoms (d/db conn) :ave :order/sku+type))))
+
+    (d/close conn)
+    (let [conn' (d/create-conn dir)]
+      (is (= [:db.type/long :db.type/keyword]
+             (get-in (d/schema conn') [:order/sku+type :db/tupleTypes])))
+      (is (= [[-2 :type/z] [0 :type/m] [10 :type/a]]
+             (mapv :v (d/datoms (d/db conn') :ave :order/sku+type))))
+      (d/close conn'))
     (u/delete-files dir)))
 
 (deftest test-queries
@@ -435,6 +525,40 @@
                   [(untuple ?b) [_ ?l _]]
                   [(< 2 ?l)]] db)))
     (d/close-db db)
+    (u/delete-files dir)))
+
+(deftest test-variable-width-final-component-prefix-order
+  (let [dir  (u/tmp-dir (str "tuple-prefix-order-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:homogeneous {:db/valueType :db.type/tuple
+                              :db/tupleType :db.type/string}
+                :heterogeneous {:db/valueType  :db.type/tuple
+                                :db/tupleTypes [:db.type/long
+                                                :db.type/string]}})
+        tx   [{:db/id 1 :homogeneous [""]   :heterogeneous [0 ""]}
+              {:db/id 2 :homogeneous ["a"]  :heterogeneous [0 "a"]}
+              {:db/id 3 :homogeneous ["ab"] :heterogeneous [0 "ab"]}
+              {:db/id 4 :homogeneous ["b"]  :heterogeneous [0 "b"]}]]
+    (d/transact! conn tx)
+    (let [db (d/db conn)]
+      (is (= [[""] ["a"] ["ab"] ["b"]]
+             (mapv :v (d/datoms db :ave :homogeneous))))
+      (is (= [[0 ""] [0 "a"] [0 "ab"] [0 "b"]]
+             (mapv :v (d/datoms db :ave :heterogeneous))))
+      (is (= [1 2 3]
+             (mapv :e (d/index-range db :homogeneous [""] ["ab"]))))
+      (is (= [1 2 3]
+             (mapv :e
+                   (d/index-range db :heterogeneous [0 ""] [0 "ab"])))))
+    (d/close conn)
+
+    (let [conn (d/create-conn dir)]
+      (is (= [[""] ["a"] ["ab"] ["b"]]
+             (mapv :v (d/datoms (d/db conn) :ave :homogeneous))))
+      (is (= [[0 ""] [0 "a"] [0 "ab"] [0 "b"]]
+             (mapv :v (d/datoms (d/db conn) :ave :heterogeneous))))
+      (d/close conn))
     (u/delete-files dir)))
 
 (deftest test-homogeneous-and-heterogeneous-tuple-with-ref

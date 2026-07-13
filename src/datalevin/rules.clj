@@ -199,7 +199,7 @@
 
 (defn- head-indices
   [attrs rule-head-vars]
-  (long-array
+  (int-array
     (mapv (fn [v]
             (if-let [i (attrs v)]
               i
@@ -208,22 +208,31 @@
           rule-head-vars)))
 
 (defn- const-indices
-  [^longs head-idxs call-args]
-  (into []
-        (keep-indexed (fn [idx arg]
-                        (when (not (qu/free-var? arg))
-                          [(aget head-idxs idx) arg])))
-        call-args))
+  [^ints head-idxs call-args]
+  (let [checks (into []
+                     (keep-indexed
+                       (fn [idx arg]
+                         (when-not (qu/free-var? arg)
+                           [(aget head-idxs idx) arg])))
+                     call-args)
+        n      (count checks)
+        idxs   (int-array n)
+        values (object-array n)]
+    (dotimes [i n]
+      (let [[idx value] (checks i)]
+        (aset idxs i (int idx))
+        (aset values i value)))
+    [idxs values]))
 
 (defn- const-check
-  [const-checks ^objects tuple]
-  (loop [[c & more] const-checks]
-    (if c
-      (let [[idx arg] c]
-        (if (= (aget tuple idx) arg)
-          (recur more)
-          false))
-      true)))
+  [^ints idxs ^objects values ^objects tuple]
+  (let [n (alength idxs)]
+    (loop [i 0]
+      (if (< i n)
+        (if (= (aget tuple (aget idxs i)) (aget values i))
+          (recur (unchecked-inc-int i))
+          false)
+        true))))
 
 (defn- var-positions
   [call-args]
@@ -235,12 +244,24 @@
     {} call-args))
 
 (defn- equality-indices
-  [^longs head-idxs var->positions]
-  (into []
-        (keep (fn [[_ idxs]]
-                (when (< 1 (count idxs))
-                  (mapv #(aget head-idxs %) idxs))))
-        var->positions))
+  [^ints head-idxs var->positions]
+  (let [pairs (into []
+                    (mapcat
+                      (fn [[_ positions]]
+                        (when (< 1 (count positions))
+                          (let [first-idx (aget head-idxs (first positions))]
+                            (map (fn [position]
+                                   [first-idx (aget head-idxs position)])
+                                 (rest positions))))))
+                    var->positions)
+        n     (count pairs)
+        left  (int-array n)
+        right (int-array n)]
+    (dotimes [i n]
+      (let [[left-idx right-idx] (pairs i)]
+        (aset left i (int left-idx))
+        (aset right i (int right-idx))))
+    [left right]))
 
 (defn- unique-vars
   [call-args]
@@ -250,35 +271,33 @@
         call-args))
 
 (defn- projection-indices
-  [var->positions ^longs head-idxs unique-call-vars]
-  (long-array (mapv #(aget head-idxs (first (var->positions %)))
-                    unique-call-vars)))
+  [var->positions ^ints head-idxs unique-call-vars]
+  (int-array (mapv #(aget head-idxs (first (var->positions %)))
+                   unique-call-vars)))
 
 (defn- equality-check
-  [equality-idxs ^objects tuple]
-  (loop [[idxs & more] equality-idxs]
-    (if idxs
-      (if (let [v0 (aget tuple (nth idxs 0))]
-            (loop [rest-idxs (rest idxs)]
-              (cond
-                (empty? rest-idxs)                    true
-                (= v0 (aget tuple (first rest-idxs))) (recur (rest rest-idxs))
-                :else                                 false)))
-        (recur more)
-        false)
-      true)))
+  [^ints left ^ints right ^objects tuple]
+  (let [n (alength left)]
+    (loop [i 0]
+      (if (< i n)
+        (if (= (aget tuple (aget left i)) (aget tuple (aget right i)))
+          (recur (unchecked-inc-int i))
+          false)
+        true))))
 
 (defn- map-rule-result
   "transforms evaluated rule-rel into a result rel tailored to the rule call"
   [rule-rel rule-head-vars call-args]
   (let [attrs            (:attrs rule-rel)
         ^List tuples     (:tuples rule-rel)
-        ^longs head-idxs (head-indices attrs rule-head-vars)
-        const-checks     (const-indices head-idxs call-args)
+        ^ints head-idxs  (head-indices attrs rule-head-vars)
+        [^ints const-idxs ^objects const-values]
+        (const-indices head-idxs call-args)
         var->positions   (var-positions call-args)
-        equality-idxs    (equality-indices head-idxs var->positions)
+        [^ints equality-left ^ints equality-right]
+        (equality-indices head-idxs var->positions)
         unique-call-vars (unique-vars call-args)
-        ^longs projection-idxs
+        ^ints projection-idxs
         (projection-indices var->positions head-idxs unique-call-vars)
         n                (alength projection-idxs)
         size             (.size tuples)]
@@ -287,8 +306,8 @@
       (let [acc (FastList. size)]
         (dotimes [i size]
           (let [^objects tuple (.get tuples i)]
-            (when (and (const-check const-checks tuple)
-                       (equality-check equality-idxs tuple))
+            (when (and (const-check const-idxs const-values tuple)
+                       (equality-check equality-left equality-right tuple))
               (let [to (object-array n)]
                 (dotimes [j n]
                   (aset to j (aget tuple (aget projection-idxs j))))

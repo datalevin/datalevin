@@ -1247,17 +1247,23 @@
               (u/raise a " :db/tupleAttrs can\u2019t depend on another tuple attribute: " attr ex-data))
 
             (when (identical? :db.cardinality/many (:db/cardinality (schema attr)))
-              (u/raise a " :db/tupleAttrs can\u2019t depend on :db.cardinality/many attribute: " attr ex-data))))))
+              (u/raise a " :db/tupleAttrs can\u2019t depend on :db.cardinality/many attribute: " attr ex-data))
+
+            (when-let [value-type (:db/valueType (schema attr))]
+              (when-not (c/tuple-value-types value-type)
+                (u/raise
+                  a " :db/tupleAttrs can\u2019t depend on attribute with unsupported tuple component type: "
+                  attr " (" value-type ")" ex-data)))))))
 
     (when (contains? kv :db/tupleType)
       (let [ex-data {:error     :schema/validation
                      :attribute a
                      :key       :db/tupleType}
             attr    (:db/tupleType kv)]
-        (when-not (c/datalog-value-types attr)
-          (u/raise a " :db/tupleType must be a single value type, got: " attr ex-data))
-        (when (identical? attr :db.type/tuple)
-          (u/raise a " :db/tupleType cannot be :db.type/tuple" ex-data))))
+        (when-not (c/tuple-value-types attr)
+          (u/raise
+            a " :db/tupleType must be a supported scalar tuple component type, got: "
+            attr ex-data))))
 
     (when (contains? kv :db/tupleTypes)
       (let [ex-data {:error     :schema/validation
@@ -1265,9 +1271,10 @@
                      :key       :db/tupleTypes}
             attrs   (:db/tupleTypes kv)]
         (when-not (and (sequential? attrs) (< 1 (count attrs))
-                       (every? c/datalog-value-types attrs)
-                       (not (some #(identical? :db.type/tuple %) attrs)))
-          (u/raise a " :db/tupleTypes must be a sequential collection of more than one value types, got: " attrs ex-data))))))
+                       (every? c/tuple-value-types attrs))
+          (u/raise
+            a " :db/tupleTypes must be a sequential collection of more than one supported scalar tuple component types, got: "
+            attrs ex-data))))))
 
 (defn validate-attr
   "Validate that an attribute is a keyword."
