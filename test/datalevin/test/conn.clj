@@ -27,6 +27,7 @@
    [datalevin.utl LRUCache]
    [datalevin.db DB]
    [datalevin.storage Store]
+   [datalevin.vector VectorIndex]
    [java.nio ByteBuffer]
    [java.util Arrays Date Random UUID]
    [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
@@ -954,6 +955,114 @@
       (is (= [1] (d/q q @conn {:active true})))
       (d/transact! conn [[:db.fn/retractAttribute 1 :doc/idoc]])
       (is (empty? (d/q q @conn {:active true})))
+      (finally
+        (d/close conn)))))
+
+(deftest test-giant-vector-projected-neighbors
+  (let [dimensions 128
+        value      (float-array
+                     (map #(float (/ (double %) (double dimensions)))
+                          (range dimensions)))
+        conn       (d/create-conn
+                     nil
+                     {:embedding {:db/valueType :db.type/vec}}
+                     {:wal?        false
+                      :vector-opts {:dimensions dimensions
+                                    :metric-type :cosine}
+                      :kv-opts     {:inmemory? true :wal? false}})
+        q-e        '[:find [?e ...]
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query {:top 1})
+                      [[?e _ _]]]]
+        q-a        '[:find [?a ...]
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query {:top 1})
+                      [[_ ?a _]]]]
+        q-v        '[:find [?v ...]
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query {:top 1})
+                      [[_ _ ?v]]]]
+        q-ed       '[:find ?e ?dist
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query
+                                     {:top 1 :display :refs+dists})
+                      [[?e _ _ ?dist]]]]
+        q-all      '[:find ?e ?a ?v ?dist
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query
+                                     {:top 1 :display :refs+dists})
+                      [[?e ?a ?v ?dist]]]]]
+    (try
+      (d/transact! conn [{:db/id 1 :embedding value}])
+      (let [store (conn-store conn)
+            index (get (.-vector-indices ^Store store) "embedding")
+            ref   (-> ^SpillableMap (.-vecs ^VectorIndex index)
+                      seq first val)]
+        (is (= [:g 1] [(first ref) (nth ref 2)]))
+        (is (int? (nth ref 3)))
+        (is (empty? (d/search-vec index value
+                                  {:top 1 :vec-filter (constantly false)}))))
+      (is (= [1] (d/q q-e @conn value)))
+      (is (= [:embedding] (d/q q-a @conn value)))
+      (is (= [(vec value)] (mapv vec (d/q q-v @conn value))))
+      (let [[e dist] (first (d/q q-ed @conn value))]
+        (is (= 1 e))
+        (is (number? dist)))
+      (let [[e a v dist] (first (d/q q-all @conn value))]
+        (is (= 1 e))
+        (is (= :embedding a))
+        (is (= (vec value) (vec v)))
+        (is (number? dist)))
+      (d/transact! conn [[:db/retract 1 :embedding value]])
+      (is (empty? (d/q q-e @conn value)))
+      (finally
+        (d/close conn)))))
+
+(deftest test-giant-cardinality-many-vector-neighbors
+  (let [dimensions 128
+        value-1    (float-array
+                     (map #(float (/ (double (inc %)) (double dimensions)))
+                          (range dimensions)))
+        value-2    (float-array
+                     (map #(float (/ (double (- dimensions %))
+                                     (double dimensions)))
+                          (range dimensions)))
+        conn       (d/create-conn
+                     nil
+                     {:embedding {:db/valueType   :db.type/vec
+                                  :db/cardinality :db.cardinality/many}}
+                     {:wal?        false
+                      :vector-opts {:dimensions dimensions
+                                    :metric-type :cosine}
+                      :kv-opts     {:inmemory? true :wal? false}})
+        q-v        '[:find [?v ...]
+                     :in $ ?query
+                     :where
+                     [(vec-neighbors $ :embedding ?query {:top 2})
+                      [[_ _ ?v]]]]]
+    (try
+      (d/transact! conn [[:db/add 1 :embedding value-1]
+                         [:db/add 1 :embedding value-2]])
+      (let [store (conn-store conn)
+            index (get (.-vector-indices ^Store store) "embedding")
+            refs  (mapv val (seq (.-vecs ^VectorIndex index)))]
+        (is (= 2 (:size (d/vector-index-info index))))
+        (is (= 2 (count (set (map second refs)))))
+        (is (every? #(and (= :g (first %))
+                          (= 1 (nth % 2))
+                          (int? (nth % 3)))
+                    refs))
+        (is (= #{(vec value-1) (vec value-2)}
+               (set (map vec (d/q q-v @conn value-1)))))
+        (d/transact! conn [[:db/retract 1 :embedding value-1]])
+        (is (= 1 (:size (d/vector-index-info index))))
+        (is (= #{(vec value-2)}
+               (set (map vec (d/q q-v @conn value-1))))))
       (finally
         (d/close conn)))))
 

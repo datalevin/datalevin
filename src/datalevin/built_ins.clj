@@ -368,47 +368,68 @@
          (mapv (fn [^objects t] [(aget t 0) (aget t 1) (aget t 2)])
                res))))))
 
+(defn- make-vector-dist-emit-fn
+  [lmdb aid->attr ^ints needed]
+  (if needed
+    (let [n          (alength needed)
+          ref-n      (loop [j 0, cnt 0]
+                       (if (clojure.core/< j n)
+                         (recur (clojure.core/inc j)
+                                (if (clojure.core/< (aget needed j) 3)
+                                  (clojure.core/inc cnt)
+                                  cnt))
+                         cnt))
+          ref-needed (int-array ref-n)]
+      (loop [j 0, ref-j 0]
+        (when (clojure.core/< j n)
+          (let [idx (aget needed j)]
+            (if (clojure.core/< idx 3)
+              (do
+                (aset-int ref-needed ref-j idx)
+                (recur (clojure.core/inc j) (clojure.core/inc ref-j)))
+              (recur (clojure.core/inc j) ref-j)))))
+      (let [emit-ref (when (clojure.core/pos? (long ref-n))
+                       (make-emit-fn lmdb aid->attr ref-needed))]
+        (fn [result]
+          (let [doc-ref        (nth result 0)
+                dist           (nth result 1)
+                ^objects tuple (when emit-ref (emit-ref doc-ref))
+                ^objects arr   (object-array n)]
+            (loop [j 0, ref-j 0]
+              (when (clojure.core/< j n)
+                (if (clojure.core/== 3 (aget needed j))
+                  (do
+                    (aset arr j dist)
+                    (recur (clojure.core/inc j) ref-j))
+                  (do
+                    (aset arr j (aget tuple ref-j))
+                    (recur (clojure.core/inc j)
+                           (clojure.core/inc ref-j))))))
+            arr))))
+    (let [emit-ref (make-emit-fn lmdb aid->attr nil)]
+      (fn [result]
+        (let [^objects tuple (emit-ref (nth result 0))]
+          (object-array [(aget tuple 0)
+                         (aget tuple 1)
+                         (aget tuple 2)
+                         (nth result 1)]))))))
+
+(defn- add-vector-neighbors!
+  [^FastList res aid->attr lmdb index query opts ^ints needed]
+  (let [display (or (:display opts)
+                    (:display (.-search-opts
+                                ^datalevin.vector.VectorIndex index))
+                    :refs)
+        emit    (if (clojure.core/= :refs+dists display)
+                  (make-vector-dist-emit-fn lmdb aid->attr needed)
+                  (make-emit-fn lmdb aid->attr needed))]
+    (doseq [result (search-vec index query opts)]
+      (.add res (emit result)))))
+
 (defn- vec-neighbors*
   [^FastList res aid->attr lmdb indices query opts domain ^ints needed]
   (when-let [index (indices domain)]
-    (let [display    (or (:display opts)
-                         (:display (.-search-opts ^datalevin.vector.VectorIndex index))
-                         :refs)
-          refs+dists (clojure.core/= :refs+dists display)
-          emit       (make-emit-fn lmdb aid->attr needed)]
-      (if refs+dists
-        ;; For refs+dists, we have 4 elements: e(0), a(1), v(2), dist(3)
-        (if needed
-          (let [n (alength needed)]
-            (doseq [d (search-vec index query opts)]
-              (let [[vec-ref dist]  d
-                    [e a v]         (if (and (vector? vec-ref)
-                                             (clojure.core/= :g (first vec-ref)))
-                                      (let [datom (idx/gt->datom lmdb (peek vec-ref))]
-                                        [(dd/datom-e datom)
-                                         (dd/datom-a datom)
-                                         (dd/datom-v datom)])
-                                      [(nth vec-ref 0)
-                                       (aid->attr (nth vec-ref 1))
-                                       (peek vec-ref)])
-                    ^objects arr    (object-array n)]
-                (dotimes [j n]
-                  (aset arr j (case (aget needed j)
-                                0 e
-                                1 a
-                                2 v
-                                3 dist)))
-                (.add res arr))))
-          (doseq [d (search-vec index query opts)]
-            (let [[vec-ref dist] d
-                  ^objects tuple (emit vec-ref)]
-              (.add res (object-array [(aget tuple 0)
-                                       (aget tuple 1)
-                                       (aget tuple 2)
-                                       dist])))))
-        ;; Regular 3-element tuples
-        (doseq [d (search-vec index query opts)]
-          (.add res (emit d)))))))
+    (add-vector-neighbors! res aid->attr lmdb index query opts needed)))
 
 (defn vec-neighbors
   "Function that does vector similarity search. Returns matching tuples of
@@ -454,34 +475,7 @@
 (defn- embedding-neighbors*
   [^FastList res aid->attr lmdb indices query-vector opts domain ^ints needed]
   (when-let [index (indices domain)]
-    (let [display    (or (:display opts)
-                         (:display (.-search-opts ^datalevin.vector.VectorIndex index))
-                         :refs)
-          refs+dists (clojure.core/= :refs+dists display)
-          emit       (make-emit-fn lmdb aid->attr needed)]
-      (if refs+dists
-        (if needed
-          (let [n (alength needed)]
-            (doseq [d (search-vec index query-vector opts)]
-              (let [[doc-ref dist] d
-                    [e a v]       (doc-ref->eav lmdb aid->attr doc-ref)
-                    ^objects arr  (object-array n)]
-                (dotimes [j n]
-                  (aset arr j (case (aget needed j)
-                                0 e
-                                1 a
-                                2 v
-                                3 dist)))
-                (.add res arr))))
-          (doseq [d (search-vec index query-vector opts)]
-            (let [[doc-ref dist] d
-                  ^objects tuple (emit doc-ref)]
-              (.add res (object-array [(aget tuple 0)
-                                       (aget tuple 1)
-                                       (aget tuple 2)
-                                       dist])))))
-        (doseq [d (search-vec index query-vector opts)]
-          (.add res (emit d)))))))
+    (add-vector-neighbors! res aid->attr lmdb index query-vector opts needed)))
 
 (defn embedding-neighbors
   "Function that does embedding similarity search over `:db/embedding` domains.

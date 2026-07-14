@@ -1368,8 +1368,8 @@
       (case (nth op 0)
         :a (add-vec index d (peek d))
         :d (remove-vec index d)
-        :g (add-vec index [:g (nth d 0)] (peek d))
-        :r (remove-vec index [:g d])))))
+        :g (add-vec index [:g (nth d 2) (nth d 0) (nth d 1)] (peek d))
+        :r (remove-vec index [:g (nth d 2) (nth d 0) (nth d 1)])))))
 
 (defn- vector-entry
   [ref value]
@@ -1407,7 +1407,9 @@
                                   (.put batches index entries)
                                   entries))]]
               (.add entries (vector-entry
-                             (if (identical? kind :g) [:g (nth d 0)] d)
+                             (if (identical? kind :g)
+                               [:g (nth d 2) (nth d 0) (nth d 1)]
+                               d)
                              (peek d))))
             (doseq [[index entries] batches]
               (v/add-vecs index entries)))
@@ -2422,8 +2424,8 @@
         (.add txs (lmdb/kv-tx :put c/giants max-gt value
                               :id vtype [:append]))))
     (when (identical? vt :db.type/vec)
-      (let [ref     (if giant? [:g max-gt] [e aid v])
-            op      (if giant? [:g [max-gt v]] [:a [e aid v]])
+      (let [ref     (if giant? [:g max-gt e aid] [e aid v])
+            op      (if giant? [:g [e aid max-gt v]] [:a [e aid v]])
             domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
         (doseq [domain domains]
           (if (async-vector-domain? store domain)
@@ -2434,7 +2436,7 @@
                            :value v})
             (.add vi-ds [[domain] op])))))
     (when embedding?
-      (let [doc-ref     (if giant? [:g max-gt] [e aid v])
+      (let [doc-ref     (if giant? [:g max-gt e aid] [e aid v])
             domain-vecs (some-> ^IdentityHashMap embedding-plan (.get d))]
         (doseq [domain (embedding-attr-domains attr props)]
           (if (async-embedding-domain? store domain)
@@ -2508,7 +2510,7 @@
                           :delete
                           (if gt [:r gt] [:d ref]))))
     (when embedding?
-      (let [doc-ref (if gt [:g gt] [e aid v])]
+      (let [doc-ref (if gt [:g gt e aid] [e aid v])]
         (doseq [domain (embedding-attr-domains attr props)]
           (if (async-embedding-domain? store domain)
             (.add em-jobs {:type :embedding
@@ -2529,8 +2531,8 @@
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
       (when (identical? vt :db.type/vec)
-        (let [ref     (if gt [:g gt] [e aid v])
-              op      (if gt [:r gt] [:d [e aid v]])
+        (let [ref     (if gt [:g gt e aid] [e aid v])
+              op      (if gt [:r [e aid gt]] [:d [e aid v]])
               domains (conjv (props :db.vec/domains) (v/attr-domain attr))]
           (doseq [domain domains]
             (if (async-vector-domain? store domain)
@@ -2556,7 +2558,8 @@
          ;; or [:r d gt]
          ft-ds  (FastList.)
          ft-jobs (FastList.)
-         ;; vector, same
+         ;; vector [:a d [e aid v]], [:d d [e aid v]],
+         ;; [:g d [e aid gt v]], or [:r d [e aid gt]]
          vi-ds  (FastList.)
          vi-jobs (FastList.)
          ;; embedding [:a [doc-ref vec]], [:d doc-ref]

@@ -570,9 +570,58 @@
           lag-trigger?
           interval-trigger?))))
 
+(defn- accept-all?
+  [_]
+  true)
+
 (def default-search-opts {:display    :refs
                           :top        10
-                          :vec-filter (constantly true)})
+                          :vec-filter accept-all?})
+
+(defn- search-refs
+  [^SpillableMap vecs ^longs keys vec-filter]
+  (let [n          (alength keys)
+        no-filter? (identical? vec-filter accept-all?)
+        res        (ArrayList. n)]
+    (loop [j 0]
+      (when (< j n)
+        (when-let [vec-ref (.get vecs (aget keys j))]
+          (when (or no-filter? (vec-filter vec-ref))
+            (.add res vec-ref)))
+        (recur (unchecked-inc-int j))))
+    res))
+
+(defn- search-refs+dists
+  [^SpillableMap vecs ^longs keys ^floats dists vec-filter]
+  (let [n          (alength keys)
+        no-filter? (identical? vec-filter accept-all?)
+        res        (ArrayList. n)]
+    (loop [j 0]
+      (when (< j n)
+        (when-let [vec-ref (.get vecs (aget keys j))]
+          (when (or no-filter? (vec-filter vec-ref))
+            (.add res [vec-ref (aget dists j)])))
+        (recur (unchecked-inc-int j))))
+    res))
+
+(defn- legacy-giant-ref
+  [vec-ref]
+  (when (and (vector? vec-ref)
+             (identical? :g (first vec-ref))
+             (< 3 (count vec-ref)))
+    [:g (second vec-ref)]))
+
+(defn- stored-vec-entry
+  [lmdb vecs-dbi vec-ref]
+  (let [ids (vec (i/get-list lmdb vecs-dbi vec-ref :data :id))]
+    (if (seq ids)
+      [vec-ref ids]
+      (if-let [legacy-ref (legacy-giant-ref vec-ref)]
+        (let [legacy-ids (vec (i/get-list lmdb vecs-dbi legacy-ref :data :id))]
+          (if (seq legacy-ids)
+            [legacy-ref legacy-ids]
+            [vec-ref ids]))
+        [vec-ref ids]))))
 
 (defn- vec-save-key* [fname] (->> fname hash (str "vec-save-") keyword))
 
@@ -606,7 +655,7 @@
   (combine [_] first)
   (callback [_] nil))
 
-(declare display-xf new-vector-index)
+(declare new-vector-index)
 
 (deftype VectorIndex [lmdb
                       closed?
@@ -694,18 +743,18 @@
       (try
         (when @closed?
           (raise "Vector index is closed." {:domain domain}))
-        (let [ids (vec (i/get-list lmdb vecs-dbi vec-ref :data :id))]
+        (let [[stored-ref ids] (stored-vec-entry lmdb vecs-dbi vec-ref)]
           ;; Apply LMDB deletion first; mutate in-memory index only after success.
           (let [commit-lsn (txn-log-next-lsn lmdb)
                 meta-op    (when (seq ids)
                              (replay-floor-put-tx lmdb domain commit-lsn))
-                txs        (cond-> [(l/kv-tx :del vecs-dbi vec-ref)]
+                txs        (cond-> [(l/kv-tx :del vecs-dbi stored-ref)]
                              (some? meta-op) (conj meta-op))]
             (i/transact-kv lmdb txs))
           (try
             (maybe-run-txn-log-vector-apply-failpoint!
              lmdb :remove-vec
-             {:domain domain :vec-ref vec-ref :ids ids})
+             {:domain domain :vec-ref stored-ref :ids ids})
             (doseq [^long id ids]
               (remove-id index id))
             (doseq [^long id ids]
@@ -716,20 +765,21 @@
                 (vector-commit-unknown!
                  lmdb :remove-vec
                  {:domain domain
-                  :vec-ref vec-ref
+                  :vec-ref stored-ref
                   :ids ids}
                  e)
                 (do
                   (when (seq ids)
                     (try
                       (i/transact-kv
-                       lmdb [(l/kv-tx :put-list vecs-dbi vec-ref ids :data :id)])
+                       lmdb [(l/kv-tx :put-list vecs-dbi stored-ref ids
+                                              :data :id)])
                       (catch Throwable rollback-e
                         (throw (ex-info "Fail to rollback vector ref mapping"
-                                        {:vec-ref vec-ref :ids ids}
+                                        {:vec-ref stored-ref :ids ids}
                                         rollback-e)))))
                   (throw (ex-info "Fail to remove vector after LMDB apply"
-                                  {:vec-ref vec-ref :ids ids}
+                                  {:vec-ref stored-ref :ids ids}
                                   e)))))))
         (finally
           (.unlock wlock)))
@@ -802,7 +852,7 @@
 
   (search-vec [this query-vec]
     (.search-vec this query-vec {}))
-  (search-vec [this query-vec {:keys [display top vec-filter]
+  (search-vec [_ query-vec {:keys [display top vec-filter]
                                :or   {display    (:display search-opts)
                                       top        (:top search-opts)
                                       vec-filter (:vec-filter search-opts)}}]
@@ -810,10 +860,12 @@
       (.lock rlock)
       (try
         (let [query                    (vec->arr dimensions quantization query-vec)
-              ^VecIdx$SearchResult res (search index query quantization (int top))]
-          (doall (sequence
-                   (display-xf this vec-filter display)
-                   (.getKeys res) (.getDists res))))
+              ^VecIdx$SearchResult res (search index query quantization (int top))
+              ^longs keys              (.getKeys res)]
+          (case display
+            :refs       (search-refs vecs keys vec-filter)
+            :refs+dists (search-refs+dists vecs keys (.getDists res)
+                                           vec-filter)))
         (finally
           (.unlock rlock)))))
 
@@ -967,24 +1019,6 @@
             (submit-async-vec-save!
              (AsyncVecSave. tx-lock index lmdb domain stats fname vec-lock))
             nil))))))
-
-(defn- get-ref
-  [^VectorIndex index vec-filter vec-id _]
-  (when-let [vec-ref ((.-vecs index) vec-id)]
-    (when (vec-filter vec-ref) vec-ref)))
-
-(defn- get-ref-dist
-  [^VectorIndex index vec-filter vec-id dist]
-  (when-let [vec-ref ((.-vecs index) vec-id)]
-    (when (vec-filter vec-ref) [vec-ref dist])))
-
-(defn- display-xf
-  [index vec-filter display]
-  (case display
-    :refs       (comp (map #(get-ref index vec-filter %1 %2))
-                   (remove nil?))
-    :refs+dists (comp (map #(get-ref-dist index vec-filter %1 %2))
-                   (remove nil?))))
 
 (def default-opts {:metric-type      c/default-metric-type
                    :quantization     c/default-quantization
