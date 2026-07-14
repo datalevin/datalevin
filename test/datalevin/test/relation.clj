@@ -3,6 +3,7 @@
    [clojure.test :refer [deftest is]]
    [datalevin.relation :as r])
   (:import
+   [datalevin.utl ArrayUtil]
    [java.util HashSet]))
 
 (deftest array-wrapper-hash-test
@@ -25,3 +26,16 @@
     (is (= h (.hashCode hashed)))
     (is (.contains seen
                    (r/reset-array-lookup-with-hash! lookup tuple h)))))
+
+(deftest fill-rule-output-hash-test
+  (let [output   (object-array 2)
+        h        (ArrayUtil/fillRuleOutputAndHash
+                   output
+                   (long-array [0 1])
+                   (int-array [1 0])
+                   (object-array [10 20])
+                   (int-array [0 1])
+                   30
+                   nil)]
+    (is (= [20 30] (vec output)))
+    (is (= h (ArrayUtil/hashObjectArray output)))))

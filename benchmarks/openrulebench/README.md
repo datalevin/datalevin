@@ -77,8 +77,8 @@ and 3,000 `sib` facts. These results use the common timing boundary above.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:small` | 3,787.4 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
-| `sg:small` | 2,538.7 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
+| `tc:small` | 2,884.0 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
+| `sg:small` | 1,956.0 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
 
 Correctness was checked for both Datalevin and Clara TC/SG rules against
 independent fixed-point references. The corrected SG reference uses the

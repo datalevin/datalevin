@@ -74,7 +74,9 @@ stratum, precompiles output and lookup metadata into primitive arrays, and
 reduces temporary tuple allocation in the seen-set path. This avoids
 materialization of large duplicate join products and repeated store lookups in
 TC/SG-style rules. Seen sets also use a mixed per-element tuple hash so dense
-numeric tuples do not collapse into heavily contended hash buckets.
+numeric tuples do not collapse into heavily contended hash buckets. The linear
+fast path fills each output array and computes that hash in one pass, then
+reuses the hash for both the seen-set probe and the stored tuple wrapper.
 
 ## Benchmarks
 

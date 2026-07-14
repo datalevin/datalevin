@@ -14,23 +14,10 @@
    [datalevin.util :as u :refer [raise]]
    [datalevin.timeout :as timeout])
   (:import
-   [clojure.lang Murmur3]
+   [datalevin.utl ArrayUtil]
    [java.util List Arrays HashSet]
    [java.io Writer]
    [org.eclipse.collections.impl.list.mutable FastList]))
-
-(defn- array-hash
-  ^long [^objects a]
-  (let [n (alength a)]
-    (loop [i 0, h (unchecked-int 0x811c9dc5)]
-      (if (< i n)
-        (let [x        (aget a i)
-              ^long eh (if (nil? x) 0 (.hashCode ^Object x))]
-          (recur (unchecked-inc-int i)
-                 (unchecked-multiply-int
-                   (unchecked-int (bit-xor h eh))
-                   16777619)))
-        (Murmur3/mixCollHash h n)))))
 
 (deftype ArrayWrapper [^objects a ^int h]
   Object
@@ -39,7 +26,8 @@
     (and (instance? ArrayWrapper that)
          (Arrays/equals a ^objects (.-a ^ArrayWrapper that)))))
 
-(defn wrap-array [^objects a] (ArrayWrapper. a (int (array-hash a))))
+(defn wrap-array [^objects a]
+  (ArrayWrapper. a (ArrayUtil/hashObjectArray a)))
 
 (defn wrap-array-with-hash
   [^objects a ^long h]
@@ -49,14 +37,14 @@
   (reset-lookup [this a]))
 
 (definterface ^:private IHashedArrayLookup
-  (^Object resetLookupHash [^objects a ^int h]))
+  (^Object resetLookupHash [^"[Ljava.lang.Object;" a ^int h]))
 
 (deftype ArrayLookup [^:unsynchronized-mutable ^objects a
                       ^:unsynchronized-mutable ^int h]
   IArrayLookup
   (reset-lookup [this a']
     (set! a a')
-    (set! h (int (array-hash ^objects a')))
+    (set! h (ArrayUtil/hashObjectArray ^objects a'))
     this)
   IHashedArrayLookup
   (resetLookupHash [this a' h']

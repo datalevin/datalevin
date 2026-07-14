@@ -39,18 +39,19 @@ open that database again with Datalevin 0.10.5.
 
 ## Automatic Data Migration
 
-For databases that is newer than version 0.9.27, a later version of Datalevin
-can automatically migrating the data when opening them. This process involves
-downloading the old version of Datalevin uberjar to dump the data, then load the
-data with the newer version of Datalevin.
+For databases newer than version 0.9.27, a later version of Datalevin can
+automatically migrate the data when opening them. This process downloads the
+old version's Datalevin uberjar and streams the logical data directly into a
+staging database created by the newer version.
 
 This process may take a long time if the database is big, so some down time is
 expected for now.
 
-The auto migration detects the presence of `datalevin/eav` DBI and dumps the
-database as a Datalog store, otherwise, it dumps all DBIs as key value
-stores. If there are mixed KV DBIs in the same file as the Datalog store, these
-extra KV DBIs will need to be dumped manually.
+The auto migration detects the presence of the `datalevin/eav` DBI. For a
+Datalog store, it migrates the schema and datoms together with any user KV DBIs
+in the same environment. Datalog-owned internal and secondary-index DBIs are
+rebuilt by the current version instead of being copied. If `datalevin/eav` is
+absent, all user DBIs are migrated as a key-value store.
 
 ## Manual Data Migration
 
