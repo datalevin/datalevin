@@ -73,7 +73,8 @@ directly into the seen set, caches static EAV adjacency maps for the recursive
 stratum, precompiles output and lookup metadata into primitive arrays, and
 reduces temporary tuple allocation in the seen-set path. This avoids
 materialization of large duplicate join products and repeated store lookups in
-TC/SG-style rules.
+TC/SG-style rules. Seen sets also use a mixed per-element tuple hash so dense
+numeric tuples do not collapse into heavily contended hash buckets.
 
 ## Benchmarks
 

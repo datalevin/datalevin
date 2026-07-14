@@ -22,6 +22,7 @@
    [datalevin.util :as u :refer [raise concatv cond+ map+]]
    [datalevin.relation :as r])
   (:import
+   [clojure.lang Murmur3]
    [datalevin.db DB]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]
@@ -735,34 +736,44 @@
   (aget delta-tuple (aget call-rel-idxs (int call-pos))))
 
 (defn- fill-fast-output!
+  ^long
   [^objects scratch ^longs head-types ^ints head-idxs ^objects delta-tuple
    ^ints call-rel-idxs eav0 eav1]
-  (dotimes [i (alength scratch)]
-    (let [idx (aget head-idxs i)]
-      (aset scratch i
-            (if (zero? (aget head-types i))
-              (call-value delta-tuple call-rel-idxs idx)
-              (if (zero? idx) eav0 eav1)))))
-  scratch)
+  (let [n (alength scratch)]
+    (loop [i 0, h (int -2128831035)]
+      (if (< i n)
+        (let [idx      (aget head-idxs i)
+              value    (if (zero? (aget head-types i))
+                         (call-value delta-tuple call-rel-idxs idx)
+                         (if (zero? idx) eav0 eav1))
+              ^long eh (if (nil? value) 0 (.hashCode ^Object value))]
+          (aset scratch i value)
+          (recur (unchecked-inc-int i)
+                 (unchecked-multiply-int
+                   (unchecked-int (bit-xor h eh))
+                   16777619)))
+        (Murmur3/mixCollHash h n)))))
 
 (defn- add-fast-output-with-probe!
   [^FastList acc ^HashSet seen-set seen-lookup ^objects scratch
    ^longs head-types ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs
    eav0 eav1]
-  (fill-fast-output! scratch head-types head-idxs delta-tuple call-rel-idxs
-                     eav0 eav1)
-  (when-not (.contains seen-set (r/reset-array-lookup! seen-lookup scratch))
-    (let [tuple (aclone scratch)]
-      (.add seen-set (r/wrap-array tuple))
-      (.add acc tuple))))
+  (let [h (fill-fast-output! scratch head-types head-idxs delta-tuple
+                             call-rel-idxs eav0 eav1)]
+    (when-not (.contains seen-set
+                         (r/reset-array-lookup-with-hash!
+                           seen-lookup scratch h))
+      (let [tuple (aclone scratch)]
+        (.add seen-set (r/wrap-array-with-hash tuple h))
+        (.add acc tuple)))))
 
 (defn- add-fast-output!
   [^FastList acc ^HashSet seen-set ^objects scratch ^longs head-types
    ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs eav0 eav1]
-  (fill-fast-output! scratch head-types head-idxs delta-tuple call-rel-idxs
-                     eav0 eav1)
-  (let [tuple (aclone scratch)]
-    (when (.add seen-set (r/wrap-array tuple))
+  (let [h     (fill-fast-output! scratch head-types head-idxs delta-tuple
+                                 call-rel-idxs eav0 eav1)
+        tuple (aclone scratch)]
+    (when (.add seen-set (r/wrap-array-with-hash tuple h))
       (.add acc tuple))))
 
 (defn- eval-linear-eav-branch-with-dedup
