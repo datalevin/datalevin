@@ -292,7 +292,7 @@
     -0.1
     (nth (.top pq) 0)))
 
-(declare doc-ref->id remove-doc* add-doc* hydrate-query display-xf
+(declare doc-ref->id stored-doc-entry remove-doc* add-doc* hydrate-query display-xf
          cached-search-results score-docs get-rawtext new-search-engine*
          parse-query* parse-query get-pos-info)
 
@@ -799,15 +799,15 @@
     (locking docs
       (when-not (s/blank? doc-text)
         (when check-exist?
-          (when-let [doc-id (doc-ref->id this doc-ref)]
-            (remove-doc* this doc-id doc-ref)))
+          (when-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
+            (remove-doc* this doc-id stored-ref)))
         (add-doc* this doc-ref doc-text))))
   (add-doc [this doc-ref doc-text]
     (.add-doc this doc-ref doc-text true))
 
   (remove-doc [this doc-ref]
-    (if-let [doc-id (doc-ref->id this doc-ref)]
-      (remove-doc* this doc-id doc-ref)
+    (if-let [[doc-id stored-ref] (stored-doc-entry this doc-ref)]
+      (remove-doc* this doc-id stored-ref)
       (u/raise "Document does not exist." {:doc-ref doc-ref})))
 
   (clear-docs [_]
@@ -820,7 +820,7 @@
     (clear-dbi lmdb positions-dbi)
     (clear-dbi lmdb rawtext-dbi))
 
-  (doc-indexed? [this doc-ref] (doc-ref->id this doc-ref))
+  (doc-indexed? [this doc-ref] (some-> (stored-doc-entry this doc-ref) first))
 
   (doc-count [_] (count docs))
 
@@ -1067,6 +1067,21 @@
     engine [:doc-ref->id doc-ref]
     (get-value (.-lmdb engine) (.-docs-dbi engine)
                doc-ref :data :int)))
+
+(defn- legacy-giant-doc-ref
+  [doc-ref]
+  (when (and (vector? doc-ref)
+             (identical? :g (first doc-ref))
+             (< 3 (count doc-ref)))
+    [:g (second doc-ref)]))
+
+(defn- stored-doc-entry
+  [^SearchEngine engine doc-ref]
+  (if-let [doc-id (doc-ref->id engine doc-ref)]
+    [doc-id doc-ref]
+    (when-let [legacy-ref (legacy-giant-doc-ref doc-ref)]
+      (when-let [doc-id (doc-ref->id engine legacy-ref)]
+        [doc-id legacy-ref]))))
 
 (defn- term-ids-via-positions-dbi
   [^SearchEngine engine doc-ref]
@@ -1369,23 +1384,29 @@
                       (.remove deleted-refs doc-ref)
                       (.put added-norms doc-id unique)
                       (.add state-actions [:add doc-id doc-ref unique]))))
-                (let [doc-id (when-not (.contains deleted-refs doc-ref)
-                               (or (.get pending-doc-ids doc-ref)
-                                   (doc-ref->id engine doc-ref)))]
-                  (when-not doc-id
+                (let [[doc-id stored-ref]
+                      (when-not (.contains deleted-refs doc-ref)
+                        (if-let [doc-id (.get pending-doc-ids doc-ref)]
+                          [doc-id doc-ref]
+                          (stored-doc-entry engine doc-ref)))]
+                  (when-not stored-ref
                     (u/raise "Document does not exist." {:doc-ref doc-ref}))
                   (.add txs (l/kv-tx :del rawtext-dbi doc-id :int))
                   (if-let [^objects doc-terms
-                           (.get pending-doc-terms doc-ref)]
+                           (.get pending-doc-terms stored-ref)]
                     (dotimes [term-idx (alength doc-terms)]
                       (remove-term! (aget doc-terms term-idx) doc-id))
-                    (doseq [term-id (doc-ref->term-ids engine doc-ref)]
+                    (doseq [term-id (doc-ref->term-ids engine stored-ref)]
                       (when-let [term (terms term-id)]
                         (remove-term! term doc-id))))
-                  (.add txs (l/kv-tx :del (.-docs-dbi engine) doc-ref :data))
+                  (.add txs
+                        (l/kv-tx :del (.-docs-dbi engine) stored-ref :data))
                   (.remove pending-doc-ids doc-ref)
+                  (.remove pending-doc-ids stored-ref)
                   (.remove pending-doc-terms doc-ref)
+                  (.remove pending-doc-terms stored-ref)
                   (.add deleted-refs doc-ref)
+                  (.add deleted-refs stored-ref)
                   (.add state-actions [:delete doc-id]))))))
         (doseq [^Map$Entry kv (.entrySet pending-terms)]
           (let [term                 (.getKey kv)

@@ -1257,17 +1257,25 @@
                      {:v-idx v-idx :attr attr}))
           out)))))
 
+(defn- fulltext-op-ref
+  [op]
+  (let [kind (nth op 0)
+        d    (nth op 1)]
+    (case kind
+      ;; Keep e and aid in giant refs so projected reads need not load the value.
+      (:g :r) [:g (nth d 2) (nth d 0) (nth d 1)]
+      (:a :d) d)))
+
 (defn- apply-fulltext-op!
   [search-engines res]
   (let [op (peek res)
-        d  (nth op 1)]
+        d  (nth op 1)
+        ref (fulltext-op-ref op)]
     (doseq [domain (nth res 0)
             :let   [engine (search-engines domain)]]
       (case (nth op 0)
-        :a (add-doc engine d (peek d) false)
-        :d (remove-doc engine d)
-        :g (add-doc engine [:g (nth d 0)] (peek d) false)
-        :r (remove-doc engine [:g d])))))
+        (:a :g) (add-doc engine ref (peek d) false)
+        (:d :r) (remove-doc engine ref)))))
 
 (defn- fulltext-entry
   [ref text]
@@ -1323,8 +1331,7 @@
           (let [batches (IdentityHashMap.)]
             (doseq [res    ft-ds
                     :let   [op   (peek res)
-                            d    (nth op 1)
-                            kind (nth op 0)]
+                            d    (nth op 1)]
                     domain (nth res 0)
                     :let   [engine (search-engines domain)
                             ^FastList entries
@@ -1334,7 +1341,7 @@
                                   entries))]]
               (.add entries
                     (fulltext-entry
-                      (if (identical? kind :g) [:g (nth d 0)] d)
+                      (fulltext-op-ref op)
                       (peek d))))
             (doseq [[engine entries] batches]
               (add-fulltext-batches! engine entries)))
@@ -1354,8 +1361,10 @@
                     (case kind
                       :a (fulltext-op-entry :add d (peek d))
                       :d (fulltext-op-entry :delete d nil)
-                      :g (fulltext-op-entry :add [:g (nth d 0)] (peek d))
-                      :r (fulltext-op-entry :delete [:g d] nil))))
+                      :g (fulltext-op-entry :add (fulltext-op-ref op)
+                                            (peek d))
+                      :r (fulltext-op-entry :delete (fulltext-op-ref op)
+                                            nil))))
             (doseq [[engine entries] batches]
               (transact-fulltext-batches! engine entries))))))))
 
@@ -2457,7 +2466,7 @@
           (.add id-ds [domain op]))))
     (when fulltext?
       (let [text (str v)
-            ref  (if giant? [:g max-gt] [e aid text])]
+            ref  (if giant? [:g max-gt e aid] [e aid text])]
         (collect-fulltext store
                           ft-ds
                           ft-jobs
@@ -2466,7 +2475,7 @@
                           text
                           ref
                           :add
-                          (if giant? [:g [max-gt text]] [:a ref]))))))
+                          (if giant? [:g [e aid max-gt text]] [:a ref]))))))
 
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
@@ -2499,7 +2508,7 @@
                            (.-g r))))]
     (when fulltext?
       (let [text (str v)
-            ref  (if gt [:g gt] [e aid text])]
+            ref  (if gt [:g gt e aid] [e aid text])]
         (collect-fulltext store
                           ft-ds
                           ft-jobs
@@ -2508,7 +2517,7 @@
                           text
                           ref
                           :delete
-                          (if gt [:r gt] [:d ref]))))
+                          (if gt [:r [e aid gt]] [:d ref]))))
     (when embedding?
       (let [doc-ref (if gt [:g gt e aid] [e aid v])]
         (doseq [domain (embedding-attr-domains attr props)]
@@ -2554,8 +2563,8 @@
    ;; Datom operations lead the batch so LMDB can select the primitive-EID
    ;; executor once; generic giant, job, and metadata operations follow.
    (let [txs    (FastList. (+ 2 (count datoms) (count extra-kv-txs)))
-         ;; fulltext [:a d [e aid v]], [:d d [e aid v]], [:g d [gt v]],
-         ;; or [:r d gt]
+         ;; fulltext [:a d [e aid v]], [:d d [e aid v]],
+         ;; [:g d [e aid gt v]], or [:r d [e aid gt]]
          ft-ds  (FastList.)
          ft-jobs (FastList.)
          ;; vector [:a d [e aid v]], [:d d [e aid v]],

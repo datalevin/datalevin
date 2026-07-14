@@ -1025,13 +1025,15 @@
 
 (deftest test-giant-cardinality-many-vector-neighbors
   (let [dimensions 128
-        value-1    (float-array
-                     (map #(float (/ (double (inc %)) (double dimensions)))
-                          (range dimensions)))
-        value-2    (float-array
-                     (map #(float (/ (double (- dimensions %))
-                                     (double dimensions)))
-                          (range dimensions)))
+        value-1    (float-array dimensions)
+        value-2    (float-array dimensions)
+        _          (dotimes [i dimensions]
+                     (aset-float value-1 i
+                                 (float (/ (double (unchecked-inc-int i))
+                                           (double dimensions))))
+                     (aset-float value-2 i
+                                 (float (/ (double (- dimensions i))
+                                           (double dimensions)))))
         conn       (d/create-conn
                      nil
                      {:embedding {:db/valueType   :db.type/vec
@@ -1065,6 +1067,125 @@
                (set (map vec (d/q q-v @conn value-1))))))
       (finally
         (d/close conn)))))
+
+(deftest test-giant-cardinality-many-fulltext-projections
+  (let [suffix     (apply str (repeat 700 "x"))
+        value-1    (str "alpha first " suffix)
+        value-2    (str "alpha second " suffix)
+        conn       (d/create-conn
+                     nil
+                     {:body {:db/valueType           :db.type/string
+                             :db/cardinality         :db.cardinality/many
+                             :db/fulltext            true
+                             :db.fulltext/autoDomain true}}
+                     {:wal?           false
+                      :kv-opts        {:inmemory? true :wal? false}
+                      :search-domains {"body" {:index-position? true
+                                                :include-text?   true}}})
+        q-e        '[:find [?e ...]
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query) [[?e]]]]
+        q-a        '[:find [?a ...]
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query) [[_ ?a]]]]
+        q-eav      '[:find ?e ?a ?v
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query) [[?e ?a ?v]]]]
+        q-score    '[:find [?score ...]
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query {:display :refs+scores})
+                      [[_ _ _ ?score]]]]
+        q-text     '[:find [?text ...]
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query {:display :texts})
+                      [[_ _ _ ?text]]]]
+        q-offsets  '[:find [?offsets ...]
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query {:display :offsets})
+                      [[_ _ _ ?offsets]]]]
+        q-text+off '[:find ?text ?offsets
+                     :in $ ?query
+                     :where
+                     [(fulltext $ :body ?query {:display :texts+offsets})
+                      [[_ _ _ ?text ?offsets]]]]]
+    (try
+      (d/transact! conn [[:db/add 1 :body value-1]
+                         [:db/add 1 :body value-2]])
+      (let [engine (conn-search-engine conn "body")
+            refs   (mapv val
+                         (seq (.-docs ^datalevin.search.SearchEngine engine)))]
+        (is (= 2 (count refs)))
+        (is (= 2 (count (set (map second refs)))))
+        (is (every? #(and (= :g (first %))
+                          (= 1 (nth % 2))
+                          (int? (nth % 3)))
+                    refs)))
+      (is (= [1] (d/q q-e @conn "alpha")))
+      (is (= [:body] (d/q q-a @conn "alpha")))
+      (is (= #{[1 :body value-1] [1 :body value-2]}
+             (set (d/q q-eav @conn "alpha"))))
+      (is (every? number? (d/q q-score @conn "alpha")))
+      (is (= #{value-1 value-2} (set (d/q q-text @conn "alpha"))))
+      (doseq [offsets (d/q q-offsets @conn "alpha")]
+        (is (= [0] (get (into {} offsets) "alpha"))))
+      (let [results (d/q q-text+off @conn "alpha")]
+        (is (= #{value-1 value-2} (set (map first results))))
+        (doseq [[_ offsets] results]
+          (is (= [0] (get (into {} offsets) "alpha")))))
+      (d/transact! conn [[:db/retract 1 :body value-1]])
+      (is (= #{[1 :body value-2]} (set (d/q q-eav @conn "alpha"))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-legacy-giant-fulltext-reference
+  (let [dir    (u/tmp-dir (str "test-legacy-giant-fulltext-"
+                               (UUID/randomUUID)))
+        value  (str "legacy searchable text "
+                    (apply str (repeat 700 "x")))
+        value' (str "replacement searchable text "
+                    (apply str (repeat 700 "y")))
+        schema {:body {:db/valueType           :db.type/string
+                       :db/fulltext            true
+                       :db.fulltext/autoDomain true}}
+        opts   {:wal? false :kv-opts {:wal? false}}
+        query  '[:find [?e ...]
+                 :in $ ?query
+                 :where
+                 [(fulltext $ :body ?query) [[?e]]]]]
+    (try
+      (let [conn (d/create-conn dir schema opts)]
+        (try
+          (d/transact! conn [{:db/id 1 :body value}])
+          (let [engine (conn-search-engine conn "body")
+                ref    (-> (.-docs ^datalevin.search.SearchEngine engine)
+                           seq first val)
+                legacy-ref [:g (second ref)]]
+            (is (= 4 (count ref)))
+            (i/remove-doc engine ref)
+            (i/add-doc engine legacy-ref value false)
+            (is (= [legacy-ref]
+                   (vec (i/search engine "searchable" {:top 1})))))
+          (finally
+            (d/close conn))))
+      (let [conn (d/create-conn dir nil opts)]
+        (try
+          (is (= [1] (d/q query @conn "searchable")))
+          (d/transact! conn [{:db/id 1 :body value'}])
+          (is (empty? (d/q query @conn "legacy")))
+          (is (= [1] (d/q query @conn "replacement")))
+          (d/transact! conn [[:db/retract 1 :body value']])
+          (is (empty? (d/q query @conn "replacement")))
+          (is (zero? (i/doc-count (conn-search-engine conn "body"))))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest test-idoc-and-fulltext-fuzz-in-same-tx
   (doseq [seed [7 29 113]]

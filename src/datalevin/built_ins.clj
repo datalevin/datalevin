@@ -243,37 +243,63 @@
                         value])
          (object-array (doc-ref->eav lmdb aid->attr doc-ref)))))))
 
-(defn- fulltext-doc-ref+extras
-  [display result]
-  (case display
-    :refs+scores   [(nth result 0) [(nth result 1)]]
-    :texts         [(nth result 0) [(nth result 1)]]
-    :offsets       [(nth result 0) [(nth result 1)]]
-    :texts+offsets [(nth result 0) [(nth result 1) (nth result 2)]]
-    [result nil]))
-
 (defn- make-fulltext-emit-fn
   [lmdb aid->attr display ^ints needed]
   (if needed
-    (let [n (alength needed)]
+    (let [n     (alength needed)
+          ref-n (loop [i 0, cnt 0]
+                  (if (clojure.core/< i n)
+                    (recur (clojure.core/inc i)
+                           (if (clojure.core/< (aget needed i) 3)
+                             (clojure.core/inc cnt)
+                             cnt))
+                    cnt))
+          ref-needed (int-array ref-n)]
+      (loop [j 0, ref-j 0]
+        (when (clojure.core/< j n)
+          (let [idx (aget needed j)]
+            (if (clojure.core/< idx 3)
+              (do
+                (aset-int ref-needed ref-j idx)
+                (recur (clojure.core/inc j) (clojure.core/inc ref-j)))
+              (recur (clojure.core/inc j) ref-j)))))
+      (let [refs-only? (clojure.core/= :refs display)
+            emit-ref   (when (clojure.core/pos? (long ref-n))
+                         (make-emit-fn lmdb aid->attr ref-needed))]
+        (fn [result]
+          (let [doc-ref        (if refs-only? result (nth result 0))
+                ^objects tuple (when emit-ref (emit-ref doc-ref))
+                ^objects arr   (object-array n)]
+            (loop [j 0, ref-j 0]
+              (when (clojure.core/< j n)
+                (let [idx (aget needed j)]
+                  (if (clojure.core/< idx 3)
+                    (do
+                      (aset arr j (aget tuple ref-j))
+                      (recur (clojure.core/inc j)
+                             (clojure.core/inc ref-j)))
+                    (do
+                      (aset arr j
+                            (when-not refs-only?
+                              (nth result (clojure.core/- idx 2) nil)))
+                      (recur (clojure.core/inc j) ref-j))))))
+            arr))))
+    (let [refs-only? (clojure.core/= :refs display)
+          extra-n    (case display
+                       :texts+offsets 2
+                       :refs         0
+                       1)
+          emit-ref   (make-emit-fn lmdb aid->attr nil)]
       (fn [result]
-        (let [[doc-ref extras] (fulltext-doc-ref+extras display result)
-              [e a v]          (doc-ref->eav lmdb aid->attr doc-ref)
-              ^objects arr     (object-array n)]
-          (dotimes [j n]
-            (let [i (aget needed j)]
-              (aset arr j (case i
-                            0 e
-                            1 a
-                            2 v
-                            (nth extras (clojure.core/- i 3) nil)))))
-          arr)))
-    (fn [result]
-      (let [[doc-ref extras] (fulltext-doc-ref+extras display result)
-            [e a v]          (doc-ref->eav lmdb aid->attr doc-ref)]
-        (object-array (if (seq extras)
-                        (into [e a v] extras)
-                        [e a v]))))))
+        (let [doc-ref        (if refs-only? result (nth result 0))
+              ^objects tuple (emit-ref doc-ref)
+              ^objects arr   (object-array (clojure.core/+ 3 extra-n))]
+          (dotimes [i 3]
+            (aset arr i (aget tuple i)))
+          (dotimes [i extra-n]
+            (aset arr (clojure.core/+ 3 i)
+                  (nth result (clojure.core/inc i))))
+          arr)))))
 
 (defn- fulltext*
   [^FastList res aid->attr lmdb engines query opts domain ^ints needed]
