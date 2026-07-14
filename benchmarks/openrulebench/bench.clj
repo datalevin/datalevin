@@ -92,10 +92,13 @@
        "        net.sekao/odoyle-rules {:mvn/version \"1.3.1\"}"
        "}}"))
 
+(def heap-opts
+  ["-J-Xmx8g"])
+
 (def jvm-opts
-  ["-J-Xmx8g"
-   "-J--add-opens=java.base/java.nio=ALL-UNNAMED"
-   "-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"])
+  (into heap-opts
+        ["-J--add-opens=java.base/java.nio=ALL-UNNAMED"
+         "-J--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"]))
 
 ;; =============================================================================
 ;; Benchmarks (OpenRuleBench standard instances)
@@ -140,14 +143,14 @@
 
 (defn run-clara [benchmarks]
   (apply run "clojure"
-         (concat ["-J-Xmx8g"]
+         (concat heap-opts
                  ["-Sdeps" clara-deps
                   "-M" "-m" "openrulebench.clara"]
                  benchmarks)))
 
 (defn run-odoyle [benchmarks]
   (apply run "clojure"
-         (concat ["-J-Xmx4g"]
+         (concat heap-opts
                  ["-Sdeps" odoyle-deps
                   "-M" "-m" "openrulebench.odoyle"]
                  benchmarks)))

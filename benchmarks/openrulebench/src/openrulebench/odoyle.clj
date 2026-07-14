@@ -152,18 +152,19 @@
   "Run TC benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
   (let [edges (data/generate-tc-instance (keyword instance-name))
+        ;; Session construction and base-fact insertion are benchmark setup.
+        session (create-tc-session edges)
         _ (System/gc)
-        start (core/now-ms)
         outcome (run-with-timeout
-                  #(let [session (-> (create-tc-session edges) fire-session)]
-                     (query-tc-all session)))
-        end (core/now-ms)]
+                  #(core/time-once
+                     (query-tc-all (fire-session session))))]
     (if (= :ok (:status outcome))
-      {:system "odoyle"
-       :benchmark (str "tc:" instance-name)
-       :time-ms (- end start)
-       :result-count (count (:result outcome))
-       :status :ok}
+      (let [[result time-ms] (:result outcome)]
+        {:system "odoyle"
+         :benchmark (str "tc:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
       {:system "odoyle"
        :benchmark (str "tc:" instance-name)
        :status (:status outcome)})))
@@ -172,18 +173,19 @@
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
   (let [relations (data/generate-sg-instance (keyword instance-name))
+        ;; Match Datalevin's boundary: time rule evaluation and querying only.
+        session (create-sg-session relations)
         _ (System/gc)
-        start (core/now-ms)
         outcome (run-with-timeout
-                  #(let [session (-> (create-sg-session relations) fire-session)]
-                     (query-sg-all session)))
-        end (core/now-ms)]
+                  #(core/time-once
+                     (query-sg-all (fire-session session))))]
     (if (= :ok (:status outcome))
-      {:system "odoyle"
-       :benchmark (str "sg:" instance-name)
-       :time-ms (- end start)
-       :result-count (count (:result outcome))
-       :status :ok}
+      (let [[result time-ms] (:result outcome)]
+        {:system "odoyle"
+         :benchmark (str "sg:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
       {:system "odoyle"
        :benchmark (str "sg:" instance-name)
        :status (:status outcome)})))

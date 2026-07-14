@@ -38,7 +38,19 @@ cd benchmarks/openrulebench
 ```
 
 The Datalevin runner uses the in-memory KV store for generated benchmark
-databases. Datalevin and Clara are both run with `-J-Xmx8g`.
+databases. Datalevin, Clara, and O'Doyle are run with `-J-Xmx8g`.
+
+### Timing Method
+
+The in-process TC and SG runners use the same timing boundary. Data generation,
+engine or session creation, base-fact loading, index creation, and statistics
+collection are setup and are not timed. After setup and a full GC, the timed
+region performs recursive rule evaluation and fully materializes the result:
+`d/q` for Datalevin, `fire-rules` plus `query` for Clara, `fire-session` plus
+`query-all` for O'Doyle, and the recursive query plus row materialization for
+SQLite and PostgreSQL. Timeout bookkeeping is outside O'Doyle's reported time.
+XSB and Souffle use external process runners and retain their documented
+process-level timings.
 
 ## Current Results
 
@@ -49,23 +61,24 @@ O'Doyle Rules `1.3.1`, OpenJDK `21.0.11`, macOS arm64, `-J-Xmx8g`.
 
 These are non-standard local development instances. `tc:tiny` uses 100 nodes
 and 1,000 edges; `sg:tiny` uses 100 nodes, 500 `par` facts, and 500 `sib` facts.
-Datalevin and Clara produced the same result counts.
+These results use the common timing boundary above. Datalevin and Clara
+produced the same result counts.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:tiny` | 62.74 ms | 575.02 ms | T/O at 60s | 10,000 for Datalevin/Clara |
-| `sg:tiny` | 38.16 ms | 521.58 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `tc:tiny` | 64.13 ms | 352.2 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `sg:tiny` | 49.48 ms | 404.5 ms | T/O at 60s | 10,000 for Datalevin/Clara |
 
 ### Small Runs
 
 `tc:small` is the OpenRuleBench TC small graph: 1,000 nodes and 50,000 edges.
 `sg:small` is the OpenRuleBench SG small shape: 1,000 nodes, 3,000 `par` facts,
-and 3,000 `sib` facts.
+and 3,000 `sib` facts. These results use the common timing boundary above.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:small` | 12,181.1 ms | OOM after about 6m45s | not run | 1,000,000 for Datalevin |
-| `sg:small` | 5,446.2 ms | 41,923.70 ms | not run | 869,923 for Datalevin/Clara |
+| `tc:small` | 12,195.3 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
+| `sg:small` | 5,381.2 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
 
 Correctness was checked for both Datalevin and Clara TC/SG rules against
 independent fixed-point references. The corrected SG reference uses the
@@ -76,12 +89,11 @@ sequential benchmark harness.
 
 O'Doyle requires tuple ids such as `[::sg x y]` to represent many-valued binary
 relations; a simpler `[x ::sg y]` encoding overwrites values for the same `x`.
-With the corrected tuple representation, a small custom SG sanity case passes,
-but both `tc:tiny` and `sg:tiny` hit the benchmark's 60 second timeout.
-
-Timing scope is not identical across systems: Datalevin timings measure the
-query after data load and `analyze`, while Clara timings include session
-creation, fact insertion, rule firing, and querying.
+With the corrected tuple representation, a small custom SG sanity case passes.
+Under the common timing boundary, both O'Doyle tiny cases still time out during
+rule evaluation. O'Doyle `sg:small` also times out during rule evaluation;
+`tc:small` did not finish the excluded session-construction phase within five
+minutes, so no timed result is reported.
 
 ## ORE 2015 OWL-RL Benchmark (Realistic Reasoning)
 
