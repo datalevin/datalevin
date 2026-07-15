@@ -657,12 +657,14 @@
 (defn- add-back-range
   [v {:keys [pred range]}]
   (if range
-    (reduce
-      (fn [p r]
-        (if r
-          (add-pred p (activate-var-pred v (range->inequality v r)) true)
-          p))
-      pred range)
+    (let [range-pred
+          (reduce
+            (fn [p r]
+              (if r
+                (add-pred p (activate-var-pred v (range->inequality v r)) true)
+                p))
+            nil range)]
+      (add-pred pred range-pred))
     pred))
 
 (defn- attrs-vec

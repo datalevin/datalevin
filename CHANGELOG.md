@@ -47,6 +47,10 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 [#376](https://github.com/datalevin/datalevin/issues/376).
 - [Datalog] `tx-data->simulated-report` leaks into connection
 [#377](https://github.com/datalevin/datalevin/issues/377).
+- [Datalog] tempid allocation bug at tuple upsert via reverse-ref.
+- [Datalog] add-back-range logic problem: need to OR alternatives then AND with
+  original predicate.
+- [DLMDB] re-encode after trunk position was an overflow large value.
 - [DLMDB] fix stale MP_PAD during page split
 [#375](https://github.com/datalevin/datalevin/issues/375).
 

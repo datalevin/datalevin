@@ -51,6 +51,42 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-bound-ref-keeps-all-value-predicates
+  (let [dir (u/tmp-dir (str "test-bound-ref-value-predicates-"
+                            (UUID/randomUUID)))
+        db  (-> (d/empty-db
+                  dir
+                  {:item/owner {:db/valueType :db.type/ref}
+                   :item/text  {:db/valueType :db.type/string}})
+                (d/db-with [{:db/id 1
+                             :item/owner 100
+                             :item/text "USA:25 February 2013"}
+                            {:db/id 2
+                             :item/owner 100
+                             :item/text "USA:1 June 2007"}
+                            {:db/id 3
+                             :item/owner 100
+                             :item/text "Turkey:24 September 2009"}]))
+        combined
+        '[:find ?text
+          :in $ ?owner
+          :where
+          [?item :item/owner ?owner]
+          [?item :item/text ?text]
+          [(and (like ?text "USA:%") (like ?text "% 200%"))]]
+        separate
+        '[:find ?text
+          :in $ ?owner
+          :where
+          [?item :item/owner ?owner]
+          [?item :item/text ?text]
+          [(like ?text "USA:%")]
+          [(like ?text "% 200%")]]]
+    (is (= #{["USA:1 June 2007"]} (d/q combined db 100)))
+    (is (= #{["USA:1 June 2007"]} (d/q separate db 100)))
+    (d/close-db db)
+    (u/delete-files dir)))
+
 (deftest test-many-joins
   (let [data (->> (range 1000)
                   (map (fn [^long i]

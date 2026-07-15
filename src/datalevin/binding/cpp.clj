@@ -534,11 +534,11 @@
 
 (defn- dtlv-val ^DTLV$MDB_val [x] (when x (.ptr ^BufVal x)))
 
-(defn- dtlv-rc [x]
-  (condp = x
-    DTLV/DTLV_TRUE true
-    DTLV/DTLV_FALSE false
-    (u/raise "Native iterator returns error code" x {})))
+(defn- dtlv-rc [^long x]
+  (cond
+    (== x DTLV/DTLV_TRUE)  true
+    (== x DTLV/DTLV_FALSE) false
+    :else (u/raise "Native iterator returns error code" x {})))
 
 (defn- dtlv-c [^long x]
   (if (< x 0)

@@ -13,7 +13,9 @@
 (deftest load-schema-first-migration-stream
   (let [dir    (u/tmp-dir (str "migration-stream-" (UUID/randomUUID)))
         bytes  (ByteArrayOutputStream.)
-        schema {:person/name {:db/valueType :db.type/string}}]
+        schema {:person/name {:db/valueType :db.type/string}}
+        calls  (atom 0)
+        analyze @m/analyze-db]
     (try
       (with-open [out (DataOutputStream. bytes)]
         (nippy/freeze-to-out!
@@ -28,14 +30,19 @@
         (nippy/freeze-to-out!
           out {:frame :datalog-end :datom-count 2})
         (nippy/freeze-to-out! out {:frame :end :entry-count 0}))
-      (is (= {:source-count    2
-              :dump-count      2
-              :loaded-count    2
-              :kv-source-count 0
-              :kv-dump-count   0
-              :kv-loaded-count 0}
-             (#'m/load-datalog-stream
-               dir (ByteArrayInputStream. (.toByteArray bytes)))))
+      (with-redefs [m/analyze-db
+                    (delay (fn [db]
+                             (swap! calls inc)
+                             (analyze db)))]
+        (is (= {:source-count    2
+                :dump-count      2
+                :loaded-count    2
+                :kv-source-count 0
+                :kv-dump-count   0
+                :kv-loaded-count 0}
+               (#'m/load-datalog-stream
+                 dir (ByteArrayInputStream. (.toByteArray bytes))))))
+      (is (= 1 @calls))
       (let [conn (d/get-conn dir)]
         (try
           (is (= #{["Alice"] ["Bob"]}

@@ -159,6 +159,7 @@
 (def fill-db (delay (requiring-resolve 'datalevin.db/fill-db)))
 (def close-db (delay (requiring-resolve 'datalevin.db/close-db)))
 (def count-datoms (delay (requiring-resolve 'datalevin.db/-count)))
+(def analyze-db (delay (requiring-resolve 'datalevin.db/analyze)))
 
 (def mixed-stream-format :datalevin/mixed-migration-v1)
 (def kv-stream-format :datalevin/kv-migration-v1)
@@ -210,19 +211,25 @@
                          end-info)
               (raise "Invalid Datalog migration stream end"
                      {:frame end-info}))
-            (let [loaded-count (@count-datoms @db [nil nil nil])
-                  db-to-close  @db]
-              (vreset! db nil)
-              (@close-db db-to-close)
-              (let [kv (l/open-kv dir)]
-                (try
-                  (merge
-                    {:source-count source-count
-                     :loaded-count loaded-count
-                     :dump-count   (:datom-count end-info)}
-                    (load-kv-sections kv in kv-dbis kv-source-count))
-                  (finally
-                    (if/close-kv kv))))))
+            (let [loaded-count (@count-datoms @db [nil nil nil])]
+              (when-not (= source-count loaded-count)
+                (raise "Migrated Datalog count does not match source"
+                       {:source-count source-count
+                        :loaded-count loaded-count
+                        :dir          dir}))
+              (@analyze-db @db)
+              (let [db-to-close @db]
+                (vreset! db nil)
+                (@close-db db-to-close)
+                (let [kv (l/open-kv dir)]
+                  (try
+                    (merge
+                      {:source-count source-count
+                       :loaded-count loaded-count
+                       :dump-count   (:datom-count end-info)}
+                      (load-kv-sections kv in kv-dbis kv-source-count))
+                    (finally
+                      (if/close-kv kv)))))))
           (finally
             (when-let [db @db]
               (@close-db db))))))))
