@@ -1,9 +1,9 @@
 (require '[clojure.string :as str]
+         '[datalevin.bits :as b]
          '[datalevin.constants :as c]
          '[datalevin.core :as d]
          '[datalevin.datom :as dd]
          '[datalevin.db :as db]
-         '[datalevin.interface :as i]
          '[taoensso.nippy :as nippy])
 
 (import '[datalevin.datom Datom]
@@ -13,14 +13,16 @@
 (def max-kv-batch-bytes (* 4 1024 1024))
 (def max-kv-batch-entries 4096)
 (def stream-format :datalevin/mixed-migration-v1)
+(def raw-key (resolve 'datalevin.lmdb/k))
+(def raw-value (resolve 'datalevin.lmdb/v))
 
-(defn backing-kv
-  [conn]
-  (if-let [datalog-kv (resolve 'datalevin.core/datalog-kv)]
-    (datalog-kv conn)
-    (let [db    @conn
-          store (clojure.lang.Reflector/getInstanceField db "store")]
-      (clojure.lang.Reflector/getInstanceField store "lmdb"))))
+(defn dbi-options
+  [kv dbi]
+  (let [opts ((or (resolve 'datalevin.interface/dbi-opts)
+                  (resolve 'datalevin.lmdb/dbi-opts))
+              kv dbi)]
+    (cond-> opts
+      (:dupsort? opts) (update :flags (fnil conj #{}) :dupsort))))
 
 (defn keyword->string
   [k]
@@ -94,52 +96,92 @@
                 idoc-domains)))))
 
 (defn user-kv-dbis
-  [kv schema opts]
+  [dbis schema opts]
   ;; Keep this classification aligned with datalevin.dump/user-kv-dbis.
   (let [derived-dbis (datalog-derived-dbis schema opts)]
-    (->> (d/list-dbis kv)
-         (remove #(or (str/starts-with? % "datalevin/")
-                      (contains? derived-dbis %)))
-         sort
-         (mapv (fn [dbi]
-                 {:dbi     dbi
-                  :entries (d/entries kv dbi)
-                  :opts    (i/dbi-opts kv dbi)})))))
+    (->> dbis
+         (remove (fn [{:keys [dbi]}]
+                   (or (str/starts-with? dbi "datalevin/")
+                       (contains? derived-dbis dbi))))
+         (sort-by :dbi)
+         vec)))
+
+(declare dupsort-dbi?)
+
+(defn read-kv-dbis
+  [dir]
+  (let [kv (d/open-kv dir)]
+    (try
+      (mapv (fn [dbi]
+              (let [opts (dbi-options kv dbi)]
+                (if (dupsort-dbi? opts)
+                  (d/open-list-dbi kv dbi opts)
+                  (d/open-dbi kv dbi opts))
+                {:dbi     dbi
+                 :entries (d/entries kv dbi)
+                 :opts    opts}))
+            (d/list-dbis kv))
+      (finally
+        (d/close-kv kv)))))
 
 (defn raw-size
   [[k v]]
   (+ (alength ^bytes k) (alength ^bytes v)))
 
+(defn batch-writer
+  [out]
+  (let [batch (volatile! (transient []))
+        state (long-array 3)
+        flush! (fn []
+                 (when (pos? (aget state 1))
+                   (nippy/freeze-to-out! out (persistent! @batch))
+                   (vreset! batch (transient []))
+                   (aset state 0 0)
+                   (aset state 1 0)))
+        add! (fn [item]
+               (let [item-size (raw-size item)]
+                 (when (and (pos? (aget state 1))
+                            (or (= (aget state 1) max-kv-batch-entries)
+                                (> (+ (aget state 0) item-size)
+                                   max-kv-batch-bytes)))
+                   (flush!))
+                 (vreset! batch (conj! @batch item))
+                 (aset state 0 (+ (aget state 0) item-size))
+                 (aset state 1 (inc (aget state 1)))
+                 (aset state 2 (inc (aget state 2)))))
+        finish! (fn []
+                  (flush!)
+                  (aget state 2))]
+    [add! finish!]))
+
+(defn dupsort-dbi?
+  [{:keys [flags dupsort?]}]
+  (or dupsort? (contains? flags :dupsort)))
+
 (defn write-kv-dbi
   [out kv {:keys [dbi entries] :as expected}]
   (nippy/freeze-to-out! out (assoc expected :frame :dbi))
-  (let [written
-        (with-open [items (d/range-seq kv dbi [:all] :raw :raw false
-                                      {:batch-size 256})]
-          (loop [items       (seq items)
-                 batch       (transient [])
-                 batch-bytes 0
-                 batch-count 0
-                 total       0]
-            (if-some [items items]
-              (let [item      (first items)
-                    item-size (raw-size item)]
-                (if (and (pos? batch-count)
-                         (or (= batch-count max-kv-batch-entries)
-                             (> (+ batch-bytes item-size)
-                                max-kv-batch-bytes)))
-                  (do
-                    (nippy/freeze-to-out! out (persistent! batch))
-                    (recur items (transient []) 0 0 total))
-                  (recur (next items)
-                         (conj! batch item)
-                         (+ batch-bytes item-size)
-                         (inc batch-count)
-                         (inc total))))
-              (do
-                (when (pos? batch-count)
-                  (nippy/freeze-to-out! out (persistent! batch)))
-                total))))]
+  (let [[add! finish!] (batch-writer out)
+        opts           (:opts expected)
+        dupsort?       (dupsort-dbi? opts)
+        _              (if dupsort?
+                         (d/open-list-dbi kv dbi opts)
+                         (d/open-dbi kv dbi opts))
+        written
+        (if dupsort?
+          (do
+            (d/visit-list-range
+              kv dbi
+              (fn [item]
+                (add! [(b/get-bytes (raw-key item))
+                       (b/get-bytes (raw-value item))]))
+              [:all] :raw [:all] :raw true)
+            (finish!))
+          (with-open [items (d/range-seq kv dbi [:all] :raw :raw false
+                                        {:batch-size 256})]
+            (doseq [item (seq items)]
+              (add! item))
+            (finish!)))]
     (when-not (= entries written)
       (throw
         (ex-info "Exported DBI entry count does not match source"
@@ -151,17 +193,17 @@
 (binding [*out* *err*]
   (let [[dir]        *command-line-args*
         entity-span  25000
-        conn         (d/get-conn dir)
+        all-kv-dbis  (read-kv-dbis dir)
+        conn         (volatile! (d/get-conn dir))
         datom-count  (volatile! 0)
         kv-count     (volatile! 0)]
     (try
-      (let [db           (d/db conn)
+      (let [db           (d/db @conn)
             max-eid      (d/max-eid db)
             source-count (d/count-datoms db nil nil nil)
-            opts         (d/opts conn)
-            schema       (d/schema conn)
-            kv           (backing-kv conn)
-            kv-dbis      (user-kv-dbis kv schema opts)
+            opts         (d/opts @conn)
+            schema       (d/schema @conn)
+            kv-dbis      (user-kv-dbis all-kv-dbis schema opts)
             kv-source-count (reduce + 0 (map :entries kv-dbis))]
         (d/datalog-index-cache-limit db 0)
         (with-open [out (DataOutputStream.
@@ -204,14 +246,22 @@
                         :dump-count   @datom-count})))
           (nippy/freeze-to-out!
             out {:frame :datalog-end :datom-count @datom-count})
-          (doseq [dbi kv-dbis]
-            (vswap! kv-count + (write-kv-dbi out kv dbi)))
-          (when-not (= kv-source-count @kv-count)
-            (throw
-              (ex-info "Exported KV entry count does not match source"
-                       {:source-count kv-source-count
-                        :dump-count   @kv-count})))
-          (nippy/freeze-to-out!
-            out {:frame :end :entry-count @kv-count})))
+          (let [conn-to-close @conn]
+            (vreset! conn nil)
+            (d/close conn-to-close))
+          (let [kv (d/open-kv dir)]
+            (try
+              (doseq [dbi kv-dbis]
+                (vswap! kv-count + (write-kv-dbi out kv dbi)))
+              (when-not (= kv-source-count @kv-count)
+                (throw
+                  (ex-info "Exported KV entry count does not match source"
+                           {:source-count kv-source-count
+                            :dump-count   @kv-count})))
+              (nippy/freeze-to-out!
+                out {:frame :end :entry-count @kv-count})
+              (finally
+                (d/close-kv kv))))))
       (finally
-        (d/close conn)))))
+        (when-let [conn @conn]
+          (d/close conn))))))
