@@ -76,7 +76,7 @@ Two classes of queries are included in the benchmark.
 - JDK 21+ (for running the benchmark)
 - Clojure CLI tools
 - Docker (for data generation)
-- ~10GB disk space for SF1 data
+- ~10GB disk space for SF1 data and the Datalevin database
 
 ## Data Generation
 
@@ -118,7 +118,7 @@ data/
 clj -M -m ldbc-snb-bench.core load data/
 ```
 
-This creates a 5.3 GiB Datalevin database in `db/ldbc-snb` with the SNB data.
+This creates a 4.0 GiB Datalevin database in `db/ldbc-snb` with the SNB data.
 
 #### Load Audit
 
@@ -172,12 +172,18 @@ Use `results/perf.csv` and `neo4j/results/perf.csv` to compare timings.
 
 ## Results
 
-We ran this benchmark on a 2023 Apple M2 Max with 12 cores, 32GB RAM, 1TB SSD,
-running macOS 15.2 and OpenJDK 21, with Clojure 1.12.4.
+We reran the full benchmark on July 15, 2026, on an Apple M3 Pro with 12 cores
+and 36 GiB RAM, running macOS 26.5.1 and OpenJDK 21.0.11, with Clojure 1.12.4.
 
 The dataset is LDBC SNB SF1 (scale factor 1), which contains approximately 3.2M
-entities and 17.3M edges. For both Datalevin and Neo4j, we ran queries twice,
-Warm up in the first, and report results of the second run.
+entities and 17.3M edges. Datalevin was run twice in separate JVMs. The first
+full pass warmed the operating-system page cache and was discarded; the tables
+report the second full pass. A separate JVM prevents the in-process query result
+cache from serving the measured pass. Timings start immediately before query
+execution and end after post-processing and realization of the result rows;
+database loading, migration, and analysis are outside the timing scope. The
+Neo4j numbers are retained from the previous benchmark run and are therefore a
+reference rather than a same-machine comparison.
 
 ### Interactive Short Queries (IS1-IS7)
 
@@ -189,17 +195,17 @@ clj -M -m ldbc-snb-bench.core bench -o results/is-results.csv -p results/is-perf
 
 | Query | Neo4j (ms) | Datalevin (ms) |
 |-------|------------|----------------|
-| IS1   | 1168.9     | 3.6           |
-| IS2   | 1173.2     | 62.0          |
-| IS3   | 1166.2     | 11.4           |
-| IS4   | 1484.7     | 0.9            |
-| IS5   | 1445.9     | 1.2            |
-| IS6   | 1494.5     | 1.9            |
-| IS7   | 5424.6     | 6.8           |
-| **Avg** | **1908.3** | **12.6**     |
+| IS1   | 1168.9     | 4.8            |
+| IS2   | 1173.2     | 68.7           |
+| IS3   | 1166.2     | 12.5           |
+| IS4   | 1484.7     | 3.3            |
+| IS5   | 1445.9     | 11.0           |
+| IS6   | 1494.5     | 2.5            |
+| IS7   | 5424.6     | 11.6           |
+| **Avg** | **1908.3** | **16.3**     |
 
-Datalevin is significantly faster across all short queries, and the speedup is
-several orders of magnitude.
+Datalevin is significantly faster across all short queries, with roughly two
+orders of magnitude difference in the averages shown here.
 
 ### Interactive Complex Queries (IC1-IC14)
 
@@ -211,31 +217,25 @@ clj -M -m ldbc-snb-bench.core bench -o results/ic-results.csv -p results/ic-perf
 
 | Query | Neo4j (ms) | Datalevin (ms) |
 |-------|------------|----------------|
-| IC1   | 3434.3     | 413.9          |
-| IC2   | 1133.4     | 221.9          |
-| IC3   | 1961.7     | 4295.6         |
-| IC4   | 1799.9     | 287.3          |
-| IC5   | 2509.2     | 9140.5         |
-| IC6   | 1561.8     | 10.0           |
-| IC7   | 1157.9     | 191.3          |
-| IC8   | 1215.9     | 18.5           |
-| IC9   | 2052.3     | 16955.7        |
-| IC10  | 1169.9     | 1294.7         |
-| IC11  | 1161.9     | 77.6           |
-| IC12  | 4361.2     | 232.6          |
-| IC13  | 1150.4     | 1163.2         |
-| IC14  | 19354.1    | 3826.7         |
-| **Avg** | **3144.6** | **2759.2**   |
+| IC1   | 3434.3     | 452.4          |
+| IC2   | 1133.4     | 1120.3         |
+| IC3   | 1961.7     | 4561.0         |
+| IC4   | 1799.9     | 266.6          |
+| IC5   | 2509.2     | 9188.1         |
+| IC6   | 1561.8     | 8.5            |
+| IC7   | 1157.9     | 173.6          |
+| IC8   | 1215.9     | 19.6           |
+| IC9   | 2052.3     | 33.8           |
+| IC10  | 1169.9     | 1226.7         |
+| IC11  | 1161.9     | 77.0           |
+| IC12  | 4361.2     | 254.7          |
+| IC13  | 1150.4     | 1059.2         |
+| IC14  | 19354.1    | 3952.0         |
+| **Avg** | **3144.6** | **1599.5**   |
 
-Datalevin is about 13% faster overall in these complex graph queries.
-
-Datalevin performs better on the majority of the queries, with some, IC6,
-IC8, IC11, are even orders of magnitude better than Neo4j, while lags behind in
-IC3, IC5, and IC9.
-
-Datalevin performs the worst in IC9, which "is one of the most complex queries",
-according to page 67 of the specification [1]. Neo4j performs surprisingly well
-on this one.
+Datalevin performs better on 11 of the 14 complex queries. IC6, IC8, IC9, and
+IC11 show especially large differences, while Datalevin remains slower on IC3,
+IC5, and IC10.
 
 ## Remark
 

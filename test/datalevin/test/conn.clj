@@ -1967,6 +1967,28 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest test-non-wal-store-ignores-stale-txlog-directory
+  (let [schema {:name {:db/valueType :db.type/string}}
+        dir    (u/tmp-dir (str "non-wal-stale-txlog-test-"
+                               (UUID/randomUUID)))
+        opts   {:wal? false :kv-opts {:wal? false}}]
+    (try
+      (let [conn (d/get-conn dir schema opts)]
+        (d/transact! conn [{:db/id 1 :name "Ada"}])
+        (d/close conn))
+      (u/create-dirs (str dir u/+separator+ "txlog"))
+      (let [conn (d/get-conn dir schema)]
+        (try
+          (is (false? (:wal? (d/opts conn))))
+          (is (= #{["Ada"]}
+                 (d/q '[:find ?name :where [_ :name ?name]] @conn)))
+          (is (not (u/file-exists
+                     (str dir u/+separator+ "snapshots"))))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest test-with-conn
   (let [dir (u/tmp-dir (str "with-conn-test-" (UUID/randomUUID)))]
     (d/with-conn [conn dir]

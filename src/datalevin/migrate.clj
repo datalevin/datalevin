@@ -164,6 +164,21 @@
 (def mixed-stream-format :datalevin/mixed-migration-v1)
 (def kv-stream-format :datalevin/kv-migration-v1)
 
+(defn- wal-enabled?
+  [opts]
+  (let [kv-opts (:kv-opts opts)]
+    (true? (if (contains? kv-opts :wal?)
+             (:wal? kv-opts)
+             (:wal? opts)))))
+
+(defn- cleanup-non-wal-artifacts!
+  [dir opts]
+  (when-not (wal-enabled? opts)
+    (doseq [name ["txlog" "snapshots"]
+            :let [path (str dir u/+separator+ name)]
+            :when (u/file-exists path)]
+      (u/delete-files path))))
+
 (defn- valid-kv-dbis?
   [dbis source-count]
   (and (vector? dbis)
@@ -221,15 +236,18 @@
               (let [db-to-close @db]
                 (vreset! db nil)
                 (@close-db db-to-close)
-                (let [kv (l/open-kv dir)]
-                  (try
-                    (merge
-                      {:source-count source-count
-                       :loaded-count loaded-count
-                       :dump-count   (:datom-count end-info)}
-                      (load-kv-sections kv in kv-dbis kv-source-count))
-                    (finally
-                      (if/close-kv kv)))))))
+                (let [kv     (l/open-kv dir)
+                      result (try
+                               (merge
+                                 {:source-count source-count
+                                  :loaded-count loaded-count
+                                  :dump-count   (:datom-count end-info)}
+                                 (load-kv-sections kv in kv-dbis
+                                                   kv-source-count))
+                               (finally
+                                 (if/close-kv kv)))]
+                  (cleanup-non-wal-artifacts! dir opts)
+                  result))))
           (finally
             (when-let [db @db]
               (@close-db db))))))))
@@ -293,15 +311,18 @@
       (let [opts (cond-> (dissoc opts :dir :temp? :inmemory?
                                 :max-val-size-changed?)
                    (:flags opts) (update :flags disj :inmemory))
-            kv   (l/open-kv dir opts)]
-        (try
-          (let [{:keys [kv-source-count kv-dump-count kv-loaded-count]}
-                (load-kv-sections kv in dbis source-count)]
-            {:source-count kv-source-count
-             :dump-count   kv-dump-count
-             :loaded-count kv-loaded-count})
-          (finally
-            (if/close-kv kv)))))))
+            kv   (l/open-kv dir opts)
+            result
+            (try
+              (let [{:keys [kv-source-count kv-dump-count kv-loaded-count]}
+                    (load-kv-sections kv in dbis source-count)]
+                {:source-count kv-source-count
+                 :dump-count   kv-dump-count
+                 :loaded-count kv-loaded-count})
+              (finally
+                (if/close-kv kv)))]
+        (cleanup-non-wal-artifacts! dir opts)
+        result))))
 
 (defn- switch-databases
   [dir ^File staged]

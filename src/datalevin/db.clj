@@ -457,6 +457,10 @@
   (and (not (tx-cache-empty? db))
        (> (long (:max-tx db)) (long (or (max-tx (:store db)) 0)))))
 
+(defn ^:no-doc pending-tx-cache?
+  [db]
+  (tx-cache-active? db))
+
 (defn- tx-cache-e-datoms
   [db e]
   (filter #(= e (.-e ^Datom %)) (:eavt db)))

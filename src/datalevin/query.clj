@@ -9,18 +9,7 @@
    [datalevin.remote :as rt])
   (:import
    [datalevin.db DB]
-   [datalevin.parser FindRel]
    [datalevin.remote DatalogStore]))
-
-(defn- apply-limit-offset
-  [parsed-q result]
-  (if (instance? FindRel (:qfind parsed-q))
-    (let [limit  (:qlimit parsed-q)
-          offset (:qoffset parsed-q)]
-      (->> result
-           (#(if offset (drop offset %) %))
-           (#(if (or (nil? limit) (= limit -1)) % (take limit %)))))
-    result))
 
 (def ^:dynamic *cache?*
   "Whether query result caching is enabled.
@@ -49,7 +38,7 @@
   (with-query-runtime
     (let [parsed-q (qcache/parsed-q q)]
       (qexec/mark-parsing-finished!)
-      (apply-limit-offset parsed-q (qcache/q-result parsed-q inputs)))))
+      (qcache/q-result parsed-q inputs))))
 
 (defn- plan-only
   [q & inputs]

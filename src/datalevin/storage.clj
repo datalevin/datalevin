@@ -3308,12 +3308,6 @@
   (or (u/file-exists (str dir u/+separator+ c/data-file-name))
       (u/file-exists (txlog-dir-path dir))))
 
-(defn- existing-store-open-kv-opts
-  [dir kv-opts]
-  (cond-> (or kv-opts {})
-    (u/file-exists (txlog-dir-path dir))
-    (assoc :wal? true)))
-
 (defn- load-existing-store-opts
   [dir _kv-opts]
   (when (existing-store? dir)
@@ -3356,8 +3350,7 @@
                                 :wal-durability-profile
                                 c/*datalog-wal-durability-profile*})
          kv-opts (cond-> (merge persisted-kv-opts kv-opts)
-                   wal-default-kv-opts (#(merge wal-default-kv-opts %))
-                   (u/file-exists (txlog-dir-path dir)) (assoc :wal? true))
+                   wal-default-kv-opts (#(merge wal-default-kv-opts %)))
          opened-with-wal? (true? (:wal? kv-opts))
          ^Store shared-store (current-shared-local-store dir)
          lmdb (or (some-> shared-store .-lmdb)

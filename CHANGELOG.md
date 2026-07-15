@@ -63,6 +63,8 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 [#215](https://github.com/datalevin/datalevin/issues/215).
 - [Datalog] fully implement datafy
 [#292](https://github.com/datalevin/datalevin/issues/292).
+- [Datalog] push down order/limit constraints to range scans, so top-k queries
+  perform significantly better (e.g. LDBC-SNB bench).
 - [Datalog] reduce allocation per tuple.
 - [Datalog] reduce allocation for multi-column hash joins.
 - [Datalog] topological sort of late clauses based on bounded variables.

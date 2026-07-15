@@ -148,12 +148,12 @@
   (if (cache-enabled?)
     (if-let [store (some #(when (db/-searchable? %) (.-store ^DB %)) inputs)]
       (let [parsed-q' (-> (update parsed-q :qwhere-qualified-fns
-                                  qualified-fn-cache-token)
-                          (dissoc :limit :offset))
+                                  qualified-fn-cache-token))
             deps      (query-cache-deps parsed-q')
             udf-token (when (query-uses-udf? parsed-q')
                         (udf-cache-token inputs))
-            k         [:query-result qresolve/*resolver-mode* deps parsed-q' udf-token
+            k         [:query-result deps :exact-window-v1
+                       qresolve/*resolver-mode* parsed-q' udf-token
                        (mapv cache-input-token inputs)]]
         (if-let [cached (db/cache-get store k)]
           cached

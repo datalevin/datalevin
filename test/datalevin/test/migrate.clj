@@ -20,7 +20,7 @@
       (with-open [out (DataOutputStream. bytes)]
         (nippy/freeze-to-out!
           out {:format          m/mixed-stream-format
-               :opts            {}
+               :opts            {:wal? false :kv-opts {:wal? false}}
                :schema          schema
                :source-count    2
                :kv-dbis         []
@@ -43,6 +43,8 @@
                (#'m/load-datalog-stream
                  dir (ByteArrayInputStream. (.toByteArray bytes))))))
       (is (= 1 @calls))
+      (is (not (u/file-exists (str dir u/+separator+ "txlog"))))
+      (is (not (u/file-exists (str dir u/+separator+ "snapshots"))))
       (let [conn (d/get-conn dir)]
         (try
           (is (= #{["Alice"] ["Bob"]}
@@ -159,6 +161,8 @@
       (is (= {:source-count 4 :dump-count 4 :loaded-count 4}
              (#'m/load-kv-stream
                target-dir (ByteArrayInputStream. (.toByteArray bytes)))))
+      (is (not (u/file-exists (str target-dir u/+separator+ "txlog"))))
+      (is (not (u/file-exists (str target-dir u/+separator+ "snapshots"))))
       (let [target (d/open-kv target-dir)]
         (try
           (d/open-dbi target "items")

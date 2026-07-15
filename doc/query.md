@@ -90,6 +90,38 @@ constant query parameters into the query itself in order to avoid expensive
 joins with these bindings turned relations. More query rewrite cases will be
 considered in the future.
 
+### Ordered limit push-down
+
+An ordered query with a small `:limit` should not have to materialize and sort
+every matching tuple. For all finite ordered relation queries, Datalevin uses a
+bounded priority queue of `:offset + :limit` tuples. This reduces sorting space
+from the full result size to the size of the requested window even when index
+push-down is not possible.
+
+Datalevin can avoid producing the full result for a conservative subset of
+these queries. The leading order term must be the value variable of a simple
+default-source EAV pattern, and an inequality predicate must provide a scalar
+or constant range boundary in the scan direction. Aggregates, pull expressions,
+`:with`, `:having`, result maps, multiple database sources, and databases with
+pending transaction datoms currently use normal execution.
+
+The optimized path walks the AVE index in order in candidate batches. It
+replaces the ordered EAV pattern with a relation containing the candidate
+entity/value pairs, then executes the rest of the original query against that
+relation. Distinct result tuples are accumulated until the scan has passed the
+primary order value of the last tuple in the requested window. All entities at
+the boundary value are evaluated before stopping, so secondary order terms are
+handled correctly. If 32 candidate batches are insufficient, execution falls
+back to the normal plan rather than allowing an unexpectedly unselective scan
+to run without a bound. `explain` also uses the normal path so its plan and
+intermediate statistics describe complete execution.
+
+The query result cache stores the exact ordered `:offset`/`:limit` window. Its
+key includes the complete parsed query, including the ordering and window, so
+different pages are cached separately. Transaction invalidation remains based
+on the attributes used by the query. Unbounded queries continue to cache their
+full result, and the plan cache remains independent of result-window caching.
+
 ### Merge scan
 
 For star-like attributes, we utilize an idea similar to pivot scan [2], which

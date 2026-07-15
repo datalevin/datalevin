@@ -28,9 +28,10 @@
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
-   [java.util Comparator]
-   [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Pattern
-    Variable]
+   [java.util Comparator PriorityQueue]
+   [datalevin.datom Datom]
+   [datalevin.parser BindScalar Constant DefaultSrc FindColl FindRel FindScalar
+    FindTuple Pattern Predicate Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private plugin-inputs qo/plugin-inputs)
@@ -404,56 +405,290 @@
                 res))
             0))))))
 
+(defn- finite-limit?
+  [limit]
+  (and (some? limit) (not= -1 limit)))
+
+(defn- result-window
+  [result limit offset]
+  (let [offset (long (or offset 0))]
+    (if (or (pos? offset) (finite-limit? limit))
+      (into []
+            (cond-> (drop offset)
+              (finite-limit? limit) (comp (take limit)))
+            result)
+      result)))
+
+(defn- top-k-result
+  [^Comparator cmp result limit offset]
+  (let [offset     (long (or offset 0))
+        window-end (+ offset (long limit))]
+    (if (or (zero? window-end) (> window-end Integer/MAX_VALUE))
+      (if (zero? window-end)
+        []
+        (result-window (sort cmp result) limit offset))
+      (let [worst-first
+            (reify Comparator
+              (compare [_ a b] (.compare cmp b a)))
+            ^PriorityQueue heap
+            (PriorityQueue. (int (max 1 window-end)) worst-first)]
+        (doseq [tuple result]
+          (if (< (.size heap) window-end)
+            (.add heap tuple)
+            (when (neg? (.compare cmp tuple (.peek heap)))
+              (.poll heap)
+              (.add heap tuple))))
+        (result-window (sort cmp (seq heap)) limit offset)))))
+
 (defn- order-result
-  [find-vars result order]
+  [find-vars result order limit offset]
   (if (seq result)
-    (sort (order-comps (tuple-get (first result)) find-vars order) result)
+    (let [cmp (order-comps (tuple-get (first result)) find-vars order)]
+      (if (finite-limit? limit)
+        (top-k-result cmp result limit offset)
+        (result-window (sort cmp result) limit offset)))
     result))
+
+(def ^:private ^:const ^long top-k-candidate-batch-size 1024)
+(def ^:private ^:const ^long top-k-max-candidate-batches 32)
+
+(defn- first-order-key
+  [order]
+  (when-let [order-var (first order)]
+    (when (symbol? order-var)
+      [order-var (if (keyword? (second order)) (second order) :asc)])))
+
+(defn- ranked-pattern
+  [parsed-q order-var]
+  (first
+    (keep-indexed
+      (fn [i clause]
+        (when (and (instance? Pattern clause)
+                   (instance? DefaultSrc (:source ^Pattern clause)))
+          (let [pattern (:pattern ^Pattern clause)]
+            (when (and (= 3 (count pattern))
+                       (instance? Variable (nth pattern 0))
+                       (instance? Constant (nth pattern 1))
+                       (keyword? (:value ^Constant (nth pattern 1)))
+                       (instance? Variable (nth pattern 2))
+                       (= order-var (:symbol ^Variable (nth pattern 2))))
+              {:clause-idx i
+               :entity-var (:symbol ^Variable (nth pattern 0))
+               :order-var  order-var
+               :attr       (:value ^Constant (nth pattern 1))}))))
+      (:qwhere parsed-q))))
+
+(defn- input-values
+  [parsed-q inputs]
+  (into {}
+        (keep (fn [[binding value]]
+                (when (instance? BindScalar binding)
+                  [(get-in binding [:variable :symbol]) value])))
+        (map vector (:qin parsed-q) inputs)))
+
+(defn- term-value
+  [values term]
+  (cond
+    (instance? Constant term) (:value ^Constant term)
+    (instance? Variable term) (get values (:symbol ^Variable term) ::none)
+    :else                     ::none))
+
+(defn- ordered-range-start
+  [parsed-q inputs order-var direction]
+  (let [values (input-values parsed-q inputs)]
+    (some
+      (fn [clause]
+        (when (instance? Predicate clause)
+          (let [op   (get-in clause [:fn :symbol])
+                args (:args ^Predicate clause)
+                lhs  (first args)
+                rhs  (second args)
+                lvar (when (instance? Variable lhs) (:symbol ^Variable lhs))
+                rvar (when (instance? Variable rhs) (:symbol ^Variable rhs))]
+            (cond
+              (and (identical? direction :desc)
+                   (= lvar order-var) (#{'< '<=} op))
+              (let [v (term-value values rhs)] (when-not (= ::none v) v))
+
+              (and (identical? direction :desc)
+                   (= rvar order-var) (#{'> '>=} op))
+              (let [v (term-value values lhs)] (when-not (= ::none v) v))
+
+              (and (identical? direction :asc)
+                   (= lvar order-var) (#{'> '>=} op))
+              (let [v (term-value values rhs)] (when-not (= ::none v) v))
+
+              (and (identical? direction :asc)
+                   (= rvar order-var) (#{'< '<=} op))
+              (let [v (term-value values lhs)] (when-not (= ::none v) v))
+
+              :else nil))))
+      (:qwhere parsed-q))))
+
+(defn- top-k-pushdown-spec
+  [parsed-q inputs]
+  (let [find          (:qfind parsed-q)
+        find-elements (dp/find-elements find)
+        limit         (:qlimit parsed-q)
+        dbs           (filterv db/db? inputs)]
+    (when (and (instance? FindRel find)
+               (finite-limit? limit)
+               (pos? (long limit))
+               (seq (:qorder parsed-q))
+               (nil? (:qwith parsed-q))
+               (empty? (:qhaving parsed-q))
+               (nil? (:qreturn-map parsed-q))
+               (not-any? #(or (dp/aggregate? %) (dp/find-expr? %)
+                              (dp/pull? %))
+                         find-elements)
+               (= 1 (count dbs))
+               (not (db/pending-tx-cache? (first dbs))))
+      (when-let [[order-var direction] (first-order-key (:qorder parsed-q))]
+        (when-let [ranked (ranked-pattern parsed-q order-var)]
+          (when-some [start-value (ordered-range-start parsed-q inputs order-var
+                                                       direction)]
+            (assoc ranked
+                   :db          (first dbs)
+                   :direction   direction
+                   :start-value start-value)))))))
+
+(defn- ranked-datom-page
+  [db attr direction start-value cursor]
+  (let [reverse?   (identical? direction :desc)
+        cursor-v   (:value cursor)
+        cursor-n   (long (or (:ties cursor) 0))
+        requested  (+ top-k-candidate-batch-size cursor-n)
+        ^java.util.List found
+        (if reverse?
+          (db/-rseek-datoms db :ave attr (or cursor-v start-value) nil requested)
+          (db/-seek-datoms db :ave attr (or cursor-v start-value) nil requested))
+        size       (.size found)
+        start      (long
+                     (loop [i 0]
+                       (if (and cursor-v (< i size)
+                                (= cursor-v (.-v ^Datom (.get found i))))
+                         (recur (unchecked-inc-int i))
+                         i)))
+        boundary   (when (< start size) (.-v ^Datom (.get found (dec size))))
+        boundary-datoms
+        ;; AVE stores entities as duplicate values. Expand the boundary key so
+        ;; secondary order terms cannot omit a primary-key tie.
+        (when boundary (db/-datoms db :ave attr boundary nil))
+        boundary-count (long (count boundary-datoms))
+        tuples     (FastList. (int (+ (- size start) boundary-count)))]
+    (loop [i start]
+      (when (< i size)
+        (let [^Datom datom (.get found i)]
+          (when-not (= boundary (.-v datom))
+            (.add tuples (object-array [(.-e datom) (.-v datom)])))
+          (recur (unchecked-inc-int i)))))
+    (doseq [^Datom datom boundary-datoms]
+      (.add tuples (object-array [(.-e datom) (.-v datom)])))
+    {:tuples tuples
+     :cursor (when boundary {:value boundary :ties boundary-count})
+     :done?  (< size requested)}))
+
+(defn- ranked-batch-query
+  [parsed-q clause-idx entity-var order-var]
+  (-> parsed-q
+      (update :qin conj (dp/parse-binding [[entity-var order-var]]))
+      (update :qwhere #(u/remove-idxs #{clause-idx} %))
+      (update :qorig-where #(u/remove-idxs #{clause-idx} %))
+      (assoc :qorder nil :qlimit nil :qoffset nil)))
+
+(defn- past-top-k-boundary?
+  [find-vars order direction rows cursor window-end]
+  (let [window-end (long window-end)]
+    (when (and cursor (<= window-end (long (count rows))))
+      (let [cmp          (order-comps (tuple-get (first rows)) find-vars order)
+            cutoff-row   (nth (sort cmp rows) (unchecked-dec window-end))
+            order-var    (first order)
+            order-idx    (u/index-of #(= order-var %) find-vars)
+            cutoff-value (nth cutoff-row order-idx)
+            c             (compare (:value cursor) cutoff-value)]
+        (if (identical? direction :desc) (neg? c) (pos? c))))))
+
+(declare execute-query)
+
+(defn- top-k-pushdown-query
+  [parsed-q inputs {:keys [db attr direction start-value clause-idx entity-var
+                           order-var]}]
+  (let [batch-query (ranked-batch-query parsed-q clause-idx entity-var order-var)
+        find-vars   (dp/find-vars (:qfind parsed-q))
+        order       (:qorder parsed-q)
+        limit       (:qlimit parsed-q)
+        offset      (:qoffset parsed-q)
+        window-end  (+ (long (or offset 0)) (long limit))]
+    (loop [cursor nil
+           rows   #{}
+           batches 0]
+      (if (>= (long batches) top-k-max-candidate-batches)
+        (execute-query parsed-q inputs)
+        (let [{:keys [tuples done?] next-cursor :cursor}
+              (ranked-datom-page db attr direction start-value cursor)]
+          (if (zero? (.size ^java.util.List tuples))
+            (order-result find-vars rows order limit offset)
+            (let [batch-result (execute-query batch-query (conj (vec inputs)
+                                                                 tuples))
+                  rows         (into rows batch-result)]
+              (if (or done?
+                      (past-top-k-boundary? find-vars order direction rows
+                                            next-cursor window-end))
+                (order-result find-vars rows order limit offset)
+                (recur next-cursor rows (unchecked-inc-int batches))))))))))
+
+(defn- execute-query
+  [parsed-q inputs]
+  (let [find          (:qfind parsed-q)
+        find-elements (dp/find-elements find)
+        result-arity  (count find-elements)
+        with          (:qwith parsed-q)
+        having        (:qhaving parsed-q)
+        find-vars     (dp/find-vars find)
+        all-vars      (concatv find-vars (map :symbol with))
+        [parsed-q inputs] (plugin-inputs parsed-q inputs)
+        udf-db        (first (filter db/-searchable? inputs))
+        context
+        (binding [built-ins/*udf-db* udf-db]
+          (-> (qplan/make-context parsed-q true)
+              (qresolve/resolve-ins inputs)
+              (materialize-input-bound-patterns)
+              (resolve-redudants)
+              (rules/rewrite)
+              (rewrite-unused-vars)
+              (-q true)
+              (collect all-vars)))
+        result
+        (binding [built-ins/*udf-db* udf-db]
+          (cond->> (:result-set context)
+            with (mapv #(subvec % 0 result-arity))
+
+            (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+            (qagg/aggregate find-elements context)
+
+            (seq having)
+            (qagg/apply-having having find-elements)
+
+            (some dp/pull? find-elements)
+            (pull find-elements context)
+
+            true
+            (-post-process find (:qreturn-map parsed-q))))]
+    (result-explain context result)
+    (if (instance? FindRel find)
+      (if-let [order (:qorder parsed-q)]
+        (order-result find-vars result order
+                      (:qlimit parsed-q) (:qoffset parsed-q))
+        (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
+      result)))
 
 (defn q*
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/to-deadline (:qtimeout parsed-q))]
-    (let [find          (:qfind parsed-q)
-          find-elements (dp/find-elements find)
-          result-arity  (count find-elements)
-          with          (:qwith parsed-q)
-          having        (:qhaving parsed-q)
-          find-vars     (dp/find-vars find)
-          all-vars      (concatv find-vars (map :symbol with))
-          [parsed-q inputs] (plugin-inputs parsed-q inputs)
-          udf-db        (first (filter db/-searchable? inputs))
-          context
-          (binding [built-ins/*udf-db* udf-db]
-            (-> (qplan/make-context parsed-q true)
-                (qresolve/resolve-ins inputs)
-                (materialize-input-bound-patterns)
-                (resolve-redudants)
-                (rules/rewrite)
-                (rewrite-unused-vars)
-                (-q true)
-                (collect all-vars)))
-          result
-          (binding [built-ins/*udf-db* udf-db]
-            (cond->> (:result-set context)
-              with (mapv #(subvec % 0 result-arity))
-
-              (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
-              (qagg/aggregate find-elements context)
-
-              (seq having)
-              (qagg/apply-having having find-elements)
-
-              (some dp/pull? find-elements)
-              (pull find-elements context)
-
-              true
-              (-post-process find (:qreturn-map parsed-q))))]
-      (result-explain context result)
-      (if-let [order (:qorder parsed-q)]
-        (if (instance? FindRel find)
-          (order-result find-vars result order)
-          result)
-        result))))
+    (if-let [spec (and (nil? qplan/*explain*)
+                       (top-k-pushdown-spec parsed-q inputs))]
+      (top-k-pushdown-query parsed-q inputs spec)
+      (execute-query parsed-q inputs))))
 
 (defn mark-parsing-finished!
   []

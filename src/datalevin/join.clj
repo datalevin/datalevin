@@ -16,7 +16,8 @@
    [datalevin.util :as u :refer [concatv]])
   (:import
    [java.util List HashMap Collection]
-   [org.eclipse.collections.impl.list.mutable FastList]))
+   [org.eclipse.collections.impl.list.mutable FastList]
+   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
 ;; hash join
 
@@ -85,9 +86,12 @@
 
 (defn hash-tuples
   [key-fn ^List tuples]
-  (let [^HashMap res (HashMap.)]
+  (let [size         (if tuples (.size tuples) 0)
+        capacity     (min Integer/MAX_VALUE
+                          (inc (quot (* (long size) 4) 3)))
+        ^HashMap res (HashMap. (int capacity))]
     (when tuples
-      (dotimes [i (.size tuples)]
+      (dotimes [i size]
         (let [x (.get tuples i)
               k (key-fn x)]
           (if-let [bucket (.get res k)]
@@ -98,6 +102,33 @@
               (.add ^List bucket x))
             (.put res k x)))))
     res))
+
+(defn- hash-long-tuples
+  [key-fn ^List tuples]
+  (let [size                    (.size tuples)
+        ^LongObjectHashMap res  (LongObjectHashMap. size)]
+    (loop [i 0]
+      (if (< i size)
+        (let [x (.get tuples i)
+              k (key-fn x)]
+          (if (instance? Long k)
+            (let [k      (.longValue ^Long k)
+                  bucket (.get res k)]
+              (if bucket
+                (if (u/array? bucket)
+                  (.put res k (doto (FastList. 2)
+                                (.add bucket)
+                                (.add x)))
+                  (.add ^List bucket x))
+                (.put res k x))
+              (recur (unchecked-inc i)))
+            nil))
+        res))))
+
+(defn- long-bucket
+  [^LongObjectHashMap hash k]
+  (when (instance? Long k)
+    (.get hash (.longValue ^Long k))))
 
 (defn- attr-keys
   "attrs are map, preserve order by val"
@@ -134,11 +165,17 @@
       (if (< (.size tuples1) (.size tuples2))
         (r/relation!
           attrs
-          (let [acc           (FastList.)
-                ^HashMap hash (hash-tuples key-fn1 tuples1)]
+          (let [acc                     (FastList.)
+                ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+                                           (hash-long-tuples key-fn1 tuples1))
+                ^HashMap hash            (when-not lhash
+                                           (hash-tuples key-fn1 tuples1))]
             (dotimes [i (.size tuples2)]
-              (let [^objects tuple2 (.get tuples2 i)]
-                (when-some [bucket (.get hash (lookup-key-fn2 tuple2))]
+              (let [^objects tuple2 (.get tuples2 i)
+                    k               (lookup-key-fn2 tuple2)]
+                (when-some [bucket (if lhash
+                                     (long-bucket lhash k)
+                                     (.get hash k))]
                   (if (u/array? bucket)
                     (.add acc (r/join-tuples bucket keep-idxs1
                                              tuple2 keep-idxs2))
@@ -149,11 +186,17 @@
             acc))
         (r/relation!
           attrs
-          (let [acc           (FastList.)
-                ^HashMap hash (hash-tuples key-fn2 tuples2)]
+          (let [acc                     (FastList.)
+                ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+                                           (hash-long-tuples key-fn2 tuples2))
+                ^HashMap hash            (when-not lhash
+                                           (hash-tuples key-fn2 tuples2))]
             (dotimes [i (.size tuples1)]
-              (let [^objects tuple1 (.get tuples1 i)]
-                (when-some [bucket (.get hash (lookup-key-fn1 tuple1))]
+              (let [^objects tuple1 (.get tuples1 i)
+                    k               (lookup-key-fn1 tuple1)]
+                (when-some [bucket (if lhash
+                                     (long-bucket lhash k)
+                                     (.get hash k))]
                   (if (u/array? bucket)
                     (.add acc (r/join-tuples tuple1 keep-idxs1
                                              bucket keep-idxs2))
@@ -179,10 +222,16 @@
         [key-fn2 lookup-key-fn2] (tuple-key-fns attrs2 common-attrs)]
     (when (and tuples1 tuples2)
       (if (< (.size tuples1) (.size tuples2))
-        (let [^HashMap hash (hash-tuples key-fn1 tuples1)]
+        (let [^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+                                         (hash-long-tuples key-fn1 tuples1))
+              ^HashMap hash            (when-not lhash
+                                         (hash-tuples key-fn1 tuples1))]
           (dotimes [i (.size tuples2)]
-            (let [^objects tuple2 (.get tuples2 i)]
-              (when-some [bucket (.get hash (lookup-key-fn2 tuple2))]
+            (let [^objects tuple2 (.get tuples2 i)
+                  k               (lookup-key-fn2 tuple2)]
+              (when-some [bucket (if lhash
+                                   (long-bucket lhash k)
+                                   (.get hash k))]
                 (if (u/array? bucket)
                   (.add ^Collection sink
                         (r/join-tuples bucket keep-idxs1 tuple2 keep-idxs2))
@@ -191,10 +240,16 @@
                       (.add ^Collection sink
                             (r/join-tuples (.get tuples1 j) keep-idxs1
                                            tuple2 keep-idxs2)))))))))
-        (let [^HashMap hash (hash-tuples key-fn2 tuples2)]
+        (let [^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+                                         (hash-long-tuples key-fn2 tuples2))
+              ^HashMap hash            (when-not lhash
+                                         (hash-tuples key-fn2 tuples2))]
           (dotimes [i (.size tuples1)]
-            (let [^objects tuple1 (.get tuples1 i)]
-              (when-some [bucket (.get hash (lookup-key-fn1 tuple1))]
+            (let [^objects tuple1 (.get tuples1 i)
+                  k               (lookup-key-fn1 tuple1)]
+              (when-some [bucket (if lhash
+                                   (long-bucket lhash k)
+                                   (.get hash k))]
                 (if (u/array? bucket)
                   (.add ^Collection sink
                         (r/join-tuples tuple1 keep-idxs1 bucket keep-idxs2))

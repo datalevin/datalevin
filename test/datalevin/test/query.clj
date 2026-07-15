@@ -22,6 +22,135 @@
   (binding [q/*cache?* false]
     (is (false? q/*cache?*))))
 
+(deftest test-query-cache-stores-exact-result-window
+  (let [dir (u/tmp-dir (str "query-window-cache-" (UUID/randomUUID)))
+        conn (d/get-conn dir)
+        q1  '[:find ?score
+              :where [?e :score ?score]
+              :order-by ?score
+              :limit 2]
+        q2  '[:find ?score
+              :where [?e :score ?score]
+              :order-by ?score
+              :offset 1
+              :limit 2]]
+    (try
+      (d/transact! conn [{:db/id 1 :score 30}
+                         {:db/id 2 :score 10}
+                         {:db/id 3 :score 20}
+                         {:db/id 4 :score 40}])
+      (let [r1 (qcache/q-result (qcache/parsed-q q1) [(d/db conn)])
+            r2 (qcache/q-result (qcache/parsed-q q2) [(d/db conn)])]
+        (is (= [[10] [20]] r1))
+        (is (= [[20] [30]] r2))
+        (is (vector? r1))
+        (is (vector? r2)))
+      (d/transact! conn [{:db/id 5 :score 5}])
+      (is (= [[5] [10]]
+             (qcache/q-result (qcache/parsed-q q1) [(d/db conn)])))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-stops-after-candidate-window
+  (let [dir   (u/tmp-dir (str "query-top-k-pushdown-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        calls (atom 0)
+        pred  (fn [_]
+                (swap! calls inc)
+                true)
+        query '[:find ?score
+                :in $ ?accept? ?max-score
+                :where
+                [?e :score ?score]
+                [(?accept? ?e)]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 3]]
+    (try
+      (d/transact! conn (mapv (fn [e] {:db/id e :score e}) (range 1 2501)))
+      (binding [q/*cache?* false]
+        (is (= [[2500] [2499] [2498]]
+               (d/q query (d/db conn) pred 2500))))
+      (is (<= @calls 1024))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-completes-primary-key-tie
+  (let [dir   (u/tmp-dir (str "query-top-k-tie-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score ?id
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :id ?id]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc ?id :asc]
+                :limit 3]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [e] {:db/id e :score 10 :id e})
+                         (range 1 1101)))
+      (binding [q/*cache?* false]
+        (is (= [[10 1] [10 2] [10 3]]
+               (d/q query (d/db conn) 10))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-pages-independently-of-entity-order
+  (let [dir        (u/tmp-dir (str "query-top-k-page-" (UUID/randomUUID)))
+        conn       (d/get-conn dir)
+        desc-query '[:find ?score
+                     :in $ ?max-score
+                     :where
+                     [?e :score ?score]
+                     [?e :keep-desc true]
+                     [(<= ?score ?max-score)]
+                     :order-by [?score :desc]
+                     :limit 1]
+        asc-query  '[:find ?score
+                     :in $ ?min-score
+                     :where
+                     [?e :score ?score]
+                     [?e :keep-asc true]
+                     [(>= ?score ?min-score)]
+                     :order-by [?score :asc]
+                     :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           (cond-> {:db/id (- 3000 score) :score score}
+                             (= score 1000) (assoc :keep-desc true)
+                             (= score 1500) (assoc :keep-asc true)))
+                         (range 1 2501)))
+      (binding [q/*cache?* false]
+        (is (= [[1000]] (d/q desc-query (d/db conn) 2500)))
+        (is (= [[1500]] (d/q asc-query (d/db conn) 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-includes-pending-transaction-datoms
+  (let [dir   (u/tmp-dir (str "query-top-k-pending-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn [{:db/id 1 :score 1}])
+      (let [db (d/db-with (d/db conn) [{:db/id 2 :score 2}])]
+        (binding [q/*cache?* false]
+          (is (= [[2]] (d/q query db 2)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-instant
   (let [dir (u/tmp-dir (str "test-instant-" (UUID/randomUUID)))
         db  (-> (d/empty-db dir
