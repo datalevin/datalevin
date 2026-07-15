@@ -78,7 +78,7 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 [#348](https://github.com/datalevin/datalevin/issues/348).
 - [Search] Reduce heap pressure for large posting list
 [#356](https://github.com/datalevin/datalevin/issues/356).
-- More robust, piping data migration.
+- More robust, stdio pipe based data migration.
 - update deps.
 
 ## 0.10.18 (2026-05-27)

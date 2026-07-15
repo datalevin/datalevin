@@ -1,8 +1,6 @@
 (require '[clojure.string :as str]
          '[datalevin.bits :as b]
-         '[datalevin.constants :as c]
          '[datalevin.core :as d]
-         '[datalevin.datom :as dd]
          '[datalevin.db :as db]
          '[taoensso.nippy :as nippy])
 
@@ -12,6 +10,7 @@
 
 (def max-kv-batch-bytes (* 4 1024 1024))
 (def max-kv-batch-entries 4096)
+(def max-datom-batch-entries 25000)
 (def stream-format :datalevin/mixed-migration-v1)
 (def raw-key (resolve 'datalevin.lmdb/k))
 (def raw-value (resolve 'datalevin.lmdb/v))
@@ -190,16 +189,63 @@
       out {:frame :dbi-end :dbi dbi :entry-count written})
     written))
 
+(defn datom-row
+  [^Datom datom]
+  [(.-e datom) (.-a datom) (.-v datom)])
+
+(defn write-datoms
+  [out db]
+  (loop [start-eid nil
+         written   0]
+    (let [^List found (db/-seek-datoms db :eav start-eid nil nil
+                                       max-datom-batch-entries)
+          size        (.size found)]
+      (if (zero? size)
+        written
+        (let [last-eid     (.-e ^Datom (.get found (dec size)))
+              suffix-size  (loop [i (dec size), n 0]
+                             (if (and (not (neg? i))
+                                      (= last-eid
+                                         (.-e ^Datom (.get found i))))
+                               (recur (dec i) (inc n))
+                               n))
+              ^List entity (db/-e-datoms db last-eid)
+              entity-size  (.size entity)
+              batch         (persistent!
+                              (loop [i 0, batch (transient [])]
+                                (if (< i size)
+                                  (recur
+                                    (inc i)
+                                    (conj! batch
+                                           (datom-row (.get found i))))
+                                  (loop [i suffix-size, batch batch]
+                                    (if (< i entity-size)
+                                      (recur
+                                        (inc i)
+                                        (conj! batch
+                                               (datom-row (.get entity i))))
+                                      batch)))))
+              batch-size    (count batch)]
+          (when (> suffix-size entity-size)
+            (throw
+              (ex-info "EAV page contains more datoms than its last entity"
+                       {:eid         last-eid
+                        :page-count  suffix-size
+                        :entity-count entity-size})))
+          (nippy/freeze-to-out! out batch)
+          (let [written (+ written batch-size)]
+            (if (= size max-datom-batch-entries)
+              (recur (inc last-eid) written)
+              written)))))))
+
 (binding [*out* *err*]
   (let [[dir]        *command-line-args*
-        entity-span  25000
         all-kv-dbis  (read-kv-dbis dir)
         conn         (volatile! (d/get-conn dir))
         datom-count  (volatile! 0)
         kv-count     (volatile! 0)]
     (try
       (let [db           (d/db @conn)
-            max-eid      (d/max-eid db)
             source-count (d/count-datoms db nil nil nil)
             opts         (d/opts @conn)
             schema       (d/schema @conn)
@@ -216,29 +262,7 @@
              :source-count    source-count
              :kv-dbis         kv-dbis
              :kv-source-count kv-source-count})
-          (loop [start-eid 0]
-            (when (<= start-eid max-eid)
-              (let [end-eid (min max-eid (+ start-eid (dec entity-span)))
-                    ^List found
-                    (db/-range-datoms
-                      db :eav
-                      (dd/datom start-eid nil c/v0)
-                      (dd/datom end-eid nil c/vmax))
-                    size  (.size found)
-                    batch (persistent!
-                            (loop [i 0, batch (transient [])]
-                              (if (< i size)
-                                (let [^Datom datom (.get found i)]
-                                  (recur
-                                    (inc i)
-                                    (conj! batch
-                                           [(.-e datom) (.-a datom)
-                                            (.-v datom)])))
-                                batch)))]
-                (when (pos? size)
-                  (nippy/freeze-to-out! out batch))
-                (vswap! datom-count + size)
-                (recur (inc end-eid)))))
+          (vreset! datom-count (write-datoms out db))
           (when-not (= source-count @datom-count)
             (throw
               (ex-info "Exported datom count does not match source"
