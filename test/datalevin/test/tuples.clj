@@ -304,6 +304,39 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-upsert-by-tuple-components-through-reverse-ref
+  (let [dir  (u/tmp-dir (str "reverse-ref-tuple-upsert-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:a/name           {:db/valueType :db.type/string
+                                   :db/unique    :db.unique/identity}
+                :rel/type+from+to {:db/unique     :db.unique/identity
+                                   :db/tupleAttrs [:rel/type
+                                                   :rel/from
+                                                   :rel/to]}
+                :rel/from         {:db/valueType :db.type/ref}
+                :rel/to           {:db/valueType :db.type/ref}
+                :rel/type         {:db/valueType :db.type/keyword}})]
+    (d/transact! conn
+                 [{:db/id 1 :a/name "A1"}
+                  {:db/id 2 :a/name "A2"}
+                  {:db/id 3 :a/name "A3"}
+                  {:rel/from 1 :rel/to 2 :rel/type :alias}
+                  {:rel/from 1 :rel/to 3 :rel/type :alias}])
+
+    (let [before (tdc/all-datoms (d/db conn))]
+      (doseq [relations [[{:rel/to 2 :rel/type :alias}
+                           {:rel/to 3 :rel/type :alias}]
+                         [{:db/id -1 :rel/to 2 :rel/type :alias}
+                          {:db/id -2 :rel/to 3 :rel/type :alias}]]]
+        (d/transact! conn [{:db/id 1 :rel/_from relations}])
+        (is (= before (tdc/all-datoms (d/db conn)))))
+      (is (= #{[:alias 1 2] [:alias 1 3]}
+             (into #{} (map :v)
+                   (d/datoms (d/db conn) :ave :rel/type+from+to)))))
+    (d/close conn)
+    (u/delete-files dir)))
+
 (deftest test-lookup-refs
   (let [dir  (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
         conn (d/create-conn
