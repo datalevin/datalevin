@@ -22,6 +22,16 @@
   (binding [q/*cache?* false]
     (is (false? q/*cache?*))))
 
+(deftest test-joined-merge-scan-estimate-is-conservative
+  (let [input-sample (java.util.ArrayList. [0 1 2 3])
+        filtered     (java.util.ArrayList. [0])
+        expanded     (java.util.ArrayList. [0 1 2 3 4 5 6 7])
+        estimate     #'qo/estimate-joined-scan-size]
+    (is (= 100 (estimate 100 [{:sample input-sample}
+                              {:sample filtered}])))
+    (is (= 200 (estimate 100 [{:sample input-sample}
+                              {:sample expanded}])))))
+
 (deftest test-query-cache-stores-exact-result-window
   (let [dir (u/tmp-dir (str "query-window-cache-" (UUID/randomUUID)))
         conn (d/get-conn dir)

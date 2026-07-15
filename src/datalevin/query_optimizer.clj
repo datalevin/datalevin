@@ -772,6 +772,14 @@
                                (/ s (.size ^List sp1))
                                c/magic-scan-ratio))))))))
 
+(defn- estimate-joined-scan-size
+  "Estimate a merge scan fused onto a join without assuming that the joined
+  entities have the same distribution as the standalone base-plan sample.
+  Preserve sampled fan-out, but do not credit sampled filtering."
+  ^long [^long e-size steps]
+  (let [^long scan-size (estimate-scan-v-size e-size steps)]
+    (if (< scan-size e-size) e-size scan-size)))
+
 (defn- factor
   [magic ^long n]
   (if (zero? n) 1 ^long (estimate-round (* ^double magic n))))
@@ -1144,7 +1152,7 @@
   (let [prev-size (:size prev-plan)
         steps     (:steps new-base-plan)]
     (case (:type link)
-      :ref     [nil (estimate-scan-v-size prev-size steps)]
+      :ref     [nil (estimate-joined-scan-size prev-size steps)]
       :or-join (let [or-size (estimate-or-join-size db sources rules ratios
                                                     prev-plan link)]
                  ;; or-join doesn't have new-base-plan steps to merge
@@ -1152,7 +1160,7 @@
       ;; :_ref and :val-eq
       (let [e-size (estimate-link-size db link-e link ratios prev-size
                                        prev-plan index)]
-        [e-size (estimate-scan-v-size e-size steps)]))))
+        [e-size (estimate-joined-scan-size e-size steps)]))))
 
 (defn- estimate-link-cost
   [^long outer-size ^long result-size]

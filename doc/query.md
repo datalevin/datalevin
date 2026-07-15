@@ -274,6 +274,13 @@ skew‑aware upper‑bound correction inspired by skew‑robust statistics [5]. 
 joins use these selectivity ratios to estimate result sizes. We have found our
 method is more effective than sampling more than 2-way joins (e.g. [9]).
 
+Cardinality estimation is intentionally asymmetric: an overestimate may miss an
+optimization, while an underestimate can select a catastrophically expensive
+join order. A standalone base sample may estimate filtering for that base
+relation, but a merge scan fused onto a join does not use that sample to reduce
+the join result size, because the joined entities may have a different
+distribution. Sampled expansion is still retained.
+
 ### Recency based link choice (new)
 
 During planning, when multiple links are possible to reach the same next node in
