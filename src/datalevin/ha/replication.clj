@@ -825,9 +825,9 @@
              sample-bytes (long 16)]
         (if (and (< sampled-count limit)
                  (seq items))
-          (let [^long item-bytes (estimate-ha-follower-value-bytes*
+          (let [item-bytes (long (estimate-ha-follower-value-bytes*
                                   (first items)
-                                  next-depth)]
+                                  next-depth))]
             (recur (rest items)
                    (unchecked-inc sampled-count)
                    (+ sample-bytes item-bytes)))

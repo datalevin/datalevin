@@ -616,17 +616,17 @@
         idxs     (int-array n)
         eav-mask (boolean-array n)]
     (doseq [[i {:keys [head-pos]}] (map-indexed vector eav-plans)]
-      (aset eav-mask (int head-pos) true)
-      (aset types (int head-pos) output-source-eav)
-      (aset idxs (int head-pos) (int i)))
+      (aset-boolean eav-mask (int head-pos) true)
+      (aset-long types (int head-pos) (long output-source-eav))
+      (aset-int idxs (int head-pos) (int i)))
     (loop [i 0]
       (if (< i n)
         (if (aget eav-mask i)
           (recur (unchecked-inc i))
           (let [head-var (nth head-vars i)]
             (when-let [call-idx (call-pos head-var)]
-              (aset types i output-source-call)
-              (aset idxs i (int call-idx))
+              (aset-long types i (long output-source-call))
+              (aset-int idxs i (int call-idx))
               (recur (unchecked-inc i)))))
         {:types types, :idxs idxs}))))
 

@@ -832,7 +832,7 @@
         store      (:store m)
         local-kv   (if (instance? Store store) (.-lmdb ^Store store) store)
         source-wm  (replica/source-watermarks source)
-        durable    (replica/durable-lsn source-wm)
+        durable    (long (replica/durable-lsn source-wm))
         source-max (long (or (:last-committed-lsn source-wm) durable))
         applied    (long (or (:replica-applied-lsn m)
                              (replica/local-applied-lsn local-kv)))
@@ -858,10 +858,11 @@
         applied)
       (let [records (replica/fetch-records source next-lsn upto-lsn)]
         (replica/validate-contiguous-records! records next-lsn upto-lsn)
-        (let [applied' (reduce (fn [_ record]
-                                 (apply-replica-record! server db-name record))
-                               applied
-                               records)]
+        (let [applied' (long (reduce (fn [_ record]
+                                      (apply-replica-record!
+                                       server db-name record))
+                                    applied
+                                    records))]
           (report-replica-floor-if-needed! server db-name source opts
                                            applied' true)
           (mark-replica-status!

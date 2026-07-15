@@ -167,11 +167,11 @@
   [dbis source-count]
   (and (vector? dbis)
        (integer? source-count)
-       (not (neg? source-count))
+       (not (neg? (compare source-count 0)))
        (every? (fn [{:keys [dbi entries opts]}]
                  (and (string? dbi)
                       (integer? entries)
-                      (not (neg? entries))
+                      (not (neg? (compare entries 0)))
                       (or (nil? opts) (map? opts))))
                dbis)
        (= (count dbis) (count (set (map :dbi dbis))))
@@ -189,7 +189,7 @@
                      (map? opts)
                      (map? schema)
                      (integer? source-count)
-                     (not (neg? source-count))
+                     (not (neg? (compare source-count 0)))
                      (valid-kv-dbis? kv-dbis kv-source-count))
         (raise "Invalid Datalog migration stream header" {:header header}))
       (let [db (volatile! (@empty-db dir schema opts))]
@@ -264,7 +264,7 @@
   (let [loaded-count
         (reduce
           (fn [total expected]
-            (+ total (load-kv-dbi kv in expected)))
+            (+ (long total) (long (load-kv-dbi kv in expected))))
           0
           dbis)
         end (nippy/thaw-from-in! in)]

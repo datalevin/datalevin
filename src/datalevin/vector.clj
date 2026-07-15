@@ -965,7 +965,7 @@
                 max-vec     (.-max-vec index)
                 domain      (.-domain index)
                 fname       (.-fname index)
-                vec-lock    (.-vec-lock index)
+                ^ReentrantReadWriteLock vec-lock (.-vec-lock index)
                 stats       (.-checkpoint-stats index)
                 wlock       (.writeLock vec-lock)
                 tx-lock     (l/write-txn lmdb)

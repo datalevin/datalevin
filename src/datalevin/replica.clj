@@ -134,7 +134,7 @@
         source-durable (some-> (:source-durable-lsn copy-meta) long)]
     (cond
       (and candidate source-durable)
-      (if (< candidate source-durable) candidate source-durable)
+      (if (< (long candidate) (long source-durable)) candidate source-durable)
 
       candidate candidate
       source-durable source-durable
