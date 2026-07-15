@@ -365,11 +365,16 @@
   [initial-report report es tempid upserted-eid tx-time]
   (let [eid (get (::upserted-tempids initial-report) tempid)]
     (vld/validate-upsert-retry-conflict eid tempid upserted-eid)
-    (let [tempids' (-> (:tempids report)
-                       (assoc tempid upserted-eid))
-          report'  (-> initial-report
-                       (assoc :tempids tempids')
-                       (update ::upserted-tempids assoc tempid upserted-eid))]
+    ;; Retain stable mappings and tempids that own this in-flight target.
+    (let [target-tempids (get (::reverse-tempids report) upserted-eid)
+          tempids'       (-> (:tempids initial-report)
+                             (merge (select-keys (:tempids report)
+                                                 target-tempids))
+                             (assoc tempid upserted-eid))
+          report'        (-> initial-report
+                             (assoc :tempids tempids')
+                             (update ::upserted-tempids assoc
+                                     tempid upserted-eid))]
       (local-transact-tx-data report' es tx-time))))
 
 (defn- flush-tuples [report]
