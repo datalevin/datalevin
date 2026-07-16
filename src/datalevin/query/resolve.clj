@@ -1082,6 +1082,44 @@
         (db/-val-eq-scan-e-list db joined tuple-len tgt-attr)))
     (FastList.)))
 
+(defn or-join-count-link
+  "Count linked or-join tuples without materializing the final target tuples."
+  [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr]
+  (if-let [{:keys [or-by-bound free-var-idx]}
+           (or-join-build sources rules tuples clause bound-var bound-idx
+                          free-vars)]
+    (let [size    (.size tuples)
+          fanouts (HashMap.)]
+      (loop [i     (long 0)
+             total (long 0)]
+        (if (< i size)
+          (let [^objects in-tuple (.get tuples i)
+                bv                (aget in-tuple bound-idx)
+                ^List matches     (.get ^HashMap or-by-bound bv)
+                total
+                (if matches
+                  (loop [j     (long 0)
+                         total (long total)]
+                    (if (< j (.size matches))
+                      (let [^objects match (.get matches j)
+                            fv             (aget match free-var-idx)
+                            cached         (.get fanouts fv)
+                            fanout         (if cached
+                                             (long cached)
+                                             (let [n (long
+                                                       (db/-count
+                                                         db [nil tgt-attr fv]
+                                                         Long/MAX_VALUE))]
+                                               (.put fanouts fv n)
+                                               n))]
+                        (recur (unchecked-inc j)
+                               (unchecked-add total fanout)))
+                      total))
+                  total)]
+            (recur (unchecked-inc i) (long total)))
+          total)))
+    0))
+
 (defn or-join-execute-link-into
   [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr
    sink]

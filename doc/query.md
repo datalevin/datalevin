@@ -256,6 +256,13 @@ order statics on the branch nodes, the range count operations have O(log n)
 time complexity. Compared with statistics based estimation, counting is simple,
 accurate and always up to date.
 
+For an `or-join` link sample, the planner resolves the `or-join` relation but
+does not materialize the final AVE join just to measure its size. It sums the
+exact target-attribute fanout for each matched free-variable value instead,
+caching fanout within the estimate. This preserves the multiplicity of both
+input and `or-join` tuples while avoiding potentially large estimate-only tuple
+products.
+
 ### Query specific sampling (new)
 
 We use sampling to estimate join result size. To ensure representative samples

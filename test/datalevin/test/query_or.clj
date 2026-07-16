@@ -3,9 +3,11 @@
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing are is use-fixtures]]
    [datalevin.core :as d]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.util :as u])
   (:import [clojure.lang ExceptionInfo]
-           [java.util UUID]))
+           [java.util List UUID]
+           [org.eclipse.collections.impl.list.mutable FastList]))
 
 (use-fixtures :each db-fixture)
 
@@ -16,6 +18,41 @@
    {:db/id 4 :name "Oleg" :age 20}
    {:db/id 5 :name "Ivan" :age 10}
    {:db/id 6 :name "Ivan" :age 20} ])
+
+(deftest test-or-join-planning-count-without-materialization
+  (let [dir    (u/tmp-dir (str "query-or-count-" (UUID/randomUUID)))
+        schema {:knows/from   {:db/valueType :db.type/ref}
+                :knows/to     {:db/valueType :db.type/ref}
+                :post/creator {:db/valueType :db.type/ref}}
+        db     (d/db-with
+                 (d/empty-db dir schema)
+                 [{:db/id 1 :person/id 1}
+                  {:db/id 2 :person/id 2}
+                  {:db/id 3 :person/id 3}
+                  {:db/id 10 :knows/from 1 :knows/to 2}
+                  {:db/id 11 :knows/from 1 :knows/to 3}
+                  {:db/id 12 :knows/from 2 :knows/to 3}
+                  {:db/id 20 :post/creator 2}
+                  {:db/id 21 :post/creator 3}
+                  {:db/id 22 :post/creator 3}])
+        clause '(or-join [?start ?person]
+                         (and [?k :knows/from ?start]
+                              [?k :knows/to ?person])
+                         (and [?k1 :knows/from ?start]
+                              [?k1 :knows/to ?mid]
+                              [?k2 :knows/from ?mid]
+                              [?k2 :knows/to ?person]))
+        tuples (FastList. ^java.util.Collection
+                          (mapv object-array [[1] [1]]))
+        args   [db {'$ db} nil tuples clause '?start 0 ['?person]
+                :post/creator]]
+    (try
+      (let [counted      (apply qresolve/or-join-count-link args)
+            materialized (apply qresolve/or-join-execute-link args)]
+        (is (= counted (.size ^List materialized))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
 
 (deftest test-or
   (let [dir     (u/tmp-dir (str "query-or-" (UUID/randomUUID)))

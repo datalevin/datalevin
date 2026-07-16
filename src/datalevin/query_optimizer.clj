@@ -44,11 +44,6 @@
 (def ^:private ^:const ^long collection-input-materialize-threshold
   100000)
 
-(defn- or-join-execute-link
-  [db sources rules tuples clause bound-var bound-idx free-vars tgt-attr]
-  (qresolve/or-join-execute-link db sources rules tuples clause bound-var
-                                 bound-idx free-vars tgt-attr))
-
 (defn- -sample [step db source]
   (qplan/step-sample step db source))
 
@@ -1106,12 +1101,11 @@
           (* ^long prev-size ^double ratio))))))
 
 (defn- count-or-join-follows
-  "Execute or-join on input tuples and count output size."
+  "Count the linked output of an or-join sample."
   [db sources rules tuples {:keys [clause bound-var free-vars tgt-attr]}
    bound-idx]
-  (let [result (or-join-execute-link db sources rules tuples clause bound-var
-                                     bound-idx free-vars tgt-attr)]
-    (.size ^List result)))
+  (qresolve/or-join-count-link db sources rules tuples clause bound-var
+                               bound-idx free-vars tgt-attr))
 
 (defn- estimate-or-join-size
   [db sources rules ^ConcurrentHashMap ratios prev-plan link]
