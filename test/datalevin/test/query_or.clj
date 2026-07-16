@@ -6,7 +6,7 @@
    [datalevin.query.resolve :as qresolve]
    [datalevin.util :as u])
   (:import [clojure.lang ExceptionInfo]
-           [java.util List UUID]
+           [java.util IdentityHashMap List UUID]
            [org.eclipse.collections.impl.list.mutable FastList]))
 
 (use-fixtures :each db-fixture)
@@ -44,11 +44,21 @@
                               [?k2 :knows/to ?person]))
         tuples (FastList. ^java.util.Collection
                           (mapv object-array [[1] [1]]))
-        args   [db {'$ db} nil tuples clause '?start 0 ['?person]
-                :post/creator]]
+        args       [db {'$ db} nil tuples clause '?start 0 ['?person]
+                    :post/creator]
+        build-args (subvec args 1 8)]
     (try
-      (let [counted      (apply qresolve/or-join-count-link args)
+      (let [cache      (IdentityHashMap.)
+            built      (let [a (apply qresolve/or-join-build-cached
+                                       cache build-args)
+                             b (apply qresolve/or-join-build-cached
+                                       cache build-args)]
+                         (is (identical? a b))
+                         a)
+            counted      (qresolve/or-join-count-built
+                           db tuples 0 :post/creator built)
             materialized (apply qresolve/or-join-execute-link args)]
+        (is (= 1 (.size cache)))
         (is (= counted (.size ^List materialized))))
       (finally
         (d/close-db db)

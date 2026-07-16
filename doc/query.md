@@ -261,7 +261,9 @@ does not materialize the final AVE join just to measure its size. It sums the
 exact target-attribute fanout for each matched free-variable value instead,
 caching fanout within the estimate. This preserves the multiplicity of both
 input and `or-join` tuples while avoiding potentially large estimate-only tuple
-products.
+products. A planning component also reuses the resolved `or-join` build across
+outgoing target attributes. The short-lived cache uses input-list identity, not
+the mutable list's content hash, together with an immutable link description.
 
 ### Query specific sampling (new)
 
@@ -280,13 +282,6 @@ empirical-Bayes shrinkage with a prior [6]. To combat extreme skew, we implement
 skew‑aware upper‑bound correction inspired by skew‑robust statistics [5]. Later
 joins use these selectivity ratios to estimate result sizes. We have found our
 method is more effective than sampling more than 2-way joins (e.g. [9]).
-
-Cardinality estimation is intentionally asymmetric: an overestimate may miss an
-optimization, while an underestimate can select a catastrophically expensive
-join order. A standalone base sample may estimate filtering for that base
-relation, but a merge scan fused onto a join does not use that sample to reduce
-the join result size, because the joined entities may have a different
-distribution. Sampled expansion is still retained.
 
 ### Recency based link choice (new)
 

@@ -24,7 +24,7 @@
    [datalevin.rules :as rules]
    [datalevin.util :as u :refer [raise concatv]])
   (:import
-   [java.util HashMap HashSet List]
+   [java.util HashMap HashSet IdentityHashMap List]
    [datalevin.parser BindColl BindIgnore BindScalar BindTuple RulesVar SrcVar]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -1059,6 +1059,22 @@
            :free-var-idx free-var-idx
            :tuple-len    (alength ^objects (.get tuples 0))})))))
 
+(defn or-join-build-cached
+  "Reuse an or-join build for the same input list and immutable link shape."
+  [^IdentityHashMap cache sources rules ^List tuples clause bound-var bound-idx
+   free-vars]
+  (let [^HashMap builds (or (.get cache tuples)
+                            (let [m (HashMap.)]
+                              (.put cache tuples m)
+                              m))
+        build-key       [clause bound-var bound-idx free-vars]]
+    (if (.containsKey builds build-key)
+      (.get builds build-key)
+      (let [built (or-join-build sources rules tuples clause bound-var
+                                 bound-idx free-vars)]
+        (.put builds build-key built)
+        built))))
+
 (defn or-join-execute-link
   [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr]
   (if-let [{:keys [or-by-bound free-var-idx tuple-len]}
@@ -1082,12 +1098,10 @@
         (db/-val-eq-scan-e-list db joined tuple-len tgt-attr)))
     (FastList.)))
 
-(defn or-join-count-link
-  "Count linked or-join tuples without materializing the final target tuples."
-  [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr]
-  (if-let [{:keys [or-by-bound free-var-idx]}
-           (or-join-build sources rules tuples clause bound-var bound-idx
-                          free-vars)]
+(defn or-join-count-built
+  "Count target tuples from an existing or-join build."
+  [db ^List tuples bound-idx tgt-attr built]
+  (if-let [{:keys [or-by-bound free-var-idx]} built]
     (let [size    (.size tuples)
           fanouts (HashMap.)]
       (loop [i     (long 0)
@@ -1119,6 +1133,13 @@
             (recur (unchecked-inc i) (long total)))
           total)))
     0))
+
+(defn or-join-count-link
+  "Count linked or-join tuples without materializing the final target tuples."
+  [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr]
+  (or-join-count-built
+    db tuples bound-idx tgt-attr
+    (or-join-build sources rules tuples clause bound-var bound-idx free-vars)))
 
 (defn or-join-execute-link-into
   [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr

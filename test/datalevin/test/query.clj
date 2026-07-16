@@ -3,15 +3,50 @@
    [datalevin.test.core :as tdc :refer [db-fixture]]
    [clojure.test :refer [deftest testing is use-fixtures]]
    [datalevin.core :as d]
+   [datalevin.constants :as c]
+   [datalevin.pipe :as pipe]
    [datalevin.query :as q]
    [datalevin.query.cache :as qcache]
    [datalevin.query-optimizer :as qo]
    [datalevin.util :as u])
   (:import
    [clojure.lang ExceptionInfo]
-   [java.util UUID]))
+   [java.util ArrayList Collection UUID]))
 
 (use-fixtures :each db-fixture)
+
+(deftest test-batched-tuple-pipe
+  (testing "collection addAll retains normal copy semantics"
+    (binding [c/query-pipe-batch-size 3
+              c/query-pipe-capacity   20]
+      (let [p      (pipe/counted-tuple-pipe)
+            tuples (ArrayList. [1 2 3])]
+        (.addAll ^Collection p tuples)
+        (.clear tuples)
+        (pipe/add-batch p [4 5 6 7])
+        (pipe/finish p)
+        (is (= [1 2 3 4 5 6 7]
+               (loop [result []]
+                 (if-let [tuple (pipe/produce p)]
+                   (recur (conj result tuple))
+                   result))))
+        (is (= 7 (pipe/total p))))))
+
+  (testing "tuple capacity still provides backpressure across batches"
+    (let [p        (binding [c/query-pipe-batch-size 3
+                             c/query-pipe-capacity   4]
+                     (pipe/tuple-pipe))
+          producer (future
+                     (doseq [tuple (range 10)]
+                       (.add ^Collection p tuple))
+                     (pipe/finish p)
+                     :done)]
+      (is (= (vec (range 10))
+             (loop [result []]
+               (if-let [tuple (pipe/produce p)]
+                 (recur (conj result tuple))
+                 result))))
+      (is (= :done (deref producer 5000 :timeout))))))
 
 (deftest test-query-cache-vars-remain-compatible
   (is (var? (ns-resolve 'datalevin.query '*cache?*)))
@@ -21,16 +56,6 @@
   (is (identical? q/*plan-cache* qo/*plan-cache*))
   (binding [q/*cache?* false]
     (is (false? q/*cache?*))))
-
-(deftest test-joined-merge-scan-estimate-is-conservative
-  (let [input-sample (java.util.ArrayList. [0 1 2 3])
-        filtered     (java.util.ArrayList. [0])
-        expanded     (java.util.ArrayList. [0 1 2 3 4 5 6 7])
-        estimate     #'qo/estimate-joined-scan-size]
-    (is (= 100 (estimate 100 [{:sample input-sample}
-                              {:sample filtered}])))
-    (is (= 200 (estimate 100 [{:sample input-sample}
-                              {:sample expanded}])))))
 
 (deftest test-query-cache-stores-exact-result-window
   (let [dir (u/tmp-dir (str "query-window-cache-" (UUID/randomUUID)))

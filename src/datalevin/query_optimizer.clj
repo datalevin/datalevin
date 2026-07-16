@@ -27,7 +27,7 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
-   [java.util List]
+   [java.util IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -767,14 +767,6 @@
                                (/ s (.size ^List sp1))
                                c/magic-scan-ratio))))))))
 
-(defn- estimate-joined-scan-size
-  "Estimate a merge scan fused onto a join without assuming that the joined
-  entities have the same distribution as the standalone base-plan sample.
-  Preserve sampled fan-out, but do not credit sampled filtering."
-  ^long [^long e-size steps]
-  (let [^long scan-size (estimate-scan-v-size e-size steps)]
-    (if (< scan-size e-size) e-size scan-size)))
-
 (defn- factor
   [magic ^long n]
   (if (zero? n) 1 ^long (estimate-round (* ^double magic n))))
@@ -1102,13 +1094,16 @@
 
 (defn- count-or-join-follows
   "Count the linked output of an or-join sample."
-  [db sources rules tuples {:keys [clause bound-var free-vars tgt-attr]}
-   bound-idx]
-  (qresolve/or-join-count-link db sources rules tuples clause bound-var
-                               bound-idx free-vars tgt-attr))
+  [db sources rules ^IdentityHashMap build-cache tuples
+   {:keys [clause bound-var free-vars tgt-attr]} bound-idx]
+  (qresolve/or-join-count-built
+    db tuples bound-idx tgt-attr
+    (qresolve/or-join-build-cached build-cache sources rules tuples clause
+                                   bound-var bound-idx free-vars)))
 
 (defn- estimate-or-join-size
-  [db sources rules ^ConcurrentHashMap ratios prev-plan link]
+  [db sources rules ^ConcurrentHashMap ratios
+   ^IdentityHashMap build-cache prev-plan link]
   (let [prev-size               (:size prev-plan)
         prev-steps              (:steps prev-plan)
         last-step               (peek prev-steps)
@@ -1120,16 +1115,16 @@
     (estimate-round
       (cond
         (< 0 ssize)
-        (let [^long size (count-or-join-follows db sources rules sample link
-                                                bound-idx)
+        (let [^long size (count-or-join-follows db sources rules build-cache
+                                                sample link bound-idx)
               ratio      (max (double (/ size ssize))
                               ^double c/magic-or-join-ratio)]
           (.put ratios ratio-key ratio)
           (* ^long prev-size ratio))
 
         (< 0 rsize)
-        (let [^long size (count-or-join-follows db sources rules result link
-                                                bound-idx)
+        (let [^long size (count-or-join-follows db sources rules build-cache
+                                                result link bound-idx)
               ratio      (/ size rsize)]
           (.put ratios ratio-key ratio)
           size)
@@ -1142,19 +1137,21 @@
             (* ^long prev-size ^double c/magic-or-join-ratio))))))
 
 (defn- estimate-join-size
-  [db sources rules link-e link ratios prev-plan index new-base-plan]
+  [db sources rules link-e link ratios build-cache prev-plan index
+   new-base-plan]
   (let [prev-size (:size prev-plan)
         steps     (:steps new-base-plan)]
     (case (:type link)
-      :ref     [nil (estimate-joined-scan-size prev-size steps)]
+      :ref     [nil (estimate-scan-v-size prev-size steps)]
       :or-join (let [or-size (estimate-or-join-size db sources rules ratios
-                                                    prev-plan link)]
+                                                    build-cache prev-plan
+                                                    link)]
                  ;; or-join doesn't have new-base-plan steps to merge
                  [or-size or-size])
       ;; :_ref and :val-eq
       (let [e-size (estimate-link-size db link-e link ratios prev-size
                                        prev-plan index)]
-        [e-size (estimate-joined-scan-size e-size steps)]))))
+        [e-size (estimate-scan-v-size e-size steps)]))))
 
 (defn- estimate-link-cost
   [^long outer-size ^long result-size]
@@ -1202,10 +1199,11 @@
       (if (< ^long c2 ^long c1) p2 p1))))
 
 (defn- or-join-plan
-  [base-plans new-e db sources rules ratios prev-plan link last-step new-key
-   link-e]
+  [base-plans new-e db sources rules ratios build-cache prev-plan link
+   last-step new-key link-e]
   (let [new-base  (base-plans [new-e])
-        or-size   (estimate-or-join-size db sources rules ratios prev-plan link)
+        or-size   (estimate-or-join-size db sources rules ratios build-cache
+                                         prev-plan link)
         cur-steps (or-join-plan* db sources rules last-step link new-key
                                  new-base)
         or-cost   (estimate-e-plan-cost (:size prev-plan) or-size cur-steps)]
@@ -1215,17 +1213,18 @@
                (- ^long (find-index link-e (:strata last-step))))))
 
 (defn- binary-plan*
-  [db sources rules base-plans ratios prev-plan link-e new-e link new-key]
+  [db sources rules base-plans ratios build-cache prev-plan link-e new-e link
+   new-key]
   (let [last-step (peek (:steps prev-plan))
         index     (index-by-link (:cols last-step) link-e link)
         link-type (:type link)]
     (if (identical? :or-join link-type)
-      (or-join-plan base-plans new-e db sources rules ratios prev-plan link
-                    last-step new-key link-e)
+      (or-join-plan base-plans new-e db sources rules ratios build-cache
+                    prev-plan link last-step new-key link-e)
       (let [new-base (base-plans [new-e])
             [e-size result-size]
-            (estimate-join-size db sources rules link-e link ratios prev-plan
-                                index new-base)]
+            (estimate-join-size db sources rules link-e link ratios build-cache
+                                prev-plan index new-base)]
         (if (and (#{:_ref :val-eq} link-type) new-base)
           (let [link-plan (e-plan db prev-plan index link-e link new-key
                                   new-base e-size result-size)]
@@ -1238,7 +1237,8 @@
                   result-size))))))
 
 (defn- binary-plan
-  [db sources rules nodes base-plans ratios prev-plan link-e new-e new-key]
+  [db sources rules nodes base-plans ratios build-cache prev-plan link-e new-e
+   new-key]
   (let [last-step     (peek (:steps prev-plan))
         seen-or-joins (or (:seen-or-joins last-step) #{})
         links         (get-in nodes [link-e :links])
@@ -1250,14 +1250,14 @@
                              (not (contains? seen-or-joins (:clause %))))))
               links)
         candidates
-        (mapv #(binary-plan* db sources rules base-plans ratios prev-plan
-                             link-e new-e % new-key)
+        (mapv #(binary-plan* db sources rules base-plans ratios build-cache
+                             prev-plan link-e new-e % new-key)
               filtered-links)]
     (when (seq candidates)
       (apply u/min-key-comp (juxt :recency :cost :size) candidates))))
 
 (defn- plans
-  [db sources rules nodes pairs base-plans prev-plans ratios]
+  [db sources rules nodes pairs base-plans prev-plans ratios build-cache]
   (apply
     u/merge-with compare-plans
     (mapv
@@ -1270,8 +1270,9 @@
                   (let [new-key  (conj prev-key new-e)
                         cur-plan (t new-key)
                         new-plan
-                        (binary-plan db sources rules nodes base-plans
-                                     ratios prev-plan link-e new-e new-key)]
+                        (binary-plan db sources rules nodes base-plans ratios
+                                     build-cache prev-plan link-e new-e
+                                     new-key)]
                     (if new-plan
                       (if (or (nil? cur-plan)
                               (identical? new-plan
@@ -1315,16 +1316,17 @@
       (let [base-plans (build-base-plans db nodes component)]
         (if (some nil? (vals base-plans))
           [nil]
-          (let [pairs  (connected-pairs nodes component)
-                tables (FastList. n)
-                ratios (ConcurrentHashMap.)
-                n-1    (dec n)
-                pn     ^long (min (long c/plan-search-max)
-                                  (long (u/n-permutations n 2)))]
+          (let [pairs       (connected-pairs nodes component)
+                tables      (FastList. n)
+                ratios      (ConcurrentHashMap.)
+                build-cache (IdentityHashMap.)
+                n-1         (dec n)
+                pn          ^long (min (long c/plan-search-max)
+                                       (long (u/n-permutations n 2)))]
             (.add tables base-plans)
             (dotimes [i n-1]
               (let [plans (plans db sources rules nodes pairs base-plans
-                                 (.get tables i) ratios)]
+                                 (.get tables i) ratios build-cache)]
                 (if (< pn (count plans))
                   (.add tables (shrink-space plans))
                   (.add tables plans))))

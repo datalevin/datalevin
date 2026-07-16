@@ -808,7 +808,7 @@ Set to 0 for strict check-on-every-call behavior."}
 (def ^{:dynamic true
        :doc     "Size below which the initial plan will execute during planning,
 above which, the same number of items will be sampled instead"}
-  init-exec-size-threshold 500)
+  init-exec-size-threshold 1000)
 
 (def ^{:dynamic true
        :doc     "Upper bound on the plan search space. When the number of plans

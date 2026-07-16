@@ -79,7 +79,7 @@
     (let [get-v? (< 1 (count vars))
           e      (first vars)]
       (if result
-        (.addAll ^Collection sink result)
+        (p/add-batch sink result)
         (cond
           know-e?
           (let [pipe (if *explain*
@@ -143,7 +143,7 @@
             (loop []
               (when (p/produce source)
                 (recur))))
-          (.addAll ^Collection sink result))
+          (p/add-batch sink result))
       (let [batch-size (long c/query-pipe-batch-size)]
         (if (zero? batch-size)
           (db/-eav-scan-v db source sink index attrs-v)
@@ -152,13 +152,13 @@
               (if-let [tuple (p/produce source)]
                 (do (.add buffer tuple)
                     (when (>= (.size buffer) batch-size)
-                      (.addAll ^Collection sink
-                               (db/-eav-scan-v-list db buffer index attrs-v))
+                      (p/add-batch
+                        sink (db/-eav-scan-v-list db buffer index attrs-v))
                       (.clear buffer))
                     (recur))
                 (when (pos? (.size buffer))
-                  (.addAll ^Collection sink
-                           (db/-eav-scan-v-list db buffer index attrs-v))))))))))
+                  (p/add-batch
+                    sink (db/-eav-scan-v-list db buffer index attrs-v))))))))))
 
   (-sample [_ db tuples]
     (if (< 0 (.size ^List tuples))
@@ -193,8 +193,8 @@
             (if-let [tuple (p/produce src)]
               (do (.add buffer tuple)
                   (when (>= (.size buffer) batch-size)
-                    (.addAll
-                      ^Collection sink
+                    (p/add-batch
+                      sink
                       (cond
                         (int? var)
                         (db/-val-eq-scan-e-list db buffer index attr var)
@@ -205,8 +205,8 @@
                     (.clear buffer))
                   (recur))
               (when (pos? (.size buffer))
-                (.addAll
-                  ^Collection sink
+                (p/add-batch
+                  sink
                   (cond
                     (int? var)
                     (db/-val-eq-scan-e-list db buffer index attr var)
@@ -317,7 +317,7 @@
           (when-let [tuple (p/produce src)]
             (.add input tuple)
             (recur))))
-      (.addAll ^Collection sink (-execute this db input))))
+      (p/add-batch sink (-execute this db input))))
 
   (-explain [_ _]
     (str "Anti-join by " vars ".")))

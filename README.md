@@ -290,9 +290,18 @@ for EDN data.
 
 ## :green_book: Documentation
 
-Please refer to [Clojure API doc](https://cljdoc.org/d/datalevin/datalevin) and
-[JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html),
- for more details.
+The [Datalevin book](https://datalevin.org) is available online as the user
+guide. It also accepts user-submitted examples so practical usage patterns can
+be shared with the community.
+
+The [complete book is available in print and ebook
+formats](https://www.amazon.com/dp/B0H8X1QF2Q/). It includes five additional
+chapters on AI memory that are not part of the online guide.
+
+Please refer to the [Clojure API
+documentation](https://cljdoc.org/d/datalevin/datalevin) and
+[JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
+for API details.
 
 ## :bar_chart: Benchmarks
 
