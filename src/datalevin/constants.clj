@@ -35,6 +35,13 @@
      :minor (some-> minor parse-long)
      :patch (some-> patch parse-long)}))
 
+(defn ^:no-doc compare-storage-versions
+  "Compare parsed versions by the major/minor components that define storage
+  compatibility. Patch versions are non-breaking."
+  [{lmajor :major lminor :minor} {rmajor :major rminor :minor}]
+  (compare [(long lmajor) (long (or lminor 0))]
+           [(long rmajor) (long (or rminor 0))]))
+
 (def require-migration?
   "if this version of Datalevin calls for migrating db"
   true)

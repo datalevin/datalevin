@@ -1,6 +1,7 @@
 (ns datalevin.test.migrate
   (:require
    [clojure.test :refer [deftest is]]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.interface :as if]
    [datalevin.migrate :as m]
@@ -9,6 +10,33 @@
   (:import
    [java.io ByteArrayInputStream ByteArrayOutputStream DataOutputStream]
    [java.util UUID]))
+
+(deftest storage-version-ordering
+  (is (pos? (c/compare-storage-versions
+              (c/parse-version "1.0.0")
+              (c/parse-version "0.10.18"))))
+  (is (neg? (c/compare-storage-versions
+              (c/parse-version "0.10.18")
+              (c/parse-version "1.0.0"))))
+  (is (zero? (c/compare-storage-versions
+               (c/parse-version "0.10.1")
+               (c/parse-version "0.10.18")))))
+
+(deftest reject-newer-database-version
+  (let [dir (u/tmp-dir (str "newer-version-" (UUID/randomUUID)))]
+    (try
+      (d/close-kv (d/open-kv dir))
+      (spit (str dir u/+separator+ c/version-file-name) "2.0.0")
+      (try
+        (d/open-kv dir)
+        (is false "Expected a newer-version error")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= {:database-version "2.0.0"
+                  :current-version  c/version
+                  :dir              dir}
+                 (ex-data e)))))
+      (finally
+        (u/delete-files dir)))))
 
 (deftest load-schema-first-migration-stream
   (let [dir    (u/tmp-dir (str "migration-stream-" (UUID/randomUUID)))

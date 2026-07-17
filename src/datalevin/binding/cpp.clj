@@ -2132,13 +2132,27 @@
            version
            (do
              (when (not= version c/version)
-               (if-let [{:keys [major minor patch]} (c/parse-version version)]
-                 (let [{cmajor :major cminor :minor} (c/parse-version c/version)]
-                   (when (and c/require-migration?
-                              (or (< ^long major ^long cmajor)
-                                  (< ^long minor ^long cminor)))
-                     (m/perform-migration dir major minor patch))
-                   (write-version-file dir-file c/version))
+               (if-let [{:keys [major minor patch] :as stored-version}
+                        (c/parse-version version)]
+                 (let [current-version (c/parse-version c/version)
+                       order (long
+                               (c/compare-storage-versions stored-version
+                                                           current-version))]
+                   (cond
+                     (neg? order)
+                     (do
+                       (when c/require-migration?
+                         (m/perform-migration dir major minor patch))
+                       (write-version-file dir-file c/version))
+
+                     (pos? order)
+                     (raise "Database was opened by a newer Datalevin version"
+                            {:database-version version
+                             :current-version  c/version
+                             :dir              dir})
+
+                     :else
+                     (write-version-file dir-file c/version)))
                  (raise "Corrupt VERSION file" {:input version})))
              (open-kv* dir dir-file db-file opts))
            :else
