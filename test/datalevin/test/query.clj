@@ -15,6 +15,33 @@
 
 (use-fixtures :each db-fixture)
 
+(deftest test-linear-recursive-keyed-seen
+  (let [conn  (d/create-conn
+                nil
+                {:edge  {:db/valueType   :db.type/ref
+                         :db/cardinality :db.cardinality/many}
+                 :scope {:db/valueType :db.type/keyword}
+                 :seed  {:db/valueType :db.type/long}}
+                {:kv-opts {:inmemory? true}})
+        rules '[[(reach ?scope ?a ?b)
+                 [?a :scope ?scope]
+                 [?a :seed ?b]]
+                [(reach ?scope ?a ?b)
+                 [?a :edge ?x]
+                 (reach ?scope ?x ?b)]]]
+    (try
+      (d/transact! conn [{:db/id 1 :scope :left :edge 2}
+                         {:db/id 2 :scope :left :edge 3 :seed 10}
+                         {:db/id 3 :scope :left}
+                         {:db/id 4 :scope :right :seed 20}])
+      (is (= #{[:left 1 10] [:left 2 10] [:right 4 20]}
+             (set (d/q '[:find ?scope ?a ?b
+                         :in $ %
+                         :where (reach ?scope ?a ?b)]
+                       (d/db conn) rules))))
+      (finally
+        (d/close conn)))))
+
 (deftest test-eav-scan-decodes-giant-value
   (let [dir     (u/tmp-dir (str "query-giant-eav-" (UUID/randomUUID)))
         conn    (d/get-conn dir {:lookup  {:db/valueType :db.type/string}

@@ -286,6 +286,15 @@
           false)
         true))))
 
+(defn- identity-indices?
+  [^ints idxs]
+  (let [n (alength idxs)]
+    (loop [i 0]
+      (if (< i n)
+        (and (= i (aget idxs i))
+             (recur (unchecked-inc-int i)))
+        true))))
+
 (defn- map-rule-result
   "transforms evaluated rule-rel into a result rel tailored to the rule call"
   [rule-rel rule-head-vars call-args]
@@ -301,19 +310,25 @@
         ^ints projection-idxs
         (projection-indices var->positions head-idxs unique-call-vars)
         n                (alength projection-idxs)
-        size             (.size tuples)]
-    (r/relation!
-      (zipmap unique-call-vars (range))
-      (let [acc (FastList. size)]
-        (dotimes [i size]
-          (let [^objects tuple (.get tuples i)]
-            (when (and (const-check const-idxs const-values tuple)
-                       (equality-check equality-left equality-right tuple))
-              (let [to (object-array n)]
-                (dotimes [j n]
-                  (aset to j (aget tuple (aget projection-idxs j))))
-                (.add acc to)))))
-        acc))))
+        result-attrs     (zipmap unique-call-vars (range))]
+    (if (and (= n (count attrs))
+             (zero? (alength const-idxs))
+             (zero? (alength equality-left))
+             (identity-indices? projection-idxs))
+      (r/relation! result-attrs tuples)
+      (r/relation!
+        result-attrs
+        (let [size (.size tuples)
+              acc  (FastList. size)]
+          (dotimes [i size]
+            (let [^objects tuple (.get tuples i)]
+              (when (and (const-check const-idxs const-values tuple)
+                         (equality-check equality-left equality-right tuple))
+                (let [to (object-array n)]
+                  (dotimes [j n]
+                    (aset to j (aget tuple (aget projection-idxs j))))
+                  (.add acc to)))))
+          acc)))))
 
 (defn- rename-rule
   [branches]
@@ -672,6 +687,7 @@
                                                       eav-plans)]
                 (when head-source
                   {:db            source
+                   :call-rule     rname
                    :delta-rel     rel
                    :call-rel-idxs call-rel-idxs
                    :head-vars     head-vars
@@ -735,6 +751,94 @@
   [^objects delta-tuple ^ints call-rel-idxs call-pos]
   (aget delta-tuple (aget call-rel-idxs (int call-pos))))
 
+(def ^:private empty-group-key (Object.))
+
+(defn- group-values!
+  [^HashMap groups ^objects tuple ^ints tuple-idxs ^objects scratch lookup]
+  (case (alength tuple-idxs)
+    0
+    (or (.get groups empty-group-key)
+        (let [values (HashSet.)]
+          (.put groups empty-group-key values)
+          values))
+
+    1
+    (let [key (aget tuple (aget tuple-idxs 0))]
+      (or (.get groups key)
+          (let [values (HashSet.)]
+            (.put groups key values)
+            values)))
+
+    (do
+      (dotimes [i (alength tuple-idxs)]
+        (aset scratch i (aget tuple (aget tuple-idxs i))))
+      (or (.get groups (r/reset-array-lookup! lookup scratch))
+          (let [key    (aclone scratch)
+                values (HashSet.)]
+            (.put groups (r/wrap-array key) values)
+            values)))))
+
+(defn- build-keyed-eav-seen
+  [{:keys [^Relation delta-rel ^ints call-rel-idxs ^longs head-types
+           ^ints head-idxs eav-plans]}
+   ^HashMap eav-index]
+  (let [head-count       (alength head-types)
+        eav-head-pos     (int (:head-pos (first eav-plans)))
+        key-count        (dec head-count)
+        candidate-idxs   (int-array key-count)
+        initial-idxs     (int-array key-count)
+        valid?           (loop [head-pos 0, key-pos 0]
+                           (if (< head-pos head-count)
+                             (if (= head-pos eav-head-pos)
+                               (recur (unchecked-inc-int head-pos) key-pos)
+                               (if (= output-source-call
+                                      (aget head-types head-pos))
+                                 (let [call-pos (aget head-idxs head-pos)]
+                                   (aset candidate-idxs key-pos
+                                         (aget call-rel-idxs call-pos))
+                                   (aset initial-idxs key-pos
+                                         (aget call-rel-idxs head-pos))
+                                   (recur (unchecked-inc-int head-pos)
+                                          (unchecked-inc-int key-pos)))
+                                 false))
+                             true))]
+    (when valid?
+      (let [groups          (HashMap.)
+            domain         (HashSet.)
+            ^List tuples    (:tuples delta-rel)
+            initial-out-idx (aget call-rel-idxs eav-head-pos)
+            scratch         (object-array key-count)
+            lookup          (r/array-lookup)]
+        (when tuples
+          (dotimes [i (.size tuples)]
+            (let [^objects tuple  (.get tuples i)
+                  ^HashSet values (group-values! groups tuple initial-idxs
+                                                  scratch lookup)]
+              (.add values (aget tuple initial-out-idx))
+              (.add domain (aget tuple initial-out-idx)))))
+        (doseq [^List values (.values eav-index)]
+          (dotimes [i (.size values)]
+            (.add domain (.get values i))))
+        {:groups         groups
+         :candidate-idxs candidate-idxs
+         :domain-size    (.size domain)}))))
+
+(defn- keyed-eav-seen
+  [context branch plan ^HashMap eav-index]
+  (when (and (:single-recursive-branch? context)
+             (= 1 (count (:eav-plans plan)))
+             (= (:current-rule context) (:call-rule plan)))
+    (let [cache (:linear-eav-keyed-seen-cache context)
+          k     [(:current-rule context) branch]]
+      (if (contains? @cache k)
+        (get @cache k)
+        (locking cache
+          (if (contains? @cache k)
+            (get @cache k)
+            (let [state (build-keyed-eav-seen plan eav-index)]
+              (swap! cache assoc k state)
+              state)))))))
+
 (defn- add-fast-output-with-probe!
   [^FastList acc ^HashSet seen-set seen-lookup ^objects scratch
    ^longs head-types ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs
@@ -748,7 +852,7 @@
         (.add seen-set (r/wrap-array-with-hash tuple h))
         (.add acc tuple)))))
 
-(defn- add-fast-output!
+(defn- add-fast-output-known-new!
   [^FastList acc ^HashSet seen-set ^objects scratch ^longs head-types
    ^ints head-idxs ^objects delta-tuple ^ints call-rel-idxs eav0 eav1]
   (let [h     (ArrayUtil/fillRuleOutputAndHash
@@ -760,10 +864,10 @@
 
 (defn- eval-linear-eav-branch-with-dedup
   [context branch ^HashSet seen-set]
-  (when-let [{:keys [^DB db ^Relation delta-rel ^ints call-rel-idxs head-vars
-                     ^longs head-types ^ints head-idxs eav-plans]}
-             (linear-eav-branch-plan context branch)]
-    (let [^List delta-tuples (:tuples delta-rel)
+  (when-let [plan (linear-eav-branch-plan context branch)]
+    (let [{:keys [^DB db ^Relation delta-rel ^ints call-rel-idxs head-vars
+                  ^longs head-types ^ints head-idxs eav-plans]} plan
+          ^List delta-tuples (:tuples delta-rel)
           acc                (FastList.)
           eav-count          (count eav-plans)
           ^objects eav-indexes
@@ -771,7 +875,15 @@
           ^ints eav-call-idxs
           (eav-call-positions eav-plans)
           output-scratch     (object-array (alength head-types))
-          seen-lookup        (r/array-lookup)]
+          seen-lookup        (r/array-lookup)
+          keyed-seen         (when (= 1 eav-count)
+                               (keyed-eav-seen
+                                 context branch plan
+                                 (aget eav-indexes 0)))
+          keyed-scratch      (when keyed-seen
+                               (object-array
+                                 (alength ^ints (:candidate-idxs keyed-seen))))
+          keyed-lookup       (when keyed-seen (r/array-lookup))]
       (when (and delta-tuples (pos? (.size delta-tuples)))
         (dotimes [i (.size delta-tuples)]
           (let [^objects delta-tuple (.get delta-tuples i)]
@@ -782,11 +894,27 @@
                                             delta-tuple call-rel-idxs
                                             (aget eav-call-idxs 0)))]
                 (when values0
-                  (dotimes [j (.size values0)]
-                    (add-fast-output-with-probe!
-                      acc seen-set seen-lookup output-scratch
-                      head-types head-idxs delta-tuple call-rel-idxs
-                      (.get values0 j) nil))))
+                  (if keyed-seen
+                    (let [^HashSet values-seen
+                          (group-values!
+                            (:groups keyed-seen) delta-tuple
+                            (:candidate-idxs keyed-seen)
+                            keyed-scratch keyed-lookup)
+                          domain-size (long (:domain-size keyed-seen))]
+                      (loop [j 0]
+                        (when (and (< j (.size values0))
+                                   (< (.size values-seen) domain-size))
+                          (let [value (.get values0 j)]
+                            (when (.add values-seen value)
+                              (add-fast-output-known-new!
+                                acc seen-set output-scratch head-types head-idxs
+                                delta-tuple call-rel-idxs value nil))
+                            (recur (unchecked-inc-int j))))))
+                    (dotimes [j (.size values0)]
+                      (add-fast-output-with-probe!
+                        acc seen-set seen-lookup output-scratch
+                        head-types head-idxs delta-tuple call-rel-idxs
+                        (.get values0 j) nil)))))
 
               2
               (let [values0  ^List (.get ^HashMap (aget eav-indexes 0)
@@ -801,10 +929,10 @@
                   (dotimes [j (.size values0)]
                     (let [v0 (.get values0 j)]
                       (dotimes [k (.size values1)]
-                        (add-fast-output! acc seen-set output-scratch
-                                          head-types head-idxs delta-tuple
-                                          call-rel-idxs
-                                          v0 (.get values1 k)))))))))))
+                        (add-fast-output-with-probe!
+                          acc seen-set seen-lookup output-scratch
+                          head-types head-idxs delta-tuple call-rel-idxs
+                          v0 (.get values1 k)))))))))))
       (r/relation! (zipmap head-vars (range)) acc))))
 
 (defn- eval-rule-body
@@ -828,7 +956,9 @@
 
 (defn- eval-rule-body-with-dedup
   [context rule-name rule-branches resolve-fn ^HashSet seen-set]
-  (let [context (assoc context :current-rule rule-name)]
+  (let [context (assoc context
+                       :current-rule rule-name
+                       :single-recursive-branch? (= 1 (count rule-branches)))]
     (reduce
       (fn [rel branch]
         (if-let [fast-rel (eval-linear-eav-branch-with-dedup
@@ -1623,7 +1753,8 @@
 	                                     :magic-seeds])
 	                       :rules-deps deps
 	                       :rule-rels base-rule-rels
-	                       :linear-eav-cache (atom {}))
+	                       :linear-eav-cache (atom {})
+	                       :linear-eav-keyed-seen-cache (atom {}))
 
                 ;; Split branches into base (non-recursive) and recursive
                 base-branches-map

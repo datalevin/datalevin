@@ -66,8 +66,11 @@ produced the same result counts.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:tiny` | 65.61 ms | 352.2 ms | T/O at 60s | 10,000 for Datalevin/Clara |
-| `sg:tiny` | 40.00 ms | 404.5 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `tc:tiny` | 57.46 ms | 352.2 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+| `sg:tiny` | 27.37 ms | 404.5 ms | T/O at 60s | 10,000 for Datalevin/Clara |
+
+The Datalevin values are one-shot fresh-process runs. Repeated runs would
+produce far shorter times.
 
 ### Small Runs
 
@@ -77,8 +80,11 @@ and 3,000 `sib` facts. These results use the common timing boundary above.
 
 | Benchmark | Datalevin | Clara | O'Doyle | Result count |
 |-----------|-----------|-------|---------|--------------|
-| `tc:small` | 2,884.0 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
-| `sg:small` | 1,956.0 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
+| `tc:small` | 1,048.8 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
+| `sg:small` | 1,470.0 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
+
+The Datalevin values are medians of five runs. The observed ranges were
+897.9-1,145.4 ms for `tc:small` and 1,311.5-1,560.2 ms for `sg:small`.
 
 Correctness was checked for both Datalevin and Clara TC/SG rules against
 independent fixed-point references. The corrected SG reference uses the

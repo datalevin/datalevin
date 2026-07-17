@@ -117,8 +117,9 @@ For embedded usage, [Java](examples/java/README.md),
 and [Clojure](https://cljdoc.org/d/datalevin/datalevin) are currently supported.
 
 More information about our vision and design decisions can be found in these
-articles and presentation:
+book, articles and presentation:
 
+* [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org)
 * [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)
 * [Achieving High Throughput and Low Latency through Adaptive Asynchronous Transaction](https://yyhh.org/blog/2025/02/achieving-high-throughput-and-low-latency-through-adaptive-asynchronous-transaction/)
 * [Competing for the JOB with a Triplestore](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
@@ -387,7 +388,7 @@ reach as soon as we can. We may adjust the priorities based on feedback.
   migration; new rule engine.~~[Done 2026/01/22]
 * 1.0.0 ~~As a document database with automatic path indexing; WAL mode;
   transaction log access API;  read-only replicas; high availability; JSON API;
-  library for Java, Python, and JavaScript;~~ Book.
+  library for Java, Python, and JavaScript; Book.~~
 * 2.0.0 TTL; extensible storage/query for arbitrary data; data compression;
   provenance annotation; incremental view maintenance; extended rule syntax to
   be able to implementing ML algorithms in DB.
