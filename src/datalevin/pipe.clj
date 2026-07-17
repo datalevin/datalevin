@@ -224,6 +224,31 @@
   []
   (->CountedTuplePipe (batched-queue) 0))
 
+(deftype ListTuplePipe [^List tuples
+                        ^:unsynchronized-mutable ^long i]
+  ITuplePipe
+  (pipe? [_] true)
+  (finish [_] nil)
+  (produce [_]
+    (when (< i (.size tuples))
+      (let [tuple (.get tuples i)]
+        (set! i (inc i))
+        tuple)))
+  (add-batch [_ _]
+    (u/raise "Cannot add tuples to a list input pipe" {}))
+  (drain-to [this sink]
+    (loop [tuple (produce this)]
+      (when tuple
+        (.add ^Collection sink tuple)
+        (recur (produce this)))))
+  (reset [_]
+    (set! i 0))
+  (total [_] 0))
+
+(defn list-tuple-pipe
+  [tuples]
+  (ListTuplePipe. tuples 0))
+
 (defn remove-end-scan
   [tuples]
   (if (.isEmpty ^Collection tuples)

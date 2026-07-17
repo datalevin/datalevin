@@ -24,7 +24,7 @@
    [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
-   [java.util Collection List]
+   [java.util AbstractCollection Collection Collections HashSet List]
    [java.util.concurrent Callable ExecutorService Executors Future]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -48,7 +48,8 @@
   (-explain [step context] "explain the query step"))
 
 (declare cols->attrs execute-steps hash-join-execute hash-join-execute-into
-         sip-execute-pipe sip-hash-join-execute)
+         sip-execute-pipe sip-hash-join-execute index-semi-join-execute
+         index-semi-join-execute-into)
 
 (defrecord InitStep
     [attr pred val range vars in out know-e? cols strata seen-or-joins mcount
@@ -265,6 +266,26 @@
                                                 :val-eq "equal values"
                                                 "link")
            (when use-sip? " with SIP") "."))))
+
+(defrecord SemiJoinStep [in out in-cols cols strata seen-or-joins join-steps]
+
+  IStep
+  (-type [_] :semi-join)
+
+  (-execute [_ db src]
+    (index-semi-join-execute db in-cols join-steps src))
+
+  (-execute-pipe [_ db src sink]
+    (let [input (FastList.)]
+      (when src
+        (loop []
+          (when-let [tuple (p/produce src)]
+            (.add input tuple)
+            (recur))))
+      (index-semi-join-execute-into db in-cols join-steps input sink)))
+
+  (-explain [_ _]
+    "Semi-join by indexed link scan."))
 
 (defrecord OrJoinStep [clause bound-var bound-idx free-vars tgt tgt-attr
                        sources rules in out cols strata seen-or-joins]
@@ -515,6 +536,86 @@
 (defn- writing?
   [db]
   (l/writing? (.-lmdb ^Store (.-store ^DB db))))
+
+(defn- prefix-set-sink
+  [^long width]
+  (let [^HashSet keys (HashSet.)
+        ^objects scratch (when (< 1 width) (object-array width))
+        lookup (when scratch (r/array-lookup))
+        add-prefix!
+        (if (= width 1)
+          (fn [^objects tuple]
+            (.add keys (aget tuple 0)))
+          (fn [^objects tuple]
+            (dotimes [i width]
+              (aset scratch i (aget tuple i)))
+            (r/reset-array-lookup! lookup scratch)
+            (if (.contains keys lookup)
+              false
+              (.add keys (r/wrap-array (aclone scratch))))))
+        contains-prefix?
+        (if (= width 1)
+          (fn [^objects tuple]
+            (.contains keys (aget tuple 0)))
+          (fn [^objects tuple]
+            (dotimes [i width]
+              (aset scratch i (aget tuple i)))
+            (r/reset-array-lookup! lookup scratch)
+            (.contains keys lookup)))
+        sink
+        (proxy [AbstractCollection] []
+          (iterator [] (.iterator (Collections/emptyList)))
+          (size [] (.size keys))
+          (add [tuple] (boolean (add-prefix! tuple))))]
+    [sink contains-prefix?]))
+
+(defn- execute-join-steps-into
+  [db join-steps ^List tuples sink]
+  (let [join-steps (vec join-steps)]
+    (case (count join-steps)
+      1
+      (step-execute-pipe (first join-steps) db (p/list-tuple-pipe tuples) sink)
+
+      2
+      (if (writing? db)
+        (let [middle (step-execute (first join-steps) db tuples)]
+          (step-execute-pipe (peek join-steps) db
+                             (p/list-tuple-pipe middle) sink))
+        (let [middle   (p/tuple-pipe)
+              bindings (get-thread-bindings)
+              tasks    [^Callable
+                        #(with-bindings bindings
+                           (try
+                             (step-execute-pipe
+                               (first join-steps) db
+                               (p/list-tuple-pipe tuples) middle)
+                             (finally (p/finish middle))))
+                        ^Callable
+                        #(with-bindings bindings
+                           (step-execute-pipe (peek join-steps) db middle
+                                              sink))]]
+          (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool tasks)]
+            (.get f))))
+
+      (u/raise "Unsupported indexed semi-join step count"
+               {:step-count (count join-steps)}))))
+
+(defn index-semi-join-execute-into
+  [db in-cols join-steps tuples sink]
+  (when (and tuples (pos? (.size ^List tuples)))
+    (let [[prefix-sink contains-prefix?] (prefix-set-sink (count in-cols))]
+      (execute-join-steps-into db join-steps tuples prefix-sink)
+      (dotimes [i (.size ^List tuples)]
+        (let [tuple (.get ^List tuples i)]
+          (when (contains-prefix? tuple)
+            (.add ^Collection sink tuple))))))
+  sink)
+
+(defn index-semi-join-execute
+  [db in-cols join-steps tuples]
+  (index-semi-join-execute-into
+    db in-cols join-steps tuples
+    (FastList. (int (if tuples (.size ^List tuples) 0)))))
 
 (defn- pipelining
   [context db attrs steps n]

@@ -363,6 +363,102 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-indexed-semi-join-for-dead-leaf
+  (let [conn      (d/create-conn
+                    nil
+                    {:credit/title {:db/valueType :db.type/ref}}
+                    {:kv-opts {:inmemory? true}})
+        dead-q    '[:find ?title
+                    :where
+                    [?t :title/name ?title]
+                    [?credit :credit/title ?t]
+                    [?credit :credit/role :actor]]
+        projected-q
+        '[:find ?title ?credit
+          :where
+          [?t :title/name ?title]
+          [?credit :credit/title ?t]
+          [?credit :credit/role :actor]]
+        value-q   '[:find ?name
+                    :where
+                    [?left :left/name ?name]
+                    [?left :left/key ?key]
+                    [?right :right/key ?key]
+                    [?right :right/role :actor]]
+        plan-steps
+        (fn [q db]
+          (->> (d/explain {} q db)
+               :plan
+               vals
+               (mapcat identity)
+               (mapcat identity)
+               (mapcat :steps)))]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1 :title/name "Wanted"}
+               {:db/id 2 :title/name "No credits"}
+               {:db/id 3 :left/name "Value match" :left/key :match}
+               {:db/id 4 :left/name "No value match" :left/key :other}]
+              (concat
+                (map (fn [^long i]
+                       {:db/id        (+ 100 i)
+                        :credit/title 1
+                        :credit/role  :actor})
+                     (range 50))
+                (map (fn [^long i]
+                       {:db/id      (+ 200 i)
+                        :right/key  :match
+                        :right/role :actor})
+                     (range 50)))))
+      (let [db (d/db conn)]
+        ;; Plan the dead-leaf form first to exercise the projection-sensitive
+        ;; plan-cache key before planning the otherwise identical query graph.
+        (is (some #(= "Semi-join by indexed link scan." %)
+                  (plan-steps dead-q db)))
+        (is (= #{["Wanted"]} (d/q dead-q db)))
+        (is (not-any? #(= "Semi-join by indexed link scan." %)
+                      (plan-steps projected-q db)))
+        (is (= 50 (count (d/q projected-q db))))
+        (is (some #(= "Semi-join by indexed link scan." %)
+                  (plan-steps value-q db)))
+        (is (= #{["Value match"]} (d/q value-q db))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-semi-join-keeps-cross-source-vars
+  (let [left  (d/create-conn
+                nil
+                {:leaf/root {:db/valueType :db.type/ref}}
+                {:kv-opts {:inmemory? true}})
+        right (d/create-conn nil {} {:kv-opts {:inmemory? true}})
+        query '[:find ?name
+                :in $left $right
+                :where
+                [$left ?root :root/name ?name]
+                [$left ?leaf :leaf/root ?root]
+                [$left ?leaf :leaf/key ?key]
+                [$right ?other :other/key ?key]]]
+    (try
+      (d/transact! left [{:db/id 1 :root/name "Wanted"}
+                         {:db/id 2 :root/name "No match"}
+                         {:db/id 10 :leaf/root 1 :leaf/key :match}
+                         {:db/id 11 :leaf/root 2 :leaf/key :miss}])
+      (d/transact! right [{:db/id 20 :other/key :match}])
+      (let [left-db  (d/db left)
+            right-db (d/db right)
+            steps    (->> (d/explain {} query left-db right-db)
+                          :plan
+                          vals
+                          (mapcat identity)
+                          (mapcat identity)
+                          (mapcat :steps))]
+        (is (not-any? #(= "Semi-join by indexed link scan." %) steps))
+        (is (= #{["Wanted"]} (d/q query left-db right-db))))
+      (finally
+        (d/close left)
+        (d/close right)))))
+
 (deftest test-duplicate-attr-merge-scan
   (let [dir (u/tmp-dir (str "test-duplicate-attr-merge-scan-"
                             (UUID/randomUUID)))

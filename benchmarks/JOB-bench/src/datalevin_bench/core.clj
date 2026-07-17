@@ -3196,7 +3196,7 @@
 
 (defn grid [&opts]
   (doseq [p [0.4]
-          v [500]
+          v [1000]
           f [12384]]
     (let [start (System/currentTimeMillis)]
       (doseq [q queries]
