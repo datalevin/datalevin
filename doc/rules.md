@@ -78,6 +78,14 @@ numeric tuples do not collapse into heavily contended hash buckets. The linear
 fast path fills each output array and computes that hash in one pass, then
 reuses the hash for both the seen-set probe and the stored tuple wrapper.
 
+When a linear branch introduces one EAV value, the engine indexes seen values
+by the remaining, invariant head values. Duplicate candidates then require only
+a scalar set probe instead of construction and hashing of the complete output
+tuple. Each group also tracks the exact value domain from the base relation and
+cached EAV adjacency. Once that domain is exhausted, later deltas for the group
+are skipped. Rule calls that only rename a complete result relation reuse its
+tuple arrays rather than materializing an identical projection.
+
 ## Benchmarks
 
 ### Math Genealogy Benchmark
