@@ -38,6 +38,7 @@
     :wdt-db
     :wlmdb
     :runner
+    :runner-skey
     :engine
     :index
     :ha-authority
@@ -1136,7 +1137,7 @@
           (finally
             ((:halt-run-fn deps) runner)
             ((:update-db-fn deps) server db-name
-             #(dissoc % :runner :wlmdb :wstore :wdt-db))
+             #(dissoc % :runner :runner-skey :wlmdb :wstore :wdt-db))
             (when lock
               (.release lock))))))))
 

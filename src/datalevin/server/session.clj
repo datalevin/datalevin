@@ -173,14 +173,15 @@
 
 (defn disconnect-client*
   [deps server client-id]
-  (remove-client deps server client-id)
   (let [^Selector selector ((:selector-fn deps) server)]
     (when (.isOpen selector)
       (doseq [^SelectionKey k (.keys selector)
               :let            [state (.attachment k)]
               :when           state]
         (when (= client-id (@state :client-id))
-          ((:close-conn-fn deps) k))))))
+          ((:cleanup-connection-transactions-fn deps) server k)
+          ((:close-conn-fn deps) k)))))
+  (remove-client deps server client-id))
 
 (defn disconnect-user
   [deps server tgt-username]

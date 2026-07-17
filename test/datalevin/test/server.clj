@@ -5,15 +5,30 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.interpret :as i]
+   [datalevin.remote :as r]
    [datalevin.server :as srv]
    [datalevin.test.core :as tc]
    [datalevin.util :as u])
   (:import
    [clojure.lang ExceptionInfo]
+   [datalevin.db DB]
+   [datalevin.remote DatalogStore]
    [datalevin.server Server]
    [java.util UUID]
    [java.util.concurrent ConcurrentHashMap ThreadPoolExecutor]
    [java.util.concurrent.locks ReentrantReadWriteLock]))
+
+(defn- wait-until
+  [pred ^long timeout-ms]
+  (let [deadline (+ (System/currentTimeMillis) timeout-ms)]
+    (loop []
+      (cond
+        (pred) true
+        (< (System/currentTimeMillis) deadline)
+        (do
+          (Thread/sleep 10)
+          (recur))
+        :else false))))
 
 (deftest server-worker-executor-is-bounded-test
   (let [port   (tc/allocate-port)
@@ -69,6 +84,45 @@
       (finally
         (when (.isWriteLockedByCurrentThread lock)
           (.unlock write-lock))
+        (srv/stop server)
+        (u/delete-files dir)))))
+
+(deftest disconnected-remote-transaction-releases-writer-test
+  (let [port    (tc/allocate-port)
+        dir     (u/tmp-dir (str "remote-transaction-disconnect-test-"
+                                (UUID/randomUUID)))
+        db-name (str "remote-transaction-disconnect-" (UUID/randomUUID))
+        uri     (str "dtlv://" c/default-username ":" c/default-password
+                     "@127.0.0.1/" db-name)
+        ^Server server (binding [c/*db-background-sampling?* false]
+                         (srv/create {:port port :root dir}))]
+    (try
+      (srv/start server)
+      (binding [cl/*default-port* port
+                c/*db-background-sampling?* false]
+        (let [conn     (d/create-conn
+                        uri {:name {:db/valueType :db.type/string}})
+              store    (.-store ^DB @conn)
+              tx-store (r/open-transact store)
+              tx-client (.-client ^DatalogStore tx-store)]
+          (try
+            (is (some? (get-in (.-dbs server) [db-name :runner])))
+            (cl/close-pool (cl/get-pool tx-client))
+            (is (wait-until
+                 #(nil? (get-in (.-dbs server) [db-name :runner]))
+                 3000))
+            (let [conn2  (d/create-conn
+                          uri {:name {:db/valueType :db.type/string}})
+                  result (future
+                           (d/transact! conn2 [{:name "after-disconnect"}]))]
+              (try
+                (is (not= ::timeout (deref result 3000 ::timeout)))
+                (finally
+                  (future-cancel result)
+                  (d/close conn2))))
+            (finally
+              (d/close conn)))))
+      (finally
         (srv/stop server)
         (u/delete-files dir)))))
 

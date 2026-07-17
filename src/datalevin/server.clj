@@ -256,7 +256,8 @@
 
 (declare event-loop close-conn store->db-name session-lmdb remove-store
          with-db-runtime-store-swap
-         halt-run session-deps copy-deps dispatch-deps ha-deps
+         halt-run cleanup-connection-transactions! session-deps copy-deps
+         dispatch-deps ha-deps
          stop-ha-background-loops!)
 
 (def session-dbi sess/session-dbi)
@@ -339,7 +340,9 @@
     (.set running false)
     (stop-ha-background-loops! server)
     (.wakeup selector)
-    (doseq [skey (.keys selector)] (close-conn skey))
+    (doseq [skey (.keys selector)]
+      (cleanup-connection-transactions! server skey)
+      (close-conn skey))
     (.close server-socket)
     (when (.isOpen selector) (.close selector))
     (shutdown-executor! dispatcher "Server dispatcher")
@@ -2080,37 +2083,92 @@
   runs `open-transact-kv`, otherwise LMDB will deadlock"
   (new-message [this skey message])
   (run-calls [this])
-  (halt-run [this]))
+  (halt-run [this])
+  (abort-run [this f]))
 
 (def ^:private runner-stop-signal ::runner-stop)
+(def ^:private runner-abort-signal ::runner-abort)
 
-(deftype Runner [server ^LinkedBlockingQueue queue running?]
+(deftype Runner [server ^LinkedBlockingQueue queue ^AtomicBoolean running?]
   IRunner
   (new-message [_ skey message]
     (trace-remote-tx! "runner-enqueue" (:type message) (nth (:args message) 0 nil))
-    (.put queue [skey message]))
+    (locking queue
+      (if (.get running?)
+        (.put queue [skey message])
+        (u/raise "Transaction runner is closed" {}))))
 
   (halt-run [_]
-    (vreset! running? false)
-    (.clear queue)
-    (.offer queue runner-stop-signal))
+    (locking queue
+      (when (.compareAndSet running? true false)
+        (.clear queue)
+        (.offer queue runner-stop-signal))))
+
+  (abort-run [_ f]
+    (locking queue
+      (when (.compareAndSet running? true false)
+        (.clear queue)
+        (.offer queue [runner-abort-signal f]))))
 
   (run-calls [_]
     (loop []
       (let [item (.take queue)]
-        (when-not (= runner-stop-signal item)
+        (cond
+          (= runner-stop-signal item)
+          nil
+
+          (= runner-abort-signal (first item))
+          ((second item))
+
+          :else
           (let [[skey message] item]
             (trace-remote-tx! "runner-dispatch" (:type message)
                               (nth (:args message) 0 nil))
-            (dispatch-message-with-ha-write-admission server skey message))
-          (when @running?
+            (dispatch-message-with-ha-write-admission server skey message)
             (recur)))))))
 
 (defn- write-txn-runner
-  [^Server server db-name kv-store]
-  (let [runner (->Runner server (LinkedBlockingQueue.) (volatile! true))]
-    (update-db server db-name #(assoc % :runner runner))
+  [^Server server db-name skey tx-state]
+  (let [runner (->Runner server (LinkedBlockingQueue.) (AtomicBoolean. true))]
+    (update-db server db-name
+               #(merge % tx-state {:runner runner :runner-skey skey}))
     runner))
+
+(defn- cleanup-abandoned-transaction!
+  [^Server server db-name runner]
+  (let [dbs (.-dbs server)
+        m   (get dbs db-name)]
+    (when (identical? runner (:runner m))
+      (let [^Semaphore lock (:lock m)]
+        (try
+          (let [kv-store (get-kv-store server db-name)]
+            (i/abort-transact-kv kv-store)
+            (i/close-transact-kv kv-store))
+          (catch Throwable t
+            (log/warn "Failed to abort abandoned remote transaction"
+                      {:db-name db-name
+                       :error-class (.getName ^Class (class t))
+                       :message (ex-message t)})
+            (log/debug t "Abandoned remote transaction cleanup stack trace"
+                       {:db-name db-name}))
+          (finally
+            (update-db server db-name
+                       (fn [state]
+                         (if (identical? runner (:runner state))
+                           (dissoc state :runner :runner-skey :wlmdb
+                                   :wstore :wdt-db)
+                           state)))
+            (when lock
+              (.release lock))))))))
+
+(defn- cleanup-connection-transactions!
+  [^Server server ^SelectionKey skey]
+  (doseq [[db-name m] (.-dbs server)
+          :let        [runner (:runner m)]
+          :when       (and runner
+                           (identical? skey (:runner-skey m)))]
+    (abort-run runner
+               #(cleanup-abandoned-transaction! server db-name runner))))
 
 (defn- handler-deps
   []
@@ -2278,6 +2336,7 @@
    :password-matches?-fn password-matches?
    :get-ip-fn get-ip
    :close-conn-fn close-conn
+   :cleanup-connection-transactions-fn cleanup-connection-transactions!
    :idle-timeout-fn (fn [^Server server] (.-idle-timeout server))})
 
 (defn- copy-deps
@@ -2288,6 +2347,7 @@
 (defn- dispatch-deps
   []
   {:close-conn-fn close-conn
+   :cleanup-connection-transactions-fn cleanup-connection-transactions!
    :dbs-fn (fn [^Server server] (.-dbs server))
    :with-ha-write-admission-fn with-ha-write-admission
    :ha-write-commit-check-fn-fn ha-write-commit-check-fn

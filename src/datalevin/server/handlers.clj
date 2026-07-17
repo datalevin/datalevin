@@ -79,6 +79,30 @@
   ^Semaphore [dbs db-name]
   (get-in dbs [db-name :lock]))
 
+(defn- cleanup-failed-open-transaction!
+  [deps server db-name runner kv-store ^Semaphore lock]
+  (let [dbs    ((:dbs deps) server)
+        owned? (or (nil? runner)
+                   (identical? runner (get-in dbs [db-name :runner])))]
+    (when owned?
+      (when kv-store
+        (try
+          (i/abort-transact-kv kv-store)
+          (i/close-transact-kv kv-store)
+          (catch Throwable cleanup-error
+            (log/warn "Failed to clean up remote transaction after open error"
+                      {:db-name db-name
+                       :error-class (.getName ^Class (class cleanup-error))
+                       :message (ex-message cleanup-error)}))))
+      (when runner
+        ((:halt-run deps) runner)
+        ((:update-db deps) server db-name
+         (fn [m]
+           (if (identical? runner (:runner m))
+             (dissoc m :runner :runner-skey :wlmdb :wstore :wdt-db)
+             m))))
+      (.release lock))))
+
 (defn- with-error
   [deps skey f]
   (try
@@ -1912,18 +1936,21 @@
           "Don't have permission to alter the database"
           (fn []
             (.acquire lock)
-            (try
-              (let [{:keys [kv-store wlmdb]}
-                    ((:open-write-txn-with-retry deps) server db-name)]
-                ((:update-db deps) server db-name
-                 (fn [m]
-                   (assoc m :wlmdb wlmdb)))
-                (let [runner ((:write-txn-runner deps) server db-name kv-store)]
+            (let [runner*   (volatile! nil)
+                  kv-store* (volatile! nil)]
+              (try
+                (let [{:keys [kv-store wlmdb]}
+                      ((:open-write-txn-with-retry deps) server db-name)
+                      _      (vreset! kv-store* kv-store)
+                      runner ((:write-txn-runner deps)
+                              server db-name skey {:wlmdb wlmdb})]
+                  (vreset! runner* runner)
                   (write-complete! deps skey)
-                  ((:run-calls deps) runner)))
-              (catch Throwable t
-                (.release lock)
-                (throw t)))))))))
+                  ((:run-calls deps) runner))
+                (catch Throwable t
+                  (cleanup-failed-open-transaction!
+                   deps server db-name @runner* @kv-store* lock)
+                  (throw t))))))))))
 
 (defn close-transact-kv
   [deps server skey {:keys [args]}]
@@ -1946,7 +1973,7 @@
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :runner :wlmdb)))
+                   (dissoc m :runner :runner-skey :wlmdb)))
                 (.release lock)))))))))
 
 (defn abort-transact-kv
@@ -1970,7 +1997,7 @@
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :runner :wlmdb)))
+                   (dissoc m :runner :runner-skey :wlmdb)))
                 (.release lock)))
             (write-complete! deps skey)))))))
 
@@ -1987,26 +2014,28 @@
           "Don't have permission to alter the database"
           (fn []
             (.acquire lock)
-            (try
-              (let [{:keys [store kv-store wlmdb]}
-                    ((:open-write-txn-with-retry deps) server db-name)
-                    wstore (st/transfer store wlmdb)
-                    runner ((:write-txn-runner deps) server db-name kv-store)]
-                ((:update-db deps)
-                 server
-                 db-name
-                 (fn [m]
-                   (assoc m
-                          :wlmdb wlmdb
-                          :wstore wstore
-                          :wdt-db ((:new-runtime-db deps)
-                                   wstore
-                                   ((:current-runtime-opts deps) m)))))
-                (write-complete! deps skey)
-                ((:run-calls deps) runner))
-              (catch Throwable t
-                (.release lock)
-                (throw t)))))))))
+            (let [runner*   (volatile! nil)
+                  kv-store* (volatile! nil)]
+              (try
+                (let [{:keys [store kv-store wlmdb]}
+                      ((:open-write-txn-with-retry deps) server db-name)
+                      _      (vreset! kv-store* kv-store)
+                      wstore (st/transfer store wlmdb)
+                      runtime-opts ((:current-runtime-opts deps)
+                                    ((:db-state deps) server db-name))
+                      runner ((:write-txn-runner deps)
+                              server db-name skey
+                              {:wlmdb wlmdb
+                               :wstore wstore
+                               :wdt-db ((:new-runtime-db deps)
+                                        wstore runtime-opts)})]
+                  (vreset! runner* runner)
+                  (write-complete! deps skey)
+                  ((:run-calls deps) runner))
+                (catch Throwable t
+                  (cleanup-failed-open-transaction!
+                   deps server db-name @runner* @kv-store* lock)
+                  (throw t))))))))))
 
 (defn close-transact
   [deps server skey {:keys [args]}]
@@ -2032,7 +2061,7 @@
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :wlmdb :wstore :wdt-db :runner)))
+                   (dissoc m :wlmdb :wstore :wdt-db :runner :runner-skey)))
                 (.release lock)))))))))
 
 (defn abort-transact
@@ -2056,7 +2085,7 @@
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :wlmdb :wstore :wdt-db :runner)))
+                   (dissoc m :wlmdb :wstore :wdt-db :runner :runner-skey)))
                 (.release lock)))
             (write-complete! deps skey)))))))
 

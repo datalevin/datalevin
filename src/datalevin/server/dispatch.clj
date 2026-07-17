@@ -377,10 +377,14 @@
         :continue
 
         (= readn -1)
-        (.close ch)))
+        (do
+          ((:cleanup-connection-transactions-fn deps) server skey)
+          (.close ch))))
     (catch java.io.IOException e
       (if (s/includes? (ex-message e) "Connection reset by peer")
-        (.close (.channel skey))
+        (do
+          ((:cleanup-connection-transactions-fn deps) server skey)
+          (.close (.channel skey)))
         (log/error "Read IOException:" (ex-message e))))
     (catch Exception e
       (log/error "Read error:" (ex-message e)))))
