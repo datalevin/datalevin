@@ -939,6 +939,19 @@
       (do (.position bf 4)
           (Retrieved. nil nil (get-value bf 2) c/normal)))))
 
+(defn avg->giant-id
+  ^long [^ByteBuffer bf]
+  (let [limit (.limit bf)]
+    (if (= c/true-value (.get bf (dec limit)))
+      (.getLong bf (- limit 9))
+      c/normal)))
+
+(defn avg->inline-value
+  "Decode the value of a non-giant AVG buffer."
+  [^ByteBuffer bf]
+  (.position bf 4)
+  (get-value bf 2))
+
 (defn- indexable->retrieved
   [^Indexable i]
   (Retrieved. (.-e i) (.-a i) (.-v i) (.-g i)))
