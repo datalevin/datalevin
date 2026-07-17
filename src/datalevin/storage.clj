@@ -383,12 +383,15 @@
                              ^long (aget ^objects b eid-idx)))))))
 
 (defn- sort-tuples-by-val
-  [^List tuples ^long v-idx]
-  (doto tuples
-    (.sort (reify Comparator
-             (compare [_ a b]
-               (d/compare-with-type (aget ^objects a v-idx)
-                                    (aget ^objects b v-idx)))))))
+  [^List tuples ^long v-idx vt]
+  (if (or (identical? vt :db.type/ref)
+          (identical? vt :db.type/long))
+    (sort-tuples-by-eid tuples v-idx)
+    (doto tuples
+      (.sort (reify Comparator
+               (compare [_ a b]
+                 (d/compare-with-type (aget ^objects a v-idx)
+                                      (aget ^objects b v-idx))))))))
 
 (defn- group-counts
   [aids]
@@ -416,7 +419,7 @@
             (let [vb (lmdb/next-val iter)
                   a  (b/read-buffer vb :int)]
               (if (== ^int a ^int (aget aids ai))
-                (let [v    (retrieved->v lmdb (b/avg->r vb))
+                (let [v    (idx/avg-buffer->v lmdb vb)
                       pred (aget preds ai)
                       fidx (aget fidxs ai)]
                   (if (and (or (nil? pred) (pred v))
@@ -462,7 +465,7 @@
                            (if in? (inc gi) gi))
                       s  (aget gstarts gi)]
                   (if (== ^int a ^int (aget aids s))
-                    (let [v (retrieved->v lmdb (b/avg->r vb))]
+                    (let [v (idx/avg-buffer->v lmdb vb)]
                       (dotimes [i (aget gcounts gi)]
                         (let [aj   (+ s i)
                               pred (aget preds aj)
@@ -1155,7 +1158,7 @@
       (when-let [props (schema attr)]
         (let [vt       (value-type props)
               aid      (props :db/aid)
-              in       (sort-tuples-by-val in v-idx)
+              in       (sort-tuples-by-val in v-idx vt)
               nt       (.size ^List in)
               out      (FastList. (* 2 nt))
               seen     (HashMap. nt)
@@ -1196,7 +1199,7 @@
     (when attr
       (when-let [props (schema attr)]
         (let [vt       (value-type props)
-              in       (sort-tuples-by-val in v-idx)
+              in       (sort-tuples-by-val in v-idx vt)
               nt       (.size ^List in)
               aid      (props :db/aid)
               dbi-name c/ave
@@ -1239,7 +1242,7 @@
     (when attr
       (when-let [props (schema attr)]
         (let [vt       (value-type props)
-              in       (sort-tuples-by-val in v-idx)
+              in       (sort-tuples-by-val in v-idx vt)
               nt       (.size ^List in)
               out      (FastList. nt)
               dbi-name c/ave

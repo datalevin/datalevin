@@ -15,6 +15,24 @@
 
 (use-fixtures :each db-fixture)
 
+(deftest test-eav-scan-decodes-giant-value
+  (let [dir     (u/tmp-dir (str "query-giant-eav-" (UUID/randomUUID)))
+        conn    (d/get-conn dir {:lookup  {:db/valueType :db.type/string}
+                                 :payload {:db/valueType :db.type/string}})
+        payload (apply str (repeat (+ c/+val-bytes-wo-hdr+ 100) "x"))]
+    (try
+      (d/transact! conn [{:db/id 1 :lookup "target" :payload payload}])
+      (is (= payload
+             (d/q '[:find ?payload .
+                    :in $ ?lookup
+                    :where
+                    [?e :lookup ?lookup]
+                    [?e :payload ?payload]]
+                  (d/db conn) "target")))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-batched-tuple-pipe
   (testing "collection addAll retains normal copy semantics"
     (binding [c/query-pipe-batch-size 3

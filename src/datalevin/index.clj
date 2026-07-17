@@ -140,3 +140,10 @@
     (if (= g c/normal)
       (.-v r)
       (d/datom-v (gt->datom lmdb g)))))
+
+(defn avg-buffer->v
+  [lmdb ^ByteBuffer bf]
+  (let [g (b/avg->giant-id bf)]
+    (if (= g c/normal)
+      (b/avg->inline-value bf)
+      (d/datom-v (gt->datom lmdb g)))))
