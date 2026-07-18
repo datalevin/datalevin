@@ -281,10 +281,6 @@
 
 (defn- retrieved->attr [attrs ^Retrieved r] (attrs (.-a r)))
 
-(defn- ave-kv->retrieved
-  [lmdb ^Retrieved r ^long e]
-  (Retrieved. e (.-a r) (retrieved->v lmdb r) (.-g r)))
-
 (defn- kv->datom
   [lmdb attrs ^long k ^Retrieved v]
   (let [g (.-g v)]
@@ -324,11 +320,6 @@
                             :else                         :open)]
     [op (b/indexable nil aid lv vt c/gmax) (b/indexable nil aid hv vt c/gmax)]))
 
-(defn- retrieve-ave
-  [lmdb kv]
-  (ave-kv->retrieved
-    lmdb (b/read-buffer (lmdb/k kv) :avg) (b/read-buffer (lmdb/v kv) :id)))
-
 (defn- ave-tuples-scan*
   [lmdb aid vt val-ranges sample-indices work]
   (if sample-indices
@@ -344,35 +335,35 @@
   (ave-tuples-scan*
     lmdb aid vt val-ranges sample-indices
     (fn [kv]
-      (let [^Retrieved r (retrieve-ave lmdb kv)]
-        (.add out (object-array [(.-e r) (.-v r)]))))))
+      (let [e (.getLong ^ByteBuffer (lmdb/v kv) 0)
+            v (idx/avg-buffer->v lmdb (lmdb/k kv))]
+        (.add out (object-array [e v]))))))
 
 (defn- ave-tuples-scan-need-v-vpred
   [lmdb ^Collection out vpred aid vt val-ranges sample-indices]
   (ave-tuples-scan*
     lmdb aid vt val-ranges sample-indices
     (fn [kv]
-      (let [^Retrieved r (retrieve-ave lmdb kv)
-            v            (.-v r)]
+      (let [v (idx/avg-buffer->v lmdb (lmdb/k kv))]
         (when (vpred v)
-          (.add out (object-array [(.-e r) v])))))))
+          (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)
+                                  v])))))))
 
 (defn- ave-tuples-scan-no-v
   [lmdb ^Collection out aid vt val-ranges sample-indices]
   (ave-tuples-scan*
     lmdb aid vt val-ranges sample-indices
     (fn [kv]
-      (.add out (object-array [(b/read-buffer (lmdb/v kv) :id)])))))
+      (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)])))))
 
 (defn- ave-tuples-scan-no-v-vpred
   [lmdb ^Collection out vpred aid vt val-ranges sample-indices]
   (ave-tuples-scan*
     lmdb aid vt val-ranges sample-indices
     (fn [kv]
-      (let [^Retrieved r (retrieve-ave lmdb kv)
-            v            (.-v r)]
+      (let [v (idx/avg-buffer->v lmdb (lmdb/k kv))]
         (when (vpred v)
-          (.add out (object-array [(.-e r)])))))))
+          (.add out (object-array [(.getLong ^ByteBuffer (lmdb/v kv) 0)])))))))
 
 (defn- sort-tuples-by-eid
   [^List tuples ^long eid-idx]
@@ -416,8 +407,8 @@
         (loop [next? (lmdb/seek-key iter te :id)
                ai    0]
           (if (and next? (< ^long ai ^long na))
-            (let [vb (lmdb/next-val iter)
-                  a  (b/read-buffer vb :int)]
+            (let [vb ^ByteBuffer (lmdb/next-val iter)
+                  a  (.getInt vb 0)]
               (if (== ^int a ^int (aget aids ai))
                 (let [v    (idx/avg-buffer->v lmdb vb)
                       pred (aget preds ai)
@@ -455,7 +446,7 @@
                in?   false]
           (when next?
             (let [vb ^ByteBuffer (lmdb/next-val iter)
-                  a  ^int (b/read-buffer vb :int)]
+                  a  (.getInt vb 0)]
               (cond
                 (neg? (Integer/compare a fa))
                 (recur (lmdb/has-next-val iter) gi pa false)
@@ -493,7 +484,8 @@
       (.addAll out (r/prod-tuples (r/single-tuples tuple) ts)))
     (let [ts (FastList.)]
       (visit-list* iter
-                   (fn [vb] (.add ts (object-array [(b/read-buffer vb :id)])))
+                   (fn [^ByteBuffer vb]
+                     (.add ts (object-array [(.getLong vb 0)])))
                    (b/indexable nil aid v vt nil) :avg vt true)
       (if (.isEmpty ts)
         (.put seen v :no-result)
@@ -502,8 +494,8 @@
 
 (defn- val-eq-scan-e-bound*
   [iter ^Collection out tuple aid v vt bound]
-  (visit-list* iter (fn [vb]
-                      (let [e (b/read-buffer vb :id)]
+  (visit-list* iter (fn [^ByteBuffer vb]
+                      (let [e (.getLong vb 0)]
                         (when (= ^long e ^long bound)
                           (.add out (r/conj-tuple tuple e)))))
                (b/indexable nil aid v vt nil) :avg vt true))
@@ -511,8 +503,8 @@
 (defn- val-eq-filter-e*
   [iter ^Collection out tuple aid v vt old-e]
   (visit-list* iter
-               (fn [vb]
-                 (when (== ^long (b/read-buffer vb :id) ^long old-e)
+               (fn [^ByteBuffer vb]
+                 (when (== (.getLong vb 0) ^long old-e)
                    (.add out tuple)))
                (b/indexable nil aid v vt nil) :avg vt true))
 
@@ -524,12 +516,12 @@
                                 :db.cardinality/many)
                    attrs))))
 
-(defn- ea->r
+(defn- ea->avg-buffer
   [schema lmdb e a]
   (when-let [aid (:db/aid (schema a))]
     (when-let [^ByteBuffer bf (near-list lmdb c/eav e aid :id :int)]
-      (when (= ^int aid ^int (b/read-buffer bf :int))
-        (b/read-buffer (.rewind bf) :avg)))))
+      (when (= ^int aid (.getInt bf 0))
+        bf))))
 
 (defprotocol IStateSync
   (mark-state-current! [this last-modified-ms])
@@ -951,12 +943,12 @@
     (when-let [e (.av-first-e this a v)] (d/datom e a v)))
 
   (ea-first-datom [_ e a]
-    (when-let [r (ea->r schema lmdb e a)]
-      (kv->datom lmdb attrs e r)))
+    (when-let [bf (ea->avg-buffer schema lmdb e a)]
+      (d/datom e a (idx/avg-buffer->v lmdb bf))))
 
   (ea-first-v [_ e a]
-    (when-let [r (ea->r schema lmdb e a)]
-      (retrieved->v lmdb r)))
+    (when-let [bf (ea->avg-buffer schema lmdb e a)]
+      (idx/avg-buffer->v lmdb bf)))
 
   (v-datoms [_ v]
     (mapcat

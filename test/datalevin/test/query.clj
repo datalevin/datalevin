@@ -42,7 +42,7 @@
       (finally
         (d/close conn)))))
 
-(deftest test-eav-scan-decodes-giant-value
+(deftest test-index-scans-decode-giant-value
   (let [dir     (u/tmp-dir (str "query-giant-eav-" (UUID/randomUUID)))
         conn    (d/get-conn dir {:lookup  {:db/valueType :db.type/string}
                                  :payload {:db/valueType :db.type/string}})
@@ -56,6 +56,11 @@
                     [?e :lookup ?lookup]
                     [?e :payload ?payload]]
                   (d/db conn) "target")))
+      (is (= payload
+             (d/q '[:find ?payload .
+                    :where
+                    [?e :payload ?payload]]
+                  (d/db conn))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

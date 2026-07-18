@@ -170,7 +170,7 @@ relation in each join.
 
 ### Join methods (new)
 
-Currently, we consider five join methods. For two sets of where clauses
+Currently, we consider six join methods. For two sets of where clauses
 involving two classes of entities respectively, e.g. `?e` and `?f`, we currently
 consider the following cases.
 
@@ -205,6 +205,44 @@ more robustly.
 
 For reverse reference type of hash join, we implement a form of sideway
 information passing (SIP) using a bitmap [15] to pre-filter target relation.
+
+#### Indexed semi-join `:semi-join`
+
+When the target of an indexed join is used only to test existence, producing
+all of its bindings can multiply the left relation without changing the query
+result. For example:
+
+```clojure
+[:find ?title
+ :where
+ [?t :title/name ?title]
+ [?credit :credit/title ?t]
+ [?credit :credit/role :actor]]
+```
+
+If `?credit` has no other graph connection and is not otherwise required, the
+last two patterns mean "a matching credit exists." An indexed semi-join emits
+each matching input tuple once instead of emitting one tuple per credit.
+
+The optimizer recognizes this conservatively. The target must be a degree-one
+leaf connected by `:ref`, `:_ref`, or `:val-eq`, with exactly one incoming graph
+link. None of the columns introduced by the target may be required by `:find`,
+`:with`, input relations, late clauses, planned `not-join` clauses, or another
+database source. The estimated ordinary join result must also be larger than
+the input, otherwise avoiding fanout is not expected to pay for the seen-set
+work. Projecting `?credit` in the example therefore selects a normal join.
+
+Execution runs the normal indexed link and merge-scan steps into a set of
+matching left prefixes, then filters the original left tuples through that set.
+The right-side bindings and duplicate matches are never materialized as output.
+`explain` identifies this step as `Semi-join by indexed link scan.` The variables
+required outside each source graph are included in the plan-cache key, so a
+plan for an existence-only query cannot be reused for a query that projects the
+same target.
+
+This optimization intentionally does not cover general last-use nodes or dead
+subgraphs. Restricting it to a leaf keeps eligibility cheap and prevents the
+smaller semi-join cardinality from changing earlier join-order decisions.
 
 #### Or-join `:or-join`
 
