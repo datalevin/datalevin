@@ -31,10 +31,30 @@
     :abort-transact-kv})
 
 (def ^:private idempotent-withtxn-control-types
-  #{:close-transact
-    :abort-transact
-    :close-transact-kv
+  #{:abort-transact
     :abort-transact-kv})
+
+(def ^:private withtxn-close-types
+  #{:close-transact
+    :close-transact-kv})
+
+(defn- missing-withtxn-error
+  [db-name type reason]
+  {:error :ha/write-indeterminate
+   :indeterminate? true
+   :reason reason
+   :db-name db-name
+   :type type})
+
+(defn- transaction-owner?
+  [^SelectionKey skey ^SelectionKey runner-skey]
+  ;; A dedicated transaction client can replace a closed pooled socket while
+  ;; retaining its server session. HA rerouting authenticates a different
+  ;; client, which must not operate or close the original runner.
+  (or (identical? skey runner-skey)
+      (let [client-id        (some-> skey .attachment deref :client-id)
+            runner-client-id (some-> runner-skey .attachment deref :client-id)]
+        (and client-id (= client-id runner-client-id)))))
 
 (def ^:private replica-extra-write-command-types
   #{:drop-database
@@ -274,27 +294,39 @@
 (defn handle-writing
   [deps server ^SelectionKey skey {:keys [args] :as message}]
   (try
-    (let [db-name  (nth args 0)
-          type     (:type message)
-          _        ((:trace-remote-tx-fn deps) "handle-writing" type db-name)
-          _        ((:get-kv-store-fn deps) server db-name)
-          runner   (get-in ((:dbs-fn deps) server) [db-name :runner])]
+    (let [db-name     (nth args 0)
+          type        (:type message)
+          _           ((:trace-remote-tx-fn deps) "handle-writing" type db-name)
+          _           ((:get-kv-store-fn deps) server db-name)
+          db-state    (get ((:dbs-fn deps) server) db-name)
+          runner      (:runner db-state)
+          runner-skey (:runner-skey db-state)]
       (cond
-        runner
+        (and runner (transaction-owner? skey runner-skey))
         ((:new-message-fn deps) runner skey message)
 
         (idempotent-withtxn-control-types type)
         ((:write-message-fn deps) skey {:type :command-complete})
 
+        runner
+        (u/raise "Active transaction belongs to another client"
+                 (missing-withtxn-error db-name type
+                                        :transaction-owner-mismatch))
+
+        (withtxn-close-types type)
+        (u/raise "Cannot confirm a transaction that is no longer active"
+                 (missing-withtxn-error db-name type
+                                        :missing-transaction))
+
         :else
         (u/raise "No active with-transaction runner"
-                 {:db-name db-name
-                  :type    type})))
+                 (missing-withtxn-error db-name type
+                                        :missing-transaction))))
     (catch Exception e
       (error-response skey
                       (str "Error Handling with-transaction message:"
                            (ex-message e))
-                      {}))))
+                      (or (ex-data e) {})))))
 
 (defn- set-last-active
   [deps server ^SelectionKey skey]

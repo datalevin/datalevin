@@ -126,6 +126,83 @@
         (srv/stop server)
         (u/delete-files dir)))))
 
+(deftest remote-transaction-close-is-client-bound-test
+  (let [port    (tc/allocate-port)
+        dir     (u/tmp-dir (str "remote-transaction-owner-test-"
+                                (UUID/randomUUID)))
+        db-name (str "remote-transaction-owner-" (UUID/randomUUID))
+        uri     (str "dtlv://" c/default-username ":" c/default-password
+                     "@127.0.0.1/" db-name)
+        ^Server server (binding [c/*db-background-sampling?* false]
+                         (srv/create {:port port :root dir}))]
+    (try
+      (srv/start server)
+      (binding [cl/*default-port* port
+                c/*db-background-sampling?* false]
+        (let [conn         (d/create-conn
+                            uri {:name {:db/valueType :db.type/string}})
+              store        (.-store ^DB @conn)
+              tx-store     (r/open-transact store)
+              other-client (cl/new-client uri)
+              runner       (get-in (.-dbs server) [db-name :runner])]
+          (try
+            (let [e (try
+                      (cl/normal-request other-client :close-transact
+                                         [db-name] true)
+                      nil
+                      (catch ExceptionInfo e
+                        e))]
+              (is (some? e))
+              (is (= :ha/write-indeterminate
+                     (get-in (ex-data e) [:err-data :error])))
+              (is (= :transaction-owner-mismatch
+                     (get-in (ex-data e) [:err-data :reason])))
+              (is (identical? runner
+                              (get-in (.-dbs server) [db-name :runner]))))
+            (finally
+              (cl/close-client other-client)
+              (r/abort-transact tx-store)
+              (d/close conn)))))
+      (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
+
+(deftest remote-transaction-close-without-open-is-indeterminate-test
+  (let [port    (tc/allocate-port)
+        dir     (u/tmp-dir (str "remote-transaction-missing-test-"
+                                (UUID/randomUUID)))
+        db-name (str "remote-transaction-missing-" (UUID/randomUUID))
+        uri     (str "dtlv://" c/default-username ":" c/default-password
+                     "@127.0.0.1/" db-name)
+        ^Server server (binding [c/*db-background-sampling?* false]
+                         (srv/create {:port port :root dir}))]
+    (try
+      (srv/start server)
+      (binding [cl/*default-port* port
+                c/*db-background-sampling?* false]
+        (let [conn  (d/create-conn
+                     uri {:name {:db/valueType :db.type/string}})
+              store (.-store ^DB @conn)]
+          (try
+            (let [e (try
+                      (cl/normal-request (.-client ^DatalogStore store)
+                                         :close-transact
+                                         [db-name]
+                                         true)
+                      nil
+                      (catch ExceptionInfo e
+                        e))]
+              (is (some? e))
+              (is (= :ha/write-indeterminate
+                     (get-in (ex-data e) [:err-data :error])))
+              (is (= :missing-transaction
+                     (get-in (ex-data e) [:err-data :reason]))))
+            (finally
+              (d/close conn)))))
+      (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
+
 (deftest remote-query-uses-server-safe-resolver-test
   (let [port   (tc/allocate-port)
         dir    (u/tmp-dir (str "server-safe-query-test-" (UUID/randomUUID)))
