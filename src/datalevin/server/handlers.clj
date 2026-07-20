@@ -71,6 +71,11 @@
   ^clojure.lang.Volatile [^SelectionKey skey]
   (.attachment skey))
 
+(defn- aborted-transaction-close-marker
+  [^SelectionKey skey close-type]
+  {:client-id (:client-id @(skey-state skey))
+   :type close-type})
+
 (defn- db-lock
   ^Semaphore [deps server db-name]
   ((:get-lock deps) server db-name))
@@ -1985,6 +1990,9 @@
       (let [db-name          (nth args 0)
             kv-store         ((:get-kv-store deps) server db-name)
             dbs              ((:dbs deps) server)
+            aborted?         (volatile! false)
+            marker           (aborted-transaction-close-marker
+                              skey :close-transact-kv)
             ^Semaphore lock (state-lock dbs db-name)]
         (db-alter-permission!
           deps server skey db-name
@@ -1993,11 +2001,14 @@
             (try
               (i/abort-transact-kv kv-store)
               (i/close-transact-kv kv-store)
+              (vreset! aborted? true)
               (finally
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :runner :runner-skey :wlmdb)))
+                   (cond-> (dissoc m :runner :runner-skey :wlmdb)
+                     @aborted?
+                     (assoc :aborted-transaction-close marker))))
                 (.release lock)))
             (write-complete! deps skey)))))))
 
@@ -2073,6 +2084,9 @@
       (let [db-name  (nth args 0)
             kv-store ((:get-kv-store deps) server db-name)
             dbs      ((:dbs deps) server)
+            aborted? (volatile! false)
+            marker   (aborted-transaction-close-marker
+                      skey :close-transact)
             ^Semaphore lock (state-lock dbs db-name)]
         (db-alter-permission!
           deps server skey db-name
@@ -2081,11 +2095,15 @@
             (try
               (i/abort-transact-kv kv-store)
               (i/close-transact-kv kv-store)
+              (vreset! aborted? true)
               (finally
                 ((:halt-run deps) (get-in dbs [db-name :runner]))
                 ((:update-db deps) server db-name
                  (fn [m]
-                   (dissoc m :wlmdb :wstore :wdt-db :runner :runner-skey)))
+                   (cond-> (dissoc m :wlmdb :wstore :wdt-db
+                                   :runner :runner-skey)
+                     @aborted?
+                     (assoc :aborted-transaction-close marker))))
                 (.release lock)))
             (write-complete! deps skey)))))))
 

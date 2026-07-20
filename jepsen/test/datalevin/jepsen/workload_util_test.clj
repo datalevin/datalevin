@@ -441,6 +441,29 @@
     (is (= 1 (:disruption-failure-count result)))
     (is (= 0 (:mismatch-count result)))))
 
+(deftest rejoin-bootstrap-checker-classifies-indeterminate-converge-write-test
+  (let [detail {:message "Request to Datalevin server failed"
+                :err-data {:error :ha/write-indeterminate
+                           :indeterminate? true
+                           :reason :transaction-owner-mismatch
+                           :type :close-transact}}
+        result (checker/check
+                (#'rejoin-bootstrap/rejoin-checker)
+                {:datalevin/nemesis-faults [:clock-skew-mixed]}
+                (history/history
+                 [{:process 0
+                   :type :info
+                   :f :converge
+                   :error "Active transaction belongs to another client"
+                   :value detail}])
+                nil)]
+    (is (= :unknown (:valid? result)) (pr-str result))
+    (is (= :disruption-only-converge (:adjusted-valid? result)))
+    (is (= 0 (:converge-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:mismatch-count result)))))
+
 (deftest rejoin-bootstrap-local-leader-values-avoid-remote-read-test
   (let [cluster-id ::local-leader-values
         test       {:datalevin/cluster-id cluster-id

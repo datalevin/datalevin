@@ -2131,7 +2131,9 @@
   [^Server server db-name skey tx-state]
   (let [runner (->Runner server (LinkedBlockingQueue.) (AtomicBoolean. true))]
     (update-db server db-name
-               #(merge % tx-state {:runner runner :runner-skey skey}))
+               #(merge (dissoc % :aborted-transaction-close)
+                       tx-state
+                       {:runner runner :runner-skey skey}))
     runner))
 
 (defn- cleanup-abandoned-transaction!
@@ -2359,6 +2361,7 @@
    :get-kv-store-fn get-kv-store
    :new-message-fn new-message
    :write-message-fn write-message
+   :update-db-fn update-db
    :get-client-fn get-client
    :clients-fn (fn [^Server server] (.-clients server))
    :with-db-runtime-read-access-fn with-db-runtime-read-access})

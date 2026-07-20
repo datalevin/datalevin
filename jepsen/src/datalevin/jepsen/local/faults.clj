@@ -732,12 +732,30 @@
     :else
     nil))
 
+(defn- write-indeterminate-error?
+  [error]
+  (cond
+    (map? error)
+    (or (= :ha/write-indeterminate (:error error))
+        (true? (:indeterminate? error))
+        (write-indeterminate-error? (:err-data error))
+        (write-indeterminate-error? (:data error)))
+
+    (instance? Throwable error)
+    (boolean
+      (some #(write-indeterminate-error? (ex-data %))
+            (take-while some? (iterate ex-cause error))))
+
+    :else
+    false))
+
 (defn expected-disruption-write-failure?
   [test error]
   (and (write-disruption-fault-active? test)
-       (when-let [message (disruption-write-failure-message error)]
-         (some #(str/includes? message %)
-               disruption-write-failure-markers))))
+       (or (write-indeterminate-error? error)
+           (when-let [message (disruption-write-failure-message error)]
+             (some #(str/includes? message %)
+                   disruption-write-failure-markers)))))
 
 (defn wedge-node-storage!
   [{:keys [clusters write-remote-content!]} cluster-id logical-node fault]
