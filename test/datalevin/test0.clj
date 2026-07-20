@@ -2,9 +2,12 @@
   "tests for core operations"
   (:require
    [clojure.test :as t]
+   datalevin.test.bits
    datalevin.test.core
    datalevin.test.components
    datalevin.test.conn
+   datalevin.test.csv
+   datalevin.test.datafy
    datalevin.test.db
    datalevin.test.entity
    datalevin.test.explode
@@ -14,6 +17,7 @@
    datalevin.test.listen
    datalevin.test.lookup-refs
    datalevin.test.lru
+   datalevin.test.migrate
    datalevin.test.parser
    datalevin.test.parser-find
    datalevin.test.parser-rules
@@ -30,6 +34,7 @@
    datalevin.test.query-pull
    datalevin.test.query-rules
    datalevin.test.replica
+   datalevin.test.spill
    datalevin.test.tuples
    datalevin.test.validation
    datalevin.test.upsert
@@ -40,9 +45,12 @@
 (defn ^:export test-clj []
   (let [{:keys [fail error]}
         (t/run-tests
+          'datalevin.test.bits
           'datalevin.test.core
           'datalevin.test.components
           'datalevin.test.conn
+          'datalevin.test.csv
+          'datalevin.test.datafy
           'datalevin.test.db
           'datalevin.test.entity
           'datalevin.test.explode
@@ -52,6 +60,7 @@
           'datalevin.test.listen
           'datalevin.test.lookup-refs
           'datalevin.test.lru
+          'datalevin.test.migrate
           'datalevin.test.parser
           'datalevin.test.parser-find
           'datalevin.test.parser-rules
@@ -68,6 +77,7 @@
           'datalevin.test.query-pull
           'datalevin.test.query-rules
           'datalevin.test.replica
+          'datalevin.test.spill
           'datalevin.test.tuples
           'datalevin.test.validation
           'datalevin.test.upsert

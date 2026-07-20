@@ -117,7 +117,8 @@
             out {:frame :datalog-end :datom-count 1})
           (doseq [{:keys [dbi entries] :as dbi-info} dbis]
             (nippy/freeze-to-out! out (assoc dbi-info :frame :dbi))
-            (with-open [items (d/range-seq source dbi [:all] :raw :raw)]
+            (with-open [^java.lang.AutoCloseable items
+                        (d/range-seq source dbi [:all] :raw :raw)]
               (nippy/freeze-to-out! out (vec (seq items))))
             (nippy/freeze-to-out!
               out {:frame :dbi-end :dbi dbi :entry-count entries}))
@@ -180,7 +181,8 @@
                  :source-count 4})
           (doseq [{:keys [dbi entries] :as dbi-info} dbis]
             (nippy/freeze-to-out! out (assoc dbi-info :frame :dbi))
-            (with-open [items (d/range-seq source dbi [:all] :raw :raw)]
+            (with-open [^java.lang.AutoCloseable items
+                        (d/range-seq source dbi [:all] :raw :raw)]
               (nippy/freeze-to-out! out (vec (seq items))))
             (nippy/freeze-to-out!
               out {:frame :dbi-end :dbi dbi :entry-count entries}))
