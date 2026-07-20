@@ -991,11 +991,17 @@
 
 (defn- pour
   [store datoms]
-  (doseq [batch (sequence (comp
-                            (map #(correct-datom store %))
-                            (partition-all c/*fill-db-batch-size*))
-                          datoms)]
-    (load-datoms store batch)))
+  (let [batch-size (long c/*fill-db-batch-size*)]
+    (when-not (<= 1 batch-size Integer/MAX_VALUE)
+      (u/raise "Invalid fill-db batch size" {:batch-size batch-size}))
+    (let [^FastList batch (FastList. (int batch-size))]
+      (doseq [datom datoms]
+        (.add batch (correct-datom store datom))
+        (when (= batch-size (.size batch))
+          (load-datoms store batch)
+          (.clear batch)))
+      (when-not (.isEmpty batch)
+        (load-datoms store batch)))))
 
 (defn close-db [^DB db]
   (let [store ^IStore (.-store db)]
@@ -1075,8 +1081,9 @@
     (try
       (with-bulk-load-direct-write-path
         lmdb
-        #(l/with-transaction-kv [_ lmdb]
-           (pour store datoms)))
+        #(binding [c/*ordered-datom-writes?* true]
+           (l/with-transaction-kv [_ lmdb]
+             (pour store datoms))))
       (finally
         (when-not nosync? (set-env-flags lmdb #{:nosync} false))))
     (sync lmdb)))

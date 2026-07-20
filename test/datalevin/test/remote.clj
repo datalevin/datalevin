@@ -8,8 +8,8 @@
    [datalevin.lmdb :as l]
    [datalevin.remote :as remote])
   (:import
-   [datalevin.bits Indexable]
    [datalevin.lmdb DatomKVTxData KVTxData]
+   [java.util Arrays]
    [java.util.concurrent.atomic AtomicBoolean]))
 
 (defrecord FakeClient [calls]
@@ -38,21 +38,21 @@
 (deftest expand-datom-kv-txs-for-transport-test
   (let [insert-avg (b/indexable nil 1 42 :db.type/long c/g0)
         delete-avg (b/indexable nil 1 43 :db.type/long c/g0)
-        txs        [(DatomKVTxData. 1000 insert-avg true)
-                    (DatomKVTxData. 1001 delete-avg false)]
+        insert-bs  (b/indexable-bytes insert-avg)
+        delete-bs  (b/indexable-bytes delete-avg)
+        txs        [(DatomKVTxData. 1000 insert-bs true)
+                    (DatomKVTxData. 1001 delete-bs false)]
         expanded   (l/expand-datom-kv-txs txs)
-        ^Indexable insert-i (.-k ^KVTxData (nth expanded 0))
-        ^Indexable delete-i (.-k ^KVTxData (nth expanded 2))]
+        ^bytes insert-key (.-k ^KVTxData (nth expanded 0))
+        ^bytes delete-key (.-k ^KVTxData (nth expanded 2))]
     (is (= 4 (count expanded)))
     (is (every? #(instance? KVTxData %) expanded))
-    (is (= (assoc (b/pr-indexable insert-avg) 0 1000)
-           (b/pr-indexable insert-i)))
-    (is (= (assoc (b/pr-indexable delete-avg) 0 1001)
-           (b/pr-indexable delete-i)))
-    (is (= [[:put c/ave insert-i 1000 :avg :id]
-            [:put c/eav 1000 insert-i :id :avg]
-            [:del-list c/ave delete-i [1001] :avg :id]
-            [:del-list c/eav 1001 [delete-i] :id :avg]]
+    (is (Arrays/equals insert-bs insert-key))
+    (is (Arrays/equals delete-bs delete-key))
+    (is (= [[:put c/ave insert-key 1000 :raw :id]
+            [:put c/eav 1000 insert-key :id :raw]
+            [:del-list c/ave delete-key [1001] :raw :id]
+            [:del-list c/eav 1001 [delete-key] :id :raw]]
            (mapv (fn [^KVTxData tx]
                    [(.-op tx) (.-dbi-name tx) (.-k tx) (.-v tx)
                     (.-kt tx) (.-vt tx)])

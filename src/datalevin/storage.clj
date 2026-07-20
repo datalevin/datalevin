@@ -17,6 +17,7 @@
    [datalevin.kv :as kv]
    [datalevin.remote :as remote]
    [datalevin.util :as u :refer [conjs conjv]]
+   [datalevin.buffer :as bf]
    [datalevin.relation :as r]
    [datalevin.bits :as b]
    [datalevin.pipe :as p]
@@ -2411,7 +2412,8 @@
 (defn- insert-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
    ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants ^HashMap attr-infos embedding-plan]
+   ^FastList id-ds ^HashMap giants ^HashMap attr-infos embedding-plan
+   ^ByteBuffer avg-bf]
   (let [attr       (.-a d)
         e          (.-e d)
         v          (.-v d)
@@ -2424,7 +2426,7 @@
         max-gt     (max-gt store)
         i          (b/indexable nil aid v vt max-gt)
         giant?     (b/giant? i)]
-    (.add txs (DatomKVTxData. e i true))
+    (.add txs (DatomKVTxData. e (b/indexable-bytes i avg-bf) true))
     (when giant?
       (.advance-max-gt store)
       (let [gd [e attr v]
@@ -2480,7 +2482,7 @@
 (defn- delete-datom
   [^Store store ^Datom d ^FastList txs ^FastList ft-ds ^FastList vi-ds
    ^FastList ft-jobs ^FastList vi-jobs ^FastList em-ds ^FastList em-jobs
-   ^FastList id-ds ^HashMap giants ^HashMap attr-infos]
+   ^FastList id-ds ^HashMap giants ^HashMap attr-infos ^ByteBuffer avg-bf]
   (let [e          (.-e d)
         attr       (.-a d)
         v          (.-v d)
@@ -2535,7 +2537,7 @@
                        [:r [e aid gt v]]
                        [:d [e aid v]])])))
     (let [ii (Indexable. nil aid v (.-f i) (.-b i) (or gt c/normal))]
-      (.add txs (DatomKVTxData. e ii false))
+      (.add txs (DatomKVTxData. e (b/indexable-bytes ii avg-bf) false))
       (when gt
         (when gt-cur (.remove giants d-eav))
         (.add txs (lmdb/kv-tx :del c/giants gt :id)))
@@ -2579,13 +2581,18 @@
          ;; [:g d [e aid gt v]], or [:r d [e aid gt v]]
          id-ds  (FastList.)
          giants (HashMap.)
-         attr-infos (HashMap.)]
-     (doseq [datom datoms]
-       (if (d/datom-added datom)
-         (insert-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds em-jobs
-                       id-ds giants attr-infos embedding-plan)
-         (delete-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds
-                       em-jobs id-ds giants attr-infos)))
+         attr-infos (HashMap.)
+         avg-bf     (bf/get-array-buffer)]
+     (try
+       (doseq [datom datoms]
+         (if (d/datom-added datom)
+           (insert-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs
+                         em-ds em-jobs id-ds giants attr-infos embedding-plan
+                         avg-bf)
+           (delete-datom store datom txs ft-ds vi-ds ft-jobs vi-jobs em-ds
+                         em-jobs id-ds giants attr-infos avg-bf)))
+       (finally
+         (bf/return-array-buffer avg-bf)))
      (let [tx-id (long (.advance-max-tx store))
            modified-ms (long (or last-modified-ms
                                  (System/currentTimeMillis)))]

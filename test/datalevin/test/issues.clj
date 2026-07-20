@@ -1,6 +1,7 @@
 (ns datalevin.test.issues
   (:require
    [datalevin.binding.cpp :as cpp]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.kv :as kv]
    [datalevin.query-optimizer :as qo]
@@ -80,7 +81,8 @@
                              (d/datom e :job/completed-at
                                       (java.util.Date. (+ 1700000000000 e))))
                            (range 1 11))
-              db1    (d/fill-db db0 datoms)]
+              db1    (binding [c/*fill-db-batch-size* 3]
+                       (d/fill-db db0 datoms))]
           (vreset! db* db1)
           (is (= 10 (d/count-datoms db1 nil :job/completed-at nil)))
           (is (= 10 (count (d/datoms db1 :ave :job/completed-at))))

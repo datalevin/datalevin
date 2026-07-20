@@ -866,10 +866,11 @@
   (let [^bytes bs (get-bytes bf)]
     (keyword (String. bs StandardCharsets/UTF_8))))
 
-(deftype Indexable [e a v f b g])
+(deftype Indexable [e ^long a v ^long f ^bytes b ^long g])
 
 (defn pr-indexable [^Indexable i]
-  [(.-e i) (.-a i) (.-v i) (.-f i) (u/hexify (.-b i)) (.-g i)])
+  [(.-e i) (.-a i) (.-v i) (when-not (zero? (.-f i)) (.-f i))
+   (u/hexify (.-b i)) (.-g i)])
 
 (defmethod print-method Indexable
   [^Indexable i, ^Writer w]
@@ -881,7 +882,7 @@
   where aid is the integer id of an attribute, vt is its :db/valueType
   max-gt is current max giant id"
   [eid aid val vt max-gt]
-  (let [hdr (val-header val vt)]
+  (let [hdr (long (or (val-header val vt) c/type-nil))]
     (if-let [vb (val-bytes val vt)]
       (let [bl   (alength ^bytes vb)
             cut? (> bl c/+val-bytes-wo-hdr+)
@@ -897,7 +898,7 @@
 (defn- put-avg
   [bf ^Indexable x]
   (put-int bf (.-a x))
-  (when-let [hdr (.-f x)] (put-byte bf hdr))
+  (when-not (zero? (.-f x)) (put-byte bf (.-f x)))
   (if-let [bs (.-b x)]
     (put-bytes bf bs)
     (put-fixed bf (.-v x) (.-f x)))
@@ -907,6 +908,18 @@
         (put-byte bf c/true-value))
     (do (put-byte bf c/separator)
         (put-byte bf c/false-value))))
+
+(defn indexable-bytes
+  "Encode an indexable as the shared AVG portion of the EAV and AVE indices."
+  (^bytes [^Indexable x]
+   (let [^ByteBuffer bf (bf/get-array-buffer)]
+     (try
+       (indexable-bytes x bf)
+       (finally
+         (bf/return-array-buffer bf)))))
+  (^bytes [^Indexable x ^ByteBuffer bf]
+   (put-avg (.clear bf) x)
+   (Arrays/copyOfRange (.array bf) 0 (.position bf))))
 
 (deftype Retrieved [e a v g])
 

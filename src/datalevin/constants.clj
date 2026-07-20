@@ -707,7 +707,10 @@
 
 (def ^{:dynamic true
        :doc     "Batch size (# of datoms) when filling Datalog DB"}
-  *fill-db-batch-size* 1048576)
+  *fill-db-batch-size* 2097152)
+
+(def ^{:dynamic true :no-doc true}
+  *ordered-datom-writes?* false)
 
 (def ^{:dynamic true
        :doc     "Datalog DB starts background sampling or not"}

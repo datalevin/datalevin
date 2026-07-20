@@ -26,7 +26,6 @@
             stat env-opts dbi-opts]])
   (:import
    [datalevin.async IAsyncWork]
-   [datalevin.bits Indexable]
    [datalevin.cpp Util]
    [clojure.lang IPersistentVector]
    [java.io Writer PushbackReader FileOutputStream FileInputStream DataOutputStream
@@ -161,7 +160,7 @@
   IKVTxable
   (kv-txable? [_] true))
 
-(deftype ^:no-doc DatomKVTxData [^long e indexable ^boolean added?])
+(deftype ^:no-doc DatomKVTxData [^long e ^bytes avg ^boolean added?])
 
 (defmethod print-method KVTxData
   [^KVTxData d, ^Writer w]
@@ -197,16 +196,14 @@
 (defn ^:no-doc add-datom-kv-txs!
   [^FastList out ^DatomKVTxData tx]
   (let [^Long e (Long/valueOf (.-e tx))
-        ^Indexable source (.-indexable tx)
-        i       (Indexable. e (.-a source) (.-v source) (.-f source)
-                            (.-b source) (.-g source))]
+        avg     (.-avg tx)]
     (if (.-added? tx)
       (do
-        (.add out (kv-tx :put c/ave i e :avg :id))
-        (.add out (kv-tx :put c/eav e i :id :avg)))
+        (.add out (kv-tx :put c/ave avg e :raw :id))
+        (.add out (kv-tx :put c/eav e avg :id :raw)))
       (do
-        (.add out (kv-tx :del-list c/ave i [e] :avg :id))
-        (.add out (kv-tx :del-list c/eav e [i] :id :avg)))))
+        (.add out (kv-tx :del-list c/ave avg [e] :raw :id))
+        (.add out (kv-tx :del-list c/eav e [avg] :id :raw)))))
   out)
 
 (defn ^:no-doc expand-datom-kv-txs

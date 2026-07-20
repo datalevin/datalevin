@@ -45,7 +45,7 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util Iterator HashMap ArrayDeque Map$Entry]
+   [java.util Iterator HashMap ArrayDeque Arrays Comparator List Map$Entry]
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
@@ -743,27 +743,71 @@
 (defn- put-datom-tx
   [^DBI ave ^DBI eav txn ^DatomKVTxData tx]
   (let [e (.-e tx)
-        i (.-indexable tx)]
+        avg (.-avg tx)]
     (if (.-added? tx)
       (do
-        (.put-key ave i :avg)
+        (.put-key ave avg :raw)
         (.putValId ave e)
         (.put ave txn)
         (.putKeyId eav e)
-        (.put-val eav i :avg)
+        (.put-val eav avg :raw)
         (.put eav txn))
       (do
         (let [^BufVal kp (.-kp ave)]
-          (.put-key ave i :avg)
+          (.put-key ave avg :raw)
           (.putValId ave e)
           (.del ave txn false)
           ;; mdb_del may mutate the native key if value is missing
           (.reset kp))
         (let [^BufVal kp (.-kp eav)]
           (.putKeyId eav e)
-          (.put-val eav i :avg)
+          (.put-val eav avg :raw)
           (.del eav txn false)
           (.reset kp))))))
+
+(defn- put-ave-datom-tx
+  [^DBI ave txn ^DatomKVTxData tx]
+  (let [e (.-e tx)
+        avg (.-avg tx)]
+    (.put-key ave avg :raw)
+    (.putValId ave e)
+    (if (.-added? tx)
+      (.put ave txn)
+      (let [^BufVal kp (.-kp ave)]
+        (.del ave txn false)
+        (.reset kp)))))
+
+(defn- put-eav-datom-tx
+  [^DBI eav txn ^DatomKVTxData tx]
+  (let [e (.-e tx)
+        avg (.-avg tx)]
+    (.putKeyId eav e)
+    (.put-val eav avg :raw)
+    (if (.-added? tx)
+      (.put eav txn)
+      (let [^BufVal kp (.-kp eav)]
+        (.del eav txn false)
+        (.reset kp)))))
+
+(def ^:private datom-eav-comparator
+  (reify Comparator
+    (compare [_ x y]
+      (let [^DatomKVTxData x x
+            ^DatomKVTxData y y
+            c (Long/compare (.-e x) (.-e y))]
+        (if (zero? c)
+          (BitOps/compareBytes (.-avg x) (.-avg y))
+          c)))))
+
+(def ^:private datom-ave-comparator
+  (reify Comparator
+    (compare [_ x y]
+      (let [^DatomKVTxData x x
+            ^DatomKVTxData y y
+            c (BitOps/compareBytes (.-avg x) (.-avg y))]
+        (if (zero? c)
+          (Long/compare (.-e x) (.-e y))
+          c)))))
 
 (defn- transact1*
   [txs ^DBI dbi txn kt vt]
@@ -796,29 +840,69 @@
             (put-tx dbi txn tx)
             (recur (next xs) ave eav)))))))
 
+(defn- datom-txs
+  [^List txs]
+  (let [n (.size txs)
+        ^objects out (object-array n)]
+    (loop [i 0
+           j 0]
+      (if (< i n)
+        (let [tx (.get txs i)]
+          (if (instance? DatomKVTxData tx)
+            (do
+              (aset out j tx)
+              (recur (unchecked-inc i) (unchecked-inc j)))
+            (recur (unchecked-inc i) j)))
+        [out j]))))
+
+(defn- transact-datom-index-passes*
+  [^List txs ^HashMap dbis txn]
+  (let [^DBI ave (or (.get dbis c/ave) (raise c/ave " is not open" {}))
+        ^DBI eav (or (.get dbis c/eav) (raise c/eav " is not open" {}))
+        [^objects datoms n] (datom-txs txs)
+        n (int n)]
+    (Arrays/sort datoms 0 n datom-eav-comparator)
+    (dotimes [i n]
+      (put-eav-datom-tx eav txn (aget datoms i)))
+    (Arrays/parallelSort datoms 0 n datom-ave-comparator)
+    (dotimes [i n]
+      (put-ave-datom-tx ave txn (aget datoms i)))
+    (dotimes [i (.size txs)]
+      (let [tx (.get txs i)]
+        (when-not (instance? DatomKVTxData tx)
+          (let [^KVTxData tx (l/->kv-tx-data tx)
+                dbi-name (.-dbi-name tx)
+                ^DBI dbi (or (.get dbis dbi-name)
+                             (raise dbi-name " is not open" {}))
+                validate? (.-validate-data? dbi)]
+            (vld/validate-kv-tx-data tx validate?)
+            (put-tx dbi txn tx)))))))
+
 (defn- transact-datom-list*
   [^java.util.List txs ^HashMap dbis txn]
-  (let [n (.size txs)]
-    (loop [i   0
-           ave nil
-           eav nil]
-      (when (< i n)
-        (let [t (.get txs i)]
-          (if (instance? DatomKVTxData t)
-            (let [^DBI ave* (or ave (.get dbis c/ave)
-                                (raise c/ave " is not open" {}))
-                  ^DBI eav* (or eav (.get dbis c/eav)
-                                (raise c/eav " is not open" {}))]
-              (put-datom-tx ave* eav* txn t)
-              (recur (unchecked-inc i) ave* eav*))
-            (let [^KVTxData tx (l/->kv-tx-data t)
-                  dbi-name (.-dbi-name tx)
-                  ^DBI dbi (or (.get dbis dbi-name)
-                               (raise dbi-name " is not open" {}))
-                  validate? (.-validate-data? dbi)]
-              (vld/validate-kv-tx-data tx validate?)
-              (put-tx dbi txn tx)
-              (recur (unchecked-inc i) ave eav))))))))
+  (if c/*ordered-datom-writes?*
+    (transact-datom-index-passes* txs dbis txn)
+    (let [n (.size txs)]
+      (loop [i   0
+             ave nil
+             eav nil]
+        (when (< i n)
+          (let [t (.get txs i)]
+            (if (instance? DatomKVTxData t)
+              (let [^DBI ave* (or ave (.get dbis c/ave)
+                                  (raise c/ave " is not open" {}))
+                    ^DBI eav* (or eav (.get dbis c/eav)
+                                  (raise c/eav " is not open" {}))]
+                (put-datom-tx ave* eav* txn t)
+                (recur (unchecked-inc i) ave* eav*))
+              (let [^KVTxData tx (l/->kv-tx-data t)
+                    dbi-name (.-dbi-name tx)
+                    ^DBI dbi (or (.get dbis dbi-name)
+                                 (raise dbi-name " is not open" {}))
+                    validate? (.-validate-data? dbi)]
+                (vld/validate-kv-tx-data tx validate?)
+                (put-tx dbi txn tx)
+                (recur (unchecked-inc i) ave eav)))))))))
 
 (defn- transact*
   [txs ^HashMap dbis txn]
