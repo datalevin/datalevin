@@ -6,7 +6,6 @@
    [clojure.java.io :as io]
    [clojure.string :as s])
   (:import
-   [java.util Arrays]
    [datalevin.utl LRUCache]))
 
 (def schema
@@ -470,7 +469,7 @@
     (reset! start now)
     db))
 
-(defn db [&opts]
+(defn db [& _opts]
   (println "Loading data to db, please wait...")
   (let [load-start (System/currentTimeMillis)
         start      (atom load-start)
@@ -519,9 +518,6 @@
     (println "Done loading data to db")
     (shutdown-agents)
     (System/exit 0)))
-
-;; assume data is already loaded into db
-(def conn (d/get-conn "db"))
 
 ;; queries that beat postgres are labeled 'good plan'
 
@@ -3177,45 +3173,53 @@
 
 (def result-filename "datalevin_onepass_time.csv")
 
-(defn -main [&opts]
+(defn -main [& _opts]
   (println "The Join Order Benchmark 1Pass test ...")
-
-  (with-open [w (io/writer result-filename)]
-    (d/write-csv w [["Query Name" "Planning Time (ms)" "Execution Time (ms)"]])
-    (doseq [q queries]
-      (let [qname     (s/replace (name q) "q-" "")
-            _         (print (str "  " qname "... "))
-            query     (-> q (#(ns-resolve 'datalevin-bench.core %)) var-get)
-            result    (d/explain {:run? true} query (d/db conn))
-            plan-time (:prepare-time result)
-            exec-time (:execution-time result)]
-        (println (str plan-time " + " exec-time " ms"))
-        (d/write-csv w [[qname plan-time exec-time]]))))
-  (d/close conn)
+  (let [conn (d/get-conn "db")]
+    (try
+      (with-open [w (io/writer result-filename)]
+        (d/write-csv
+          w [["Query Name" "Planning Time (ms)" "Execution Time (ms)"]])
+        (doseq [q queries]
+          (let [qname     (s/replace (name q) "q-" "")
+                _         (print (str "  " qname "... "))
+                query     (-> q (#(ns-resolve 'datalevin-bench.core %)) var-get)
+                result    (d/explain {:run? true} query (d/db conn))
+                plan-time (:prepare-time result)
+                exec-time (:execution-time result)]
+            (println (str plan-time " + " exec-time " ms"))
+            (d/write-csv w [[qname plan-time exec-time]]))))
+      (finally
+        (d/close conn))))
   (println "Done. Results are in " result-filename))
 
-(defn grid [&opts]
-  (doseq [p [0.4]
-          v [1000]
-          f [12384]]
-    (let [start (System/currentTimeMillis)]
-      (doseq [q queries]
-        (let [query (-> q (#(ns-resolve 'datalevin-bench.core %)) var-get)]
-          (binding [c/link-estimate-var-alpha  p
-                    c/init-exec-size-threshold v
-                    c/query-pipe-batch-size    f
-                    q/*cache?*                 false]
-            (.clear ^LRUCache q/*plan-cache*)
-            (let [start (System/currentTimeMillis)]
-              (d/q query (d/db conn))
-              (println q "took" (- (System/currentTimeMillis) start))))))
-      (println "p" p "v" v "f"  f "->"
-               (format
-                 "%.2f"
-                 (double (/ (- (System/currentTimeMillis) start) 1000))))))
-  (d/close conn))
+(defn grid [& _opts]
+  (let [conn (d/get-conn "db")]
+    (try
+      (doseq [p [0.4]
+              v [1000]
+              f [12384]]
+        (let [start (System/currentTimeMillis)]
+          (doseq [q queries]
+            (let [query (-> q (#(ns-resolve 'datalevin-bench.core %)) var-get)]
+              (binding [c/link-estimate-var-alpha  p
+                        c/init-exec-size-threshold v
+                        c/query-pipe-batch-size    f
+                        q/*cache?*                 false]
+                (.clear ^LRUCache q/*plan-cache*)
+                (let [start (System/currentTimeMillis)]
+                  (d/q query (d/db conn))
+                  (println q "took" (- (System/currentTimeMillis) start))))))
+          (println "p" p "v" v "f"  f "->"
+                   (format
+                     "%.2f"
+                     (double (/ (- (System/currentTimeMillis) start) 1000))))))
+      (finally
+        (d/close conn)))))
 
 (comment
+
+  (def conn (d/get-conn "db"))
 
   (:plan (d/explain {:run? true} q-10c (d/db conn)))
 

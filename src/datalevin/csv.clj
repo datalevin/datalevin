@@ -12,72 +12,24 @@
   (:require
    [clojure.string :as s])
   (:import
+   [datalevin.utl CSVReader]
    [java.io Reader Writer StringReader]))
-
-(defn- read-record
-  [^Reader reader sep quo nl?]
-  (let [rec (volatile! (transient []))
-        q?  (volatile! false)]
-    (loop [c   (.read reader)
-           sb  (StringBuilder.)
-           nl? nl?
-           e?  false]
-      (if (== c -1)
-        (when-not (zero? (.length sb))
-          [(persistent! (vswap! rec conj! (.toString sb))) nl?])
-        (let [cc (char c)]
-          (condp == c
-            sep (if @q?
-                  (recur (.read reader) (.append sb cc) false false)
-                  (do (vswap! rec conj! (.toString sb))
-                      (recur (.read reader) (StringBuilder.) false false)))
-            quo (if @q?
-                  (if e?
-                    (recur (.read reader) (.append sb cc) false false)
-                    (do (vreset! q? false)
-                        (recur (.read reader) sb false false)))
-                  (if (zero? (.length sb))
-                    (do (vreset! q? true)
-                        (recur (.read reader) sb false false))
-                    (recur (.read reader) (.append sb cc) false false)))
-            (case cc
-              \newline
-              (if @q?
-                (recur (.read reader) (.append sb cc) false false)
-                (if nl?
-                  (recur (.read reader) sb false false)
-                  [(persistent! (vswap! rec conj! (.toString sb))) false]))
-              \return
-              (if @q?
-                (recur (.read reader) (.append sb cc) false false)
-                (if nl?
-                  (recur (.read reader) sb false false)
-                  [(persistent! (vswap! rec conj! (.toString sb))) true]))
-              \\
-              (if @q?
-                (recur (.read reader) sb false true)
-                (recur (.read reader) (.append sb cc) false false))
-              (recur (.read reader) (.append sb cc) false false))))))))
-
-(defprotocol IReadCSV
-  (read-csv* [input sep quo nl?]))
-
-(extend-protocol IReadCSV
-  String
-  (read-csv* [s sep quo nl?]
-    (read-csv* (StringReader. s) sep quo nl?))
-
-  Reader
-  (read-csv* [^Reader reader sep quo nl?]
-    (lazy-seq
-      (when-let [[record nl?] (read-record reader sep quo nl?)]
-        (cons record (read-csv* reader sep quo nl?))))))
 
 (defn read-csv
   [input & options]
   (let [{:keys [separator quote]
-         :or   {separator \, quote \"}} options]
-    (read-csv* input (int separator) (int quote) false)))
+         :or   {separator \, quote \"}} options
+        ^Reader reader (cond
+                         (string? input) (StringReader. input)
+                         (instance? Reader input) input
+                         :else
+                         (throw
+                           (IllegalArgumentException.
+                             "CSV input must be a String or java.io.Reader")))]
+    (lazy-seq
+      (map vec
+           (iterator-seq
+             (CSVReader. reader (char separator) (char quote)))))))
 
 ;; minor modification from clojure.data.csv, included for convenience
 
