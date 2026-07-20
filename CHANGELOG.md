@@ -71,6 +71,8 @@ tuple identities no longer creates partial `[nil ...]` tuple values
 - [Datalog] fast path for linear recursive rules.
 - [Datalog] use primitive longs in local transactions.
 - [Datalog] compile schema lookups into an array in transaction.
+- [Datalog] faster `init-db` and `fill-db` by sorting and writing EAV and AVE
+  raw bytes separately.
 - [Datalog] add e and aid to secondary indices refs, so we no longer decode
   giant values unnecessarily in query.
 - [Lib] fuller Java, Python, JS API, and bb pods parity with Clojure.

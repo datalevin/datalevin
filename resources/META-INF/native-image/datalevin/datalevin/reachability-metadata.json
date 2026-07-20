@@ -1854,6 +1854,12 @@
         },
         {
             "glob": "raft.desc"
+        },
+        {
+            "glob": "datalevin/migration_export.clj"
+        },
+        {
+            "glob": "datalevin/migration_kv_export.clj"
         }
     ],
     "jni": [
