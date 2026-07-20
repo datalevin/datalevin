@@ -504,7 +504,12 @@
         transport-error "Unable to connect to server: Connection refused"
         control-timeout "Request to Datalevin server failed: \"HA control command timed out\""
         commit-confirmation-failure
-        "Request to Datalevin server failed: \"HA write commit confirmation failed\""]
+        "Request to Datalevin server failed: \"HA write commit confirmation failed\""
+        write-indeterminate
+        {:message "Request to Datalevin server failed"
+         :err-data {:error :ha/write-indeterminate
+                    :indeterminate? true
+                    :reason :transaction-owner-mismatch}}]
     (is (true? (boolean
                  (local/expected-disruption-write-failure?
                    {:datalevin/nemesis-faults [:node-kill]}
@@ -529,10 +534,23 @@
                  (local/expected-disruption-write-failure?
                    active-test
                    {:error commit-confirmation-failure}))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   write-indeterminate))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                   active-test
+                   (ex-info "indeterminate close"
+                            (:err-data write-indeterminate))))))
     (is (false? (boolean
                   (local/expected-disruption-write-failure?
                     inactive-test
-                    control-timeout))))))
+                    control-timeout))))
+    (is (false? (boolean
+                  (local/expected-disruption-write-failure?
+                    inactive-test
+                    write-indeterminate))))))
 
 (deftest local-query-uses-server-ha-read-view-test
   (assert-local-query-refreshes-ha-read-view!

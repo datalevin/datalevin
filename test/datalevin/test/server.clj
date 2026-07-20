@@ -203,6 +203,50 @@
         (srv/stop server)
         (u/delete-files dir)))))
 
+(deftest remote-abort-allows-idempotent-wrapper-close-test
+  (let [port    (tc/allocate-port)
+        dir     (u/tmp-dir (str "remote-transaction-abort-test-"
+                                (UUID/randomUUID)))
+        dl-name (str "remote-datalog-abort-" (UUID/randomUUID))
+        kv-name (str "remote-kv-abort-" (UUID/randomUUID))
+        uri     (fn [db-name]
+                  (str "dtlv://" c/default-username ":" c/default-password
+                       "@127.0.0.1/" db-name))
+        ^Server server (binding [c/*db-background-sampling?* false]
+                         (srv/create {:port port :root dir}))]
+    (try
+      (srv/start server)
+      (binding [cl/*default-port* port
+                c/*db-background-sampling?* false]
+        (let [conn (d/create-conn
+                    (uri dl-name)
+                    {:value {:db/valueType :db.type/string}})]
+          (try
+            (d/transact! conn [{:db/id 1 :value "before"}])
+            (d/with-transaction [tx-conn conn]
+              (d/transact! tx-conn [{:db/id 1 :value "discarded"}])
+              (d/abort-transact tx-conn))
+            (is (= "before"
+                   (d/q '[:find ?value .
+                          :in $ ?entity
+                          :where [?entity :value ?value]]
+                        @conn 1)))
+            (finally
+              (d/close conn))))
+        (let [kv (d/open-kv (uri kv-name))]
+          (try
+            (d/open-dbi kv "data")
+            (d/transact-kv kv [[:put "data" :key :before]])
+            (d/with-transaction-kv [tx-kv kv]
+              (d/transact-kv tx-kv [[:put "data" :key :discarded]])
+              (d/abort-transact-kv tx-kv))
+            (is (= :before (d/get-value kv "data" :key)))
+            (finally
+              (d/close-kv kv)))))
+      (finally
+        (srv/stop server)
+        (u/delete-files dir)))))
+
 (deftest remote-query-uses-server-safe-resolver-test
   (let [port   (tc/allocate-port)
         dir    (u/tmp-dir (str "server-safe-query-test-" (UUID/randomUUID)))

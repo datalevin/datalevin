@@ -46,15 +46,57 @@
    :db-name db-name
    :type type})
 
+(defn- selection-key-client-id
+  [^SelectionKey skey]
+  (some-> skey .attachment deref :client-id))
+
 (defn- transaction-owner?
   [^SelectionKey skey ^SelectionKey runner-skey]
   ;; A dedicated transaction client can replace a closed pooled socket while
   ;; retaining its server session. HA rerouting authenticates a different
   ;; client, which must not operate or close the original runner.
   (or (identical? skey runner-skey)
-      (let [client-id        (some-> skey .attachment deref :client-id)
-            runner-client-id (some-> runner-skey .attachment deref :client-id)]
+      (let [client-id        (selection-key-client-id skey)
+            runner-client-id (selection-key-client-id runner-skey)]
         (and client-id (= client-id runner-client-id)))))
+
+(defn- close-type-for-abort
+  [type]
+  (case type
+    :abort-transact :close-transact
+    :abort-transact-kv :close-transact-kv
+    nil))
+
+(defn- aborted-close-marker
+  [^SelectionKey skey close-type]
+  (when-let [client-id (selection-key-client-id skey)]
+    {:client-id client-id
+     :type close-type}))
+
+(defn- remember-idempotent-abort!
+  [deps server db-name skey abort-type]
+  (when-let [marker (aborted-close-marker skey
+                                          (close-type-for-abort abort-type))]
+    ((:update-db-fn deps) server db-name
+     (fn [state]
+       (if (:runner state)
+         state
+         (assoc state :aborted-transaction-close marker))))))
+
+(defn- consume-aborted-close!
+  [deps server db-name skey close-type]
+  (let [marker    (aborted-close-marker skey close-type)
+        consumed? (volatile! false)]
+    (when marker
+      ((:update-db-fn deps) server db-name
+       (fn [state]
+         (if (and (nil? (:runner state))
+                  (= marker (:aborted-transaction-close state)))
+           (do
+             (vreset! consumed? true)
+             (dissoc state :aborted-transaction-close))
+           state))))
+    @consumed?))
 
 (def ^:private replica-extra-write-command-types
   #{:drop-database
@@ -306,12 +348,19 @@
         ((:new-message-fn deps) runner skey message)
 
         (idempotent-withtxn-control-types type)
-        ((:write-message-fn deps) skey {:type :command-complete})
+        (do
+          (when-not runner
+            (remember-idempotent-abort! deps server db-name skey type))
+          ((:write-message-fn deps) skey {:type :command-complete}))
 
         runner
         (u/raise "Active transaction belongs to another client"
                  (missing-withtxn-error db-name type
                                         :transaction-owner-mismatch))
+
+        (and (withtxn-close-types type)
+             (consume-aborted-close! deps server db-name skey type))
+        ((:write-message-fn deps) skey {:type :command-complete})
 
         (withtxn-close-types type)
         (u/raise "Cannot confirm a transaction that is no longer active"
