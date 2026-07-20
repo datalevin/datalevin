@@ -952,6 +952,11 @@
       (do (.position bf 4)
           (Retrieved. nil nil (get-value bf 2) c/normal)))))
 
+(defn avg->aid
+  "Read the attribute ID from an encoded AVG buffer without decoding its value."
+  ^long [^ByteBuffer bf]
+  (.getInt bf 0))
+
 (defn avg->giant-id
   ^long [^ByteBuffer bf]
   (let [limit (.limit bf)]

@@ -34,6 +34,7 @@
    [datalevin.interface IStore ILMDB]
    [datalevin.storage Store]
    [java.net ConnectException URI]
+   [java.nio ByteBuffer]
    [java.nio.channels ClosedChannelException]
    [java.util UUID]
    [java.util.concurrent Callable ExecutorCompletionService
@@ -1676,6 +1677,9 @@
   (cond
     (instance? Indexable x) (.-a ^Indexable x)
     (instance? Retrieved x) (.-a ^Retrieved x)
+    (bytes? x) (let [^bytes bs x]
+                 (when (>= (alength bs) Integer/BYTES)
+                   (b/avg->aid (ByteBuffer/wrap bs))))
     :else nil))
 
 (defn- eav-replay-values

@@ -13,17 +13,13 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.string :as str]
-   [datalevin.bits :as b]
    [datalevin.binding.cpp :as cpp]
    [datalevin.constants :as c]
-   [datalevin.datom :as dd]
    [datalevin.interface :as i]
-   [datalevin.index :as idx]
    [datalevin.lmdb :as l]
    [datalevin.txlog :as txlog]
    [datalevin.util :as u :refer [raise]])
   (:import
-   [datalevin.bits Retrieved]
    [datalevin.lmdb DatomKVTxData]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
@@ -2202,142 +2198,10 @@
 (declare append-monotonic-payload-lsn-row)
 (declare align-runtime-txlog-payload-floor!)
 
-(defn- replay-avg-row?
-  [row]
-  (and (vector? row)
-       (or (= :avg (nth row 4 nil))
-           (= :avg (nth row 5 nil)))))
-
-(defn- open-replay-avg-dbi!
-  [lmdb dbi-name opts]
-  (or (try
-        (i/get-dbi lmdb dbi-name false)
-        (catch Throwable _
-          nil))
-      (try
-        (i/open-dbi lmdb dbi-name opts)
-        (catch Throwable _
-          nil))))
-
-(defn- ensure-replay-avg-state!
-  [lmdb]
-  ;; Txlog recovery runs before storage/open has reopened Datalog system DBIs.
-  ;; Open the subset needed to normalize :avg rows against snapshot state.
-  (open-replay-avg-dbi! lmdb c/schema {:key-size c/+max-key-size+})
-  (open-replay-avg-dbi! lmdb c/giants {:key-size c/+id-bytes+}))
-
-(defn- load-replay-attr-state
-  [lmdb]
-  (ensure-replay-avg-state! lmdb)
-  (try
-    (let [schema (into {} (i/get-range lmdb c/schema [:all] :attr :data))
-          attrs-by-aid
-          (into {}
-                (keep (fn [[attr props]]
-                        (when-let [aid (:db/aid props)]
-                          [aid attr])))
-                schema)]
-      {:schema schema
-       :attrs-by-aid attrs-by-aid})
-    (catch Throwable _
-      {:schema {}
-       :attrs-by-aid {}})))
-
-(defn- normalize-txlog-replay-avg-rows
-  [lmdb rows record]
-  (if-not (some replay-avg-row? rows)
-    rows
-    (let [{:keys [schema attrs-by-aid]} (load-replay-attr-state lmdb)
-          giant-datoms
-          (into {}
-                (keep (fn [row]
-                        (when (vector? row)
-                          (let [[op dbi k v _ vt] row]
-                            (when (and (= op :put)
-                                       (= dbi c/giants)
-                                       (integer? k))
-                              [k (if (= vt :raw)
-                                   (idx/decode-giant-datom v)
-                                   v)])))))
-                rows)
-          schema-overrides
-          (reduce
-           (fn [overrides row]
-             (if (vector? row)
-               (let [[op dbi attr props] row]
-                 (if (= dbi c/schema)
-                   (case op
-                     :put (assoc overrides attr props)
-                     :del (dissoc overrides attr)
-                     overrides)
-                   overrides))
-               overrides))
-           {}
-           rows)
-          pending-attrs
-          (into {}
-                (keep (fn [[attr props]]
-                        (when-let [aid (:db/aid props)]
-                          [aid attr])))
-                schema-overrides)
-          attr-props
-          (fn [aid]
-            (when-let [attr (or (get pending-attrs aid)
-                                (get attrs-by-aid aid))]
-              (merge (get schema attr)
-                     (get schema-overrides attr))))
-          normalize-avg
-          (fn normalize-avg [e x]
-            (cond
-              (instance? Retrieved x)
-              (let [^Retrieved r x
-                    aid (.-a r)
-                    props (attr-props aid)
-                    vt (when props
-                         (idx/value-type props))
-                    g (or (.-g r) c/normal)
-                    rv (if (= g c/normal)
-                         (.-v r)
-                         (or (some-> (get giant-datoms g)
-                                     dd/datom-v)
-                             (some-> (idx/gt->datom lmdb g)
-                                     dd/datom-v)))]
-                (when-not vt
-                  (raise "Txn-log replay is missing attr value type"
-                         {:type :txlog/replay-missing-attr-type
-                          :aid aid
-                          :record (select-keys record
-                                               [:lsn :segment-id :offset])}))
-                (b/indexable e aid rv vt (long g)))
-
-              (sequential? x)
-              (mapv #(normalize-avg e %) x)
-
-              :else
-              x))]
-      (mapv
-       (fn [row]
-         (if (replay-avg-row? row)
-           (let [[op dbi k v kt vt :as row*] row
-                 k' (if (= kt :avg)
-                      (normalize-avg nil k)
-                      k)
-                 v' (if (= vt :avg)
-                      (normalize-avg (when (integer? k)
-                                       (long k))
-                                     v)
-                      v)]
-             (cond-> row*
-               (not= k' k) (assoc 2 k')
-               (not= v' v) (assoc 3 v')))
-           row))
-       rows))))
-
 (declare with-runtime-txlog-rollback)
 
 (defn ^:no-doc replay-txlog-rows!
-  "Apply txlog payload rows directly to LMDB using the same normalization path
-  as local txlog recovery, but without consuming a new local txlog LSN."
+  "Apply physical txlog payload rows without consuming a new local txlog LSN."
   [lmdb rows lsn]
   (let [rows (rows-vector rows)
         record {:lsn (long lsn)
@@ -2346,23 +2210,16 @@
       lmdb
       (fn []
         (txlog-prepare-replay-dbis! lmdb [record] (dec (long lsn)))
-        (let [normalized (rows-vector
-                          (normalize-txlog-replay-avg-rows lmdb rows record))]
-          (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
-            (binding [*out* *err*]
-              (prn {:ha-replay-debug true
-                    :lsn (long lsn)
-                    :row-count (count rows)
-                    :normalized-count (count normalized)
-                    :row-types (mapv class rows)
-                    :rows rows
-                    :normalized normalized})))
-          (i/transact-kv
-           lmdb
-           (append-monotonic-payload-lsn-row
-            lmdb
-            normalized
-            (long lsn))))))))
+        (when (= "1" (System/getenv "HA_REPLAY_DEBUG"))
+          (binding [*out* *err*]
+            (prn {:ha-replay-debug true
+                  :lsn (long lsn)
+                  :row-count (count rows)
+                  :row-types (mapv class rows)
+                  :rows rows})))
+        (i/transact-kv
+         lmdb
+         (append-monotonic-payload-lsn-row lmdb rows (long lsn)))))))
 
 (defn- txlog-replay-record!
   [lmdb state record]
@@ -2378,7 +2235,7 @@
          (:rows record))
         rows (append-monotonic-payload-lsn-row
               lmdb
-              (normalize-txlog-replay-avg-rows lmdb rows record)
+              rows
               (:lsn record))]
     (maybe-run-storage-fault-lmdb! lmdb
                                    :txlog-replay
@@ -2965,22 +2822,15 @@
                   lmdb
                   [(assoc record :rows materialize-rows)]
                   (dec record-lsn))
-                 (let [normalized-rows
-                       (rows-vector
-                        (normalize-txlog-replay-avg-rows lmdb
-                                                         record-rows
-                                                         record))
+                 (let [record-rows (rows-vector record-rows)
                        materialized-rows
                        (if (seq preapply-rows)
-                         (rows-vector
-                          (normalize-txlog-replay-avg-rows lmdb
-                                                           materialize-rows
-                                                           record))
-                         normalized-rows)
+                         (rows-vector materialize-rows)
+                         record-rows)
                        append-res (binding [txlog/*commit-payload-ha-term*
                                             (some-> (:ha-term record) long)]
                                     (txlog/append-durable! state
-                                                           normalized-rows
+                                                           record-rows
                                                            txlog-append-hooks))]
                    (when-not (= record-lsn (long (:lsn append-res)))
                      (raise "Follower replay appended unexpected txn-log LSN"

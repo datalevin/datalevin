@@ -17,6 +17,8 @@
   (let [normal (avg-buffer "inline" :db.type/string 42)
         giant  (avg-buffer (apply str (repeat 1024 "x"))
                            :db.type/string 42)]
+    (is (= 2 (b/avg->aid normal)))
     (is (= c/normal (b/avg->giant-id normal)))
     (is (= "inline" (b/avg->inline-value normal)))
+    (is (= 2 (b/avg->aid giant)))
     (is (= 42 (b/avg->giant-id giant)))))
