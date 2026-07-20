@@ -193,7 +193,7 @@
     (-add-all state (FastList. ^Collection l))))
 
 (deftype CountedTuplePipe [^BatchedQueue state
-                           ^:unsynchronized-mutable total]
+                           ^:unsynchronized-mutable ^long total]
   ITuplePipe
   (pipe? [_] true)
   (finish [_] (-finish state))
