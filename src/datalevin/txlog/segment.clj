@@ -222,9 +222,11 @@
    sync-mode))
 
 (defn force-parent-directory!
-  "Force the parent directory entry for path to stable storage."
+  "Force the parent directory entry for path to stable storage when the
+  platform supports opening directories as file channels."
   [^String path]
-  (when path
+  ;; Windows FileChannel rejects directory paths with AccessDeniedException.
+  (when (and path (not (u/windows?)))
     (when-let [^File parent (.getParentFile (io/file path))]
       (with-open [^FileChannel ch (FileChannel/open
                                    (.toPath parent)
