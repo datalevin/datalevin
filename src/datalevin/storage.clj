@@ -393,7 +393,7 @@
   (int-array (->> counts (reductions +) butlast (into [0]))))
 
 (defn- eav-scan-v-single*
-  [lmdb iter na ^Collection out ^objects tuple eid-idx
+  [lmdb iter na nvs ^Collection out ^objects tuple eid-idx
    ^LongObjectHashMap seen ^ints aids ^objects preds ^objects fidxs
    ^booleans skips]
   (let [te        ^long (aget tuple eid-idx)
@@ -403,9 +403,10 @@
       (if (identical? ts :skip)
         (.add out tuple)
         (.add out (r/join-tuples tuple ts)))
-      (let [vs (FastList. (int na))]
+      (let [vs (object-array (int nvs))]
         (loop [next? (lmdb/seek-key iter te :id)
-               ai    0]
+               ai    0
+               vi    0]
           (if (and next? (< ^long ai ^long na))
             (let [vb ^ByteBuffer (lmdb/next-val iter)
                   a  (.getInt vb 0)]
@@ -415,17 +416,19 @@
                       fidx (aget fidxs ai)]
                   (if (and (or (nil? pred) (pred v))
                            (or (nil? fidx) (= v (aget tuple (int fidx)))))
-                    (do (when-not (aget skips ai) (.add vs v))
-                        (recur (lmdb/has-next-val iter) (u/long-inc ai)))
+                    (if (aget skips ai)
+                      (recur (lmdb/has-next-val iter) (u/long-inc ai) vi)
+                      (do (aset vs (int vi) v)
+                          (recur (lmdb/has-next-val iter) (u/long-inc ai)
+                                 (u/long-inc vi))))
                     :reject))
-                (recur (lmdb/has-next-val iter) ai)))
+                (recur (lmdb/has-next-val iter) ai vi)))
             (when (== ^long ai ^long na)
-              (if (.isEmpty vs)
+              (if (zero? ^long nvs)
                 (do (.put seen te :skip)
                     (.add out tuple))
-                (let [vst (.toArray vs)]
-                  (.put seen te vst)
-                  (.add out (r/join-tuples tuple vst)))))))))))
+                (do (.put seen te vs)
+                    (.add out (r/join-tuples tuple vs)))))))))))
 
 (defn- eav-scan-v-multi*
   [lmdb iter na ^Collection out ^objects tuple eid-idx
@@ -1056,6 +1059,7 @@
             aids      (mapv get-aid attrs-v)
             na        (count aids)
             maps      (mapv peek attrs-v)
+            nvs       (count (remove :skip? maps))
             skips     (boolean-array (map :skip? maps))
             preds     (object-array (map :pred maps))
             fidxs     (object-array (map :fidx maps))
@@ -1069,7 +1073,7 @@
             (if (single-attrs? schema attrs-v)
               (loop [tuple (p/produce in)]
                 (when tuple
-                  (eav-scan-v-single* lmdb iter na out tuple eid-idx
+                  (eav-scan-v-single* lmdb iter na nvs out tuple eid-idx
                                       seen aids preds fidxs skips)
                   (recur (p/produce in))))
               (let [gcounts (group-counts aids)
@@ -1098,6 +1102,7 @@
             nt        (.size ^List in)
             out       (FastList. nt)
             maps      (mapv peek attrs-v)
+            nvs       (count (remove :skip? maps))
             skips     (boolean-array (map :skip? maps))
             preds     (object-array (map :pred maps))
             fidxs     (object-array (map :fidx maps))
@@ -1111,7 +1116,7 @@
             (if (single-attrs? schema attrs-v)
               (dotimes [i nt]
                 (eav-scan-v-single*
-                  lmdb iter na out (.get ^List in i) eid-idx seen aids
+                  lmdb iter na nvs out (.get ^List in i) eid-idx seen aids
                   preds fidxs skips))
               (let [gcounts (group-counts aids)
                     gstarts ^ints (group-starts gcounts)

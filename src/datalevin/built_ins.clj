@@ -41,6 +41,15 @@
    [datalevin.db DB]))
 
 (def ^:no-doc like-cache (LRUCache. 256))
+(def ^:no-doc not-like-cache (LRUCache. 256))
+(def ^:no-doc like-options-cache (LRUCache. 256))
+
+(defn- compile-like
+  [^String pattern escape not?]
+  (let [pb  (.getBytes pattern StandardCharsets/UTF_8)
+        fsm (if escape (LikeFSM. pb escape) (LikeFSM. pb))
+        f   #(.match fsm (.getBytes ^String % StandardCharsets/UTF_8))]
+    (if not? #(clojure.core/not (f %)) f)))
 
 (defn like
   "Predicate similar to `LIKE` in SQL, e.g. `[(like ?name \"%Smith\")]`"
@@ -49,20 +58,15 @@
   ([input pattern opts]
    (like input pattern opts false))
   ([input ^String pattern {:keys [escape]} not?]
-   (let [matcher
-         (let [k [pattern escape not?]]
-           (clojure.core/or
-             (.get ^LRUCache like-cache k)
-             (let [mf (let [pb  (.getBytes pattern StandardCharsets/UTF_8)
-                            fsm (if escape
-                                  (LikeFSM. pb escape)
-                                  (LikeFSM. pb))
-                            f   #(.match fsm
-                                         (.getBytes ^String %
-                                                    StandardCharsets/UTF_8))]
-                        (if not? #(clojure.core/not (f %)) f))]
-               (.put ^LRUCache like-cache k mf)
-               mf)))]
+   (let [^LRUCache cache (if escape
+                           like-options-cache
+                           (if not? not-like-cache like-cache))
+         k               (if escape [pattern escape not?] pattern)
+         matcher         (clojure.core/or
+                           (.get cache k)
+                           (let [mf (compile-like pattern escape not?)]
+                             (.put cache k mf)
+                             mf))]
      (matcher input))))
 
 (defn not-like
