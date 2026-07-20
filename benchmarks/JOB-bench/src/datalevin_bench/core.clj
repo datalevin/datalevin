@@ -6,7 +6,13 @@
    [clojure.java.io :as io]
    [clojure.string :as s])
   (:import
-   [datalevin.utl LRUCache]))
+   [datalevin.utl CSVReader LRUCache]))
+
+(defn- csv-rows
+  [reader]
+  (let [rows (CSVReader. reader)]
+    (reify Iterable
+      (iterator [_] rows))))
 
 (def schema
   {:aka-name/person        {:db/valueType :db.type/ref}
@@ -137,43 +143,49 @@
 (def title-base           80000000)
 
 (defn- add-comp-cast-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long comp-cast-type-base (Long/parseLong id))
-                  :comp-cast-type/kind content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long comp-cast-type-base (Long/parseLong id))
+                    :comp-cast-type/kind content)))
+    (csv-rows reader)))
 
 (defn- add-company-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long company-type-base (Long/parseLong id))
-                  :company-type/kind content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long company-type-base (Long/parseLong id))
+                    :company-type/kind content)))
+    (csv-rows reader)))
 
 (defn- add-kind-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long kind-type-base (Long/parseLong id))
-                  :kind-type/kind content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long kind-type-base (Long/parseLong id))
+                    :kind-type/kind content)))
+    (csv-rows reader)))
 
 (defn- add-link-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long link-type-base (Long/parseLong id))
-                  :link-type/link content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long link-type-base (Long/parseLong id))
+                    :link-type/link content)))
+    (csv-rows reader)))
 
 (defn- add-role-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long role-type-base (Long/parseLong id))
-                  :role-type/role content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long role-type-base (Long/parseLong id))
+                    :role-type/role content)))
+    (csv-rows reader)))
 
 (defn- add-info-type [reader]
-  (map (fn [[id content]]
-         (d/datom (+ ^long info-type-base (Long/parseLong id))
-                  :info-type/info content))
-       (d/read-csv reader)))
+  (eduction
+    (map (fn [[id content]]
+           (d/datom (+ ^long info-type-base (Long/parseLong id))
+                    :info-type/info content)))
+    (csv-rows reader)))
 
 (defn- add-movie-link [reader]
-  (sequence
+  (eduction
     (comp
       (map (fn [[id movie linked-movie link-type]]
              (let [eid (+ ^long movie-link-base (Long/parseLong id))]
@@ -184,10 +196,10 @@
                 (d/datom eid :movie-link/link-type
                          (+ ^long link-type-base (Long/parseLong link-type)))])))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-aka-name [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id person name imdb-index name-pcode-cf
@@ -205,10 +217,10 @@
               (not (s/blank? surname-pcode))
               (conj (d/datom eid :aka-name/surname-pcode surname-pcode))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-aka-title [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id movie title imdb-index kind production-year phonetic-code
@@ -237,10 +249,10 @@
               (not (s/blank? note))
               (conj (d/datom eid :aka-title/note note))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-company-name [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id name country-code imdb-id name-pcode-nf name-pcode-sf]]
@@ -255,10 +267,10 @@
               (not (s/blank? name-pcode-sf))
               (conj (d/datom eid :company-name/name-pcode-sf name-pcode-sf))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-complete-cast [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id movie subject status]]
@@ -270,10 +282,10 @@
              (d/datom eid :complete-cast/status
                       (+ ^long comp-cast-type-base (Long/parseLong status)))])))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-keyword [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id keyword phonetic-code]]
@@ -281,10 +293,10 @@
             [(d/datom eid :keyword/keyword keyword)
              (d/datom eid :keyword/phonetic-code phonetic-code)])))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-char-name [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id name imdb-index imdb-id name-pcode-nf surname-pcode]]
@@ -299,10 +311,10 @@
               (not (s/blank? surname-pcode))
               (conj (d/datom eid :char-name/surname-pcode surname-pcode))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-movie-companies [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id movie company company-type note]]
@@ -318,10 +330,10 @@
               (not (s/blank? note))
               (conj (d/datom eid :movie-companies/note note))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-movie-info [reader]
-  (sequence
+  (eduction
     (comp
       (map (fn [[id movie info-type info note]]
              (let [eid (+ ^long movie-info-base (Long/parseLong id))]
@@ -334,10 +346,10 @@
                  (not (s/blank? note))
                  (conj (d/datom eid :movie-info/note note))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-movie-info-idx [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id movie info-type info note]]
@@ -350,10 +362,10 @@
               (not (s/blank? note))
               (conj (d/datom eid :movie-info-idx/note note))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-movie-keyword [reader]
-  (sequence
+  (eduction
     (comp
       (map (fn [[id movie keyword]]
              (let [eid (+ ^long movie-keyword-base (Long/parseLong id))]
@@ -362,10 +374,10 @@
                 (d/datom eid :movie-keyword/keyword
                          (+ ^long keyword-base (Long/parseLong keyword)))])))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-name [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id name imdb-index imdb-id gender name-pcode-cf name-pcode-nf
@@ -385,10 +397,10 @@
               (not (s/blank? surname-pcode))
               (conj (d/datom eid :name/surname-pcode surname-pcode))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-person-info [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id person info-type info note]]
@@ -401,10 +413,10 @@
               (not (s/blank? note))
               (conj (d/datom eid :person-info/note note))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-title [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id title imdb-index kind production-year imdb-id phonetic-code
@@ -433,10 +445,10 @@
               (not (s/blank? series-years))
               (conj (d/datom eid :title/series-years series-years))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- add-cast-info [reader]
-  (sequence
+  (eduction
     (comp
       (map
         (fn [[id person movie person-role note nr-order role]]
@@ -457,7 +469,7 @@
 
                              (Long/parseLong nr-order)))))))
       cat)
-    (d/read-csv reader)))
+    (csv-rows reader)))
 
 (defn- load-table
   "Open a CSV reader, fill db, close reader, show timing."
