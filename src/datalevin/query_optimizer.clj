@@ -31,7 +31,7 @@
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
-   [datalevin.utl LRUCache]
+   [datalevin.utl DPKey LRUCache]
    [datalevin.parser And BindColl BindIgnore BindScalar BindTuple Constant
     DefaultSrc Function Or Variable Pattern Predicate Not RuleExpr]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -1336,17 +1336,25 @@
       nil links)))
 
 (defn- plans
-  [db sources rules nodes incoming-link-counts required-vars pairs base-plans
-   prev-plans ratios build-cache]
+  [db sources rules nodes node-ids incoming-link-counts required-vars pairs
+   base-plans prev-plans ratios build-cache]
   (persistent!
     (reduce
       (fn [plans [prev-key prev-plan]]
-        (let [prev-key-set (set prev-key)]
+        (let [prev-key-set (when-not node-ids (set prev-key))]
           (reduce
-            (fn [plans [link-e new-e]]
-              (if (and (prev-key-set link-e) (not (prev-key-set new-e)))
-                (let [new-key  (conj prev-key new-e)
-                      cur-plan (plans new-key)
+            (fn [plans [link-e new-e link-id new-id]]
+              (if (if node-ids
+                    (and (.contains ^DPKey prev-key (int link-id))
+                         (not (.contains ^DPKey prev-key (int new-id))))
+                    (and (prev-key-set link-e) (not (prev-key-set new-e))))
+                (let [plan-key  (if node-ids
+                                  (.append ^DPKey prev-key (int new-id))
+                                  (conj prev-key new-e))
+                      new-key   (if node-ids
+                                  (conj (:out (peek (:steps prev-plan))) new-e)
+                                  plan-key)
+                      cur-plan  (plans plan-key)
                       new-plan
                       (binary-plan db sources rules nodes incoming-link-counts
                                    required-vars base-plans ratios build-cache
@@ -1356,13 +1364,45 @@
                                (identical?
                                  new-plan
                                  (compare-plans cur-plan new-plan))))
-                    (assoc! plans new-key new-plan)
+                    (assoc! plans plan-key new-plan)
                     plans))
                 plans))
             plans pairs)))
       (transient {}) prev-plans)))
 
 (def ^:private connected-pairs qog/connected-pairs)
+
+(defn- dp-node-ids
+  [component]
+  (when (<= (count component) Long/SIZE)
+    (into {} (map-indexed (fn [i e] [e i])) component)))
+
+(defn- dp-key
+  [node-ids entities ordered?]
+  (if ordered?
+    (reduce (fn [key e]
+              (let [node (int (node-ids e))]
+                (if key
+                  (.append ^DPKey key node)
+                  (DPKey/ordered node))))
+            nil entities)
+    (DPKey/canonical
+      (reduce (fn [^long members e]
+                (bit-set members (long (node-ids e))))
+              0 entities))))
+
+(defn- dp-initial-plans
+  [base-plans node-ids]
+  (persistent!
+    (reduce-kv (fn [plans [e] plan]
+                 (assoc! plans (DPKey/ordered (int (node-ids e))) plan))
+               (transient {}) base-plans)))
+
+(defn- dp-pairs
+  [pairs node-ids]
+  (mapv (fn [[link-e new-e]]
+          [link-e new-e (node-ids link-e) (node-ids new-e)])
+        pairs))
 
 (defn- incoming-link-counts
   [nodes]
@@ -1376,24 +1416,38 @@
       (transient {}) nodes)))
 
 (defn- shrink-space
-  [plans]
+  [plans node-ids]
   (persistent!
     (reduce-kv
       (fn [m k ps]
-        (assoc! m k (-> (peek (apply min-key (fn [p] (:cost (peek p))) ps))
-                        (update :steps (fn [ss]
-                                         (if (= 1 (count ss))
-                                           [(update (first ss) :out set)]
-                                           [(first ss)
-                                            (update (peek ss) :out set)]))))))
-      (transient {}) (group-by (fn [p] (set (nth p 0))) plans))))
+        (assoc! m (if node-ids (DPKey/canonical (long k)) k)
+                (-> (peek (apply min-key (fn [p] (:cost (peek p))) ps))
+                    (update :steps (fn [ss]
+                                     (if (= 1 (count ss))
+                                       [(update (first ss) :out set)]
+                                       [(first ss)
+                                        (update (peek ss) :out set)]))))))
+      (transient {})
+      (group-by (fn [p]
+                  (if node-ids
+                    (.members ^DPKey (nth p 0))
+                    (set (nth p 0))))
+                plans))))
+
+(defn- dp-table-key
+  [table node-ids entities]
+  (if node-ids
+    (dp-key node-ids entities (.isOrdered ^DPKey (ffirst table)))
+    entities))
 
 (defn- trace-steps
-  [^List tables ^long n-1]
+  [^List tables ^long n-1 node-ids]
   (let [final-plans (vals (.get tables n-1))]
     (reduce
       (fn [plans i]
-        (cons ((.get tables i) (:in (first (:steps (first plans))))) plans))
+        (let [table (.get tables i)
+              in    (:in (first (:steps (first plans))))]
+          (cons (table (dp-table-key table node-ids in)) plans)))
       [(apply min-key :cost final-plans)]
       (range (dec n-1) -1 -1))))
 
@@ -1402,25 +1456,32 @@
   (let [n (count component)]
     (if (= n 1)
       [(base-plan db nodes (first component) true)]
-      (let [base-plans (build-base-plans db nodes component)]
+      (let [base-plans (build-base-plans db nodes component)
+            node-ids   (dp-node-ids component)]
         (if (some nil? (vals base-plans))
           [nil]
-          (let [pairs       (connected-pairs nodes component)
-                tables      (FastList. n)
-                ratios      (ConcurrentHashMap.)
-                build-cache (IdentityHashMap.)
-                n-1         (dec n)
-                pn          ^long (min (long c/plan-search-max)
-                                       (long (u/n-permutations n 2)))]
-            (.add tables base-plans)
+          (let [raw-pairs     (connected-pairs nodes component)
+                pairs         (if node-ids
+                                (dp-pairs raw-pairs node-ids)
+                                raw-pairs)
+                initial-plans (if node-ids
+                                (dp-initial-plans base-plans node-ids)
+                                base-plans)
+                tables        (FastList. n)
+                ratios        (ConcurrentHashMap.)
+                build-cache   (IdentityHashMap.)
+                n-1           (dec n)
+                pn            ^long (min (long c/plan-search-max)
+                                         (long (u/n-permutations n 2)))]
+            (.add tables initial-plans)
             (dotimes [i n-1]
-              (let [plans (plans db sources rules nodes incoming-link-counts
-                                 required-vars pairs base-plans (.get tables i)
-                                 ratios build-cache)]
+              (let [plans (plans db sources rules nodes node-ids
+                                 incoming-link-counts required-vars pairs
+                                 base-plans (.get tables i) ratios build-cache)]
                 (if (< pn (count plans))
-                  (.add tables (shrink-space plans))
+                  (.add tables (shrink-space plans node-ids))
                   (.add tables plans))))
-            (trace-steps tables n-1)))))))
+            (trace-steps tables n-1 node-ids)))))))
 
 (def ^:private connected-components qog/connected-components)
 
