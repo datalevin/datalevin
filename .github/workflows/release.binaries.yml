@@ -1,12 +1,12 @@
 name: Build
 
-# on: push
+on: push
 # on: workflow_dispatch
-on:
-  workflow_dispatch:
-  release:
-    types:
-      - created
+# on:
+#   workflow_dispatch:
+#   release:
+#     types:
+#       - created
 
 jobs:
   build:
@@ -67,13 +67,13 @@ jobs:
             echo "Generated JAR files:"
             dir target\*.jar
 
-      - name: Upload Uberjar
-        if: matrix.os == 'ubuntu-22.04'
-        uses: shogo82148/actions-upload-release-asset@v1
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: target/datalevin-${{ github.event.release.tag_name }}-standalone.jar
-          overwrite: true
+      # - name: Upload Uberjar
+      #   if: matrix.os == 'ubuntu-22.04'
+      #   uses: shogo82148/actions-upload-release-asset@v1
+      #   with:
+      #     upload_url: ${{ github.event.release.upload_url }}
+      #     asset_path: target/datalevin-${{ github.event.release.tag_name }}-standalone.jar
+      #     overwrite: true
 
       - name: Setup Graalvm
         uses: graalvm/setup-graalvm@v1
@@ -115,9 +115,9 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: 7z a -tzip dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip dtlv.exe
 
-      - name: Upload Binary
-        uses: shogo82148/actions-upload-release-asset@v1
-        with:
-          upload_url: ${{ github.event.release.upload_url }}
-          asset_path: dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip
-          overwrite: true
+      # - name: Upload Binary
+      #   uses: shogo82148/actions-upload-release-asset@v1
+      #   with:
+      #     upload_url: ${{ github.event.release.upload_url }}
+      #     asset_path: dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip
+      #     overwrite: true
