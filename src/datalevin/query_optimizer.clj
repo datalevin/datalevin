@@ -27,7 +27,7 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
-   [java.util IdentityHashMap List]
+   [java.util HashMap HashSet IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -897,34 +897,50 @@
     (some #(when (symbol? %) %) col)
     col))
 
-(defn- col-attrs
-  [col]
-  (if (set? col)
-    (into #{} (filter keyword?) col)
-    #{}))
-
 (defn- merge-join-cols
   "Merge input and target cols for hash join output, preserving input order.
    Returns [merged-cols new-vars]."
   [in-cols tgt-cols]
-  (let [in-vars    (mapv col-var in-cols)
-        tgt-vars   (mapv col-var tgt-cols)
-        tgt-map    (zipmap tgt-vars tgt-cols)
-        in-var-set (set in-vars)
-        merged-in  (mapv (fn [col v]
-                           (if-let [tcol (tgt-map v)]
-                             (let [attrs (set/union (col-attrs col)
-                                                    (col-attrs tcol))]
-                               (if (seq attrs)
-                                 (conj attrs v)
-                                 v))
-                             col))
-                         in-cols in-vars)
-        new-cols   (reduce (fn [acc [v col]]
-                             (if (in-var-set v) acc (conj acc col)))
-                           [] (map vector tgt-vars tgt-cols))
-        new-vars   (set/difference (set tgt-vars) in-var-set)]
-    [(into merged-in new-cols) new-vars]))
+  (let [^HashMap tgt-map    (HashMap.)
+        ^HashSet in-var-set (HashSet.)]
+    (doseq [col tgt-cols]
+      (.put tgt-map (col-var col) col))
+    (let [merged-in
+          (mapv (fn [col]
+                  (let [v (col-var col)]
+                    (.add in-var-set v)
+                    (if (.containsKey tgt-map v)
+                      (let [tcol (.get tgt-map v)]
+                        (cond
+                          (set? col)  (if (set? tcol) (into col tcol) col)
+                          (set? tcol) tcol
+                          :else       v))
+                      col)))
+                in-cols)
+          [new-cols new-vars]
+          (loop [i        0
+                 new-cols (transient [])
+                 new-vars (transient #{})]
+            (if (< i (count tgt-cols))
+              (let [col (nth tgt-cols i)
+                    v   (col-var col)]
+                (if (.contains in-var-set v)
+                  (recur (u/long-inc i) new-cols new-vars)
+                  (recur (u/long-inc i) (conj! new-cols col)
+                         (conj! new-vars v))))
+              [(persistent! new-cols) (persistent! new-vars)]))]
+      [(into merged-in new-cols) new-vars])))
+
+(defn- required-new-join-var?
+  [required-vars in-cols tgt-cols]
+  (let [^HashSet in-vars (HashSet.)]
+    (doseq [col in-cols]
+      (.add in-vars (col-var col)))
+    (boolean
+      (some (fn [col]
+              (let [v (col-var col)]
+                (and (required-vars v) (not (.contains in-vars v)))))
+            tgt-cols))))
 
 (defn- link-step
   [type last-step index attr tgt new-key]
@@ -979,20 +995,16 @@
                (- ^long (find-index link-e (:strata last-step))))))
 
 (defn- semi-join-eligible?
-  [nodes required-vars prev-plan link-e new-e link new-base-plan]
+  [nodes incoming-link-counts required-vars prev-plan link-e new-e link
+   new-base-plan]
   (when (and new-base-plan
              (#{:ref :_ref :val-eq} (:type link))
              (= 1 (count (get-in nodes [new-e :links])))
              (= link-e (get-in nodes [new-e :links 0 :tgt]))
-             (= 1 (reduce-kv
-                    (fn [^long n _ node]
-                      (+ n (long (count (filter #(= new-e (:tgt %))
-                                                (:links node))))))
-                    0 nodes)))
+             (= 1 (long (get incoming-link-counts new-e 0))))
     (let [in-cols  (:cols (peek (:steps prev-plan)))
-          tgt-cols (:cols (peek (:steps new-base-plan)))
-          [_ new-vars] (merge-join-cols in-cols tgt-cols)]
-      (empty? (set/intersection required-vars new-vars)))))
+          tgt-cols (:cols (peek (:steps new-base-plan)))]
+      (not (required-new-join-var? required-vars in-cols tgt-cols)))))
 
 (defn- or-join-plan*
   [db sources rules last-step
@@ -1051,6 +1063,20 @@
          :sumsq   sumsq
          :max-val mx}))))
 
+(defn- count-init-follows-stats-cached
+  "Cache exact fan-out stats by sample identity, without hashing the sample list."
+  [^DB db ^IdentityHashMap cache tuples attr index]
+  (let [^HashMap entries (or (.get cache tuples)
+                             (let [m (HashMap.)]
+                               (.put cache tuples m)
+                               m))
+        k                [::link-follow-stats attr index]]
+    (if (.containsKey entries k)
+      (.get entries k)
+      (let [stats (count-init-follows-stats db tuples attr index)]
+        (.put entries k stats)
+        stats))))
+
 (defn- link-ratio-key
   [link-e {:keys [type attr attrs tgt]}]
   (case type
@@ -1060,7 +1086,7 @@
 
 (defn- estimate-link-size
   [db link-e {:keys [type attr attrs tgt var]} ^ConcurrentHashMap ratios
-   prev-size prev-plan index]
+   ^IdentityHashMap build-cache prev-size prev-plan index]
   (let [prev-steps              (:steps prev-plan)
         attr                    (or attr (attrs tgt))
         ratio-key               (link-ratio-key link-e {:type  type
@@ -1075,7 +1101,7 @@
       (cond
         (< 0 ssize)
         (let [{:keys [^long n ^double sum ^double sumsq ^double max-val]}
-              (count-init-follows-stats db sample attr index)
+              (count-init-follows-stats-cached db build-cache sample attr index)
 
               mean       (if (pos? n) (/ sum (double n)) 0.0)
               variance   (if (pos? n)
@@ -1169,8 +1195,8 @@
                  ;; or-join doesn't have new-base-plan steps to merge
                  [or-size or-size])
       ;; :_ref and :val-eq
-      (let [e-size (estimate-link-size db link-e link ratios prev-size
-                                       prev-plan index)]
+      (let [e-size (estimate-link-size db link-e link ratios build-cache
+                                       prev-size prev-plan index)]
         [e-size (estimate-scan-v-size e-size steps)]))))
 
 (defn- estimate-link-cost
@@ -1285,61 +1311,69 @@
                   index-semi (conj index-semi)))))))
 
 (defn- binary-plan
-  [db sources rules nodes required-vars base-plans ratios build-cache prev-plan
-   link-e new-e new-key]
+  [db sources rules nodes incoming-link-counts required-vars base-plans ratios
+   build-cache prev-plan link-e new-e new-key]
   (let [last-step     (peek (:steps prev-plan))
         seen-or-joins (or (:seen-or-joins last-step) #{})
         links         (get-in nodes [link-e :links])
-        filtered-links
-        (into []
-              (comp
-                (filter #(= new-e (:tgt %)))
-                (filter #(or (not= :or-join (:type %))
-                             (not (contains? seen-or-joins (:clause %))))))
-              links)
-        candidates
-        (mapv (fn [link]
-                (let [new-base  (base-plans [new-e])
-                      semi-join?
-                      (semi-join-eligible? nodes required-vars prev-plan link-e
-                                           new-e link new-base)]
-                  (binary-plan* db sources rules base-plans ratios
-                                build-cache prev-plan link-e new-e link
-                                new-key semi-join?)))
-              filtered-links)]
-    (when (seq candidates)
-      (apply u/min-key-comp (juxt :recency :cost :size) candidates))))
+        candidate-key (juxt :recency :cost :size)]
+    (reduce
+      (fn [best link]
+        (if (and (= new-e (:tgt link))
+                 (or (not= :or-join (:type link))
+                     (not (contains? seen-or-joins (:clause link)))))
+          (let [new-base  (base-plans [new-e])
+                semi-join?
+                (semi-join-eligible? nodes incoming-link-counts required-vars
+                                     prev-plan link-e new-e link new-base)
+                candidate (binary-plan* db sources rules base-plans ratios
+                                        build-cache prev-plan link-e new-e link
+                                        new-key semi-join?)]
+            (if best
+              (u/min-key-comp candidate-key best candidate)
+              candidate))
+          best))
+      nil links)))
 
 (defn- plans
-  [db sources rules nodes required-vars pairs base-plans prev-plans ratios
-   build-cache]
-  (apply
-    u/merge-with compare-plans
-    (mapv
-      (fn [[prev-key prev-plan]]
+  [db sources rules nodes incoming-link-counts required-vars pairs base-plans
+   prev-plans ratios build-cache]
+  (persistent!
+    (reduce
+      (fn [plans [prev-key prev-plan]]
         (let [prev-key-set (set prev-key)]
-          (persistent!
-            (reduce
-              (fn [t [link-e new-e]]
-                (if (and (prev-key-set link-e) (not (prev-key-set new-e)))
-                  (let [new-key  (conj prev-key new-e)
-                        cur-plan (t new-key)
-                        new-plan
-                        (binary-plan db sources rules nodes required-vars
-                                     base-plans ratios build-cache prev-plan
-                                     link-e new-e new-key)]
-                    (if new-plan
-                      (if (or (nil? cur-plan)
-                              (identical? new-plan
-                                          (compare-plans cur-plan new-plan)))
-                        (assoc! t new-key new-plan)
-                        t)
-                      t))
-                  t))
-              (transient {}) pairs))))
-      prev-plans)))
+          (reduce
+            (fn [plans [link-e new-e]]
+              (if (and (prev-key-set link-e) (not (prev-key-set new-e)))
+                (let [new-key  (conj prev-key new-e)
+                      cur-plan (plans new-key)
+                      new-plan
+                      (binary-plan db sources rules nodes incoming-link-counts
+                                   required-vars base-plans ratios build-cache
+                                   prev-plan link-e new-e new-key)]
+                  (if (and new-plan
+                           (or (nil? cur-plan)
+                               (identical?
+                                 new-plan
+                                 (compare-plans cur-plan new-plan))))
+                    (assoc! plans new-key new-plan)
+                    plans))
+                plans))
+            plans pairs)))
+      (transient {}) prev-plans)))
 
 (def ^:private connected-pairs qog/connected-pairs)
+
+(defn- incoming-link-counts
+  [nodes]
+  (persistent!
+    (reduce-kv
+      (fn [counts _ {:keys [links]}]
+        (reduce (fn [counts {:keys [tgt]}]
+                  (assoc! counts tgt
+                          (inc (long (get counts tgt 0)))))
+                counts links))
+      (transient {}) nodes)))
 
 (defn- shrink-space
   [plans]
@@ -1364,7 +1398,7 @@
       (range (dec n-1) -1 -1))))
 
 (defn- plan-component
-  [db sources rules nodes required-vars component]
+  [db sources rules nodes incoming-link-counts required-vars component]
   (let [n (count component)]
     (if (= n 1)
       [(base-plan db nodes (first component) true)]
@@ -1380,8 +1414,9 @@
                                        (long (u/n-permutations n 2)))]
             (.add tables base-plans)
             (dotimes [i n-1]
-              (let [plans (plans db sources rules nodes required-vars pairs
-                                 base-plans (.get tables i) ratios build-cache)]
+              (let [plans (plans db sources rules nodes incoming-link-counts
+                                 required-vars pairs base-plans (.get tables i)
+                                 ratios build-cache)]
                 (if (< pn (count plans))
                   (.add tables (shrink-space plans))
                   (.add tables plans))))
@@ -1391,11 +1426,14 @@
 
 (defn- build-plan*
   [db sources rules nodes required-vars]
-  (let [cc (connected-components nodes)]
+  (let [cc              (connected-components nodes)
+        incoming-counts (incoming-link-counts nodes)]
     (if (= 1 (count cc))
-      [(plan-component db sources rules nodes required-vars (first cc))]
+      [(plan-component db sources rules nodes incoming-counts required-vars
+                       (first cc))]
       (map+ (bound-fn [component]
-              (plan-component db sources rules nodes required-vars component))
+              (plan-component db sources rules nodes incoming-counts
+                              required-vars component))
             cc))))
 
 (defn- required-plan-vars
