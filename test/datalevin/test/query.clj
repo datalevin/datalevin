@@ -98,6 +98,33 @@
                  result))))
       (is (= :done (deref producer 5000 :timeout))))))
 
+(deftest test-explain-without-intermediate-counts
+  (let [conn  (d/create-conn nil {} {:kv-opts {:inmemory? true}})
+        query '[:find ?name
+                :where
+                [?e :person/name ?name]
+                [?e :person/age ?age]
+                [?e :person/active true]]
+        plan-maps #(filter map? (tree-seq coll? seq (:plan %)))]
+    (try
+      (d/transact! conn [{:db/id 1 :person/name "Ada"
+                          :person/age 30 :person/active true}
+                         {:db/id 2 :person/name "Bea"
+                          :person/age 40 :person/active true}
+                         {:db/id 3 :person/name "Cid"
+                          :person/age 50 :person/active false}])
+      (let [db        (d/db conn)
+            counted   (d/explain {:run? true} query db)
+            uncounted (d/explain {:run? true :intermediate-counts? false}
+                                 query db)]
+        (is (= #{["Ada"] ["Bea"]} (:result counted) (:result uncounted)))
+        (is (= 2 (:actual-result-size counted)
+               (:actual-result-size uncounted)))
+        (is (some #(contains? % :actual-size) (plan-maps counted)))
+        (is (not-any? #(contains? % :actual-size) (plan-maps uncounted))))
+      (finally
+        (d/close conn)))))
+
 (deftest test-query-cache-vars-remain-compatible
   (is (var? (ns-resolve 'datalevin.query '*cache?*)))
   (is (var? (ns-resolve 'datalevin.query '*query-cache*)))

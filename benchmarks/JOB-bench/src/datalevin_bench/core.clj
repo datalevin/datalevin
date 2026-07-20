@@ -3196,7 +3196,8 @@
           (let [qname     (s/replace (name q) "q-" "")
                 _         (print (str "  " qname "... "))
                 query     (-> q (#(ns-resolve 'datalevin-bench.core %)) var-get)
-                result    (d/explain {:run? true} query (d/db conn))
+                result    (d/explain {:run? true :intermediate-counts? false}
+                                     query (d/db conn))
                 plan-time (:prepare-time result)
                 exec-time (:execution-time result)]
             (println (str plan-time " + " exec-time " ms"))

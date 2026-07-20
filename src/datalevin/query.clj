@@ -48,12 +48,14 @@
       (qexec/plan* parsed-q inputs))))
 
 (defn- explain*
-  [{:keys [run?] :or {run? false}} & args]
-  (binding [qplan/*explain*     (volatile! {})
-            qcache/*cache?*     false
-            qcache/*query-cache* *query-cache*
-            qo/*plan-cache*      *plan-cache*
-            qplan/*start-time*  (System/nanoTime)]
+  [{:keys [run? intermediate-counts?]
+    :or   {run? false intermediate-counts? true}} & args]
+  (binding [qplan/*explain*              (volatile! {})
+            qplan/*intermediate-counts?* intermediate-counts?
+            qcache/*cache?*              false
+            qcache/*query-cache*         *query-cache*
+            qo/*plan-cache*              *plan-cache*
+            qplan/*start-time*           (System/nanoTime)]
     (if run?
       (do (apply perform args) @qplan/*explain*)
       (do (apply plan-only args)

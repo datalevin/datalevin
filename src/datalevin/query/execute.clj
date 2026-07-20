@@ -373,10 +373,11 @@
                              (cond->
                                  (assoc plan :steps
                                         (mapv #(qplan/step-explain % context) steps))
-                               run? (assoc :actual-size
-                                           (get-in @(:intermediates context)
-                                                   [(:out (last steps))
-                                                    :tuples-count]))))
+                               (and run? qplan/*intermediate-counts?*)
+                               (assoc :actual-size
+                                      (get-in @(:intermediates context)
+                                              [(:out (last steps))
+                                               :tuples-count]))))
                            e)) plan)
                :late-clauses late-clauses)))))
 

@@ -421,6 +421,9 @@ Only usable for debug output.
     `opts` is a map, with these keys:
 
       * `:run?` indicate whether to actually run the query. Default is `false`, so only query plan is produced.
+      * `:intermediate-counts?` controls collection of intermediate result sizes
+        when the query is run. Default is `true`. Set it to `false` when timing
+        execution without per-tuple counting overhead.
 
     `query` and `inputs` are the same as that of [[q]]
 

@@ -32,6 +32,8 @@
 
 (def ^:dynamic *explain* nil)
 
+(def ^:dynamic *intermediate-counts?* true)
+
 (def ^:dynamic *start-time* nil)
 
 (defrecord Context [parsed-q rels sources rules opt-clauses late-clauses
@@ -83,7 +85,7 @@
         (p/add-batch sink result)
         (cond
           know-e?
-          (let [pipe (if *explain*
+          (let [pipe (if (and *explain* *intermediate-counts?*)
                        (p/counted-tuple-pipe)
                        (p/tuple-pipe))
                 src  (doto ^Collection pipe
@@ -520,7 +522,8 @@
 
 (defn- save-intermediates
   [context steps ^objects sinks ^List tuples]
-  (when-let [res (:intermediates context)]
+  (when-let [res (and *explain* *intermediate-counts?*
+                      (:intermediates context))]
     (vswap! res merge
             (u/reduce-indexed
               (fn [m step i]
@@ -621,7 +624,8 @@
   [context db attrs steps n]
   (let [n-1    (dec ^long n)
         tuples (FastList. (int c/init-exec-size-threshold))
-        pipes  (object-array (repeatedly n-1 #(if *explain*
+        pipes  (object-array (repeatedly n-1 #(if (and *explain*
+                                                       *intermediate-counts?*)
                                                 (p/counted-tuple-pipe)
                                                 (p/tuple-pipe))))
         work   (fn [step ^long i]
