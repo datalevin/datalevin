@@ -170,11 +170,11 @@
 
 (defn -main []
   (run-tests)
-  ;; (update-version)
-  ;; (cljdoc-check)
-  ;; (make-commit)
-  ;; (github-release)
-  ;; (sh "./deploy" :dir "script")
+  (update-version)
+  (cljdoc-check)
+  (make-commit)
+  (github-release)
+  (sh "./deploy" :dir "script")
   (System/exit 0)
   )
 
