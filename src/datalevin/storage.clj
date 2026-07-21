@@ -545,7 +545,7 @@
          ensure-embedding-vector!
          migrate-attr-values transact-opts ->SamplingWork e-sample*
          default-ratio* analyze*
-         init-idoc-domains init-idoc-indices store-idoc-indices)
+         init-idoc-domains init-idoc-indices)
 
 (defn- merge-missing-idoc-indices
   [lmdb idoc-indices schema opts]
@@ -556,6 +556,9 @@
     (if (seq missing)
       (merge idoc-indices (init-idoc-indices lmdb missing))
       idoc-indices)))
+
+(defprotocol ^:no-doc IStoreIdocIndices
+  (store-idoc-indices [store]))
 
 (deftype Store [lmdb
                 search-engines
@@ -577,6 +580,10 @@
                 ^ReentrantReadWriteLock sampling-lock
                 ^:volatile-mutable local-closed?
                 shared-dir-key]
+
+  IStoreIdocIndices
+
+  (store-idoc-indices [_] idoc-indices)
 
   IWriting
 
@@ -3573,15 +3580,6 @@
 (defn- transfer-idoc-indices
   [indices lmdb]
   (zipmap (keys indices) (map #(idoc/transfer % lmdb) (vals indices))))
-
-(def ^:private store-idoc-indices-field
-  (delay
-    (doto (.getDeclaredField Store "idoc_indices")
-      (.setAccessible true))))
-
-(defn ^:no-doc store-idoc-indices
-  [store]
-  (.get ^java.lang.reflect.Field @store-idoc-indices-field store))
 
 (defn transfer
   "transfer state of an existing store to a new store that has a different
