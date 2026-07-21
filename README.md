@@ -133,26 +133,27 @@ Datalevin is simple to add as a dependency to your project written in Java,
 Python, node.js or Clojure. There are also several other installation options.
 Please see details in [Installation Documentation](doc/install.md)
 
-## :birthday: Upgrade
+## :green_book: Documentation
 
-Please read
-[Upgrade
-Documentation](https://github.com/datalevin/datalevin/blob/master/doc/upgrade.md)
-for information regarding upgrading your existing Datalevin database from older
-versions.
+The searchable [online user guide](https://datalevin.org) also accepts
+user-submitted examples so practical usage patterns can be shared with the
+community.
 
-## :tada: Usage
+The [complete book is available in print and ebook
+formats](https://www.amazon.com/dp/B0H8X1QF2Q/). It includes five additional
+chapters on AI memory that are not part of the online guide.
+
+Please refer to the [Clojure API
+documentation](https://cljdoc.org/d/datalevin/datalevin) and
+[JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
+for API details.
+
+
+## :tada: Quick Examples
 
 Datalevin is aimed to be a versatile database.
 
 ### Use as a Datalog store
-
-In addition to [Clojure API doc](https://cljdoc.org/d/datalevin/datalevin) and
-[JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html),
-Datalevin has almost the same Datalog API as
-[Datascript](https://github.com/tonsky/datascript), which in turn has almost the
-same API as Datomic®, please consult the abundant tutorials, guides and learning
-sites available online to learn about the usage of Datomic® flavor of Datalog.
 
 Here is a simple Clojure code example using Datalevin:
 
@@ -288,21 +289,6 @@ for EDN data.
 (d/close-kv db)
 
 ```
-
-## :green_book: Documentation
-
-The [Datalevin book](https://datalevin.org) is available online as the user
-guide. It also accepts user-submitted examples so practical usage patterns can
-be shared with the community.
-
-The [complete book is available in print and ebook
-formats](https://www.amazon.com/dp/B0H8X1QF2Q/). It includes five additional
-chapters on AI memory that are not part of the online guide.
-
-Please refer to the [Clojure API
-documentation](https://cljdoc.org/d/datalevin/datalevin) and
-[JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
-for API details.
 
 ## :bar_chart: Benchmarks
 
