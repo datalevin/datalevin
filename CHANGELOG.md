@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.0.0 (2026-07-20)
 
 ### Added
 - [Datalog]`datalog-kv` function to return the underlying DLMDB instance for a
