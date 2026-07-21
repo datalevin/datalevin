@@ -83,6 +83,55 @@
       (finally
         (u/delete-files dir)))))
 
+(deftest load-migration-stream-with-partial-composite-tuple
+  (let [dir    (u/tmp-dir (str "migration-partial-tuple-"
+                               (UUID/randomUUID)))
+        bytes  (ByteArrayOutputStream.)
+        attr   :order/number+region+kind
+        schema {:order/number {:db/valueType :db.type/long}
+                :order/region {:db/valueType :db.type/string}
+                :order/kind   {:db/valueType :db.type/keyword}
+                attr          {:db/tupleAttrs [:order/number
+                                               :order/region
+                                               :order/kind]}}]
+    (try
+      (with-open [out (DataOutputStream. bytes)]
+        (nippy/freeze-to-out!
+          out {:format          m/mixed-stream-format
+               :opts            {}
+               :schema          schema
+               :source-count    3
+               :kv-dbis         []
+               :kv-source-count 0})
+        (nippy/freeze-to-out!
+          out [[1 :order/number 42]
+               [1 :order/kind :kind/a]
+               [1 attr [42 nil :kind/a]]])
+        (nippy/freeze-to-out!
+          out {:frame :datalog-end :datom-count 3})
+        (nippy/freeze-to-out! out {:frame :end :entry-count 0}))
+      (is (= {:source-count    3
+              :dump-count      3
+              :loaded-count    3
+              :kv-source-count 0
+              :kv-dump-count   0
+              :kv-loaded-count 0}
+             (#'m/load-datalog-stream
+               dir (ByteArrayInputStream. (.toByteArray bytes)))))
+      (let [conn (d/get-conn dir)]
+        (try
+          (is (= [:db.type/long :db.type/string :db.type/keyword]
+                 (get-in (d/schema conn) [attr :db/tupleTypes])))
+          (is (= [42 nil :kind/a]
+                 (d/q '[:find ?value .
+                        :in $ ?attr
+                        :where [1 ?attr ?value]]
+                      (d/db conn) attr)))
+          (finally
+            (d/close conn))))
+      (finally
+        (u/delete-files dir)))))
+
 (deftest load-mixed-migration-stream
   (let [source-dir (u/tmp-dir (str "migration-mixed-source-"
                                    (UUID/randomUUID)))
