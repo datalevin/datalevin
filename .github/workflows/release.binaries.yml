@@ -4,29 +4,31 @@ name: Build
 # on: workflow_dispatch
 on:
   workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag whose macOS asset should be rebuilt
+        required: true
+        type: string
   release:
     types:
       - created
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ${{ matrix.os }}
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'release' && github.event.release.tag_name || inputs.release_tag }}
     strategy:
-      matrix:
-        include:
-          - os: macos-15
-            arch: aarch64
-          - os: ubuntu-22.04
-            arch: amd64
-          - os: ubuntu-24.04-arm
-            arch: aarch64
-          - os: windows-latest
-            arch: amd64
+      matrix: ${{ fromJSON(github.event_name == 'workflow_dispatch' && '{"include":[{"os":"macos-14","arch":"aarch64"}]}' || '{"include":[{"os":"macos-14","arch":"aarch64"},{"os":"ubuntu-22.04","arch":"amd64"},{"os":"ubuntu-24.04-arm","arch":"aarch64"},{"os":"windows-latest","arch":"amd64"}]}') }}
 
     steps:
       - name: Checkout repository and submodules
         uses: actions/checkout@v3
         with:
+          ref: ${{ env.RELEASE_TAG }}
           submodules: recursive
 
       - name: Get Java
@@ -68,7 +70,7 @@ jobs:
             dir target\*.jar
 
       - name: Upload Uberjar
-        if: matrix.os == 'ubuntu-22.04'
+        if: github.event_name == 'release' && matrix.os == 'ubuntu-22.04'
         uses: shogo82148/actions-upload-release-asset@v1
         with:
           upload_url: ${{ github.event.release.upload_url }}
@@ -109,15 +111,23 @@ jobs:
 
       - name: Zip Binary (Unix)
         if: matrix.os != 'windows-latest'
-        run: 7z a -tzip dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip dtlv
+        run: 7z a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ matrix.arch }}.zip dtlv
 
       - name: Zip Binary (Windows)
         if: matrix.os == 'windows-latest'
-        run: 7z a -tzip dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip dtlv.exe
+        run: 7z a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ matrix.arch }}.zip dtlv.exe
 
       - name: Upload Binary
+        if: github.event_name == 'release'
         uses: shogo82148/actions-upload-release-asset@v1
         with:
           upload_url: ${{ github.event.release.upload_url }}
-          asset_path: dtlv-${{ github.event.release.tag_name }}-${{ matrix.os }}-${{ matrix.arch }}.zip
+          asset_path: dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ matrix.arch }}.zip
           overwrite: true
+
+      - name: Replace Binary on Existing Release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "dtlv-${RELEASE_TAG}-${{ matrix.os }}-${{ matrix.arch }}.zip" --clobber
