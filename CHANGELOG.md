@@ -3,6 +3,7 @@
 ## WIP
 
 ### Fixed
+- [Datalog] fix composite tuple `nil` regression.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
 
