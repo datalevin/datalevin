@@ -775,6 +775,12 @@
                    [2 :name "Petr"]]
                   [])
              #{}))
+      (is (= (d/q '[:find [?id ...]
+                    :in $ [?id ...]
+                    :where [?id :age _]]
+                  db
+                  nil)
+             []))
       (is (= (d/q '[:find ?id
                     :in $ [[?id]]
                     :where [?id :age _]]

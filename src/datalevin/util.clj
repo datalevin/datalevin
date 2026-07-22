@@ -528,18 +528,26 @@
 (defn keep-idxs
   "take a set of idxs to keep"
   [kp-idxs-set coll]
-  (into []
-        (comp (map-indexed #(when (kp-idxs-set %1) %2))
-           (remove nil?))
-        coll))
+  (loop [i 0, xs (seq coll), result (transient [])]
+    (if xs
+      (recur (unchecked-inc-int i)
+             (next xs)
+             (if (kp-idxs-set i)
+               (conj! result (first xs))
+               result))
+      (persistent! result))))
 
 (defn remove-idxs
   "take a set of idxs to remove"
   [rm-idxs-set coll]
-  (into []
-        (comp (map-indexed #(when-not (rm-idxs-set %1) %2))
-           (remove nil?))
-        coll))
+  (loop [i 0, xs (seq coll), result (transient [])]
+    (if xs
+      (recur (unchecked-inc-int i)
+             (next xs)
+             (if (rm-idxs-set i)
+               result
+               (conj! result (first xs))))
+      (persistent! result))))
 
 (defn min-key-comp
   "Similar to min-key, but use compare, so it is not limited to numbers"

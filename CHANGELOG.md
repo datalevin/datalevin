@@ -1,5 +1,11 @@
 # Change Log
 
+## WIP
+
+### Fixed
+- [Datalog] fix internal utility function `remove-idxs` that removes `nil`
+  unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
+
 ## 1.0.0 (2026-07-20)
 
 ### Added
