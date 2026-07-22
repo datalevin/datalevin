@@ -43,7 +43,7 @@ query looks like in Datalevin:
               [?sales :sales/total ?total]
               [?sales :sales/customer ?customer]
               [?customer :customers/name ?name]]
-      (d/db conn) 2024)
+      (d/db conn) 2026)
 ```
 
 ## :question: Why
@@ -72,7 +72,7 @@ semantics](https://jepsen.io/analyses/datomic-pro-1.0.7075).
 In addition to support Datomic® flavor of Datalog query language, Datalevin has
 a [novel cost-based query optimizer](doc/query.md) with a much better query
 performance, which is competitive with SQL RDBMS such as
-[PostgreSQL](benchmarks/JOB-bench) and graph databases such as
+[PostgreSQL and SQLite](benchmarks/JOB-bench) and graph databases such as
 [Neo4j](benchmarks/LDBC-SNB-bench).
 
 Datalevin provides robust ACID transaction features on the basis of [our
@@ -94,10 +94,7 @@ performance.
 
 Datalevin is also AI-native. It ships with a built-in local [MCP
 server](doc/mcp.md). Datalevin supports in-DB embedding and text generation with
-built-in [llama.cpp](https://github.com/ggml-org/llama.cpp), and compatible
-OCR-capable generation models can be used for OCR workflows, so
-AI clients can query Datalevin over MCP while RAG applications keep embedding
-generation and search in the same database runtime.
+built-in [llama.cpp](https://github.com/ggml-org/llama.cpp).
 
 Datalevin can be used as a fast key-value store for
 [EDN](https://en.wikipedia.org/wiki/Extensible_Data_Notation) data. The native
@@ -135,7 +132,7 @@ Please see details in [Installation Documentation](doc/install.md)
 
 ## :green_book: Documentation
 
-The searchable [online user guide](https://datalevin.org) also accepts
+The searchable [online user guide](https://datalevin.org) accepts
 user-submitted examples so practical usage patterns can be shared with the
 community.
 
@@ -147,7 +144,6 @@ Please refer to the [Clojure API
 documentation](https://cljdoc.org/d/datalevin/datalevin) and
 [JavaDoc](https://javadoc.io/doc/org.datalevin/datalevin-java/latest/datalevin/package-summary.html)
 for API details.
-
 
 ## :tada: Quick Examples
 
@@ -388,7 +384,8 @@ pull requests.
 
 If commercial support is needed, talk to us.
 
-You can talk to us in the `#datalevin` channel on [Clojurians Slack](http://clojurians.net/).
+You can talk to us in the `#datalevin` channel on [Clojurians
+Slack](http://clojurians.net/) or use the Github Discussions feature above.
 
 ## License
 
