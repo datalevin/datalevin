@@ -1139,5 +1139,6 @@
            (if (= 1 ct)
              (let [t' (first t)] (every? #(valid-data* % t') x))
              (and (= ct (count x))
-                  (every? true? (map #(valid-data* %1 %2) x t))))))
+                  (every? true?
+                          (map #(or (nil? %1) (valid-data* %1 %2)) x t))))))
     (valid-data* x t)))

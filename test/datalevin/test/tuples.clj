@@ -560,6 +560,37 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-validated-composite-tuple-with-missing-component
+  (let [dir  (u/tmp-dir (str "partial-composite-tuple-" (UUID/randomUUID)))
+        attr :accessMethod/custProfile+name+acct
+        conn (d/create-conn
+               dir
+               {:accessMethod/name
+                {:db/valueType :db.type/string}
+                :accessMethod/forAccount
+                {:db/valueType :db.type/ref}
+                :accessMethod/forCustProfile
+                {:db/valueType :db.type/ref}
+                attr
+                {:db/valueType  :db.type/tuple
+                 :db/tupleAttrs [:accessMethod/forCustProfile
+                                 :accessMethod/name
+                                 :accessMethod/forAccount]
+                 :db/unique     :db.unique/identity}}
+               {:validate-data? true})]
+    (try
+      (d/transact! conn [{:db/id                       1
+                          :accessMethod/forCustProfile 12
+                          :accessMethod/name           "test"}])
+      (is (= [12 "test" nil]
+             (d/q '[:find ?value .
+                    :in $ ?attr
+                    :where [1 ?attr ?value]]
+                  (d/db conn) attr)))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-variable-width-final-component-prefix-order
   (let [dir  (u/tmp-dir (str "tuple-prefix-order-" (UUID/randomUUID)))
         conn (d/create-conn
