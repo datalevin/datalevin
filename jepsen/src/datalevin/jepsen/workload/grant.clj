@@ -2,9 +2,14 @@
   (:require
    [datalevin.core :as d]
    [datalevin.interpret :as i]
+   [datalevin.jepsen.init-cache :as init-cache]
+   [datalevin.jepsen.local :as local]
    [datalevin.jepsen.workload.util :as workload.util]
    [jepsen.checker :as checker]
-   [jepsen.client :as client]))
+   [jepsen.client :as client])
+  (:import
+   [java.util.concurrent Callable ExecutionException Executors ThreadFactory
+    TimeUnit TimeoutException]))
 
 (def schema
   {:grant/id           {:db/valueType :db.type/long
@@ -49,6 +54,11 @@
    {:db/ident :grant/deny
     :db/fn    deny-grant}])
 
+(defonce ^:private initialized-clusters (init-cache/cluster-cache))
+(def ^:private default-setup-timeout-ms 15000)
+(def ^:dynamic *close-conn!* d/close)
+(def ^:dynamic *read-timeout-ms* 10000)
+
 (defn- now-ms
   []
   (System/currentTimeMillis))
@@ -69,6 +79,21 @@
                      vec)]
     (when (seq missing)
       (d/transact! conn missing))))
+
+(defn- ensure-grant-initialized!
+  [test]
+  (let [cluster-id (:datalevin/cluster-id test)]
+    (when-not (contains? @initialized-clusters cluster-id)
+      (locking initialized-clusters
+        (when-not (contains? @initialized-clusters cluster-id)
+          (workload.util/with-retrying-leader-conn
+            :setup
+            test
+            schema
+            (local/workload-setup-timeout-ms cluster-id
+                                             default-setup-timeout-ms)
+            ensure-tx-fns!)
+          (swap! initialized-clusters conj cluster-id))))))
 
 (defn- grant-state
   [db grant-id]
@@ -105,7 +130,6 @@
 
 (defn- execute-op!
   [conn op]
-  (ensure-tx-fns! conn)
   (case (:f op)
     :create
     (let [{:keys [grant-id amount]} (:value op)]
@@ -136,6 +160,90 @@
     (all-grant-states @conn)
 
     [:unsupported-client-op (:f op)]))
+
+(defn- close-conn-quietly!
+  [conn]
+  (when conn
+    (try
+      (*close-conn!* conn)
+      (catch Throwable _
+        nil))))
+
+(defn- async-close-conn-quietly!
+  [conn]
+  (when conn
+    (let [close! (bound-fn []
+                   (close-conn-quietly! conn))]
+      (.start
+       (doto (Thread.
+              (reify Runnable
+                (run [_]
+                  (close!)))
+              (str "datalevin-jepsen-grant-close-timeout-"
+                   (System/nanoTime)))
+         (.setDaemon true))))))
+
+(defn- call-with-timeout-ms
+  [timeout-ms f]
+  (let [executor (Executors/newSingleThreadExecutor
+                  (reify ThreadFactory
+                    (newThread [_ runnable]
+                      (doto (Thread. runnable
+                                     (str "datalevin-jepsen-grant-read-timeout-"
+                                          (System/nanoTime)))
+                        (.setDaemon true)))))
+        bound-f  (bound-fn* f)
+        task     (.submit executor
+                          ^Callable
+                          (reify Callable
+                            (call [_]
+                              (bound-f))))]
+    (try
+      {:status :completed
+       :value (.get task (long timeout-ms) TimeUnit/MILLISECONDS)}
+      (catch TimeoutException _
+        (.cancel task true)
+        {:status :timeout})
+      (catch ExecutionException e
+        (throw (or (.getCause e) e)))
+      (catch InterruptedException e
+        (.cancel task true)
+        (.interrupt (Thread/currentThread))
+        (throw e))
+      (finally
+        (.shutdownNow executor)))))
+
+(defn- complete-op
+  [op value]
+  (if (and (vector? value)
+           (= :unsupported-client-op (first value)))
+    (assoc op
+           :type :fail
+           :error value)
+    (assoc op
+           :type :ok
+           :value value)))
+
+(defn- invoke-final-read!
+  [test op]
+  (let [conn*  (atom nil)
+        result (call-with-timeout-ms
+                *read-timeout-ms*
+                (fn []
+                  (let [conn (workload.util/*open-leader-conn* test schema)]
+                    (reset! conn* conn)
+                    (try
+                      (complete-op op (execute-op! conn op))
+                      (finally
+                        (close-conn-quietly! conn))))))]
+    (if (= :timeout (:status result))
+      (do
+        (async-close-conn-quietly! @conn*)
+        (assoc op
+               :type :info
+               :error :read-timeout
+               :grant/timeout-ms *read-timeout-ms*))
+      (:value result))))
 
 (defn- op-error
   [e]
@@ -207,25 +315,20 @@
     (workload.util/attach-cached-leader-conn
       (assoc this :node node)))
 
-  (setup! [this _test]
+  (setup! [this test]
+    (ensure-grant-initialized! test)
     this)
 
   (invoke! [this test op]
     (try
-      (workload.util/with-cached-leader-conn
-        this
-        test
-        schema
-        (fn [conn]
-          (let [value (execute-op! conn op)]
-            (if (and (vector? value)
-                     (= :unsupported-client-op (first value)))
-              (assoc op
-                     :type :fail
-                     :error value)
-              (assoc op
-                     :type :ok
-                     :value value)))))
+      (if (= :read-all (:f op))
+        (invoke-final-read! test op)
+        (workload.util/with-cached-leader-conn
+          this
+          test
+          schema
+          (fn [conn]
+            (complete-op op (execute-op! conn op)))))
       (catch Throwable e
         (workload.util/assoc-exception-op op e (op-error e)))))
 

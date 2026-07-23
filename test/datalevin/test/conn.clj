@@ -10,6 +10,7 @@
    [datalevin.conn :as dc]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.ha.replication :as repl]
    [datalevin.interface :as i]
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
@@ -2921,6 +2922,59 @@
                                     [:identity/key "identity-1"]))))
                 (finally
                   (d/close target-conn')))))
+          (finally
+            (d/close source-conn)
+            (when-not (d/closed? target-conn)
+              (d/close target-conn)))))
+      (finally
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
+(deftest test-wal-replay-preserves-repeated-cardinality-one-giant-updates
+  (let [source-dir (u/tmp-dir (str "wal-replay-giant-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-giant-target-"
+                                   (UUID/randomUUID)))
+        schema     {:giant/key     {:db/valueType :db.type/long
+                                    :db/unique :db.unique/identity}
+                    :giant/version {:db/valueType :db.type/long}
+                    :giant/payload {:db/valueType :db.type/string}}
+        opts       {:wal? true
+                    :wal-durability-profile :strict}
+        payload    (fn [version]
+                     (apply str (take 12000 (cycle (str "payload-" version)))))]
+    (try
+      (let [source-conn (d/create-conn source-dir schema opts)
+            target-conn (d/create-conn target-dir schema opts)]
+        (try
+          (doseq [version [29 13 9]]
+            (d/transact! source-conn
+                         [{:db/id "giant-2"
+                           :giant/key 2
+                           :giant/version version
+                           :giant/payload (payload version)}]))
+          ;; Model a follower snapshot at version 29, then stream the two
+          ;; subsequent raw WAL records through the real HA replay path.
+          (d/transact! target-conn
+                       [{:db/id "giant-2"
+                         :giant/key 2
+                         :giant/version 29
+                         :giant/payload (payload 29)}])
+          (let [source-kv (.-lmdb ^Store (conn-store source-conn))
+                target-store (conn-store target-conn)
+                target-kv (.-lmdb ^Store target-store)
+                next-lsn (long @(:next-lsn (txlog/state target-kv)))
+                records (drop-while #(< (long (:lsn %)) next-lsn)
+                                    (kv/open-tx-log source-kv 1))]
+            (is (= 2 (count records)))
+            (reduce repl/apply-ha-follower-txlog-record!
+                    {:store target-store}
+                    records)
+            (db/refresh-cache target-store)
+            (let [entity (d/entity (db/new-db target-store)
+                                   [:giant/key 2])]
+              (is (= 9 (:giant/version entity)))
+              (is (= (payload 9) (:giant/payload entity)))))
           (finally
             (d/close source-conn)
             (when-not (d/closed? target-conn)
