@@ -831,8 +831,13 @@
 
 (defn limit-rel
   [rel vars]
-  (when-some [attrs (not-empty (select-keys (:attrs rel) vars))]
-    (assoc rel :attrs attrs)))
+  (if-some [attrs (not-empty (select-keys (:attrs rel) vars))]
+    (assoc rel :attrs attrs)
+    ;; Projecting away every column of a non-empty relation is existential
+    ;; success, so that relation can be dropped. An empty relation is branch
+    ;; failure, however, and must remain as an attribute-free annihilator.
+    (when (r/rel-empty rel)
+      (assoc rel :attrs {}))))
 
 (defn limit-context
   [context vars]

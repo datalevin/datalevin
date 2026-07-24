@@ -201,6 +201,45 @@
                   :where (is ?id false)] db rules)
            #{[2]}))))
 
+(deftest test-multi-branch-rule-respects-outer-binding
+  (let [dir    (u/tmp-dir (str "rule-or-join-" (UUID/randomUUID)))
+        schema {:rel/from    {:db/valueType :db.type/ref}
+                :rel/type    {:db/valueType :db.type/keyword}
+                :rel/to      {:db/valueType :db.type/ref}
+                :company/name {:db/valueType :db.type/string
+                               :db/unique    :db.unique/identity}}
+        db     (d/db-with
+                 (d/empty-db dir schema)
+                 [{:db/id 1 :company/name "A"}
+                  {:db/id 2 :company/name "B"}
+                  {:db/id 3 :company/name "Lonely"}
+                  {:rel/from 1 :rel/type :alias :rel/to 2}])
+        rules  '[[(bidirectional-rel ?type ?a ?b)
+                  [?rel :rel/from ?a]
+                  [?rel :rel/type ?type]
+                  [?rel :rel/to ?b]]
+                 [(bidirectional-rel ?type ?a ?b)
+                  [?rel :rel/from ?b]
+                  [?rel :rel/type ?type]
+                  [?rel :rel/to ?a]]]]
+    (try
+      (is (= #{[1 :alias 2] [2 :alias 1]}
+             (d/q '[:find ?c1 ?type ?c2
+                    :in $ %
+                    :where
+                    (bidirectional-rel ?type ?c1 ?c2)]
+                  db rules)))
+      (is (= #{}
+             (d/q '[:find ?c1 ?type ?c2
+                    :in $ %
+                    :where
+                    [?c1 :company/name "Lonely"]
+                    (bidirectional-rel ?type ?c1 ?c2)]
+                  db rules)))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest test-rule-performance-on-larger-datasets
   (let [now        (fn [] (/ (System/nanoTime) 1000000.0))
         inline     (fn [db]
