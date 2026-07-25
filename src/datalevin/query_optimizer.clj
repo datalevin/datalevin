@@ -631,6 +631,59 @@
     (let [flat (fn [k m] (map-indexed (fn [i clause] [k i clause]) m))]
       (concat (flat :bound bound) (flat :free free)))))
 
+(defn- fallback-clause-count
+  "Estimate a base clause without exposing its predicate-specific count to the
+  cost model. Attribute population counts and durable average fanout remain
+  available as coarse catalog metadata."
+  ^long [^DB db {:keys [attr val range pred]} ^long attr-count]
+  (let [estimate
+        (long
+          (cond
+            (and (nil? val) (nil? range) (nil? pred))
+            attr-count
+
+            (some? val)
+            (estimate-round (db/-default-ratio db attr))
+
+            :else
+            (estimate-round
+              (* (double attr-count)
+                 (double c/optimizer-fallback-selectivity)))))]
+    (long (max 1 (min attr-count (long estimate))))))
+
+(defn- count-node-datoms-without-direct-counts
+  [^DB db {:keys [free bound] :as node}]
+  (reduce
+    (fn [{:keys [mcount] :as node} [k i clause]]
+      (let [physical0 (fast-clause-count db nil clause Long/MAX_VALUE)
+            physical  (if (zero? physical0)
+                        (zero-count-clause-size db nil clause)
+                        physical0)]
+        (if (zero? physical)
+          (reduced (assoc node :mcount 0))
+          (let [attr-count (if (and (nil? (:val clause))
+                                    (nil? (:range clause))
+                                    (nil? (:pred clause)))
+                             physical
+                             (fast-clause-count
+                               db nil
+                               (assoc clause :val nil :range nil :pred nil)
+                               Long/MAX_VALUE))
+                estimate   (fallback-clause-count db clause attr-count)
+                node       (-> node
+                               (assoc-in [k i :count] estimate)
+                               (assoc-in [k i :physical-count] physical)
+                               (assoc-in [k i :estimate-source] :fallback))]
+            (if (< estimate ^long mcount)
+              (assoc node
+                     :mcount estimate
+                     :physical-mcount physical
+                     :mpath [k i])
+              node)))))
+    (assoc node :mcount Long/MAX_VALUE)
+    (let [flat (fn [k m] (map-indexed (fn [i clause] [k i clause]) m))]
+      (concat (flat :bound bound) (flat :free free)))))
+
 (defn- count-known-e-datoms
   [db e {:keys [free] :as node}]
   (u/reduce-indexed
@@ -651,7 +704,9 @@
   [db e node]
   (unreduced (if (int? e)
                (count-known-e-datoms db e node)
-               (count-node-datoms db node))))
+               (if c/use-direct-predicate-counts?
+                 (count-node-datoms db node)
+                 (count-node-datoms-without-direct-counts db node)))))
 
 (defn- add-back-range
   [v {:keys [pred range]}]
@@ -678,15 +733,17 @@
 
 (defn- init-steps
   [db e node single?]
-  (let [{:keys [bound free mpath mcount]}            node
+  (let [{:keys [bound free mpath mcount physical-mcount]} node
         {:keys [attr var val range pred] :as clause} (get-in node mpath)
+        physical-mcount (long (or physical-mcount mcount))
 
         know-e? (int? e)
         no-var? (or (not var) (qu/placeholder? var))
 
         init (cond-> (map->init-step
                        {:attr attr :vars [e] :out [e]
-                        :mcount (:count clause)})
+                        :mcount (or (:physical-count clause)
+                                    (:count clause))})
                var     (assoc :pred pred
                               :vars (cond-> [e]
                                       (not no-var?) (conj var))
@@ -701,9 +758,14 @@
                                   :seen-or-joins #{})))
 
                (not single?)
-               (#(if (< ^long c/init-exec-size-threshold ^long mcount)
+               (#(cond
+                   (<= physical-mcount ^long c/init-exec-size-threshold)
+                   (assoc % :result (-execute % db nil))
+
+                   c/use-query-local-sampling?
                    (assoc % :sample (-sample % db nil))
-                   (assoc % :result (-execute % db nil)))))]
+
+                   :else %)))]
     (cond-> [init]
       (< 1 (+ (count bound) (count free)))
       (conj
@@ -769,7 +831,8 @@
                     sample (let [s (.size ^List sample)]
                              (if (< 0 s)
                                (/ s (.size ^List sp1))
-                               c/magic-scan-ratio))))))))
+                               c/magic-scan-ratio))
+                    :else c/magic-scan-ratio))))))
 
 (defn- factor
   [magic ^long n]
@@ -1451,11 +1514,26 @@
       [(apply min-key :cost final-plans)]
       (range (dec n-1) -1 -1))))
 
+(defn- record-optimizer-search!
+  [component round candidate-count retained-count pruned?]
+  (when-let [explain qplan/*explain*]
+    ;; Connected components may be planned concurrently.
+    (locking explain
+      (vswap! explain update :optimizer-search
+               (fnil conj [])
+               {:component-size  (count component)
+                :round           round
+                :candidate-count candidate-count
+                :retained-count  retained-count
+                :pruned?         pruned?}))))
+
 (defn- plan-component
   [db sources rules nodes incoming-link-counts required-vars component]
   (let [n (count component)]
     (if (= n 1)
-      [(base-plan db nodes (first component) true)]
+      (do
+        (record-optimizer-search! component 0 1 1 false)
+        [(base-plan db nodes (first component) true)])
       (let [base-plans (build-base-plans db nodes component)
             node-ids   (dp-node-ids component)]
         (if (some nil? (vals base-plans))
@@ -1478,9 +1556,14 @@
               (let [plans (plans db sources rules nodes node-ids
                                  incoming-link-counts required-vars pairs
                                  base-plans (.get tables i) ratios build-cache)]
-                (if (< pn (count plans))
-                  (.add tables (shrink-space plans node-ids))
-                  (.add tables plans))))
+                (let [candidate-count (count plans)
+                      pruned?         (< pn candidate-count)
+                      retained        (if pruned?
+                                        (shrink-space plans node-ids)
+                                        plans)]
+                  (record-optimizer-search!
+                    component (inc i) candidate-count (count retained) pruned?)
+                  (.add tables retained))))
             (trace-steps tables n-1 node-ids)))))))
 
 (def ^:private connected-components qog/connected-components)

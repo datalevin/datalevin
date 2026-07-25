@@ -177,6 +177,68 @@ for the query, because that would be mainly benchmarking caching behavior of the
 databases, as they all have various caches. In this test, we are mainly
 interested in the behavior of query optimizer.
 
+## Optimizer Evaluation
+
+The CIDR evaluation runner performs the cardinality-estimator ablations
+separately from the conventional one-pass comparison:
+
+```bash
+clj -Xeval
+```
+
+It evaluates four modes:
+
+|Mode|Predicate-specific index counts|Query-local sampling|
+|---|:---:|:---:|
+|`full`|yes|yes|
+|`counts-only`|yes|no|
+|`sampling-only`|no|yes|
+|`fallback-only`|no|no|
+
+When predicate-specific counts are disabled, the physical count is still used
+privately to address a valid index sample and to verify empty ranges. It is not
+exposed to path selection or the cost model; those use attribute population,
+average fanout, and a documented fallback selectivity. This keeps the ablation
+from changing query semantics or asking the storage layer to sample beyond a
+range.
+
+Every query/mode pair gets a fresh plan cache, and pairs are run in a
+seed-controlled randomized order. Timing passes disable intermediate tuple
+counts. A separate cardinality pass enables them and exports each plan stage's
+estimated cardinality, actual cardinality, and q-error. Result size and hash are
+checked against the full mode.
+
+For a short validation run:
+
+```bash
+clj -Xeval \
+  :queries '["1a" "10c"]' \
+  :warmup-runs 0 \
+  :runs 1 \
+  :cardinality-runs 1
+```
+
+For the intended repeated experiment:
+
+```bash
+clj -Xeval \
+  :warmup-runs 1 \
+  :runs 5 \
+  :cardinality-runs 1 \
+  :seed 20260724
+```
+
+CSV files are written under `results/` by default. Other accepted options are
+documented on `datalevin-bench.evaluation/run`; for example,
+`:modes '[:full :counts-only]'`, `:cardinality-modes '[:full]`,
+`:db-path '"/path/to/db"'`, and `:output-dir '"/path/to/results"'`.
+
+The evaluation intentionally does not include a star-simplification ablation.
+Merge scans and entity-star normalization are established architectural
+techniques, and disabling them would change the physical algebra rather than
+isolate the cardinality estimator. The CSV still records optimized-clause and
+entity-star counts to characterize the workload seen by the optimizer.
+
 ## Results
 
 We look at the timing results. The total query time can be divided into two

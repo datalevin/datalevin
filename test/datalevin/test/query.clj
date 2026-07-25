@@ -11,6 +11,7 @@
    [datalevin.util :as u])
   (:import
    [clojure.lang ExceptionInfo]
+   [datalevin.utl LRUCache]
    [java.util ArrayList Collection UUID]))
 
 (use-fixtures :each db-fixture)
@@ -122,6 +123,72 @@
                (:actual-result-size uncounted)))
         (is (some #(contains? % :actual-size) (plan-maps counted)))
         (is (not-any? #(contains? % :actual-size) (plan-maps uncounted))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-optimizer-estimation-ablation-switches
+  (let [conn       (d/create-conn
+                     nil
+                     {:item/category {:db/valueType :db.type/ref}}
+                     {:kv-opts {:inmemory? true}})
+        rare-query '[:find ?payload
+                     :where
+                     [?e :item/kind :rare]
+                     [?e :item/payload ?payload]
+                     [?e :item/category ?category]
+                     [?category :category/name ?category-name]]
+        common-query '[:find ?payload
+                       :where
+                       [?e :item/kind :common]
+                       [?e :item/payload ?payload]
+                       [?e :item/category ?category]
+                       [?category :category/name ?category-name]]
+        plan-maps  #(filter
+                      (fn [m]
+                        (and (map? m)
+                             (contains? m :size)
+                             (contains? m :steps)))
+                      (tree-seq coll? seq (:plan %)))
+        item-plan   #(some
+                       (fn [m]
+                         (when (re-find #":item/kind" (str (:steps m))) m))
+                       (plan-maps %))]
+    (try
+      (d/transact!
+        conn
+        (into
+          (mapv (fn [category]
+                  {:db/id category
+                   :category/name (str "category-" category)})
+                (range 101 201))
+          (mapv (fn [e]
+                  {:db/id         e
+                   :item/kind     (if (= e 10) :rare :common)
+                   :item/payload  (str "payload-" e)
+                   :item/category 101})
+                (range 1 11))))
+      (let [db       (d/db conn)
+            exact    (binding [q/*plan-cache* (LRUCache. 16)]
+                       (d/explain {:run? true} rare-query db))
+            fallback (binding [c/use-direct-predicate-counts? false
+                               q/*plan-cache*                   (LRUCache. 16)]
+                       (d/explain {:run? true} rare-query db))]
+        (is (= #{["payload-10"]} (:result exact) (:result fallback)))
+        (is (= 1 (:size (item-plan exact))))
+        (is (= 5 (:size (item-plan fallback))))
+        (is (seq (:optimizer-search exact)))
+        (is (every? #(<= (:retained-count %) (:candidate-count %))
+                    (:optimizer-search exact))))
+      (let [db         (d/db conn)
+            sampled    (binding [c/init-exec-size-threshold 1
+                                 q/*plan-cache*             (LRUCache. 16)]
+                         (d/explain {} common-query db))
+            unsampled  (binding [c/init-exec-size-threshold 1
+                                 c/use-query-local-sampling? false
+                                 q/*plan-cache*             (LRUCache. 16)]
+                         (d/explain {} common-query db))]
+        (is (= 9 (:size (item-plan sampled))))
+        (is (= 1 (:size (item-plan unsampled)))))
       (finally
         (d/close conn)))))
 

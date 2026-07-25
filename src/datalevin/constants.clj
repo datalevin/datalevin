@@ -821,6 +821,23 @@ above which, the same number of items will be sampled instead"}
   init-exec-size-threshold 1000)
 
 (def ^{:dynamic true
+       :doc     "Whether predicate-specific point and range counts are exposed
+to the query cost model. Execution may still obtain physical range sizes for
+correct index sampling. Intended primarily for optimizer evaluation."}
+  use-direct-predicate-counts? true)
+
+(def ^{:dynamic true
+       :doc     "Whether large query-local base relations are sampled during
+planning. Small relations may still be executed exactly. Intended primarily
+for optimizer evaluation."}
+  use-query-local-sampling? true)
+
+(def ^{:dynamic true
+       :doc     "Fallback selectivity for constrained base clauses when
+predicate-specific counts are hidden from the cost model."}
+  optimizer-fallback-selectivity 0.1)
+
+(def ^{:dynamic true
        :doc     "Upper bound on the plan search space. When the number of plans
 considered exceeds this cap, the planner switches from exhaustive to greedy. Default
 is Integer/MAX_VALUE, i.e. no cap."}
