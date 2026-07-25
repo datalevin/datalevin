@@ -53,6 +53,7 @@ Defaults:
   rate/time-limit: 6/5 for most workloads
   fencing rate/time-limit: 1/2
   rejoin-bootstrap rate/time-limit: 4/8
+  abort if the Git source revision changes during the sweep
 
 Environment overrides:
   DTLV_JEPSEN_COMBO_KEY_COUNT
@@ -191,6 +192,23 @@ ensure_java_classes() {
   )
 }
 
+git_revision() {
+  git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null \
+    || printf 'unversioned\n'
+}
+
+check_source_revision() {
+  observed_revision="$(git_revision)"
+  [[ "$observed_revision" == "$source_revision" ]]
+}
+
+print_source_revision_change() {
+  printf 'Source revision changed during the combo sweep: %s -> %s\n' \
+    "$source_revision" \
+    "$observed_revision" >&2
+  printf 'Aborting because compiled classes and source files may now describe different revisions.\n' >&2
+}
+
 slugify_nemesis() {
   echo "$1" | tr ',' '-' | tr -cs '[:alnum:]-' '-' | sed 's/^-*//; s/-*$//'
 }
@@ -285,11 +303,26 @@ log_dir="$repo_root/tmp/jepsen-combo-workloads/${nemesis_slug}/$run_id"
 stream_logs="${DTLV_JEPSEN_COMBO_STREAM_LOGS:-0}"
 port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
+source_revision="$(git_revision)"
+observed_revision="$source_revision"
 
 mkdir -p "$log_dir"
+printf 'Source revision: %s\n' "$source_revision"
 ensure_java_classes
 
+if ! check_source_revision; then
+  print_source_revision_change
+  exit 1
+fi
+
 for workload in "${selected_workloads[@]}"; do
+  if ! check_source_revision; then
+    print_source_revision_change
+    status=1
+    summaries+=("$workload not-run source-revision-changed from=$source_revision to=$observed_revision")
+    break
+  fi
+
   workload_rate="$rate"
   workload_time_limit="$time_limit"
   if [[ "$workload" == "fencing" ]]; then
@@ -347,6 +380,13 @@ for workload in "${selected_workloads[@]}"; do
     run_exit=0
   else
     run_exit=$?
+  fi
+
+  if ! check_source_revision; then
+    print_source_revision_change
+    status=1
+    summaries+=("$workload mixed-source-revision from=$source_revision to=$observed_revision log=$log_file")
+    break
   fi
 
   after_results="$(latest_results_file "$workload" || true)"
