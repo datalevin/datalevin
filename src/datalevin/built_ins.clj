@@ -21,9 +21,9 @@
    [datalevin.db :as db]
    [datalevin.datom :as dd]
    [datalevin.storage :as st]
-   [datalevin.index :as idx]
    [datalevin.idoc :as idoc]
    [datalevin.embedding :as emb]
+   [datalevin.query.tuple :as qtuple]
    [datalevin.udf :as udf-reg]
    [datalevin.vector :as v]
    [datalevin.entity :as de]
@@ -35,6 +35,7 @@
    [java.nio.charset StandardCharsets]
    [datalevin.utl LikeFSM LRUCache]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [org.roaringbitmap PeekableIntIterator RoaringBitmap]
    [datalevin.idoc IdocIndex]
    [datalevin.storage Store]
    [datalevin.remote DatalogStore]
@@ -167,151 +168,14 @@
   e.g. [(or (= ?g \"f\"\") (like ?n \"A%\"\"))]"
   or-fn)
 
-(defn- doc-ref->eav
-  [lmdb aid->attr doc-ref]
-  (if (and (vector? doc-ref)
-           (clojure.core/= :g (first doc-ref)))
-    (let [d (idx/gt->datom lmdb (second doc-ref))]
-      [(dd/datom-e d) (dd/datom-a d) (dd/datom-v d)])
-    [(nth doc-ref 0)
-     (aid->attr (nth doc-ref 1))
-     (peek doc-ref)]))
-
-(defn- giant-doc-ref?
-  [doc-ref]
-  (clojure.core/and (vector? doc-ref)
-                    (clojure.core/identical? :g (first doc-ref))))
-
-(defn- rich-giant-doc-ref?
-  [doc-ref]
-  (clojure.core/and (giant-doc-ref? doc-ref)
-                    (clojure.core/< 3 (clojure.core/count doc-ref))))
-
-(defn- make-emit-fn
-  "Create an emit function that produces tuples with only the needed indices.
-   If needed is nil, produces full [e a v] tuples."
-  [lmdb aid->attr ^ints needed]
-  (if needed
-    (let [n            (alength needed)
-          needs-value? (loop [i 0]
-                         (cond
-                           (clojure.core/== i n) false
-                           (clojure.core/== 2 (aget needed i)) true
-                           :else (recur (clojure.core/inc i))))
-          needs-ref?   (loop [i 0]
-                         (cond
-                           (clojure.core/== i n) false
-                           (clojure.core/< (aget needed i) 2) true
-                           :else (recur (clojure.core/inc i))))]
-      (letfn [(emit [doc-ref value-provided? value]
-                (let [giant?      (giant-doc-ref? doc-ref)
-                      rich-giant? (rich-giant-doc-ref? doc-ref)
-                      datom        (when (clojure.core/and
-                                           giant?
-                                           (clojure.core/or
-                                             (clojure.core/and
-                                               needs-ref?
-                                               (clojure.core/not rich-giant?))
-                                             (clojure.core/and
-                                               needs-value?
-                                               (clojure.core/not
-                                                 value-provided?))))
-                                     (idx/gt->datom lmdb (second doc-ref)))
-                      ^objects arr (object-array n)]
-                  (dotimes [j n]
-                    (aset arr j (case (aget needed j)
-                                  0 (cond
-                                      rich-giant? (nth doc-ref 2)
-                                      giant?      (dd/datom-e datom)
-                                      :else       (nth doc-ref 0))
-                                  1 (cond
-                                      rich-giant? (aid->attr (nth doc-ref 3))
-                                      giant?      (dd/datom-a datom)
-                                      :else       (aid->attr (nth doc-ref 1)))
-                                  2 (if value-provided?
-                                      value
-                                      (if giant?
-                                        (dd/datom-v datom)
-                                        (peek doc-ref))))))
-                  arr))]
-        (fn
-          ([doc-ref] (emit doc-ref false nil))
-          ([doc-ref value] (emit doc-ref true value)))))
-    (fn
-      ([doc-ref]
-       (object-array (doc-ref->eav lmdb aid->attr doc-ref)))
-      ([doc-ref value]
-       (if (rich-giant-doc-ref? doc-ref)
-         (object-array [(nth doc-ref 2)
-                        (aid->attr (nth doc-ref 3))
-                        value])
-         (object-array (doc-ref->eav lmdb aid->attr doc-ref)))))))
-
-(defn- make-fulltext-emit-fn
-  [lmdb aid->attr display ^ints needed]
-  (if needed
-    (let [n     (alength needed)
-          ref-n (loop [i 0, cnt 0]
-                  (if (clojure.core/< i n)
-                    (recur (clojure.core/inc i)
-                           (if (clojure.core/< (aget needed i) 3)
-                             (clojure.core/inc cnt)
-                             cnt))
-                    cnt))
-          ref-needed (int-array ref-n)]
-      (loop [j 0, ref-j 0]
-        (when (clojure.core/< j n)
-          (let [idx (aget needed j)]
-            (if (clojure.core/< idx 3)
-              (do
-                (aset-int ref-needed ref-j idx)
-                (recur (clojure.core/inc j) (clojure.core/inc ref-j)))
-              (recur (clojure.core/inc j) ref-j)))))
-      (let [refs-only? (clojure.core/= :refs display)
-            emit-ref   (when (clojure.core/pos? (long ref-n))
-                         (make-emit-fn lmdb aid->attr ref-needed))]
-        (fn [result]
-          (let [doc-ref        (if refs-only? result (nth result 0))
-                ^objects tuple (when emit-ref (emit-ref doc-ref))
-                ^objects arr   (object-array n)]
-            (loop [j 0, ref-j 0]
-              (when (clojure.core/< j n)
-                (let [idx (aget needed j)]
-                  (if (clojure.core/< idx 3)
-                    (do
-                      (aset arr j (aget tuple ref-j))
-                      (recur (clojure.core/inc j)
-                             (clojure.core/inc ref-j)))
-                    (do
-                      (aset arr j
-                            (when-not refs-only?
-                              (nth result (clojure.core/- idx 2) nil)))
-                      (recur (clojure.core/inc j) ref-j))))))
-            arr))))
-    (let [refs-only? (clojure.core/= :refs display)
-          extra-n    (case display
-                       :texts+offsets 2
-                       :refs         0
-                       1)
-          emit-ref   (make-emit-fn lmdb aid->attr nil)]
-      (fn [result]
-        (let [doc-ref        (if refs-only? result (nth result 0))
-              ^objects tuple (emit-ref doc-ref)
-              ^objects arr   (object-array (clojure.core/+ 3 extra-n))]
-          (dotimes [i 3]
-            (aset arr i (aget tuple i)))
-          (dotimes [i extra-n]
-            (aset arr (clojure.core/+ 3 i)
-                  (nth result (clojure.core/inc i))))
-          arr)))))
-
 (defn- fulltext*
   [^FastList res aid->attr lmdb engines query opts domain ^ints needed]
   (let [engine  (engines domain)
         display (or (:display opts)
                     (get-in engine [:search-opts :display])
                     :refs)
-        emit    (make-fulltext-emit-fn lmdb aid->attr display needed)]
+        emit    (qtuple/make-fulltext-emitter
+                  lmdb aid->attr display needed)]
     (doseq [d (search engine query opts)]
       (.add res (emit d)))))
 
@@ -398,61 +262,14 @@
          (mapv (fn [^objects t] [(aget t 0) (aget t 1) (aget t 2)])
                res))))))
 
-(defn- make-vector-dist-emit-fn
-  [lmdb aid->attr ^ints needed]
-  (if needed
-    (let [n          (alength needed)
-          ref-n      (loop [j 0, cnt 0]
-                       (if (clojure.core/< j n)
-                         (recur (clojure.core/inc j)
-                                (if (clojure.core/< (aget needed j) 3)
-                                  (clojure.core/inc cnt)
-                                  cnt))
-                         cnt))
-          ref-needed (int-array ref-n)]
-      (loop [j 0, ref-j 0]
-        (when (clojure.core/< j n)
-          (let [idx (aget needed j)]
-            (if (clojure.core/< idx 3)
-              (do
-                (aset-int ref-needed ref-j idx)
-                (recur (clojure.core/inc j) (clojure.core/inc ref-j)))
-              (recur (clojure.core/inc j) ref-j)))))
-      (let [emit-ref (when (clojure.core/pos? (long ref-n))
-                       (make-emit-fn lmdb aid->attr ref-needed))]
-        (fn [result]
-          (let [doc-ref        (nth result 0)
-                dist           (nth result 1)
-                ^objects tuple (when emit-ref (emit-ref doc-ref))
-                ^objects arr   (object-array n)]
-            (loop [j 0, ref-j 0]
-              (when (clojure.core/< j n)
-                (if (clojure.core/== 3 (aget needed j))
-                  (do
-                    (aset arr j dist)
-                    (recur (clojure.core/inc j) ref-j))
-                  (do
-                    (aset arr j (aget tuple ref-j))
-                    (recur (clojure.core/inc j)
-                           (clojure.core/inc ref-j))))))
-            arr))))
-    (let [emit-ref (make-emit-fn lmdb aid->attr nil)]
-      (fn [result]
-        (let [^objects tuple (emit-ref (nth result 0))]
-          (object-array [(aget tuple 0)
-                         (aget tuple 1)
-                         (aget tuple 2)
-                         (nth result 1)]))))))
-
 (defn- add-vector-neighbors!
   [^FastList res aid->attr lmdb index query opts ^ints needed]
   (let [display (or (:display opts)
                     (:display (.-search-opts
                                 ^datalevin.vector.VectorIndex index))
                     :refs)
-        emit    (if (clojure.core/= :refs+dists display)
-                  (make-vector-dist-emit-fn lmdb aid->attr needed)
-                  (make-emit-fn lmdb aid->attr needed))]
+        emit    (qtuple/make-vector-emitter
+                  lmdb aid->attr display needed)]
     (doseq [result (search-vec index query opts)]
       (.add res (emit result)))))
 
@@ -563,36 +380,57 @@
       (raise "Attribute is not an idoc type: " attr {:attribute attr}))
     (or (:db/domain props) (u/keyword->string attr))))
 
-(defn- idoc-match-domain
+(defn- idoc-match-context
   [^Store store ^IdocIndex index query domain ^ints needed]
   (let [{:keys [ids exact? verify]} (idoc/candidate-ids* index query)
-
         lmdb      (.-lmdb store)
-        aid->attr (attrs store)
-        verify?   (and (clojure.core/not exact?)
-                       (clojure.core/not (idoc/ids-empty? verify)))
-        emit      (make-emit-fn lmdb aid->attr needed)]
+        aid->attr (attrs store)]
+    {:index     index
+     :query     query
+     :domain    domain
+     :ids       ids
+     :exact?    exact?
+     :verify    verify
+     :verify?   (and (clojure.core/not exact?)
+                     (clojure.core/not (idoc/ids-empty? verify)))
+     :emit      (qtuple/make-datom-emitter lmdb aid->attr needed)
+     :lmdb      lmdb}))
+
+(defn- idoc-match-tuple
+  [{:keys [^IdocIndex index query exact? verify verify? emit lmdb]}
+   doc-id doc-ref]
+  (cond
+    exact?
+    [(emit doc-ref) false]
+
+    verify?
+    (if (idoc/ids-contains? verify doc-id)
+      (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+        [(when (idoc/matches-doc? index doc query)
+           (emit doc-ref doc))
+         true])
+      [(emit doc-ref) false])
+
+    :else
+    (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
+      [(when (idoc/matches-doc? index doc query)
+         (emit doc-ref doc))
+       true])))
+
+(defn ^:no-doc idoc-match-domain
+  [^Store store ^IdocIndex index query domain ^ints needed]
+  (let [{:keys [ids exact? verify] :as context}
+        (idoc-match-context store index query domain needed)]
     (if (clojure.core/nil? idoc/*trace*)
       (let [res (FastList.)]
         (idoc/ids-iterate-doc-refs
           index
           ids
           (fn [doc-id doc-ref]
-            (cond
-              exact?
-              (.add res (emit doc-ref))
-
-              verify?
-              (if (idoc/ids-contains? verify doc-id)
-                (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                  (when (idoc/matches-doc? index doc query)
-                    (.add res (emit doc-ref doc))))
-                (.add res (emit doc-ref)))
-
-              :else
-              (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                (when (idoc/matches-doc? index doc query)
-                  (.add res (emit doc-ref doc)))))))
+            (when-let [tuple (first
+                               (idoc-match-tuple
+                                 context doc-id doc-ref))]
+              (.add res tuple))))
         res)
       (let [start        (System/nanoTime)
             cand-count   (idoc/ids-count ids)
@@ -604,31 +442,13 @@
           index
           ids
           (fn [doc-id doc-ref]
-            (cond
-              exact?
-              (do
+            (let [[tuple fetched?]
+                  (idoc-match-tuple context doc-id doc-ref)]
+              (when fetched?
+                (vswap! doc-fetches long-inc))
+              (when tuple
                 (vswap! match-count long-inc)
-                (.add res (emit doc-ref)))
-
-              verify?
-              (if (idoc/ids-contains? verify doc-id)
-                (do
-                  (vswap! doc-fetches long-inc)
-                  (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                    (when (idoc/matches-doc? index doc query)
-                      (vswap! match-count long-inc)
-                      (.add res (emit doc-ref doc)))))
-                (do
-                  (vswap! match-count long-inc)
-                  (.add res (emit doc-ref))))
-
-              :else
-              (do
-                (vswap! doc-fetches long-inc)
-                (let [doc (idoc/doc-ref->doc lmdb doc-ref)]
-                  (when (idoc/matches-doc? index doc query)
-                    (vswap! match-count long-inc)
-                    (.add res (emit doc-ref doc))))))))
+                (.add res tuple)))))
         (idoc/*trace* {:event           :idoc-match-domain
                        :domain          domain
                        :candidate-count cand-count
@@ -638,6 +458,208 @@
                        :exact?          exact?
                        :elapsed-ns      (clojure.core/- (System/nanoTime) start)})
         res))))
+
+(defrecord ^:no-doc IdocDomainMatchCursor
+    [context ^PeekableIntIterator iterator candidate-count verify-count
+     ^long started-at counters traced?])
+
+(defrecord ^:no-doc IdocMatchCursor
+    [request state closed?])
+
+(defn- trace-idoc-domain!
+  [^IdocDomainMatchCursor cursor partial?]
+  (when (and idoc/*trace*
+             (compare-and-set! (:traced? cursor) false true))
+    (let [{:keys [domain exact?]} (:context cursor)
+          {:keys [inspected doc-fetches matches]} @(:counters cursor)]
+      (idoc/*trace* {:event           :idoc-match-domain
+                     :domain          domain
+                     :candidate-count (:candidate-count cursor)
+                     :verify-count    (:verify-count cursor)
+                     :inspected-count inspected
+                     :doc-fetch-count doc-fetches
+                     :match-count     matches
+                     :exact?          exact?
+                     :partial?        (boolean partial?)
+                     :elapsed-ns      (clojure.core/-
+                                        (System/nanoTime)
+                                        (long (:started-at cursor)))}))))
+
+(defn- prepare-idoc-domain-cursor
+  [^Store store ^IdocIndex index query domain ^ints needed after-doc-id]
+  (let [{:keys [ids verify] :as context}
+        (idoc-match-context store index query domain needed)
+        ^PeekableIntIterator iterator
+        (.getIntIterator ^RoaringBitmap ids)]
+    (when (clojure.core/some? after-doc-id)
+      (if (clojure.core/< (long after-doc-id) Integer/MAX_VALUE)
+        (.advanceIfNeeded iterator (unchecked-inc-int (int after-doc-id)))
+        (while (.hasNext iterator) (.next iterator))))
+    (->IdocDomainMatchCursor
+      context iterator (idoc/ids-count ids) (idoc/ids-count verify)
+      (System/nanoTime)
+      (atom {:inspected 0 :doc-fetches 0 :matches 0})
+      (atom false))))
+
+(defn ^:no-doc prepare-idoc-match-cursor
+  "Prepare a resumable idoc cursor. Candidate bitmaps are prepared lazily,
+  one domain at a time, when the cursor is first read."
+  ([request]
+   (prepare-idoc-match-cursor request nil))
+  ([request resume]
+   (let [continuation (clojure.core/or (:continuation resume) resume)]
+     (->IdocMatchCursor
+       request
+       (volatile!
+         {:domain-index (long
+                          (clojure.core/or
+                            (:domain-index continuation) 0))
+          :after-doc-id (:after-doc-id continuation)
+          :domain-cursor nil})
+       (atom false)))))
+
+(defn- idoc-domain-cursor-batch
+  [^IdocDomainMatchCursor cursor ^long maximum]
+  (let [^PeekableIntIterator iterator (:iterator cursor)
+        ids                           (FastList. (int maximum))]
+    (loop [n 0
+           last-doc-id nil]
+      (if (and (clojure.core/< (long n) maximum)
+               (.hasNext iterator))
+        (let [doc-id (.next iterator)]
+          (.add ids doc-id)
+          (recur (unchecked-inc-int n) doc-id))
+        (let [^FastList refs
+              (idoc/doc-refs-by-ids
+                (get-in cursor [:context :index]) ids)
+              tuples      (FastList.)
+              doc-fetches (volatile! 0)
+              matches     (volatile! 0)]
+          (loop [i 0
+                 size (.size refs)]
+            (when (clojure.core/< (long i) (long size))
+              (let [[tuple fetched?]
+                    (idoc-match-tuple
+                      (:context cursor)
+                      (.get refs i)
+                      (.get refs (unchecked-inc-int i)))]
+                (when fetched?
+                  (vswap! doc-fetches long-inc))
+                (when tuple
+                  (vswap! matches long-inc)
+                  (.add tuples tuple))
+                (recur (unchecked-add-int i 2) size))))
+          (swap! (:counters cursor)
+                 (fn [counters]
+                   (-> counters
+                       (update :inspected clojure.core/+ n)
+                       (update :doc-fetches clojure.core/+ @doc-fetches)
+                       (update :matches clojure.core/+ @matches))))
+          {:tuples      tuples
+           :scanned     (long n)
+           :last-doc-id last-doc-id
+           :exhausted?  (clojure.core/not (.hasNext iterator))})))))
+
+(defn ^:no-doc next-idoc-match-cursor-batch
+  "Read at most `maximum` physical idoc candidates across the requested
+  domains. Returns compact tuples plus an opaque continuation."
+  [^IdocMatchCursor cursor ^long maximum]
+  (if @(:closed? cursor)
+    {:tuples (FastList.) :scanned 0 :continuation nil :exhausted? true}
+    (let [{:keys [store indices query domains needed]} (:request cursor)
+          domain-count (clojure.core/count domains)
+          tuples       (FastList.)]
+      (loop [scanned (long 0)]
+        (let [{:keys [domain-index after-doc-id domain-cursor]}
+              @(:state cursor)]
+          (cond
+            (clojure.core/<= domain-count (long domain-index))
+            {:tuples tuples
+             :scanned scanned
+             :continuation nil
+             :exhausted? true}
+
+            (clojure.core/<= maximum (long scanned))
+            {:tuples tuples
+             :scanned scanned
+             :continuation
+             {:domain-index domain-index
+              :after-doc-id after-doc-id}
+             :exhausted? false}
+
+            :else
+            (let [domain        (nth domains domain-index)
+                  domain-cursor
+                  (clojure.core/or
+                    domain-cursor
+                    (prepare-idoc-domain-cursor
+                      store (indices domain) query domain needed after-doc-id))
+                  batch
+                  (idoc-domain-cursor-batch
+                    domain-cursor
+                    (clojure.core/- maximum (long scanned)))
+                  scanned       (long
+                                  (clojure.core/+
+                                    (long scanned)
+                                    (long (:scanned batch))))
+                  exhausted?    (:exhausted? batch)
+                  last-doc-id   (:last-doc-id batch)]
+              (.addAll tuples ^List (:tuples batch))
+              (if exhausted?
+                (do
+                  (trace-idoc-domain! domain-cursor false)
+                  (vreset! (:state cursor)
+                           {:domain-index
+                            (unchecked-inc (long domain-index))
+                            :after-doc-id nil
+                            :domain-cursor nil}))
+                (vreset! (:state cursor)
+                         {:domain-index domain-index
+                          :after-doc-id last-doc-id
+                          :domain-cursor domain-cursor}))
+              (recur scanned))))))))
+
+(defn ^:no-doc close-idoc-match-cursor
+  [^IdocMatchCursor cursor]
+  (when (compare-and-set! (:closed? cursor) false true)
+    (when-let [domain-cursor (:domain-cursor @(:state cursor))]
+      (trace-idoc-domain! domain-cursor true))))
+
+(defrecord ^:no-doc IdocMatchRequest
+    [store indices query opts domains needed])
+
+(defn ^:no-doc idoc-match-request
+  "Normalize one idoc-match invocation without preparing index candidates.
+  Candidate preparation and tuple production are deferred to
+  `execute-idoc-match-request`."
+  [^DB db arg1 arg2 arg3 ^ints needed]
+  (let [^Store store (.-store db)
+        indices      (st/store-idoc-indices store)
+        attr?        (keyword? arg1)
+        domains0     (if attr?
+                       [(idoc-domain store arg1)]
+                       (:domains arg2))
+        query        (if attr? arg2 arg1)
+        opts         (if attr? arg3 arg2)
+        domains      (or (when (map? opts) (:domains opts))
+                         domains0
+                         (keys indices))
+        missing      (seq (remove indices domains))]
+    (when missing
+      (raise "Idoc domain not found: " missing {:domains missing}))
+    (->IdocMatchRequest store indices query opts domains needed)))
+
+(defn ^:no-doc execute-idoc-match-request
+  "Execute a normalized idoc match request and return its compact tuples."
+  [{:keys [indices query domains needed] :as request}]
+  (let [^Store store (:store request)
+        res          (FastList.)]
+    (doseq [domain (if (seq domains) domains [])]
+      (let [^List tuples (idoc-match-domain store (indices domain) query
+                                             domain needed)]
+        (when (and tuples (clojure.core/pos? (.size tuples)))
+          (.addAll res tuples))))
+    res))
 
 (defn idoc-match
   "Function that searches indexed documents. Returns matching tuples of
@@ -657,28 +679,9 @@
   ([db arg1 arg2]
    (idoc-match db arg1 arg2 nil))
   ([^DB db arg1 arg2 arg3]
-   (let [^Store store (.-store db)
-         indices      (st/store-idoc-indices store)
-         attr?        (keyword? arg1)
-         domains0     (if attr?
-                        [(idoc-domain store arg1)]
-                        (:domains arg2))
-         query        (if attr? arg2 arg1)
-         opts         (if attr? arg3 arg2)
-         needed       (extract-needed arg3 arg2 arg1)
-         domains      (or (when (map? opts) (:domains opts))
-                          domains0
-                          (keys indices))
-         missing      (seq (remove indices domains))]
-     (when missing
-       (raise "Idoc domain not found: " missing {:domains missing}))
-     (let [res (FastList.)]
-       (doseq [domain (if (seq domains) domains [])]
-         (let [^List tuples (idoc-match-domain store (indices domain) query
-                                               domain needed)]
-           (when (and tuples (clojure.core/pos? (.size tuples)))
-             (.addAll res tuples))))
-       res))))
+   (execute-idoc-match-request
+     (idoc-match-request
+       db arg1 arg2 arg3 (extract-needed arg3 arg2 arg1)))))
 
 (defn idoc-get
   "Function that extracts a value by path from a bound idoc document."

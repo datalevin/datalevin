@@ -6,7 +6,11 @@
    [datalevin.constants :as c]
    [datalevin.pipe :as pipe]
    [datalevin.query :as q]
+   [datalevin.query.access :as qaccess]
+   [datalevin.query.access.ave :as qave]
    [datalevin.query.cache :as qcache]
+   [datalevin.query.execute :as qexec]
+   [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
    [datalevin.util :as u])
   (:import
@@ -14,6 +18,18 @@
    [java.util ArrayList Collection UUID]))
 
 (use-fixtures :each db-fixture)
+
+(defn access-source-ids
+  [_db]
+  [[1]])
+
+(defn access-projected-tuples
+  [x]
+  [[x :ignored]])
+
+(defn keep-access-id?
+  [e]
+  (even? e))
 
 (deftest test-linear-recursive-keyed-seen
   (let [conn  (d/create-conn
@@ -189,6 +205,47 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-ordered-limit-offset-pushdown-retains-work-reduction
+  (let [dir          (u/tmp-dir
+                       (str "query-top-k-work-" (UUID/randomUUID)))
+        conn         (d/get-conn dir)
+        pushed-calls (atom 0)
+        normal-calls (atom 0)
+        pushed-pred  (fn [_]
+                       (swap! pushed-calls inc)
+                       true)
+        normal-pred  (fn [_]
+                       (swap! normal-calls inc)
+                       true)
+        query        '[:find ?score
+                       :in $ ?accept? ?max-score
+                       :where
+                       [?e :score ?score]
+                       [(?accept? ?e)]
+                       [(<= ?score ?max-score)]
+                       :order-by [?score :desc]
+                       :offset 100
+                       :limit 3]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [e] {:db/id e :score e})
+                         (range 1 2501)))
+      (let [db       (d/db conn)
+            pushed  (binding [q/*cache?* false]
+                      (d/q query db pushed-pred 2500))
+            normal   (binding [q/*cache?* false
+                               qexec/*access-methods* []]
+                       (d/q query db normal-pred 2500))]
+        (is (= [[2400] [2399] [2398]] pushed normal))
+        ;; A timer assertion would be noisy in CI. Predicate evaluations are a
+        ;; deterministic proxy for the dominant candidate-processing work.
+        (is (<= @pushed-calls c/init-exec-size-threshold))
+        (is (= 2500 @normal-calls))
+        (is (< @pushed-calls @normal-calls)))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-ordered-limit-completes-primary-key-tie
   (let [dir   (u/tmp-dir (str "query-top-k-tie-" (UUID/randomUUID)))
         conn  (d/get-conn dir)
@@ -210,6 +267,713 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest test-access-planning-sample-is-hard-bounded-across-ties
+  (let [dir   (u/tmp-dir (str "query-access-sample-bound-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score ?id
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :id ?id]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc ?id :asc]
+                :limit 3]]
+    (try
+      ;; Exact execution must account for the whole tie, but planning must not
+      ;; turn a bounded sample into a scan of the entire tie.
+      (d/transact! conn
+                   (mapv (fn [e] {:db/id e :score 10 :id e})
+                         (range 1 (+ 2 c/init-exec-size-threshold))))
+      (let [preferred (:preferred-access-plan
+                        (d/explain {} query (d/db conn) 10))]
+        (is (<= (get-in preferred [:estimate :sample-rows])
+                c/init-exec-size-threshold)))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ave-frontier-pages-large-ties-within-work-budget
+  (let [dir  (u/tmp-dir (str "query-access-tie-budget-"
+                             (UUID/randomUUID)))
+        conn (d/get-conn dir)]
+    (try
+      (d/transact! conn
+                   (mapv (fn [e] {:db/id e :score 10})
+                         (range 1 1101)))
+      (let [db     (d/db conn)
+            path   (qave/ordered-path db :score :desc 10 '?score)
+            demand (qaccess/top-k-demand
+                     '[?score :desc ?id :asc] 0 3)
+            work   (qaccess/->AccessWork nil 64 100 nil 0)
+            cursor (qaccess/open-access path demand work db)]
+        (try
+          (let [batch1 (qaccess/next-batch cursor)
+                batch2 (qaccess/next-batch cursor)
+                batch3 (qaccess/next-batch cursor)
+                cutoff {:primary-value 10}]
+            (is (= 64 (count (:tuples batch1))))
+            (is (= 36 (count (:tuples batch2))))
+            (is (empty? (:tuples batch3)))
+            (is (false? (:exhausted? batch3)))
+            ;; No page certifies the primary-key boundary until every member
+            ;; of the tie has been consumed.
+            (is (false? (boolean
+                          (qaccess/frontier-satisfies?
+                            path demand (:frontier batch1) cutoff))))
+            (is (false? (boolean
+                          (qaccess/frontier-satisfies?
+                            path demand (:frontier batch2) cutoff)))))
+          (finally
+            (qaccess/close-cursor cursor))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ave-access-resumes-after-sampled-prefix
+  (let [dir  (u/tmp-dir (str "query-access-resume-"
+                             (UUID/randomUUID)))
+        conn (d/get-conn dir)]
+    (try
+      (d/transact! conn
+                   (mapv (fn [score] {:db/id score :score score})
+                         (range 1 6)))
+      (let [db      (d/db conn)
+            path    (qave/ordered-path db :score :desc 5 '?score)
+            demand  (qaccess/top-k-demand '[?score :desc] 0 2)
+            sample-cursor
+            (qaccess/open-access
+              path demand (qaccess/->AccessWork 2 2 nil nil 0) db)
+            sample  (try
+                      (qaccess/next-batch sample-cursor)
+                      (finally
+                        (qaccess/close-cursor sample-cursor)))
+            resumed-cursor
+            (qaccess/open-access
+              path demand
+              (assoc (qaccess/->AccessWork nil 2 5 nil 0)
+                     :resume (:frontier sample)
+                     :emitted (count (:tuples sample)))
+              db)]
+        (try
+          (is (= [[5 5] [4 4]]
+                 (mapv vec (:tuples sample))))
+          (is (= [[3 3] [2 2]]
+                 (mapv vec
+                       (:tuples (qaccess/next-batch resumed-cursor)))))
+          (finally
+            (qaccess/close-cursor resumed-cursor))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-policy-controls-planning-sampling-and-reuse
+  (let [path (fn [policy]
+               (qaccess/map->AccessPath {:policy policy}))]
+    (is (true? (qaccess/planning-sample?
+                 (path (qaccess/access-policy :restart :planning)))))
+    (is (false? (qaccess/reusable-sample?
+                  (path (qaccess/access-policy :restart :planning)))))
+    (is (true? (qaccess/reusable-sample?
+                 (path (qaccess/access-policy :resumable :planning)))))
+    (is (false? (qaccess/planning-sample?
+                  (path (qaccess/access-policy :resumable :execution)))))
+    (is (false? (qaccess/planning-sample?
+                  (path (qaccess/access-policy :none :planning)))))
+    (is (thrown? ExceptionInfo
+                 (qaccess/access-policy :unknown :planning)))
+    (is (thrown? ExceptionInfo
+                 (qaccess/access-policy :restart :unknown)))))
+
+(deftest test-access-step-uses-explicit-named-source
+  (let [left-dir  (u/tmp-dir (str "query-access-left-"
+                                  (UUID/randomUUID)))
+        right-dir (u/tmp-dir (str "query-access-right-"
+                                  (UUID/randomUUID)))
+        left-conn (d/get-conn left-dir)
+        right-conn (d/get-conn right-dir)
+        opened    (atom nil)
+        query
+        '[:find ?e ?name
+          :in $left $right
+          :where
+          [(datalevin.test.query/access-source-ids $right) [[?e]]]
+          [$right ?e :name ?name]]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q]}]
+            (let [covered (first (:qwhere parsed-q))
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :named-source-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(first (:qorig-where parsed-q))}
+                     :requires #{}
+                     :produces #{'?e}
+                     :join-vars #{'?e}
+                     :cols ['?e]
+                     :source '$right})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :named-source-test this :complete nil #{:complete} {}
+                      (qaccess/access-policy :none :execution))
+                    :quality :exact)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds) (qaccess/access-work)
+                 (assoc
+                   (qaccess/->AccessEstimate 0.0 0.0 1 0.0 :medium)
+                   :range-rows 1))]))
+
+          (-open-access [_ _ _ _ _ source]
+            (reset! opened source)
+            (let [done? (atom false)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (qaccess/->AccessBatch
+                      (ArrayList. [(object-array [1])]) nil true)
+                    (qaccess/->AccessBatch (ArrayList.) nil true)))
+                (-close-cursor [_]))))
+
+          (-frontier-satisfies? [_ _ _ _ _] false))]
+    (try
+      (d/transact! left-conn [{:db/id 1 :name "left"}])
+      (d/transact! right-conn [{:db/id 1 :name "right"}])
+      (let [left  (d/db left-conn)
+            right (d/db right-conn)]
+        (binding [qexec/*access-methods* [method]
+                  q/*cache?*              false]
+          (let [explain (d/explain {} query left right)]
+            (is (= '$right
+                   (get-in explain [:preferred-access-plan :source])))
+            (is (some
+                  #(= 1 (count (:operators %)))
+                  (filter
+                    #(= :access (:kind %))
+                    (:physical-plan-alternatives explain)))))
+          (is (= #{[1 "right"]}
+                 (set (d/q query left right)))))
+        (is (identical? right @opened)))
+      (finally
+        (d/close left-conn)
+        (d/close right-conn)
+        (u/delete-files left-dir)
+        (u/delete-files right-dir)))))
+
+(deftest test-function-binding-reuses-tuple-projection
+  (let [query
+        '[:find ?y
+          :in [?x ...]
+          :where
+          [(datalevin.test.query/access-projected-tuples ?x) [[?y _]]]]]
+    (is (= #{[1] [2] [3]}
+           (set (d/q query [1 2 3]))))))
+
+(deftest test-selected-access-reuses-planning-prefix
+  (let [dir        (u/tmp-dir (str "query-access-prefix-root-"
+                                   (UUID/randomUUID)))
+        conn       (d/get-conn dir)
+        opens      (atom [])
+        total      1100
+        candidates (vec
+                     (map (fn [score] [score score])
+                          (range total 0 -1)))
+        query      '[:find ?score
+                     :where
+                     [?e :score ?score]
+                     :order-by [?score :desc]
+                     :limit 1001]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q demand]}]
+            (let [covered (first (:qwhere parsed-q))
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :prefix-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(first (:qorig-where parsed-q))}
+                     :requires #{}
+                     :produces #{'?e '?score}
+                     :join-vars #{'?e}
+                     :cols ['?e '?score]})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :prefix-test this :ordered
+                      '[[?score :desc]]
+                      #{:complete :ordered :resumable :monotone
+                        :tie-complete :exact-frontier}
+                      {}
+                      (qaccess/access-policy :resumable :planning))
+                    :quality :exact)
+                  rows (:required-count demand)
+                  estimate
+                  (assoc
+                    (qaccess/->AccessEstimate
+                      0.0 0.0 rows 0.0 :medium)
+                    :range-rows total)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds)
+                 (qaccess/->AccessWork nil 1000 nil nil 0)
+                 estimate)]))
+
+          (-open-access [_ _ _ _ work _]
+            (swap! opens conj work)
+            (let [done?   (atom false)
+                  start   (long
+                            (or (get-in work
+                                        [:resume :continuation :index])
+                                0))
+                  emitted (long (or (:emitted work) 0))
+                  allowed (if-some [maximum (:max-candidates work)]
+                            (max 0 (- (long maximum) emitted))
+                            Long/MAX_VALUE)
+                  n       (long
+                            (min (long (or (:sample-size work)
+                                           (:batch-size work)
+                                           total))
+                                 allowed
+                                 (- total start)))
+                  end     (+ start n)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (let [tuples (ArrayList.
+                                   (mapv (fn [[e score]]
+                                           (object-array [e score]))
+                                         (subvec candidates start end)))
+                          score  (when (pos? n)
+                                   (second (nth candidates (dec end))))]
+                      (qaccess/->AccessBatch
+                        tuples
+                        (when score
+                          (qaccess/->AccessFrontier
+                            {:index end} score))
+                        (= end total)))
+                    (qaccess/->AccessBatch (ArrayList.) nil (= end total))))
+                (-close-cursor [_]))))
+
+          (-frontier-satisfies? [_ _ _ frontier cutoff]
+            (not (pos? (compare (:certificate frontier)
+                                (:primary-value cutoff))))))]
+    (try
+      (d/transact! conn
+                   (mapv (fn [score]
+                           {:db/id score :score score})
+                         (range 1 (inc total))))
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (let [result (d/q query (d/db conn))]
+          (is (= 1001 (count result)))
+          (is (= [1100] (first result)))
+          (is (= [100] (last result)))))
+      (is (= 2 (count @opens)))
+      (is (nil? (:resume (first @opens))))
+      (is (= 1000 (:emitted (second @opens))))
+      (is (= 1000
+             (get-in (second @opens)
+                     [:resume :continuation :index])))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-correlated-access-step-opens-once-per-outer-binding
+  (let [opens  (atom [])
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [_ _] [])
+          (-open-access [_ _ _ _ _ _]
+            (throw (ex-info "Expected correlated open" {})))
+          (-frontier-satisfies? [_ _ _ _ _] false)
+
+          qaccess/ICorrelatedAccessMethod
+          (-open-correlated-access [_ _ _ _ _ _ bindings]
+            (swap! opens conj bindings)
+            (let [done? (atom false)
+                  x     (get bindings '?x)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (qaccess/->AccessBatch
+                      (ArrayList.
+                        [(object-array [x (* 10 x)])])
+                      nil true)
+                    (qaccess/->AccessBatch (ArrayList.) nil true)))
+                (-close-cursor [_])))))
+        expr   (qaccess/map->AccessExpr
+                 {:method    :correlated-test
+                  :covers    #{:logical-access}
+                  :requires  #{'?x}
+                  :produces  #{'?x '?y}
+                  :join-vars #{'?x}
+                  :cols      ['?x '?y]})
+        path   (assoc
+                 (qaccess/->AccessPath
+                   :correlated-test method :lookup nil
+                   #{:complete} {} (qaccess/access-policy))
+                 :quality :exact)
+        demand (qaccess/->AccessDemand nil 0 nil nil :exact #{'?x '?y})
+        step   (qplan/access-step
+                 expr path demand (qaccess/access-work) ['?x])
+        source (ArrayList.
+                 [(object-array [1])
+                  (object-array [2])])]
+    (is (thrown-with-msg?
+          ExceptionInfo #"requirements are not bound"
+          (qplan/access-step expr path demand)))
+    (is (= [[1 10] [2 20]]
+           (mapv vec (qplan/step-execute step nil source))))
+    (is (= [{'?x 1} {'?x 2}] @opens))))
+
+(deftest test-correlated-access-is-scheduled-after-required-subset
+  (let [dir   (u/tmp-dir (str "query-correlated-schedule-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?term ?doc
+                :where
+                [?q :raw ?raw]
+                [(+ ?raw 0) ?term]
+                [?doc :synthetic ?term]]
+        parsed (qcache/parsed-q query)
+        covered (nth (:qwhere parsed) 2)
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [_ _] [])
+          (-open-access [_ _ _ _ _ _]
+            (throw (ex-info "Expected correlated open" {})))
+          (-frontier-satisfies? [_ _ _ _ _] false)
+
+          qaccess/ICorrelatedAccessMethod
+          (-open-correlated-access [_ _ _ _ _ _ bindings]
+            (let [done? (atom false)
+                  term  (get bindings '?term)
+                  doc   ({1 101 2 202} term)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (qaccess/->AccessBatch
+                      (ArrayList. [(object-array [term doc])])
+                      nil true)
+                    (qaccess/->AccessBatch (ArrayList.) nil true)))
+                (-close-cursor [_])))))
+        expr (qaccess/map->AccessExpr
+               {:method :correlated-test
+                :covers #{covered}
+                :covered-originals
+                #{(nth (:qorig-where parsed) 2)}
+                :requires #{'?term}
+                :produces #{'?term '?doc}
+                :join-vars #{'?term}
+                :cols ['?term '?doc]})
+        path (assoc
+               (qaccess/->AccessPath
+                 :correlated-test method :lookup nil #{:complete} {}
+                 (qaccess/access-policy))
+               :quality :exact)
+        demand (qaccess/->AccessDemand
+                 nil 0 nil nil :exact #{'?term '?doc})
+        access-plan
+        (assoc
+          (qaccess/->AccessPlan
+            expr path (qaccess/source-bounds) (qaccess/access-work)
+            (qaccess/->AccessEstimate 1.0 1.0 2 3.0 :medium))
+          :demand demand)]
+    (try
+      (d/transact! conn [{:db/id 1 :raw 1}
+                         {:db/id 2 :raw 2}])
+      (let [db        (d/db conn)
+            scheduled (qo/schedule-correlated-access
+                        db parsed [db] access-plan)
+            outer-q   ((ns-resolve 'datalevin.query.execute
+                                   'access-outer-query)
+                       parsed scheduled)
+            residual-q ((ns-resolve 'datalevin.query.execute
+                                    'access-batch-query)
+                        parsed (assoc scheduled :joins []) false)
+            execute-q (ns-resolve 'datalevin.query.execute 'execute-query)
+            outer     (execute-q outer-q [db])
+            tuples    (qplan/step-execute
+                        (:step scheduled) db outer)]
+        (is (= #{'?term} (get-in scheduled [:expr :requires])))
+        (is (= 2 (count (:outer-joins scheduled))))
+        (is (qaccess/access-ready?
+              (:expr scheduled) (:outer-cols scheduled)))
+        (is (= #{[1 101] [2 202]}
+               (set (execute-q residual-q [db tuples])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-correlated-access-root-is-selected-and-executed
+  (let [dir   (u/tmp-dir (str "query-correlated-root-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        opens (atom 0)
+        query '[:find ?term ?doc
+                :where
+                [?q :raw ?raw]
+                [(+ ?raw 0) ?term]
+                [?doc :synthetic ?term]]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q]}]
+            (let [covered (nth (:qwhere parsed-q) 2)
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :correlated-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(nth (:qorig-where parsed-q) 2)}
+                     :requires #{'?term}
+                     :produces #{'?term '?doc}
+                     :join-vars #{'?term}
+                     :cols ['?term '?doc]})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :correlated-test this :lookup nil #{:complete} {}
+                      (qaccess/access-policy))
+                    :quality :exact)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds) (qaccess/access-work)
+                 (qaccess/->AccessEstimate 0.0 0.0 2 0.0 :medium))]))
+          (-open-access [_ _ _ _ _ _]
+            (throw (ex-info "Expected correlated open" {})))
+          (-frontier-satisfies? [_ _ _ _ _] false)
+
+          qaccess/ICorrelatedAccessMethod
+          (-open-correlated-access [_ _ _ _ _ _ bindings]
+            (swap! opens inc)
+            (let [done? (atom false)
+                  term  (get bindings '?term)
+                  doc   ({1 101 2 202} term)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (qaccess/->AccessBatch
+                      (ArrayList. [(object-array [term doc])])
+                      nil true)
+                    (qaccess/->AccessBatch (ArrayList.) nil true)))
+                (-close-cursor [_])))))]
+    (try
+      (d/transact! conn [{:db/id 1 :raw 1}
+                         {:db/id 2 :raw 2}
+                         {:db/id 101 :synthetic 1}
+                         {:db/id 202 :synthetic 2}])
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (is (= #{[1 101] [2 202]}
+               (set (d/q query (d/db conn))))))
+      (is (= 2 @opens))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-complete-access-demand-keeps-source-bounds-and-skips-preparation
+  (let [dir   (u/tmp-dir (str "query-complete-access-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        opens (atom [])
+        query '[:find ?e
+                :where
+                [?e :synthetic true]]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q]}]
+            (let [covered (first (:qwhere parsed-q))
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :complete-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(first (:qorig-where parsed-q))}
+                     :requires #{}
+                     :produces #{'?e}
+                     :join-vars #{'?e}
+                     :cols ['?e]})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :complete-test this :lookup nil #{:complete} {}
+                      (qaccess/access-policy :none :execution))
+                    :quality :exact)
+                  estimate
+                  (assoc
+                    (qaccess/->AccessEstimate 0.0 0.0 2 0.0 :medium)
+                    :range-rows 2)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds 0 2)
+                 (qaccess/access-work) estimate)]))
+
+          (-open-access [_ _ demand bounds work _]
+            (swap! opens conj {:demand demand :bounds bounds :work work})
+            (let [done? (atom false)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if (compare-and-set! done? false true)
+                    (qaccess/->AccessBatch
+                      (ArrayList.
+                        [(object-array [1])
+                         (object-array [2])])
+                      nil true)
+                    (qaccess/->AccessBatch (ArrayList.) nil true)))
+                (-close-cursor [_]))))
+
+          (-frontier-satisfies? [_ _ _ _ _] false))]
+    (try
+      (d/transact! conn [{:db/id 1 :synthetic true}
+                         {:db/id 2 :synthetic true}])
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (let [explain (d/explain {} query (d/db conn))
+              plan    (first (:access-plans explain))]
+          (is (nil? (:required-count plan)))
+          (is (= 2 (:source-limit plan)))
+          (is (= :none (get-in plan [:policy :sampling])))
+          (is (empty? @opens)))
+        (is (= #{[1] [2]} (d/q query (d/db conn)))))
+      (is (= 1 (count @opens)))
+      (is (nil? (get-in @opens [0 :demand :required-count])))
+      (is (= 2 (get-in @opens [0 :bounds :limit])))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-unordered-limit-adapts-after-residual-filtering
+  (let [conn       (d/create-conn nil {} {:kv-opts {:inmemory? true}})
+        opens      (atom [])
+        inspected  (atom 0)
+        candidates (vec (range 1 21))
+        query
+        '[:find ?e
+          :where
+          [?e :candidate true]
+          [(datalevin.test.query/keep-access-id? ?e)]
+          :offset 1
+          :limit 3]
+        exhaustion-query
+        '[:find ?e
+          :where
+          [?e :candidate true]
+          [(datalevin.test.query/keep-access-id? ?e)]
+          :limit 12]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q]}]
+            (let [covered (first (:qwhere parsed-q))
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :unordered-limit-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(first (:qorig-where parsed-q))}
+                     :requires #{}
+                     :produces #{'?e}
+                     :join-vars #{'?e}
+                     :cols ['?e]})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :unordered-limit-test this :unordered-scan nil
+                      #{:complete :resumable} {}
+                      (qaccess/access-policy :none :execution))
+                    :quality :exact)
+                  estimate
+                  (assoc
+                    (qaccess/->AccessEstimate 0.0 0.0 20 0.0 :medium)
+                    :range-rows 20
+                    :scan-rows 20
+                    :output-rows 20
+                    :yield 0.5)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds)
+                 (qaccess/access-work 2) estimate)]))
+
+          (-open-access [_ _ demand bounds work _]
+            (swap! opens conj {:demand demand :bounds bounds :work work})
+            (let [position (volatile! 0)
+                  closed?  (volatile! false)
+                  maximum  (:max-candidates work)]
+              (reify
+                qaccess/IAccessCursor
+                (-next-batch [_]
+                  (if @closed?
+                    (qaccess/->AccessBatch (ArrayList.) nil true)
+                    (let [start     (long @position)
+                          remaining (if (some? maximum)
+                                      (max 0 (- (long maximum) start))
+                                      (- (count candidates) start))
+                          n         (long
+                                      (min 2 remaining
+                                           (- (count candidates) start)))
+                          end       (+ start n)
+                          tuples    (ArrayList.
+                                      (mapv #(object-array [%])
+                                            (subvec candidates start end)))
+                          exhausted? (= end (count candidates))]
+                      (vreset! position end)
+                      (swap! inspected + n)
+                      (qaccess/->AccessBatch
+                        tuples
+                        (when (pos? n)
+                          (qaccess/->AccessFrontier
+                            {:index end} nil))
+                        exhausted?))))
+                (-close-cursor [_]
+                  (vreset! closed? true)))))
+
+          (-frontier-satisfies? [_ _ _ _ _] false))]
+    (try
+      (d/transact! conn
+                   (mapv (fn [e] {:db/id e :candidate true})
+                         candidates))
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (let [explain (d/explain {} query (d/db conn))
+              result  (d/q query (d/db conn))]
+          (is (= :adaptive-limit
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= 4
+                 (get-in explain
+                         [:selected-plan-alternative
+                          :cost-breakdown :required-count])))
+          (is (= 3 (count result)))
+          (is (every? (comp even? first) result))))
+      (is (= 1 (count @opens)))
+      (is (= 4 (get-in @opens [0 :demand :required-count])))
+      (is (= 0 (get-in @opens [0 :bounds :offset])))
+      (is (nil? (get-in @opens [0 :bounds :limit])))
+      (is (= 8 (get-in @opens [0 :work :max-candidates])))
+      (is (= 8 @inspected))
+      (reset! opens [])
+      (reset! inspected 0)
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (let [explain (d/explain {} exhaustion-query (d/db conn))
+              result  (d/q exhaustion-query (d/db conn))]
+          (is (= :adaptive-limit
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= 10 (count result)))))
+      (is (= 20 @inspected))
+      (finally
+        (d/close conn)))))
 
 (deftest test-ordered-limit-pages-independently-of-entity-order
   (let [dir        (u/tmp-dir (str "query-top-k-page-" (UUID/randomUUID)))
@@ -240,6 +1004,520 @@
       (binding [q/*cache?* false]
         (is (= [[1000]] (d/q desc-query (d/db conn) 2500)))
         (is (= [[1500]] (d/q asc-query (d/db conn) 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-applies-offset-after-qualification
+  (let [dir   (u/tmp-dir (str "query-top-k-offset-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :keep true]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :offset 1
+                :limit 2]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           (cond-> {:db/id score :score score}
+                             (#{100 1100 2200} score) (assoc :keep true)))
+                         (range 1 2501)))
+      (binding [q/*cache?* false]
+        (is (= [[1100] [100]]
+               (d/q query (d/db conn) 2500))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordered-limit-access-plan-is-explained
+  (let [dir   (u/tmp-dir (str "query-top-k-explain-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :keep true]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :offset 1
+                :limit 2]]
+    (try
+      (d/transact! conn [{:db/id 1 :score 1 :keep true}])
+      (let [explain   (d/explain {} query (d/db conn) 100)
+            preferred (:preferred-access-plan explain)]
+        (is (= 1 (count (:access-plans explain))))
+        (is (= :ave (:method preferred)))
+        (is (= :ordered-scan (:strategy preferred)))
+        (is (= '[?score :desc] (:ordering preferred)))
+        (is (= [['?score :desc]] (:path-ordering preferred)))
+        (is (= 3 (:required-count preferred)))
+        (is (= :exact (:quality preferred)))
+        (is (contains? (:capabilities preferred) :exact-frontier))
+        (is (= :sampled (get-in preferred [:estimate :confidence])))
+        (is (= (:selected-plan-alternative explain)
+               (:recommended-plan-alternative explain)))
+        (is (= :not-run
+               (get-in explain [:executed-plan-alternative :kind])))
+        (is (= {:type :access
+                :cols ['?e '?score]
+                :out  #{'?e '?score}}
+               (:step preferred))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-plan-orders-selective-bound-joins-first
+  (let [dir   (u/tmp-dir (str "query-access-joins-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :common true]
+                [?e :rare true]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           (cond-> {:db/id score
+                                    :score score
+                                    :common true}
+                             (= score 1) (assoc :rare true)))
+                         (range 1 1001)))
+      (let [db        (d/db conn)
+            explain   (d/explain {} query db 1000)
+            preferred (:preferred-access-plan explain)]
+        (is (= [:rare :common] (mapv :attr (:joins preferred))))
+        (is (= 1000 (:candidate-budget preferred)))
+        (is (= 1000 (get-in preferred [:estimate :sample-rows])))
+        (is (= 1 (get-in preferred [:estimate :sample-output])))
+        (is (= :sampled (get-in preferred [:estimate :confidence])))
+        (is (false? (:access-path-selected? explain)))
+        (is (= #{:conventional :access}
+               (set (map :kind (:physical-plan-alternatives explain)))))
+        ;; Source, each independently reachable join subset, and their union
+        ;; are memoized separately.
+        (is (<= 4 (count (:physical-plan-subsets explain))))
+        (let [access-alternatives
+              (filter #(= :access (:kind %))
+                      (:physical-plan-alternatives explain))
+              operator-counts (set (map (comp count :operators)
+                                        access-alternatives))]
+          ;; Retained source-only, partial, and complete fragments are all
+          ;; connected to executable roots. Each root exposes the schema
+          ;; produced by its selected physical fragment.
+          (is (every? operator-counts #{0 1 2}))
+          (is (every? seq (map :fragment-cols access-alternatives))))
+        (is (= :conventional
+               (get-in explain [:selected-plan-alternative :kind])))
+        (let [discover (ns-resolve 'datalevin.query.execute
+                                   'discover-access-plans)
+              plan     (ns-resolve 'datalevin.query.execute
+                                   'access-query-plan)
+              parsed-q (qcache/parsed-q query)
+              plans    (discover parsed-q [db 1000])
+              context  (plan parsed-q [db 1000] plans)
+              selected (qo/selected-alternative context)
+              access   (first
+                         (filter #(= :access (:kind %))
+                                 (get-in context
+                                         [:property-memo :alternatives])))]
+          (is (instance? datalevin.query.plan.ConventionalRootPlan
+                         (:plan selected)))
+          (is (instance? datalevin.query.plan.Context
+                         (get-in selected [:plan :context])))
+          ;; Adaptive fallback and conventional selection share the same
+          ;; already-planned conventional root.
+          (is (identical? (:plan selected)
+                          (get-in access [:plan :fallback]))))
+        (binding [q/*cache?* false]
+          (is (= [[1]] (d/q query db 1000)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-step-samples-leading-prefix
+  (let [dir  (u/tmp-dir (str "query-access-step-" (UUID/randomUUID)))
+        conn (d/get-conn dir)]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           {:db/id score :score score})
+                         (range 1 6)))
+      (let [db     (d/db conn)
+            expr   (qaccess/map->AccessExpr
+                     {:method     :ave
+                      :requires   #{}
+                      :produces   #{'?e '?score}
+                      :join-vars  #{'?e}
+                      :cols       ['?e '?score]})
+            path   (qave/ordered-path db :score :desc 5)
+            demand (qaccess/top-k-demand '[?score :desc] 0 2)
+            work   (qaccess/->AccessWork 2 2 nil nil 0)
+            step   (qplan/access-step expr path demand work)]
+        (is (= :access (qplan/step-type step)))
+        (is (= [[5 5] [4 4]]
+               (mapv vec (qplan/step-sample step db nil))))
+        ;; Sampling reads a bounded prefix. Normal step execution implements
+        ;; the complete logical access expression.
+        (is (= [[5 5] [4 4] [3 3] [2 2] [1 1]]
+               (mapv vec (qplan/step-execute step db nil))))
+        (let [relation (qplan/execute-steps nil db [step])]
+          (is (= {'?e 0 '?score 1} (:attrs relation)))
+          (is (= [[5 5] [4 4] [3 3] [2 2] [1 1]]
+                 (mapv vec (:tuples relation)))))
+        (is (re-find #":ave/:ordered-scan"
+                     (qplan/step-explain step nil))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-incomplete-access-alternative-requires-top-k-proof
+  (let [satisfies? (ns-resolve 'datalevin.query-optimizer
+                               'alternative-satisfies?)
+        demand     (qaccess/top-k-demand '[?score :desc] 0 1)
+        alternative
+        (fn [capabilities]
+          (qplan/->PlanAlternative
+            :access
+            :query-root
+            (qplan/->PhysicalProperties
+              '[?score :desc] true false :exact capabilities)
+            nil 1.0 1 nil))]
+    (is (false? (satisfies? (alternative #{:ordered}) demand)))
+    (is (true?
+          (satisfies?
+            (alternative #{:ordered :resumable :monotone :tie-complete
+                           :exact-frontier})
+            demand)))))
+
+(deftest test-property-frontier-retains-subset-variants
+  (let [logical-key #{:access :join}
+        properties
+        (fn [ordering]
+          (qplan/->PhysicalProperties
+            ordering true true :exact
+            #{:complete :resumable}))
+        alternative
+        (fn [ordering cost]
+          (qplan/->PlanAlternative
+            :access-fragment logical-key (properties ordering)
+            {:ordering ordering} cost 10 nil))
+        unordered (alternative nil 5.0)
+        ordered-7 (alternative '[[?score :desc]] 7.0)
+        ordered-6 (alternative '[[?score :desc]] 6.0)
+        frontier (-> []
+                     (qo/retain-property-alternative unordered)
+                     (qo/retain-property-alternative ordered-7)
+                     (qo/retain-property-alternative ordered-6))
+        ordered-properties (properties '[[?score :desc]])
+        hash-properties
+        (qo/propagate-physical-properties
+          ordered-properties {:type :hash-join})]
+    (is (= 2 (count frontier)))
+    (is (= #{5.0 6.0} (set (map :cost frontier))))
+    (is (some #(seq (get-in % [:properties :ordering])) frontier))
+    (is (some #(empty? (get-in % [:properties :ordering])) frontier))
+    (is (= ordered-properties
+           (qo/propagate-physical-properties
+             ordered-properties
+             {:type :index-join :preserves-outer-order? true})))
+    (is (nil? (:ordering hash-properties)))
+    (is (false? (:resumable? hash-properties)))
+    (is (not (contains? (:capabilities hash-properties) :resumable)))))
+
+(deftest test-access-path-selected-when-prefix-is-cheaper
+  (let [dir   (u/tmp-dir (str "query-access-selected-" (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           {:db/id score :score score})
+                         (range 1 101)))
+      (let [db          (d/db conn)
+            explain     (d/explain {} query db 100)
+            run-explain (d/explain {:run? true} query db 100)]
+        (is (true? (:access-path-selected? explain)))
+        (is (< (get-in explain [:preferred-access-plan :estimate :cost])
+               (:conventional-plan-cost explain)))
+        (is (= :access
+               (get-in explain [:selected-plan-alternative :kind])))
+        (is (pos? (get-in explain
+                          [:preferred-access-plan :sample-prefix-size])))
+        (is (true? (get-in explain
+                           [:preferred-access-plan :sample-resumable?])))
+        (is (= (get-in explain
+                       [:preferred-access-plan :estimate :sample-rows])
+               (get-in explain
+                       [:preferred-access-plan
+                        :estimate :reused-candidates])))
+        (is (seq (:physical-plan-subsets explain)))
+        (is (every? seq (vals (:physical-plan-subsets explain))))
+        (is (= :adaptive-top-k
+               (get-in explain [:selected-plan-alternative :mode])))
+        (is (map?
+              (get-in explain
+                      [:selected-plan-alternative :cost-breakdown])))
+        (is (number?
+              (get-in explain
+                      [:selected-plan-alternative
+                       :cost-breakdown :enforcer])))
+        (is (= :access
+               (get-in explain [:recommended-plan-alternative :kind])))
+        (is (= :not-run
+               (get-in explain [:executed-plan-alternative :kind])))
+        (is (= :access
+               (get-in run-explain [:recommended-plan-alternative :kind])))
+        (is (= :conventional
+               (get-in run-explain [:executed-plan-alternative :kind])))
+        (is (= '[?score :desc]
+               (get-in explain
+                       [:selected-plan-alternative :properties :ordering])))
+        ;; The retained access fragment remains resumable, while the executable
+        ;; root has consumed it and materialized a complete result.
+        (is (true?
+              (get-in explain
+                      [:selected-plan-alternative
+                       :fragment-properties :resumable?])))
+        (is (false?
+              (get-in explain
+                      [:selected-plan-alternative :properties :resumable?])))
+        (binding [q/*cache?* false]
+          (is (= [[100]] (d/q query db 100)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-conventional-alternative-costs-late-functions
+  (let [dir   (u/tmp-dir (str "query-access-late-function-cost-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score ?copy
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [(identity ?score) ?copy]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           {:db/id score :score score})
+                         (range 1 101)))
+      (let [explain
+            (d/explain {} query (d/db conn) 100)
+            conventional
+            (first
+              (filter #(= :conventional (:kind %))
+                      (:physical-plan-alternatives explain)))
+            {:keys [late late-stages]} (:cost-breakdown conventional)
+            function-stage
+            (first (filter #(= :function (:operation %)) late-stages))]
+        (is (some? function-stage))
+        (is (= (:size conventional) (:input function-stage)))
+        (is (= (long (* (double (:input function-stage))
+                        (double c/magic-cost-pred)))
+               (:cost function-stage)))
+        (is (== (double (reduce + 0 (map :cost late-stages)))
+                (double late)))
+        (is (==
+              (+ (double (get-in conventional [:cost-breakdown :base]))
+                 (double late)
+                 (double
+                   (get-in conventional [:cost-breakdown :enforcer])))
+              (double (:cost conventional)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-fallback-work-is-bounded-by-conventional-plan
+  (let [dir          (u/tmp-dir (str "query-access-work-budget-"
+                                     (UUID/randomUUID)))
+        conn         (d/get-conn dir)
+        row-count    32769
+        probe-budget 1024
+        calls        (atom 0)
+        accept?      (fn [e]
+                       (swap! calls inc)
+                       (= e 1))
+        query        '[:find ?score
+                       :in $ ?accept? ?max-score
+                       :where
+                       [?e :score ?score]
+                       [(?accept? ?e)]
+                       [(<= ?score ?max-score)]
+                       :order-by [?score :desc]
+                       :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [score] {:db/id score :score score})
+                         (range 1 (inc row-count))))
+      (binding [q/*cache?* false]
+        (is (= [[1]]
+               (d/q query (d/db conn) accept? row-count))))
+      ;; A low-confidence access attempt may spend one bounded probe before
+      ;; choosing the conventional plan, but it must not scan 32 batches and
+      ;; then repeat the complete conventional scan.
+      (is (<= @calls (+ row-count probe-budget)))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-step-zero-yield-uses-existing-scan-adjustment
+  (let [dir   (u/tmp-dir (str "query-access-zero-yield-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?score
+                :in $ ?max-score
+                :where
+                [?e :score ?score]
+                [?e :keep true]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           {:db/id score :score score})
+                         (range 1 2001)))
+      (let [preferred (:preferred-access-plan
+                        (d/explain {} query (d/db conn) 2000))]
+        (is (= 1000 (get-in preferred [:estimate :sample-rows])))
+        (is (zero? (get-in preferred [:estimate :sample-output])))
+        (is (= c/magic-scan-ratio
+               (get-in preferred [:estimate :yield])))
+        (is (= 1000 (:candidate-budget preferred))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-access-estimate-separates-scan-work-from-output-rows
+  (let [dir   (u/tmp-dir (str "query-access-scan-output-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        query '[:find ?e ?name
+                :where
+                [(datalevin.test.query/access-source-ids $) [[?e]]]
+                [?e :name ?name]]
+        method
+        (reify
+          qaccess/IAccessMethod
+          (-access-plans [this {:keys [parsed-q]}]
+            (let [covered (first (:qwhere parsed-q))
+                  expr
+                  (qaccess/map->AccessExpr
+                    {:method :scan-output-test
+                     :covers #{covered}
+                     :covered-originals
+                     #{(first (:qorig-where parsed-q))}
+                     :requires #{}
+                     :produces #{'?e}
+                     :join-vars #{'?e}
+                     :cols ['?e]
+                     :source '$})
+                  path
+                  (assoc
+                    (qaccess/->AccessPath
+                      :scan-output-test this :complete nil #{:complete} {}
+                      (qaccess/access-policy :none :execution))
+                    :quality :exact)
+                  estimate
+                  (assoc
+                    (qaccess/->AccessEstimate
+                      2.0 3.0 100 302.0 :low)
+                    :range-rows 100
+                    :scan-rows 100
+                    :output-rows 4
+                    :yield 1.0)]
+              [(qaccess/->AccessPlan
+                 expr path (qaccess/source-bounds)
+                 (qaccess/access-work)
+                 estimate)]))
+
+          (-open-access [_ _ _ _ _ _]
+            (throw (ex-info "Explain should not execute access" {})))
+
+          (-frontier-satisfies? [_ _ _ _ _] false))]
+    (try
+      (d/transact! conn [{:db/id 1 :name "Ada"}])
+      (binding [qexec/*access-methods* [method]
+                q/*cache?*              false]
+        (let [explain   (d/explain {} query (d/db conn))
+              preferred (:preferred-access-plan explain)
+              source
+              (first
+                (for [[logical-key alternatives]
+                      (:physical-plan-subsets explain)
+                      :when (= 1 (count logical-key))
+                      alternative alternatives
+                      :when (= :access-fragment (:kind alternative))]
+                  alternative))]
+          (is (= 100 (get-in preferred [:estimate :scan-rows])))
+          (is (= 4 (get-in preferred [:estimate :output-rows])))
+          (is (= 4 (get-in preferred [:estimate :rows])))
+          (is (= 302.0 (get-in preferred [:estimate :upper-cost])))
+          (is (= 4 (:size source)))
+          (is (= 302.0 (:cost source)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-ordinary-query-skips-access-join-planning
+  (let [conn (d/create-conn nil {} {:kv-opts {:inmemory? true}})]
+    (try
+      (d/transact! conn [{:db/id 1 :name "Ada"}])
+      (with-redefs [qo/plan-access-joins
+                    (fn [& _]
+                      (throw (ex-info "Access join planner should be skipped"
+                                      {})))
+                    qo/build-property-memo
+                    (fn [& _]
+                      (throw (ex-info "Property memo should be skipped"
+                                      {})))]
+        (binding [q/*cache?* false]
+          (is (= #{["Ada"]}
+                 (d/q '[:find ?name
+                        :where
+                        [?e :name ?name]]
+                      (d/db conn))))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-ordered-limit-falls-back-after-candidate-batch-cap
+  (let [dir       (u/tmp-dir (str "query-top-k-fallback-" (UUID/randomUUID)))
+        conn      (d/get-conn dir)
+        max-score 32769
+        query     '[:find ?score
+                    :in $ ?max-score
+                    :where
+                    [?e :score ?score]
+                    [?e :keep true]
+                    [(<= ?score ?max-score)]
+                    :order-by [?score :desc]
+                    :limit 1]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long score]
+                           (cond-> {:db/id score :score score}
+                             (= score 1) (assoc :keep true)))
+                         (range 1 (inc max-score))))
+      (binding [q/*cache?* false]
+        (is (= [[1]]
+               (d/q query (d/db conn) max-score))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

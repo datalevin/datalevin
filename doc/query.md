@@ -122,6 +122,25 @@ different pages are cached separately. Transaction invalidation remains based
 on the attributes used by the query. Unbounded queries continue to cache their
 full result, and the plan cache remains independent of result-window caching.
 
+### Adaptive unordered limits
+
+A finite unordered relation query can also avoid producing every source match
+when its driving operation exposes a resumable access path, such as an
+optimizer-selected `idoc-match`. Unlike ordered limit push-down, this execution
+mode does not require or provide an ordering property.
+
+The root query retains `:offset + :limit` as its required output count while
+the access source is read in bounded batches. The remaining joins and filters
+run on each batch, and offset is applied only after enough distinct final
+tuples survive. The optimizer estimates how many source candidates those
+clauses may discard and can resume the source to fetch more.
+
+This path competes with the conventional plan in the cost model. Queries
+without a finite limit and query shapes that cannot safely preserve their
+semantics under batching continue to use conventional execution. Adaptive
+execution also retains the conventional plan as a fallback if candidate work
+reaches its safety budget.
+
 ### Merge scan
 
 For star-like attributes, we utilize an idea similar to pivot scan [2], which

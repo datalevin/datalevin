@@ -3,9 +3,13 @@
 ## WIP
 
 ### Fixed
-- [Datalog] fix composite tuple `nil` regression.
+- [Datalog] fix composite tuple `nil` regression introduced in 1.0.0.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
+
+### Improved
+- [Datalog] integrating top-k access paths into cost based optimizer, covering
+  AVE scan, idoc, full-text and vector query functions.
 
 ## 1.0.0 (2026-07-20)
 

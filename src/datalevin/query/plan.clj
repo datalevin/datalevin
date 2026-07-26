@@ -11,6 +11,7 @@
   "Shared query plan, step, and step-execution helpers."
   (:refer-clojure :exclude [update assoc])
   (:require
+   [clojure.set :as set]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
    [datalevin.db :as db]
@@ -18,6 +19,7 @@
    [datalevin.join :as j]
    [datalevin.lmdb :as l]
    [datalevin.pipe :as p]
+   [datalevin.query.access :as qaccess]
    [datalevin.query.optimizer.range :as qor]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
@@ -42,6 +44,21 @@
 
 (defrecord Plan [steps cost size recency])
 
+(defrecord AccessRootPlan
+    [mode source residual-query demand work properties cost size fallback])
+
+(defrecord ConventionalRootPlan
+    [context properties cost size])
+
+(defrecord PhysicalProperties
+    [ordering resumable? complete? quality capabilities])
+
+(defrecord PlanAlternative
+    [kind logical-key properties plan cost size payload])
+
+(defrecord PropertyMemo
+    [logical-key demand alternatives selected subsets])
+
 (defprotocol IStep
   (-type [step] "return the type of step as a keyword")
   (-execute [step db source] "execute query step and return tuples")
@@ -52,6 +69,156 @@
 (declare cols->attrs execute-steps hash-join-execute hash-join-execute-into
          sip-execute-pipe sip-hash-join-execute index-semi-join-execute
          index-semi-join-execute-into)
+
+(defn- read-access-prefix
+  ([path demand bounds work source]
+   (read-access-prefix path demand bounds work source nil))
+  ([path demand bounds work source bindings]
+   (let [cursor (qaccess/open-access
+                  path demand bounds work source bindings)]
+     (try
+       (qaccess/next-batch cursor)
+       (finally
+         (qaccess/close-cursor cursor))))))
+
+(defn- read-access-all
+  ([path demand bounds work source]
+   (read-access-all path demand bounds work source nil))
+  ([path demand bounds work source bindings]
+   (let [cursor (qaccess/open-access
+                  path demand bounds (assoc work :max-candidates nil)
+                  source bindings)
+         tuples (FastList.)]
+    (try
+      (loop []
+        (let [{batch-tuples :tuples
+               :keys        [exhausted?]} (qaccess/next-batch cursor)]
+          (.addAll tuples ^Collection batch-tuples)
+          (if exhausted?
+            tuples
+            (recur))))
+      (finally
+        (qaccess/close-cursor cursor))))))
+
+(defn- tuple-bindings
+  [cols tuple]
+  (let [get-value (if (u/array? tuple)
+                    #(aget ^objects tuple (long %))
+                    #(nth tuple %))]
+    (persistent!
+      (reduce-kv
+        (fn [bindings i col]
+          (assoc! bindings col (get-value i)))
+        (transient {}) cols))))
+
+(defn- merge-access-tuple
+  [input-cols access-cols output-cols input-tuple access-tuple]
+  (let [input-bindings  (tuple-bindings input-cols input-tuple)
+        access-bindings (tuple-bindings access-cols access-tuple)
+        shared          (set/intersection (set input-cols)
+                                          (set access-cols))]
+    (when (every? #(= (get input-bindings %)
+                      (get access-bindings %))
+                  shared)
+      (let [bindings (merge input-bindings access-bindings)]
+        (object-array (map bindings output-cols))))))
+
+(defn- read-correlated-all
+  [path demand bounds work db input-cols access-cols output-cols source]
+  (let [tuples (FastList.)]
+    (doseq [input-tuple source]
+      (let [bindings   (tuple-bindings input-cols input-tuple)
+            candidates (read-access-all
+                         path demand bounds work db bindings)]
+        (doseq [access-tuple candidates]
+          (when-let [tuple
+                     (merge-access-tuple input-cols access-cols output-cols
+                                         input-tuple access-tuple)]
+            (.add tuples tuple)))))
+    tuples))
+
+(defrecord AccessStep
+    [expr path demand bounds work in out cols input-cols access-cols
+     access-source strata seen-or-joins result sample]
+
+  IStep
+  (-type [_] :access)
+
+  (-execute [_ db source]
+    (let [db (or access-source db)]
+      (or result
+          (if (seq input-cols)
+            (read-correlated-all path demand bounds work db input-cols
+                                 access-cols cols source)
+            (read-access-all path demand bounds work db)))))
+
+  (-execute-pipe [_ db source sink]
+    (let [db (or access-source db)]
+      (p/add-batch sink
+                   (or result
+                       (if (seq input-cols)
+                         (read-correlated-all
+                           path demand bounds work db input-cols access-cols
+                           cols source)
+                         (read-access-all path demand bounds work db))))))
+
+  (-sample [_ db _source]
+    (or sample
+        (:tuples
+          (read-access-prefix
+            path demand bounds
+            (assoc work :sample-size (or (:sample-size work)
+                                         (:batch-size work)))
+            (or access-source db)))))
+
+  (-explain [_ _]
+    (str "Access " cols " by " (:method expr) "/" (:strategy path)
+         (when-let [required-count (:required-count demand)]
+           (str " for " required-count " candidates"))
+         (when-let [source-limit (:limit bounds)]
+           (str " within source limit " source-limit))
+         (when-let [ordering (:ordering demand)]
+           (str " ordered by " ordering))
+         ".")))
+
+(defn access-step
+  ([expr path demand]
+   (access-step expr path demand (qaccess/source-bounds)
+                (qaccess/access-work) []))
+  ([expr path demand work]
+   (access-step expr path demand (qaccess/source-bounds) work []))
+  ([expr path demand work input-cols]
+   (access-step expr path demand (qaccess/source-bounds) work input-cols))
+  ([expr path demand bounds work input-cols]
+   (access-step expr path demand bounds work input-cols nil))
+  ([expr path demand bounds work input-cols access-source]
+   (let [access-cols (or
+                       (:cols expr)
+                       (throw
+                         (ex-info "Access expression requires an output schema"
+                                  {:expr expr})))
+         input-cols  (vec input-cols)
+         requires    (set (:requires expr))
+         supplied    (set input-cols)]
+     (when-not (set/subset? requires supplied)
+       (throw
+         (ex-info "Access expression requirements are not bound"
+                  {:requires requires :supplied supplied})))
+     (let [cols (into input-cols (remove supplied) access-cols)
+           out  (set cols)]
+       (->AccessStep expr path demand bounds work supplied out cols
+                     input-cols access-cols access-source
+                     [out] #{} nil nil)))))
+
+(defn access-sample-batch
+  [step db]
+  (or (:sample-batch step)
+      (read-access-prefix
+        (:path step) (:demand step) (:bounds step)
+        (assoc (:work step)
+               :sample-size (or (get-in step [:work :sample-size])
+                                (get-in step [:work :batch-size])))
+        (or (:access-source step) db))))
 
 (defrecord InitStep
     [attr pred val range vars in out know-e? cols strata seen-or-joins mcount
