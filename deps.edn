@@ -1,17 +1,17 @@
 {:paths ["src" "target/classes"]
- :deps  {
-         org.clojure/clojure                           {:mvn/version "1.12.4"}
+ :deps  {org.clojure/clojure                           {:mvn/version "1.12.4"}
          babashka/babashka.pods                        {:mvn/version "0.2.0"}
          com.cognitect/transit-clj                     {:mvn/version "1.1.357"}
          com.github.clj-easy/graal-build-time          {:mvn/version "1.0.5"}
          com.taoensso/nippy                            {:mvn/version "3.7.0-beta1"}
-        com.github.luben/zstd-jni                     {:mvn/version "1.5.7-11"}
+         com.s-exp/hako                                {:mvn/version "1.0.0-alpha31"}
+         com.github.luben/zstd-jni                     {:mvn/version "1.5.7-11"}
          com.taoensso/timbre                           {:mvn/version "6.5.0"}
-        me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.14"}
+         me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.14"}
          metosin/jsonista                              {:mvn/version "1.0.0"}
          io.github.nextjournal/markdown                {:mvn/version "0.7.225"}
          nrepl/bencode                                 {:mvn/version "1.2.0"}
-        org.babashka/sci                              {:mvn/version "0.13.53"}
+         org.babashka/sci                              {:mvn/version "0.13.53"}
          org.clojure/tools.cli                         {:mvn/version "1.4.256"}
          org.clojars.huahaiy/dtlvnative-macosx-arm64   {:mvn/version "0.18.8"}
          org.clojars.huahaiy/dtlvnative-linux-arm64    {:mvn/version "0.18.8"}
@@ -21,26 +21,21 @@
          org.roaringbitmap/RoaringBitmap               {:mvn/version "1.6.14"}
          org.bouncycastle/bcpkix-jdk15on               {:mvn/version "1.70"}
          org.bouncycastle/bcprov-jdk15on               {:mvn/version "1.70"}
-        com.alipay.sofa/jraft-core                    {:mvn/version "1.4.1"
-                                                        :exclusions [org.rocksdb/rocksdbjni]}
-         }
+         com.alipay.sofa/jraft-core                    {:mvn/version "1.4.1"
+                                                        :exclusions [org.rocksdb/rocksdbjni]}}
 
  :deps/prep-lib {:alias  :build
                  :fn     compile-java
                  :ensure "target/classes"}
 
- :aliases {
-           :dev {
-                 :jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+ :aliases {:dev {:jvm-opts ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                             "--add-opens=java.base/java.nio=ALL-UNNAMED"
                             "--add-opens=java.base/java.util=ALL-UNNAMED"
                             "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                             "--enable-native-access=ALL-UNNAMED"
-                            "-Dclojure.compiler.direct-linking=true"]
-                 }
+                            "-Dclojure.compiler.direct-linking=true"]}
 
-           :pod   {
-                   :jvm-opts   ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+           :pod   {:jvm-opts   ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                                 "--add-opens=java.base/java.nio=ALL-UNNAMED"
                                 "--add-opens=java.base/java.util=ALL-UNNAMED"
                                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
@@ -49,14 +44,12 @@
                    :main-opts  ["-m" "pod.huahaiy.datalevin"]
                    :ns-default pod.huahaiy.datalevin
                    :exec-fn    run}
-           :test  {
-                   :extra-paths ["test"]
+           :test  {:extra-paths ["test"]
                    :jvm-opts    ["--add-opens=java.base/java.lang=ALL-UNNAMED"
                                  "--add-opens=java.base/java.nio=ALL-UNNAMED"
                                  "--add-opens=java.base/java.util=ALL-UNNAMED"
                                  "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                                  "--enable-native-access=ALL-UNNAMED"
-                                 "-Dclojure.compiler.direct-linking=true"]
-                   }
+                                 "-Dclojure.compiler.direct-linking=true"]}
            :build {:deps       {io.github.clojure/tools.build {:git/tag "v0.8.3" :git/sha "0d20256"}}
                    :ns-default build}}}
