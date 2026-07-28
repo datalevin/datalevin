@@ -174,6 +174,39 @@
         (#'cl/raise-normal-request-error req message err-data nil)
         result))))
 
+(defn- disable-ha-transaction-retry!
+  [routing-client]
+  (let [active-client (#'cl/active-ha-request-client routing-client)]
+    ;; Explicit transactions are owned by one server session. Pin both the
+    ;; routing facade and the active endpoint client so control messages cannot
+    ;; fail over to a different session after the transaction has opened.
+    (#'cl/disable-ha-write-retry! routing-client)
+    (when-not (identical? routing-client active-client)
+      (#'cl/disable-ha-write-retry! active-client))
+    active-client))
+
+(defn- enable-ha-transaction-retry!
+  [routing-client]
+  (let [active-client (#'cl/active-ha-request-client routing-client)]
+    (#'cl/enable-ha-write-retry! routing-client)
+    (when-not (identical? routing-client active-client)
+      (#'cl/enable-ha-write-retry! active-client))))
+
+(defn- close-ha-transaction!
+  [routing-client request-type db-name]
+  ;; On failure, keep routing pinned so the with-transaction cleanup path can
+  ;; send abort to the session that still owns the transaction.
+  (let [result (#'cl/normal-request routing-client request-type [db-name] true)]
+    (enable-ha-transaction-retry! routing-client)
+    result))
+
+(defn- abort-ha-transaction!
+  [routing-client request-type db-name]
+  (try
+    (#'cl/normal-request routing-client request-type [db-name] true)
+    (finally
+      (enable-ha-transaction-retry! routing-client))))
+
 (defn- load-datoms*
   ([client db-name datoms datom-type simulated?]
    (load-datoms* client db-name datoms datom-type simulated? false nil))
@@ -591,8 +624,7 @@
                                   :args [db-name]
                                   :writing? false})
     (#'cl/sync-ha-routing! tx-client client)
-    (let [active-client (#'cl/active-ha-request-client tx-client)]
-      (#'cl/disable-ha-write-retry! active-client)
+    (let [active-client (disable-ha-transaction-retry! tx-client)]
       (DatalogStore. uri db-name active-client active-client
                      (volatile! :remote-dl-mutex) true
                      open-db-info
@@ -604,16 +636,10 @@
                      closed?)))
 
   (abort-transact [this]
-    (try
-      (#'cl/normal-request tx-client :abort-transact [db-name] true)
-      (finally
-        (#'cl/enable-ha-write-retry! tx-client))))
+    (abort-ha-transaction! tx-client :abort-transact db-name))
 
   (close-transact [_]
-    (try
-      (#'cl/normal-request tx-client :close-transact [db-name] true)
-      (finally
-        (#'cl/enable-ha-write-retry! tx-client))))
+    (close-ha-transaction! tx-client :close-transact db-name))
 
   ILMDB
   (kv-info [_] nil)
@@ -1121,8 +1147,7 @@
     (#'request-ha-open client {:type :open-transact-kv
                                :args [db-name]
                                :writing? false})
-    (let [active-client (#'cl/active-ha-request-client client)]
-      (#'cl/disable-ha-write-retry! active-client)
+    (let [active-client (disable-ha-transaction-retry! client)]
       (->KVStore uri db-name active-client
                  (volatile! :remote-kv-mutex) true
                  open-db-opts
@@ -1130,16 +1155,10 @@
                  closed?)))
 
   (close-transact-kv [_]
-    (try
-      (#'cl/normal-request client :close-transact-kv [db-name] true)
-      (finally
-        (#'cl/enable-ha-write-retry! client))))
+    (close-ha-transaction! client :close-transact-kv db-name))
 
   (abort-transact-kv [_]
-    (try
-      (#'cl/normal-request client :abort-transact-kv [db-name] true)
-      (finally
-        (#'cl/enable-ha-write-retry! client))))
+    (abort-ha-transaction! client :abort-transact-kv db-name))
 
   (transact-kv [this txs] (.transact-kv this nil txs))
   (transact-kv [this dbi-name txs]
