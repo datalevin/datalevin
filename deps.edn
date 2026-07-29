@@ -4,7 +4,7 @@
          com.cognitect/transit-clj                     {:mvn/version "1.1.357"}
          com.github.clj-easy/graal-build-time          {:mvn/version "1.0.5"}
          com.taoensso/nippy                            {:mvn/version "3.7.0-beta1"}
-         com.s-exp/hako                                {:mvn/version "1.0.0-alpha31"}
+         com.s-exp/hako                                {:mvn/version "1.0.0-alpha32"}
          com.github.luben/zstd-jni                     {:mvn/version "1.5.7-11"}
          com.taoensso/timbre                           {:mvn/version "6.5.0"}
          me.lemire.integercompression/JavaFastPFOR     {:mvn/version "0.3.14"}
