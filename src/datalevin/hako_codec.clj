@@ -66,12 +66,14 @@
     (hako/decode-into! rd (.asSlice ^MemorySegment seg 0 n) {:cache-idents true})))
 
 (defn freeze
-  "Encode `v` to a fresh byte[]. Convenience mirror of nippy/freeze."
+  "Encode `v` to a fresh byte[]. Signature-compatible with the
+  former `nippy/freeze` for drop-in replacement."
   ^bytes [v]
   (hako/encode v))
 
 (defn thaw
-  "Decode a hako-encoded byte[]. Convenience mirror of nippy/thaw."
+  "Decode a hako-encoded byte[]. Signature-compatible with the
+  former `nippy/thaw` for drop-in replacement."
   [^bytes bs]
   (hako/decode bs {:cache-idents true}))
 
