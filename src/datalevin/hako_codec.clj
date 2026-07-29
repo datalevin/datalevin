@@ -8,11 +8,16 @@
   without refactoring callers to `MemorySegment`.
 
   Wire format per call: `<u32 length LE><hako-encoded payload>`.
-  Length-prefix lets multiple values interleave in the same stream."
+  Length-prefix lets multiple values interleave in the same stream.
+
+  Phase 2 additions: `put-data-into-buffer!` bypasses the byte[]
+  bounce for LMDB writes — hako's arena-backed MemorySegment gets
+  copied directly into the caller's ByteBuffer, no heap intermediate."
   (:require [s-exp.hako :as hako])
   (:import (com.s_exp.hako Reader Writer)
            (java.io DataInput DataOutput)
-           (java.lang.foreign MemorySegment ValueLayout)))
+           (java.lang.foreign MemorySegment ValueLayout)
+           (java.nio ByteBuffer)))
 
 (set! *warn-on-reflection* true)
 
@@ -69,3 +74,57 @@
   "Decode a hako-encoded byte[]. Convenience mirror of nippy/thaw."
   [^bytes bs]
   (hako/decode bs {:cache-idents true}))
+
+(defn fast-freeze
+  "byte[]-returning encode via the thread-local reusable Writer.
+  Amortizes arena setup; copies segment → byte[] on the way out."
+  ^bytes [v]
+  (let [wr ^Writer (.get tl-writer)
+        seg (hako/encode-into! wr v)
+        n (.byteSize seg)
+        _ (when (> n Integer/MAX_VALUE)
+            (throw (IllegalStateException.
+                    (str "hako-codec: payload exceeds Integer/MAX_VALUE: " n))))
+        arr (byte-array n)]
+    (MemorySegment/copy seg ValueLayout/JAVA_BYTE 0 arr 0 n)
+    arr))
+
+(defn fast-thaw
+  "Decode via the thread-local reusable Reader."
+  [^bytes bs]
+  (let [rd ^Reader (.get tl-reader)
+        seg (MemorySegment/ofArray bs)]
+    (hako/decode-into! rd seg {:cache-idents true})))
+
+;; Phase 2: direct-ByteBuffer paths — skip the byte[] bounce.
+
+(defn put-data-into-buffer!
+  "Encode `v` with hako's reusable Writer, then copy segment bytes
+  directly into `bb` at its current position. Advances `bb.position`
+  by the byte count written. Skips the byte[] intermediate that
+  `serialize` + `.put(bb, bs)` allocates. Returns the byte count."
+  [^ByteBuffer bb v]
+  (let [wr ^Writer (.get tl-writer)
+        seg (hako/encode-into! wr v)
+        n (.byteSize seg)
+        _ (when (> n Integer/MAX_VALUE)
+            (throw (IllegalStateException.
+                    (str "hako-codec: payload exceeds Integer/MAX_VALUE: " n))))
+        src-bb (.asByteBuffer seg)]
+    (.put bb src-bb)
+    (int n)))
+
+(defn get-data-from-buffer!
+  "Decode `n` bytes from `bb`'s current position via the reusable
+  Reader. Wraps the ByteBuffer region as a MemorySegment slice —
+  zero heap copy for the wrap step. Advances `bb.position` by n."
+  [^ByteBuffer bb ^long n]
+  (let [rd ^Reader (.get tl-reader)
+        start (.position bb)
+        seg (if (.hasArray bb)
+              (.asSlice (MemorySegment/ofArray ^bytes (.array bb))
+                        (+ (.arrayOffset bb) start) n)
+              (.asSlice (MemorySegment/ofBuffer bb) 0 n))
+        v (hako/decode-into! rd seg {:cache-idents true})]
+    (.position bb (+ start (int n)))
+    v))

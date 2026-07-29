@@ -20,7 +20,7 @@
    [datalevin.interface :as i]
    [datalevin.txlog :as txlog]
    [clojure.string :as s]
-   [taoensso.nippy :as nippy])
+   [datalevin.hako-codec :as codec])
   (:import
    [datalevin.dtlvnative DTLV DTLV$usearch_index_t]
    [datalevin.cpp VecIdx VecIdx$SearchResult VecIdx$IndexInfo]
@@ -68,12 +68,12 @@
   [dimensions metric-key quantization connectivity expansion-add
    expansion-search]
   (VecIdx/create
-    ^long dimensions
-    ^int (metric-key->type metric-key)
-    ^int (scalar-kind quantization)
-    ^long connectivity
-    ^long expansion-add
-    ^long expansion-search))
+   ^long dimensions
+   ^int (metric-key->type metric-key)
+   ^int (scalar-kind quantization)
+   ^long connectivity
+   ^long expansion-add
+   ^long expansion-search))
 
 (defn- ->array
   [quantization vec-data]
@@ -435,7 +435,7 @@
               (let [offset-l (unchecked-multiply (long i) (long chunk-size))
                     offset   (int offset-l)
                     end      (int (min (unchecked-add offset-l
-                                                     (long chunk-size))
+                                                      (long chunk-size))
                                        total-bytes))
                     chunk  (Arrays/copyOfRange all-bytes offset end)]
                 (.add txs (l/kv-tx :put c/vec-index-dbi
@@ -449,7 +449,7 @@
           (VecIdx/save index (.getAbsolutePath tmp-file))
           (with-open [fis (FileInputStream. tmp-file)]
             (let [read-buf (byte-array (int (min (long chunk-size)
-                                             (long Integer/MAX_VALUE))))]
+                                                 (long Integer/MAX_VALUE))))]
               (loop [chunk-id 0]
                 (let [n (.read fis read-buf)]
                   (when (pos? n)
@@ -690,7 +690,7 @@
           (let [commit-lsn (txn-log-next-lsn lmdb)
                 meta-op    (replay-floor-put-tx lmdb domain commit-lsn)
                 txs        (cond-> [(l/kv-tx :put vecs-dbi vec-ref id
-                                              :data :id)]
+                                             :data :id)]
                              (some? meta-op) (conj meta-op))]
             (i/transact-kv lmdb txs))
           (try
@@ -773,7 +773,7 @@
                     (try
                       (i/transact-kv
                        lmdb [(l/kv-tx :put-list vecs-dbi stored-ref ids
-                                              :data :id)])
+                                      :data :id)])
                       (catch Throwable rollback-e
                         (throw (ex-info "Fail to rollback vector ref mapping"
                                         {:vec-ref stored-ref :ids ids}
@@ -853,9 +853,9 @@
   (search-vec [this query-vec]
     (.search-vec this query-vec {}))
   (search-vec [_ query-vec {:keys [display top vec-filter]
-                               :or   {display    (:display search-opts)
-                                      top        (:top search-opts)
-                                      vec-filter (:vec-filter search-opts)}}]
+                            :or   {display    (:display search-opts)
+                                   top        (:top search-opts)
+                                   vec-filter (:vec-filter search-opts)}}]
     (let [rlock (.readLock vec-lock)]
       (.lock rlock)
       (try
@@ -874,15 +874,15 @@
     (try
       (let [dfname (str fname ".dump")
             dos    (DataOutputStream. (FileOutputStream. ^String dfname))]
-        (nippy/freeze-to-out!
-          dos (for [[vec-id vec-ref] vecs]
-                [vec-ref (get-vec* index vec-id quantization dimensions)]))
+        (codec/freeze-to-out!
+         dos (for [[vec-id vec-ref] vecs]
+               [vec-ref (get-vec* index vec-id quantization dimensions)]))
         (.flush dos)
         (.close dos)
         (.clear-vecs this)
         (let [new (new-vector-index lmdb opts)
               dis (DataInputStream. (FileInputStream. ^String dfname))]
-          (doseq [[vec-ref vec-data] (nippy/thaw-from-in! dis)]
+          (doseq [[vec-ref vec-data] (codec/thaw-from-in! dis)]
             (i/add-vec new vec-ref vec-data))
           (.close dis)
           (u/delete-files dfname)
@@ -1060,25 +1060,25 @@
                    :vec-checkpoint-bytes
                    (nonneg-long (or (:total-bytes meta-val) 0))
                    :vec-checkpoint-failure-count 0})]
-      (let [vi (->VectorIndex lmdb
-                              (volatile! false)
-                              index
-                              fname
-                              domain
-                              dimensions
-                              metric-type
-                              quantization
-                              connectivity
-                              expansion-add
-                              expansion-search
-                              vecs-dbi
-                              vecs
-                              (AtomicLong. max-vec-id)
-                              search-opts
-                              checkpoint-stats
-                              (ReentrantReadWriteLock.))]
-        (swap! l/vector-indices assoc fname vi)
-        vi)))))
+        (let [vi (->VectorIndex lmdb
+                                (volatile! false)
+                                index
+                                fname
+                                domain
+                                dimensions
+                                metric-type
+                                quantization
+                                connectivity
+                                expansion-add
+                                expansion-search
+                                vecs-dbi
+                                vecs
+                                (AtomicLong. max-vec-id)
+                                search-opts
+                                checkpoint-stats
+                                (ReentrantReadWriteLock.))]
+          (swap! l/vector-indices assoc fname vi)
+          vi)))))
 
 (defn new-vector-index
   [lmdb opts]

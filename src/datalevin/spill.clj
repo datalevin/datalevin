@@ -16,11 +16,11 @@
    [datalevin.util :as u]
    [datalevin.lmdb :as l]
    [datalevin.interface :as i]
-   [taoensso.nippy :as nippy]
+   [s-exp.hako.ext :as hext]
    [clojure.set :as set])
   (:import
+   [com.s_exp.hako Reader Writer]
    [java.util Iterator List UUID NoSuchElementException Map Set Collection]
-   [java.io DataInput DataOutput]
    [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
    [javax.management NotificationEmitter NotificationListener Notification]
@@ -50,9 +50,9 @@
     (let [^NotificationListener listener
           (reify NotificationListener
             (^void handleNotification [_ ^Notification notif _]
-             (when (= (.getType notif)
-                      GarbageCollectionNotificationInfo/GARBAGE_COLLECTION_NOTIFICATION)
-               (set-memory-pressure))))]
+              (when (= (.getType notif)
+                       GarbageCollectionNotificationInfo/GARBAGE_COLLECTION_NOTIFICATION)
+                (set-memory-pressure))))]
       (vswap! listeners assoc gcbean listener)
       (.addNotificationListener gcbean listener nil nil))))
 
@@ -304,7 +304,7 @@
 
   (cons [_ _]
     (throw (UnsupportedOperationException.
-             "Changing SpillableVector.SVecSeq is not supported")))
+            "Changing SpillableVector.SVecSeq is not supported")))
 
   (count [_] (- (count v) i))
 
@@ -329,7 +329,7 @@
 
   (cons [_ _]
     (throw (UnsupportedOperationException.
-             "Changing SpillableVector.RSVecSeq is not supported")))
+            "Changing SpillableVector.RSVecSeq is not supported")))
 
   (count [_] (inc i))
 
@@ -362,24 +362,22 @@
 (defn map-sv
   [f sv]
   (reduce
-    (fn [^SpillableVector acc r] (.cons acc (f r)))
-    (new-spillable-vector)
-    sv))
+   (fn [^SpillableVector acc r] (.cons acc (f r)))
+   (new-spillable-vector)
+   sv))
 
-(nippy/extend-freeze
-    SpillableVector :spillable-vec
-    [^SpillableVector x ^DataOutput out]
-  (let [n (count x)]
-    (.writeLong out n)
-    (dotimes [i n] (nippy/freeze-to-out! out (nth x i)))))
-
-(nippy/extend-thaw
-  :spillable-vec
-  [^DataInput in]
-  (let [n                   (.readLong in)
-        ^SpillableVector vs (new-spillable-vector)]
-    (dotimes [_ n] (.cons vs (nippy/thaw-from-in! in)))
-    vs))
+(hext/register-user-tag!
+ 0x10000002                             ; private range, subtag 2 = spillable-vec
+ SpillableVector
+ (fn write-spillable-vec [^Writer w ^SpillableVector x]
+   (let [n (count x)]
+     (.putI64 w n)
+     (dotimes [i n] (.writeAny w (nth x i)))))
+ (fn read-spillable-vec [^Reader r]
+   (let [n (.getI64 r)
+         ^SpillableVector vs (new-spillable-vector)]
+     (dotimes [_ n] (.cons vs (.readAny r)))
+     vs)))
 
 (deftype SpillableMap [^long spill-threshold
                        ^String spill-root
@@ -550,15 +548,13 @@
      (doseq [[k v] m] (assoc smap k v))
      smap)))
 
-(nippy/extend-freeze
-  SpillableMap :spillable-map
-  [^SpillableMap x ^DataOutput out]
-  (nippy/freeze-to-out! out (into {} x)))
-
-(nippy/extend-thaw
-  :spillable-map
-  [^DataInput in]
-  (new-spillable-map (nippy/thaw-from-in! in)))
+(hext/register-user-tag!
+ 0x10000003                             ; private range, subtag 3 = spillable-map
+ SpillableMap
+ (fn write-spillable-map [^Writer w ^SpillableMap x]
+   (.writeAny w (into {} x)))
+ (fn read-spillable-map [^Reader r]
+   (new-spillable-map (.readAny r))))
 
 (deftype SpillableSet [^SpillableMap impl
                        ^:unsynchronized-mutable meta]
@@ -574,7 +570,7 @@
 
   (count [_] (count impl))
 
-  (contains[_ o] (.containsKey impl o))
+  (contains [_ o] (.containsKey impl o))
 
   (cons [this o] (.put impl o c/slash) this)
 
@@ -647,12 +643,10 @@
      (doseq [e s] (.put impl e c/slash))
      (SpillableSet. impl nil))))
 
-(nippy/extend-freeze
-  SpillableSet :spillable-set
-  [^SpillableSet x ^DataOutput out]
-  (nippy/freeze-to-out! out (into #{} x)))
-
-(nippy/extend-thaw
-  :spillable-set
-  [^DataInput in]
-  (new-spillable-set (nippy/thaw-from-in! in)))
+(hext/register-user-tag!
+ 0x10000004                             ; private range, subtag 4 = spillable-set
+ SpillableSet
+ (fn write-spillable-set [^Writer w ^SpillableSet x]
+   (.writeAny w (into #{} x)))
+ (fn read-spillable-set [^Reader r]
+   (new-spillable-set (.readAny r))))

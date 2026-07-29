@@ -13,9 +13,10 @@
   (:require
    [datalevin.ints :as i]
    [datalevin.interface :refer [compress uncompress]]
-   [taoensso.nippy :as nippy])
+   [s-exp.hako.ext :as hext])
   (:import
-   [java.io Writer DataInput DataOutput]
+   [com.s_exp.hako Reader]
+   [java.io Writer DataInput DataOutput ByteArrayOutputStream DataOutputStream ByteArrayInputStream DataInputStream]
    [java.nio ByteBuffer]
    [datalevin.utl GrowingIntArray]
    [org.roaringbitmap ImmutableBitmapDataProvider RoaringBitmap]
@@ -75,52 +76,59 @@
          (.equals indices (.-indices ^SparseIntArrayList other))
          (.equals items (.-items ^SparseIntArrayList other)))))
 
-(nippy/extend-freeze
-  RoaringBitmap :dtlv/bm
-  [^RoaringBitmap x ^DataOutput out]
-  (.serialize x out))
+(hext/register-user-tag!
+ 0x10000005                             ; private range, subtag 5 = RoaringBitmap
+ RoaringBitmap
+ (fn write-bm [^com.s_exp.hako.Writer w ^RoaringBitmap x]
+   (let [baos (ByteArrayOutputStream.)
+         dos  (DataOutputStream. baos)]
+     (.serialize x ^DataOutput dos)
+     (.flush dos)
+     (.writeBytes w (.toByteArray baos))))
+ (fn read-bm [^Reader r]
+   (let [tag (.getByte r)
+         low (bit-and tag 0x0F)
+         n   (.readTierPayload r (int low))
+         arr (.getBytes r (int n))
+         dis (DataInputStream. (ByteArrayInputStream. arr))]
+     (doto (RoaringBitmap.) (.deserialize ^DataInput dis)))))
 
-(nippy/extend-freeze
-    GrowingIntArray :dtlv/gia
-    [^GrowingIntArray x ^DataOutput out]
-  (let [ar        (.toArray  x)
-        osize     (alength ar)
-        comp?     (< 3 osize)
-        ^ints car (if comp?
-                    (compress i/int-compressor ar)
-                    ar)
-        size      (alength car)]
-    (.writeInt out (if comp? (- size) size))
-    (dotimes [i size] (.writeInt out (aget car i)))))
+(hext/register-user-tag!
+ 0x10000006                             ; private range, subtag 6 = GrowingIntArray
+ GrowingIntArray
+ (fn write-gia [^com.s_exp.hako.Writer w ^GrowingIntArray x]
+   (let [ar        (.toArray x)
+         osize     (alength ar)
+         comp?     (< 3 osize)
+         ^ints car (if comp?
+                     (compress i/int-compressor ar)
+                     ar)
+         size      (alength car)]
+     (.putI32 w (if comp? (- size) size))
+     (dotimes [i size] (.putI32 w (aget car i)))))
+ (fn read-gia [^Reader r]
+   (let [csize (.getI32 r)
+         comp? (neg? csize)
+         size  (if comp? (- csize) csize)
+         car   (int-array size)
+         items (GrowingIntArray.)]
+     (dotimes [i size] (aset car i (.getI32 r)))
+     (.addAll items
+              (if comp?
+                (uncompress i/int-compressor car)
+                car))
+     items)))
 
-(nippy/extend-freeze
-  SparseIntArrayList :dtlv/sial
-  [^SparseIntArrayList x ^DataOutput out]
-  (nippy/freeze-to-out! out (.-items x))
-  (nippy/freeze-to-out! out (.-indices x)))
-
-(nippy/extend-thaw
-  :dtlv/bm [^DataInput in]
-  (doto (RoaringBitmap.) (.deserialize in)))
-
-(nippy/extend-thaw
-    :dtlv/gia [^DataInput in]
-  (let [csize (.readInt in)
-        comp? (neg? csize)
-        size  (if comp? (- csize) csize)
-        car   (int-array size)
-        items (GrowingIntArray.)]
-    (dotimes [i size] (aset car i (.readInt in)))
-    (.addAll items
-             (if comp?
-               (uncompress i/int-compressor car)
-               car))
-    items))
-
-(nippy/extend-thaw
-  :dtlv/sial [^DataInput in]
-  (let [items (nippy/thaw-from-in! in)]
-    (->SparseIntArrayList (nippy/thaw-from-in! in) items)))
+(hext/register-user-tag!
+ 0x10000007                             ; private range, subtag 7 = SparseIntArrayList
+ SparseIntArrayList
+ (fn write-sial [^com.s_exp.hako.Writer w ^SparseIntArrayList x]
+   (.writeAny w (.-items x))
+   (.writeAny w (.-indices x)))
+ (fn read-sial [^Reader r]
+   (let [items (.readAny r)
+         indices (.readAny r)]
+     (->SparseIntArrayList indices items))))
 
 (defn sparse-arraylist
   ([]
@@ -136,7 +144,7 @@
        (when (and ks vs)
          (set ssl (first ks) (first vs))
          (recur (next ks) (next vs))))
-     ssl)) )
+     ssl)))
 
 (defn deserialize-off-heap
   "Deserialize a read-only sparse list with its bitmap backed by direct memory."
