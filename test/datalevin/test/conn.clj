@@ -2800,7 +2800,45 @@
                         :rows [[:put "a" :covered :ok]]})]
               (is (= 15 (long (:lsn res))))
               (is (:skipped? res))
+              (is (nil? (d/get-value db "a" :covered)))
               (is (= 16 (long @(:next-lsn state))))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-replay-materializes-skipped-unapplied-tail
+  (let [dir  (u/tmp-dir (str "wal-replay-unapplied-tail-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k :expected]])))
+          (let [record (last (kv/open-tx-log db 1))
+                lsn    (long (:lsn record))]
+            ;; Model a crash after WAL append but before its LMDB payload was
+            ;; fully reflected: the local cursor contains the record, while
+            ;; the persisted materialization floor still trails it.
+            (is (= :transacted
+                   (kv/transact-kv-without-txlog!
+                    db
+                    [[:put "a" :k :stale]
+                     [:put c/kv-info c/wal-local-payload-lsn
+                      (dec lsn) :keyword :data]])))
+            (let [res (kv/mirror-replayed-txlog-record!
+                       db record nil {:replay-skipped? true})]
+              (is (:skipped? res))
+              (is (:replayed? res))
+              (is (= :expected (d/get-value db "a" :k)))
+              (is (= lsn
+                     (long (i/get-value db
+                                        c/kv-info
+                                        c/wal-local-payload-lsn
+                                        :keyword
+                                        :data))))))
           (finally
             (d/close-kv db))))
       (finally
@@ -2922,6 +2960,113 @@
                                     [:identity/key "identity-1"]))))
                 (finally
                   (d/close target-conn')))))
+          (finally
+            (d/close source-conn)
+            (when-not (d/closed? target-conn)
+              (d/close target-conn)))))
+      (finally
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
+(deftest test-wal-ha-replay-serializes-cardinality-one-cleanup
+  (let [source-dir (u/tmp-dir (str "wal-replay-serialized-cleanup-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-serialized-cleanup-target-"
+                                   (UUID/randomUUID)))
+        schema     {:bank/id      {:db/valueType :db.type/long
+                                   :db/unique :db.unique/identity}
+                    :bank/balance {:db/valueType :db.type/long}}
+        opts       {:wal? true
+                    :wal-durability-profile :strict}
+        initial    [{:db/id "account-0" :bank/id 0 :bank/balance 100}
+                    {:db/id "account-1" :bank/id 1 :bank/balance 100}
+                    {:db/id "account-2" :bank/id 2 :bank/balance 100}]]
+    (try
+      (let [source-conn (d/create-conn source-dir schema opts)
+            target-conn (d/create-conn target-dir schema opts)]
+        (try
+          (d/transact! source-conn initial)
+          (d/transact! target-conn initial)
+          ;; Consecutive transfers share account 1. If both replay callbacks
+          ;; derive cleanup rows before record 1 is materialized, record 2
+          ;; deletes balance 100 instead of 105 and leaves a stale duplicate.
+          (d/transact! source-conn
+                       [{:db/id [:bank/id 0] :bank/balance 95}
+                        {:db/id [:bank/id 1] :bank/balance 105}])
+          (d/transact! source-conn
+                       [{:db/id [:bank/id 1] :bank/balance 101}
+                        {:db/id [:bank/id 2] :bank/balance 104}])
+          (let [source-kv   (.-lmdb ^Store (conn-store source-conn))
+                target-store (conn-store target-conn)
+                target-kv   (.-lmdb ^Store target-store)
+                next-lsn    (long @(:next-lsn (txlog/state target-kv)))
+                records     (vec
+                             (drop-while #(< (long (:lsn %)) next-lsn)
+                                         (kv/open-tx-log source-kv 1)))
+                cleanup-var (ns-resolve
+                             'datalevin.ha.replication
+                             'ha-cardinality-one-eav-cleanup-rows)
+                cleanup-fn  @cleanup-var
+                second-entered (promise)
+                second-future (promise)
+                second-during-first (atom nil)
+                cleanup     (fn [record]
+                              (cleanup-fn
+                               target-store
+                               target-kv
+                               (vec (or (:rows record) (:ops record)))))]
+            (is (= 2 (count records)))
+            (let [record-1 (first records)
+                  record-2 (second records)
+                  result-1
+                  (kv/mirror-replayed-txlog-record!
+                   target-kv
+                   record-1
+                   (fn []
+                     (let [f2
+                           (future
+                             (try
+                               (kv/mirror-replayed-txlog-record!
+                                target-kv
+                                record-2
+                                (fn []
+                                  (deliver second-entered true)
+                                  (cleanup record-2)))
+                               (catch Throwable e
+                                 e)))]
+                       (deliver second-future f2)
+                       ;; The second cleanup supplier must not run while the
+                       ;; first replay owns the serialized WAL/LMDB apply lock.
+                       (reset! second-during-first
+                               (deref second-entered 300 ::timeout))
+                       (cleanup record-1))))
+                  f2 (deref second-future 5000 ::timeout)
+                  result-2 (if (= ::timeout f2)
+                             ::timeout
+                             (deref f2 10000 ::timeout))]
+              (is (= ::timeout @second-during-first))
+              (is (map? result-1))
+              (is (map? result-2)
+                  (when (instance? Throwable result-2)
+                    (ex-message result-2))))
+            (s/sync-max-tx-floor!
+             target-store
+             (long (i/get-value target-kv c/meta :max-tx :attr :long)))
+            (db/refresh-cache target-store)
+            (let [target-db (db/new-db target-store)
+                  balances (mapv
+                            (fn [account-id]
+                              (:bank/balance
+                               (d/entity target-db [:bank/id account-id])))
+                            [0 1 2])
+                  account-1-eid (d/entid target-db [:bank/id 1])
+                  account-1-eav (i/get-list target-kv
+                                            c/eav
+                                            account-1-eid
+                                            :id
+                                            :avg)]
+              (is (= [95 101 104] balances))
+              (is (= 2 (count account-1-eav)))))
           (finally
             (d/close source-conn)
             (when-not (d/closed? target-conn)
