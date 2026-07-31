@@ -374,7 +374,12 @@
                                            dir new-schema new-opts)]
          (db/close-db db))
        (catch Exception e
-         (u/raise "Error loading nippy file into Datalog DB: " e {})))
+         (u/raise
+          "Failed to load binary dump into Datalog DB. If this dump was
+           produced by a pre-hako Datalevin, re-dump it with the old
+           version to the EDN format (drop the `--nippy` flag on
+           `dtlv dump`) and reload here."
+          e {})))
      (load-datalog dir in schema opts)))
   ([dir in schema opts]
    (try

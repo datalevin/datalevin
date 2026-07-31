@@ -253,15 +253,19 @@
 (defn- get-data
   "Read data from a ByteBuffer. Phase-2 path: decodes hako bytes
   directly via a MemorySegment view of the ByteBuffer region, no
-  intermediate byte[] allocation."
+  intermediate byte[] allocation. Empty payloads (n == 0) yield nil;
+  negative `n` (post-v overruns remaining) throws."
   ([^ByteBuffer bb]
    (let [n (.remaining bb)]
      (when (pos? n)
        (codec/get-data-from-buffer! bb n))))
   ([^ByteBuffer bb post-v]
    (let [n (- (.remaining bb) (long post-v))]
-     (when (pos? n)
-       (codec/get-data-from-buffer! bb n)))))
+     (cond
+       (neg? n) (throw (IllegalStateException.
+                        (str "bits/get-data: post-v " post-v
+                             " exceeds remaining " (.remaining bb))))
+       (pos? n) (codec/get-data-from-buffer! bb n)))))
 
 (def ^:no-doc ^:const float-sign-idx 31)
 (def ^:no-doc ^:const double-sign-idx 63)

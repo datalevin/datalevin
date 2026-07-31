@@ -220,7 +220,7 @@
 (def datom->vec-xf (map datom-eav))
 
 (hext/register-user-tag!
- 0x10000001                             ; private range, subtag 1 = datom
+ 1                                      ; subtag 1 = datom (wire id 0x10000001)
  Datom
  (fn write-datom [^Writer w ^Datom d]
    (.putI64 w (.-e d))
@@ -228,8 +228,5 @@
    (.writeAny w (.-v d))
    (.writeAny w (.-tx d)))
  (fn read-datom [^Reader r]
-   (let [e  (.getI64 r)
-         a  (.readAny r)
-         v  (.readAny r)
-         tx (.readAny r)]
-     (datom-from-reader (if tx [e a v tx] [e a v])))))
+   ;; write side always emits tx (possibly nil); 4-arity `datom` accepts nil.
+   (datom (.getI64 r) (.readAny r) (.readAny r) (.readAny r))))

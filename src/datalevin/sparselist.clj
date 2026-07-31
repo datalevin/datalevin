@@ -76,16 +76,28 @@
          (.equals indices (.-indices ^SparseIntArrayList other))
          (.equals items (.-items ^SparseIntArrayList other)))))
 
+;; RoaringBitmap serializes through a DataOutputStream contract we can't
+;; easily bridge to hako's segment. Cache the intermediate stream per
+;; thread so we don't pay the alloc on every bitmap encode.
+(def ^:private ^ThreadLocal tl-bm-baos
+  (proxy [ThreadLocal] []
+    (initialValue [] (ByteArrayOutputStream. 256))))
+
 (hext/register-user-tag!
- 0x10000005                             ; private range, subtag 5 = RoaringBitmap
+ 5                                      ; subtag 5 = RoaringBitmap (wire id 0x10000005)
  RoaringBitmap
  (fn write-bm [^com.s_exp.hako.Writer w ^RoaringBitmap x]
-   (let [baos (ByteArrayOutputStream.)
+   (let [^ByteArrayOutputStream baos (.get tl-bm-baos)
+         _    (.reset baos)
          dos  (DataOutputStream. baos)]
      (.serialize x ^DataOutput dos)
      (.flush dos)
      (.writeBytes w (.toByteArray baos))))
  (fn read-bm [^Reader r]
+   ;; Manual tier decode: hako's writeBytes emits `[M_BYTES tag][tier
+   ;; code][len bytes]`. `.readAny` would work but returns a fresh
+   ;; byte[]; this path reads the payload straight into `getBytes` and
+   ;; feeds RoaringBitmap.deserialize without the readAny dispatch.
    (let [tag (.getByte r)
          low (bit-and tag 0x0F)
          n   (.readTierPayload r (int low))
@@ -94,7 +106,7 @@
      (doto (RoaringBitmap.) (.deserialize ^DataInput dis)))))
 
 (hext/register-user-tag!
- 0x10000006                             ; private range, subtag 6 = GrowingIntArray
+ 6                                      ; subtag 6 = GrowingIntArray (wire id 0x10000006)
  GrowingIntArray
  (fn write-gia [^com.s_exp.hako.Writer w ^GrowingIntArray x]
    (let [ar        (.toArray x)
@@ -120,7 +132,7 @@
      items)))
 
 (hext/register-user-tag!
- 0x10000007                             ; private range, subtag 7 = SparseIntArrayList
+ 7                                      ; subtag 7 = SparseIntArrayList (wire id 0x10000007)
  SparseIntArrayList
  (fn write-sial [^com.s_exp.hako.Writer w ^SparseIntArrayList x]
    (.writeAny w (.-items x))

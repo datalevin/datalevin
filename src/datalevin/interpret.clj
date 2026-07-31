@@ -568,7 +568,7 @@
   `(def ~fn-name (inter-fn ~args ~@body)))
 
 (hext/register-user-tag!
- 0x10000009                             ; private range, subtag 9 = inter-fn
+ 9                                      ; subtag 9 = inter-fn (wire id 0x10000009)
  AFn
  (fn write-inter-fn [^com.s_exp.hako.Writer w ^AFn x]
    (if (inter-fn? x)

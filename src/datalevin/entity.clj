@@ -254,7 +254,7 @@
       e)))
 
 (hext/register-user-tag!
- 0x10000008                             ; private range, subtag 8 = entity
+ 8                                      ; subtag 8 = entity (wire id 0x10000008)
  Entity
  (fn write-entity [^Writer w ^Entity x]
    (.writeAny w (ent->map x)))

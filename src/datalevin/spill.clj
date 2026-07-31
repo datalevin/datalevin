@@ -367,12 +367,15 @@
    sv))
 
 (hext/register-user-tag!
- 0x10000002                             ; private range, subtag 2 = spillable-vec
+ 2                                      ; subtag 2 = spillable-vec (wire id 0x10000002)
  SpillableVector
  (fn write-spillable-vec [^Writer w ^SpillableVector x]
-   (let [n (count x)]
-     (.putI64 w n)
-     (dotimes [i n] (.writeAny w (nth x i)))))
+   ;; Iterate via the SpillableVector iterator — `nth` on a spilled
+   ;; backing is O(seek) per index, so a `dotimes`+`nth` loop is
+   ;; quadratic on the disk-resident portion.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it) (.writeAny w (.next it)))))
  (fn read-spillable-vec [^Reader r]
    (let [n (.getI64 r)
          ^SpillableVector vs (new-spillable-vector)]
@@ -549,12 +552,22 @@
      smap)))
 
 (hext/register-user-tag!
- 0x10000003                             ; private range, subtag 3 = spillable-map
+ 3                                      ; subtag 3 = spillable-map (wire id 0x10000003)
  SpillableMap
  (fn write-spillable-map [^Writer w ^SpillableMap x]
-   (.writeAny w (into {} x)))
+   ;; Stream entries instead of materialising `(into {} x)` — spilled
+   ;; maps would otherwise pull the entire disk backing into heap here.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it)
+       (let [^java.util.Map$Entry e (.next it)]
+         (.writeAny w (.getKey e))
+         (.writeAny w (.getValue e))))))
  (fn read-spillable-map [^Reader r]
-   (new-spillable-map (.readAny r))))
+   (let [n (.getI64 r)
+         smap (new-spillable-map)]
+     (dotimes [_ n] (assoc smap (.readAny r) (.readAny r)))
+     smap)))
 
 (deftype SpillableSet [^SpillableMap impl
                        ^:unsynchronized-mutable meta]
@@ -644,9 +657,16 @@
      (SpillableSet. impl nil))))
 
 (hext/register-user-tag!
- 0x10000004                             ; private range, subtag 4 = spillable-set
+ 4                                      ; subtag 4 = spillable-set (wire id 0x10000004)
  SpillableSet
  (fn write-spillable-set [^Writer w ^SpillableSet x]
-   (.writeAny w (into #{} x)))
+   ;; Stream elements instead of `(into #{} x)` — spilled sets would
+   ;; otherwise materialise the whole disk backing into a heap set.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it) (.writeAny w (.next it)))))
  (fn read-spillable-set [^Reader r]
-   (new-spillable-set (.readAny r))))
+   (let [n (.getI64 r)
+         ^SpillableSet s (new-spillable-set)]
+     (dotimes [_ n] (conj s (.readAny r)))
+     s)))

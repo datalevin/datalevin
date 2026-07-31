@@ -76,7 +76,9 @@
 
 (defn- serialize-value
   ^bytes [fmt msg]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (write-transit-bytes msg)
     2 (b/serialize msg)
     (u/raise "Unknown wire message format"
@@ -174,13 +176,17 @@
 
 (defn- write-value-bf
   [bf fmt msg]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (write-transit-bf bf msg)
     2 (write-nippy-bf bf msg)))
 
 (defn- read-value-bf
   [bf fmt]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (read-transit-bf bf)
     2 (read-nippy-bf bf)))
 

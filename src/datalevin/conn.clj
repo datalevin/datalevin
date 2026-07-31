@@ -201,28 +201,28 @@
   [conn]
   (when conn
     (let [detached? (volatile! false)]
-    (try
-      (when-not (closed? conn)
-        (when-let [store (.-store ^DB @conn)]
-          (case (release-shared-local-store! store)
-            :detached
-            (vreset! detached? true)
+      (try
+        (when-not (closed? conn)
+          (when-let [store (.-store ^DB @conn)]
+            (case (release-shared-local-store! store)
+              :detached
+              (vreset! detached? true)
 
-            :close
-            (do
-              (i/close store)
-              (when (i/closed? store)
-                (vreset! detached? true))))))
-      (finally
-        (when (or @detached? (closed? conn))
-          (remove-conn (:dir (meta conn)) conn)
-          (when-let [listeners (:listeners (meta conn))]
-            (when (instance? clojure.lang.IAtom listeners)
-              (reset! listeners {})))
-          (when (instance? clojure.lang.IAtom conn)
-            (reset! conn nil))
-          (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
-        (shutdown-transact-async-executor-if-idle!)))))
+              :close
+              (do
+                (i/close store)
+                (when (i/closed? store)
+                  (vreset! detached? true))))))
+        (finally
+          (when (or @detached? (closed? conn))
+            (remove-conn (:dir (meta conn)) conn)
+            (when-let [listeners (:listeners (meta conn))]
+              (when (instance? clojure.lang.IAtom listeners)
+                (reset! listeners {})))
+            (when (instance? clojure.lang.IAtom conn)
+              (reset! conn nil))
+            (alter-conn-meta! conn dissoc :dir :remote-store-opts-cache))
+          (shutdown-transact-async-executor-if-idle!)))))
   nil)
 
 (defn closed?
@@ -343,7 +343,7 @@
                    s1#     (volatile! nil)
                    res1#   (l/with-transaction-kv [kv1# kv# tx-timeout-opt#]
                              (let [conn1# (atom (db/transfer
-                                                  db# (s/transfer s# kv1#))
+                                                 db# (s/transfer s# kv1#))
                                                 :meta (meta orig-conn#))
                                    res#   (let [~conn conn1#]
                                             ~@body)]
@@ -387,14 +387,14 @@
       (db/disable-cache store)
       (try
         (let [report (u/repeat-try-catch
-                       c/+in-tx-overflow-times+
-                       l/resized?
-                       (with db tx-data tx-meta))]
+                      c/+in-tx-overflow-times+
+                      l/resized?
+                      (with db tx-data tx-meta))]
           (reset! conn (db/carry-runtime-opts (:db-after report) db))
           (assoc report :db-after @conn))
-          (finally
-            (when-not old
-              (db/enable-cache (.-store ^DB @conn))))))))
+        (finally
+          (when-not old
+            (db/enable-cache (.-store ^DB @conn))))))))
 
 (defn- direct-local-blind-transact!
   [conn prepared tx-meta]
@@ -413,7 +413,7 @@
                           db1    ^DB    (db/transfer db store1)]
                       (vreset! prepared-store store1)
                       (let [[report info] (db/stamp-blind-local-tx
-                                            db1 prepared tx-meta)]
+                                           db1 prepared tx-meta)]
                         (db/commit-prepared-tx-data! db1 (:tx-data report))
                         [report info])))
                   new-store      ^Store (s/transfer ^Store @prepared-store kv)
@@ -421,8 +421,8 @@
                                         (long (or (i/last-modified new-store)
                                                   0)))
                   new-db         (db/carry-runtime-opts
-                                   (db/new-db new-store new-info)
-                                   db)]
+                                  (db/new-db new-store new-info)
+                                  db)]
               (reset! conn new-db)
               (assoc report :db-after @conn))
             (finally
@@ -455,9 +455,9 @@
       (db/disable-cache store)
       (try
         (let [report (u/repeat-try-catch
-                       c/+in-tx-overflow-times+
-                       l/resized?
-                       (with db tx-data tx-meta true))]
+                      c/+in-tx-overflow-times+
+                      l/resized?
+                      (with db tx-data tx-meta true))]
           (with-transaction [c conn]
             (assert (active-conn-structural? c))
             (db/commit-prepared-tx-data! @c (:tx-data report) report))
@@ -533,12 +533,12 @@
 (defn- current-thread-holds-store-write-lock?
   [store]
   (boolean
-    (or
-      (when-let [write-lock (l/write-txn store)]
-        (Thread/holdsLock write-lock))
-      (when (instance? Store store)
-        (when-let [lmdb-write-lock (l/write-txn (.-lmdb ^Store store))]
-          (Thread/holdsLock lmdb-write-lock))))))
+   (or
+    (when-let [write-lock (l/write-txn store)]
+      (Thread/holdsLock write-lock))
+    (when (instance? Store store)
+      (when-let [lmdb-write-lock (l/write-txn (.-lmdb ^Store store))]
+        (Thread/holdsLock lmdb-write-lock))))))
 
 (defn- wal-sync-queue-profile-from-opts
   [opts]
@@ -574,11 +574,11 @@
             (cond
               (instance? Store store)
               (wal-sync-queue-profile-from-opts
-                (i/env-opts (.-lmdb ^Store store)))
+               (i/env-opts (.-lmdb ^Store store)))
 
               (instance? DatalogStore store)
               (wal-sync-queue-profile-from-opts
-                (cached-remote-store-opts conn store))
+               (cached-remote-store-opts conn store))
 
               :else nil)))))))
 
@@ -666,13 +666,13 @@
   ([conn db] (reset-conn! conn db nil))
   ([conn db tx-meta]
    (let [report (db/map->TxReport
-                  {:db-before @conn
-                   :db-after  db
-                   :tx-data   (let [ds (db/-datoms db :eav nil nil nil)]
-                                (u/concatv
-                                  (mapv #(assoc % :added false) ds)
-                                  ds))
-                   :tx-meta   tx-meta})]
+                 {:db-before @conn
+                  :db-after  db
+                  :tx-data   (let [ds (db/-datoms db :eav nil nil nil)]
+                               (u/concatv
+                                (mapv #(assoc % :added false) ds)
+                                ds))
+                  :tx-meta   tx-meta})]
      (reset! conn db)
      (doseq [[_ callback] (some-> (:listeners (meta conn)) (deref))]
        (callback report))
@@ -773,9 +773,9 @@
   []
   (let [threads (.availableProcessors (Runtime/getRuntime))
         workers (ThreadPoolExecutor.
-                  threads threads 0 TimeUnit/MILLISECONDS
-                  (ArrayBlockingQueue. (* 4 threads))
-                  (ThreadPoolExecutor$CallerRunsPolicy.))
+                 threads threads 0 TimeUnit/MILLISECONDS
+                 (ArrayBlockingQueue. (* 4 threads))
+                 (ThreadPoolExecutor$CallerRunsPolicy.))
         executor (a/->AsyncExecutor (Executors/newSingleThreadExecutor)
                                     workers
                                     (LinkedBlockingQueue.)
@@ -810,11 +810,11 @@
       (let [^LinkedBlockingQueue event-queue (.-event-queue executor)
             workers                         (.-workers executor)
             ^ThreadPoolExecutor worker-pool (when (instance? ThreadPoolExecutor workers)
-                                               workers)
+                                              workers)
             workers-idle?                   (if worker-pool
-                                             (and (zero? (.getActiveCount worker-pool))
-                                                  (.isEmpty (.getQueue worker-pool)))
-                                             true)]
+                                              (and (zero? (.getActiveCount worker-pool))
+                                                   (.isEmpty (.getQueue worker-pool)))
+                                              true)]
         (when (and (.isEmpty event-queue) workers-idle?)
           (a/stop executor)
           (reset! transact-async-executor-atom nil)))))
@@ -943,9 +943,9 @@
       (when (< i n)
         (let [^SyncQueuedReq req (.get requests i)
               ^TxReport report (with db
-                                 (.-tx-data req)
-                                 (.-tx-meta req)
-                                 true)]
+                                     (.-tx-data req)
+                                     (.-tx-meta req)
+                                     true)]
           (aset reports i report)
           (recur (inc i) (:db-after report)))))))
 
@@ -970,8 +970,8 @@
                                                  (.-tx-data req)
                                                  (.-tx-meta req))]
                 (deliver-sync-queued-success!
-                  req
-                  (finalize-sync-queued-report report @conn))))
+                 req
+                 (finalize-sync-queued-report report @conn))))
             (catch Throwable e
               (deliver-sync-queued-error! req e)))
           nil)
@@ -988,10 +988,10 @@
             (let [db-after @conn]
               (dotimes [i n]
                 (deliver-sync-queued-success!
-                  (.get requests i)
-                  (finalize-sync-queued-report
-                    ^TxReport (aget reports i)
-                    db-after))))
+                 (.get requests i)
+                 (finalize-sync-queued-report
+                  ^TxReport (aget reports i)
+                  db-after))))
             (catch Throwable e
               (dotimes [i n]
                 (deliver-sync-queued-error! (.get requests i) e))))
