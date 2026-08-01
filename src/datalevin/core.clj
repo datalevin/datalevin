@@ -1028,8 +1028,10 @@ Only usable for debug output.
                    [conn schema-update del-attrs rename-map])
        :doc      "Update the schema of an open connection to a Datalog db.
 
-  * `schema-update` is a map from attribute keywords to maps of corresponding
-  properties.
+  * `schema-update` is a map from attribute keywords to property patches.
+  Properties omitted from an existing attribute are preserved. Set a property
+  to `:db/retract` to remove it explicitly. The internal `:db/aid` property is
+  ignored when supplied and cannot be changed by a schema update.
 
   * `del-attrs` is a set of attributes to be removed from the schema, if there is
   no datoms associated with them, otherwise an exception will be thrown.
@@ -1042,6 +1044,8 @@ Only usable for debug output.
   Example:
 
         (update-schema conn {:new/attr {:db/valueType :db.type/string}})
+        (update-schema conn {:new/attr {:db/unique :db.unique/identity}})
+        (update-schema conn {:new/attr {:db/unique :db/retract}})
         (update-schema conn {:new/attr {:db/valueType :db.type/string}}
                             #{:old/attr1 :old/attr2})
         (update-schema conn nil nil {:old/attr :new/attr}) "}

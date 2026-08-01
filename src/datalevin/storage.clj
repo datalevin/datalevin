@@ -87,6 +87,31 @@
 
 (defonce ^:private shared-local-stores (atom {}))
 
+(defn- patch-attr-schema
+  [old-props property-patch]
+  (reduce-kv
+    (fn [props k v]
+      (cond
+        ;; Attribute IDs are allocated and owned by storage. Ignoring incoming
+        ;; IDs makes the result of `schema` safe to reuse as schema input.
+        (identical? k :db/aid) props
+
+        ;; A schema property is removed only when explicitly retracted.
+        (identical? v :db/retract) (dissoc props k)
+
+        :else (assoc props k v)))
+    (or old-props {})
+    property-patch))
+
+(defn- apply-schema-patch
+  [old-schema schema-update]
+  (reduce-kv
+    (fn [updates attr property-patch]
+      (assoc updates attr
+             (patch-attr-schema (old-schema attr) property-patch)))
+    {}
+    (or schema-update {})))
+
 (defn- infer-tuple-attr-types
   "Add typed tuple encoding to composite attributes whose schema only declares
   :db/tupleAttrs. Component types come from the source attributes. Attributes
@@ -96,7 +121,7 @@
   (let [full-schema (merge old-schema schema-update)]
     (reduce-kv
       (fn [updates attr props]
-        (if (and (contains? props :db/tupleAttrs)
+        (if (and (sequential? (:db/tupleAttrs props))
                  (not (contains? props :db/tupleType))
                  (not (contains? props :db/tupleTypes)))
           (let [types (mapv #(get-in full-schema [% :db/valueType])
@@ -111,6 +136,12 @@
           updates))
       (or schema-update {})
       full-schema)))
+
+(defn- prepare-schema-update
+  [old-schema schema-update]
+  (vld/validate-schema-update schema-update)
+  (infer-tuple-attr-types
+    old-schema (apply-schema-patch old-schema schema-update)))
 
 (defn- shared-local-store-key
   [dir]
@@ -243,7 +274,12 @@
       (seq missing)
       (transact-schema lmdb (update-schema now missing))))
   (when schema
-    (transact-schema lmdb (update-schema (load-schema lmdb) schema)))
+    (let [old-schema   (load-schema lmdb)
+          schema       (prepare-schema-update old-schema schema)
+          full-schema  (merge old-schema schema)]
+      (vld/validate-schema full-schema)
+      (when (schema-update-required? old-schema schema)
+        (transact-schema lmdb (update-schema old-schema schema)))))
   (load-schema lmdb))
 
 (defn- init-attrs [schema]
@@ -675,7 +711,7 @@
   (rschema [_] rschema)
 
   (set-schema [this new-schema]
-    (let [new-schema (infer-tuple-attr-types schema new-schema)]
+    (let [new-schema (prepare-schema-update schema new-schema)]
       (when (seq new-schema)
         (vld/validate-schema (merge schema new-schema)))
       (doseq [[attr new] new-schema
@@ -692,7 +728,11 @@
         ;; Re-encode stored values before persisting schema change.
         (migrate-attr-values this attr new-vt))
       (when (schema-update-required? schema new-schema)
-        (set! schema (init-schema lmdb new-schema))
+        ;; `new-schema` is already the complete effective definition for every
+        ;; updated attribute. Persist it directly so an explicitly retracted
+        ;; property is not reintroduced by applying the patch a second time.
+        (transact-schema lmdb (update-schema schema new-schema))
+        (set! schema (load-schema lmdb))
         (set! rschema (schema->rschema schema))
         (set! attrs (init-attrs schema))
         (set! max-aid (init-max-aid schema))

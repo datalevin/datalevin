@@ -175,6 +175,11 @@ Here is a simple Clojure code example using Datalevin:
 ;; or if you have a Datalevin server running on myhost with default port 8898
 ;; (def conn (d/get-conn "dtlv://myname:mypasswd@myhost/mydb" schema))
 
+;; Schema input patches existing attribute definitions: omitted properties are
+;; preserved. Use :db/retract as a property value to remove that property.
+;; Internal :db/aid values returned by d/schema are ignored in schema input.
+;; (d/update-schema conn {:name {:db/unique :db/retract}})
+
 ;; Transact some data
 ;; `:nation` is not defined in schema, so it will be treated as an EDN blob
 (d/transact! conn

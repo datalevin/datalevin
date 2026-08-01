@@ -697,7 +697,7 @@
     (vswap! qplan/*explain* assoc :parsing-time
             (- (System/nanoTime) ^long qplan/*start-time*))))
 
-(defn plan*
+(defn plan-context*
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/to-deadline (:qtimeout parsed-q))]
     (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)]
@@ -707,5 +707,69 @@
           (resolve-redudants)
           (rules/rewrite)
           (rewrite-unused-vars)
-          (-q false)
-          (result-explain)))))
+          (-q false)))))
+
+(defn plan*
+  [parsed-q inputs]
+  (result-explain (plan-context* parsed-q inputs)))
+
+(defn- relation-product-count
+  [rels]
+  (reduce
+    (fn [^long total rel]
+      (Math/multiplyExact total
+                          (long (.size ^java.util.List (:tuples rel)))))
+    1 rels))
+
+(defn count-plan*
+  "Count tuples produced by the optimized where-clause plan without retaining
+  its final output. Late clauses are applied to bounded batches so generated
+  cardinality probes do not retain the complete intermediate relation."
+  [parsed-q inputs]
+  (let [udf-db (first (filter db/-searchable? inputs))]
+    (binding [built-ins/*udf-db* udf-db]
+      (let [{:keys [plan sources late-clauses rels result-set] :as context}
+            (plan-context* parsed-q inputs)
+            component-plans
+            (vec
+              (for [[src components] plan
+                    plans components]
+                [(sources src) (vec (mapcat :steps plans))]))]
+        (cond
+          (= result-set #{}) 0
+
+          (seq rels)
+          (throw (ex-info "Streaming plan count does not support input relations"
+                          {:relation-count (count rels)}))
+
+          (seq late-clauses)
+          (do
+            (when-not (= 1 (count component-plans))
+              (throw
+                (ex-info
+                  "Streaming late-clause count requires one connected plan"
+                  {:component-count (count component-plans)
+                   :late-clauses late-clauses})))
+            (let [[source steps] (first component-plans)
+                  attrs          (qplan/step-attrs steps)]
+              (qplan/reduce-step-batches
+                source steps 16384
+                (fn [^long total tuples]
+                  (let [resolved
+                        (binding [qu/*implicit-source* (get sources '$)]
+                          (reduce
+                            qresolve/resolve-clause
+                            (assoc context :rels [(r/relation! attrs tuples)])
+                            late-clauses))]
+                    (Math/addExact total
+                                   (long (relation-product-count
+                                           (:rels resolved))))))
+                0)))
+
+          :else
+          (reduce
+            (fn [^long total ^long component-count]
+              (Math/multiplyExact total component-count))
+            1
+            (for [[source steps] component-plans]
+              (qplan/count-steps source steps))))))))

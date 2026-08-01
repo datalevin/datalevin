@@ -27,7 +27,7 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
-   [java.util HashMap HashSet IdentityHashMap List]
+   [java.util Arrays HashMap HashSet IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -37,6 +37,36 @@
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *plan-cache* (LRUCache. c/query-result-cache-size))
+
+(def ^:dynamic *link-estimate-observer*
+  "Optional function called with sampled directional fanout estimator
+  observations. Intended for controlled optimizer evaluation."
+  nil)
+
+(def ^:dynamic *cardinality-oracle*
+  "Optional function that returns an exact logical output cardinality for a
+  request map. Intended for fixed-search optimizer experiments. When bound,
+  every requested cardinality must be present so an experiment cannot silently
+  fall back to sampled estimates."
+  nil)
+
+(def cardinality-oracle-fallback
+  "Sentinel an experimental oracle may return to use the normal estimate for
+  one request. A completed fixed-search oracle should never return it."
+  ::cardinality-oracle-fallback)
+
+(defn- oracle-cardinality
+  [request]
+  (when *cardinality-oracle*
+    (let [cardinality (*cardinality-oracle* request)]
+      (if (identical? cardinality cardinality-oracle-fallback)
+        nil
+        (do
+          (when-not (and (integer? cardinality) (not (neg? cardinality)))
+            (throw
+              (ex-info "Cardinality oracle returned an invalid value"
+                       {:request request :cardinality cardinality})))
+          (long cardinality))))))
 
 (def ^:private ^:const ^long collection-input-plugin-threshold
   128)
@@ -864,12 +894,16 @@
    (let [node   (get nodes e)
          mcount (:mcount node)]
      (when-not (zero? ^long mcount)
-       (let [isteps (init-steps db e node single?)]
+       (let [isteps (init-steps db e node single?)
+             size   (when-not single?
+                      (or (oracle-cardinality
+                            {:kind :subset :entities #{e}})
+                          (estimate-scan-v-size mcount isteps)))]
          (if single?
            (make-plan isteps nil nil 0)
            (make-plan isteps
                       (estimate-base-cost node isteps)
-                      (estimate-scan-v-size mcount isteps)
+                      size
                       0)))))))
 
 (defn writing? [db] (l/writing? (.-lmdb ^Store (.-store ^DB db))))
@@ -1126,19 +1160,44 @@
          :sumsq   sumsq
          :max-val mx}))))
 
-(defn- count-init-follows-stats-cached
-  "Cache exact fan-out stats by sample identity, without hashing the sample list."
-  [^DB db ^IdentityHashMap cache tuples attr index]
+(defn- count-init-follows-summary
+  [^DB db tuples attr index]
+  (let [store    (.-store db)
+        ^List ts (p/remove-end-scan tuples)
+        n        (.size ts)]
+    (loop [i   0
+           sum 0.0]
+      (if (< i n)
+        (let [^objects t (.get ts i)]
+          (recur (u/long-inc i)
+                 (+ sum
+                    (double (av-size store attr (aget t index))))))
+        {:n n
+         :sum sum}))))
+
+(defn- cached-link-follow
+  [^IdentityHashMap cache tuples k collect]
   (let [^HashMap entries (or (.get cache tuples)
                              (let [m (HashMap.)]
                                (.put cache tuples m)
-                               m))
-        k                [::link-follow-stats attr index]]
+                               m))]
     (if (.containsKey entries k)
       (.get entries k)
-      (let [stats (count-init-follows-stats db tuples attr index)]
-        (.put entries k stats)
-        stats))))
+      (let [value (collect)]
+        (.put entries k value)
+        value))))
+
+(defn- count-init-follows-stats-cached
+  "Cache exact fan-out stats by sample identity, without hashing the sample list."
+  [^DB db ^IdentityHashMap cache tuples attr index]
+  (cached-link-follow cache tuples [::link-follow-stats attr index]
+                      #(count-init-follows-stats db tuples attr index)))
+
+(defn- count-init-follows-summary-cached
+  "Cache count and sum only for the production envelope fast path."
+  [^DB db ^IdentityHashMap cache tuples attr index]
+  (cached-link-follow cache tuples [::link-follow-summary attr index]
+                      #(count-init-follows-summary db tuples attr index)))
 
 (defn- link-ratio-key
   [link-e {:keys [type attr attrs tgt]}]
@@ -1146,6 +1205,102 @@
     :val-eq [type (attrs link-e) (attrs tgt)]
     :_ref   [type attr]
     [type attr]))
+
+(defn- sample-fingerprint
+  ^long [^List tuples]
+  (loop [i 0
+         h (long 1)]
+    (if (< i (.size tuples))
+      (recur (inc i)
+             (unchecked-add
+               (unchecked-multiply h 31)
+               (long (Arrays/hashCode ^objects (.get tuples i)))))
+      h)))
+
+(def ^:private link-estimate-policies
+  #{:raw :shrink :skew :shrink-skew :production})
+
+(defn- production-envelope?
+  []
+  (and (= :production c/link-estimate-policy)
+       c/link-estimate-conservative-lower-bound?
+       (not (pos? (double c/link-estimate-tail-weight)))))
+
+(defn- sampled-link-estimate
+  [{:keys [^long n ^double sum ^double sumsq ^double max-val]}
+   ^double base-ratio]
+  (let [mean        (if (pos? n) (/ sum (double n)) 0.0)
+        variance    (if (pos? n)
+                      (max 0.0 (- (/ sumsq (double n)) (* mean mean)))
+                      0.0)
+        cv2         (if (pos? mean) (/ variance (* mean mean)) 0.0)
+        k-eff       (* (double c/link-estimate-prior-size)
+                       (+ 1.0 (* (double c/link-estimate-var-alpha) cv2)))
+        blended     (if (pos? (+ (double n) k-eff))
+                      (/ (+ sum (* k-eff base-ratio))
+                         (+ (double n) k-eff))
+                      base-ratio)
+        tail-weight (max 0.0 (double c/link-estimate-tail-weight))
+        raw-tail-adjustment
+        (if (pos? (+ (double n) tail-weight))
+          (/ (* tail-weight (max 0.0 (- max-val mean)))
+             (+ (double n) tail-weight))
+          0.0)
+        shrink-tail-adjustment
+        (if (pos? (+ (double n) k-eff tail-weight))
+          (/ (* tail-weight (max 0.0 (- max-val blended)))
+             (+ (double n) k-eff tail-weight))
+          0.0)
+        raw-tail    (+ mean raw-tail-adjustment)
+        shrink-tail (+ blended shrink-tail-adjustment)
+        policy      c/link-estimate-policy
+        _           (when-not (link-estimate-policies policy)
+                      (throw (ex-info "Unknown sampled link estimator policy"
+                                      {:policy policy
+                                       :supported link-estimate-policies})))
+        no-tail-center (case policy
+                         (:raw :skew) mean
+                         (:shrink :shrink-skew :production) blended)
+        center      (case policy
+                      :raw mean
+                      :shrink blended
+                      :skew raw-tail
+                      (:shrink-skew :production) shrink-tail)
+        tail-adjustment (- center no-tail-center)
+        lower-bound (if (and (= :production policy)
+                             c/link-estimate-conservative-lower-bound?)
+                      (max base-ratio mean)
+                      0.0)
+        final-ratio (max lower-bound center
+                         (double c/magic-link-ratio))]
+    {:policy       policy
+     :n            n
+     :sum          sum
+     :sumsq        sumsq
+     :max-val      max-val
+     :mean         mean
+     :variance     variance
+     :cv2          cv2
+     :base-ratio   base-ratio
+     :prior-size   (double c/link-estimate-prior-size)
+     :var-alpha    (double c/link-estimate-var-alpha)
+     :k-eff        k-eff
+     :blended      blended
+     :no-tail-center no-tail-center
+     :center       center
+     :tail-weight  tail-weight
+     :tail-adjustment tail-adjustment
+     :lower-bound  lower-bound
+     :final-ratio  final-ratio}))
+
+(defn- sampled-link-ratio
+  ^double [stats ^double base-ratio]
+  (if (production-envelope?)
+    (let [^long n      (:n stats)
+          ^double sum  (:sum stats)
+          mean         (if (pos? n) (/ sum (double n)) 0.0)]
+      (max mean base-ratio (double c/magic-link-ratio)))
+    (double (:final-ratio (sampled-link-estimate stats base-ratio)))))
 
 (defn- estimate-link-size
   [db link-e {:keys [type attr attrs tgt var]} ^ConcurrentHashMap ratios
@@ -1163,27 +1318,31 @@
     (estimate-round
       (cond
         (< 0 ssize)
-        (let [{:keys [^long n ^double sum ^double sumsq ^double max-val]}
-              (count-init-follows-stats-cached db build-cache sample attr index)
-
-              mean       (if (pos? n) (/ sum (double n)) 0.0)
-              variance   (if (pos? n)
-                           (max 0.0 (- (/ sumsq (double n)) (* mean mean)))
-                           0.0)
-              cv2        (if (pos? mean) (/ variance (* mean mean)) 0.0)
+        (let [fast?      (and (production-envelope?)
+                              (nil? *link-estimate-observer*))
+              stats      (if fast?
+                           (count-init-follows-summary-cached
+                             db build-cache sample attr index)
+                           (count-init-follows-stats-cached
+                             db build-cache sample attr index))
               base-ratio (double (db/-default-ratio db attr))
-              k-eff      (* (double c/link-estimate-prior-size)
-                            (+ 1.0 (* (double c/link-estimate-var-alpha) cv2)))
-              blended    (if (pos? (+ (double n) k-eff))
-                           (/ (+ sum (* k-eff base-ratio))
-                              (+ (double n) k-eff))
-                           base-ratio)
-              ub         (if (pos? n)
-                           (min (+ mean (/ (- max-val mean)
-                                           (Math/sqrt (double n))))
-                                (* mean (double c/link-estimate-max-multi)))
-                           base-ratio)
-              ratio      (max base-ratio blended ub (double c/magic-link-ratio))]
+              estimate   (when-not fast?
+                           (sampled-link-estimate stats base-ratio))
+              ratio      (if fast?
+                           (sampled-link-ratio stats base-ratio)
+                           (double (:final-ratio estimate)))]
+          (when *link-estimate-observer*
+            (*link-estimate-observer*
+              (assoc estimate
+                     :ratio-key ratio-key
+                     :link-type type
+                     :attr attr
+                     :index index
+                     :sample-size ssize
+                     :population-size (:mcount (first prev-steps))
+                     :sample-fingerprint (sample-fingerprint sample)
+                     :input-size prev-size
+                     :estimated-output (* (double prev-size) ratio))))
           (.put ratios ratio-key ratio)
           (* (double prev-size) ratio))
 
@@ -1245,22 +1404,53 @@
         (do (.put ratios ratio-key c/magic-or-join-ratio)
             (* ^long prev-size ^double c/magic-or-join-ratio))))))
 
+(defn- plan-entities
+  [plan]
+  (set (:out (peek (:steps plan)))))
+
+(defn- oracle-link-input-size
+  "Back-compute the link output used by the unchanged physical cost model from
+  an exact logical result and the target star's exact marginal selectivity.
+  The logical DP-state cardinality is exact; this internal size preserves the
+  optimizer's existing link-then-filter cost decomposition without consulting
+  a sample."
+  [^long result-size new-base-plan]
+  (let [steps (:steps new-base-plan)]
+    (if (= 1 (count steps))
+      result-size
+      (let [^long base-input  (:mcount (first steps))
+            ^long base-output (:size new-base-plan)]
+        (if (or (zero? result-size) (zero? base-input) (zero? base-output))
+          result-size
+          (max result-size
+               (estimate-round
+                 (/ (* (double result-size) (double base-input))
+                    (double base-output)))))))))
+
 (defn- estimate-join-size
   [db sources rules link-e link ratios build-cache prev-plan index
    new-base-plan]
-  (let [prev-size (:size prev-plan)
-        steps     (:steps new-base-plan)]
+  (let [prev-size   (:size prev-plan)
+        steps       (:steps new-base-plan)
+        exact-size  (oracle-cardinality
+                      {:kind     :subset
+                       :entities (conj (plan-entities prev-plan) (:tgt link))})]
     (case (:type link)
-      :ref     [nil (estimate-scan-v-size prev-size steps)]
+      :ref     [nil (or exact-size
+                        (estimate-scan-v-size prev-size steps))]
       :or-join (let [or-size (estimate-or-join-size db sources rules ratios
                                                     build-cache prev-plan
                                                     link)]
                  ;; or-join doesn't have new-base-plan steps to merge
-                 [or-size or-size])
+                 (if exact-size
+                   [exact-size exact-size]
+                   [or-size or-size]))
       ;; :_ref and :val-eq
-      (let [e-size (estimate-link-size db link-e link ratios build-cache
-                                       prev-size prev-plan index)]
-        [e-size (estimate-scan-v-size e-size steps)]))))
+      (if exact-size
+        [(oracle-link-input-size exact-size new-base-plan) exact-size]
+        (let [e-size (estimate-link-size db link-e link ratios build-cache
+                                         prev-size prev-plan index)]
+          [e-size (estimate-scan-v-size e-size steps)])))))
 
 (defn- estimate-link-cost
   [^long outer-size ^long result-size]
@@ -1331,8 +1521,11 @@
   [base-plans new-e db sources rules ratios build-cache prev-plan link
    last-step new-key link-e]
   (let [new-base  (base-plans [new-e])
-        or-size   (estimate-or-join-size db sources rules ratios build-cache
-                                         prev-plan link)
+        or-size   (or (oracle-cardinality
+                        {:kind     :subset
+                         :entities (conj (plan-entities prev-plan) new-e)})
+                      (estimate-or-join-size db sources rules ratios build-cache
+                                             prev-plan link))
         cur-steps (or-join-plan* db sources rules last-step link new-key
                                  new-base)
         or-cost   (estimate-e-plan-cost (:size prev-plan) or-size cur-steps)]

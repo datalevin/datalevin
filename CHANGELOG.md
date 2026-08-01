@@ -2,6 +2,12 @@
 
 ## WIP
 
+### Changed
+- [Datalog] Schema property maps now patch existing attribute definitions:
+  omitted properties are preserved, `:db/retract` explicitly removes a
+  property, and incoming internal `:db/aid` values are ignored so `d/schema`
+  output is safe to reuse as schema input.
+
 ### Fixed
 - [Datalog] preserves empty projected relations as attribute-free annihilators.
 - [Datalog] fix composite tuple `nil` regression.

@@ -862,9 +862,22 @@ values put more weight on the default ratio when sample CV^2 is large."}
   link-estimate-var-alpha 0.4)
 
 (def ^{:dynamic true
-       :doc     "Multiplier over mean for link ratio upper bound. Higher
-values means trust sampled high ratio more."}
-  link-estimate-max-multi 1.0)
+       :doc     "Named sampled-link estimator policy. Supported values are
+:raw, :shrink, :skew, :shrink-skew, and :production. Intended primarily for
+controlled optimizer evaluation."}
+  link-estimate-policy :production)
+
+(def ^{:dynamic true
+       :doc     "Whether sampled link estimates retain the sampled mean and
+durable fanout as conservative lower bounds. Disable only for controlled
+evaluation of symmetric empirical-Bayes shrinkage."}
+  link-estimate-conservative-lower-bound? true)
+
+(def ^{:dynamic true
+       :doc     "Pseudo-count assigned to the largest observed directional
+fanout. Zero disables the tail term. Positive values add bounded tail evidence
+to sampled link estimates and should be selected by controlled evaluation."}
+  link-estimate-tail-weight 0.0)
 
 (def ^{:dynamic true
        :doc     "Default expansion ratio for or-join size estimate"}

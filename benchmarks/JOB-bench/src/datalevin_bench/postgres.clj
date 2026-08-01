@@ -4,7 +4,7 @@
    [clojure.java.io :as io]
    [clojure.string :as s])
   (:import
-   [java.sql DriverManager Connection Statement]
+   [java.sql DriverManager Connection]
    [org.postgresql.copy CopyManager]
    [org.postgresql PGConnection]))
 

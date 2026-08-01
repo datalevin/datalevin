@@ -46,7 +46,9 @@ public final class Connection extends HandleResource {
     }
 
     /**
-     * Applies a raw schema update and returns the updated schema.
+     * Applies a raw schema property patch and returns the updated schema.
+     * Omitted properties are preserved; a {@code :db/retract} value removes a
+     * property. Any supplied {@code :db/aid} is ignored.
      */
     public Map<?, ?> updateSchema(Map<?, ?> schemaUpdate) {
         return (Map<?, ?>) ClojureRuntime.core("update-schema",

@@ -47,6 +47,15 @@
       (qexec/mark-parsing-finished!)
       (qexec/plan* parsed-q inputs))))
 
+(defn count-plan
+  "Count tuples produced by an optimizable where-clause plan without retaining
+  its final output. Intended for offline cardinality experiments."
+  [query & inputs]
+  (with-query-runtime
+    (let [parsed-q (qcache/parsed-q query)]
+      (qexec/mark-parsing-finished!)
+      (qexec/count-plan* parsed-q inputs))))
+
 (defn- explain*
   [{:keys [run? intermediate-counts?]
     :or   {run? false intermediate-counts? true}} & args]

@@ -183,7 +183,7 @@
 (defn- open-conn-db
   [dir schema opts]
   {:pre [(or (nil? schema) (map? schema))]}
-  (vld/validate-schema schema)
+  (vld/validate-schema-update schema)
   (let [[_ runtime-opts] (split-runtime-opts opts)]
     (if-let [dir-key (shared-local-store-key dir)]
       (let [store (acquire-shared-local-store dir schema opts)]
@@ -739,7 +739,7 @@
    (update-schema conn schema-update del-attrs nil))
   ([conn schema-update del-attrs rename-map]
    {:pre [(conn? conn)]}
-   (when schema-update (vld/validate-schema schema-update))
+   (vld/validate-schema-update schema-update)
    (let [^DB db       (db conn)
          ^Store store (.-store db)]
      (i/set-schema store schema-update)

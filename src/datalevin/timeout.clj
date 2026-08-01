@@ -21,11 +21,19 @@
   (some-> timeout-in-ms
           (#(+ ^long % ^long (System/currentTimeMillis)))))
 
+(defn time-left
+  "Returns the remaining timeout in milliseconds, or nil when no deadline is
+  bound."
+  []
+  (when *deadline*
+    (max 0 (- ^long *deadline* ^long (System/currentTimeMillis)))))
+
 (defn assert-time-left
   "Throws if timeout exceeded"
   []
   (when (some-> *deadline*
-                (#(< ^long % ^long (System/currentTimeMillis))))
+                (#(<= ^long % ^long (System/currentTimeMillis))))
     (throw
       (ex-info "Query and/or pull expression took too long to run."
-               {}))))
+               {:type :query/timeout
+                :deadline *deadline*}))))

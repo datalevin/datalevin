@@ -789,6 +789,81 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest test-update-schema-property-patches
+  (let [dir    (u/tmp-dir (str "schema-patch-" (UUID/randomUUID)))
+        schema {:user/email  {:db/valueType   :db.type/string
+                              :db/cardinality :db.cardinality/one
+                              :db/doc         "Email address"}
+                :user/friend {:db/valueType :db.type/ref}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (let [email-aid (get-in (d/schema conn) [:user/email :db/aid])]
+        ;; A supplied property map patches, rather than replaces, the existing
+        ;; attribute definition.
+        (d/update-schema conn
+                         {:user/email {:db/unique :db.unique/identity}})
+        (is (= {:db/valueType   :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/doc         "Email address"
+                :db/unique      :db.unique/identity
+                :db/aid         email-aid}
+               (get (d/schema conn) :user/email)))
+
+        ;; An empty property patch is a no-op, and a patch may rely on a stored
+        ;; property to satisfy whole-definition validation.
+        (let [before (d/schema conn)]
+          (is (= before
+                 (d/update-schema conn {:user/email {}}))))
+        (d/update-schema conn {:user/friend {:db/isComponent true}})
+        (is (= {:db/valueType  :db.type/ref
+                :db/isComponent true}
+               (dissoc (get (d/schema conn) :user/friend) :db/aid)))
+
+        ;; Property removal is explicit. Incoming internal attribute IDs are
+        ;; ignored for both existing and new attributes.
+        (d/update-schema conn
+                         {:user/email {:db/unique :db/retract
+                                       :db/aid    -1}
+                          :user/age   {:db/valueType :db.type/long
+                                       :db/aid       email-aid}})
+        (is (= email-aid
+               (get-in (d/schema conn) [:user/email :db/aid])))
+        (is (not (contains? (get (d/schema conn) :user/email) :db/unique)))
+        (is (not= email-aid
+                  (get-in (d/schema conn) [:user/age :db/aid])))
+        (is (= (count (d/schema conn))
+               (count (set (map :db/aid (vals (d/schema conn)))))))
+
+        ;; `schema` output, including :db/aid, is safe to feed back as input.
+        (let [before (d/schema conn)]
+          (is (= before (d/update-schema conn before))))
+
+        ;; Retractions are validated against the resulting complete
+        ;; definition, and a rejected patch leaves the schema unchanged.
+        (let [before (d/schema conn)]
+          (is (thrown-with-msg?
+                Exception #"isComponent.*should also have.*ref"
+                (d/update-schema
+                  conn {:user/friend {:db/valueType :db/retract}})))
+          (is (= before (d/schema conn)))))
+      (finally
+        (d/close conn)))
+
+    ;; Opening an existing database with a schema also applies property maps as
+    ;; patches instead of erasing omitted properties.
+    (let [conn' (d/create-conn dir {:user/email {:db/doc "Primary email"}})]
+      (try
+        (is (= :db.type/string
+               (get-in (d/schema conn') [:user/email :db/valueType])))
+        (is (= :db.cardinality/one
+               (get-in (d/schema conn') [:user/email :db/cardinality])))
+        (is (= "Primary email"
+               (get-in (d/schema conn') [:user/email :db/doc])))
+        (is (not (contains? (get (d/schema conn') :user/email) :db/unique)))
+        (finally
+          (d/close conn')
+          (u/delete-files dir))))))
+
 (deftest test-live-idoc-schema-initializes-index-and-logs-dbis
   (let [dir  (u/tmp-dir (str "test-live-idoc-schema-"
                              (UUID/randomUUID)))
@@ -1605,6 +1680,25 @@
     (is (= c/implicit-schema (db/-schema @conn)))
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-source-schema-ignores-aids
+  (let [dir  (u/tmp-dir (str "source-schema-aid-" (UUID/randomUUID)))
+        conn (d/create-conn dir
+                            {:source/one {:db/valueType :db.type/string
+                                          :db/aid       0}
+                             :source/two {:db/aid 0}})]
+    (try
+      (let [schema (d/schema conn)
+            aid-1  (get-in schema [:source/one :db/aid])
+            aid-2  (get-in schema [:source/two :db/aid])]
+        (is (not= 0 aid-1))
+        (is (not= 0 aid-2))
+        (is (not= aid-1 aid-2))
+        (is (= :db.type/string
+               (get-in schema [:source/one :db/valueType]))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest test-ways-to-create-conn-2
   (let [schema { :aka { :db/cardinality :db.cardinality/many

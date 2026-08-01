@@ -22,6 +22,7 @@
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
+   [datalevin.timeout :as timeout]
    [datalevin.util :as u])
   (:import
    [java.util AbstractCollection Collection Collections HashSet List]
@@ -353,13 +354,22 @@
   (-type step))
 
 (defn step-execute [step db source]
-  (-execute step db source))
+  (timeout/assert-time-left)
+  (let [result (-execute step db source)]
+    (timeout/assert-time-left)
+    result))
 
 (defn step-execute-pipe [step db source sink]
-  (-execute-pipe step db source sink))
+  (timeout/assert-time-left)
+  (let [result (-execute-pipe step db source sink)]
+    (timeout/assert-time-left)
+    result))
 
 (defn step-sample [step db source]
-  (-sample step db source))
+  (timeout/assert-time-left)
+  (let [result (-sample step db source)]
+    (timeout/assert-time-left)
+    result))
 
 (defn step-explain [step context]
   (-explain step context))
@@ -672,3 +682,102 @@
           (save-intermediates context steps (object-array [src]) tuples)
           (r/relation! attrs tuples))
       (pipelining context db attrs steps n))))
+
+(defn count-steps
+  "Execute a component plan and count its output without retaining the final
+  tuples. This is intended for offline exact-cardinality measurements."
+  [db steps]
+  (let [steps    (vec steps)
+        n        (count steps)
+        pipes    (object-array
+                   (mapv (fn [i]
+                           (if (= i (dec n))
+                             (p/counted-tuple-pipe)
+                             (p/tuple-pipe)))
+                         (range n)))
+        bindings (get-thread-bindings)
+        workers
+        (mapv
+          (fn [step i]
+            ^Callable
+            #(with-bindings bindings
+               (try
+                 (step-execute-pipe
+                   step db
+                   (when (pos? i) (aget pipes (dec i)))
+                   (aget pipes i))
+                 (finally
+                   (p/finish (aget pipes i))))))
+          steps (range))
+        output   (aget pipes (dec n))
+        drain    ^Callable
+        #(with-bindings bindings
+           (loop []
+             (when (p/produce output)
+               (recur))))]
+    (when (zero? n)
+      (u/raise "Cannot count an empty query plan" {}))
+    (when (writing? db)
+      (u/raise "Exact plan counting requires a read-only database" {}))
+    (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool
+                                  (conj workers drain))]
+      (.get f))
+    (p/total output)))
+
+(defn step-attrs
+  "Return the relation attributes produced by the final step in `steps`."
+  [steps]
+  (let [steps (vec steps)]
+    (when (empty? steps)
+      (u/raise "Cannot inspect an empty query plan" {}))
+    (cols->attrs (:cols (peek steps)))))
+
+(defn reduce-step-batches
+  "Execute a component plan and reduce bounded batches of its output. The
+  reducing function receives the accumulator and a `FastList` of tuples. This
+  is intended for offline measurements that must apply post-plan clauses
+  without retaining the complete intermediate relation."
+  [db steps batch-size rf init]
+  (let [steps      (vec steps)
+        n          (count steps)
+        batch-size (long batch-size)
+        pipes      (object-array (repeatedly n p/tuple-pipe))
+        bindings   (get-thread-bindings)
+        workers
+        (mapv
+          (fn [step i]
+            ^Callable
+            #(with-bindings bindings
+               (try
+                 (step-execute-pipe
+                   step db
+                   (when (pos? i) (aget pipes (dec i)))
+                   (aget pipes i))
+                 (finally
+                   (p/finish (aget pipes i))))))
+          steps (range))
+        output     (aget pipes (dec n))
+        drain      ^Callable
+        #(with-bindings bindings
+           (loop [acc   init
+                  batch (FastList. (int batch-size))]
+             (if-some [tuple (p/produce output)]
+               (do
+                 (.add batch tuple)
+                 (if (>= (.size batch) batch-size)
+                   (recur (rf acc batch) (FastList. (int batch-size)))
+                   (recur acc batch)))
+               (if (pos? (.size batch)) (rf acc batch) acc))))]
+    (when (zero? n)
+      (u/raise "Cannot reduce an empty query plan" {}))
+    (when-not (pos? batch-size)
+      (u/raise "Plan reduction batch size must be positive"
+               {:batch-size batch-size}))
+    (when (writing? db)
+      (u/raise "Exact plan reduction requires a read-only database" {}))
+    (let [^java.util.List futures
+          (.invokeAll ^ExecutorService pipe-thread-pool
+                      (conj workers drain))]
+      (doseq [^Future f (butlast futures)]
+        (.get f))
+      (.get ^Future (.get futures (unchecked-dec-int (.size futures)))))))
