@@ -18,8 +18,14 @@
 ### Fixed
 - [Datalog] preserves empty projected relations as attribute-free annihilators.
 - [Datalog] fix composite tuple `nil` regression.
+- [Datalog] prevent nested `q` leaking variables to outter `q`.
+- [Datalog] proper validation of tuple bindings.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
+
+### Improved
+- [Datalog] LMDB shutdown hook now delgetes to store close, preventing crash due
+  to stray open connection.
 
 ## 1.0.0 (2026-07-20)
 
