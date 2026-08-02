@@ -1035,9 +1035,15 @@ Only usable for debug output.
 
   * `del-attrs` is a set of attributes to be removed from the schema, if there is
   no datoms associated with them, otherwise an exception will be thrown.
+  Deleting an attribute that is already absent is a no-op.
 
   * `rename-map` is a map of old attributes to new attributes, for renaming
-  attributes
+  attributes. Replaying a completed rename is a no-op. A rename fails if both
+  names exist; rename chains and cycles are rejected.
+
+  The complete operation is validated before writing and commits atomically.
+  Concurrent schema updates are serialized, so property patches compose rather
+  than overwriting one another.
 
   Return the updated schema.
 

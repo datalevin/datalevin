@@ -1438,12 +1438,12 @@
     (case (:type link)
       :ref     [nil (or exact-size
                         (estimate-scan-v-size prev-size steps))]
-      :or-join (let [or-size (estimate-or-join-size db sources rules ratios
-                                                    build-cache prev-plan
-                                                    link)]
+      :or-join (if exact-size
                  ;; or-join doesn't have new-base-plan steps to merge
-                 (if exact-size
-                   [exact-size exact-size]
+                 [exact-size exact-size]
+                 (let [or-size
+                       (estimate-or-join-size db sources rules ratios
+                                              build-cache prev-plan link)]
                    [or-size or-size]))
       ;; :_ref and :val-eq
       (if exact-size
@@ -1748,15 +1748,15 @@
             (dotimes [i n-1]
               (let [plans (plans db sources rules nodes node-ids
                                  incoming-link-counts required-vars pairs
-                                 base-plans (.get tables i) ratios build-cache)]
-                (let [candidate-count (count plans)
-                      pruned?         (< pn candidate-count)
-                      retained        (if pruned?
-                                        (shrink-space plans node-ids)
-                                        plans)]
-                  (record-optimizer-search!
-                    component (inc i) candidate-count (count retained) pruned?)
-                  (.add tables retained))))
+                                 base-plans (.get tables i) ratios build-cache)
+                    candidate-count (count plans)
+                    pruned?         (< pn candidate-count)
+                    retained        (if pruned?
+                                      (shrink-space plans node-ids)
+                                      plans)]
+                (record-optimizer-search!
+                  component (inc i) candidate-count (count retained) pruned?)
+                (.add tables retained)))
             (trace-steps tables n-1 node-ids)))))))
 
 (def ^:private connected-components qog/connected-components)

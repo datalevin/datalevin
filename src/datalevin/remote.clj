@@ -400,6 +400,9 @@
   (set-schema [_ new-schema]
     (datalog-request read-floor-tx client :set-schema
                      [db-name new-schema] writing?))
+  (set-schema [_ new-schema del-attrs rename-map]
+    (datalog-request read-floor-tx client :set-schema
+                     [db-name new-schema del-attrs rename-map] writing?))
 
   (init-max-eid [_]
     (datalog-request read-floor-tx client :init-max-eid [db-name] writing?))

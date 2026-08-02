@@ -4,9 +4,16 @@
 
 ### Changed
 - [Datalog] Schema property maps now patch existing attribute definitions:
-  omitted properties are preserved, `:db/retract` explicitly removes a
-  property, and incoming internal `:db/aid` values are ignored so `d/schema`
-  output is safe to reuse as schema input.
+  omitted properties are preserved, `:db/retract` removes a property, and
+  incoming internal `:db/aid` values are ignored, so `d/schema` output is safe
+  to reuse as schema input.
+- [Datalog] `update-schema` now validates the complete request before writing,
+  then commits all changes atomically. Commit failures roll back, and concurrent
+  property patches compose without lost updates.
+- [Datalog] Schema deletion and rename retries are now idempotent: deleting an
+  absent attribute or replaying a completed rename is a no-op. Renames fail
+  without overwriting when both names exist; rename chains, cycles, duplicate
+  targets, and conflicting patch/delete operations are rejected.
 
 ### Fixed
 - [Datalog] preserves empty projected relations as attribute-free annihilators.

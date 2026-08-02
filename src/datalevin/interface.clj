@@ -354,6 +354,7 @@ values;")
   (schema [this] "Return the schema map")
   (rschema [this] "Return the reverse schema map")
   (set-schema [this new-schema]
+              [this new-schema del-attrs rename-map]
     "Update the schema of open storage, return updated schema")
   (attrs [this] "Return the aid -> attr map")
   (init-max-eid [this] "Initialize and return the max entity id")

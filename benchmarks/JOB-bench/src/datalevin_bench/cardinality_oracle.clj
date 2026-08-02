@@ -4,6 +4,7 @@
    [clojure.edn :as edn]
    [clojure.java.io :as io]
    [clojure.set :as set]
+   [clojure.walk :as walk]
    [datalevin-bench.core :as job]
    [datalevin.core :as d]
    [datalevin.parser :as dp]
@@ -49,17 +50,29 @@
 
 (defn query-analysis
   [query]
-  (let [where      (query-where query)
+  (let [parsed-q   (dp/parse-query query)
+        replacements (qo/unused-var-replacements parsed-q)
+        where      (mapv #(walk/postwalk-replace replacements %)
+                         (query-where query))
         patterns   (filterv pattern-clause? where)
         predicates (filterv (complement pattern-clause?) where)
         by-entity  (group-by first patterns)
-        entities   (set (keys by-entity))]
+        entities   (set (keys by-entity))
+        entity-query-vars
+        (into {}
+              (map (fn [entity]
+                     [entity
+                      (if (qu/placeholder? entity)
+                        (symbol (str "?oracle__" (subs (name entity) 1)))
+                        entity)]))
+              entities)]
     {:query      query
      :where      where
      :patterns   patterns
      :predicates predicates
      :by-entity  by-entity
-     :entities   entities}))
+     :entities   entities
+     :entity-query-vars entity-query-vars}))
 
 (defn subset-clauses
   [{:keys [where]} entities]
@@ -77,10 +90,15 @@
 (defn subset-count-form
   [analysis entities]
   (let [{:keys [clauses bound-vars]} (subset-clauses analysis entities)
+        entity-query-vars (:entity-query-vars analysis)
+        replacements (select-keys entity-query-vars entities)
+        clauses     (mapv #(walk/postwalk-replace replacements %) clauses)
         root        (first (sort-by pr-str entities))
-        with-vars   (-> bound-vars (disj root) (->> (sort-by pr-str)))]
+        root-var    (entity-query-vars root)
+        count-vars  (into bound-vars (vals replacements))
+        with-vars   (-> count-vars (disj root-var) (->> (sort-by pr-str)))]
     (vec
-      (concat [:find (list 'count root) '.]
+      (concat [:find (list 'count root-var) '.]
               (when (seq with-vars)
                 (into [:with] with-vars))
               [:where]
@@ -258,14 +276,15 @@
   (.flush writer))
 
 (defn- submit-count
-  [^ExecutorService executor db analysis entities timeout-ms known-counts]
+  [^ExecutorService executor count-subset db analysis entities timeout-ms
+   known-counts]
   (.submit
     executor
     ^Callable
     (bound-fn []
       (let [start       (System/nanoTime)
-            cardinality (exact-subset-count db analysis entities timeout-ms
-                                            known-counts)]
+            cardinality (count-subset db analysis entities timeout-ms
+                                      known-counts)]
         {:cardinality cardinality
          :elapsed-ms (double (/ (- (System/nanoTime) start) 1000000.0))}))))
 
@@ -282,8 +301,10 @@
 
 (defn precompute-query!
   [db query-sym {:keys [output-file timeout-ms shared-counts shared-writer
-                        executor]
-                 :or   {timeout-ms 300000}}]
+                        executor count-subset count-method]
+                 :or   {timeout-ms 300000
+                        count-subset exact-subset-count
+                        count-method :executed}}]
   (let [query      (query-value query-sym)
         name       (query-name query-sym)
         analysis   (query-analysis query)
@@ -330,8 +351,8 @@
                          {:cardinality 0 :elapsed-ms 0.0}
 
                          :else
-                         (submit-count executor db analysis entities
-                                       timeout-ms counts))}))
+                         (submit-count executor count-subset db analysis
+                                       entities timeout-ms counts))}))
                   missing)]
             (reduce
               (fn [counts {:keys [i entities key shared? inferred-zero?
@@ -345,17 +366,21 @@
                                       (cond
                                         shared? :shared
                                         inferred-zero? :zero-superset
-                                        :else :executed))
+                                        :else count-method))
                   (when (and shared-counts (not shared?))
                     (swap! shared-counts assoc key cardinality)
                     (append-shared-checkpoint! shared-writer key name entities
                                                cardinality))
-                  (println name (inc i) "/" (count subsets)
-                           (vec (sort-by pr-str entities)) "=" cardinality
-                           (cond
-                             shared? "shared"
-                             inferred-zero? "zero-superset"
-                             :else (format "%.1f ms" elapsed-ms)))
+                  (when (or (= i (dec (count subsets)))
+                            (zero? (mod (inc i) 100)))
+                    (println name (inc i) "/" (count subsets)
+                             (vec (sort-by pr-str entities)) "=" cardinality
+                             (cond
+                               shared? "shared"
+                               inferred-zero? "zero-superset"
+                               :else
+                               (str (clojure.core/name count-method) " "
+                                    (format "%.1f ms" elapsed-ms)))))
                   (assoc counts entities cardinality)))
               counts jobs)))
         existing

@@ -31,6 +31,7 @@
    [datalevin.vector VectorIndex]
    [java.nio ByteBuffer]
    [java.util Arrays Date Random UUID]
+   [java.util.concurrent CountDownLatch TimeUnit]
    [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
 
 (use-fixtures :each db-fixture)
@@ -864,6 +865,134 @@
           (d/close conn')
           (u/delete-files dir))))))
 
+(deftest test-update-schema-delete-and-rename-replays
+  (let [dir    (u/tmp-dir (str "schema-replay-" (UUID/randomUUID)))
+        schema {:old/name    {:db/valueType :db.type/string}
+                :delete/me   {}
+                :other/name  {:db/valueType :db.type/string}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (let [after-delete (d/update-schema conn nil #{:delete/me})
+            modified     (i/last-modified (conn-store conn))]
+        (is (not (contains? after-delete :delete/me)))
+        (is (= after-delete
+               (d/update-schema conn nil #{:delete/me})))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (let [aid       (get-in (d/schema conn) [:old/name :db/aid])
+            update    {:old/name {:db/doc "Renamed attribute"}}
+            renames   {:old/name :new/name}
+            after     (d/update-schema conn update nil renames)
+            modified  (i/last-modified (conn-store conn))]
+        (is (not (contains? after :old/name)))
+        (is (= aid (get-in after [:new/name :db/aid])))
+        (is (= "Renamed attribute" (get-in after [:new/name :db/doc])))
+        ;; Replaying the original request redirects its property patch to the
+        ;; target instead of recreating the old attribute.
+        (is (= after (d/update-schema conn update nil renames)))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (let [before (d/schema conn)]
+        (is (thrown-with-msg?
+              Exception #"target already exists"
+              (d/update-schema conn nil nil {:new/name :other/name})))
+        (is (= before (d/schema conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-update-schema-validates-whole-operation-before-writing
+  (let [dir    (u/tmp-dir (str "schema-preflight-" (UUID/randomUUID)))
+        schema {:safe/name  {:db/valueType :db.type/string}
+                :busy/value {}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (d/transact! conn [{:db/id 1 :busy/value 42}])
+      (let [before   (d/schema conn)
+            modified (i/last-modified (conn-store conn))]
+        (is (thrown-with-msg?
+              Exception #"Cannot delete attribute"
+              (d/update-schema conn
+                               {:safe/name {:db/doc "must roll back"}}
+                               #{:busy/value})))
+        (is (= before (d/schema conn)))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (is (thrown-with-msg?
+            Exception #"patch and delete"
+            (d/update-schema conn {:safe/name {:db/doc "ambiguous"}}
+                             #{:safe/name})))
+      (is (thrown-with-msg?
+            Exception #"chains and cycles"
+            (d/update-schema conn nil nil
+                             {:safe/name :middle/name
+                              :middle/name :final/name})))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-update-schema-commit-failure-rolls-back-migration
+  (let [dir  (u/tmp-dir (str "schema-commit-failure-" (UUID/randomUUID)))
+        conn (d/create-conn dir {:item/value {}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/value 42}])
+      (let [before (d/schema conn)]
+        (is (thrown-with-msg?
+              Exception #"forced schema commit failure"
+              (binding [cpp/*before-write-commit-fn*
+                        (fn [{:keys [operation]}]
+                          (when (= operation :close-transact-kv)
+                            (throw (ex-info "forced schema commit failure"
+                                            {:error ::forced-commit-failure}))))]
+                (d/update-schema
+                  conn {:item/value {:db/valueType :db.type/string}}))))
+        (is (= before (d/schema conn)))
+        (is (= 42 (:item/value (d/entity @conn 1)))))
+
+      ;; The identical operation can be retried after the failed commit.
+      (d/update-schema conn {:item/value {:db/valueType :db.type/string}})
+      (is (= :db.type/string
+             (get-in (d/schema conn) [:item/value :db/valueType])))
+      (is (= "42" (:item/value (d/entity @conn 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-concurrent-schema-property-patches-compose
+  (let [dir     (u/tmp-dir (str "schema-concurrent-" (UUID/randomUUID)))
+        conn    (d/create-conn
+                  dir {:item/value {:db/valueType :db.type/string}})
+        patches [{:db/doc "Concurrent patches"}
+                 {:db/cardinality :db.cardinality/one}
+                 {:db/fulltext false}
+                 {:db/isComponent false}
+                 {:db/embedding false}
+                 {:db/idocFormat :edn}
+                 {:db.embedding/autoDomain false}]
+        ready   (CountDownLatch. (count patches))
+        start   (CountDownLatch. 1)
+        workers (mapv
+                  (fn [patch]
+                    (future
+                      (.countDown ready)
+                      (.await start)
+                      (d/update-schema conn {:item/value patch})))
+                  patches)]
+    (try
+      (is (.await ready 10 TimeUnit/SECONDS))
+      (.countDown start)
+      (doseq [worker workers]
+        (is (not= ::timeout (deref worker 10000 ::timeout))))
+      (let [props (get (d/schema conn) :item/value)]
+        (doseq [patch patches]
+          (is (= patch (select-keys props (keys patch))))))
+      (finally
+        (.countDown start)
+        (doseq [worker workers]
+          (future-cancel worker))
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-live-idoc-schema-initializes-index-and-logs-dbis
   (let [dir  (u/tmp-dir (str "test-live-idoc-schema-"
                              (UUID/randomUUID)))
@@ -928,6 +1057,23 @@
       (finally
         (when-not (d/closed? conn)
           (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest test-idoc-schema-update-inside-explicit-transaction
+  (let [dir  (u/tmp-dir (str "schema-idoc-transaction-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn dir)]
+    (try
+      (d/with-transaction [tx conn]
+        (d/update-schema tx
+                         {:doc/idoc {:db/valueType :db.type/idoc
+                                     :db/domain    "profiles"}}))
+      (is (some? (get (s/store-idoc-indices (conn-store conn)) "profiles")))
+      (d/transact! conn [{:db/id 1 :doc/idoc {:status "active"}}])
+      (is (= {:status "active"}
+             (:doc/idoc (d/entity @conn 1))))
+      (finally
+        (d/close conn)
         (u/delete-files dir)))))
 
 (deftest test-idoc-selective-path-indexing-domain-options

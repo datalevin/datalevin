@@ -741,11 +741,12 @@
    {:pre [(conn? conn)]}
    (vld/validate-schema-update schema-update)
    (let [^DB db       (db conn)
-         ^Store store (.-store db)]
-     (i/set-schema store schema-update)
-     (doseq [attr del-attrs] (i/del-attr store attr))
-     (doseq [[old new] rename-map] (i/rename-attr store old new))
-     (schema conn))))
+         ^Store store (.-store db)
+         result       (i/set-schema store schema-update del-attrs rename-map)]
+     ;; A value-type update can re-encode stored datoms without going through
+     ;; the normal Datalog transaction cache invalidation path.
+     (db/refresh-cache store)
+     result)))
 
 (defonce ^:private connections (atom {}))
 (defonce ^:private transact-async-executor-atom (atom nil))

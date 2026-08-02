@@ -178,6 +178,8 @@ Here is a simple Clojure code example using Datalevin:
 ;; Schema input patches existing attribute definitions: omitted properties are
 ;; preserved. Use :db/retract as a property value to remove that property.
 ;; Internal :db/aid values returned by d/schema are ignored in schema input.
+;; Property patches, value migrations, deletions, and renames commit atomically;
+;; repeating a completed deletion or rename is safe.
 ;; (d/update-schema conn {:name {:db/unique :db/retract}})
 
 ;; Transact some data
