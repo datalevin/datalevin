@@ -117,3 +117,27 @@
                 :else               nil))]
       (walk clause)
       @vars)))
+
+(defn collect-fn-arg-vars
+  "Collect variables that a query function call reads from its arguments.
+   Collection literals are constants in the query grammar, even when they
+   contain symbols such as ?x. Lists are the exception because the executor
+   treats them as nested function calls."
+  [args]
+  (let [vars (volatile! #{})]
+    (letfn [(walk [arg]
+              (cond
+                (binding-var? arg)
+                (vswap! vars conj arg)
+
+                (list? arg)
+                (do
+                  (when (binding-var? (first arg))
+                    (vswap! vars conj (first arg)))
+                  (doseq [nested-arg (next arg)]
+                    (walk nested-arg)))
+
+                :else nil))]
+      (doseq [arg args]
+        (walk arg))
+      @vars)))
