@@ -509,12 +509,21 @@
                                :table projection-table
                                :statements
                                (when-not (= projection-vars vars)
-                                 [(str "DROP TABLE IF EXISTS "
-                                       projection-table)
-                                  (str "CREATE TEMP TABLE " projection-table
-                                       " ON COMMIT PRESERVE ROWS AS "
-                                       projection-sql)
-                                  (str "ANALYZE " projection-table)])}))
+                                 (vec
+                                   (concat
+                                     [(str "DROP TABLE IF EXISTS "
+                                           projection-table)
+                                      (str "CREATE TEMP TABLE "
+                                           projection-table
+                                           " ON COMMIT PRESERVE ROWS AS "
+                                           projection-sql)]
+                                     (when (seq projection-columns)
+                                       [(str "CREATE INDEX ON "
+                                             projection-table " ("
+                                             (str/join ", " projection-columns)
+                                             ")")])
+                                     [(str "ANALYZE "
+                                           projection-table)])))}))
                           (range (bit-shift-left 1 (count ordered-vars))))
                         projection-map
                         (into {} (map (juxt :vars :table)) projections)]
@@ -527,9 +536,11 @@
                               (concat
                                 [(str "DROP TABLE IF EXISTS " table)
                                  (str "CREATE TEMP TABLE " table
-                                      " ON COMMIT PRESERVE ROWS AS "
-                                      select-sql)
-                                 (str "ANALYZE " table)]
+                                      " ON COMMIT PRESERVE ROWS AS " select-sql)]
+                                (when (seq names)
+                                  [(str "CREATE INDEX ON " table " ("
+                                        (str/join ", " names) ")")])
+                                [(str "ANALYZE " table)]
                                 (mapcat :statements projections)))}]))
                 from-items))]
     {:var-name var-name
@@ -722,7 +733,7 @@
 
 (defn run
   [{:keys [db-path sql-dir output-dir queries timeout-ms parallelism
-           url user password validate-existing?]
+           url user password validate-existing? skip-complete?]
     :or   {db-path "db"
            sql-dir "queries"
            output-dir "results/cidr-exact-cardinalities"
@@ -732,7 +743,8 @@
            user (or (System/getProperty "pg.user")
                     (System/getenv "USER"))
            password ""
-           validate-existing? true}}]
+           validate-existing? true
+           skip-complete? false}}]
   (when-not (and (integer? parallelism) (pos? parallelism))
     (throw (ex-info "SQL oracle parallelism must be a positive integer"
                     {:parallelism parallelism})))
@@ -743,10 +755,28 @@
         calibration-cache (atom {})]
     (try
       (let [shared-file   (io/file output-dir "shared.edn")
-            shared-counts (atom (oracle/read-shared-checkpoint shared-file))]
+            shared-counts (atom (oracle/read-shared-checkpoint shared-file))
+            query-symbols
+            (cond->> (oracle/selected-query-symbols queries)
+              skip-complete?
+              (filterv
+                (fn [query-sym]
+                  (let [query-name (oracle/query-name query-sym)
+                        output-file (io/file output-dir
+                                             (str query-name ".edn"))
+                        existing (set (keys (oracle/read-checkpoint
+                                              output-file)))
+                        required (set (oracle/all-connected-subsets
+                                        (oracle/query-graph
+                                          database
+                                          (oracle/query-value query-sym))))
+                        complete? (= required existing)]
+                    (when complete?
+                      (println query-name "already complete; skipped"))
+                    (not complete?)))))]
         (io/make-parents shared-file)
         (with-open [shared-writer (io/writer shared-file :append true)]
-          (doseq [query-sym (oracle/selected-query-symbols queries)]
+          (doseq [query-sym query-symbols]
             (let [query-name (oracle/query-name query-sym)
                   sql-file   (io/file sql-dir (str query-name ".sql"))
                   _          (when-not (.exists sql-file)
