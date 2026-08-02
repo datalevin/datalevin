@@ -83,6 +83,7 @@ Defaults:
   snapshot/rejoin rate/time-limit: 5/30 for degraded-rejoin and snapshot
                                    corruption/identity recovery workloads
   rejoin-bootstrap rate/time-limit: 4/8
+  abort if the Git source revision changes during the sweep
 
 Notes:
   --all-workloads runs every standard local workload except witness-topology,
@@ -178,6 +179,23 @@ print_result_summary() {
         (when-not accepted?
           (System/exit 1)))'
   )
+}
+
+git_revision() {
+  git -C "$repo_root" rev-parse --verify HEAD 2>/dev/null \
+    || printf 'unversioned\n'
+}
+
+check_source_revision() {
+  observed_revision="$(git_revision)"
+  [[ "$observed_revision" == "$source_revision" ]]
+}
+
+print_source_revision_change() {
+  printf 'Source revision changed during the clock sweep: %s -> %s\n' \
+    "$source_revision" \
+    "$observed_revision" >&2
+  printf 'Aborting because compiled classes and source files may now describe different revisions.\n' >&2
 }
 
 run_jepsen() {
@@ -330,6 +348,8 @@ port_retry_count="${DTLV_JEPSEN_PORT_RETRY_COUNT:-2}"
 port_retry_delay_s="${DTLV_JEPSEN_PORT_RETRY_DELAY_S:-1}"
 hard_timeout_s="${DTLV_JEPSEN_CLOCK_HARD_TIMEOUT_S:-180}"
 timeout_bin=""
+source_revision="$(git_revision)"
+observed_revision="$source_revision"
 
 if command -v timeout >/dev/null 2>&1; then
   timeout_bin="timeout"
@@ -338,8 +358,21 @@ elif command -v gtimeout >/dev/null 2>&1; then
 fi
 
 mkdir -p "$log_dir"
+printf 'Source revision: %s\n' "$source_revision"
+
+if ! check_source_revision; then
+  print_source_revision_change
+  exit 1
+fi
 
 for workload in "${selected_workloads[@]}"; do
+  if ! check_source_revision; then
+    print_source_revision_change
+    status=1
+    summaries+=("$workload not-run source-revision-changed from=$source_revision to=$observed_revision")
+    break
+  fi
+
   workload_rate="$rate"
   workload_time_limit="$time_limit"
   if [[ "$workload" == "fencing" ]]; then
@@ -412,6 +445,13 @@ for workload in "${selected_workloads[@]}"; do
   fi
 
   if run_jepsen "$log_file" "${wrapped_cmd[@]}"; then
+    if ! check_source_revision; then
+      print_source_revision_change
+      status=1
+      summaries+=("$workload mixed-source-revision from=$source_revision to=$observed_revision log=$log_file")
+      break
+    fi
+
     results_file="$(latest_results_file "$workload" || true)"
     if [[ -n "${results_file:-}" && "$results_file" != "$before_results" ]]; then
       if summary_output="$(print_result_summary "$results_file")"; then
@@ -429,6 +469,13 @@ for workload in "${selected_workloads[@]}"; do
     fi
   else
     run_exit=$?
+    if ! check_source_revision; then
+      print_source_revision_change
+      status=1
+      summaries+=("$workload mixed-source-revision from=$source_revision to=$observed_revision log=$log_file")
+      break
+    fi
+
     results_file="$(latest_results_file "$workload" || true)"
     if [[ -n "${results_file:-}" && "$results_file" != "$before_results" ]]; then
       if summary_output="$(print_result_summary "$results_file")"; then

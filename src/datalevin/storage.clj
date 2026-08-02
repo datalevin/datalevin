@@ -12,7 +12,7 @@
   (:refer-clojure :exclude [update assoc])
   (:require
    [datalevin.lmdb :as lmdb :refer [IWriting]]
-   [datalevin.binding.cpp]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.inline :refer [update assoc]]
    [datalevin.kv :as kv]
    [datalevin.remote :as remote]
@@ -3844,6 +3844,9 @@
                (locking shared-local-stores
                  (swap! shared-local-stores
                         assoc dir-key {:store store :refs 1})))
+             (cpp/register-shutdown-close!
+               (kv/raw-lmdb lmdb)
+               #(close-store-resources! store))
              (enqueue-secondary-index-work-if-needed! store))))))))
 
 (defn- transfer-engines
@@ -3939,16 +3942,17 @@
         wlock (.writeLock sampling-lock)]
     (.lock wlock)
     (try
-      (.stop-sampling this)
-      (doseq [index (vals (.-vector-indices this))]
-        (when-not (vec-closed? index)
-          (close-vecs index)))
-      (doseq [index (vals (.-embedding-indices this))]
-        (when-not (vec-closed? index)
-          (close-vecs index)))
-      (doseq [provider (vals (.-embedding-providers this))]
-        (emb/close-provider provider))
-      (close-kv (.-lmdb this))
+      (when-not (closed-kv? (.-lmdb this))
+        (.stop-sampling this)
+        (doseq [index (vals (.-vector-indices this))]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [index (vals (.-embedding-indices this))]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [provider (vals (.-embedding-providers this))]
+          (emb/close-provider provider))
+        (close-kv (.-lmdb this)))
       (finally
         (.unlock wlock)))))
 

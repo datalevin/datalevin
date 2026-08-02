@@ -1208,6 +1208,7 @@
     (vreset! scheduled-sync fut)))
 
 (defonce ^:private shutdown-hooks (atom {}))
+(defonce ^:private shutdown-close-actions (atom {}))
 (defonce ^:private active-local-kv-handles (atom #{}))
 (defonce ^:private open-local-kv-handles (atom {}))
 
@@ -1263,8 +1264,23 @@
   (swap! shutdown-hooks assoc dir hook)
   nil)
 
+(defn register-shutdown-close!
+  "Register a higher-level close action for an open LMDB environment.
+   The raw JVM shutdown hook uses this action when present and otherwise
+   falls back to closing LMDB directly."
+  [lmdb close-fn]
+  (swap! shutdown-close-actions assoc (env-dir lmdb) close-fn)
+  nil)
+
+(defn- run-shutdown-close!
+  [dir lmdb]
+  (if-let [close-fn (get @shutdown-close-actions dir)]
+    (close-fn)
+    (close-kv lmdb)))
+
 (defn- unregister-shutdown-hook!
   [dir]
+  (swap! shutdown-close-actions dissoc dir)
   (when-let [^Thread hook (get @shutdown-hooks dir)]
     (swap! shutdown-hooks dissoc dir)
     (try
@@ -2183,7 +2199,8 @@
             (set-max-val-size lmdb (max-val-size lmdb))
             (set-key-compressor lmdb k-comp)
             (set-val-compressor lmdb v-comp)
-            (register-shutdown-hook! dir (Thread. #(close-kv lmdb)))
+            (register-shutdown-hook!
+              dir (Thread. #(run-shutdown-close! dir lmdb)))
             (start-scheduled-sync (.-scheduled-sync lmdb) dir env)))
         (register-local-kv-handle! local-handle-key (l/wrap-open-kv lmdb)))
       (catch Exception e
