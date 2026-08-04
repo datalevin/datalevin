@@ -129,16 +129,20 @@
           row))
       timing)))
 
-(defn- percentile
-  [values p]
-  (when (seq values)
-    (let [sorted (vec (sort values))
-          pos    (* (double p) (double (dec (count sorted))))
+(defn- percentile-sorted
+  [sorted p]
+  (when (seq sorted)
+    (let [pos    (* (double p) (double (dec (count sorted))))
           lo     (long (Math/floor pos))
           hi     (long (Math/ceil pos))
           a      (double (nth sorted lo))
           b      (double (nth sorted hi))]
       (+ a (* (- pos lo) (- b a))))))
+
+(defn- percentile
+  [values p]
+  (when (seq values)
+    (percentile-sorted (vec (sort values)) p)))
 
 (defn- distribution
   [values]
@@ -634,6 +638,105 @@
        :contrasts-versus-baseline contrasts
        :pairwise-contrasts pairwise-contrasts})))
 
+(defn- paired-runtime-ratio-rows
+  [rows baseline condition]
+  (let [runtime-rows  (remove :plan-only? rows)
+        baseline-rows (into {}
+                            (map (juxt paired-row-key identity))
+                            (filter #(= baseline (:mode %)) runtime-rows))]
+    (->> runtime-rows
+         (filter #(= condition (:mode %)))
+         (keep
+           (fn [condition-row]
+             (when-let [baseline-row
+                        (baseline-rows (paired-row-key condition-row))]
+               (let [baseline-ms  (:charged-execution-ms baseline-row)
+                     condition-ms (:charged-execution-ms condition-row)]
+                 (when (and (number? baseline-ms)
+                            (pos? (double baseline-ms))
+                            (number? condition-ms))
+                   {:run (:run condition-row)
+                    :query (:query condition-row)
+                    :sample-seed (:sample-seed condition-row)
+                    :baseline-ms baseline-ms
+                    :condition-ms condition-ms
+                    :ratio (/ (double condition-ms)
+                              (double baseline-ms))})))))
+         vec)))
+
+(defn- paired-runtime-ratio-metrics
+  [pairs]
+  (let [ratios (vec (sort (map :ratio pairs)))
+        n      (count ratios)]
+    {:pairs n
+     :queries (count (distinct (map :query pairs)))
+     :p50-ratio (percentile-sorted ratios 0.50)
+     :p95-ratio (percentile-sorted ratios 0.95)
+     :p99-ratio (percentile-sorted ratios 0.99)
+     :geometric-mean-ratio (geometric-mean ratios)
+     :condition-faster-rate
+     (when (pos? n)
+       (/ (double (count (filter #(< (double %) 1.0) ratios)))
+          (double n)))
+     :ge-10-rate
+     (when (pos? n)
+       (/ (double (count (filter #(<= 10.0 (double %)) ratios)))
+          (double n)))}))
+
+(defn- hierarchical-paired-ratio-resample
+  [pairs ^Random random]
+  (let [queries (vec (vals (group-by :query pairs)))]
+    (vec
+      (mapcat
+        (fn [_]
+          (let [query-pairs (sample-value random queries)]
+            (repeatedly (count query-pairs)
+                        #(sample-value random query-pairs))))
+        queries))))
+
+(defn- paired-runtime-ratio-bootstrap
+  [pairs samples seed]
+  (when (pos? samples)
+    (let [random     (Random. (long seed))
+          metrics    [:p50-ratio :p95-ratio :p99-ratio
+                      :geometric-mean-ratio :condition-faster-rate
+                      :ge-10-rate]
+          estimate   (paired-runtime-ratio-metrics pairs)
+          replicates (vec
+                       (repeatedly
+                         samples
+                         #(paired-runtime-ratio-metrics
+                            (hierarchical-paired-ratio-resample
+                              pairs random))))]
+      {:samples samples
+       :seed seed
+       :method :hierarchical-paired-query-then-seed-bootstrap
+       :metrics
+       (into {}
+             (map
+               (fn [metric]
+                 [metric
+                  {:estimate (get estimate metric)
+                   :ci95 (confidence-interval
+                           (keep #(get % metric) replicates))}]))
+             metrics)})))
+
+(defn- paired-runtime-ratio-summary
+  [rows bootstrap-samples bootstrap-seed]
+  (when-let [baseline (baseline-condition rows)]
+    {:baseline-condition baseline
+     :ratio :condition-query-time-over-paired-baseline-query-time
+     :conditions
+     (into (sorted-map)
+           (for [condition (vec (sort (distinct (map :mode rows))))
+                 :when (not= baseline condition)
+                 :let [pairs (paired-runtime-ratio-rows
+                               rows baseline condition)]]
+             [condition
+              {:estimate (paired-runtime-ratio-metrics pairs)
+               :bootstrap (paired-runtime-ratio-bootstrap
+                            pairs bootstrap-samples bootstrap-seed)}]))}))
+
 (defn plan-disagreements
   "Return query/sample pairs where selected conditions chose different plans."
   [rows]
@@ -675,6 +778,9 @@
                         (group-by :mode rows))
       :bootstrap (bootstrap-summary
                    rows bootstrap-samples bootstrap-seed)
+      :paired-runtime-ratios
+      (paired-runtime-ratio-summary
+        rows bootstrap-samples bootstrap-seed)
       :causal-comparisons (causal-comparisons rows)
       :pairwise-plan-comparisons (pairwise-plan-comparisons rows)
       :worker-rewarm (worker-rewarm-summary rows)

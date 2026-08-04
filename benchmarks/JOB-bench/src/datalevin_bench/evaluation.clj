@@ -21,6 +21,7 @@
   (:import
    [com.sun.management OperatingSystemMXBean]
    [datalevin.utl LRUCache]
+   [java.io StringWriter]
    [java.lang.management ManagementFactory]
    [java.nio.charset StandardCharsets]
    [java.time Instant]
@@ -132,7 +133,7 @@
 (defonce ^:private exact-cardinality-cache (atom {}))
 
 (defn- exact-cardinality-oracle
-  [oracle-dir query-name]
+  [oracle-dir query-name require-material?]
   (let [file (io/file oracle-dir (str query-name ".edn"))
         path (.getCanonicalPath file)
         counts
@@ -143,12 +144,35 @@
                                 {:query query-name :file path})))
               (get (swap! exact-cardinality-cache
                           #(if (contains? % path) % (assoc % path loaded)))
-                   path)))]
+                   path)))
+        material-file (io/file oracle-dir (str query-name ".material.edn"))
+        material-path (.getCanonicalPath material-file)
+        material-counts
+        (or (get @exact-cardinality-cache material-path)
+            (let [loaded (oracle/read-material-checkpoint material-file)]
+              (get (swap! exact-cardinality-cache
+                          #(if (contains? % material-path) %
+                               (assoc % material-path loaded)))
+                   material-path)))]
     (fn [{:keys [kind entities] :as request}]
-      (when-not (= :subset kind)
+      (case kind
+        :subset
+        (get counts entities)
+
+        :link-input
+        (if-let [cardinality
+                 (get material-counts (oracle/material-request-key request))]
+          cardinality
+          (if require-material?
+            (throw
+              (ex-info "Exact material-cardinality checkpoint is missing"
+                       {:query query-name
+                        :file material-path
+                        :request request}))
+            qo/cardinality-oracle-fallback))
+
         (throw (ex-info "Unsupported exact-cardinality oracle request"
-                        {:query query-name :request request})))
-      (get counts entities))))
+                        {:query query-name :request request}))))))
 
 (defn- available-queries []
   (into {} (map (juxt query-name identity)) job/queries))
@@ -214,8 +238,30 @@
                       {:condition condition
                        :mode mode
                        :available (vec (sort (keys estimator-modes)))})))
-    (let [condition (merge template defaults condition
-                           {:name name :mode mode})]
+    (let [condition (-> (merge template defaults condition
+                               {:name name :mode mode})
+                        (update :cost-model
+                                #(or % c/optimizer-cost-model))
+                        (update :base-estimate-prior-size
+                                #(or % c/base-estimate-prior-size))
+                        (update :physical-cost-tuple
+                                #(or % c/physical-cost-tuple))
+                        (update :physical-cost-hash-row
+                                #(or % c/physical-cost-hash-row))
+                        (update :physical-cost-sip-hash-row
+                                #(or % c/physical-cost-sip-hash-row))
+                        (update :physical-cost-hash-output-cell
+                                #(or % c/physical-cost-hash-output-cell))
+                        (update :physical-cost-link-probe
+                                #(or % c/physical-cost-link-probe))
+                        (update :physical-cost-link-retrieval
+                                #(or % c/physical-cost-link-retrieval))
+                        (update :physical-cost-merge-locality-weight
+                                #(or % c/physical-cost-merge-locality-weight))
+                        (update :physical-cost-pipeline-parallelism
+                                #(or % c/physical-cost-pipeline-parallelism))
+                        (update :require-material-cardinalities?
+                                #(if (nil? %) false %)))]
       (when-not (and (integer? (:sample-size condition))
                      (pos? (:sample-size condition)))
         (throw (ex-info "Condition sample budget must be a positive integer"
@@ -236,10 +282,41 @@
         (throw
           (ex-info "Condition conservative lower bound must be boolean"
                    {:condition condition})))
+      (when-not (#{:legacy :physical} (:cost-model condition))
+        (throw
+          (ex-info "Condition cost model must be :legacy or :physical"
+                   {:condition condition})))
+      (when-not (nonnegative-finite-number?
+                  (:base-estimate-prior-size condition))
+        (throw
+          (ex-info "Base estimate prior size must be non-negative and finite"
+                   {:condition condition})))
+      (doseq [parameter [:physical-cost-tuple
+                         :physical-cost-hash-row
+                         :physical-cost-sip-hash-row
+                         :physical-cost-hash-output-cell
+                         :physical-cost-link-probe
+                         :physical-cost-link-retrieval
+                         :physical-cost-pipeline-parallelism]]
+        (when-not (and (nonnegative-finite-number? (parameter condition))
+                       (pos? (double (parameter condition))))
+          (throw
+            (ex-info "Physical cost coefficients must be positive and finite"
+                     {:parameter parameter :condition condition}))))
+      (when-not (nonnegative-finite-number?
+                  (:physical-cost-merge-locality-weight condition))
+        (throw
+          (ex-info "Physical locality weight must be non-negative and finite"
+                   {:condition condition})))
       (when (and (:exact-cardinality? condition)
                  (not (string? (:oracle-dir condition))))
         (throw
           (ex-info "Exact-cardinality condition requires :oracle-dir"
+                   {:condition condition})))
+      (when-not (instance? Boolean
+                           (:require-material-cardinalities? condition))
+        (throw
+          (ex-info "Require-material-cardinalities flag must be boolean"
                    {:condition condition})))
       condition)))
 
@@ -287,8 +364,11 @@
       (normalize-condition mode
                            {:sample-size c/init-exec-size-threshold
                             :prior-size c/link-estimate-prior-size
+                            :base-estimate-prior-size
+                            c/base-estimate-prior-size
                             :variance-alpha c/link-estimate-var-alpha
                             :tail-weight c/link-estimate-tail-weight
+                            :cost-model c/optimizer-cost-model
                             :conservative-lower-bound?
                             c/link-estimate-conservative-lower-bound?})))
 
@@ -387,9 +467,18 @@
 (defn- run-query
   [db observed {:keys [mode query sample-seed] :as entry}
    {:keys [intermediate-counts? plan-only? query-timeout-ms timing-method]}]
-  (let [{:keys [direct-counts? query-sampling? estimator-policy sample-size
+  (let [{:keys [direct-counts? query-sampling? estimator-policy cost-model
+                base-estimate-prior-size
+                physical-cost-tuple physical-cost-hash-row
+                physical-cost-sip-hash-row
+                physical-cost-hash-output-cell
+                physical-cost-link-probe physical-cost-link-retrieval
+                physical-cost-merge-locality-weight
+                physical-cost-pipeline-parallelism
+                sample-size
                 prior-size variance-alpha tail-weight
-                conservative-lower-bound? exact-cardinality? oracle-dir]}
+                conservative-lower-bound? exact-cardinality? oracle-dir
+                require-material-cardinalities?]}
         (entry-condition entry)
         {:keys [name symbol]} query
         observations          (atom {})
@@ -406,6 +495,20 @@
             (binding [c/use-direct-predicate-counts? direct-counts?
                       c/use-query-local-sampling?   query-sampling?
                       c/link-estimate-policy       estimator-policy
+                      c/optimizer-cost-model        cost-model
+                      c/base-estimate-prior-size   base-estimate-prior-size
+                      c/physical-cost-tuple         physical-cost-tuple
+                      c/physical-cost-hash-row      physical-cost-hash-row
+                      c/physical-cost-sip-hash-row  physical-cost-sip-hash-row
+                      c/physical-cost-hash-output-cell
+                      physical-cost-hash-output-cell
+                      c/physical-cost-link-probe    physical-cost-link-probe
+                      c/physical-cost-link-retrieval
+                      physical-cost-link-retrieval
+                      c/physical-cost-merge-locality-weight
+                      physical-cost-merge-locality-weight
+                      c/physical-cost-pipeline-parallelism
+                      physical-cost-pipeline-parallelism
                       c/init-exec-size-threshold   sample-size
                       c/link-estimate-prior-size   prior-size
                       c/link-estimate-var-alpha    variance-alpha
@@ -415,7 +518,8 @@
                       u/*reservoir-sampling-seed*   sample-seed
                       qo/*cardinality-oracle*
                       (when exact-cardinality?
-                        (exact-cardinality-oracle oracle-dir name))
+                        (exact-cardinality-oracle
+                          oracle-dir name require-material-cardinalities?))
                       qo/*link-estimate-observer*
                       (when (= :explain timing-method) observe!)
                       q/*cache?*                   false
@@ -990,6 +1094,69 @@
                         {:phase phase :pass pass :reasons reasons})))
       value)))
 
+(defn- append-writer!
+  [writer value]
+  (.write ^java.io.Writer writer (str value))
+  (.flush ^java.io.Writer writer))
+
+(defn- contamination-rejection?
+  [error]
+  (and (instance? clojure.lang.ExceptionInfo error)
+       (seq (:reasons (ex-data error)))
+       (= "Machine health changed during optimizer evaluation"
+          (.getMessage ^Throwable error))))
+
+(defn- accepted-measured-pass!
+  "Run and commit one health interval. A contaminated attempt is written only
+  to the rejected-health audit stream, then the identical pass is retried after
+  restarting the isolated worker. Callers must buffer result rows inside `f` and
+  write them only after this function returns."
+  [health-writer rejected-health-writer phase pass
+   {:keys [contamination-retries contamination-retry-pause-ms
+           worker-state worker-needs-rewarm? measured-pass-fn]
+    :or {contamination-retries 0
+         contamination-retry-pause-ms 10000}
+    :as options}
+   f]
+  (loop [attempt 0]
+    (let [measure!       (or measured-pass-fn measured-pass!)
+          attempt-health (StringWriter.)
+          result
+          (try
+            {:value (measure! attempt-health phase pass options f)}
+            (catch Throwable error
+              {:error error}))]
+      (if-let [error (:error result)]
+        (let [rejected? (contamination-rejection? error)
+              retry?    (and rejected?
+                             (< attempt (long contamination-retries)))]
+          (if retry?
+            (do
+              (write-edn!
+                rejected-health-writer
+                {:event :rejected-pass
+                 :phase phase
+                 :pass pass
+                 :attempt attempt
+                 :reasons (:reasons (ex-data error))})
+              (append-writer! rejected-health-writer
+                              (.toString attempt-health))
+              (println "Rejected contaminated" (name phase) "pass"
+                       (inc pass) "attempt" (inc attempt) "of"
+                       (inc (long contamination-retries)) "; retrying the"
+                       "identical paired schedule")
+              (when (and worker-state worker-needs-rewarm?)
+                (stop-current-worker! worker-state worker-needs-rewarm?))
+              (System/gc)
+              (Thread/sleep (long contamination-retry-pause-ms))
+              (recur (inc attempt)))
+            (do
+              (append-writer! health-writer (.toString attempt-health))
+              (throw error))))
+        (do
+          (append-writer! health-writer (.toString attempt-health))
+          (:value result))))))
+
 (defn- repository-root
   []
   (loop [directory (.getCanonicalFile (io/file "."))]
@@ -1073,8 +1240,14 @@
   (->> conditions
        (keep
          (fn [{:keys [name estimator-policy tail-weight
-                      conservative-lower-bound? exact-cardinality?]}]
+                      conservative-lower-bound? exact-cardinality?
+                      require-material-cardinalities?]}]
            (cond
+             (and exact-cardinality? require-material-cardinalities?)
+             (str name ": exact logical outputs and indexed-link materialized "
+                  "inputs replace estimates; enumeration, pruning, operators, "
+                  "and the cost model are unchanged.")
+
              exact-cardinality?
              (str name ": exact logical cardinalities replace estimates; "
                   "enumeration, pruning, operators, and the cost model are "
@@ -1123,6 +1296,9 @@
   `:worker-rewarm-query` fixed representative query before exact replays,
                         default `\"6d\"`
   `:reject-contaminated?` fail a pass after health violations, default true
+  `:contamination-retries` retry a rejected whole pass with the identical
+                        schedule after a worker restart, default 0
+  `:contamination-retry-pause-ms` pause before a whole-pass retry, default 10000
   `:require-docker-stopped?` refuse to start with Docker, default true
   `:minimum-memory-free-percent` reject low-memory passes, default 20
   `:reject-pageouts?`    treat any pageout increase as contamination
@@ -1142,6 +1318,7 @@
            worker-rewarm-query
            worker-timeout-grace-ms
            worker-startup-timeout-ms reject-contaminated?
+           contamination-retries contamination-retry-pause-ms
            require-docker-stopped? reject-pageouts?
            minimum-memory-free-percent sample-size prior-size variance-alpha
            tail-weight conservative-lower-bound?]
@@ -1162,6 +1339,8 @@
            worker-timeout-grace-ms  5000
            worker-startup-timeout-ms 60000
            reject-contaminated?     true
+           contamination-retries    0
+           contamination-retry-pause-ms 10000
            require-docker-stopped?  true
            reject-pageouts?         false
            minimum-memory-free-percent 20
@@ -1183,6 +1362,22 @@
                                (ex-info
                                  "Timing method must be :plain-query or :explain"
                                  {:timing-method timing-method})))
+        _                  (when-not
+                             (and (integer? contamination-retries)
+                                  (not (neg? contamination-retries)))
+                             (throw
+                               (ex-info
+                                 "Contamination retries must be non-negative"
+                                 {:contamination-retries
+                                  contamination-retries})))
+        _                  (when-not
+                             (and (integer? contamination-retry-pause-ms)
+                                  (not (neg? contamination-retry-pause-ms)))
+                             (throw
+                               (ex-info
+                                 "Contamination retry pause must be non-negative"
+                                 {:contamination-retry-pause-ms
+                                  contamination-retry-pause-ms})))
         timing-method      (if plan-only? :explain timing-method)
         diagnostic-replay? (boolean
                              (and diagnostic-replay?
@@ -1223,6 +1418,9 @@
                                    (str "optimizer_estimates_" stamp ".csv"))
         health-file       (io/file output-dir
                                    (str "optimizer_health_" stamp ".edn"))
+        rejected-health-file
+        (io/file output-dir
+                 (str "optimizer_rejected_health_" stamp ".edn"))
         manifest-file     (io/file output-dir
                                    (str "optimizer_manifest_" stamp ".edn"))
         files             {:timing-file (.getPath timing-file)
@@ -1230,6 +1428,8 @@
                            :cardinality-file (.getPath cardinality-file)
                            :estimator-file (.getPath estimator-file)
                            :health-file (.getPath health-file)
+                           :rejected-health-file
+                           (.getPath rejected-health-file)
                            :manifest-file (.getPath manifest-file)}
         config            {:db-path db-path
                            :output-dir (.getPath output-dir)
@@ -1253,6 +1453,9 @@
                            :worker-startup-timeout-ms
                            worker-startup-timeout-ms
                            :reject-contaminated? reject-contaminated?
+                           :contamination-retries contamination-retries
+                           :contamination-retry-pause-ms
+                           contamination-retry-pause-ms
                            :reject-pageouts? reject-pageouts?
                            :minimum-memory-free-percent
                            minimum-memory-free-percent
@@ -1282,6 +1485,9 @@
                            :worker-startup-timeout-ms
                            worker-startup-timeout-ms
                            :reject-contaminated? reject-contaminated?
+                           :contamination-retries contamination-retries
+                           :contamination-retry-pause-ms
+                           contamination-retry-pause-ms
                            :reject-pageouts? reject-pageouts?
                            :minimum-memory-free-percent
                            minimum-memory-free-percent
@@ -1309,7 +1515,9 @@
                     diagnostic-writer (io/writer diagnostic-file)
                     cardinality-writer (io/writer cardinality-file)
                     estimator-writer  (io/writer estimator-file)
-                    health-writer     (io/writer health-file)]
+                    health-writer     (io/writer health-file)
+                    rejected-health-writer
+                    (io/writer rejected-health-file)]
           (d/write-csv timing-writer [timing-header])
           (d/write-csv diagnostic-writer [timing-header])
           (d/write-csv cardinality-writer [cardinality-header])
@@ -1319,8 +1527,8 @@
           (.flush cardinality-writer)
           (.flush estimator-writer)
           (dotimes [run warmup-runs]
-            (measured-pass!
-              health-writer :warmup run run-options
+            (accepted-measured-pass!
+              health-writer rejected-health-writer :warmup run run-options
               #(warm-up! database observed queries conditions 1
                          (+ (long seed) (long run)) run-options)))
           (dotimes [run runs]
@@ -1328,70 +1536,101 @@
                        "Plan census pass"
                        "Measured timing pass")
                      (inc run) "of" runs)
-            (measured-pass!
-              health-writer :timing run run-options
-              #(execute-schedule!
-                 database observed
-                 (schedule queries conditions run seed
-                           (+ (long seed) (long run)))
-                 (assoc run-options :intermediate-counts? false)
-                 (fn [result]
-                   (d/write-csv timing-writer [(timing-row result)])
-                   (when (seq (:estimator-observations result))
-                     (d/write-csv estimator-writer
-                                  (estimator-rows :timing result)))
-                   (.flush timing-writer)
-                   (.flush estimator-writer)))))
+            (let [{:keys [rows estimates]}
+                  (accepted-measured-pass!
+                    health-writer rejected-health-writer
+                    :timing run run-options
+                    (fn []
+                      (let [rows      (volatile! [])
+                            estimates (volatile! [])]
+                        (execute-schedule!
+                          database observed
+                          (schedule queries conditions run seed
+                                    (+ (long seed) (long run)))
+                          (assoc run-options :intermediate-counts? false)
+                          (fn [result]
+                            (vswap! rows conj (timing-row result))
+                            (when (seq (:estimator-observations result))
+                              (vswap! estimates into
+                                      (estimator-rows :timing result)))))
+                        {:rows @rows :estimates @estimates})))]
+              (d/write-csv timing-writer rows)
+              (when (seq estimates)
+                (d/write-csv estimator-writer estimates))
+              (.flush timing-writer)
+              (.flush estimator-writer)))
           (when diagnostic-replay?
             (dotimes [run runs]
               (println "Diagnostic replay pass" (inc run) "of" runs)
-              (measured-pass!
-                health-writer :diagnostic run run-options
-                #(execute-schedule!
-                   database observed
-                   (schedule queries conditions run seed
-                             (+ (long seed) (long run)))
-                   (assoc run-options
-                          :timing-method :explain
-                          :intermediate-counts? false
-                          :plan-only? true)
-                   (fn [result]
-                     (d/write-csv diagnostic-writer [(timing-row result)])
-                     (when (seq (:estimator-observations result))
-                       (d/write-csv estimator-writer
-                                    (estimator-rows :diagnostic result)))
-                     (.flush diagnostic-writer)
-                     (.flush estimator-writer))))))
+              (let [{:keys [rows estimates]}
+                    (accepted-measured-pass!
+                      health-writer rejected-health-writer
+                      :diagnostic run run-options
+                      (fn []
+                        (let [rows      (volatile! [])
+                              estimates (volatile! [])]
+                          (execute-schedule!
+                            database observed
+                            (schedule queries conditions run seed
+                                      (+ (long seed) (long run)))
+                            (assoc run-options
+                                   :timing-method :explain
+                                   :intermediate-counts? false
+                                   :plan-only? true)
+                            (fn [result]
+                              (vswap! rows conj (timing-row result))
+                              (when (seq (:estimator-observations result))
+                                (vswap! estimates into
+                                        (estimator-rows :diagnostic result)))))
+                          {:rows @rows :estimates @estimates})))]
+                (d/write-csv diagnostic-writer rows)
+                (when (seq estimates)
+                  (d/write-csv estimator-writer estimates))
+                (.flush diagnostic-writer)
+                (.flush estimator-writer))))
           (dotimes [run cardinality-runs]
             (println "Cardinality pass" (inc run) "of" cardinality-runs)
-            (measured-pass!
-              health-writer :cardinality run run-options
-              #(execute-schedule!
-                 database observed
-                 (schedule queries cardinality-conditions run seed
-                           (+ (long seed) (long run)))
-                 (assoc run-options
-                        :timing-method :explain
-                        :intermediate-counts? true
-                        :plan-only? false)
-                 (fn [result]
-                   (when (= "ok" (:status result))
-                     (d/write-csv cardinality-writer
-                                  (cardinality-rows result)))
-                   (when (seq (:estimator-observations result))
-                     (d/write-csv estimator-writer
-                                  (estimator-rows :cardinality result)))
-                   (.flush cardinality-writer)
-                   (.flush estimator-writer))))))
+            (let [{:keys [rows estimates]}
+                  (accepted-measured-pass!
+                    health-writer rejected-health-writer
+                    :cardinality run run-options
+                    (fn []
+                      (let [rows      (volatile! [])
+                            estimates (volatile! [])]
+                        (execute-schedule!
+                          database observed
+                          (schedule queries cardinality-conditions run seed
+                                    (+ (long seed) (long run)))
+                          (assoc run-options
+                                 :timing-method :explain
+                                 :intermediate-counts? true
+                                 :plan-only? false)
+                          (fn [result]
+                            (when (= "ok" (:status result))
+                              (vswap! rows into
+                                      (cardinality-rows result)))
+                            (when (seq (:estimator-observations result))
+                              (vswap! estimates into
+                                      (estimator-rows :cardinality result)))))
+                        {:rows @rows :estimates @estimates})))]
+              (when (seq rows)
+                (d/write-csv cardinality-writer rows))
+              (when (seq estimates)
+                (d/write-csv estimator-writer estimates))
+              (.flush cardinality-writer)
+              (.flush estimator-writer))))
         (let [summary (merge files
                              {:queries (count queries)
                               :timing-conditions
                               (mapv #(select-keys
                                        % [:name :mode :estimator-policy
+                                          :cost-model
+                                          :base-estimate-prior-size
                                           :sample-size :prior-size
                                           :variance-alpha :tail-weight
                                           :conservative-lower-bound?
                                           :exact-cardinality? :oracle-dir
+                                          :require-material-cardinalities?
                                           :baseline?])
                                     conditions)
                               :runs runs
@@ -1401,10 +1640,13 @@
                               :cardinality-conditions
                               (mapv #(select-keys
                                        % [:name :mode :estimator-policy
+                                          :cost-model
+                                          :base-estimate-prior-size
                                           :sample-size :prior-size
                                           :variance-alpha :tail-weight
                                           :conservative-lower-bound?
                                           :exact-cardinality? :oracle-dir
+                                          :require-material-cardinalities?
                                           :baseline?])
                                     cardinality-conditions)
                               :cardinality-runs cardinality-runs

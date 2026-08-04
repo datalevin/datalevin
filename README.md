@@ -343,7 +343,7 @@ applying 4 rules to a mathematics genealogy data set on a Macbook Pro 2023.
 | -------- | ------- | -------- | -------- | -------- |
 | Datomic 1.0.7469   | 1275.1 | 1296.7 | 967.2 | 41192.9 |
 | Datascript 1.7.8  | 109.7 | 707.2 | 584.7 | Out of Memory |
-| Datalevin latest | 14.4 | 330.9 | 269.6 | 2.9 |
+| Datalevin 1.0.0 | 14.4 | 330.9 | 269.6 | 2.9 |
 
 For recursive rules like Q4, Datalevin can be orders of magnitude faster,
 while Datomic and Datascript struggle.
@@ -356,7 +356,8 @@ comparably with Neo4j on complex graph queries.
 ## :rocket: Status
 
 Datalevin is extensively tested with property-based testing and is used
-in production at [Juji](https://juji.io), among other companies.
+in production at [Juji](https://juji.io), among [other companies or
+projects](https://github.com/datalevin/datalevin/issues/383).
 
 ## :earth_americas: Roadmap
 

@@ -87,13 +87,14 @@
        where)
      :bound-vars bound-vars}))
 
-(defn subset-count-form
-  [analysis entities]
-  (let [{:keys [clauses bound-vars]} (subset-clauses analysis entities)
-        entity-query-vars (:entity-query-vars analysis)
+(defn clauses-count-form
+  "Count the multiplicity of `root` after applying an explicit logical clause
+  set. `entities` is used only to replace optimizer placeholder entities with
+  legal query variables."
+  [analysis entities clauses bound-vars root]
+  (let [entity-query-vars (:entity-query-vars analysis)
         replacements (select-keys entity-query-vars entities)
         clauses     (mapv #(walk/postwalk-replace replacements %) clauses)
-        root        (first (sort-by pr-str entities))
         root-var    (entity-query-vars root)
         count-vars  (into bound-vars (vals replacements))
         with-vars   (-> count-vars (disj root-var) (->> (sort-by pr-str)))]
@@ -104,17 +105,60 @@
               [:where]
               clauses))))
 
+(defn subset-count-form
+  [analysis entities]
+  (let [{:keys [clauses bound-vars]} (subset-clauses analysis entities)]
+    (clauses-count-form analysis entities clauses bound-vars
+                        (first (sort-by pr-str entities)))))
+
+(defn link-input-clause
+  "Return the single target pattern executed by an indexed link before the
+  target star's remaining clauses are merged and filtered."
+  [{:keys [patterns]} {:keys [link-e target type attr var attrs] :as request}]
+  (let [target-attr (case type
+                      :_ref attr
+                      :val-eq (get attrs target)
+                      nil)
+        target-val  (case type
+                      :_ref link-e
+                      :val-eq var
+                      nil)
+        matches     (filterv (fn [[entity pattern-attr value]]
+                               (and (= target entity)
+                                    (= target-attr pattern-attr)
+                                    (= target-val value)))
+                             patterns)]
+    (when-not (= 1 (count matches))
+      (throw (ex-info "Cannot identify one indexed-link target clause"
+                      {:request request :matches matches})))
+    (first matches)))
+
+(defn link-input-count-form
+  "Build an exact count for rows emitted by a reverse/value-equality link,
+  before any other clauses in the newly joined target star are applied."
+  [analysis {:keys [entities target] :as request}]
+  (let [{:keys [clauses bound-vars]} (subset-clauses analysis entities)
+        link-clause (link-input-clause analysis request)
+        all-entities (conj entities target)]
+    (clauses-count-form analysis all-entities
+                        (conj clauses link-clause)
+                        (into bound-vars (clause-vars link-clause))
+                        target)))
+
 (defn subset-count-query
   [analysis entities timeout-ms]
   (cond-> (dp/query->map (subset-count-form analysis entities))
     timeout-ms (assoc :timeout timeout-ms)))
 
-(defn subset-query-key
-  [analysis entities]
-  (let [bytes  (.getBytes (pr-str (subset-count-form analysis entities))
-                          StandardCharsets/UTF_8)
+(defn- count-form-key
+  [form]
+  (let [bytes  (.getBytes (pr-str form) StandardCharsets/UTF_8)
         digest (.digest (MessageDigest/getInstance "SHA-256") bytes)]
     (.encodeToString (.withoutPadding (Base64/getUrlEncoder)) digest)))
+
+(defn subset-query-key
+  [analysis entities]
+  (count-form-key (subset-count-form analysis entities)))
 
 (defn exact-subset-count
   ([db analysis entities timeout-ms]
@@ -135,6 +179,25 @@
                (long (bit-and Long/MAX_VALUE (hash [(:query analysis)
                                                      entities])))]
        (long (q/count-plan query db))))))
+
+(defn exact-link-input-count
+  [db analysis request timeout-ms known-counts]
+  (let [query (cond-> (dp/query->map (link-input-count-form analysis request))
+                timeout-ms (assoc :timeout timeout-ms))
+        oracle
+        (when known-counts
+          (fn [{:keys [kind entities]}]
+            (if (and (= :subset kind) (contains? known-counts entities))
+              (known-counts entities)
+              qo/cardinality-oracle-fallback)))]
+    (binding [qo/*cardinality-oracle* oracle
+              qplan/*explain*         nil
+              q/*cache?*              false
+              q/*plan-cache*          (LRUCache. 16)
+              u/*reservoir-sampling-seed*
+              (long (bit-and Long/MAX_VALUE (hash [(:query analysis)
+                                                    request])))]
+      (long (q/count-plan query db)))))
 
 (defn query-graph
   [db query]
@@ -239,6 +302,58 @@
             (line-seq reader)))
     {}))
 
+(def material-request-fields
+  [:kind :entities :link-e :target :type :attr :var :attrs])
+
+(defn material-query-key
+  "Hash the exact count form rather than the optimizer request. Different DP
+  transitions often ask for the same physical row count; sharing by form
+  avoids executing those equivalent counts repeatedly."
+  [analysis request]
+  (count-form-key (link-input-count-form analysis request)))
+
+(defn material-request-key
+  [request]
+  (-> (select-keys request material-request-fields)
+      (update :entities set)))
+
+(defn read-material-checkpoint
+  [file]
+  (if (.exists (io/file file))
+    (with-open [reader (io/reader file)]
+      (into {}
+            (keep (fn [line]
+                    (when-not (empty? line)
+                      (let [{:keys [cardinality] :as row}
+                            (edn/read-string line)]
+                        [(material-request-key row) cardinality]))))
+            (line-seq reader)))
+    {}))
+
+(defn append-material-checkpoint!
+  ([writer query-name request cardinality elapsed-ms]
+   (append-material-checkpoint! writer query-name request cardinality
+                                elapsed-ms :executed))
+  ([^Writer writer query-name request cardinality elapsed-ms method]
+   (.write writer
+           (str (pr-str (merge (material-request-key request)
+                               {:query query-name
+                                :cardinality cardinality
+                                :elapsed-ms elapsed-ms
+                                :method method}))
+                "\n"))
+   (.flush writer)))
+
+(defn append-material-shared-checkpoint!
+  [^Writer writer key query-name request cardinality]
+  (.write writer
+          (str (pr-str {:key key
+                        :query query-name
+                        :request (material-request-key request)
+                        :cardinality cardinality})
+               "\n"))
+  (.flush writer))
+
 (defn append-checkpoint!
   ([writer query-name entities cardinality elapsed-ms]
    (append-checkpoint! writer query-name entities cardinality elapsed-ms
@@ -287,6 +402,175 @@
                                       known-counts)]
         {:cardinality cardinality
          :elapsed-ms (double (/ (- (System/nanoTime) start) 1000000.0))}))))
+
+(defn material-requests
+  "Plan one query with exact logical counts and every material count currently
+  known, returning all indexed-link input requests encountered by the DP
+  search. Missing material counts deliberately use the production fallback so
+  collection can continue; callers replan after filling them until closure."
+  [db query logical-counts material-counts]
+  (let [requests (atom #{})
+        cardinality
+        (fn [{:keys [kind entities] :as request}]
+          (case kind
+            :subset
+            (if (contains? logical-counts entities)
+              (get logical-counts entities)
+              (throw
+                (ex-info "Exact logical cardinality checkpoint is missing"
+                         {:request request})))
+
+            :link-input
+            (let [request (material-request-key request)]
+              (swap! requests conj request)
+              (get material-counts request qo/cardinality-oracle-fallback))
+
+            (throw (ex-info "Unsupported cardinality request"
+                            {:request request}))))]
+    (binding [qo/*cardinality-oracle* cardinality
+              qplan/*explain*         nil
+              q/*cache?*              false
+              q/*plan-cache*          (LRUCache. 16)
+              u/*reservoir-sampling-seed*
+              (long (bit-and Long/MAX_VALUE (hash query)))]
+      (d/explain {:run? false} query db))
+    @requests))
+
+(defn- submit-material-count
+  [^ExecutorService executor count-material db analysis request timeout-ms
+   logical-counts]
+  (.submit
+    executor
+    ^Callable
+    (bound-fn []
+      (let [start (System/nanoTime)
+            cardinality
+            (count-material db analysis request timeout-ms logical-counts)]
+        {:cardinality cardinality
+         :elapsed-ms (double (/ (- (System/nanoTime) start) 1000000.0))}))))
+
+(defn- register-material-shared!
+  [shared-counts shared-writer key query-name request cardinality]
+  (if (contains? @shared-counts key)
+    (when-not (= (long (get @shared-counts key)) (long cardinality))
+      (throw
+        (ex-info "Equivalent material count forms disagree"
+                 {:key key
+                  :query query-name
+                  :request request
+                  :shared-cardinality (get @shared-counts key)
+                  :cardinality cardinality})))
+    (do
+      (swap! shared-counts assoc key cardinality)
+      (append-material-shared-checkpoint!
+        shared-writer key query-name request cardinality))))
+
+(defn seed-material-shared!
+  "Add completed per-query material counts to the cross-query form cache."
+  [shared-counts shared-writer query-name analysis material-counts]
+  (doseq [[request cardinality] material-counts]
+    (register-material-shared!
+      shared-counts shared-writer (material-query-key analysis request)
+      query-name request cardinality)))
+
+(defn precompute-material-query!
+  "Fill every indexed-link input count requested while planning one query with
+  exact logical cardinalities. Results are checkpointed after each completed
+  form and planning repeats until no request falls back."
+  [db query-sym {:keys [logical-file output-file timeout-ms executor
+                        shared-counts shared-writer count-material count-method
+                        trusted-shared-only?]
+                 :or   {timeout-ms 300000
+                        count-material exact-link-input-count
+                        count-method :executed
+                        trusted-shared-only? false}}]
+  (let [query          (query-value query-sym)
+        name           (query-name query-sym)
+        analysis       (query-analysis query)
+        logical-counts (read-checkpoint logical-file)
+        checkpointed   (read-material-checkpoint output-file)
+        existing
+        (if trusted-shared-only?
+          (into {}
+                (filter
+                  (fn [[request cardinality]]
+                    (let [key (material-query-key analysis request)]
+                      (and (contains? @shared-counts key)
+                           (= (long cardinality)
+                              (long (get @shared-counts key)))))))
+                checkpointed)
+          checkpointed)
+        output         (io/file output-file)]
+    (when (empty? logical-counts)
+      (throw (ex-info "Exact logical-cardinality checkpoint is missing"
+                      {:query name :file (str logical-file)})))
+    (io/make-parents output)
+    (when-not trusted-shared-only?
+      (seed-material-shared! shared-counts shared-writer name analysis existing))
+    (with-open [writer (io/writer output :append true)]
+      (loop [counts existing
+             pass   1]
+        (when (> pass 20)
+          (throw (ex-info "Material-cardinality collection did not converge"
+                          {:query name :passes (dec pass)})))
+        (let [requested (material-requests db query logical-counts counts)
+              missing   (remove #(contains? counts %) requested)]
+          (if (empty? missing)
+            (do
+              (println name "material complete:" (count requested)
+                       "requests," (count counts) "checkpointed")
+              counts)
+            (let [groups
+                  (->> missing
+                       (group-by #(material-query-key analysis %))
+                       (sort-by key)
+                       vec)
+                  jobs
+                  (mapv
+                    (fn [[key requests]]
+                      (if (contains? @shared-counts key)
+                        {:key key
+                         :requests requests
+                         :cached? true
+                         :method :shared
+                         :result {:cardinality (get @shared-counts key)
+                                  :elapsed-ms 0.0}}
+                        {:key key
+                         :requests requests
+                         :cached? false
+                         :method count-method
+                         :result (submit-material-count
+                                   executor count-material db analysis
+                                   (first requests) timeout-ms
+                                   logical-counts)}))
+                    groups)]
+              (println name "material pass" pass ":" (count missing)
+                       "missing requests," (count groups) "unique forms")
+              (recur
+                (reduce
+                  (fn [counts [i {:keys [key requests cached? method result]}]]
+                    (let [{:keys [cardinality elapsed-ms]}
+                          (if cached?
+                            result
+                            (.get ^Future result))]
+                      (register-material-shared!
+                        shared-counts shared-writer key name (first requests)
+                        cardinality)
+                      (when (or (= i (dec (count jobs)))
+                                (zero? (mod (inc i) 100)))
+                        (println name "material forms" (inc i) "/"
+                                 (count jobs) "=" cardinality
+                                 (clojure.core/name method)
+                                 (format "%.1f ms" elapsed-ms)))
+                      (reduce
+                        (fn [counts request]
+                          (append-material-checkpoint!
+                            writer name request cardinality elapsed-ms method)
+                          (assoc counts request cardinality))
+                        counts requests)))
+                  counts
+                  (map-indexed vector jobs))
+                (inc pass)))))))))
 
 (defn- minimal-zero-subsets
   [counts]
@@ -396,30 +680,58 @@
       job/queries)))
 
 (defn run
-  [{:keys [db-path output-dir queries timeout-ms parallelism]
+  [{:keys [db-path output-dir queries timeout-ms parallelism
+           material-cardinalities?]
     :or   {db-path "db"
            output-dir "results/cidr-exact-cardinalities"
            timeout-ms 300000
-           parallelism 2}}]
+           parallelism 2
+           material-cardinalities? false}}]
   (when-not (and (integer? parallelism) (pos? parallelism))
     (throw (ex-info "Oracle parallelism must be a positive integer"
                     {:parallelism parallelism})))
   (let [conn     (d/get-conn db-path)
         executor (Executors/newFixedThreadPool (int parallelism))]
     (try
-      (let [shared-file   (io/file output-dir "shared.edn")
+      (let [query-symbols (selected-query-symbols queries)
+            shared-file   (io/file output-dir
+                                   (if material-cardinalities?
+                                     "shared.material.edn"
+                                     "shared.edn"))
             shared-counts (atom (read-shared-checkpoint shared-file))]
         (io/make-parents shared-file)
         (with-open [shared-writer (io/writer shared-file :append true)]
-          (doseq [query-sym (selected-query-symbols queries)]
-            (precompute-query!
-              (d/db conn) query-sym
-              {:output-file (str (io/file output-dir
-                                          (str (query-name query-sym) ".edn")))
-               :timeout-ms timeout-ms
-               :shared-counts shared-counts
-               :shared-writer shared-writer
-               :executor executor}))))
+          ;; Seed all completed material files before starting new work, so an
+          ;; early query can reuse an equivalent form already collected for a
+          ;; later query.
+          (when material-cardinalities?
+            (doseq [query-sym query-symbols]
+              (let [name     (query-name query-sym)
+                    analysis (query-analysis (query-value query-sym))]
+                (seed-material-shared!
+                  shared-counts shared-writer name analysis
+                  (read-material-checkpoint
+                    (io/file output-dir (str name ".material.edn")))))))
+          (doseq [query-sym query-symbols]
+            (let [name (query-name query-sym)]
+              (if material-cardinalities?
+                (precompute-material-query!
+                  (d/db conn) query-sym
+                  {:logical-file (io/file output-dir (str name ".edn"))
+                   :output-file (io/file output-dir
+                                         (str name ".material.edn"))
+                   :timeout-ms timeout-ms
+                   :shared-counts shared-counts
+                   :shared-writer shared-writer
+                   :executor executor})
+                (precompute-query!
+                  (d/db conn) query-sym
+                  {:output-file (str (io/file output-dir
+                                              (str name ".edn")))
+                   :timeout-ms timeout-ms
+                   :shared-counts shared-counts
+                   :shared-writer shared-writer
+                   :executor executor}))))))
       (finally
         (.shutdownNow ^ExecutorService executor)
         (d/close conn)))))

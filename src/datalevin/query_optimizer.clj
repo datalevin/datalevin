@@ -114,8 +114,83 @@
   (qplan/->NotJoinStep clause vars sources rules in out cols strata
                        seen-or-joins))
 
-(defn- make-plan [steps cost size recency]
-  (qplan/->Plan steps cost size recency))
+(defn- make-plan
+  ([steps cost size recency]
+   (qplan/->Plan steps cost size recency))
+  ([steps cost size recency distinct-sizes]
+   (cond-> (qplan/->Plan steps cost size recency)
+     (identical? c/optimizer-cost-model :physical)
+     (assoc :distinct-sizes distinct-sizes))))
+
+(defn- plan-work-cost
+  ^long [plan]
+  (long (or (:work-cost plan) (:cost plan) 0)))
+
+(defn- max-stage-cost
+  ^long [stage-costs]
+  (long (reduce max 0 stage-costs)))
+
+(declare estimate-round)
+
+(defn- physical-plan-score
+  ^long [^long latency ^long work]
+  (estimate-round
+    (+ (double latency)
+       (/ (double work)
+          (double (max 1 (long c/physical-cost-pipeline-parallelism)))))))
+
+(defn- with-initial-stream-cost
+  "Attach both total work and latency cost to a new streaming pipeline. Read
+  queries execute three or more flattened steps concurrently, so physical
+  latency follows the slowest stage rather than the sum of all stages."
+  [plan stage-costs]
+  (if (identical? c/optimizer-cost-model :physical)
+    (let [phase (max-stage-cost stage-costs)]
+      (assoc plan
+             :cost (physical-plan-score
+                     phase (long (reduce + 0 stage-costs)))
+             :work-cost (long (reduce + 0 stage-costs))
+             :pipeline-latency-cost phase
+             :pipeline-completed-cost 0
+             :pipeline-phase-cost phase))
+    plan))
+
+(defn- with-appended-stream-cost
+  [plan prev-plan stage-costs]
+  (if (identical? c/optimizer-cost-model :physical)
+    (let [completed (long (or (:pipeline-completed-cost prev-plan) 0))
+          old-phase (long (or (:pipeline-phase-cost prev-plan)
+                              (:cost prev-plan)
+                              0))
+          phase     (max old-phase (max-stage-cost stage-costs))
+          latency   (+ completed phase)
+          work      (+ (plan-work-cost prev-plan)
+                       (long (reduce + 0 stage-costs)))]
+      (assoc plan
+             :cost (physical-plan-score latency work)
+             :work-cost work
+             :pipeline-latency-cost latency
+             :pipeline-completed-cost completed
+             :pipeline-phase-cost phase))
+    plan))
+
+(defn- with-appended-barrier-cost
+  "A blocking step consumes the upstream stream before producing results.
+  Flush the current pipeline phase, then add its internal latency."
+  [plan prev-plan ^long internal-cost ^long internal-work]
+  (if (identical? c/optimizer-cost-model :physical)
+    (let [prev-latency (long (or (:pipeline-latency-cost prev-plan)
+                                 (:cost prev-plan)
+                                 0))
+          completed    (+ prev-latency internal-cost)
+          work         (+ (plan-work-cost prev-plan) internal-work)]
+      (assoc plan
+             :cost (physical-plan-score completed work)
+             :work-cost work
+             :pipeline-latency-cost completed
+             :pipeline-completed-cost completed
+             :pipeline-phase-cost 0))
+    plan))
 
 (defn- plan-cache ^LRUCache []
   *plan-cache*)
@@ -842,50 +917,187 @@
 
 (defn- estimate-scan-v-size
   [^long e-size steps]
-  (cond+
-    (= (count steps) 1) e-size ; no merge step
+  (let [{:keys [know-e? mcount pred]} (first steps)
+        {:keys [attrs-v result sample]} (peek steps)]
+    (cond
+      ;; The retained tuples include both the initial predicate and all merge
+      ;; filters. Scale their selectivity by the caller's input size: base
+      ;; planning passes the physical population, while linked planning passes
+      ;; the rows produced by the link. Returning the retained count directly
+      ;; here would incorrectly turn a target marginal into a join result.
+      (some? result)
+      (let [population (long (or mcount e-size))]
+        (if (pos? population)
+          (estimate-round
+            (* (double e-size)
+               (/ (double (.size ^List result)) (double population))))
+          0))
 
-    :let [{:keys [know-e?] res1 :result sp1 :sample} (first steps)
-          {:keys [attrs-v result sample]} (peek steps)]
+      ;; The initial sample is drawn from the physical index population before
+      ;; its predicate is applied. Use that draw count as the denominator.
+      ;; Dividing by the surviving initial tuples erases initial-predicate
+      ;; selectivity (e.g. 3 final rows / 3 surviving rows becomes 100%).
+      (some? sample)
+      (let [population (long (or mcount e-size))
+            draws      (long (min population
+                                  (long c/init-exec-size-threshold)))
+            retained   (.size ^List sample)
+            filtered?  (or (some? pred) (< 1 (count steps)))
+            prior-mean (if filtered?
+                         (double c/optimizer-fallback-selectivity)
+                         1.0)
+            prior-size (double c/base-estimate-prior-size)
+            ratio      (if (pos? draws)
+                         (max
+                           (double c/magic-scan-ratio)
+                           (/ (+ (double retained)
+                                 (* prior-size prior-mean))
+                              (+ (double draws) prior-size)))
+                         0.0)]
+        (estimate-round (* (double e-size) ratio)))
 
-    know-e? (count attrs-v)
+      know-e?
+      (count attrs-v)
 
-    :else
-    (estimate-round
-      (* e-size (double
-                  (cond
-                    result (let [s (.size ^List result)]
-                             (if (< 0 s)
-                               (/ s (.size ^List res1))
-                               c/magic-scan-ratio))
-                    sample (let [s (.size ^List sample)]
-                             (if (< 0 s)
-                               (/ s (.size ^List sp1))
-                               c/magic-scan-ratio))
-                    :else c/magic-scan-ratio))))))
+      (= (count steps) 1)
+      e-size
+
+      :else
+      (estimate-round (* e-size (double c/magic-scan-ratio))))))
 
 (defn- factor
   [magic ^long n]
   (if (zero? n) 1 ^long (estimate-round (* ^double magic n))))
 
 (defn- estimate-scan-v-cost
-  [{:keys [attrs-v vars]} ^long size]
-  (* size
-     ^double c/magic-cost-merge-scan-v
-     ^long (factor c/magic-cost-var (count vars))
-     ^long (factor c/magic-cost-pred (n-items attrs-v :pred))
-     ^long (factor c/magic-cost-fidx (n-items attrs-v :fidx))))
+  ([step ^long size]
+   (estimate-scan-v-cost step size size size))
+  ([{:keys [attrs-v vars]} ^long input-size ^long distinct-size
+    ^long output-size]
+   (estimate-scan-v-cost {:attrs-v attrs-v :vars vars}
+                         input-size distinct-size output-size distinct-size))
+  ([{:keys [attrs-v vars]} input-size distinct-size output-size population-size]
+   (let [input-size      (long input-size)
+         distinct-size   (long distinct-size)
+         output-size     (long output-size)
+         population-size (long population-size)]
+     (case c/optimizer-cost-model
+     :legacy
+     (* input-size
+        ^double c/magic-cost-merge-scan-v
+        ^long (factor c/magic-cost-var (count vars))
+        ^long (factor c/magic-cost-pred (n-items attrs-v :pred))
+        ^long (factor c/magic-cost-fidx (n-items attrs-v :fidx)))
 
-(defn- estimate-base-cost
-  [{:keys [mcount]} steps]
+     :physical
+     (let [population-size (max distinct-size population-size)
+           ;; Sorted entity probes still seek through the EAV tree. Sparse
+           ;; probes touch far more index pages per entity than a dense walk
+           ;; over the same target population. log2(population / probes)
+           ;; approximates those additional locality levels while converging
+           ;; to one for a full-population scan.
+           full-locality (if (pos? distinct-size)
+                           (/ (Math/log1p
+                                (/ (double population-size)
+                                   (double distinct-size)))
+                              (Math/log 2.0))
+                           1.0)
+           locality (+ 1.0
+                       (* (double c/physical-cost-merge-locality-weight)
+                          (- full-locality 1.0)))]
+       (estimate-round
+         (+ (* input-size ^double c/physical-cost-tuple)
+            (* distinct-size locality
+               (+ ^double c/magic-cost-merge-scan-v
+                  (* ^double c/magic-cost-var (count vars))
+                  (* ^double c/magic-cost-pred (n-items attrs-v :pred))
+                  (* ^double c/magic-cost-fidx (n-items attrs-v :fidx))))
+            (* output-size ^double c/physical-cost-tuple))))
+
+       (throw (ex-info "Unknown optimizer cost model"
+                       {:cost-model c/optimizer-cost-model}))))))
+
+(defn- merge-scan-population
+  ^long [db {:keys [attrs-v]} ^long fallback]
+  (if-let [attr (ffirst attrs-v)]
+    (long (fast-clause-count db nil {:attr attr} Long/MAX_VALUE))
+    fallback))
+
+(defn- estimate-base-stage-costs
+  [db {:keys [mcount]} steps ^long output-size]
   (let [{:keys [pred]} (first steps)
         init-cost      (estimate-round
-                         (cond-> (* ^double c/magic-cost-init-scan-e
-                                    ^long mcount)
-                           pred (* ^double c/magic-cost-pred)))]
-    (if (< 1 (count steps))
-      (+ ^long init-cost ^long (estimate-scan-v-cost (peek steps) mcount))
-      init-cost)))
+                         (* ^long mcount
+                            (case c/optimizer-cost-model
+                              :legacy
+                              (cond-> ^double c/magic-cost-init-scan-e
+                                pred (* ^double c/magic-cost-pred))
+
+                              :physical
+                              (+ ^double c/magic-cost-init-scan-e
+                                 (if pred
+                                   ^double c/magic-cost-pred
+                                   0.0))
+
+                              (throw
+                                (ex-info "Unknown optimizer cost model"
+                                         {:cost-model
+                                          c/optimizer-cost-model})))))]
+    (cond-> [init-cost]
+      (< 1 (count steps))
+      (conj (estimate-scan-v-cost
+              (peek steps) mcount mcount output-size
+              (if (identical? c/optimizer-cost-model :physical)
+                (merge-scan-population db (peek steps) mcount)
+                mcount))))))
+
+(defn- estimate-base-cost
+  [db node steps ^long output-size]
+  (long (reduce + 0 (estimate-base-stage-costs db node steps output-size))))
+
+(defn- sampled-distinct-size
+  "Estimate a population NDV from one reservoir sample. Singletons are the
+  evidence for values not yet observed: when every sampled value is unique,
+  the estimate expands to the population; repeated values keep it below that
+  ceiling. Exact pre-executed bases use their observed NDV directly."
+  ^long [^List tuples ^long index ^long population-size exact?]
+  (let [sample-size (.size tuples)]
+    (if (or (zero? population-size) (zero? sample-size))
+      0
+      (let [frequencies
+            (persistent!
+              (loop [i 0 counts (transient {})]
+                (if (< i sample-size)
+                  (let [value (aget ^objects (.get tuples i) index)]
+                    (recur (u/long-inc i)
+                           (assoc! counts value
+                                   (inc (long (get counts value 0))))))
+                  counts)))
+            observed (count frequencies)]
+        (long
+          (min population-size
+               (if exact?
+                 observed
+                 (let [singletons (count (filter #(= 1 (long %))
+                                                 (vals frequencies)))
+                       unseen-rows (max 0 (- population-size sample-size))]
+                   (max observed
+                        (estimate-round
+                          (+ observed
+                             (/ (* (double singletons)
+                                   (double unseen-rows))
+                                (double sample-size)))))))))))))
+
+(defn- estimate-base-distinct-sizes
+  "Return estimated NDVs aligned with the final base-step columns."
+  [steps ^long output-size]
+  (let [{:keys [cols result sample]} (peek steps)
+        tuples (or result sample)
+        exact? (some? result)]
+    (if (and tuples (pos? (.size ^List tuples)))
+      (mapv #(sampled-distinct-size tuples % output-size exact?)
+            (range (count cols)))
+      (vec (repeat (count cols) output-size)))))
 
 (defn- base-plan
   ([db nodes e]
@@ -901,10 +1113,20 @@
                           (estimate-scan-v-size mcount isteps)))]
          (if single?
            (make-plan isteps nil nil 0)
-           (make-plan isteps
-                      (estimate-base-cost node isteps)
-                      size
-                      0)))))))
+           (let [stage-costs (estimate-base-stage-costs
+                               db node isteps size)]
+             (with-initial-stream-cost
+               (if (identical? c/optimizer-cost-model :physical)
+                 (make-plan isteps
+                            (long (reduce + 0 stage-costs))
+                            size
+                            0
+                            (estimate-base-distinct-sizes isteps size))
+                 (make-plan isteps
+                            (long (reduce + 0 stage-costs))
+                            size
+                            0))
+               stage-costs))))))))
 
 (defn writing? [db] (l/writing? (.-lmdb ^Store (.-store ^DB db))))
 
@@ -1028,6 +1250,77 @@
               [(persistent! new-cols) (persistent! new-vars)]))]
       [(into merged-in new-cols) new-vars])))
 
+(defn- same-logical-col?
+  [left right]
+  (cond
+    (= left right) true
+    (set? left) (if (set? right)
+                  (boolean (seq (set/intersection left right)))
+                  (contains? left right))
+    (set? right) (contains? right left)
+    :else false))
+
+(defn- plan-col-distinct-size
+  [plan col]
+  (let [cols      (:cols (peek (:steps plan)))
+        distincts (:distinct-sizes plan)]
+    (when-let [index (first
+                       (keep-indexed
+                         (fn [i candidate]
+                           (when (same-logical-col? candidate col) i))
+                         cols))]
+      (long (or (get distincts index) (:size plan) 0)))))
+
+(defn- estimate-selected-distinct-size
+  "Estimate how many distinct values survive when `input-size` rows become
+  `output-size` rows. Under uniform survival, a value with average frequency
+  input/NDV survives unless all of its rows are rejected. Expansion does not
+  increase the NDV of an existing column."
+  ^long [^long distinct-size ^long input-size ^long output-size]
+  (cond
+    (or (zero? distinct-size) (zero? output-size)) 0
+    (or (zero? input-size) (<= input-size output-size))
+    (long (min distinct-size output-size))
+    :else
+    (let [survival (/ (double output-size) (double input-size))
+          frequency (/ (double input-size) (double distinct-size))]
+      (long
+        (min output-size distinct-size
+             (max 1
+                  (estimate-round
+                    (* (double distinct-size)
+                       (- 1.0 (Math/pow (- 1.0 survival)
+                                        frequency))))))))))
+
+(defn- join-distinct-sizes
+  "Propagate per-column NDV upper bounds through a binary join. Existing and
+  target columns can only lose distinct values, and a shared join column is
+  bounded by both inputs. Callers invoke this only for the physical cost model;
+  the legacy planner must not pay for this quadratic-in-width bookkeeping."
+  [prev-plan target-plan out-cols ^long result-size]
+  (mapv
+    (fn [col]
+      (let [candidates
+            (keep (fn [plan]
+                    (when-let [distinct-size
+                               (plan-col-distinct-size plan col)]
+                      (estimate-selected-distinct-size
+                        distinct-size (long (or (:size plan) 0)) result-size)))
+                  [prev-plan target-plan])]
+        (long (min result-size
+                   (if (seq candidates)
+                     (apply min candidates)
+                     result-size)))))
+    out-cols))
+
+(defn- estimated-link-probes
+  [prev-plan ^long index]
+  (long
+    (min (long (or (:size prev-plan) 0))
+         (long (or (get (:distinct-sizes prev-plan) index)
+                   (:size prev-plan)
+                   0)))))
+
 (defn- required-new-join-var?
   [required-vars in-cols tgt-cols]
   (let [^HashSet in-vars (HashSet.)]
@@ -1067,9 +1360,53 @@
       [step]
       [step (merge-scan-step db step n-index new-key new-steps)])))
 
+(defn- sip-hash-join?
+  [link ^long in-size ^long tgt-size]
+  (and (identical? (:type link) :_ref)
+       (> tgt-size (* in-size (long c/sip-ratio-threshold)))))
+
+(defn- estimate-sip-target-size
+  "Estimate target tuples materialized after SIP. The input tuple count is an
+  upper bound on distinct join keys. Dividing that bound by the source star's
+  local entity population therefore conservatively estimates key coverage;
+  duplicates can only make the actual SIP target smaller."
+  ^long [source-base-plan new-base-plan ^long in-size]
+  (let [source-population (some-> source-base-plan :steps first :mcount)
+        target-size       (long (or (:size new-base-plan) 0))]
+    (if (and (pos? in-size)
+             (pos? target-size)
+             (some? source-population)
+             (pos? (long source-population)))
+      (long
+        (min target-size
+             (max 1
+                  (estimate-round
+                    (* (double target-size)
+                       (min 1.0 (/ (double in-size)
+                                   (double (long source-population)))))))))
+      target-size)))
+
+(defn- estimate-sip-base-cost
+  "Keep all target index-scan work, but charge tuple materialization only for
+  the rows expected to survive SIP. A one-step base scan has no separately
+  modeled output term to remove."
+  ^long [new-base-plan ^long sip-target-size]
+  (let [base-cost   (plan-work-cost new-base-plan)
+        target-size (long (or (:size new-base-plan) 0))]
+    (if (and (identical? c/optimizer-cost-model :physical)
+             (< 1 (count (:steps new-base-plan)))
+             (< sip-target-size target-size))
+      (long
+        (max 0
+             (- base-cost
+                (estimate-round
+                  (* (- target-size sip-target-size)
+                     (double c/physical-cost-tuple))))))
+      base-cost)))
+
 (defn- hash-join-plan
-  [_db {:keys [steps cost size]} link-e link new-key
-   new-base-plan result-size]
+  [_db {:keys [steps cost size] :as prev-plan} link-e link new-key
+   source-base-plan new-base-plan result-size]
   (let [last-step       (peek steps)
         in              (:out last-step)
         out             (if (set? in) (set new-key) new-key)
@@ -1084,12 +1421,32 @@
         step            (mk-hash-join-step link link-e in out lcols cols
                                            (conj lstrata new-vars) lseen
                                            tgt-steps in-size tgt-size)
-        base-cost       (or (:cost new-base-plan) 0)
-        join-cost       (estimate-hash-join-cost in-size tgt-size)]
-    (make-plan [step]
-               (+ ^long cost ^long base-cost ^long join-cost)
-               result-size
-               (- ^long (find-index link-e (:strata last-step))))))
+        sip?            (sip-hash-join? link in-size tgt-size)
+        hash-tgt-size   (if sip?
+                          (estimate-sip-target-size
+                            source-base-plan new-base-plan in-size)
+                          tgt-size)
+        physical?       (identical? c/optimizer-cost-model :physical)
+        base-cost       (if sip?
+                          (estimate-sip-base-cost new-base-plan hash-tgt-size)
+                          (plan-work-cost new-base-plan))
+        join-cost       (estimate-hash-join-cost
+                          in-size hash-tgt-size result-size (count cols) sip?)]
+    (with-appended-barrier-cost
+      (if physical?
+        (make-plan [step]
+                   (+ ^long cost ^long base-cost ^long join-cost)
+                   result-size
+                   (- ^long (find-index link-e (:strata last-step)))
+                   (join-distinct-sizes prev-plan new-base-plan cols
+                                        result-size))
+        (make-plan [step]
+                   (+ ^long cost ^long base-cost ^long join-cost)
+                   result-size
+                   (- ^long (find-index link-e (:strata last-step)))))
+      prev-plan
+      (+ ^long base-cost ^long join-cost)
+      (+ ^long base-cost ^long join-cost))))
 
 (defn- semi-join-eligible?
   [nodes incoming-link-counts required-vars prev-plan link-e new-e link
@@ -1408,12 +1765,27 @@
   [plan]
   (set (:out (peek (:steps plan)))))
 
+(defn- link-input-oracle-request
+  "Describe the rows materialized by an indexed link before the target star's
+  local predicates are applied. Logical subset cardinality alone does not
+  determine this work: a transition can enumerate millions of target rows and
+  then retain only a few hundred."
+  [prev-plan link-e {:keys [type tgt attr var attrs]}]
+  {:kind     :link-input
+   :entities (plan-entities prev-plan)
+   :link-e   link-e
+   :target   tgt
+   :type     type
+   :attr     attr
+   :var      var
+   :attrs    attrs})
+
 (defn- oracle-link-input-size
-  "Back-compute the link output used by the unchanged physical cost model from
-  an exact logical result and the target star's exact marginal selectivity.
-  The logical DP-state cardinality is exact; this internal size preserves the
-  optimizer's existing link-then-filter cost decomposition without consulting
-  a sample."
+  "Back-compute a lower bound for link output from an exact logical result and
+  the target star's exact marginal selectivity. The logical DP-state
+  cardinality is exact, but this internal link-before-filter size is not: a
+  correlated linking value can require scanning many more rows than marginal
+  independence predicts."
   [^long result-size new-base-plan]
   (let [steps (:steps new-base-plan)]
     (if (= 1 (count steps))
@@ -1427,17 +1799,110 @@
                  (/ (* (double result-size) (double base-input))
                     (double base-output)))))))))
 
+(defn- linked-target-population
+  "Return the catalog population against which a linked target plan's base
+  cardinality is selective. Reverse-reference and value-equality links first
+  enumerate datoms of the linking attribute. A forward reference instead
+  supplies target entity ids, so use the target plan's initial attribute.
+
+  This deliberately uses the attribute's datom population. It is exact for
+  cardinality-one attributes and preserves the old one-output-per-entity
+  assumption for cardinality-many attributes, for which we do not maintain a
+  distinct-entity count."
+  ^long [db {:keys [type attr attrs tgt]} new-base-plan]
+  (let [population-attr (if (identical? type :ref)
+                          (:attr (first (:steps new-base-plan)))
+                          (or attr (get attrs tgt)))]
+    (if population-attr
+      (long (fast-clause-count db nil {:attr population-attr}
+                               Long/MAX_VALUE))
+      0)))
+
+(defn- conservative-filter-ratio
+  "Combine catalog independence with a directional sample. A linked target
+  predicate may be positively correlated with the source restriction, so the
+  catalog ratio alone is not a safe estimate. The larger of the observed and
+  catalog ratios preserves evidence of that correlation. With no source
+  sample, retain the historical neutral ratio."
+  ^double [^double catalog-ratio ^long sample-input ^long sample-output]
+  (if (pos? sample-input)
+    (max catalog-ratio (/ (double sample-output) (double sample-input)))
+    1.0))
+
+(defn- scale-linked-target-size
+  "Apply a target star's marginal selectivity to rows obtained through a
+  different linking attribute. The denominator must be the population scanned
+  by that link, not the population of whichever target clause happened to be
+  cheapest as a standalone initializer."
+  ^long [^long link-size ^long base-size ^long link-population]
+  (if (pos? link-population)
+    (estimate-round
+      (* (double link-size)
+         (/ (double base-size) (double link-population))))
+    link-size))
+
+(defn- estimate-forward-ref-size
+  "Estimate a forward-reference target scan from the source star's local
+  sample. Executing the actual target merge over that bounded sample captures
+  correlations such as a value range whose rows all reference one target
+  category. Ratios are cached per directed edge for the optimizer invocation."
+  [db link-e link ^ConcurrentHashMap ratios input-size
+         source-base-plan new-base-plan]
+  (let [ratio-key [:ref-filter link-e (:tgt link)]]
+    (estimate-round
+      (* (double input-size)
+         (double
+           (if (.containsKey ratios ratio-key)
+             (.get ratios ratio-key)
+             (let [population (linked-target-population
+                                db link new-base-plan)
+                   base-size  (long (:size new-base-plan))
+                   catalog-ratio
+                   (if (pos? population)
+                     (/ (double base-size) (double population))
+                     1.0)
+                   source-step (some-> source-base-plan :steps peek)
+                   source      (or (:result source-step)
+                                   (:sample source-step))
+                   sample-input (if source (.size ^List source) 0)
+                   base-index  (when source-step
+                                 (index-by-link (:cols source-step)
+                                                link-e link))
+                   sample-output
+                   (if (and (pos? sample-input) (some? base-index))
+                     (let [step (merge-scan-step
+                                  db source-step base-index #{(:tgt link)}
+                                  (:steps new-base-plan))]
+                       (.size ^List (-sample step db source)))
+                     0)
+                   ratio (conservative-filter-ratio
+                           catalog-ratio sample-input sample-output)]
+               (.put ratios ratio-key ratio)
+               ratio)))))))
+
 (defn- estimate-join-size
   [db sources rules link-e link ratios build-cache prev-plan index
-   new-base-plan]
+   source-base-plan new-base-plan]
   (let [prev-size   (:size prev-plan)
         steps       (:steps new-base-plan)
         exact-size  (oracle-cardinality
                       {:kind     :subset
-                       :entities (conj (plan-entities prev-plan) (:tgt link))})]
+                       :entities (conj (plan-entities prev-plan) (:tgt link))})
+        exact-link-input
+        (when (and exact-size (#{:_ref :val-eq} (:type link)))
+          (oracle-cardinality
+            (link-input-oracle-request prev-plan link-e link)))]
     (case (:type link)
       :ref     [nil (or exact-size
-                        (estimate-scan-v-size prev-size steps))]
+                        (case c/optimizer-cost-model
+                          :legacy (estimate-scan-v-size prev-size steps)
+                          :physical (estimate-forward-ref-size
+                                      db link-e link ratios prev-size
+                                      source-base-plan new-base-plan)
+                          (throw
+                            (ex-info "Unknown optimizer cost model"
+                                     {:cost-model
+                                      c/optimizer-cost-model}))))]
       :or-join (if exact-size
                  ;; or-join doesn't have new-base-plan steps to merge
                  [exact-size exact-size]
@@ -1447,34 +1912,134 @@
                    [or-size or-size]))
       ;; :_ref and :val-eq
       (if exact-size
-        [(oracle-link-input-size exact-size new-base-plan) exact-size]
+        ;; Exact logical cardinality does not reveal link-before-local-filter
+        ;; work. A material-cardinality oracle supplies that distinct quantity.
+        ;; Older logical-only oracles fall back to the conservative estimates
+        ;; so existing experiments remain runnable, but they do not fully
+        ;; isolate cost-model error.
+        [(if exact-link-input
+           (max (long exact-size) (long exact-link-input))
+           (max (long exact-size)
+                (long (oracle-link-input-size exact-size new-base-plan))
+                (long (estimate-link-size db link-e link ratios build-cache
+                                          prev-size prev-plan index))))
+         exact-size]
         (let [e-size (estimate-link-size db link-e link ratios build-cache
                                          prev-size prev-plan index)]
-          [e-size (estimate-scan-v-size e-size steps)])))))
+          [e-size
+           (case c/optimizer-cost-model
+             :legacy (estimate-scan-v-size e-size steps)
+             ;; A reverse/value-equality link scans the linking attribute, not
+             ;; the target star's cheapest initial clause. Price its local
+             ;; filters against that scanned population. Using the initial
+             ;; clause as the denominator can erase a selective range or
+             ;; predicate completely.
+             :physical (scale-linked-target-size
+                         e-size
+                         (long (:size new-base-plan))
+                         (linked-target-population db link new-base-plan))
+             (throw
+               (ex-info "Unknown optimizer cost model"
+                        {:cost-model c/optimizer-cost-model})))])))))
 
 (defn- estimate-link-cost
-  [^long outer-size ^long result-size]
+  [^long outer-size ^long probe-count ^long result-size]
   (estimate-round
-    (+ (* outer-size ^double c/magic-cost-link-probe)
-       (* result-size ^double c/magic-cost-link-retrieval))))
+    (case c/optimizer-cost-model
+      :legacy
+      (+ (* outer-size ^double c/magic-cost-link-probe)
+         (* result-size ^double c/magic-cost-link-retrieval))
+
+      :physical
+      (+ (* outer-size ^double c/physical-cost-tuple)
+         (* probe-count ^double c/physical-cost-link-probe)
+         (* result-size ^double c/physical-cost-link-retrieval))
+
+      (throw
+        (ex-info "Unknown optimizer cost model"
+                 {:cost-model c/optimizer-cost-model})))))
 
 (defn- estimate-hash-join-cost
-  [^long left-size ^long right-size]
-  (estimate-round (* ^double c/magic-cost-hash-join
-                     (+ left-size right-size))))
+  [left-size right-size result-size output-width sip?]
+  (let [left-size   (long left-size)
+        right-size  (long right-size)
+        result-size (long result-size)
+        output-width (long output-width)]
+    (estimate-round
+      (case c/optimizer-cost-model
+        :legacy
+        (* ^double c/magic-cost-hash-join (+ left-size right-size))
 
-(defn- estimate-e-plan-cost
-  [prev-size e-size cur-steps]
+        :physical
+        (+ (* ^double (if sip?
+                        c/physical-cost-sip-hash-row
+                        c/physical-cost-hash-row)
+              (+ left-size right-size))
+           (* result-size
+              (+ ^double c/physical-cost-tuple
+                 (* ^double c/physical-cost-hash-output-cell output-width))))
+
+        (throw
+          (ex-info "Unknown optimizer cost model"
+                   {:cost-model c/optimizer-cost-model}))))))
+
+(defn- estimate-e-plan-stage-costs
+  [db prev-size probe-count e-size result-size distinct-size cur-steps]
   (let [step1 (first cur-steps)]
     (if (= 1 (count cur-steps))
-      (if (identical? (-type step1) :merge)
-        (estimate-scan-v-cost step1 prev-size)
-        (estimate-link-cost prev-size e-size))
-      (+ ^long (estimate-link-cost prev-size e-size)
-         ^long (estimate-scan-v-cost (peek cur-steps) e-size)))))
+      [(if (identical? (-type step1) :merge)
+         (estimate-scan-v-cost
+           step1 prev-size distinct-size result-size
+           (if (identical? c/optimizer-cost-model :physical)
+             (merge-scan-population db step1 distinct-size)
+             distinct-size))
+         (estimate-link-cost prev-size probe-count e-size))]
+      [(estimate-link-cost prev-size probe-count e-size)
+       (estimate-scan-v-cost
+         (peek cur-steps) e-size distinct-size result-size
+         (if (identical? c/optimizer-cost-model :physical)
+           (merge-scan-population db (peek cur-steps) distinct-size)
+           distinct-size))])))
+
+(defn- estimate-e-plan-cost
+  [db prev-size probe-count e-size result-size distinct-size cur-steps]
+  (long
+    (reduce + 0 (estimate-e-plan-stage-costs
+                  db prev-size probe-count e-size result-size distinct-size
+                  cur-steps))))
+
+(defn- estimate-repeated-link-distinct-size
+  "Estimate distinct target entities after an indexed link. Repeated outer
+  keys replicate the same linked rows, but the following EAV merge caches
+  those target entity ids."
+  ^long [^long scan-size ^long outer-size ^long probes ^long population]
+  (let [unique-size
+        (if (pos? outer-size)
+          (estimate-round
+            (* (double scan-size) (/ (double probes) (double outer-size))))
+          scan-size)]
+    (long (min unique-size
+               (if (pos? population) population unique-size)))))
+
+(defn- estimate-target-distinct-size
+  [db link prev-plan index new-base-plan scan-size]
+  (let [scan-size (long scan-size)]
+    (if (or (zero? scan-size) (identical? (:type link) :or-join))
+    scan-size
+    (if (identical? (:type link) :ref)
+      ;; A forward reference already carries target entity ids in the input.
+      ;; The EAV merge scan caches those ids, so its storage work follows the
+      ;; propagated NDV rather than the (possibly duplicated) tuple count.
+      (estimated-link-probes prev-plan index)
+      (estimate-repeated-link-distinct-size
+        scan-size
+        (long (or (:size prev-plan) 0))
+        (estimated-link-probes prev-plan index)
+        (linked-target-population db link new-base-plan))))))
 
 (defn- e-plan
-  [db {:keys [steps cost size]} index link-e link new-key new-base-plan e-size
+  [db {:keys [steps cost size] :as prev-plan} index link-e link new-key
+   new-base-plan e-size
    result-size]
   (let [new-steps (:steps new-base-plan)
         last-step (peek steps)
@@ -1482,11 +2047,34 @@
         (case (:type link)
           :ref    [(merge-scan-step db last-step index new-key new-steps)]
           :_ref   (rev-ref-plan db last-step index link new-key new-steps)
-          :val-eq (val-eq-plan db last-step index link new-key new-steps))]
-    (make-plan cur-steps
-               (+ ^long cost ^long (estimate-e-plan-cost size e-size cur-steps))
-               result-size
-               (- ^long (find-index link-e (:strata last-step))))))
+          :val-eq (val-eq-plan db last-step index link new-key new-steps))
+        scan-size (long (if (identical? (:type link) :ref) size e-size))
+        physical? (identical? c/optimizer-cost-model :physical)
+        probe-count (if physical?
+                      (estimated-link-probes prev-plan index)
+                      (long size))
+        distinct-size (if physical?
+                        (estimate-target-distinct-size
+                          db link prev-plan index new-base-plan scan-size)
+                        scan-size)
+        stage-costs
+        (estimate-e-plan-stage-costs
+          db size probe-count e-size result-size distinct-size cur-steps)]
+    (with-appended-stream-cost
+      (if physical?
+        (make-plan cur-steps
+                   (+ ^long cost (long (reduce + 0 stage-costs)))
+                   result-size
+                   (- ^long (find-index link-e (:strata last-step)))
+                   (join-distinct-sizes
+                     prev-plan new-base-plan (:cols (peek cur-steps))
+                     result-size))
+        (make-plan cur-steps
+                   (+ ^long cost (long (reduce + 0 stage-costs)))
+                   result-size
+                   (- ^long (find-index link-e (:strata last-step)))))
+      prev-plan
+      stage-costs)))
 
 (defn- index-semi-join-plan
   [db prev-plan link-e link new-key new-base-plan e-size result-size]
@@ -1502,11 +2090,22 @@
             step      (mk-semi-join-step in out cols cols
                                          (:strata last-step)
                                          (:seen-or-joins last-step)
-                                         (:steps join-plan))]
-        (make-plan [step]
-                   (:cost join-plan)
-                   in-size
-                   (:recency join-plan))))))
+                                         (:steps join-plan))
+            internal-work (long
+                            (max 0 (- (plan-work-cost join-plan)
+                                      (plan-work-cost prev-plan))))]
+        (with-appended-barrier-cost
+          (if (identical? c/optimizer-cost-model :physical)
+            (make-plan [step]
+                       (:cost join-plan)
+                       in-size
+                       (:recency join-plan)
+                       (:distinct-sizes prev-plan))
+            (make-plan [step]
+                       (:cost join-plan)
+                       in-size
+                       (:recency join-plan)))
+          prev-plan internal-work internal-work)))))
 
 (defn- compare-plans
   "Compare two plans. Prefer lower cost, then lower size as tiebreaker."
@@ -1528,11 +2127,23 @@
                                              prev-plan link))
         cur-steps (or-join-plan* db sources rules last-step link new-key
                                  new-base)
-        or-cost   (estimate-e-plan-cost (:size prev-plan) or-size cur-steps)]
-    (make-plan cur-steps
-               (+ ^long (:cost prev-plan) ^long or-cost)
-               or-size
-               (- ^long (find-index link-e (:strata last-step))))))
+        physical? (identical? c/optimizer-cost-model :physical)
+        or-cost   (estimate-e-plan-cost
+                    db (:size prev-plan) (:size prev-plan) or-size or-size
+                    or-size cur-steps)]
+    (with-appended-barrier-cost
+      (if physical?
+        (make-plan cur-steps
+                   (+ ^long (:cost prev-plan) ^long or-cost)
+                   or-size
+                   (- ^long (find-index link-e (:strata last-step)))
+                   (join-distinct-sizes
+                     prev-plan new-base (:cols (peek cur-steps)) or-size))
+        (make-plan cur-steps
+                   (+ ^long (:cost prev-plan) ^long or-cost)
+                   or-size
+                   (- ^long (find-index link-e (:strata last-step)))))
+      prev-plan or-cost or-cost)))
 
 (defn- binary-plan*
   [db sources rules base-plans ratios build-cache prev-plan link-e new-e link
@@ -1544,9 +2155,10 @@
       (or-join-plan base-plans new-e db sources rules ratios build-cache
                     prev-plan link last-step new-key link-e)
       (let [new-base (base-plans [new-e])
+            source-base (base-plans [link-e])
             [e-size result-size]
             (estimate-join-size db sources rules link-e link ratios build-cache
-                                prev-plan index new-base)
+                                prev-plan index source-base new-base)
             link-plan  (e-plan db prev-plan index link-e link new-key
                                new-base e-size result-size)
             regular    (if (and (#{:_ref :val-eq} link-type)
@@ -1556,7 +2168,7 @@
                          (compare-plans
                            link-plan
                            (hash-join-plan db prev-plan link-e link new-key
-                                           new-base result-size))
+                                           source-base new-base result-size))
                          link-plan)
             index-semi (when semi-join?
                          (index-semi-join-plan

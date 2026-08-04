@@ -125,6 +125,22 @@
                    [:production-t0 :raw-t10]
                    :catastrophe-rate :ci95])))))
 
+(deftest paired-runtime-ratios-use-the-matched-baseline-trial
+  (let [summary (analysis/summarize
+                  rows 30000
+                  {:bootstrap-samples 40 :bootstrap-seed 99})
+        paired  (get-in summary
+                        [:paired-runtime-ratios :conditions :raw-t10])]
+    (is (= :production-t0
+           (get-in summary [:paired-runtime-ratios :baseline-condition])))
+    (is (= 3 (get-in paired [:estimate :pairs])))
+    (is (= 15.0 (get-in paired [:estimate :p50-ratio])))
+    (is (= (/ 2.0 3.0) (get-in paired [:estimate :ge-10-rate])))
+    (is (= :hierarchical-paired-query-then-seed-bootstrap
+           (get-in paired [:bootstrap :method])))
+    (is (vector?
+          (get-in paired [:bootstrap :metrics :p99-ratio :ci95])))))
+
 (deftest plan-census-does-not-report-runtime-tail-rates
   (let [plan-rows (mapv #(assoc % :plan-only? true) rows)
         summary   (analysis/summarize

@@ -144,6 +144,76 @@
               (subs raw 1))]
     (str/replace raw "-" "_")))
 
+(defn- entity-table
+  [analysis entity]
+  (let [tables (into #{}
+                     (map (fn [[_ attr _]]
+                            (some-> attr namespace
+                                    (str/replace "-" "_"))))
+                     (get-in analysis [:by-entity entity]))]
+    (when-not (= 1 (count tables))
+      (throw (ex-info "Datalog entity does not identify one JOB table"
+                      {:entity entity :tables tables})))
+    (first tables)))
+
+(defn- rewrite-condition-aliases
+  [condition alias-map]
+  (str/replace
+    condition #"(?i)(?<![a-z0-9_])([a-z][a-z0-9_]*)\."
+    (fn [[_ alias]]
+      (str (get alias-map (str/lower-case alias)
+                (str/lower-case alias)) "."))))
+
+(defn align-sql-spec
+  "Align SQL aliases with translated Datalog entity stars by base table.
+
+  The JOB translation deliberately omits some SQL-only existence joins, and a
+  few retained aliases differ (`it`/`it1`, `miidx`/`mi_idx`, and so on). Drop
+  relations without a Datalog star and rename the retained SQL aliases so the
+  exact backend counts the translated workload rather than the source SQL."
+  [sql-spec analysis]
+  (let [datalog-by-table
+        (group-by #(entity-table analysis %) (:entities analysis))
+        sql-by-table (group-by :table (:from-items sql-spec))
+        alias-map
+        (reduce-kv
+          (fn [result table entities]
+            (let [datalog-aliases (into #{} (map entity-alias) entities)
+                  sql-aliases     (into #{} (map :alias)
+                                        (get sql-by-table table))
+                  exact           (set/intersection datalog-aliases
+                                                    sql-aliases)
+                  remaining-d     (sort (set/difference datalog-aliases exact))
+                  remaining-s     (sort (set/difference sql-aliases exact))]
+              (when-not (= (count datalog-aliases) (count sql-aliases))
+                (throw
+                  (ex-info "Datalog and SQL table occurrences differ"
+                           {:table table
+                            :datalog-aliases datalog-aliases
+                            :sql-aliases sql-aliases})))
+              (into result
+                    (concat (map (juxt identity identity) exact)
+                            (map vector remaining-s remaining-d)))))
+          {} datalog-by-table)
+        retained-aliases (set (keys alias-map))
+        from-items
+        (into []
+              (comp
+                (filter #(contains? retained-aliases (:alias %)))
+                (map (fn [{:keys [table alias] :as item}]
+                       (let [aligned (alias-map alias)]
+                         (assoc item
+                                :alias aligned
+                                :sql (str table " AS " aligned))))))
+              (:from-items sql-spec))
+        conditions
+        (mapv (fn [{:keys [sql aliases] :as condition}]
+                (assoc condition
+                       :sql (rewrite-condition-aliases sql alias-map)
+                       :aliases (into #{} (map #(get alias-map % %)) aliases)))
+              (:conditions sql-spec))]
+    (assoc sql-spec :from-items from-items :conditions conditions)))
+
 (defn subset-sql
   ([sql-spec entities]
    (subset-sql sql-spec entities {} {} {}))
@@ -272,8 +342,12 @@
                        columns)
                   group-columns
                   (map (fn [[_var column]] (str alias "." column)) columns)
-                  needed-vars (into #{} (map first) columns)]
-              (if prepared-factors
+                  needed-vars (into #{} (map first) columns)
+                  prepared? (and prepared-factors
+                                 (not (contains?
+                                        (:unprepared-aliases prepared-factors)
+                                        alias)))]
+              (if prepared?
                 (let [{:keys [vars]}
                       (or (get-in prepared-factors [:factors alias])
                           (throw (ex-info "Prepared SQL factor is missing"
@@ -290,12 +364,14 @@
                                       :factor-vars vars})))]
                   {:name (str "f" (alias-index alias))
                    :vars needed-vars
+                   :prepared? true
                    :sql  (str "SELECT "
                               (when (seq needed-columns)
                                 (str (str/join ", " needed-columns) ", "))
                               "w AS w FROM " projection-table)})
                 {:name (str "f" (alias-index alias))
                  :vars needed-vars
+                 :prepared? false
                  :sql  (str "SELECT "
                             (when (seq select-columns)
                               (str (str/join ", " select-columns) ", "))
@@ -315,9 +391,9 @@
                        :sql-aliases (mapv :alias from-items)})))
     (loop [factors   (mapv #(select-keys % [:name :vars]) initial-factors)
            variables (set outer-vars)
-           ctes      (mapv (fn [{:keys [name sql]}]
+           ctes      (mapv (fn [{:keys [name sql prepared?]}]
                              (str name
-                                  (if prepared-factors
+                                  (if prepared?
                                     " AS NOT MATERIALIZED ("
                                     " AS MATERIALIZED (")
                                   sql ")"))
@@ -582,6 +658,35 @@
       entity-columns
       (:patterns analysis))))
 
+(defn material-factorized-sql
+  "Count rows emitted by one indexed link before target-local filtering.
+  Source stars retain their translated predicates and prepared factors; the
+  target is read from its raw JOB relation with only the linking column
+  required. Join equalities still come from the translated Datalog variables."
+  [database sql-spec request required exclusions joins factor-spec]
+  (let [{:keys [entities target type attr attrs]} request
+        source-aliases (into #{} (map entity-alias) entities)
+        target-alias   (entity-alias target)
+        target-attr    (case type
+                         :_ref attr
+                         :val-eq (get attrs target)
+                         (throw (ex-info "Unsupported material link type"
+                                         {:request request})))
+        target-column  (sql-column (db/-schema database) target-attr)
+        material-required
+        (assoc (select-keys required source-aliases)
+               target-alias #{target-column})
+        material-conditions
+        (filterv #(set/subset? (:aliases %) source-aliases)
+                 (:conditions sql-spec))
+        material-factors
+        (assoc factor-spec :unprepared-aliases #{target-alias})]
+    (factorized-subset-sql
+      (assoc sql-spec
+             :conditions material-conditions
+             :prepared-factors material-factors)
+      (conj entities target) material-required exclusions joins)))
+
 (declare worker-connection)
 
 (defn- singleton-id-form
@@ -690,6 +795,18 @@
     (doseq [sql statements]
       (.execute statement sql))))
 
+(defn- ensure-factors!
+  [^Connection connection prepared factor-spec aliases timeout-ms]
+  (let [thread (Thread/currentThread)]
+    (doseq [alias (sort (distinct aliases))]
+      (let [statements (or (get-in factor-spec [:factors alias :statements])
+                           (throw (ex-info "Prepared SQL factor is missing"
+                                           {:alias alias})))
+            key [thread alias]]
+        (when-not (= statements (get @prepared key))
+          (prepare-factors! connection statements timeout-ms)
+          (swap! prepared assoc key statements))))))
+
 (defn- sql-count
   [connections url user password sql timeout-ms]
   (let [^Connection conn (worker-connection connections url user password)]
@@ -733,7 +850,8 @@
 
 (defn run
   [{:keys [db-path sql-dir output-dir queries timeout-ms parallelism
-           url user password validate-existing? skip-complete?]
+           url user password validate-existing? skip-complete?
+           material-cardinalities?]
     :or   {db-path "db"
            sql-dir "queries"
            output-dir "results/cidr-exact-cardinalities"
@@ -744,7 +862,8 @@
                     (System/getenv "USER"))
            password ""
            validate-existing? true
-           skip-complete? false}}]
+           skip-complete? false
+           material-cardinalities? false}}]
   (when-not (and (integer? parallelism) (pos? parallelism))
     (throw (ex-info "SQL oracle parallelism must be a positive integer"
                     {:parallelism parallelism})))
@@ -752,13 +871,17 @@
         database    (d/db conn)
         executor    (Executors/newFixedThreadPool (int parallelism))
         connections (atom {})
+        prepared    (atom {})
         calibration-cache (atom {})]
     (try
-      (let [shared-file   (io/file output-dir "shared.edn")
+      (let [shared-file   (io/file output-dir
+                                   (if material-cardinalities?
+                                     "shared.material.postgres.edn"
+                                     "shared.edn"))
             shared-counts (atom (oracle/read-shared-checkpoint shared-file))
             query-symbols
             (cond->> (oracle/selected-query-symbols queries)
-              skip-complete?
+              (and skip-complete? (not material-cardinalities?))
               (filterv
                 (fn [query-sym]
                   (let [query-name (oracle/query-name query-sym)
@@ -783,9 +906,10 @@
                                (throw (ex-info "JOB SQL file is missing"
                                                {:query query-name
                                                 :file (str sql-file)})))
-                  sql-spec   (parse-job-sql (slurp sql-file))
                   analysis   (oracle/query-analysis
                                (oracle/query-value query-sym))
+                  sql-spec   (align-sql-spec
+                               (parse-job-sql (slurp sql-file)) analysis)
                   required   (required-columns database analysis)
                   joins      (join-columns database analysis)
                   calibration-file
@@ -803,7 +927,6 @@
                       value))
                   factor-spec (prepared-factor-spec sql-spec required
                                                     exclusions joins)
-                  prepared-threads (atom #{})
                   sql-aliases (into #{} (map :alias) (:from-items sql-spec))
                   datalog-aliases (into #{} (map entity-alias)
                                         (:entities analysis))
@@ -819,36 +942,58 @@
                   existing    (oracle/read-checkpoint output-file)
                   count-subset
                   (fn [_db _analysis entities per-query-timeout-ms _known]
-                    (let [thread     (Thread/currentThread)
-                          connection (worker-connection connections url user
+                    (let [connection (worker-connection connections url user
                                                         password)]
-                      (when-not (contains? @prepared-threads thread)
-                        (prepare-factors! connection (:statements factor-spec)
-                                          per-query-timeout-ms)
-                        (swap! prepared-threads conj thread))
+                      (ensure-factors! connection prepared factor-spec
+                                       (map entity-alias entities)
+                                       per-query-timeout-ms)
                       (sql-count connections url user password
                                  (factorized-subset-sql
                                    (assoc sql-spec
                                           :prepared-factors factor-spec)
                                    entities required exclusions joins)
-                                 per-query-timeout-ms)))]
-              (when (and validate-existing? (seq existing))
+                                 per-query-timeout-ms)))
+                  count-material
+                  (fn [_db _analysis request per-query-timeout-ms _known]
+                    (let [connection (worker-connection connections url user
+                                                        password)
+                          source-aliases
+                          (map entity-alias (:entities request))]
+                      (ensure-factors! connection prepared factor-spec
+                                       source-aliases per-query-timeout-ms)
+                      (sql-count
+                        connections url user password
+                        (material-factorized-sql
+                          database sql-spec request required exclusions joins
+                          factor-spec)
+                        per-query-timeout-ms)))]
+              (when (and (not material-cardinalities?)
+                         validate-existing? (seq existing))
                 (validate-existing! executor count-subset database analysis
                                     existing timeout-ms query-name))
-              (oracle/precompute-query!
-                database query-sym
-                {:output-file output-file
-                 :timeout-ms timeout-ms
-                 :shared-counts shared-counts
-                 :shared-writer shared-writer
-                 :executor executor
-                 :count-subset count-subset
-                 :count-method :postgres-exact})
-              ;; Closing the per-thread connections drops all temporary factor
-              ;; projections before the next JOB query is prepared.
-              (doseq [[_ ^Connection connection] @connections]
-                (.close connection))
-              (reset! connections {})))))
+              (if material-cardinalities?
+                (oracle/precompute-material-query!
+                  database query-sym
+                  {:logical-file output-file
+                   :output-file (str (io/file output-dir
+                                              (str query-name
+                                                   ".material.edn")))
+                   :timeout-ms timeout-ms
+                   :shared-counts shared-counts
+                   :shared-writer shared-writer
+                   :executor executor
+                   :count-material count-material
+                   :count-method :postgres-exact
+                   :trusted-shared-only? true})
+                (oracle/precompute-query!
+                  database query-sym
+                  {:output-file output-file
+                   :timeout-ms timeout-ms
+                   :shared-counts shared-counts
+                   :shared-writer shared-writer
+                   :executor executor
+                   :count-subset count-subset
+                   :count-method :postgres-exact}))))))
       (finally
         (.shutdownNow ^ExecutorService executor)
         (doseq [[_ ^Connection connection] @connections]

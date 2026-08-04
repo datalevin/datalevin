@@ -66,6 +66,12 @@
                        "--enable-native-access=ALL-UNNAMED"
                        "-Dclojure.compiler.direct-linking=true"]
             :exec-fn datalevin-bench.cardinality-sql/run}
+           :oracle-factorized
+           {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
+                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+                       "--enable-native-access=ALL-UNNAMED"
+                       "-Dclojure.compiler.direct-linking=true"]
+            :exec-fn datalevin-bench.cardinality-factorized/run}
            :analyze {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
                                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
                                 "--enable-native-access=ALL-UNNAMED"

@@ -838,6 +838,12 @@ predicate-specific counts are hidden from the cost model."}
   optimizer-fallback-selectivity 0.1)
 
 (def ^{:dynamic true
+       :doc     "Prior sample size used when estimating a filtered base star
+from its query-local reservoir sample. This prevents a few or zero retained
+rows from being extrapolated as near-zero population cardinality."}
+  base-estimate-prior-size 0)
+
+(def ^{:dynamic true
        :doc     "Upper bound on the plan search space. When the number of plans
 considered exceeds this cap, the planner switches from exhaustive to greedy. Default
 is Integer/MAX_VALUE, i.e. no cap."}
@@ -884,6 +890,12 @@ to sampled link estimates and should be selected by controlled evaluation."}
   magic-or-join-ratio 10.0)
 
 (def ^{:dynamic true
+       :doc     "Query optimizer cost model. :legacy retains the historical
+multiplicative scan factors and processor-scaled hash penalty. :physical uses
+additive per-row operator work and a hardware-independent hash-row cost."}
+  optimizer-cost-model :legacy)
+
+(def ^{:dynamic true
        :doc     "Cost associated with running a predicate during scan"}
   magic-cost-pred 3.5)
 
@@ -916,6 +928,51 @@ to sampled link estimates and should be selected by controlled evaluation."}
   magic-cost-hash-join (* 5.0
                           ;; for hash join is a barrier to parallelism
                           (.availableProcessors (Runtime/getRuntime))))
+
+(def ^{:dynamic true
+       :doc     "Per input row cost of hash build/probe work in the physical
+optimizer cost model. Pipeline barriers are represented by the materialized
+inputs themselves rather than scaling this coefficient by processor count."}
+  physical-cost-hash-row 6.25)
+
+(def ^{:dynamic true
+       :doc     "Per input row cost of a hash join whose target scan is
+restricted by sideways information passing."}
+  physical-cost-sip-hash-row 5.0)
+
+(def ^{:dynamic true
+       :doc     "Cost per copied output cell in a physical hash join. Hash
+output materialization allocates a new tuple and copies every retained column,
+so row count alone does not represent this work."}
+  physical-cost-hash-output-cell 1.0)
+
+(def ^{:dynamic true
+       :doc     "Cost per outer index probe in the physical optimizer cost
+model. Kept separate from the legacy heuristic so random access can be
+calibrated against sequential scans."}
+  physical-cost-link-probe 2.5)
+
+(def ^{:dynamic true
+       :doc     "Cost per tuple retrieved by an indexed link step in the
+physical optimizer cost model."}
+  physical-cost-link-retrieval 1.2)
+
+(def ^{:dynamic true
+       :doc     "Cost of processing or emitting one tuple around a cached
+entity merge scan in the physical optimizer cost model."}
+  physical-cost-tuple 4.0)
+
+(def ^{:dynamic true
+       :doc     "Weight of the sparse EAV merge-probe locality correction.
+Zero disables it; one applies the full log2 population-to-probe gap."}
+  physical-cost-merge-locality-weight 1.0)
+
+(def ^{:dynamic true
+       :doc     "Effective parallelism used to turn total streaming work into
+wall-clock cost. A pipelined plan is priced as its critical stage plus total
+work divided by this value."}
+  physical-cost-pipeline-parallelism
+  (max 1 (.availableProcessors (Runtime/getRuntime))))
 
 (def ^{:dynamic true
        :doc     "Minimum input size before considering hash join"}

@@ -1,7 +1,9 @@
 (ns datalevin-bench.evaluation-test
   (:require
    [clojure.test :refer [deftest is testing]]
-   [datalevin-bench.evaluation :as evaluation]))
+   [datalevin-bench.evaluation :as evaluation])
+  (:import
+   [java.io StringWriter]))
 
 (def queries
   [{:name "1a" :symbol 'q-1a}
@@ -69,6 +71,49 @@
     (is (= [0.0 10.0] (mapv :tail-weight conditions)))
     (is (= [true false] (mapv :baseline? conditions)))
     (is (= 2 (count (distinct (map :name conditions)))))))
+
+(deftest cost-model-is-part-of-condition
+  (let [conditions
+        (#'evaluation/selected-conditions
+         [{:name :legacy-cost :mode :full :cost-model :legacy}
+          {:name :physical-cost
+           :mode :full
+           :cost-model :physical
+           :base-estimate-prior-size 6.0
+           :physical-cost-tuple 7.0
+           :physical-cost-hash-row 8.0
+           :physical-cost-sip-hash-row 9.0
+           :physical-cost-hash-output-cell 10.0
+           :physical-cost-link-probe 11.0
+           :physical-cost-link-retrieval 12.0
+           :physical-cost-merge-locality-weight 0.5
+           :physical-cost-pipeline-parallelism 6.0}]
+         nil defaults)]
+    (is (= [:legacy :physical] (mapv :cost-model conditions)))
+    (is (= [6.0 7.0 8.0 9.0 10.0 11.0 12.0 0.5 6.0]
+           ((juxt :base-estimate-prior-size
+                  :physical-cost-tuple
+                  :physical-cost-hash-row
+                  :physical-cost-sip-hash-row
+                  :physical-cost-hash-output-cell
+                  :physical-cost-link-probe
+                  :physical-cost-link-retrieval
+                  :physical-cost-merge-locality-weight
+                  :physical-cost-pipeline-parallelism)
+            (second conditions))))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"cost model"
+          (#'evaluation/selected-conditions
+           [{:name :bad-cost :mode :full :cost-model :unknown}]
+           nil defaults)))
+    (is (thrown-with-msg?
+          clojure.lang.ExceptionInfo #"cost coefficients"
+          (#'evaluation/selected-conditions
+           [{:name :bad-coefficient
+             :mode :full
+             :cost-model :physical
+             :physical-cost-tuple 0.0}]
+           nil defaults)))))
 
 (deftest estimator-observation-export
   (let [entry {:run 2
@@ -216,6 +261,35 @@
   (is (#'evaluation/acceptable-warm-up-status? "ok"))
   (is (#'evaluation/acceptable-warm-up-status? "timeout"))
   (is (false? (#'evaluation/acceptable-warm-up-status? "error"))))
+
+(deftest contaminated-whole-pass-is-audited-and-retried-before-commit
+  (let [attempts        (atom 0)
+        pass-executions (atom 0)
+        accepted-health (StringWriter.)
+        rejected-health (StringWriter.)
+        measure!
+        (fn [writer _phase _pass _options f]
+          (let [attempt (swap! attempts inc)
+                value   (f)]
+            (.write ^java.io.Writer writer (str "{:attempt " attempt "}\n"))
+            (if (= 1 attempt)
+              (throw
+                (ex-info "Machine health changed during optimizer evaluation"
+                         {:reasons [:swapout]}))
+              value)))]
+    (is (= {:rows [:accepted]}
+           (#'evaluation/accepted-measured-pass!
+             accepted-health rejected-health :timing 4
+             {:contamination-retries 1
+              :contamination-retry-pause-ms 0
+              :measured-pass-fn measure!}
+             (fn []
+               (let [execution (swap! pass-executions inc)]
+                 {:rows [(if (= execution 1) :rejected :accepted)]})))))
+    (is (= 2 @pass-executions))
+    (is (= "{:attempt 2}\n" (str accepted-health)))
+    (is (re-find #":event :rejected-pass" (str rejected-health)))
+    (is (re-find #"\{:attempt 1\}" (str rejected-health)))))
 
 (deftest restarted-worker-replays-the-next-exact-trial-before-recording
   (let [calls         (atom [])
