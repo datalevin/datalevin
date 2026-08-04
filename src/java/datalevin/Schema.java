@@ -394,6 +394,14 @@ public final class Schema {
         }
 
         /**
+         * Retracts one property when this attribute is used in a schema update.
+         */
+        public Attribute retract(String property) {
+            props.put(Datalevin.kw(property), Datalevin.kw("db/retract"));
+            return this;
+        }
+
+        /**
          * Adds an arbitrary schema property.
          */
         public Attribute prop(String key, Object value) {

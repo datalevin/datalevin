@@ -2,14 +2,37 @@
 
 ## WIP
 
+### Changed
+- [Datalog] Schema property maps now patch existing attribute definitions:
+  omitted properties are preserved, `:db/retract` removes a property, and
+  incoming internal `:db/aid` values are ignored, so `d/schema` output is safe
+  to reuse as schema input.
+- [Datalog] `update-schema` now validates the complete request before writing,
+  then commits all changes atomically. Commit failures roll back, and concurrent
+  property patches compose without lost updates.
+- [Datalog] Schema deletion and rename retries are now idempotent: deleting an
+  absent attribute or replaying a completed rename is a no-op. Renames fail
+  without overwriting when both names exist; rename chains, cycles, duplicate
+  targets, and conflicting patch/delete operations are rejected.
+
 ### Fixed
 - [Datalog] fix composite tuple `nil` regression introduced in 1.0.0.
+- [Datalog] Nested `q` calls now inherit the containing query deadline, do not
+  corrupt `explain {:run? true}` timing state, and cannot leave stale containing
+  query results in the cache after a transaction.
+- [Datalog] preserves empty projected relations as attribute-free annihilators.
+- [Datalog] prevent nested `q` leaking variables to outter `q`.
+- [Datalog] proper validation of tuple bindings.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
 
 ### Improved
 - [Datalog] integrating top-k access paths into cost based optimizer, covering
   AVE scan, idoc, full-text and vector query functions.
+- [Datalog] LMDB shutdown hook now delgetes to store close, preventing crash due
+  to stray open connection.
+- [Datalog] Nested `q` relation results are documented as derived relations,
+  allowing aggregate stages to compose within one query.
 
 ## 1.0.0 (2026-07-20)
 

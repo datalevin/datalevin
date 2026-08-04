@@ -230,6 +230,16 @@
          (.put ^LRUCache cache# ~pattern res#)
          res#))))
 
+(defn- sample-init-cache-key
+  [a mcount v-ranges pred get-v?]
+  [:sample-init-tuples a mcount v-ranges pred get-v?
+   u/*reservoir-sampling-seed*])
+
+(defn- e-sample-cache-key
+  [a mcount]
+  [:e-sample a mcount c/init-exec-size-threshold
+   u/*reservoir-sampling-seed*])
+
 (defn- tx-touch-summary
   [tx-data]
   (reduce
@@ -590,14 +600,20 @@
   (-sample-init-tuples-list
     [db a mcount v-ranges pred get-v?]
     (wrap-cache
-        store [:sample-init-tuples a mcount v-ranges pred get-v?]
+        store (sample-init-cache-key a mcount v-ranges pred get-v?)
       (sample-ave-tuples-list store a mcount v-ranges pred get-v?)))
 
   (-e-sample
     [db a]
-    (wrap-cache
-        store [:e-sample a]
-      (e-sample store a)))
+    (if (some? u/*reservoir-sampling-seed*)
+      (let [mcount (a-size store a)]
+        (wrap-cache
+            store (e-sample-cache-key a mcount)
+          (sample-ave-tuples-list
+            store a mcount [[[:closed c/v0] [:closed c/vmax]]] nil false)))
+      (wrap-cache
+          store [:e-sample a]
+        (e-sample store a))))
 
   (-default-ratio
     [db a]
@@ -964,7 +980,7 @@
   ([dir schema] (empty-db dir schema nil))
   ([dir schema opts]
    {:pre [(or (nil? schema) (map? schema))]}
-   (vld/validate-schema schema)
+   (vld/validate-schema-update schema)
    (let [[_ runtime-opts] (split-runtime-opts opts)]
      (cond-> (new-db (open-store dir schema opts))
        (some? runtime-opts) (with-runtime-opts runtime-opts)))))
@@ -1095,7 +1111,7 @@
   ([datoms dir schema opts]
    {:pre [(or (nil? schema) (map? schema))]}
    (vld/validate-datom-list datoms)
-   (vld/validate-schema schema)
+   (vld/validate-schema-update schema)
    (let [[_ runtime-opts] (split-runtime-opts opts)
          ^Store store    (open-store dir schema opts)]
      (quick-fill store datoms)

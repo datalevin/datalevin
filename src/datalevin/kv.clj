@@ -2764,17 +2764,28 @@
 (defn ^:no-doc mirror-replayed-txlog-record!
   "Append a replicated HA record into the local txlog at the same LSN and
   apply its payload to LMDB. This keeps promoted followers on the same WAL
-  sequence and preserves source records for downstream followers."
+  sequence and preserves source records for downstream followers.
+
+  `preapply-rows` may be a collection or a zero-argument function. Functions
+  are evaluated under the replay write lock so read-dependent cleanup rows are
+  derived from the state immediately preceding this record. Set
+  `:replay-skipped?` when an existing local LSN may represent a different
+  local-only record and the incoming payload must still be materialized."
   ([lmdb record]
    (mirror-replayed-txlog-record! lmdb record nil))
   ([lmdb record preapply-rows]
+   (mirror-replayed-txlog-record! lmdb record preapply-rows nil))
+  ([lmdb record preapply-rows {:keys [replay-skipped?]}]
    ;; Replay mutates both the runtime txlog metadata and LMDB itself. Keep the
    ;; same lock order as close/transact paths so follower replay cannot deadlock
    ;; with concurrent write-txn close on the same store.
    (with-write-txn-lock-before-runtime-txlog-state
      lmdb
      (fn []
-       (let [record-rows (cond
+       (let [preapply-rows (if (fn? preapply-rows)
+                             (preapply-rows)
+                             preapply-rows)
+             record-rows (cond
                            (vector? (:rows record)) (:rows record)
                            (sequential? (:rows record)) (vec (:rows record))
                            (vector? (:ops record)) (:ops record)
@@ -2815,8 +2826,14 @@
                   state
                   record
                   expected-lsn)
-                 {:lsn record-lsn
-                  :skipped? true})
+                 (if replay-skipped?
+                   (do
+                     (replay-txlog-rows! lmdb materialize-rows record-lsn)
+                     {:lsn record-lsn
+                      :skipped? true
+                      :replayed? true})
+                   {:lsn record-lsn
+                    :skipped? true}))
                (do
                  (txlog-prepare-replay-dbis!
                   lmdb

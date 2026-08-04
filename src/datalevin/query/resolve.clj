@@ -161,7 +161,8 @@
              {:error :query/binding, :value coll, :binding (dp/source binding)})
 
       :else
-      (reduce r/prod-rel (map #(in->rel %1 %2) (:bindings binding) coll)))))
+      (reduce j/hash-join
+              (map #(in->rel %1 %2) (:bindings binding) coll)))))
 
 (defn resolve-ins
   [context values]
@@ -624,7 +625,7 @@
 (defn filter-by-pred
   [context clause]
   (let [[[f & args]]         clause
-        attrs                (qu/collect-vars args)
+        attrs                (qu/collect-fn-arg-vars args)
         [context production] (rel-prod-by-attrs context attrs)
         new-rel              (let [tuple-pred (-call-fn context production f args)]
                                (update production :tuples
@@ -674,13 +675,30 @@
 
 (defn- compile-tuple-product
   [left-attrs right-attrs]
-  (let [left-vars  (vec (keys left-attrs))
-        right-vars (vec (keys right-attrs))]
+  (let [left-vars        (vec (keys left-attrs))
+        right-vars       (vec (keys right-attrs))
+        common-vars      (into [] (filter #(contains? right-attrs %))
+                               left-vars)
+        new-right-vars   (into [] (remove #(contains? left-attrs %))
+                               right-vars)]
     (object-array
       [right-attrs
-       (zipmap (u/concatv left-vars right-vars) (range))
+       (zipmap (u/concatv left-vars new-right-vars) (range))
        (int-array (map left-attrs left-vars))
-       (int-array (map right-attrs right-vars))])))
+       (int-array (map right-attrs new-right-vars))
+       (int-array (map left-attrs common-vars))
+       (int-array (map right-attrs common-vars))])))
+
+(defn- tuple-product-match?
+  [^objects left-tuple ^objects right-tuple ^objects product-plan]
+  (let [^ints left-idxs  (aget product-plan 4)
+        ^ints right-idxs (aget product-plan 5)
+        n                (alength left-idxs)]
+    (loop [i 0]
+      (or (== i n)
+          (and (= (aget left-tuple (aget left-idxs i))
+                  (aget right-tuple (aget right-idxs i)))
+               (recur (unchecked-inc-int i)))))))
 
 (defn- append-tuple-product!
   [^List res ^objects left-tuple bound-rel ^objects product-plan]
@@ -689,8 +707,10 @@
         ^ints right-idxs   (aget product-plan 3)
         size               (.size right-tuples)]
     (dotimes [i size]
-      (.add res (r/join-tuples left-tuple left-idxs
-                               (.get right-tuples i) right-idxs)))))
+      (let [^objects right-tuple (.get right-tuples i)]
+        (when (tuple-product-match? left-tuple right-tuple product-plan)
+          (.add res (r/join-tuples left-tuple left-idxs
+                                   right-tuple right-idxs)))))))
 
 (defn- bind-coll-tuples
   [production binding projection needed tuple-fn]
@@ -721,7 +741,7 @@
                                                       bound-attrs))]
                   (append-tuple-product! res tuple bound-rel plan)
                   (recur (unchecked-inc-int i) plan res))
-                (let [joined (r/prod-rel
+                (let [joined (j/hash-join
                                (r/relation! (:attrs production)
                                             (r/single-tuples tuple))
                                bound-rel)
@@ -732,7 +752,7 @@
                          product-plan (:tuples merged)))))))
         (if product-plan
           (r/relation! (aget product-plan 1) res)
-          (r/prod-rel production (empty-rel binding)))))))
+          (j/hash-join production (empty-rel binding)))))))
 
 (defn bind-by-fn
   [context clause]
@@ -749,7 +769,7 @@
         args'                (if needed
                                (attach-needed-meta args needed)
                                args)
-        attrs                (qu/collect-vars args)
+        attrs                (qu/collect-fn-arg-vars args)
         [context production] (rel-prod-by-attrs context attrs)
         out-var              (when (instance? BindScalar binding)
                                (get-in binding [:variable :symbol]))
@@ -783,8 +803,13 @@
 
 (defn limit-rel
   [rel vars]
-  (when-some [attrs (not-empty (select-keys (:attrs rel) vars))]
-    (assoc rel :attrs attrs)))
+  (if-some [attrs (not-empty (select-keys (:attrs rel) vars))]
+    (assoc rel :attrs attrs)
+    ;; Projecting away every column of a non-empty relation is existential
+    ;; success, so that relation can be dropped. An empty relation is branch
+    ;; failure, however, and must remain as an attribute-free annihilator.
+    (when (r/rel-empty rel)
+      (assoc rel :attrs {}))))
 
 (defn limit-context
   [context vars]

@@ -2,9 +2,78 @@
   (:require
    [clojure.test :as t :refer        [is are deftest testing]]
    [datalevin.interpret :as i]
-   [datalevin.core :as d]))
+   [datalevin.core :as d]
+   [datalevin.timeout :as timeout]))
 
 (defn sort-reverse [xs] (reverse (sort xs)))
+
+(deftest test-derived-aggregate-relations
+  (let [a [[1 :x] [2 :x] [3 :y]]
+        b [[4 :x] [5 :x] [6 :x] [7 :y]]
+        c [[8 :x] [9 :y] [10 :y]]]
+    (is (= 8
+           (d/q '[:find (sum ?w) .
+                  :in $a $b $c
+                  :where
+                  [(q [:find ?x (count ?a)
+                       :in $a
+                       :where [$a ?a ?x]]
+                      $a)
+                   [[?x ?wa]]]
+                  [(q [:find ?x (count ?b)
+                       :in $b
+                       :where [$b ?b ?x]]
+                      $b)
+                   [[?x ?wb]]]
+                  [(q [:find ?x (count ?c)
+                       :in $c
+                       :where [$c ?c ?x]]
+                      $c)
+                   [[?x ?wc]]]
+                  [(* ?wa ?wb ?wc) ?w]]
+                a b c)))))
+
+(deftest test-nested-query-cache-invalidation-and-explain
+  (let [conn  (d/create-conn nil {} {:kv-opts {:inmemory? true}})
+        query '[:find ?n .
+                :where
+                [(q [:find (count ?e) .
+                     :where [?e :test/value]]
+                    $)
+                 ?n]]]
+    (try
+      (d/transact! conn [{:db/id 1 :test/value 1}])
+      (is (= 1 (d/q query @conn)))
+
+      ;; The containing query must not return its cached result after a nested
+      ;; query's database dependencies change.
+      (d/transact! conn [{:db/id 2 :test/value 2}])
+      (is (= 2 (d/q query @conn)))
+
+      (let [explanation (d/explain {:run? true} query @conn)]
+        (is (= 2 (:result explanation)))
+        (is (= 1 (:actual-result-size explanation))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-nested-query-inherits-deadline
+  (let [parent-deadline (+ (System/currentTimeMillis) 60000)
+        deadline
+        (d/q '[:find ?deadline .
+               :in ?capture
+               :where
+               [(q [:find ?deadline .
+                    :in ?f
+                    :where [(?f) ?deadline]]
+                   ?capture)
+                ?deadline]
+               :timeout 10000]
+             (fn [] timeout/*deadline*))]
+    (is (integer? deadline))
+    (is (<= deadline (+ (System/currentTimeMillis) 10000)))
+    (binding [timeout/*deadline* parent-deadline]
+      (is (= parent-deadline (timeout/effective-deadline nil)))
+      (is (= parent-deadline (timeout/effective-deadline 120000))))))
 
 (deftest test-aggregates
   (let [monsters [ ["Cerberus" 3]

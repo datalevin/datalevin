@@ -1819,25 +1819,19 @@
                   acc))
               0
               replay-rows)
-            cleanup-rows
-            (ha-cardinality-one-eav-cleanup-rows store kv-store replay-rows)
-            materialize-rows
-            (if (seq cleanup-rows)
-              (into (vec cleanup-rows) replay-rows)
-              replay-rows)
             next-state
             (do
-              (let [mirror-res (kv/mirror-replayed-txlog-record! kv-store
-                                                                 record
-                                                                 cleanup-rows)]
-                ;; A restarted follower can already have the replicated WAL
-                ;; record locally while still missing the materialized LMDB
-                ;; rows. If replay sees the LSN and skips the append, reapply
-                ;; the payload directly so the datalog state catches up to the
-                ;; existing txlog floor.
-                (when (:skipped? mirror-res)
-                  (kv/replay-txlog-rows! kv-store materialize-rows
-                                         (long (:lsn record)))))
+              ;; Cleanup depends on the follower's current EAV contents. Derive
+              ;; it under the same write lock that serializes WAL append and
+              ;; LMDB materialization; otherwise adjacent records can both
+              ;; observe the same old cardinality-one value and leave a stale
+              ;; duplicate behind.
+              (kv/mirror-replayed-txlog-record!
+               kv-store
+               record
+               #(ha-cardinality-one-eav-cleanup-rows
+                 store kv-store replay-rows)
+               {:replay-skipped? true})
               (when (and (instance? IStore store)
                          (pos? (long replayed-max-gt)))
                 (st/sync-max-gt-floor! store replayed-max-gt))

@@ -9,9 +9,52 @@
    [clojure.test :refer [deftest testing is use-fixtures]]
    [datalevin.util :as u])
   (:import
-   [java.util UUID]))
+   [datalevin.storage Store]
+   [java.util UUID]
+   [java.util.concurrent.locks ReentrantReadWriteLock]))
 
 (use-fixtures :each db-fixture)
+
+(defn- cpp-shutdown-hook
+  [dir]
+  (let [hooks-var (ns-resolve 'datalevin.binding.cpp 'shutdown-hooks)]
+    (get @(var-get hooks-var) dir)))
+
+(deftest raw-shutdown-hook-coordinates-with-background-sampling
+  (let [dir      (u/tmp-dir (str "shutdown-sampling-" (UUID/randomUUID)))
+        db       (d/empty-db dir nil {:background-sampling? true})
+        store    ^Store (:store db)
+        raw-lmdb (kv/raw-lmdb (.-lmdb store))
+        hook     ^Thread (cpp-shutdown-hook (d/dir raw-lmdb))
+        lock     ^ReentrantReadWriteLock (.-sampling-lock store)
+        rlock    (.readLock lock)
+        acquired (promise)
+        release  (promise)
+        holder   (future
+                   (.lock rlock)
+                   (try
+                     (deliver acquired true)
+                     @release
+                     (finally
+                       (.unlock rlock))))]
+    (try
+      (is (true? (deref acquired 5000 false)))
+      (is (some? @(.-scheduled-sampling store)))
+      (let [close-started (promise)
+            closer        (future
+                            (deliver close-started true)
+                            (.run hook))]
+        (is (true? (deref close-started 5000 false)))
+        (is (= ::blocked (deref closer 100 ::blocked)))
+        (deliver release true)
+        (is (nil? (deref closer 5000 ::timed-out)))
+        (is (d/closed-kv? raw-lmdb))
+        (is (nil? @(.-scheduled-sampling store))))
+      (finally
+        (deliver release true)
+        (deref holder 5000 nil)
+        (d/close-db db)
+        (u/delete-files dir)))))
 
 (deftest issue-262
   (let [dir (u/tmp-dir (str "query-or-" (UUID/randomUUID)))

@@ -12,6 +12,7 @@
   (:refer-clojure :exclude [update assoc])
   (:require
    [datalevin.constants :as c]
+   [datalevin.timeout :as timeout]
    [datalevin.util :as u])
   (:import
    [java.util List Collection HashMap]
@@ -89,6 +90,7 @@
                        ^:unsynchronized-mutable ^long consumer-idx]
   IBatchedQueue
   (-flush [_]
+    (timeout/assert-time-left)
     (when (pos? (.size producer))
       (enqueue-batches queue permits producer batch-size)
       (set! producer (FastList. (int batch-size)))))
@@ -106,6 +108,7 @@
     (-flush this)
     (enqueue queue :datalevin/end-scan))
   (-produce [_]
+    (timeout/assert-time-left)
     (loop []
       (if consumer
         (let [i      consumer-idx
@@ -119,11 +122,17 @@
                 (set! consumer-idx 0))
             (set! consumer-idx next-i))
           tuple)
-        (let [o (.poll queue ^long c/query-pipe-timeout
+        (let [remaining (timeout/time-left)
+              wait-ms   (if remaining
+                          (max 1 (min (long c/query-pipe-timeout)
+                                      (long remaining)))
+                          (long c/query-pipe-timeout))
+              o (.poll queue wait-ms
                        TimeUnit/MILLISECONDS)]
           (when (nil? o)
+            (timeout/assert-time-left)
             (u/raise "Pipe take timed out waiting for producer"
-                     {:timeout c/query-pipe-timeout}))
+                     {:timeout wait-ms}))
           (when-not (identical? :datalevin/end-scan o)
             (set! consumer o)
             (set! consumer-idx (.-start consumer))
@@ -231,6 +240,8 @@
   (finish [_] nil)
   (produce [_]
     (when (< i (.size tuples))
+      (when (zero? (rem i (max 1 (long c/query-pipe-batch-size))))
+        (timeout/assert-time-left))
       (let [tuple (.get tuples i)]
         (set! i (inc i))
         tuple)))

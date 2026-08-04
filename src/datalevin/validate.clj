@@ -130,10 +130,15 @@
 (defn validate-schema-mutation
   "Validate schema attribute changes (cardinality, value type, uniqueness)."
   [store lmdb attr old-props new-props]
-  (doseq [[k v] new-props
-          :let  [v' (old-props k)]]
+  (doseq [k [:db/cardinality :db/valueType :db/unique]
+          :let [v' (old-props k)
+                v  (new-props k)]
+          :when (not= v' v)]
     (case k
-      :db/cardinality (validate-cardinality-change store attr v' v)
+      :db/cardinality (validate-cardinality-change
+                        store attr
+                        (or v' :db.cardinality/one)
+                        (or v :db.cardinality/one))
       :db/valueType   (validate-value-type-change store attr v' v)
       :db/unique      (validate-uniqueness-change store lmdb attr v' v)
       :pass-through))
@@ -874,6 +879,29 @@
               :key       k
               :value     v})))
 
+(defn validate-schema-update
+  "Validate the shape of a schema update.
+
+  Property values are validated after the update is merged with the stored
+  attribute definitions. This permits partial property maps and the
+  :db/retract property-removal marker."
+  [schema-update]
+  (when-not (or (nil? schema-update) (map? schema-update))
+    (u/raise "Schema update must be a map"
+             {:error :schema/validation
+              :value schema-update}))
+  (doseq [[a props] schema-update]
+    (when-not (keyword? a)
+      (u/raise "Schema attribute must be a keyword: " a
+               {:error     :schema/validation
+                :attribute a}))
+    (when-not (map? props)
+      (u/raise "Schema properties for " a " must be a map"
+               {:error     :schema/validation
+                :attribute a
+                :value     props})))
+  schema-update)
+
 (def tuple-props #{:db/tupleAttrs :db/tupleTypes :db/tupleType})
 
 (defn- normalize-attr-preds
@@ -1166,6 +1194,7 @@
 (defn validate-schema
   "Validate full schema structure."
   [schema]
+  (validate-schema-update schema)
   (doseq [[a kv] schema]
     (let [comp? (:db/isComponent kv false)]
       (validate-schema-key a :db/isComponent (:db/isComponent kv) #{true false})

@@ -656,28 +656,56 @@
 
 (defonce sample-cache (LRUCache. 128))
 
+(def ^:dynamic *reservoir-sampling-seed*
+  "When non-nil, makes reservoir sampling deterministic. The seed is part of
+  the sample-cache key, so callers can obtain several replayable samples for
+  the same population and sample sizes."
+  nil)
+
+(defn- mix-sampling-seed
+  ^long [^long seed ^long m ^long n]
+  (let [z (bit-xor seed
+                   (unchecked-multiply m -7046029254386353131)
+                   (Long/rotateLeft n 32))
+        z (unchecked-multiply
+            (bit-xor z (unsigned-bit-shift-right z 30))
+            -4658895280553007687)
+        z (unchecked-multiply
+            (bit-xor z (unsigned-bit-shift-right z 27))
+            -7723592293110705685)]
+    (bit-xor z (unsigned-bit-shift-right z 31))))
+
 (defn reservoir-sampling
   "optimized reservoir sampling, random sample n out of m items, returns a
   sorted array of sampled indices, or returns nil if n > m"
   ^longs [^long m ^long n]
-  (or (.get ^LRUCache sample-cache [m n])
-      (let [res (cond
-                  (< n m)
-                  (let [indices (long-array (range n))
-                        r       (Random.)
-                        p       (Math/log (- 1.0 (double (/ n m))))]
-                    (loop [i n]
-                      (when (< i m)
-                        (aset indices (.nextInt r n) i)
-                        (recur (+ i
-                                  (long (/ (Math/log (- 1.0 (.nextDouble r))) p))
-                                  1))))
-                    (Arrays/sort indices)
-                    indices)
-                  (= n m) (long-array (range n))
-                  :else   nil)]
-        (.put ^LRUCache sample-cache [m n] res)
-        res)))
+  (let [seed      *reservoir-sampling-seed*
+        cache-key (if (some? seed) [m n seed] [m n])]
+    (or (.get ^LRUCache sample-cache cache-key)
+        (let [res (cond
+                    (< n m)
+                    (let [indices (long-array (range n))
+                          r       (if (some? seed)
+                                    (Random.
+                                      (mix-sampling-seed
+                                        (long seed) m n))
+                                    (Random.))
+                          p       (Math/log (- 1.0 (double (/ n m))))]
+                      (loop [i n]
+                        (when (< i m)
+                          (aset indices (.nextInt r n) i)
+                          (recur (+ i
+                                    (long
+                                      (/ (Math/log
+                                           (- 1.0 (.nextDouble r)))
+                                         p))
+                                    1))))
+                      (Arrays/sort indices)
+                      indices)
+                    (= n m) (long-array (range n))
+                    :else   nil)]
+          (.put ^LRUCache sample-cache cache-key res)
+          res))))
 
 (defn factorial
   [^long n]

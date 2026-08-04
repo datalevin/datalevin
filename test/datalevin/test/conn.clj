@@ -10,6 +10,7 @@
    [datalevin.conn :as dc]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.ha.replication :as repl]
    [datalevin.interface :as i]
    [datalevin.constants :as c]
    [datalevin.kv :as kv]
@@ -30,6 +31,7 @@
    [datalevin.vector VectorIndex]
    [java.nio ByteBuffer]
    [java.util Arrays Date Random UUID]
+   [java.util.concurrent CountDownLatch TimeUnit]
    [org.roaringbitmap.buffer ImmutableRoaringBitmap]))
 
 (use-fixtures :each db-fixture)
@@ -788,6 +790,209 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest test-update-schema-property-patches
+  (let [dir    (u/tmp-dir (str "schema-patch-" (UUID/randomUUID)))
+        schema {:user/email  {:db/valueType   :db.type/string
+                              :db/cardinality :db.cardinality/one
+                              :db/doc         "Email address"}
+                :user/friend {:db/valueType :db.type/ref}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (let [email-aid (get-in (d/schema conn) [:user/email :db/aid])]
+        ;; A supplied property map patches, rather than replaces, the existing
+        ;; attribute definition.
+        (d/update-schema conn
+                         {:user/email {:db/unique :db.unique/identity}})
+        (is (= {:db/valueType   :db.type/string
+                :db/cardinality :db.cardinality/one
+                :db/doc         "Email address"
+                :db/unique      :db.unique/identity
+                :db/aid         email-aid}
+               (get (d/schema conn) :user/email)))
+
+        ;; An empty property patch is a no-op, and a patch may rely on a stored
+        ;; property to satisfy whole-definition validation.
+        (let [before (d/schema conn)]
+          (is (= before
+                 (d/update-schema conn {:user/email {}}))))
+        (d/update-schema conn {:user/friend {:db/isComponent true}})
+        (is (= {:db/valueType  :db.type/ref
+                :db/isComponent true}
+               (dissoc (get (d/schema conn) :user/friend) :db/aid)))
+
+        ;; Property removal is explicit. Incoming internal attribute IDs are
+        ;; ignored for both existing and new attributes.
+        (d/update-schema conn
+                         {:user/email {:db/unique :db/retract
+                                       :db/aid    -1}
+                          :user/age   {:db/valueType :db.type/long
+                                       :db/aid       email-aid}})
+        (is (= email-aid
+               (get-in (d/schema conn) [:user/email :db/aid])))
+        (is (not (contains? (get (d/schema conn) :user/email) :db/unique)))
+        (is (not= email-aid
+                  (get-in (d/schema conn) [:user/age :db/aid])))
+        (is (= (count (d/schema conn))
+               (count (set (map :db/aid (vals (d/schema conn)))))))
+
+        ;; `schema` output, including :db/aid, is safe to feed back as input.
+        (let [before (d/schema conn)]
+          (is (= before (d/update-schema conn before))))
+
+        ;; Retractions are validated against the resulting complete
+        ;; definition, and a rejected patch leaves the schema unchanged.
+        (let [before (d/schema conn)]
+          (is (thrown-with-msg?
+                Exception #"isComponent.*should also have.*ref"
+                (d/update-schema
+                  conn {:user/friend {:db/valueType :db/retract}})))
+          (is (= before (d/schema conn)))))
+      (finally
+        (d/close conn)))
+
+    ;; Opening an existing database with a schema also applies property maps as
+    ;; patches instead of erasing omitted properties.
+    (let [conn' (d/create-conn dir {:user/email {:db/doc "Primary email"}})]
+      (try
+        (is (= :db.type/string
+               (get-in (d/schema conn') [:user/email :db/valueType])))
+        (is (= :db.cardinality/one
+               (get-in (d/schema conn') [:user/email :db/cardinality])))
+        (is (= "Primary email"
+               (get-in (d/schema conn') [:user/email :db/doc])))
+        (is (not (contains? (get (d/schema conn') :user/email) :db/unique)))
+        (finally
+          (d/close conn')
+          (u/delete-files dir))))))
+
+(deftest test-update-schema-delete-and-rename-replays
+  (let [dir    (u/tmp-dir (str "schema-replay-" (UUID/randomUUID)))
+        schema {:old/name    {:db/valueType :db.type/string}
+                :delete/me   {}
+                :other/name  {:db/valueType :db.type/string}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (let [after-delete (d/update-schema conn nil #{:delete/me})
+            modified     (i/last-modified (conn-store conn))]
+        (is (not (contains? after-delete :delete/me)))
+        (is (= after-delete
+               (d/update-schema conn nil #{:delete/me})))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (let [aid       (get-in (d/schema conn) [:old/name :db/aid])
+            update    {:old/name {:db/doc "Renamed attribute"}}
+            renames   {:old/name :new/name}
+            after     (d/update-schema conn update nil renames)
+            modified  (i/last-modified (conn-store conn))]
+        (is (not (contains? after :old/name)))
+        (is (= aid (get-in after [:new/name :db/aid])))
+        (is (= "Renamed attribute" (get-in after [:new/name :db/doc])))
+        ;; Replaying the original request redirects its property patch to the
+        ;; target instead of recreating the old attribute.
+        (is (= after (d/update-schema conn update nil renames)))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (let [before (d/schema conn)]
+        (is (thrown-with-msg?
+              Exception #"target already exists"
+              (d/update-schema conn nil nil {:new/name :other/name})))
+        (is (= before (d/schema conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-update-schema-validates-whole-operation-before-writing
+  (let [dir    (u/tmp-dir (str "schema-preflight-" (UUID/randomUUID)))
+        schema {:safe/name  {:db/valueType :db.type/string}
+                :busy/value {}}
+        conn   (d/create-conn dir schema)]
+    (try
+      (d/transact! conn [{:db/id 1 :busy/value 42}])
+      (let [before   (d/schema conn)
+            modified (i/last-modified (conn-store conn))]
+        (is (thrown-with-msg?
+              Exception #"Cannot delete attribute"
+              (d/update-schema conn
+                               {:safe/name {:db/doc "must roll back"}}
+                               #{:busy/value})))
+        (is (= before (d/schema conn)))
+        (is (= modified (i/last-modified (conn-store conn)))))
+
+      (is (thrown-with-msg?
+            Exception #"patch and delete"
+            (d/update-schema conn {:safe/name {:db/doc "ambiguous"}}
+                             #{:safe/name})))
+      (is (thrown-with-msg?
+            Exception #"chains and cycles"
+            (d/update-schema conn nil nil
+                             {:safe/name :middle/name
+                              :middle/name :final/name})))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-update-schema-commit-failure-rolls-back-migration
+  (let [dir  (u/tmp-dir (str "schema-commit-failure-" (UUID/randomUUID)))
+        conn (d/create-conn dir {:item/value {}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/value 42}])
+      (let [before (d/schema conn)]
+        (is (thrown-with-msg?
+              Exception #"forced schema commit failure"
+              (binding [cpp/*before-write-commit-fn*
+                        (fn [{:keys [operation]}]
+                          (when (= operation :close-transact-kv)
+                            (throw (ex-info "forced schema commit failure"
+                                            {:error ::forced-commit-failure}))))]
+                (d/update-schema
+                  conn {:item/value {:db/valueType :db.type/string}}))))
+        (is (= before (d/schema conn)))
+        (is (= 42 (:item/value (d/entity @conn 1)))))
+
+      ;; The identical operation can be retried after the failed commit.
+      (d/update-schema conn {:item/value {:db/valueType :db.type/string}})
+      (is (= :db.type/string
+             (get-in (d/schema conn) [:item/value :db/valueType])))
+      (is (= "42" (:item/value (d/entity @conn 1))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-concurrent-schema-property-patches-compose
+  (let [dir     (u/tmp-dir (str "schema-concurrent-" (UUID/randomUUID)))
+        conn    (d/create-conn
+                  dir {:item/value {:db/valueType :db.type/string}})
+        patches [{:db/doc "Concurrent patches"}
+                 {:db/cardinality :db.cardinality/one}
+                 {:db/fulltext false}
+                 {:db/isComponent false}
+                 {:db/embedding false}
+                 {:db/idocFormat :edn}
+                 {:db.embedding/autoDomain false}]
+        ready   (CountDownLatch. (count patches))
+        start   (CountDownLatch. 1)
+        workers (mapv
+                  (fn [patch]
+                    (future
+                      (.countDown ready)
+                      (.await start)
+                      (d/update-schema conn {:item/value patch})))
+                  patches)]
+    (try
+      (is (.await ready 10 TimeUnit/SECONDS))
+      (.countDown start)
+      (doseq [worker workers]
+        (is (not= ::timeout (deref worker 10000 ::timeout))))
+      (let [props (get (d/schema conn) :item/value)]
+        (doseq [patch patches]
+          (is (= patch (select-keys props (keys patch))))))
+      (finally
+        (.countDown start)
+        (doseq [worker workers]
+          (future-cancel worker))
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-live-idoc-schema-initializes-index-and-logs-dbis
   (let [dir  (u/tmp-dir (str "test-live-idoc-schema-"
                              (UUID/randomUUID)))
@@ -852,6 +1057,23 @@
       (finally
         (when-not (d/closed? conn)
           (d/close conn))
+        (u/delete-files dir)))))
+
+(deftest test-idoc-schema-update-inside-explicit-transaction
+  (let [dir  (u/tmp-dir (str "schema-idoc-transaction-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn dir)]
+    (try
+      (d/with-transaction [tx conn]
+        (d/update-schema tx
+                         {:doc/idoc {:db/valueType :db.type/idoc
+                                     :db/domain    "profiles"}}))
+      (is (some? (get (s/store-idoc-indices (conn-store conn)) "profiles")))
+      (d/transact! conn [{:db/id 1 :doc/idoc {:status "active"}}])
+      (is (= {:status "active"}
+             (:doc/idoc (d/entity @conn 1))))
+      (finally
+        (d/close conn)
         (u/delete-files dir)))))
 
 (deftest test-idoc-selective-path-indexing-domain-options
@@ -1604,6 +1826,25 @@
     (is (= c/implicit-schema (db/-schema @conn)))
     (d/close conn)
     (u/delete-files dir)))
+
+(deftest test-source-schema-ignores-aids
+  (let [dir  (u/tmp-dir (str "source-schema-aid-" (UUID/randomUUID)))
+        conn (d/create-conn dir
+                            {:source/one {:db/valueType :db.type/string
+                                          :db/aid       0}
+                             :source/two {:db/aid 0}})]
+    (try
+      (let [schema (d/schema conn)
+            aid-1  (get-in schema [:source/one :db/aid])
+            aid-2  (get-in schema [:source/two :db/aid])]
+        (is (not= 0 aid-1))
+        (is (not= 0 aid-2))
+        (is (not= aid-1 aid-2))
+        (is (= :db.type/string
+               (get-in schema [:source/one :db/valueType]))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest test-ways-to-create-conn-2
   (let [schema { :aka { :db/cardinality :db.cardinality/many
@@ -2799,7 +3040,45 @@
                         :rows [[:put "a" :covered :ok]]})]
               (is (= 15 (long (:lsn res))))
               (is (:skipped? res))
+              (is (nil? (d/get-value db "a" :covered)))
               (is (= 16 (long @(:next-lsn state))))))
+          (finally
+            (d/close-kv db))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest test-wal-replay-materializes-skipped-unapplied-tail
+  (let [dir  (u/tmp-dir (str "wal-replay-unapplied-tail-test-"
+                             (UUID/randomUUID)))
+        opts {:wal? true}]
+    (try
+      (let [db (d/open-kv dir opts)]
+        (try
+          (d/open-dbi db "a")
+          (is (= :transacted
+                 (d/transact-kv db [[:put "a" :k :expected]])))
+          (let [record (last (kv/open-tx-log db 1))
+                lsn    (long (:lsn record))]
+            ;; Model a crash after WAL append but before its LMDB payload was
+            ;; fully reflected: the local cursor contains the record, while
+            ;; the persisted materialization floor still trails it.
+            (is (= :transacted
+                   (kv/transact-kv-without-txlog!
+                    db
+                    [[:put "a" :k :stale]
+                     [:put c/kv-info c/wal-local-payload-lsn
+                      (dec lsn) :keyword :data]])))
+            (let [res (kv/mirror-replayed-txlog-record!
+                       db record nil {:replay-skipped? true})]
+              (is (:skipped? res))
+              (is (:replayed? res))
+              (is (= :expected (d/get-value db "a" :k)))
+              (is (= lsn
+                     (long (i/get-value db
+                                        c/kv-info
+                                        c/wal-local-payload-lsn
+                                        :keyword
+                                        :data))))))
           (finally
             (d/close-kv db))))
       (finally
@@ -2921,6 +3200,166 @@
                                     [:identity/key "identity-1"]))))
                 (finally
                   (d/close target-conn')))))
+          (finally
+            (d/close source-conn)
+            (when-not (d/closed? target-conn)
+              (d/close target-conn)))))
+      (finally
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
+(deftest test-wal-ha-replay-serializes-cardinality-one-cleanup
+  (let [source-dir (u/tmp-dir (str "wal-replay-serialized-cleanup-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-serialized-cleanup-target-"
+                                   (UUID/randomUUID)))
+        schema     {:bank/id      {:db/valueType :db.type/long
+                                   :db/unique :db.unique/identity}
+                    :bank/balance {:db/valueType :db.type/long}}
+        opts       {:wal? true
+                    :wal-durability-profile :strict}
+        initial    [{:db/id "account-0" :bank/id 0 :bank/balance 100}
+                    {:db/id "account-1" :bank/id 1 :bank/balance 100}
+                    {:db/id "account-2" :bank/id 2 :bank/balance 100}]]
+    (try
+      (let [source-conn (d/create-conn source-dir schema opts)
+            target-conn (d/create-conn target-dir schema opts)]
+        (try
+          (d/transact! source-conn initial)
+          (d/transact! target-conn initial)
+          ;; Consecutive transfers share account 1. If both replay callbacks
+          ;; derive cleanup rows before record 1 is materialized, record 2
+          ;; deletes balance 100 instead of 105 and leaves a stale duplicate.
+          (d/transact! source-conn
+                       [{:db/id [:bank/id 0] :bank/balance 95}
+                        {:db/id [:bank/id 1] :bank/balance 105}])
+          (d/transact! source-conn
+                       [{:db/id [:bank/id 1] :bank/balance 101}
+                        {:db/id [:bank/id 2] :bank/balance 104}])
+          (let [source-kv   (.-lmdb ^Store (conn-store source-conn))
+                target-store (conn-store target-conn)
+                target-kv   (.-lmdb ^Store target-store)
+                next-lsn    (long @(:next-lsn (txlog/state target-kv)))
+                records     (vec
+                             (drop-while #(< (long (:lsn %)) next-lsn)
+                                         (kv/open-tx-log source-kv 1)))
+                cleanup-var (ns-resolve
+                             'datalevin.ha.replication
+                             'ha-cardinality-one-eav-cleanup-rows)
+                cleanup-fn  @cleanup-var
+                second-entered (promise)
+                second-future (promise)
+                second-during-first (atom nil)
+                cleanup     (fn [record]
+                              (cleanup-fn
+                               target-store
+                               target-kv
+                               (vec (or (:rows record) (:ops record)))))]
+            (is (= 2 (count records)))
+            (let [record-1 (first records)
+                  record-2 (second records)
+                  result-1
+                  (kv/mirror-replayed-txlog-record!
+                   target-kv
+                   record-1
+                   (fn []
+                     (let [f2
+                           (future
+                             (try
+                               (kv/mirror-replayed-txlog-record!
+                                target-kv
+                                record-2
+                                (fn []
+                                  (deliver second-entered true)
+                                  (cleanup record-2)))
+                               (catch Throwable e
+                                 e)))]
+                       (deliver second-future f2)
+                       ;; The second cleanup supplier must not run while the
+                       ;; first replay owns the serialized WAL/LMDB apply lock.
+                       (reset! second-during-first
+                               (deref second-entered 300 ::timeout))
+                       (cleanup record-1))))
+                  f2 (deref second-future 5000 ::timeout)
+                  result-2 (if (= ::timeout f2)
+                             ::timeout
+                             (deref f2 10000 ::timeout))]
+              (is (= ::timeout @second-during-first))
+              (is (map? result-1))
+              (is (map? result-2)
+                  (when (instance? Throwable result-2)
+                    (ex-message result-2))))
+            (s/sync-max-tx-floor!
+             target-store
+             (long (i/get-value target-kv c/meta :max-tx :attr :long)))
+            (db/refresh-cache target-store)
+            (let [target-db (db/new-db target-store)
+                  balances (mapv
+                            (fn [account-id]
+                              (:bank/balance
+                               (d/entity target-db [:bank/id account-id])))
+                            [0 1 2])
+                  account-1-eid (d/entid target-db [:bank/id 1])
+                  account-1-eav (i/get-list target-kv
+                                            c/eav
+                                            account-1-eid
+                                            :id
+                                            :avg)]
+              (is (= [95 101 104] balances))
+              (is (= 2 (count account-1-eav)))))
+          (finally
+            (d/close source-conn)
+            (when-not (d/closed? target-conn)
+              (d/close target-conn)))))
+      (finally
+        (u/delete-files source-dir)
+        (u/delete-files target-dir)))))
+
+(deftest test-wal-replay-preserves-repeated-cardinality-one-giant-updates
+  (let [source-dir (u/tmp-dir (str "wal-replay-giant-source-"
+                                   (UUID/randomUUID)))
+        target-dir (u/tmp-dir (str "wal-replay-giant-target-"
+                                   (UUID/randomUUID)))
+        schema     {:giant/key     {:db/valueType :db.type/long
+                                    :db/unique :db.unique/identity}
+                    :giant/version {:db/valueType :db.type/long}
+                    :giant/payload {:db/valueType :db.type/string}}
+        opts       {:wal? true
+                    :wal-durability-profile :strict}
+        payload    (fn [version]
+                     (apply str (take 12000 (cycle (str "payload-" version)))))]
+    (try
+      (let [source-conn (d/create-conn source-dir schema opts)
+            target-conn (d/create-conn target-dir schema opts)]
+        (try
+          (doseq [version [29 13 9]]
+            (d/transact! source-conn
+                         [{:db/id "giant-2"
+                           :giant/key 2
+                           :giant/version version
+                           :giant/payload (payload version)}]))
+          ;; Model a follower snapshot at version 29, then stream the two
+          ;; subsequent raw WAL records through the real HA replay path.
+          (d/transact! target-conn
+                       [{:db/id "giant-2"
+                         :giant/key 2
+                         :giant/version 29
+                         :giant/payload (payload 29)}])
+          (let [source-kv (.-lmdb ^Store (conn-store source-conn))
+                target-store (conn-store target-conn)
+                target-kv (.-lmdb ^Store target-store)
+                next-lsn (long @(:next-lsn (txlog/state target-kv)))
+                records (drop-while #(< (long (:lsn %)) next-lsn)
+                                    (kv/open-tx-log source-kv 1))]
+            (is (= 2 (count records)))
+            (reduce repl/apply-ha-follower-txlog-record!
+                    {:store target-store}
+                    records)
+            (db/refresh-cache target-store)
+            (let [entity (d/entity (db/new-db target-store)
+                                   [:giant/key 2])]
+              (is (= 9 (:giant/version entity)))
+              (is (= (payload 9) (:giant/payload entity)))))
           (finally
             (d/close source-conn)
             (when-not (d/closed? target-conn)

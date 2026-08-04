@@ -34,6 +34,7 @@
    datalevin.test.query-pull
    datalevin.test.query-rules
    datalevin.test.replica
+   datalevin.test.remote
    datalevin.test.spill
    datalevin.test.tuples
    datalevin.test.validation
@@ -77,6 +78,7 @@
           'datalevin.test.query-pull
           'datalevin.test.query-rules
           'datalevin.test.replica
+          'datalevin.test.remote
           'datalevin.test.spill
           'datalevin.test.tuples
           'datalevin.test.validation

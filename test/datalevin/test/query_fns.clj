@@ -964,6 +964,61 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-function-tuple-binding-unifies-existing-vars
+  (is (= #{}
+         (d/q '[:find ?item ?bad
+                :in [[?item ?bad]]
+                :where
+                [(vector ?item 4) [_ ?item]]]
+              [[1 "bad data"]])))
+  (is (= #{[1 "good data"]}
+         (d/q '[:find ?item ?data
+                :in [[?item ?data]]
+                :where
+                [(vector :ignored ?item) [_ ?item]]]
+              [[1 "good data"]])))
+  (is (= #{}
+         (d/q '[:find ?item
+                :where
+                [(identity [1 2]) [?item ?item]]])))
+  (is (= #{[1]}
+         (d/q '[:find ?item
+                :where
+                [(identity [1 1]) [?item ?item]]]))))
+
+(deftest test-nested-query-vector-vars-are-locally-scoped
+  (let [dir (u/tmp-dir (str "query-nested-q-scope-" (UUID/randomUUID)))
+        db  (d/db-with
+              (d/empty-db
+                dir
+                {:test/unrelated    {:db/valueType :db.type/string
+                                     :db/cardinality :db.cardinality/one}
+                 :test/item         {:db/valueType :db.type/ref
+                                     :db/cardinality :db.cardinality/many}
+                 :test.item/inner   {:db/valueType :db.type/long
+                                     :db/cardinality :db.cardinality/one}})
+              '[[:db/add 1 :test/unrelated "bad data"]
+                [:db/add 3 :test/item 2]
+                [:db/add 2 :test.item/inner 5]
+                [:db/add 3 :test/item 4]
+                [:db/add 4 :test.item/inner 10]])]
+    (try
+      (is (= #{}
+             (d/q '[:find ?item ?bad
+                    :where
+                    [(q [:find ?inner ?item
+                         :where
+                         [?item :test.item/inner ?inner]]
+                        $)
+                     ?list]
+                    [(sort (comp - compare) ?list) ?sorted-list]
+                    [(first ?sorted-list) [_ ?item]]
+                    [?item :test/unrelated ?bad]]
+                  db)))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest test-predicates
   (let [entities [{:db/id 1 :name "Ivan" :age 10}
                   {:db/id 2 :name "Ivan" :age 20}

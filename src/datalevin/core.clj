@@ -403,6 +403,12 @@ Only usable for debug output.
 
   In addition, when `:find` spec is a relation, `:order-by` clause is supported, which can be followed by a single variable or a vector. The vector includes one or more variables, each optionally followed by a keyword `:asc` or `:desc`, specifying ascending or descending order, respectively. The default is `:asc`. `:limit` is also supported to specify the number of tuples to be returned.
 
+  Nested queries can be used as derived relations. Bind a nested relation
+  result with a relation binding such as `[[?key ?weight]]`; its columns then
+  participate in the containing query like columns from any other relation.
+  Nested-query variables are locally scoped. An uncorrelated nested query is
+  evaluated once.
+
           Usage:
 
           ```
@@ -412,6 +418,16 @@ Only usable for debug output.
                :timeout 5000]
              db)
           ; => #{[\"pizza\"] [\"pie\"] [\"fries\"] [\"candy\"]}
+
+          (q '[:find (sum ?subtotal) .
+               :where
+               [(q [:find ?category (sum ?amount)
+                    :where
+                    [?sale :sale/category ?category]
+                    [?sale :sale/amount ?amount]]
+                   $)
+                [[?category ?subtotal]]]]
+             db)
           ```"}
   q dq/q)
 
@@ -1028,20 +1044,30 @@ Only usable for debug output.
                    [conn schema-update del-attrs rename-map])
        :doc      "Update the schema of an open connection to a Datalog db.
 
-  * `schema-update` is a map from attribute keywords to maps of corresponding
-  properties.
+  * `schema-update` is a map from attribute keywords to property patches.
+  Properties omitted from an existing attribute are preserved. Set a property
+  to `:db/retract` to remove it explicitly. The internal `:db/aid` property is
+  ignored when supplied and cannot be changed by a schema update.
 
   * `del-attrs` is a set of attributes to be removed from the schema, if there is
   no datoms associated with them, otherwise an exception will be thrown.
+  Deleting an attribute that is already absent is a no-op.
 
   * `rename-map` is a map of old attributes to new attributes, for renaming
-  attributes
+  attributes. Replaying a completed rename is a no-op. A rename fails if both
+  names exist; rename chains and cycles are rejected.
+
+  The complete operation is validated before writing and commits atomically.
+  Concurrent schema updates are serialized, so property patches compose rather
+  than overwriting one another.
 
   Return the updated schema.
 
   Example:
 
         (update-schema conn {:new/attr {:db/valueType :db.type/string}})
+        (update-schema conn {:new/attr {:db/unique :db.unique/identity}})
+        (update-schema conn {:new/attr {:db/unique :db/retract}})
         (update-schema conn {:new/attr {:db/valueType :db.type/string}}
                             #{:old/attr1 :old/attr2})
         (update-schema conn nil nil {:old/attr :new/attr}) "}

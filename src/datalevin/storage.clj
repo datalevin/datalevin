@@ -12,7 +12,7 @@
   (:refer-clojure :exclude [update assoc])
   (:require
    [datalevin.lmdb :as lmdb :refer [IWriting]]
-   [datalevin.binding.cpp]
+   [datalevin.binding.cpp :as cpp]
    [datalevin.inline :refer [update assoc]]
    [datalevin.kv :as kv]
    [datalevin.remote :as remote]
@@ -87,6 +87,31 @@
 
 (defonce ^:private shared-local-stores (atom {}))
 
+(defn- patch-attr-schema
+  [old-props property-patch]
+  (reduce-kv
+    (fn [props k v]
+      (cond
+        ;; Attribute IDs are allocated and owned by storage. Ignoring incoming
+        ;; IDs makes the result of `schema` safe to reuse as schema input.
+        (identical? k :db/aid) props
+
+        ;; A schema property is removed only when explicitly retracted.
+        (identical? v :db/retract) (dissoc props k)
+
+        :else (assoc props k v)))
+    (or old-props {})
+    property-patch))
+
+(defn- apply-schema-patch
+  [old-schema schema-update]
+  (reduce-kv
+    (fn [updates attr property-patch]
+      (assoc updates attr
+             (patch-attr-schema (old-schema attr) property-patch)))
+    {}
+    (or schema-update {})))
+
 (defn- infer-tuple-attr-types
   "Add typed tuple encoding to composite attributes whose schema only declares
   :db/tupleAttrs. Component types come from the source attributes. Attributes
@@ -96,7 +121,7 @@
   (let [full-schema (merge old-schema schema-update)]
     (reduce-kv
       (fn [updates attr props]
-        (if (and (contains? props :db/tupleAttrs)
+        (if (and (sequential? (:db/tupleAttrs props))
                  (not (contains? props :db/tupleType))
                  (not (contains? props :db/tupleTypes)))
           (let [types (mapv #(get-in full-schema [% :db/valueType])
@@ -111,6 +136,12 @@
           updates))
       (or schema-update {})
       full-schema)))
+
+(defn- prepare-schema-update
+  [old-schema schema-update]
+  (vld/validate-schema-update schema-update)
+  (infer-tuple-attr-types
+    old-schema (apply-schema-patch old-schema schema-update)))
 
 (defn- shared-local-store-key
   [dir]
@@ -243,7 +274,12 @@
       (seq missing)
       (transact-schema lmdb (update-schema now missing))))
   (when schema
-    (transact-schema lmdb (update-schema (load-schema lmdb) schema)))
+    (let [old-schema   (load-schema lmdb)
+          schema       (prepare-schema-update old-schema schema)
+          full-schema  (merge old-schema schema)]
+      (vld/validate-schema full-schema)
+      (when (schema-update-required? old-schema schema)
+        (transact-schema lmdb (update-schema old-schema schema)))))
   (load-schema lmdb))
 
 (defn- init-attrs [schema]
@@ -545,7 +581,8 @@
          ensure-embedding-vector!
          migrate-attr-values transact-opts ->SamplingWork e-sample*
          default-ratio* analyze*
-         init-idoc-domains init-idoc-indices)
+         init-idoc-domains init-idoc-indices
+         apply-schema-update! transfer-current)
 
 (defn- merge-missing-idoc-indices
   [lmdb idoc-indices schema opts]
@@ -675,31 +712,68 @@
   (rschema [_] rschema)
 
   (set-schema [this new-schema]
-    (let [new-schema (infer-tuple-attr-types schema new-schema)]
-      (when (seq new-schema)
-        (vld/validate-schema (merge schema new-schema)))
-      (doseq [[attr new] new-schema
-              :let       [old (schema attr)]
-              :when      old]
-        (check this attr old new))
-      (doseq [[attr new] new-schema
-              :let       [old (schema attr)]
-              :when      old
-              :let       [old-vt (value-type old)
-                          new-vt (value-type new)]
-              :when      (and (identical? old-vt :data)
-                              (not (identical? new-vt :data)))]
-        ;; Re-encode stored values before persisting schema change.
-        (migrate-attr-values this attr new-vt))
-      (when (schema-update-required? schema new-schema)
-        (set! schema (init-schema lmdb new-schema))
-        (set! rschema (schema->rschema schema))
-        (set! attrs (init-attrs schema))
-        (set! max-aid (init-max-aid schema))
-        (set! idoc-indices
-              (merge-missing-idoc-indices lmdb idoc-indices schema opts))
-        (mark-state-current! this (init-state-sync-ms lmdb)))
-      schema))
+    (if-not (lmdb/writing? lmdb)
+      ;; Route direct callers through the same serialized, atomic operation.
+      (datalevin.interface/set-schema this new-schema nil nil)
+      (let [new-schema (prepare-schema-update schema new-schema)]
+        (when (seq new-schema)
+          (vld/validate-schema (merge schema new-schema)))
+        (doseq [[attr new] new-schema
+                :let       [old (schema attr)]
+                :when      old]
+          (check this attr old new))
+        (doseq [[attr new] new-schema
+                :let       [old (schema attr)]
+                :when      old
+                :let       [old-vt (value-type old)
+                            new-vt (value-type new)]
+                :when      (and (identical? old-vt :data)
+                                (not (identical? new-vt :data)))]
+          ;; Re-encode stored values before persisting schema change.
+          (migrate-attr-values this attr new-vt))
+        (when (schema-update-required? schema new-schema)
+          ;; `new-schema` is already the complete effective definition for
+          ;; every updated attribute. Persist it directly so an explicitly
+          ;; retracted property is not reintroduced by applying the patch a
+          ;; second time.
+          (transact-schema lmdb (update-schema schema new-schema))
+          (set! schema (load-schema lmdb))
+          (set! rschema (schema->rschema schema))
+          (set! attrs (init-attrs schema))
+          (set! max-aid (init-max-aid schema))
+          (mark-state-current! this (init-state-sync-ms lmdb)))
+        schema)))
+
+  (set-schema [this schema-update del-attrs rename-map]
+    ;; Keep the LMDB write lock through commit and in-memory state adoption.
+    ;; The nested lock taken by with-transaction-kv is reentrant.
+    (locking (lmdb/write-txn lmdb)
+      (let [committed-state (volatile! nil)
+            result
+            (lmdb/with-transaction-kv [tx-lmdb lmdb]
+              (let [tx-store (transfer-current this tx-lmdb)
+                    result   (apply-schema-update!
+                               tx-store schema-update del-attrs rename-map)]
+                (vreset! committed-state
+                         {:schema  result
+                          :max-aid (datalevin.interface/max-aid tx-store)
+                          :max-gt  (datalevin.interface/max-gt tx-store)})
+                result))
+            {schema*  :schema
+             max-aid* :max-aid
+             max-gt*  :max-gt} @committed-state]
+        (set! schema schema*)
+        (set! rschema (schema->rschema schema*))
+        (set! attrs (init-attrs schema*))
+        (set! max-aid (max ^long max-aid ^long max-aid*))
+        (set! max-gt (max ^long max-gt ^long max-gt*))
+        ;; Opening a new idoc domain creates auxiliary DBIs, which must happen
+        ;; only after the outermost LMDB write transaction has committed.
+        (when-not (lmdb/writing? lmdb)
+          (set! idoc-indices
+                (merge-missing-idoc-indices lmdb idoc-indices schema* opts)))
+        (mark-state-current! this (init-state-sync-ms lmdb))
+        result)))
 
   (attrs [_] attrs)
 
@@ -735,32 +809,60 @@
       p))
 
   (del-attr [this attr]
-    (vld/validate-attr-deletable
-      (.populated?
-        this :ave (d/datom c/e0 attr c/v0) (d/datom c/emax attr c/vmax)))
-    (let [aid ((schema attr) :db/aid)]
-      (transact-kv
-        lmdb [(lmdb/kv-tx :del c/schema attr :attr)
-              (lmdb/kv-tx :put c/meta :last-modified
-                          (System/currentTimeMillis) :attr :long)])
-      (set! schema (dissoc schema attr))
-      (set! rschema (schema->rschema schema))
-      (set! attrs (dissoc attrs aid))
-      (mark-state-current! this (init-state-sync-ms lmdb))
-      attrs))
+    (locking (lmdb/write-txn lmdb)
+      (if-let [props (schema attr)]
+        (do
+          (vld/validate-attr-deletable
+            (.populated?
+              this :ave (d/datom c/e0 attr c/v0) (d/datom c/emax attr c/vmax)))
+          (let [aid (props :db/aid)]
+            (transact-kv
+              lmdb [(lmdb/kv-tx :del c/schema attr :attr)
+                    (lmdb/kv-tx :put c/meta :last-modified
+                                (System/currentTimeMillis) :attr :long)])
+            (set! schema (dissoc schema attr))
+            (set! rschema (schema->rschema schema))
+            (set! attrs (dissoc attrs aid))
+            (mark-state-current! this (init-state-sync-ms lmdb))
+            attrs))
+        attrs)))
 
   (rename-attr [this attr new-attr]
-    (let [props (schema attr)]
-      (transact-kv
-        lmdb [(lmdb/kv-tx :del c/schema attr :attr)
-              (lmdb/kv-tx :put c/schema new-attr props :attr)
-              (lmdb/kv-tx :put c/meta :last-modified
-                          (System/currentTimeMillis) :attr :long)])
-      (set! schema (-> schema (dissoc attr) (assoc new-attr props)))
-      (set! rschema (schema->rschema schema))
-      (set! attrs (assoc attrs (props :db/aid) new-attr))
-      (mark-state-current! this (init-state-sync-ms lmdb))
-      attrs))
+    (locking (lmdb/write-txn lmdb)
+      (let [props     (schema attr)
+            new-props (schema new-attr)]
+        (cond
+          (= attr new-attr)
+          attrs
+
+          (and props new-props)
+          (u/raise "Cannot rename attribute: target already exists"
+                   {:error     :schema/rename-conflict
+                    :attribute attr
+                    :target    new-attr})
+
+          props
+          (do
+            (transact-kv
+              lmdb [(lmdb/kv-tx :del c/schema attr :attr)
+                    (lmdb/kv-tx :put c/schema new-attr props :attr)
+                    (lmdb/kv-tx :put c/meta :last-modified
+                                (System/currentTimeMillis) :attr :long)])
+            (set! schema (-> schema (dissoc attr) (assoc new-attr props)))
+            (set! rschema (schema->rschema schema))
+            (set! attrs (assoc attrs (props :db/aid) new-attr))
+            (mark-state-current! this (init-state-sync-ms lmdb))
+            attrs)
+
+          ;; A replay after a successful rename sees only the target.
+          new-props
+          attrs
+
+          :else
+          (u/raise "Cannot rename missing attribute"
+                   {:error     :schema/missing-attribute
+                    :attribute attr
+                    :target    new-attr})))))
 
   (datom-count [_ index]
     (entries lmdb (if (string? index) index (index->dbi index))))
@@ -1653,6 +1755,181 @@
 
 (defn- check [store attr old new]
   (vld/validate-schema-mutation store (.-lmdb ^Store store) attr old new))
+
+(defn- validate-schema-operations
+  [schema-update del-attrs rename-map]
+  (vld/validate-schema-update schema-update)
+  (when-not (or (nil? del-attrs)
+                (set? del-attrs)
+                (sequential? del-attrs))
+    (u/raise "Schema attributes to delete must be a set or sequence"
+             {:error :schema/validation
+              :value del-attrs}))
+  (doseq [attr del-attrs]
+    (when-not (keyword? attr)
+      (u/raise "Schema attribute to delete must be a keyword"
+               {:error     :schema/validation
+                :attribute attr})))
+  (when-not (or (nil? rename-map) (map? rename-map))
+    (u/raise "Schema attribute renames must be a map"
+             {:error :schema/validation
+              :value rename-map}))
+  (doseq [[old new] rename-map]
+    (when-not (and (keyword? old) (keyword? new))
+      (u/raise "Schema rename attributes must be keywords"
+               {:error     :schema/validation
+                :attribute old
+                :target    new}))))
+
+(defn- normalize-schema-renames
+  [rename-map]
+  (let [renames (into {} (remove (fn [[old new]] (= old new))) rename-map)
+        targets (vec (vals renames))]
+    (when-not (= (count targets) (count (set targets)))
+      (u/raise "Schema rename targets must be unique"
+               {:error      :schema/rename-conflict
+                :rename-map rename-map}))
+    (let [sources (set (keys renames))
+          overlap (set (filter sources targets))]
+      (when (seq overlap)
+        (u/raise "Schema rename chains and cycles are not supported"
+                 {:error      :schema/rename-conflict
+                  :attributes overlap
+                  :rename-map rename-map})))
+    renames))
+
+(defn- schema-rename-plans
+  [current-schema schema-update renames]
+  (reduce-kv
+    (fn [plans old new]
+      (let [old?       (contains? current-schema old)
+            new?       (contains? current-schema new)
+            patch-old? (contains? schema-update old)]
+        (cond
+          (and old? new?)
+          (u/raise "Cannot rename attribute: target already exists"
+                   {:error     :schema/rename-conflict
+                    :attribute old
+                    :target    new})
+
+          old?
+          (conj plans {:old old :new new :canonical old :pending? true})
+
+          new?
+          (conj plans {:old old :new new :canonical new :pending? false})
+
+          patch-old?
+          (conj plans {:old old :new new :canonical old :pending? true})
+
+          :else
+          (u/raise "Cannot rename missing attribute"
+                   {:error     :schema/missing-attribute
+                    :attribute old
+                    :target    new}))))
+    [] renames))
+
+(defn- resolve-renamed-schema-patches
+  [schema-update rename-plans]
+  (let [aliases
+        (reduce
+          (fn [m {:keys [old new canonical]}]
+            (-> m (assoc old canonical) (assoc new canonical)))
+          {} rename-plans)]
+    (reduce-kv
+      (fn [resolved attr property-patch]
+        (let [canonical (get aliases attr attr)]
+          (when (contains? resolved canonical)
+            (u/raise "Schema patches resolve to the same renamed attribute"
+                     {:error     :schema/rename-conflict
+                      :attribute canonical}))
+          (assoc resolved canonical property-patch)))
+      {} schema-update)))
+
+(defn- populated-attr?
+  [store attr]
+  (populated? store :ave
+              (d/datom c/e0 attr c/v0)
+              (d/datom c/emax attr c/vmax)))
+
+(defn- plan-schema-update
+  [^Store store schema-update del-attrs rename-map]
+  (validate-schema-operations schema-update del-attrs rename-map)
+  (let [schema-update (or schema-update {})
+        deletions     (vec (set (or del-attrs [])))
+        deletion-set (set deletions)
+        renames       (normalize-schema-renames (or rename-map {}))
+        endpoints     (concat (keys renames) (vals renames))]
+    (when-let [attr (first (filter deletion-set (keys schema-update)))]
+      (u/raise "Cannot patch and delete the same schema attribute"
+               {:error     :schema/update-conflict
+                :attribute attr}))
+    (when-let [attr (first (filter deletion-set endpoints))]
+      (u/raise "Cannot delete an attribute participating in a rename"
+               {:error     :schema/update-conflict
+                :attribute attr}))
+    (let [current-schema  (schema store)
+          rename-plans   (schema-rename-plans
+                           current-schema schema-update renames)
+          resolved-update (resolve-renamed-schema-patches
+                            schema-update rename-plans)
+          prepared-update (prepare-schema-update
+                            current-schema resolved-update)]
+      ;; Check every property mutation before any value re-encoding begins.
+      (when (seq prepared-update)
+        (vld/validate-schema (merge current-schema prepared-update)))
+      (doseq [[attr new] prepared-update
+              :let       [old (current-schema attr)]
+              :when      old]
+        (check store attr old new))
+      (let [patched-schema
+            (if (seq prepared-update)
+              (merge current-schema
+                     (update-schema current-schema prepared-update))
+              current-schema)
+            deletions-to-apply
+            (filterv #(contains? patched-schema %) deletions)]
+        (doseq [attr deletions-to-apply]
+          (vld/validate-attr-deletable (populated-attr? store attr)))
+        (let [after-deletions (apply dissoc patched-schema deletions)
+              final-schema
+              (reduce
+                (fn [result {:keys [old new pending?]}]
+                  (if pending?
+                    (let [props (result old)]
+                      (when (or (nil? props) (contains? result new))
+                        (u/raise "Schema rename cannot be applied"
+                                 {:error     :schema/rename-conflict
+                                  :attribute old
+                                  :target    new}))
+                      (-> result (dissoc old) (assoc new props)))
+                    result))
+                after-deletions rename-plans)
+              renames-to-apply
+              (into {} (keep (fn [{:keys [old new pending?]}]
+                               (when pending? [old new])))
+                    rename-plans)]
+          (vld/validate-schema final-schema)
+          {:schema-update resolved-update
+           :del-attrs     deletions-to-apply
+           :rename-map    renames-to-apply
+           :final-schema  final-schema})))))
+
+(defn- apply-schema-update!
+  [store schema-update del-attrs rename-map]
+  (let [{:keys [schema-update del-attrs rename-map final-schema]}
+        (plan-schema-update store schema-update del-attrs rename-map)]
+    (datalevin.interface/set-schema store schema-update)
+    (doseq [attr del-attrs]
+      (datalevin.interface/del-attr store attr))
+    (doseq [[old new] rename-map]
+      (datalevin.interface/rename-attr store old new))
+    (let [result (schema store)]
+      (when-not (= final-schema result)
+        (u/raise "Schema update result differed from its validated plan"
+                 {:error    :schema/update-conflict
+                  :expected final-schema
+                  :actual   result}))
+      result)))
 
 (defn migrate-attr-values
   "Re-encode all datoms for `attr` from :data (untyped) to `new-vt`.
@@ -3567,6 +3844,9 @@
                (locking shared-local-stores
                  (swap! shared-local-stores
                         assoc dir-key {:store store :refs 1})))
+             (cpp/register-shutdown-close!
+               (kv/raw-lmdb lmdb)
+               #(close-store-resources! store))
              (enqueue-secondary-index-work-if-needed! store))))))))
 
 (defn- transfer-engines
@@ -3581,19 +3861,22 @@
   [indices lmdb]
   (zipmap (keys indices) (map #(idoc/transfer % lmdb) (vals indices))))
 
-(defn transfer
-  "transfer state of an existing store to a new store that has a different
-  LMDB instance"
-  [^Store old lmdb]
-  (let [schema* (schema old)]
+(defn- transfer-with-schema
+  [^Store old lmdb schema*]
+  (let [opts*         (opts old)
+        idoc-indices (transfer-idoc-indices (store-idoc-indices old) lmdb)
+        idoc-indices (if (lmdb/writing? lmdb)
+                       idoc-indices
+                       (merge-missing-idoc-indices
+                         lmdb idoc-indices schema* opts*))]
     (->Store lmdb
              (transfer-engines (.-search-engines old) lmdb)
              (transfer-indices (.-vector-indices old) lmdb)
              (transfer-indices (.-embedding-indices old) lmdb)
-             (transfer-idoc-indices (store-idoc-indices old) lmdb)
+             idoc-indices
              (.-embedding-providers old)
              (.-counts old)
-             (opts old)
+             opts*
              schema*
              (schema->rschema schema*)
              (init-attrs schema*)
@@ -3609,6 +3892,19 @@
              (.-sampling-lock old)
              false
              (.-shared-dir-key old))))
+
+(defn transfer
+  "transfer state of an existing store to a new store that has a different
+  LMDB instance"
+  [^Store old lmdb]
+  (transfer-with-schema old lmdb (schema old)))
+
+(defn- transfer-current
+  "Transfer a Store while taking its schema from the LMDB transaction. The
+  caller must hold the write lock so planning cannot race another schema
+  mutation."
+  [^Store old lmdb]
+  (transfer-with-schema old lmdb (load-schema lmdb)))
 
 (defn with-open-opts
   "Return a Store wrapper over the same open LMDB state but with different
@@ -3646,16 +3942,17 @@
         wlock (.writeLock sampling-lock)]
     (.lock wlock)
     (try
-      (.stop-sampling this)
-      (doseq [index (vals (.-vector-indices this))]
-        (when-not (vec-closed? index)
-          (close-vecs index)))
-      (doseq [index (vals (.-embedding-indices this))]
-        (when-not (vec-closed? index)
-          (close-vecs index)))
-      (doseq [provider (vals (.-embedding-providers this))]
-        (emb/close-provider provider))
-      (close-kv (.-lmdb this))
+      (when-not (closed-kv? (.-lmdb this))
+        (.stop-sampling this)
+        (doseq [index (vals (.-vector-indices this))]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [index (vals (.-embedding-indices this))]
+          (when-not (vec-closed? index)
+            (close-vecs index)))
+        (doseq [provider (vals (.-embedding-providers this))]
+          (emb/close-provider provider))
+        (close-kv (.-lmdb this)))
       (finally
         (.unlock wlock)))))
 

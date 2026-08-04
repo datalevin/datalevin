@@ -4,6 +4,7 @@
    [datalevin.conn :as conn]
    [datalevin.core :as d]
    [datalevin.jepsen.workload.bank :as bank]
+   [datalevin.jepsen.workload.grant :as grant]
    [datalevin.jepsen.workload.identity-upsert :as identity-upsert]
    [datalevin.jepsen.workload.index-consistency :as index-consistency]
    [datalevin.jepsen.workload.internal :as internal]
@@ -136,6 +137,12 @@
                      {:err-data {:type :txlog/commit-timeout
                                  :lsn 22
                                  :timeout-ms 5000}}))))
+    (is (true?
+          (workload.util/retryable-leader-conn-error?
+            (ex-info "Request to Datalevin server failed: \"Active transaction belongs to another client\""
+                     {:err-data {:error :ha/write-indeterminate
+                                 :indeterminate? true
+                                 :reason :transaction-owner-mismatch}}))))
     (is (false?
           (workload.util/retryable-leader-conn-error?
             (ex-info "definite setup failure" {:error :bad-setup}))))))
@@ -1108,6 +1115,38 @@
                   :type :info
                   :error :read-timeout
                   :bank/timeout-ms 50)
+           (:op result)))
+    (is (< (:elapsed-ms result) 1000))))
+
+(deftest grant-read-all-is-bounded-test
+  (let [started? (promise)
+        read-op  {:type :invoke
+                  :f :read-all}
+        blocking-conn
+        (reify clojure.lang.IDeref
+          (deref [_]
+            (deliver started? true)
+            (Thread/sleep 10000)
+            nil))
+        client   (grant/->Client "n1")
+        result   (with-redefs-fn
+                   {#'workload.util/*open-leader-conn*
+                    (fn [_test _schema]
+                      blocking-conn)}
+                   (fn []
+                     (binding [grant/*close-conn!* (fn [_conn] nil)
+                               grant/*read-timeout-ms* 50]
+                       (let [started-ms (System/currentTimeMillis)
+                             op         (client/invoke! client {} read-op)
+                             elapsed-ms (- (System/currentTimeMillis)
+                                           started-ms)]
+                         {:op op
+                          :elapsed-ms elapsed-ms}))))]
+    (is (deref started? 500 false))
+    (is (= (assoc read-op
+                  :type :info
+                  :error :read-timeout
+                  :grant/timeout-ms 50)
            (:op result)))
     (is (< (:elapsed-ms result) 1000))))
 

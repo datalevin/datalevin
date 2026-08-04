@@ -12,9 +12,11 @@
    [datalevin.query.execute :as qexec]
    [datalevin.query.plan :as qplan]
    [datalevin.query-optimizer :as qo]
+   [datalevin.timeout :as timeout]
    [datalevin.util :as u])
   (:import
    [clojure.lang ExceptionInfo]
+   [datalevin.utl LRUCache]
    [java.util ArrayList Collection UUID]))
 
 (use-fixtures :each db-fixture)
@@ -30,6 +32,146 @@
 (defn keep-access-id?
   [e]
   (even? e))
+
+(deftest test-sampled-link-ratio
+  (let [estimate     (deref #'qo/sampled-link-ratio)
+        estimate-map (deref #'qo/sampled-link-estimate)
+        close?   (fn [expected actual]
+                   (< (Math/abs (- (double expected) (double actual))) 1.0e-9))]
+    (binding [c/link-estimate-prior-size 100
+              c/link-estimate-var-alpha 0.4
+              c/link-estimate-conservative-lower-bound? true
+              c/link-estimate-tail-weight 10.0
+              c/magic-link-ratio        1.0]
+      (testing "stable evidence retains the sampled mean as a lower bound"
+        (is (close? 10.0
+                    (estimate {:n 100 :sum 1000.0 :sumsq 10000.0
+                               :max-val 10.0}
+                              2.0))))
+      (testing "a heavy observed fanout raises the estimate"
+        (is (close? (/ 2300.0 210.0)
+                    (estimate {:n 100 :sum 1000.0 :sumsq 10000.0
+                               :max-val 110.0}
+                              2.0))))
+      (testing "dispersion changes the prior weight behind the tail term"
+        (binding [c/link-estimate-conservative-lower-bound? false]
+          (is (close? (/ 2380.0 250.0)
+                      (estimate {:n 100 :sum 1000.0 :sumsq 20000.0
+                                 :max-val 110.0}
+                                2.0)))))
+      (testing "tail weight acts as a pseudo-count on the observed maximum"
+        (binding [c/link-estimate-tail-weight 20.0]
+          (is (close? (/ 3400.0 220.0)
+                      (estimate {:n 100 :sum 1000.0 :sumsq 10000.0
+                                 :max-val 110.0}
+                                2.0)))))
+      (testing "zero tail weight disables the tail adjustment"
+        (binding [c/link-estimate-tail-weight 0.0]
+          (is (close? 10.0
+                      (estimate {:n 100 :sum 1000.0 :sumsq 10000.0
+                                 :max-val 110.0}
+                                2.0)))))
+      (testing "production envelope bypasses shrinkage statistics"
+        (binding [c/link-estimate-policy :production
+                  c/link-estimate-conservative-lower-bound? true
+                  c/link-estimate-tail-weight 0.0
+                  c/link-estimate-prior-size ::unused
+                  c/link-estimate-var-alpha ::unused]
+          (is (close? 10.0
+                      (estimate {:n 100 :sum 1000.0} 2.0)))))
+      (testing "the durable ratio remains a conservative lower bound"
+        (is (close? 10.0
+                    (estimate {:n 100 :sum 100.0 :sumsq 100.0
+                               :max-val 1.0}
+                              10.0))))
+      (testing "symmetric shrinkage can be isolated for evaluation"
+        (binding [c/link-estimate-conservative-lower-bound? false
+                  c/link-estimate-tail-weight 0.0]
+          (is (close? 6.0
+                      (estimate {:n 100 :sum 1000.0 :sumsq 10000.0
+                                 :max-val 10.0}
+                                2.0)))))
+      (testing "the default link ratio remains a lower bound"
+        (is (close? 1.0
+                    (estimate {:n 0 :sum 0.0 :sumsq 0.0 :max-val 0.0}
+                              0.0))))
+      (testing "named policies isolate shrinkage and skew handling"
+        (let [stats {:n 100 :sum 1000.0 :sumsq 10000.0 :max-val 110.0}
+              ratio (fn [policy]
+                      (binding [c/link-estimate-policy policy]
+                        (:final-ratio (estimate-map stats 2.0))))]
+          (is (close? 10.0 (ratio :raw)))
+          (is (close? 6.0 (ratio :shrink)))
+          (is (close? (/ 2100.0 110.0) (ratio :skew)))
+          (is (close? (/ 2300.0 210.0) (ratio :shrink-skew)))
+          (is (close? (/ 2300.0 210.0) (ratio :production)))
+          (is (> (ratio :production)
+                 (max 10.0 2.0)))))
+      (testing "shrinkage moves a low mean upward toward a higher prior"
+        (binding [c/link-estimate-policy :shrink]
+          (is (close? 5.5
+                      (:final-ratio
+                        (estimate-map
+                          {:n 100 :sum 100.0 :sumsq 100.0 :max-val 1.0}
+                          10.0))))))
+      (testing "tail regularization cannot pull a shrinkage center downward"
+        (binding [c/link-estimate-policy :shrink-skew
+                  c/link-estimate-conservative-lower-bound? false]
+          (let [{:keys [center tail-adjustment]}
+                (estimate-map
+                  {:n 100 :sum 100.0 :sumsq 100.0 :max-val 1.0}
+                  10.0)]
+            (is (close? 5.5 center))
+            (is (zero? tail-adjustment)))))
+      (testing "the explicit skew policy uses the tail pseudo-count"
+        (binding [c/link-estimate-policy :skew
+                  c/link-estimate-tail-weight 20.0]
+          (is (close? (/ 3200.0 120.0)
+                      (:final-ratio
+                        (estimate-map
+                          {:n 100 :sum 1000.0 :sumsq 10000.0
+                           :max-val 110.0}
+                          2.0))))))
+      (testing "unknown policies fail instead of silently changing a condition"
+        (binding [c/link-estimate-policy :unknown]
+          (is (thrown-with-msg?
+                ExceptionInfo #"Unknown sampled link estimator policy"
+                (estimate-map {:n 1 :sum 1.0 :sumsq 1.0 :max-val 1.0}
+                              1.0))))))))
+
+(deftest query-pipe-observes-query-deadline
+  (let [tuples (doto (ArrayList.)
+                 (.add (object-array [1])))
+        input  (pipe/list-tuple-pipe tuples)]
+    (binding [timeout/*deadline* (dec (System/currentTimeMillis))]
+      (try
+        (pipe/produce input)
+        (is false "expected query timeout")
+        (catch ExceptionInfo e
+          (is (= :query/timeout (:type (ex-data e)))))))))
+
+(deftest test-streaming-plan-count
+  (let [dir  (u/tmp-dir (str "test-plan-count-" (UUID/randomUUID)))
+        conn (d/get-conn dir)
+        all  '[:find (count ?e) .
+               :where
+               [?e :person/age ?age]]
+        late '[:find (count ?e) .
+               :where
+               [?e :person/age ?age]
+               [(<= 20 ?age)]]]
+    (try
+      (d/transact! conn [{:db/id 1 :person/age 10}
+                         {:db/id 2 :person/age 20}
+                         {:db/id 3 :person/age 30}])
+      (testing "a plain optimized plan is counted without collecting results"
+        (is (= (d/q all @conn) (q/count-plan all @conn))))
+      (testing "late predicates are evaluated in bounded output batches"
+        (is (= 2 (q/count-plan late @conn)))
+        (is (= (d/q late @conn) (q/count-plan late @conn))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest test-linear-recursive-keyed-seen
   (let [conn  (d/create-conn
@@ -138,6 +280,72 @@
                (:actual-result-size uncounted)))
         (is (some #(contains? % :actual-size) (plan-maps counted)))
         (is (not-any? #(contains? % :actual-size) (plan-maps uncounted))))
+      (finally
+        (d/close conn)))))
+
+(deftest test-optimizer-estimation-ablation-switches
+  (let [conn       (d/create-conn
+                     nil
+                     {:item/category {:db/valueType :db.type/ref}}
+                     {:kv-opts {:inmemory? true}})
+        rare-query '[:find ?payload
+                     :where
+                     [?e :item/kind :rare]
+                     [?e :item/payload ?payload]
+                     [?e :item/category ?category]
+                     [?category :category/name ?category-name]]
+        common-query '[:find ?payload
+                       :where
+                       [?e :item/kind :common]
+                       [?e :item/payload ?payload]
+                       [?e :item/category ?category]
+                       [?category :category/name ?category-name]]
+        plan-maps  #(filter
+                      (fn [m]
+                        (and (map? m)
+                             (contains? m :size)
+                             (contains? m :steps)))
+                      (tree-seq coll? seq (:plan %)))
+        item-plan   #(some
+                       (fn [m]
+                         (when (re-find #":item/kind" (str (:steps m))) m))
+                       (plan-maps %))]
+    (try
+      (d/transact!
+        conn
+        (into
+          (mapv (fn [category]
+                  {:db/id category
+                   :category/name (str "category-" category)})
+                (range 101 201))
+          (mapv (fn [e]
+                  {:db/id         e
+                   :item/kind     (if (= e 10) :rare :common)
+                   :item/payload  (str "payload-" e)
+                   :item/category 101})
+                (range 1 11))))
+      (let [db       (d/db conn)
+            exact    (binding [q/*plan-cache* (LRUCache. 16)]
+                       (d/explain {:run? true} rare-query db))
+            fallback (binding [c/use-direct-predicate-counts? false
+                               q/*plan-cache*                   (LRUCache. 16)]
+                       (d/explain {:run? true} rare-query db))]
+        (is (= #{["payload-10"]} (:result exact) (:result fallback)))
+        (is (= 1 (:size (item-plan exact))))
+        (is (= 5 (:size (item-plan fallback))))
+        (is (seq (:optimizer-search exact)))
+        (is (every? #(<= (:retained-count %) (:candidate-count %))
+                    (:optimizer-search exact))))
+      (let [db         (d/db conn)
+            sampled    (binding [c/init-exec-size-threshold 1
+                                 q/*plan-cache*             (LRUCache. 16)]
+                         (d/explain {} common-query db))
+            unsampled  (binding [c/init-exec-size-threshold 1
+                                 c/use-query-local-sampling? false
+                                 q/*plan-cache*             (LRUCache. 16)]
+                         (d/explain {} common-query db))]
+        (is (= 9 (:size (item-plan sampled))))
+        (is (= 1 (:size (item-plan unsampled)))))
       (finally
         (d/close conn)))))
 

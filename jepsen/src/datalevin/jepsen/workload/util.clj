@@ -279,6 +279,7 @@
           (true? (:retryable? err-data))
           (= :txlog/commit-timeout (:type err-data))
           (= :ha/write-rejected (:error err-data))
+          (= :ha/write-indeterminate (:error err-data))
           (and (string? message)
                (some #(str/includes? message %)
                      retryable-leader-failure-markers))))))
