@@ -403,6 +403,12 @@ Only usable for debug output.
 
   In addition, when `:find` spec is a relation, `:order-by` clause is supported, which can be followed by a single variable or a vector. The vector includes one or more variables, each optionally followed by a keyword `:asc` or `:desc`, specifying ascending or descending order, respectively. The default is `:asc`. `:limit` is also supported to specify the number of tuples to be returned.
 
+  Nested queries can be used as derived relations. Bind a nested relation
+  result with a relation binding such as `[[?key ?weight]]`; its columns then
+  participate in the containing query like columns from any other relation.
+  Nested-query variables are locally scoped. An uncorrelated nested query is
+  evaluated once.
+
           Usage:
 
           ```
@@ -412,6 +418,16 @@ Only usable for debug output.
                :timeout 5000]
              db)
           ; => #{[\"pizza\"] [\"pie\"] [\"fries\"] [\"candy\"]}
+
+          (q '[:find (sum ?subtotal) .
+               :where
+               [(q [:find ?category (sum ?amount)
+                    :where
+                    [?sale :sale/category ?category]
+                    [?sale :sale/amount ?amount]]
+                   $)
+                [[?category ?subtotal]]]]
+             db)
           ```"}
   q dq/q)
 

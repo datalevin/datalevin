@@ -21,6 +21,18 @@
   (some-> timeout-in-ms
           (#(+ ^long % ^long (System/currentTimeMillis)))))
 
+(defn ^:no-doc effective-deadline
+  "Return the earliest of the currently bound deadline and a query-local
+  timeout. A nested query without its own timeout inherits its parent's
+  deadline, and an explicit nested timeout cannot extend the parent deadline."
+  [timeout-in-ms]
+  (let [local-deadline (to-deadline timeout-in-ms)]
+    (cond
+      (nil? *deadline*)     local-deadline
+      (nil? local-deadline) *deadline*
+      :else                 (min (long *deadline*)
+                                 (long local-deadline)))))
+
 (defn time-left
   "Returns the remaining timeout in milliseconds, or nil when no deadline is
   bound."

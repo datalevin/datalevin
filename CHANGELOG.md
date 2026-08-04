@@ -16,6 +16,9 @@
   targets, and conflicting patch/delete operations are rejected.
 
 ### Fixed
+- [Datalog] Nested `q` calls now inherit the containing query deadline, do not
+  corrupt `explain {:run? true}` timing state, and cannot leave stale containing
+  query results in the cache after a transaction.
 - [Datalog] preserves empty projected relations as attribute-free annihilators.
 - [Datalog] fix composite tuple `nil` regression.
 - [Datalog] prevent nested `q` leaking variables to outter `q`.
@@ -26,6 +29,8 @@
 ### Improved
 - [Datalog] LMDB shutdown hook now delgetes to store close, preventing crash due
   to stray open connection.
+- [Datalog] Nested `q` relation results are documented as derived relations,
+  allowing aggregate stages to compose within one query.
 
 ## 1.0.0 (2026-07-20)
 

@@ -45,6 +45,34 @@ predicates down to index scan methods brings more benefits.
 Datalevin query engine exploits these design choices to maximize query
 performance.
 
+## Nested Queries and Derived Relations
+
+The built-in `q` function runs a nested Datalog query. When its result is bound
+with a relation binding, the result becomes a derived relation whose columns
+can be joined and aggregated by the containing query:
+
+```clojure
+(d/q '[:find (sum ?w) .
+       :where
+       [(q [:find ?key (count ?left-row)
+            :where [?left-row :left/key ?key]]
+           $)
+        [[?key ?wl]]]
+       [(q [:find ?key (count ?right-row)
+            :where [?right-row :right/key ?key]]
+           $)
+        [[?key ?wr]]]
+       [(* ?wl ?wr) ?w]]
+     db)
+```
+
+Variables inside a nested query are locally scoped. The output binding maps
+the nested query's result columns positionally to variables in the containing
+query. An uncorrelated nested query, whose inputs contain no outer logic
+variables, is evaluated once and materialized before it is joined with other
+relations. A nested query that receives outer logic variables is correlated and
+may be evaluated once per input tuple.
+
 ## Nested Triple Storage
 
 Literal representation of triples in an index introduces significant redundant

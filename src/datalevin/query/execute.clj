@@ -690,7 +690,8 @@
 
 (defn q*
   [parsed-q inputs]
-  (binding [timeout/*deadline* (timeout/to-deadline (:qtimeout parsed-q))]
+  (binding [timeout/*deadline* (timeout/effective-deadline
+                                 (:qtimeout parsed-q))]
     (if-let [spec (and (nil? qplan/*explain*)
                        (top-k-pushdown-spec parsed-q inputs))]
       (top-k-pushdown-query parsed-q inputs spec)
@@ -704,7 +705,8 @@
 
 (defn plan-context*
   [parsed-q inputs]
-  (binding [timeout/*deadline* (timeout/to-deadline (:qtimeout parsed-q))]
+  (binding [timeout/*deadline* (timeout/effective-deadline
+                                 (:qtimeout parsed-q))]
     (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)]
       (-> (qplan/make-context parsed-q false)
           (qresolve/resolve-ins inputs)
@@ -731,7 +733,8 @@
   its final output. Late clauses are applied to bounded batches so generated
   cardinality probes do not retain the complete intermediate relation."
   [parsed-q inputs]
-  (binding [timeout/*deadline* (timeout/to-deadline (:qtimeout parsed-q))]
+  (binding [timeout/*deadline* (timeout/effective-deadline
+                                 (:qtimeout parsed-q))]
     (let [udf-db (first (filter db/-searchable? inputs))]
       (binding [built-ins/*udf-db* udf-db]
         (let [{:keys [plan sources late-clauses rels result-set] :as context}

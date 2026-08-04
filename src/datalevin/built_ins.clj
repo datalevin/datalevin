@@ -130,11 +130,14 @@
 (def ^:private query-var
   (delay
     (clojure.core/or
-      (resolve 'datalevin.query/q)
-      (requiring-resolve 'datalevin.query/q))))
+      (resolve 'datalevin.query/q-nested)
+      (requiring-resolve 'datalevin.query/q-nested))))
 
 (defn q
-  "Function. Run a nested Datalog query. E.g.
+  "Function. Run a nested Datalog query. A relation result can be bound to a
+  relation binding, allowing aggregate results to feed later query clauses.
+  An uncorrelated nested query, whose inputs contain no outer logic variables,
+  is evaluated once. E.g.
   `[(q '[:find (min ?duration)
          :where [_ :track/duration ?duration]]
       $) [[?duration]]]`"

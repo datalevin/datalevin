@@ -89,6 +89,13 @@
     (rt/q store query inputs')
     (apply perform query inputs)))
 
+(defn ^:no-doc q-nested
+  "Execute a query invoked by the query-language `q` function without sharing
+  the containing query's explain accumulator."
+  [query & inputs]
+  (binding [qplan/*explain* nil]
+    (apply q query inputs)))
+
 (defn explain
   [opts query & inputs]
   (if-let [[store inputs'] (only-remote-db inputs)]

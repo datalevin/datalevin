@@ -59,6 +59,16 @@
     (some #(= 'udf (some-> ^Function % :fn :symbol))
           (dp/collect #(instance? Function %) (:qwhere parsed-q)))))
 
+(defn- contains-nested-query?
+  "Whether a query invokes the built-in `q` function. The nested query owns its
+  result-cache entry, but the containing query cannot safely cache until cache
+  dependency analysis descends into literal nested queries."
+  [parsed-q]
+  (boolean
+    (seq (dp/collect #(and (sequential? %)
+                           (= 'q (first %)))
+                     (:qorig-where parsed-q)))))
+
 (defn- udf-cache-token
   [inputs]
   (mapv #(when (db/-searchable? %) (db/udf-cache-token %)) inputs))
@@ -145,7 +155,8 @@
 
 (defn q-result
   [parsed-q inputs]
-  (if (cache-enabled?)
+  (if (and (cache-enabled?)
+           (not (contains-nested-query? parsed-q)))
     (if-let [store (some #(when (db/-searchable? %) (.-store ^DB %)) inputs)]
       (let [parsed-q' (-> (update parsed-q :qwhere-qualified-fns
                                   qualified-fn-cache-token))
