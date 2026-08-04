@@ -108,7 +108,7 @@
           upsert-value
           (fn [a v]
             (if (txcommon/ref? db a)
-              (when-not (tempid? v)
+              (when-not (or (tempid? v) (map? v))
                 (txcommon/entid db v))
               (coreprep/correct-value-with-props options (schema a) a v)))
           validate-upsert-preds

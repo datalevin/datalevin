@@ -27,7 +27,7 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
-   [java.util Arrays HashMap HashSet IdentityHashMap List]
+   [java.util HashMap HashSet IdentityHashMap List]
    [java.util.concurrent ConcurrentHashMap]
    [datalevin.db DB]
    [datalevin.storage Store]
@@ -37,36 +37,6 @@
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:dynamic *plan-cache* (LRUCache. c/query-result-cache-size))
-
-(def ^:dynamic *link-estimate-observer*
-  "Optional function called with sampled directional fanout estimator
-  observations. Intended for controlled optimizer evaluation."
-  nil)
-
-(def ^:dynamic *cardinality-oracle*
-  "Optional function that returns an exact logical output cardinality for a
-  request map. Intended for fixed-search optimizer experiments. When bound,
-  every requested cardinality must be present so an experiment cannot silently
-  fall back to sampled estimates."
-  nil)
-
-(def cardinality-oracle-fallback
-  "Sentinel an experimental oracle may return to use the normal estimate for
-  one request. A completed fixed-search oracle should never return it."
-  ::cardinality-oracle-fallback)
-
-(defn- oracle-cardinality
-  [request]
-  (when *cardinality-oracle*
-    (let [cardinality (*cardinality-oracle* request)]
-      (if (identical? cardinality cardinality-oracle-fallback)
-        nil
-        (do
-          (when-not (and (integer? cardinality) (not (neg? cardinality)))
-            (throw
-              (ex-info "Cardinality oracle returned an invalid value"
-                       {:request request :cardinality cardinality})))
-          (long cardinality))))))
 
 (def ^:private ^:const ^long collection-input-plugin-threshold
   128)
@@ -661,59 +631,6 @@
     (let [flat (fn [k m] (map-indexed (fn [i clause] [k i clause]) m))]
       (concat (flat :bound bound) (flat :free free)))))
 
-(defn- fallback-clause-count
-  "Estimate a base clause without exposing its predicate-specific count to the
-  cost model. Attribute population counts and durable average fanout remain
-  available as coarse catalog metadata."
-  ^long [^DB db {:keys [attr val range pred]} ^long attr-count]
-  (let [estimate
-        (long
-          (cond
-            (and (nil? val) (nil? range) (nil? pred))
-            attr-count
-
-            (some? val)
-            (estimate-round (db/-default-ratio db attr))
-
-            :else
-            (estimate-round
-              (* (double attr-count)
-                 (double c/optimizer-fallback-selectivity)))))]
-    (long (max 1 (min attr-count (long estimate))))))
-
-(defn- count-node-datoms-without-direct-counts
-  [^DB db {:keys [free bound] :as node}]
-  (reduce
-    (fn [{:keys [mcount] :as node} [k i clause]]
-      (let [physical0 (fast-clause-count db nil clause Long/MAX_VALUE)
-            physical  (if (zero? physical0)
-                        (zero-count-clause-size db nil clause)
-                        physical0)]
-        (if (zero? physical)
-          (reduced (assoc node :mcount 0))
-          (let [attr-count (if (and (nil? (:val clause))
-                                    (nil? (:range clause))
-                                    (nil? (:pred clause)))
-                             physical
-                             (fast-clause-count
-                               db nil
-                               (assoc clause :val nil :range nil :pred nil)
-                               Long/MAX_VALUE))
-                estimate   (fallback-clause-count db clause attr-count)
-                node       (-> node
-                               (assoc-in [k i :count] estimate)
-                               (assoc-in [k i :physical-count] physical)
-                               (assoc-in [k i :estimate-source] :fallback))]
-            (if (< estimate ^long mcount)
-              (assoc node
-                     :mcount estimate
-                     :physical-mcount physical
-                     :mpath [k i])
-              node)))))
-    (assoc node :mcount Long/MAX_VALUE)
-    (let [flat (fn [k m] (map-indexed (fn [i clause] [k i clause]) m))]
-      (concat (flat :bound bound) (flat :free free)))))
-
 (defn- count-known-e-datoms
   [db e {:keys [free] :as node}]
   (u/reduce-indexed
@@ -734,9 +651,7 @@
   [db e node]
   (unreduced (if (int? e)
                (count-known-e-datoms db e node)
-               (if c/use-direct-predicate-counts?
-                 (count-node-datoms db node)
-                 (count-node-datoms-without-direct-counts db node)))))
+               (count-node-datoms db node))))
 
 (defn- add-back-range
   [v {:keys [pred range]}]
@@ -763,17 +678,15 @@
 
 (defn- init-steps
   [db e node single?]
-  (let [{:keys [bound free mpath mcount physical-mcount]} node
+  (let [{:keys [bound free mpath mcount]}            node
         {:keys [attr var val range pred] :as clause} (get-in node mpath)
-        physical-mcount (long (or physical-mcount mcount))
 
         know-e? (int? e)
         no-var? (or (not var) (qu/placeholder? var))
 
         init (cond-> (map->init-step
                        {:attr attr :vars [e] :out [e]
-                        :mcount (or (:physical-count clause)
-                                    (:count clause))})
+                        :mcount (:count clause)})
                var     (assoc :pred pred
                               :vars (cond-> [e]
                                       (not no-var?) (conj var))
@@ -788,14 +701,9 @@
                                   :seen-or-joins #{})))
 
                (not single?)
-               (#(cond
-                   (<= physical-mcount ^long c/init-exec-size-threshold)
-                   (assoc % :result (-execute % db nil))
-
-                   c/use-query-local-sampling?
+               (#(if (< ^long c/init-exec-size-threshold ^long mcount)
                    (assoc % :sample (-sample % db nil))
-
-                   :else %)))]
+                   (assoc % :result (-execute % db nil)))))]
     (cond-> [init]
       (< 1 (+ (count bound) (count free)))
       (conj
@@ -861,8 +769,7 @@
                     sample (let [s (.size ^List sample)]
                              (if (< 0 s)
                                (/ s (.size ^List sp1))
-                               c/magic-scan-ratio))
-                    :else c/magic-scan-ratio))))))
+                               c/magic-scan-ratio))))))))
 
 (defn- factor
   [magic ^long n]
@@ -894,16 +801,12 @@
    (let [node   (get nodes e)
          mcount (:mcount node)]
      (when-not (zero? ^long mcount)
-       (let [isteps (init-steps db e node single?)
-             size   (when-not single?
-                      (or (oracle-cardinality
-                            {:kind :subset :entities #{e}})
-                          (estimate-scan-v-size mcount isteps)))]
+       (let [isteps (init-steps db e node single?)]
          (if single?
            (make-plan isteps nil nil 0)
            (make-plan isteps
                       (estimate-base-cost node isteps)
-                      size
+                      (estimate-scan-v-size mcount isteps)
                       0)))))))
 
 (defn writing? [db] (l/writing? (.-lmdb ^Store (.-store ^DB db))))
@@ -1139,27 +1042,6 @@
       (rd/map #(av-size store attr (aget ^objects % index))
               (p/remove-end-scan tuples)))))
 
-(defn- count-init-follows-stats
-  [^DB db tuples attr index]
-  (let [store    (.-store db)
-        ^List ts (p/remove-end-scan tuples)
-        n        (.size ts)]
-    (loop [i     0
-           sum   0.0
-           sumsq 0.0
-           mx    0.0]
-      (if (< i n)
-        (let [^objects t (.get ts i)
-              f          (double (av-size store attr (aget t index)))]
-          (recur (u/long-inc i)
-                 (+ sum f)
-                 (+ sumsq (* f f))
-                 (if (> f mx) f mx)))
-        {:n       n
-         :sum     sum
-         :sumsq   sumsq
-         :max-val mx}))))
-
 (defn- count-init-follows-summary
   [^DB db tuples attr index]
   (let [store    (.-store db)
@@ -1175,29 +1057,19 @@
         {:n n
          :sum sum}))))
 
-(defn- cached-link-follow
-  [^IdentityHashMap cache tuples k collect]
+(defn- count-init-follows-summary-cached
+  "Cache count and sum by sample identity, without hashing the sample list."
+  [^DB db ^IdentityHashMap cache tuples attr index]
   (let [^HashMap entries (or (.get cache tuples)
                              (let [m (HashMap.)]
                                (.put cache tuples m)
-                               m))]
+                               m))
+        k                [::link-follow-summary attr index]]
     (if (.containsKey entries k)
       (.get entries k)
-      (let [value (collect)]
-        (.put entries k value)
-        value))))
-
-(defn- count-init-follows-stats-cached
-  "Cache exact fan-out stats by sample identity, without hashing the sample list."
-  [^DB db ^IdentityHashMap cache tuples attr index]
-  (cached-link-follow cache tuples [::link-follow-stats attr index]
-                      #(count-init-follows-stats db tuples attr index)))
-
-(defn- count-init-follows-summary-cached
-  "Cache count and sum only for the production envelope fast path."
-  [^DB db ^IdentityHashMap cache tuples attr index]
-  (cached-link-follow cache tuples [::link-follow-summary attr index]
-                      #(count-init-follows-summary db tuples attr index)))
+      (let [summary (count-init-follows-summary db tuples attr index)]
+        (.put entries k summary)
+        summary))))
 
 (defn- link-ratio-key
   [link-e {:keys [type attr attrs tgt]}]
@@ -1205,102 +1077,6 @@
     :val-eq [type (attrs link-e) (attrs tgt)]
     :_ref   [type attr]
     [type attr]))
-
-(defn- sample-fingerprint
-  ^long [^List tuples]
-  (loop [i 0
-         h (long 1)]
-    (if (< i (.size tuples))
-      (recur (inc i)
-             (unchecked-add
-               (unchecked-multiply h 31)
-               (long (Arrays/hashCode ^objects (.get tuples i)))))
-      h)))
-
-(def ^:private link-estimate-policies
-  #{:raw :shrink :skew :shrink-skew :production})
-
-(defn- production-envelope?
-  []
-  (and (= :production c/link-estimate-policy)
-       c/link-estimate-conservative-lower-bound?
-       (not (pos? (double c/link-estimate-tail-weight)))))
-
-(defn- sampled-link-estimate
-  [{:keys [^long n ^double sum ^double sumsq ^double max-val]}
-   ^double base-ratio]
-  (let [mean        (if (pos? n) (/ sum (double n)) 0.0)
-        variance    (if (pos? n)
-                      (max 0.0 (- (/ sumsq (double n)) (* mean mean)))
-                      0.0)
-        cv2         (if (pos? mean) (/ variance (* mean mean)) 0.0)
-        k-eff       (* (double c/link-estimate-prior-size)
-                       (+ 1.0 (* (double c/link-estimate-var-alpha) cv2)))
-        blended     (if (pos? (+ (double n) k-eff))
-                      (/ (+ sum (* k-eff base-ratio))
-                         (+ (double n) k-eff))
-                      base-ratio)
-        tail-weight (max 0.0 (double c/link-estimate-tail-weight))
-        raw-tail-adjustment
-        (if (pos? (+ (double n) tail-weight))
-          (/ (* tail-weight (max 0.0 (- max-val mean)))
-             (+ (double n) tail-weight))
-          0.0)
-        shrink-tail-adjustment
-        (if (pos? (+ (double n) k-eff tail-weight))
-          (/ (* tail-weight (max 0.0 (- max-val blended)))
-             (+ (double n) k-eff tail-weight))
-          0.0)
-        raw-tail    (+ mean raw-tail-adjustment)
-        shrink-tail (+ blended shrink-tail-adjustment)
-        policy      c/link-estimate-policy
-        _           (when-not (link-estimate-policies policy)
-                      (throw (ex-info "Unknown sampled link estimator policy"
-                                      {:policy policy
-                                       :supported link-estimate-policies})))
-        no-tail-center (case policy
-                         (:raw :skew) mean
-                         (:shrink :shrink-skew :production) blended)
-        center      (case policy
-                      :raw mean
-                      :shrink blended
-                      :skew raw-tail
-                      (:shrink-skew :production) shrink-tail)
-        tail-adjustment (- center no-tail-center)
-        lower-bound (if (and (= :production policy)
-                             c/link-estimate-conservative-lower-bound?)
-                      (max base-ratio mean)
-                      0.0)
-        final-ratio (max lower-bound center
-                         (double c/magic-link-ratio))]
-    {:policy       policy
-     :n            n
-     :sum          sum
-     :sumsq        sumsq
-     :max-val      max-val
-     :mean         mean
-     :variance     variance
-     :cv2          cv2
-     :base-ratio   base-ratio
-     :prior-size   (double c/link-estimate-prior-size)
-     :var-alpha    (double c/link-estimate-var-alpha)
-     :k-eff        k-eff
-     :blended      blended
-     :no-tail-center no-tail-center
-     :center       center
-     :tail-weight  tail-weight
-     :tail-adjustment tail-adjustment
-     :lower-bound  lower-bound
-     :final-ratio  final-ratio}))
-
-(defn- sampled-link-ratio
-  ^double [stats ^double base-ratio]
-  (if (production-envelope?)
-    (let [^long n      (:n stats)
-          ^double sum  (:sum stats)
-          mean         (if (pos? n) (/ sum (double n)) 0.0)]
-      (max mean base-ratio (double c/magic-link-ratio)))
-    (double (:final-ratio (sampled-link-estimate stats base-ratio)))))
 
 (defn- estimate-link-size
   [db link-e {:keys [type attr attrs tgt var]} ^ConcurrentHashMap ratios
@@ -1318,31 +1094,13 @@
     (estimate-round
       (cond
         (< 0 ssize)
-        (let [fast?      (and (production-envelope?)
-                              (nil? *link-estimate-observer*))
-              stats      (if fast?
-                           (count-init-follows-summary-cached
-                             db build-cache sample attr index)
-                           (count-init-follows-stats-cached
-                             db build-cache sample attr index))
+        (let [{:keys [^long n ^double sum]}
+              (count-init-follows-summary-cached
+                db build-cache sample attr index)
+              mean       (if (pos? n) (/ sum (double n)) 0.0)
               base-ratio (double (db/-default-ratio db attr))
-              estimate   (when-not fast?
-                           (sampled-link-estimate stats base-ratio))
-              ratio      (if fast?
-                           (sampled-link-ratio stats base-ratio)
-                           (double (:final-ratio estimate)))]
-          (when *link-estimate-observer*
-            (*link-estimate-observer*
-              (assoc estimate
-                     :ratio-key ratio-key
-                     :link-type type
-                     :attr attr
-                     :index index
-                     :sample-size ssize
-                     :population-size (:mcount (first prev-steps))
-                     :sample-fingerprint (sample-fingerprint sample)
-                     :input-size prev-size
-                     :estimated-output (* (double prev-size) ratio))))
+              ratio      (max mean base-ratio
+                              (double c/magic-link-ratio))]
           (.put ratios ratio-key ratio)
           (* (double prev-size) ratio))
 
@@ -1404,53 +1162,22 @@
         (do (.put ratios ratio-key c/magic-or-join-ratio)
             (* ^long prev-size ^double c/magic-or-join-ratio))))))
 
-(defn- plan-entities
-  [plan]
-  (set (:out (peek (:steps plan)))))
-
-(defn- oracle-link-input-size
-  "Back-compute the link output used by the unchanged physical cost model from
-  an exact logical result and the target star's exact marginal selectivity.
-  The logical DP-state cardinality is exact; this internal size preserves the
-  optimizer's existing link-then-filter cost decomposition without consulting
-  a sample."
-  [^long result-size new-base-plan]
-  (let [steps (:steps new-base-plan)]
-    (if (= 1 (count steps))
-      result-size
-      (let [^long base-input  (:mcount (first steps))
-            ^long base-output (:size new-base-plan)]
-        (if (or (zero? result-size) (zero? base-input) (zero? base-output))
-          result-size
-          (max result-size
-               (estimate-round
-                 (/ (* (double result-size) (double base-input))
-                    (double base-output)))))))))
-
 (defn- estimate-join-size
   [db sources rules link-e link ratios build-cache prev-plan index
    new-base-plan]
-  (let [prev-size   (:size prev-plan)
-        steps       (:steps new-base-plan)
-        exact-size  (oracle-cardinality
-                      {:kind     :subset
-                       :entities (conj (plan-entities prev-plan) (:tgt link))})]
+  (let [prev-size (:size prev-plan)
+        steps     (:steps new-base-plan)]
     (case (:type link)
-      :ref     [nil (or exact-size
-                        (estimate-scan-v-size prev-size steps))]
-      :or-join (if exact-size
+      :ref     [nil (estimate-scan-v-size prev-size steps)]
+      :or-join (let [or-size (estimate-or-join-size db sources rules ratios
+                                                    build-cache prev-plan
+                                                    link)]
                  ;; or-join doesn't have new-base-plan steps to merge
-                 [exact-size exact-size]
-                 (let [or-size
-                       (estimate-or-join-size db sources rules ratios
-                                              build-cache prev-plan link)]
-                   [or-size or-size]))
+                 [or-size or-size])
       ;; :_ref and :val-eq
-      (if exact-size
-        [(oracle-link-input-size exact-size new-base-plan) exact-size]
-        (let [e-size (estimate-link-size db link-e link ratios build-cache
-                                         prev-size prev-plan index)]
-          [e-size (estimate-scan-v-size e-size steps)])))))
+      (let [e-size (estimate-link-size db link-e link ratios build-cache
+                                       prev-size prev-plan index)]
+        [e-size (estimate-scan-v-size e-size steps)]))))
 
 (defn- estimate-link-cost
   [^long outer-size ^long result-size]
@@ -1521,11 +1248,8 @@
   [base-plans new-e db sources rules ratios build-cache prev-plan link
    last-step new-key link-e]
   (let [new-base  (base-plans [new-e])
-        or-size   (or (oracle-cardinality
-                        {:kind     :subset
-                         :entities (conj (plan-entities prev-plan) new-e)})
-                      (estimate-or-join-size db sources rules ratios build-cache
-                                             prev-plan link))
+        or-size   (estimate-or-join-size db sources rules ratios build-cache
+                                         prev-plan link)
         cur-steps (or-join-plan* db sources rules last-step link new-key
                                  new-base)
         or-cost   (estimate-e-plan-cost (:size prev-plan) or-size cur-steps)]
@@ -1707,26 +1431,11 @@
       [(apply min-key :cost final-plans)]
       (range (dec n-1) -1 -1))))
 
-(defn- record-optimizer-search!
-  [component round candidate-count retained-count pruned?]
-  (when-let [explain qplan/*explain*]
-    ;; Connected components may be planned concurrently.
-    (locking explain
-      (vswap! explain update :optimizer-search
-               (fnil conj [])
-               {:component-size  (count component)
-                :round           round
-                :candidate-count candidate-count
-                :retained-count  retained-count
-                :pruned?         pruned?}))))
-
 (defn- plan-component
   [db sources rules nodes incoming-link-counts required-vars component]
   (let [n (count component)]
     (if (= n 1)
-      (do
-        (record-optimizer-search! component 0 1 1 false)
-        [(base-plan db nodes (first component) true)])
+      [(base-plan db nodes (first component) true)]
       (let [base-plans (build-base-plans db nodes component)
             node-ids   (dp-node-ids component)]
         (if (some nil? (vals base-plans))
@@ -1748,15 +1457,10 @@
             (dotimes [i n-1]
               (let [plans (plans db sources rules nodes node-ids
                                  incoming-link-counts required-vars pairs
-                                 base-plans (.get tables i) ratios build-cache)
-                    candidate-count (count plans)
-                    pruned?         (< pn candidate-count)
-                    retained        (if pruned?
-                                      (shrink-space plans node-ids)
-                                      plans)]
-                (record-optimizer-search!
-                  component (inc i) candidate-count (count retained) pruned?)
-                (.add tables retained)))
+                                 base-plans (.get tables i) ratios build-cache)]
+                (if (< pn (count plans))
+                  (.add tables (shrink-space plans node-ids))
+                  (.add tables plans))))
             (trace-steps tables n-1 node-ids)))))))
 
 (def ^:private connected-components qog/connected-components)

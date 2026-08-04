@@ -23,6 +23,7 @@
 - [Datalog] fix composite tuple `nil` regression.
 - [Datalog] prevent nested `q` leaking variables to outter `q`.
 - [Datalog] proper validation of tuple bindings.
+- [Datalog] correct handling of nested map.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
 

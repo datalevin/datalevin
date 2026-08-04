@@ -294,6 +294,32 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-nested-map-through-unique-ref
+  (let [dir    (u/tmp-dir (str "nested-unique-ref-" (UUID/randomUUID)))
+        schema {:domain/name {:db/unique    :db.unique/identity
+                              :db/valueType :db.type/string}
+                :url/domain  {:db/unique    :db.unique/identity
+                              :db/valueType :db.type/ref}}
+        conn   (d/create-conn dir schema)
+        query  '[:find ?url ?domain ?path
+                 :where
+                 [?domain :domain/name "google.com"]
+                 [?url :url/domain ?domain]
+                 [?url :url/path ?path]]]
+    (try
+      (d/transact! conn [{:url/domain {:domain/name "google.com"}
+                          :url/path   "/"}])
+      (is (= 1 (count (d/q query @conn))))
+
+      (d/transact! conn [{:url/domain {:domain/name "google.com"}
+                          :url/path   "/search"}])
+      (let [rows (d/q query @conn)]
+        (is (= 1 (count rows)))
+        (is (= #{"/search"} (set (map #(nth % 2) rows)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-two-tempids-two-retries
   (let [dir      (u/tmp-dir (str "twice-" (UUID/randomUUID)))
         schema   {:name {:db/unique :db.unique/identity}

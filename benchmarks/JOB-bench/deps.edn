@@ -49,44 +49,6 @@
                                "-Dclojure.compiler.direct-linking=true"]
                    :main-opts ["-m" "datalevin-bench.core"]
                    :exec-fn   datalevin-bench.core/grid}
-           :eval  {:jvm-opts  ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                               "--enable-native-access=ALL-UNNAMED"
-                               "-Dclojure.compiler.direct-linking=true"]
-                   :main-opts ["-m" "datalevin-bench.evaluation"]
-                   :exec-fn   datalevin-bench.evaluation/run}
-           :oracle {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                               "--enable-native-access=ALL-UNNAMED"
-                               "-Dclojure.compiler.direct-linking=true"]
-                    :exec-fn datalevin-bench.cardinality-oracle/run}
-           :oracle-sql
-           {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                       "--enable-native-access=ALL-UNNAMED"
-                       "-Dclojure.compiler.direct-linking=true"]
-            :exec-fn datalevin-bench.cardinality-sql/run}
-           :analyze {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                                "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                                "--enable-native-access=ALL-UNNAMED"
-                                "-Dclojure.compiler.direct-linking=true"]
-                     :exec-fn datalevin-bench.evaluation-analysis/run}
-           :validate {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                                 "--enable-native-access=ALL-UNNAMED"
-                                 "-Dclojure.compiler.direct-linking=true"]
-                      :exec-fn datalevin-bench.evaluation-validation/run}
-           :external {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                                 "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                                 "--enable-native-access=ALL-UNNAMED"
-                                 "-Dclojure.compiler.direct-linking=true"]
-                      :exec-fn datalevin-bench.external-benchmark/run}
-           :external-analyze
-           {:jvm-opts ["--add-opens=java.base/java.nio=ALL-UNNAMED"
-                       "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
-                       "--enable-native-access=ALL-UNNAMED"
-                       "-Dclojure.compiler.direct-linking=true"]
-            :exec-fn datalevin-bench.external-analysis/run}
            :sqlite-db    {:jvm-opts  ["-Dclojure.compiler.direct-linking=true"]
                           :exec-fn   datalevin-bench.sqlite/db}
            :sqlite-bench {:jvm-opts  ["-Dclojure.compiler.direct-linking=true"]
