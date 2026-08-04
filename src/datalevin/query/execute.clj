@@ -21,6 +21,7 @@
    [datalevin.query.access :as qaccess]
    [datalevin.query.access.ave :as qave]
    [datalevin.query.access.function :as qfunction]
+   [datalevin.query.access.fulltext :as qfulltext]
    [datalevin.query.access.idoc :as qidoc]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
@@ -40,7 +41,8 @@
 (def ^:private plugin-inputs qo/plugin-inputs)
 
 (def ^:private function-access-method
-  (qfunction/access-method {:idoc qidoc/access-method}))
+  (qfunction/access-method {:fulltext qfulltext/access-method
+                            :idoc     qidoc/access-method}))
 
 (def ^:dynamic *access-methods*
   "Physical access methods considered during query planning."

@@ -189,6 +189,54 @@
     (some-> arg2 clojure.core/meta :tuple-needed)
     (some-> arg1 clojure.core/meta :tuple-needed)))
 
+(defrecord ^:no-doc FulltextRequest
+    [store lmdb engines aid->attr query opts domains needed])
+
+(defn ^:no-doc fulltext-request
+  "Normalize one fulltext invocation without executing the search. This is the
+  shared semantic boundary used by ordinary function execution and physical
+  fulltext access paths."
+  [^DB db arg1 arg2 arg3 ^ints needed]
+  (let [^Store store (.-store db)
+        engines      (.-search-engines store)
+        attr?        (keyword? arg1)
+        domains      (if attr?
+                       [(u/keyword->string arg1)]
+                       (:domains arg2))
+        query        (if attr? arg2 arg1)
+        opts         (if attr? arg3 arg2)]
+    (when attr?
+      (when-not (-> store schema arg1 :db.fulltext/autoDomain)
+        (raise ":db.fulltext/autoDomain is not true for " arg1 {})))
+    (->FulltextRequest
+      store (.-lmdb store) engines (attrs store) query opts
+      (if (seq domains) domains (keys engines)) needed)))
+
+(defn ^:no-doc execute-fulltext-request
+  "Execute a normalized fulltext request and return its compact tuples."
+  [{:keys [lmdb engines aid->attr query opts domains needed]}]
+  (let [res (FastList.)]
+    (doseq [domain domains]
+      (fulltext* res aid->attr lmdb engines query opts domain needed))
+    res))
+
+(defn ^:no-doc fulltext-request-results
+  "Return the exact logical result stream of a normalized fulltext request.
+  Search ranking uses the request's original options; tuple decoding remains
+  lazy so an access cursor can stop consuming the stream early."
+  [{:keys [lmdb engines aid->attr query opts domains needed]}]
+  (mapcat
+    (fn [domain]
+      (let [engine  (engines domain)
+            display (clojure.core/or
+                      (:display opts)
+                      (get-in engine [:search-opts :display])
+                      :refs)
+            emit    (qtuple/make-fulltext-emitter
+                      lmdb aid->attr display needed)]
+        (map emit (search engine query opts))))
+    domains))
+
 (defn fulltext
   "Function that does fulltext search. Returns matching tuples ordered by
   relevance.
@@ -234,25 +282,9 @@
   ([db arg1 arg2]
    (fulltext db arg1 arg2 nil))
   ([^DB db arg1 arg2 arg3]
-   (let [^Store store (.-store db)
-         lmdb         (.-lmdb store)
-         engines      (.-search-engines store)
-         aid->attr    (attrs store)
-         attr?        (keyword? arg1)
-         domains      (if attr?
-                        [(u/keyword->string arg1)]
-                        (:domains arg2))
-         query        (if attr? arg2 arg1)
-         opts         (if attr? arg3 arg2)
-         needed       (extract-needed arg3 arg2 arg1)]
-     (when attr?
-       (when-not (-> store schema arg1 :db.fulltext/autoDomain)
-         (raise ":db.fulltext/autoDomain is not true for " arg1
-                {})))
-     (let [res (FastList.)]
-       (doseq [domain (if (seq domains) domains (keys engines))]
-         (fulltext* res aid->attr lmdb engines query opts domain needed))
-       res))))
+   (execute-fulltext-request
+     (fulltext-request db arg1 arg2 arg3
+                       (extract-needed arg3 arg2 arg1)))))
 
 (defn fulltext-datoms
   ([db query]
