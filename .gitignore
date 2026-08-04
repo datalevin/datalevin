@@ -3,6 +3,11 @@ dtlv-test0
 dtlv-test1
 test-jar/test-jar
 benchmarks/JOB-bench/db/data.mdb
+/benchmarks/JOB-bench/db/
+/benchmarks/JOB-bench/db.bak-*/
+/benchmarks/JOB-bench/db.partial-*/
+/benchmarks/JOB-bench/db.pre-rebuild-*/
+/benchmarks/JOB-bench/results/
 benchmarks/openrulebench/data/downloaded/
 .classpath
 .dir-locals.el
@@ -93,3 +98,14 @@ bindings/javascript/*.tgz
 bindings/python/src/*.dist-info/
 bindings/python/**/__pycache__/
 bindings/python/**/*.py[cod]
+
+# CIDR paper build products (the submitted PDF and source figures are tracked).
+/doc/conference-submissions/cidr2027/auto/
+/doc/conference-submissions/cidr2027/*.aux
+/doc/conference-submissions/cidr2027/*.bbl
+/doc/conference-submissions/cidr2027/*.blg
+/doc/conference-submissions/cidr2027/*.fdb_latexmk
+/doc/conference-submissions/cidr2027/*.fls
+/doc/conference-submissions/cidr2027/*.log
+/doc/conference-submissions/cidr2027/*.out
+/doc/conference-submissions/cidr2027/scripts/__pycache__/

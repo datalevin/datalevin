@@ -1,0 +1,103 @@
+{:name :cidr-sensitivity-20261201
+ :status :frozen-before-execution
+ :exploratory? true
+ :selection
+ {:source "results/cidr-uncertainty-plan-census-deterministic-20260801/optimizer_ablation_1785309301598.csv"
+  :source-condition :raw
+  :variable-rule "Include every query with more than one Raw structural plan over the accepted 100-seed census."
+  :variable-queries
+  ["11a" "11b" "11c" "11d" "12b" "13a" "13b" "13c" "13d" "14b"
+   "15a" "15b" "15c" "15d" "18a" "18b" "19a" "19b" "19c" "21a"
+   "21b" "21c" "22a" "22b" "22d" "23a" "23b" "23c" "24a" "24b"
+   "25c" "27a" "27b" "27c" "28a" "29a" "29b" "29c" "30a" "30b"
+   "30c" "31a" "31b" "31c" "32a" "32b" "33b" "3c" "4a" "4b"
+   "4c" "5b" "7c" "8a" "8b" "9a" "9b" "9c" "9d"]
+  :stable-rule "Sort the 54 queries with one Raw structural plan, shuffle with java.util.Random(20260729), and take 20."
+  :stable-control-seed 20260729
+  :stable-controls
+  ["26c" "6f" "17a" "1c" "33a" "28c" "8d" "2d" "6a" "16c"
+   "28b" "16d" "17e" "6b" "19d" "8c" "2b" "3b" "10a" "5a"]}
+ :queries
+ ["11a" "11b" "11c" "11d" "12b" "13a" "13b" "13c" "13d" "14b"
+  "15a" "15b" "15c" "15d" "18a" "18b" "19a" "19b" "19c" "21a"
+  "21b" "21c" "22a" "22b" "22d" "23a" "23b" "23c" "24a" "24b"
+  "25c" "27a" "27b" "27c" "28a" "29a" "29b" "29c" "30a" "30b"
+  "30c" "31a" "31b" "31c" "32a" "32b" "33b" "3c" "4a" "4b"
+  "4c" "5b" "7c" "8a" "8b" "9a" "9b" "9c" "9d"
+  "26c" "6f" "17a" "1c" "33a" "28c" "8d" "2d" "6a" "16c"
+  "28b" "16d" "17e" "6b" "19d" "8c" "2b" "3b" "10a" "5a"]
+ :conditions
+ [{:name :s1000-p100-a04
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 100
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false
+   :baseline? true}
+  {:name :s250-p100-a04
+   :mode :shrink-only
+   :sample-size 250
+   :prior-size 100
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s4000-p100-a04
+   :mode :shrink-only
+   :sample-size 4000
+   :prior-size 100
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s1000-p0-a04
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 0
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s1000-p25-a04
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 25
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s1000-p400-a04
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 400
+   :variance-alpha 0.4
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s1000-p100-a0
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 100
+   :variance-alpha 0.0
+   :tail-weight 0.0
+   :conservative-lower-bound? false}
+  {:name :s1000-p100-a16
+   :mode :shrink-only
+   :sample-size 1000
+   :prior-size 100
+   :variance-alpha 1.6
+   :tail-weight 0.0
+   :conservative-lower-bound? false}]
+ :design
+ {:kind :one-factor-at-a-time
+  :reason "Avoid duplicate prior=0 × variance conditions and keep effects attributable around the frozen shrinkage setting."
+  :sample-seeds [20261201 20261202 20261203 20261204 20261205
+                 20261206 20261207 20261208 20261209 20261210]
+  :warmup-runs 1
+  :runs 10
+  :cardinality-runs 0
+  :query-timeout-ms 30000}
+ :health-gates
+ {:require-docker-stopped? true
+  :minimum-memory-free-percent 20
+  :reject-contaminated? true
+  :reject-pageouts? false}
+ :interpretation
+ {:retune-production? false
+  :note "This is post-confirmatory exploratory sensitivity. It cannot change the already reported production setting."}}

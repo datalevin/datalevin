@@ -11,6 +11,13 @@ This benchmark uses real world data set, and is extremely challenging, compared
 with other benchmarks, such as TPC series. We ported this benchmark to Datalog
 to see how Datalevin handle complex queries.
 
+## CIDR 2027 Artifact
+
+The frozen code, configurations, accepted result tables, compressed per-trial
+timings, and exact-cardinality checkpoints for the CIDR 2027 paper are indexed
+in the [artifact README](artifacts/cidr2027/README.md). The `cidr2027` tag fixes
+the paper and every artifact to the submitted version.
+
 ## Data Set
 
 The data set is originally from Internet Movie Database
