@@ -248,6 +248,64 @@
       (finally
         (d/close conn)))))
 
+(deftest test-idoc-limit-preserves-distinct-window-on-budget-fallback
+  (let [conn (d/create-conn
+               nil
+               {:doc/profile {:db/valueType :db.type/idoc
+                              :db/domain    "profiles"}
+                :doc/order   {:db/valueType :db.type/idoc
+                              :db/domain    "orders"}}
+               {:kv-opts {:inmemory? true}})
+        query
+        '[:find ?e
+          :where
+          [(idoc-match $ {:status "active"}
+             {:domains ["profiles" "orders"]}) [[?e _ _]]]
+          :offset 5
+          :limit 10]
+        events (atom [])]
+    (try
+      ;; The first eight entities occur in both domains. If the candidate
+      ;; budget ends before there are offset-plus-limit distinct projected
+      ;; rows, the adaptive executor must use the conventional fallback rather
+      ;; than return a short page.
+      (d/transact!
+        conn
+        (mapv (fn [^long e]
+                (cond-> {:db/id e
+                         :doc/order {:status "active"}}
+                  (<= e 8)
+                  (assoc :doc/profile {:status "active"})))
+              (range 1 101)))
+      (binding [q/*cache?* false]
+        (let [db       (d/db conn)
+              raw      (mapv vec
+                             (built-ins/idoc-match
+                               db {:status "active"}
+                               {:domains ["profiles" "orders"]}))
+              entities (set (map first raw))
+              explain  (d/explain {} query db)
+              actual   (binding [idoc/*trace* #(swap! events conj %)]
+                         (d/q query db))]
+          (is (= 108 (count raw)))
+          (is (= 100 (count entities)))
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-limit
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= 15
+                 (get-in explain
+                         [:preferred-access-plan :required-count])))
+          (is (= 15
+                 (get-in explain
+                         [:preferred-access-plan :candidate-budget])))
+          (is (= 10 (count actual)))
+          (is (= 10 (count (set actual))))
+          (is (every? #(contains? entities (first %)) actual))
+          (is (= 15 (reduce + 0 (keep :inspected-count @events))))
+          (is (some #(not (contains? % :inspected-count)) @events))))
+      (finally
+        (d/close conn)))))
+
 (deftest test-idoc-only-limit-selects-adaptive-access
   (let [conn (d/create-conn
                nil

@@ -313,6 +313,197 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-fulltext-top-k-matches-conventional-after-filter-and-offset
+  (let [dir  (u/tmp-dir (str "query-access-fulltext-filter-offset-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn
+               dir fulltext-schema {:search-domains {"text" {}}})
+        query
+        '[:find ?e ?score
+          :where
+          [(fulltext $ :text "red" {:top 160 :display :refs+scores})
+           [[?e _ _ ?score]]]
+          [?e :keep true]
+          :order-by [?score :desc ?e :asc]
+          :offset 3
+          :limit 7]]
+    (try
+      (d/transact! conn (fulltext-docs 160))
+      (binding [q/*cache?* false]
+        (let [db       (d/db conn)
+              expected (binding [qexec/*access-methods* []]
+                         (d/q query db))
+              explain  (d/explain {} query db)
+              actual   (d/q query db)]
+          (is (= expected actual))
+          (is (= 7 (count actual)))
+          (is (every? #(zero? (rem (long (first %)) 5)) actual))
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-top-k
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= 10
+                 (get-in explain
+                         [:preferred-access-plan :required-count])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-fulltext-top-k-deduplicates-before-offset-and-limit
+  (let [dir  (u/tmp-dir (str "query-access-fulltext-distinct-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:tags {:db/valueType   :db.type/string
+                       :db/cardinality :db.cardinality/many
+                       :db/fulltext    true
+                       :db.fulltext/autoDomain true}}
+               {:search-domains {"tags" {}}})
+        query
+        '[:find ?e ?score
+          :where
+          [(fulltext $ :tags "red"
+                     {:top 160 :display :refs+scores})
+           [[?e _ _ ?score]]]
+          :order-by [?score :desc ?e :asc]
+          :offset 5
+          :limit 10]]
+    (try
+      ;; Each entity contributes two physical search hits with the same term
+      ;; frequency and document length. Their projected [e score] rows must be
+      ;; deduplicated before the root offset and limit are applied.
+      (d/transact!
+        conn
+        (mapv (fn [e]
+                {:db/id e :tags ["red alpha" "red bravo"]})
+              (range 1 81)))
+      (binding [q/*cache?* false]
+        (let [db       (d/db conn)
+              raw      (mapv
+                         (fn [^objects tuple]
+                           [(aget tuple 0) (aget tuple 3)])
+                         (built-ins/fulltext
+                           db :tags "red"
+                           {:top 160 :display :refs+scores}))
+              expected (binding [qexec/*access-methods* []]
+                         (d/q query db))
+              explain  (d/explain {} query db)
+              actual   (d/q query db)]
+          (is (= 160 (count raw)))
+          (is (= 80 (count (set raw))))
+          (is (= expected actual))
+          (is (= 10 (count actual)))
+          (is (= 10 (count (set (map first actual)))))
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-top-k
+                 (get-in explain [:selected-plan-alternative :mode])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-fulltext-multi-domain-cursor-preserves-concatenation
+  (let [dir  (u/tmp-dir (str "query-access-fulltext-domains-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn
+               dir
+               {:left  {:db/valueType :db.type/string
+                        :db/fulltext true
+                        :db.fulltext/autoDomain true}
+                :right {:db/valueType :db.type/string
+                        :db/fulltext true
+                        :db.fulltext/autoDomain true}}
+               {:search-domains {"left" {} "right" {}}})
+        opts {:domains ["left" "right"]
+              :top 3
+              :display :refs+scores}
+        form
+        '[:find ?e ?a ?score
+          :where
+          [(fulltext $ "red"
+                     {:domains ["left" "right"]
+                      :top 3
+                      :display :refs+scores})
+           [[?e ?a _ ?score]]]]]
+    (try
+      (d/transact!
+        conn
+        (vec
+          (concat
+            (map (fn [e] {:db/id e :left (str "red left " e)})
+                 (range 1 6))
+            (map (fn [e] {:db/id e :right (str "red right " e)})
+                 (range 11 16)))))
+      (let [db       (d/db conn)
+            parsed   (dp/parse-query form)
+            method   (qfunction/access-method
+                       {:fulltext qfulltext/access-method})
+            demand   (qaccess/complete-demand :exact #{'?e '?a '?score})
+            plan     (first
+                       (qaccess/access-plans
+                         [method]
+                         {:parsed-q parsed :inputs [db] :demand demand}))
+            expected (mapv
+                       (fn [^objects tuple]
+                         [(aget tuple 0) (aget tuple 1) (aget tuple 3)])
+                       (built-ins/fulltext db "red" opts))
+            cursor   (qaccess/open-access
+                       (:path plan) demand (:bounds plan)
+                       (qaccess/access-work 2) db nil)]
+        (try
+          (let [batches (loop [batches []]
+                          (let [batch (qaccess/next-batch cursor)
+                                batches (conj batches batch)]
+                            (if (:exhausted? batch)
+                              batches
+                              (recur batches))))]
+            (is (nil? (get-in plan [:path :ordering])))
+            (is (= expected (into [] cat (map batch-rows batches))))
+            (is (= [2 2 2] (mapv qaccess/batch-work batches))))
+          (finally
+            (qaccess/close-cursor cursor))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest test-fulltext-access-preserves-text-and-offset-projection
+  (let [dir  (u/tmp-dir (str "query-access-fulltext-text-offsets-"
+                             (UUID/randomUUID)))
+        conn (d/create-conn
+               dir fulltext-schema
+               {:search-domains
+                {"text" {:include-text? true :index-position? true}}})
+        query
+        '[:find ?e ?raw-text ?offsets
+          :where
+          [(fulltext $ :text "red"
+                     {:top 40 :display :texts+offsets})
+           [[?e _ _ ?raw-text ?offsets]]]
+          :limit 4]]
+    (try
+      (d/transact! conn (fulltext-docs 40))
+      (binding [q/*cache?* false]
+        (let [db       (d/db conn)
+              expected (set
+                         (map (fn [^objects tuple]
+                                [(aget tuple 0)
+                                 (aget tuple 3)
+                                 (aget tuple 4)])
+                              (built-ins/fulltext
+                                db :text "red"
+                                {:top 40 :display :texts+offsets})))
+              explain  (d/explain {} query db)
+              actual   (d/q query db)]
+          (is (= 4 (count actual)))
+          (is (every? expected actual))
+          (is (every? (fn [[_ text offsets]]
+                        (and (string? text) (some? offsets)))
+                      actual))
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-limit
+                 (get-in explain [:selected-plan-alternative :mode])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-correlated-fulltext-stays-on-conventional-path
   (let [dir  (u/tmp-dir (str "query-access-fulltext-correlated-"
                              (UUID/randomUUID)))

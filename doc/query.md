@@ -131,20 +131,23 @@ For an AVE path, the leading order term must be the value variable of a simple
 default-source EAV pattern, and an inequality predicate must provide a scalar
 or constant range boundary in the scan direction. A single-domain `fulltext`
 clause using `:display :refs+scores` can provide the same descending property
-when the score variable is the leading order term. Aggregates, pull expressions,
-`:with`, `:having`, result maps, and other unsafe batching shapes use complete
-or normal execution.
+when the score variable is the leading order term. A single-domain
+`vec-neighbors` or `embedding-neighbors` clause using
+`:display :refs+dists` similarly provides ascending distance order. Aggregates,
+pull expressions, `:with`, `:having`, result maps, and other unsafe batching
+shapes use complete or normal execution.
 
-The optimized path walks the AVE index or fixed fulltext result stream in
-candidate batches. It replaces the covered source clause with a relation of
-candidate tuples, then executes the rest of the original query against that
-relation. Distinct result tuples are accumulated until the scan has passed the
-primary order value of the last tuple in the requested window. All candidates
-at the boundary value are evaluated before stopping, so secondary order terms
-are handled correctly. If 32 candidate batches are insufficient, execution
-falls back to the normal plan rather than allowing an unexpectedly unselective
-scan to run without a bound. `explain` also uses the normal path so its plan and
-intermediate statistics describe complete execution.
+The optimized path walks the AVE index, fixed fulltext result stream, or fixed
+approximate vector result stream in candidate batches. It replaces the covered
+source clause with a relation of candidate tuples, then executes the rest of the
+original query against that relation. Distinct result tuples are accumulated
+until the scan has passed the primary order value of the last tuple in the
+requested window. All candidates at the boundary value are evaluated before
+stopping, so secondary order terms are handled correctly. If 32 candidate
+batches are insufficient, execution falls back to the normal plan rather than
+allowing an unexpectedly unselective scan to run without a bound. `explain`
+also uses the normal path so its plan and intermediate statistics describe
+complete execution.
 
 The query result cache stores the exact ordered `:offset`/`:limit` window. Its
 key includes the complete parsed query, including the ordering and window, so
@@ -156,8 +159,9 @@ full result, and the plan cache remains independent of result-window caching.
 
 A finite unordered relation query can also avoid producing every source match
 when its driving operation exposes a resumable access path, such as an
-optimizer-selected `idoc-match` or `fulltext`. Unlike ordered limit push-down,
-this execution mode does not require or provide an ordering property.
+optimizer-selected `idoc-match`, `fulltext`, `vec-neighbors`, or
+`embedding-neighbors`. Unlike ordered limit push-down, this execution mode does
+not require or provide an ordering property.
 
 The root query retains `:offset + :limit` as its required output count while
 the access source is read in bounded batches. The remaining joins and filters

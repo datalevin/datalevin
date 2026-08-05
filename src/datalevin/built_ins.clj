@@ -297,21 +297,98 @@
          (mapv (fn [^objects t] [(aget t 0) (aget t 1) (aget t 2)])
                res))))))
 
-(defn- add-vector-neighbors!
-  [^FastList res aid->attr lmdb index query opts ^ints needed]
+(defn- vector-neighbor-results
+  [aid->attr lmdb index query opts ^ints needed]
   (let [display (or (:display opts)
                     (:display (.-search-opts
                                 ^datalevin.vector.VectorIndex index))
                     :refs)
         emit    (qtuple/make-vector-emitter
                   lmdb aid->attr display needed)]
-    (doseq [result (search-vec index query opts)]
-      (.add res (emit result)))))
+    (map emit (search-vec index query opts))))
 
-(defn- vec-neighbors*
-  [^FastList res aid->attr lmdb indices query opts domain ^ints needed]
-  (when-let [index (indices domain)]
-    (add-vector-neighbors! res aid->attr lmdb index query opts needed)))
+(defrecord ^:no-doc VectorRequest
+    [kind store lmdb indices aid->attr query opts domains needed])
+
+(defn ^:no-doc vec-neighbors-request
+  "Normalize one vector-neighbor invocation without executing its approximate
+  searches."
+  [^DB db arg1 arg2 arg3 ^ints needed]
+  (let [^Store store (.-store db)
+        indices      (.-vector-indices store)
+        attr?        (keyword? arg1)
+        domains      (if attr?
+                       [(v/attr-domain arg1)]
+                       (:domains arg2))
+        query        (if attr? arg2 arg1)
+        opts         (if attr? arg3 arg2)]
+    (when-not (and (sequential? domains) (seq domains))
+      (raise "Need a vector search domain." {}))
+    (->VectorRequest
+      :vector store (.-lmdb store) indices (attrs store) query opts
+      (vec domains) needed)))
+
+(defn ^:no-doc embedding-neighbors-request
+  "Normalize one embedding-neighbor invocation without embedding the query or
+  executing its approximate searches."
+  [^DB db arg1 arg2 arg3 ^ints needed]
+  (let [^Store store (.-store db)
+        indices      (.-embedding-indices store)
+        attr?        (keyword? arg1)
+        domains      (if attr?
+                       [(v/attr-domain arg1)]
+                       (:domains arg2))
+        query        (if attr? arg2 arg1)
+        opts         (if attr? arg3 arg2)]
+    (when attr?
+      (when-not (-> store schema arg1 :db.embedding/autoDomain)
+        (raise ":db.embedding/autoDomain is not true for " arg1 {})))
+    (when-not (string? query)
+      (raise "Embedding query must be a string" {:query query}))
+    (when-not (and (sequential? domains) (seq domains))
+      (raise "Need an embedding search domain." {}))
+    (let [domains (vec domains)
+          missing (seq (remove indices domains))]
+      (when missing
+        (raise "Embedding domain not found: " missing {:domains missing}))
+      (->VectorRequest
+        :embedding store (.-lmdb store) indices (attrs store) query opts
+        domains needed))))
+
+(defn- embedding-query-vector
+  [^Store store domain query]
+  (let [provider (st/embedding-provider store domain)]
+    (when-not provider
+      (raise "Embedding provider is not initialized" {:domain domain}))
+    (first
+      (emb/embedding provider
+                     [{:text query :kind :query :domain domain}]
+                     nil))))
+
+(defn ^:no-doc vector-request-results
+  "Return the exact logical result stream of an existing approximate vector or
+  embedding-neighbor invocation. Each domain retains its own configured top-N
+  search and the original domain concatenation order."
+  [{:keys [kind store lmdb indices aid->attr query opts domains needed]}]
+  (mapcat
+    (fn [domain]
+      (when-let [index (indices domain)]
+        (let [query-vector
+              (case kind
+                :vector    query
+                :embedding (embedding-query-vector store domain query))]
+          (vector-neighbor-results
+            aid->attr lmdb index query-vector opts needed))))
+    domains))
+
+(defn ^:no-doc execute-vector-request
+  "Materialize a normalized vector request for ordinary query-function
+  execution."
+  [request]
+  (let [res (FastList.)]
+    (doseq [tuple (vector-request-results request)]
+      (.add res tuple))
+    res))
 
 (defn vec-neighbors
   "Function that does vector similarity search. Returns matching tuples of
@@ -336,28 +413,9 @@
   ([db arg1 arg2]
    (vec-neighbors db arg1 arg2 nil))
   ([^DB db arg1 arg2 arg3]
-   (let [^Store store (.-store db)
-         lmdb         (.-lmdb store)
-         indices      (.-vector-indices store)
-         aid->attr    (attrs store)
-         attr?        (keyword? arg1)
-         domains      (if attr?
-                        [(v/attr-domain arg1)]
-                        (:domains arg2))
-         query        (if attr? arg2 arg1)
-         opts         (if attr? arg3 arg2)
-         needed       (extract-needed arg3 arg2 arg1)
-         res          (FastList.)]
-     (doseq [domain (if (and (sequential? domains) (seq domains))
-                      domains
-                      (raise "Need a vector search domain." {}))]
-       (vec-neighbors* res aid->attr lmdb indices query opts domain needed))
-     res)))
-
-(defn- embedding-neighbors*
-  [^FastList res aid->attr lmdb indices query-vector opts domain ^ints needed]
-  (when-let [index (indices domain)]
-    (add-vector-neighbors! res aid->attr lmdb index query-vector opts needed)))
+   (execute-vector-request
+     (vec-neighbors-request
+       db arg1 arg2 arg3 (extract-needed arg3 arg2 arg1)))))
 
 (defn embedding-neighbors
   "Function that does embedding similarity search over `:db/embedding` domains.
@@ -372,41 +430,9 @@
   ([db arg1 arg2]
    (embedding-neighbors db arg1 arg2 nil))
   ([^DB db arg1 arg2 arg3]
-   (let [^Store store     (.-store db)
-         lmdb             (.-lmdb store)
-         indices          (.-embedding-indices store)
-         aid->attr        (attrs store)
-         attr?            (keyword? arg1)
-         domains          (if attr?
-                            [(v/attr-domain arg1)]
-                            (:domains arg2))
-         query            (if attr? arg2 arg1)
-         opts             (if attr? arg3 arg2)
-         needed           (extract-needed arg3 arg2 arg1)
-         missing          (seq (remove indices domains))
-         res              (FastList.)]
-     (when attr?
-       (when-not (-> store schema arg1 :db.embedding/autoDomain)
-         (raise ":db.embedding/autoDomain is not true for " arg1 {})))
-     (when-not (string? query)
-       (raise "Embedding query must be a string" {:query query}))
-     (when-not (and (sequential? domains) (seq domains))
-       (raise "Need an embedding search domain." {}))
-     (when missing
-       (raise "Embedding domain not found: " missing {:domains missing}))
-     (doseq [domain domains]
-       (let [provider (st/embedding-provider store domain)]
-         (when-not provider
-           (raise "Embedding provider is not initialized"
-                  {:domain domain}))
-         (let [query-vec (first (emb/embedding provider
-                                               [{:text   query
-                                                 :kind   :query
-                                                 :domain domain}]
-                                               nil))]
-         (embedding-neighbors* res aid->attr lmdb indices query-vec opts domain
-                               needed))))
-     res)))
+   (execute-vector-request
+     (embedding-neighbors-request
+       db arg1 arg2 arg3 (extract-needed arg3 arg2 arg1)))))
 
 (defn- idoc-domain
   [store attr]

@@ -28,8 +28,7 @@
 
 ### Improved
 - [Datalog] integrating top-k access paths into cost based optimizer, covering
-  AVE scan, idoc, and full-text query functions. Vector access remains under
-  development.
+  AVE scan, idoc, full-text, and vector query functions.
 - [Datalog] LMDB shutdown hook now delgetes to store close, preventing crash due
   to stray open connection.
 - [Datalog] Nested `q` relation results are documented as derived relations,
