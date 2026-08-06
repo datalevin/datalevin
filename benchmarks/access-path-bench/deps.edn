@@ -1,0 +1,15 @@
+{:paths ["src"]
+ :deps  {datalevin/datalevin {:local/root "../.."}
+         org.clojure/clojure {:mvn/version "1.12.4"}}
+
+ :aliases
+ {:bench
+  {:jvm-opts  ["--add-opens=java.base/java.lang=ALL-UNNAMED"
+               "--add-opens=java.base/java.nio=ALL-UNNAMED"
+               "--add-opens=java.base/java.util=ALL-UNNAMED"
+               "--add-opens=java.base/sun.nio.ch=ALL-UNNAMED"
+               "--enable-native-access=ALL-UNNAMED"
+               "-Dclojure.compiler.direct-linking=true"
+               "-Xms2g"
+               "-Xmx4g"]
+   :main-opts ["-m" "access-path-bench.core"]}}}

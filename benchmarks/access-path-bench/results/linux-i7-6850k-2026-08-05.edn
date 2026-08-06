@@ -1,0 +1,149 @@
+{:host
+ {:timestamp "2026-08-05T16:00:22.382832554Z",
+  :java "21.0.10",
+  :vm "OpenJDK 64-Bit Server VM",
+  :os "Linux",
+  :os-version "6.12.73+deb13-amd64",
+  :arch "amd64",
+  :processors 12},
+ :configuration
+ {:limit 10,
+  :keep-every 10,
+  :dimensions 16,
+  :seed 42,
+  :records 20000,
+  :iterations 20,
+  :fanout 64,
+  :warmup 8,
+  :source-top 10000,
+  :workloads #{:fulltext :vector},
+  :batch-size 500},
+ :load-seconds 8.765516234,
+ :elapsed-seconds 16.692585189,
+ :results
+ [{:result-count 10,
+   :median-speedup 23.047918717589994,
+   :source-calls {:conventional 10000, :access 65},
+   :latency-ms
+   {:conventional
+    {:min 93.119099,
+     :median 95.732227,
+     :p95 102.939308,
+     :max 263.172817,
+     :mean 104.74600615,
+     :samples-ms
+     [98.899051
+      102.373469
+      97.271601
+      95.749302
+      95.774946
+      95.579628
+      95.359349
+      95.732227
+      95.080113
+      96.082892
+      95.699294
+      95.233994
+      95.190245
+      95.125785
+      95.949367
+      102.939308
+      95.978891
+      263.172817
+      94.608745
+      93.119099]},
+    :access
+    {:min 3.182431,
+     :median 4.153617,
+     :p95 5.404562,
+     :max 6.104955,
+     :mean 4.0560734,
+     :samples-ms
+     [5.404562
+      6.104955
+      4.606673
+      3.548221
+      4.509639
+      3.396082
+      4.547779
+      3.404619
+      4.250444
+      3.48668
+      4.405356
+      3.282227
+      4.23693
+      3.342902
+      4.304701
+      3.289059
+      4.153617
+      3.40347
+      4.261121
+      3.182431]}},
+   :candidate-budget 100,
+   :planned-candidate-reduction 100.0,
+   :source-top 10000,
+   :workload :fulltext,
+   :plan-mode :adaptive-top-k}
+  {:result-count 10,
+   :median-speedup 8.781887467416919,
+   :source-calls {:conventional 10000, :access 10000},
+   :latency-ms
+   {:conventional
+    {:min 102.243026,
+     :median 103.998791,
+     :p95 136.028356,
+     :max 168.561697,
+     :mean 108.84419305,
+     :samples-ms
+     [104.466051
+      104.698344
+      104.487653
+      105.554695
+      103.880834
+      102.243026
+      104.025092
+      136.028356
+      103.950015
+      102.264659
+      103.383042
+      103.432417
+      103.482049
+      104.763737
+      103.892296
+      106.156997
+      103.998791
+      168.561697
+      105.291992
+      102.322118]},
+    :access
+    {:min 10.823029,
+     :median 11.842419,
+     :p95 13.013898,
+     :max 13.191379,
+     :mean 11.967306800000001,
+     :samples-ms
+     [13.191379
+      11.199521
+      12.504796
+      10.945979
+      12.310408
+      11.476657
+      12.84737
+      11.17299
+      12.429623
+      11.428171
+      13.013898
+      11.842419
+      12.583012
+      10.823029
+      12.425846
+      11.643313
+      12.54139
+      11.389476
+      12.575257
+      11.001602]}},
+   :candidate-budget 100,
+   :planned-candidate-reduction 100.0,
+   :source-top 10000,
+   :workload :vector,
+   :plan-mode :adaptive-top-k}]}
