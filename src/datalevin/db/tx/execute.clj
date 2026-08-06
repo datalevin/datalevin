@@ -763,7 +763,11 @@
       :let [upserted-eid (when (and unique-identity?
                                     (contains? (::reverse-tempids report) e)
                                     e)
-                           (av-first-e store a v))]
+                           (or (:e (sf (.subSet
+                                        ^TreeSortedSet (:avet db)
+                                        (d/datom e0 a v tx0)
+                                        (d/datom emax a v txmax))))
+                               (av-first-e store a v)))]
 
       (and upserted-eid (not= e upserted-eid))
       (handle-reverse-tempid-upsert initial-report report entity entities

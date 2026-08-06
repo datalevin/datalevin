@@ -304,6 +304,20 @@
     (d/close-db db)
     (u/delete-files dir)))
 
+(deftest test-upsert-by-tuple-components-in-same-transaction
+  (let [dir  (u/tmp-dir (str "tuples-" (UUID/randomUUID)))
+        conn (d/create-conn
+               dir {:a+b {:db/tupleAttrs [:a :b]
+                          :db/unique     :db.unique/identity}})]
+    (d/transact! conn [{:a "A" :b "B"}
+                       {:a "A" :b "B"}])
+    (is (= #{[1 :a "A"]
+             [1 :b "B"]
+             [1 :a+b ["A" "B"]]}
+           (tdc/all-datoms (d/db conn))))
+    (d/close conn)
+    (u/delete-files dir)))
+
 (deftest test-upsert-by-tuple-components-through-reverse-ref
   (let [dir  (u/tmp-dir (str "reverse-ref-tuple-upsert-" (UUID/randomUUID)))
         conn (d/create-conn
