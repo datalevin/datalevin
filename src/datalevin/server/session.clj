@@ -16,7 +16,7 @@
    [datalevin.util :as u]
    [taoensso.timbre :as log])
   (:import
-   [java.nio.channels Selector SelectionKey]
+   [java.nio.channels ClosedSelectorException Selector SelectionKey]
    [java.util Map UUID]
    [java.util.concurrent ConcurrentHashMap]))
 
@@ -171,16 +171,23 @@
          (assoc :open-dbs (:stores m))
          (select-keys [:ip :username :roles :permissions :open-dbs]))]))
 
+(defn- open-selector-keys
+  [^Selector selector]
+  (try
+    (when (.isOpen selector)
+      (.keys selector))
+    (catch ClosedSelectorException _
+      nil)))
+
 (defn disconnect-client*
   [deps server client-id]
   (let [^Selector selector ((:selector-fn deps) server)]
-    (when (.isOpen selector)
-      (doseq [^SelectionKey k (.keys selector)
-              :let            [state (.attachment k)]
-              :when           state]
-        (when (= client-id (@state :client-id))
-          ((:cleanup-connection-transactions-fn deps) server k)
-          ((:close-conn-fn deps) k)))))
+    (doseq [^SelectionKey k (open-selector-keys selector)
+            :let            [state (.attachment k)]
+            :when           state]
+      (when (= client-id (@state :client-id))
+        ((:cleanup-connection-transactions-fn deps) server k)
+        ((:close-conn-fn deps) k))))
   (remove-client deps server client-id))
 
 (defn disconnect-user
