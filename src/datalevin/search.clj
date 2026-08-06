@@ -740,7 +740,10 @@
     (contains? search-opts k) (get search-opts k)
     :else                    default))
 
-(defn- search-page
+(defn ^:no-doc search-page
+  "Resolve the ranked window returned by one search invocation. Exposed for
+  query access planning so physical cursors can retain the search function's
+  own offset and result-count semantics."
   [opts search-opts]
   (let [opts        (or opts {})
         search-opts (or search-opts {})

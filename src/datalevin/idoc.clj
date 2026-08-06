@@ -953,34 +953,36 @@
 
 (def ^:private ^:const doc-ref-read-batch-size 512)
 
+(defn doc-refs-by-ids
+  "Return alternating document ids and document references for one bounded
+  candidate batch."
+  [^IdocIndex index doc-ids]
+  (let [refs  (FastList. (* 2 (count doc-ids)))
+        ^Lock lock (state-read-lock index)]
+    (.lock lock)
+    (try
+      (doseq [doc-id doc-ids]
+        (when-let [doc-ref (.get ^SpillableMap (.-doc-refs index) doc-id)]
+          (.add refs doc-id)
+          (.add refs doc-ref)))
+      (finally
+        (.unlock lock)))
+    refs))
+
 (defn ids-iterate-doc-refs
   [^IdocIndex index ids f]
   (let [batch-ids  (FastList.)
-        batch-refs (FastList.)
         flush!     (fn []
                      (when-not (.isEmpty batch-ids)
-                       (.clear batch-refs)
-                       (let [^Lock lock (state-read-lock index)]
-                         (.lock lock)
-                         (try
-                           (dotimes [i (.size batch-ids)]
-                             (let [doc-id  (.get batch-ids i)
-                                   doc-ref (.get ^SpillableMap
-                                                 (.-doc-refs index)
-                                                 doc-id)]
-                               (when doc-ref
-                                 (.add batch-refs doc-id)
-                                 (.add batch-refs doc-ref))))
-                           (finally
-                             (.unlock lock))))
-                       (loop [i 0
-                              n (.size batch-refs)]
-                         (when (< i n)
-                           (f (.get batch-refs i)
-                              (.get batch-refs (unchecked-inc-int i)))
-                           (recur (unchecked-add-int i 2) n)))
-                       (.clear batch-ids)
-                       (.clear batch-refs)))]
+                       (let [^FastList batch-refs
+                             (doc-refs-by-ids index batch-ids)]
+                         (loop [i 0
+                                n (.size batch-refs)]
+                           (when (< i n)
+                             (f (.get batch-refs i)
+                                (.get batch-refs (unchecked-inc-int i)))
+                             (recur (unchecked-add-int i 2) n)))
+                         (.clear batch-ids))))]
     (ids-iterate
       ids
       (fn [doc-id]
@@ -2097,6 +2099,17 @@
     (nil? ids)      0
     (b/bitmap? ids) (.getCardinality ^RoaringBitmap ids)
     :else           (count ids)))
+
+(defn doc-count
+  "Return the current number of documents in an idoc domain without preparing
+  query candidates."
+  ^long [^IdocIndex index]
+  (let [^Lock lock (state-read-lock index)]
+    (.lock lock)
+    (try
+      (.getCardinality ^RoaringBitmap (.-all-doc-ids index))
+      (finally
+        (.unlock lock)))))
 
 (defn ids-empty?
   [ids]

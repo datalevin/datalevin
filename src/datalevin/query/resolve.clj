@@ -19,6 +19,7 @@
    [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.pipe :as p]
+   [datalevin.query.tuple :as qtuple]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
    [datalevin.rules :as rules]
@@ -64,63 +65,52 @@
 (defprotocol IBinding
   ^Relation (in->rel [binding value]))
 
-(defn- bindtuple-attrs
-  "Build attr -> index map for a tuple binding. Returns nil when binding
-  contains unsupported elements or duplicate variables."
-  [^BindTuple binding]
-  (loop [i 0, bs (:bindings binding), attrs {}]
-    (if (seq bs)
-      (let [b (first bs)]
-        (cond
-          (instance? BindScalar b)
-          (let [sym (get-in b [:variable :symbol])]
-            (if (contains? attrs sym)
-              nil
-              (recur (inc i) (next bs) (assoc attrs sym i))))
-
-          (instance? BindIgnore b)
-          (recur (inc i) (next bs) attrs)
-
-          :else nil))
-      attrs)))
-
-(defn- tuple-needed-indices
-  "Returns an int array of indices that are needed (not BindIgnore) from a
-   BindTuple. Returns nil if all indices are needed."
-  [^BindTuple binding]
-  (let [bs     (:bindings binding)
-        n      (count bs)
-        needed (int-array (keep-indexed
-                            (fn [i b] (when-not (instance? BindIgnore b) i))
-                            bs))]
-    (when (< (alength needed) n)
-      needed)))
-
-(defn- compact-bindtuple-attrs
-  "Build attr -> compact index map for a tuple binding when using needed indices.
-   Maps each non-ignored variable to its position in the compact tuple."
-  [^BindTuple binding]
-  (loop [i 0, compact-i 0, bs (:bindings binding), attrs {}]
-    (if (seq bs)
-      (let [b (first bs)]
-        (cond
-          (instance? BindScalar b)
-          (let [sym (get-in b [:variable :symbol])]
-            (if (contains? attrs sym)
-              nil
-              (recur (inc i) (inc compact-i) (next bs)
-                     (assoc attrs sym compact-i))))
-
-          (instance? BindIgnore b)
-          (recur (inc i) compact-i (next bs) attrs)
-
-          :else nil))
-      attrs)))
-
 (def tuple-producing-fns
   "Set of function symbols that produce tuples and can benefit from
-   knowing which indices are needed."
+  knowing which indices are needed."
   #{'fulltext 'idoc-match 'vec-neighbors 'embedding-neighbors})
+
+(defn- tuple-list->rel
+  [binding ^List tuples
+   {:keys [attrs source-attrs needed source-width output-width]}]
+  (let [size         (.size tuples)
+        source-width (long source-width)
+        output-width (long output-width)]
+    (if (zero? size)
+      (empty-rel binding)
+      (let [t0 (.get tuples 0)]
+        (if (u/array? t0)
+          (let [^objects t0 t0]
+            (when (< (alength t0) source-width)
+              (raise "Not enough elements in a collection " tuples
+                     " to bind tuple " (dp/source binding)
+                     {:error   :query/binding
+                      :value   tuples
+                      :binding (dp/source binding)}))
+            (r/relation! source-attrs tuples))
+          (let [^ints src-idxs
+                (or needed (int-array (range source-width)))
+                res (FastList. size)]
+            (dotimes [i size]
+              (let [row (.get tuples i)]
+                (when-not (u/seqable? row)
+                  (raise "Cannot bind value " row " to tuple "
+                         (dp/source (:binding binding))
+                         {:error   :query/binding
+                          :value   row
+                          :binding (dp/source (:binding binding))}))
+                (when (< (count row) source-width)
+                  (raise "Not enough elements in a collection " row
+                         " to bind tuple "
+                         (dp/source (:binding binding))
+                         {:error   :query/binding
+                          :value   row
+                          :binding (dp/source (:binding binding))}))
+                (let [tuple (object-array output-width)]
+                  (dotimes [j output-width]
+                    (aset tuple j (nth row (aget src-idxs j))))
+                  (.add res tuple))))
+            (r/relation! attrs res)))))))
 
 (extend-protocol IBinding
   BindIgnore
@@ -150,56 +140,9 @@
 
       (and (instance? java.util.List coll)
            (instance? BindTuple (:binding binding)))
-      (if-let [attrs (bindtuple-attrs (:binding binding))]
-        (let [^List tuples coll
-              size        (.size tuples)]
-          (if (zero? size)
-            (empty-rel binding)
-            (let [t0 (.get tuples 0)]
-              (if (u/array? t0)
-                (let [^objects t0 t0
-                      needed     (count (:bindings (:binding binding)))]
-                  (when (< (alength t0) needed)
-                    (raise "Not enough elements in a collection " coll
-                           " to bind tuple " (dp/source binding)
-                           {:error   :query/binding
-                            :value   coll
-                            :binding (dp/source binding)}))
-                  (r/relation! attrs tuples))
-                (if-let [compact-attrs
-                         (compact-bindtuple-attrs (:binding binding))]
-                  (let [bindings (:bindings (:binding binding))
-                        width    (count bindings)
-                        ^ints src-idxs
-                        (int-array
-                          (keep-indexed
-                            (fn [i b]
-                              (when-not (instance? BindIgnore b) i))
-                            bindings))
-                        out-size (alength src-idxs)
-                        res      (FastList. size)]
-                    (dotimes [i size]
-                      (let [row (.get tuples i)]
-                        (when-not (u/seqable? row)
-                          (raise "Cannot bind value " row " to tuple "
-                                 (dp/source (:binding binding))
-                                 {:error   :query/binding
-                                  :value   row
-                                  :binding (dp/source (:binding binding))}))
-                        (when (< (count row) width)
-                          (raise "Not enough elements in a collection " row
-                                 " to bind tuple "
-                                 (dp/source (:binding binding))
-                                 {:error   :query/binding
-                                  :value   row
-                                  :binding (dp/source (:binding binding))}))
-                        (let [tuple (object-array out-size)]
-                          (dotimes [j out-size]
-                            (aset tuple j (nth row (aget src-idxs j))))
-                          (.add res tuple))))
-                    (r/relation! compact-attrs res))
-                  (transduce (map #(in->rel (:binding binding) %))
-                             r/sum-rel coll))))))
+      (if-let [projection
+               (qtuple/tuple-binding-projection (:binding binding))]
+        (tuple-list->rel binding coll projection)
         (transduce (map #(in->rel (:binding binding) %)) r/sum-rel coll))
 
       :else
@@ -770,7 +713,7 @@
                                    right-tuple right-idxs)))))))
 
 (defn- bind-coll-tuples
-  [production binding needed tuple-fn]
+  [production binding projection needed tuple-fn]
   (let [^List tuples (:tuples production)
         size         (.size tuples)
         initial-res  (FastList. size)]
@@ -780,11 +723,16 @@
               val   (tuple-fn tuple)]
           (if (nil? val)
             (recur (unchecked-inc-int i) product-plan res)
-            (let [bound-rel (if needed
-                              (r/relation!
-                                (compact-bindtuple-attrs (:binding binding))
-                                val)
-                              (in->rel binding val))
+            (let [bound-rel
+                  (cond
+                    needed
+                    (r/relation! (:attrs projection) val)
+
+                    (and projection (instance? java.util.List val))
+                    (tuple-list->rel binding val projection)
+
+                    :else
+                    (in->rel binding val))
                   bound-attrs (:attrs bound-rel)]
               (if (or (nil? product-plan)
                       (= (aget product-plan 0) bound-attrs))
@@ -812,9 +760,12 @@
         binding              (dp/parse-binding out)
         tuple-bind?          (and (instance? BindColl binding)
                                   (instance? BindTuple (:binding binding)))
-        needed               (when (and tuple-bind?
+        projection           (when tuple-bind?
+                               (qtuple/tuple-binding-projection
+                                 (:binding binding)))
+        needed               (when (and projection
                                         (contains? tuple-producing-fns f))
-                               (tuple-needed-indices (:binding binding)))
+                               (:needed projection))
         args'                (if needed
                                (attach-needed-meta args needed)
                                args)
@@ -837,7 +788,8 @@
           (let [tuple-fn (-call-fn context production f args')]
             (if (instance? BindScalar binding)
               (bind-scalar-tuples production out-var tuple-fn)
-              (bind-coll-tuples production binding needed tuple-fn))))]
+              (bind-coll-tuples
+                production binding projection needed tuple-fn))))]
     (update context :rels collapse-rels new-rel)))
 
 (defn dynamic-lookup-attrs

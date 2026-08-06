@@ -155,6 +155,35 @@ v]` triples.
      {:status "active" :profile {:age 30}})
 ```
 
+#### Limit and offset
+
+Finite relation queries that use `idoc-match` can use query-level `:limit` and
+`:offset`:
+
+```clojure
+(d/q '[:find ?e
+       :where
+       [(idoc-match $ :doc/edn {:status "active"}) [[?e _ _]]]
+       :offset 100
+       :limit 20]
+     db)
+```
+
+For eligible queries, the optimizer can scan idoc matches incrementally and
+stop after enough distinct final result tuples survive the remaining joins and
+filters. `:offset` and `:limit` apply to those final tuples, not directly to the
+raw idoc candidates. Datalevin fetches additional candidate batches when the
+remaining clauses filter out earlier matches.
+
+This is a cost-based optimization rather than a different query mode.
+Unbounded queries, queries whose shape cannot be evaluated safely in batches,
+or plans for which the access path is not estimated to help use conventional
+execution. If bounded execution reaches its work budget, it falls back to the
+conventional plan without changing the query semantics.
+
+Idoc access does not define a result order. Without `:order-by`, the returned
+window has no ordering guarantee.
+
 #### Nested maps and arrays
 
 Map values can be nested maps. Vectors are treated as arrays: a match succeeds

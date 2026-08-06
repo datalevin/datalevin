@@ -21,10 +21,12 @@
    [datalevin.parser :as dp]
    [datalevin.query.optimizer.graph :as qog]
    [datalevin.pipe :as p]
+   [datalevin.query.access :as qaccess]
    [datalevin.query.optimizer.range :as qor]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
+   [datalevin.relation :as r]
    [datalevin.util :as u :refer [cond+ raise conjv concatv map+]])
   (:import
    [java.util HashMap HashSet IdentityHashMap List]
@@ -90,7 +92,8 @@
 (defn- plan-cache ^LRUCache []
   *plan-cache*)
 
-(declare estimate-hash-join-cost)
+(declare access-clause-deps access-clause-ready?
+         estimate-hash-join-cost estimate-link-cost)
 
 ;; optimizer
 
@@ -540,7 +543,7 @@
      :or-join-link qresolve/->OrJoinLink}
     context))
 
-(defn- estimate-round [x]
+(defn- estimate-round ^long [x]
   (let [v (Math/ceil (double x))]
     (if (>= v (double Long/MAX_VALUE))
       Long/MAX_VALUE
@@ -614,6 +617,640 @@
       (some? val) (av-size store attr val)
       range       (range-count db attr range mcount)
       :else       (db/-count db [nil attr nil] mcount))))
+
+(defn- adjusted-scan-ratio
+  ^double
+  [^long input-size ^long output-size]
+  (if (and (pos? input-size) (pos? output-size))
+    (/ (double output-size) input-size)
+    (double c/magic-scan-ratio)))
+
+(defn- access-join-candidate
+  [db access-source covered clause-idx clause]
+  (when (and (not (contains? covered clause))
+             (instance? Pattern clause)
+             (= (or (qaccess/source-symbol access-source) '$)
+                (clause-source-symbol (:source ^Pattern clause))))
+    (let [pattern (:pattern ^Pattern clause)]
+      (when (= 3 (count pattern))
+        (let [e    (nth pattern 0)
+              a    (nth pattern 1)
+              v    (nth pattern 2)
+              attr (when (instance? Constant a) (:value ^Constant a))
+              evar (when (instance? Variable e) (:symbol ^Variable e))
+              vvar (when (instance? Variable v) (:symbol ^Variable v))]
+          (when (and evar (keyword? attr))
+            (let [val  (when (instance? Constant v) (:value ^Constant v))
+                  rows (fast-clause-count db nil {:attr attr :val val}
+                                          Long/MAX_VALUE)]
+              {:clause-idx clause-idx
+               :clause     clause
+               :attr       attr
+               :entity-var evar
+               :value-var  vvar
+               :cols       (cond-> [evar] vvar (conj vvar))
+               :vars       (cond-> #{evar} vvar (conj vvar))
+               :rows       rows})))))))
+
+(defn- eligible-access-join
+  [bound {:keys [entity-var value-var] :as join}]
+  (let [entity-bound? (contains? bound entity-var)
+        value-bound?  (and value-var (contains? bound value-var))]
+    (when (or entity-bound? value-bound?)
+      join)))
+
+(defn- access-join-candidates
+  [db parsed-q {:keys [expr]}]
+  (into []
+        (keep-indexed
+          #(access-join-candidate
+             db (:source expr) (:covers expr) %1 %2))
+        (:qwhere parsed-q)))
+
+(defn- access-join-from-bound
+  [bound {:keys [cols vars rows] :as candidate}]
+  (when-let [join (eligible-access-join bound candidate)]
+    (-> join
+        (dissoc :entity-var :value-var :vars :rows)
+        (assoc :requires (set/intersection bound vars)
+               :produces (set/difference vars bound)
+               :produces-cols (into [] (remove bound) cols)
+               :estimate {:rows rows
+                          :confidence :medium}))))
+
+(defn- order-access-joins
+  [db parsed-q {:keys [expr] :as plan}]
+  (let [initial-bound (into (:requires expr)
+                            (filter qu/binding-var?)
+                            (:cols expr))
+        candidates    (access-join-candidates db parsed-q plan)]
+    (loop [bound     initial-bound
+           candidates candidates
+           joins      []]
+      (let [eligible (keep #(eligible-access-join bound %) candidates)]
+        (if (seq eligible)
+          (let [{:keys [clause-idx vars] :as chosen}
+                (apply min-key :rows eligible)
+                join (access-join-from-bound bound chosen)]
+            (recur (into bound vars)
+                   (filterv #(not= clause-idx (:clause-idx %)) candidates)
+                   (conj joins join)))
+          joins)))))
+
+(defn- input-bound-vars
+  [parsed-q inputs]
+  (qresolve/bound-vars
+    (qresolve/resolve-ins (qplan/make-context parsed-q false) inputs)))
+
+(defn- order-correlated-bindings
+  [db parsed-q inputs {:keys [expr]}]
+  (let [required   (set (:requires expr))
+        input-bound (set (input-bound-vars parsed-q inputs))
+        candidates
+        (into []
+              (keep-indexed
+                (fn [i clause]
+                  (let [orig-clause (nth (:qorig-where parsed-q) i)]
+                    (when-not
+                      (or (contains? (:covers expr) clause)
+                          (contains? (:covered-originals expr) orig-clause))
+                      (let [pattern
+                            (access-join-candidate
+                              db (:source expr) #{} i clause)
+                            deps (access-clause-deps orig-clause)
+                            vars (set/union
+                                   (set (:requires deps))
+                                   (set (:requires-any deps))
+                                   (set (:provides deps)))]
+                        (assoc deps
+                               :clause-idx i
+                               :clause clause
+                               :orig-clause orig-clause
+                               :vars vars
+                               :rows (long
+                                       (or (:rows pattern)
+                                           Long/MAX_VALUE))))))))
+              (:qwhere parsed-q))
+        needed
+        (loop [needed required]
+          (let [needed'
+                (reduce
+                  (fn [needed {:keys [requires provides]}]
+                    (if (seq (set/intersection needed (set provides)))
+                      (into needed requires)
+                      needed))
+                  needed candidates)]
+            (if (= needed needed')
+              needed
+              (recur needed'))))]
+    (loop [bound      input-bound
+           candidates candidates
+           outer      []]
+      (if (qaccess/access-ready? expr bound)
+        {:outer-joins outer
+         :outer-cols  (vec
+                        (sort-by str
+                                 (set/union required
+                                            (into #{} (mapcat :vars) outer))))}
+        (let [eligible
+              (filter
+                (fn [{:keys [provides] :as candidate}]
+                  (and (access-clause-ready? bound candidate)
+                       (seq (set/intersection
+                              (set provides)
+                              (set/difference needed bound)))))
+                candidates)]
+          (when (seq eligible)
+            (let [chosen (apply min-key :rows eligible)]
+              (recur (into bound (:provides chosen))
+                     (filterv #(not= (:clause-idx chosen)
+                                     (:clause-idx %))
+                              candidates)
+                     (conj outer chosen)))))))))
+
+(defn schedule-correlated-access
+  "Schedule a correlated access source after a bounded outer subset has
+   produced every variable in AccessExpr.requires. Returns nil when no safe
+   outer subset can provide the requirements."
+  [db parsed-q inputs
+   {:keys [expr path demand bounds work access-source] :as plan}]
+  (when (satisfies? qaccess/ICorrelatedAccessMethod
+                    (:implementation path))
+    (when-let [{:keys [outer-cols] :as schedule}
+               (order-correlated-bindings db parsed-q inputs plan)]
+      (let [finite-rows (keep (fn [{:keys [rows]}]
+                                (when (< (long rows) Long/MAX_VALUE)
+                                  (long rows)))
+                              (:outer-joins schedule))
+            minimum    (long (or (when (seq finite-rows)
+                                   (apply min finite-rows))
+                                 1))
+            outer-rows (max 1 minimum)
+            outer-cost (* (double outer-rows)
+                          (double (max 1
+                                       (count (:outer-joins schedule)))))]
+        (merge plan schedule
+               {:correlated? true
+                :outer-estimate {:rows outer-rows
+                                 :cost outer-cost
+                                 :confidence :medium}
+                :step (qplan/access-step
+                        expr path demand bounds work outer-cols
+                        access-source)})))))
+
+(defn- access-join-pattern
+  [parsed-q clause-idx]
+  (let [pattern (nth (:qorig-where parsed-q) clause-idx)]
+    (if (and (vector? pattern) (qu/source? (first pattern)))
+      (subvec pattern 1)
+      pattern)))
+
+(defn- sample-relation-projection-count
+  [find-vars {:keys [attrs tuples]}]
+  (let [projected (filterv #(contains? attrs %) find-vars)]
+    (cond
+      (.isEmpty ^List tuples) 0
+      (empty? projected)       1
+      :else
+      (count
+        (into #{}
+              (map (fn [^objects tuple]
+                     (mapv #(aget tuple (long (attrs %))) projected)))
+              tuples)))))
+
+(defn- sampled-access-output
+  [parsed-q relations]
+  (let [find-vars (dp/find-vars (:qfind parsed-q))]
+    (reduce
+      (fn [n relation]
+        (estimate-round
+          (* (double n)
+             (double
+               (sample-relation-projection-count find-vars relation)))))
+      1 relations)))
+
+(defn- sample-context-size
+  [relations]
+  (reduce
+    (fn [n relation]
+      (estimate-round
+        (* (double n) (.size ^List (:tuples relation)))))
+    1 relations))
+
+(defn- access-sample-relation
+  [context access-var]
+  (some #(when (contains? (:attrs %) access-var) %)
+        (:rels context)))
+
+(defn- access-clause-vars
+  [form]
+  (into #{} (filter qu/binding-var?) (qu/collect-vars form)))
+
+(defn- access-clause-deps
+  [clause]
+  (let [clause (if (and (sequential? clause)
+                        (qu/source? (first clause)))
+                 (next clause)
+                 clause)
+        head   (when (sequential? clause) (first clause))]
+    (cond
+      (and (sequential? head) (= 1 (count clause)))
+      {:requires (access-clause-vars head)}
+
+      (and (sequential? head) (= 2 (count clause)))
+      {:requires (access-clause-vars head)
+       :provides (access-clause-vars (second clause))}
+
+      (= 'not head)
+      {:requires-any (access-clause-vars (next clause))}
+
+      (= 'not-join head)
+      {:requires (access-clause-vars (second clause))}
+
+      (= 'or-join head)
+      (let [vars-form (second clause)
+            req-form  (when (and (sequential? vars-form)
+                                 (sequential? (first vars-form)))
+                        (first vars-form))]
+        {:requires (access-clause-vars req-form)
+         :provides (access-clause-vars vars-form)})
+
+      :else
+      {:provides (access-clause-vars clause)})))
+
+(defn- access-clause-ready?
+  [bound {:keys [requires requires-any]}]
+  (and (every? bound requires)
+       (or (empty? requires-any)
+           (some bound requires-any))))
+
+(defn- order-access-residuals
+  [bound entries]
+  (let [entries (mapv #(merge % (access-clause-deps (:orig-clause %)))
+                      entries)]
+    (loop [bound bound
+           todo  entries
+           acc   []]
+      (if (empty? todo)
+        acc
+        (if-let [idx (first
+                       (keep-indexed
+                         (fn [i entry]
+                           (when (access-clause-ready? bound entry) i))
+                         todo))]
+          (let [entry (nth todo idx)]
+            (recur (into bound (:provides entry))
+                   (u/vec-remove todo idx)
+                   (conj acc entry)))
+          ;; Preserve query order for clauses whose dependencies require
+          ;; runtime rule/or semantics that this lightweight sorter cannot
+          ;; prove. Resolution will still enforce binding correctness.
+          (into acc todo))))))
+
+(defn- residual-operation
+  [clause]
+  (cond
+    (instance? Pattern clause)   :indexed-join
+    (instance? Predicate clause) :predicate
+    (instance? Function clause)  :function
+    (instance? Not clause)       :not
+    (instance? Or clause)        :or
+    (instance? RuleExpr clause)  :rule
+    :else                        :residual))
+
+(defn- sample-safe-residual?
+  [clause]
+  ;; Query-input functions can be effectful and have no estimator contract.
+  ;; Account for their evaluation cost, but leave their selectivity unknown
+  ;; until adaptive execution observes it.
+  (not (and (or (instance? Predicate clause)
+                (instance? Function clause))
+            (instance? Variable (:fn clause)))))
+
+(defn- access-residual-entries
+  [parsed-q step joins]
+  (let [covered-clauses (or (get-in step [:expr :covers]) #{})
+        covered-originals
+        (or (get-in step [:expr :covered-originals]) #{})
+        joined (into #{} (map :clause-idx) joins)]
+    (into []
+          (keep-indexed
+            (fn [i [clause orig-clause]]
+              (when-not (or (joined i)
+                            (contains? covered-clauses clause)
+                            (contains? covered-originals orig-clause))
+                {:clause-idx i
+                 :clause clause
+                 :orig-clause orig-clause})))
+          (map vector (:qwhere parsed-q) (:qorig-where parsed-q)))))
+
+(defn- sample-access-residuals
+  [parsed-q context step joins stages]
+  (let [bound   (qresolve/bound-vars context)
+        entries (order-access-residuals
+                  bound (access-residual-entries parsed-q step joins))]
+    (reduce
+      (fn [[context stages] {:keys [clause-idx clause orig-clause]}]
+        (let [before   (sample-context-size (:rels context))
+              safe?    (sample-safe-residual? clause)
+              context' (if safe?
+                         (qresolve/resolve-clause context orig-clause)
+                         context)
+              after    (sample-context-size (:rels context'))]
+          [context'
+           (conj stages
+                 {:clause-idx clause-idx
+                  :operation  (if safe?
+                                (residual-operation clause)
+                                :opaque-predicate)
+                  :modeled?   safe?
+                  :input      before
+                  :output     after})]))
+      [context stages]
+      entries)))
+
+(defn- sample-access-joins
+  [db parsed-q inputs step planned-joins sample-size]
+  (if (pos? (long sample-size))
+    (let [sample-work (assoc (:work step)
+                             :sample-size sample-size
+                             :batch-size sample-size)
+          sample-step (assoc step :work sample-work)
+          sample-batch  (qplan/access-sample-batch sample-step db)
+          ^List sample  (:tuples sample-batch)
+          initial       (r/relation! (qplan/cols->attrs (:cols step)) sample)
+          context       (-> (qplan/make-context parsed-q false)
+                            (qresolve/resolve-ins inputs)
+                            (update :rels qresolve/collapse-rels initial))
+          access-var    (first (:cols step))]
+      (loop [context context
+             joins   planned-joins
+             stages  []]
+        (let [relation (access-sample-relation context access-var)
+              before   (.size ^List (:tuples relation))]
+          (if (or (zero? before) (empty? joins))
+            (let [[context stages]
+                  (sample-access-residuals
+                    parsed-q context step planned-joins stages)]
+              {:sample        sample
+               :sample-batch  sample-batch
+               :sample-rows   (.size sample)
+               :sample-output (sampled-access-output parsed-q (:rels context))
+               :stages        stages})
+            (let [{:keys [clause-idx attr]} (first joins)
+                  pattern  (access-join-pattern parsed-q clause-idx)
+                  new-rel  (qresolve/lookup-pattern
+                             (assoc context :rels-bound-cache (volatile! {}))
+                             db pattern)
+                  rels     (qresolve/collapse-rels (:rels context) new-rel)
+                  relation (access-sample-relation
+                             (assoc context :rels rels) access-var)
+                  after    (.size ^List (:tuples relation))]
+              (recur (assoc context :rels rels)
+                     (next joins)
+                     (conj stages
+                           {:clause-idx clause-idx
+                            :attr       attr
+                            :operation  :indexed-join
+                            :input      before
+                            :output     after})))))))
+    {:sample        (FastList.)
+     :sample-batch  nil
+     :sample-rows   0
+     :sample-output 0
+     :stages        []}))
+
+(defn- adjusted-access-yield
+  ^double
+  [^long sample-rows ^long sample-output]
+  (if (zero? sample-rows)
+    0.0
+    (adjusted-scan-ratio sample-rows sample-output)))
+
+(defn- unsampled-access-yield
+  ^double
+  [parsed-q step joins ^long range-rows]
+  (let [^double join-yield
+        (reduce
+          (fn [^double yield join]
+            (let [rows  (long (or (get-in join [:estimate :rows]) 0))
+                  ratio (if (pos? range-rows)
+                          (min 1.0
+                               (adjusted-scan-ratio range-rows rows))
+                          0.0)]
+              (* yield ratio)))
+          1.0 joins)
+        residual-count
+        (count (access-residual-entries parsed-q step joins))]
+    (* join-yield
+       (Math/pow (double c/magic-scan-ratio)
+                 (double residual-count)))))
+
+(defn- estimate-row-evaluation-cost
+  ^long
+  [^long input-size]
+  (estimate-round
+    (* (double input-size) (double c/magic-cost-pred))))
+
+(defn- access-candidate-budget
+  ^long
+  [^long required-count ^long range-rows ^double yield]
+  (if (or (zero? range-rows) (zero? yield))
+    0
+    (min range-rows
+         (max 1 (long
+                  (estimate-round (/ (double required-count) yield)))))))
+
+(defn- proportional-scan-rows
+  ^long
+  [^long candidate-rows ^long range-rows ^long scan-rows]
+  (cond
+    (or (zero? candidate-rows) (zero? range-rows) (zero? scan-rows)) 0
+    (<= range-rows candidate-rows) scan-rows
+    :else
+    (min scan-rows
+         (max 1
+              (long
+                (Math/ceil
+                  (* (double scan-rows)
+                     (/ (double candidate-rows)
+                        (double range-rows)))))))))
+
+(defn- adjusted-access-cost
+  [estimate scan-rows input-rows stages]
+  (let [base-cost (if (pos? (long scan-rows))
+                    (+ (double (:startup estimate))
+                       (* (double scan-rows)
+                          (double (:per-row estimate))))
+                    0.0)]
+    (first
+      (reduce
+        (fn [[cost input-size] {:keys [operation input output]}]
+          (let [ratio       (adjusted-scan-ratio (long input) (long output))
+                output-size (estimate-round (* (double input-size) ratio))
+                stage-cost  (if (#{:predicate :function :opaque-predicate}
+                                  operation)
+                              (estimate-row-evaluation-cost input-size)
+                              (estimate-link-cost input-size output-size))]
+            [(+ (double cost)
+                (double stage-cost))
+             output-size]))
+        [base-cost input-rows]
+        stages))))
+
+(defn- adjust-access-plan
+  [db parsed-q inputs {:keys [step path demand work estimate] :as plan}]
+  (if step
+    (let [range-rows      (qaccess/estimate-range-rows estimate)
+          scan-rows       (qaccess/estimate-scan-rows estimate)
+          output-rows     (qaccess/estimate-output-rows estimate)
+          adaptive?       (qaccess/adaptive-demand? path demand)
+          sample?         (and (qaccess/planning-sample? path)
+                               (pos? range-rows))
+          sample-size     (if sample?
+                            (long (min range-rows
+                                       (long c/init-exec-size-threshold)))
+                            0)
+          {:keys [sample sample-batch sample-rows sample-output stages]}
+          (if sample?
+            (sample-access-joins
+              db parsed-q inputs step (:joins plan) sample-size)
+            {:sample        (FastList.)
+             :sample-batch  nil
+             :sample-rows   0
+             :sample-output 0
+             :stages        []})
+          sample-rows     (long sample-rows)
+          sample-output   (long sample-output)
+          yield           (if (pos? sample-rows)
+                            (adjusted-access-yield sample-rows sample-output)
+                            (double
+                              (if (contains? estimate :yield)
+                                (:yield estimate)
+                                (unsampled-access-yield
+                                  parsed-q step (:joins plan) range-rows))))
+          heuristic-yield?
+          (and (zero? sample-rows)
+               (not (contains? estimate :yield))
+               (< yield 1.0))
+          complete?       (nil? (:required-count demand))
+          initial-candidate-budget
+          (if complete?
+            range-rows
+            (access-candidate-budget (long (:required-count demand))
+                                     range-rows yield))
+          candidate-budget
+          (long
+            (if (and adaptive? heuristic-yield?)
+              (min range-rows
+                   (* 2 (long initial-candidate-budget)))
+              initial-candidate-budget))
+          point-output-rows
+          (long (if adaptive?
+                  (min output-rows candidate-budget)
+                  output-rows))
+          point-scan-rows
+          (long (if adaptive?
+                  (proportional-scan-rows
+                    candidate-budget range-rows scan-rows)
+                  scan-rows))
+          reusable?       (and sample?
+                               (qaccess/reusable-sample? path)
+                               adaptive?
+                               (some? sample-batch))
+          reused-rows     (long (if reusable? sample-rows 0))
+          candidate-remaining (- candidate-budget reused-rows)
+          remaining-candidates
+          (if (pos? candidate-remaining) candidate-remaining 0)
+          range-remaining (- range-rows reused-rows)
+          remaining-range
+          (if (pos? range-remaining) range-remaining 0)
+          point-scan-remaining (- point-scan-rows reused-rows)
+          remaining-point-scan
+          (if (pos? point-scan-remaining) point-scan-remaining 0)
+          scan-remaining (- scan-rows reused-rows)
+          remaining-scan
+          (if (pos? scan-remaining) scan-remaining 0)
+          point-cost      (adjusted-access-cost
+                            estimate remaining-point-scan
+                            point-output-rows stages)
+          upper-cost      (adjusted-access-cost
+                            estimate remaining-scan output-rows stages)
+          selection-cost  (if (or (not adaptive?)
+                                  (and (pos? sample-rows)
+                                       (zero? sample-output)
+                                       (< sample-rows range-rows)))
+                            upper-cost
+                            point-cost)
+          estimate        (assoc estimate
+                                 :rows point-output-rows
+                                 :range-rows range-rows
+                                 :scan-rows scan-rows
+                                 :output-rows output-rows
+                                 :point-scan-rows point-scan-rows
+                                 :point-output-rows point-output-rows
+                                 :cost selection-cost
+                                 :point-cost point-cost
+                                 :upper-cost upper-cost
+                                 :confidence (if sample?
+                                               :sampled
+                                               (or (:confidence estimate) :low))
+                                 :sample-rows sample-rows
+                                 :sample-output sample-output
+                                 :reused-candidates reused-rows
+                                 :remaining-candidates remaining-candidates
+                                 :remaining-range remaining-range
+                                 :remaining-scan-rows remaining-scan
+                                 :remaining-point-scan-rows
+                                 remaining-point-scan
+                                 :yield yield
+                                 :join-stages stages)
+          work
+          (cond->
+              (assoc work :max-candidates candidate-budget)
+            (and adaptive?
+                 (pos? (long initial-candidate-budget)))
+            (assoc :batch-size
+                   (min
+                     (long (or (:batch-size work)
+                               initial-candidate-budget))
+                     (long initial-candidate-budget))))]
+      (assoc plan
+             :work work
+             :estimate estimate
+             :step (assoc step
+                          :work work
+                          :sample sample
+                          :sample-batch (when reusable? sample-batch))
+             :sample-batch (when reusable? sample-batch)))
+    plan))
+
+(defn plan-access-joins
+  "Add a greedy order for indexed pattern joins reachable from each access
+   plan's initially produced variables. This is called only when access plans
+   exist; ordinary query planning stays on the existing path."
+  [parsed-q inputs plans]
+  (let [input-db (first (filter db/db? inputs))]
+    (mapv (fn [plan]
+            (if-let [plan-db (or (:access-source plan)
+                                 (get-in plan [:path :options :db])
+                                 input-db)]
+              (if-let [plan
+                       (or (when (:step plan) plan)
+                           (schedule-correlated-access
+                             plan-db parsed-q inputs plan))]
+                (let [plan (assoc
+                             plan
+                             :joins
+                             (order-access-joins plan-db parsed-q plan)
+                             :join-candidates
+                             (access-join-candidates plan-db parsed-q plan))]
+                  (if (:correlated? plan)
+                    plan
+                    (adjust-access-plan plan-db parsed-q inputs plan)))
+                (assoc plan :unavailable? true))
+              plan))
+          plans)))
 
 (defn- count-node-datoms
   [^DB db {:keys [free bound] :as node}]
@@ -762,14 +1399,13 @@
     (estimate-round
       (* e-size (double
                   (cond
-                    result (let [s (.size ^List result)]
-                             (if (< 0 s)
-                               (/ s (.size ^List res1))
-                               c/magic-scan-ratio))
-                    sample (let [s (.size ^List sample)]
-                             (if (< 0 s)
-                               (/ s (.size ^List sp1))
-                               c/magic-scan-ratio))))))))
+                    result (adjusted-scan-ratio
+                             (.size ^List res1)
+                             (.size ^List result))
+                    sample (adjusted-scan-ratio
+                             (.size ^List sp1)
+                             (.size ^List sample))
+                    :else c/magic-scan-ratio))))))
 
 (defn- factor
   [magic ^long n]
@@ -793,6 +1429,605 @@
     (if (< 1 (count steps))
       (+ ^long init-cost ^long (estimate-scan-v-cost (peek steps) mcount))
       init-cost)))
+
+(defn- final-plan-cost
+  [plan-trace]
+  (if-let [{:keys [steps cost]} (peek plan-trace)]
+    (if (some? cost)
+      (double cost)
+      (if (seq steps)
+        (double
+          (estimate-base-cost
+            {:mcount (long (or (:mcount (first steps)) 1))}
+            steps))
+        0.0))
+    0.0))
+
+(defn estimated-plan-cost
+  "Return the existing planner's estimated cost for all final component plans."
+  [{:keys [plan result-set]}]
+  (if (= result-set #{})
+    0.0
+    (reduce
+      (fn [cost [_src components]]
+        (+ (double cost)
+           (reduce
+             (fn [cost plan-trace]
+               (+ (double cost) (final-plan-cost plan-trace)))
+             0.0 components)))
+      0.0 plan)))
+
+(defn- final-plan-size
+  [plan-trace]
+  (if-let [{:keys [steps size]} (peek plan-trace)]
+    (long (or size
+              (some-> steps first :mcount)
+              1))
+    0))
+
+(defn- estimated-plan-size
+  [{:keys [plan result-set]}]
+  (if (= result-set #{})
+    0
+    (reduce
+      (fn [size [_src components]]
+        (let [component-size
+              (reduce
+                (fn [size plan-trace]
+                  (let [n (final-plan-size plan-trace)]
+                    (if (zero? size)
+                      n
+                      (estimate-round (* (double size) n)))))
+                0 components)]
+          (if (zero? size)
+              component-size
+              (estimate-round (* (double size) component-size)))))
+      0 plan)))
+
+(defn- late-row-operation
+  [clause]
+  (let [parsed (if (or (instance? Predicate clause)
+                       (instance? Function clause))
+                 clause
+                 (dp/parse-clause clause))]
+    (cond
+      (instance? Predicate parsed) :predicate
+      (instance? Function parsed)  :function
+      :else                        nil)))
+
+(defn- estimated-late-input-size
+  ^long
+  [{:keys [plan rels result-set]} ^long plan-size]
+  (cond
+    (= result-set #{}) 0
+    (seq plan)          plan-size
+    :else               (long (sample-context-size rels))))
+
+(defn- estimated-late-cost
+  [context ^long plan-size]
+  (let [input-size (estimated-late-input-size context plan-size)]
+    (reduce
+      (fn [{:keys [cost stages] :as estimate} clause]
+        (if-let [operation (late-row-operation clause)]
+          (let [stage-cost (estimate-row-evaluation-cost input-size)]
+            {:cost   (+ (double cost) (double stage-cost))
+             :stages (conj stages
+                           {:operation operation
+                            :input     input-size
+                            :cost      stage-cost
+                            :clause    clause})})
+          estimate))
+      {:cost 0.0 :stages []}
+      (:late-clauses context))))
+
+(defn- logical-plan-key
+  [graph]
+  (into #{}
+        (mapcat (fn [[src nodes]]
+                  (map #(vector src %) (keys nodes))))
+        graph))
+
+(defn- top-k-enforcer-cost
+  [^long rows demand]
+  (if (and (pos? rows) (seq (:ordering demand)))
+    (let [required-count (long (or (:required-count demand) rows))
+          required (max 1 required-count)
+          retained (long (max 2 (min rows required)))]
+      (* (double rows)
+         (/ (Math/log (double retained)) (Math/log 2.0))))
+    0.0))
+
+(defn- conventional-access-cost
+  [access-plans]
+  (reduce
+    +
+    0.0
+    (vals
+      (reduce
+        (fn [costs {:keys [expr estimate]}]
+          (if-some [cost (:conventional-cost estimate)]
+            (let [logical-key (or (:covered-originals expr)
+                                  (:covers expr))]
+              (update costs logical-key
+                      (fn [previous]
+                        (if (some? previous)
+                          (min (double previous) (double cost))
+                          (double cost)))))
+            costs))
+        {}
+        access-plans))))
+
+(defn- conventional-alternative
+  [context logical-key demand access-plans]
+  (let [size       (estimated-plan-size context)
+        base-cost  (estimated-plan-cost context)
+        late       (estimated-late-cost context size)
+        late-cost  (:cost late)
+        access-cost (conventional-access-cost access-plans)
+        effective-late-cost (max (double late-cost)
+                                 (double access-cost))
+        properties (qplan/->PhysicalProperties
+                     (:ordering demand) false true :exact
+                     #{:complete :top-k-enforced})
+        enforcer-cost (top-k-enforcer-cost size demand)
+        cost          (+ (double base-cost)
+                         effective-late-cost
+                         (double enforcer-cost))
+        plan          (qplan/->ConventionalRootPlan
+                        context properties cost size)]
+    (assoc
+      (qplan/->PlanAlternative
+        :conventional logical-key properties plan
+        cost size nil)
+      :cost-breakdown {:base        base-cost
+                       :late        late-cost
+                       :access-expression access-cost
+                       :effective-late effective-late-cost
+                       :late-stages (:stages late)
+                       :enforcer    enforcer-cost})))
+
+(defn- root-access-properties
+  [fragment-properties demand]
+  (let [ordered? (seq (:ordering demand))]
+    (qplan/->PhysicalProperties
+      (when ordered? (:ordering demand))
+      false
+      true
+      (:quality fragment-properties)
+      (cond-> (set/difference (:capabilities fragment-properties)
+                              qaccess/top-k-proof-capabilities)
+        true     (conj :complete)
+        ordered? (conj :top-k-enforced)))))
+
+(defn- fragment-output-cols
+  [step joins]
+  (reduce
+    (fn [cols join]
+      (into cols (remove (set cols)) (:produces-cols join)))
+    (vec (:cols step))
+    joins))
+
+(defn- estimated-fragment-join-cost
+  [joins operators initial-size]
+  (first
+    (reduce
+      (fn [[cost size] [join operator]]
+        (let [join-size     (max 0 (long (or (get-in join [:estimate :rows])
+                                             size)))
+              operator-cost (case (:type operator)
+                              :hash-join
+                              (estimate-hash-join-cost size join-size)
+
+                              :index-join
+                              (estimate-link-cost size join-size)
+
+                              0.0)]
+          [(+ (double cost) (double operator-cost)) join-size]))
+      [0.0 (max 0 (long initial-size))]
+      (map vector joins operators))))
+
+(defn- access-alternative
+  [logical-key fallback access-plan fragment]
+  (let [{:keys [step demand work estimate
+                correlated? outer-query outer-estimate]} access-plan
+        fragment-plan (:plan fragment)
+        fragment-properties (:properties fragment)
+        joins       (:joins fragment-plan)
+        operators   (:operators fragment-plan)
+        fragment-cols (fragment-output-cols step joins)
+        access-plan (assoc access-plan
+                           :joins joins
+                           :operators operators
+                           :fragment-cols fragment-cols
+                           :fragment-properties fragment-properties
+                           :fragment-cost (:cost fragment)
+                           :fragment-size (:size fragment))
+        adaptive-top-k?
+        (and (not correlated?)
+             (qaccess/adaptive-top-k-properties?
+               (:ordering fragment-properties)
+               (:capabilities fragment-properties)
+               demand))
+        adaptive-limit?
+        (and (not correlated?)
+             (qaccess/adaptive-limit-properties?
+               (:capabilities fragment-properties) demand))
+        adaptive? (or adaptive-top-k? adaptive-limit?)
+        per-open-cost
+        (double
+          (if adaptive?
+            (:cost estimate)
+            (or (:upper-cost estimate) (:cost estimate))))
+        per-open-rows
+        (long
+          (or (if adaptive?
+                (:rows estimate)
+                (qaccess/estimate-output-rows estimate))
+              0))
+        outer-rows (long (if correlated?
+                           (or (:rows outer-estimate) 1)
+                           1))
+        modeled-joins? (some #(= :indexed-join (:operation %))
+                             (:join-stages estimate))
+        all-joins      (or (:joins access-plan) [])
+        candidate-rows per-open-rows
+        unmodeled-join-cost
+        (if modeled-joins?
+          0.0
+          (estimated-fragment-join-cost
+            all-joins
+            (repeat {:type :index-join})
+            candidate-rows))
+        selected-index-cost
+        (estimated-fragment-join-cost
+          joins
+          (repeat {:type :index-join})
+          candidate-rows)
+        selected-physical-cost
+        (estimated-fragment-join-cost joins operators candidate-rows)
+        physical-adjustment (- (double selected-physical-cost)
+                               (double selected-index-cost))
+        access-cost
+        (+ (double (if correlated? (or (:cost outer-estimate) 0.0) 0.0))
+           (* (double outer-rows)
+              (+ per-open-cost
+                 (double unmodeled-join-cost)
+                 physical-adjustment)))
+        rows      (long (* outer-rows per-open-rows))
+        properties (root-access-properties fragment-properties demand)
+        estimated-size
+        (estimate-round
+          (* (double rows)
+             (double (or (:yield estimate) 1.0))))
+        size (max 0 (long estimated-size))
+        enforcer-cost (top-k-enforcer-cost size demand)
+        cost          (+ (double access-cost) (double enforcer-cost))
+        plan (assoc
+               (qplan/->AccessRootPlan
+                 (cond
+                   correlated?     :correlated-complete
+                   adaptive-top-k? :adaptive-top-k
+                   adaptive-limit? :adaptive-limit
+                   :else           :complete)
+                 step nil demand work properties
+                 cost size fallback)
+               :access-plan access-plan
+               :outer-query outer-query
+               :logical-key logical-key
+               :joins joins
+               :operators operators
+               :fragment-cols fragment-cols
+               :fragment-properties fragment-properties)]
+    (assoc
+      (qplan/->PlanAlternative
+        :access logical-key properties plan cost size nil)
+      :cost-breakdown
+      {:point       (:point-cost estimate)
+       :upper-bound (:upper-cost estimate)
+       :required-count (:required-count demand)
+       :outer       (when correlated? outer-estimate)
+       :access      access-cost
+       :fragment    (:cost fragment)
+       :unmodeled-joins unmodeled-join-cost
+       :physical-adjustment physical-adjustment
+       :enforcer    enforcer-cost
+       :selected    cost
+       :stages      (:join-stages estimate)})))
+
+(defn- quality-satisfies?
+  [provided required]
+  (or (nil? required)
+      (= provided required)
+      (and (= required :approximate) (= provided :exact))))
+
+(defn- ordering-terms
+  [ordering]
+  (if (every? sequential? ordering)
+    (vec ordering)
+    (mapv vec (partition-all 2 ordering))))
+
+(defn- ordering-satisfies?
+  [provided required]
+  (let [provided (ordering-terms provided)
+        required (ordering-terms required)]
+    (or (empty? required)
+        (and (<= (count required) (count provided))
+             (= required (subvec provided 0 (count required)))))))
+
+(defn properties-satisfy?
+  "Return true when provided physical properties are a superset of required
+   properties for one logical subset."
+  [provided required]
+  (and (ordering-satisfies? (:ordering provided) (:ordering required))
+       (or (not (:resumable? required)) (:resumable? provided))
+       (or (not (:complete? required)) (:complete? provided))
+       (quality-satisfies? (:quality provided) (:quality required))
+       (set/subset? (:capabilities required) (:capabilities provided))))
+
+(defn- alternative-dominates?
+  [left right]
+  (and (<= (double (:cost left)) (double (:cost right)))
+       (<= (long (:size left)) (long (:size right)))
+       (properties-satisfy? (:properties left) (:properties right))))
+
+(defn retain-property-alternative
+  "Retain a bounded Pareto frontier for alternatives implementing one logical
+   subset. Cheaper alternatives with a property superset dominate."
+  [alternatives candidate]
+  (if (some #(alternative-dominates? % candidate) alternatives)
+    (vec alternatives)
+    (conj
+      (into []
+            (remove #(alternative-dominates? candidate %))
+            alternatives)
+      candidate)))
+
+(defn propagate-physical-properties
+  "Transfer physical properties through an access-aware physical operator."
+  [properties {:keys [type preserves-outer-order? ordering]}]
+  (case type
+    :filter properties
+
+    :index-join
+    (if preserves-outer-order?
+      properties
+      (assoc properties
+             :ordering nil
+             :resumable? false
+             :capabilities
+             (set/difference (:capabilities properties)
+                             qaccess/top-k-proof-capabilities)))
+
+    :hash-join
+    (assoc properties
+           :ordering nil
+           :resumable? false
+           :capabilities
+           (set/difference (:capabilities properties)
+                           qaccess/top-k-proof-capabilities))
+
+    :sort
+    (assoc properties
+           :ordering ordering
+           :resumable? false
+           :capabilities
+           (-> (:capabilities properties)
+               (set/difference qaccess/top-k-proof-capabilities)
+               (conj :top-k-enforced)))
+
+    properties))
+
+(defn- alternative-satisfies?
+  [{:keys [properties]} demand]
+  (and (quality-satisfies? (:quality properties) (:quality demand))
+       (or (:complete? properties)
+           (and (= (:ordering properties) (:ordering demand))
+                (set/subset? qaccess/top-k-proof-capabilities
+                             (:capabilities properties))))))
+
+(defn- choose-alternative
+  [alternatives demand]
+  (first
+    (sort-by
+      (juxt :cost #(if (= :conventional (:kind %)) 0 1))
+      (filter #(alternative-satisfies? % demand) alternatives))))
+
+(defn- access-fragment-properties
+  [path]
+  (qplan/->PhysicalProperties
+    (:ordering path)
+    (contains? (:capabilities path) :resumable)
+    (contains? (:capabilities path) :complete)
+    (:quality path)
+    (:capabilities path)))
+
+(defn- add-subset-alternative
+  [subsets alternative]
+  (update subsets (:logical-key alternative)
+          #(retain-property-alternative (or % []) alternative)))
+
+(defn- access-subset-alternatives
+  [{:keys [access-id expr path demand estimate step joins join-candidates]}]
+  (let [joins      (vec (or join-candidates joins))
+        properties (access-fragment-properties path)
+        source-key (set (:covers expr))
+        adaptive?  (qaccess/adaptive-demand? path demand)
+        estimated-source-size
+        (long
+          (if adaptive?
+            (or (:rows estimate) 0)
+            (qaccess/estimate-output-rows estimate)))
+        source-size (max 0 estimated-source-size)
+        source-scan-rows
+        (long
+          (if adaptive?
+            (or (:remaining-point-scan-rows estimate)
+                (:point-scan-rows estimate)
+                source-size)
+            (qaccess/estimate-scan-rows estimate)))
+        source-cost
+        (double
+          (if (pos? source-scan-rows)
+            (+ (double (or (:startup estimate) 0.0))
+               (* (double source-scan-rows)
+                  (double (or (:per-row estimate) 0.0))))
+            0.0))
+        source
+        (qplan/->PlanAlternative
+          :access-fragment source-key properties
+          {:access-id access-id :source step :joins [] :operators []}
+          source-cost source-size nil)]
+    (loop [queue      [#{}]
+           memo       {#{} [source]}
+           expansions 0]
+      (if (or (empty? queue)
+              (>= (long expansions) (long c/plan-search-max)))
+        (mapcat val memo)
+        (let [used       (first queue)
+              queue      (subvec queue 1)
+              frontier   (get memo used)
+              bound      (into (set (:cols step))
+                               (mapcat :vars)
+                               (map joins used))
+              eligible
+              (keep-indexed
+                (fn [i candidate]
+                  (when-not (contains? used i)
+                    (when-let [join
+                               (access-join-from-bound bound candidate)]
+                      [i join])))
+                joins)
+              [memo queue]
+              (reduce
+                (fn [[memo queue] [i {:keys [estimate] :as join}]]
+                  (let [used'       (conj used i)
+                        logical-key
+                        (into source-key
+                              (map (comp :clause joins))
+                              used')
+                        candidates
+                        (mapcat
+                          (fn [{:keys [properties plan cost size]}]
+                            (let [estimated-join-size
+                                  (long (or (:rows estimate) size))
+                                  join-size (max 0 estimated-join-size)
+                                  index-op
+                                  {:type :index-join
+                                   :preserves-outer-order? true}
+                                  hash-op {:type :hash-join}
+                                  alternative
+                                  (fn [operator operator-cost]
+                                    (qplan/->PlanAlternative
+                                      :access-fragment logical-key
+                                      (propagate-physical-properties
+                                        properties operator)
+                                      (-> plan
+                                          (update :joins conj join)
+                                          (update :operators conj operator))
+                                      (+ (double cost)
+                                         (double operator-cost))
+                                      join-size nil))]
+                              [(alternative
+                                 index-op
+                                 (estimate-link-cost size join-size))
+                               (alternative
+                                 hash-op
+                                 (estimate-hash-join-cost size join-size))]))
+                          frontier)
+                        previous (get memo used' [])
+                        retained
+                        (reduce retain-property-alternative
+                                previous candidates)]
+                    (if (= previous retained)
+                      [memo queue]
+                      [(assoc memo used' retained)
+                       (conj queue used')])))
+                [memo queue] eligible)]
+          (recur queue memo (unchecked-inc expansions)))))))
+
+(defn- access-subset-memo
+  [access-plans]
+  (reduce
+    (fn [subsets alternative]
+      (add-subset-alternative subsets alternative))
+    {}
+    (mapcat access-subset-alternatives access-plans)))
+
+(defn- executable-access-fragments
+  [subsets {:keys [access-id] :as access-plan}]
+  (let [source-key (set (get-in access-plan [:expr :covers]))]
+    (->> subsets
+         (mapcat val)
+         (filter #(and (= access-id (get-in % [:plan :access-id]))
+                       (set/subset? source-key (:logical-key %))))
+         ;; Prefer a more complete physical fragment when costs and properties
+         ;; tie, while still retaining executable roots for smaller subsets.
+         (sort-by #(count (:logical-key %)) >)
+         vec)))
+
+(defn build-property-memo
+  "For access queries, retain conventional and physical access alternatives
+   under one logical root until the query's ordering/quality demand is applied."
+  [{:keys [access-plans access-demand graph] :as context}]
+  (if (seq access-plans)
+    (let [logical-key  (logical-plan-key graph)
+          demand       (or access-demand (:demand (first access-plans)))
+          executable   (into []
+                             (comp
+                               (filter #(and (:step %)
+                                             (not (:unavailable? %))))
+                               (map-indexed #(assoc %2 :access-id %1)))
+                             access-plans)
+          conventional (conventional-alternative
+                         context logical-key demand access-plans)
+          subsets      (access-subset-memo executable)
+          alternatives
+          (into [conventional]
+                (mapcat
+                  (fn [access-plan]
+                    (map #(access-alternative
+                            logical-key (:plan conventional) access-plan %)
+                         (executable-access-fragments subsets access-plan))))
+                executable)
+          selected     (choose-alternative alternatives demand)]
+      (assoc context
+             :access-plans executable
+             :property-memo
+             (qplan/->PropertyMemo
+               logical-key demand alternatives selected subsets)))
+    context))
+
+(defn selected-access-plan
+  [context]
+  (let [selected (get-in context [:property-memo :selected])]
+    (when (= :access (:kind selected))
+      (get-in selected [:plan :access-plan]))))
+
+(defn selected-alternative
+  [context]
+  (get-in context [:property-memo :selected]))
+
+(defn property-memo-summary
+  [{:keys [logical-key demand alternatives selected subsets]}]
+  (let [summary (fn [{:keys [kind properties cost size cost-breakdown plan]}]
+                  {:kind       kind
+                   :properties properties
+                   :fragment-properties (:fragment-properties plan)
+                   :cost       cost
+                   :size       size
+                   :mode       (:mode plan)
+                   :operators  (:operators plan)
+                   :fragment-cols (:fragment-cols plan)
+                   :cost-breakdown cost-breakdown})]
+    {:logical-key  logical-key
+     :demand       demand
+     :alternatives (mapv summary alternatives)
+     :selected     (some-> selected summary)
+     :subsets
+     (into {}
+           (map (fn [[logical-key alternatives]]
+                  [logical-key (mapv summary alternatives)]))
+           subsets)}))
 
 (defn- base-plan
   ([db nodes e]

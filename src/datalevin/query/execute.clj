@@ -18,6 +18,12 @@
    [datalevin.parser :as dp]
    [datalevin.pull-api :as dpa]
    [datalevin.query.aggregate :as qagg]
+   [datalevin.query.access :as qaccess]
+   [datalevin.query.access.ave :as qave]
+   [datalevin.query.access.function :as qfunction]
+   [datalevin.query.access.fulltext :as qfulltext]
+   [datalevin.query.access.idoc :as qidoc]
+   [datalevin.query.access.vector :as qvector]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -29,19 +35,120 @@
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
    [java.util Comparator PriorityQueue]
-   [datalevin.datom Datom]
-   [datalevin.parser BindScalar Constant DefaultSrc FindColl FindRel FindScalar
-    FindTuple Pattern Predicate Variable]
+   [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Pattern
+    Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private plugin-inputs qo/plugin-inputs)
+
+(def ^:private function-access-method
+  (qfunction/access-method {:fulltext qfulltext/access-method
+                            :idoc     qidoc/access-method
+                            :vector   qvector/access-method}))
+
+(def ^:dynamic *access-methods*
+  "Physical access methods considered during query planning."
+  [qave/access-method function-access-method])
 
 (def ^:private materialize-input-bound-patterns
   qo/materialize-input-bound-patterns)
 
 (def ^:private rewrite-unused-vars qo/rewrite-unused-vars)
 
-(declare sort-planned-late-clauses)
+(declare sort-planned-late-clauses access-batch-query access-outer-query)
+
+(defn- adaptive-limit-query?
+  [parsed-q]
+  (let [find          (:qfind parsed-q)
+        find-elements (dp/find-elements find)]
+    (and (instance? FindRel find)
+         (nil? (:qwith parsed-q))
+         (empty? (:qhaving parsed-q))
+         (nil? (:qreturn-map parsed-q))
+         (not-any? #(or (dp/aggregate? %) (dp/find-expr? %)
+                        (dp/pull? %))
+                   find-elements))))
+
+(defn- root-access-demand
+  [parsed-q]
+  (let [ordering     (:qorder parsed-q)
+        query-limit  (:qlimit parsed-q)
+        finite-limit (when (and (some? query-limit)
+                                (not= -1 query-limit))
+                       query-limit)
+        required-vars (set (dp/find-vars (:qfind parsed-q)))]
+    (cond
+      (and (seq ordering)
+           (some? finite-limit)
+           (pos? (long finite-limit)))
+      (assoc
+        (qaccess/top-k-demand ordering (:qoffset parsed-q) finite-limit)
+        :required-vars required-vars)
+
+      (and (empty? ordering)
+           (some? finite-limit)
+           (pos? (long finite-limit))
+           (adaptive-limit-query? parsed-q))
+      (qaccess/limit-demand
+        (:qoffset parsed-q) finite-limit :exact required-vars)
+
+      :else
+      (qaccess/complete-demand
+        ordering (:qoffset parsed-q) finite-limit :exact required-vars))))
+
+(defn- discover-access-plans
+  [parsed-q inputs]
+  (let [root-demand  (root-access-demand parsed-q)
+        input-values (delay (qaccess/scalar-input-values parsed-q inputs))
+        planning-context
+        {:parsed-q    parsed-q
+         :inputs      inputs
+         :input-values input-values
+         :demand      root-demand}
+        plans (mapv (fn [{:keys [expr path bounds work] :as plan}]
+                      (let [bounds (or bounds (qaccess/source-bounds))
+                            access-source
+                            (or (:access-source plan)
+                                (qaccess/resolve-source
+                                  @input-values (:source expr))
+                                (get-in path [:options :db]))]
+                        (cond->
+                          (assoc plan
+                                 :demand root-demand
+                                 :bounds bounds
+                                 :access-source access-source
+                                 :query parsed-q
+                                 :inputs inputs)
+                        (empty? (:requires expr))
+                        (assoc :step
+                               (qplan/access-step
+                                 expr path root-demand bounds work []
+                                 access-source)))))
+                    (qaccess/access-plans
+                      *access-methods* planning-context))]
+    plans))
+
+(defn- prepare-access-plans
+  [plans]
+  (if (or (empty? plans) (:prepared? (first plans)))
+    plans
+    (let [{:keys [query inputs]} (first plans)]
+      (mapv
+        (fn [plan]
+          (if (:unavailable? plan)
+            (assoc plan :prepared? true)
+            (cond->
+                (assoc plan :prepared? true)
+              (:correlated? plan)
+              (assoc :outer-query (access-outer-query query plan)))))
+        (qo/plan-access-joins query inputs plans)))))
+
+(defn- attach-access-plans
+  [context plans]
+  (assoc context
+         :access-plans plans
+         :access-demand (some-> plans first :demand)
+         :preferred-access-plan (qaccess/best-plan plans)))
 
 (defn- build-explain
   []
@@ -58,7 +165,14 @@
       ((fn [c] (build-explain) c))
       qo/build-plan
       qo/plan-not-joins
-      sort-planned-late-clauses))
+      sort-planned-late-clauses
+      ((fn [context]
+         (if (seq (:access-plans context))
+           (let [plans (prepare-access-plans (:access-plans context))]
+             (-> context
+                 (attach-access-plans plans)
+                 (qo/build-property-memo)))
+           context)))))
 
 (defn execute-plan
   [{:keys [plan sources] :as context}]
@@ -343,10 +457,16 @@
   ([context result]
    (result-explain context)
    (when qplan/*explain* (vswap! qplan/*explain* assoc :result result)))
-  ([{:keys [graph result-set plan opt-clauses late-clauses run?] :as context}]
+  ([{:keys [graph result-set plan opt-clauses late-clauses run?
+            access-plans preferred-access-plan property-memo]
+     :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
            @qplan/*explain*
+           memo-summary (some-> property-memo qo/property-memo-summary)
+           conventional-cost
+           (some #(when (= :conventional (:kind %)) (:cost %))
+                 (:alternatives memo-summary))
            et  (double (/ (- ^long (System/nanoTime)
                              (+ ^long qplan/*start-time* planning-time
                                 parsing-time building-time))
@@ -381,10 +501,22 @@
                                (and run? qplan/*intermediate-counts?*)
                                (assoc :actual-size
                                       (get-in @(:intermediates context)
-                                              [(:out (last steps))
-                                               :tuples-count]))))
+                                               [(:out (last steps))
+                                                :tuples-count]))))
                            e)) plan)
-               :late-clauses late-clauses)))))
+               :late-clauses late-clauses
+               :access-plans (mapv qaccess/plan-summary access-plans)
+               :preferred-access-plan
+               (some-> preferred-access-plan qaccess/plan-summary)
+               :conventional-plan-cost conventional-cost
+               :access-path-selected?
+               (= :access (get-in memo-summary [:selected :kind]))
+               :physical-plan-alternatives (:alternatives memo-summary)
+               :physical-plan-subsets (:subsets memo-summary)
+               :selected-plan-alternative (:selected memo-summary)
+               :recommended-plan-alternative (:selected memo-summary)
+               :executed-plan-alternative
+               {:kind (if run? :conventional :not-run)})))))
 
 (defn- order-comps
   [tg find-vars order]
@@ -455,196 +587,370 @@
         (result-window (sort cmp result) limit offset)))
     result))
 
-(def ^:private ^:const ^long top-k-candidate-batch-size 1024)
 (def ^:private ^:const ^long top-k-max-candidate-batches 32)
 
-(defn- first-order-key
-  [order]
-  (when-let [order-var (first order)]
-    (when (symbol? order-var)
-      [order-var (if (keyword? (second order)) (second order) :asc)])))
+(defn- access-outer-query
+  [parsed-q {:keys [outer-cols outer-joins]}]
+  (let [where      (mapv :clause outer-joins)
+        orig-where (mapv :orig-clause outer-joins)]
+    (assoc parsed-q
+           :qfind       (dp/parse-find outer-cols)
+           :qorig-find  outer-cols
+           :qwith       nil
+           :qreturn-map nil
+           :qwhere      where
+           :qorig-where orig-where
+           :qhaving     nil
+           :qorder      nil
+           :qlimit      nil
+           :qoffset     nil)))
 
-(defn- ranked-pattern
-  [parsed-q order-var]
-  (first
-    (keep-indexed
-      (fn [i clause]
-        (when (and (instance? Pattern clause)
-                   (instance? DefaultSrc (:source ^Pattern clause)))
-          (let [pattern (:pattern ^Pattern clause)]
-            (when (and (= 3 (count pattern))
-                       (instance? Variable (nth pattern 0))
-                       (instance? Constant (nth pattern 1))
-                       (keyword? (:value ^Constant (nth pattern 1)))
-                       (instance? Variable (nth pattern 2))
-                       (= order-var (:symbol ^Variable (nth pattern 2))))
-              {:clause-idx i
-               :entity-var (:symbol ^Variable (nth pattern 0))
-               :order-var  order-var
-               :attr       (:value ^Constant (nth pattern 1))}))))
-      (:qwhere parsed-q))))
+(defn- access-batch-query
+  [parsed-q {:keys [expr joins outer-joins step fragment-cols]} adaptive?]
+  (let [covered-clauses   (or (:covers expr) #{})
+        covered-originals (or (:covered-originals expr) #{})
+        fragment-clauses  (into #{} (map :clause) joins)
+        fragment-originals
+        (into #{}
+              (map #(nth (:qorig-where parsed-q) (:clause-idx %)))
+              joins)
+        outer-clauses     (into #{} (map :clause) outer-joins)
+        outer-originals   (into #{} (map :orig-clause) outer-joins)
+        cols              (or fragment-cols (:cols step))]
+    (cond->
+        (-> parsed-q
+            (update :qin conj (dp/parse-binding [cols]))
+            (update :qwhere
+                    #(into []
+                           (remove
+                             (some-fn covered-clauses fragment-clauses
+                                      outer-clauses))
+                           %))
+            (update :qorig-where
+                    #(into []
+                           (remove
+                             (some-fn covered-originals fragment-originals
+                                      outer-originals))
+                           %)))
+      adaptive? (assoc :qorder nil :qlimit nil :qoffset nil))))
 
-(defn- input-values
-  [parsed-q inputs]
-  (into {}
-        (keep (fn [[binding value]]
-                (when (instance? BindScalar binding)
-                  [(get-in binding [:variable :symbol]) value])))
-        (map vector (:qin parsed-q) inputs)))
+(defn- access-fragment-pattern
+  [parsed-q clause-idx]
+  (let [pattern (nth (:qorig-where parsed-q) clause-idx)]
+    (if (and (vector? pattern) (qu/source? (first pattern)))
+      (subvec pattern 1)
+      pattern)))
 
-(defn- term-value
-  [values term]
-  (cond
-    (instance? Constant term) (:value ^Constant term)
-    (instance? Variable term) (get values (:symbol ^Variable term) ::none)
-    :else                     ::none))
+(defn- project-access-relation
+  [relation cols]
+  (let [attrs       (:attrs relation)
+        ^java.util.List tuples (:tuples relation)
+        n           (.size tuples)
+        output-attrs (qplan/cols->attrs cols)]
+    ;; Some joins report only the looked-up side's schema when their result is
+    ;; empty. Preserve the fragment's declared schema without trying to project
+    ;; columns from an empty intermediate.
+    (if (zero? n)
+      (r/relation! output-attrs (FastList.))
+      (let [indices    (mapv attrs cols)
+            missing    (into []
+                             (keep-indexed
+                               (fn [i idx]
+                                 (when (nil? idx) (nth cols i))))
+                             indices)
+            _          (when (seq missing)
+                         (throw
+                           (ex-info "Access fragment lost projected columns"
+                                    {:missing missing
+                                     :available (keys attrs)
+                                     :projected cols})))
+            projected  (FastList. n)
+            ^ints idxs (int-array indices)
+            width      (alength idxs)]
+        (dotimes [i n]
+          (let [^objects tuple (.get tuples i)
+                ^objects output (object-array width)]
+            (dotimes [j width]
+              (aset output j (aget tuple (aget idxs j))))
+            (.add projected output)))
+        (r/relation! output-attrs projected)))))
 
-(defn- ordered-range-start
-  [parsed-q inputs order-var direction]
-  (let [values (input-values parsed-q inputs)]
-    (some
-      (fn [clause]
-        (when (instance? Predicate clause)
-          (let [op   (get-in clause [:fn :symbol])
-                args (:args ^Predicate clause)
-                lhs  (first args)
-                rhs  (second args)
-                lvar (when (instance? Variable lhs) (:symbol ^Variable lhs))
-                rvar (when (instance? Variable rhs) (:symbol ^Variable rhs))]
-            (cond
-              (and (identical? direction :desc)
-                   (= lvar order-var) (#{'< '<=} op))
-              (let [v (term-value values rhs)] (when-not (= ::none v) v))
+(defn- execute-index-fragment-join
+  [parsed-q source-db relation join output-cols]
+  (let [pattern (access-fragment-pattern parsed-q (:clause-idx join))
+        ^java.util.List tuples (:tuples relation)
+        joined (FastList.)]
+    (dotimes [i (.size tuples)]
+      (let [tuple   (.get tuples i)
+            one     (r/relation! (:attrs relation)
+                                 (doto (FastList.) (.add tuple)))
+            context (assoc (qplan/make-context parsed-q false)
+                           :rels [one])
+            lookup  (qresolve/lookup-pattern context source-db pattern)]
+        ;; A bound index lookup can legitimately miss for an individual
+        ;; access tuple. `lookup-pattern` represents that as a relation with a
+        ;; nil tuple list; it is an empty join result, not an input to
+        ;; `prod-rel`.
+        (when (some? (:tuples lookup))
+          (let [result (reduce r/prod-rel
+                               (qresolve/collapse-rels [one] lookup))
+                projected (project-access-relation result output-cols)]
+            (.addAll joined ^java.util.Collection (:tuples projected))))))
+    (r/relation! (qplan/cols->attrs output-cols) joined)))
 
-              (and (identical? direction :desc)
-                   (= rvar order-var) (#{'> '>=} op))
-              (let [v (term-value values lhs)] (when-not (= ::none v) v))
+(defn- execute-hash-fragment-join
+  [parsed-q source-db relation join output-cols]
+  (let [pattern (access-fragment-pattern parsed-q (:clause-idx join))
+        context (assoc (qplan/make-context parsed-q false)
+                       :rels [relation])
+        lookup  (qresolve/lookup-pattern context source-db pattern)]
+    (if (some? (:tuples lookup))
+      (let [result (reduce r/prod-rel
+                           (qresolve/collapse-rels [relation] lookup))]
+        (project-access-relation result output-cols))
+      (r/relation! (qplan/cols->attrs output-cols) (FastList.)))))
 
-              (and (identical? direction :asc)
-                   (= lvar order-var) (#{'> '>=} op))
-              (let [v (term-value values rhs)] (when-not (= ::none v) v))
+(defn- execute-access-fragment
+  [parsed-q source-db {:keys [step joins operators]} tuples]
+  (if (seq joins)
+    (:tuples
+      (first
+        (reduce
+          (fn [[relation cols] [join operator]]
+            (let [output-cols
+                  (into cols (remove (set cols)) (:produces-cols join))
+                  relation
+                  (case (:type operator)
+                    :index-join
+                    (execute-index-fragment-join
+                      parsed-q source-db relation join output-cols)
 
-              (and (identical? direction :asc)
-                   (= rvar order-var) (#{'< '<=} op))
-              (let [v (term-value values lhs)] (when-not (= ::none v) v))
+                    :hash-join
+                    (execute-hash-fragment-join
+                      parsed-q source-db relation join output-cols)
 
-              :else nil))))
-      (:qwhere parsed-q))))
-
-(defn- top-k-pushdown-spec
-  [parsed-q inputs]
-  (let [find          (:qfind parsed-q)
-        find-elements (dp/find-elements find)
-        limit         (:qlimit parsed-q)
-        dbs           (filterv db/db? inputs)]
-    (when (and (instance? FindRel find)
-               (finite-limit? limit)
-               (pos? (long limit))
-               (seq (:qorder parsed-q))
-               (nil? (:qwith parsed-q))
-               (empty? (:qhaving parsed-q))
-               (nil? (:qreturn-map parsed-q))
-               (not-any? #(or (dp/aggregate? %) (dp/find-expr? %)
-                              (dp/pull? %))
-                         find-elements)
-               (= 1 (count dbs))
-               (not (db/pending-tx-cache? (first dbs))))
-      (when-let [[order-var direction] (first-order-key (:qorder parsed-q))]
-        (when-let [ranked (ranked-pattern parsed-q order-var)]
-          (when-some [start-value (ordered-range-start parsed-q inputs order-var
-                                                       direction)]
-            (assoc ranked
-                   :db          (first dbs)
-                   :direction   direction
-                   :start-value start-value)))))))
-
-(defn- ranked-datom-page
-  [db attr direction start-value cursor]
-  (let [reverse?   (identical? direction :desc)
-        cursor-v   (:value cursor)
-        cursor-n   (long (or (:ties cursor) 0))
-        requested  (+ top-k-candidate-batch-size cursor-n)
-        ^java.util.List found
-        (if reverse?
-          (db/-rseek-datoms db :ave attr (or cursor-v start-value) nil requested)
-          (db/-seek-datoms db :ave attr (or cursor-v start-value) nil requested))
-        size       (.size found)
-        start      (long
-                     (loop [i 0]
-                       (if (and cursor-v (< i size)
-                                (= cursor-v (.-v ^Datom (.get found i))))
-                         (recur (unchecked-inc-int i))
-                         i)))
-        boundary   (when (< start size) (.-v ^Datom (.get found (dec size))))
-        boundary-datoms
-        ;; AVE stores entities as duplicate values. Expand the boundary key so
-        ;; secondary order terms cannot omit a primary-key tie.
-        (when boundary (db/-datoms db :ave attr boundary nil))
-        boundary-count (long (count boundary-datoms))
-        tuples     (FastList. (int (+ (- size start) boundary-count)))]
-    (loop [i start]
-      (when (< i size)
-        (let [^Datom datom (.get found i)]
-          (when-not (= boundary (.-v datom))
-            (.add tuples (object-array [(.-e datom) (.-v datom)])))
-          (recur (unchecked-inc-int i)))))
-    (doseq [^Datom datom boundary-datoms]
-      (.add tuples (object-array [(.-e datom) (.-v datom)])))
-    {:tuples tuples
-     :cursor (when boundary {:value boundary :ties boundary-count})
-     :done?  (< size requested)}))
-
-(defn- ranked-batch-query
-  [parsed-q clause-idx entity-var order-var]
-  (-> parsed-q
-      (update :qin conj (dp/parse-binding [[entity-var order-var]]))
-      (update :qwhere #(u/remove-idxs #{clause-idx} %))
-      (update :qorig-where #(u/remove-idxs #{clause-idx} %))
-      (assoc :qorder nil :qlimit nil :qoffset nil)))
+                    relation)]
+              [relation output-cols]))
+          [(r/relation! (qplan/cols->attrs (:cols step)) tuples)
+           (vec (:cols step))]
+          (map vector joins operators))))
+    tuples))
 
 (defn- past-top-k-boundary?
-  [find-vars order direction rows cursor window-end]
+  [path demand find-vars order rows frontier window-end]
   (let [window-end (long window-end)]
-    (when (and cursor (<= window-end (long (count rows))))
+    (when (and frontier (<= window-end (long (count rows))))
       (let [cmp          (order-comps (tuple-get (first rows)) find-vars order)
             cutoff-row   (nth (sort cmp rows) (unchecked-dec window-end))
             order-var    (first order)
             order-idx    (u/index-of #(= order-var %) find-vars)
-            cutoff-value (nth cutoff-row order-idx)
-            c             (compare (:value cursor) cutoff-value)]
-        (if (identical? direction :desc) (neg? c) (pos? c))))))
+            cutoff-value (nth cutoff-row order-idx)]
+        (qaccess/frontier-satisfies?
+          path demand frontier
+          {:row           cutoff-row
+           :find-vars     find-vars
+           :ordering      order
+           :primary-value cutoff-value})))))
 
-(declare execute-query)
+(declare execute-query execute-planned-query)
+
+(defn- access-source-db
+  [step inputs]
+  (or (:access-source step)
+      (first (filter db/db? inputs))))
 
 (defn- top-k-pushdown-query
-  [parsed-q inputs {:keys [db attr direction start-value clause-idx entity-var
-                           order-var]}]
-  (let [batch-query (ranked-batch-query parsed-q clause-idx entity-var order-var)
+  [parsed-q inputs
+   {:keys [source residual-query demand work fallback access-plan]}]
+  (let [path        (:path source)
+        source-db   (access-source-db source inputs)
+        batch-query residual-query
         find-vars   (dp/find-vars (:qfind parsed-q))
-        order       (:qorder parsed-q)
-        limit       (:qlimit parsed-q)
-        offset      (:qoffset parsed-q)
-        window-end  (+ (long (or offset 0)) (long limit))]
-    (loop [cursor nil
-           rows   #{}
-           batches 0]
-      (if (>= (long batches) top-k-max-candidate-batches)
-        (execute-query parsed-q inputs)
-        (let [{:keys [tuples done?] next-cursor :cursor}
-              (ranked-datom-page db attr direction start-value cursor)]
-          (if (zero? (.size ^java.util.List tuples))
-            (order-result find-vars rows order limit offset)
-            (let [batch-result (execute-query batch-query (conj (vec inputs)
-                                                                 tuples))
-                  rows         (into rows batch-result)]
-              (if (or done?
-                      (past-top-k-boundary? find-vars order direction rows
-                                            next-cursor window-end))
-                (order-result find-vars rows order limit offset)
-                (recur next-cursor rows (unchecked-inc-int batches))))))))))
+        order       (:ordering demand)
+        limit       (:limit demand)
+        offset      (:offset demand)
+        window-end  (:required-count demand)
+        work-budget (:max-candidates work)
+        budgeted?   (some? work-budget)
+        sample-batch (:sample-batch source)
+        sample-tuples (:tuples sample-batch)
+        sample-count (long (if sample-tuples
+                             (.size ^java.util.List sample-tuples)
+                             0))
+        sample-rows
+        (if (pos? sample-count)
+          (into #{}
+                (execute-query batch-query
+                               (conj
+                                 (vec inputs)
+                                 (execute-access-fragment
+                                   parsed-q source-db access-plan
+                                   sample-tuples))))
+          #{})
+        sample-done?
+        (or (:exhausted? sample-batch)
+            (past-top-k-boundary?
+              path demand find-vars order sample-rows
+              (:frontier sample-batch) window-end))
+        attempt-work
+        (cond-> work
+          (and budgeted? (pos? (long work-budget)))
+          (assoc :batch-size
+                 (min (long (or (:batch-size work) work-budget))
+                      (long work-budget)))
 
-(defn- execute-query
-  [parsed-q inputs]
+          sample-batch
+          (assoc :resume (:frontier sample-batch)
+                 :emitted sample-count))
+        fallback-query #(execute-planned-query (:context fallback) inputs)]
+    (cond
+      sample-done?
+      (order-result find-vars sample-rows order limit offset)
+
+      (and budgeted?
+           (or (not (pos? (long work-budget)))
+               (>= sample-count (long work-budget))))
+      (fallback-query)
+
+      :else
+      (let [cursor (qaccess/open-access
+                     path demand (:bounds source) attempt-work source-db nil)]
+        (try
+          (loop [rows sample-rows
+                 batches (if sample-batch 1 0)
+                 scanned sample-count]
+            (if (or (and (not budgeted?)
+                         (>= (long batches) top-k-max-candidate-batches))
+                    (and budgeted?
+                         (>= (long scanned) (long work-budget))))
+              (fallback-query)
+              (let [{:keys [tuples frontier exhausted?] :as batch}
+                    (qaccess/next-batch cursor)]
+                (if (zero? (.size ^java.util.List tuples))
+                  (if exhausted?
+                    (order-result find-vars rows order limit offset)
+                    (fallback-query))
+                  (let [batch-result
+                        (execute-query batch-query
+                                       (conj
+                                         (vec inputs)
+                                         (execute-access-fragment
+                                           parsed-q source-db access-plan
+                                           tuples)))
+                        rows (into rows batch-result)]
+                    (if (or exhausted?
+                            (past-top-k-boundary?
+                              path demand find-vars order rows
+                              frontier window-end))
+                      (order-result find-vars rows order limit offset)
+                      (recur rows
+                             (unchecked-inc-int batches)
+                             (+ (long scanned)
+                                (qaccess/batch-work batch)))))))))
+          (finally
+            (qaccess/close-cursor cursor)))))))
+
+(defn- limit-pushdown-query
+  [parsed-q inputs
+   {:keys [source residual-query demand work fallback access-plan]}]
+  (let [path          (:path source)
+        source-db     (access-source-db source inputs)
+        batch-query   residual-query
+        limit         (:limit demand)
+        offset        (:offset demand)
+        window-end    (long (:required-count demand))
+        work-budget   (:max-candidates work)
+        budgeted?     (some? work-budget)
+        sample-batch  (:sample-batch source)
+        sample-tuples (:tuples sample-batch)
+        sample-count  (long (if sample-tuples
+                              (.size ^java.util.List sample-tuples)
+                              0))
+        sample-work   (if sample-batch
+                        (qaccess/batch-work sample-batch)
+                        0)
+        sample-rows
+        (if (pos? sample-count)
+          (into #{}
+                (execute-query batch-query
+                               (conj
+                                 (vec inputs)
+                                 (execute-access-fragment
+                                   parsed-q source-db access-plan
+                                   sample-tuples))))
+          #{})
+        sample-done?
+        (or (:exhausted? sample-batch)
+            (<= window-end (long (count sample-rows))))
+        attempt-work
+        (cond-> work
+          (and budgeted? (pos? (long work-budget)))
+          (assoc :batch-size
+                 (min (long (or (:batch-size work) work-budget))
+                      (long work-budget)))
+
+          sample-batch
+          (assoc :resume (:frontier sample-batch)
+                 :emitted sample-work))
+        fallback-query #(execute-planned-query (:context fallback) inputs)
+        finish         #(result-window % limit offset)]
+    (cond
+      (zero? window-end)
+      []
+
+      sample-done?
+      (finish sample-rows)
+
+      (and budgeted?
+           (or (not (pos? (long work-budget)))
+               (>= sample-work (long work-budget))))
+      (fallback-query)
+
+      :else
+      (let [cursor (qaccess/open-access
+                     path demand (:bounds source) attempt-work source-db nil)]
+        (try
+          (loop [rows    sample-rows
+                 batches (if sample-batch 1 0)
+                 scanned sample-work]
+            (if (or (and (not budgeted?)
+                         (>= (long batches) top-k-max-candidate-batches))
+                    (and budgeted?
+                         (>= (long scanned) (long work-budget))))
+              (fallback-query)
+              (let [{:keys [tuples exhausted?] :as batch}
+                    (qaccess/next-batch cursor)
+                    batch-work (qaccess/batch-work batch)
+                    scanned    (+ (long scanned) batch-work)]
+                (if (zero? (.size ^java.util.List tuples))
+                  (cond
+                    exhausted?
+                    (finish rows)
+
+                    (zero? batch-work)
+                    (fallback-query)
+
+                    :else
+                    (recur rows (unchecked-inc-int batches) scanned))
+                  (let [batch-result
+                        (execute-query batch-query
+                                       (conj
+                                         (vec inputs)
+                                         (execute-access-fragment
+                                           parsed-q source-db access-plan
+                                           tuples)))
+                        rows (into rows batch-result)]
+                    (if (or exhausted?
+                            (<= window-end (long (count rows))))
+                      (finish rows)
+                      (recur rows
+                             (unchecked-inc-int batches)
+                             scanned)))))))
+          (finally
+            (qaccess/close-cursor cursor)))))))
+
+(defn- finish-query
+  [parsed-q context]
   (let [find          (:qfind parsed-q)
         find-elements (dp/find-elements find)
         result-arity  (count find-elements)
@@ -652,34 +958,22 @@
         having        (:qhaving parsed-q)
         find-vars     (dp/find-vars find)
         all-vars      (concatv find-vars (map :symbol with))
-        [parsed-q inputs] (plugin-inputs parsed-q inputs)
-        udf-db        (first (filter db/-searchable? inputs))
-        context
-        (binding [built-ins/*udf-db* udf-db]
-          (-> (qplan/make-context parsed-q true)
-              (qresolve/resolve-ins inputs)
-              (materialize-input-bound-patterns)
-              (resolve-redudants)
-              (rules/rewrite)
-              (rewrite-unused-vars)
-              (-q true)
-              (collect all-vars)))
+        context       (collect context all-vars)
         result
-        (binding [built-ins/*udf-db* udf-db]
-          (cond->> (:result-set context)
-            with (mapv #(subvec % 0 result-arity))
+        (cond->> (:result-set context)
+          with (mapv #(subvec % 0 result-arity))
 
-            (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
-            (qagg/aggregate find-elements context)
+          (some #(or (dp/aggregate? %) (dp/find-expr? %)) find-elements)
+          (qagg/aggregate find-elements context)
 
-            (seq having)
-            (qagg/apply-having having find-elements)
+          (seq having)
+          (qagg/apply-having having find-elements)
 
-            (some dp/pull? find-elements)
-            (pull find-elements context)
+          (some dp/pull? find-elements)
+          (pull find-elements context)
 
-            true
-            (-post-process find (:qreturn-map parsed-q))))]
+          true
+          (-post-process find (:qreturn-map parsed-q)))]
     (result-explain context result)
     (if (instance? FindRel find)
       (if-let [order (:qorder parsed-q)]
@@ -688,14 +982,119 @@
         (result-window result (:qlimit parsed-q) (:qoffset parsed-q)))
       result)))
 
+(defn- run-planned-context
+  [{:keys [result-set late-clauses sources] :as context}]
+  (binding [qu/*implicit-source* (get sources '$)]
+    (if (= result-set #{})
+      context
+      (let [context (execute-plan context)]
+        (reduce qresolve/resolve-clause context late-clauses)))))
+
+(defn- execute-planned-query
+  [context inputs]
+  (let [parsed-q (:parsed-q context)
+        udf-db   (first (filter db/-searchable? inputs))]
+    (binding [built-ins/*udf-db* udf-db]
+      (finish-query parsed-q (run-planned-context context)))))
+
+(defn- execute-query
+  ([parsed-q inputs]
+   (execute-query parsed-q inputs []))
+  ([parsed-q inputs access-plans]
+   (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)
+         udf-db            (first (filter db/-searchable? inputs))
+         context
+         (binding [built-ins/*udf-db* udf-db]
+           (-> (qplan/make-context parsed-q true)
+               (attach-access-plans access-plans)
+               (qresolve/resolve-ins inputs)
+               (materialize-input-bound-patterns)
+               (resolve-redudants)
+               (rules/rewrite)
+               (rewrite-unused-vars)
+               (-q true)))]
+     (binding [built-ins/*udf-db* udf-db]
+       (finish-query parsed-q context)))))
+
+(defn- access-query-plan
+  [parsed-q inputs access-plans]
+  (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)
+        udf-db            (first (filter db/-searchable? inputs))]
+    (binding [built-ins/*udf-db* udf-db]
+      (-> (qplan/make-context parsed-q false)
+          (attach-access-plans access-plans)
+          (qresolve/resolve-ins inputs)
+          (materialize-input-bound-patterns)
+          (resolve-redudants)
+          (rules/rewrite)
+          (rewrite-unused-vars)
+          (-q false)))))
+
+(defmulti ^:private execute-alternative
+  (fn [_parsed-q _inputs _access-plans alternative]
+    (:kind alternative)))
+
+(defmethod execute-alternative :access
+  [parsed-q inputs _access-plans alternative]
+  (let [{:keys [mode source outer-query access-plan] :as plan}
+        (:plan alternative)
+        adaptive?     (#{:adaptive-top-k :adaptive-limit} mode)
+        residual-query (access-batch-query parsed-q access-plan adaptive?)
+        outer-query   (or outer-query
+                          (when (:correlated? access-plan)
+                            (access-outer-query parsed-q access-plan)))
+        plan          (assoc plan
+                             :residual-query residual-query
+                             :outer-query outer-query)]
+    (case mode
+      :adaptive-top-k
+      (top-k-pushdown-query parsed-q inputs plan)
+
+      :adaptive-limit
+      (limit-pushdown-query parsed-q inputs plan)
+
+      :correlated-complete
+      (let [source-db (access-source-db source inputs)
+            outer     (execute-query outer-query inputs)
+            tuples    (->> (qplan/step-execute source source-db outer)
+                           (execute-access-fragment
+                             parsed-q source-db access-plan))]
+        (execute-query residual-query (conj (vec inputs) tuples)))
+
+      :complete
+      (let [source-db (access-source-db source inputs)
+            tuples    (->> (qplan/step-execute source source-db nil)
+                           (execute-access-fragment
+                             parsed-q source-db access-plan))]
+        (execute-query residual-query (conj (vec inputs) tuples)))
+
+      (execute-query parsed-q inputs))))
+
+(defmethod execute-alternative :conventional
+  [_parsed-q inputs _access-plans alternative]
+  (execute-planned-query (get-in alternative [:plan :context]) inputs))
+
+(defmethod execute-alternative :default
+  [parsed-q inputs access-plans _alternative]
+  (execute-query parsed-q inputs access-plans))
+
 (defn q*
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/effective-deadline
                                  (:qtimeout parsed-q))]
-    (if-let [spec (and (nil? qplan/*explain*)
-                       (top-k-pushdown-spec parsed-q inputs))]
-      (top-k-pushdown-query parsed-q inputs spec)
-      (execute-query parsed-q inputs))))
+    (let [plans (discover-access-plans parsed-q inputs)]
+      (cond
+        qplan/*explain*
+        (execute-query parsed-q inputs plans)
+
+        (seq plans)
+        (let [planned-context (access-query-plan parsed-q inputs plans)]
+          (execute-alternative
+            parsed-q inputs (:access-plans planned-context)
+            (qo/selected-alternative planned-context)))
+
+        :else
+        (execute-query parsed-q inputs plans)))))
 
 (defn mark-parsing-finished!
   []
@@ -707,8 +1106,10 @@
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/effective-deadline
                                  (:qtimeout parsed-q))]
-    (let [[parsed-q inputs] (plugin-inputs parsed-q inputs)]
+    (let [plans             (discover-access-plans parsed-q inputs)
+          [parsed-q inputs] (plugin-inputs parsed-q inputs)]
       (-> (qplan/make-context parsed-q false)
+          (attach-access-plans plans)
           (qresolve/resolve-ins inputs)
           (materialize-input-bound-patterns)
           (resolve-redudants)

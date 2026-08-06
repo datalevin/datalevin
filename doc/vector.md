@@ -397,6 +397,29 @@ passed at run time to customize search:
 * `:domains` specifies a list of embedding domains to search when using the
   domain-based form of `embedding-neighbors`.
 
+#### Datalog vector access paths
+
+For finite Datalog relation queries, the optimizer can consume the existing
+approximate result stream of `vec-neighbors` or `embedding-neighbors` through a
+resumable access path. Each function invocation retains its own `:top`,
+`:vec-filter`, display mode, domain order, and per-domain search. A query-level
+limit never widens the function's approximate top-N window.
+
+This access path is exact relative to the result returned by the existing
+approximate query function; it does not turn HNSW search into exact
+nearest-neighbor search or claim additional recall. The native vector search
+still computes the configured source top-N. Bounded consumption avoids decoding
+and joining every returned tuple when enough final query results have already
+survived later predicates and joins.
+
+When exactly one domain returns `:display :refs+dists`, an `:order-by` whose
+leading term is the distance variable in ascending order can consume the ranked
+stream directly. Equal-distance candidates in that stream are consumed
+completely before early termination, preserving later order terms. Multi-domain
+searches and `:refs` display provide a complete, resumable unordered path.
+Correlated vector or embedding arguments currently use normal query-function
+execution.
+
 #### Vector search domains
 
 Vectors can be added to different vector search domains, each corresponding to a

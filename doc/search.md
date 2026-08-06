@@ -130,6 +130,22 @@ normal page-by-page access reuses the same ranked window. `:paging-cache-pages`
 defaults to `10`. When `:limit` is not supplied, Datalevin scores
 `:offset + :top` candidates.
 
+For finite Datalog relation queries, the optimizer can consume this fixed
+fulltext result window as a resumable access path. The fulltext function's own
+`:top`, `:limit`, and `:offset` remain source-local bounds and are never widened
+by a query-level limit. Matching tuples are decoded and joined in bounded
+batches, allowing execution to stop after enough final tuples survive the
+remaining filters and joins. The conventional plan remains available as a
+cost-based fallback.
+
+When exactly one search domain returns `:display :refs+scores`, an
+`:order-by` whose leading term is the score variable in descending order can
+also use the ranked stream directly. Score ties are consumed completely before
+the access frontier permits early termination, so later order terms remain
+correct. Multi-domain searches and other display modes provide a complete,
+resumable unordered path. Correlated fulltext arguments currently use normal
+query-function execution.
+
 ```Clojure
 (let [db (-> (d/empty-db "/tmp/mydb"
                {:text {:db/valueType           :db.type/string
