@@ -1241,6 +1241,46 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-access-index-fragment-skips-missing-lookups
+  (let [dir   (u/tmp-dir (str "query-access-missing-lookup-"
+                              (UUID/randomUUID)))
+        conn  (d/get-conn dir)
+        tags  (mapv #(str "tag-" %) (range 32))
+        query '[:find ?e ?rank ?tag
+                :in $ ?max-rank
+                :where
+                [?e :rank ?rank]
+                [(<= ?rank ?max-rank)]
+                [?e :keep true]
+                [?e :tag ?tag]
+                :order-by [?rank :desc ?e :asc ?tag :asc]
+                :limit 10]]
+    (try
+      ;; Most bound index lookups miss. An access fragment must treat each
+      ;; miss as an empty join result instead of passing a nil tuple list to
+      ;; relation multiplication.
+      (d/transact!
+        conn
+        (mapv (fn [^long rank]
+                (cond-> {:db/id rank :rank rank}
+                  (zero? (rem rank 10))
+                  (assoc :keep true :tag tags)))
+              (range 1 2001)))
+      (binding [q/*cache?* false]
+        (let [db       (d/db conn)
+              expected (binding [qexec/*access-methods* []]
+                         (d/q query db 2000))
+              explain  (d/explain {} query db 2000)
+              actual   (d/q query db 2000)]
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-top-k
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= 10 (count actual)))
+          (is (= expected actual))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-ordered-limit-access-plan-is-explained
   (let [dir   (u/tmp-dir (str "query-top-k-explain-" (UUID/randomUUID)))
         conn  (d/get-conn dir)

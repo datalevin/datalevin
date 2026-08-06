@@ -1,16 +1,17 @@
 # Access-path Benchmark
 
 This benchmark measures the query-engine benefit of Datalevin physical access
-paths. It runs the same fulltext and vector queries in two modes:
+paths. It covers AVE, idoc, fulltext, and vector access, plus a conventional
+control query. Each query runs in two modes:
 
-1. **Conventional**: the existing query function materializes its complete
-   source-local top-N result before the residual indexed join and root
-   top-k are evaluated.
-2. **Access**: the optimizer selects `:adaptive-top-k` and incrementally feeds
-   source rows through the residual join until the root top-k result is
-   proven complete.
+1. **Conventional**: physical access methods are disabled and the query uses
+   its normal complete plan.
+2. **Access**: physical access methods are enabled. Eligible queries use
+   `:adaptive-top-k` or `:adaptive-limit`; the control remains conventional.
 
 Before timing, the runner requires both modes to return exactly the same ordered
+result for AVE, fulltext, vector, and control queries. Idoc uses an unordered
+limit, so both windows are instead checked against the complete conventional
 result. Query-result caching is disabled in both modes. Measurements alternate
 the execution order of the two modes and report median and p95 latency.
 
@@ -19,7 +20,10 @@ window, joins it with a selective boolean attribute and multi-valued metadata,
 and asks the root query for a small ordered result. Conventional execution
 expands the full ranked window through those joins; access execution only
 expands the candidate prefix needed to prove the top-k. This is the workload
-shape the access path is designed to improve.
+shape the access path is designed to improve. The idoc workload exercises
+adaptive unordered limits. The control workload has no eligible access path and
+measures the overhead of leaving access discovery enabled for an ordinary
+bounded query.
 
 ## Vector benchmark scope
 
@@ -38,18 +42,22 @@ One default-configuration run on 2026-08-05 produced the following result.
 The host was an Intel Core i7-6850K (6 cores/12 threads), Linux amd64, and
 OpenJDK 21.0.10. Absolute latency and speedup are machine-dependent.
 
-| Workload | Conventional median | Access median | Speedup | Conventional p95 | Access p95 | Source filter calls |
+| Workload | Conventional median | Access median | Ratio | Conventional p95 | Access p95 | Source checks |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| Fulltext | 95.732 ms | 4.154 ms | 23.05x | 102.939 ms | 5.405 ms | 10,000 -> 65 |
-| Vector | 103.999 ms | 11.842 ms | 8.78x | 136.028 ms | 13.014 ms | 10,000 -> 10,000 |
+| AVE | 191.874 ms | 34.828 ms | 5.51x | 233.027 ms | 40.178 ms | — |
+| Control | 31.048 ms | 30.603 ms | 1.01x | 33.825 ms | 33.150 ms | — |
+| Fulltext | 94.647 ms | 2.682 ms | 35.30x | 150.425 ms | 3.540 ms | 10,000 -> 65 |
+| Idoc | 68.618 ms | 4.199 ms | 16.34x | 75.498 ms | 4.762 ms | — |
+| Vector | 102.201 ms | 11.706 ms | 8.73x | 108.840 ms | 12.752 ms | 10,000 -> 10,000 |
 
-Both access plans used `:adaptive-top-k`, had a maximum candidate budget of
-100 instead of the conventional 10,000-row source window, and returned the
-same ordered 10 rows as conventional execution. Fulltext's lazy source also
-reduced document-filter checks. Vector's unchanged source-filter count confirms
-that this benchmark leaves the existing eager approximate HNSW search alone;
-its speedup comes from avoiding downstream Datalog expansion and
-materialization.
+AVE, fulltext, and vector used `:adaptive-top-k`; idoc used `:adaptive-limit`.
+Their maximum candidate budgets were 2, 100, 100, and 200 respectively, versus
+20,000-row AVE/idoc and 10,000-row fulltext/vector source windows. Fulltext's
+lazy source also reduced document-filter checks. Vector's unchanged source
+check count confirms that this benchmark leaves the existing eager approximate
+HNSW search alone; its speedup comes from avoiding downstream Datalog expansion
+and materialization. The control selected no access path and stayed within
+measurement noise of disabled access discovery.
 
 The [raw result](results/linux-i7-6850k-2026-08-05.edn) includes all twenty
 latency samples for each workload and mode, configuration, load time, and JVM
@@ -64,8 +72,10 @@ clojure -M:bench
 ```
 
 The defaults load 20,000 entities, add 64 metadata values to one entity in ten,
-request a source-local top 10,000, and return the root top 10. Each mode gets
-eight warmup runs and twenty measured runs.
+request a source-local fulltext/vector top 10,000, and return the root top 10.
+All five workloads run by default. Each mode gets eight warmup runs and twenty
+measured runs. Use `--workloads` with a comma-separated subset of
+`ave,idoc,fulltext,vector,control` to narrow a run.
 
 For a quick smoke run:
 
@@ -92,10 +102,11 @@ The most useful fields are:
   latency.
 - `candidate window`: the conventional source top-N compared with the
   optimizer's maximum access attempt before its safe conventional fallback.
-- `source filter calls`: diagnostic source work. This shows lazy consumption
-  for fulltext; it intentionally stays unchanged for the current eager vector
-  source.
+- `source checks`: diagnostic source work where a provider exposes a safe
+  filter hook. This shows lazy consumption for fulltext; it intentionally stays
+  unchanged for the current eager vector source.
 
-The runner fails before timing if the access plan is not selected, adaptive
-top-k is not used, the two modes disagree, or the root result window is not
-full.
+The runner fails before timing if an access workload does not select its
+expected adaptive mode, the control unexpectedly selects an access path, an
+ordered result differs, an idoc window contains a row outside the complete
+result, or a root result window is not full.

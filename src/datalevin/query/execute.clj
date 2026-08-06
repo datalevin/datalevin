@@ -686,11 +686,16 @@
                                  (doto (FastList.) (.add tuple)))
             context (assoc (qplan/make-context parsed-q false)
                            :rels [one])
-            lookup  (qresolve/lookup-pattern context source-db pattern)
-            result  (reduce r/prod-rel
-                            (qresolve/collapse-rels [one] lookup))
-            projected (project-access-relation result output-cols)]
-        (.addAll joined ^java.util.Collection (:tuples projected))))
+            lookup  (qresolve/lookup-pattern context source-db pattern)]
+        ;; A bound index lookup can legitimately miss for an individual
+        ;; access tuple. `lookup-pattern` represents that as a relation with a
+        ;; nil tuple list; it is an empty join result, not an input to
+        ;; `prod-rel`.
+        (when (some? (:tuples lookup))
+          (let [result (reduce r/prod-rel
+                               (qresolve/collapse-rels [one] lookup))
+                projected (project-access-relation result output-cols)]
+            (.addAll joined ^java.util.Collection (:tuples projected))))))
     (r/relation! (qplan/cols->attrs output-cols) joined)))
 
 (defn- execute-hash-fragment-join
@@ -698,10 +703,12 @@
   (let [pattern (access-fragment-pattern parsed-q (:clause-idx join))
         context (assoc (qplan/make-context parsed-q false)
                        :rels [relation])
-        lookup  (qresolve/lookup-pattern context source-db pattern)
-        result  (reduce r/prod-rel
-                        (qresolve/collapse-rels [relation] lookup))]
-    (project-access-relation result output-cols)))
+        lookup  (qresolve/lookup-pattern context source-db pattern)]
+    (if (some? (:tuples lookup))
+      (let [result (reduce r/prod-rel
+                           (qresolve/collapse-rels [relation] lookup))]
+        (project-access-relation result output-cols))
+      (r/relation! (qplan/cols->attrs output-cols) (FastList.)))))
 
 (defn- execute-access-fragment
   [parsed-q source-db {:keys [step joins operators]} tuples]

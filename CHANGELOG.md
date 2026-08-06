@@ -16,6 +16,8 @@
   targets, and conflicting patch/delete operations are rejected.
 
 ### Fixed
+- [Datalog] Adaptive access fragments treat missing bound index lookups as
+  empty join results instead of failing during relation multiplication.
 - [Datalog] fix composite tuple `nil` regression introduced in 1.0.0.
 - [Datalog] Nested `q` calls now inherit the containing query deadline, do not
   corrupt `explain {:run? true}` timing state, and cannot leave stale containing
