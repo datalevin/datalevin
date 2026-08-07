@@ -43,7 +43,7 @@
         (is (= active-client
                (#'remote/disable-ha-transaction-retry! routing-client)))
         (is (= [active-client] @cleared))
-        (is (= [active-client] @disabled)))
+        (is (= [routing-client active-client] @disabled)))
 
       (testing "a successful close restores normal HA routing"
         (is (= :ok

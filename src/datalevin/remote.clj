@@ -180,11 +180,13 @@
     ;; The open request has already selected the exact endpoint client whose
     ;; server session owns this transaction. A cached endpoint client can have
     ;; a stale preference of its own, so remove that nested route before using
-    ;; it for transaction data and control messages. Only this concrete client
-    ;; is retained by the transaction wrapper; disabling a distinct routing
-    ;; facade would leave it disabled after the wrapper closes.
+    ;; it for transaction data and control messages. Keep both the routing
+    ;; facade and the selected endpoint pinned for the lifetime of the explicit
+    ;; transaction.
     (#'cl/clear-preferred-ha-endpoint! active-client)
-    (#'cl/disable-ha-write-retry! active-client)
+    (#'cl/disable-ha-write-retry! routing-client)
+    (when-not (identical? routing-client active-client)
+      (#'cl/disable-ha-write-retry! active-client))
     active-client))
 
 (defn- enable-ha-transaction-retry!
