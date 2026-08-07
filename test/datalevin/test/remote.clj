@@ -9,6 +9,7 @@
         active-client  ::active-client
         disabled       (atom [])
         enabled        (atom [])
+        cleared        (atom [])
         requests       (atom [])
         fail-close?    (atom false)]
     (with-redefs [client/active-ha-request-client
@@ -24,6 +25,10 @@
                   (fn [client]
                     (swap! enabled conj client)
                     client)
+                  client/clear-preferred-ha-endpoint!
+                  (fn [client]
+                    (swap! cleared conj client)
+                    client)
                   client/normal-request
                   (fn [client request-type args writing?]
                     (swap! requests conj
@@ -34,16 +39,17 @@
                                           request-type))
                       (throw (ex-info "close rejected" {})))
                     :ok)]
-      (testing "the routing facade and selected endpoint are both pinned"
+      (testing "the selected endpoint is pinned to its owning session"
         (is (= active-client
                (#'remote/disable-ha-transaction-retry! routing-client)))
-        (is (= [routing-client active-client] @disabled)))
+        (is (= [active-client] @cleared))
+        (is (= [active-client] @disabled)))
 
       (testing "a successful close restores normal HA routing"
         (is (= :ok
                (#'remote/close-ha-transaction!
-                routing-client :close-transact "db")))
-        (is (= [routing-client active-client] @enabled)))
+                active-client :close-transact "db")))
+        (is (= [active-client] @enabled)))
 
       (reset! enabled [])
       (reset! fail-close? true)
@@ -52,16 +58,16 @@
              clojure.lang.ExceptionInfo
              #"close rejected"
              (#'remote/close-ha-transaction!
-              routing-client :close-transact "db")))
+              active-client :close-transact "db")))
         (is (empty? @enabled)))
 
       (reset! fail-close? false)
       (testing "abort restores routing even when used as failure cleanup"
         (is (= :ok
                (#'remote/abort-ha-transaction!
-                routing-client :abort-transact "db")))
-        (is (= [routing-client active-client] @enabled))
-        (is (= [[routing-client :close-transact ["db"] true]
-                [routing-client :close-transact ["db"] true]
-                [routing-client :abort-transact ["db"] true]]
+                active-client :abort-transact "db")))
+        (is (= [active-client] @enabled))
+        (is (= [[active-client :close-transact ["db"] true]
+                [active-client :close-transact ["db"] true]
+                [active-client :abort-transact ["db"] true]]
                @requests))))))

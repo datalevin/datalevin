@@ -177,12 +177,14 @@
 (defn- disable-ha-transaction-retry!
   [routing-client]
   (let [active-client (#'cl/active-ha-request-client routing-client)]
-    ;; Explicit transactions are owned by one server session. Pin both the
-    ;; routing facade and the active endpoint client so control messages cannot
-    ;; fail over to a different session after the transaction has opened.
-    (#'cl/disable-ha-write-retry! routing-client)
-    (when-not (identical? routing-client active-client)
-      (#'cl/disable-ha-write-retry! active-client))
+    ;; The open request has already selected the exact endpoint client whose
+    ;; server session owns this transaction. A cached endpoint client can have
+    ;; a stale preference of its own, so remove that nested route before using
+    ;; it for transaction data and control messages. Only this concrete client
+    ;; is retained by the transaction wrapper; disabling a distinct routing
+    ;; facade would leave it disabled after the wrapper closes.
+    (#'cl/clear-preferred-ha-endpoint! active-client)
+    (#'cl/disable-ha-write-retry! active-client)
     active-client))
 
 (defn- enable-ha-transaction-retry!
