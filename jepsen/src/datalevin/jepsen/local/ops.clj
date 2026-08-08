@@ -844,9 +844,9 @@
               (when (store-open? lmdb)
                 (i/txlog-retention-state lmdb)))))))))
 
-(defn copy-backup-pin-ids
-  [deps cluster-id logical-node]
-  (->> (get-in (txlog-retention-state deps cluster-id logical-node)
+(defn- copy-backup-pin-ids-from-retention-state
+  [retention-state]
+  (->> (get-in retention-state
                [:floor-providers :backup :pins])
        (keep (fn [{:keys [pin-id expired?]}]
                (when (and (string? pin-id)
@@ -855,6 +855,11 @@
                  pin-id)))
        sort
        vec))
+
+(defn copy-backup-pin-ids
+  [deps cluster-id logical-node]
+  (copy-backup-pin-ids-from-retention-state
+   (txlog-retention-state deps cluster-id logical-node)))
 
 (defn- node-kv-open-opts
   [{:keys [base-opts node-ha-opt-overrides]} logical-node node]
@@ -890,7 +895,8 @@
                   (if (store-open? lmdb)
                     (f (ensure-kv-info-dbi-open! lmdb))
                     (u/raise "Cannot access KV store on unavailable Jepsen node"
-                             {:cluster-id cluster-id
+                             {:type :lmdb/closed
+                              :cluster-id cluster-id
                               :logical-node logical-node
                               :db-name db-name})))))]
         (if (= read-lock-unavailable result)
@@ -1005,36 +1011,20 @@
             (i/close store)))))))
 
 (defn clear-copy-backup-pins-on-node!
-  [{:keys [clusters remote-cluster?] :as deps} cluster-id logical-node]
-  (if (remote-cluster? cluster-id)
-    (let [pin-ids (copy-backup-pin-ids deps cluster-id logical-node)]
-      (when (seq pin-ids)
-        (with-node-kv-store
-          deps
-          cluster-id
-          logical-node
-          (fn [kv-store]
-            (doseq [pin-id pin-ids]
-              (i/txlog-unpin-backup-floor! kv-store pin-id)))))
-      {:cleared-pin-ids pin-ids
-       :remaining-pin-ids (copy-backup-pin-ids deps cluster-id logical-node)})
-    (let [{:keys [db-name servers]} (get @clusters cluster-id)
-          state (db-state (get servers logical-node) db-name)]
-      (when-not state
-        (u/raise "Cannot clear copy backup pins on unavailable Jepsen node"
-                 {:cluster-id cluster-id
-                  :logical-node logical-node}))
-      (let [pin-ids  (copy-backup-pin-ids deps cluster-id logical-node)]
-        (when (seq pin-ids)
-          (with-node-kv-store
-            deps
-            cluster-id
-            logical-node
-            (fn [kv-store]
-              (doseq [pin-id pin-ids]
-                (i/txlog-unpin-backup-floor! kv-store pin-id)))))
+  [deps cluster-id logical-node]
+  (with-node-kv-store
+    deps
+    cluster-id
+    logical-node
+    (fn [kv-store]
+      (let [pin-ids (copy-backup-pin-ids-from-retention-state
+                     (i/txlog-retention-state kv-store))]
+        (doseq [pin-id pin-ids]
+          (i/txlog-unpin-backup-floor! kv-store pin-id))
         {:cleared-pin-ids pin-ids
-         :remaining-pin-ids (copy-backup-pin-ids deps cluster-id logical-node)}))))
+         :remaining-pin-ids
+         (copy-backup-pin-ids-from-retention-state
+          (i/txlog-retention-state kv-store))}))))
 
 (defn create-snapshot-on-node!
   [{:keys [clusters remote-cluster?] :as deps} cluster-id logical-node]

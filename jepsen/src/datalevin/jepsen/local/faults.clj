@@ -62,6 +62,8 @@
   ["HA write admission rejected"
    "HA control command timed out"
    "HA write commit confirmation failed"
+   "Active transaction belongs to another client"
+   "Cannot confirm a transaction that is no longer active"
    "Timed out waiting for durable LSN"
    "Timed out waiting for single leader"
    "Socket channel is closed."

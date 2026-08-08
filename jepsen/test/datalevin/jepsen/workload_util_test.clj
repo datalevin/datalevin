@@ -831,6 +831,31 @@
     (is (= 0 (:failure-count result)))
     (is (= 1 (:indeterminate-count result)))))
 
+(deftest identity-upsert-checker-classifies-flattened-transaction-close-test
+  (let [op     {:f :lookup-ref-cas
+                :identity/case-id 9}
+        result (checker/check
+                (#'identity-upsert/identity-upsert-checker)
+                {:datalevin/nemesis-faults [:clock-skew-leader-fast]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :info
+                         :error
+                         (str "Request to Datalevin server failed: \"Error "
+                              "Handling with-transaction message:Cannot "
+                              "confirm a transaction that is no longer active\""))
+                  {:process 1
+                   :type :ok
+                   :f :probe
+                   :value {}}])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:indeterminate-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
+
 (deftest identity-upsert-checker-ignores-node-kill-admission-rejections-test
   (let [op     {:f :lookup-ref-intermediate
                 :identity/case-id 2}
@@ -947,6 +972,31 @@
     (is (= 0 (:mismatch-count result)))
     (is (= 0 (:failure-count result)))
     (is (= 1 (:indeterminate-count result)))))
+
+(deftest index-consistency-checker-classifies-flattened-transaction-close-test
+  (let [op     {:f :ref-create
+                :index/case-id 14}
+        result (checker/check
+                (#'index-consistency/index-consistency-checker)
+                {:datalevin/nemesis-faults [:clock-skew-leader-slow]}
+                (history/history
+                 [(assoc op
+                         :process 0
+                         :type :info
+                         :error
+                         (str "Request to Datalevin server failed: \"Error "
+                              "Handling with-transaction message:Cannot "
+                              "confirm a transaction that is no longer active\""))
+                  {:process 1
+                   :type :ok
+                   :f :probe
+                   :value {}}])
+                nil)]
+    (is (true? (:valid? result)) (pr-str result))
+    (is (= 1 (:disruption-failure-count result)))
+    (is (= 0 (:indeterminate-count result)))
+    (is (= 0 (:failure-count result)))
+    (is (= 0 (:probe-mismatch-count result)))))
 
 (deftest index-consistency-checker-allows-transient-read-back-mismatch-test
   (let [op     {:f :ref-create

@@ -300,6 +300,54 @@
         (d/close-kv kv-store)
         (u/delete-files dir)))))
 
+(deftest clear-copy-backup-pins-on-live-store-test
+  (let [dir      (u/tmp-dir (str "jepsen-clear-copy-backup-pins-"
+                                 (UUID/randomUUID)))
+        db-name  "clear-copy-backup-pins"
+        kv-store (d/open-kv dir {:wal? true})
+        server   (ha-test-server {db-name {:store kv-store}})
+        deps     (local-ops-test-deps db-name server)]
+    (try
+      (i/txlog-pin-backup-floor! kv-store "backup-copy/active" 0)
+      (i/txlog-pin-backup-floor! kv-store
+                                 "backup-copy/expired"
+                                 0
+                                 (dec (System/currentTimeMillis)))
+      (i/txlog-pin-backup-floor! kv-store "replication/n1" 0)
+      (is (= ["backup-copy/active"]
+             (lops/copy-backup-pin-ids deps :test-cluster "n1")))
+      (is (= {:cleared-pin-ids ["backup-copy/active"]
+              :remaining-pin-ids []}
+             (lops/clear-copy-backup-pins-on-node!
+              deps
+              :test-cluster
+              "n1")))
+      (is (= []
+             (lops/copy-backup-pin-ids deps :test-cluster "n1")))
+      (is (= ["backup-copy/expired" "replication/n1"]
+             (->> (get-in (i/txlog-retention-state kv-store)
+                          [:floor-providers :backup :pins])
+                  (map :pin-id)
+                  sort
+                  vec)))
+      (finally
+        (d/close-kv kv-store)
+        (u/delete-files dir)))))
+
+(deftest local-with-node-kv-store-reports-closed-store-test
+  (let [error (try
+                (lops/with-node-kv-store
+                 (local-ops-test-deps "closed-store" nil)
+                 :test-cluster
+                 "n1"
+                 identity)
+                nil
+                (catch clojure.lang.ExceptionInfo e
+                  e))]
+    (is (= "Cannot access KV store on unavailable Jepsen node"
+           (ex-message error)))
+    (is (= :lmdb/closed (:type (ex-data error))))))
+
 (deftest gc-txlog-segments-on-node-allows-expected-skip-test
   (let [db-name "gc-skip-test"
         server  (ha-test-server {db-name {:store ::store}})
@@ -505,6 +553,14 @@
         control-timeout "Request to Datalevin server failed: \"HA control command timed out\""
         commit-confirmation-failure
         "Request to Datalevin server failed: \"HA write commit confirmation failed\""
+        missing-transaction
+        (str "Request to Datalevin server failed: \"Error Handling "
+             "with-transaction message:Cannot confirm a transaction "
+             "that is no longer active\"")
+        owner-mismatch
+        (str "Request to Datalevin server failed: \"Error Handling "
+             "with-transaction message:Active transaction belongs to "
+             "another client\"")
         write-indeterminate
         {:message "Request to Datalevin server failed"
          :err-data {:error :ha/write-indeterminate
@@ -536,6 +592,14 @@
                    {:error commit-confirmation-failure}))))
     (is (true? (boolean
                  (local/expected-disruption-write-failure?
+                  active-test
+                  missing-transaction))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
+                  active-test
+                  owner-mismatch))))
+    (is (true? (boolean
+                 (local/expected-disruption-write-failure?
                    active-test
                    write-indeterminate))))
     (is (true? (boolean
@@ -550,7 +614,11 @@
     (is (false? (boolean
                   (local/expected-disruption-write-failure?
                     inactive-test
-                    write-indeterminate))))))
+                    write-indeterminate))))
+    (is (false? (boolean
+                  (local/expected-disruption-write-failure?
+                   inactive-test
+                   missing-transaction))))))
 
 (deftest local-query-uses-server-ha-read-view-test
   (assert-local-query-refreshes-ha-read-view!
