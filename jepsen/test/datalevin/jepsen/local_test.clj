@@ -18,7 +18,8 @@
    [datalevin.server Server]
    [java.net ServerSocket]
    [java.util UUID]
-   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue TimeUnit]
+   [java.util.concurrent ConcurrentHashMap ConcurrentLinkedQueue CountDownLatch
+    TimeUnit]
    [java.util.concurrent.atomic AtomicBoolean]))
 
 (use-fixtures :once test-support/quiet-logs-fixture)
@@ -347,6 +348,38 @@
     (is (= "Cannot access KV store on unavailable Jepsen node"
            (ex-message error)))
     (is (= :lmdb/closed (:type (ex-data error))))))
+
+(deftest local-snapshot-creation-waits-for-runtime-store-swap-test
+  (let [db-name      "snapshot-store-swap"
+        server       (ha-test-server {db-name {:store ::store}})
+        deps         (local-ops-test-deps db-name server)
+        swap-started (CountDownLatch. 1)
+        release-swap (CountDownLatch. 1)
+        swap-future  (future
+                       (#'srv/with-db-runtime-store-swap
+                        server
+                        db-name
+                        (fn []
+                          (.countDown swap-started)
+                          (.await release-swap 5 TimeUnit/SECONDS))))]
+    (is (.await swap-started 5 TimeUnit/SECONDS))
+    (try
+      (with-redefs [i/create-snapshot! (fn [_]
+                                         {:ok? true
+                                          :snapshot {:applied-lsn 1}})]
+        (let [snapshot-future
+              (future
+                (lops/create-snapshot-on-node!
+                 deps
+                 :test-cluster
+                 "n1"))]
+          (is (= ::blocked (deref snapshot-future 100 ::blocked)))
+          (.countDown release-swap)
+          (is (= {:ok? true :snapshot {:applied-lsn 1}}
+                 (deref snapshot-future 5000 ::timed-out)))))
+      (finally
+        (.countDown release-swap)
+        (deref swap-future 5000 ::timed-out)))))
 
 (deftest gc-txlog-segments-on-node-allows-expected-skip-test
   (let [db-name "gc-skip-test"

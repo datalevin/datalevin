@@ -425,6 +425,23 @@
                   result)))))
       (is (= 3 @attempts)))))
 
+(deftest rejoin-bootstrap-retries-kv-info-reopen-gap-test
+  (let [attempts (atom 0)]
+    (with-redefs [rejoin-bootstrap/wal-gap-retry-sleep-ms 0]
+      (is (= :recovered
+             (#'rejoin-bootstrap/with-retrying-bootstrap-gap!
+              1000
+              (fn [_timeout-ms]
+                (case (swap! attempts inc)
+                  1 (throw (ex-info "DBI datalevin/kv-info is not open" {}))
+                  2 (throw (ex-info
+                             "Request to Datalevin server failed"
+                             {:err-data
+                              {:message
+                               "DBI datalevin/kv-info is not open"}}))
+                  :recovered)))))
+      (is (= 3 @attempts)))))
+
 (deftest rejoin-bootstrap-checker-classifies-disrupted-converge-read-rejection-test
   (let [result (checker/check
                 (#'rejoin-bootstrap/rejoin-checker)

@@ -1,6 +1,7 @@
 (ns datalevin.jepsen.workload.rejoin-bootstrap
   (:require
    [clojure.string :as str]
+   [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.jepsen.init-cache :as init-cache]
    [datalevin.jepsen.local :as local]
@@ -619,6 +620,11 @@
   (and (string? message)
        (str/includes? message "LMDB env is closed")))
 
+(defn- kv-info-dbi-not-open-message?
+  [message]
+  (and (string? message)
+       (str/includes? message (str "DBI " c/kv-info " is not open"))))
+
 (defn- retryable-bootstrap-gap-error?
   [e]
   (boolean
@@ -644,7 +650,10 @@
                        (get-in gap-error [:data :error]))
             (lmdb-closed-message? message)
             (lmdb-closed-message? (:message data))
-            (lmdb-closed-message? (:message err-data)))))
+            (lmdb-closed-message? (:message err-data))
+            (kv-info-dbi-not-open-message? message)
+            (kv-info-dbi-not-open-message? (:message data))
+            (kv-info-dbi-not-open-message? (:message err-data)))))
     (take-while some? (iterate ex-cause e)))))
 
 (defn- with-retrying-bootstrap-gap!

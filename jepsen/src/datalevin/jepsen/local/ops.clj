@@ -63,6 +63,12 @@
      f)
     (f)))
 
+(defn- with-live-store-read-access-blocking
+  [server db-name f]
+  (if server
+    (srv/with-db-runtime-store-read-access server db-name f)
+    (f)))
+
 (defn- store-open?
   [store]
   (try
@@ -1036,16 +1042,18 @@
                    (fn [kv-store]
                      (i/create-snapshot! kv-store)))
                  (let [{:keys [db-name servers]} (get @clusters cluster-id)
-                       state (db-state (get servers logical-node) db-name)]
-                   (when-not state
-                     (u/raise "Cannot create snapshot on unavailable Jepsen node"
-                              {:cluster-id cluster-id
-                               :logical-node logical-node}))
-                   (let [store  (:store state)
-                         lmdb   (if (instance? Store store)
-                                  (.-lmdb ^Store store)
-                                  store)]
-                     (i/create-snapshot! lmdb))))]
+                       server (get servers logical-node)]
+                   (with-live-store-read-access-blocking
+                     server
+                     db-name
+                     (fn []
+                       (let [state (db-state server db-name)]
+                         (when-not state
+                           (u/raise
+                             "Cannot create snapshot on unavailable Jepsen node"
+                             {:cluster-id cluster-id
+                              :logical-node logical-node}))
+                         (i/create-snapshot! (state-lmdb state)))))))]
     (when-not (:ok? result)
       (u/raise "Jepsen snapshot creation failed"
                {:cluster-id cluster-id
@@ -1076,16 +1084,18 @@
                    (fn [kv-store]
                      (i/gc-txlog-segments! kv-store)))
                  (let [{:keys [db-name servers]} (get @clusters cluster-id)
-                       state (db-state (get servers logical-node) db-name)]
-                   (when-not state
-                     (u/raise "Cannot GC WAL segments on unavailable Jepsen node"
-                              {:cluster-id cluster-id
-                               :logical-node logical-node}))
-                   (let [store  (:store state)
-                         lmdb   (if (instance? Store store)
-                                   (.-lmdb ^Store store)
-                                   store)]
-                     (i/gc-txlog-segments! lmdb))))]
+                       server (get servers logical-node)]
+                   (with-live-store-read-access-blocking
+                     server
+                     db-name
+                     (fn []
+                       (let [state (db-state server db-name)]
+                         (when-not state
+                           (u/raise
+                             "Cannot GC WAL segments on unavailable Jepsen node"
+                             {:cluster-id cluster-id
+                              :logical-node logical-node}))
+                         (i/gc-txlog-segments! (state-lmdb state)))))))]
     (when-not (or (:ok? result)
                   (expected-txlog-gc-skip? result))
       (u/raise "Jepsen WAL GC failed"
