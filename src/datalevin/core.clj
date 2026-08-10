@@ -635,7 +635,7 @@ Only usable for debug output.
        :doc      "Count the number of unique values of an attribute in a Datalog db."}
   cardinality db/-cardinality)
 
-(def ^{:arglists '([db a])
+(def ^{:arglists '([db])
        :doc      "Return the current maximal entity id of a Datalog db"}
   max-eid db/max-eid)
 
