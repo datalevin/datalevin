@@ -20,6 +20,7 @@ args_app=(
 
 args_test0=(
     "--verbose"
+    "-H:DeadlockWatchdogInterval=30"
     '--initialize-at-build-time=inter_fn_host$testing_fn'
     "-jar" "target/test0.uberjar.jar"
     "-H:Name=dtlv-test0"
