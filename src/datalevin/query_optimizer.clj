@@ -1432,7 +1432,7 @@
 
 (defn- final-plan-cost
   [plan-trace]
-  (if-let [{:keys [steps cost]} (peek plan-trace)]
+  (if-let [{:keys [steps cost]} (last plan-trace)]
     (if (some? cost)
       (double cost)
       (if (seq steps)
@@ -1459,7 +1459,7 @@
 
 (defn- final-plan-size
   [plan-trace]
-  (if-let [{:keys [steps size]} (peek plan-trace)]
+  (if-let [{:keys [steps size]} (last plan-trace)]
     (long (or size
               (some-> steps first :mcount)
               1))

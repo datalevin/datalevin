@@ -1145,6 +1145,35 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest test-access-plan-with-list-conventional-trace
+  (let [dir   (u/tmp-dir (str "query-access-list-trace-" (UUID/randomUUID)))
+        conn  (d/get-conn
+                dir
+                {:child/owner {:db/valueType :db.type/ref}
+                 :item/child  {:db/valueType :db.type/ref}})
+        query '[:find ?score
+                :in $ ?owner-id ?max-score
+                :where
+                [?owner :owner/id ?owner-id]
+                [?child :child/owner ?owner]
+                [?item :item/child ?child]
+                [?item :score ?score]
+                [(<= ?score ?max-score)]
+                :order-by [?score :desc]
+                :limit 1]]
+    (try
+      (d/transact! conn [{:db/id 1 :owner/id 100}
+                         {:db/id 2 :child/owner 1}
+                         {:db/id 3 :item/child 2 :score 10}
+                         {:db/id 4 :item/child 2 :score 20}])
+      (let [db      (d/db conn)
+            explain (d/explain {} query db 100 100)]
+        (is (seq (:access-plans explain)))
+        (is (= [[20]] (d/q query db 100 100))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest test-access-plan-orders-selective-bound-joins-first
   (let [dir   (u/tmp-dir (str "query-access-joins-" (UUID/randomUUID)))
         conn  (d/get-conn dir)
