@@ -491,6 +491,32 @@
       (finally
         (.release lock)))))
 
+(defn ha-follower-store-swap-with-guard
+  [deps server db-name expected-state f]
+  (let [^Semaphore lock ((:get-lock-fn deps) server db-name)]
+    (.acquire lock)
+    (try
+      (locking ((:db-write-admission-lock-fn deps) server db-name)
+        (let [current-state (get ((:dbs-fn deps) server) db-name)]
+          (if (and current-state
+                   (= :follower (:ha-role current-state))
+                   (same-ha-runtime-state?
+                    current-state
+                    expected-state
+                    :ha-follower-loop-running?))
+            ((:with-db-runtime-store-swap-fn deps)
+             server
+             db-name
+             f)
+            (u/raise "HA follower store swap aborted because follower state changed"
+                     {:error :ha/follower-stale-state
+                      :db-name db-name
+                      :state current-state
+                      :current-role (:ha-role current-state)
+                      :expected-role (:ha-role expected-state)}))))
+      (finally
+        (.release lock)))))
+
 (defn with-ha-follower-replay-quiesced
   [deps server db-name f]
   (let [^Semaphore lock ((:get-lock-fn deps) server db-name)]
@@ -641,9 +667,11 @@
                                             record))
                                          drep/*ha-with-local-store-swap-fn*
                                          (fn [f]
-                                           ((:with-db-runtime-store-swap-fn deps)
+                                           (ha-follower-store-swap-with-guard
+                                            deps
                                             server
                                             db-name
+                                            m
                                             f))
                                          drep/*ha-with-local-store-read-fn*
                                          (fn [f]

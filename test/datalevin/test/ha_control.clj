@@ -141,3 +141,49 @@
               state
               {:lsn 7})))
       (is (true? @applied-in-swap?)))))
+
+(deftest follower-snapshot-store-swap-rejects-promotion-race-test
+  (let [running?       (Object.)
+        authority      (Object.)
+        follower-state {:ha-role :follower
+                        :ha-authority authority
+                        :ha-node-id 1
+                        :ha-db-identity "dbid"
+                        :ha-membership-hash "hash"
+                        :ha-follower-loop-running? running?}
+        current-state  (atom follower-state)
+        admission-lock (Object.)
+        replay-lock    (Semaphore. 1)
+        started        (promise)
+        swapped?       (atom false)
+        deps            {:get-lock-fn
+                         (fn [_server _db-name]
+                           replay-lock)
+                         :db-write-admission-lock-fn
+                         (fn [_server _db-name]
+                           admission-lock)
+                         :dbs-fn
+                         (fn [_server]
+                           {"db" @current-state})
+                         :with-db-runtime-store-swap-fn
+                         (fn [_server _db-name f]
+                           (reset! swapped? true)
+                           (f))}]
+    (.acquire replay-lock)
+    (let [result (future
+                   (deliver started true)
+                   (try
+                     (#'server-ha/ha-follower-store-swap-with-guard
+                      deps
+                      ::server
+                      "db"
+                      follower-state
+                      (constantly :installed))
+                     (catch Exception e
+                       (ex-data e))))]
+      @started
+      (reset! current-state (assoc follower-state :ha-role :leader))
+      (.release replay-lock)
+      (is (= :ha/follower-stale-state (:error @result)))
+      (is (= :leader (:current-role @result)))
+      (is (false? @swapped?)))))
