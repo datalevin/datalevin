@@ -493,29 +493,29 @@
 
 (defn ha-follower-store-swap-with-guard
   [deps server db-name expected-state f]
-  (let [^Semaphore lock ((:get-lock-fn deps) server db-name)]
-    (.acquire lock)
-    (try
-      (locking ((:db-write-admission-lock-fn deps) server db-name)
-        (let [current-state (get ((:dbs-fn deps) server) db-name)]
-          (if (and current-state
-                   (= :follower (:ha-role current-state))
-                   (same-ha-runtime-state?
-                    current-state
-                    expected-state
-                    :ha-follower-loop-running?))
-            ((:with-db-runtime-store-swap-fn deps)
-             server
-             db-name
-             f)
-            (u/raise "HA follower store swap aborted because follower state changed"
-                     {:error :ha/follower-stale-state
-                      :db-name db-name
-                      :state current-state
-                      :current-role (:ha-role current-state)
-                      :expected-role (:ha-role expected-state)}))))
-      (finally
-        (.release lock)))))
+  ;; Promotion takes this same admission lock before publishing the leader
+  ;; role. Recheck the role while holding it so a fetched follower snapshot
+  ;; cannot install after promotion. Do not take the DB transaction semaphore
+  ;; here: read handlers take the runtime read lock before that semaphore, so
+  ;; taking them in the opposite order would deadlock follower initialization.
+  (locking ((:db-write-admission-lock-fn deps) server db-name)
+    (let [current-state (get ((:dbs-fn deps) server) db-name)]
+      (if (and current-state
+               (= :follower (:ha-role current-state))
+               (same-ha-runtime-state?
+                current-state
+                expected-state
+                :ha-follower-loop-running?))
+        ((:with-db-runtime-store-swap-fn deps)
+         server
+         db-name
+         f)
+        (u/raise "HA follower store swap aborted because follower state changed"
+                 {:error :ha/follower-stale-state
+                  :db-name db-name
+                  :state current-state
+                  :current-role (:ha-role current-state)
+                  :expected-role (:ha-role expected-state)})))))
 
 (defn with-ha-follower-replay-quiesced
   [deps server db-name f]

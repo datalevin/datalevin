@@ -153,13 +153,9 @@
                         :ha-follower-loop-running? running?}
         current-state  (atom follower-state)
         admission-lock (Object.)
-        replay-lock    (Semaphore. 1)
         started        (promise)
         swapped?       (atom false)
-        deps            {:get-lock-fn
-                         (fn [_server _db-name]
-                           replay-lock)
-                         :db-write-admission-lock-fn
+        deps            {:db-write-admission-lock-fn
                          (fn [_server _db-name]
                            admission-lock)
                          :dbs-fn
@@ -168,22 +164,24 @@
                          :with-db-runtime-store-swap-fn
                          (fn [_server _db-name f]
                            (reset! swapped? true)
-                           (f))}]
-    (.acquire replay-lock)
-    (let [result (future
-                   (deliver started true)
-                   (try
-                     (#'server-ha/ha-follower-store-swap-with-guard
-                      deps
-                      ::server
-                      "db"
-                      follower-state
-                      (constantly :installed))
-                     (catch Exception e
-                       (ex-data e))))]
-      @started
-      (reset! current-state (assoc follower-state :ha-role :leader))
-      (.release replay-lock)
-      (is (= :ha/follower-stale-state (:error @result)))
-      (is (= :leader (:current-role @result)))
-      (is (false? @swapped?)))))
+                           (f))}
+        result          (locking admission-lock
+                          (let [result
+                                (future
+                                  (deliver started true)
+                                  (try
+                                    (#'server-ha/ha-follower-store-swap-with-guard
+                                     deps
+                                     ::server
+                                     "db"
+                                     follower-state
+                                     (constantly :installed))
+                                    (catch Exception e
+                                      (ex-data e))))]
+                            @started
+                            (reset! current-state
+                                    (assoc follower-state :ha-role :leader))
+                            result))]
+    (is (= :ha/follower-stale-state (:error @result)))
+    (is (= :leader (:current-role @result)))
+    (is (false? @swapped?))))
