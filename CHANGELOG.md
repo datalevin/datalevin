@@ -26,6 +26,7 @@
 - [Datalog] correct handling of nested map.
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
+- [Datalog] fix arglists metadata for max-eid [thx @xfthhxk]
 
 ### Improved
 - [Datalog] integrating top-k access paths into cost based optimizer, covering
