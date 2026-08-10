@@ -27,6 +27,8 @@
 - [Datalog] fix internal utility function `remove-idxs` that removes `nil`
   unnecessarily [#382](https://github.com/datalevin/datalevin/issues/382).
 - [Datalog] fix arglists metadata for max-eid [thx @xfthhxk]
+- [Datalog] auto entity time works with transaction functions
+  [#387](https://github.com/datalevin/datalevin/issues/387)
 
 ### Improved
 - [Datalog] integrating top-k access paths into cost based optimizer, covering

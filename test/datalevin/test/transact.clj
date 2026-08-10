@@ -327,6 +327,104 @@
     (d/close conn)
     (u/delete-files dir)))
 
+(deftest test-db-fn-auto-entity-time
+  (let [dir         (u/tmp-dir (str "db-fn-auto-time-" (UUID/randomUUID)))
+        schema      {:user/email {:db/valueType :db.type/string
+                                  :db/unique    :db.unique/identity}
+                     :user/name  {:db/valueType :db.type/string}}
+        descriptor  {:udf/lang :test
+                     :udf/kind :tx-fn
+                     :udf/id   :user/rename}
+        rename-user (fn [db email new-name]
+                      (if-some [user (d/entity db [:user/email email])]
+                        [[:db/add (:db/id user) :user/name new-name]]
+                        []))
+        installed-rename
+        (i/inter-fn [db email new-name]
+          (if-some [user (d/entity db [:user/email email])]
+            [[:db/add (:db/id user) :user/name new-name]]
+            []))
+        registry    (doto (udf/create-registry)
+                      (udf/register! descriptor rename-user))
+        updated-eids
+        (fn [report]
+          (into #{}
+                (comp
+                  (filter #(= :db/updated-at (dd/datom-a %)))
+                  (map dd/datom-e))
+                (:tx-data report)))]
+    ;; Seed without automatic timestamps so each function call must add the
+    ;; first :db/updated-at value to the entity it actually changes.
+    (let [conn (d/create-conn
+                 dir schema
+                 {:kv-opts {:flags (conj c/default-env-flags :nosync)}})]
+      (try
+        (d/transact! conn [{:db/id 1
+                            :user/email "inline@example.com"
+                            :user/name "Inline"}
+                           {:db/id 2
+                            :user/email "direct@example.com"
+                            :user/name "Direct"}
+                           {:db/id 3
+                            :user/email "descriptor@example.com"
+                            :user/name "Descriptor"}
+                           {:db/id 4
+                            :user/email "ident@example.com"
+                            :user/name "Ident"}
+                           {:db/id 5
+                            :user/email "prepared@example.com"
+                            :user/name "Prepared"}
+                           {:db/id    10
+                            :db/ident :user/rename
+                            :db/fn    installed-rename}])
+        (finally
+          (d/close conn))))
+
+    (let [conn (d/create-conn
+                 dir schema
+                 {:auto-entity-time? true
+                  :runtime-opts      {:udf-registry registry}
+                  :kv-opts           {:flags (conj c/default-env-flags
+                                                    :nosync)}})]
+      (try
+        (let [report (d/transact!
+                       conn
+                       [[:db.fn/call rename-user
+                         "inline@example.com" "Inline V2"]])]
+          (is (= #{1} (updated-eids report))))
+
+        (let [report (d/transact!
+                       conn
+                       [[:user/rename "direct@example.com" "Direct V2"]])]
+          (is (= #{2} (updated-eids report)))
+          (is (not (contains? (:tempids report) "direct@example.com"))))
+
+        (let [report (d/transact!
+                       conn
+                       [[:db.fn/call descriptor
+                         "descriptor@example.com" "Descriptor V2"]])]
+          (is (= #{3} (updated-eids report))))
+
+        (let [report (d/transact!
+                       conn
+                       [[:db.fn/call :user/rename
+                         "ident@example.com" "Ident V2"]])]
+          (is (= #{4} (updated-eids report))))
+
+        (binding [c/*use-prepare-path* true]
+          (let [report (d/transact!
+                         conn
+                         [[:db.fn/call rename-user
+                           "prepared@example.com" "Prepared V2"]])]
+            (is (= #{5} (updated-eids report)))))
+
+        (is (= ["Inline V2" "Direct V2" "Descriptor V2" "Ident V2"
+                "Prepared V2"]
+               (mapv #(:user/name (d/entity @conn %)) (range 1 6))))
+        (finally
+          (d/close conn)
+          (u/delete-files dir))))))
+
 (deftest test-db-ident-inter-fn-host-var
   (let [dir  (u/tmp-dir (str "inter-fn-host-var-" (UUID/randomUUID)))
         conn (d/create-conn

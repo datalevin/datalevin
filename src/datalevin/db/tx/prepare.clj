@@ -284,19 +284,21 @@
     (apply f db args)))
 
 (defn handle-custom-tx-fn
-  [db store entity entities]
-  (let [op    (first entity)
-        ident (or (:e (sf (.subSet
-                            ^TreeSortedSet (:avet db)
-                            (d/datom e0 op nil tx0)
-                            (d/datom emax op nil txmax))))
-                  (txcommon/entid db op))]
-    (vld/validate-custom-tx-fn-entity ident op entity)
-    (let [fun  (or (resolve-installed-tx-callable db op entity)
-                   (lookup-tx-fn-value db store ident))
-          args (next entity)]
-      (vld/validate-custom-tx-fn-value fun op entity)
-      (concat (apply fun db args) entities))))
+  ([db store entity]
+   (let [op    (first entity)
+         ident (or (:e (sf (.subSet
+                             ^TreeSortedSet (:avet db)
+                             (d/datom e0 op nil tx0)
+                             (d/datom emax op nil txmax))))
+                   (txcommon/entid db op))]
+     (vld/validate-custom-tx-fn-entity ident op entity)
+     (let [fun  (or (resolve-installed-tx-callable db op entity)
+                    (lookup-tx-fn-value db store ident))
+           args (next entity)]
+       (vld/validate-custom-tx-fn-value fun op entity)
+       (apply fun db args))))
+  ([db store entity entities]
+   (concat (handle-custom-tx-fn db store entity) entities)))
 
 (defn- expand-multival?
   [db a vs]
@@ -367,7 +369,9 @@
     (let [[op e _ _] entity]
       (if (or (identical? op :db/retractEntity)
               (identical? op :db.fn/retractEntity)
-              (identical? op :db/ensure))
+              (identical? op :db/ensure)
+              (identical? op :db.fn/call)
+              (and (keyword? op) (not (builtin-fn? op))))
         [entity]
         [entity [:db/add e :db/updated-at tx-time]]))
 
@@ -393,3 +397,9 @@
         (comp (mapcat expand-transactable-entity)
               (map aat)))
       entities)))
+
+(defn prepare-tx-fn-result
+  [db entities tx-time]
+  (if (:auto-entity-time? (opts (:store db)))
+    (prepare-entities db entities tx-time)
+    entities))

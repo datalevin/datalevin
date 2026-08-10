@@ -722,13 +722,19 @@
         tuple-types?   (contains? props :db/tupleTypes)]
     (cond+
       (identical? op :db.fn/call)
-      [report (concat (txprep/handle-fn-call db entity) entities)]
+      [report (concat
+                (txprep/prepare-tx-fn-result
+                  db (txprep/handle-fn-call db entity) tx-time)
+                entities)]
 
       (identical? op :db/ensure)
       (handle-ensure report entity entities)
 
       (and (keyword? op) (not (txprep/builtin-fn? op)))
-      [report (txprep/handle-custom-tx-fn db store entity entities)]
+      [report (concat
+                (txprep/prepare-tx-fn-result
+                  db (txprep/handle-custom-tx-fn db store entity) tx-time)
+                entities)]
 
       (and (txprep/tempid? e) (not (identical? op :db/add)))
       (vld/validate-tempid-op true op entity)
