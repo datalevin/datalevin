@@ -155,6 +155,11 @@
             Exception
             #":db.attr/preds entries must be qualified symbols"
             (d/create-conn dir2 {:bad/attr {:db.attr/preds ['unqualified?]}})))
+      (let [conn (d/create-conn dir1 {:good/attr {:db/valueType :db.type/long}})]
+        (try
+          (is (not (d/closed? conn)))
+          (finally
+            (d/close conn))))
       (finally
         (when (u/file-exists dir1) (u/delete-files dir1))
         (when (u/file-exists dir2) (u/delete-files dir2))))))

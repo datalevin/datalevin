@@ -3610,6 +3610,25 @@
         (open-dbis probe)
         (not-empty (load-opts probe))))))
 
+(defn- close-failed-open!
+  [dir shared-store lmdb]
+  (when-not shared-store
+    (try
+      (if-let [^Store store (current-shared-local-store dir)]
+        (if (identical? lmdb (.-lmdb store))
+          (datalevin.interface/close store)
+          (close-kv lmdb))
+        (close-kv lmdb))
+      (catch Throwable _))))
+
+(defn- with-open-failure-cleanup
+  [dir shared-store lmdb f]
+  (try
+    (f)
+    (catch Throwable t
+      (close-failed-open! dir shared-store lmdb)
+      (throw t))))
+
 (defn open
   "Open and return the storage."
   ([]
@@ -3646,8 +3665,13 @@
          ^Store shared-store (current-shared-local-store dir)
          lmdb (or (some-> shared-store .-lmdb)
                   (lmdb/open-kv dir kv-opts))]
-     (open-dbis lmdb)
-     (let [loaded-opts (when-not persisted-opts
+     (with-open-failure-cleanup
+       dir
+       shared-store
+       lmdb
+       (fn []
+         (open-dbis lmdb)
+         (let [loaded-opts (when-not persisted-opts
                          (not-empty (load-opts lmdb)))
            opts0     (or persisted-opts
                          loaded-opts
@@ -3847,7 +3871,7 @@
              (cpp/register-shutdown-close!
                (kv/raw-lmdb lmdb)
                #(close-store-resources! store))
-             (enqueue-secondary-index-work-if-needed! store))))))))
+             (enqueue-secondary-index-work-if-needed! store))))))))))
 
 (defn- transfer-engines
   [engines lmdb]
