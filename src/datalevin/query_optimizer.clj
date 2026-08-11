@@ -1430,7 +1430,7 @@
       (+ ^long init-cost ^long (estimate-scan-v-cost (peek steps) mcount))
       init-cost)))
 
-(defn- final-plan-cost
+(defn- final-plan-cost ^double
   [plan-trace]
   (if-let [{:keys [steps cost]} (last plan-trace)]
     (if (some? cost)
@@ -1451,13 +1451,14 @@
     (reduce
       (fn [cost [_src components]]
         (+ (double cost)
-           (reduce
-             (fn [cost plan-trace]
-               (+ (double cost) (final-plan-cost plan-trace)))
-             0.0 components)))
+           (double
+             (reduce
+               (fn [cost plan-trace]
+                 (+ (double cost) (final-plan-cost plan-trace)))
+               0.0 components))))
       0.0 plan)))
 
-(defn- final-plan-size
+(defn- final-plan-size ^long
   [plan-trace]
   (if-let [{:keys [steps size]} (last plan-trace)]
     (long (or size
@@ -1475,13 +1476,13 @@
               (reduce
                 (fn [size plan-trace]
                   (let [n (final-plan-size plan-trace)]
-                    (if (zero? size)
+                    (if (zero? (long size))
                       n
                       (estimate-round (* (double size) n)))))
                 0 components)]
-          (if (zero? size)
-              component-size
-              (estimate-round (* (double size) component-size)))))
+          (if (zero? (long size))
+            component-size
+            (estimate-round (* (double size) (long component-size))))))
       0 plan)))
 
 (defn- late-row-operation

@@ -865,7 +865,7 @@
         bindings (get-thread-bindings)
         workers
         (mapv
-          (fn [step i]
+          (fn [step ^long i]
             ^Callable
             #(with-bindings bindings
                (try
@@ -912,7 +912,7 @@
         bindings   (get-thread-bindings)
         workers
         (mapv
-          (fn [step i]
+          (fn [step ^long i]
             ^Callable
             #(with-bindings bindings
                (try
