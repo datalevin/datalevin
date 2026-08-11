@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.0.2 (2026-08-11)
 
 ### Improved
 - [Datalog] rule-expanded `and` clauses are now resolved by binding dependencies

@@ -171,4 +171,4 @@ __all__ = [
     "write_edn",
 ]
 
-__version__ = "1.0.1"
+__version__ = "1.0.2"
