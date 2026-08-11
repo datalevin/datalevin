@@ -5,7 +5,9 @@
    [datalevin.core :as d]
    [datalevin.entity :as de]
    [taoensso.timbre :as log]
-   [datalevin.constants :as c]))
+   [datalevin.constants :as c])
+  (:import
+   [java.net ServerSocket]))
 
 (defn wrap-res [f]
   (let [res (f)]
@@ -37,6 +39,11 @@
 (defn no-namespace-maps [t]
   (binding [*print-namespace-maps* false]
     (t)))
+
+(defn allocate-port
+  []
+  (with-open [s (ServerSocket. 0)]
+    (.getLocalPort s)))
 
 (defn db-fixture
   [f]

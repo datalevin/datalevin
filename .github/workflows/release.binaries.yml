@@ -1,27 +1,27 @@
 name: Build
 
-on: push
+# on: push
 # on: workflow_dispatch
-# on:
-#   workflow_dispatch:
-#     inputs:
-#       release_tag:
-#         description: Existing release tag whose binary asset should be rebuilt
-#         required: true
-#         type: string
-#       runner:
-#         description: Platform asset to rebuild
-#         required: true
-#         default: macos-14
-#         type: choice
-#         options:
-#           - macos-14
-#           - ubuntu-22.04
-#           - ubuntu-24.04-arm
-#           - windows-latest
-#   release:
-#     types:
-#       - created
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing release tag whose binary asset should be rebuilt
+        required: true
+        type: string
+      runner:
+        description: Platform asset to rebuild
+        required: true
+        default: macos-14
+        type: choice
+        options:
+          - macos-14
+          - ubuntu-22.04
+          - ubuntu-24.04-arm
+          - windows-latest
+  release:
+    types:
+      - created
 
 permissions:
   contents: write
@@ -80,13 +80,13 @@ jobs:
             echo "Generated JAR files:"
             dir target\*.jar
 
-      # - name: Upload Uberjar
-      #   if: github.event_name == 'release' && matrix.os == 'ubuntu-22.04'
-      #   uses: shogo82148/actions-upload-release-asset@v1
-      #   with:
-      #     upload_url: ${{ github.event.release.upload_url }}
-      #     asset_path: target/datalevin-${{ github.event.release.tag_name }}-standalone.jar
-      #     overwrite: true
+      - name: Upload Uberjar
+        if: github.event_name == 'release' && matrix.os == 'ubuntu-22.04'
+        uses: shogo82148/actions-upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: target/datalevin-${{ github.event.release.tag_name }}-standalone.jar
+          overwrite: true
 
       - name: Setup Graalvm
         uses: graalvm/setup-graalvm@v1
@@ -104,6 +104,8 @@ jobs:
         run: |
           export DTLV_OS=${{ runner.os == 'macOS' && 'macos' || 'linux' }}
           export DTLV_ARCH=${{ env.RELEASE_ARCH }}
+
+
           if [ "${{ runner.os }}" == "macOS" ]; then
             bash script/compile-native
           else
@@ -128,17 +130,17 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: 7z a -tzip dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip dtlv.exe
 
-      # - name: Upload Binary
-      #   if: github.event_name == 'release'
-      #   uses: shogo82148/actions-upload-release-asset@v1
-      #   with:
-      #     upload_url: ${{ github.event.release.upload_url }}
-      #     asset_path: dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip
-      #     overwrite: true
+      - name: Upload Binary
+        if: github.event_name == 'release'
+        uses: shogo82148/actions-upload-release-asset@v1
+        with:
+          upload_url: ${{ github.event.release.upload_url }}
+          asset_path: dtlv-${{ env.RELEASE_TAG }}-${{ matrix.os }}-${{ env.RELEASE_ARCH }}.zip
+          overwrite: true
 
-      # - name: Replace Binary on Existing Release
-      #   if: github.event_name == 'workflow_dispatch'
-      #   shell: bash
-      #   env:
-      #     GH_TOKEN: ${{ github.token }}
-      #   run: gh release upload "$RELEASE_TAG" "dtlv-${RELEASE_TAG}-${{ matrix.os }}-${RELEASE_ARCH}.zip" --clobber
+      - name: Replace Binary on Existing Release
+        if: github.event_name == 'workflow_dispatch'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$RELEASE_TAG" "dtlv-${RELEASE_TAG}-${{ matrix.os }}-${RELEASE_ARCH}.zip" --clobber
