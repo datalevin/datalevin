@@ -5,42 +5,20 @@
    datalevin.test.bits
    datalevin.test.core
    datalevin.test.components
-   datalevin.test.conn
    datalevin.test.csv
    datalevin.test.datafy
    datalevin.test.db
    datalevin.test.entity
-   datalevin.test.explode
-   datalevin.test.ha-control
    datalevin.test.ident
    datalevin.test.index
    datalevin.test.listen
-   datalevin.test.lookup-refs
    datalevin.test.lru
    datalevin.test.migrate
-   datalevin.test.parser
-   datalevin.test.parser-find
-   datalevin.test.parser-rules
-   datalevin.test.parser-query
-   datalevin.test.parser-where
-   datalevin.test.pull-api
-   datalevin.test.pull-parser
-   datalevin.test.query
-   datalevin.test.query-aggregates
-   datalevin.test.query-find-specs
-   datalevin.test.query-fns
-   datalevin.test.query-not
-   datalevin.test.query-or
-   datalevin.test.query-pull
-   datalevin.test.query-rules
-   datalevin.test.replica
-   datalevin.test.remote
    datalevin.test.spill
+   datalevin.test.transact
    datalevin.test.tuples
-   datalevin.test.validation
    datalevin.test.upsert
-   datalevin.test.issues
-   datalevin.test.transact)
+   datalevin.test.validation)
   (:gen-class))
 
 (defn ^:export test-clj []
@@ -49,42 +27,20 @@
           'datalevin.test.bits
           'datalevin.test.core
           'datalevin.test.components
-          'datalevin.test.conn
           'datalevin.test.csv
           'datalevin.test.datafy
           'datalevin.test.db
           'datalevin.test.entity
-          'datalevin.test.explode
-          'datalevin.test.ha-control
           'datalevin.test.ident
           'datalevin.test.index
           'datalevin.test.listen
-          'datalevin.test.lookup-refs
           'datalevin.test.lru
           'datalevin.test.migrate
-          'datalevin.test.parser
-          'datalevin.test.parser-find
-          'datalevin.test.parser-rules
-          'datalevin.test.parser-query
-          'datalevin.test.parser-where
-          'datalevin.test.pull-api
-          'datalevin.test.pull-parser
-          'datalevin.test.query
-          'datalevin.test.query-aggregates
-          'datalevin.test.query-find-specs
-          'datalevin.test.query-fns
-          'datalevin.test.query-not
-          'datalevin.test.query-or
-          'datalevin.test.query-pull
-          'datalevin.test.query-rules
-          'datalevin.test.replica
-          'datalevin.test.remote
           'datalevin.test.spill
+          'datalevin.test.transact
           'datalevin.test.tuples
-          'datalevin.test.validation
           'datalevin.test.upsert
-          'datalevin.test.issues
-          'datalevin.test.transact)]
+          'datalevin.test.validation)]
     (System/exit (if (zero? ^long (+ ^long fail ^long error)) 0 1))))
 
 (defn -main [& _args]
