@@ -1,6 +1,6 @@
 {
   "name": "datalevin-node",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Node.js bindings for Datalevin over the JVM interop bridge",
   "type": "module",
   "repository": {

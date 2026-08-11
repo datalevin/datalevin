@@ -20,7 +20,7 @@
 
 (def version
   "Version number of Datalevin"
-  "1.0.0")
+  "1.0.1")
 
 (def version-file-name
   "Name of the file that stores version on disk"

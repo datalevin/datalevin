@@ -1,6 +1,6 @@
 # Change Log
 
-## WIP
+## 1.0.1 (2026-08-10)
 
 ### Changed
 - [Datalog] schema property maps now patch existing attribute definitions:
