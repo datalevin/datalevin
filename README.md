@@ -389,10 +389,11 @@ Datalevin will remain open source for the foreseeable future. We appreciate and
 welcome your contributions or suggestions. Please feel free to file issues or
 pull requests.
 
-If commercial support is needed, talk to us.
+You can join the discussions in the `#datalevin`
+channel on [Clojurians Slack](http://clojurians.net/) or use the Github
+Discussions feature above.
 
-You can talk to us in the `#datalevin` channel on [Clojurians
-Slack](http://clojurians.net/) or use the Github Discussions feature above.
+If commercial support is needed, reach out to https://agenwiz.com
 
 ## License
 
