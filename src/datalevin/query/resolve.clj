@@ -871,6 +871,70 @@
 (defn- clause-vars [clause]
   (into #{} (filter qu/binding-var?) (nfirst clause)))
 
+(defn- call-vars
+  [[f & args]]
+  (cond-> (qu/collect-fn-arg-vars args)
+    (qu/binding-var? f) (conj f)))
+
+(defn- clause-binding-requirements
+  [clause]
+  (let [clause (if (and (sequential? clause)
+                        (qu/source? (first clause)))
+                 (next clause)
+                 clause)
+        head   (when (sequential? clause) (first clause))]
+    (cond
+      ;; Predicate and function expressions need their call arguments. The
+      ;; function binding, if present, is an output and is not required.
+      (and (vector? clause) (sequential? head))
+      {:required (call-vars head)}
+
+      ;; Plain not joins on whichever variables it shares with the surrounding
+      ;; context. Its existing validation requires at least one such variable.
+      (= 'not head)
+      {:required-any (qu/collect-vars (next clause))}
+
+      (= 'not-join head)
+      {:required (qu/collect-vars (second clause))}
+
+      (= 'or-join head)
+      (let [vars-form (second clause)
+            req-form  (when (and (sequential? vars-form)
+                                 (sequential? (first vars-form)))
+                        (first vars-form))]
+        {:required (qu/collect-vars req-form)})
+
+      :else {})))
+
+(defn- clause-bindings-ready?
+  [bound clause]
+  (let [{:keys [required required-any]}
+        (clause-binding-requirements clause)]
+    (and (set/subset? required bound)
+         (or (empty? required-any)
+             (some bound required-any)))))
+
+(defn- resolve-clauses
+  "Resolve conjunction clauses in dependency order, retaining source order
+  among clauses whose input bindings are already available."
+  [context clauses]
+  (loop [context context
+         pending (vec clauses)]
+    (if (empty? pending)
+      context
+      (let [bound (bound-vars context)
+            idx   (first
+                    (keep-indexed
+                      (fn [i clause]
+                        (when (clause-bindings-ready? bound clause) i))
+                      pending))]
+        (if (some? idx)
+          (recur (resolve-clause context (nth pending idx))
+                 (u/vec-remove pending idx))
+          ;; Preserve the resolver's detailed insufficient-binding error when
+          ;; the conjunction has no clause capable of making progress.
+          (reduce resolve-clause context pending))))))
+
 (defn -resolve-clause
   ([context clause]
    (-resolve-clause context clause clause))
@@ -938,7 +1002,7 @@
 
      '[and *]
      (let [[_ & clauses] clause]
-       (reduce resolve-clause context clauses))
+       (resolve-clauses context clauses))
 
      '[not *]
      (let [[_ & clauses] clause
