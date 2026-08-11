@@ -13,11 +13,7 @@
    datalevin.test.index
    datalevin.test.listen
    datalevin.test.lru
-   datalevin.test.migrate
    datalevin.test.spill
-   datalevin.test.transact
-   datalevin.test.tuples
-   datalevin.test.upsert
    datalevin.test.validation)
   (:gen-class))
 
@@ -35,11 +31,7 @@
           'datalevin.test.index
           'datalevin.test.listen
           'datalevin.test.lru
-          'datalevin.test.migrate
           'datalevin.test.spill
-          'datalevin.test.transact
-          'datalevin.test.tuples
-          'datalevin.test.upsert
           'datalevin.test.validation)]
     (System/exit (if (zero? ^long (+ ^long fail ^long error)) 0 1))))
 

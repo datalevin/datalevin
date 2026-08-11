@@ -1,12 +1,11 @@
 (ns datalevin.test.core
   (:require
-   [clojure.test :as t :refer [is are deftest testing]]
+   [clojure.test :as t]
    [clojure.walk :as walk]
    [datalevin.core :as d]
    [datalevin.entity :as de]
    [taoensso.timbre :as log]
-   [datalevin.constants :as c]
-   [datalevin.util :refer [defrecord-updatable]]))
+   [datalevin.constants :as c]))
 
 (defn wrap-res [f]
   (let [res (f)]

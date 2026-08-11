@@ -31,7 +31,6 @@ echo Build native test ...
 
 call "%GRAALVM_HOME%\bin\native-image.cmd" ^
    "-R:MaxHeapSize=5g" ^
-   "--initialize-at-build-time=inter_fn_host$testing_fn" ^
    "-jar" "target/test0.uberjar.jar" ^
    "-H:NativeLinkerOption=legacy_stdio_definitions.lib" ^
    dtlv-test0

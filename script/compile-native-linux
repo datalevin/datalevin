@@ -24,7 +24,6 @@ args_test0=(
     "--verbose"
     "--gc=G1"
     "--native-compiler-path=/usr/bin/gcc-12"
-    '--initialize-at-build-time=inter_fn_host$testing_fn'
     "-jar" "target/test0.uberjar.jar"
     "-H:Name=dtlv-test0"
 )
