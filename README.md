@@ -114,15 +114,16 @@ For embedded usage, [Java](examples/java/README.md),
 and [Clojure](https://cljdoc.org/d/datalevin/datalevin) are currently supported.
 
 More information about our vision and design decisions can be found in these
-book, articles and presentation:
+resources:
 
-* [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org)
-* [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)
-* [Achieving High Throughput and Low Latency through Adaptive Asynchronous Transaction](https://yyhh.org/blog/2025/02/achieving-high-throughput-and-low-latency-through-adaptive-asynchronous-transaction/)
-* [Competing for the JOB with a Triplestore](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
-* [If I had to Pick One: Datalevin](https://vimsical.notion.site/If-I-Had-To-Pick-One-Datalevin-be5c4b62cda342278a10a5e5cdc2206d)
-* [T-Wand: Beat Lucene in Less Than 600 Lines of Code](https://yyhh.org/blog/2021/11/t-wand-beat-lucene-in-less-than-600-lines-of-code/)
-* [2020 London Clojurians Meetup](https://youtu.be/-5SrIUK6k5g)
+* Interview [Clojure Corner Interview with Huahai Yang](https://www.youtube.com/watch?v=1XMU5mdDj7I)
+* Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org)
+* Post [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)
+* Post [Achieving High Throughput and Low Latency through Adaptive Asynchronous Transaction](https://yyhh.org/blog/2025/02/achieving-high-throughput-and-low-latency-through-adaptive-asynchronous-transaction/)
+* Post [Competing for the JOB with a Triplestore](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
+* Post [If I had to Pick One: Datalevin](https://vimsical.notion.site/If-I-Had-To-Pick-One-Datalevin-be5c4b62cda342278a10a5e5cdc2206d)
+* Post [T-Wand: Beat Lucene in Less Than 600 Lines of Code](https://yyhh.org/blog/2021/11/t-wand-beat-lucene-in-less-than-600-lines-of-code/)
+* Presentation [2020 London Clojurians Meetup](https://youtu.be/-5SrIUK6k5g)
 
 ## :truck: [Installation](doc/install.md)
 
