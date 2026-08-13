@@ -14,6 +14,7 @@
    [clojure.set :as set]
    [clojure.string :as str]
    [datalevin.built-ins :as built-ins]
+   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.inline :refer [update assoc]]
    [datalevin.join :as j]
@@ -275,7 +276,40 @@
             nil))
         entity-values))
 
-(def ^:const ^:private ^long multi-lookup-threshold 100000)
+;; Guardrail against pathological per-key work. Within this limit, the cost
+;; comparison below chooses between indexed probes and a full scan.
+(def ^:const ^:private ^long multi-lookup-safety-limit 1000000)
+
+(defn- estimate-multi-lookup-output
+  ^long [^long bound-count ^long scan-count]
+  (long
+    (min scan-count
+         (Math/ceil (* (double bound-count)
+                       (double c/magic-link-ratio))))))
+
+(defn- estimate-multi-lookup-cost
+  ^double [^long bound-count ^long output-count]
+  (let [bound  (double bound-count)
+        output (double output-count)]
+    (+ (* bound (double c/magic-cost-link-probe))
+       (* output (double c/magic-cost-link-retrieval))
+       (* (+ bound output) (double c/magic-cost-hash-join)))))
+
+(defn- estimate-full-lookup-cost
+  ^double [^long bound-count ^long scan-count]
+  (let [bound (double bound-count)
+        scan  (double scan-count)]
+    (+ (* scan (double c/magic-cost-init-scan-e))
+       (* (+ bound scan) (double c/magic-cost-hash-join)))))
+
+(defn- multi-lookup-cheaper?
+  [^long bound-count ^long scan-count]
+  (and (pos? bound-count)
+       (<= bound-count multi-lookup-safety-limit)
+       (< (estimate-multi-lookup-cost
+            bound-count
+            (estimate-multi-lookup-output bound-count scan-count))
+          (estimate-full-lookup-cost bound-count scan-count))))
 
 (defn- lookup-pattern-multi-entity
   "Perform multiple point lookups for bound entity values.
@@ -333,19 +367,29 @@
 (defn lookup-pattern-db
   [context db pattern]
   (let [[e a v]           pattern
+        search-pattern    (delay
+                            (->> pattern
+                                 (substitute-constants context)
+                                 (resolve-pattern-lookup-refs db)
+                                 (mapv #(if (or (qu/free-var? %) (= % '_))
+                                          nil
+                                          %))))
+        scan-count        (delay (long (db/-count db @search-pattern)))
         entity-values     (when (and (qu/binding-var? e) (keyword? a))
                             (bound-values context e))
         use-entity-multi? (and entity-values
-                               (<= (.size ^HashSet entity-values)
-                                   multi-lookup-threshold))
+                               (multi-lookup-cheaper?
+                                 (long (.size ^HashSet entity-values))
+                                 @scan-count))
         value-values      (when (and (not use-entity-multi?)
                                      (qu/binding-var? e)
                                      (qu/binding-var? v)
                                      (keyword? a))
                             (bound-values context v))
         use-value-multi?  (and value-values
-                               (<= (.size ^HashSet value-values)
-                                   multi-lookup-threshold))]
+                               (multi-lookup-cheaper?
+                                 (long (.size ^HashSet value-values))
+                                 @scan-count))]
     (cond
       use-entity-multi?
       (let [resolved-pattern (resolve-pattern-lookup-refs db pattern)
@@ -372,12 +416,7 @@
                                                  e-is-var?)))
 
       :else
-      (let [search-pattern (->> pattern
-                                (substitute-constants context)
-                                (resolve-pattern-lookup-refs db)
-                                (mapv #(if (or (qu/free-var? %) (= % '_))
-                                         nil
-                                         %)))]
+      (let [search-pattern @search-pattern]
         (r/relation! (let [idxs (volatile! {})
                            i    (volatile! 0)]
                        (mapv (fn [p sp]

@@ -1,0 +1,115 @@
+;;
+;; Copyright (c) Huahai Yang. All rights reserved.
+;; The use and distribution terms for this software are covered by the
+;; Eclipse Public License 2.0 (https://opensource.org/license/epl-2-0)
+;; which can be found in the file LICENSE at the root of this distribution.
+;; By using this software in any fashion, you are agreeing to be bound by
+;; the terms of this license.
+;; You must not remove this notice, or any other, from this software.
+;;
+(ns datalevin.query-not-test
+  (:require
+   [clojure.test :refer [deftest is testing]]
+   [datalevin.constants :as c]
+   [datalevin.core :as d]
+   [datalevin.relation :as r]
+   [datalevin.util :as u])
+  (:import
+   [java.util ArrayList UUID]))
+
+(defn- tuples
+  [& rows]
+  (let [result (ArrayList.)]
+    (doseq [row rows]
+      (.add result (object-array row)))
+    result))
+
+(defn- rows
+  [rel]
+  (mapv vec (:tuples rel)))
+
+(deftest multi-lookup-cost-selection-test
+  (let [cheaper? @(ns-resolve 'datalevin.query.resolve
+                              'multi-lookup-cheaper?)]
+    (binding [c/magic-link-ratio           1.0
+              c/magic-cost-link-probe      2.5
+              c/magic-cost-link-retrieval  1.2
+              c/magic-cost-init-scan-e     2.0
+              c/magic-cost-hash-join       60.0]
+      (testing "indexed probes win when the attribute scan is much larger"
+        (is (cheaper? 110918 3509083)))
+      (testing "a small attribute scan wins over many indexed probes"
+        (is (not (cheaper? 150000 1000)))
+        (is (not (cheaper? 1000 1000))))
+      (testing "the safety limit is independent of the cost comparison"
+        (is (not (cheaper? 1000001 100000000)))))))
+
+(deftest project-distinct-test
+  (let [rel (r/relation! {'?entity 0 '?group 1 '?kind 2}
+                         (tuples [1 "g" :x]
+                                 [2 "g" :x]
+                                 [3 "g" :y]
+                                 [4 "h" :x]))]
+    (testing "one-column keys are physically projected and deduplicated"
+      (let [projected (r/project-distinct rel ['?group])]
+        (is (= {'?group 0} (:attrs projected)))
+        (is (= [["g"] ["h"]] (rows projected)))
+        (is (every? #(= 1 (alength ^objects %)) (:tuples projected)))))
+    (testing "compound keys retain their declared column order"
+      (let [projected (r/project-distinct rel ['?kind '?group])]
+        (is (= {'?kind 0 '?group 1} (:attrs projected)))
+        (is (= [[:x "g"] [:y "g"] [:x "h"]]
+               (rows projected)))
+        (is (every? #(= 2 (alength ^objects %)) (:tuples projected)))))))
+
+(deftest not-join-distinct-key-semantics-test
+  (let [dir  (u/tmp-dir (str "not-join-distinct-" (UUID/randomUUID)))
+        conn (d/get-conn dir)]
+    (try
+      (d/transact!
+        conn
+        [{:db/id 1 :item/group "keep" :item/kind :x}
+         {:db/id 2 :item/group "drop" :item/kind :x}
+         {:db/id 3 :item/group "drop" :item/kind :x}
+         {:db/id 4 :item/group "drop" :item/kind :y}
+         {:db/id 5 :item/group "keep" :item/kind :x}
+         {:db/id 101 :block/group "drop" :block/kind :x :block/score 1}
+         {:db/id 102 :block/group "drop" :block/kind :x :block/score 2}])
+      (let [db (d/db conn)]
+        (testing "a duplicate single key excludes every matching outer tuple"
+          (is (= #{[1 "keep"] [5 "keep"]}
+                 (set
+                   (d/q
+                     '[:find ?item ?group
+                       :where
+                       [?item :item/group ?group]
+                       (not-join [?group]
+                         [?block :block/group ?group])]
+                     db)))))
+        (testing "compound keys exclude only the matching key combination"
+          (is (= #{[1 "keep" :x] [4 "drop" :y] [5 "keep" :x]}
+                 (set
+                   (d/q
+                     '[:find ?item ?group ?kind
+                       :where
+                       [?item :item/group ?group]
+                       [?item :item/kind ?kind]
+                       (not-join [?group ?kind]
+                         [?block :block/group ?group]
+                         [?block :block/kind ?kind])]
+                     db)))))
+        (testing "complex not-join clauses use the same key semantics"
+          (is (= #{[1 "keep"] [5 "keep"]}
+                 (set
+                   (d/q
+                     '[:find ?item ?group
+                       :where
+                       [?item :item/group ?group]
+                       (not-join [?group]
+                         [?block :block/group ?group]
+                         [?block :block/score ?score]
+                         [(> ?score 0)])]
+                     db))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
