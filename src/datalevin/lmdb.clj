@@ -639,10 +639,21 @@
         (shutdown!)
         (catch Throwable _ nil)))))
 
+(defn- shutdown-query-plan-pool-if-loaded!
+  []
+  ;; Avoid introducing a cycle: query.plan depends on this namespace. If query
+  ;; execution has loaded it, stop its cached pool when the last LMDB closes.
+  (when-let [plan-ns (find-ns 'datalevin.query.plan)]
+    (when-let [shutdown! (ns-resolve plan-ns 'shutdown-pipe-thread-pool!)]
+      (try
+        (shutdown!)
+        (catch Throwable _ nil)))))
+
 (defn ^:no-doc shutdown-last-lmdb-executors!
   []
   (a/shutdown-executor)
   (shutdown-transact-async-executor-if-loaded!)
+  (shutdown-query-plan-pool-if-loaded!)
   (u/shutdown-worker-thread-pool)
   (u/shutdown-scheduler)
   nil)

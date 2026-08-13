@@ -5,7 +5,11 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
-   [datalevin.util :as u :refer [defrecord-updatable]]))
+   [datalevin.lmdb :as l]
+   [datalevin.query.plan :as qplan]
+   [datalevin.util :as u :refer [defrecord-updatable]])
+  (:import
+   [java.util.concurrent Callable ExecutorService Future TimeUnit]))
 
 ;;
 ;; verify that defrecord-updatable works with compiler/core macro configuration
@@ -37,6 +41,24 @@
     (is (= (cache-key 42 1000) (cache-key 42 1000)))
     (is (not= (cache-key 42 1000) (cache-key 43 1000)))
     (is (not= (cache-key 42 1000) (cache-key 42 4000)))))
+
+(deftest query-plan-pool-shuts-down-with-last-lmdb-executors
+  (let [^ExecutorService pool (#'qplan/get-pipe-thread-pool)]
+    (is (= :started
+           (.get ^Future (.submit pool ^Callable (fn [] :started)))))
+    (is (not (.isShutdown pool)))
+    (l/shutdown-last-lmdb-executors!)
+    (is (.isShutdown pool))
+    (is (.awaitTermination pool 1 TimeUnit/SECONDS))
+    (let [^ExecutorService new-pool (#'qplan/get-pipe-thread-pool)]
+      (try
+        (is (not (identical? pool new-pool)))
+        (is (not (.isShutdown new-pool)))
+        (is (= :restarted
+               (.get ^Future
+                     (.submit new-pool ^Callable (fn [] :restarted)))))
+        (finally
+          (qplan/shutdown-pipe-thread-pool!))))))
 
 (defn- now [] (System/currentTimeMillis))
 

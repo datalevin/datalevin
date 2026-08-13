@@ -28,7 +28,7 @@
    [datalevin.util :as u])
   (:import
    [java.util AbstractCollection Collection Collections HashSet List]
-   [java.util.concurrent Callable ExecutorService Executors Future]
+   [java.util.concurrent Callable ExecutorService Executors Future TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -695,7 +695,26 @@
           out)
         (FastList.)))))
 
-(def pipe-thread-pool (Executors/newCachedThreadPool))
+(defonce ^:private pipe-thread-pool-atom (atom nil))
+
+(defn- get-pipe-thread-pool
+  []
+  (locking pipe-thread-pool-atom
+    (let [^ExecutorService pool @pipe-thread-pool-atom]
+      (if (or (nil? pool) (.isShutdown pool))
+        (let [pool (Executors/newCachedThreadPool)]
+          (reset! pipe-thread-pool-atom pool)
+          pool)
+        pool))))
+
+(defn ^:no-doc shutdown-pipe-thread-pool!
+  []
+  (locking pipe-thread-pool-atom
+    (when-let [^ExecutorService pool @pipe-thread-pool-atom]
+      (.shutdownNow pool)
+      (.awaitTermination pool 100 TimeUnit/MILLISECONDS)
+      (reset! pipe-thread-pool-atom nil)))
+  nil)
 
 (defn- save-intermediates
   [context steps ^objects sinks ^List tuples]
@@ -774,7 +793,8 @@
                         #(with-bindings bindings
                            (step-execute-pipe (peek join-steps) db middle
                                               sink))]]
-          (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool tasks)]
+          (doseq [^Future f (.invokeAll ^ExecutorService
+                                        (get-pipe-thread-pool) tasks)]
             (.get f))))
 
       (u/raise "Unsupported indexed semi-join step count"
@@ -828,7 +848,8 @@
                                   (finally
                                     (finish i)))))
                            steps (range))]
-        (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool tasks)]
+        (doseq [^Future f (.invokeAll ^ExecutorService
+                                      (get-pipe-thread-pool) tasks)]
           (.get f))))
     (p/remove-end-scan tuples)
     (save-intermediates context steps pipes tuples)
@@ -886,7 +907,7 @@
       (u/raise "Cannot count an empty query plan" {}))
     (when (writing? db)
       (u/raise "Exact plan counting requires a read-only database" {}))
-    (doseq [^Future f (.invokeAll ^ExecutorService pipe-thread-pool
+    (doseq [^Future f (.invokeAll ^ExecutorService (get-pipe-thread-pool)
                                   (conj workers drain))]
       (.get f))
     (p/total output)))
@@ -943,7 +964,7 @@
     (when (writing? db)
       (u/raise "Exact plan reduction requires a read-only database" {}))
     (let [^java.util.List futures
-          (.invokeAll ^ExecutorService pipe-thread-pool
+          (.invokeAll ^ExecutorService (get-pipe-thread-pool)
                       (conj workers drain))]
       (doseq [^Future f (butlast futures)]
         (.get f))
