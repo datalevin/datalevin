@@ -7,8 +7,7 @@
    [openrulebench.core :as core]
    [openrulebench.data :as data]
    [clojure.java.io :as io]
-   [clojure.java.shell :as sh]
-   [clojure.string :as str])
+   [clojure.java.shell :as sh])
   (:import
    [java.util UUID]))
 
@@ -106,19 +105,20 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
   (let [edges (data/generate-tc-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-souffle-tc-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-tc-files edges dir)
-        _ (System/gc)
-        [output-dir time-ms] (core/time-once (run-souffle prog-file dir))
-        result-count (when output-dir (count-output output-dir "tc"))]
-    ;; Cleanup
-    (doseq [f (.listFiles (io/file dir))]
-      (io/delete-file f true))
-    (io/delete-file dir true)
-    {:system "souffle"
-     :benchmark (str "tc:" instance-name)
-     :time-ms time-ms
-     :result-count (or result-count 0)
-     :status (if result-count :ok :error)}))
+        prog-file (write-tc-files edges dir)]
+    (try
+      (System/gc)
+      (let [[output-dir time-ms] (core/time-once (run-souffle prog-file dir))
+            result-count (when output-dir (count-output output-dir "tc"))]
+        {:system "souffle"
+         :benchmark (str "tc:" instance-name)
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (.listFiles (io/file dir))]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
@@ -126,30 +126,30 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
   (let [relations (data/generate-sg-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-souffle-sg-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-sg-files relations dir)
-        _ (System/gc)
-        [output-dir time-ms] (core/time-once (run-souffle prog-file dir))
-        result-count (when output-dir (count-output output-dir "sg"))]
-    ;; Cleanup
-    (doseq [f (.listFiles (io/file dir))]
-      (io/delete-file f true))
-    (io/delete-file dir true)
-    {:system "souffle"
-     :benchmark (str "sg:" instance-name)
-     :time-ms time-ms
-     :result-count (or result-count 0)
-     :status (if result-count :ok :error)}))
+        prog-file (write-sg-files relations dir)]
+    (try
+      (System/gc)
+      (let [[output-dir time-ms] (core/time-once (run-souffle prog-file dir))
+            result-count (when output-dir (count-output output-dir "sg"))]
+        {:system "souffle"
+         :benchmark (str "sg:" instance-name)
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (.listFiles (io/file dir))]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 ;; =============================================================================
 ;; Main Entry Point
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "tc:medium" "sg:small"])
+  ["tc:small" "sg:small"])
 
 (defn parse-benchmark [spec]
-  (let [[bench-type instance] (str/split spec #":")]
-    [bench-type instance]))
+  (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
   (let [[bench-type instance] (parse-benchmark spec)]
@@ -166,6 +166,9 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
   (doall (map run-benchmark benchmark-specs)))
 
 (defn -main [& args]
-  (let [benchmarks (if (seq args) args default-benchmarks)
-        results (run-benchmarks benchmarks)]
-    (core/print-row "souffle" results)))
+  (let [report (try
+                 (core/run-system-cli! "souffle" default-benchmarks
+                                       run-benchmark args)
+                 (finally
+                   (shutdown-agents)))]
+    (System/exit (:exit-code report))))

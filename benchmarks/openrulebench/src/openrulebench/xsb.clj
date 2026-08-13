@@ -106,22 +106,23 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
   (let [edges (data/generate-tc-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-xsb-tc-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-tc-files edges dir)
-        _ (System/gc)
-        start (core/now-ms)
-        ;; First materialize (bench), then count
-        _ (run-xsb prog-file "bench")
-        result-count (run-xsb-timed prog-file "count_tc")
-        time-ms (- (core/now-ms) start)]
-    ;; Cleanup
-    (doseq [f (.listFiles (io/file dir))]
-      (io/delete-file f true))
-    (io/delete-file dir true)
-    {:system "xsb"
-     :benchmark (str "tc:" instance-name)
-     :time-ms time-ms
-     :result-count (or result-count 0)
-     :status (if result-count :ok :error)}))
+        prog-file (write-tc-files edges dir)]
+    (try
+      (System/gc)
+      (let [start        (core/now-ms)
+            ;; The count goal materializes the table and consumes all answers
+            ;; in one XSB process; a separate pre-run would not warm this process.
+            result-count (run-xsb-timed prog-file "count_tc")
+            time-ms      (- (core/now-ms) start)]
+        {:system "xsb"
+         :benchmark (str "tc:" instance-name)
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (.listFiles (io/file dir))]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 (defn run-sg-benchmark
   "Run SG benchmark on an OpenRuleBench instance. Returns result map."
@@ -129,33 +130,31 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
   (let [relations (data/generate-sg-instance (keyword instance-name))
         dir (str "/tmp/openrulebench-xsb-sg-" (UUID/randomUUID))
         _ (io/make-parents (str dir "/dummy"))
-        prog-file (write-sg-files relations dir)
-        _ (System/gc)
-        start (core/now-ms)
-        ;; First materialize (bench), then count
-        _ (run-xsb prog-file "bench")
-        result-count (run-xsb-timed prog-file "count_sg")
-        time-ms (- (core/now-ms) start)]
-    ;; Cleanup
-    (doseq [f (.listFiles (io/file dir))]
-      (io/delete-file f true))
-    (io/delete-file dir true)
-    {:system "xsb"
-     :benchmark (str "sg:" instance-name)
-     :time-ms time-ms
-     :result-count (or result-count 0)
-     :status (if result-count :ok :error)}))
+        prog-file (write-sg-files relations dir)]
+    (try
+      (System/gc)
+      (let [start        (core/now-ms)
+            result-count (run-xsb-timed prog-file "count_sg")
+            time-ms      (- (core/now-ms) start)]
+        {:system "xsb"
+         :benchmark (str "sg:" instance-name)
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (.listFiles (io/file dir))]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 ;; =============================================================================
 ;; Main Entry Point
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "tc:medium" "sg:small"])
+  ["tc:small" "sg:small"])
 
 (defn parse-benchmark [spec]
-  (let [[bench-type instance] (str/split spec #":")]
-    [bench-type instance]))
+  (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
   (let [[bench-type instance] (parse-benchmark spec)]
@@ -172,6 +171,9 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
   (doall (map run-benchmark benchmark-specs)))
 
 (defn -main [& args]
-  (let [benchmarks (if (seq args) args default-benchmarks)
-        results (run-benchmarks benchmarks)]
-    (core/print-row "xsb" results)))
+  (let [report (try
+                 (core/run-system-cli! "xsb" default-benchmarks
+                                       run-benchmark args)
+                 (finally
+                   (shutdown-agents)))]
+    (System/exit (:exit-code report))))

@@ -1,6 +1,8 @@
 (ns idoc-bench.core
   "YCSB-style benchmark with idoc query workload."
   (:require
+   [clojure.java.io :as io]
+   [clojure.pprint :as pprint]
    [clojure.string :as str]
    [datalevin.constants :as c]
    [datalevin.core :as d]
@@ -11,11 +13,13 @@
    [next.jdbc.result-set :as rs]
    [next.jdbc.sql :as sql])
   (:import
-   [com.mongodb ExplainVerbosity]
    [com.mongodb.client MongoClients]
    [com.mongodb.client.model Filters]
+   [java.nio.charset StandardCharsets]
+   [java.security MessageDigest]
+   [java.time Instant]
    [java.util ArrayList Random UUID]
-   [java.util.concurrent CountDownLatch]
+   [java.util.concurrent Callable ExecutionException Executors TimeUnit]
    [org.bson Document]
    [org.postgresql.util PGobject]))
 
@@ -86,8 +90,10 @@
    :batch-size  1000
    :idoc-ratio  30
    :idoc-trace? false
+   :verify?     true
    :hotset      1.0
    :seed        42
+   :output      nil
    :dir         nil
    :dtlv-uri    nil
    :keep-db?    false
@@ -157,34 +163,27 @@
     (vec (map (fn [id] (make-doc r id)) (range 1 (inc records))))))
 
 (defn- update-doc
-  [doc ^Random r]
+  [doc {:keys [score last-seen]}]
   (-> doc
-      (assoc-in [:stats :score] (double (.nextDouble r)))
-      (assoc-in [:stats :last_seen] (+ base-ts (.nextInt r 2000000)))))
+      (assoc-in [:stats :score] score)
+      (assoc-in [:stats :last_seen] last-seen)))
 
 (defn- update-doc-patch
-  [doc ^Random r]
-  (let [score     (double (.nextDouble r))
-        last-seen (+ base-ts (.nextInt r 2000000))
-        doc'      (-> doc
-                      (assoc-in [:stats :score] score)
-                      (assoc-in [:stats :last_seen] last-seen))]
-    [doc' [[:set [:stats :score] score]
-           [:set [:stats :last_seen] last-seen]]]))
+  [doc {:keys [score last-seen] :as operation}]
+  [(update-doc doc operation)
+   [[:set [:stats :score] score]
+    [:set [:stats :last_seen] last-seen]]])
 
 (defn- rmw-doc
-  [doc ^Random r]
+  [doc {:keys [last-seen]}]
   (-> doc
       (update-in [:stats :score] (fnil #(+ % 0.01) 0.0))
-      (assoc-in [:stats :last_seen] (+ base-ts (.nextInt r 2000000)))))
+      (assoc-in [:stats :last_seen] last-seen)))
 
 (defn- rmw-doc-patch
-  [doc ^Random r]
+  [doc {:keys [last-seen] :as operation}]
   (let [score     (double ((fnil #(+ % 0.01) 0.0) (get-in doc [:stats :score])))
-        last-seen (+ base-ts (.nextInt r 2000000))
-        doc'      (-> doc
-                      (assoc-in [:stats :score] score)
-                      (assoc-in [:stats :last_seen] last-seen))]
+        doc'      (rmw-doc doc operation)]
     [doc' [[:set [:stats :score] score]
            [:set [:stats :last_seen] last-seen]]]))
 
@@ -198,15 +197,17 @@
 (def query-types [:nested :range :wildcard-one :wildcard-depth :array])
 
 (defn- rand-query-spec
-  [^Random r]
-  (case (rand-choice r query-types)
+  ([^Random r]
+   (rand-query-spec r (rand-choice r query-types)))
+  ([^Random r query-type]
+   (case query-type
     :nested {:type :nested :value (rand-choice r langs)}
     :range (let [lo (double (* 0.1 (.nextInt r 8)))      ;; 0.0 to 0.7
                  hi (double (+ lo 0.1 (* 0.1 (.nextInt r 3))))] ;; lo+0.1 to lo+0.3
              {:type :range :lo lo :hi (min hi 1.0)})
     :wildcard-one {:type :wildcard-one :value (rand-choice r cities)}
     :wildcard-depth {:type :wildcard-depth :value (rand-choice r entities)}
-    :array {:type :array :value (rand-choice r tags)}))
+    :array {:type :array :value (rand-choice r tags)})))
 
 (defn- spec->idoc-query
   [spec]
@@ -241,20 +242,68 @@
     (cond-> (vec base)
       (pos? idoc-ratio) (conj [:idoc idoc-ratio]))))
 
-(defn- update-stat
-  [stats op nanos]
-  (update stats op
-          (fnil (fn [{:keys [count nanos-sum]}]
-                  {:count     (inc count)
-                   :nanos-sum (+ nanos-sum nanos)})
-                {:count 0 :nanos-sum 0})))
+(defn- generate-operation
+  [selector ^Random r {:keys [records hotset]}]
+  (let [op (selector r)]
+    (case op
+      :read {:op op :id (rand-id r records hotset)}
+      :update {:op        op
+               :id        (rand-id r records hotset)
+               :score     (double (.nextDouble r))
+               :last-seen (+ base-ts (.nextInt r 2000000))}
+      :rmw {:op        op
+            :id        (rand-id r records hotset)
+            :last-seen (+ base-ts (.nextInt r 2000000))}
+      :idoc {:op op :spec (rand-query-spec r)})))
 
-(defn- merge-stats
-  [a b]
-  (merge-with (fn [x y]
-                {:count     (+ (:count x) (:count y))
-                  :nanos-sum (+ (:nanos-sum x) (:nanos-sum y))})
-              a b))
+(defn- generate-schedule
+  [opts operation-count seed]
+  (let [r        (Random. seed)
+        selector (build-selector (workload->weights (:workload opts)
+                                                    (:idoc-ratio opts)))]
+    (mapv (fn [index]
+            (assoc (generate-operation selector r opts)
+                   :schedule-index index))
+          (range operation-count))))
+
+(defn- schedule-digest
+  [schedule]
+  (let [digest (.digest (MessageDigest/getInstance "SHA-256")
+                        (.getBytes (pr-str schedule) StandardCharsets/UTF_8))]
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff)) digest))))
+
+(defn- percentile
+  [sorted-values fraction]
+  (let [n     (count sorted-values)
+        index (min (dec n)
+                   (dec (long (Math/ceil (* fraction n)))))]
+    (nth sorted-values (max 0 index))))
+
+(defn- latency-summary
+  [samples]
+  (let [values (vec (sort (map :latency-ns samples)))
+        n      (count values)
+        in-ms  #(/ (double %) 1e6)]
+    (when (pos? n)
+      {:count  n
+       :min    (in-ms (first values))
+       :median (in-ms (percentile values 0.5))
+       :p95    (in-ms (percentile values 0.95))
+       :p99    (in-ms (percentile values 0.99))
+       :max    (in-ms (peek values))
+       :mean   (in-ms (/ (reduce + values) (double n)))})))
+
+(defn- summarize-samples
+  [samples]
+  {:operations
+   (into (sorted-map)
+         (map (fn [[op op-samples]] [op (latency-summary op-samples)]))
+         (group-by :op samples))
+   :idoc-shapes
+   (into (sorted-map)
+         (map (fn [[shape shape-samples]]
+                [shape (latency-summary shape-samples)]))
+         (group-by :shape (filter :shape samples)))})
 
 (def ^:private empty-idoc-trace
   {:count          0
@@ -319,19 +368,31 @@
                       "\t" (format "%.4f" (double avg-ms))
                       "\t" (format "%.1f" (double exact-p))))))))
 
+(defn- print-latency-table
+  [title summaries]
+  (when (seq summaries)
+    (println)
+    (println title)
+    (println "name\tcount\tmean-ms\tmedian-ms\tp95-ms\tp99-ms")
+    (doseq [[label {:keys [count mean median p95 p99]}] summaries]
+      (println (str (name label)
+                    "\t" count
+                    "\t" (format "%.4f" (double mean))
+                    "\t" (format "%.4f" (double median))
+                    "\t" (format "%.4f" (double p95))
+                    "\t" (format "%.4f" (double p99)))))))
+
 (defn- print-summary
-  [stats total-ops elapsed-ms]
+  [summary total-ops elapsed-ms]
   (println "Total ops:" total-ops)
   (println "Elapsed (ms):" (format "%.2f" (double elapsed-ms)))
   (println "Throughput (ops/sec):"
-           (format "%.2f" (double (/ total-ops (/ elapsed-ms 1000.0)))))
-  (println)
-  (println "op\tcount\tavg-ms")
-  (doseq [[op {:keys [count nanos-sum]}] (sort-by key stats)]
-    (let [avg-ms (if (pos? count) (/ nanos-sum (* count 1e6)) 0.0)]
-      (println (str (name op)
-                    "\t" count
-                    "\t" (format "%.4f" (double avg-ms)))))))
+           (format "%.2f"
+                   (double (if (pos? elapsed-ms)
+                             (/ total-ops (/ elapsed-ms 1000.0))
+                             0.0))))
+  (print-latency-table "operation latency" (:operations summary))
+  (print-latency-table "idoc latency by query shape" (:idoc-shapes summary)))
 
 (defn- load-docs-datalevin!
   [conn docs batch-size]
@@ -360,6 +421,10 @@
   (jdbc/execute! conn (into [sql] params)
                  {:builder-fn rs/as-unqualified-lower-maps}))
 
+(defn- sql-query-ids
+  [conn sql params]
+  (into #{} (map :id) (sql-query conn sql params)))
+
 (defn- sql-read-doc
   [conn table id]
   (let [row (jdbc/execute-one! conn
@@ -377,7 +442,7 @@
                    [(encode-json {:profile {:lang (:value spec)}})]]
     :range        [(str "SELECT id FROM " table
                         " WHERE (doc->'stats'->>'score')::double precision"
-                        " BETWEEN ? AND ?")
+                        " > ? AND (doc->'stats'->>'score')::double precision < ?")
                    [(:lo spec) (:hi spec)]]
     :wildcard-one [(str "SELECT id FROM " table
                         " WHERE doc @> ?::jsonb OR doc @> ?::jsonb")
@@ -423,7 +488,7 @@
                    [(:value spec)]]
     :range        [(str "SELECT id FROM " table
                         " WHERE CAST(json_extract(doc, '$.stats.score') AS REAL)"
-                        " BETWEEN ? AND ?")
+                        " > ? AND CAST(json_extract(doc, '$.stats.score') AS REAL) < ?")
                    [(:lo spec) (:hi spec)]]
     :wildcard-one [(str "SELECT id FROM " table
                         " WHERE json_extract(doc, '$.facts.city') = ?"
@@ -478,9 +543,9 @@
   [conn id score last-seen]
   (jdbc/execute!
     conn
-    ["UPDATE idoc_bench_docs"
-     " SET doc = json_set(doc, '$.stats.score', ?, '$.stats.last_seen', ?)"
-     " WHERE id = ?"
+    [(str "UPDATE idoc_bench_docs"
+          " SET doc = json_set(doc, '$.stats.score', ?, '$.stats.last_seen', ?)"
+          " WHERE id = ?")
      score
      last-seen
      id]))
@@ -490,8 +555,8 @@
   (case (:type spec)
     :nested         (Filters/eq "profile.lang" (:value spec))
     :range          (Filters/and (list
-                          (Filters/gte "stats.score" (:lo spec))
-                          (Filters/lte "stats.score" (:hi spec))))
+                          (Filters/gt "stats.score" (:lo spec))
+                          (Filters/lt "stats.score" (:hi spec))))
     :wildcard-one   (Filters/or (list
                                 (Filters/eq "facts.city" (:value spec))
                                 (Filters/eq "facts.team" (:value spec))))
@@ -521,6 +586,12 @@
   (when-let [doc (.first (.find coll (Filters/eq "_id" (long id))))]
     (dissoc (bson->clj doc) :_id)))
 
+(defn- mongo-query-ids
+  [coll spec]
+  (into #{}
+        (map #(long (.get ^Document % "_id")))
+        (.find coll (mongo-filter spec))))
+
 (defn- mongo-update-stats!
   [coll id score last-seen]
   (let [updates (Document. {"$set" (Document. {"stats.score" score
@@ -544,42 +615,9 @@
     (jdbc/execute! conn ["PRAGMA busy_timeout=5000;"])
     conn))
 
-(defn- pg-explain-query
-  "Run EXPLAIN ANALYZE and return [results total-time-nanos].
-   Total time = Planning Time + Execution Time (excludes network roundtrip)."
-  [conn sql params]
-  (let [explain-sql (str "EXPLAIN ANALYZE " sql)
-        rows        (jdbc/execute! conn (into [explain-sql] params)
-                                   {:builder-fn rs/as-unqualified-lower-maps})
-        ;; Parse both Planning Time and Execution Time from the output
-        extract-time (fn [pattern]
-                       (some (fn [row]
-                               (let [plan (or (get row (keyword "query plan"))
-                                              (get row :query-plan)
-                                              (first (vals row)))]
-                                 (when-let [[_ ms] (re-find pattern (str plan))]
-                                   (Double/parseDouble ms))))
-                             (reverse rows)))
-        planning-ms (or (extract-time #"Planning Time:\s+([\d.]+)\s+ms") 0.0)
-        exec-ms     (or (extract-time #"Execution Time:\s+([\d.]+)\s+ms") 0.0)
-        total-ms    (+ planning-ms exec-ms)]
-    [nil (long (* total-ms 1e6))]))
-
-(defn- mongo-explain-query
-  "Run find with explain and return [results exec-time-nanos]."
-  [coll filter]
-  (let [;; Run the actual query with explain
-        find-iterable (.find coll filter)
-        explain       (.explain find-iterable ExplainVerbosity/EXECUTION_STATS)
-        exec-stats    (.get explain "executionStats")
-        exec-ms       (when exec-stats (.get exec-stats "executionTimeMillis"))]
-    ;; Consume the results
-    (doall (map #(.getLong ^Document % "_id") find-iterable))
-    [nil (long (* (or exec-ms 0) 1e6))]))
-
 (defn- datalevin-handlers
   [opts docs]
-  (let [{:keys [records hotset batch-size env-flags keep-db? idoc-trace?
+  (let [{:keys [batch-size env-flags keep-db? idoc-trace?
                 dtlv-uri]} opts
 
         dir    (when-not dtlv-uri
@@ -598,11 +636,20 @@
                    dir
                    schema
                    {:kv-opts {:flags (into c/default-env-flags env-flags)}}))
-        label  (or db-uri dir)
+        label  (if db-uri "remote Datalevin" dir)
         trace  (when idoc-trace? (atom {}))
         tracer (fn [spec]
                  (when trace
-                   (fn [event] (update-idoc-trace! trace spec event))))]
+                   (fn [event] (update-idoc-trace! trace spec event))))
+        query-ids
+        (fn [spec trace?]
+          (let [q   (spec->idoc-query spec)
+                db  (d/db conn)
+                res (if (and trace trace?)
+                      (binding [idoc/*trace* (tracer spec)]
+                        (d/q q-idoc db q))
+                      (d/q q-idoc db q))]
+            (into #{} (map first) res)))]
     {:system       :datalevin
      :label        label
      :load!        (fn []
@@ -611,37 +658,27 @@
                      (d/analyze (d/db conn)))
      :make-thread  (fn [_] {:conn conn})
      :close-thread (fn [_] nil)
-     :op-read      (fn [{:keys [conn]} r]
-                     (let [id (rand-id r records hotset)
-                           db (d/db conn)]
+     :op-read      (fn [{:keys [conn]} {:keys [id]}]
+                     (let [db (d/db conn)]
                        (:mem/doc (d/entity db id))))
-     :op-update    (fn [{:keys [conn]} r]
-                     (let [id         (rand-id r records hotset)
-                           idx        (dec id)
+     :op-update    (fn [{:keys [conn]} {:keys [id] :as operation}]
+                     (let [idx        (dec id)
                            doc        (nth @docs idx)
-                           [doc' ops] (update-doc-patch doc r)]
+                           [doc' ops] (update-doc-patch doc operation)]
                        (swap! docs assoc idx doc')
                        (d/transact! conn [[:db.fn/patchIdoc id :mem/doc ops]])))
-     :op-rmw       (fn [{:keys [conn]} r]
-                     (let [id         (rand-id r records hotset)
-                           db         (d/db conn)
+     :op-rmw       (fn [{:keys [conn]} {:keys [id] :as operation}]
+                     (let [db         (d/db conn)
                            doc        (:mem/doc (d/entity db id))
-                           [doc' ops] (rmw-doc-patch doc r)]
+                           [doc' ops] (rmw-doc-patch doc operation)]
                        (swap! docs assoc (dec id) doc')
                        (d/transact! conn [[:db.fn/patchIdoc id :mem/doc ops]])))
-     :op-idoc      (fn [{:keys [conn]} r]
-                     (let [spec    (rand-query-spec r)
-                           q       (spec->idoc-query spec)
-                           db      (d/db conn)
-                           start   (System/nanoTime)
-                           res     (if trace
-                                     (binding [idoc/*trace* (tracer spec)]
-                                     (d/q q-idoc db q))
-                                   (d/q q-idoc db q))
-                           elapsed (- (System/nanoTime) start)]
-                       [res elapsed]))
+     :op-idoc      (fn [_ {:keys [spec]}] (query-ids spec true))
+     :query-ids    (fn [_ spec] (query-ids spec false))
      :close!       (fn [] (d/close conn))
      :trace-report (when trace #(print-idoc-trace trace))
+     :trace-data   (when trace #(into {} @trace))
+     :reset-trace! (when trace #(reset! trace {}))
      :cleanup!     (fn []
                      (when (and (not keep-db?) dir)
                        (when-not (u/windows?)
@@ -649,7 +686,7 @@
 
 (defn- postgres-handlers
   [opts docs]
-  (let [{:keys [records hotset batch-size keep-db? pg-url pg-user
+  (let [{:keys [batch-size keep-db? pg-url pg-user
                 pg-password pg-table]} opts
 
         ds       (jdbc/get-datasource
@@ -676,38 +713,38 @@
                    (pg-analyze! ds pg-table))
         op-query (fn [conn spec]
                    (let [[sql params] (pg-idoc-query pg-table spec)]
-                     (pg-explain-query conn sql params)))
+                     (sql-query-ids conn sql params)))
         read-doc (fn [conn id] (sql-read-doc conn pg-table id))
         update-doc!
-        (fn [conn id doc]
-          (let [score     (get-in doc [:stats :score])
-                last-seen (get-in doc [:stats :last_seen])]
-            (pg-update-stats! conn pg-table id score last-seen)))]
+        (fn [conn id score last-seen]
+          (pg-update-stats! conn pg-table id score last-seen))]
     {:system       :postgres
-     :label        (str pg-url " (" pg-table ")")
+     :label        (str "PostgreSQL (" pg-table ")")
      :load!        (fn []
                      (init!)
                      (load!))
      :make-thread  (fn [_] {:conn (jdbc/get-connection ds)})
      :close-thread (fn [{:keys [conn]}] (.close conn))
-     :op-read      (fn [{:keys [conn]} r]
-                     (let [id (rand-id r records hotset)]
-                       (read-doc conn id)))
-     :op-update    (fn [{:keys [conn]} r]
-                     (let [id   (rand-id r records hotset)
-                           idx  (dec id)
+     :op-read      (fn [{:keys [conn]} {:keys [id]}]
+                     (read-doc conn id))
+     :op-update    (fn [{:keys [conn]}
+                        {:keys [id score last-seen] :as operation}]
+                     (let [idx  (dec id)
                            doc  (nth @docs idx)
-                           doc' (update-doc doc r)]
+                           doc' (update-doc doc operation)]
                        (swap! docs assoc idx doc')
-                       (update-doc! conn id doc')))
-     :op-rmw       (fn [{:keys [conn]} r]
-                     (let [id   (rand-id r records hotset)
-                           doc  (read-doc conn id)
-                           doc' (rmw-doc doc r)]
+                       (update-doc! conn id score last-seen)))
+     :op-rmw       (fn [{:keys [conn]}
+                        {:keys [id last-seen] :as operation}]
+                     (let [doc  (read-doc conn id)
+                           doc' (rmw-doc doc operation)]
                        (swap! docs assoc (dec id) doc')
-                       (update-doc! conn id doc')))
-     :op-idoc      (fn [{:keys [conn]} r]
-                     (op-query conn (rand-query-spec r)))
+                       (update-doc! conn id
+                                    (get-in doc' [:stats :score])
+                                    last-seen)))
+     :op-idoc      (fn [{:keys [conn]} {:keys [spec]}]
+                     (op-query conn spec))
+     :query-ids    (fn [{:keys [conn]} spec] (op-query conn spec))
      :close!       (fn [] nil)
      :cleanup!     (fn []
                      (when-not keep-db?
@@ -716,7 +753,7 @@
 
 (defn- sqlite-handlers
   [opts docs]
-  (let [{:keys [records hotset batch-size keep-db? sqlite-path]} opts
+  (let [{:keys [batch-size keep-db? sqlite-path]} opts
 
         default-dir  (str (u/tmp-dir
                             (str "idoc-bench-sqlite-" (UUID/randomUUID))))
@@ -758,13 +795,11 @@
         op-query
         (fn [conn spec]
           (let [[sql params] (sqlite-idoc-query "idoc_bench_docs" spec)]
-            (sql-query conn sql params)))
+            (sql-query-ids conn sql params)))
         read-doc     (fn [conn id] (sql-read-doc conn "idoc_bench_docs" id))
         update-doc!
-        (fn [conn id doc]
-          (let [score     (get-in doc [:stats :score])
-                last-seen (get-in doc [:stats :last_seen])]
-            (sqlite-update-stats! conn id score last-seen)))]
+        (fn [conn id score last-seen]
+          (sqlite-update-stats! conn id score last-seen))]
     {:system       :sqlite
      :label        db-path
      :load!        (fn []
@@ -772,24 +807,26 @@
                      (load!))
      :make-thread  (fn [_] {:conn (sqlite-conn ds)})
      :close-thread (fn [{:keys [conn]}] (.close conn))
-     :op-read      (fn [{:keys [conn]} r]
-                     (let [id (rand-id r records hotset)]
-                       (read-doc conn id)))
-     :op-update    (fn [{:keys [conn]} r]
-                     (let [id   (rand-id r records hotset)
-                           idx  (dec id)
+     :op-read      (fn [{:keys [conn]} {:keys [id]}]
+                     (read-doc conn id))
+     :op-update    (fn [{:keys [conn]}
+                        {:keys [id score last-seen] :as operation}]
+                     (let [idx  (dec id)
                            doc  (nth @docs idx)
-                           doc' (update-doc doc r)]
+                           doc' (update-doc doc operation)]
                        (swap! docs assoc idx doc')
-                       (update-doc! conn id doc')))
-     :op-rmw       (fn [{:keys [conn]} r]
-                     (let [id   (rand-id r records hotset)
-                           doc  (read-doc conn id)
-                           doc' (rmw-doc doc r)]
+                       (update-doc! conn id score last-seen)))
+     :op-rmw       (fn [{:keys [conn]}
+                        {:keys [id last-seen] :as operation}]
+                     (let [doc  (read-doc conn id)
+                           doc' (rmw-doc doc operation)]
                        (swap! docs assoc (dec id) doc')
-                       (update-doc! conn id doc')))
-     :op-idoc      (fn [{:keys [conn]} r]
-                     (op-query conn (rand-query-spec r)))
+                       (update-doc! conn id
+                                    (get-in doc' [:stats :score])
+                                    last-seen)))
+     :op-idoc      (fn [{:keys [conn]} {:keys [spec]}]
+                     (op-query conn spec))
+     :query-ids    (fn [{:keys [conn]} spec] (op-query conn spec))
      :close!       (fn [] nil)
      :cleanup!     (fn []
                      (when-not keep-db?
@@ -801,14 +838,14 @@
 
 (defn- mongo-handlers
   [opts docs]
-  (let [{:keys [records hotset batch-size keep-db? mongo-uri mongo-db mongo-coll]}
+  (let [{:keys [batch-size keep-db? mongo-uri mongo-db mongo-coll]}
         opts
 
         client   (MongoClients/create mongo-uri)
         database (.getDatabase client mongo-db)
         coll     (.getCollection database mongo-coll)]
     {:system       :mongo
-     :label        (str mongo-uri " (" mongo-db "/" mongo-coll ")")
+     :label        (str "MongoDB (" mongo-db "/" mongo-coll ")")
      :load!
      (fn []
        (.drop coll)
@@ -821,30 +858,27 @@
        (mongo-create-indexes! coll))
      :make-thread  (fn [_] {:coll coll})
      :close-thread (fn [_] nil)
-     :op-read      (fn [{:keys [coll]} r]
-                     (let [id (rand-id r records hotset)]
-                       (mongo-read-doc coll id)))
-     :op-update    (fn [{:keys [coll]} r]
-                     (let [id   (rand-id r records hotset)
-                           idx  (dec id)
+     :op-read      (fn [{:keys [coll]} {:keys [id]}]
+                     (mongo-read-doc coll id))
+     :op-update    (fn [{:keys [coll]}
+                        {:keys [id score last-seen] :as operation}]
+                     (let [idx  (dec id)
                            doc  (nth @docs idx)
-                           doc' (update-doc doc r)]
+                           doc' (update-doc doc operation)]
                        (swap! docs assoc idx doc')
-                       (mongo-update-stats! coll id
-                                            (get-in doc' [:stats :score])
-                                            (get-in doc' [:stats :last_seen]))))
-     :op-rmw       (fn [{:keys [coll]} r]
-                     (let [id   (rand-id r records hotset)
-                           doc  (mongo-read-doc coll id)
-                           doc' (rmw-doc doc r)]
+                       (mongo-update-stats! coll id score last-seen)))
+     :op-rmw       (fn [{:keys [coll]}
+                        {:keys [id last-seen] :as operation}]
+                     (let [doc  (mongo-read-doc coll id)
+                           doc' (rmw-doc doc operation)]
                        (swap! docs assoc (dec id) doc')
                        (mongo-update-stats! coll id
                                             (get-in doc' [:stats :score])
-                                            (get-in doc' [:stats :last_seen]))))
-     :op-idoc
-     (fn [{:keys [coll]} r]
-       ;; Use explain to get db-reported execution time
-       (mongo-explain-query coll (mongo-filter (rand-query-spec r))))
+                                            last-seen)))
+     :op-idoc      (fn [{:keys [coll]} {:keys [spec]}]
+                     (mongo-query-ids coll spec))
+     :query-ids    (fn [{:keys [coll]} spec]
+                     (mongo-query-ids coll spec))
      :close!       (fn [] nil)
      :cleanup!     (fn []
                      (if keep-db?
@@ -852,6 +886,133 @@
                        (do
                          (.drop coll)
                          (.close client))))}))
+
+(defn- canonical-doc
+  [value]
+  (cond
+    (map? value)
+    (into {} (map (fn [[k v]] [(if (keyword? k) (name k) (str k))
+                               (canonical-doc v)])) value)
+
+    (sequential? value) (mapv canonical-doc value)
+    :else value))
+
+(defn- reference-match?
+  [doc {:keys [type value lo hi]}]
+  (case type
+    :nested (= value (get-in doc [:profile :lang]))
+    :range (let [score (get-in doc [:stats :score])]
+             (< lo score hi))
+    :wildcard-one (boolean (some #{value} (vals (:facts doc))))
+    :wildcard-depth
+    (boolean (some #(= value (get-in % [:entity :name])) (:events doc)))
+    :array
+    (boolean (some #(some #{value} (:tags %)) (:events doc)))))
+
+(defn- reference-query-ids
+  [docs spec]
+  (into #{}
+        (keep-indexed (fn [idx doc]
+                        (when (reference-match? doc spec) (inc idx))))
+        docs))
+
+(defn- verification-specs
+  [docs]
+  (let [sample-docs (take 8 docs)
+        take-values (fn [values] (take 3 (distinct values)))
+        nested      (take-values (map #(get-in % [:profile :lang]) sample-docs))
+        scores      (take-values (map #(get-in % [:stats :score]) sample-docs))
+        facts       (take-values (mapcat (comp vals :facts) sample-docs))
+        event-vals  (mapcat :events sample-docs)
+        entities'   (take-values (map #(get-in % [:entity :name]) event-vals))
+        tags'       (take-values (mapcat :tags event-vals))
+        missing     "__idoc_bench_missing__"]
+    (vec
+      (distinct
+        (concat
+          (map #(hash-map :type :nested :value %) nested)
+          [{:type :nested :value missing}]
+          (map #(hash-map :type :range
+                          :lo (- (double %) 1e-9)
+                          :hi (+ (double %) 1e-9))
+               scores)
+          [{:type :range :lo 0.25 :hi 0.75}]
+          (map #(hash-map :type :wildcard-one :value %) facts)
+          [{:type :wildcard-one :value missing}]
+          (map #(hash-map :type :wildcard-depth :value %) entities')
+          [{:type :wildcard-depth :value missing}]
+          (map #(hash-map :type :array :value %) tags')
+          [{:type :array :value missing}])))))
+
+(defn- verify-handlers!
+  [handlers docs]
+  (let [ctx       ((:make-thread handlers) :verification)
+        record-n  (count docs)
+        read-ids  (vec (distinct [1 (inc (quot (dec record-n) 2)) record-n]))
+        specs     (verification-specs docs)]
+    (try
+      (doseq [id read-ids]
+        (let [expected (canonical-doc (nth docs (dec id)))
+              actual   (canonical-doc ((:op-read handlers) ctx
+                                       {:op :read :id id}))]
+          (when-not (= expected actual)
+            (throw (ex-info "Point-read correctness check failed"
+                            {:system (:system handlers) :id id
+                             :expected expected :actual actual})))))
+      (let [id          1
+            original    (first docs)
+            update-op   {:op :update :id id :score 0.123456789
+                         :last-seen (+ base-ts 3000001)}
+            updated     (update-doc original update-op)
+            rmw-op      {:op :rmw :id id :last-seen (+ base-ts 3000002)}
+            rmw-updated (rmw-doc updated rmw-op)
+            restore-op  {:op :update :id id
+                         :score (get-in original [:stats :score])
+                         :last-seen (get-in original [:stats :last_seen])}]
+        ((:op-update handlers) ctx update-op)
+        (when-not (= (canonical-doc updated)
+                     (canonical-doc ((:op-read handlers) ctx
+                                     {:op :read :id id})))
+          (throw (ex-info "Update correctness check failed"
+                          {:system (:system handlers) :id id})))
+        ((:op-rmw handlers) ctx rmw-op)
+        (when-not (= (canonical-doc rmw-updated)
+                     (canonical-doc ((:op-read handlers) ctx
+                                     {:op :read :id id})))
+          (throw (ex-info "Read-modify-write correctness check failed"
+                          {:system (:system handlers) :id id})))
+        ((:op-update handlers) ctx restore-op))
+      (let [query-results
+            (mapv
+              (fn [spec]
+                (let [expected (reference-query-ids docs spec)
+                      actual   ((:query-ids handlers) ctx spec)]
+                  (when-not (= expected actual)
+                    (throw
+                      (ex-info "Idoc query correctness check failed"
+                               {:system     (:system handlers)
+                                :spec       spec
+                                :expected-count (count expected)
+                                :actual-count   (count actual)
+                                :missing    (vec (take 20
+                                                       (sort (remove actual
+                                                                     expected))))
+                                :unexpected (vec (take 20
+                                                       (sort (remove expected
+                                                                     actual))))})))
+                  {:spec spec :result-count (count actual)}))
+              specs)]
+        (println "Correctness:"
+                 (count read-ids) "point reads and"
+                 "2 mutations and"
+                 (count specs) "idoc queries passed")
+        {:status :passed
+         :point-read-checks (count read-ids)
+         :mutation-checks 2
+         :query-checks (count specs)
+         :queries query-results})
+      (finally
+        ((:close-thread handlers) ctx)))))
 
 (defn- build-handlers
   [system opts docs]
@@ -862,101 +1023,160 @@
     :mongo     (mongo-handlers opts docs)
     (throw (ex-info "Unsupported system" {:system system}))))
 
+(defn- execute-operation!
+  [handlers ctx record-locks {:keys [op id] :as operation}]
+  (let [execute
+        (fn []
+          (case op
+            :read   ((:op-read handlers) ctx operation)
+            :update ((:op-update handlers) ctx operation)
+            :rmw    ((:op-rmw handlers) ctx operation)
+            :idoc   ((:op-idoc handlers) ctx operation)))]
+    (if (#{:update :rmw} op)
+      (locking (nth record-locks (dec id))
+        (execute))
+      (execute))))
+
 (defn- run-thread
-  [handlers opts tid]
-  (let [r        (Random. (+ (:seed opts) tid))
-        selector (build-selector (workload->weights (:workload opts)
-                                                    (:idoc-ratio opts)))
-        ctx      ((:make-thread handlers) tid)]
+  [handlers operations tid record-locks]
+  (let [ctx ((:make-thread handlers) tid)]
     (try
-      (loop [i     0
-             stats {}]
-        (if (< i (:ops opts))
-          (let [op      (selector r)
-                start   (System/nanoTime)
-                ;; op-idoc may return [result exec-nanos] for db-reported timing
-                result  (case op
-                          :read   ((:op-read handlers) ctx r)
-                          :update ((:op-update handlers) ctx r)
-                          :rmw    ((:op-rmw handlers) ctx r)
-                          :idoc   ((:op-idoc handlers) ctx r))
-                elapsed (if (and (= op :idoc)
-                                 (vector? result)
-                                 (number? (second result)))
-                          (second result)
-                          (- (System/nanoTime) start))]
-            (recur (inc i) (update-stat stats op elapsed)))
-          stats))
+      (mapv
+        (fn [{:keys [op id spec schedule-index] :as operation}]
+          (let [start (System/nanoTime)]
+            (execute-operation! handlers ctx record-locks operation)
+            (cond-> {:thread tid
+                     :schedule-index schedule-index
+                     :op op
+                     :latency-ns (- (System/nanoTime) start)}
+              id   (assoc :record-id id)
+              spec (assoc :shape (:type spec) :query spec))))
+        operations)
       (finally
         ((:close-thread handlers) ctx)))))
 
 (defn- warmup
-  [handlers opts]
-  (let [warmup-ops (:warmup opts)]
-    (when (pos? warmup-ops)
-      (let [r        (Random. (:seed opts))
-            selector (build-selector (workload->weights (:workload opts)
-                                                        (:idoc-ratio opts)))
-            ctx      ((:make-thread handlers) :warmup)]
-        (try
-          (dotimes [_ warmup-ops]
-            (case (selector r)
-              :read   ((:op-read handlers) ctx r)
-              :update ((:op-update handlers) ctx r)
-              :rmw    ((:op-rmw handlers) ctx r)
-              :idoc   ((:op-idoc handlers) ctx r)))
-          (finally
-            ((:close-thread handlers) ctx)))))))
+  [handlers operations record-locks]
+  (when (seq operations)
+    (let [ctx ((:make-thread handlers) :warmup)]
+      (try
+        (doseq [operation operations]
+          (execute-operation! handlers ctx record-locks operation))
+        (finally
+          ((:close-thread handlers) ctx))))))
+
+(defn- split-schedule
+  [schedule thread-count]
+  (let [operation-count (count schedule)
+        base            (quot operation-count thread-count)
+        extra           (mod operation-count thread-count)]
+    (loop [tid    0
+           offset 0
+           result []]
+      (if (= tid thread-count)
+        result
+        (let [n   (+ base (if (< tid extra) 1 0))
+              end (+ offset n)]
+          (recur (inc tid) end (conj result (subvec schedule offset end))))))))
+
+(defn- run-workers
+  [handlers schedule thread-count record-locks]
+  (let [executor (Executors/newFixedThreadPool (int thread-count))
+        partitions (split-schedule schedule thread-count)]
+    (try
+      (let [futures
+            (mapv
+              (fn [tid operations]
+                (.submit executor
+                         ^Callable
+                         (reify Callable
+                           (call [_]
+                             (run-thread handlers operations tid record-locks)))))
+              (range thread-count)
+              partitions)]
+        (vec
+          (mapcat
+            (fn [future]
+              (try
+                (.get future)
+                (catch ExecutionException e
+                  (throw (or (.getCause e) e)))))
+            futures)))
+      (finally
+        (.shutdownNow executor)
+        (.awaitTermination executor 30 TimeUnit/SECONDS)))))
 
 (defn- run-bench
-  [system opts base-docs]
+  [system opts base-docs warmup-schedule schedule]
   (let [docs     (atom (vec base-docs))
         handlers (build-handlers system opts docs)
         {:keys [records ops threads]} opts
+        record-locks (vec (repeatedly records #(Object.)))
         warmup-ops (:warmup opts)]
     (println)
     (println "System:" (name system))
     (println "Loading" records "documents into" (:label handlers) "...")
     (try
       ((:load! handlers))
-      (println "Warmup" warmup-ops "ops ...")
-      (warmup handlers opts)
-      (println "Running workload" (:workload opts)
-               "with idoc weight" (:idoc-ratio opts)
-               "on" threads "threads ...")
-      (let [start-ms       (System/currentTimeMillis)
-            ops-per-thread (long (Math/floor (/ ops (double threads))))
-            extra          (mod ops threads)
-            latch          (CountDownLatch. threads)
-            results        (atom [])]
-        (dotimes [tid threads]
-          (let [n-ops (+ ops-per-thread (if (< tid extra) 1 0))]
-            (future
-              (try
-                (let [stats (run-thread handlers (assoc opts :ops n-ops) tid)]
-                  (swap! results conj stats))
-                (catch Throwable t
-                  (binding [*out* *err*]
-                    (println "idoc-bench worker failed"
-                             {:tid tid
-                              :ops n-ops
-                              :workload (:workload opts)
-                              :system (:system opts)}))
-                  (.printStackTrace t))
-                (finally
-                  (.countDown latch))))))
-        (.await latch)
-        (let [elapsed-ms (- (System/currentTimeMillis) start-ms)
-              stats      (reduce merge-stats {} @results)]
-          (print-summary stats ops elapsed-ms)
+      (let [correctness (if (:verify? opts)
+                          (verify-handlers! handlers base-docs)
+                          {:status :skipped})]
+        (println "Warmup" warmup-ops "ops ...")
+        (warmup handlers warmup-schedule record-locks)
+        (when-let [reset-trace! (:reset-trace! handlers)]
+          (reset-trace!))
+        (println "Running workload" (:workload opts)
+                 "with idoc weight" (:idoc-ratio opts)
+                 "on" threads "threads ...")
+        (let [start       (System/nanoTime)
+              samples     (run-workers handlers schedule threads record-locks)
+              elapsed-ms  (/ (- (System/nanoTime) start) 1e6)
+              actual-ops  (count samples)
+              summary     (summarize-samples samples)
+              throughput  (if (pos? elapsed-ms)
+                            (/ actual-ops (/ elapsed-ms 1000.0))
+                            0.0)]
+          (when-not (= ops actual-ops)
+            (throw
+              (ex-info "Benchmark did not complete every scheduled operation"
+                       {:system system :expected ops :actual actual-ops})))
+          (print-summary summary actual-ops elapsed-ms)
           (when-let [report (:trace-report handlers)]
-            (report))))
+            (report))
+          {:system system
+           :correctness correctness
+           :elapsed-ms elapsed-ms
+           :throughput-ops-per-second throughput
+           :latency-ms summary
+           :raw-samples samples
+           :idoc-trace (when-let [trace-data (:trace-data handlers)]
+                         (trace-data))}))
       (finally
-        ((:close! handlers))
-        ((:cleanup! handlers))))))
+        (try
+          ((:close! handlers))
+          (finally
+            ((:cleanup! handlers))))))))
+
+(def ^:private value-options
+  #{"--system" "--workload" "--records" "--ops" "--warmup" "--threads"
+    "--batch" "--idoc" "--hotset" "--output" "--dir" "--dtlv-uri"
+    "--sqlite-path" "--pg-url" "--pg-user" "--pg-password" "--pg-table"
+    "--mongo-uri" "--mongo-db" "--mongo-coll" "--seed"})
+
+(defn- require-option-values!
+  [args]
+  (loop [more args]
+    (when-let [arg (first more)]
+      (if (contains? value-options arg)
+        (do
+          (when-not (second more)
+            (throw (ex-info (str "Missing value for " arg) {:option arg})))
+          (recur (nnext more)))
+        (recur (next more))))))
 
 (defn- parse-args
   [args]
+  (require-option-values! args)
   (loop [opts default-opts
          more args]
     (if-let [arg (first more)]
@@ -980,7 +1200,10 @@
         "--idoc"       (recur (assoc opts :idoc-ratio (Long/parseLong (second more)))
                               (nnext more))
         "--idoc-trace" (recur (assoc opts :idoc-trace? true) (next more))
+        "--no-verify"  (recur (assoc opts :verify? false) (next more))
         "--hotset"     (recur (assoc opts :hotset (Double/parseDouble (second more)))
+                              (nnext more))
+        "--output"     (recur (assoc opts :output (second more))
                               (nnext more))
         "--dir"        (recur (assoc opts :dir (second more))
                               (nnext more))
@@ -1006,10 +1229,8 @@
         "--seed"       (recur (assoc opts :seed (Long/parseLong (second more)))
                               (nnext more))
         "--help"       (recur (assoc opts :help? true) (next more))
-        (do
-          (when (str/starts-with? arg "--")
-            (println "WARNING: Unrecognized option:" arg))
-          (recur opts (next more))))
+        (throw (ex-info (str "Unrecognized argument: " arg)
+                        {:argument arg})))
       opts)))
 
 (defn- usage []
@@ -1023,7 +1244,9 @@
   (println "  --batch N          Load batch size (default 1000)")
   (println "  --idoc N           Weight for idoc queries (default 30)")
   (println "  --idoc-trace       Trace idoc candidate sizes and match stats")
+  (println "  --no-verify        Skip correctness checks (not for published results)")
   (println "  --hotset P         Hotset fraction (0-1, default 1.0)")
+  (println "  --output PATH      Write host metadata, summaries, and raw samples as EDN")
   (println "  --dir PATH         Datalevin DB directory (default /tmp/idoc-bench-<uuid>)")
   (println "  --dtlv-uri URI     Datalevin server URI (e.g. dtlv://host:port)")
   (println "  --sqlite-path PATH SQLite DB file path")
@@ -1038,15 +1261,94 @@
   (println "  --keep             Keep DB artifacts after run")
   (println "  --help             Show this help"))
 
+(def ^:private report-config-keys
+  [:system :workload :records :ops :warmup :threads :batch-size
+   :idoc-ratio :idoc-trace? :verify? :hotset :seed :keep-db?])
+
+(defn- host-info
+  []
+  {:timestamp  (str (Instant/now))
+   :clojure    (clojure-version)
+   :datalevin  c/version
+   :java       (System/getProperty "java.version")
+   :vm         (System/getProperty "java.vm.name")
+   :os         (System/getProperty "os.name")
+   :os-version (System/getProperty "os.version")
+   :arch       (System/getProperty "os.arch")
+   :processors (.availableProcessors (Runtime/getRuntime))})
+
+(defn- validate-options
+  [{:keys [system workload records ops warmup threads batch-size idoc-ratio
+           hotset pg-table] :as opts}]
+  (cond
+    (not (contains? #{:datalevin :postgres :sqlite :mongo :all} system))
+    (str "unsupported system: " system)
+
+    (not (contains? workloads workload))
+    (str "unsupported workload: " workload)
+
+    (not (pos? records)) "--records must be positive"
+    (not (pos? ops)) "--ops must be positive"
+    (neg? warmup) "--warmup must not be negative"
+    (not (pos? threads)) "--threads must be positive"
+    (> threads ops) "--threads must not exceed --ops"
+    (not (pos? batch-size)) "--batch must be positive"
+    (neg? idoc-ratio) "--idoc must not be negative"
+    (not (< 0.0 hotset 1.0000000001)) "--hotset must be greater than 0 and at most 1"
+    (not (re-matches #"[A-Za-z_][A-Za-z0-9_]*" pg-table))
+    "--pg-table must be an unqualified SQL identifier"
+    :else opts))
+
+(defn- write-report!
+  [path report]
+  (let [file (io/file path)]
+    (when-let [parent (.getParentFile file)]
+      (.mkdirs parent))
+    (spit file (with-out-str (pprint/pprint report)))
+    (println)
+    (println "Wrote results to" (.getPath file))))
+
+(defn run-benchmark
+  [opts]
+  (let [validated (validate-options opts)]
+    (if (string? validated)
+      (throw (ex-info validated
+                      {:options (select-keys opts report-config-keys)}))
+      (let [systems         (if (= :all (:system opts))
+                              [:datalevin :postgres :sqlite :mongo]
+                              [(:system opts)])
+            base-docs       (generate-docs (:records opts) (:seed opts))
+            warmup-schedule (generate-schedule opts (:warmup opts)
+                                               (+ (:seed opts) 1000003))
+            schedule        (generate-schedule opts (:ops opts)
+                                               (+ (:seed opts) 2000003))
+            schedule-info   {:dataset-sha256 (schedule-digest base-docs)
+                             :warmup-sha256 (schedule-digest warmup-schedule)
+                             :measurement-sha256 (schedule-digest schedule)
+                             :operation-counts (frequencies (map :op schedule))}
+            _               (println "Schedule SHA-256:"
+                                     (:measurement-sha256 schedule-info))
+            results         (mapv #(run-bench % opts base-docs
+                                              warmup-schedule schedule)
+                                  systems)
+            report          {:format-version 1
+                             :benchmark :indexed-document
+                             :host (host-info)
+                             :configuration (select-keys opts report-config-keys)
+                             :schedule schedule-info
+                             :results results}]
+        (when-let [output (:output opts)]
+          (write-report! output report))
+        report))))
+
 (defn -main
   [& args]
-  (let [opts (parse-args args)]
-    (when (:help? opts)
-      (usage)
-      (System/exit 0))
-    (let [systems (if (= :all (:system opts))
-                    [:datalevin :postgres :sqlite :mongo]
-                    [(:system opts)])
-          base-docs (generate-docs (:records opts) (:seed opts))]
-      (doseq [system systems]
-        (run-bench system opts base-docs)))))
+  (try
+    (let [opts (parse-args args)]
+      (if (:help? opts)
+        (usage)
+        (run-benchmark opts)))
+    (finally
+      ;; The benchmark previously left Clojure's future/agent executors alive.
+      ;; Keep CLI invocation deterministic even if a dependency starts one.
+      (shutdown-agents))))

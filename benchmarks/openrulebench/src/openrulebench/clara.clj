@@ -1,7 +1,6 @@
 (ns openrulebench.clara
   "Clara Rules benchmarks for OpenRuleBench."
   (:require
-   [clojure.string :as str]
    [openrulebench.core :as core]
    [openrulebench.data :as data]
    [clara.rules :refer [defrule defquery fire-rules insert
@@ -145,11 +144,10 @@
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "tc:medium" "sg:small"])
+  ["tc:small" "sg:small"])
 
 (defn parse-benchmark [spec]
-  (let [[bench-type instance] (str/split spec #":")]
-    [bench-type instance]))
+  (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
   (let [[bench-type instance] (parse-benchmark spec)]
@@ -168,6 +166,9 @@
   (doall (map run-benchmark benchmark-specs)))
 
 (defn -main [& args]
-  (let [benchmarks (if (seq args) args default-benchmarks)
-        results (run-benchmarks benchmarks)]
-    (core/print-row "clara" results)))
+  (let [report (try
+                 (core/run-system-cli! "clara" default-benchmarks
+                                       run-benchmark args)
+                 (finally
+                   (shutdown-agents)))]
+    (System/exit (:exit-code report))))

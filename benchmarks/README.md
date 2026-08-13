@@ -22,5 +22,8 @@ The following benchmarks are included:
   residual candidate work.
 * [Idoc](idoc-bench) runs YCSB-style A/C/F workloads plus idoc query mixes
   (nested paths, ranges, wildcards, arrays) to stress document queries.
+* [OpenRuleBench](openrulebench) compares recursive TC/SG rule evaluation and
+  includes Datalevin Join1, DBLP, and LUBM workloads. Its TC/SG core uses
+  independent correctness oracles and repeated measurements with raw artifacts.
 * [Write](write-bench) studies writing synthetic data to measure Datalevin's write
   performance in various conditions, and compares with SQLite.

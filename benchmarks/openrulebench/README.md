@@ -1,4 +1,4 @@
-# OpenRuleBench for Datalevin (WIP)
+# OpenRuleBench for Datalevin
 
 Benchmarks for comparing Datalevin's Datalog engine with rule engines,
 recursive SQL systems, and deductive systems. The suite follows the
@@ -21,24 +21,53 @@ for local development runs when the standard `small` case is too large.
 ```bash
 cd benchmarks/openrulebench
 
-# Run the configured default benchmarks
-./bench.clj
+# Run the common TC/SG core on Datalevin and SQLite
+./bench.clj --output results/core.edn
 
 # Run a tiny local comparison between Datalevin and Clara
 ./bench.clj --systems datalevin,clara tc:tiny sg:tiny
 
 # Run selected OpenRuleBench standard cases
-./bench.clj --systems datalevin,clara tc:small sg:small
+./bench.clj --systems datalevin,sqlite --warmup 1 --iterations 5 \
+  --output results/tc-sg-small.edn tc:small sg:small
 
-# Run all OpenRuleBench benchmarks
-./bench.clj all
+# Run every workload supported by each selected system; unsupported pairs are N/A
+./bench.clj --systems datalevin,sqlite all
 
-# Run stress tests
-./bench.clj stress
+# Run Datalevin stress tests
+./bench.clj --systems datalevin stress
 ```
 
 The Datalevin runner uses the in-memory KV store for generated benchmark
 databases. Datalevin, Clara, and O'Doyle are run with `-J-Xmx8g`.
+
+The default is deliberately limited to the common TC/SG core. Workloads not
+implemented by a selected system are printed as `N/A`; they are not reported
+as errors or silently substituted. `join1`, DBLP, and LUBM can currently be
+selected for Datalevin, while the comparison runners implement TC and SG.
+
+### Benchmark Contract
+
+- Each warmup and measured sample gets a freshly generated, freshly loaded
+  database or rule-engine session. Generation uses fixed seeds.
+- The default is one warmup and five measured iterations. The reported value
+  is the median; EDN artifacts retain every sample and min/mean/p95/p99.
+- Setup is excluded. The timed region performs rule evaluation and fully
+  materializes results.
+- TC and SG counts are checked before a result is accepted, using independent
+  fixed-point implementations in `openrulebench.core`. A mismatch is `BAD`.
+- Errors, timeouts, out-of-memory results, incorrect results, missing child
+  reports, and child-process failures produce a non-zero harness exit status.
+- `--output` records the commands' configuration, host/JVM metadata, status,
+  correctness result, summary statistics, and raw samples in EDN.
+
+Run `clojure -M:test` for the fixed-point oracle, statistics, failure-gate, and
+CLI tests. Tiny end-to-end smoke checks are:
+
+```bash
+./bench.clj --systems datalevin,sqlite --warmup 0 --iterations 2 \
+  tc:tiny sg:tiny
+```
 
 ### Timing Method
 
@@ -50,7 +79,19 @@ region performs recursive rule evaluation and fully materializes the result:
 `query-all` for O'Doyle, and the recursive query plus row materialization for
 SQLite and PostgreSQL. Timeout bookkeeping is outside O'Doyle's reported time.
 XSB and Souffle use external process runners and retain their documented
-process-level timings.
+process-level timings. XSB materializes and counts answers in one timed process;
+Soufflé includes its compilation/execution process and output writing. Those
+numbers should only be compared when their runner-specific boundaries are held
+fixed.
+
+### Options
+
+- `--systems LIST` — comma-separated systems; default `datalevin,sqlite`
+- `--warmup N` — fresh-database warmup runs; default 1
+- `--iterations N` — measured fresh-database runs; default 5
+- `--output PATH` — write a combined EDN artifact
+- `--no-verify` — skip the TC/SG oracle; unsuitable for published results
+- `--help` — print usage without compiling or running a benchmark
 
 ## Current Results
 
@@ -69,8 +110,8 @@ produced the same result counts.
 | `tc:tiny` | 57.46 ms | 352.2 ms | T/O at 60s | 10,000 for Datalevin/Clara |
 | `sg:tiny` | 27.37 ms | 404.5 ms | T/O at 60s | 10,000 for Datalevin/Clara |
 
-The Datalevin values are one-shot fresh-process runs. Repeated runs would
-produce far shorter times.
+These are historical one-shot values retained for context; they predate the
+current artifact-producing harness and are not a current baseline.
 
 ### Small Runs
 
@@ -83,7 +124,7 @@ and 3,000 `sib` facts. These results use the common timing boundary above.
 | `tc:small` | 1,048.8 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
 | `sg:small` | 1,470.0 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
 
-The Datalevin values are medians of five runs. The observed ranges were
+These are historical medians of five runs. The observed ranges were
 897.9-1,145.4 ms for `tc:small` and 1,311.5-1,560.2 ms for `sg:small`.
 
 Correctness was checked for both Datalevin and Clara TC/SG rules against
@@ -238,7 +279,7 @@ Tests type inference with university domain ontology:
 ## Requirements
 
 ### Required
-- Clojure 1.12+; benchmark aliases currently pin Clojure `1.12.5`
+- Clojure 1.12+; benchmark aliases currently pin Clojure `1.12.4`
 - Java 17+
 
 ### Optional External Systems

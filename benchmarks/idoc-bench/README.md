@@ -16,8 +16,35 @@ Each benchmark run performs the same high-level tasks:
    - Datalevin runs `analyze` to refresh sampling stats.
    - Postgres/SQLite build expression indexes for the query mix and run `ANALYZE`.
    - MongoDB builds field indexes for the query mix.
-3. **Warmup**: execute `--warmup` operations to stabilize caches.
-4. **Run**: execute `--ops` operations according to the workload mix.
+3. **Verify**: compare reads, mutations, and idoc queries with an independent
+   Clojure oracle.
+4. **Warmup**: execute `--warmup` operations to stabilize caches.
+5. **Run**: execute `--ops` operations according to the workload mix.
+
+Verification is mandatory by default. A mismatch or worker failure aborts the
+run with a non-zero exit status, so an incomplete run cannot be mistaken for a
+benchmark result.
+
+## Measurement Contract
+
+- The dataset, warmup operations, and measured operations are generated once
+  from `--seed`. `--system all` reuses those exact schedules for every system.
+- The report records SHA-256 digests for the dataset and both schedules.
+- Every operation uses client-observed wall-clock time. Query latency includes
+  planning, database execution, transfer, and complete realization of result
+  ids for all four systems.
+- Updates and read-modify-writes use the same per-record critical section on
+  every backend. Time waiting on a contended record is included in latency.
+- Database creation, loading, index creation, correctness checks, and warmup
+  are outside the measured interval.
+- The console reports mean, median, p95, and p99 latency by operation. Idoc
+  latency is also broken down by query shape.
+- `--output` writes host/JVM metadata, configuration, correctness results,
+  summaries, and every raw latency sample to one EDN artifact.
+
+This contract deliberately does not mix database-reported `EXPLAIN` time with
+client wall-clock time. Explain plans remain useful diagnostics, but they are
+not comparable latency measurements across these systems.
 
 ### Operation Types
 
@@ -79,9 +106,9 @@ The `idoc` operation randomly picks one of these query shapes:
 - **Nested equality**: match a profile language.
   - Idoc: `{:profile {:lang "en"}}`
   - SQL/Mongo: `profile.lang = 'en'`
-- **Range predicate**: score between two values.
+- **Range predicate**: score strictly between two values.
   - Idoc: `(< 0.3 [:stats :score] 0.8)`
-  - SQL/Mongo: `stats.score BETWEEN 0.3 AND 0.8`
+  - SQL/Mongo: `stats.score > 0.3 AND stats.score < 0.8`
 - **Wildcard (one segment)**: match any `:facts` value.
   - Idoc: `{:facts {:? "SF"}}`
   - SQL/Mongo: match `"facts.city" = "SF"` or `"facts.team" = "SF"`
@@ -96,19 +123,22 @@ The `idoc` operation randomly picks one of these query shapes:
 
 ```bash
 # Datalevin
-clj -M:bench --system datalevin
+clojure -M:bench --system datalevin \
+  --output results/datalevin-c.edn
 
 # Postgres (JSONB)
-clj -M:bench --system postgres --pg-url jdbc:postgresql://localhost:5432/postgres
+clojure -M:bench --system postgres \
+  --pg-url jdbc:postgresql://localhost:5432/postgres
 
 # SQLite (JSON1 extension)
-clj -M:bench --system sqlite --sqlite-path /tmp/idoc-bench.sqlite
+clojure -M:bench --system sqlite --sqlite-path /tmp/idoc-bench.sqlite
 
 # MongoDB
-clj -M:bench --system mongo --mongo-uri mongodb://localhost:27017
+clojure -M:bench --system mongo --mongo-uri mongodb://localhost:27017
 
 # Run all systems sequentially
-clj -M:bench --system all
+clojure -M:bench --system all --records 10000 --ops 10000 \
+  --output results/all-c.edn
 ```
 
 ### Options
@@ -121,7 +151,10 @@ clj -M:bench --system all
 - `--threads N`       Number of worker threads (default 1)
 - `--batch N`         Load batch size (default 1000)
 - `--idoc N`          Weight for idoc queries (default 30)
+- `--idoc-trace`      Record Datalevin candidate/verification trace metrics
+- `--no-verify`       Skip correctness checks (not valid for published results)
 - `--hotset P`        Hotset fraction for id selection (0-1, default 1.0)
+- `--output PATH`     Write metadata, summaries, and raw samples as EDN
 - `--dir PATH`        Datalevin DB directory (default /tmp/idoc-bench-<uuid>)
 - `--dtlv-uri URI`    Datalevin server URI (e.g. dtlv://host:port)
 - `--sqlite-path PATH` SQLite DB file path
@@ -137,9 +170,27 @@ clj -M:bench --system all
 
 ## Results
 
-The explain functions of Datalevin/MongoDB/PostgreSQL all report timing, so
-these are recorded as results. SQLite does not, so the wall clock time is
-recorded.
+Use `--output` for any result intended to guide optimization or be published.
+The raw samples make it possible to recalculate distributions and detect
+outliers without rerunning the workload. A result is comparable only when its
+dataset and measurement schedule hashes match and its correctness status is
+`:passed`.
+
+For a before/after optimization comparison, keep the full command, seed,
+machine, JVM, database versions, and service configuration fixed. Run each
+configuration multiple times and compare medians from complete artifacts; do
+not treat the tiny smoke commands below as performance baselines.
+
+## Tests and Smoke Checks
+
+```bash
+# Pure schedule, oracle, statistics, and validation tests
+clojure -M:test
+
+# Fast end-to-end checks for the two embedded systems
+clojure -M:bench --system datalevin --records 100 --ops 40 --warmup 5
+clojure -M:bench --system sqlite --records 100 --ops 40 --warmup 5
+```
 
 
 
@@ -154,6 +205,9 @@ recorded.
   the `events` array to match the generated documents.
 - The benchmark drops Postgres tables / Mongo collections and removes SQLite
   files unless `--keep` is supplied.
+- With multiple threads, throughput is measured over the concurrent wall-clock
+  interval, while each raw latency sample is measured around its individual
+  operation. Their durations therefore overlap as expected.
 - SQLite limitation: SQLite cannot create indexes on nested array elements.
   Queries like `wildcard-depth` (searching `events[*].entity.name`) and `array`
   (searching `events[*].tags`) cannot use indexes in SQLite and require full

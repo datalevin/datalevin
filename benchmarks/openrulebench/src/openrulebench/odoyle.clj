@@ -195,11 +195,10 @@
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "tc:medium" "sg:small"])
+  ["tc:small" "sg:small"])
 
 (defn parse-benchmark [spec]
-  (let [[bench-type instance] (clojure.string/split spec #":")]
-    [bench-type instance]))
+  (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
   (let [[bench-type instance] (parse-benchmark spec)]
@@ -220,7 +219,9 @@
   (doall (map run-benchmark benchmark-specs)))
 
 (defn -main [& args]
-  (let [benchmarks (if (seq args) args default-benchmarks)
-        results (run-benchmarks benchmarks)]
-    (core/print-row "odoyle" results)
-    (shutdown-agents)))
+  (let [report (try
+                 (core/run-system-cli! "odoyle" default-benchmarks
+                                       run-benchmark args)
+                 (finally
+                   (shutdown-agents)))]
+    (System/exit (:exit-code report))))

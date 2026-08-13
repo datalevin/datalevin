@@ -221,57 +221,60 @@
    Instance can be: tiny, small, medium, large, xlarge, xxlarge."
   [instance-name]
   (let [instance-key (keyword instance-name)
-        edges (data/generate-tc-instance instance-key)
-        conn (create-tc-db edges)
-        db (d/db conn)
-        _ (d/analyze db)
-        _ (System/gc)
-        [result time-ms] (core/time-once (run-tc-query db))
-        result-count (count result)]
-    (d/close conn)
-    {:system "datalevin"
-     :benchmark (str "tc:" instance-name)
-     :time-ms time-ms
-     :result-count result-count
-     :status :ok}))
+        edges        (data/generate-tc-instance instance-key)
+        conn         (create-tc-db edges)]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            [result time-ms] (core/time-once (run-tc-query db))]
+        {:system "datalevin"
+         :benchmark (str "tc:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 (defn run-sg-benchmark
   "Run SG benchmark on an instance. Returns result map.
    Instance can be: tiny, small, medium, large."
   [instance-name]
   (let [instance-key (keyword instance-name)
-        relations (data/generate-sg-instance instance-key)
-        conn (create-sg-db relations)
-        db (d/db conn)
-        _ (d/analyze db)
-        _ (System/gc)
-        [result time-ms] (core/time-once (run-sg-query db))
-        result-count (count result)]
-    (d/close conn)
-    {:system "datalevin"
-     :benchmark (str "sg:" instance-name)
-     :time-ms time-ms
-     :result-count result-count
-     :status :ok}))
+        relations    (data/generate-sg-instance instance-key)
+        conn         (create-sg-db relations)]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            [result time-ms] (core/time-once (run-sg-query db))]
+        {:system "datalevin"
+         :benchmark (str "sg:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 (defn run-join1-benchmark
   "Run JOIN1 benchmark on an instance. Returns result map.
    Instance can be: small, medium, large (OpenRuleBench)."
   [instance-name]
   (let [instance-key (keyword instance-name)
-        relations (data/generate-join1-instance instance-key)
-        conn (create-join1-db relations)
-        db (d/db conn)
-        _ (d/analyze db)
-        _ (System/gc)
-        [result time-ms] (core/time-once (run-join1-query db))
-        result-count (count result)]
-    (d/close conn)
-    {:system "datalevin"
-     :benchmark (str "join1:" instance-name)
-     :time-ms time-ms
-     :result-count result-count
-     :status :ok}))
+        relations    (data/generate-join1-instance instance-key)
+        conn         (create-join1-db relations)]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            [result time-ms] (core/time-once (run-join1-query db))]
+        {:system "datalevin"
+         :benchmark (str "join1:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 (defn run-dblp-benchmark
   "Run DBLP benchmark on an instance. Returns result map.
@@ -282,18 +285,19 @@
             (throw (ex-info (str "Unknown DBLP instance: " instance-name)
                             {:available (keys dblp/dblp-instances)})))
         datoms (dblp/load-dblp-instance instance-key)
-        conn (create-dblp-db datoms)
-        db (d/db conn)
-        _ (d/analyze db)
-        _ (System/gc)
-        [result time-ms] (core/time-once (run-dblp-query db))
-        result-count (count result)]
-    (d/close conn)
-    {:system "datalevin"
-     :benchmark (str "dblp:" instance-name)
-     :time-ms time-ms
-     :result-count result-count
-     :status :ok}))
+        conn   (create-dblp-db datoms)]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            [result time-ms] (core/time-once (run-dblp-query db))]
+        {:system "datalevin"
+         :benchmark (str "dblp:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 (defn run-lubm-benchmark
   "Run LUBM benchmark on an instance. Returns result map.
@@ -305,19 +309,20 @@
             (throw (ex-info (str "Unknown LUBM instance: " instance-name)
                             {:available (keys lubm/lubm-instances)})))
         datoms (lubm/load-lubm-instance instance-key)
-        conn (create-lubm-db datoms)
-        db (d/db conn)
-        _ (d/analyze db)
-        _ (System/gc)
-        ;; Run Q2 as the main benchmark (tests type inference rules)
-        [result time-ms] (core/time-once (run-lubm-q2 db))
-        result-count (count result)]
-    (d/close conn)
-    {:system "datalevin"
-     :benchmark (str "lubm:" instance-name)
-     :time-ms time-ms
-     :result-count result-count
-     :status :ok}))
+        conn   (create-lubm-db datoms)]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            ;; Run Q2 as the main benchmark (tests type inference rules)
+            [result time-ms] (core/time-once (run-lubm-q2 db))]
+        {:system "datalevin"
+         :benchmark (str "lubm:" instance-name)
+         :time-ms time-ms
+         :result-count (count result)
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 ;; =============================================================================
 ;; Main Entry Point
@@ -326,13 +331,12 @@
 (def default-benchmarks
   "Default benchmarks: benchmark-type:instance-size
    Uses OpenRuleBench standard sizes where available."
-  ["tc:small" "tc:medium" "sg:small" "join1:small"])
+  ["tc:small" "sg:small"])
 
 (defn parse-benchmark
   "Parse benchmark spec like 'tc:p1000' into [type instance]."
   [spec]
-  (let [[bench-type instance] (clojure.string/split spec #":")]
-    [bench-type instance]))
+  (core/parse-benchmark spec))
 
 (defn run-benchmark
   "Run a single benchmark by spec. Returns result map."
@@ -359,9 +363,12 @@
   (doall (map run-benchmark benchmark-specs)))
 
 (defn -main [& args]
-  (let [benchmarks (if (seq args) args default-benchmarks)
-        results (run-benchmarks benchmarks)]
-    (core/print-row "datalevin" results)))
+  (let [report (try
+                 (core/run-system-cli! "datalevin" default-benchmarks
+                                       run-benchmark args)
+                 (finally
+                   (shutdown-agents)))]
+    (System/exit (:exit-code report))))
 
 (comment
   ;; Quick test with generated data
