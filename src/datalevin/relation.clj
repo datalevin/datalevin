@@ -225,6 +225,56 @@
                      (.add new t))))
                new)))))
 
+(defn project-distinct
+  "Physically project `rel` to `vars` and retain one tuple per distinct key.
+   Unlike changing `:attrs`, this removes hidden tuple cells before deduping."
+  [rel vars]
+  (let [attrs        (:attrs rel)
+        vars         (vec (distinct vars))
+        missing      (into [] (remove #(contains? attrs %)) vars)
+        _            (when (seq missing)
+                       (raise "Cannot project missing relation attributes"
+                              {:missing missing
+                               :available (keys attrs)}))
+        output-attrs (zipmap vars (range))
+        ^List tuples (:tuples rel)
+        size         (long (if tuples (.size tuples) 0))
+        ^ints idxs   (int-array (map attrs vars))
+        width        (alength idxs)
+        output       (FastList. (int size))]
+    (cond
+      (zero? size)
+      (relation! output-attrs output)
+
+      (zero? width)
+      (do
+        (.add output (object-array 0))
+        (relation! output-attrs output))
+
+      (= 1 width)
+      (let [idx  (aget idxs 0)
+            seen (HashSet. (int size))]
+        (dotimes [i size]
+          (let [value (aget ^objects (.get tuples i) idx)]
+            (when (.add seen value)
+              (.add output (object-array [value])))))
+        (relation! output-attrs output))
+
+      :else
+      (let [seen    (HashSet. (int size))
+            scratch (object-array width)
+            lookup  (array-lookup)]
+        (dotimes [i size]
+          (let [^objects tuple (.get tuples i)]
+            (dotimes [j width]
+              (aset scratch j (aget tuple (aget idxs j))))
+            (reset-array-lookup! lookup scratch)
+            (when-not (.contains seen lookup)
+              (let [key (aclone scratch)]
+                (.add seen (wrap-array key))
+                (.add output key)))))
+        (relation! output-attrs output)))))
+
 (defn sum-rel-dedupe
   ([] (relation! {} (FastList.)))
   ([a] a)

@@ -1022,18 +1022,25 @@
 
      '[not-join [*] *]
      (let [[_ vars & clauses] clause
-           vars               (into #{} (filter qu/binding-var?) vars)
+           vars               (into []
+                                    (comp (filter qu/binding-var?) (distinct))
+                                    vars)
+           var-set            (set vars)
            bound              (bound-vars context)
-           _                  (check-bound bound vars orig-clause)
+           _                  (check-bound bound var-set orig-clause)
            context1           (assoc context :rels
                                      [(reduce j/hash-join (:rels context))])
-           join-context       (limit-context context1 vars)
+           outer-rel          (single (:rels context1))
+           join-context       (assoc context1 :rels
+                                     [(r/project-distinct outer-rel vars)])
            negation-context   (-> (reduce resolve-clause join-context clauses)
-                                  (limit-context vars))
-           neg-rel            (reduce j/hash-join (:rels negation-context))]
+                                  (limit-context var-set))
+           neg-rel            (-> (reduce j/hash-join
+                                          (:rels negation-context))
+                                  (r/project-distinct vars))]
        (assoc context1 :rels
               [(j/subtract-rel
-                 (single (:rels context1))
+                 outer-rel
                  neg-rel)]))
 
      '[*]
