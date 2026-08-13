@@ -20,13 +20,15 @@
 (def ^DateTimeFormatter date-formatter
   (DateTimeFormatter/ofPattern "yyyy-MM-dd"))
 
-(defn parse-datetime [s]
+(defn parse-datetime
   "Parse datetime string to java.util.Date (required by Datalevin's :db.type/instant)"
+  [s]
   (when-not (str/blank? s)
     (Date/from (Instant/from (.parse datetime-formatter s)))))
 
-(defn parse-date [s]
+(defn parse-date
   "Parse date string to java.util.Date (required by Datalevin's :db.type/instant)"
+  [s]
   (when-not (str/blank? s)
     (Date/from (.toInstant (.atStartOfDay (LocalDate/parse s date-formatter) ZoneOffset/UTC)))))
 
@@ -37,8 +39,9 @@
 (defn not-blank [s]
   (when-not (str/blank? s) s))
 
-(defn split-multi [s]
+(defn split-multi
   "Split semicolon-separated values into a sequence."
+  [s]
   (when-not (str/blank? s)
     (str/split s #";")))
 

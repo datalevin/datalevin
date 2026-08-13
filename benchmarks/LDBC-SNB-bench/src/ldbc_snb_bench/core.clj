@@ -13,10 +13,10 @@
             [clojure.stacktrace :as stacktrace]
             [clojure.string :as str]
             [datalevin.core :as d]
-            [datalevin.query :as q]
+            [ldbc-snb-bench.harness :as harness]
             [ldbc-snb-bench.schema :as schema]
             [ldbc-snb-bench.loader :as loader]
-            [ldbc-snb-bench.queries.common :as common]
+            [ldbc-snb-bench.parameters :as parameters]
             [ldbc-snb-bench.queries.interactive :as ic]
             [ldbc-snb-bench.queries.short :as is])
   (:import [java.time Instant ZoneOffset ZonedDateTime]
@@ -30,10 +30,23 @@
 (def db-path "db/ldbc-snb")
 (def default-results-path "results/results.csv")
 (def default-perf-path "results/perf.csv")
+(def default-report-path "results/report.edn")
 (def default-data-path "data")
 (def debug-errors? (boolean (System/getenv "LDBC_BENCH_DEBUG")))
-(def fail-fast? (boolean (System/getenv "LDBC_BENCH_FAIL_FAST")))
 (def show-results? (boolean (System/getenv "LDBC_BENCH_SHOW_RESULTS")))
+
+(def default-bench-options
+  {:db-path db-path
+   :results-path default-results-path
+   :perf-path default-perf-path
+   :output default-report-path
+   :warmup 1
+   :iterations 5
+   :parameter-count 10
+   :seed 42
+   :scale-factor "1"
+   :verify? true
+   :query-cache? false})
 
 (def ^DateTimeFormatter date-formatter
   (DateTimeFormatter/ofPattern "yyyy-MM-dd"))
@@ -114,7 +127,7 @@
 (defn to-date
   "Convert Instant to Date for Datalevin"
   [s]
-  (Date/from (Instant/parse s)))
+  (parameters/to-date s))
 
 (def sample-params
   "Sample parameters for benchmark queries.
@@ -159,6 +172,19 @@
    :is6  {:message-id 1099512606636}
    :is7  {:message-id 1099512606636}})
 
+(def sample-result-counts
+  "Known result counts for the bundled parameters against the validated SF1
+   fixture used by this project. These are a fast pre-timing oracle; the test
+   suite additionally checks representative values from every query."
+  {:ic1 20, :ic2 20, :ic3 3, :ic4 10, :ic5 20, :ic6 0, :ic7 20
+   :ic8 20, :ic9 20, :ic10 10, :ic11 10, :ic12 20, :ic13 1, :ic14 17
+   :is1 1, :is2 10, :is3 29, :is4 1, :is5 1, :is6 1, :is7 0})
+
+(def sample-suite
+  (into (sorted-map)
+        (map (fn [[query params]] [query [params]]))
+        sample-params))
+
 
 ;; ============================================================
 ;; Database connection
@@ -180,30 +206,23 @@
 
 (defn load-data
   "Load LDBC SNB data from the given directory."
-  [data-dir]
-  (println "============================================")
-  (println "LDBC SNB Data Loader for Datalevin")
-  (println "============================================")
-  (println)
-  (println "Data directory:" data-dir)
-  (println "Database path:" db-path)
-  (println)
+  ([data-dir]
+   (load-data db-path data-dir))
+  ([target-db-path data-dir]
+   (println "============================================")
+   (println "LDBC SNB Data Loader for Datalevin")
+   (println "============================================")
+   (println)
+   (println "Data directory:" data-dir)
+   (println "Database path:" target-db-path)
+   (println)
 
-  ;; Check if data directory exists
-  (when-not (.exists (io/file data-dir))
-    (println "ERROR: Data directory does not exist:" data-dir)
-    (println)
-    (println "Please generate LDBC SNB data using:")
-    (println "  git clone https://github.com/ldbc/ldbc_snb_datagen_spark.git")
-    (println "  cd ldbc_snb_datagen_spark")
-    (println "  ./tools/run.py --parallelism 4 --memory 8g -- \\")
-    (println "      --format csv --scale-factor 1 --mode raw")
-    (println)
-    (println "Then copy the output to:" data-dir)
-    (System/exit 1))
+   (when-not (.exists (io/file data-dir))
+     (throw (ex-info (str "Data directory does not exist: " data-dir)
+                     {:data-dir data-dir})))
 
-  ;; Load data using empty-db + fill-db pattern
-  (loader/load-all-data db-path data-dir))
+   ;; Load data using empty-db + fill-db pattern.
+   (loader/load-all-data target-db-path data-dir)))
 
 ;; ============================================================
 ;; Benchmark execution
@@ -235,21 +254,21 @@
             inputs (if rules
                      (concat [db rules] param-vals)
                      (concat [db] param-vals))
-            start-time (System/nanoTime)]
-        (let [rows (apply d/q query inputs)
-              final-rows (if post-process
-                           (post-process db params rows)
-                           rows)
-              result-rows (vec final-rows)
-              result-count (count result-rows)
-              end-time (System/nanoTime)
-              exec-time (/ (- end-time start-time) 1000000.0)]
-          {:name (:name query-def)
-           :planning-time 0.0
-           :execution-time exec-time
-           :result-count result-count
-           :rows result-rows
-           :columns (query-find-columns query)})))))
+            start-time (System/nanoTime)
+            rows (apply d/q query inputs)
+            final-rows (if post-process
+                         (post-process db params rows)
+                         rows)
+            result-rows (vec final-rows)
+            result-count (count result-rows)
+            end-time (System/nanoTime)
+            exec-time (/ (- end-time start-time) 1000000.0)]
+        {:name (:name query-def)
+         :planning-time 0.0
+         :execution-time exec-time
+         :result-count result-count
+         :rows result-rows
+         :columns (query-find-columns query)}))))
 
 (defn- normalize-query-names
   [names]
@@ -288,20 +307,17 @@
                (println "  DEBUG: stack trace for" (:name query-def))
                (stacktrace/print-stack-trace e)
                (println))
-             (when fail-fast?
-               (throw e))
              (println "  ERROR:" (.getMessage e))
-             {:name (:name query-def)
-              :planning-time -1
-              :execution-time -1
-              :result-count 0
-              :error (.getMessage e)})))))))
+             (throw (ex-info (str "Query " (:name query-def) " failed")
+                             {:query (:name query-def)}
+                             e)))))))))
 
 (defn write-results-rows
   "Write query result rows to a Neo4j-style plain CSV file."
   [results results-path]
-  (io/make-parents results-path)
-  (with-open [w (io/writer results-path)]
+  (when-let [parent (.getParentFile (io/file results-path))]
+    (.mkdirs parent))
+  (with-open [w (io/writer results-path :encoding "UTF-8")]
     (doseq [r results]
       (let [rows (:rows r)
             columns (result-columns r)]
@@ -314,8 +330,9 @@
 (defn write-perf
   "Write benchmark timing results to CSV file."
   [results perf-path]
-  (io/make-parents perf-path)
-  (with-open [w (io/writer perf-path)]
+  (when-let [parent (.getParentFile (io/file perf-path))]
+    (.mkdirs parent))
+  (with-open [w (io/writer perf-path :encoding "UTF-8")]
     (.write w "Query,Total Time (ms),Result Count,Error\n")
     (doseq [r results]
       (let [has-error (some? (:error r))
@@ -373,111 +390,62 @@
                        (/ (reduce + (map #(or (:execution-time %) 0) is-results)) (count is-results)))))))
 
 (defn run-benchmark
-  "Run the LDBC SNB benchmark.
-   Options:
-     :query-names  - seq of query names to run (nil for all)
-     :results-path - path for results CSV (default: results/results.csv)
-     :perf-path    - path for perf CSV (default: results/perf.csv)"
+  "Run the correctness-gated LDBC SNB read-query latency harness."
   ([] (run-benchmark {}))
   ([opts]
    (let [opts (if (sequential? opts)
-                {:query-names opts}  ; backwards compatible: treat seq as query-names
+                {:query-names opts}
                 opts)
-         {:keys [query-names results-path perf-path]
-          :or {results-path default-results-path
-               perf-path default-perf-path}} opts]
-     (println "============================================")
-     (println "LDBC SNB Benchmark for Datalevin")
-     (println "============================================")
-     (println)
-
-     ;; Check if database exists
-     (when-not (.exists (io/file db-path))
-       (println "ERROR: Database does not exist:" db-path)
-       (println "Please run 'clj -M:load <data-dir>' first to load data.")
-       (System/exit 1))
-
-     (let [conn (get-conn)]
-       (try
-         (let [db (d/db conn)]
-           (println "Database:" db-path)
-           (println)
-           (if (seq query-names)
-             (println "Running benchmark queries:" (str/join ", " (normalize-query-names query-names)))
-             (println "Running benchmark queries..."))
-           (println)
-
-           (let [results (doall (run-all-queries db sample-params query-names))]
-             (write-results-rows results results-path)
-             (write-perf results perf-path)
-             (print-summary results)
-             (println)
-             (println "Results written to:" results-path)
-             (println "Perf written to:" perf-path)))
-         (finally
-           (close-conn conn)))))))
+         opts (-> (merge default-bench-options opts)
+                  (assoc :debug? debug-errors?)
+                  (update :show-results? #(or show-results? %)))]
+     (harness/run-benchmark!
+       {:all-query-defs (vec (concat ic/all-queries is/all-queries))
+        :sample-suite sample-suite
+        :sample-result-counts sample-result-counts
+        :get-conn get-conn
+        :close-conn close-conn
+        :run-query run-query
+        :write-results-rows write-results-rows}
+       opts))))
 
 ;; ============================================================
 ;; CLI entry point
 ;; ============================================================
 
 (defn- parse-bench-args
-  "Parse bench command arguments.
-   Supports:
-     -o, --results <path>  : results CSV output path
-     -p, --perf <path>     : perf CSV output path
-     [query names...]      : specific queries to run"
+  "Parse benchmark command arguments."
   [args]
-  (loop [args args
-         opts {}]
-    (if (empty? args)
-      opts
-      (let [[arg & rest-args] args]
-        (cond
-          (or (= arg "-o") (= arg "--results"))
-          (recur (rest rest-args)
-                 (assoc opts :results-path (first rest-args)))
-
-          (or (= arg "-p") (= arg "--perf"))
-          (recur (rest rest-args)
-                 (assoc opts :perf-path (first rest-args)))
-
-          :else
-          (recur rest-args
-                 (update opts :query-names (fnil conj []) arg)))))))
+  (harness/parse-bench-args args))
 
 (defn -main
-  "Main entry point.
-
-   Usage:
-     clj -M -m ldbc-snb-bench.core load <data-dir>
-     clj -M -m ldbc-snb-bench.core bench [options] [IS1 IS2 ...]
-
-   Bench options:
-     -o, --results <path>  Output path for results CSV (default: results/results.csv)
-     -p, --perf <path>     Output path for perf CSV (default: results/perf.csv)"
+  "Main entry point for loading data and running the read-query harness."
   [& args]
-  (let [cmd (first args)]
-    (case cmd
-      "load"  (load-data (or (second args) default-data-path))
-      "bench" (run-benchmark (parse-bench-args (rest args)))
-      ;; Default: show usage
-      (do
-        (println "LDBC SNB Benchmark for Datalevin")
-        (println)
-        (println "Usage:")
-        (println "  clj -M -m ldbc-snb-bench.core load [data-dir]  ; Load LDBC SNB data")
-        (println "  clj -M -m ldbc-snb-bench.core bench [options] [IS1 IS2 ...]  ; Run benchmark")
-        (println)
-        (println "Bench options:")
-        (println "  -o, --results <path>  Output path for results CSV (default: results/results.csv)")
-        (println "  -p, --perf <path>     Output path for perf CSV (default: results/perf.csv)")
-        (println)
-        (println "Example:")
-        (println "  # Generate data using LDBC SNB Datagen first")
-        (println "  clj -M -m ldbc-snb-bench.core load data/")
-        (println "  clj -M -m ldbc-snb-bench.core bench IS1")
-        (println "  clj -M -m ldbc-snb-bench.core bench -o my-results.csv IS1 IS2")))))
+  (try
+    (let [cmd (first args)]
+      (case cmd
+        "load"
+        (if (some #{"--help"} (rest args))
+          (println (harness/usage))
+          (let [{:keys [db-path data-path]}
+                (harness/parse-load-args (rest args))]
+            (load-data db-path data-path)))
+
+        "bench"
+        (let [opts (parse-bench-args (rest args))]
+          (if (:help? opts)
+            (println (harness/usage))
+            (let [report (run-benchmark opts)]
+              (when (pos? (:exit-code report))
+                (throw (ex-info "One or more benchmark queries failed"
+                                {:exit-code (:exit-code report)}))))))
+
+        (if (or (nil? cmd) (= "--help" cmd))
+          (println (harness/usage))
+          (throw (ex-info (str "Unknown command: " cmd)
+                          {:command cmd})))))
+    (finally
+      (shutdown-agents))))
 
 ;; ============================================================
 ;; REPL helpers
@@ -494,7 +462,7 @@
   (def conn (get-conn))
   (def db (d/db conn))
 
-  (binding [q/*debug-plan* true]
+  (binding [datalevin.query/*debug-plan* true]
     (let [{:keys [person-id min-date]} (:ic5 sample-params)]
       (d/explain {:run? true} (:query ic/ic5)
                  db person-id min-date)))

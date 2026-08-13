@@ -1,5 +1,11 @@
 # Change Log
 
+## WIP
+
+### Improved
+- [Datalog] planner accounts for late clauses cost and better hash join cost
+  estimation.
+
 ## 1.0.2 (2026-08-11)
 
 ### Improved

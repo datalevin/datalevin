@@ -5,9 +5,7 @@
             [ldbc-snb-bench.queries.interactive :as ic]
             [ldbc-snb-bench.queries.short :as is]
             [datalevin.core :as d]
-            [clojure.test :as t :refer [deftest is testing are use-fixtures]])
-  (:import [java.time Instant]
-           [java.util Date]))
+            [clojure.test :as t :refer [deftest is testing use-fixtures]]))
 
 ;; ============================================================
 ;; Test fixtures
@@ -17,12 +15,13 @@
 (def ^:dynamic *db* nil)
 
 (defn db-fixture [f]
-  (binding [*conn* (sut/get-conn)
-            *db*   (d/db (sut/get-conn))]
-    (try
-      (f)
-      (finally
-        (d/close *conn*)))))
+  (let [conn (sut/get-conn)]
+    (binding [*conn* conn
+              *db*   (d/db conn)]
+      (try
+        (f)
+        (finally
+          (d/close conn))))))
 
 (use-fixtures :once db-fixture)
 

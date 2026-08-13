@@ -1,268 +1,247 @@
-# LDBC SNB Benchmark
+# LDBC SNB read-query benchmark
 
-This benchmark implements the Graph Data Council's [LDBC Social Network
-Benchmark (SNB)](https://ldbcouncil.org/benchmarks/snb/) Interactive Workload.
+This project implements the 14 Interactive Complex reads (IC1-IC14) and seven
+Interactive Short reads (IS1-IS7) from LDBC Social Network Benchmark
+Interactive v1 in Datalevin. It provides a correctness-gated, repeated
+query-latency harness for optimization work.
 
-## Overview
+This is not an official LDBC result. The official driver defines a scheduled
+workload with update operations, dependent short reads, throughput/power
+metrics, and auditing rules. This harness measures the implemented read
+queries in one embedded Datalevin process; its EDN report records
+`:official-ldbc-result false` to make that distinction machine-readable.
 
-LDBC SNB is an industry-standard benchmark for graph databases that
-simulates a social network workload with:
+## What is covered
 
-- **8 entity types**: Person, Post, Comment, Forum, Place, Organization, Tag,
-  TagClass
-- **7 short queries (IS1-IS7)**: Point lookups and small traversals
-- **14 complex queries (IC1-IC14)**: Multi-hop traversals, aggregations, path
-  finding
+| Class | Queries | Examples |
+|---|---:|---|
+| Interactive Complex | IC1-IC14 | multi-hop traversal, aggregation, negation, shortest paths |
+| Interactive Short | IS1-IS7 | person/message lookup and small traversals |
 
-We unofficially implemented the benchmark specification [1] in Datalevin. We
-also include an implementation in Neo4j for comparison.
-
-## Schema
-
-The LDBC SNB data model is mapped to the attribute centered Datalevin
-[schema](src/ldbc_snb_bench/schema.clj):
-
-```clojure
-;; Entity attributes
-:person/id, :person/firstName, :person/lastName, ...
-:message/id, :message/content, :message/hasCreator, ...
-:message/isContainedIn, :message/replyOf, ...
-...
-
-;; Relationship edges attributes
-:knows/person1, :knows/person2, :knows/creationDate
-:workAt/person, :workAt/organization, :workAt/workFrom
-...
-```
-
-## Query
-
-Two classes of queries are included in the benchmark.
-
-### Interactive [Short](src/ldbc_snb_bench/queries/short.clj) Queries (IS1-IS7)
-
-| Query | Description |
-|-------|-------------|
-| IS1 | Profile of a Person |
-| IS2 | Recent messages of a Person |
-| IS3 | Friends of a Person |
-| IS4 | Content of a message |
-| IS5 | Creator of a message |
-| IS6 | Forum of a message |
-| IS7 | Replies to a message |
-
-### [Interactive](src/ldbc_snb_bench/queries/interactive.clj) Complex Queries
-(IC1-IC14)
-
-| Query | Description | Key Features |
-|-------|-------------|--------------|
-| IC1 | Friends with given first name | 3-hop traversal with recursive rules |
-| IC2 | Recent messages by friends | Join + temporal filter |
-| IC3 | Friends in countries X and Y | Geographic filtering |
-| IC4 | New topics | Aggregation + negation |
-| IC5 | New groups | Forum membership |
-| IC6 | Tag co-occurrence | Tag joins |
-| IC7 | Recent likes | Like relationship |
-| IC8 | Recent replies | Comment chains |
-| IC9 | Recent posts by friends-of-friends | 2-hop traversal |
-| IC10 | Friend recommendation | Common interests |
-| IC11 | Job referral | Work relationships |
-| IC12 | Expert search | TagClass hierarchy (recursive) |
-| IC13 | Shortest path | Recursive path finding |
-| IC14 | Trusted connection paths | Weighted paths |
+The Datalevin mapping is in
+[`schema.clj`](src/ldbc_snb_bench/schema.clj), the loader is in
+[`loader.clj`](src/ldbc_snb_bench/loader.clj), and query implementations are in
+[`queries/`](src/ldbc_snb_bench/queries/).
 
 ## Prerequisites
 
-- JDK 21+ (for running the benchmark)
+- JDK 21+
 - Clojure CLI tools
-- Docker (for data generation)
-- ~10GB disk space for SF1 data and the Datalevin database
+- Docker for the included Spark Datagen helper
+- enough disk for the generated data and Datalevin database (about 10 GiB is
+  a practical minimum for SF1)
 
-## Data Generation
+Run commands below from `benchmarks/LDBC-SNB-bench`.
 
-Generate LDBC SNB data using the LDBC SNB Spark Datagen [2] via Docker:
+## Generate and load data
+
+The included helper wraps the LDBC Spark Datagen Docker image:
 
 ```bash
-# Clone Datagen (one time, sibling to this repo)
-git clone https://github.com/ldbc/ldbc_snb_datagen_spark.git ../ldbc_snb_datagen_spark
+git clone https://github.com/ldbc/ldbc_snb_datagen_spark.git \
+  ../../../ldbc_snb_datagen_spark
 
-# Generate SF1 data (scale factor 1)
 ./generate-data-docker.sh \
   --scale-factor 1 \
   --parallelism 4 \
   --memory 8g
 ```
 
-The `data/` directory should have this structure:
-```
-data/
-└── graphs/csv/raw/composite-merged-fk/
-    ├── static/Place/part-*.csv
-    ├── static/Organisation/part-*.csv
-    ├── static/TagClass/part-*.csv
-    ├── static/Tag/part-*.csv
-    ├── dynamic/Person/part-*.csv
-    ├── dynamic/Person_knows_Person/part-*.csv
-    ├── dynamic/Forum/part-*.csv
-    ├── dynamic/Post/part-*.csv
-    ├── dynamic/Comment/part-*.csv
-    └── ...
+The loader expects Spark Datagen's merged raw CSV tree below `data/`, including
+paths such as:
+
+```text
+data/graphs/csv/raw/composite-merged-fk/
+├── static/Place/part-*.csv
+├── static/Organisation/part-*.csv
+├── dynamic/Person/part-*.csv
+├── dynamic/Person_knows_Person/part-*.csv
+├── dynamic/Forum/part-*.csv
+├── dynamic/Post/part-*.csv
+└── dynamic/Comment/part-*.csv
 ```
 
-## Running the Benchmark
-
-### 1. Load Data
+Load and audit it:
 
 ```bash
-# Load LDBC SNB data into Datalevin
 clj -M -m ldbc-snb-bench.core load data/
-```
-
-This creates a 4.0 GiB Datalevin database in `db/ldbc-snb` with the SNB data.
-
-#### Load Audit
-
-To sanity-check that the loader ingested all entity/edge rows:
-
-```bash
 clj -M -m ldbc-snb-bench.audit
 ```
 
-### 2. Run Benchmark
+Use an alternate database location for loading and benchmarking with
+`--db PATH`:
 
 ```bash
-# Run all benchmark queries
-clj -M -m ldbc-snb-bench.core bench
+clj -M -m ldbc-snb-bench.core load --db /tmp/ldbc-sf1 data/
+clj -M:bench --db /tmp/ldbc-sf1 IS1
 ```
 
-Results are by default written to `results/results.csv` (query outputs) and
-`results/perf.csv` (timings).
+## Run the benchmark
 
-### 3. Run Tests
+The default command runs every query with the bundled validated SF1 parameter
+for that query. There is one untimed correctness execution, one warmup, and
+five measured repetitions:
 
-To verify query results are correct:
+```bash
+clj -M:bench
+```
+
+Run a subset or change repetition counts:
+
+```bash
+clj -M:bench \
+  --warmup 2 \
+  --iterations 10 \
+  IC1 IC3 IC5 IS1
+```
+
+The bundled suite contains one parameter row per query. Multi-parameter runs
+use official substitution files or an EDN suite.
+
+### Official IC substitution parameters
+
+Interactive v1 Datagen writes pipe-delimited files named
+`interactive_1_param.txt` through `interactive_14_param.txt`. Dates in those
+files are epoch milliseconds. Pass the directory directly:
+
+```bash
+clj -M:bench \
+  --parameters /path/to/substitution_parameters \
+  --parameter-count 10 \
+  --seed 42 \
+  IC1 IC2 IC3 IC4 IC5 IC6 IC7 IC8 IC9 IC10 IC11 IC12 IC13 IC14
+```
+
+Up to `--parameter-count` rows are selected independently for each query using
+a stable seeded shuffle. Selection is derived from the query's fixed ordinal,
+so selecting only IC5 produces the same IC5 schedule as an all-query run. The
+selected rows and schedule SHA-256 are stored in the report.
+
+The v1 substitution directory contains parameters for the complex reads only.
+When it is used in an all-query latency run, IS1-IS7 use the bundled SF1 rows.
+Use EDN when you need multiple short-read parameters.
+
+### EDN parameter suites
+
+An EDN suite maps case-insensitive query names to one parameter map or a vector
+of maps. It may contain any subset if the command selects only that subset:
+
+```clojure
+{:ic1 [{:person-id 100 :first-name "John"}
+       {:person-id 200 :first-name "Jane"}]
+ :ic2 [{:person-id 100 :max-date #inst "2012-07-01T00:00:00.000-00:00"}]
+ :is1 [{:person-id 100}
+       {:person-id 200}]
+ :is4 [{:message-id 1099512606636}]}
+```
+
+Date parameters accept EDN instants, ISO-8601 strings, or epoch-millisecond
+numbers/strings. IDs, months, durations, and years are normalized to longs.
+Headers, required parameters, scalar types, missing files, and empty suites are
+validated before the database is opened.
+
+```bash
+clj -M:bench --parameters parameters.edn --parameter-count 20 IC1 IS1 IS4
+```
+
+## Measurement contract
+
+For every selected query/parameter pair, the harness performs:
+
+1. an untimed correctness execution;
+2. the configured untimed warmups;
+3. the configured measured repetitions;
+4. result digest checks after each warmup and measured run;
+5. artifact writing only after measurement is complete.
+
+The timer starts immediately before Datalevin query execution and stops after
+query-specific post-processing and full result realization. Database open,
+parameter conversion, the correctness baseline, warmups, console output, and
+artifact writing are excluded.
+
+Datalevin's query-result cache is disabled by default. This prevents repeated
+parameters from measuring cached answers, while normal parse/plan and storage
+caches can still warm. `--query-cache` explicitly measures the cached
+application path and is recorded in the report; do not mix the two modes in a
+comparison.
+
+The default is a warm-cache, single-process latency workload. It is not a
+cold-page-cache test, a concurrent throughput test, or the official operation
+schedule.
+
+## Correctness and failures
+
+For the bundled SF1 parameters, the untimed result count is compared with the
+validated per-query oracle before any timing is accepted. Every later result
+must also have the exact same canonical SHA-256 digest as the untimed result.
+
+For external parameters, no independent expected output is bundled. The
+untimed result becomes a repeat-consistency oracle, and the report labels the
+check `:consistent` rather than claiming an independent validation. Generate
+or retain official driver validation outputs when stronger external-parameter
+validation is required.
+
+Any query exception, known-count mismatch, or repeat-digest mismatch marks the
+run failed, stops timing that parameter, is written to the artifacts, and
+causes a non-zero CLI exit. `--no-verify` exists for diagnosis only and should
+not be used for published optimization numbers.
+
+The test suite includes an SF1 semantic test for each of the 21 query
+implementations, plus parameter parser, deterministic scheduling, latency
+statistics, CLI validation, and failure-gate tests:
 
 ```bash
 clj -M:test
 ```
 
-This runs 21 tests (one per query) with 97 assertions that validate result
-counts and specific field values against expected outputs.
+## Artifacts
 
-## Neo4j Comparison
+Defaults:
 
-To compare query results and performance against Neo4j:
+| Path | Contents |
+|---|---|
+| `results/report.edn` | host/JVM manifest, DB metadata, parameter schedule and digest, raw samples, summaries, result digests, correctness status |
+| `results/perf.csv` | one latency-distribution row per query/parameter pair |
+| `results/results.csv` | untimed correctness result rows, in report schedule order |
 
-```bash
-# Install Neo4j (macOS via Homebrew)
-./neo4j/install-neo4j.sh
+Override them with `--output`, `--perf`, and `--results`. The EDN report is the
+source of truth; CSV files are conveniences. Retain the EDN report whenever a
+number informs an optimization decision.
 
-# Import data into Neo4j (use --wipe for clean reimport)
-./neo4j/bulk-import-native.sh
+The database manifest hashes file names, sizes, and modification times. It does
+not hash the multi-gigabyte LMDB contents, so also retain the data-generation
+configuration and immutable dataset location for durable comparisons.
 
-# Start Neo4j
-neo4j start
-
-# Run Neo4j queries (default password: neo4jtest)
-./neo4j/run-queries.sh
-```
-
-Compare `results/results.csv` with `neo4j/results/results.csv` to validate outputs.
-Use `results/perf.csv` and `neo4j/results/perf.csv` to compare timings.
-
-## Results
-
-We reran the full benchmark on July 15, 2026, on an Apple M3 Pro with 12 cores
-and 36 GiB RAM, running macOS 26.5.1 and OpenJDK 21.0.11, with Clojure 1.12.4.
-
-The dataset is LDBC SNB SF1 (scale factor 1), which contains approximately 3.2M
-entities and 17.3M edges. Datalevin was run twice in separate JVMs. The first
-full pass warmed the operating-system page cache and was discarded; the tables
-report the second full pass. A separate JVM prevents the in-process query result
-cache from serving the measured pass. Timings start immediately before query
-execution and end after post-processing and realization of the result rows;
-database loading, migration, and analysis are outside the timing scope. The
-Neo4j numbers are retained from the previous benchmark run and are therefore a
-reference rather than a same-machine comparison.
-
-### Interactive Short Queries (IS1-IS7)
-
-Run IS queries with:
+Example small smoke run:
 
 ```bash
-clj -M -m ldbc-snb-bench.core bench -o results/is-results.csv -p results/is-perf.csv IS1 IS2 IS3 IS4 IS5 IS6 IS7
+clj -M:bench \
+  --warmup 0 \
+  --iterations 2 \
+  --parameter-count 1 \
+  --output /tmp/ldbc-smoke.edn \
+  --perf /tmp/ldbc-smoke.csv \
+  IS1
 ```
 
-| Query | Neo4j (ms) | Datalevin (ms) |
-|-------|------------|----------------|
-| IS1   | 1168.9     | 4.8            |
-| IS2   | 1173.2     | 68.7           |
-| IS3   | 1166.2     | 12.5           |
-| IS4   | 1484.7     | 3.3            |
-| IS5   | 1445.9     | 11.0           |
-| IS6   | 1494.5     | 2.5            |
-| IS7   | 5424.6     | 11.6           |
-| **Avg** | **1908.3** | **16.3**     |
+See every option with `clj -M:bench --help`.
 
-Datalevin is significantly faster across all short queries, with roughly two
-orders of magnitude difference in the averages shown here.
+## Comparing systems
 
-### Interactive Complex Queries (IC1-IC14)
+The `neo4j/` directory contains the earlier Neo4j loader and one-shot query
+runner. Those scripts are useful for semantic cross-checking, but their timing
+boundary and repetition model are not yet equivalent to this harness. Do not
+present their numbers as a same-harness comparison until the runner produces
+the same parameter schedule, correctness gates, raw repetitions, cache policy,
+and host manifest.
 
-Run IC queries with:
-
-```bash
-clj -M -m ldbc-snb-bench.core bench -o results/ic-results.csv -p results/ic-perf.csv IC1 IC2 IC3 IC4 IC5 IC6 IC7 IC8 IC9 IC10 IC11 IC12 IC13 IC14
-```
-
-| Query | Neo4j (ms) | Datalevin (ms) |
-|-------|------------|----------------|
-| IC1   | 3434.3     | 452.4          |
-| IC2   | 1133.4     | 1120.3         |
-| IC3   | 1961.7     | 4561.0         |
-| IC4   | 1799.9     | 266.6          |
-| IC5   | 2509.2     | 9188.1         |
-| IC6   | 1561.8     | 8.5            |
-| IC7   | 1157.9     | 173.6          |
-| IC8   | 1215.9     | 19.6           |
-| IC9   | 2052.3     | 33.8           |
-| IC10  | 1169.9     | 1226.7         |
-| IC11  | 1161.9     | 77.0           |
-| IC12  | 4361.2     | 254.7          |
-| IC13  | 1150.4     | 1059.2         |
-| IC14  | 19354.1    | 3952.0         |
-| **Avg** | **3144.6** | **1599.5**   |
-
-Datalevin performs better on 11 of the 14 complex queries. IC6, IC8, IC9, and
-IC11 show especially large differences, while Datalevin remains slower on IC3,
-IC5, and IC10.
-
-## Remark
-
-Considering Neo4j is on the Graph Data Council as one of the authors of this
-benchmark, it is remarkable that Datalevin performs so favorably without any
-tuning or customization.
-
-## Extending the Benchmark
-
-### Adding Query Parameters
-
-Edit `sample-params` in `core.clj` to use different parameter values:
-
-```clojure
-(def sample-params
-  {:ic1 {:person-id 12345
-         :first-name "Alice"}
-   ...})
-```
-
-### Loading Parameters from LDBC Files
-
-LDBC Datagen generates `substitution_parameters/` with parameter files.
-These can be loaded to run the official benchmark parameters.
-
+Likewise, historical single-pass numbers previously shown in this README are
+not the benchmark baseline. Regenerate results with the current harness and
+archive the EDN reports before drawing performance conclusions.
 
 ## References
 
-1. [LDBC SNB Specification](https://ldbcouncil.org/ldbc_snb_docs/ldbc-snb-specification.pdf)
-2. [LDBC SNB Datagen](https://github.com/ldbc/ldbc_snb_datagen_spark)
+1. [LDBC SNB benchmark and specifications](https://ldbcouncil.org/benchmarks/snb/)
+2. [LDBC SNB Interactive v1 driver](https://github.com/ldbc/ldbc_snb_interactive_v1_driver)
+3. [LDBC SNB Interactive v1 Hadoop Datagen](https://github.com/ldbc/ldbc_snb_datagen_hadoop)
+4. [LDBC SNB Spark Datagen](https://github.com/ldbc/ldbc_snb_datagen_spark)

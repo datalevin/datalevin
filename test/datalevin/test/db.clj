@@ -2,6 +2,7 @@
   (:require
    [clojure.data]
    [clojure.test :as t :refer [is are deftest testing]]
+   [datalevin.binding.cpp]
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
@@ -59,6 +60,21 @@
                      (.submit new-pool ^Callable (fn [] :restarted)))))
         (finally
           (qplan/shutdown-pipe-thread-pool!))))))
+
+(deftest read-transaction-acquisition-preserves-cause
+  (let [dir      "/tmp/datalevin-reader-error"
+        cause    (IllegalArgumentException. "native reader failure")
+        error-fn (ns-resolve 'datalevin.binding.cpp
+                             'read-transaction-acquisition-error)
+        error    (error-fn dir cause)]
+    (is (= "Failed to acquire LMDB read transaction: native reader failure"
+           (ex-message error)))
+    (is (= {:type      :lmdb/read-transaction
+            :operation :acquire
+            :dir       dir
+            :cause     "native reader failure"}
+           (ex-data error)))
+    (is (identical? cause (ex-cause error)))))
 
 (defn- now [] (System/currentTimeMillis))
 

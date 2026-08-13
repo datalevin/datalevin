@@ -1183,6 +1183,16 @@
           (close-rtx-quiet! old))))
     rtx))
 
+(defn- read-transaction-acquisition-error
+  [dir ^Exception e]
+  (ex-info
+    (str "Failed to acquire LMDB read transaction: " (ex-message e))
+    {:type      :lmdb/read-transaction
+     :operation :acquire
+     :dir       dir
+     :cause     (ex-message e)}
+    e))
+
 (defn- sync-key* [dir] (->> dir hash (str "lmdb-sync-") keyword))
 
 (def sync-key (memoize sync-key*))
@@ -1560,8 +1570,7 @@
               (sweep-dead-reader-rtxs! reader-registry)
               (fresh-reader-rtx this env tl-reader reader-registry)))
         (catch Exception e
-          (raise duplicate-local-open-msg
-                 {:cause (.getMessage e)})))))
+          (throw (read-transaction-acquisition-error (env-dir this) e))))))
 
   (return-rtx [this rtx]
     (when-not (.closed-kv? this)

@@ -1485,16 +1485,32 @@
             (estimate-round (* (double size) (long component-size))))))
       0 plan)))
 
-(defn- late-row-operation
+(defn- late-operation
   [clause]
   (let [parsed (if (or (instance? Predicate clause)
-                       (instance? Function clause))
+                       (instance? Function clause)
+                       (instance? Pattern clause)
+                       (instance? Not clause)
+                       (instance? Or clause)
+                       (instance? RuleExpr clause))
                  clause
                  (dp/parse-clause clause))]
     (cond
+      (instance? Pattern parsed)   :indexed-join
       (instance? Predicate parsed) :predicate
       (instance? Function parsed)  :function
-      :else                        nil)))
+      (instance? Not parsed)       :not
+      (instance? Or parsed)        :or
+      (instance? RuleExpr parsed)  :rule
+      :else                        :residual)))
+
+(defn- late-row-operation?
+  [operation]
+  (#{:predicate :function} operation))
+
+(defn- late-expansion-operation?
+  [operation]
+  (#{:indexed-join :or :rule} operation))
 
 (defn- estimated-late-input-size
   ^long
@@ -1504,22 +1520,73 @@
     (seq plan)          plan-size
     :else               (long (sample-context-size rels))))
 
+(defn- sampled-access-cardinality
+  "Estimate complete result cardinality from real planning samples. Heuristic
+   access estimates are deliberately excluded: only an observed residual yield
+   may increase the conventional plan's late-clause cardinality."
+  [access-plans]
+  (reduce
+    (fn [best {:keys [correlated? estimate]}]
+      (let [sample-rows (long (or (:sample-rows estimate) 0))
+            sample-output (long (or (:sample-output estimate) 0))
+            output-rows (qaccess/estimate-output-rows estimate)
+            yield       (:yield estimate)]
+        (if (and (not correlated?)
+                 (= :sampled (:confidence estimate))
+                 (pos? sample-rows)
+                 (pos? sample-output)
+                 (number? yield)
+                 (pos? output-rows))
+          (let [rows (estimate-round (* (double output-rows)
+                                        (double yield)))
+                candidate {:rows          rows
+                           :sample-rows   sample-rows
+                           :sample-output sample-output
+                           :range-rows    (qaccess/estimate-range-rows estimate)
+                           :yield         (double yield)
+                           :confidence    :sampled}]
+            (if (> rows (long (or (:rows best) 0))) candidate best))
+          best)))
+    nil access-plans))
+
 (defn- estimated-late-cost
-  [context ^long plan-size]
-  (let [input-size (estimated-late-input-size context plan-size)]
+  [context ^long plan-size access-plans]
+  (let [input-size  (estimated-late-input-size context plan-size)
+        operations  (mapv late-operation (:late-clauses context))
+        expansion?  (some late-expansion-operation? operations)
+        sampled     (when expansion?
+                      (sampled-access-cardinality access-plans))
+        output-size (max input-size (long (or (:rows sampled) 0)))
+        expanded?   (< input-size output-size)
+        expansion-cost
+        (if expanded?
+          (estimate-link-cost input-size output-size)
+          0)
+        initial
+        {:cost expansion-cost
+         :output-size output-size
+         :stages
+         (cond-> []
+           expanded?
+           (conj (assoc sampled
+                        :operation :sampled-late-expansion
+                        :input input-size
+                        :output output-size
+                        :cost expansion-cost)))}]
     (reduce
-      (fn [{:keys [cost stages] :as estimate} clause]
-        (if-let [operation (late-row-operation clause)]
-          (let [stage-cost (estimate-row-evaluation-cost input-size)]
+      (fn [{:keys [cost stages] :as estimate} [clause operation]]
+        (if (late-row-operation? operation)
+          (let [stage-cost (estimate-row-evaluation-cost output-size)]
             {:cost   (+ (double cost) (double stage-cost))
+             :output-size output-size
              :stages (conj stages
                            {:operation operation
-                            :input     input-size
+                            :input     output-size
                             :cost      stage-cost
                             :clause    clause})})
           estimate))
-      {:cost 0.0 :stages []}
-      (:late-clauses context))))
+      initial
+      (map vector (:late-clauses context) operations))))
 
 (defn- logical-plan-key
   [graph]
@@ -1560,9 +1627,10 @@
 
 (defn- conventional-alternative
   [context logical-key demand access-plans]
-  (let [size       (estimated-plan-size context)
+  (let [plan-size  (estimated-plan-size context)
         base-cost  (estimated-plan-cost context)
-        late       (estimated-late-cost context size)
+        late       (estimated-late-cost context plan-size access-plans)
+        size        (:output-size late)
         late-cost  (:cost late)
         access-cost (conventional-access-cost access-plans)
         effective-late-cost (max (double late-cost)
@@ -2224,7 +2292,8 @@
                                            (conj lstrata new-vars) lseen
                                            tgt-steps in-size tgt-size)
         base-cost       (or (:cost new-base-plan) 0)
-        join-cost       (estimate-hash-join-cost in-size tgt-size)]
+        join-cost       (estimate-hash-join-cost
+                          in-size tgt-size result-size (count cols))]
     (make-plan [step]
                (+ ^long cost ^long base-cost ^long join-cost)
                result-size
@@ -2422,9 +2491,22 @@
        (* result-size ^double c/magic-cost-link-retrieval))))
 
 (defn- estimate-hash-join-cost
-  [^long left-size ^long right-size]
-  (estimate-round (* ^double c/magic-cost-hash-join
-                     (+ left-size right-size))))
+  "Price a hash join by its dominating input or output work. The legacy input
+  coefficient is a monolithic operator estimate, so adding ordinary output
+  work would double count it. A many-to-many join can emit enough tuples that
+  allocation and column copies dominate that estimate, however."
+  ([^long left-size ^long right-size]
+   (estimate-round (* ^double c/magic-cost-hash-join
+                      (+ left-size right-size))))
+  ([^long left-size ^long right-size ^long result-size ^long output-width]
+   (let [input-cost  (* ^double c/magic-cost-hash-join
+                        (+ left-size right-size))
+         output-cost (* result-size
+                        (+ ^double c/magic-cost-hash-join-output-tuple
+                           (* ^double c/magic-cost-hash-join-output-cell
+                              output-width)))]
+     (estimate-round
+       (max input-cost output-cost)))))
 
 (defn- estimate-e-plan-cost
   [prev-size e-size cur-steps]

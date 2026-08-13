@@ -873,6 +873,14 @@ is Integer/MAX_VALUE, i.e. no cap."}
                           (.availableProcessors (Runtime/getRuntime))))
 
 (def ^{:dynamic true
+       :doc     "Cost per output tuple materialized by a hash join"}
+  magic-cost-hash-join-output-tuple 4.0)
+
+(def ^{:dynamic true
+       :doc     "Cost per output cell copied by a hash join"}
+  magic-cost-hash-join-output-cell 1.0)
+
+(def ^{:dynamic true
        :doc     "Minimum input size before considering hash join"}
   hash-join-min-input-size 20000)
 

@@ -1,6 +1,5 @@
 (ns ldbc-snb-bench.queries.common
   "Shared helpers and rules for LDBC SNB queries."
-  (:require [datalevin.core :as d])
   (:import [java.time Duration ZoneOffset ZonedDateTime]
            [java.time.temporal ChronoUnit]
            [java.util Date]))
