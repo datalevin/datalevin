@@ -314,26 +314,30 @@
 (defn- lookup-pattern-multi-entity
   "Perform multiple point lookups for bound entity values.
    More efficient than full table scan when entity is bound to multiple values.
-   Returns tuples in format matching what full scan would return."
+   Wildcard values use existence probes and emit one tuple per entity."
   [db pattern entity-pairs v-is-var?]
-  (let [[_ a v] pattern
-        a'      (if (keyword? a) a nil)
-        v'      (if (or (qu/free-var? v) (= v '_)) nil v)
-        acc     (FastList.)]
+  (let [[_ a v]          pattern
+        a'               (if (keyword? a) a nil)
+        v'               (if (or (qu/free-var? v) (= v '_)) nil v)
+        existence-only?  (or (= v '_) (qu/placeholder? v))
+        acc              (FastList.)]
     (doseq [[e eid] entity-pairs]
-      (let [tuples (db/-search-tuples db [eid a' v'])]
-        (when tuples
-          (let [^List ts tuples
-                n        (.size ts)]
-            (if v-is-var?
-              (dotimes [i n]
-                (let [^objects t (.get ts i)
-                      result     (object-array 2)]
-                  (aset result 0 e)
-                  (aset result 1 (aget t 0))
-                  (.add acc result)))
-              (when (pos? n)
-                (.add acc (object-array [e]))))))))
+      (if existence-only?
+        (when (db/-ea-populated? db eid a')
+          (.add acc (object-array [e])))
+        (let [tuples (db/-search-tuples db [eid a' v'])]
+          (when tuples
+            (let [^List ts tuples
+                  n        (.size ts)]
+              (if v-is-var?
+                (dotimes [i n]
+                  (let [^objects t (.get ts i)
+                        result     (object-array 2)]
+                    (aset result 0 e)
+                    (aset result 1 (aget t 0))
+                    (.add acc result)))
+                (when (pos? n)
+                  (.add acc (object-array [e])))))))))
     acc))
 
 (defn- lookup-pattern-multi-value

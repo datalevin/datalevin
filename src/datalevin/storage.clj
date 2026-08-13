@@ -880,14 +880,25 @@
                         [:closed lk hk] :id [:closed lv hv] :avg))))
 
   (populated? [_ index low-datom high-datom]
-    (let [lk (index->k index schema low-datom false)
-          hk (index->k index schema high-datom true)
-          lv (index->v index schema low-datom false)
-          hv (index->v index schema high-datom true) ]
-      (list-range-first
-        lmdb (index->dbi index)
-        [:closed lk hk] (index->ktype index)
-        [:closed lv hv] (index->vtype index))))
+    (let [^Datom low-datom  low-datom
+          ^Datom high-datom high-datom
+          e                 (.-e low-datom)
+          a                 (.-a low-datom)]
+      (if (and (identical? index :eav)
+               (== e (.-e high-datom))
+               (keyword? a)
+               (= a (.-a high-datom))
+               (identical? (.-v low-datom) c/v0)
+               (identical? (.-v high-datom) c/vmax))
+        (when (ea->avg-buffer schema lmdb e a) true)
+        (let [lk (index->k index schema low-datom false)
+              hk (index->k index schema high-datom true)
+              lv (index->v index schema low-datom false)
+              hv (index->v index schema high-datom true)]
+          (list-range-first
+            lmdb (index->dbi index)
+            [:closed lk hk] (index->ktype index)
+            [:closed lv hv] (index->vtype index))))))
 
   (size [_ index low-datom high-datom]
     (list-range-count

@@ -853,6 +853,15 @@
         store [:index-range-size attr start end]
       (av-range-size store attr start end))))
 
+(defn ^:no-doc -ea-populated?
+  "Test whether an entity has an attribute without caching or retrieving its
+   value. Intended for batched existence probes with mostly unique entities."
+  [^DB db e a]
+  (let [store (.-store db)]
+    (populated? store :eav
+                (d/datom e a c/v0)
+                (d/datom e a c/vmax))))
+
 ;; (defmethod print-method DB [^DB db, ^java.io.Writer w]
 ;;   (binding [*out* w]
 ;;     (let [{:keys [store eavt max-eid max-tx]} db]

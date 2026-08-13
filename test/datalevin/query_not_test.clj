@@ -12,6 +12,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.constants :as c]
    [datalevin.core :as d]
+   [datalevin.db :as db]
    [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
@@ -43,6 +44,32 @@
         (is (not (cheaper? 1000 1000))))
       (testing "the safety limit is independent of the cost comparison"
         (is (not (cheaper? 1000001 100000000)))))))
+
+(deftest wildcard-multi-lookup-uses-existence-test
+  (let [lookup @(ns-resolve 'datalevin.query.resolve
+                            'lookup-pattern-multi-entity)
+        dir    (u/tmp-dir (str "wildcard-existence-" (UUID/randomUUID)))
+        conn   (d/get-conn
+                 dir {:item/tags {:db/cardinality :db.cardinality/many}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/tags [:a :b]}
+                         {:db/id 2 :item/name "no tags"}])
+      (let [database (d/db conn)
+            wildcard (lookup database ['?item :item/tags '_]
+                             [[1 1] [2 2]] true)
+            values   (lookup database ['?item :item/tags '?tag]
+                             [[1 1] [2 2]] true)
+            exact    (lookup database ['?item :item/tags :a]
+                             [[1 1] [2 2]] false)]
+        (is (db/-ea-populated? database 1 :item/tags))
+        (is (nil? (db/-ea-populated? database 2 :item/tags)))
+        (is (= [[1]] (mapv vec wildcard)))
+        (is (every? #(= 1 (alength ^objects %)) wildcard))
+        (is (= #{[1 :a] [1 :b]} (set (mapv vec values))))
+        (is (= [[1]] (mapv vec exact))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest project-distinct-test
   (let [rel (r/relation! {'?entity 0 '?group 1 '?kind 2}
