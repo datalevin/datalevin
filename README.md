@@ -375,13 +375,17 @@ reach as soon as we can. We may adjust the priorities based on feedback.
 * 0.10.0 ~~Async transaction; boolean search expression and phrase search; as a
   vector database; counted and prefix compressed KV storage; auto upgrade
   migration; new rule engine.~~[Done 2026/01/22]
-* 1.0.2 ~~As a document database with automatic path indexing; WAL mode;
+* 1.0.0 ~~As a document database with automatic path indexing; WAL mode;
   transaction log access API;  read-only replicas; high availability; JSON API;
-  library for Java, Python, and JavaScript; Book.~~
-* 2.0.0 TTL; extensible storage/query for arbitrary data; data compression;
-  provenance annotation; incremental view maintenance; extended rule syntax to
-  be able to implementing ML algorithms in DB.
-* 3.0.0 Sharding and data distribution.
+  library for Java, Python, and JavaScript; Book.~~[Done 2027/07/20]
+* 1.1.0 data compression; KV TTL;
+* 1.2.0 extensible storage/query for arbitrary data; entity-level security.
+* 2.0.0 direct analytics and virtual relationships.
+* 2.1.0 incremental view maintenance core.
+* 3.0.0 aggregation in rule heads.
+* 3.1.0 provenance annotation.
+* 4.0.0 local sharding.
+* 4.1.0 data distribution.
 
 ## :arrows_clockwise: Contact
 
