@@ -337,6 +337,94 @@
   (when (instance? Variable x)
     (:symbol x)))
 
+(defn- unique-attr?
+  [source attr]
+  (contains? #{:db.unique/identity :db.unique/value}
+             (get-in (db/-schema source) [attr :db/unique])))
+
+(defn- bound-unique-entity-var?
+  [parsed-q sym]
+  (or (contains? (find-var-symbols parsed-q) sym)
+      (contains? (with-var-symbols parsed-q) sym)
+      (some #(or-join-var? % sym) (:qorig-where parsed-q))))
+
+(defn- protected-unique-constant-patterns
+  [context]
+  (let [{:keys [parsed-q sources]} context]
+    (keep-indexed
+      (fn [clause-idx [parsed-clause orig-clause]]
+        (when (and (instance? Pattern parsed-clause)
+                   (vector? orig-clause))
+          (let [pattern (:pattern parsed-clause)
+                e-sym   (pattern-var-symbol (first pattern))
+                attr    (second pattern)
+                value   (when (<= 3 (count pattern)) (nth pattern 2))]
+            (when (and e-sym
+                       (instance? Constant attr)
+                       (keyword? (:value attr))
+                       (instance? Constant value)
+                       (bound-unique-entity-var? parsed-q e-sym))
+              (when-let [source (get sources
+                                     (clause-source-symbol
+                                       (:source parsed-clause)))]
+                (when (and (db/-searchable? source)
+                           (unique-attr? source (:value attr)))
+                  {:clause-idx clause-idx
+                   :source     source
+                   :pattern    (pattern-form orig-clause)
+                   :entity-sym e-sym}))))))
+      (map vector (:qwhere parsed-q)
+           (:qorig-where parsed-q)))))
+
+(defn- connected-vars
+  [clause-vars seed]
+  (loop [connected #{seed}]
+    (let [expanded
+          (reduce
+            (fn [connected vars]
+              (if (seq (set/intersection connected vars))
+                (set/union connected vars)
+                connected))
+            connected clause-vars)]
+      (if (= connected expanded)
+        connected
+        (recur expanded)))))
+
+(defn- connected-unique-anchors
+  [parsed-q candidates]
+  (let [clause-vars (mapv qu/collect-vars (:qorig-where parsed-q))
+        anchor-vars (into #{} (map :entity-sym) candidates)]
+    (filterv
+      (fn [{:keys [entity-sym]}]
+        (<= 2 (count (set/intersection
+                       anchor-vars
+                       (connected-vars clause-vars entity-sym)))))
+      candidates)))
+
+(defn- materialize-protected-unique-anchors
+  [context]
+  (let [candidates (->> (protected-unique-constant-patterns context)
+                        vec
+                        (connected-unique-anchors (:parsed-q context)))]
+    ;; A single unique literal is already an ideal selective planner root.
+    ;; Eager binding is useful when multiple protected roots must constrain the
+    ;; same join component, as in two-endpoint path queries.
+    (if (empty? candidates)
+      context
+      (let [context (reduce
+                      (fn [context {:keys [source pattern]}]
+                        (let [rel (qresolve/lookup-pattern
+                                    (assoc context :rels-bound-cache
+                                           (volatile! {}))
+                                    source pattern)]
+                          (update context :rels qresolve/collapse-rels rel)))
+                      context candidates)
+            idxs    (into #{} (map :clause-idx) candidates)]
+        (-> context
+            (update-in [:parsed-q :qwhere] #(u/remove-idxs idxs %))
+            (update-in [:parsed-q :qorig-where]
+                       #(u/remove-idxs idxs %)))))))
+
 (defn- materializable-input-bound-pattern
   [context]
   (let [{:keys [parsed-q sources]} context
@@ -354,25 +442,28 @@
                   e-bound? (small-bound-relation? context e-sym)
                   v-bound? (small-bound-relation? context v-sym)]
               (when (and (instance? Constant attr)
-                         (keyword? (:value attr))
-                         (or e-bound? v-bound?)
-                         (not (and e-bound? v-bound?)))
+                         (keyword? (:value attr)))
                 (when-let [source (get sources
                                        (clause-source-symbol
                                          (:source parsed-clause)))]
-                  (when (db/-searchable? source)
-                    {:clause-idx clause-idx
-                     :source     source
-                     :pattern    (pattern-form orig-clause)}))))))
+                  (let [input-bound?
+                        (and (or e-bound? v-bound?)
+                             (not (and e-bound? v-bound?)))]
+                    (when (and (db/-searchable? source)
+                               input-bound?)
+                      {:clause-idx clause-idx
+                       :source     source
+                       :pattern    (pattern-form orig-clause)})))))))
         (map vector qwhere
              (:qorig-where parsed-q))))))
 
 (defn materialize-input-bound-patterns
-  "Materialize patterns constrained by small input-bound relations as indexed
-   lookup relations before planning, so downstream clauses can use bounded
-   entity/value relations instead of scanning large intermediates."
+  "Materialize patterns constrained by small input-bound relations before
+   planning. When a query has multiple unique constant anchors whose entity
+   variables must remain bound, seed all anchors first so they constrain the
+   same join component instead of leaving one as a late filter."
   [context]
-  (loop [context context]
+  (loop [context (materialize-protected-unique-anchors context)]
     (if-let [{:keys [^long clause-idx source pattern]}
              (materializable-input-bound-pattern context)]
       (let [rel (qresolve/lookup-pattern

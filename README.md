@@ -117,7 +117,7 @@ More information about our vision and design decisions can be found in these
 resources:
 
 * Interview [Clojure Corner Interview with Huahai Yang](https://www.youtube.com/watch?v=1XMU5mdDj7I)
-* Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org)
+* Book [Datalevin: the Definite Guide to Logical and Intelligent Databases](https://datalevin.org/docs)
 * Post [Triple Store, Triple Progress: Datalevin Posited for the Future](https://yyhh.org/blog/2026/01/triple-store-triple-progress-datalevin-posited-for-the-future/)
 * Post [Achieving High Throughput and Low Latency through Adaptive Asynchronous Transaction](https://yyhh.org/blog/2025/02/achieving-high-throughput-and-low-latency-through-adaptive-asynchronous-transaction/)
 * Post [Competing for the JOB with a Triplestore](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
