@@ -7,6 +7,7 @@
    [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.query.execute :as qexec]
+   [datalevin.query.optimizer.range :as qor]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -169,8 +170,8 @@
         union-clause   pushed-equality-disjunction-clause
         resolve-late   @(ns-resolve 'datalevin.query.execute
                                     'resolve-late-clauses)
-        choose-union   @(ns-resolve 'datalevin.query.execute
-                                    'cheaper-indexed-union)
+        choose-late    @(ns-resolve 'datalevin.query.execute
+                                    'cheaper-late-producer)
         make-context
         (fn [people]
           {:sources {'$ (d/db conn)}
@@ -246,12 +247,215 @@
                 (with-redefs [db/-count
                               (fn [& _]
                                 (throw (ex-info "unexpected count" {})))]
-                  (choose-union
-                    (make-context [10 11]) creator-clause
-                    ['[?message :message/isLocatedIn ?country-x]]))))))
+                  (choose-late
+                    (make-context [10 11])
+                    [creator-clause
+                     '[?message :message/isLocatedIn ?country-x]]))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest costed-indexed-date-range-order-test
+  (let [dir            (u/tmp-dir
+                         (str "indexed-date-range-order-" (UUID/randomUUID)))
+        schema         {:message/hasCreator
+                        {:db/valueType :db.type/ref}
+                        :message/creationDate
+                        {:db/valueType :db.type/instant}}
+        conn           (d/get-conn dir schema)
+        creator-clause '[?message :message/hasCreator ?person]
+        date-clause    '[?message :message/creationDate ?date]
+        lower-clause   '[(<= #inst "2020-01-01T00:00:00.000-00:00" ?date)]
+        upper-clause   '[(< ?date #inst "2021-01-01T00:00:00.000-00:00")]
+        clauses        [creator-clause date-clause lower-clause upper-clause]
+        parsed-q       (dp/parse-query {:find  ['?message '?person]
+                                        :where clauses})
+        resolve-late   @(ns-resolve 'datalevin.query.execute
+                                    'resolve-late-clauses)
+        choose-late    @(ns-resolve 'datalevin.query.execute
+                                    'cheaper-late-producer)
+        make-context
+        (fn [people]
+          {:sources  {'$ (d/db conn)}
+           :rules    nil
+           :parsed-q parsed-q
+           :rels
+           [(r/relation!
+              {'?person 0}
+              (FastList. ^java.util.Collection
+                         (mapv #(object-array [%]) people)))]})
+        run
+        (fn [people]
+          (let [explain (volatile! {})
+                context (make-context people)
+                result  (binding [qplan/*explain* explain
+                                  qu/*implicit-source* (get-in context
+                                                               [:sources '$])]
+                          (resolve-late context clauses))
+                rel     (if (< 1 (count (:rels result)))
+                          (reduce j/hash-join (:rels result))
+                          (first (:rels result)))
+                attrs   (:attrs rel)]
+            {:decision (first (:late-clause-decisions @explain))
+             :order    (:late-clauses result)
+             :rows     (into #{}
+                             (map (fn [^objects tuple]
+                                    [(aget tuple (long (attrs '?message)))
+                                     (aget tuple (long (attrs '?person)))]))
+                             (:tuples rel))}))]
+    (try
+      (d/transact!
+        conn
+        (concat
+          [{:db/id 1000 :message/hasCreator 10
+            :message/creationDate
+            #inst "2020-01-01T00:00:00.000-00:00"}
+           {:db/id 1001 :message/hasCreator 10
+            :message/creationDate
+            #inst "2020-06-01T00:00:00.000-00:00"}
+           {:db/id 1002 :message/hasCreator 10
+            :message/creationDate
+            #inst "2021-01-01T00:00:00.000-00:00"}
+           {:db/id 2000 :message/hasCreator 11
+            :message/creationDate
+            #inst "2020-03-01T00:00:00.000-00:00"}
+           {:db/id 2001 :message/hasCreator 11
+            :message/creationDate
+            #inst "2020-12-01T00:00:00.000-00:00"}]
+          (map (fn [^long id]
+                 {:db/id id :message/hasCreator 10
+                  :message/creationDate
+                  #inst "2019-01-01T00:00:00.000-00:00"})
+               (range 1003 1020))))
+      (let [wide          (run [10 11])
+            narrow        (run [11])
+            wide-choice   (:decision wide)
+            narrow-choice (:decision narrow)]
+        (testing "a selective AVE date range runs before creator fanout"
+          (is (= :indexed-range-first (:strategy wide-choice)))
+          (is (= 22 (:pattern-fanout wide-choice)))
+          (is (= 4 (:range-fanout wide-choice)))
+          (is (= [date-clause lower-clause upper-clause creator-clause]
+                 (:order wide)))
+          (is (= #{[1000 10] [1001 10] [2000 11] [2001 11]}
+                 (:rows wide))))
+        (testing "a selective creator binding remains creator-first"
+          (is (= :bound-pattern-first (:strategy narrow-choice)))
+          (is (= 2 (:pattern-fanout narrow-choice)))
+          (is (= 4 (:range-fanout narrow-choice)))
+          (is (= creator-clause (first (:order narrow))))
+          (is (= #{[2000 11] [2001 11]} (:rows narrow))))
+        (testing "the range variable must be fully consumed and not returned"
+          (let [output-context
+                (assoc (make-context [10 11])
+                       :parsed-q
+                       (dp/parse-query {:find  ['?message '?date]
+                                        :where clauses}))]
+            (is (nil? (choose-late output-context clauses))))
+          (is (nil?
+                (with-redefs [db/-index-range-size
+                              (fn [& _]
+                                (throw (ex-info "unexpected range count" {})))]
+                  (choose-late (make-context [10 11])
+                               [creator-clause date-clause lower-clause]))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest costed-indexed-scalar-range-order-test
+  (doseq [{:keys [label value-type lower upper values outside]}
+          [{:label      "long"
+            :value-type :db.type/long
+            :lower      10
+            :upper      20
+            :values     [10 12 15 19]
+            :outside    0}
+           {:label      "string"
+            :value-type :db.type/string
+            :lower      "b"
+            :upper      "d"
+            :values     ["b" "bc" "c" "cz"]
+            :outside    "a"}
+           {:label      "bytes"
+            :value-type :db.type/bytes
+            :lower      (byte-array [1])
+            :upper      (byte-array [4])
+            :values     [(byte-array [1]) (byte-array [2])
+                         (byte-array [3]) (byte-array [3 1])]
+            :outside    (byte-array [0])}]]
+    (testing label
+      (let [dir          (u/tmp-dir
+                           (str "indexed-scalar-range-order-"
+                                (UUID/randomUUID)))
+            schema       {:item/owner {:db/valueType :db.type/ref}
+                          :item/rank  {:db/valueType value-type}}
+            conn         (d/get-conn dir schema)
+            owner-clause '[?item :item/owner ?owner]
+            range-clause '[?item :item/rank ?rank]
+            lower-clause [(list '<= lower '?rank)]
+            upper-clause [(list '< '?rank upper)]
+            clauses      [owner-clause range-clause
+                          lower-clause upper-clause]
+            parsed-q     (dp/parse-query {:find  ['?item '?owner]
+                                          :where clauses})
+            resolve-late @(ns-resolve 'datalevin.query.execute
+                                      'resolve-late-clauses)
+            make-context
+            (fn []
+              {:sources  {'$ (d/db conn)}
+               :rules    nil
+               :parsed-q parsed-q
+               :rels
+               [(r/relation!
+                  {'?owner 0}
+                  (FastList. ^java.util.Collection
+                             (mapv #(object-array [%]) [10 11])))]})]
+        (try
+          (d/transact!
+            conn
+            (concat
+              [(assoc {:db/id 1000 :item/owner 10} :item/rank (values 0))
+               (assoc {:db/id 1001 :item/owner 10} :item/rank (values 1))
+               (assoc {:db/id 1002 :item/owner 10} :item/rank upper)
+               (assoc {:db/id 2000 :item/owner 11} :item/rank (values 2))
+               (assoc {:db/id 2001 :item/owner 11} :item/rank (values 3))]
+              (map (fn [^long id]
+                     {:db/id id :item/owner 10 :item/rank outside})
+                   (range 1003 1020))))
+          (let [explain (volatile! {})
+                context (make-context)
+                result  (binding [qplan/*explain* explain
+                                  qu/*implicit-source* (get-in context
+                                                               [:sources '$])]
+                          (resolve-late context clauses))
+                rel     (if (< 1 (count (:rels result)))
+                          (reduce j/hash-join (:rels result))
+                          (first (:rels result)))
+                attrs   (:attrs rel)
+                choice  (first (:late-clause-decisions @explain))
+                rows    (into #{}
+                              (map (fn [^objects tuple]
+                                     [(aget tuple (long (attrs '?item)))
+                                      (aget tuple (long (attrs '?owner)))]))
+                              (:tuples rel))]
+            (is (= :indexed-range-first (:strategy choice)))
+            (is (= 22 (:pattern-fanout choice)))
+            (is (= 4 (:range-fanout choice)))
+            (is (= [range-clause lower-clause upper-clause owner-clause]
+                   (:late-clauses result)))
+            (is (= #{[1000 10] [1001 10] [2000 11] [2001 11]} rows)))
+          (finally
+            (d/close conn)
+            (u/delete-files dir)))))))
+
+(deftest exact-inequality-range-capability-test
+  (testing "ordinary ordered scalar values can use exact AVE bounds"
+    (is (qor/exact-inequality-range? :db.type/instant))
+    (is (qor/exact-inequality-range? :db.type/long))
+    (is (qor/exact-inequality-range? :db.type/string))
+    (is (qor/exact-inequality-range? :db.type/bytes)))
+  (testing "BigDecimal retains its exact residual predicate"
+    (is (not (qor/exact-inequality-range? :db.type/bigdec)))))
 
 (deftest unique-constant-lookups-materialized-test
   (let [dir    (u/tmp-dir (str "unique-constant-lookup-"

@@ -154,7 +154,24 @@
       (let [row (first-row result)]
         (is (= "Igor" (nth row 1)))
         (is (= "Gusev" (nth row 2)))
-        (is (= 2 (nth row 5)))))))  ; total messages
+        (is (= 2 (nth row 5))))))  ; total messages
+  (testing "IC3: Country names exclude other Place types"
+    (let [query-forms (set (:query ic/ic3))
+          result
+          (run-query-with-params
+            ic/ic3 {:person-id 66
+                    :country-x-name "Australia"
+                    :country-y-name "New_Zealand"
+                    :start-date (sut/to-date "2011-01-01T00:00:00Z")
+                    :duration-days 365})]
+      (is (contains? query-forms '[?country-x :place/type "Country"]))
+      (is (contains? query-forms '[?country-y :place/type "Country"]))
+      (is (= [[2199033260487 "Bing" "Yang" 1 1 2]
+              [4398056519949 "Arjun" "Khan" 1 1 2]
+              [6597079774986 "Joe" "Fox" 1 1 2]
+              [15393172798303 "Sinan" "Simsek" 1 1 2]
+              [19791219306158 "Bobby" "Garcia" 1 1 2]]
+             (:rows result))))))
 
 (deftest ic4-test
   (testing "IC4: New topics"

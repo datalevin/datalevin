@@ -14,7 +14,9 @@
    [clojure.walk :as w]
    [datalevin.built-ins :as built-ins]
    [datalevin.constants :as c]
+   [datalevin.datom :as dd]
    [datalevin.db :as db]
+   [datalevin.index :as idx]
    [datalevin.inline :refer [update assoc]]
    [datalevin.join :as j]
    [datalevin.parser :as dp]
@@ -26,6 +28,7 @@
    [datalevin.query.access.fulltext :as qfulltext]
    [datalevin.query.access.idoc :as qidoc]
    [datalevin.query.access.vector :as qvector]
+   [datalevin.query.optimizer.range :as qor]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -408,6 +411,137 @@
         follow-up-cost (indexed-producer-cost fanout fanout)]
     (+ producer-cost projection-cost follow-up-cost)))
 
+(def ^:private no-range-bound (Object.))
+
+(defn- scalar-range-bound
+  [context term]
+  (cond
+    (qu/binding-var? term)
+    (let [values (context-bound-values context term)]
+      (if (= 1 (count values)) (first values) no-range-bound))
+
+    (and (some? term)
+         (not (coll? term))
+         (empty? (qu/collect-vars term)))
+    term
+
+    :else
+    no-range-bound))
+
+(defn- range-boundary
+  [context value clause]
+  (when (and (vector? clause) (= 1 (count clause)))
+    (let [pred (first clause)]
+      (when (and (sequential? pred) (= 3 (count pred)))
+        (let [[f left right] pred
+              value-left?      (= value left)
+              value-right?     (= value right)]
+          (when (not= value-left? value-right?)
+            (let [bound (scalar-range-bound
+                          context (if value-left? right left))]
+              (when-not (identical? bound no-range-bound)
+                (cond
+                  (u/sym-name-eqs f "<")
+                  {:side     (if value-left? :upper :lower)
+                   :endpoint [:open bound]}
+
+                  (u/sym-name-eqs f "<=")
+                  {:side     (if value-left? :upper :lower)
+                   :endpoint [:closed bound]}
+
+                  (u/sym-name-eqs f ">")
+                  {:side     (if value-left? :lower :upper)
+                   :endpoint [:open bound]}
+
+                  (u/sym-name-eqs f ">=")
+                  {:side     (if value-left? :lower :upper)
+                   :endpoint [:closed bound]})))))))))
+
+(defn- query-result-var?
+  [context sym]
+  (let [{:keys [qfind qwith qhaving]} (:parsed-q context)]
+    (or (some #{sym} (when qfind (dp/find-vars qfind)))
+        (some #(= sym (:symbol %))
+              (concat qwith (dp/collect-vars-distinct qhaving))))))
+
+(defn- indexed-range-candidate
+  [context pending current-entity idx clause]
+  (when-let [{:keys [source entity attr value] :as producer}
+             (data-pattern-parts clause '$)]
+    (let [bound      (qresolve/bound-vars context)
+          source-db  (get (:sources context) source)
+          schema      (when source-db (db/-schema source-db))
+          attr-schema (get schema attr)]
+      (when (and (= entity current-entity)
+                 source-db
+                 (db/-searchable? source-db)
+                 attr-schema
+                 (not (contains? bound value))
+                 (qor/exact-inequality-range?
+                   (idx/value-type attr-schema))
+                 (not (identical? :db.cardinality/many
+                                  (:db/cardinality attr-schema)))
+                 (not (query-result-var? context value)))
+        (let [uses       (keep-indexed
+                           (fn [i candidate]
+                             (when (contains? (qu/collect-vars candidate) value)
+                               i))
+                           pending)
+              pred-idxs  (remove #{idx} uses)
+              boundaries (mapv
+                           (fn [i]
+                             (when-let [boundary
+                                        (range-boundary context value
+                                                        (nth pending i))]
+                               (assoc boundary :idx i)))
+                           pred-idxs)
+              lower      (filterv #(= :lower (:side %)) boundaries)
+              upper      (filterv #(= :upper (:side %)) boundaries)]
+          (when (and (= 3 (count uses))
+                     (= 2 (count pred-idxs))
+                     (every? some? boundaries)
+                     (= 1 (count lower))
+                     (= 1 (count upper)))
+            (let [predicate-idxs (sort (map :idx boundaries))
+                  selected-idxs  (into [idx] predicate-idxs)]
+              (assoc producer
+                     :kind              :indexed-range
+                     :source-db         source-db
+                     :pattern-clause    clause
+                     :predicate-clauses (mapv #(nth pending %)
+                                               predicate-idxs)
+                     :selected-idxs     selected-idxs
+                     :selected-clauses  (mapv #(nth pending %)
+                                               selected-idxs)
+                     :range             [(:endpoint (first lower))
+                                         (:endpoint (first upper))]))))))))
+
+(defn- indexed-range-fanout
+  [source attr [[lower-kind lower] [upper-kind upper]]]
+  (let [^long comparison (dd/compare-with-type lower upper)]
+    (if (or (pos? comparison)
+            (and (zero? comparison)
+                 (or (identical? lower-kind :open)
+                     (identical? upper-kind :open))))
+      0
+      (let [inclusive (long (db/-index-range-size source attr lower upper))
+            lower-n   (if (identical? lower-kind :open)
+                        (indexed-fanout source attr [lower])
+                        0)
+            upper-n   (if (identical? upper-kind :open)
+                        (indexed-fanout source attr [upper])
+                        0)]
+        (max 0 (- inclusive lower-n upper-n))))))
+
+(defn- isolated-range-switch-cost
+  ^double [^long fanout ^double producer-cost]
+  (let [materialization-cost
+        (* (double fanout)
+           (+ (double c/magic-cost-hash-join-output-tuple)
+              (double c/magic-cost-hash-join-output-cell)))
+        follow-up-cost (indexed-producer-cost fanout fanout)]
+    (+ producer-cost materialization-cost follow-up-cost)))
+
 (defn- bound-pattern-producer
   [context clause]
   (when-let [{:keys [source entity value] :as producer}
@@ -441,53 +575,103 @@
                :fanout output
                :cost (indexed-producer-cost probes output))))))
 
-(defn- cheaper-indexed-union
-  [context clause remaining]
-  (when-let [{:keys [entity attr source-db values]}
-             (bound-pattern-producer context clause)]
-    (let [candidates
-          (keep-indexed
-            (fn [idx candidate]
-              (when-let [union (indexed-or-union context candidate entity)]
-                (assoc union :idx (unchecked-inc (long idx)))))
-            remaining)]
-      ;; Do no index counting on the common path where no compatible union is
-      ;; waiting. In particular, ordinary JOB late clauses pay no scheduling
-      ;; overhead merely because their pattern value is already bound.
-      (when (seq candidates)
-        (let [pattern-fanout (indexed-fanout source-db attr values)
-              pattern-cost   (indexed-producer-cost (count values)
-                                                    pattern-fanout)
-              unions
-              (keep
-                (fn [candidate]
-                  (when-let [estimate
-                             (union-producer-estimate context candidate)]
-                    (assoc estimate
-                           :switch-cost
-                           (isolated-union-switch-cost
-                             context (:clause candidate) (:fanout estimate)
-                             (double (:cost estimate))))))
-                candidates)]
-          (when-let [{:keys [idx fanout cost switch-cost] :as best}
-                     (when (seq unions)
-                       (apply min-key :switch-cost unions))]
-            (let [switch-cost (double switch-cost)]
-              {:idx (if (< switch-cost pattern-cost) idx 0)
-               :decision
-               {:strategy          (if (< switch-cost pattern-cost)
-                                     :indexed-union-first
-                                     :bound-pattern-first)
-                :entity            entity
-                :bound-pattern     clause
-                :indexed-union     (:clause best)
-                :pattern-probes    (count values)
-                :pattern-fanout    pattern-fanout
-                :pattern-cost      pattern-cost
-                :union-probes      (:probe-count best)
-                :union-fanout      fanout
-                :union-cost        cost
-                :union-switch-cost switch-cost}})))))))
+(defn- indexed-union-alternatives
+  [context pending entity]
+  (keep-indexed
+    (fn [idx candidate]
+      (when (pos? (long idx))
+        (when-let [union (indexed-or-union context candidate entity)]
+          (when-let [estimate (union-producer-estimate context union)]
+            (assoc estimate
+                   :kind             :indexed-union
+                   :selected-idxs    [idx]
+                   :selected-clauses [candidate]
+                   :producer-cost    (:cost estimate)
+                   :switch-cost
+                   (isolated-union-switch-cost
+                     context candidate (:fanout estimate)
+                     (double (:cost estimate))))))))
+    pending))
+
+(defn- indexed-range-alternatives
+  [context pending entity]
+  (keep-indexed
+    (fn [idx candidate]
+      (when (pos? (long idx))
+        (when-let [{:keys [source-db attr range] :as producer}
+                   (indexed-range-candidate
+                     context pending entity idx candidate)]
+          (let [fanout (long (indexed-range-fanout source-db attr range))
+                cost   (* (double fanout)
+                          (double c/magic-cost-init-scan-e))]
+            (assoc producer
+                   :fanout       fanout
+                   :producer-cost cost
+                   :switch-cost  (isolated-range-switch-cost fanout cost))))))
+    pending))
+
+(defn- late-producer-decision
+  [clause entity values pattern-fanout pattern-cost best]
+  (let [switch-cost (double (:switch-cost best))
+        switch?     (< switch-cost (double pattern-cost))
+        strategy    (if switch?
+                      (case (:kind best)
+                        :indexed-union :indexed-union-first
+                        :indexed-range :indexed-range-first)
+                      :bound-pattern-first)
+        common      {:strategy       strategy
+                     :entity         entity
+                     :bound-pattern  clause
+                     :pattern-probes (count values)
+                     :pattern-fanout (long pattern-fanout)
+                     :pattern-cost   (double pattern-cost)}]
+    (case (:kind best)
+      :indexed-union
+      (merge common
+             {:indexed-union     (:clause best)
+              :union-probes      (:probe-count best)
+              :union-fanout      (:fanout best)
+              :union-cost        (:producer-cost best)
+              :union-switch-cost switch-cost})
+
+      :indexed-range
+      (merge common
+             {:range-pattern     (:pattern-clause best)
+              :range-predicates  (:predicate-clauses best)
+              :indexed-range     (:range best)
+              :range-fanout      (:fanout best)
+              :range-cost        (:producer-cost best)
+              :range-switch-cost switch-cost}))))
+
+(defn- cheaper-late-producer
+  ([context pending]
+   (cheaper-late-producer context pending #{:indexed-union :indexed-range}))
+  ([context pending kinds]
+   (let [clause (first pending)]
+     (when-let [{:keys [entity attr source-db values]}
+                (bound-pattern-producer context clause)]
+       (let [alternatives
+             (concat
+               (when (contains? kinds :indexed-union)
+                 (indexed-union-alternatives context pending entity))
+               (when (contains? kinds :indexed-range)
+                 (indexed-range-alternatives context pending entity)))]
+         ;; Do no index counting on the common path where no compatible
+         ;; producer is waiting. Ordinary JOB late clauses therefore pay no
+         ;; scheduling overhead merely because their value is already bound.
+         (when (seq alternatives)
+           (let [pattern-fanout (indexed-fanout source-db attr values)
+                 pattern-cost   (indexed-producer-cost (count values)
+                                                       pattern-fanout)
+                 best           (apply min-key :switch-cost alternatives)
+                 decision       (late-producer-decision
+                                  clause entity values pattern-fanout
+                                  pattern-cost best)
+                 switch?        (not= :bound-pattern-first
+                                      (:strategy decision))]
+             {:idxs     (if switch? (:selected-idxs best) [0])
+              :producer best
+              :decision decision})))))))
 
 (defn- isolated-union-context
   [context clause]
@@ -516,6 +700,11 @@
     ;; unrelated outer relation that happens to carry the same singleton.
     (update context :rels conj projected)))
 
+(defn- isolated-range-context
+  [context {:keys [entity attr range source-db]}]
+  (let [tuples (db/-init-tuples-list source-db attr [range] nil false)]
+    (update context :rels conj (r/relation! {entity 0} tuples))))
+
 (defn- resolve-late-clauses
   [context clauses]
   (loop [context  context
@@ -523,20 +712,31 @@
          executed []]
     (if (empty? pending)
       (assoc context :late-clauses executed)
-      (let [clause   (first pending)
-            choice   (cheaper-indexed-union context clause (next pending))
-            idx      (long (or (:idx choice) 0))
-            selected (nth pending idx)]
+      (let [clause           (first pending)
+            choice           (cheaper-late-producer context pending)
+            selected-idxs    (or (:idxs choice) [0])
+            selected-clauses (if (and choice
+                                      (not= :bound-pattern-first
+                                            (get-in choice
+                                                    [:decision :strategy])))
+                               (get-in choice [:producer :selected-clauses])
+                               [clause])
+            strategy         (get-in choice [:decision :strategy])]
         (when-let [decision (:decision choice)]
           (when qplan/*explain*
             (vswap! qplan/*explain* update :late-clause-decisions
                     (fnil conj []) decision)))
-        (recur (if (= :indexed-union-first
-                      (get-in choice [:decision :strategy]))
-                 (isolated-union-context context selected)
-                 (qresolve/resolve-clause context selected))
-               (u/vec-remove pending idx)
-               (conj executed selected))))))
+        (recur (case strategy
+                 :indexed-union-first
+                 (isolated-union-context
+                   context (get-in choice [:producer :clause]))
+
+                 :indexed-range-first
+                 (isolated-range-context context (:producer choice))
+
+                 (qresolve/resolve-clause context clause))
+               (u/remove-idxs (set selected-idxs) pending)
+               (into executed selected-clauses))))))
 
 (defn- plan-explain
   []

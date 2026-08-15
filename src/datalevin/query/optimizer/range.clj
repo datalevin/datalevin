@@ -232,10 +232,17 @@
        new-pred)
      old-pred)))
 
-(defn- bigdec-attr?
+(defn exact-inequality-range?
+  "Whether AVE ordering exactly implements Datalog inequality ordering for a
+  value type. BigDecimal values retain a residual predicate because their
+  index encoding starts with an inexact double approximation."
+  [value-type]
+  (not (identical? :db.type/bigdec value-type)))
+
+(defn- inexact-inequality-range-attr?
   [helpers source attr]
   (when-let [attr-value-type (:attr-value-type helpers)]
-    (identical? :db.type/bigdec (attr-value-type source attr))))
+    (not (exact-inequality-range? (attr-value-type source attr)))))
 
 (defn- optimize-like
   [helpers m pred [_ ^String pattern {:keys [escape]}] v not?]
@@ -332,7 +339,8 @@
                                   (nested-pred helpers f args v))
                           (case f
                             (< <= > >=)
-                            (if (bigdec-attr? helpers source (:attr m))
+                            (if (inexact-inequality-range-attr?
+                                  helpers source (:attr m))
                               (update m :pred add-pred
                                       (activate-var-pred helpers v pred))
                               (inequality->range m f args v))

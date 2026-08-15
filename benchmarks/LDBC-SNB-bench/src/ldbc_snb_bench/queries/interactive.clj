@@ -87,7 +87,9 @@
                   :where
                   ;; Resolve country entities once for ID comparisons
                   [?country-x :place/name ?country-x-name]
+                  [?country-x :place/type "Country"]
                   [?country-y :place/name ?country-y-name]
+                  [?country-y :place/type "Country"]
 
                   ;; Friends within 2 hops
                   [?start :person/id ?person-id]
