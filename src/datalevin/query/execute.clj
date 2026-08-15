@@ -58,6 +58,9 @@
 (def ^:private materialize-input-bound-patterns
   qo/materialize-input-bound-patterns)
 
+(def ^:private materialize-selective-value-lookups
+  qo/materialize-selective-value-lookups)
+
 (def ^:private push-down-equality-disjunctions
   qo/push-down-equality-disjunctions)
 
@@ -168,11 +171,14 @@
 
 (defn- planning
   [context]
-  (-> context
-      qo/build-graph
-      ((fn [c] (build-explain) c))
-      qo/build-plan
-      qo/plan-not-joins
+  (-> (if (:datalevin.query-optimizer/selective-preplanned? context)
+        (dissoc context
+                :datalevin.query-optimizer/selective-preplanned?)
+        (-> context
+            qo/build-graph
+            ((fn [c] (build-explain) c))
+            qo/build-plan
+            qo/plan-not-joins))
       sort-planned-late-clauses
       ((fn [context]
          (if (seq (:access-plans context))
@@ -1534,6 +1540,7 @@
                (rules/rewrite)
                (push-down-equality-disjunctions)
                (rewrite-unused-vars)
+               (materialize-selective-value-lookups)
                (-q true)))]
      (binding [built-ins/*udf-db* udf-db]
        (finish-query parsed-q context)))))
@@ -1551,6 +1558,7 @@
           (rules/rewrite)
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
+          (materialize-selective-value-lookups)
           (-q false)))))
 
 (defmulti ^:private execute-alternative
@@ -1639,6 +1647,7 @@
           (rules/rewrite)
           (push-down-equality-disjunctions)
           (rewrite-unused-vars)
+          (materialize-selective-value-lookups)
           (-q false)))))
 
 (defn plan*

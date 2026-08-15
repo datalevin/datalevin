@@ -1,6 +1,7 @@
 (ns datalevin.query-optimizer-test
   (:require
    [clojure.test :refer [deftest is testing]]
+   [clojure.walk :as walk]
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
@@ -45,6 +46,22 @@
     [?edge2 :edge/from ?middle]
     [?edge2 :edge/to ?end]])
 
+(def selective-tag-anchor-query
+  '[:find ?message
+    :where
+    [?start :start/id 1]
+    (or-join [?start ?person]
+      (and [?k :knows/from ?start]
+           [?k :knows/to ?person])
+      (and [?k1 :knows/from ?start]
+           [?k1 :knows/to ?mid]
+           [?k2 :knows/from ?mid]
+           [?k2 :knows/to ?person]))
+    [?tag :tag/name "needle"]
+    [?message :message/hasTag ?tag]
+    [?message :message/hasCreator ?person]
+    [?message :message/marker _]])
+
 (def equality-disjunction-query
   '[:find ?message ?x-inc ?y-inc
     :where
@@ -82,6 +99,14 @@
   [db-value query]
   (-> (materialized-context db-value query)
       (qo/push-down-equality-disjunctions)))
+
+(defn- selectively-materialized-context
+  [db-value query]
+  (-> (materialized-context db-value query)
+      (qexec/resolve-redudants)
+      (qo/push-down-equality-disjunctions)
+      (qo/rewrite-unused-vars)
+      (qo/materialize-selective-value-lookups)))
 
 (defn- redundant-resolved-context
   [db-value query]
@@ -500,7 +525,7 @@
                         [?edge :edge/from ?start]
                         [?edge :edge/to ?end]]
                       db-value))))
-        (testing "non-unique constant lookups remain planner clauses"
+        (testing "a standalone non-unique lookup remains a planner clause"
           (let [query   '[:find ?e :where [?e :node/group "odd"]]
                 context (materialized-context db-value query)]
             (is (empty? (:rels context)))
@@ -524,6 +549,95 @@
             (is (empty? (:rels context)))
             (is (= (set (:qorig-where (dp/parse-query query)))
                    (set (get-in context [:parsed-q :qorig-where])))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest costed-selective-value-pre-materialization-test
+  (let [dir    (u/tmp-dir (str "selective-value-anchor-"
+                               (UUID/randomUUID)))
+        schema {:start/id            {:db/valueType :db.type/long
+                                      :db/unique :db.unique/identity}
+                :knows/from          {:db/valueType :db.type/ref}
+                :knows/to            {:db/valueType :db.type/ref}
+                :tag/name            {:db/valueType :db.type/string}
+                :message/hasTag      {:db/valueType :db.type/ref}
+                :message/hasCreator  {:db/valueType :db.type/ref}
+                :message/marker      {:db/valueType :db.type/keyword}}
+        conn   (d/get-conn dir schema)
+        people (range 100 110)
+        messages
+        (map-indexed
+          (fn [idx person]
+            {:db/id (+ 10000 (long idx))
+             :message/hasCreator person
+             :message/hasTag (cond
+                               (= idx 0) 9001
+                               (= idx 1) 9002
+                               :else     9999)
+             :message/marker :present})
+          (take 100 (cycle people)))]
+    (try
+      (d/transact! conn
+                   (into [{:db/id 1 :start/id 1}
+                          {:db/id 9001 :tag/name "needle"}
+                          {:db/id 9002 :tag/name "needle"}
+                          {:db/id 9999 :tag/name "common"}]
+                         (concat
+                           (map-indexed
+                             (fn [idx person]
+                               {:db/id (+ 2000 (long idx))
+                                :knows/from 1
+                                :knows/to person})
+                             people)
+                           messages)))
+      (let [db-value       (d/db conn)
+            selected       (selectively-materialized-context
+                             db-value selective-tag-anchor-query)
+            tag-rel        (some #(when (contains? (:attrs %) '?tag) %)
+                                 (:rels selected))
+            remaining      (set (get-in selected
+                                        [:parsed-q :qorig-where]))
+            selective-plan (d/explain {:run? false}
+                                      selective-tag-anchor-query db-value)
+            selective-pick (first
+                             (:pre-materialization-decisions selective-plan))
+            common-query   (walk/postwalk-replace
+                             {"needle" "common"}
+                             selective-tag-anchor-query)
+            common-plan    (d/explain {:run? false} common-query db-value)
+            common-pick    (first
+                             (:pre-materialization-decisions common-plan))]
+        (testing "all entities for a selective non-unique value are retained"
+          (is (= 2 (:fanout selective-pick)))
+          (is (= :pre-materialized-value-lookup
+                 (:strategy selective-pick)))
+          (is (< (:candidate-cost selective-pick)
+                 (:baseline-cost selective-pick)))
+          (is (= 2 (.size ^List (:tuples tag-rel))))
+          (is (not (contains? remaining '[?tag :tag/name "needle"])))
+          (is (= #{[10000] [10001]}
+                 (d/q selective-tag-anchor-query db-value))))
+        (testing "downstream work can stop a point-value trial"
+          (is (= 1 (:fanout common-pick)))
+          (is (= :planner-value-lookup (:strategy common-pick)))
+          (is (nil? (:candidate-cost common-pick)))
+          (is (= :propagation-preflight
+                 (get-in common-pick [:guardrail :phase])))
+          (is (= (:lookup-cost common-pick)
+                 (:materialization-cost common-pick)))
+          (is (<= (get-in common-pick [:guardrail :budget])
+                  (+ (double
+                       (get-in common-pick
+                               [:guardrail :accumulated-cost]))
+                     (double
+                       (get-in common-pick
+                               [:guardrail :projected-cost])))))
+          (let [common-context (selectively-materialized-context
+                                 db-value common-query)]
+            (is (contains?
+                  (set (get-in common-context [:parsed-q :qorig-where]))
+                  '[?tag :tag/name "common"])))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

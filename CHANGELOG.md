@@ -6,6 +6,8 @@
 - [Datalog] planner accounts for late clauses cost and better hash join cost
   estimation.
 - [Datalog] range fusion in late clauses.
+- [Datalog] costed pre-materialization of selective constant AVE lookups,
+  including non-unique values.
 
 ## 1.0.2 (2026-08-11)
 

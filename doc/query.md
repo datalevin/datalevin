@@ -194,6 +194,34 @@ constrain the same join component. This special handling applies only when at
 least two connected unique entity variables must be preserved by `:find`,
 `:with`, or an `or-join`.
 
+Pre-materialization is not limited to attributes declared unique. After the
+other pre-planning rewrites, a constant AVE lookup whose entity variable joins
+the rest of the query is considered as a possible entity relation, regardless
+of the attribute's value type. The first cost gate compares its exact AVE
+fanout and one-column materialization cost with the marginal cost of the normal
+plan step that first introduces that entity. It also requires that delayed step
+to dominate the remaining plan, so borderline alternatives do not materialize
+candidate tuples.
+
+For a candidate that passes the gate, Datalevin resolves every entity matching
+the value, including all matches of a non-unique attribute, and propagates the
+new bindings through the same bounded-pattern machinery described above. It
+first performs a tuple-free preflight of the complete propagation chain, using
+bounded or sampled cardinality probes for each step. If that projection fits
+within the delayed-step cost budget, actual propagation begins and is checked
+against the same budget after every lookup. Datalevin charges the lookup
+outputs, relation allocation, hash joins, and the estimated residual plan. The
+rewrite is accepted only when that complete cost is lower than the unchanged
+plan. Consequently, a two-entity value can be pre-materialized when it prevents
+a much larger intermediate, while even a one-entity value remains in the graph
+when its downstream expansion would make eager propagation more expensive.
+
+With `explain`, evaluated candidates appear in
+`:pre-materialization-decisions`. Each decision reports AVE fanout, lookup and
+delayed-step costs, materialization and residual costs, both complete plan
+costs, any cost-budget guardrail that stopped a trial, and the selected
+strategy (`:pre-materialized-value-lookup` or `:planner-value-lookup`).
+
 ### Equality-disjunction pattern push-down
 
 A value filter expressed as an `or-join` may otherwise be applied only after a
