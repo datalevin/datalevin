@@ -514,17 +514,39 @@
     (some #(when (contains? (:attrs %) sym) %)
           (:rels context))))
 
+(defn- relation-size
+  ^long [rel]
+  (if-some [^List tuples (:tuples rel)]
+    (.size tuples)
+    0))
+
 (defn- small-bound-relation?
   [context sym]
   (when-let [rel (rel-for-var context sym)]
-    (let [n (.size ^List (:tuples rel))]
+    (let [n (relation-size rel)]
       (and (pos? n)
            (<= n collection-input-materialize-threshold)))))
 
 (defn- bound-relation?
   [context sym]
   (when-let [rel (rel-for-var context sym)]
-    (pos? (.size ^List (:tuples rel)))))
+    (pos? (relation-size rel))))
+
+(defn- relation-has-unresolved-ref?
+  [context source attr entity? sym]
+  (when (and (qu/binding-var? sym)
+             (or entity? (db/ref? source attr)))
+    (when-let [rel (rel-for-var context sym)]
+      (let [^List tuples (:tuples rel)
+            idx          (int ((:attrs rel) sym))]
+        (when tuples
+          (loop [i 0]
+            (when (< i (.size tuples))
+              (let [^objects tuple (.get tuples i)
+                    value          (aget tuple idx)]
+                (if (or (qu/lookup-ref? value) (keyword? value))
+                  true
+                  (recur (unchecked-inc-int i)))))))))))
 
 (defn- unique-attr?
   [source attr]
@@ -635,11 +657,20 @@
                 (when-let [source (get sources
                                        (clause-source-symbol
                                          (:source parsed-clause)))]
-                  (let [input-bound?
+                  (let [attr-value (:value attr)
+                        input-bound?
                         (and (or e-bound? v-bound?)
-                             (not (and e-bound? v-bound?)))]
+                             (not (and e-bound? v-bound?)))
+                        unresolved-ref?
+                        (or (and e-bound?
+                                 (relation-has-unresolved-ref?
+                                   context source attr-value true e-sym))
+                            (and v-bound?
+                                 (relation-has-unresolved-ref?
+                                   context source attr-value false v-sym)))]
                     (when (and (db/-searchable? source)
-                               input-bound?)
+                               input-bound?
+                               (not unresolved-ref?))
                       {:clause-idx clause-idx
                        :source     source
                        :pattern    (pattern-form orig-clause)})))))))
@@ -673,10 +704,6 @@
                    (update-in [:parsed-q :qorig-where]
                               #(u/remove-idxs #{clause-idx} %)))))
       context)))
-
-(defn- relation-size
-  ^long [rel]
-  (.size ^List (:tuples rel)))
 
 (defn- materialized-output-cost
   ^double [^long tuple-count ^long width]
@@ -993,7 +1020,7 @@
                        :budget budget}}
           (let [pattern-vars (into #{}
                                    (filter qu/binding-var?)
-                                   [(first pattern) (nth pattern 2)])
+                                   [(first pattern) (nth pattern 2 nil)])
                 next-group  {:vars   (set/union (:vars group) pattern-vars)
                              :rows   output-count
                              :exact? false}]
@@ -1466,11 +1493,11 @@
       pattern)))
 
 (defn- sample-relation-projection-count
-  [find-vars {:keys [attrs tuples]}]
+  [find-vars {:keys [attrs tuples] :as relation}]
   (let [projected (filterv #(contains? attrs %) find-vars)]
     (cond
-      (.isEmpty ^List tuples) 0
-      (empty? projected)       1
+      (zero? (relation-size relation)) 0
+      (empty? projected)              1
       :else
       (count
         (into #{}
@@ -1494,7 +1521,7 @@
   (reduce
     (fn [n relation]
       (estimate-round
-        (* (double n) (.size ^List (:tuples relation)))))
+        (* (double n) (double (relation-size relation)))))
     1 relations))
 
 (defn- access-sample-relation
@@ -1647,7 +1674,7 @@
              joins   planned-joins
              stages  []]
         (let [relation (access-sample-relation context access-var)
-              before   (.size ^List (:tuples relation))]
+              before   (relation-size relation)]
           (if (or (zero? before) (empty? joins))
             (let [[context stages]
                   (sample-access-residuals
@@ -1665,7 +1692,7 @@
                   rels     (qresolve/collapse-rels (:rels context) new-rel)
                   relation (access-sample-relation
                              (assoc context :rels rels) access-var)
-                  after    (.size ^List (:tuples relation))]
+                  after    (relation-size relation)]
               (recur (assoc context :rels rels)
                      (next joins)
                      (conj stages

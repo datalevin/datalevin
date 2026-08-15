@@ -679,6 +679,61 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest input-bound-pre-materialization-regression-test
+  (let [dir    (u/tmp-dir (str "input-bound-pre-materialization-"
+                               (UUID/randomUUID)))
+        schema {:name           {:db/unique :db.unique/identity}
+                :friend         {:db/valueType :db.type/ref}
+                :permission/act {:db/valueType :db.type/keyword}
+                :permission/obj {:db/valueType :db.type/keyword}
+                :permission/tgt {:db/valueType :db.type/string}}
+        db     (d/db-with
+                 (d/empty-db dir schema)
+                 [{:db/id 1 :name "Ivan" :age 15 :friend 2}
+                  {:db/id 2 :name "Petr" :age 22 :friend 3}
+                  {:db/id 3 :name "Oleg" :age 33}
+                  {:db/id 10
+                   :permission/act :alter
+                   :permission/obj :database
+                   :permission/tgt "other"}])]
+    (try
+      (testing "two-element existence patterns remain plannable"
+        (is (= #{[15]}
+               (d/q '[:find ?age
+                      :in $ ?name
+                      :where
+                      [?e :friend]
+                      [?e :name ?name]
+                      [?e :age ?age]]
+                    db "Ivan"))))
+      (testing "lookup-ref inputs retain their query values"
+        (is (= #{[[:name "Ivan"] 15]
+                 [[:name "Petr"] 22]}
+               (d/q '[:find ?e ?age
+                      :in $ [?e ...]
+                      :where
+                      [?e :age ?age]]
+                    db [[:name "Ivan"] [:name "Petr"]])))
+        (is (= #{[1 [:name "Petr"]]
+                 [2 [:name "Oleg"]]}
+               (d/q '[:find ?e ?friend
+                      :in $ [?friend ...]
+                      :where
+                      [?e :friend ?friend]]
+                    db [[:name "Petr"] [:name "Oleg"]]))))
+      (testing "cost estimation accepts an empty materialized relation"
+        (is (nil?
+              (d/q '[:find ?permission .
+                     :in $ ?act ?obj ?target
+                     :where
+                     [?permission :permission/act ?act]
+                     [?permission :permission/obj ?obj]
+                     [?permission :permission/tgt ?target]]
+                   db :alter :database "missing"))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest hash-join-output-materialization-cost-test
   (let [estimate-cost @(ns-resolve 'datalevin.query-optimizer
                                    'estimate-hash-join-cost)]
