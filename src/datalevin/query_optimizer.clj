@@ -319,6 +319,191 @@
                        {:error :query/inputs :expected ins :got inputs})
       :else     (plugin-inputs* parsed-q inputs))))
 
+(defn- pattern-var-symbol
+  [x]
+  (when (instance? Variable x)
+    (:symbol x)))
+
+(defn- form-var-symbols
+  [form]
+  (let [vars (volatile! #{})]
+    (w/postwalk
+      (fn [x]
+        (cond
+          (instance? Variable x) (vswap! vars conj (:symbol x))
+          (qu/binding-var? x)     (vswap! vars conj x))
+        x)
+      form)
+    @vars))
+
+(defn- or-join-form-parts
+  [form]
+  (when (and (sequential? form) (not (vector? form)))
+    (let [source? (qu/source? (first form))
+          body    (if source? (next form) form)]
+      (when (and (u/sym-name-eqs (first body) "or-join")
+                 (vector? (second body))
+                 (every? qu/binding-var? (second body)))
+        {:source   (when source? (first form))
+         :vars     (second body)
+         :branches (nnext body)}))))
+
+(defn- equality-target
+  [value-sym clause]
+  (when (and (vector? clause) (= 1 (count clause)))
+    (let [call (first clause)]
+      (when (and (sequential? call)
+                 (= 3 (count call))
+                 (u/sym-name-eqs (first call) "="))
+        (let [[_ left right] call]
+          (cond
+            (and (= value-sym left)
+                 (qu/binding-var? right)
+                 (not= value-sym right))
+            right
+
+            (and (= value-sym right)
+                 (qu/binding-var? left)
+                 (not= value-sym left))
+            left))))))
+
+(defn- rewrite-equality-branch
+  [pattern ^long value-idx value-sym branch]
+  (let [and?    (and (sequential? branch)
+                     (u/sym-name-eqs (first branch) "and"))
+        clauses (if and? (vec (next branch)) [branch])
+        matches (keep-indexed
+                  (fn [idx clause]
+                    (when-let [target (equality-target value-sym clause)]
+                      [idx target]))
+                  clauses)]
+    (when (= 1 (count matches))
+      (let [[idx target] (first matches)
+            remaining    (u/remove-idxs #{idx} clauses)]
+        (when (not-any? #(contains? (qu/collect-vars %) value-sym) remaining)
+          (let [rewritten (assoc clauses idx (assoc pattern value-idx target))]
+            {:target target
+             :branch (if and?
+                       (apply list 'and rewritten)
+                       (first rewritten))}))))))
+
+(defn- rel-bound-var?
+  [context sym]
+  (some #(contains? (:attrs %) sym) (:rels context)))
+
+(defn- constant-constrained-pattern-var?
+  [parsed-clause sym]
+  (when (instance? Pattern parsed-clause)
+    (let [pattern (:pattern parsed-clause)
+          e       (first pattern)
+          v       (nth pattern 2 nil)]
+      (or (and (= sym (pattern-var-symbol e))
+               (instance? Constant v))
+          (and (= sym (pattern-var-symbol v))
+               (instance? Constant e))))))
+
+(defn- selectively-bound-var?
+  [context sym excluded-idxs]
+  (or (rel-bound-var? context sym)
+      (some true?
+            (keep-indexed
+              (fn [idx clause]
+                (when-not (contains? excluded-idxs idx)
+                  (constant-constrained-pattern-var? clause sym)))
+              (get-in context [:parsed-q :qwhere])))))
+
+(defn- protected-query-vars
+  [parsed-q]
+  (set/union
+    (find-var-symbols parsed-q)
+    (with-var-symbols parsed-q)
+    (form-var-symbols (:qin parsed-q))
+    (form-var-symbols (:qhaving parsed-q))
+    (form-var-symbols (:qorder parsed-q))))
+
+(defn- rewrite-equality-or-join
+  [context pattern-idx orig-pattern e-sym value-sym value-idx or-idx or-form]
+  (when (not= pattern-idx or-idx)
+    (when-let [{:keys [source vars branches]} (or-join-form-parts or-form)]
+      (when (and (<= 2 (count branches))
+                 (some #{value-sym} vars)
+                 (not (some #{e-sym} vars)))
+        (let [rewrites (mapv #(rewrite-equality-branch
+                                orig-pattern value-idx value-sym %)
+                             branches)]
+          (when (every? some? rewrites)
+            (let [targets       (into #{} (map :target) rewrites)
+                  excluded-idxs #{pattern-idx or-idx}
+                  other-clauses (u/remove-idxs
+                                  excluded-idxs
+                                  (get-in context [:parsed-q :qorig-where]))]
+              (when (and (every? (set vars) targets)
+                         (not-any? #(contains? (qu/collect-vars %) value-sym)
+                                   other-clauses)
+                         (every? #(selectively-bound-var?
+                                    context % excluded-idxs)
+                                 targets)
+                         (not (selectively-bound-var?
+                                context e-sym excluded-idxs)))
+                (let [new-vars     (mapv #(if (= value-sym %) e-sym %) vars)
+                      new-branches (mapv :branch rewrites)]
+                  (if source
+                    (apply list source 'or-join new-vars new-branches)
+                    (apply list 'or-join new-vars new-branches)))))))))))
+
+(defn- equality-pushdown-candidate
+  [{:keys [parsed-q sources] :as context} ^long pattern-idx]
+  (let [parsed-pattern (nth (:qwhere parsed-q) pattern-idx)
+        orig-pattern   (nth (:qorig-where parsed-q) pattern-idx)]
+    (when (and (instance? Pattern parsed-pattern)
+               (vector? orig-pattern)
+               (= 3 (count (:pattern parsed-pattern))))
+      (let [pattern    (:pattern parsed-pattern)
+            e-sym      (pattern-var-symbol (first pattern))
+            attr       (second pattern)
+            value-sym  (pattern-var-symbol (nth pattern 2))
+            value-idx  (pattern-value-form-idx orig-pattern)
+            source     (get sources
+                            (clause-source-symbol (:source parsed-pattern)))]
+        (when (and e-sym value-sym (not= e-sym value-sym)
+                   (instance? Constant attr)
+                   (keyword? (:value attr))
+                   source
+                   (db/-searchable? source)
+                   (not (contains? (protected-query-vars parsed-q) value-sym)))
+          (some
+            (fn [[or-idx or-form]]
+              (when-let [or-clause
+                         (rewrite-equality-or-join
+                           context pattern-idx orig-pattern e-sym value-sym
+                           value-idx or-idx or-form)]
+                {:pattern-idx pattern-idx
+                 :or-idx      or-idx
+                 :or-clause   or-clause}))
+            (map-indexed vector (:qorig-where parsed-q))))))))
+
+(defn push-down-equality-disjunctions
+  "Push a filter-only pattern into simple equality or-join branches. This lets
+   runtime lookup costing use a small set of bound AV values instead of first
+   materializing an entire attribute relation. The rewrite is deliberately
+   limited to selectively bound branch targets and unanchored entity vars."
+  [{:keys [parsed-q] :as context}]
+  (loop [parsed-q parsed-q]
+    (let [context (assoc context :parsed-q parsed-q)]
+      (if-let [{:keys [^long pattern-idx ^long or-idx or-clause]}
+               (first (keep-indexed
+                        (fn [idx _]
+                          (equality-pushdown-candidate context idx))
+                        (:qwhere parsed-q)))]
+        (let [qorig-where (u/remove-idxs
+                            #{pattern-idx}
+                            (assoc (:qorig-where parsed-q)
+                                   or-idx or-clause))]
+          (recur (assoc parsed-q
+                        :qorig-where qorig-where
+                        :qwhere (dp/parse-where qorig-where))))
+        (assoc context :parsed-q parsed-q)))))
+
 (defn- rel-for-var
   [context sym]
   (when (qu/binding-var? sym)
@@ -331,11 +516,6 @@
     (let [n (.size ^List (:tuples rel))]
       (and (pos? n)
            (<= n collection-input-materialize-threshold)))))
-
-(defn- pattern-var-symbol
-  [x]
-  (when (instance? Variable x)
-    (:symbol x)))
 
 (defn- unique-attr?
   [source attr]

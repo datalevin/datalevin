@@ -5,6 +5,7 @@
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.parser :as dp]
+   [datalevin.query.execute :as qexec]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -39,6 +40,31 @@
     [?edge2 :edge/from ?middle]
     [?edge2 :edge/to ?end]])
 
+(def equality-disjunction-query
+  '[:find ?message ?x-inc ?y-inc
+    :where
+    [?country-x :place/name "X"]
+    [?country-y :place/name "Y"]
+    [?person :person/name "P"]
+    [?message :message/hasCreator ?person]
+    [?message :message/isLocatedIn ?loc]
+    (or-join [?loc ?country-x ?country-y ?x-inc ?y-inc]
+      (and [(= ?loc ?country-x)]
+           [(ground 1) ?x-inc]
+           [(ground 0) ?y-inc])
+      (and [(= ?country-y ?loc)]
+           [(ground 0) ?x-inc]
+           [(ground 1) ?y-inc]))])
+
+(def pushed-equality-disjunction-clause
+  '(or-join [?message ?country-x ?country-y ?x-inc ?y-inc]
+    (and [?message :message/isLocatedIn ?country-x]
+         [(ground 1) ?x-inc]
+         [(ground 0) ?y-inc])
+    (and [?message :message/isLocatedIn ?country-y]
+         [(ground 0) ?x-inc]
+         [(ground 1) ?y-inc])))
+
 (defn- materialized-context
   [db-value query]
   (let [parsed-q          (dp/parse-query query)
@@ -46,6 +72,89 @@
     (-> (qplan/make-context parsed-q false)
         (qresolve/resolve-ins inputs)
         (qo/materialize-input-bound-patterns))))
+
+(defn- equality-rewritten-context
+  [db-value query]
+  (-> (materialized-context db-value query)
+      (qo/push-down-equality-disjunctions)))
+
+(defn- redundant-resolved-context
+  [db-value query]
+  (let [parsed-q          (dp/parse-query query)
+        [parsed-q inputs] (qo/plugin-inputs parsed-q [db-value])]
+    (-> (qplan/make-context parsed-q false)
+        (qresolve/resolve-ins inputs)
+        (qexec/resolve-redudants))))
+
+(deftest equality-disjunction-pattern-pushdown-test
+  (let [dir    (u/tmp-dir (str "equality-disjunction-pushdown-"
+                               (UUID/randomUUID)))
+        schema {:place/name          {:db/valueType :db.type/string}
+                :person/name         {:db/valueType :db.type/string}
+                :message/id          {:db/valueType :db.type/long
+                                      :db/unique    :db.unique/identity}
+                :message/hasCreator  {:db/valueType :db.type/ref}
+                :message/isLocatedIn {:db/valueType :db.type/ref}}
+        conn   (d/get-conn dir schema)]
+    (try
+      (d/transact! conn
+                   [{:db/id 1 :place/name "X"}
+                    {:db/id 2 :place/name "Y"}
+                    {:db/id 3 :place/name "Z"}
+                    {:db/id 10 :person/name "P"}
+                    {:db/id 100 :message/id 100
+                     :message/hasCreator 10 :message/isLocatedIn 1}
+                    {:db/id 101 :message/id 101
+                     :message/hasCreator 10 :message/isLocatedIn 2}
+                    {:db/id 102 :message/id 102
+                     :message/hasCreator 10 :message/isLocatedIn 3}])
+      (let [db-value  (d/db conn)
+            original  (:qorig-where (dp/parse-query
+                                      equality-disjunction-query))
+            rewritten (get-in
+                        (equality-rewritten-context
+                          db-value equality-disjunction-query)
+                        [:parsed-q :qorig-where])]
+        (testing "a filter-only value pattern is distributed into AV branches"
+          (is (not (some #{'[?message :message/isLocatedIn ?loc]}
+                         rewritten)))
+          (is (some #{pushed-equality-disjunction-clause} rewritten))
+          (is (= (dec (count original)) (count rewritten))))
+        (testing "the rewrite preserves branch bindings and query results"
+          (is (= #{[100 1 0] [101 0 1]}
+                 (d/q equality-disjunction-query db-value))))
+        (testing "a value needed by the result remains outside the rewrite"
+          (let [query     {:find  ['?message '?loc]
+                           :where original}
+                remaining (get-in (equality-rewritten-context db-value query)
+                                  [:parsed-q :qorig-where])]
+            (is (= original remaining))))
+        (testing "a value used by another where clause remains available"
+          (let [where     (conj original '[?loc :place/name ?loc-name])
+                query     {:find  ['?message]
+                           :where where}
+                remaining (get-in (equality-rewritten-context db-value query)
+                                  [:parsed-q :qorig-where])]
+            (is (= where remaining))))
+        (testing "an entity with a selective constant anchor keeps one probe"
+          (let [where     (conj original '[?message :message/id 100])
+                query     {:find  ['?message]
+                           :where where}
+                remaining (get-in (equality-rewritten-context db-value query)
+                                  [:parsed-q :qorig-where])]
+            (is (= where remaining))))
+        (testing "branch targets without selective outer bindings are skipped"
+          (let [where     (-> original
+                              (assoc 0 '[?country-x :place/name ?x-name])
+                              (assoc 1 '[?country-y :place/name ?y-name]))
+                query     {:find  ['?message]
+                           :where where}
+                remaining (get-in (equality-rewritten-context db-value query)
+                                  [:parsed-q :qorig-where])]
+            (is (= where remaining)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest unique-constant-lookups-materialized-test
   (let [dir    (u/tmp-dir (str "unique-constant-lookup-"
@@ -114,6 +223,43 @@
             (is (empty? (:rels context)))
             (is (= (set (:qorig-where (dp/parse-query query)))
                    (set (get-in context [:parsed-q :qorig-where])))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest redundant-value-pattern-cardinality-test
+  (let [dir    (u/tmp-dir (str "redundant-value-pattern-"
+                               (UUID/randomUUID)))
+        schema {:item/state {:db/valueType :db.type/keyword}
+                :item/tags  {:db/valueType   :db.type/keyword
+                             :db/cardinality :db.cardinality/many}}
+        conn   (d/get-conn dir schema)
+        one-q  '[:find ?e ?state
+                 :where
+                 [?e :item/state :active]
+                 [?e :item/state ?state]]
+        many-q '[:find ?e ?tag
+                 :where
+                 [?e :item/tags ?tag]
+                 [?e :item/tags :a]]]
+    (try
+      (d/transact! conn
+                   [{:db/id 1 :item/state :active :item/tags [:a :b]}
+                    {:db/id 2 :item/state :inactive :item/tags [:a]}])
+      (let [db-value    (d/db conn)
+            one-context (redundant-resolved-context db-value one-q)
+            many-context (redundant-resolved-context db-value many-q)]
+        (testing "a cardinality-one constant determines the duplicate value"
+          (is (= ['[?e :item/state :active]]
+                 (get-in one-context [:parsed-q :qorig-where])))
+          (is (= #{[1 :active]} (d/q one-q db-value))))
+        (testing "a cardinality-many value pattern retains all matching values"
+          (is (empty? (get-in many-context [:parsed-q :qorig-where])))
+          (let [rel (first (:rels many-context))]
+            (is (= #{'?e '?tag} (set (keys (:attrs rel)))))
+            (is (= 3 (.size ^List (:tuples rel)))))
+          (is (= #{[1 :a] [1 :b] [2 :a]}
+                 (d/q many-q db-value)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

@@ -108,15 +108,164 @@ Datalevin query engine employs multiple optimization strategies.
 
 As mentioned above, we take advantage of the opportunities to push selection
 predicates down to index scan in order to minimize unnecessary intermediate
-results. Currently, two types of predicates are pushed down: 1. inequality
-predicates involving one variable and one or two constants are converted to
-range boundary in range scan; 2. other predicates involving one attributes are
-pushed down to operations that scan the attribute values.
+results. A predicate is eligible when it contains exactly one free variable,
+that variable is an attribute value in the query graph, and the predicate does
+not contain a dynamic source form.
 
-These predicates push-downs are implemented as query rewrites. We also plug the
-constant query parameters into the query itself in order to avoid expensive
-joins with these bindings turned relations. More query rewrite cases will be
-considered in the future.
+Comparisons (`<`, `<=`, `>`, and `>=`) involving constants become open or
+closed AVE range boundaries. Equality becomes an exact range, while `in` and
+`not-in` become one or more exact or complementary ranges. `like` and
+`not-like` derive a prefix range when the pattern permits it and retain the
+value predicate for the final check; a wildcard-free `like` becomes an exact
+bound value. Multiple range predicates on the same value are intersected, so a
+contradictory intersection can be recognized without scanning. Big-decimal
+inequalities and other single-variable predicates that cannot safely become
+index bounds are still attached to the value scan instead of being evaluated
+after materialization.
+
+These push-downs are implemented while building the query graph. Related input
+specialization and early materialization rewrites run before graph planning.
+
+### Input and dead-binding specialization
+
+Datalevin substitutes a safe scalar query input directly into its where
+clauses and removes the corresponding one-row input relation. This avoids a
+relation join for values that are not returned and do not need to remain as
+variables for an `or-join`. Sequential scalar inputs remain intact so query
+functions can consume them lazily. An unprojected singleton collection input
+used exactly once as a pattern value can likewise become a literal pattern
+value.
+
+Repeated patterns with the same source, entity, and attribute receive
+schema-aware handling when one pattern contains a constant value. For a
+cardinality-one attribute, the constant determines the duplicate variable and
+the extra lookup is replaced by a one-value binding. For a cardinality-many or
+schema-unknown attribute, that equivalence would be invalid, so Datalevin
+materializes the repeated group with its constant pattern first and retains all
+matching variable values.
+
+After input, rule, and disjunction rewrites, the optimizer also replaces a
+variable that occurs only once and is not needed by `:find`, `:with`, `:in`, an
+input relation, or a nested clause with an internal placeholder. For a pattern
+such as `[?e :item/name ?unused]`, this preserves the existence test but avoids
+reading and carrying an unused value column through scans and joins. Variables
+used by predicates, functions, rules, `or`, or `not` forms are protected from
+this rewrite.
+
+### Pre-planning pattern materialization
+
+After resolving query inputs, Datalevin materializes a database pattern before
+graph planning when exactly one of its entity or value variables is already
+represented by a small relation. The pattern must have a constant keyword
+attribute and use a searchable database source. Its normal costed lookup is
+joined into the current relations, the pattern is removed from the remaining
+where clauses, and the process repeats while newly bound variables make another
+pattern eligible.
+
+This propagation avoids planning an unconstrained scan when an input relation
+already provides the relevant entity IDs or attribute values. The safety limit
+also prevents a large input collection from turning pre-planning into an
+unbounded series of point lookups.
+
+A related case handles multiple unique constant anchors. Consider a path query
+whose two endpoint IDs are projected or otherwise must remain bound:
+
+```clojure
+[:find ?start ?middle ?end
+ :where
+ [?start :node/id 1]
+ [?end :node/code "three"]
+ [?edge1 :edge/from ?start]
+ [?edge1 :edge/to ?middle]
+ [?edge2 :edge/from ?middle]
+ [?edge2 :edge/to ?end]]
+```
+
+If `:node/id` and `:node/code` are declared `:db.unique/identity` or
+`:db.unique/value`, and the anchors belong to the same connected query
+component, Datalevin resolves both before planning. Their entity relations then
+constrain propagation from both ends of the path. A missing unique value
+produces an empty relation and short-circuits the query.
+
+The optimizer intentionally leaves a single unique literal with the normal
+planner because it is already an ideal selective root. It also leaves unique
+anchors in disconnected components alone, avoiding eager work that cannot
+constrain the same join component. This special handling applies only when at
+least two connected unique entity variables must be preserved by `:find`,
+`:with`, or an `or-join`.
+
+### Equality-disjunction pattern push-down
+
+A value filter expressed as an `or-join` may otherwise be applied only after a
+large attribute relation has been materialized. For example:
+
+```clojure
+[?message :message/isLocatedIn ?loc]
+(or-join [?loc ?country-x ?country-y ?x-inc ?y-inc]
+  (and [(= ?loc ?country-x)]
+       [(ground 1) ?x-inc]
+       [(ground 0) ?y-inc])
+  (and [(= ?loc ?country-y)]
+       [(ground 0) ?x-inc]
+       [(ground 1) ?y-inc]))
+```
+
+When `?loc` is only an internal filter variable, the optimizer distributes the
+pattern into the equality branches:
+
+```clojure
+(or-join [?message ?country-x ?country-y ?x-inc ?y-inc]
+  (and [?message :message/isLocatedIn ?country-x]
+       [(ground 1) ?x-inc]
+       [(ground 0) ?y-inc])
+  (and [?message :message/isLocatedIn ?country-y]
+       [(ground 0) ?x-inc]
+       [(ground 1) ?y-inc]))
+```
+
+This is the relational rewrite `P(e, v) AND OR_i(v = t_i AND B_i)` to
+`OR_i(P(e, t_i) AND B_i)`. It exposes each selectively bound target value to
+the normal pattern lookup machinery. Runtime lookup costing can then choose
+AVE point probes instead of an attribute scan, while retaining entity-bound or
+full lookup when either is estimated to be cheaper.
+
+The rewrite is deliberately conservative. It requires:
+
+* a three-element EAV pattern, after an optional source, with variable entity
+  and value positions and a constant keyword attribute on a searchable source;
+* a flat, explicit `or-join` variable list with at least two branches;
+* exactly one equality in every branch between the pattern's value variable and
+  a branch target, with no other use of that value variable in the branch;
+* branch targets declared by the `or-join` and selectively bound outside it by
+  an already materialized relation or a constant-constrained pattern;
+* no use of the eliminated value variable by another where clause, `:find`,
+  `:with`, `:in`, `:having`, or `:order-by`; and
+* no already materialized or selective constant binding for the entity
+  variable, since the original pattern can already use a cheap entity probe in
+  that case.
+
+If any condition is not met, the query is left unchanged and follows normal
+planning and late-clause resolution. The rewrite runs after scalar inputs and
+non-recursive rules have been expanded, and before graph construction, so the
+rewritten patterns participate in the existing lookup cost decisions.
+
+### Costed bound-pattern lookup
+
+When clause resolution reaches a database pattern, a single bound entity or
+value becomes an ordinary EAV or AVE point lookup. If a relation supplies
+multiple distinct entities or values, Datalevin compares two complete costs:
+performing one indexed probe per bound key and joining the returned tuples, or
+scanning the matching attribute range and hash-joining it with the bindings.
+The comparison includes probe, retrieval, scan, and join work and uses the
+current index count. A large-key safety limit remains a guardrail, but it is not
+the normal decision boundary.
+
+Entity-bound patterns whose value is `_` or an optimizer-generated placeholder
+take a narrower path. They use an EAV `populated?` probe and emit the entity at
+most once instead of retrieving every matching value. This is especially
+useful for cardinality-many attributes used only as existence conditions. A
+concrete value also emits only the entity binding once after a successful
+probe, while a required value variable retains normal multiplicity.
 
 ### Ordered limit push-down
 
@@ -175,6 +324,10 @@ semantics under batching continue to use conventional execution. Adaptive
 execution also retains the conventional plan as a fallback if candidate work
 reaches its safety budget.
 
+The general access-method contract, property propagation rules, correlated
+access scheduling, and bounded alternative search are described in
+[Property-Aware Access Planning](access-planning.md).
+
 ### Merge scan
 
 For star-like attributes, we utilize an idea similar to pivot scan [2], which
@@ -223,7 +376,7 @@ relation in each join.
 
 ### Join methods (new)
 
-Currently, we consider six join methods. For two sets of where clauses
+Currently, we consider seven join methods. For two sets of where clauses
 involving two classes of entities respectively, e.g. `?e` and `?f`, we currently
 consider the following cases.
 
@@ -255,6 +408,21 @@ An alternative to reverse references and value equality joins is hash join. Our
 hash join operator chooses build side vs. probe side based on actual input
 relation sizes, so it is more flexible and handles size estimation inaccuracy
 more robustly.
+
+The graph planner uses a minimum-input guard before considering a hash join,
+then compares it with the indexed-link alternative by cost. Hash-join costing
+uses the larger of its input-work estimate and an output-materialization
+estimate based on predicted result cardinality and tuple width. This makes a
+high-fanout join expensive when allocating and copying its output dominates,
+without double-charging ordinary output already covered by the historical
+input coefficient.
+
+For access-source fragments, the property memo can retain both an ordered
+index-join alternative and an unordered hash-join alternative for the same
+logical subset. Index joins preserve outer order when their operator contract
+says so; hash joins discard ordering and resumability. An alternative is
+removed only when another has no greater cost and size while providing a
+superset of its physical properties.
 
 For reverse reference type of hash join, we implement a form of sideway
 information passing (SIP) using a bitmap [15] to pre-filter target relation.
@@ -305,6 +473,9 @@ in some triple patterns, the entities of these patterns can now be joined with
 the entity of the bound variable. We first perform the `or-join` operation
 to get a relation, then join with these pattern relations. This join also
 benefits from a form of SIP by passing in bound values to `or-join` operation.
+Value-filtering shapes may first undergo the
+[equality-disjunction pattern push-down](#equality-disjunction-pattern-push-down),
+which exposes branch target values directly to indexed pattern lookup.
 
 The choice of these join methods in the query plan and their ordering is
 determined by the optimizer based on its cost estimation.
@@ -323,6 +494,13 @@ evaluation in common cases and can reduce intermediate relation sizes before
 subsequent work. Clauses outside these conditions (e.g. nested complex clauses,
 cross-source shapes, or ambiguous binding points) still fall back to late
 resolution.
+
+Both planned and late `not-join` execution physically project the outer input
+to the declared join keys and deduplicate those keys before resolving the
+negative body. The negative result is projected and deduplicated the same way
+before subtraction. This avoids carrying hidden tuple columns or repeated keys
+through the anti-join while preserving the original outer tuples in the final
+result.
 
 ### Directional join result size estimation (new)
 
@@ -343,9 +521,10 @@ As mentioned, the main advantage of our system is having more accurate
 result size estimation. Instead of relying on statistics based estimations
 using histograms and the like, we count elements directly, because counts in our
 list based triple storage are cheap to obtain. As our B+tree KV storage maintains
-order statics on the branch nodes, the range count operations have O(log n)
+order statistics on the branch nodes, the range count operations have O(log n)
 time complexity. Compared with statistics based estimation, counting is simple,
-accurate and always up to date.
+direct, and transactionally maintained. Because a zero count is also used as a
+correctness decision, it receives the additional verification described below.
 
 For an `or-join` link sample, the planner resolves the `or-join` relation but
 does not materialize the final AVE join just to measure its size. It sums the
@@ -356,23 +535,32 @@ products. A planning component also reuses the resolved `or-join` build across
 outgoing target attributes. The short-lived cache uses input-list identity, not
 the mutable list's content hash, together with an immutable link description.
 
+A zero returned by counted-index metadata is verified against the actual EAV
+or AVE range before it is allowed to short-circuit the query. If the range is
+populated, the optimizer substitutes a conservative non-empty size and stays on
+the sampled planning path. This keeps a fast but stale metadata zero from being
+treated as a correctness proof that the result is empty.
+
 ### Query specific sampling (new)
 
-We use sampling to estimate join result size. To ensure representative samples
-that are specific to the query and data distribution, we perform sampling by
-execution under actual query conditions. Online sampling is performed during
-query using reservoir sampling methods. Similar to counting, online sampling
-takes advantage of O(log n) rank operation of the counted feature of our KV
-storage.
+We use sampling to estimate join result size. To ensure samples are specific to
+the query and data distribution, sampling executes the same base scans,
+predicates, and directional links being considered by the planner. Similar to
+counting, online sampling takes advantage of rank operations on the counted KV
+indexes.
 
-A sample of base entity IDs are collected first, then merge scans are performed
-to obtain base selectivity ratios. After that, the selectivity of all possible
-two way joins are obtained by counting the number of linked entity ids based on
-these samples. The estimated selectivity is then calculated using
-empirical-Bayes shrinkage with a prior [6]. To combat extreme skew, we implements
-skew‑aware upper‑bound correction inspired by skew‑robust statistics [5]. Later
-joins use these selectivity ratios to estimate result sizes. We have found our
-method is more effective than sampling more than 2-way joins (e.g. [9]).
+A sample of base entity IDs is collected first, then merge scans obtain base
+selectivity ratios. Two-way link selectivity is measured by counting linked
+entity IDs from these samples. The active mainline policy applies a conservative
+dominating envelope: it uses at least the observed sample mean, the
+storage-derived default fanout, and the semantic fallback floor. The selected
+ratio is cached within the planning component and used to estimate later joins.
+
+Empirical-Bayes shrinkage and optional tail corrections are alternative
+policies evaluated by the CIDR work; they are not the estimator used by this
+branch. See the
+[CIDR 2027 estimator study](cidr2027.md#24-managing-sampling-uncertainty) for
+the distinction and experimental results.
 
 ### Recency based link choice (new)
 
@@ -426,6 +614,17 @@ dependent clauses before their inputs are bound. The ordering is stable among
 clauses that are ready at the same time, and clauses whose dependencies cannot
 be satisfied are left in their original order so normal validation errors remain
 clear. The planned order is visible in `explain` under `:late-clauses`.
+
+Late work also participates in physical-plan costing. Predicates and function
+bindings are charged per estimated input row. Patterns, `or` clauses, and rules
+may expand cardinality rather than merely filter it; when a non-correlated
+access path has a real planning sample with positive residual output, Datalevin
+extrapolates that observed yield to the complete access range. The conventional
+alternative is then costed with the larger of its own planned cardinality and
+the sampled expansion. Heuristic estimates and zero-output samples are not
+used for this upward correction. `explain` reports the correction as a
+`:sampled-late-expansion` stage in the conventional alternative's cost
+breakdown.
 
 Rules are resolved by the rule engine when their rule clauses are reached; see
 [rules](rules.md) for details of the rule engine.
