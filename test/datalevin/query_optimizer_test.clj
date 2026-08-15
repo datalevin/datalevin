@@ -693,6 +693,38 @@
         (is (= 350 (estimate-cost 10 20 50 3)))
         (is (= 1050 (estimate-cost 10 20 150 3)))))))
 
+(deftest merge-range-predicate-cost-test
+  (let [merge-pred-options @(ns-resolve 'datalevin.query-optimizer
+                                        'merge-pred-options)
+        estimate-cost      @(ns-resolve 'datalevin.query-optimizer
+                                        'estimate-scan-v-cost)
+        interval           [[:open 10] [:closed c/vmax]]
+        range-options      (merge-pred-options '?date
+                                               {:range [interval]})
+        residual-options   (merge-pred-options '?date
+                                               {:range [interval]
+                                                :pred  (constantly true)})
+        disjoint-options   (merge-pred-options
+                             '?date
+                             {:range [interval
+                                      [[:closed 1] [:closed 2]]]})]
+    (testing "only a single pure synthesized range retains provenance"
+      (is (true? (:range-pred? range-options)))
+      (is (nil? (:range-pred? residual-options)))
+      (is (nil? (:range-pred? disjoint-options))))
+    (binding [c/magic-cost-merge-scan-v 2.0
+              c/magic-cost-var          1.0
+              c/magic-cost-pred         3.0
+              c/magic-cost-fidx         1.0]
+      (testing "a pure range check does not multiply the whole merge scan"
+        (is (= 20.0 (estimate-cost {:attrs-v [[:date range-options]]
+                                    :vars    []}
+                                   10))))
+      (testing "a residual predicate keeps the existing predicate factor"
+        (is (= 60.0 (estimate-cost {:attrs-v [[:date residual-options]]
+                                    :vars    []}
+                                   10)))))))
+
 (deftest sampled-late-expansion-cost-test
   (let [dir    (u/tmp-dir (str "late-expansion-cost-" (UUID/randomUUID)))
         schema {:start/id   {:db/valueType :db.type/long

@@ -644,7 +644,9 @@
         new-attrs-v
         (mapv (fn [[a opts :as entry]]
                 (if (= a join-attr)
-                  [a (update opts :pred #(compose-pred % bm-pred))]
+                  [a (-> opts
+                         (update :pred #(compose-pred % bm-pred))
+                         (dissoc :range-pred?))]
                   entry))
               attrs-v)]
     (assoc merge-step :attrs-v new-attrs-v)))

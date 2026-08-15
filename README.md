@@ -359,6 +359,9 @@ comparably with Neo4j on complex graph queries.
 Datalevin is extensively tested with property-based testing and is used
 in production at [Juji](https://juji.io), among other companies.
 
+If your project is using Datalevin in production, drop a comment in [this
+issue](https://github.com/datalevin/datalevin/issues/383).
+
 ## :earth_americas: Roadmap
 
 The goal of Datalevin is to simplify data storage and access. We aim to support

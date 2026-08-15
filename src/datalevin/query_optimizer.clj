@@ -1963,13 +1963,26 @@
       (add-pred pred range-pred))
     pred))
 
+(defn- simple-range-pred?
+  "Whether add-back-range produces only one index-derived range predicate.
+  Keep residual predicates and disjoint ranges on the ordinary predicate cost
+  path: both can do materially more work per scanned entity."
+  [{:keys [pred range]}]
+  (and (nil? pred) (vector? range) (= 1 (count range))))
+
+(defn- merge-pred-options
+  [v clause]
+  (let [pred (add-back-range v clause)]
+    (cond-> {:pred pred}
+      (and pred (simple-range-pred? clause)) (assoc :range-pred? true))))
+
 (defn- attrs-vec
-  [attrs preds skips fidxs]
-  (mapv (fn [a p f]
-          [a (cond-> {:pred p :skip? false :fidx nil}
+  [attrs pred-options skips fidxs]
+  (mapv (fn [a options f]
+          [a (cond-> (assoc options :skip? false :fidx nil)
                (skips a) (assoc :skip? true)
                f         (assoc :fidx f :skip? true))])
-        attrs preds fidxs))
+        attrs pred-options fidxs))
 
 (defn- aid [db] #(((db/-schema db) %) :db/aid))
 
@@ -2023,18 +2036,20 @@
                                         (remove nil?))
                                      attrs vars))
                         no-var? (conj attr))
-              preds   (mapv add-back-range vars all)
-              attrs-v (attrs-vec attrs preds skips (repeat nil))
-              cols    (into (:cols init)
-                            (sequence
-                              (comp (map (fn [a v] (when-not (skips a) #{a v})))
-                                 (remove nil?))
-                              attrs vars))
-              strata  (conj (:strata init) (set vars))
-              ires    (:result init)
-              isp     (:sample init)
-              step    (mk-merge-scan-step 0 attrs-v vars [e] [e] cols strata
-                                          #{} nil nil)]
+              pred-options (mapv merge-pred-options vars all)
+              attrs-v      (attrs-vec attrs pred-options skips (repeat nil))
+              cols         (into (:cols init)
+                                 (sequence
+                                   (comp
+                                     (map (fn [a v]
+                                            (when-not (skips a) #{a v})))
+                                     (remove nil?))
+                                   attrs vars))
+              strata       (conj (:strata init) (set vars))
+              ires         (:result init)
+              isp          (:sample init)
+              step         (mk-merge-scan-step
+                             0 attrs-v vars [e] [e] cols strata #{} nil nil)]
           (cond-> step
             ires (assoc :result (-execute step db ires))
             isp  (assoc :sample (-sample step db isp))))))))
@@ -2043,6 +2058,13 @@
   [attrs-v k]
   (reduce
     (fn [^long c [_ m]] (if (m k) (inc c) c))
+    0 attrs-v))
+
+(defn- n-costly-preds
+  [attrs-v]
+  (reduce
+    (fn [^long c [_ {:keys [pred range-pred?]}]]
+      (if (and pred (not range-pred?)) (inc c) c))
     0 attrs-v))
 
 (defn- estimate-scan-v-size
@@ -2076,7 +2098,7 @@
   (* size
      ^double c/magic-cost-merge-scan-v
      ^long (factor c/magic-cost-var (count vars))
-     ^long (factor c/magic-cost-pred (n-items attrs-v :pred))
+     ^long (factor c/magic-cost-pred (n-costly-preds attrs-v))
      ^long (factor c/magic-cost-fidx (n-items attrs-v :fidx))))
 
 (defn- estimate-base-cost
@@ -3024,19 +3046,22 @@
 
 (defn- merge-scan-step
   [db last-step index new-key new-steps]
-  (let [in       (:out last-step)
-        out      (if (set? in) (set new-key) new-key)
-        lcols    (:cols last-step)
-        lstrata  (:strata last-step)
-        ncols    (:cols (peek new-steps))
-        [s1 s2]  new-steps
-        val1     (:val s1)
-        [_ v1]   (:vars s1)
-        a1       (:attr s1)
-        ip       (cond-> (add-back-range v1 s1)
-                   (some? val1) (add-pred #(= % val1)))
-        attrs-v2 (:attrs-v s2)
-        get-a    (fn [coll] (some #(when (keyword? %) %) coll))
+  (let [in         (:out last-step)
+        out        (if (set? in) (set new-key) new-key)
+        lcols      (:cols last-step)
+        lstrata    (:strata last-step)
+        ncols      (:cols (peek new-steps))
+        [s1 s2]    new-steps
+        val1       (:val s1)
+        [_ v1]     (:vars s1)
+        a1         (:attr s1)
+        ip-options (merge-pred-options v1 s1)
+        ip         (cond-> (:pred ip-options)
+                     (some? val1) (add-pred #(= % val1)))
+        ip-options (cond-> (assoc ip-options :pred ip)
+                     (some? val1) (dissoc :range-pred?))
+        attrs-v2   (:attrs-v s2)
+        get-a      (fn [coll] (some #(when (keyword? %) %) coll))
         [attrs-v vars cols]
         (reduce
           (fn [[attrs-v vars cols] col]
@@ -3044,20 +3069,31 @@
               (if (and ip (= v v1))
                 [attrs-v vars cols]
                 (let [a (get-a col)
-                      p (some #(when (= a (first %)) (:pred (peek %))) attrs-v2)]
+                      options (or (some (fn [[attr options]]
+                                          (when (and (= a attr)
+                                                     (:pred options))
+                                            (select-keys options
+                                                         [:pred
+                                                          :range-pred?])))
+                                        attrs-v2)
+                                  {:pred nil})
+                      skip? (boolean
+                              (some (fn [[attr options]]
+                                      (when (= a attr) (:skip? options)))
+                                    attrs-v2))]
                   (if-let [f (find-index v lcols)]
-                    [(conj attrs-v [a {:pred p :skip? true :fidx f}]) vars cols]
-                    [(conj attrs-v [a {:pred  p
-                                       :skip? (if (some #(when (= a (first %))
-                                                           (:skip? (peek %)))
-                                                        attrs-v2)
-                                                true false)
-                                       :fidx  nil}])
+                    [(conj attrs-v
+                           [a (assoc options :skip? true :fidx f)])
+                     vars cols]
+                    [(conj attrs-v
+                           [a (assoc options
+                                     :skip? skip?
+                                     :fidx nil)])
                      (conj vars v) (conj cols col)])))))
           (if (or ip (nil? v1))
-            [[[a1 {:pred  ip
-                   :skip? (if (and v1 (find-index v1 ncols)) false true)
-                   :fidx  nil}]]
+            [[[a1 (assoc ip-options
+                         :skip? (not (and v1 (find-index v1 ncols)))
+                         :fidx nil)]]
              (if v1 [v1] [])
              (if v1 [#{a1 v1}] [])]
             [[] [] []])
