@@ -4,14 +4,18 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.query.execute :as qexec]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.query-util :as qu]
+   [datalevin.relation :as r]
    [datalevin.util :as u])
   (:import
-   [java.util List UUID]))
+   [java.util List UUID]
+   [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def late-expansion-query
   '[:find ?id ?score
@@ -152,6 +156,99 @@
                 remaining (get-in (equality-rewritten-context db-value query)
                                   [:parsed-q :qorig-where])]
             (is (= where remaining)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest costed-indexed-union-order-test
+  (let [dir    (u/tmp-dir (str "indexed-union-order-" (UUID/randomUUID)))
+        schema {:message/hasCreator  {:db/valueType :db.type/ref}
+                :message/isLocatedIn {:db/valueType :db.type/ref}}
+        conn   (d/get-conn dir schema)
+        creator-clause '[?message :message/hasCreator ?person]
+        union-clause   pushed-equality-disjunction-clause
+        resolve-late   @(ns-resolve 'datalevin.query.execute
+                                    'resolve-late-clauses)
+        choose-union   @(ns-resolve 'datalevin.query.execute
+                                    'cheaper-indexed-union)
+        make-context
+        (fn [people]
+          {:sources {'$ (d/db conn)}
+           :rules   nil
+           :rels
+           [(r/relation!
+              {'?person 0 '?country-x 1 '?country-y 2}
+              (FastList. ^java.util.Collection
+                         (mapv #(object-array [% 100 101]) people)))]})
+        run
+        (fn [people]
+          (let [explain (volatile! {})
+                context (make-context people)
+                result  (binding [qplan/*explain* explain
+                                  qu/*implicit-source* (get-in context
+                                                               [:sources '$])]
+                          (resolve-late context
+                                        [creator-clause union-clause]))
+                rel     (if (< 1 (count (:rels result)))
+                          (reduce j/hash-join (:rels result))
+                          (first (:rels result)))
+                attrs   (:attrs rel)]
+            {:decision (first (:late-clause-decisions @explain))
+             :order    (:late-clauses result)
+             :rows     (into #{}
+                             (map (fn [^objects tuple]
+                                    (mapv #(aget tuple (long (attrs %)))
+                                          ['?message '?person
+                                           '?x-inc '?y-inc])))
+                             (:tuples rel))}))]
+    (try
+      (let [messages
+            (into
+              [{:db/id 1000 :message/hasCreator 10
+                :message/isLocatedIn 100}
+               {:db/id 1001 :message/hasCreator 10
+                :message/isLocatedIn 100}
+               {:db/id 1002 :message/hasCreator 10
+                :message/isLocatedIn 101}
+               {:db/id 1003 :message/hasCreator 10
+                :message/isLocatedIn 101}
+               {:db/id 2000 :message/hasCreator 11
+                :message/isLocatedIn 100}
+               {:db/id 2001 :message/hasCreator 11
+                :message/isLocatedIn 101}]
+              (map (fn [^long id]
+                     {:db/id id :message/hasCreator 10
+                      :message/isLocatedIn 102}))
+              (range 1004 1020))]
+        (d/transact! conn messages))
+      (let [wide          (run [10 11])
+            narrow        (run [11])
+            wide-choice   (:decision wide)
+            narrow-choice (:decision narrow)]
+        (testing "the smaller indexed country union runs before creator fanout"
+          (is (= :indexed-union-first (:strategy wide-choice)))
+          (is (= 22 (:pattern-fanout wide-choice)))
+          (is (= 6 (:union-fanout wide-choice)))
+          (is (= union-clause (first (:order wide))))
+          (is (= #{[1000 10 1 0] [1001 10 1 0]
+                   [1002 10 0 1] [1003 10 0 1]
+                   [2000 11 1 0] [2001 11 0 1]}
+                 (:rows wide))))
+        (testing "a selective creator binding retains creator-first order"
+          (is (= :bound-pattern-first (:strategy narrow-choice)))
+          (is (= 2 (:pattern-fanout narrow-choice)))
+          (is (= 6 (:union-fanout narrow-choice)))
+          (is (= creator-clause (first (:order narrow))))
+          (is (= #{[2000 11 1 0] [2001 11 0 1]}
+                 (:rows narrow))))
+        (testing "ordinary late clauses cause no speculative index counts"
+          (is (nil?
+                (with-redefs [db/-count
+                              (fn [& _]
+                                (throw (ex-info "unexpected count" {})))]
+                  (choose-union
+                    (make-context [10 11]) creator-clause
+                    ['[?message :message/isLocatedIn ?country-x]]))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

@@ -368,6 +368,131 @@
                   (.add acc (object-array [v])))))))))
     acc))
 
+(defn- resolve-value-pairs
+  [db attr values]
+  (let [ref-attr? (and (keyword? attr) (db/ref? db attr))]
+    (keep (fn [value]
+            (if ref-attr?
+              (when-some [resolved (if (or (qu/lookup-ref? value)
+                                           (keyword? value))
+                                     (db/entid db value)
+                                     value)]
+                [value resolved])
+              [value value]))
+          values)))
+
+(defn- pairs-by-resolved
+  [pairs]
+  (reduce (fn [m [original resolved]]
+            (update m resolved (fnil conj []) original))
+          {}
+          pairs))
+
+(defn- bounded-side-fanout
+  ^long [db patterns]
+  (reduce
+    (fn [^long total pattern]
+      (let [n (long (db/-count db pattern))]
+        (if (> n (- Long/MAX_VALUE total))
+          (reduced Long/MAX_VALUE)
+          (+ total n))))
+    0
+    patterns))
+
+(defn- bounded-both-strategy
+  [db attr entity-pairs value-pairs]
+  (let [entity-count  (long (count entity-pairs))
+        value-count   (long (count value-pairs))
+        cardinality-many?
+        (identical? :db.cardinality/many
+                    (get-in (db/-schema db) [attr :db/cardinality]))
+        ;; A cardinality-one EAV lookup emits at most one value per entity, so
+        ;; counting every entity first would merely duplicate the actual scan.
+        entity-fanout (if cardinality-many?
+                        (bounded-side-fanout
+                          db (map (fn [[_ e]] [e attr nil]) entity-pairs))
+                        entity-count)
+        value-fanout  (bounded-side-fanout
+                        db (map (fn [[_ v]] [nil attr v]) value-pairs))
+        scan-count    (long (db/-count db [nil attr nil]))
+        alternatives
+        (cond-> [{:kind       :full
+                  :candidates scan-count
+                  :cost       (estimate-full-lookup-cost
+                                (+ entity-count value-count) scan-count)}]
+          (<= entity-count multi-lookup-safety-limit)
+          (conj {:kind       :entity
+                 :candidates entity-fanout
+                 :cost       (estimate-multi-lookup-cost
+                               entity-count entity-fanout)})
+
+          (<= value-count multi-lookup-safety-limit)
+          (conj {:kind       :value
+                 :candidates value-fanout
+                 :cost       (estimate-multi-lookup-cost
+                               value-count value-fanout)}))]
+    (:kind (apply min-key :cost alternatives))))
+
+(defn- pair-input-list
+  [pairs]
+  (let [input (FastList. (count pairs))]
+    (doseq [[_ resolved] pairs]
+      (.add input (object-array [resolved])))
+    input))
+
+(defn- add-bounded-match!
+  [^List acc entity-originals value-originals]
+  (doseq [entity entity-originals
+          value  value-originals]
+    (.add acc (object-array [entity value])))
+  acc)
+
+(defn- lookup-pattern-bounded-both
+  "Intersect a pattern with bound sets on both entity and value while reading
+   only the cheaper indexed side (or one full scan). Unlike a generic lookup
+   followed by two hash joins, non-matching tuples are never materialized."
+  [db pattern entity-values value-values]
+  (let [[_ attr _]  pattern
+        entity-pairs (vec (resolve-entity-pairs db entity-values))
+        value-pairs  (vec (resolve-value-pairs db attr value-values))
+        entities     (pairs-by-resolved entity-pairs)
+        values       (pairs-by-resolved value-pairs)
+        strategy     (bounded-both-strategy db attr entity-pairs value-pairs)
+        acc          (FastList.)]
+    (case strategy
+      :entity
+      (when-let [^List tuples
+                 (db/-eav-scan-v-list
+                   db (pair-input-list entity-pairs) 0
+                   [[attr {:skip? false}]])]
+        (dotimes [i (.size tuples)]
+          (let [^objects tuple (.get tuples i)
+                entity-originals (get entities (aget tuple 0))
+                value-originals  (get values (aget tuple 1))]
+            (when (and entity-originals value-originals)
+              (add-bounded-match! acc entity-originals value-originals)))))
+
+      :value
+      (when-let [^List tuples
+                 (db/-val-eq-scan-e-list
+                   db (pair-input-list value-pairs) 0 attr)]
+        (dotimes [i (.size tuples)]
+          (let [^objects tuple (.get tuples i)
+                value-originals  (get values (aget tuple 0))
+                entity-originals (get entities (aget tuple 1))]
+            (when (and entity-originals value-originals)
+              (add-bounded-match! acc entity-originals value-originals)))))
+
+      :full
+      (when-let [^List tuples (db/-search-tuples db [nil attr nil])]
+        (dotimes [i (.size tuples)]
+          (let [^objects tuple (.get tuples i)
+                entity-originals (get entities (aget tuple 0))
+                value-originals  (get values (aget tuple 1))]
+            (when (and entity-originals value-originals)
+              (add-bounded-match! acc entity-originals value-originals))))))
+    acc))
+
 (defn lookup-pattern-db
   [context db pattern]
   (let [[e a v]           pattern
@@ -381,20 +506,28 @@
         scan-count        (delay (long (db/-count db @search-pattern)))
         entity-values     (when (and (qu/binding-var? e) (keyword? a))
                             (bound-values context e))
-        use-entity-multi? (and entity-values
+        value-values      (when (and (qu/binding-var? e)
+                                     (qu/binding-var? v)
+                                     (not= e v)
+                                     (keyword? a))
+                            (bound-values context v))
+        use-bounded-both? (and entity-values value-values)
+        use-entity-multi? (and (not use-bounded-both?)
+                               entity-values
                                (multi-lookup-cheaper?
                                  (long (.size ^HashSet entity-values))
                                  @scan-count))
-        value-values      (when (and (not use-entity-multi?)
-                                     (qu/binding-var? e)
-                                     (qu/binding-var? v)
-                                     (keyword? a))
-                            (bound-values context v))
-        use-value-multi?  (and value-values
+        use-value-multi?  (and (not use-bounded-both?)
+                               value-values
                                (multi-lookup-cheaper?
                                  (long (.size ^HashSet value-values))
                                  @scan-count))]
     (cond
+      use-bounded-both?
+      (r/relation! {e 0, v 1}
+                   (lookup-pattern-bounded-both db pattern entity-values
+                                                value-values))
+
       use-entity-multi?
       (let [resolved-pattern (resolve-pattern-lookup-refs db pattern)
             entity-pairs     (resolve-entity-pairs db entity-values)

@@ -267,6 +267,44 @@ useful for cardinality-many attributes used only as existence conditions. A
 concrete value also emits only the entity binding once after a successful
 probe, while a required value variable retains normal multiplicity.
 
+When both the entity and value variables have multi-value bindings, the lookup
+intersects them while reading the cheaper physical side. It compares batched
+EAV probes, batched AVE probes, and an attribute scan using the current index
+counts. Tuples whose opposite endpoint is not in the other bound set are
+discarded during the read, before a relation and its hash joins are
+materialized.
+
+### Costed late indexed-union scheduling
+
+Some dependencies expressed by rules or disjunctions are deliberately left
+outside the graph plan and resolved after its planned components. At that
+boundary, Datalevin can reorder a bound database pattern with a later indexed
+`or-join` that produces the pattern's entity variable. For the rewritten
+country example above, this means choosing between expanding all messages for
+the currently bound people and first forming the union of message IDs in the
+two bound countries.
+
+The decision uses exact index counts for the values present in the runtime
+relations. It charges the indexed union for its probes and retrievals, the
+isolated projection needed to materialize it, and the subsequent two-sided
+pattern lookup. The original bound pattern is retained when that complete
+switch cost is not lower. This avoids relying on a fixed cardinality ratio and
+allows the same query shape to choose a different order for different input
+parameters.
+
+Eligibility is intentionally narrow: a flat explicit `or-join` must have at
+least two branches, each branch must contain one pattern with the same source
+and attribute, the entity must be declared by the `or-join`, and every
+currently bound declared variable must have exactly one value. The remaining
+branch clauses may only be constant `ground` bindings. The union is evaluated
+in an isolated context and projected to its newly produced variables before it
+is joined with the outer relations. This prevents unrelated singleton seed
+columns from creating a Cartesian product during materialization.
+
+With `{:run? true}`, `explain` reports these runtime choices in
+`:late-clause-decisions`, including both fanouts, both producer costs, the
+complete union switch cost, and the selected strategy.
+
 ### Ordered limit push-down
 
 An ordered query with a small `:limit` should not have to materialize and sort

@@ -13,8 +13,10 @@
   (:require
    [clojure.walk :as w]
    [datalevin.built-ins :as built-ins]
+   [datalevin.constants :as c]
    [datalevin.db :as db]
    [datalevin.inline :refer [update assoc]]
+   [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.pull-api :as dpa]
    [datalevin.query.aggregate :as qagg]
@@ -281,6 +283,261 @@
     (assoc :late-clauses
            (sort-late-clauses (planned-bound-vars context) late-clauses))))
 
+(defn- context-bound-values
+  [context sym]
+  (when-let [{:keys [attrs tuples]}
+             (some #(when (contains? (:attrs %) sym) %) (:rels context))]
+    (let [idx (long (attrs sym))]
+      (into #{}
+            (map (fn [^objects tuple] (aget tuple idx)))
+            tuples))))
+
+(defn- data-pattern-parts
+  [clause default-source]
+  (when (vector? clause)
+    (let [source? (qu/source? (first clause))
+          pattern (if source? (subvec clause 1) clause)]
+      (when (and (= 3 (count pattern))
+                 (qu/binding-var? (first pattern))
+                 (keyword? (second pattern))
+                 (qu/binding-var? (nth pattern 2)))
+        {:source (if source? (first clause) default-source)
+         :entity (first pattern)
+         :attr   (second pattern)
+         :value  (nth pattern 2)}))))
+
+(defn- constant-ground-binding?
+  [clause]
+  (when (and (vector? clause) (= 2 (count clause)))
+    (let [[call binding] clause]
+      (and (sequential? call)
+           (u/sym-name-eqs (first call) "ground")
+           (empty? (qu/collect-vars call))
+           (qu/binding-var? binding)))))
+
+(defn- branch-clauses
+  [branch]
+  (if (and (sequential? branch)
+           (u/sym-name-eqs (first branch) "and"))
+    (vec (next branch))
+    [branch]))
+
+(defn- branch-indexed-producer
+  [branch default-source]
+  (let [clauses   (branch-clauses branch)
+        producers (keep-indexed
+                    (fn [idx clause]
+                      (when-let [producer
+                                 (data-pattern-parts clause default-source)]
+                        (assoc producer :idx idx)))
+                    clauses)]
+    (when (= 1 (count producers))
+      (let [{:keys [idx] :as producer} (first producers)]
+        (when (every? constant-ground-binding?
+                      (u/remove-idxs #{idx} clauses))
+          (dissoc producer :idx))))))
+
+(defn- indexed-or-union
+  [context clause entity]
+  (when (and (sequential? clause) (not (vector? clause)))
+    (let [source? (qu/source? (first clause))
+          body    (if source? (next clause) clause)
+          source  (if source? (first clause) '$)]
+      (when (and (u/sym-name-eqs (first body) "or-join")
+                 (vector? (second body))
+                 (not (vector? (first (second body))))
+                 (<= 2 (count (nnext body))))
+        (let [vars      (set (second body))
+              bound     (qresolve/bound-vars context)
+              producers (mapv #(branch-indexed-producer % source)
+                              (nnext body))]
+          (when (and (every? some? producers)
+                     (contains? vars entity)
+                     (every? #(= entity (:entity %)) producers)
+                     (every? #(contains? vars (:value %)) producers)
+                     (apply = (map (juxt :source :attr) producers))
+                     (every? #(= 1 (count (context-bound-values
+                                           context (:value %))))
+                             producers)
+                     (every? #(= 1 (count (context-bound-values context %)))
+                             (filter bound vars)))
+            {:clause    clause
+             :entity    entity
+             :source    (:source (first producers))
+             :attr      (:attr (first producers))
+             :producers producers}))))))
+
+(defn- saturating-add
+  ^long [^long x ^long y]
+  (if (> y (- Long/MAX_VALUE x))
+    Long/MAX_VALUE
+    (+ x y)))
+
+(defn- indexed-fanout
+  ^long [source attr values]
+  (reduce
+    (fn [^long total value]
+      (let [pattern (qresolve/resolve-pattern-lookup-refs
+                      source [nil attr value])]
+        (saturating-add total (long (db/-count source pattern)))))
+    0
+    values))
+
+(defn- indexed-producer-cost
+  ^double [^long probe-count ^long output-count]
+  (+ (* (double probe-count) (double c/magic-cost-link-probe))
+     (* (double output-count) (double c/magic-cost-link-retrieval))
+     (* (+ (double probe-count) (double output-count))
+        (double c/magic-cost-hash-join))))
+
+(defn- or-join-vars
+  [clause]
+  (let [body (if (qu/source? (first clause)) (next clause) clause)]
+    (second body)))
+
+(defn- isolated-union-switch-cost
+  ^double [context clause ^long fanout ^double producer-cost]
+  (let [vars      (or-join-vars clause)
+        bound     (qresolve/bound-vars context)
+        new-width (count (remove bound vars))
+        projection-cost
+        (* (double fanout)
+           (+ (double c/magic-cost-hash-join-output-tuple)
+              (* (double new-width)
+                 (double c/magic-cost-hash-join-output-cell))))
+        follow-up-cost (indexed-producer-cost fanout fanout)]
+    (+ producer-cost projection-cost follow-up-cost)))
+
+(defn- bound-pattern-producer
+  [context clause]
+  (when-let [{:keys [source entity value] :as producer}
+             (data-pattern-parts clause '$)]
+    (let [bound  (qresolve/bound-vars context)
+          source (get (:sources context) source)
+          values (context-bound-values context value)]
+      (when (and source
+                 (db/-searchable? source)
+                 (not (contains? bound entity))
+                 (contains? bound value)
+                 (some? values))
+        (assoc producer :source-db source :values values)))))
+
+(defn- union-producer-estimate
+  [context {:keys [source attr producers] :as union}]
+  (when-let [source-db (get (:sources context) source)]
+    (when (db/-searchable? source-db)
+      (let [{:keys [probes output]}
+            (reduce
+              (fn [{:keys [^long probes ^long output]} producer]
+                (let [values (context-bound-values context (:value producer))]
+                  {:probes (saturating-add probes (long (count values)))
+                   :output (saturating-add
+                             output
+                             (indexed-fanout source-db attr values))}))
+              {:probes 0 :output 0}
+              producers)]
+        (assoc union
+               :probe-count probes
+               :fanout output
+               :cost (indexed-producer-cost probes output))))))
+
+(defn- cheaper-indexed-union
+  [context clause remaining]
+  (when-let [{:keys [entity attr source-db values]}
+             (bound-pattern-producer context clause)]
+    (let [candidates
+          (keep-indexed
+            (fn [idx candidate]
+              (when-let [union (indexed-or-union context candidate entity)]
+                (assoc union :idx (unchecked-inc (long idx)))))
+            remaining)]
+      ;; Do no index counting on the common path where no compatible union is
+      ;; waiting. In particular, ordinary JOB late clauses pay no scheduling
+      ;; overhead merely because their pattern value is already bound.
+      (when (seq candidates)
+        (let [pattern-fanout (indexed-fanout source-db attr values)
+              pattern-cost   (indexed-producer-cost (count values)
+                                                    pattern-fanout)
+              unions
+              (keep
+                (fn [candidate]
+                  (when-let [estimate
+                             (union-producer-estimate context candidate)]
+                    (assoc estimate
+                           :switch-cost
+                           (isolated-union-switch-cost
+                             context (:clause candidate) (:fanout estimate)
+                             (double (:cost estimate))))))
+                candidates)]
+          (when-let [{:keys [idx fanout cost switch-cost] :as best}
+                     (when (seq unions)
+                       (apply min-key :switch-cost unions))]
+            (let [switch-cost (double switch-cost)]
+              {:idx (if (< switch-cost pattern-cost) idx 0)
+               :decision
+               {:strategy          (if (< switch-cost pattern-cost)
+                                     :indexed-union-first
+                                     :bound-pattern-first)
+                :entity            entity
+                :bound-pattern     clause
+                :indexed-union     (:clause best)
+                :pattern-probes    (count values)
+                :pattern-fanout    pattern-fanout
+                :pattern-cost      pattern-cost
+                :union-probes      (:probe-count best)
+                :union-fanout      fanout
+                :union-cost        cost
+                :union-switch-cost switch-cost}})))))))
+
+(defn- isolated-union-context
+  [context clause]
+  (let [vars       (or-join-vars clause)
+        bound      (qresolve/bound-vars context)
+        bound-vars (filterv bound vars)
+        new-vars   (filterv (complement bound) vars)
+        seed-rels
+        (keep
+          (fn [rel]
+            (let [rel-vars (filterv #(contains? (:attrs rel) %) bound-vars)]
+              (when (seq rel-vars)
+                (r/project-distinct rel rel-vars))))
+          (:rels context))
+        seed-rel   (if (< 1 (count seed-rels))
+                     (reduce j/hash-join seed-rels)
+                     (first seed-rels))
+        resolved   (qresolve/resolve-clause
+                     (assoc context :rels [seed-rel]) clause)
+        union-rel  (if (< 1 (count (:rels resolved)))
+                     (reduce j/hash-join (:rels resolved))
+                     (first (:rels resolved)))
+        projected  (r/project-distinct union-rel new-vars)]
+    ;; The bound seed variables have already constrained the union. Keeping
+    ;; them on the new relation would eagerly cross-product the union with an
+    ;; unrelated outer relation that happens to carry the same singleton.
+    (update context :rels conj projected)))
+
+(defn- resolve-late-clauses
+  [context clauses]
+  (loop [context  context
+         pending  (vec clauses)
+         executed []]
+    (if (empty? pending)
+      (assoc context :late-clauses executed)
+      (let [clause   (first pending)
+            choice   (cheaper-indexed-union context clause (next pending))
+            idx      (long (or (:idx choice) 0))
+            selected (nth pending idx)]
+        (when-let [decision (:decision choice)]
+          (when qplan/*explain*
+            (vswap! qplan/*explain* update :late-clause-decisions
+                    (fnil conj []) decision)))
+        (recur (if (= :indexed-union-first
+                      (get-in choice [:decision :strategy]))
+                 (isolated-union-context context selected)
+                 (qresolve/resolve-clause context selected))
+               (u/vec-remove pending idx)
+               (conj executed selected))))))
+
 (defn- plan-explain
   []
   (when qplan/*explain*
@@ -299,7 +556,7 @@
           (do (plan-explain) c)
           (if run? (execute-plan c) c)
           (if run?
-            (reduce qresolve/resolve-clause c (:late-clauses c))
+            (resolve-late-clauses c (:late-clauses c))
             c))))))
 
 (defn -collect-tuples
@@ -1052,7 +1309,7 @@
     (if (= result-set #{})
       context
       (let [context (execute-plan context)]
-        (reduce qresolve/resolve-clause context late-clauses)))))
+        (resolve-late-clauses context late-clauses)))))
 
 (defn- execute-planned-query
   [context inputs]
