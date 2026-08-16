@@ -16,7 +16,7 @@
    [datalevin.ints :as i]
    [datalevin.sparselist :as sl]
    [clojure.string :as s]
-   [taoensso.nippy :as nippy])
+   [datalevin.hako-codec :as codec])
   (:import
    [java.util Arrays UUID Date Base64 Base64$Decoder Base64$Encoder]
    [java.util.regex Pattern]
@@ -94,31 +94,18 @@
 
 (defn bigint-from-reader ^BigInteger [^String s] (BigInteger. s))
 
-;; nippy
+;; hako (was nippy)
 
 (defn serialize ^bytes
   [x]
-  (binding [nippy/*freeze-serializable-allowlist*
-            (if (seq c/*data-serializable-classes*)
-              (into nippy/*thaw-serializable-allowlist*
-                    c/*data-serializable-classes*)
-              nippy/*thaw-serializable-allowlist*)]
-    (if (instance? java.lang.Class x)
-      (u/raise "Unfreezable type: java.lang.Class" {})
-      (nippy/fast-freeze x))))
+  (if (instance? java.lang.Class x)
+    (u/raise "Unfreezable type: java.lang.Class" {})
+    (codec/fast-freeze x)))
 
 (defn deserialize
   "Deserialize from bytes. "
   [^bytes bs]
-  (binding [nippy/*thaw-serializable-allowlist*
-            (if (seq c/*data-serializable-classes*)
-              (into nippy/*thaw-serializable-allowlist*
-                    c/*data-serializable-classes*)
-              nippy/*thaw-serializable-allowlist*)]
-    (try
-      (nippy/fast-thaw bs)
-      (catch Exception _
-        (nippy/thaw bs)))))
+  (codec/fast-thaw bs))
 
 ;; bitmap
 
@@ -158,15 +145,15 @@
   [bitmaps]
   (when-not (empty? bitmaps)
     (FastAggregation/and
-      ^"[Lorg.roaringbitmap.RoaringBitmap;"
-      (into-array RoaringBitmap bitmaps))))
+     ^"[Lorg.roaringbitmap.RoaringBitmap;"
+     (into-array RoaringBitmap bitmaps))))
 
 (defn bitmaps-or
   [bitmaps]
   (when-not (empty? bitmaps)
     (FastAggregation/or
-      ^"[Lorg.roaringbitmap.RoaringBitmap;"
-      (into-array RoaringBitmap bitmaps))))
+     ^"[Lorg.roaringbitmap.RoaringBitmap;"
+     (into-array RoaringBitmap bitmaps))))
 
 (defn bitmap-or
   [a b]
@@ -264,12 +251,21 @@
   (get-bytes bf (- (.remaining bf) post-v)))
 
 (defn- get-data
-  "Read data from a ByteBuffer"
+  "Read data from a ByteBuffer. Phase-2 path: decodes hako bytes
+  directly via a MemorySegment view of the ByteBuffer region, no
+  intermediate byte[] allocation. Empty payloads (n == 0) yield nil;
+  negative `n` (post-v overruns remaining) throws."
   ([^ByteBuffer bb]
-   (when-let [bs (get-bytes bb)]
-     (deserialize bs)))
+   (let [n (.remaining bb)]
+     (when (pos? n)
+       (codec/get-data-from-buffer! bb n))))
   ([^ByteBuffer bb post-v]
-   (when-let [bs (get-bytes-val bb post-v)] (deserialize bs))))
+   (let [n (- (.remaining bb) (long post-v))]
+     (cond
+       (neg? n) (throw (IllegalStateException.
+                        (str "bits/get-data: post-v " post-v
+                             " exceeds remaining " (.remaining bb))))
+       (pos? n) (codec/get-data-from-buffer! bb n)))))
 
 (def ^:no-doc ^:const float-sign-idx 31)
 (def ^:no-doc ^:const double-sign-idx 63)
@@ -284,9 +280,9 @@
 (defn- put-instant
   [^ByteBuffer bf x]
   (.putLong bf (code-instant
-                 (if (inst? x)
-                   (inst-ms x)
-                   (u/raise "Expect an inst? value" {:value x})))))
+                (if (inst? x)
+                  (inst-ms x)
+                  (u/raise "Expect an inst? value" {:value x})))))
 
 (defn- decode-float
   [x]
@@ -408,7 +404,12 @@
         ^int scale        (get-int bb)]
     (BigDecimal. value scale)))
 
-(defn- put-data [^ByteBuffer bb x] (put-bytes bb (serialize x)))
+(defn- put-data [^ByteBuffer bb x]
+  ;; Phase-2 path: hako encodes into a reusable arena-backed segment,
+  ;; then copies segment → ByteBuffer directly. Skips the byte[]
+  ;; intermediate that `serialize` + `put-bytes` allocate on every
+  ;; LMDB write.
+  (codec/put-data-into-buffer! bb x))
 
 (defn- put-uuid
   [bf ^UUID val]
@@ -500,7 +501,7 @@
 (defn- string-bytes
   [^String v]
   (wrap-extrema
-    v c/min-bytes c/max-bytes (.getBytes v StandardCharsets/UTF_8)))
+   v c/min-bytes c/max-bytes (.getBytes v StandardCharsets/UTF_8)))
 
 (defn- key-sym-bytes
   [x]
@@ -604,8 +605,8 @@
     -10 (put-double bf (wrap-extrema v Double/NEGATIVE_INFINITY
                                      Double/POSITIVE_INFINITY v))
     -9  (put-long bf (code-instant
-                       (wrap-extrema v Long/MIN_VALUE Long/MAX_VALUE
-                                     (.getTime ^Date v))))
+                      (wrap-extrema v Long/MIN_VALUE Long/MAX_VALUE
+                                    (.getTime ^Date v))))
     -8  (put-long bf (wrap-extrema v c/e0 Long/MAX_VALUE v))
     -7  (put-uuid bf (wrap-extrema v c/min-uuid c/max-uuid v))
     -3  (put-byte bf (wrap-extrema v c/false-value c/true-value
@@ -622,8 +623,8 @@
                         :db.value/sysMax c/tuple-max-bytes
                         (key-sym-bytes v)))
     -6  (put-bytes bf (wrap-extrema
-                        v c/min-bytes c/tuple-max-bytes
-                        (.getBytes ^String v StandardCharsets/UTF_8)))
+                       v c/min-bytes c/tuple-max-bytes
+                       (.getBytes ^String v StandardCharsets/UTF_8)))
     -14 (put-bytes bf (wrap-extrema v c/min-bytes c/tuple-max-bytes
                                     (encode-bigdec v)))
     -15 (put-bytes bf (wrap-extrema v c/min-bytes c/tuple-max-bytes
@@ -716,9 +717,9 @@
              post-vs (->> (get-tuple-sizes bf c outer-post-v)
                           reverse
                           (reduce
-                            (fn [vs s]
-                              (conj vs (+ ^long s (inc ^long (first vs)))))
-                            '(0))
+                           (fn [vs s]
+                             (conj vs (+ ^long s (inc ^long (first vs)))))
+                           '(0))
                           rest
                           (map #(+ ^long % c 2 outer-post-v))
                           vec)
@@ -739,8 +740,8 @@
          post-vs (->> (get-tuple-sizes bf c outer-post-v)
                       reverse
                       (reduce
-                        (fn [vs s] (conj vs (+ ^long s ^long (first vs))))
-                        '(0))
+                       (fn [vs s] (conj vs (+ ^long s ^long (first vs))))
+                       '(0))
                       rest
                       (map #(+ ^long % c 1 outer-post-v))
                       vec)
@@ -777,16 +778,16 @@
 (defn- tuple-bytes
   [v t]
   (wrap-extrema
-    v c/min-bytes c/max-bytes
-    (let [t        (into [] (map dl-type->raw) t)
-          tuple-bf ^ByteBuffer (bf/get-array-buffer)]
-      (if (= 1 (count t))
-        (put-homo-tuple tuple-bf v (nth t 0))
-        (put-hete-tuple tuple-bf v t))
-      (let [res (Arrays/copyOfRange (.array tuple-bf)
-                                    0 (.position tuple-bf))]
-        (bf/return-array-buffer tuple-bf)
-        res))))
+   v c/min-bytes c/max-bytes
+   (let [t        (into [] (map dl-type->raw) t)
+         tuple-bf ^ByteBuffer (bf/get-array-buffer)]
+     (if (= 1 (count t))
+       (put-homo-tuple tuple-bf v (nth t 0))
+       (put-hete-tuple tuple-bf v t))
+     (let [res (Arrays/copyOfRange (.array tuple-bf)
+                                   0 (.position tuple-bf))]
+       (bf/return-array-buffer tuple-bf)
+       res))))
 
 (defn- val-bytes
   "Turn datalog value into bytes according to :db/valueType"
@@ -989,7 +990,7 @@
      ;; user facing
      :string         (do (put-byte bf (raw-header x :string))
                          (put-bytes
-                           bf (.getBytes ^String x StandardCharsets/UTF_8)))
+                          bf (.getBytes ^String x StandardCharsets/UTF_8)))
      :bigint         (do (put-byte bf (raw-header x :bigint))
                          (put-bigint bf x))
      :bigdec         (do (put-byte bf (raw-header x :bigdec))
@@ -1061,7 +1062,7 @@
   [^ByteBuffer bf data type]
   (when-some [x data]
     (.clear bf)
-    (put-buffer bf x type )
+    (put-buffer bf x type)
     (.flip bf)))
 
 (defn read-buffer

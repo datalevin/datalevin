@@ -15,7 +15,7 @@
    [clojure.edn :as edn]
    [clojure.string :as s]
    [clojure.pprint :as p]
-   [taoensso.nippy :as nippy]
+   [datalevin.hako-codec :as codec]
    [datalevin.async :as a]
    [datalevin.bits :as b]
    [datalevin.util :as u]
@@ -256,9 +256,9 @@
    (p/pprint (set (list-dbis lmdb))))
   ([lmdb data-output]
    (if data-output
-     (nippy/freeze-to-out!
-       data-output
-       (set (list-dbis lmdb)))
+     (codec/freeze-to-out!
+      data-output
+      (set (list-dbis lmdb)))
      (dump-dbis-list lmdb))))
 
 ;; We have consolidated bindings to JavaCPP
@@ -296,7 +296,7 @@
      (p/pprint [(b/encode-base64 k) (b/encode-base64 v)])))
   ([lmdb dbi data-output]
    (if data-output
-     (nippy/freeze-to-out! data-output (nippy-dbi lmdb dbi))
+     (codec/freeze-to-out! data-output (nippy-dbi lmdb dbi))
      (dump-dbi lmdb dbi))))
 
 (defn dump-dbi-section
@@ -314,10 +314,10 @@
    (doseq [dbi (set (list-dbis lmdb))] (dump-dbi lmdb dbi)))
   ([lmdb data-output]
    (if data-output
-     (nippy/freeze-to-out!
-       data-output
-       (conj (for [dbi (set (list-dbis lmdb))] (nippy-dbi lmdb dbi))
-             (nippy-dbi lmdb c/kv-info)))
+     (codec/freeze-to-out!
+      data-output
+      (conj (for [dbi (set (list-dbis lmdb))] (nippy-dbi lmdb dbi))
+            (nippy-dbi lmdb c/kv-info)))
      (dump-all lmdb))))
 
 (defn- load-kv [dbi [k v]]
@@ -333,7 +333,7 @@
 (defn load-dbi
   ([lmdb dbi in nippy?]
    (if nippy?
-     (let [[_ kvs] (nippy/thaw-from-in! in)]
+     (let [[_ kvs] (codec/thaw-from-in! in)]
        (open-dbi lmdb dbi)
        (transact-kv lmdb (map #(load-kv dbi %) kvs)))
      (load-dbi lmdb dbi in)))
@@ -359,7 +359,7 @@
 (defn load-all
   ([lmdb in nippy?]
    (if nippy?
-     (doseq [[{:keys [dbi]} kvs] (nippy/thaw-from-in! in)]
+     (doseq [[{:keys [dbi]} kvs] (codec/thaw-from-in! in)]
        (open-dbi lmdb dbi)
        (transact-kv lmdb (map #(load-kv dbi %) kvs)))
      (load-all lmdb in)))
@@ -392,7 +392,7 @@
                            (mapcat load-dbi)))))
 
 (defn clear [lmdb]
-  (doseq [dbi (set (list-dbis lmdb)) ] (clear-dbi lmdb dbi)))
+  (doseq [dbi (set (list-dbis lmdb))] (clear-dbi lmdb dbi)))
 
 (defn dump
   [db ^String dumpfile]
@@ -413,7 +413,7 @@
   (try
     (let [bk    (when (:backup? opts)
                   (u/tmp-dir
-                    (str "dtlv-re-index-" (System/currentTimeMillis))))
+                   (str "dtlv-re-index-" (System/currentTimeMillis))))
           d     (env-dir db)
           dfile (str d u/+separator+ "kv-dump")]
       (when bk (copy db bk true))
@@ -548,12 +548,12 @@
   [db]
   (* ^long (:psize (stat db))
      ^long (reduce
-             (fn [^long pages dbi]
-               (+ pages (let [m (stat db dbi)]
-               (+ ^long (:branch-pages m)
-                              ^long (:leaf-pages m)
-                              ^long (:overflow-pages m)))))
-             0 (list-dbis db))))
+            (fn [^long pages dbi]
+              (+ pages (let [m (stat db dbi)]
+                         (+ ^long (:branch-pages m)
+                            ^long (:leaf-pages m)
+                            ^long (:overflow-pages m)))))
+            0 (list-dbis db))))
 
 (defmacro with-transaction-kv
   "Evaluate body within the context of a single new read/write transaction,
@@ -586,43 +586,43 @@
              opened?#   (volatile! false)
              condition# (fn [~'e] (and (resized? ~'e) (not writing#)))]
          (u/repeat-try-catch
-             ~c/+in-tx-overflow-times+
-             condition#
-             (try
-               (vreset! opened?# false)
-               (let [watchdog# (volatile! nil)
-                     res#      (try
-                                 (vreset! watchdog#
-                                          (start-explicit-transaction-watchdog!
-                                           tx-timeout-ms#))
-                                 (let [res# (let [~db (if writing#
-                                                        orig-db#
-                                                        (let [db# (open-transact-kv
-                                                                   orig-db#)]
-                                                          (vreset! opened?# true)
-                                                          db#))]
-                                              (u/repeat-try-catch
-                                                  ~c/+in-tx-overflow-times+
-                                                  condition#
-                                                ~@body))]
-                                   (cancel-explicit-transaction-watchdog!
-                                    @watchdog#)
-                                   (assert-explicit-transaction-live!
-                                    @watchdog#)
-                                   res#)
-                                 (catch Throwable t#
-                                   (throw-explicit-transaction-failure!
-                                    @watchdog# t#))
-                                 (finally
-                                   (cancel-explicit-transaction-watchdog!
-                                    @watchdog#)))]
-                 (when (and (not writing#) @opened?#)
-                   (close-transact-kv orig-db#))
-                 res#)
-             (catch Throwable t#
-               (when (and (not writing#) @opened?#)
-                 (abort-open-transaction-kv! orig-db# t#))
-               (throw t#))))))))
+          ~c/+in-tx-overflow-times+
+          condition#
+          (try
+            (vreset! opened?# false)
+            (let [watchdog# (volatile! nil)
+                  res#      (try
+                              (vreset! watchdog#
+                                       (start-explicit-transaction-watchdog!
+                                        tx-timeout-ms#))
+                              (let [res# (let [~db (if writing#
+                                                     orig-db#
+                                                     (let [db# (open-transact-kv
+                                                                orig-db#)]
+                                                       (vreset! opened?# true)
+                                                       db#))]
+                                           (u/repeat-try-catch
+                                            ~c/+in-tx-overflow-times+
+                                            condition#
+                                            ~@body))]
+                                (cancel-explicit-transaction-watchdog!
+                                 @watchdog#)
+                                (assert-explicit-transaction-live!
+                                 @watchdog#)
+                                res#)
+                              (catch Throwable t#
+                                (throw-explicit-transaction-failure!
+                                 @watchdog# t#))
+                              (finally
+                                (cancel-explicit-transaction-watchdog!
+                                 @watchdog#)))]
+              (when (and (not writing#) @opened?#)
+                (close-transact-kv orig-db#))
+              res#)
+            (catch Throwable t#
+              (when (and (not writing#) @opened?#)
+                (abort-open-transaction-kv! orig-db# t#))
+              (throw t#))))))))
 
 ;; for shutting down various executors when the last LMDB exits
 (defonce lmdb-dirs (atom #{}))

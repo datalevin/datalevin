@@ -10,10 +10,12 @@
 (ns ^:no-doc datalevin.datom
   "Datom object"
   (:require
-   [taoensso.nippy :as nippy]
+   [datalevin.hako-codec :as codec]
+   [s-exp.hako.ext :as hext]
    [datalevin.constants :refer [tx0]]
    [datalevin.util :refer [combine-hashes combine-cmp defcomp]])
   (:import
+   [com.s_exp.hako Reader Writer]
    [datalevin.utl BitOps]
    [java.util Arrays]
    [java.io DataInput DataOutput]))
@@ -151,7 +153,7 @@
              :tx    (datom (.-e d) (.-a d) (.-v d) v (datom-added d))
              :added (datom (.-e d) (.-a d) (.-v d) (datom-tx d) v)
              (throw (IllegalArgumentException.
-                      (str "invalid key for #datalevin/Datom: " k))))]
+                     (str "invalid key for #datalevin/Datom: " k))))]
     (if m (with-meta d' m) d')))
 
 ;; printing and reading
@@ -195,17 +197,17 @@
 
 (defcomp cmp-datoms-eavt [^Datom d1, ^Datom d2]
   (combine-cmp
-    (long-compare (.-e d1) (.-e d2))
-    (nil-cmp (.-a d1) (.-a d2))
-    (nil-cmp-type (.-v d1) (.-v d2))
-    (long-compare (datom-tx d1) (datom-tx d2))))
+   (long-compare (.-e d1) (.-e d2))
+   (nil-cmp (.-a d1) (.-a d2))
+   (nil-cmp-type (.-v d1) (.-v d2))
+   (long-compare (datom-tx d1) (datom-tx d2))))
 
 (defcomp cmp-datoms-avet [^Datom d1, ^Datom d2]
   (combine-cmp
-    (nil-cmp (.-a d1) (.-a d2))
-    (nil-cmp-type (.-v d1) (.-v d2))
-    (long-compare (.-e d1) (.-e d2))
-    (long-compare (datom-tx d1) (datom-tx d2))))
+   (nil-cmp (.-a d1) (.-a d2))
+   (nil-cmp-type (.-v d1) (.-v d2))
+   (long-compare (.-e d1) (.-e d2))
+   (long-compare (datom-tx d1) (datom-tx d2))))
 
 (defn datom-e [^Datom d] (.-e d))
 
@@ -217,20 +219,14 @@
 
 (def datom->vec-xf (map datom-eav))
 
-(nippy/extend-freeze Datom :datalevin/datom
-    [^Datom x ^DataOutput out]
-  (.writeLong out (.-e x))
-  (nippy/freeze-to-out! out (.-a x))
-  (nippy/freeze-to-out! out (.-v x))
-  (when-let [tx (.-tx x)]
-    (nippy/freeze-to-out! out tx)))
-
-(nippy/extend-thaw :datalevin/datom
-                   [^DataInput in]
-  (let [vs [(.readLong in)
-            (nippy/thaw-from-in! in)
-            (nippy/thaw-from-in! in)]
-        tx (nippy/thaw-from-in! in)]
-                     (datom-from-reader (if tx
-                                          (conj vs tx)
-                                          vs))))
+(hext/register-user-tag!
+ 1                                      ; subtag 1 = datom (wire id 0x10000001)
+ Datom
+ (fn write-datom [^Writer w ^Datom d]
+   (.putI64 w (.-e d))
+   (.writeAny w (.-a d))
+   (.writeAny w (.-v d))
+   (.writeAny w (.-tx d)))
+ (fn read-datom [^Reader r]
+   ;; write side always emits tx (possibly nil); 4-arity `datom` accepts nil.
+   (datom (.getI64 r) (.readAny r) (.readAny r) (.readAny r))))

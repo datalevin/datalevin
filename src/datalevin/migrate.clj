@@ -13,7 +13,7 @@
    [clojure.java.io :as io]
    [clojure.java.shell :as sh]
    [clojure.edn :as edn]
-   [taoensso.nippy :as nippy]
+   [datalevin.hako-codec :as codec]
    [datalevin.datom :as dd]
    [datalevin.lmdb :as l]
    [datalevin.interface :as if]
@@ -32,8 +32,8 @@
 (defn- jar-url
   [version]
   (format
-    "https://github.com/juji-io/datalevin/releases/download/%s/datalevin-%s-standalone.jar"
-    version version))
+   "https://github.com/juji-io/datalevin/releases/download/%s/datalevin-%s-standalone.jar"
+   version version))
 
 (defn ensure-jar
   [major minor patch]
@@ -200,7 +200,7 @@
   (with-open [in (DataInputStream. (BufferedInputStream. stream))]
     (let [{:keys [format opts schema source-count kv-dbis kv-source-count]
            :as   header}
-          (nippy/thaw-from-in! in)]
+          (codec/thaw-from-in! in)]
       (when-not (and (= mixed-stream-format format)
                      (map? opts)
                      (map? schema)
@@ -211,15 +211,15 @@
       (let [db (volatile! (@empty-db dir schema opts))]
         (try
           (let [end-info (loop []
-                           (let [batch (nippy/thaw-from-in! in)]
+                           (let [batch (codec/thaw-from-in! in)]
                              (if (map? batch)
                                batch
                                (do
                                  (vreset!
-                                   db
-                                   (@fill-db
-                                     @db
-                                     (map #(apply dd/datom %) batch)))
+                                  db
+                                  (@fill-db
+                                   @db
+                                   (map #(apply dd/datom %) batch)))
                                  (recur)))))]
             (when-not (= {:frame       :datalog-end
                           :datom-count source-count}
@@ -239,11 +239,11 @@
                 (let [kv     (l/open-kv dir)
                       result (try
                                (merge
-                                 {:source-count source-count
-                                  :loaded-count loaded-count
-                                  :dump-count   (:datom-count end-info)}
-                                 (load-kv-sections kv in kv-dbis
-                                                   kv-source-count))
+                                {:source-count source-count
+                                 :loaded-count loaded-count
+                                 :dump-count   (:datom-count end-info)}
+                                (load-kv-sections kv in kv-dbis
+                                                  kv-source-count))
                                (finally
                                  (if/close-kv kv)))]
                   (cleanup-non-wal-artifacts! dir opts)
@@ -254,20 +254,20 @@
 
 (defn- load-kv-dbi
   [kv in {:keys [dbi entries opts] :as expected}]
-  (let [start (nippy/thaw-from-in! in)]
+  (let [start (codec/thaw-from-in! in)]
     (when-not (= (assoc expected :frame :dbi) start)
       (raise "Invalid KV migration DBI header"
              {:expected expected :header start}))
     (if opts (if/open-dbi kv dbi opts) (if/open-dbi kv dbi))
     (if/clear-dbi kv dbi)
     (loop [loaded 0]
-      (let [frame (nippy/thaw-from-in! in)]
+      (let [frame (codec/thaw-from-in! in)]
         (cond
           (vector? frame)
           (do
             (if/transact-kv
-              kv
-              (map (fn [[k v]] (l/kv-tx :put dbi k v :raw :raw)) frame))
+             kv
+             (map (fn [[k v]] (l/kv-tx :put dbi k v :raw :raw)) frame))
             (recur (+ loaded (count frame))))
 
           (= {:frame :dbi-end :dbi dbi :entry-count loaded} frame)
@@ -288,11 +288,11 @@
   [kv in dbis source-count]
   (let [loaded-count
         (reduce
-          (fn [total expected]
-            (+ (long total) (long (load-kv-dbi kv in expected))))
-          0
-          dbis)
-        end (nippy/thaw-from-in! in)]
+         (fn [total expected]
+           (+ (long total) (long (load-kv-dbi kv in expected))))
+         0
+         dbis)
+        end (codec/thaw-from-in! in)]
     (when-not (= {:frame :end :entry-count source-count} end)
       (raise "Invalid KV migration stream end" {:frame end}))
     {:kv-source-count source-count
@@ -303,13 +303,13 @@
   [dir stream]
   (with-open [in (DataInputStream. (BufferedInputStream. stream))]
     (let [{:keys [format opts dbis source-count] :as header}
-          (nippy/thaw-from-in! in)]
+          (codec/thaw-from-in! in)]
       (when-not (and (= kv-stream-format format)
                      (map? opts)
                      (valid-kv-dbis? dbis source-count))
         (raise "Invalid KV migration stream header" {:header header}))
       (let [opts (cond-> (dissoc opts :dir :temp? :inmemory?
-                                :max-val-size-changed?)
+                                 :max-val-size-changed?)
                    (:flags opts) (update :flags disj :inmemory))
             kv   (l/open-kv dir opts)
             result

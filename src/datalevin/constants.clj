@@ -280,7 +280,6 @@
 
 (def ^:no-doc ^:const +value-compress-dict-size+ 32) ;; in KB
 
-
 ;; search
 
 (def ^:const default-domain "datalevin")
@@ -412,7 +411,10 @@
 (def ^:no-doc ^:const message-header-size 5) ; bytes, 1 type + 4 length
 
 (def ^:no-doc ^:const message-format-transit (unchecked-byte 0x01))
-(def ^:no-doc ^:const message-format-nippy (unchecked-byte 0x02))
+;; Wire-format tag byte for hako-encoded messages. Value kept at 0x02
+;; (was `message-format-nippy` on master) for wire compatibility with
+;; the existing protocol frame.
+(def ^:no-doc ^:const message-format-hako (unchecked-byte 0x02))
 (def ^:no-doc ^:const message-format-mask 0x0F)
 (def ^:no-doc ^:const message-flag-zstd 0x10)
 
@@ -900,7 +902,6 @@ is Integer/MAX_VALUE, i.e. no cap."}
        :doc     "Change ratio of an attribute's values, beyond which re-sampling will be done"}
   sample-change-ratio 0.05)
 
-
 (def ^{:dynamic true
        :doc     "Max milliseconds to wait for a tuple before failing. nil to wait forever."}
   query-pipe-timeout 3000000)
@@ -912,7 +913,6 @@ is Integer/MAX_VALUE, i.e. no cap."}
 (def ^{:dynamic true
        :doc     "Batch size for pipelined scans. Tuples are buffered, sorted, then scanned in batch for sequential seeks. Set to 0 to disable batching."}
   query-pipe-batch-size 12384)
-
 
 ;; search engine
 

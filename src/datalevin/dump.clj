@@ -14,7 +14,7 @@
    [clojure.string :as str]
    [clojure.pprint :as p]
    [clojure.edn :as edn]
-   [taoensso.nippy :as nippy]
+   [datalevin.hako-codec :as codec]
    [datalevin.util :as u]
    [datalevin.constants :as c]
    [datalevin.conn :as conn]
@@ -62,10 +62,10 @@
   [attr props]
   (when (:db/fulltext props)
     (vec
-      (distinct
-        (cond-> (vec (or (seq (:db.fulltext/domains props))
-                         [c/default-domain]))
-          (:db.fulltext/autoDomain props) (conj (u/keyword->string attr)))))))
+     (distinct
+      (cond-> (vec (or (seq (:db.fulltext/domains props))
+                       [c/default-domain]))
+        (:db.fulltext/autoDomain props) (conj (u/keyword->string attr)))))))
 
 (defn- vector-attr-domains
   [attr props]
@@ -76,10 +76,10 @@
   [attr props]
   (when (:db/embedding props)
     (vec
-      (distinct
-        (cond-> (vec (or (seq (:db.embedding/domains props))
-                         [c/default-domain]))
-          (:db.embedding/autoDomain props) (conj (attr-domain attr)))))))
+     (distinct
+      (cond-> (vec (or (seq (:db.embedding/domains props))
+                       [c/default-domain]))
+        (:db.embedding/autoDomain props) (conj (attr-domain attr)))))))
 
 (defn- idoc-attr-domain
   [attr props]
@@ -89,14 +89,14 @@
 (defn- domains-from-schema
   [schema f]
   (reduce-kv
-    (fn [domains attr props]
-      (let [v (f attr props)]
-        (cond
-          (nil? v) domains
-          (coll? v) (into domains v)
-          :else (conj domains v))))
-    #{}
-    schema))
+   (fn [domains attr props]
+     (let [v (f attr props)]
+       (cond
+         (nil? v) domains
+         (coll? v) (into domains v)
+         :else (conj domains v))))
+   #{}
+   schema))
 
 (defn- fulltext-dbis
   [domain]
@@ -129,11 +129,11 @@
                                 (domains-from-schema schema embedding-attr-domains))
         idoc-domains      (domains-from-schema schema idoc-attr-domain)]
     (set
-      (concat
-        (mapcat fulltext-dbis search-domains)
-        (mapcat vector-dbis vector-domains)
-        (mapcat #(vector-dbis (embedding-index-domain %)) embedding-domains)
-        (mapcat idoc-dbis idoc-domains)))))
+     (concat
+      (mapcat fulltext-dbis search-domains)
+      (mapcat vector-dbis vector-domains)
+      (mapcat #(vector-dbis (embedding-index-domain %)) embedding-domains)
+      (mapcat idoc-dbis idoc-domains)))))
 
 (defn- user-kv-dbis
   [dbis schema opts]
@@ -154,10 +154,10 @@
 
     (map? v)
     (reduce-kv
-      (fn [m k v]
-        (assoc m k (idoc-dump-value v)))
-      {}
-      v)
+     (fn [m k v]
+       (assoc m k (idoc-dump-value v)))
+     {}
+     v)
 
     (vector? v)
     (mapv idoc-dump-value v)
@@ -192,12 +192,12 @@
   ([conn data-output]
    (if data-output
      (let [schema (conn/schema conn)]
-       (nippy/freeze-to-out!
-         data-output
-         [(conn/opts conn)
+       (codec/freeze-to-out!
+        data-output
+        [(conn/opts conn)
          schema
          (map (fn [^Datom datom] (datom-dump-row schema datom))
-               (db/-datoms @conn :eav nil nil nil))]))
+              (db/-datoms @conn :eav nil nil nil))]))
      (dump-datalog conn))))
 
 (defn- dump-datalog-section
@@ -264,12 +264,12 @@
 (defn- normalize-legacy-ha-nil-sentinels
   [opts]
   (reduce
-    (fn [m k]
-      (if (= nippy-meta-protocol-key (get m k))
-        (assoc m k nil)
-        m))
-    (or opts {})
-    legacy-ha-nil-sentinel-keys))
+   (fn [m k]
+     (if (= nippy-meta-protocol-key (get m k))
+       (assoc m k nil)
+       m))
+   (or opts {})
+   legacy-ha-nil-sentinel-keys))
 
 (defn- load-datalog-from-first*
   [dir read-form first-form schema opts stop?]
@@ -293,8 +293,8 @@
 (defn- load-datalog-section
   [dir read-form schema opts]
   (load-datalog-from-first*
-    dir read-form (read-form) schema opts
-    #(and (map? %) (= :datalog (get % section-end-key)))))
+   dir read-form (read-form) schema opts
+   #(and (map? %) (= :datalog (get % section-end-key)))))
 
 (defn- load-mixed
   [dir read-form schema opts]
@@ -336,10 +336,10 @@
           (let [lmdb (l/open-kv dir)]
             (try
               (l/load-all-forms
-                lmdb
-                (cons first-form
-                      (take-while #(not= ::EOF %)
-                                  (repeatedly read-form))))
+               lmdb
+               (cons first-form
+                     (take-while #(not= ::EOF %)
+                                 (repeatedly read-form))))
               (finally
                 (i/close-kv lmdb))))
 
@@ -363,18 +363,23 @@
   ([dir in schema opts nippy?]
    (if nippy?
      (try
-       (let [[old-opts old-schema datoms] (nippy/thaw-from-in! in)
+       (let [[old-opts old-schema datoms] (codec/thaw-from-in! in)
              old-opts                     (normalize-legacy-ha-nil-sentinels
-                                            old-opts)
+                                           old-opts)
              new-opts                     (merge old-opts opts)
              new-schema                   (merge old-schema schema)
              db                           (db/init-db
-                                            (for [d datoms]
-                                              (load-datom new-schema d))
-                                            dir new-schema new-opts)]
+                                           (for [d datoms]
+                                             (load-datom new-schema d))
+                                           dir new-schema new-opts)]
          (db/close-db db))
        (catch Exception e
-         (u/raise "Error loading nippy file into Datalog DB: " e {})))
+         (u/raise
+          "Failed to load binary dump into Datalog DB. If this dump was
+           produced by a pre-hako Datalevin, re-dump it with the old
+           version to the EDN format (drop the `--nippy` flag on
+           `dtlv dump`) and reload here."
+          e {})))
      (load-datalog dir in schema opts)))
   ([dir in schema opts]
    (try

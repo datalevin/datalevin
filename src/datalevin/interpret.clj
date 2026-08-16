@@ -16,7 +16,7 @@
    [clojure.pprint :as p]
    [clojure.java.io :as io]
    [sci.core :as sci]
-   [taoensso.nippy :as nippy]
+   [s-exp.hako.ext :as hext]
    [datalevin.query-util :as qu]
    [datalevin.util :as u]
    [datalevin.core]
@@ -51,12 +51,12 @@
 (defn ^:no-doc available-map [ns var-map pred]
   (let [sci-ns (sci/create-ns ns)]
     (reduce
-      (fn [m [k v]]
-        (assoc m k (sci/new-var (symbol v) v (assoc (meta v)
-                                                    :sci.impl/built-in true
-                                                    :ns sci-ns))))
-      {}
-      (select-keys var-map (keep (fn [[k v]] (when (pred v) k)) var-map)))))
+     (fn [m [k v]]
+       (assoc m k (sci/new-var (symbol v) v (assoc (meta v)
+                                                   :sci.impl/built-in true
+                                                   :ns sci-ns))))
+     {}
+     (select-keys var-map (keep (fn [[k v]] (when (pred v) k)) var-map)))))
 
 (defn ^:no-doc user-facing-map [ns var-map]
   (available-map ns var-map user-facing?))
@@ -66,17 +66,17 @@
 
 (defn- user-facing-vars []
   (reduce
-    (fn [m ns]
-      (assoc m ns (user-facing-map ns (ns-publics ns))))
-    {}
-    user-facing-ns))
+   (fn [m ns]
+     (assoc m ns (user-facing-map ns (ns-publics ns))))
+   {}
+   user-facing-ns))
 
 (defn- additional-vars []
   (reduce
-    (fn [m ns]
-      (assoc m ns (additional-map ns (ns-publics ns))))
-    {}
-    additional-ns))
+   (fn [m ns]
+     (assoc m ns (additional-map ns (ns-publics ns))))
+   {}
+   additional-ns))
 
 (defn ^:no-doc resolve-var [s]
   (when (symbol? s)
@@ -488,20 +488,20 @@
   (let [sci-ns (sci/create-ns ns-sym)]
     [ns-sym
      (reduce
-       (fn [m sym]
-         (let [var-sym (symbol (name sym))
-               v       (or (resolve-public-host-var sym)
-                           (u/raise
-                             "Cannot resolve host var for inter-fn " sym
-                             {:type   :datalevin/unresolved-inter-fn-host-var
-                              :symbol sym}))]
-           (assoc m var-sym
-                  (sci/new-var (symbol v) v
-                               (assoc (meta v)
-                                      :sci.impl/built-in true
-                                      :ns sci-ns)))))
-       {}
-       syms)]))
+      (fn [m sym]
+        (let [var-sym (symbol (name sym))
+              v       (or (resolve-public-host-var sym)
+                          (u/raise
+                           "Cannot resolve host var for inter-fn " sym
+                           {:type   :datalevin/unresolved-inter-fn-host-var
+                            :symbol sym}))]
+          (assoc m var-sym
+                 (sci/new-var (symbol v) v
+                              (assoc (meta v)
+                                     :sci.impl/built-in true
+                                     :ns sci-ns)))))
+      {}
+      syms)]))
 
 (defn- host-var-namespaces
   [src]
@@ -567,16 +567,15 @@
   [fn-name args & body]
   `(def ~fn-name (inter-fn ~args ~@body)))
 
-(nippy/extend-freeze AFn :datalevin/inter-fn
-    [^AFn x ^DataOutput out]
-  (if (inter-fn? x)
-    (nippy/freeze-to-out! out (:source (meta x)))
-    (u/raise "Can only freeze an inter-fn" {:x x})))
-
-(nippy/extend-thaw :datalevin/inter-fn
-    [^DataInput in]
-  (let [src (nippy/thaw-from-in! in)]
-    (source->inter-fn src)))
+(hext/register-user-tag!
+ 9                                      ; subtag 9 = inter-fn (wire id 0x10000009)
+ AFn
+ (fn write-inter-fn [^com.s_exp.hako.Writer w ^AFn x]
+   (if (inter-fn? x)
+     (.writeAny w (:source (meta x)))
+     (u/raise "Can only freeze an inter-fn" {:x x})))
+ (fn read-inter-fn [^com.s_exp.hako.Reader r]
+   (source->inter-fn (.readAny r))))
 
 (defmethod print-method :datalevin/inter-fn [f, ^Writer w]
   (.write w "#datalevin/inter-fn ")

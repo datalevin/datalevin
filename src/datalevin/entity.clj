@@ -16,14 +16,14 @@
    [datalevin.remote :as r]
    [datalevin.util :as u]
    [datalevin.interface :refer [db-name]]
-   [taoensso.nippy :as nippy]
+   [s-exp.hako.ext :as hext]
    [clojure.set :as set]
    [datalevin.query-util :as qu])
   (:import
+   [com.s_exp.hako Reader Writer]
    [datalevin.db DB]
    [datalevin.interface IStore]
-   [datalevin.remote DatalogStore]
-   [java.io DataInput DataOutput]))
+   [datalevin.remote DatalogStore]))
 
 (declare entity ->Entity equiv-entity lookup-entity touch entity->txs
          lookup-stage-then-entity)
@@ -114,8 +114,8 @@
   (let [staged (not-empty (.-tbd e))
         ent    (assoc @(.cache e) :db/id (.eid e))]
     (.write w (pr-str
-                (cond-> ent
-                  staged (assoc :<STAGED> staged))))))
+               (cond-> ent
+                 staged (assoc :<STAGED> staged))))))
 
 (defn- rschema->attr-types
   [{ref-attrs  :db.type/ref
@@ -133,8 +133,6 @@
 (defn- db->attr-types [db]
   (mem-rschema->attr-types (db/-rschema db)))
 
-
-
 (defn lookup-stage-then-entity
   ([e k] (lookup-stage-then-entity e k nil))
   ([^Entity e k default-value]
@@ -150,37 +148,37 @@
         {:keys [ref-many-rattrs ref-many-attrs]}
         (db->attr-types db)]
     (into
-      []
-      (mapcat
-        (fn [[k [meta v]]]
-          (let [{:keys [op]} meta]
-            (if (or (ref-many-attrs k) (ref-many-rattrs k))
-              (let [v (if (qu/lookup-ref? v)
-                        [v]
-                        (u/ensure-vec v))]
-                (case op
-                  :assoc   [[:db.fn/retractAttribute eid k]
-                            {:db/id eid
-                             k      (mapv (fn [e] (or (:db/id e) e)) v)}]
-                  :add     [{:db/id eid
-                             k      (mapv (fn [e] (or (:db/id e) e)) v)}]
-                  :dissoc  [[:db.fn/retractAttribute eid k]]
-                  :retract (into []
-                                 (map (fn [e]
-                                        [:db/retract eid k (:db/id e)]))
-                                 v)))
+     []
+     (mapcat
+      (fn [[k [meta v]]]
+        (let [{:keys [op]} meta]
+          (if (or (ref-many-attrs k) (ref-many-rattrs k))
+            (let [v (if (qu/lookup-ref? v)
+                      [v]
+                      (u/ensure-vec v))]
               (case op
-                (:dissoc :retract) [[:db.fn/retractAttribute eid k]]
-                (:assoc :add)      [[:db/add eid k v]])))))
-      (.-tbd e))))
+                :assoc   [[:db.fn/retractAttribute eid k]
+                          {:db/id eid
+                           k      (mapv (fn [e] (or (:db/id e) e)) v)}]
+                :add     [{:db/id eid
+                           k      (mapv (fn [e] (or (:db/id e) e)) v)}]
+                :dissoc  [[:db.fn/retractAttribute eid k]]
+                :retract (into []
+                               (map (fn [e]
+                                      [:db/retract eid k (:db/id e)]))
+                               v)))
+            (case op
+              (:dissoc :retract) [[:db.fn/retractAttribute eid k]]
+              (:assoc :add)      [[:db/add eid k v]])))))
+     (.-tbd e))))
 
 (defn entity? [x] (instance? Entity x))
 
 (defn- equiv-entity [^Entity this that]
   (and
-    (instance? Entity that)
-    (identical? (.-db this) (.-db ^Entity that)) ; `=` and `hash` on db is expensive
-    (= (.-eid this) (.-eid ^Entity that))))
+   (instance? Entity that)
+   (identical? (.-db this) (.-db ^Entity that)) ; `=` and `hash` on db is expensive
+   (= (.-eid this) (.-eid ^Entity that))))
 
 (defn- lookup-entity
   ([this attr] (lookup-entity this attr nil))
@@ -202,11 +200,11 @@
 (defn touch-components [db a->v]
   (reduce-kv (fn [acc a v]
                (assoc acc a
-                          (if (db/component? db a)
-                            (if (db/multival? db a)
-                              (set (map touch v))
-                              (touch v))
-                            v)))
+                      (if (db/component? db a)
+                        (if (db/multival? db a)
+                          (set (map touch v))
+                          (touch v))
+                        v)))
              {} a->v))
 
 (defn- datoms->cache [db datoms]
@@ -246,10 +244,6 @@
       (assoc m :touched true :cache @(.-cache x))
       m)))
 
-(nippy/extend-freeze Entity :datalevin/entity
-                     [^Entity x ^DataOutput out]
-                     (nippy/freeze-to-out! out (ent->map x)))
-
 (defn- map->ent
   [{:keys [db-name touched cache db/id]}]
   (let [db (let [^DB db (@db/dbs db-name)]
@@ -259,6 +253,10 @@
       (load-cache e cache)
       e)))
 
-(nippy/extend-thaw :datalevin/entity
-                   [^DataInput in]
-                   (map->ent (nippy/thaw-from-in! in)))
+(hext/register-user-tag!
+ 8                                      ; subtag 8 = entity (wire id 0x10000008)
+ Entity
+ (fn write-entity [^Writer w ^Entity x]
+   (.writeAny w (ent->map x)))
+ (fn read-entity [^Reader r]
+   (map->ent (.readAny r))))

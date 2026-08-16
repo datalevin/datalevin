@@ -34,11 +34,11 @@
 
 (def transit-write-handlers
   {Datom           (transit/write-handler
-                     "datalevin/Datom"
-                     (fn [^Datom d] [(.-e d) (.-a d) (.-v d) (.-tx d)]))
+                    "datalevin/Datom"
+                    (fn [^Datom d] [(.-e d) (.-a d) (.-v d) (.-tx d)]))
    SpillableVector (transit/write-handler
-                     "datalevin/SpillableVector"
-                     (fn [v] (into [] v)))})
+                    "datalevin/SpillableVector"
+                    (fn [v] (into [] v)))})
 
 (declare write-transit-bytes)
 
@@ -76,7 +76,9 @@
 
 (defn- serialize-value
   ^bytes [fmt msg]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (write-transit-bytes msg)
     2 (b/serialize msg)
     (u/raise "Unknown wire message format"
@@ -128,9 +130,9 @@
   [^String s]
   (try
     (transit/read
-      (transit/reader
-        (ByteArrayInputStream. (.getBytes s "utf-8")) :json
-        {:handlers transit-read-handlers}))
+     (transit/reader
+      (ByteArrayInputStream. (.getBytes s "utf-8")) :json
+      {:handlers transit-read-handlers}))
     (catch Exception e
       (u/raise "Unable to read transit:" e {:string s}))))
 
@@ -140,7 +142,7 @@
   (try
     (let [baos (ByteArrayOutputStream.)]
       (transit/write
-        (transit/writer baos :json {:handlers transit-write-handlers}) v)
+       (transit/writer baos :json {:handlers transit-write-handlers}) v)
       (.toString baos "utf-8"))
     (catch Exception e
       (u/raise "Unable to write transit:" e {:value v}))))
@@ -174,13 +176,17 @@
 
 (defn- write-value-bf
   [bf fmt msg]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (write-transit-bf bf msg)
     2 (write-nippy-bf bf msg)))
 
 (defn- read-value-bf
   [bf fmt]
-  (case (short fmt)
+  ;; `short` alone would sign-extend a byte >= 0x80; go through
+  ;; fmt-code which masks the flag bits and gives an unsigned code.
+  (case (int (fmt-code fmt))
     1 (read-transit-bf bf)
     2 (read-nippy-bf bf)))
 
@@ -188,7 +194,7 @@
   "Write a message to a ByteBuffer. First byte is format, then four bytes
   length of the whole message (include header), followed by message value"
   ([bf msg]
-   (write-message-bf bf msg c/message-format-nippy nil))
+   (write-message-bf bf msg c/message-format-hako nil))
   ([bf msg fmt]
    (write-message-bf bf msg fmt nil))
   ([^ByteBuffer bf msg fmt wire-opts]
@@ -251,7 +257,7 @@
 (defn send-all
   "Send all data in buffer to channel, will block if channel is busy.
   Close the channel and raise exception if something is wrong"
-  [^SocketChannel ch ^ByteBuffer bf ]
+  [^SocketChannel ch ^ByteBuffer bf]
   (let [non-blocking? (not (.isBlocking ch))
         selector      (volatile! nil)]
     (try
@@ -292,7 +298,7 @@
   ([^SocketChannel ch ^ByteBuffer bf msg wire-opts]
    (locking bf
      (.clear bf)
-     (write-message-bf bf msg c/message-format-nippy wire-opts)
+     (write-message-bf bf msg c/message-format-hako wire-opts)
      (.flip bf)
      (send-all ch bf))))
 
@@ -313,7 +319,7 @@
                  read-bf   (if (< (.capacity read-bf) length)
                              (let [^ByteBuffer bf
                                    (ByteBuffer/allocateDirect
-                                     (* ^long c/+buffer-grow-factor+ length))]
+                                    (* ^long c/+buffer-grow-factor+ length))]
                                (.rewind read-bf)
                                (bf/buffer-transfer read-bf bf)
                                bf)

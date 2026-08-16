@@ -16,11 +16,11 @@
    [datalevin.util :as u]
    [datalevin.lmdb :as l]
    [datalevin.interface :as i]
-   [taoensso.nippy :as nippy]
+   [s-exp.hako.ext :as hext]
    [clojure.set :as set])
   (:import
+   [com.s_exp.hako Reader Writer]
    [java.util Iterator List UUID NoSuchElementException Map Set Collection]
-   [java.io DataInput DataOutput]
    [java.lang.ref Cleaner Cleaner$Cleanable]
    [java.lang.management ManagementFactory]
    [javax.management NotificationEmitter NotificationListener Notification]
@@ -50,9 +50,9 @@
     (let [^NotificationListener listener
           (reify NotificationListener
             (^void handleNotification [_ ^Notification notif _]
-             (when (= (.getType notif)
-                      GarbageCollectionNotificationInfo/GARBAGE_COLLECTION_NOTIFICATION)
-               (set-memory-pressure))))]
+              (when (= (.getType notif)
+                       GarbageCollectionNotificationInfo/GARBAGE_COLLECTION_NOTIFICATION)
+                (set-memory-pressure))))]
       (vswap! listeners assoc gcbean listener)
       (.addNotificationListener gcbean listener nil nil))))
 
@@ -304,7 +304,7 @@
 
   (cons [_ _]
     (throw (UnsupportedOperationException.
-             "Changing SpillableVector.SVecSeq is not supported")))
+            "Changing SpillableVector.SVecSeq is not supported")))
 
   (count [_] (- (count v) i))
 
@@ -329,7 +329,7 @@
 
   (cons [_ _]
     (throw (UnsupportedOperationException.
-             "Changing SpillableVector.RSVecSeq is not supported")))
+            "Changing SpillableVector.RSVecSeq is not supported")))
 
   (count [_] (inc i))
 
@@ -362,24 +362,25 @@
 (defn map-sv
   [f sv]
   (reduce
-    (fn [^SpillableVector acc r] (.cons acc (f r)))
-    (new-spillable-vector)
-    sv))
+   (fn [^SpillableVector acc r] (.cons acc (f r)))
+   (new-spillable-vector)
+   sv))
 
-(nippy/extend-freeze
-    SpillableVector :spillable-vec
-    [^SpillableVector x ^DataOutput out]
-  (let [n (count x)]
-    (.writeLong out n)
-    (dotimes [i n] (nippy/freeze-to-out! out (nth x i)))))
-
-(nippy/extend-thaw
-  :spillable-vec
-  [^DataInput in]
-  (let [n                   (.readLong in)
-        ^SpillableVector vs (new-spillable-vector)]
-    (dotimes [_ n] (.cons vs (nippy/thaw-from-in! in)))
-    vs))
+(hext/register-user-tag!
+ 2                                      ; subtag 2 = spillable-vec (wire id 0x10000002)
+ SpillableVector
+ (fn write-spillable-vec [^Writer w ^SpillableVector x]
+   ;; Iterate via the SpillableVector iterator — `nth` on a spilled
+   ;; backing is O(seek) per index, so a `dotimes`+`nth` loop is
+   ;; quadratic on the disk-resident portion.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it) (.writeAny w (.next it)))))
+ (fn read-spillable-vec [^Reader r]
+   (let [n (.getI64 r)
+         ^SpillableVector vs (new-spillable-vector)]
+     (dotimes [_ n] (.cons vs (.readAny r)))
+     vs)))
 
 (deftype SpillableMap [^long spill-threshold
                        ^String spill-root
@@ -550,15 +551,23 @@
      (doseq [[k v] m] (assoc smap k v))
      smap)))
 
-(nippy/extend-freeze
-  SpillableMap :spillable-map
-  [^SpillableMap x ^DataOutput out]
-  (nippy/freeze-to-out! out (into {} x)))
-
-(nippy/extend-thaw
-  :spillable-map
-  [^DataInput in]
-  (new-spillable-map (nippy/thaw-from-in! in)))
+(hext/register-user-tag!
+ 3                                      ; subtag 3 = spillable-map (wire id 0x10000003)
+ SpillableMap
+ (fn write-spillable-map [^Writer w ^SpillableMap x]
+   ;; Stream entries instead of materialising `(into {} x)` — spilled
+   ;; maps would otherwise pull the entire disk backing into heap here.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it)
+       (let [^java.util.Map$Entry e (.next it)]
+         (.writeAny w (.getKey e))
+         (.writeAny w (.getValue e))))))
+ (fn read-spillable-map [^Reader r]
+   (let [n (.getI64 r)
+         smap (new-spillable-map)]
+     (dotimes [_ n] (assoc smap (.readAny r) (.readAny r)))
+     smap)))
 
 (deftype SpillableSet [^SpillableMap impl
                        ^:unsynchronized-mutable meta]
@@ -574,7 +583,7 @@
 
   (count [_] (count impl))
 
-  (contains[_ o] (.containsKey impl o))
+  (contains [_ o] (.containsKey impl o))
 
   (cons [this o] (.put impl o c/slash) this)
 
@@ -647,12 +656,17 @@
      (doseq [e s] (.put impl e c/slash))
      (SpillableSet. impl nil))))
 
-(nippy/extend-freeze
-  SpillableSet :spillable-set
-  [^SpillableSet x ^DataOutput out]
-  (nippy/freeze-to-out! out (into #{} x)))
-
-(nippy/extend-thaw
-  :spillable-set
-  [^DataInput in]
-  (new-spillable-set (nippy/thaw-from-in! in)))
+(hext/register-user-tag!
+ 4                                      ; subtag 4 = spillable-set (wire id 0x10000004)
+ SpillableSet
+ (fn write-spillable-set [^Writer w ^SpillableSet x]
+   ;; Stream elements instead of `(into #{} x)` — spilled sets would
+   ;; otherwise materialise the whole disk backing into a heap set.
+   (.putI64 w (count x))
+   (let [it (.iterator x)]
+     (while (.hasNext it) (.writeAny w (.next it)))))
+ (fn read-spillable-set [^Reader r]
+   (let [n (.getI64 r)
+         ^SpillableSet s (new-spillable-set)]
+     (dotimes [_ n] (conj s (.readAny r)))
+     s)))
