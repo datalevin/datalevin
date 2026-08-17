@@ -517,10 +517,8 @@
                            (and [(= ?p1 ?p2)]
                                 [(ground 0) ?dist])
                            ;; Find path within 3 hops using friends-3 rule
-                           ;; Note: use unbound ?friend then filter, as bound target doesn't work
                            (and [(not= ?p1 ?p2)]
-                                (friends-3 ?p1 ?friend ?dist)
-                                [(= ?friend ?p2)]))]})
+                                (friends-3 ?p1 ?p2 ?dist)))]})
 
 (def ic14
   {:name        "IC14"

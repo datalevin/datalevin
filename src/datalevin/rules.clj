@@ -429,6 +429,17 @@
   [context]
   (into #{} (mapcat #(keys (:attrs %))) (:rels context)))
 
+(defn- values-for-var
+  [context v]
+  (let [values (HashSet.)]
+    (doseq [rel (:rels context)
+            :let [idx ((:attrs rel) v)]
+            :when (some? idx)]
+      (let [tuples ^List (:tuples rel)]
+        (dotimes [i (.size tuples)]
+          (.add values (aget ^objects (.get tuples i) ^long idx)))))
+    (vec values)))
+
 (defn- clause-source
   [clause context]
   (let [src-sym (if (qu/source? (first clause))
@@ -436,7 +447,16 @@
                   '$)]
     (get-in context [:sources src-sym])))
 
-(defn- clause->pattern [clause] (mapv #(if (qu/free-var? %) nil %) clause))
+(defn- clause-pattern
+  [clause]
+  (if (qu/source? (first clause))
+    (subvec clause 1)
+    clause))
+
+(defn- clause->pattern
+  [clause]
+  (mapv #(if (or (qu/free-var? %) (= % '_)) nil %)
+        (clause-pattern clause)))
 
 (defn- rel-size
   [rel]
@@ -453,9 +473,8 @@
       (rel-size rel))))
 
 (defn- unbound-eav-pattern?
-  [clause context]
-  (let [bound (context-bound-vars context)
-        [e _ v] clause]
+  [clause bound]
+  (let [[e _ v] (clause-pattern clause)]
     (and (or (qu/free-var? e) (= e '_))
          (or (qu/free-var? v) (= v '_))
          (not (contains? bound e))
@@ -470,8 +489,59 @@
         Long/MAX_VALUE
         (unchecked-multiply n factor)))))
 
+(def ^:private ^:const rule-bound-count-limit
+  "Maximum materialized values probed when costing a bound rule pattern."
+  128)
+
+(defn- saturating-count-add
+  ^long [^long x ^long y]
+  (if (> y (- Long/MAX_VALUE x))
+    Long/MAX_VALUE
+    (+ x y)))
+
+(defn- pattern-count
+  ^long [^DB source pattern]
+  (long (or (db/-count source pattern) Long/MAX_VALUE)))
+
+(defn- bounded-pattern-count-sum
+  [^DB source values pattern-fn]
+  (when (<= (long (count values)) (long rule-bound-count-limit))
+    (reduce
+      (fn [^long total value]
+        (saturating-count-add total
+                              (pattern-count source (pattern-fn value))))
+      0 values)))
+
+(defn- context-values-for-term
+  [context term]
+  (when (and (qu/binding-var? term)
+             (contains? (context-bound-vars context) term))
+    (values-for-var context term)))
+
+(defn- bound-pattern-size
+  "Estimate an EAV clause from small value domains already materialized in
+   the rule context. Returns nil when the domains are too large to probe."
+  [^DB source clause context]
+  (let [[e a v]   (clause-pattern clause)
+        a          (if (or (qu/free-var? a) (= a '_)) nil a)
+        e-values   (context-values-for-term context e)
+        v-values   (context-values-for-term context v)
+        fixed-e    (when-not (or (qu/free-var? e) (= e '_)) e)
+        fixed-v    (when-not (or (qu/free-var? v) (= v '_)) v)
+        from-e     (when (some? e-values)
+                     (bounded-pattern-count-sum
+                       source e-values #(vector % a fixed-v)))
+        from-v     (when (some? v-values)
+                     (bounded-pattern-count-sum
+                       source v-values #(vector fixed-e a %)))]
+    (cond
+      (and (some? from-e) (some? from-v))
+      (min (long from-e) (long from-v))
+      (some? from-e) from-e
+      (some? from-v) from-v)))
+
 (defn- estimate-clause-size
-  [clause context]
+  [clause context bound]
   (cond
     (and (vector? clause)
          (dp/parse-pattern clause)
@@ -479,9 +549,9 @@
          (not (dp/parse-fn clause)))
     (if-let [^DB db (clause-source clause context)]
       (try
-        (let [n (or (db/-count (.-store db) (clause->pattern clause))
-                    Long/MAX_VALUE)]
-          (if (unbound-eav-pattern? clause context)
+        (let [n (or (bound-pattern-size db clause context)
+                    (pattern-count db (clause->pattern clause)))]
+          (if (unbound-eav-pattern? clause bound)
             (scale-estimate n c/rule-unbound-pattern-penalty)
             n))
         (catch Exception _ Long/MAX_VALUE))
@@ -514,14 +584,17 @@
                 candidates-indices
                 (range (count remaining)))
 
-              ^long best-idx
-              (first (sort-by
-                       (fn [idx]
-                         (let [clause (nth remaining idx)]
-                           [(- (count (set/intersection
-                                        (clause-free-vars clause) @bound)))
-                            (estimate-clause-size clause context)]))
-                       candidates-indices))
+              scored-candidates
+              (mapv
+                (fn [idx]
+                  (let [clause (nth remaining idx)]
+                    [idx
+                     [(- (count (set/intersection
+                                  (clause-free-vars clause) @bound)))
+                      (estimate-clause-size clause context @bound)]]))
+                candidates-indices)
+
+              ^long best-idx (ffirst (sort-by second scored-candidates))
 
               best-clause (nth remaining best-idx)]
 
@@ -1139,17 +1212,6 @@
     (into #{} (filter qu/free-var?) clause)
 
     :else #{}))
-
-(defn- values-for-var
-  [context v]
-  (let [values (HashSet.)]
-    (doseq [rel (:rels context)
-            :let [idx ((:attrs rel) v)]
-            :when (some? idx)]
-      (let [tuples ^List (:tuples rel)]
-        (dotimes [i (.size tuples)]
-          (.add values (aget ^objects (.get tuples i) ^long idx)))))
-    (vec values)))
 
 (defn- magic-seed-rel
   [context head-vars bound-args]

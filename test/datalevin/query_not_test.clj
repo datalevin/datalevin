@@ -14,6 +14,7 @@
    [datalevin.core :as d]
    [datalevin.db :as db]
    [datalevin.relation :as r]
+   [datalevin.rules]
    [datalevin.util :as u])
   (:import
    [java.util ArrayList UUID]))
@@ -28,6 +29,49 @@
 (defn- rows
   [rel]
   (mapv vec (:tuples rel)))
+
+(deftest rule-bound-value-cardinality-order-test
+  (let [estimate-clause-size @(ns-resolve 'datalevin.rules
+                                          'estimate-clause-size)
+        reorder-clauses      @(ns-resolve 'datalevin.rules
+                                          'reorder-clauses)
+        dir                  (u/tmp-dir
+                               (str "rule-bound-value-cost-"
+                                    (UUID/randomUUID)))
+        conn                 (d/get-conn
+                               dir
+                               {:edge/from {:db/valueType :db.type/long}
+                                :edge/to   {:db/valueType :db.type/long}})
+        middle-values        (vec (range 1000 1012))
+        target               4242
+        bridge-clause        '[?edge :edge/from ?middle]
+        endpoint-clause      '[?edge :edge/to ?target]]
+    (try
+      (d/transact!
+        conn
+        (mapv (fn [^long i middle]
+                {:db/id     (+ 100 i)
+                 :edge/from middle
+                 :edge/to   (if (zero? i) target (+ 5000 i))})
+              (range (count middle-values)) middle-values))
+      (let [database (d/db conn)
+            context  {:sources {'$ database}
+                      :rels
+                      [(r/relation! {'?middle 0}
+                                    (apply tuples (map vector middle-values)))
+                       (r/relation! {'?target 0}
+                                    (tuples [target]))]}
+            bound    #{'?middle '?target}]
+        (testing "small materialized domains produce exact fan-out estimates"
+          (is (= 12 (estimate-clause-size bridge-clause context bound)))
+          (is (= 1 (estimate-clause-size endpoint-clause context bound))))
+        (testing "the selective endpoint wins an equal-connectivity tie"
+          (is (= [endpoint-clause bridge-clause]
+                 (reorder-clauses [bridge-clause endpoint-clause]
+                                  context)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest multi-lookup-cost-selection-test
   (let [cheaper? @(ns-resolve 'datalevin.query.resolve
