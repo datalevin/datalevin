@@ -15,11 +15,43 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [concatv]])
   (:import
-   [java.util List HashMap Collection]
+   [datalevin.utl ArrayUtil LongPairObjectHashMap]
+   [java.util List HashMap Collection Objects]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
 ;; hash join
+
+;; Amortize the primitive map's three backing arrays. The pair-join kernel
+;; crosses over the generic fixed-width key between 64 and 256 build rows.
+(def ^:private ^:const long-pair-hash-min-tuples 256)
+
+(definterface ^:private IPairLookup
+  (^Object resetPair [^Object a ^Object b ^int h]))
+
+(deftype ^:private PairKey [a b ^int h]
+  Object
+  (hashCode [_] h)
+  (equals [_ that]
+    (and (instance? PairKey that)
+         (Objects/equals a (.-a ^PairKey that))
+         (Objects/equals b (.-b ^PairKey that)))))
+
+(deftype ^:private PairLookup [^:unsynchronized-mutable a
+                               ^:unsynchronized-mutable b
+                               ^:unsynchronized-mutable ^int h]
+  IPairLookup
+  (resetPair [this a' b' h']
+    (set! a a')
+    (set! b b')
+    (set! h h')
+    this)
+  Object
+  (hashCode [_] h)
+  (equals [_ that]
+    (and (instance? PairKey that)
+         (Objects/equals a (.-a ^PairKey that))
+         (Objects/equals b (.-b ^PairKey that)))))
 
 (defn- resolve-eid
   [eid]
@@ -39,9 +71,28 @@
 (defn- tuple-key-fns
   [attrs common-attrs]
   (let [n (count common-attrs)]
-    (if (== n 1)
+    (cond
+      (== n 1)
       (let [getter (getter-fn attrs (first common-attrs))]
         [getter getter])
+
+      (== n 2)
+      (let [attr-a   (first common-attrs)
+            attr-b   (second common-attrs)
+            getter-a (getter-fn attrs attr-a)
+            getter-b (getter-fn attrs attr-b)]
+        [(fn build-pair-key [^objects tuple]
+           (let [a (getter-a tuple)
+                 b (getter-b tuple)]
+             (PairKey. a b (ArrayUtil/hashObjectPair a b))))
+         (let [lookup (PairLookup. nil nil (int 0))]
+           (fn lookup-pair-key [^objects tuple]
+             (let [a (getter-a tuple)
+                   b (getter-b tuple)]
+               (.resetPair ^IPairLookup lookup a b
+                           (ArrayUtil/hashObjectPair a b)))))])
+
+      :else
       (let [^ints idxs        (int-array n)
             ^booleans resolve (boolean-array n)
             resolve?          (boolean
@@ -130,6 +181,56 @@
   (when (instance? Long k)
     (.get hash (.longValue ^Long k))))
 
+(defn- long-pair-indexes
+  [attrs common-attrs]
+  (when (and (== 2 (count common-attrs))
+             (not-any? #(contains? qu/*lookup-attrs* %) common-attrs))
+    (int-array [(int (attrs (first common-attrs)))
+                (int (attrs (second common-attrs)))])))
+
+(defn- long-pair-tuple?
+  [^ints idxs ^objects tuple]
+  (and (instance? Long (aget tuple (aget idxs 0)))
+       (instance? Long (aget tuple (aget idxs 1)))))
+
+(defn- sampled-long-pair-tuples?
+  [^ints idxs ^List tuples]
+  (let [size (.size tuples)]
+    (or (zero? size)
+        (and (long-pair-tuple? idxs (.get tuples 0))
+             (long-pair-tuple? idxs (.get tuples (quot size 2)))
+             (long-pair-tuple? idxs (.get tuples (unchecked-dec size)))))))
+
+(defn- hash-long-pair-tuples
+  [^ints idxs ^List tuples]
+  (let [size (.size tuples)]
+    (when (and (<= long-pair-hash-min-tuples size)
+               (sampled-long-pair-tuples? idxs tuples))
+      (let [^LongPairObjectHashMap res (LongPairObjectHashMap. size)
+            idx-a                      (aget idxs 0)
+            idx-b                      (aget idxs 1)]
+        (loop [i 0]
+          (if (< i size)
+            (let [^objects x (.get tuples i)
+                  a          (aget x idx-a)
+                  b          (aget x idx-b)]
+              (if (and (instance? Long a) (instance? Long b))
+                (let [a (.longValue ^Long a)
+                      b (.longValue ^Long b)]
+                  (.add res a b x)
+                  (recur (unchecked-inc i)))
+                nil))
+            res))))))
+
+(defn- long-pair-bucket
+  [^LongPairObjectHashMap hash ^ints idxs ^objects tuple]
+  (let [a (aget tuple (aget idxs 0))
+        b (aget tuple (aget idxs 1))]
+    (when (and (instance? Long a) (instance? Long b))
+      (let [a (long (.longValue ^Long a))
+            b (long (.longValue ^Long b))]
+        (.get hash a b)))))
+
 (defn- attr-keys
   "attrs are map, preserve order by val"
   [attrs]
@@ -157,6 +258,8 @@
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
         keep-idxs1   (int-array (sort (vals attrs1)))
         keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
+        pair-idxs1   (long-pair-indexes attrs1 common-attrs)
+        pair-idxs2   (long-pair-indexes attrs2 common-attrs)
         [key-fn1 lookup-key-fn1] (tuple-key-fns attrs1 common-attrs)
         [key-fn2 lookup-key-fn2] (tuple-key-fns attrs2 common-attrs)
         attrs        (zipmap (concatv keep-attrs1 keep-attrs2) (range))]
@@ -165,17 +268,25 @@
       (if (< (.size tuples1) (.size tuples2))
         (r/relation!
           attrs
-          (let [acc                     (FastList.)
+          (let [acc                         (FastList.)
+                ^LongPairObjectHashMap pair-hash
+                (when pair-idxs1
+                  (hash-long-pair-tuples pair-idxs1 tuples1))
                 ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
                                            (hash-long-tuples key-fn1 tuples1))
-                ^HashMap hash            (when-not lhash
+                ^HashMap hash            (when-not (or pair-hash lhash)
                                            (hash-tuples key-fn1 tuples1))]
             (dotimes [i (.size tuples2)]
               (let [^objects tuple2 (.get tuples2 i)
-                    k               (lookup-key-fn2 tuple2)]
-                (when-some [bucket (if lhash
-                                     (long-bucket lhash k)
-                                     (.get hash k))]
+                    k               (when-not pair-hash
+                                      (lookup-key-fn2 tuple2))]
+                (when-some [bucket (cond
+                                     pair-hash
+                                     (long-pair-bucket pair-hash pair-idxs2
+                                                       tuple2)
+
+                                     lhash (long-bucket lhash k)
+                                     :else (.get hash k))]
                   (if (u/array? bucket)
                     (.add acc (r/join-tuples bucket keep-idxs1
                                              tuple2 keep-idxs2))
@@ -186,17 +297,25 @@
             acc))
         (r/relation!
           attrs
-          (let [acc                     (FastList.)
+          (let [acc                         (FastList.)
+                ^LongPairObjectHashMap pair-hash
+                (when pair-idxs2
+                  (hash-long-pair-tuples pair-idxs2 tuples2))
                 ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
                                            (hash-long-tuples key-fn2 tuples2))
-                ^HashMap hash            (when-not lhash
+                ^HashMap hash            (when-not (or pair-hash lhash)
                                            (hash-tuples key-fn2 tuples2))]
             (dotimes [i (.size tuples1)]
               (let [^objects tuple1 (.get tuples1 i)
-                    k               (lookup-key-fn1 tuple1)]
-                (when-some [bucket (if lhash
-                                     (long-bucket lhash k)
-                                     (.get hash k))]
+                    k               (when-not pair-hash
+                                      (lookup-key-fn1 tuple1))]
+                (when-some [bucket (cond
+                                     pair-hash
+                                     (long-pair-bucket pair-hash pair-idxs1
+                                                       tuple1)
+
+                                     lhash (long-bucket lhash k)
+                                     :else (.get hash k))]
                   (if (u/array? bucket)
                     (.add acc (r/join-tuples tuple1 keep-idxs1
                                              bucket keep-idxs2))
@@ -218,20 +337,30 @@
         keep-attrs2  (diff-keys keep-attrs1 (attr-keys attrs2))
         keep-idxs1   (int-array (sort (vals attrs1)))
         keep-idxs2   (int-array (->Eduction (map attrs2) keep-attrs2))
+        pair-idxs1   (long-pair-indexes attrs1 common-attrs)
+        pair-idxs2   (long-pair-indexes attrs2 common-attrs)
         [key-fn1 lookup-key-fn1] (tuple-key-fns attrs1 common-attrs)
         [key-fn2 lookup-key-fn2] (tuple-key-fns attrs2 common-attrs)]
     (when (and tuples1 tuples2)
       (if (< (.size tuples1) (.size tuples2))
-        (let [^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+        (let [^LongPairObjectHashMap pair-hash
+              (when pair-idxs1
+                (hash-long-pair-tuples pair-idxs1 tuples1))
+              ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
                                          (hash-long-tuples key-fn1 tuples1))
-              ^HashMap hash            (when-not lhash
+              ^HashMap hash            (when-not (or pair-hash lhash)
                                          (hash-tuples key-fn1 tuples1))]
           (dotimes [i (.size tuples2)]
             (let [^objects tuple2 (.get tuples2 i)
-                  k               (lookup-key-fn2 tuple2)]
-              (when-some [bucket (if lhash
-                                   (long-bucket lhash k)
-                                   (.get hash k))]
+                  k               (when-not pair-hash
+                                    (lookup-key-fn2 tuple2))]
+              (when-some [bucket (cond
+                                   pair-hash
+                                   (long-pair-bucket pair-hash pair-idxs2
+                                                     tuple2)
+
+                                   lhash (long-bucket lhash k)
+                                   :else (.get hash k))]
                 (if (u/array? bucket)
                   (.add ^Collection sink
                         (r/join-tuples bucket keep-idxs1 tuple2 keep-idxs2))
@@ -240,16 +369,24 @@
                       (.add ^Collection sink
                             (r/join-tuples (.get tuples1 j) keep-idxs1
                                            tuple2 keep-idxs2)))))))))
-        (let [^LongObjectHashMap lhash (when (== 1 (count common-attrs))
+        (let [^LongPairObjectHashMap pair-hash
+              (when pair-idxs2
+                (hash-long-pair-tuples pair-idxs2 tuples2))
+              ^LongObjectHashMap lhash (when (== 1 (count common-attrs))
                                          (hash-long-tuples key-fn2 tuples2))
-              ^HashMap hash            (when-not lhash
+              ^HashMap hash            (when-not (or pair-hash lhash)
                                          (hash-tuples key-fn2 tuples2))]
           (dotimes [i (.size tuples1)]
             (let [^objects tuple1 (.get tuples1 i)
-                  k               (lookup-key-fn1 tuple1)]
-              (when-some [bucket (if lhash
-                                   (long-bucket lhash k)
-                                   (.get hash k))]
+                  k               (when-not pair-hash
+                                    (lookup-key-fn1 tuple1))]
+              (when-some [bucket (cond
+                                   pair-hash
+                                   (long-pair-bucket pair-hash pair-idxs1
+                                                     tuple1)
+
+                                   lhash (long-bucket lhash k)
+                                   :else (.get hash k))]
                 (if (u/array? bucket)
                   (.add ^Collection sink
                         (r/join-tuples tuple1 keep-idxs1 bucket keep-idxs2))
