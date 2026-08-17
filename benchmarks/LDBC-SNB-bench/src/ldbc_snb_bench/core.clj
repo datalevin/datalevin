@@ -13,6 +13,7 @@
             [clojure.stacktrace :as stacktrace]
             [clojure.string :as str]
             [datalevin.core :as d]
+            [datalevin.query :as query]
             [ldbc-snb-bench.harness :as harness]
             [ldbc-snb-bench.schema :as schema]
             [ldbc-snb-bench.loader :as loader]
@@ -21,7 +22,8 @@
             [ldbc-snb-bench.queries.short :as is])
   (:import [java.time Instant ZoneOffset ZonedDateTime]
            [java.time.format DateTimeFormatter]
-           [java.util Date]))
+           [java.util Date]
+           [datalevin.utl LRUCache]))
 
 ;; ============================================================
 ;; Configuration
@@ -40,8 +42,8 @@
    :results-path default-results-path
    :perf-path default-perf-path
    :output default-report-path
-   :warmup 1
-   :iterations 5
+   :warmup 0
+   :iterations 1
    :parameter-count 10
    :seed 42
    :scale-factor "1"
@@ -406,6 +408,16 @@
         :get-conn get-conn
         :close-conn close-conn
         :run-query run-query
+        :before-query
+        (fn [phase _]
+          (when (= phase :measurement)
+            (.clear ^LRUCache query/*query-cache*)
+            (.clear ^LRUCache query/*plan-cache*)))
+        :measurement-cache-policy :fresh-parse-and-plan
+        :report-extra
+        {:datalevin-benchmark
+         {:measurement-cache-implementation
+          :clear-parse-and-plan-caches-before-each-query}}
         :write-results-rows write-results-rows}
        opts))))
 

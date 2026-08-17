@@ -80,7 +80,7 @@
                            (common/add-days
                              (:start-date params)
                              (:duration-days params)))))
-   :query       '[:find ?person ?first-name ?last-name (sum ?x-inc) (sum ?y-inc)
+   :query       '[:find ?other-id ?first-name ?last-name (sum ?x-inc) (sum ?y-inc)
                   (+ (sum ?x-inc) (sum ?y-inc))
                   :in $ ?person-id ?country-x-name ?country-y-name
                   ?start-date ?end-date
@@ -104,6 +104,7 @@
 
                   [?person :person/firstName ?first-name]
                   [?person :person/lastName ?last-name]
+                  [?person :person/id ?other-id]
 
                   ;; Person must be foreign (city -> country direct)
                   [?person :person/isLocatedIn ?city]

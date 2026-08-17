@@ -150,8 +150,9 @@
                                                  :start-date (sut/to-date "2011-01-01T00:00:00Z")
                                                  :duration-days 365})]
       (is (= 3 (row-count result)))
-      ;; Results: [person first-name last-name x-count y-count total]
+      ;; Results: [person-id first-name last-name x-count y-count total]
       (let [row (first-row result)]
+        (is (= 2199023261775 (nth row 0)))
         (is (= "Igor" (nth row 1)))
         (is (= "Gusev" (nth row 2)))
         (is (= 2 (nth row 5))))))  ; total messages
@@ -166,11 +167,11 @@
                     :duration-days 365})]
       (is (contains? query-forms '[?country-x :place/type "Country"]))
       (is (contains? query-forms '[?country-y :place/type "Country"]))
-      (is (= [[2199033260487 "Bing" "Yang" 1 1 2]
-              [4398056519949 "Arjun" "Khan" 1 1 2]
-              [6597079774986 "Joe" "Fox" 1 1 2]
-              [15393172798303 "Sinan" "Simsek" 1 1 2]
-              [19791219306158 "Bobby" "Garcia" 1 1 2]]
+      (is (= [[2199023260487 "Bing" "Yang" 1 1 2]
+              [4398046519949 "Arjun" "Khan" 1 1 2]
+              [6597069774986 "Joe" "Fox" 1 1 2]
+              [15393162798303 "Sinan" "Simsek" 1 1 2]
+              [19791209306158 "Bobby" "Garcia" 1 1 2]]
              (:rows result))))))
 
 (deftest ic4-test

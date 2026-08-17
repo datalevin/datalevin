@@ -13,18 +13,23 @@
    [ldbc-snb-bench.parameters :as parameters])
   (:import
    [java.io File]
+   [java.lang ProcessHandle]
    [java.nio.charset StandardCharsets]
    [java.security MessageDigest]
    [java.time Instant]
-   [java.util ArrayList Date Locale Random]))
+   [java.util ArrayList Date Locale Random UUID]))
+
+(def ^:private jvm-instance-id
+  (str (UUID/randomUUID)))
 
 (def default-options
   {:db-path "db/ldbc-snb"
    :results-path "results/results.csv"
    :perf-path "results/perf.csv"
    :output "results/report.edn"
-   :warmup 1
-   :iterations 5
+   :warmup 0
+   :iterations 1
+   :run-role :measurement
    :parameter-count 10
    :seed 42
    :scale-factor "1"
@@ -248,6 +253,11 @@
 ;; Correctness-gated repeated execution
 ;; ---------------------------------------------------------------------------
 
+(def ^:dynamic *benchmark-phase*
+  "Current suite phase, exposed so runners can bypass plan/query caches only
+   for measured executions."
+  nil)
+
 (defn- exception-data
   [^Exception exception]
   {:class (.getName (class exception))
@@ -272,141 +282,196 @@
       {:status :error
        :error (exception-data exception)})))
 
-(defn- execute-phase
-  [run-once params phase n expected-digest verify? debug?]
-  (loop [index 0
-         observations []
-         first-result nil]
-    (if (= index n)
-      {:status :ok
-       :phase phase
-       :observations observations
-       :first-result first-result}
-      (let [{:keys [status result observed error]}
-            (execute-once run-once params debug?)]
-        (if (= :error status)
-          {:status :error
-           :phase phase
-           :iteration index
-           :error error
-           :observations observations
-           :first-result first-result}
-          (let [mismatch? (and verify?
-                               expected-digest
-                               (not= expected-digest
-                                     (:result-sha256 observed)))
-                observations' (conj observations observed)]
-            (if mismatch?
-              {:status :incorrect
-               :phase phase
-               :iteration index
-               :expected-result-sha256 expected-digest
-               :observed observed
-               :observations observations'
-               :first-result (or first-result result)}
-              (recur (inc index) observations'
-                     (or first-result result)))))))))
+(defn- entry-base
+  [{:keys [query-def query-key selection-index source-index params origin]}]
+  {:name (:name query-def)
+   :query query-key
+   :description (:description query-def)
+   :selection-index selection-index
+   :source-index source-index
+   :parameters params
+   :parameter-origin origin})
 
-(defn- failed-outcome
-  [base failure baseline]
+(defn- initial-state
+  [entry]
+  {:entry entry
+   :base (entry-base entry)
+   :status :active
+   :baseline nil
+   :output nil
+   :observations []
+   :execution-count 0
+   :verified-comparisons 0})
+
+(defn- remember-execution
+  [state result observed]
+  (cond-> (update state :execution-count inc)
+    (nil? (:baseline state)) (assoc :baseline observed)
+    (nil? (:output state)) (assoc :output result)))
+
+(defn- process-execution
+  [state phase iteration verify? execution]
+  (if (= :error (:status execution))
+    (assoc state
+           :status :failed
+           :failure {:status :error
+                     :phase phase
+                     :iteration iteration
+                     :error (:error execution)})
+    (let [{:keys [result observed]} execution
+          expected-count (get-in state [:entry :expected-count])
+          expected-digest (get-in state [:baseline :result-sha256])
+          state' (remember-execution state result observed)]
+      (cond
+        (and verify?
+             (some? expected-count)
+             (not= expected-count (:result-count observed)))
+        (assoc state'
+               :status :failed
+               :failure {:status :incorrect
+                         :phase phase
+                         :iteration iteration
+                         :oracle :sf1-result-count
+                         :expected-result-count expected-count
+                         :observed observed})
+
+        (and verify?
+             expected-digest
+             (not= expected-digest (:result-sha256 observed)))
+        (assoc state'
+               :status :failed
+               :failure {:status :incorrect
+                         :phase phase
+                         :iteration iteration
+                         :oracle :repeat-digest
+                         :expected-result-sha256 expected-digest
+                         :observed observed})
+
+        :else
+        (cond-> state'
+          (= phase :measurement)
+          (update :observations conj observed)
+
+          (and verify? expected-digest)
+          (update :verified-comparisons inc))))))
+
+(defn- execute-round
+  [states phase iteration run-entry
+   {:keys [before-query progress-fn verify? debug?]}]
+  (mapv
+    (fn [{:keys [entry status] :as state}]
+      (if (not= :active status)
+        state
+        (do
+          (when progress-fn
+            (progress-fn phase iteration entry))
+          (process-execution
+            state phase iteration verify?
+            (execute-once
+              (fn [_]
+                (when before-query
+                  (before-query phase entry))
+                (binding [*benchmark-phase* phase]
+                  (run-entry entry)))
+              (:params entry)
+              debug?)))))
+    states))
+
+(defn- execute-rounds
+  [states phase n run-entry opts]
+  (loop [iteration 0
+         current states]
+    (if (= iteration n)
+      current
+      (recur (inc iteration)
+             (execute-round current phase iteration run-entry opts)))))
+
+(defn- failure-correctness
+  [{:keys [status oracle expected-result-count]}]
+  (if (= :incorrect status)
+    (cond-> {:status :failed :oracle oracle}
+      (some? expected-result-count)
+      (assoc :expected-count expected-result-count))
+    {:status :not-completed}))
+
+(defn- finalize-failed-state
+  [{:keys [base failure baseline output observations]}]
   (cond-> (merge base
                  (select-keys failure
                               [:status :phase :iteration :error
+                               :expected-result-count
                                :expected-result-sha256 :observed])
-                 {:samples-ms (mapv :time-ms (:observations failure))
-                  :correctness
-                  (if (= :incorrect (:status failure))
-                    {:status :failed :oracle :repeat-digest}
-                    {:status :not-completed})})
-    baseline
-    (assoc :result-count (:result-count baseline)
-           :result-sha256 (result-digest (:rows baseline))
-           :rows (:rows baseline)
-           :columns (:columns baseline))))
+                 {:samples-ms (mapv :time-ms observations)
+                  :correctness (failure-correctness failure)})
+    (or baseline output)
+    (assoc :result-count (or (:result-count baseline)
+                             (:result-count output))
+           :result-sha256 (or (:result-sha256 baseline)
+                              (some-> output :rows result-digest))
+           :rows (:rows output)
+           :columns (:columns output))))
+
+(defn- successful-correctness
+  [{:keys [entry verified-comparisons]} verify?]
+  (let [expected-count (:expected-count entry)]
+    (cond
+      (not verify?)
+      {:status :skipped}
+
+      (some? expected-count)
+      {:status :passed
+       :oracle (if (pos? verified-comparisons)
+                 :sf1-count-and-repeat-digest
+                 :sf1-result-count)
+       :expected-count expected-count}
+
+      (pos? verified-comparisons)
+      {:status :consistent
+       :oracle :repeat-digest}
+
+      :else
+      {:status :single-execution
+       :oracle :none})))
+
+(defn- finalize-successful-state
+  [{:keys [base baseline output observations] :as state} verify?]
+  (let [samples (mapv :time-ms observations)
+        summary (latency-summary samples)]
+    (merge base
+           {:status :ok
+            :phase :complete
+            :result-count (:result-count baseline)
+            :result-sha256 (:result-sha256 baseline)
+            :execution-time (:median summary)
+            :latency-ms summary
+            :samples-ms samples
+            :rows (:rows output)
+            :columns (:columns output)
+            :correctness (successful-correctness state verify?)})))
+
+(defn benchmark-schedule
+  "Execute complete warmup passes before complete measured passes.
+
+   The first successful execution establishes the correctness baseline. With
+   the default zero in-process warmups, this is the measured execution itself."
+  [schedule run-entry {:keys [warmup iterations verify?] :as opts}]
+  (let [states (mapv initial-state schedule)
+        warmed (execute-rounds states :warmup warmup run-entry opts)
+        measured (execute-rounds warmed :measurement iterations run-entry opts)]
+    (mapv (fn [{:keys [status] :as state}]
+            (if (= :failed status)
+              (finalize-failed-state state)
+              (finalize-successful-state state verify?)))
+          measured)))
 
 (defn benchmark-parameter
-  "Benchmark one query/parameter pair with an untimed correctness baseline."
-  [{:keys [query-def query-key selection-index source-index params origin
-           expected-count]}
-   run-once
-   {:keys [warmup iterations verify? debug?]}]
-  (let [base {:name (:name query-def)
-              :query query-key
-              :description (:description query-def)
-              :selection-index selection-index
-              :source-index source-index
-              :parameters params
-              :parameter-origin origin}]
-    (try
-      (let [verification (when verify?
-                           (run-once params))
-            baseline-observation (when verification
-                                   (observation verification))]
-        (if (and verify?
-                 (some? expected-count)
-                 (not= expected-count
-                       (:result-count baseline-observation)))
-          (merge base
-                 {:status :incorrect
-                  :phase :verification
-                  :expected-result-count expected-count
-                  :result-count (:result-count baseline-observation)
-                  :result-sha256 (:result-sha256 baseline-observation)
-                  :samples-ms []
-                  :rows (:rows verification)
-                  :columns (:columns verification)
-                  :correctness {:status :failed
-                                :oracle :sf1-result-count
-                                :expected-count expected-count}})
-          (let [expected-digest (:result-sha256 baseline-observation)
-                warmup-result (execute-phase run-once params :warmup warmup
-                                             expected-digest verify? debug?)]
-            (if (not= :ok (:status warmup-result))
-              (failed-outcome base warmup-result verification)
-              (let [measured (execute-phase run-once params :measurement
-                                            iterations expected-digest
-                                            verify? debug?)]
-                (if (not= :ok (:status measured))
-                  (failed-outcome base measured verification)
-                  (let [observations (:observations measured)
-                        samples      (mapv :time-ms observations)
-                        summary      (latency-summary samples)
-                        output       (or verification
-                                         (:first-result measured))
-                        signature    (or baseline-observation
-                                         (first observations))
-                        correctness  (cond
-                                       (not verify?)
-                                       {:status :skipped}
-
-                                       (some? expected-count)
-                                       {:status :passed
-                                        :oracle :sf1-count-and-repeat-digest
-                                        :expected-count expected-count}
-
-                                       :else
-                                       {:status :consistent
-                                        :oracle :repeat-digest})]
-                    (merge base
-                           {:status :ok
-                            :phase :complete
-                            :result-count (:result-count signature)
-                            :result-sha256 (:result-sha256 signature)
-                            :execution-time (:median summary)
-                            :latency-ms summary
-                            :samples-ms samples
-                            :rows (:rows output)
-                            :columns (:columns output)
-                            :correctness correctness}))))))))
-      (catch Exception exception
-        (when debug?
-          (.printStackTrace exception))
-        (merge base
-               {:status :error
-                :phase :verification
-                :error (exception-data exception)
-                :correctness {:status :not-completed}
-                :samples-ms []})))))
+  "Benchmark one query/parameter pair using warmup then measured execution."
+  [entry run-once opts]
+  (first
+    (benchmark-schedule
+      [entry]
+      (fn [{:keys [params]}] (run-once params))
+      opts)))
 
 (defn result-failure?
   [{:keys [status]}]
@@ -419,6 +484,8 @@
 (defn host-info
   []
   {:timestamp (str (Instant/now))
+   :process-id (.pid (ProcessHandle/current))
+   :jvm-instance-id jvm-instance-id
    :clojure (clojure-version)
    :datalevin constants/version
    :java (System/getProperty "java.version")
@@ -551,13 +618,17 @@
 
 (def report-configuration-keys
   [:warmup :iterations :parameter-count :seed :scale-factor :verify?
-   :query-cache? :query-names :results-path :perf-path :output])
+   :query-cache? :query-names :run-role :results-path :perf-path :output])
 
 (defn run-benchmark!
   [{:keys [all-query-defs sample-suite sample-result-counts get-conn
-           close-conn run-query write-results-rows]}
+           close-conn run-query write-results-rows connection->db manifest-fn
+           system-name report-extra before-query measurement-cache-policy]}
    raw-options]
   (let [opts       (merge default-options raw-options)
+        system-name (or system-name "Datalevin")
+        connection->db (or connection->db d/db)
+        manifest-fn (or manifest-fn db-manifest)
         query-defs (select-query-defs all-query-defs (:query-names opts))
         db-path    (:db-path opts)
         db-file    (io/file db-path)]
@@ -570,62 +641,86 @@
           schedule (build-schedule all-query-defs query-defs source opts
                                    sample-result-counts)
           schedule-report (schedule-artifact source schedule)
-          manifest (db-manifest db-path)]
+          manifest (manifest-fn db-path)]
       (println "============================================")
-      (println "LDBC SNB read-query benchmark for Datalevin")
+      (println "LDBC SNB read-query benchmark for" system-name)
       (println "============================================")
       (println "Database:" (:path manifest))
       (println "Parameter schedule SHA-256:" (:sha256 schedule-report))
+      (println "Run role:" (name (:run-role opts)))
       (println "Query result cache:"
                (if (:query-cache? opts) "enabled" "disabled"))
+      (when measurement-cache-policy
+        (println "Measured query-cache policy:" measurement-cache-policy))
       (println)
       (let [connection (get-conn db-path)]
         (try
-          (let [db      (d/db connection)
+          (let [db      (connection->db connection)
+                current-pass (atom nil)
+                progress-fn
+                (fn [phase iteration
+                     {:keys [query-def selection-index source-index]}]
+                  (let [pass [phase iteration]]
+                    (when-not (= pass @current-pass)
+                      (reset! current-pass pass)
+                      (println
+                        (str (if (= phase :warmup)
+                               "In-process warmup"
+                               (if (= :warmup (:run-role opts))
+                                 "Warmup"
+                                 "Measurement"))
+                             " pass " (inc iteration) " of "
+                             (if (= phase :warmup)
+                               (:warmup opts)
+                               (:iterations opts))))))
+                  (println "  Running" (:name query-def)
+                           (str "parameter " (inc selection-index)
+                                " (source row " (inc source-index) ")")))
                 results
-                (mapv
-                  (fn [{:keys [query-def selection-index source-index]
-                        :as entry}]
-                    (println "Running" (:name query-def)
-                             (str "parameter " (inc selection-index)
-                                  " (source row " (inc source-index) ")"))
-                    (let [result
-                          (benchmark-parameter
-                            entry
-                            (fn [params]
-                              (binding [q/*cache?* (:query-cache? opts)]
-                                (run-query db query-def params)))
-                            (assoc opts :debug? (:debug? opts)))]
-                      (when (and (:show-results? opts) (seq (:rows result)))
-                        (doseq [row (:rows result)]
-                          (println "  " (pr-str row))))
-                      (when (result-failure? result)
-                        (println "  ERROR:"
-                                 (or (get-in result [:error :message])
-                                     (str "correctness failure during "
-                                          (name (:phase result))))))
-                      result))
-                  schedule)
+                (benchmark-schedule
+                  schedule
+                  (fn [{:keys [query-def params]}]
+                    (binding [q/*cache?* (:query-cache? opts)]
+                      (run-query db query-def params)))
+                  (assoc opts
+                         :debug? (:debug? opts)
+                         :before-query before-query
+                         :progress-fn progress-fn))
+                _ (doseq [result results]
+                    (when (and (:show-results? opts) (seq (:rows result)))
+                      (doseq [row (:rows result)]
+                        (println "  " (pr-str row))))
+                    (when (result-failure? result)
+                      (println "  ERROR:"
+                               (or (get-in result [:error :message])
+                                   (str "correctness failure during "
+                                        (name (:phase result)))))))
                 summaries (query-summaries results)
                 exit-code (if (some result-failure? results) 1 0)
-                report {:format-version 1
-                        :benchmark-suite :ldbc-snb-interactive-v1-read-latency
-                        :official-ldbc-result false
-                        :host (host-info)
-                        :dataset {:scale-factor (:scale-factor opts)
-                                  :database manifest}
-                        :configuration (select-keys opts
-                                                    report-configuration-keys)
-                        :timing-boundary
-                        {:included [:query-execution :post-processing
-                                    :result-realization]
-                         :excluded [:database-open :correctness-baseline
-                                    :warmup :artifact-writing]
-                         :query-result-cache (:query-cache? opts)}
-                        :parameter-schedule schedule-report
-                        :summaries summaries
-                        :results (mapv #(dissoc % :rows) results)
-                        :exit-code exit-code}]
+                report-base
+                {:format-version 1
+                 :benchmark-suite :ldbc-snb-interactive-v1-read-latency
+                 :benchmark-system system-name
+                 :official-ldbc-result false
+                 :host (host-info)
+                 :dataset {:scale-factor (:scale-factor opts)
+                           :database manifest}
+                 :configuration (select-keys opts report-configuration-keys)
+                 :timing-boundary
+                 {:included [:query-execution :post-processing
+                             :result-realization]
+                  :excluded [:database-open :warmup :artifact-writing]
+                  :query-result-cache (:query-cache? opts)
+                  :measurement-cache-policy measurement-cache-policy}
+                 :parameter-schedule schedule-report
+                 :summaries summaries
+                 :results (mapv #(dissoc % :rows) results)
+                 :exit-code exit-code}
+                extra (cond
+                        (fn? report-extra) (report-extra connection)
+                        (map? report-extra) report-extra
+                        :else {})
+                report (merge report-base extra)]
             (when-let [output (:output opts)]
               (write-edn! output report))
             (write-results-rows results (:results-path opts))
@@ -647,7 +742,7 @@
 (def ^:private value-options
   #{"-o" "--results" "-p" "--perf" "--output" "--db"
     "--parameters" "--parameter-count" "--warmup" "--iterations"
-    "--seed" "--scale-factor"})
+    "--seed" "--scale-factor" "--run-role"})
 
 (defn- require-option-values!
   [args]
@@ -723,6 +818,12 @@
         "--scale-factor" (recur (nnext remaining)
                                  (assoc opts :scale-factor (second remaining))
                                  query-names)
+        "--run-role"
+        (let [role (keyword (str/lower-case (second remaining)))]
+          (when-not (contains? #{:warmup :measurement} role)
+            (throw (ex-info "--run-role must be warmup or measurement"
+                            {:option arg :value (second remaining)})))
+          (recur (nnext remaining) (assoc opts :run-role role) query-names))
         "--no-verify" (recur (next remaining)
                               (assoc opts :verify? false) query-names)
         "--query-cache" (recur (next remaining)
@@ -769,16 +870,17 @@
     "  --db PATH             Datalevin database (default db/ldbc-snb)\n"
     "  --parameters PATH     Official parameter directory or EDN suite\n"
     "  --parameter-count N   Deterministically select up to N rows/query (default 10)\n"
-    "  --warmup N            Untimed warmup runs per parameter (default 1)\n"
-    "  --iterations N         Measured runs per parameter (default 5)\n"
+    "  --warmup N            Same-process warmup passes (default 0)\n"
+    "  --iterations N         Measured passes (default 1)\n"
+    "  --run-role ROLE        Label pass as warmup or measurement\n"
     "  --seed N               Parameter selection seed (default 42)\n"
     "  --scale-factor SF      Dataset scale factor recorded in report (default 1)\n"
-    "  -o, --results PATH     Untimed query outputs CSV\n"
+    "  -o, --results PATH     Query outputs CSV\n"
     "  -p, --perf PATH        Latency summary CSV\n"
     "  --output PATH          Raw samples and run manifest EDN\n"
-    "  --no-verify            Skip pre-timing count/digest checks\n"
+    "  --no-verify            Skip result count/digest checks\n"
     "  --query-cache          Include Datalevin's query-result cache\n"
-    "  --show-results         Print untimed result rows\n"
+    "  --show-results         Print result rows\n"
     "  --help                 Show this help\n\n"
     "This harness measures read-query latency. It is not an official LDBC result;\n"
     "the official driver also schedules updates, dependent reads, and throughput.\n"))

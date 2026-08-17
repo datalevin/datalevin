@@ -58,10 +58,10 @@
                       :rows [[100 "John"]]
                       :columns ["id" "name"]}))
                  {:warmup 1 :iterations 3 :verify? true})]
-    (is (= 5 @calls))
+    (is (= 4 @calls))
     (is (= :ok (:status result)))
-    (is (= [3.0 4.0 5.0] (:samples-ms result)))
-    (is (= 4.0 (:execution-time result)))
+    (is (= [2.0 3.0 4.0] (:samples-ms result)))
+    (is (= 3.0 (:execution-time result)))
     (is (= :passed (get-in result [:correctness :status])))))
 
 (deftest oracle-failure-stops-before-timing-test
@@ -76,7 +76,7 @@
                  {:warmup 4 :iterations 5 :verify? true})]
     (is (= 1 @calls))
     (is (= :incorrect (:status result)))
-    (is (= :verification (:phase result)))
+    (is (= :warmup (:phase result)))
     (is (empty? (:samples-ms result)))))
 
 (deftest repeat-digest-failure-test
@@ -91,7 +91,7 @@
                  {:warmup 1 :iterations 3 :verify? true})]
     (is (= 2 @calls))
     (is (= :incorrect (:status result)))
-    (is (= :warmup (:phase result)))))
+    (is (= :measurement (:phase result)))))
 
 (deftest verification-can-be-explicitly-skipped-test
   (let [calls (atom 0)
@@ -108,15 +108,42 @@
     (is (= [2.0 3.0] (:samples-ms result)))
     (is (= :skipped (get-in result [:correctness :status])))))
 
+(deftest schedule-runs-complete-passes-test
+  (let [calls (atom [])
+        entries [entry
+                 (assoc entry
+                        :query-def {:name "IC2" :description "second"}
+                        :query-key :ic2
+                        :expected-count 1)]
+        results
+        (harness/benchmark-schedule
+          entries
+          (fn [{:keys [query-def]}]
+            (swap! calls conj [harness/*benchmark-phase* (:name query-def)])
+            {:execution-time 1.0
+             :result-count 1
+             :rows [[(:name query-def)]]})
+          {:warmup 1 :iterations 1 :verify? true})]
+    (is (= [[:warmup "IC1"]
+            [:warmup "IC2"]
+            [:measurement "IC1"]
+            [:measurement "IC2"]]
+           @calls))
+    (is (= [1.0] (:samples-ms (first results))))
+    (is (= [1.0] (:samples-ms (second results))))))
+
 (deftest benchmark-argument-test
+  (is (= 0 (:warmup harness/default-options)))
+  (is (= 1 (:iterations harness/default-options)))
   (let [opts (harness/parse-bench-args
                ["--warmup" "0" "--iterations" "3"
                 "--parameter-count" "2" "--parameters" "params.edn"
-                "--no-verify" "is1"])]
+                "--run-role" "warmup" "--no-verify" "is1"])]
     (is (= 0 (:warmup opts)))
     (is (= 3 (:iterations opts)))
     (is (= 2 (:parameter-count opts)))
     (is (= "params.edn" (:parameters opts)))
+    (is (= :warmup (:run-role opts)))
     (is (false? (:verify? opts)))
     (is (= ["IS1"] (:query-names opts))))
   (testing "invalid and incomplete options fail loudly"
@@ -125,4 +152,8 @@
                           (harness/parse-bench-args ["--iterations"])))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo
                           #"Unrecognized option"
-                          (harness/parse-bench-args ["--wat"])))))
+                          (harness/parse-bench-args ["--wat"])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"warmup or measurement"
+                          (harness/parse-bench-args
+                            ["--run-role" "cached"])))))

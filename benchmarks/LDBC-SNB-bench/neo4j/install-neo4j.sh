@@ -5,20 +5,22 @@ usage() {
   cat <<'EOF'
 Usage: install-neo4j.sh [options]
 
-Installs and configures Neo4j for LDBC SNB benchmarks (macOS via Homebrew).
+Installs or upgrades Neo4j and prepares the isolated benchmark configuration
+(macOS via Homebrew).
 
 Options:
   --password PASS    Initial Neo4j password (default: neo4jtest)
-  --heap SIZE        Heap memory size (default: 2g)
-  --pagecache SIZE   Page cache size (default: 1g)
-  --start            Start Neo4j after installation
+  --heap SIZE        Benchmark heap size (default: 8g)
+  --pagecache SIZE   Benchmark page cache size (default: 4g)
+  --start            Start the isolated benchmark server
   -h, --help         Show this help
 EOF
 }
 
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:-neo4jtest}"
-HEAP_SIZE="2g"
-PAGECACHE_SIZE="1g"
+HEAP_SIZE="8g"
+PAGECACHE_SIZE="4g"
 START_NEO4J="0"
 
 while [[ $# -gt 0 ]]; do
@@ -64,48 +66,28 @@ fi
 
 echo "Installing Neo4j via Homebrew..."
 if brew list neo4j &>/dev/null; then
-  echo "Neo4j is already installed."
+  echo "Neo4j is already installed; upgrading to the latest stable formula..."
+  brew upgrade neo4j
 else
   brew install neo4j
 fi
 
+echo "Installed Neo4j version: $(neo4j --version)"
+
 NEO4J_HOME="$(brew --prefix neo4j)/libexec"
-NEO4J_CONF="$NEO4J_HOME/conf/neo4j.conf"
 
-echo "Configuring Neo4j..."
+echo "Preparing the isolated benchmark configuration..."
 echo "  NEO4J_HOME: $NEO4J_HOME"
-
-# Stop Neo4j if running
-if pgrep -f "neo4j" >/dev/null 2>&1; then
-  echo "Stopping Neo4j..."
-  neo4j stop 2>/dev/null || true
-  sleep 2
-fi
-
-# Configure memory settings
-if [[ -f "$NEO4J_CONF" ]]; then
-  # Update heap settings
-  if grep -q "^server.memory.heap" "$NEO4J_CONF"; then
-    sed -i '' "s/^server.memory.heap.initial_size=.*/server.memory.heap.initial_size=$HEAP_SIZE/" "$NEO4J_CONF"
-    sed -i '' "s/^server.memory.heap.max_size=.*/server.memory.heap.max_size=$HEAP_SIZE/" "$NEO4J_CONF"
-  else
-    echo "server.memory.heap.initial_size=$HEAP_SIZE" >> "$NEO4J_CONF"
-    echo "server.memory.heap.max_size=$HEAP_SIZE" >> "$NEO4J_CONF"
-  fi
-
-  # Update page cache
-  if grep -q "^server.memory.pagecache.size" "$NEO4J_CONF"; then
-    sed -i '' "s/^server.memory.pagecache.size=.*/server.memory.pagecache.size=$PAGECACHE_SIZE/" "$NEO4J_CONF"
-  else
-    echo "server.memory.pagecache.size=$PAGECACHE_SIZE" >> "$NEO4J_CONF"
-  fi
-
-  echo "  Heap: $HEAP_SIZE, Page cache: $PAGECACHE_SIZE"
-fi
+echo "  Heap: $HEAP_SIZE, Page cache: $PAGECACHE_SIZE"
+NEO4J_HOME="$NEO4J_HOME" NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+  NEO4J_HEAP="$HEAP_SIZE" NEO4J_PAGECACHE="$PAGECACHE_SIZE" \
+  "${SCRIPT_DIR}/server.sh" prepare
 
 # Set initial password
 echo "Setting initial password..."
-neo4j-admin dbms set-initial-password "$NEO4J_PASSWORD" 2>/dev/null || true
+NEO4J_HOME="$NEO4J_HOME" NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+  NEO4J_HEAP="$HEAP_SIZE" NEO4J_PAGECACHE="$PAGECACHE_SIZE" \
+  "${SCRIPT_DIR}/server.sh" set-password 2>/dev/null || true
 
 echo ""
 echo "Neo4j installation complete!"
@@ -113,11 +95,13 @@ echo ""
 
 if [[ "$START_NEO4J" == "1" ]]; then
   echo "Starting Neo4j..."
-  neo4j start
+  NEO4J_HOME="$NEO4J_HOME" NEO4J_HEAP="$HEAP_SIZE" \
+    NEO4J_PAGECACHE="$PAGECACHE_SIZE" "${SCRIPT_DIR}/server.sh" start
   echo ""
   echo "Waiting for Neo4j to become ready..."
   for i in {1..30}; do
-    if cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1;" >/dev/null 2>&1; then
+    if "${NEO4J_HOME}/bin/cypher-shell" -a bolt://localhost:7687 \
+      -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1;" >/dev/null 2>&1; then
       echo "Neo4j is ready!"
       exit 0
     fi
@@ -125,8 +109,8 @@ if [[ "$START_NEO4J" == "1" ]]; then
   done
   echo "Neo4j may still be starting. Check with 'neo4j status'."
 else
-  echo "To start Neo4j:"
-  echo "  neo4j start"
+  echo "To start the benchmark server:"
+  echo "  ./server.sh start"
   echo ""
   echo "To import data:"
   echo "  ./bulk-import-native.sh --start"

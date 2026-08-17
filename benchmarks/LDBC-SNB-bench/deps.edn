@@ -1,9 +1,13 @@
 {:paths ["src"]
- :deps {datalevin/datalevin {:local/root "../.."}
-        org.clojure/clojure {:mvn/version "1.12.4"}}
+ :deps {datalevin/datalevin {:local/root "../.."
+                             :exclusions [io.netty/netty-all]}
+        org.clojure/clojure {:mvn/version "1.12.4"}
+        org.neo4j.driver/neo4j-java-driver {:mvn/version "6.2.0"}}
  :aliases
  {:load {:main-opts ["-m" "ldbc-snb-bench.core" "load"]}
   :bench {:main-opts ["-m" "ldbc-snb-bench.core" "bench"]}
+  :neo4j-bench {:main-opts ["-m" "ldbc-snb-bench.neo4j"]}
+  :compare {:main-opts ["-m" "ldbc-snb-bench.comparison"]}
   :repl {:main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
   :test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner {:git/tag "v0.5.1" :git/sha "dfb30dd"}}

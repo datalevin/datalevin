@@ -5,6 +5,8 @@ db/
 neo4j/data/
 neo4j/results/
 neo4j/import/
+neo4j/runtime/
+neo4j/data.pre-*/
 
 # Results (regenerated)
 results/*.csv

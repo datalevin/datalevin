@@ -10,6 +10,7 @@ Bulk-imports LDBC SNB CSV data into Neo4j using native neo4j-admin.
 Options:
   --data-dir PATH     Data dir (default: benchmarks/LDBC-SNB-bench/data)
   --import-dir PATH   Staging dir for neo4j-admin CSVs (default: benchmarks/LDBC-SNB-bench/neo4j/import)
+  --neo4j-data PATH   Neo4j data directory (default: benchmarks/LDBC-SNB-bench/neo4j/data)
   --neo4j-home PATH   Neo4j home directory (default: auto-detect from brew)
   --db-name NAME      Neo4j database name (default: neo4j)
   --password PASS     Neo4j password (default: neo4jtest)
@@ -26,6 +27,7 @@ DATALEVIN_ROOT="$(cd "${SCRIPT_DIR}/../../.." && pwd)"
 
 DATA_DIR="${DATA_DIR:-${DATALEVIN_ROOT}/benchmarks/LDBC-SNB-bench/data}"
 IMPORT_DIR="${IMPORT_DIR:-${DATALEVIN_ROOT}/benchmarks/LDBC-SNB-bench/neo4j/import}"
+NEO4J_DATA_DIR="${NEO4J_DATA_DIR:-${DATALEVIN_ROOT}/benchmarks/LDBC-SNB-bench/neo4j/data}"
 NEO4J_HOME="${NEO4J_HOME:-}"
 DB_NAME="${DB_NAME:-neo4j}"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:-neo4jtest}"
@@ -42,6 +44,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --import-dir)
       IMPORT_DIR="${2:-}"
+      shift 2
+      ;;
+    --neo4j-data)
+      NEO4J_DATA_DIR="${2:-}"
       shift 2
       ;;
     --neo4j-home)
@@ -109,13 +115,18 @@ fi
 
 # Detect NEO4J_HOME
 if [[ -z "$NEO4J_HOME" ]]; then
-  if command -v brew >/dev/null 2>&1 && brew list neo4j &>/dev/null; then
-    NEO4J_HOME="$(brew --prefix neo4j)/libexec"
-  elif [[ -d "/usr/local/neo4j" ]]; then
+  if command -v brew >/dev/null 2>&1; then
+    NEO4J_BREW_PREFIX="$(brew --prefix neo4j 2>/dev/null || true)"
+    if [[ -x "${NEO4J_BREW_PREFIX}/libexec/bin/neo4j-admin" ]]; then
+      NEO4J_HOME="${NEO4J_BREW_PREFIX}/libexec"
+    fi
+  fi
+  if [[ -z "$NEO4J_HOME" && -d "/usr/local/neo4j" ]]; then
     NEO4J_HOME="/usr/local/neo4j"
-  elif [[ -d "$HOME/neo4j" ]]; then
+  elif [[ -z "$NEO4J_HOME" && -d "$HOME/neo4j" ]]; then
     NEO4J_HOME="$HOME/neo4j"
-  else
+  fi
+  if [[ -z "$NEO4J_HOME" ]]; then
     echo "ERROR: Could not detect NEO4J_HOME. Please specify with --neo4j-home." >&2
     exit 1
   fi
@@ -128,27 +139,22 @@ fi
 
 echo "Using NEO4J_HOME: $NEO4J_HOME"
 
-# Set NEO4J_CONF for neo4j-admin to find configuration
-NEO4J_CONF="${NEO4J_HOME}/conf"
+NEO4J_DATA_DIR="${NEO4J_DATA_DIR%/}"
+mkdir -p "$NEO4J_DATA_DIR"
+NEO4J_DATA_DIR="$(cd "$NEO4J_DATA_DIR" && pwd -P)"
+NEO4J_HOME="$NEO4J_HOME" NEO4J_DATA_DIR="$NEO4J_DATA_DIR" \
+  NEO4J_IMPORT_DIR="$IMPORT_DIR" "${SCRIPT_DIR}/server.sh" prepare >/dev/null
+NEO4J_CONF="${SCRIPT_DIR}/runtime/conf"
 export NEO4J_CONF
 echo "Using NEO4J_CONF: $NEO4J_CONF"
-
-# Read actual data directory from config
-NEO4J_DATA_DIR=""
-if [[ -f "$NEO4J_CONF/neo4j.conf" ]]; then
-  NEO4J_DATA_DIR=$(grep -E "^server.directories.data=" "$NEO4J_CONF/neo4j.conf" 2>/dev/null | cut -d= -f2 || true)
-fi
-if [[ -z "$NEO4J_DATA_DIR" ]]; then
-  NEO4J_DATA_DIR="$NEO4J_HOME/data"
-fi
 echo "Using data directory: $NEO4J_DATA_DIR"
 
 # Find neo4j-admin
 NEO4J_ADMIN=""
-if command -v neo4j-admin >/dev/null 2>&1; then
-  NEO4J_ADMIN="neo4j-admin"
-elif [[ -x "$NEO4J_HOME/bin/neo4j-admin" ]]; then
+if [[ -x "$NEO4J_HOME/bin/neo4j-admin" ]]; then
   NEO4J_ADMIN="$NEO4J_HOME/bin/neo4j-admin"
+elif command -v neo4j-admin >/dev/null 2>&1; then
+  NEO4J_ADMIN="neo4j-admin"
 else
   echo "ERROR: neo4j-admin not found. Please ensure Neo4j is installed." >&2
   exit 1
@@ -156,12 +162,9 @@ fi
 
 echo "Using neo4j-admin: $NEO4J_ADMIN"
 
-# Stop Neo4j if running
-if pgrep -f "neo4j" >/dev/null 2>&1; then
-  echo "Stopping Neo4j..."
-  neo4j stop 2>/dev/null || true
-  sleep 2
-fi
+# Stop this benchmark server if it is running.
+NEO4J_HOME="$NEO4J_HOME" NEO4J_DATA_DIR="$NEO4J_DATA_DIR" \
+  NEO4J_IMPORT_DIR="$IMPORT_DIR" "${SCRIPT_DIR}/server.sh" stop 2>/dev/null || true
 
 safe_wipe_dir() {
   local dir="$1"
@@ -251,14 +254,23 @@ echo ""
 echo "Neo4j import complete!"
 echo ""
 
+NEO4J_HOME="$NEO4J_HOME" NEO4J_DATA_DIR="$NEO4J_DATA_DIR" \
+  NEO4J_IMPORT_DIR="$IMPORT_DIR" NEO4J_PASSWORD="$NEO4J_PASSWORD" \
+  "${SCRIPT_DIR}/server.sh" set-password
+
 if [[ "$START_NEO4J" == "1" ]]; then
   echo "Starting Neo4j..."
-  neo4j start
+  NEO4J_HOME="$NEO4J_HOME" NEO4J_DATA_DIR="$NEO4J_DATA_DIR" \
+    NEO4J_IMPORT_DIR="$IMPORT_DIR" "${SCRIPT_DIR}/server.sh" start
 
   echo "Waiting for Neo4j to become ready..."
   for i in {1..60}; do
-    if cypher-shell -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1;" >/dev/null 2>&1; then
+    if "${NEO4J_HOME}/bin/cypher-shell" -a bolt://localhost:7687 \
+      -u neo4j -p "$NEO4J_PASSWORD" "RETURN 1;" >/dev/null 2>&1; then
       echo "Neo4j is ready!"
+      echo "Applying benchmark uniqueness constraints..."
+      "${NEO4J_HOME}/bin/cypher-shell" -a bolt://localhost:7687 \
+        -u neo4j -p "$NEO4J_PASSWORD" -f "${SCRIPT_DIR}/schema.cypher"
       echo ""
       echo "To run benchmark queries:"
       echo "  ./run-queries.sh --password $NEO4J_PASSWORD"
@@ -269,6 +281,6 @@ if [[ "$START_NEO4J" == "1" ]]; then
   echo "WARNING: Neo4j may not be fully ready yet. Check with 'neo4j status'."
 else
   echo "To start Neo4j and run queries:"
-  echo "  neo4j start"
+  echo "  ./server.sh start"
   echo "  ./run-queries.sh --password $NEO4J_PASSWORD"
 fi

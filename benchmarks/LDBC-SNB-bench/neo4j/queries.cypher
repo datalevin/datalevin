@@ -440,16 +440,13 @@ RETURN "IS6" AS query,
 
 // IS7
 CALL {
-  MATCH (message:Post {id: $messageId})
-  RETURN message
+  MATCH (message:Post {id: $messageId})<-[:REPLY_OF_POST]-(comment:Comment)
+  RETURN message, comment
   UNION ALL
-  MATCH (message:Comment {id: $messageId})
-  RETURN message
+  MATCH (message:Comment {id: $messageId})<-[:REPLY_OF_COMMENT]-(comment:Comment)
+  RETURN message, comment
 }
 MATCH (message)-[:HAS_CREATOR]->(messageAuthor:Person)
-MATCH (comment:Comment)
-WHERE (comment)-[:REPLY_OF_POST]->(message)
-   OR (comment)-[:REPLY_OF_COMMENT]->(message)
 MATCH (comment)-[:HAS_CREATOR]->(replyAuthor:Person)
 RETURN "IS7" AS query,
        comment.id,
