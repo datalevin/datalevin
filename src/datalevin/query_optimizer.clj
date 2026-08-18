@@ -1335,6 +1335,8 @@
                :attr       attr
                :entity-var evar
                :value-var  vvar
+               :value      val
+               :constant-value? (instance? Constant v)
                :cols       (cond-> [evar] vvar (conj vvar))
                :vars       (cond-> #{evar} vvar (conj vvar))
                :rows       rows})))))))
@@ -1355,13 +1357,15 @@
         (:qwhere parsed-q)))
 
 (defn- access-join-from-bound
-  [bound {:keys [cols vars rows] :as candidate}]
+  [bound {:keys [cols vars rows entity-var value-var] :as candidate}]
   (when-let [join (eligible-access-join bound candidate)]
     (-> join
-        (dissoc :entity-var :value-var :vars :rows)
+        (dissoc :vars :rows)
         (assoc :requires (set/intersection bound vars)
                :produces (set/difference vars bound)
                :produces-cols (into [] (remove bound) cols)
+               :entity-bound? (contains? bound entity-var)
+               :value-bound? (and value-var (contains? bound value-var))
                :estimate {:rows rows
                           :confidence :medium}))))
 
@@ -1656,8 +1660,104 @@
       [context stages]
       entries)))
 
+(defn- over-count-cap
+  ^long [^long cap]
+  (if (= cap Long/MAX_VALUE) Long/MAX_VALUE (unchecked-inc cap)))
+
+(defn- capped-tuple-count-sum
+  ^long [^List tuples count-tuple ^long cap]
+  (loop [i     0
+         total 0]
+    (if (< i (.size tuples))
+      (let [n (max 0 (long (count-tuple (.get tuples i))))]
+        (if (< (- cap total) n)
+          (over-count-cap cap)
+          (recur (unchecked-inc-int i) (+ total n))))
+      total)))
+
+(defn- projected-access-join-output
+  "Estimate a bound pattern's joined output from the actual access sample,
+  without materializing that output. Counts are weighted by duplicate sample
+  rows, since those duplicates participate independently in the subsequent
+  hash join."
+  ^long [^DB db relation
+         {:keys [attr entity-var value-var value entity-bound? value-bound?
+                 constant-value?]}
+         ^long cap]
+  (let [attrs       (:attrs relation)
+        ^List tuples (:tuples relation)
+        entity-idx  (get attrs entity-var)
+        value-idx   (get attrs value-var)
+        store       (.-store db)
+        count-tuple
+        (cond
+          (and entity-bound? value-bound? entity-idx value-idx)
+          (fn [^objects tuple]
+            (let [entity (resolved-bound-entity db
+                                                (aget tuple (long entity-idx)))
+                  value  (resolved-bound-value db attr
+                                               (aget tuple (long value-idx)))]
+              (if (and entity (some? value))
+                (db/-count db [entity attr value])
+                0)))
+
+          (and entity-bound? constant-value? entity-idx)
+          (fn [^objects tuple]
+            (let [entity (resolved-bound-entity db
+                                                (aget tuple (long entity-idx)))
+                  value  (resolved-bound-value db attr value)]
+              (if (and entity (some? value))
+                (db/-count db [entity attr value])
+                0)))
+
+          (and entity-bound? entity-idx
+               (identical? :db.cardinality/many
+                           (get-in (db/-schema db)
+                                   [attr :db/cardinality])))
+          (fn [^objects tuple]
+            (if-let [entity (resolved-bound-entity
+                              db (aget tuple (long entity-idx)))]
+              (db/-count db [entity attr nil])
+              0))
+
+          (and value-bound? value-idx)
+          (fn [^objects tuple]
+            (let [value (resolved-bound-value
+                          db attr (aget tuple (long value-idx)))]
+              (if (some? value) (av-size store attr value) 0)))
+
+          :else nil)]
+    (cond
+      (nil? tuples) 0
+      ;; A cardinality-one entity lookup emits at most one row per input.
+      (and entity-bound? entity-idx (not value-bound?)
+           (not constant-value?) (nil? count-tuple))
+      (min (long (.size tuples)) (over-count-cap cap))
+
+      count-tuple
+      (capped-tuple-count-sum tuples count-tuple cap)
+
+      :else
+      (min (long (.size tuples)) (over-count-cap cap)))))
+
+(defn- sample-stage-output-cap
+  ^long [^double remaining-budget ^long output-width]
+  (if-not (pos? remaining-budget)
+    0
+    (let [per-output (+ (double c/magic-cost-hash-join-output-tuple)
+                        (* (double c/magic-cost-hash-join-output-cell)
+                           (double output-width)))]
+      (long
+        (min (double Long/MAX_VALUE)
+             (Math/floor (/ remaining-budget per-output)))))))
+
+(defn- estimated-access-sample-stage-cost
+  ^double [^long input-size ^long output-size ^long output-width]
+  (+ (double (estimate-link-cost input-size output-size))
+     (materialized-output-cost output-size output-width)))
+
 (defn- sample-access-joins
-  [db parsed-q inputs step planned-joins sample-size]
+  [db parsed-q inputs step planned-joins sample-size sample-cost-budget estimate]
   (if (pos? (long sample-size))
     (let [sample-work (assoc (:work step)
                              :sample-size sample-size
@@ -1669,42 +1769,120 @@
           context       (-> (qplan/make-context parsed-q false)
                             (qresolve/resolve-ins inputs)
                             (update :rels qresolve/collapse-rels initial))
-          access-var    (first (:cols step))]
+          access-var    (first (:cols step))
+          sample-rows   (long (.size sample))
+          source-cost   (+ (double (or (:startup estimate) 0.0))
+                           (* (double sample-rows)
+                              (double (or (:per-row estimate) 0.0))))
+          bounded?      (and (number? sample-cost-budget)
+                             (Double/isFinite
+                               (double sample-cost-budget)))
+          budget        (if bounded?
+                          (max 0.0 (double sample-cost-budget))
+                          Double/POSITIVE_INFINITY)]
       (loop [context context
              joins   planned-joins
-             stages  []]
+             stages  []
+             spent   source-cost]
         (let [relation (access-sample-relation context access-var)
               before   (relation-size relation)]
-          (if (or (zero? before) (empty? joins))
+          (cond
+            (and bounded? (> spent budget))
+            {:sample        sample
+             :sample-batch  nil
+             :sample-rows   sample-rows
+             :sample-output 0
+             :sample-cost   spent
+             :stages        stages
+             :aborted?      true
+             :abort         {:reason :sample-work-budget
+                             :budget budget
+                             :cost spent}}
+
+            (or (zero? before) (empty? joins))
             (let [[context stages]
                   (sample-access-residuals
                     parsed-q context step planned-joins stages)]
               {:sample        sample
                :sample-batch  sample-batch
-               :sample-rows   (.size sample)
+               :sample-rows   sample-rows
                :sample-output (sampled-access-output parsed-q (:rels context))
+               :sample-cost   spent
                :stages        stages})
-            (let [{:keys [clause-idx attr]} (first joins)
-                  pattern  (access-join-pattern parsed-q clause-idx)
-                  new-rel  (qresolve/lookup-pattern
-                             (assoc context :rels-bound-cache (volatile! {}))
-                             db pattern)
-                  rels     (qresolve/collapse-rels (:rels context) new-rel)
-                  relation (access-sample-relation
-                             (assoc context :rels rels) access-var)
-                  after    (relation-size relation)]
-              (recur (assoc context :rels rels)
-                     (next joins)
-                     (conj stages
-                           {:clause-idx clause-idx
-                            :attr       attr
-                            :operation  :indexed-join
-                            :input      before
-                            :output     after})))))))
+
+            :else
+            (let [{:keys [clause-idx attr produces-cols] :as join}
+                  (first joins)
+                  output-width (+ (count (:attrs relation))
+                                  (count produces-cols))
+                  remaining    (- budget spent)
+                  output-cap   (if bounded?
+                                 (sample-stage-output-cap
+                                   remaining output-width)
+                                 Long/MAX_VALUE)
+                  projected    (when bounded?
+                                 (projected-access-join-output
+                                   db relation join output-cap))
+                  projected-cost
+                  (when projected
+                    (estimated-access-sample-stage-cost
+                      before projected output-width))]
+              (if (and bounded?
+                       (> (+ spent (double projected-cost)) budget))
+                {:sample        sample
+                 :sample-batch  nil
+                 :sample-rows   sample-rows
+                 :sample-output 0
+                 :sample-cost   spent
+                 :stages
+                 (conj stages
+                       {:clause-idx clause-idx
+                        :attr       attr
+                        :operation  :indexed-join
+                        :input      before
+                        :output     projected
+                        :projected-output projected
+                        :projected-cost projected-cost
+                        :sampling   :aborted})
+                 :aborted?      true
+                 :abort         {:reason :sample-work-budget
+                                 :clause-idx clause-idx
+                                 :attr attr
+                                 :budget budget
+                                 :cost spent
+                                 :projected-cost projected-cost
+                                 :projected-output projected}}
+                (let [pattern  (access-join-pattern parsed-q clause-idx)
+                      new-rel  (qresolve/lookup-pattern
+                                 (assoc context :rels-bound-cache
+                                        (volatile! {}))
+                                 db pattern)
+                      rels     (qresolve/collapse-rels
+                                 (:rels context) new-rel)
+                      relation (access-sample-relation
+                                 (assoc context :rels rels) access-var)
+                      after    (relation-size relation)
+                      actual-cost
+                      (+ (double
+                           (estimate-link-cost before
+                                               (relation-size new-rel)))
+                         (materialized-output-cost
+                           after (count (:attrs relation))))]
+                  (recur (assoc context :rels rels)
+                         (next joins)
+                         (conj stages
+                               {:clause-idx clause-idx
+                                :attr       attr
+                                :operation  :indexed-join
+                                :input      before
+                                :output     after
+                                :cost       actual-cost})
+                         (+ spent actual-cost)))))))))
     {:sample        (FastList.)
      :sample-batch  nil
      :sample-rows   0
      :sample-output 0
+     :sample-cost   0.0
      :stages        []}))
 
 (defn- adjusted-access-yield
@@ -1786,7 +1964,8 @@
         stages))))
 
 (defn- adjust-access-plan
-  [db parsed-q inputs {:keys [step path demand work estimate] :as plan}]
+  [db parsed-q inputs
+   {:keys [step path demand work estimate sample-cost-budget] :as plan}]
   (if step
     (let [range-rows      (qaccess/estimate-range-rows estimate)
           scan-rows       (qaccess/estimate-scan-rows estimate)
@@ -1798,14 +1977,17 @@
                             (long (min range-rows
                                        (long c/init-exec-size-threshold)))
                             0)
-          {:keys [sample sample-batch sample-rows sample-output stages]}
+          {:keys [sample sample-batch sample-rows sample-output sample-cost
+                  stages aborted? abort]}
           (if sample?
             (sample-access-joins
-              db parsed-q inputs step (:joins plan) sample-size)
+              db parsed-q inputs step (:joins plan) sample-size
+              sample-cost-budget estimate)
             {:sample        (FastList.)
              :sample-batch  nil
              :sample-rows   0
              :sample-output 0
+             :sample-cost   0.0
              :stages        []})
           sample-rows     (long sample-rows)
           sample-output   (long sample-output)
@@ -1879,11 +2061,15 @@
                                  :cost selection-cost
                                  :point-cost point-cost
                                  :upper-cost upper-cost
-                                 :confidence (if sample?
-                                               :sampled
+                                 :confidence (cond
+                                               aborted? :bounded-sample
+                                               sample?  :sampled
+                                               :else
                                                (or (:confidence estimate) :low))
                                  :sample-rows sample-rows
                                  :sample-output sample-output
+                                 :planning-sample-cost sample-cost
+                                 :sampling-abort abort
                                  :reused-candidates reused-rows
                                  :remaining-candidates remaining-candidates
                                  :remaining-range remaining-range
@@ -1902,42 +2088,65 @@
                      (long (or (:batch-size work)
                                initial-candidate-budget))
                      (long initial-candidate-budget))))]
-      (assoc plan
-             :work work
-             :estimate estimate
-             :step (assoc step
-                          :work work
-                          :sample sample
-                          :sample-batch (when reusable? sample-batch))
-             :sample-batch (when reusable? sample-batch)))
+      (cond->
+          (assoc plan
+                 :work work
+                 :estimate estimate
+                 :step (assoc step
+                              :work work
+                              :sample sample
+                              :sample-batch (when reusable? sample-batch))
+                 :sample-batch (when reusable? sample-batch))
+        aborted?
+        (assoc :unavailable? true
+               :unavailable-reason (:reason abort))))
     plan))
 
 (defn plan-access-joins
   "Add a greedy order for indexed pattern joins reachable from each access
    plan's initially produced variables. This is called only when access plans
-   exist; ordinary query planning stays on the existing path."
-  [parsed-q inputs plans]
-  (let [input-db (first (filter db/db? inputs))]
-    (mapv (fn [plan]
-            (if-let [plan-db (or (:access-source plan)
-                                 (get-in plan [:path :options :db])
-                                 input-db)]
-              (if-let [plan
-                       (or (when (:step plan) plan)
-                           (schedule-correlated-access
-                             plan-db parsed-q inputs plan))]
-                (let [plan (assoc
-                             plan
-                             :joins
-                             (order-access-joins plan-db parsed-q plan)
-                             :join-candidates
-                             (access-join-candidates plan-db parsed-q plan))]
-                  (if (:correlated? plan)
-                    plan
-                    (adjust-access-plan plan-db parsed-q inputs plan)))
-                (assoc plan :unavailable? true))
-              plan))
-          plans)))
+   exist; ordinary query planning stays on the existing path. The optional
+   sample-cost-budget is shared across alternatives so rejected planning
+   samples cannot collectively cost more than the conventional root."
+  ([parsed-q inputs plans]
+   (plan-access-joins parsed-q inputs plans nil))
+  ([parsed-q inputs plans sample-cost-budget]
+   (let [input-db (first (filter db/db? inputs))
+         bounded? (and (number? sample-cost-budget)
+                       (Double/isFinite (double sample-cost-budget)))]
+     (loop [remaining (when bounded?
+                        (max 0.0 (double sample-cost-budget)))
+            todo      (seq plans)
+            prepared  (transient [])]
+       (if-some [plan (first todo)]
+         (let [plan-db (or (:access-source plan)
+                           (get-in plan [:path :options :db])
+                           input-db)
+               plan
+               (if plan-db
+                 (if-let [plan
+                          (or (when (:step plan) plan)
+                              (schedule-correlated-access
+                                plan-db parsed-q inputs plan))]
+                   (let [plan (assoc
+                                plan
+                                :sample-cost-budget remaining
+                                :joins
+                                (order-access-joins plan-db parsed-q plan)
+                                :join-candidates
+                                (access-join-candidates plan-db parsed-q plan))]
+                     (if (:correlated? plan)
+                       plan
+                       (adjust-access-plan plan-db parsed-q inputs plan)))
+                   (assoc plan :unavailable? true))
+                 plan)
+               sample-cost
+               (double (or (get-in plan [:estimate :planning-sample-cost])
+                           0.0))
+               remaining
+               (when bounded? (max 0.0 (- (double remaining) sample-cost)))]
+           (recur remaining (next todo) (conj! prepared plan)))
+         (persistent! prepared))))))
 
 (defn- count-node-datoms
   [^DB db {:keys [free bound] :as node}]
@@ -2220,6 +2429,21 @@
 (defn- late-expansion-operation?
   [operation]
   (#{:indexed-join :or :rule} operation))
+
+(defn access-sample-cost-budget
+  "Bound physical-access sampling by the conventional plan when that plan has
+  a complete cardinality estimate. An unresolved late join/rule is precisely
+  where sampling supplies missing expansion evidence, so its underestimated
+  conventional cost is not a sound boundary."
+  [context]
+  (when-not (some (comp late-expansion-operation? late-operation)
+                  (:late-clauses context))
+    (let [cost (estimated-plan-cost context)]
+      ;; A zero cost means the conventional root has not supplied a useful
+      ;; boundary (for example, a query planned entirely from existing
+      ;; relations). Treating it as a real budget would reject even a
+      ;; one-row access sample.
+      (when (pos? (double cost)) cost))))
 
 (defn- estimated-late-input-size
   ^long

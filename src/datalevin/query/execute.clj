@@ -140,10 +140,11 @@
     plans))
 
 (defn- prepare-access-plans
-  [plans]
+  [context plans]
   (if (or (empty? plans) (:prepared? (first plans)))
     plans
-    (let [{:keys [query inputs]} (first plans)]
+    (let [{:keys [query inputs]} (first plans)
+          sample-cost-budget (qo/access-sample-cost-budget context)]
       (mapv
         (fn [plan]
           (if (:unavailable? plan)
@@ -152,7 +153,7 @@
                 (assoc plan :prepared? true)
               (:correlated? plan)
               (assoc :outer-query (access-outer-query query plan)))))
-        (qo/plan-access-joins query inputs plans)))))
+        (qo/plan-access-joins query inputs plans sample-cost-budget)))))
 
 (defn- attach-access-plans
   [context plans]
@@ -182,7 +183,8 @@
       sort-planned-late-clauses
       ((fn [context]
          (if (seq (:access-plans context))
-           (let [plans (prepare-access-plans (:access-plans context))]
+           (let [plans (prepare-access-plans context
+                                             (:access-plans context))]
              (-> context
                  (attach-access-plans plans)
                  (qo/build-property-memo)))

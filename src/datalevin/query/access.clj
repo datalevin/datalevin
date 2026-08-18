@@ -285,7 +285,8 @@
 
 (defn plan-summary
   [{:keys [expr path demand bounds work estimate joins step sample-batch
-           correlated? outer-cols outer-joins unavailable?]}]
+           correlated? outer-cols outer-joins unavailable?
+           unavailable-reason]}]
   {:method         (:method expr)
    :source         (:source expr)
    :strategy       (:strategy path)
@@ -309,7 +310,10 @@
    :policy          (path-policy path)
    :capabilities   (:capabilities path)
    :estimate       estimate
-   :joins          joins
+   :joins          (mapv #(dissoc % :entity-var :value-var :value
+                                  :constant-value? :entity-bound?
+                                  :value-bound?)
+                         joins)
    :sample-prefix-size
    (long (or (some-> sample-batch :tuples count) 0))
    :sample-resumable? (boolean (some-> sample-batch :frontier))
@@ -317,6 +321,7 @@
    :outer-cols     outer-cols
    :outer-clauses  (mapv :orig-clause outer-joins)
    :unavailable?   (boolean unavailable?)
+   :unavailable-reason unavailable-reason
    :step            (when step
                       {:type :access
                        :cols (:cols step)

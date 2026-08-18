@@ -36,6 +36,21 @@
     :order-by [?score :desc ?id :asc]
     :limit 5])
 
+(def bounded-access-sample-query
+  '[:find ?friend-id ?message-id ?date
+    :in $ ?person-id ?max-date
+    :where
+    [?start :person/id ?person-id]
+    [?k :knows/from ?start]
+    [?k :knows/to ?friend]
+    [?friend :person/id ?friend-id]
+    [?message :message/creator ?friend]
+    [?message :message/id ?message-id]
+    [?message :message/date ?date]
+    [(< ?date ?max-date)]
+    :order-by [?date :desc ?message-id :asc]
+    :limit 20])
+
 (def unique-endpoint-query
   '[:find ?start ?middle ?end
     :where
@@ -832,6 +847,68 @@
                     [1996 1996]
                     [1995 1995]]
                    (d/q late-expansion-query db-value))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest bounded-access-sample-cost-test
+  (let [dir    (u/tmp-dir (str "bounded-access-sample-"
+                               (UUID/randomUUID)))
+        schema {:person/id       {:db/valueType :db.type/long
+                                  :db/unique    :db.unique/identity}
+                :knows/from      {:db/valueType :db.type/ref}
+                :knows/to        {:db/valueType :db.type/ref}
+                :message/creator {:db/valueType :db.type/ref}
+                :message/id      {:db/valueType :db.type/long
+                                  :db/unique    :db.unique/identity}
+                :message/date    {:db/valueType :db.type/long}}
+        conn   (d/get-conn dir schema)
+        creator-count        (long 50)
+        messages-per-creator (long 21)
+        knows-per-creator    (long 30)
+        friend-count         (long 20)]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1 :person/id 1}]
+              (concat
+                (map (fn [^long i]
+                       {:db/id (+ 1000 i) :person/id (+ 100 i)})
+                     (range creator-count))
+                (map (fn [^long i]
+                       {:db/id            (+ 10000 i)
+                        :message/id       i
+                        :message/date     i
+                        :message/creator  (+ 1000
+                                             (long (mod i creator-count)))})
+                     (range (* creator-count messages-per-creator)))
+                (for [^long i (range creator-count)
+                      ^long k (range knows-per-creator)]
+                  {:db/id      (+ 100000 (* i knows-per-creator) k)
+                   :knows/from (if (and (< i friend-count) (zero? k))
+                                 1
+                                 (+ 1000000 (* i knows-per-creator) k))
+                   :knows/to   (+ 1000 i)}))))
+      (let [db-value  (db/-clear-tx-cache (d/db conn))
+            explain   (d/explain {:run? false}
+                                 bounded-access-sample-query
+                                 db-value 1 2000)
+            preferred (:preferred-access-plan explain)
+            abort     (get-in preferred [:estimate :sampling-abort])
+            result    (d/q bounded-access-sample-query db-value 1 2000)]
+        (testing "a projected fanout cannot outspend the conventional plan"
+          (is (true? (:unavailable? preferred)))
+          (is (= :sample-work-budget (:unavailable-reason preferred)))
+          (is (= :knows/to (:attr abort)))
+          (is (< (double (:budget abort))
+                 (+ (double (:cost abort))
+                    (double (:projected-cost abort)))))
+          (is (= :conventional
+                 (get-in explain [:selected-plan-alternative :kind]))))
+        (testing "aborting the planning sample preserves ordered results"
+          (is (= 20 (count result)))
+          (is (= [119 1019 1019] (first result)))
+          (is (= [100 1000 1000] (peek result)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

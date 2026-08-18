@@ -27,13 +27,6 @@ public final class ArrayUtil {
         return Murmur3.mixCollHash(hash, values.length);
     }
 
-    /** Returns the same hash as a two-element object array without allocating it. */
-    public static int hashObjectPair(Object first, Object second) {
-        int hash = addHash(HASH_OFFSET, first);
-        hash = addHash(hash, second);
-        return Murmur3.mixCollHash(hash, 2);
-    }
-
     /**
      * Fills a recursive-rule output tuple and returns its relation tuple hash.
      */

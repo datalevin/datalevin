@@ -865,6 +865,73 @@
        (int-array (map left-attrs common-vars))
        (int-array (map right-attrs common-vars))])))
 
+(defn- compile-flat-tuple-product
+  [left-attrs {:keys [cols source-attrs source-width]}]
+  (let [left-vars       (vec (keys left-attrs))
+        common-vars     (into [] (filter #(contains? left-attrs %)) cols)
+        new-right-vars  (into [] (remove #(contains? left-attrs %)) cols)]
+    (object-array
+      [(zipmap (u/concatv left-vars new-right-vars) (range))
+       (int-array (map left-attrs left-vars))
+       (int-array (map left-attrs common-vars))
+       (int-array (map source-attrs common-vars))
+       (int-array (map source-attrs new-right-vars))
+       (long source-width)])))
+
+(defn- flat-tuple-product-match?
+  [^objects left-tuple value ^objects product-plan]
+  (let [^ints left-idxs   (aget product-plan 2)
+        ^ints source-idxs (aget product-plan 3)
+        n                 (alength left-idxs)]
+    (loop [i 0]
+      (or (== i n)
+          (and (= (aget left-tuple (aget left-idxs i))
+                  (nth value (aget source-idxs i)))
+               (recur (unchecked-inc-int i)))))))
+
+(defn- append-flat-tuple-product!
+  [^List res ^objects left-tuple value ^objects product-plan]
+  (when (flat-tuple-product-match? left-tuple value product-plan)
+    (let [^ints left-idxs   (aget product-plan 1)
+          ^ints source-idxs (aget product-plan 4)
+          left-size         (alength left-idxs)
+          source-size       (alength source-idxs)
+          ^objects out      (object-array (+ left-size source-size))]
+      (dotimes [i left-size]
+        (aset out i (aget left-tuple (aget left-idxs i))))
+      (dotimes [i source-size]
+        (aset out (+ left-size i) (nth value (aget source-idxs i))))
+      (.add res out))))
+
+(defn- bind-flat-tuple-tuples
+  "Bind a flat tuple-valued function directly into each production tuple.
+  This avoids constructing and hash-joining a pair of temporary relations for
+  every function result. Duplicate or nested tuple bindings keep using the
+  general binding path because `tuple-binding-projection` rejects them."
+  [production binding projection tuple-fn]
+  (let [^List tuples (:tuples production)
+        size         (.size tuples)
+        res          (FastList. size)
+        product-plan (compile-flat-tuple-product
+                       (:attrs production) projection)
+        source-width (long (aget ^objects product-plan 5))]
+    (dotimes [i size]
+      (let [^objects tuple (.get tuples i)
+            value          (tuple-fn tuple)]
+        (when-not (nil? value)
+          (when-not (u/seqable? value)
+            (raise "Cannot bind value " value " to tuple "
+                   (dp/source binding)
+                   {:error :query/binding, :value value,
+                    :binding (dp/source binding)}))
+          (when (< (count value) source-width)
+            (raise "Not enough elements in a collection " value
+                   " to bind tuple " (dp/source binding)
+                   {:error :query/binding, :value value,
+                    :binding (dp/source binding)}))
+          (append-flat-tuple-product! res tuple value product-plan))))
+    (r/relation! (aget ^objects product-plan 0) res)))
+
 (defn- tuple-product-match?
   [^objects left-tuple ^objects right-tuple ^objects product-plan]
   (let [^ints left-idxs  (aget product-plan 4)
@@ -934,9 +1001,12 @@
   [context clause]
   (let [[[f & args] out]     clause
         binding              (dp/parse-binding out)
-        tuple-bind?          (and (instance? BindColl binding)
+        flat-tuple-projection
+        (when (instance? BindTuple binding)
+          (qtuple/tuple-binding-projection binding))
+        coll-tuple-bind?     (and (instance? BindColl binding)
                                   (instance? BindTuple (:binding binding)))
-        projection           (when tuple-bind?
+        projection           (when coll-tuple-bind?
                                (qtuple/tuple-binding-projection
                                  (:binding binding)))
         needed               (when (and projection
@@ -964,8 +1034,11 @@
           (let [tuple-fn (-call-fn context production f args')]
             (if (instance? BindScalar binding)
               (bind-scalar-tuples production out-var tuple-fn)
-              (bind-coll-tuples
-                production binding projection needed tuple-fn))))]
+              (if flat-tuple-projection
+                (bind-flat-tuple-tuples
+                  production binding flat-tuple-projection tuple-fn)
+                (bind-coll-tuples
+                  production binding projection needed tuple-fn)))))]
     (update context :rels collapse-rels new-rel)))
 
 (defn dynamic-lookup-attrs
