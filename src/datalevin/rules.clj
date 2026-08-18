@@ -464,12 +464,14 @@
     (if tuples (.size tuples) 0)))
 
 (defn- cached-rule-rel-size
-  "Get cached size for a rule call. Only uses :rule-totals which contains
-   stable pre-computed results for non-recursive external rules.
-   Does NOT fall back to :rule-rels which may contain deltas during iteration."
+  "Get a stable size for a rule call. Uses either :rule-totals, which contains
+   pre-computed results for non-recursive external rules, or an explicit magic
+   seed. Does NOT fall back to :rule-rels, which may contain deltas during
+   iteration."
   [context clause]
   (when (rule-call? context clause)
-    (when-let [rel (get-in context [:rule-totals (rule-head clause)])]
+    (when-let [rel (or (get-in context [:rule-totals (rule-head clause)])
+                       (get-in context [:magic-seeds (rule-head clause)]))]
       (rel-size rel))))
 
 (defn- unbound-eav-pattern?

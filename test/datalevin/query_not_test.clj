@@ -73,6 +73,27 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest seeded-magic-rule-cardinality-order-test
+  (let [cached-rule-rel-size @(ns-resolve 'datalevin.rules
+                                          'cached-rule-rel-size)
+        reorder-clauses      @(ns-resolve 'datalevin.rules
+                                          'reorder-clauses)
+        magic-call           '(magic__walk ?message)
+        global-clause        '[?message :message/replyOf ?parent]
+        seed-rel             (r/relation! {'?magic 0} (tuples [42]))
+        context              {:rules
+                              {'magic__walk
+                               '[[(magic__walk ?message)
+                                  [?message :message/replyOf ?parent]
+                                  (magic__walk ?parent)]]}
+                              :magic-seeds {'magic__walk seed-rel}
+                              :rels        []}]
+    (testing "an explicit magic seed supplies a stable rule-call estimate"
+      (is (= 1 (cached-rule-rel-size context magic-call))))
+    (testing "the seed binds the entity before an otherwise global scan"
+      (is (= [magic-call global-clause]
+             (reorder-clauses [global-clause magic-call] context))))))
+
 (deftest multi-lookup-cost-selection-test
   (let [cheaper? @(ns-resolve 'datalevin.query.resolve
                               'multi-lookup-cheaper?)]
