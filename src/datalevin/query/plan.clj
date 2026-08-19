@@ -222,6 +222,12 @@
                                 (get-in step [:work :batch-size])))
         (or (:access-source step) db))))
 
+(defn- known-entity-clause-present?
+  [db e attr val]
+  (if (some? val)
+    (db/-populated? db :eav e attr val)
+    (db/-ea-populated? db e attr)))
+
 (defrecord InitStep
     [attr pred val range vars in out know-e? cols strata seen-or-joins mcount
      result sample]
@@ -238,8 +244,11 @@
           know-e?
           (let [src (doto (FastList.) (.add (object-array [e])))]
             (if get-v?
-              (db/-eav-scan-v-list db src 0 [[attr {:skip? false}]])
-              src))
+              (db/-eav-scan-v-list
+                db src 0 [[attr {:skip? false :pred pred}]])
+              (if (known-entity-clause-present? db e attr val)
+                src
+                (FastList.))))
           (nil? val)
           (db/-init-tuples-list
             db attr (or range [[[:closed c/v0] [:closed c/vmax]]]) pred get-v?)
@@ -254,15 +263,17 @@
         (p/add-batch sink result)
         (cond
           know-e?
-          (let [pipe (if (and *explain* *intermediate-counts?*)
-                       (p/counted-tuple-pipe)
-                       (p/tuple-pipe))
-                src  (doto ^Collection pipe
-                       (.add (object-array [e]))
-                       (p/finish))]
-            (if get-v?
-              (db/-eav-scan-v db src sink 0 [[attr {:skip? false}]])
-              (p/drain-to src sink)))
+          (if get-v?
+            (let [pipe (if (and *explain* *intermediate-counts?*)
+                         (p/counted-tuple-pipe)
+                         (p/tuple-pipe))
+                  src  (doto ^Collection pipe
+                         (.add (object-array [e]))
+                         (p/finish))]
+              (db/-eav-scan-v
+                db src sink 0 [[attr {:skip? false :pred pred}]]))
+            (when (known-entity-clause-present? db e attr val)
+              (.add ^Collection sink (object-array [e]))))
           (nil? val)
           (db/-init-tuples
             db sink attr
@@ -271,9 +282,10 @@
           (db/-init-tuples
             db sink attr [[[:closed val] [:closed val]]] nil false)))))
 
-  (-sample [_ db _]
+  (-sample [this db _]
     (let [get-v? (< 1 (count vars))]
       (cond
+        know-e? (-execute this db nil)
         (some? val)
         (db/-sample-init-tuples-list
           db attr mcount [[[:closed val] [:closed val]]] nil false)

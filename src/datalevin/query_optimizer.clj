@@ -1391,7 +1391,11 @@
       (let [eligible (keep #(eligible-access-join bound %) candidates)]
         (if (seq eligible)
           (let [{:keys [clause-idx vars] :as chosen}
-                (apply min-key :rows eligible)
+                ;; On equal catalog counts, apply a constant-value filter
+                ;; before a value-producing lookup that may fan out.
+                (apply u/min-key-comp
+                       (juxt :rows #(if (:constant-value? %) 0 1))
+                       eligible)
                 join (access-join-from-bound bound chosen)]
             (recur (into bound vars)
                    (filterv #(not= clause-idx (:clause-idx %)) candidates)
@@ -1670,6 +1674,34 @@
       [context stages]
       entries)))
 
+(defn- safely-resolvable-access-residuals?
+  [parsed-q context step joins]
+  (let [bound   (qresolve/bound-vars context)
+        entries (order-access-residuals
+                  bound (access-residual-entries parsed-q step joins))]
+    (loop [bound bound
+           entries entries]
+      (if-let [{:keys [clause provides] :as entry} (first entries)]
+        (and (access-clause-ready? bound entry)
+             (instance? Predicate clause)
+             (sample-safe-residual? clause)
+             (recur (into bound provides) (next entries)))
+        true))))
+
+(defn- terminal-access-join-countable?
+  "A terminal EAV lookup can be sampled by counting without materializing its
+   values when the projected entity/value pair proves distinct result rows."
+  [parsed-q context step planned-joins remaining-joins
+   {:keys [entity-var value-var]}]
+  (and (empty? remaining-joins)
+       entity-var
+       value-var
+       (let [find-vars (set (dp/find-vars (:qfind parsed-q)))]
+         (and (contains? find-vars entity-var)
+              (contains? find-vars value-var)))
+       (safely-resolvable-access-residuals?
+         parsed-q context step planned-joins)))
+
 (defn- over-count-cap
   ^long [^long cap]
   (if (= cap Long/MAX_VALUE) Long/MAX_VALUE (unchecked-inc cap)))
@@ -1708,7 +1740,7 @@
                   value  (resolved-bound-value db attr
                                                (aget tuple (long value-idx)))]
               (if (and entity (some? value))
-                (db/-count db [entity attr value])
+                (if (db/-populated? db :eav entity attr value) 1 0)
                 0)))
 
           (and entity-bound? constant-value? entity-idx)
@@ -1717,17 +1749,18 @@
                                                 (aget tuple (long entity-idx)))
                   value  (resolved-bound-value db attr value)]
               (if (and entity (some? value))
-                (db/-count db [entity attr value])
+                (if (db/-populated? db :eav entity attr value) 1 0)
                 0)))
 
-          (and entity-bound? entity-idx
-               (identical? :db.cardinality/many
-                           (get-in (db/-schema db)
-                                   [attr :db/cardinality])))
+          (and entity-bound? entity-idx)
           (fn [^objects tuple]
             (if-let [entity (resolved-bound-entity
                               db (aget tuple (long entity-idx)))]
-              (db/-count db [entity attr nil])
+              (if (identical? :db.cardinality/many
+                              (get-in (db/-schema db)
+                                      [attr :db/cardinality]))
+                (count (db/-datoms db :eav entity attr))
+                (if (db/-ea-populated? db entity attr) 1 0))
               0))
 
           (and value-bound? value-idx)
@@ -1739,11 +1772,6 @@
           :else nil)]
     (cond
       (nil? tuples) 0
-      ;; A cardinality-one entity lookup emits at most one row per input.
-      (and entity-bound? entity-idx (not value-bound?)
-           (not constant-value?) (nil? count-tuple))
-      (min (long (.size tuples)) (over-count-cap cap))
-
       count-tuple
       (capped-tuple-count-sum tuples count-tuple cap)
 
@@ -1766,20 +1794,92 @@
   (+ (double (estimate-link-cost input-size output-size))
      (materialized-output-cost output-size output-width)))
 
+(defn- count-only-output-cap
+  ^long [^double remaining-budget ^long input-size]
+  (let [probe-cost (* (double input-size)
+                      (double c/magic-cost-link-probe))
+        available  (- remaining-budget probe-cost)]
+    (if-not (pos? available)
+      0
+      (long
+        (min (double (dec Long/MAX_VALUE))
+             (Math/floor
+               (/ available (double c/magic-cost-link-retrieval))))))))
+
+(defn- terminal-access-count-sample
+  [db parsed-q context step planned-joins joins join access-var sample
+   sample-batch sample-rows stages spent budget]
+  (let [sample-rows (long sample-rows)
+        spent       (double spent)
+        budget      (double budget)]
+    (when (terminal-access-join-countable?
+            parsed-q context step planned-joins (next joins) join)
+      (let [[context stages]
+            (sample-access-residuals
+              parsed-q context step planned-joins stages)
+            relation      (access-sample-relation context access-var)
+            before        (relation-size relation)
+            find-vars     (dp/find-vars (:qfind parsed-q))
+            unique-input? (= before
+                             (sample-relation-projection-count
+                               find-vars relation))
+            output-cap    (count-only-output-cap (- budget spent) before)
+            output        (when unique-input?
+                            (projected-access-join-output
+                              db relation join output-cap))]
+        (when (some? output)
+          (let [output     (long output)
+                count-cost (double (estimate-link-cost before output))
+                total-cost (+ spent count-cost)]
+            (when (<= total-cost budget)
+              (let [other-output
+                    (long (reduce
+                            (fn [n other]
+                              (if (identical? relation other)
+                                n
+                                (estimate-round
+                                  (* (double n)
+                                     (double
+                                       (sample-relation-projection-count
+                                         find-vars other))))))
+                            1 (:rels context)))
+                    sample-output
+                    (estimate-round (* (double output)
+                                       (double other-output)))]
+                {:sample        sample
+                 :sample-batch  sample-batch
+                 :sample-rows   sample-rows
+                 :sample-output sample-output
+                 :sample-cost   total-cost
+                 :stages
+                 (conj stages
+                       {:clause-idx (:clause-idx join)
+                        :attr       (:attr join)
+                        :operation  :indexed-join
+                        :input      before
+                        :output     output
+                        :cost       count-cost
+                        :sampling   :counted})}))))))))
+
 (defn- access-variable-domain-estimates
   [step join-candidates ^long range-rows]
-  (reduce
-    (fn [domains {:keys [entity-var rows]}]
-      (let [rows (long rows)]
-        (if (and entity-var (pos? rows) (< rows Long/MAX_VALUE))
-          (update domains entity-var
-                  (fn [current]
-                    (if current (min (long current) rows) rows)))
-          domains)))
-    (if-let [access-var (first (:cols step))]
-      {access-var range-rows}
-      {})
-    join-candidates))
+  (let [access-var (first (:cols step))]
+    (reduce
+      (fn [domains {:keys [entity-var rows]}]
+        (let [rows (long rows)]
+          ;; The access variable already has the source range as its domain.
+          ;; A residual attribute count is selectivity evidence, not a smaller
+          ;; replacement domain for that same variable.
+          (if (and entity-var
+                   (not= access-var entity-var)
+                   (pos? rows)
+                   (< rows Long/MAX_VALUE))
+            (update domains entity-var
+                    (fn [current]
+                      (if current (min (long current) rows) rows)))
+            domains)))
+      (if access-var {access-var range-rows} {})
+      join-candidates)))
 
 (defn- scaled-row-estimate
   ^long [^long input-size ^double ratio]
@@ -1942,29 +2042,33 @@
                       before projected output-width))]
               (if (and bounded?
                        (> (+ spent (double projected-cost)) budget))
-                {:sample        sample
-                 :sample-batch  nil
-                 :sample-rows   sample-rows
-                 :sample-output 0
-                 :sample-cost   spent
-                 :stages
-                 (conj stages
-                       {:clause-idx clause-idx
-                        :attr       attr
-                        :operation  :indexed-join
-                        :input      before
-                        :output     projected
-                        :projected-output projected
-                        :projected-cost projected-cost
-                        :sampling   :aborted})
-                 :aborted?      true
-                 :abort         {:reason :sample-work-budget
-                                 :clause-idx clause-idx
-                                 :attr attr
-                                 :budget budget
-                                 :cost spent
-                                 :projected-cost projected-cost
-                                 :projected-output projected}}
+                (or
+                  (terminal-access-count-sample
+                    db parsed-q context step planned-joins joins join access-var
+                    sample sample-batch sample-rows stages spent budget)
+                  {:sample        sample
+                   :sample-batch  nil
+                   :sample-rows   sample-rows
+                   :sample-output 0
+                   :sample-cost   spent
+                   :stages
+                   (conj stages
+                         {:clause-idx clause-idx
+                          :attr       attr
+                          :operation  :indexed-join
+                          :input      before
+                          :output     projected
+                          :projected-output projected
+                          :projected-cost projected-cost
+                          :sampling   :aborted})
+                   :aborted?      true
+                   :abort         {:reason :sample-work-budget
+                                   :clause-idx clause-idx
+                                   :attr attr
+                                   :budget budget
+                                   :cost spent
+                                   :projected-cost projected-cost
+                                   :projected-output projected}})
                 (let [pattern  (access-join-pattern parsed-q clause-idx)
                       new-rel  (qresolve/lookup-pattern
                                  (assoc context :rels-bound-cache
@@ -2301,20 +2405,21 @@
       (concat (flat :bound bound) (flat :free free)))))
 
 (defn- count-known-e-datoms
-  [db e {:keys [free] :as node}]
-  (u/reduce-indexed
-    (fn [{:keys [mcount] :as node} {:keys [attr]} i]
-      (let [c (fast-clause-count db e {:attr attr} (long mcount))
-            c (if (zero? c)
-                (zero-count-clause-size db e {:attr attr})
-                c)]
+  [db e {:keys [bound free] :as node}]
+  (reduce
+    (fn [{:keys [mcount] :as node} [k i clause]]
+      (let [c (fast-clause-count db e clause (long mcount))
+            c (if (zero? c) (zero-count-clause-size db e clause) c)]
         (cond
           (zero? c)          (reduced (assoc node :mcount 0))
           (< c ^long mcount) (-> node
-                                 (assoc-in [:free i :count] c)
-                                 (assoc :mcount c :mpath [:free i]))
-          :else              (assoc-in node [:free i :count] c))))
-    (assoc node :mcount Long/MAX_VALUE) free))
+                                 (assoc-in [k i :count] c)
+                                 (assoc :mcount c :mpath [k i]))
+          :else              (assoc-in node [k i :count] c))))
+    (assoc node :mcount Long/MAX_VALUE)
+    (let [flat (fn [k clauses]
+                 (map-indexed (fn [i clause] [k i clause]) clauses))]
+      (concat (flat :bound bound) (flat :free free)))))
 
 (defn- count-datoms
   [db e node]
@@ -2365,6 +2470,9 @@
 
         know-e? (int? e)
         no-var? (or (not var) (qu/placeholder? var))
+        pred    (if (and know-e? var)
+                  (add-back-range var clause)
+                  pred)
 
         init (cond-> (map->init-step
                        {:attr attr :vars [e] :out [e]
@@ -4200,27 +4308,30 @@
 (defn- binary-plan
   [db sources rules nodes incoming-link-counts required-vars base-plans ratios
    build-cache prev-plan link-e new-e new-key]
-  (let [last-step     (peek (:steps prev-plan))
-        seen-or-joins (or (:seen-or-joins last-step) #{})
-        links         (get-in nodes [link-e :links])
-        candidate-key (juxt :recency :cost :size)]
-    (reduce
-      (fn [best link]
-        (if (and (= new-e (:tgt link))
-                 (or (not= :or-join (:type link))
-                     (not (contains? seen-or-joins (:clause link)))))
-          (let [new-base  (base-plans [new-e])
-                semi-join?
-                (semi-join-eligible? nodes incoming-link-counts required-vars
-                                     prev-plan link-e new-e link new-base)
-                candidate (binary-plan* db sources rules base-plans ratios
-                                        build-cache prev-plan link-e new-e link
-                                        new-key semi-join?)]
-            (if best
-              (u/min-key-comp candidate-key best candidate)
-              candidate))
-          best))
-      nil links)))
+  ;; A nil base plan can mean either a deliberately property-free link target
+  ;; or an unsatisfiable node. Only the former may use IdentityStep.
+  (when-not (zero? (long (get-in nodes [new-e :mcount])))
+    (let [last-step     (peek (:steps prev-plan))
+          seen-or-joins (or (:seen-or-joins last-step) #{})
+          links         (get-in nodes [link-e :links])
+          candidate-key (juxt :recency :cost :size)]
+      (reduce
+        (fn [best link]
+          (if (and (= new-e (:tgt link))
+                   (or (not= :or-join (:type link))
+                       (not (contains? seen-or-joins (:clause link)))))
+            (let [new-base  (base-plans [new-e])
+                  semi-join?
+                  (semi-join-eligible? nodes incoming-link-counts required-vars
+                                       prev-plan link-e new-e link new-base)
+                  candidate (binary-plan* db sources rules base-plans ratios
+                                          build-cache prev-plan link-e new-e link
+                                          new-key semi-join?)]
+              (if best
+                (u/min-key-comp candidate-key best candidate)
+                candidate))
+            best))
+        nil links))))
 
 (defn- plans
   [db sources rules nodes node-ids incoming-link-counts required-vars pairs

@@ -954,6 +954,61 @@
         (is (= 350 (estimate-cost 10 20 50 3)))
         (is (= 1050 (estimate-cost 10 20 150 3)))))))
 
+(deftest zero-cardinality-linked-node-test
+  (let [dir  (u/tmp-dir (str "zero-linked-node-" (UUID/randomUUID)))
+        conn (d/get-conn
+               dir {:node/title {:db/unique :db.unique/identity}
+                    :block/refs {:db/valueType   :db.type/ref
+                                 :db/cardinality :db.cardinality/many}})]
+    (try
+      (d/transact! conn [{:db/id 1 :node/title "Present"}
+                         {:db/id 2 :block/refs 1}])
+      (let [query '[:find ?block
+                    :where
+                    [?page :node/title "Missing"]
+                    [?block :block/refs ?page]]
+            db    (d/db conn)]
+        (is (= #{} (d/q query db)))
+        (is (= 0 (:actual-result-size
+                   (d/explain {:run? true} query db))))
+        (is (nil? (:plan (d/explain {:run? false} query db)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest known-entity-bound-clause-test
+  (let [dir (u/tmp-dir (str "known-entity-bound-" (UUID/randomUUID)))
+        db  (-> (d/empty-db
+                  dir {:name {:db/unique :db.unique/identity}
+                       :aka  {:db/cardinality :db.cardinality/many}})
+                (d/db-with [{:db/id 1 :name "Ivan" :age 15
+                             :aka ["robot" "ai"]}]))
+        query '[:find ?a ?v
+                :in $ ?e ?alias
+                :where
+                [?e ?a ?v]
+                [?e :aka ?alias]]]
+    (try
+      (testing "a true literal clause seeds late dynamic-attribute work"
+        (is (= #{[:name "Ivan"] [:age 15]
+                 [:aka "robot"] [:aka "ai"]}
+               (d/q query db 1 "ai")))
+        (is (= 4 (:actual-result-size
+                   (d/explain {:run? true} query db 1 "ai")))))
+      (testing "the known entity is still checked against the literal"
+        (is (= #{} (d/q query db 1 "missing"))))
+      (testing "known-entity value predicates are applied during EAV scan"
+        (is (= #{}
+               (d/q '[:find ?age
+                      :in $ ?e
+                      :where
+                      [?e :age ?age]
+                      [(> ?age 20)]]
+                    db 1))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
 (deftest multi-key-join-cardinality-test
   (let [estimate-size @(ns-resolve 'datalevin.query-optimizer
                                    'multi-key-result-size)
@@ -1203,6 +1258,54 @@
           (is (= 20 (count result)))
           (is (= [119 1019 1019] (first result)))
           (is (= [100 1000 1000] (peek result)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest terminal-access-count-sample-test
+  (let [dir    (u/tmp-dir (str "terminal-access-count-"
+                               (UUID/randomUUID)))
+        schema {:sample/rank {:db/valueType :db.type/long}
+                :sample/keep {:db/valueType :db.type/boolean}
+                :sample/tag  {:db/valueType   :db.type/string
+                              :db/cardinality :db.cardinality/many}}
+        conn   (d/get-conn dir schema)
+        query  '[:find ?e ?rank ?tag
+                 :in $ ?max-rank
+                 :where
+                 [?e :sample/rank ?rank]
+                 [(<= ?rank ?max-rank)]
+                 [?e :sample/keep true]
+                 [?e :sample/tag ?tag]
+                 :order-by [?rank :desc ?e :asc ?tag :asc]
+                 :limit 6]]
+    (try
+      (d/transact!
+        conn
+        (mapv
+          (fn [^long e]
+            (let [tag-count (unchecked-inc (long (mod (quot e 5) 5)))]
+              (cond-> {:db/id e :sample/rank e}
+                (zero? (rem e 5))
+                (assoc :sample/keep true
+                       :sample/tag
+                       (mapv #(str "tag-" %) (range tag-count))))))
+          (range 1 361)))
+      (let [db-value  (db/-clear-tx-cache (d/db conn))
+            explain   (d/explain {:run? false} query db-value 360)
+            preferred (:preferred-access-plan explain)
+            counted   (some #(when (= :counted (:sampling %)) %)
+                            (get-in preferred [:estimate :join-stages]))]
+        (testing "a terminal projection can be sampled without materializing"
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-top-k
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= :sample/tag (:attr counted)))
+          (is (pos? (long (:output counted))))
+          (is (<= (double
+                    (get-in preferred [:estimate :planning-sample-cost]))
+                  (double (:conventional-plan-cost explain))))
+          (is (= 6 (count (d/q query db-value 360))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
