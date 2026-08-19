@@ -1539,44 +1539,48 @@
     (let [dir         (env-dir this)
           dir-key     (local-kv-handle-key (u/file dir) (@info :flags))
           close-error (volatile! nil)]
-      (when-not (.isClosed env)
-        (unregister-shutdown-hook! dir)
-        (stop-scheduled-sync scheduled-sync)
-        (close-reader-rtxs! reader-registry)
-        (when-let [^Rtx wtxn @write-txn]
-          (close-rtx-quiet! wtxn)
-          (vreset! write-txn nil))
-        (.remove tl-reader)
-        (let [dir-prefix (str (.env-dir this) u/+separator+)
-              indices    (->> @l/vector-indices
-                              (keep (fn [[fname idx]]
-                                      (when (and (string? fname)
-                                                 (s/starts-with? fname dir-prefix))
-                                        idx)))
-                              vec)]
-          ;; Close vector indices while LMDB env is still valid.
-          (doseq [idx indices]
+      ;; The shutdown hook can race an explicit close. All marked-write views
+      ;; share this lock, so guard the complete native teardown rather than only
+      ;; the final env close.
+      (locking write-txn
+        (when-not (.isClosed env)
+          (unregister-shutdown-hook! dir)
+          (stop-scheduled-sync scheduled-sync)
+          (close-reader-rtxs! reader-registry)
+          (when-let [^Rtx wtxn @write-txn]
+            (close-rtx-quiet! wtxn)
+            (vreset! write-txn nil))
+          (.remove tl-reader)
+          (let [dir-prefix (str (.env-dir this) u/+separator+)
+                indices    (->> @l/vector-indices
+                                (keep (fn [[fname idx]]
+                                        (when (and (string? fname)
+                                                   (s/starts-with? fname
+                                                                   dir-prefix))
+                                          idx)))
+                                vec)]
+            ;; Close vector indices while LMDB env is still valid.
+            (doseq [idx indices]
+              (try
+                (close-vecs idx)
+                (catch Throwable e
+                  (when-not @close-error
+                    (vreset! close-error e))))))
+          (doseq [^DBI db (.values dbis)]
             (try
-              (close-vecs idx)
+              (close-dbi-quiet! db)
               (catch Throwable e
                 (when-not @close-error
-                  (vreset! close-error e))))))
-        (doseq [^DBI db (.values dbis)]
-          (try
-            (close-dbi-quiet! db)
-            (catch Throwable e
-              (when-not @close-error
-                (vreset! close-error e)))))
-        (.clear dbis)
-        (close-bufval-quiet! kp-w)
-        (close-bufval-quiet! vp-w)
-        (close-bufval-quiet! start-kp-w)
-        (close-bufval-quiet! stop-kp-w)
-        (close-bufval-quiet! start-vp-w)
-        (close-bufval-quiet! stop-vp-w)
-        (clean-buffer-quiet! k-comp-bf-w)
-        (clean-buffer-quiet! v-comp-bf-w)
-        (locking write-txn
+                  (vreset! close-error e)))))
+          (.clear dbis)
+          (close-bufval-quiet! kp-w)
+          (close-bufval-quiet! vp-w)
+          (close-bufval-quiet! start-kp-w)
+          (close-bufval-quiet! stop-kp-w)
+          (close-bufval-quiet! start-vp-w)
+          (close-bufval-quiet! stop-vp-w)
+          (clean-buffer-quiet! k-comp-bf-w)
+          (clean-buffer-quiet! v-comp-bf-w)
           (try
             (.sync env 1)
             (catch Throwable e
@@ -1586,8 +1590,8 @@
             (.close env)
             (catch Throwable e
               (when-not @close-error
-                (vreset! close-error e)))))
-        (when (@info :temp?) (u/delete-files (@info :dir))))
+                (vreset! close-error e))))
+          (when (@info :temp?) (u/delete-files (@info :dir)))))
       (when (.isClosed env)
         (release-local-kv-handle! dir-key)
         (swap! l/lmdb-dirs disj dir)

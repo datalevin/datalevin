@@ -10,7 +10,10 @@
    [datalevin.query.plan :as qplan]
    [datalevin.util :as u :refer [defrecord-updatable]])
   (:import
-   [java.util.concurrent Callable ExecutorService Future TimeUnit]))
+   [java.lang Thread$State]
+   [java.util UUID]
+   [java.util.concurrent Callable CountDownLatch ExecutorService Future
+    TimeUnit]))
 
 ;;
 ;; verify that defrecord-updatable works with compiler/core macro configuration
@@ -75,6 +78,55 @@
             :cause     "native reader failure"}
            (ex-data error)))
     (is (identical? cause (ex-cause error)))))
+
+(defn- wait-until-blocked
+  [^Thread thread]
+  (loop [attempt 0]
+    (cond
+      (= Thread$State/BLOCKED (.getState thread)) true
+      (not (.isAlive thread))                     false
+      (< attempt 1000) (do
+                         (Thread/sleep 1)
+                         (recur (unchecked-inc-int attempt)))
+      :else false)))
+
+(deftest close-kv-locks-before-native-teardown
+  (let [dir           (u/tmp-dir
+                       (str "close-kv-lock-test-" (UUID/randomUUID)))
+        lmdb          (d/open-kv dir)
+        write-lock    (l/write-txn lmdb)
+        hooks         (var-get (ns-resolve 'datalevin.binding.cpp
+                                           'shutdown-hooks))
+        close-started (CountDownLatch. 1)
+        close-error   (atom nil)
+        closer        (Thread.
+                       (fn []
+                         (.countDown close-started)
+                         (try
+                           (d/close-kv lmdb)
+                           (catch Throwable e
+                             (reset! close-error e)))))]
+    (try
+      (is (contains? @hooks dir))
+      (locking write-lock
+        (.start closer)
+        (is (.await close-started 1 TimeUnit/SECONDS))
+        (is (wait-until-blocked closer))
+        ;; Closing used to unregister the hook and release native resources
+        ;; before acquiring this lock, allowing a shutdown-hook double-close.
+        (is (contains? @hooks dir)))
+      (.join closer 5000)
+      (is (not (.isAlive closer)))
+      (is (nil? @close-error))
+      (is (d/closed-kv? lmdb))
+      (is (not (contains? @hooks dir)))
+      (finally
+        (when (.isAlive closer)
+          (.interrupt closer)
+          (.join closer 5000))
+        (when-not (d/closed-kv? lmdb)
+          (d/close-kv lmdb))
+        (u/delete-files dir)))))
 
 (defn- now [] (System/currentTimeMillis))
 

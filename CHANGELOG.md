@@ -9,6 +9,8 @@
 - [Datalog] costed pre-materialization of selective constant AVE lookups,
   including non-unique values.
 - [Datalog] parallel index scans.
+- [Datalog] magic-set seeds participate in rule-call cost estimation.
+- [Datalog] late or-join branch planner.
 
 ## 1.0.2 (2026-08-11)
 
