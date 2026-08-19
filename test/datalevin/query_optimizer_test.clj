@@ -52,6 +52,26 @@
     :order-by [?date :desc ?message-id :asc]
     :limit 20])
 
+(def dominated-projection-root-query
+  '[:find ?friend-id ?first-name ?last-name
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?friend]
+    [?friend :person/id ?friend-id]
+    [?friend :person/firstName ?first-name]
+    [?friend :person/lastName ?last-name]])
+
+(def filtered-projection-root-query
+  '[:find ?friend-id ?score
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?friend]
+    [?friend :person/id ?friend-id]
+    [?friend :person/score ?score]
+    [(> ?score 1100)]])
+
 (def unique-endpoint-query
   '[:find ?start ?middle ?end
     :where
@@ -1010,6 +1030,11 @@
         (testing "a projected fanout cannot outspend the conventional plan"
           (is (true? (:unavailable? preferred)))
           (is (= :sample-work-budget (:unavailable-reason preferred)))
+          (is (= :access-propagation-preflight (:phase abort)))
+          (is (zero? (long (get-in preferred [:estimate :sample-rows]))))
+          (is (zero? (double
+                       (get-in preferred
+                               [:estimate :planning-sample-cost]))))
           (is (= :knows/to (:attr abort)))
           (is (< (double (:budget abort))
                  (+ (double (:cost abort))
@@ -1020,6 +1045,52 @@
           (is (= 20 (count result)))
           (is (= [119 1019 1019] (first result)))
           (is (= [100 1000 1000] (peek result)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest dominated-projection-base-sample-test
+  (let [dir    (u/tmp-dir (str "dominated-projection-root-"
+                               (UUID/randomUUID)))
+        schema {:start/id         {:db/valueType :db.type/long
+                                   :db/unique    :db.unique/identity}
+                :edge/from        {:db/valueType :db.type/ref}
+                :edge/to          {:db/valueType :db.type/ref}
+                :person/id        {:db/valueType :db.type/long
+                                   :db/unique    :db.unique/identity}
+                :person/firstName {:db/valueType :db.type/string}
+                :person/lastName  {:db/valueType :db.type/string}
+                :person/score     {:db/valueType :db.type/long}}
+        conn   (d/get-conn dir schema)
+        people (mapv (fn [^long i]
+                       {:db/id            (+ 1000 i)
+                        :person/id        i
+                        :person/firstName (str "first-" i)
+                        :person/lastName  (str "last-" i)
+                        :person/score     i})
+                     (range 1200))
+        edges  (mapv (fn [^long i]
+                       {:db/id     (+ 10000 i)
+                        :edge/from 1
+                        :edge/to   (+ 1000 i)})
+                     (range 29))]
+    (try
+      (d/transact! conn (into [{:db/id 1 :start/id 1}]
+                              (concat people edges)))
+      (let [db-value (d/db conn)
+            explain  (d/explain {:run? false}
+                                dominated-projection-root-query db-value)
+            result   (d/q dominated-projection-root-query db-value)
+            filtered (d/explain {:run? false}
+                                filtered-projection-root-query db-value)]
+        (testing "pure output properties defer their global root sample"
+          (is (= ['?friend]
+                 (get (:deferred-base-samples explain) '$)))
+          (is (= 29 (count result)))
+          (is (contains? result [0 "first-0" "last-0"]))
+          (is (contains? result [28 "first-28" "last-28"])))
+        (testing "a projected property used by a predicate is still sampled"
+          (is (nil? (:deferred-base-samples filtered)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
