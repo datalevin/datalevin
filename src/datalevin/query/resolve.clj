@@ -44,6 +44,13 @@
   as call targets, and UDFs reached through the built-in udf function."
   :embedded)
 
+(def ^:dynamic *or-join-branch-selector*
+  "Optional selector used by late execution to choose among ready clauses in
+  a direct `and` branch of an or-join. The function receives the current
+  context, pending clauses, and ready clause indices, and returns one of those
+  indices. Normal resolution retains dependency-ordered source order."
+  nil)
+
 (defn server-safe-resolver?
   []
   (= :server-safe *resolver-mode*))
@@ -1207,23 +1214,28 @@
 (defn- resolve-clauses
   "Resolve conjunction clauses in dependency order, retaining source order
   among clauses whose input bindings are already available."
-  [context clauses]
-  (loop [context context
-         pending (vec clauses)]
-    (if (empty? pending)
-      context
-      (let [bound (bound-vars context)
-            idx   (first
-                    (keep-indexed
-                      (fn [i clause]
-                        (when (clause-bindings-ready? bound clause) i))
-                      pending))]
-        (if (some? idx)
-          (recur (resolve-clause context (nth pending idx))
-                 (u/vec-remove pending idx))
-          ;; Preserve the resolver's detailed insufficient-binding error when
-          ;; the conjunction has no clause capable of making progress.
-          (reduce resolve-clause context pending))))))
+  ([context clauses]
+   (resolve-clauses context clauses nil))
+  ([context clauses selector]
+   (loop [context context
+          pending (vec clauses)]
+     (if (empty? pending)
+       context
+       (let [bound (bound-vars context)
+             ready (into []
+                         (keep-indexed
+                           (fn [i clause]
+                             (when (clause-bindings-ready? bound clause) i)))
+                         pending)
+             selected (when (and selector (seq ready))
+                        (selector context pending ready))
+             idx (if (some #{selected} ready) selected (first ready))]
+         (if (some? idx)
+           (recur (resolve-clause context (nth pending idx))
+                  (u/vec-remove pending idx))
+           ;; Preserve the resolver's detailed insufficient-binding error when
+           ;; the conjunction has no clause capable of making progress.
+           (reduce resolve-clause context pending)))))))
 
 (defn -resolve-clause
   ([context clause]
@@ -1281,8 +1293,14 @@
            join-context        (limit-context context vars)]
        (update context :rels collapse-rels
                (transduce (comp (map (fn [branch]
-                                       (-> join-context
-                                           (resolve-clause branch)
+                                       (-> (if (and *or-join-branch-selector*
+                                                    (sequential? branch)
+                                                    (= 'and (first branch)))
+                                             (resolve-clauses
+                                               join-context (next branch)
+                                               *or-join-branch-selector*)
+                                             (resolve-clause join-context
+                                                             branch))
                                            (limit-context vars))))
                                 (map #(let [rels (:rels %)]
                                         (if (seq rels)

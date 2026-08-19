@@ -39,7 +39,7 @@
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
-   [java.util Comparator PriorityQueue]
+   [java.util Comparator List PriorityQueue]
    [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Pattern
     Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -401,6 +401,188 @@
      (* (+ (double probe-count) (double output-count))
         (double c/magic-cost-hash-join))))
 
+(def ^:const ^:private ^long late-or-join-branch-probe-limit 100000)
+(def ^:const ^:private ^long late-or-join-exact-count-limit 8)
+
+(defn- late-branch-pattern-parts
+  [clause default-source]
+  (when (vector? clause)
+    (let [source? (qu/source? (first clause))
+          pattern (if source? (subvec clause 1) clause)]
+      (when (and (= 3 (count pattern))
+                 (keyword? (second pattern)))
+        {:source (if source? (first clause) default-source)
+         :entity (first pattern)
+         :attr   (second pattern)
+         :value  (nth pattern 2)}))))
+
+(defn- late-bound-term
+  [context term]
+  (cond
+    (qu/binding-var? term)
+    (when-let [{:keys [attrs tuples]}
+               (some #(when (contains? (:attrs %) term) %) (:rels context))]
+      (let [n (.size ^List tuples)]
+        (if (<= n late-or-join-exact-count-limit)
+          (let [values (into #{}
+                             (map (fn [^objects tuple]
+                                    (aget tuple (long (attrs term)))))
+                             tuples)]
+            {:probes (count values) :values values})
+          ;; A large relation's row count is a cheap conservative proxy for
+          ;; distinct bound values. Avoid materializing a set merely to choose
+          ;; the next branch pattern; the lookup itself will deduplicate it.
+          {:probes n})))
+
+    (or (nil? term) (= '_ term) (qu/placeholder? term)) nil
+    :else {:probes 1 :values #{term}}))
+
+(defn- late-indexed-side-fanout
+  [source attr side {:keys [probes values]}]
+  (let [probes (long probes)]
+    (when (<= probes late-or-join-branch-probe-limit)
+      (try
+        (if (some? values)
+          {:fanout
+           (reduce
+             (fn [^long total value]
+               (let [pattern (if (identical? side :entity)
+                               [value attr nil]
+                               [nil attr value])
+                     resolved (qresolve/resolve-pattern-lookup-refs source
+                                                                    pattern)]
+                 (saturating-add total (long (db/-count source resolved)))))
+             0 values)
+           :confidence :counted}
+          (let [scan-count (long (db/-count source [nil attr nil]))
+                estimated (long
+                            (Math/ceil
+                              (* (double probes)
+                                 (double c/magic-link-ratio))))]
+            {:fanout (min scan-count estimated)
+             :confidence :heuristic}))
+        ;; Planning must not surface lookup-ref or storage errors from a clause
+        ;; that normal source-order execution may never reach.
+        (catch Exception _ nil)))))
+
+(defn- cached-late-side-estimate
+  [cache source-sym source attr side {:keys [probes values]}]
+  (let [key [source-sym attr side probes values]
+        m   @cache]
+    (if (contains? m key)
+      (get m key)
+      (let [{:keys [fanout confidence]}
+            (late-indexed-side-fanout source attr side
+                                      {:probes probes :values values})
+            result (when (some? fanout)
+                     {:side       side
+                      :probes     probes
+                      :fanout     (long fanout)
+                      :confidence confidence
+                      :cost       (indexed-producer-cost probes
+                                                         (long fanout))})]
+        (vswap! cache assoc key result)
+        result))))
+
+(defn- cheaper-estimate
+  [best candidate]
+  (if (< (double (or (:rank-cost candidate) (:cost candidate)))
+         (double (or (:rank-cost best) (:cost best))))
+    candidate
+    best))
+
+(defn- comparable-estimates
+  [estimates]
+  (let [all-counted? (every? #(identical? :counted (:confidence %))
+                             estimates)]
+    (mapv (fn [{:keys [probes cost] :as estimate}]
+            (assoc estimate :rank-cost
+                   (if all-counted?
+                     cost
+                     (let [fanout (long
+                                    (Math/ceil
+                                      (* (double probes)
+                                         (double c/magic-link-ratio))))]
+                       (indexed-producer-cost probes fanout)))))
+          estimates)))
+
+(defn- late-branch-pattern-estimate
+  [context cache idx clause]
+  (when-let [{:keys [source entity attr value]}
+             (late-branch-pattern-parts clause '$)]
+    (let [source-db (get (:sources context) source)]
+      (when (and source-db
+                 (db/-searchable? source-db)
+                 (not (and (qu/binding-var? entity)
+                           (= entity value))))
+        (let [entity-term (late-bound-term context entity)
+              value-term  (late-bound-term context value)
+              estimates
+              (cond-> []
+                (some? entity-term)
+                (conj (cached-late-side-estimate
+                        cache source source-db attr :entity entity-term))
+
+                (some? value-term)
+                (conj (cached-late-side-estimate
+                        cache source source-db attr :value value-term)))
+              estimates (->> estimates (filterv some?) comparable-estimates)]
+          (when (seq estimates)
+            (assoc (reduce cheaper-estimate estimates)
+                   :idx idx :clause clause)))))))
+
+(defn- ready-pattern-run
+  [pending ready first-ready]
+  (let [ready (set ready)]
+    (loop [idx (long first-ready)
+           result []]
+      (if (and (< idx (long (count pending)))
+               (contains? ready idx)
+               (late-branch-pattern-parts (nth pending idx) '$))
+        (recur (u/long-inc idx) (conj result idx))
+        result))))
+
+(defn- explain-late-or-join-choice
+  [or-clause pending first-ready selected estimates]
+  (when qplan/*explain*
+    (vswap! qplan/*explain* update :late-or-join-branch-decisions
+            (fnil conj [])
+            {:or-join        or-clause
+             :from-index     first-ready
+             :selected-index (:idx selected)
+             :from-clause    (nth pending first-ready)
+             :selected-clause (:clause selected)
+             :alternatives
+             (mapv #(select-keys % [:idx :clause :side :probes :fanout
+                                    :confidence :cost :rank-cost])
+                   estimates)})))
+
+(defn- late-or-join-branch-selector
+  [or-clause]
+  (let [cache (volatile! {})]
+    (fn [context pending ready]
+      (let [first-ready (first ready)
+            run         (ready-pattern-run pending ready first-ready)
+            estimates   (->> run
+                             (keep #(late-branch-pattern-estimate
+                                      context cache % (nth pending %)))
+                             vec
+                             comparable-estimates)]
+        (if (and (seq estimates)
+                 (= first-ready (:idx (first estimates))))
+          (let [selected (reduce cheaper-estimate estimates)]
+            (when (not= first-ready (:idx selected))
+              (explain-late-or-join-choice or-clause pending first-ready
+                                           selected estimates))
+            (:idx selected))
+          first-ready)))))
+
+(defn- late-or-join-clause?
+  [clause]
+  (when (and (sequential? clause) (not (vector? clause)))
+    (let [body (if (qu/source? (first clause)) (next clause) clause)]
+      (u/sym-name-eqs (first body) "or-join"))))
+
 (defn- or-join-vars
   [clause]
   (let [body (if (qu/source? (first clause)) (next clause) clause)]
@@ -713,6 +895,14 @@
   (let [tuples (db/-init-tuples-list source-db attr [range] nil false)]
     (update context :rels conj (r/relation! {entity 0} tuples))))
 
+(defn- resolve-late-clause
+  [context clause]
+  (if (late-or-join-clause? clause)
+    (binding [qresolve/*or-join-branch-selector*
+              (late-or-join-branch-selector clause)]
+      (qresolve/resolve-clause context clause))
+    (qresolve/resolve-clause context clause)))
+
 (defn- resolve-late-clauses
   [context clauses]
   (loop [context  context
@@ -742,7 +932,7 @@
                  :indexed-range-first
                  (isolated-range-context context (:producer choice))
 
-                 (qresolve/resolve-clause context clause))
+                 (resolve-late-clause context clause))
                (u/remove-idxs (set selected-idxs) pending)
                (into executed selected-clauses))))))
 

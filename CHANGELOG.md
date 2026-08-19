@@ -8,6 +8,7 @@
 - [Datalog] range fusion in late clauses.
 - [Datalog] costed pre-materialization of selective constant AVE lookups,
   including non-unique values.
+- [Datalog] parallel index scans.
 
 ## 1.0.2 (2026-08-11)
 

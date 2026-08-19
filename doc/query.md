@@ -699,6 +699,15 @@ clauses that are ready at the same time, and clauses whose dependencies cannot
 be satisfied are left in their original order so normal validation errors remain
 clear. The planned order is visible in `explain` under `:late-clauses`.
 
+Direct `and` branches of a late `or-join` receive an additional dynamic ordering
+step. Within each contiguous run of ready, fixed-attribute data patterns, the
+resolver chooses the cheapest indexed pattern using the bindings produced so
+far. Very small bound sets use exact index fanout counts; larger sets use a
+bounded probe-count estimate so planning does not repeat the scan's work.
+Predicates, functions, and other clause forms remain ordering barriers. When a
+branch pattern moves ahead of source order, `explain` records the alternatives
+and selected pattern under `:late-or-join-branch-decisions`.
+
 Late work also participates in physical-plan costing. Predicates and function
 bindings are charged per estimated input row. Patterns, `or` clauses, and rules
 may expand cardinality rather than merely filter it; when a non-correlated

@@ -296,6 +296,77 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest late-or-join-branch-order-test
+  (let [dir      (u/tmp-dir (str "late-or-join-branch-"
+                                 (UUID/randomUUID)))
+        schema   {:edge/from {:db/valueType :db.type/ref}
+                  :edge/to   {:db/valueType :db.type/ref}}
+        conn     (d/get-conn dir schema)
+        forward '[?k3 :edge/from ?mid2]
+        reverse '[?k3 :edge/to ?friend]
+        clause   '(or-join [?start ?friend ?dist]
+                    (and [?k1 :edge/from ?start]
+                         [?k1 :edge/to ?mid1]
+                         [?k2 :edge/from ?mid1]
+                         [?k2 :edge/to ?mid2]
+                         [?k3 :edge/from ?mid2]
+                         [?k3 :edge/to ?friend]
+                         [(ground 3) ?dist]))
+        resolve-late @(ns-resolve 'datalevin.query.execute
+                                  'resolve-late-clauses)]
+    (try
+      (d/transact!
+        conn
+        (concat [{:db/id 100 :edge/from 1 :edge/to 2}
+                 {:db/id 101 :edge/from 2 :edge/to 3}
+                 {:db/id 200 :edge/from 3 :edge/to 999}
+                 {:db/id 300 :edge/from 500 :edge/to 999}
+                 {:db/id 301 :edge/from 501 :edge/to 999}
+                 {:db/id 302 :edge/from 502 :edge/to 999}
+                 {:db/id 303 :edge/from 503 :edge/to 999}]
+                (map (fn [^long i]
+                       {:db/id (+ 200 i)
+                        :edge/from 3
+                        :edge/to   (+ 1000 i)})
+                     (range 1 50))))
+      (let [context {:sources {'$ (d/db conn)}
+                     :rules   nil
+                     :rels
+                     [(r/relation! {'?start 0}
+                                   (doto (FastList.)
+                                     (.add (object-array [1]))))
+                      (r/relation! {'?friend 0}
+                                   (doto (FastList.)
+                                     (.add (object-array [999]))))]}
+            explain (volatile! {})
+            result  (binding [qplan/*explain* explain
+                              qu/*implicit-source* (get-in context
+                                                           [:sources '$])]
+                      (resolve-late context [clause]))
+            rel     (if (< 1 (count (:rels result)))
+                      (reduce j/hash-join (:rels result))
+                      (first (:rels result)))
+            attrs   (:attrs rel)
+            rows    (into #{}
+                          (map (fn [^objects tuple]
+                                 (mapv #(aget tuple (long (attrs %)))
+                                       ['?start '?friend '?dist])))
+                          (:tuples rel))
+            decision
+            (some #(when (= reverse (:selected-clause %)) %)
+                  (:late-or-join-branch-decisions @explain))
+            alternatives (into {}
+                               (map (juxt :clause identity))
+                               (:alternatives decision))]
+        (is (= #{[1 999 3]} rows))
+        (is (some? decision))
+        (is (= 50 (get-in alternatives [forward :fanout])))
+        (is (= 5 (get-in alternatives [reverse :fanout])))
+        (is (= :value (get-in alternatives [reverse :side]))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest costed-indexed-date-range-order-test
   (let [dir            (u/tmp-dir
                          (str "indexed-date-range-order-" (UUID/randomUUID)))
