@@ -215,6 +215,17 @@
   [store k v]
   (.put ^LRUCache (.get ^ConcurrentHashMap caches (dir store)) k v))
 
+(defn ^:no-doc cache-token
+  [store]
+  (let [cache ^LRUCache (.get ^ConcurrentHashMap caches (dir store))]
+    [cache (.generation cache)]))
+
+(defn ^:no-doc cache-put-if-current
+  [store [^LRUCache cache generation] k v]
+  (and (identical? cache
+                   (.get ^ConcurrentHashMap caches (dir store)))
+       (.putIfGeneration cache k v (long generation))))
+
 (defn remove-cache
   [store]
   (.remove ^ConcurrentHashMap caches (dir store))
@@ -224,11 +235,12 @@
 (defmacro wrap-cache
   [store pattern body]
   `(let [store# ~store
-         cache# (.get ^ConcurrentHashMap caches (dir store#))]
+         cache# ^LRUCache (.get ^ConcurrentHashMap caches (dir store#))
+         generation# (.generation cache#)]
      (if-some [cached# (.get ^LRUCache cache# ~pattern)]
        cached#
        (let [res# ~body]
-         (.put ^LRUCache cache# ~pattern res#)
+         (.putIfGeneration cache# ~pattern res# generation#)
          res#))))
 
 (defn- sample-init-cache-key
@@ -451,10 +463,17 @@
      (do
        (when (seq tx-data)
          (let [touches (tx-touch-summary tx-data)]
-           (doseq [k (.keys cache)
-                   :when (tx-affects-cache-key? touches k)]
-             (.remove cache k))))
-       (.setTarget cache target)
+           ;; Prevent a reader that started before this commit from publishing
+           ;; its old snapshot after the affected entries have been removed.
+           ;; LRUCache methods synchronize on the cache monitor, so this also
+           ;; keeps cache hits out of the invalidation window.
+           (locking cache
+             (.beginInvalidation cache (long (or target 0)))
+             (doseq [k (.keys cache)
+                     :when (tx-affects-cache-key? touches k)]
+               (.remove cache k)))))
+       (when-not (seq tx-data)
+         (.setTarget cache (long (or target 0))))
        (mark-remote-cache-max-tx! store remote-max-tx))
      (refresh-cache store target remote-max-tx))))
 

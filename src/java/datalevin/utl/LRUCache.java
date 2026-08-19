@@ -8,6 +8,8 @@ public class LRUCache {
 
     long target;
 
+    long generation;
+
     boolean disabled;
 
     public LRUCache(int capacity) {
@@ -27,53 +29,65 @@ public class LRUCache {
         this.target = target;
     }
 
-    public boolean isDisabled() {
+    public synchronized boolean isDisabled() {
         return disabled;
     }
 
-    public void disable() {
+    public synchronized void disable() {
         disabled = true;
     }
 
-    public void enable() {
+    public synchronized void enable() {
         disabled = false;
     }
 
-    public long target() {
+    public synchronized long target() {
         return target;
     }
 
-    public void setTarget(long target) {
+    public synchronized void setTarget(long target) {
         this.target = target;
     }
 
-    public Object get(Object key) {
+    public synchronized long generation() {
+        return generation;
+    }
+
+    public synchronized void beginInvalidation(long target) {
+        this.target = target;
+        generation++;
+    }
+
+    public synchronized Object get(Object key) {
         if (disabled == true) return null;
         return map.get(key);
     }
 
-    public void put(Object key, Object value) {
+    public synchronized void put(Object key, Object value) {
         if (disabled == true) return;
         map.put(key, value);
     }
 
-    public Object remove(Object key) {
+    public synchronized boolean putIfGeneration(Object key, Object value,
+                                                long expectedGeneration) {
+        if (disabled == true || generation != expectedGeneration) return false;
+        map.put(key, value);
+        return true;
+    }
+
+    public synchronized Object remove(Object key) {
         return map.remove(key);
     }
 
-    public Set<Object> keys() {
-        synchronized(map) {
-            return new HashSet<Object>(map.keySet());
-        }
+    public synchronized Set<Object> keys() {
+        return new HashSet<Object>(map.keySet());
     }
 
-    public List<Object> orderedKeys() {
-        synchronized(map) {
-            return new ArrayList<Object>(map.keySet());
-        }
+    public synchronized List<Object> orderedKeys() {
+        return new ArrayList<Object>(map.keySet());
     }
 
-    public void clear() {
+    public synchronized void clear() {
         map.clear();
     }
 }

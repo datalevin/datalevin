@@ -52,3 +52,14 @@
     (is (= #{:a :b} (set (.keys l))))
     (.setTarget l 42)
     (is (= 42 (.target l)))))
+
+(deftest stale-generation-cannot-publish
+  (let [l          (LRUCache. 4 1)
+        generation (.generation l)]
+    (is (.putIfGeneration l :before :old generation))
+    (.beginInvalidation l 2)
+    (.remove l :before)
+    (is (not (.putIfGeneration l :stale :old generation)))
+    (is (nil? (.get l :stale)))
+    (is (.putIfGeneration l :current :new (.generation l)))
+    (is (= :new (.get l :current)))))

@@ -165,11 +165,12 @@
                         (udf-cache-token inputs))
             k         [:query-result deps :exact-window-v1
                        qresolve/*resolver-mode* parsed-q' udf-token
-                       (mapv cache-input-token inputs)]]
+                       (mapv cache-input-token inputs)]
+            token     (db/cache-token store)]
         (if-let [cached (db/cache-get store k)]
           cached
           (let [res (run-query parsed-q inputs)]
-            (db/cache-put store k res)
+            (db/cache-put-if-current store token k res)
             res)))
       (run-query parsed-q inputs))
     (run-query parsed-q inputs)))

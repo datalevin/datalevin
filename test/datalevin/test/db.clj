@@ -25,6 +25,15 @@
 (defrecord-updatable HashBeef [x]
   clojure.lang.IHashEq (hasheq [hb] 0xBEEF))
 
+(def ^:private stale-query-cache-coordination (atom nil))
+
+(defn stale-query-cache-pass?
+  [value]
+  (when-let [{:keys [query-value release]} @stale-query-cache-coordination]
+    (deliver query-value value)
+    (deref release 5000 ::timeout))
+  true)
+
 (deftest test-defrecord-updatable
   (is (= 0xBEEF (-> (map->HashBeef {:x :ignored}) hash))))
 
@@ -47,6 +56,43 @@
     (is (= (cache-key 42 1000) (cache-key 42 1000)))
     (is (not= (cache-key 42 1000) (cache-key 43 1000)))
     (is (not= (cache-key 42 1000) (cache-key 42 4000)))))
+
+(deftest stale-query-result-cannot-repopulate-cache-after-commit
+  (let [dir          (u/tmp-dir
+                      (str "stale-query-cache-" (UUID/randomUUID)))
+        conn         (d/create-conn dir {:item/value {}})
+        query        '[:find ?value .
+                       :where
+                       [1 :item/value ?value]
+                       [(datalevin.test.db/stale-query-cache-pass? ?value)
+                        ?passed]
+                       [(= true ?passed)]]
+        query-result (promise)
+        release      (promise)
+        stale-query  (atom nil)]
+    (try
+      (d/transact! conn [{:db/id 1 :item/value 100}])
+      (db/refresh-cache (:store @conn))
+      (let [db-before @conn]
+        (reset! stale-query-cache-coordination
+                {:query-value query-result
+                 :release release})
+        (reset! stale-query
+                (future (d/q query db-before)))
+        (is (= 100 (deref query-result 5000 ::timeout)))
+        (d/transact! conn [{:db/id 1 :item/value 101}])
+        (deliver release true)
+        (is (= 100 (deref @stale-query 5000 ::timeout)))
+        ;; The old reader may return its own snapshot, but must not publish that
+        ;; result into the cache after the committing transaction invalidated it.
+        (is (= 101 (d/q query @conn))))
+      (finally
+        (reset! stale-query-cache-coordination nil)
+        (deliver release true)
+        (when-let [query-future @stale-query]
+          (future-cancel query-future))
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest query-plan-pool-shuts-down-with-last-lmdb-executors
   (let [^ExecutorService pool (#'qplan/get-pipe-thread-pool)]
