@@ -123,6 +123,21 @@
       nil
       as)))
 
+(defn get-some-else
+  "Total variant of `get-some`. Return the first found attribute and value, or
+   `[nil else-val]` when none of the cardinality-one attributes exists. The
+   explicit fallback makes this function cardinality preserving, which allows
+   projection-only calls to run after top-k. e.g.
+  `[(get-some-else $ ?e \"N/A\" :country :artist :book) [_ ?val]]`"
+  [db e else-val & as]
+  (clojure.core/or (apply get-some db e as) [nil else-val]))
+
+(def ^:no-doc post-top-k-enrichment-fns
+  "Built-in functions that deterministically produce exactly one tuple per
+   input row and perform property enrichment suitable for post-top-k
+   execution when the query planner proves the remaining dependencies safe."
+  #{'get-some-else 'datalevin.built-ins/get-some-else})
+
 (def ground
   "Function. Same as Clojure `identity`. E.g.
   `[(ground [:a :e :i :o :u]) [?vowel ...]]`"
@@ -1156,6 +1171,7 @@
    '-differ?      -differ?,
    'get-else      get-else,
    'get-some      get-some,
+   'get-some-else get-some-else,
    'missing?      missing?,
    'ground        identity,
    'quote         identity,

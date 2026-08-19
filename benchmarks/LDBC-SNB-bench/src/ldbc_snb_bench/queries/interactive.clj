@@ -60,9 +60,9 @@
                   ;; messages
                   [?message :message/hasCreator ?friend]
                   [?message :message/id ?message-id]
-                  [(get-some $ ?message
-                             :message/content
-                             :message/imageFile) [_ ?content]]
+                  [(get-some-else $ ?message nil
+                                  :message/content
+                                  :message/imageFile) [_ ?content]]
                   [?message :message/creationDate ?creation-date]
                   [(< ?creation-date ?max-date)]
                   :order-by [?creation-date :desc ?message-id :asc]

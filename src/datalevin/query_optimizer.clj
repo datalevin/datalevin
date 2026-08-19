@@ -51,6 +51,12 @@
 (def ^:private ^:const ^double selective-anchor-dominance-margin
   2.0)
 
+(def ^:private ^:const ^long max-deferred-attribute-groups
+  4)
+
+(def ^:private ^:const ^long max-deferred-attribute-plan-nodes
+  10)
+
 (defn- -sample [step db source]
   (qplan/step-sample step db source))
 
@@ -71,6 +77,9 @@
 (defn- mk-link-step [type index attr var fidx in out cols strata seen-or-joins]
   (qplan/->LinkStep type index attr var fidx in out cols strata
                     seen-or-joins))
+
+(defn- mk-identity-step [in out cols strata seen-or-joins]
+  (qplan/->IdentityStep in out cols strata seen-or-joins))
 
 (defn- mk-hash-join-step
   [link link-e in out in-cols cols strata seen-or-joins tgt-steps in-size tgt-size]
@@ -1382,7 +1391,11 @@
       (let [eligible (keep #(eligible-access-join bound %) candidates)]
         (if (seq eligible)
           (let [{:keys [clause-idx vars] :as chosen}
-                (apply min-key :rows eligible)
+                ;; On equal catalog counts, apply a constant-value filter
+                ;; before a value-producing lookup that may fan out.
+                (apply u/min-key-comp
+                       (juxt :rows #(if (:constant-value? %) 0 1))
+                       eligible)
                 join (access-join-from-bound bound chosen)]
             (recur (into bound vars)
                    (filterv #(not= clause-idx (:clause-idx %)) candidates)
@@ -1661,6 +1674,34 @@
       [context stages]
       entries)))
 
+(defn- safely-resolvable-access-residuals?
+  [parsed-q context step joins]
+  (let [bound   (qresolve/bound-vars context)
+        entries (order-access-residuals
+                  bound (access-residual-entries parsed-q step joins))]
+    (loop [bound bound
+           entries entries]
+      (if-let [{:keys [clause provides] :as entry} (first entries)]
+        (and (access-clause-ready? bound entry)
+             (instance? Predicate clause)
+             (sample-safe-residual? clause)
+             (recur (into bound provides) (next entries)))
+        true))))
+
+(defn- terminal-access-join-countable?
+  "A terminal EAV lookup can be sampled by counting without materializing its
+   values when the projected entity/value pair proves distinct result rows."
+  [parsed-q context step planned-joins remaining-joins
+   {:keys [entity-var value-var]}]
+  (and (empty? remaining-joins)
+       entity-var
+       value-var
+       (let [find-vars (set (dp/find-vars (:qfind parsed-q)))]
+         (and (contains? find-vars entity-var)
+              (contains? find-vars value-var)))
+       (safely-resolvable-access-residuals?
+         parsed-q context step planned-joins)))
+
 (defn- over-count-cap
   ^long [^long cap]
   (if (= cap Long/MAX_VALUE) Long/MAX_VALUE (unchecked-inc cap)))
@@ -1699,7 +1740,7 @@
                   value  (resolved-bound-value db attr
                                                (aget tuple (long value-idx)))]
               (if (and entity (some? value))
-                (db/-count db [entity attr value])
+                (if (db/-populated? db :eav entity attr value) 1 0)
                 0)))
 
           (and entity-bound? constant-value? entity-idx)
@@ -1708,17 +1749,18 @@
                                                 (aget tuple (long entity-idx)))
                   value  (resolved-bound-value db attr value)]
               (if (and entity (some? value))
-                (db/-count db [entity attr value])
+                (if (db/-populated? db :eav entity attr value) 1 0)
                 0)))
 
-          (and entity-bound? entity-idx
-               (identical? :db.cardinality/many
-                           (get-in (db/-schema db)
-                                   [attr :db/cardinality])))
+          (and entity-bound? entity-idx)
           (fn [^objects tuple]
             (if-let [entity (resolved-bound-entity
                               db (aget tuple (long entity-idx)))]
-              (db/-count db [entity attr nil])
+              (if (identical? :db.cardinality/many
+                              (get-in (db/-schema db)
+                                      [attr :db/cardinality]))
+                (count (db/-datoms db :eav entity attr))
+                (if (db/-ea-populated? db entity attr) 1 0))
               0))
 
           (and value-bound? value-idx)
@@ -1730,11 +1772,6 @@
           :else nil)]
     (cond
       (nil? tuples) 0
-      ;; A cardinality-one entity lookup emits at most one row per input.
-      (and entity-bound? entity-idx (not value-bound?)
-           (not constant-value?) (nil? count-tuple))
-      (min (long (.size tuples)) (over-count-cap cap))
-
       count-tuple
       (capped-tuple-count-sum tuples count-tuple cap)
 
@@ -1756,6 +1793,181 @@
   ^double [^long input-size ^long output-size ^long output-width]
   (+ (double (estimate-link-cost input-size output-size))
      (materialized-output-cost output-size output-width)))
+
+(defn- count-only-output-cap
+  ^long [^double remaining-budget ^long input-size]
+  (let [probe-cost (* (double input-size)
+                      (double c/magic-cost-link-probe))
+        available  (- remaining-budget probe-cost)]
+    (if-not (pos? available)
+      0
+      (long
+        (min (double (dec Long/MAX_VALUE))
+             (Math/floor
+               (/ available (double c/magic-cost-link-retrieval))))))))
+
+(defn- terminal-access-count-sample
+  [db parsed-q context step planned-joins joins join access-var sample
+   sample-batch sample-rows stages spent budget]
+  (let [sample-rows (long sample-rows)
+        spent       (double spent)
+        budget      (double budget)]
+    (when (terminal-access-join-countable?
+            parsed-q context step planned-joins (next joins) join)
+      (let [[context stages]
+            (sample-access-residuals
+              parsed-q context step planned-joins stages)
+            relation      (access-sample-relation context access-var)
+            before        (relation-size relation)
+            find-vars     (dp/find-vars (:qfind parsed-q))
+            unique-input? (= before
+                             (sample-relation-projection-count
+                               find-vars relation))
+            output-cap    (count-only-output-cap (- budget spent) before)
+            output        (when unique-input?
+                            (projected-access-join-output
+                              db relation join output-cap))]
+        (when (some? output)
+          (let [output     (long output)
+                count-cost (double (estimate-link-cost before output))
+                total-cost (+ spent count-cost)]
+            (when (<= total-cost budget)
+              (let [other-output
+                    (long (reduce
+                            (fn [n other]
+                              (if (identical? relation other)
+                                n
+                                (estimate-round
+                                  (* (double n)
+                                     (double
+                                       (sample-relation-projection-count
+                                         find-vars other))))))
+                            1 (:rels context)))
+                    sample-output
+                    (estimate-round (* (double output)
+                                       (double other-output)))]
+                {:sample        sample
+                 :sample-batch  sample-batch
+                 :sample-rows   sample-rows
+                 :sample-output sample-output
+                 :sample-cost   total-cost
+                 :stages
+                 (conj stages
+                       {:clause-idx (:clause-idx join)
+                        :attr       (:attr join)
+                        :operation  :indexed-join
+                        :input      before
+                        :output     output
+                        :cost       count-cost
+                        :sampling   :counted})}))))))))
+
+(defn- access-variable-domain-estimates
+  [step join-candidates ^long range-rows]
+  (let [access-var (first (:cols step))]
+    (reduce
+      (fn [domains {:keys [entity-var rows]}]
+        (let [rows (long rows)]
+          ;; The access variable already has the source range as its domain.
+          ;; A residual attribute count is selectivity evidence, not a smaller
+          ;; replacement domain for that same variable.
+          (if (and entity-var
+                   (not= access-var entity-var)
+                   (pos? rows)
+                   (< rows Long/MAX_VALUE))
+            (update domains entity-var
+                    (fn [current]
+                      (if current (min (long current) rows) rows)))
+            domains)))
+      (if access-var {access-var range-rows} {})
+      join-candidates)))
+
+(defn- scaled-row-estimate
+  ^long [^long input-size ^double ratio]
+  (if (or (zero? input-size) (not (pos? ratio)))
+    0
+    (long
+      (min (double Long/MAX_VALUE)
+           (Math/ceil (* (double input-size) ratio))))))
+
+(defn- preflight-access-join-output
+  ^long [^long input-size domains
+         {:keys [entity-var value-var entity-bound? value-bound? estimate]}]
+  (let [rows          (long (or (:rows estimate) 0))
+        entity-domain (long (or (get domains entity-var) rows 1))
+        value-domain  (long (or (get domains value-var) rows 1))
+        entity-ratio  (if (pos? entity-domain)
+                        (min 1.0 (/ (double rows) entity-domain))
+                        1.0)
+        value-ratio   (if (pos? value-domain)
+                        (/ (double rows) value-domain)
+                        1.0)
+        ratio         (cond
+                        (and entity-bound? value-bound?) entity-ratio
+                        entity-bound?                    entity-ratio
+                        value-bound?                     value-ratio
+                        :else                            1.0)]
+    (scaled-row-estimate input-size ratio)))
+
+(defn- access-sample-preflight
+  "Project the indexed fragment's sample work from catalog counts before
+   opening its cursor. In particular, a reverse lookup is charged by the
+   attribute row count divided by the tightest known domain for its bound
+   value. The projection uses the same budget and operator cost model as the
+   materialized sample, so an over-budget fragment can be rejected without
+   reading speculative tuples."
+  [step joins join-candidates sample-size budget estimate range-rows]
+  (let [sample-size (long sample-size)
+        budget      (double budget)
+        range-rows  (long range-rows)
+        domains     (access-variable-domain-estimates
+                      step join-candidates range-rows)
+        source-cost (+ (double (or (:startup estimate) 0.0))
+                       (* (double sample-size)
+                          (double (or (:per-row estimate) 0.0))))]
+    (if (> source-cost budget)
+      {:aborted? true
+       :stages []
+       :abort {:reason :sample-work-budget
+               :phase :access-propagation-preflight
+               :budget budget
+               :cost 0.0
+               :projected-cost source-cost
+               :projected-output sample-size}}
+      (loop [input-size sample-size
+             output-width (count (:cols step))
+             spent source-cost
+             joins joins
+             stages []]
+        (if-let [{:keys [clause-idx attr produces-cols] :as join}
+                 (first joins)]
+          (let [output-size (preflight-access-join-output
+                              input-size domains join)
+                output-width (+ output-width (count produces-cols))
+                projected-cost
+                (estimated-access-sample-stage-cost
+                  input-size output-size output-width)
+                stage {:clause-idx clause-idx
+                       :attr attr
+                       :operation :indexed-join
+                       :input input-size
+                       :output output-size
+                       :projected-output output-size
+                       :projected-cost projected-cost
+                       :sampling :preflight}]
+            (if (> (+ spent projected-cost) budget)
+              {:aborted? true
+               :stages (conj stages stage)
+               :abort {:reason :sample-work-budget
+                       :phase :access-propagation-preflight
+                       :clause-idx clause-idx
+                       :attr attr
+                       :budget budget
+                       :cost spent
+                       :projected-cost projected-cost
+                       :projected-output output-size}}
+              (recur output-size output-width (+ spent projected-cost)
+                     (next joins) (conj stages stage))))
+          {:aborted? false :stages stages :cost spent})))))
 
 (defn- sample-access-joins
   [db parsed-q inputs step planned-joins sample-size sample-cost-budget estimate]
@@ -1830,29 +2042,33 @@
                       before projected output-width))]
               (if (and bounded?
                        (> (+ spent (double projected-cost)) budget))
-                {:sample        sample
-                 :sample-batch  nil
-                 :sample-rows   sample-rows
-                 :sample-output 0
-                 :sample-cost   spent
-                 :stages
-                 (conj stages
-                       {:clause-idx clause-idx
-                        :attr       attr
-                        :operation  :indexed-join
-                        :input      before
-                        :output     projected
-                        :projected-output projected
-                        :projected-cost projected-cost
-                        :sampling   :aborted})
-                 :aborted?      true
-                 :abort         {:reason :sample-work-budget
-                                 :clause-idx clause-idx
-                                 :attr attr
-                                 :budget budget
-                                 :cost spent
-                                 :projected-cost projected-cost
-                                 :projected-output projected}}
+                (or
+                  (terminal-access-count-sample
+                    db parsed-q context step planned-joins joins join access-var
+                    sample sample-batch sample-rows stages spent budget)
+                  {:sample        sample
+                   :sample-batch  nil
+                   :sample-rows   sample-rows
+                   :sample-output 0
+                   :sample-cost   spent
+                   :stages
+                   (conj stages
+                         {:clause-idx clause-idx
+                          :attr       attr
+                          :operation  :indexed-join
+                          :input      before
+                          :output     projected
+                          :projected-output projected
+                          :projected-cost projected-cost
+                          :sampling   :aborted})
+                   :aborted?      true
+                   :abort         {:reason :sample-work-budget
+                                   :clause-idx clause-idx
+                                   :attr attr
+                                   :budget budget
+                                   :cost spent
+                                   :projected-cost projected-cost
+                                   :projected-output projected}})
                 (let [pattern  (access-join-pattern parsed-q clause-idx)
                       new-rel  (qresolve/lookup-pattern
                                  (assoc context :rels-bound-cache
@@ -1966,7 +2182,8 @@
 
 (defn- adjust-access-plan
   [db parsed-q inputs
-   {:keys [step path demand work estimate sample-cost-budget] :as plan}]
+   {:keys [step path demand work estimate sample-cost-budget join-candidates]
+    :as plan}]
   (if step
     (let [range-rows      (qaccess/estimate-range-rows estimate)
           scan-rows       (qaccess/estimate-scan-rows estimate)
@@ -1978,12 +2195,34 @@
                             (long (min range-rows
                                        (long c/init-exec-size-threshold)))
                             0)
+          bounded-sample? (and sample?
+                               (number? sample-cost-budget)
+                               (Double/isFinite
+                                 (double sample-cost-budget)))
+          preflight       (when bounded-sample?
+                            (access-sample-preflight
+                              step (:joins plan) join-candidates sample-size
+                              (max 0.0 (double sample-cost-budget)) estimate
+                              range-rows))
           {:keys [sample sample-batch sample-rows sample-output sample-cost
                   stages aborted? abort]}
-          (if sample?
+          (cond
+            (:aborted? preflight)
+            {:sample        (FastList.)
+             :sample-batch  nil
+             :sample-rows   0
+             :sample-output 0
+             :sample-cost   0.0
+             :stages        (:stages preflight)
+             :aborted?      true
+             :abort         (:abort preflight)}
+
+            sample?
             (sample-access-joins
               db parsed-q inputs step (:joins plan) sample-size
               sample-cost-budget estimate)
+
+            :else
             {:sample        (FastList.)
              :sample-batch  nil
              :sample-rows   0
@@ -2166,20 +2405,21 @@
       (concat (flat :bound bound) (flat :free free)))))
 
 (defn- count-known-e-datoms
-  [db e {:keys [free] :as node}]
-  (u/reduce-indexed
-    (fn [{:keys [mcount] :as node} {:keys [attr]} i]
-      (let [c (fast-clause-count db e {:attr attr} (long mcount))
-            c (if (zero? c)
-                (zero-count-clause-size db e {:attr attr})
-                c)]
+  [db e {:keys [bound free] :as node}]
+  (reduce
+    (fn [{:keys [mcount] :as node} [k i clause]]
+      (let [c (fast-clause-count db e clause (long mcount))
+            c (if (zero? c) (zero-count-clause-size db e clause) c)]
         (cond
           (zero? c)          (reduced (assoc node :mcount 0))
           (< c ^long mcount) (-> node
-                                 (assoc-in [:free i :count] c)
-                                 (assoc :mcount c :mpath [:free i]))
-          :else              (assoc-in node [:free i :count] c))))
-    (assoc node :mcount Long/MAX_VALUE) free))
+                                 (assoc-in [k i :count] c)
+                                 (assoc :mcount c :mpath [k i]))
+          :else              (assoc-in node [k i :count] c))))
+    (assoc node :mcount Long/MAX_VALUE)
+    (let [flat (fn [k clauses]
+                 (map-indexed (fn [i clause] [k i clause]) clauses))]
+      (concat (flat :bound bound) (flat :free free)))))
 
 (defn- count-datoms
   [db e node]
@@ -2224,12 +2464,15 @@
 (defn- aid [db] #(((db/-schema db) %) :db/aid))
 
 (defn- init-steps
-  [db e node single?]
+  [db e node single? sample?]
   (let [{:keys [bound free mpath mcount]}            node
         {:keys [attr var val range pred] :as clause} (get-in node mpath)
 
         know-e? (int? e)
         no-var? (or (not var) (qu/placeholder? var))
+        pred    (if (and know-e? var)
+                  (add-back-range var clause)
+                  pred)
 
         init (cond-> (map->init-step
                        {:attr attr :vars [e] :out [e]
@@ -2247,7 +2490,7 @@
                                   :strata [(set vars)]
                                   :seen-or-joins #{})))
 
-               (not single?)
+               (and (not single?) sample?)
                (#(if (< ^long c/init-exec-size-threshold ^long mcount)
                    (assoc % :sample (-sample % db nil))
                    (assoc % :result (-execute % db nil)))))]
@@ -2309,10 +2552,12 @@
 (defn- estimate-scan-v-size
   [^long e-size steps]
   (cond+
-    (= (count steps) 1) e-size ; no merge step
+    (<= (count steps) 1) e-size ; no merge step
 
     :let [{:keys [know-e?] res1 :result sp1 :sample} (first steps)
           {:keys [attrs-v result sample]} (peek steps)]
+
+    (:deferred-projection? (peek steps)) e-size
 
     know-e? (count attrs-v)
 
@@ -2332,11 +2577,20 @@
   [magic ^long n]
   (if (zero? n) 1 ^long (estimate-round (* ^double magic n))))
 
+(defn- fused-var-factor
+  [^long n]
+  (if (zero? n)
+    1
+    (estimate-round
+      (* ^double c/magic-cost-var
+         (+ 1.0 (* ^double c/magic-cost-fused-var-marginal
+                   (double (dec n))))))))
+
 (defn- estimate-scan-v-cost
   [{:keys [attrs-v vars]} ^long size]
   (* size
      ^double c/magic-cost-merge-scan-v
-     ^long (factor c/magic-cost-var (count vars))
+     ^long (fused-var-factor (count vars))
      ^long (factor c/magic-cost-pred (n-costly-preds attrs-v))
      ^long (factor c/magic-cost-fidx (n-items attrs-v :fidx))))
 
@@ -2489,6 +2743,8 @@
   [context ^long plan-size access-plans]
   (let [input-size  (estimated-late-input-size context plan-size)
         operations  (mapv late-operation (:late-clauses context))
+        deferred    (set (get-in context
+                                 [:post-top-k-enrichment :clauses]))
         expansion?  (some late-expansion-operation? operations)
         sampled     (when expansion?
                       (sampled-access-cardinality access-plans))
@@ -2512,14 +2768,23 @@
     (reduce
       (fn [{:keys [cost stages] :as estimate} [clause operation]]
         (if (late-row-operation? operation)
-          (let [stage-cost (estimate-row-evaluation-cost output-size)]
+          (let [post-top-k? (contains? deferred clause)
+                stage-input (if post-top-k?
+                              (min output-size
+                                   (long
+                                     (get-in context
+                                             [:post-top-k-enrichment :limit]
+                                             output-size)))
+                              output-size)
+                stage-cost (estimate-row-evaluation-cost stage-input)]
             {:cost   (+ (double cost) (double stage-cost))
              :output-size output-size
              :stages (conj stages
-                           {:operation operation
-                            :input     output-size
-                            :cost      stage-cost
-                            :clause    clause})})
+                           (cond-> {:operation operation
+                                    :input     stage-input
+                                    :cost      stage-cost
+                                    :clause    clause}
+                             post-top-k? (assoc :post-top-k? true)))})
           estimate))
       initial
       (map vector (:late-clauses context) operations))))
@@ -3265,17 +3530,23 @@
 
 (defn- base-plan
   ([db nodes e]
-   (base-plan db nodes e false))
+   (base-plan db nodes e false true))
   ([db nodes e single?]
+   (base-plan db nodes e single? true))
+  ([db nodes e single? sample?]
    (let [node   (get nodes e)
          mcount (:mcount node)]
-     (when-not (zero? ^long mcount)
-       (let [isteps (init-steps db e node single?)]
+     (when (and (:mpath node) (not (zero? ^long mcount)))
+       (let [isteps (cond->> (init-steps db e node single? sample?)
+                      (not sample?)
+                      (mapv #(assoc % :deferred-projection? true)))]
          (if single?
            (make-plan isteps nil nil 0)
            (make-plan isteps
                       (estimate-base-cost node isteps)
-                      (estimate-scan-v-size mcount isteps)
+                      (if sample?
+                        (estimate-scan-v-size mcount isteps)
+                        mcount)
                       0)))))))
 
 (defn writing? [db] (l/writing? (.-lmdb ^Store (.-store ^DB db))))
@@ -3289,12 +3560,166 @@
                  (map f (keys nodes))
                  (map+ f (keys nodes)))))))
 
+(defn- component-connection-vars
+  [nodes component]
+  (into (set component)
+        (comp
+          (mapcat #(get-in nodes [% :links]))
+          (keep :var))
+        component))
+
+(defn- movable-attribute-clause?
+  [db connection-vars {:keys [attr var val]}]
+  (and (qu/binding-var? var)
+       (not (qu/placeholder? var))
+       (not (contains? connection-vars var))
+       (nil? val)
+       (not= :db.cardinality/many
+             (get-in (db/-schema db) [attr :db/cardinality]))))
+
+(defn- attribute-group-role
+  [{:keys [range pred]}]
+  (if (or range pred) :local-filter :projection))
+
+(defn- recount-node
+  [{:keys [bound free] :as node}]
+  (let [clauses (concat (map-indexed (fn [i clause] [:bound i clause]) bound)
+                        (map-indexed (fn [i clause] [:free i clause]) free))]
+    (if-let [[k i clause]
+             (when (seq clauses)
+               (apply min-key (fn [[_ _ clause]]
+                                (long (or (:count clause) Long/MAX_VALUE)))
+                      clauses))]
+      (assoc node :mpath [k i]
+                  :mcount (long (or (:count clause) Long/MAX_VALUE)))
+      (assoc node :mpath nil :mcount Long/MAX_VALUE))))
+
+(defn- attribute-clause-selectivity
+  [db {:keys [attr range] :as clause}]
+  (if range
+    (let [total   (long (fast-clause-count db nil {:attr attr}
+                                           Long/MAX_VALUE))
+          matched (long (fast-clause-count db nil clause Long/MAX_VALUE))]
+      (if (pos? total)
+        (max (double c/magic-scan-ratio)
+             (min 1.0 (/ (double matched) (double total))))
+        0.0))
+    ;; A projection can still reject an entity missing the property, and a
+    ;; residual predicate can be selective. Without a representative sample,
+    ;; treating either as a reducer would make deferral look artificially
+    ;; attractive. The complete-plan comparison therefore prices it as
+    ;; cardinality preserving.
+    1.0))
+
+(defn- classify-attribute-groups
+  "Split movable cardinality-one EAV clauses from their entity nodes. Groups
+  are dependency nodes in the join DP, so their placement is costed against
+  the complete component rather than decided at the originating scan."
+  ([db nodes component]
+   (classify-attribute-groups db nodes component #{}))
+  ([db nodes component already-late-attrs]
+   (when (< 1 (count component))
+     (let [connection-vars (component-connection-vars nodes component)
+           candidates
+           (into {}
+                 (keep
+                   (fn [e]
+                     (let [{:keys [free mcount]} (get nodes e)
+                           clauses
+                           (filterv #(and (not (contains? already-late-attrs
+                                                         (:attr %)))
+                                          (movable-attribute-clause?
+                                            db connection-vars %))
+                                    free)]
+                       (when (and (not (int? e))
+                                  (< (long c/init-exec-size-threshold)
+                                     (long mcount))
+                                  (seq clauses))
+                         [e clauses]))))
+                 component)
+           raw-groups
+           (for [[e clauses] (sort-by (comp str key) candidates)
+                 [role grouped] (sort-by
+                                  (comp str key)
+                                  (group-by attribute-group-role clauses))]
+             (let [id [::attribute-group e role]]
+               [id {:id id
+                    :owner e
+                    :role role
+                    :clauses (vec (sort-by (comp (aid db) :attr) grouped))
+                    :selectivity
+                    (reduce * 1.0
+                            (map #(attribute-clause-selectivity db %)
+                                 grouped))}]))
+           groups (into {} raw-groups)
+           node-count (+ (count component) (count groups))]
+       (when (and (seq groups)
+                  (<= (count groups) max-deferred-attribute-groups)
+                  (<= node-count max-deferred-attribute-plan-nodes))
+         (let [nodes'
+               (reduce-kv
+                 (fn [nodes e clauses]
+                   (let [deferred (set clauses)]
+                     (update nodes e
+                             (fn [node]
+                               (-> node
+                                   (update :free
+                                           (fn [free]
+                                             (filterv
+                                               #(not (contains? deferred %))
+                                               free)))
+                                   recount-node)))))
+                 nodes candidates)]
+           {:nodes nodes'
+            :groups groups
+            :component (into (vec component) (map first raw-groups))}))))))
+
+(defn- selective-anchor-node?
+  [{:keys [bound mcount]}]
+  (and (= 1 (long mcount)) (seq bound)))
+
+(defn- projection-only-clause?
+  [db projected-vars connection-vars {:keys [attr var val range pred]}]
+  (and (qu/binding-var? var)
+       (not (qu/placeholder? var))
+       (contains? projected-vars var)
+       (not (contains? connection-vars var))
+       (nil? val)
+       (nil? range)
+       (nil? pred)
+       (not= :db.cardinality/many
+             (get-in (db/-schema db) [attr :db/cardinality]))))
+
+(defn- deferred-base-sample-entities
+  "Return unbound, cardinality-one projection nodes whose global root sample
+   cannot compete with an exact one-row anchor in the same connected
+   component. Their catalog count remains available to join enumeration; only
+   the speculative 1,000-row value sample is deferred."
+  [db nodes component projected-vars]
+  (if (some #(selective-anchor-node? (get nodes %)) component)
+    (let [connection-vars (component-connection-vars nodes component)]
+      (into #{}
+            (filter
+              (fn [e]
+                (let [{:keys [bound free mcount]} (get nodes e)]
+                  (and (empty? bound)
+                       (< (long c/init-exec-size-threshold) (long mcount))
+                       (seq free)
+                       (every? #(projection-only-clause?
+                                  db projected-vars connection-vars %)
+                               free)))))
+            component))
+    #{}))
+
 (defn- build-base-plans
-  [db nodes component]
-  (let [f (bound-fn [e] [[e] (base-plan db nodes e)])]
+  [db nodes component deferred]
+  (let [f (bound-fn [e]
+            (when-let [plan (base-plan db nodes e false
+                                      (not (contains? deferred e)))]
+              [[e] plan]))]
     (into {} (if (writing? db)
-               (map f component)
-               (map+ f component)))))
+               (keep f component)
+               (keep identity (map+ f component))))))
 
 (def find-index qplan/find-index)
 
@@ -3382,6 +3807,45 @@
     (some #(when (symbol? %) %) col)
     col))
 
+(defn- col-attr
+  [col]
+  (when (set? col)
+    (some #(when (keyword? %) %) col)))
+
+(defn- multi-key-result-size
+  "Dampen a join estimate for equality keys already present on both sides but
+  not represented by the selected graph link. Full independence is too
+  aggressive for graph data, so each additional key contributes only the
+  square root of its observed value-domain cardinality."
+  [db link-e link prev-plan new-base-plan result-size]
+  (let [result-size (long result-size)
+        in-cols     (:cols (peek (:steps prev-plan)))
+        tgt-cols    (some-> new-base-plan :steps peek :cols)
+        primary-var (case (:type link)
+                      :val-eq (:var link)
+                      :_ref   link-e
+                      :ref    (:tgt link)
+                      nil)
+        in-vars     (into #{} (keep col-var) in-cols)
+        extra-cols  (filter (fn [col]
+                              (let [v (col-var col)]
+                                (and v
+                                     (not= v primary-var)
+                                     (contains? in-vars v)
+                                     (col-attr col))))
+                            tgt-cols)
+        divisor     (double
+                      (reduce
+                        (fn ^double [^double d col]
+                          (let [cardinality
+                                (long (db/-cardinality db (col-attr col)))]
+                            (* d (Math/sqrt
+                                   (double (max 1 cardinality))))))
+                        (double 1.0) extra-cols))]
+    (if (> divisor 1.0)
+      (max 1 (estimate-round (/ (double result-size) divisor)))
+      result-size)))
+
 (defn- merge-join-cols
   "Merge input and target cols for hash join output, preserving input order.
    Returns [merged-cols new-vars]."
@@ -3440,10 +3904,17 @@
     [(mk-link-step type index attr tgt fidx in out cols (conj lstrata #{tgt}) lseen)
      (or fidx (dec (count cols)))]))
 
+(defn- identity-link-step
+  [last-step new-key]
+  (let [in   (:out last-step)
+        out  (if (set? in) (set new-key) new-key)]
+    (mk-identity-step in out (:cols last-step) (:strata last-step)
+                      (:seen-or-joins last-step))))
+
 (defn- rev-ref-plan
   [db last-step index {:keys [type attr tgt]} new-key new-steps]
   (let [[step n-index] (link-step type last-step index attr tgt new-key)]
-    (if (= 1 (count new-steps))
+    (if (<= (count new-steps) 1)
       [step]
       [step (merge-scan-step db step n-index new-key new-steps)])))
 
@@ -3451,7 +3922,7 @@
   [db last-step index {:keys [type attrs tgt]} new-key new-steps]
   (let [attr           (attrs tgt)
         [step n-index] (link-step type last-step index attr tgt new-key)]
-    (if (= 1 (count new-steps))
+    (if (<= (count new-steps) 1)
       [step]
       [step (merge-scan-step db step n-index new-key new-steps)])))
 
@@ -3662,8 +4133,10 @@
                  [or-size or-size])
       ;; :_ref and :val-eq
       (let [e-size (estimate-link-size db link-e link ratios build-cache
-                                       prev-size prev-plan index)]
-        [e-size (estimate-scan-v-size e-size steps)]))))
+                                       prev-size prev-plan index)
+            result-size (estimate-scan-v-size e-size steps)]
+        [e-size (multi-key-result-size db link-e link prev-plan new-base-plan
+                                       result-size)]))))
 
 (defn- estimate-link-cost
   [^long outer-size ^long result-size]
@@ -3693,8 +4166,9 @@
   [prev-size e-size cur-steps]
   (let [step1 (first cur-steps)]
     (if (= 1 (count cur-steps))
-      (if (identical? (-type step1) :merge)
-        (estimate-scan-v-cost step1 prev-size)
+      (case (-type step1)
+        :identity 0
+        :merge    (estimate-scan-v-cost step1 prev-size)
         (estimate-link-cost prev-size e-size))
       (+ ^long (estimate-link-cost prev-size e-size)
          ^long (estimate-scan-v-cost (peek cur-steps) e-size)))))
@@ -3706,13 +4180,55 @@
         last-step (peek steps)
         cur-steps
         (case (:type link)
-          :ref    [(merge-scan-step db last-step index new-key new-steps)]
+          :ref    (if (seq new-steps)
+                    [(merge-scan-step db last-step index new-key new-steps)]
+                    [(identity-link-step last-step new-key)])
           :_ref   (rev-ref-plan db last-step index link new-key new-steps)
           :val-eq (val-eq-plan db last-step index link new-key new-steps))]
     (make-plan cur-steps
                (+ ^long cost ^long (estimate-e-plan-cost size e-size cur-steps))
                result-size
                (- ^long (find-index link-e (:strata last-step))))))
+
+(defn- attribute-group-plan
+  [{:keys [steps cost size recency]} new-key
+   {:keys [id owner role clauses selectivity]}]
+  (let [last-step (peek steps)
+        index     (find-index owner (:cols last-step))]
+    (when (some? index)
+      (let [in     (:out last-step)
+            out    (if (set? in) (set new-key) new-key)
+            lcols  (:cols last-step)
+            [attrs-v vars cols]
+            (reduce
+              (fn [[attrs-v vars cols] {:keys [attr var] :as clause}]
+                (let [options (merge-pred-options var clause)]
+                  (if-let [fidx (find-index var lcols)]
+                    [(conj attrs-v
+                           [attr (assoc options :skip? true :fidx fidx)])
+                     vars cols]
+                    [(conj attrs-v
+                           [attr (assoc options :skip? false :fidx nil)])
+                     (conj vars var)
+                     (conj cols #{attr var})])))
+              [[] [] []] clauses)
+            step   (assoc
+                     (mk-merge-scan-step
+                       index attrs-v vars in out (into lcols cols)
+                       (conj (:strata last-step) (set vars))
+                       (:seen-or-joins last-step) nil nil)
+                     :attribute-group id
+                     :attribute-group-owner owner
+                     :attribute-group-role role)
+            result-size
+            (cond
+              (zero? (long size)) 0
+              (zero? (double selectivity)) 0
+              :else (max 1 (estimate-round
+                             (* (double size) (double selectivity)))))]
+        (make-plan [step]
+                   (+ ^long cost ^long (estimate-scan-v-cost step size))
+                   result-size recency)))))
 
 (defn- index-semi-join-plan
   [db prev-plan link-e link new-key new-base-plan e-size result-size]
@@ -3792,41 +4308,52 @@
 (defn- binary-plan
   [db sources rules nodes incoming-link-counts required-vars base-plans ratios
    build-cache prev-plan link-e new-e new-key]
-  (let [last-step     (peek (:steps prev-plan))
-        seen-or-joins (or (:seen-or-joins last-step) #{})
-        links         (get-in nodes [link-e :links])
-        candidate-key (juxt :recency :cost :size)]
-    (reduce
-      (fn [best link]
-        (if (and (= new-e (:tgt link))
-                 (or (not= :or-join (:type link))
-                     (not (contains? seen-or-joins (:clause link)))))
-          (let [new-base  (base-plans [new-e])
-                semi-join?
-                (semi-join-eligible? nodes incoming-link-counts required-vars
-                                     prev-plan link-e new-e link new-base)
-                candidate (binary-plan* db sources rules base-plans ratios
-                                        build-cache prev-plan link-e new-e link
-                                        new-key semi-join?)]
-            (if best
-              (u/min-key-comp candidate-key best candidate)
-              candidate))
-          best))
-      nil links)))
+  ;; A nil base plan can mean either a deliberately property-free link target
+  ;; or an unsatisfiable node. Only the former may use IdentityStep.
+  (when-not (zero? (long (get-in nodes [new-e :mcount])))
+    (let [last-step     (peek (:steps prev-plan))
+          seen-or-joins (or (:seen-or-joins last-step) #{})
+          links         (get-in nodes [link-e :links])
+          candidate-key (juxt :recency :cost :size)]
+      (reduce
+        (fn [best link]
+          (if (and (= new-e (:tgt link))
+                   (or (not= :or-join (:type link))
+                       (not (contains? seen-or-joins (:clause link)))))
+            (let [new-base  (base-plans [new-e])
+                  semi-join?
+                  (semi-join-eligible? nodes incoming-link-counts required-vars
+                                       prev-plan link-e new-e link new-base)
+                  candidate (binary-plan* db sources rules base-plans ratios
+                                          build-cache prev-plan link-e new-e link
+                                          new-key semi-join?)]
+              (if best
+                (u/min-key-comp candidate-key best candidate)
+                candidate))
+            best))
+        nil links))))
 
 (defn- plans
   [db sources rules nodes node-ids incoming-link-counts required-vars pairs
-   base-plans prev-plans ratios build-cache]
+   base-plans groups predecessors prev-plans ratios build-cache]
   (persistent!
     (reduce
       (fn [plans [prev-key prev-plan]]
         (let [prev-key-set (when-not node-ids (set prev-key))]
           (reduce
             (fn [plans [link-e new-e link-id new-id]]
-              (if (if node-ids
-                    (and (.contains ^DPKey prev-key (int link-id))
-                         (not (.contains ^DPKey prev-key (int new-id))))
-                    (and (prev-key-set link-e) (not (prev-key-set new-e))))
+              (if (and
+                    (if node-ids
+                      (and (.contains ^DPKey prev-key (int link-id))
+                           (not (.contains ^DPKey prev-key (int new-id))))
+                      (and (prev-key-set link-e) (not (prev-key-set new-e))))
+                    (every?
+                      (fn [required-e]
+                        (if node-ids
+                          (.contains ^DPKey prev-key
+                                     (int (node-ids required-e)))
+                          (prev-key-set required-e)))
+                      (get predecessors new-e)))
                 (let [plan-key  (if node-ids
                                   (.append ^DPKey prev-key (int new-id))
                                   (conj prev-key new-e))
@@ -3835,9 +4362,11 @@
                                   plan-key)
                       cur-plan  (plans plan-key)
                       new-plan
-                      (binary-plan db sources rules nodes incoming-link-counts
-                                   required-vars base-plans ratios build-cache
-                                   prev-plan link-e new-e new-key)]
+                      (if-let [group (get groups new-e)]
+                        (attribute-group-plan prev-plan new-key group)
+                        (binary-plan db sources rules nodes incoming-link-counts
+                                     required-vars base-plans ratios build-cache
+                                     prev-plan link-e new-e new-key))]
                   (if (and new-plan
                            (or (nil? cur-plan)
                                (identical?
@@ -3931,50 +4460,286 @@
       (range (dec n-1) -1 -1))))
 
 (defn- plan-component
-  [db sources rules nodes incoming-link-counts required-vars component]
-  (let [n (count component)]
-    (if (= n 1)
-      [(base-plan db nodes (first component) true)]
-      (let [base-plans (build-base-plans db nodes component)
-            node-ids   (dp-node-ids component)]
-        (if (some nil? (vals base-plans))
-          [nil]
-          (let [raw-pairs     (connected-pairs nodes component)
-                pairs         (if node-ids
-                                (dp-pairs raw-pairs node-ids)
-                                raw-pairs)
-                initial-plans (if node-ids
-                                (dp-initial-plans base-plans node-ids)
-                                base-plans)
-                tables        (FastList. n)
-                ratios        (ConcurrentHashMap.)
-                build-cache   (IdentityHashMap.)
-                n-1           (dec n)
-                pn            ^long (min (long c/plan-search-max)
-                                         (long (u/n-permutations n 2)))]
-            (.add tables initial-plans)
-            (dotimes [i n-1]
-              (let [plans (plans db sources rules nodes node-ids
-                                 incoming-link-counts required-vars pairs
-                                 base-plans (.get tables i) ratios build-cache)]
-                (if (< pn (count plans))
-                  (.add tables (shrink-space plans node-ids))
-                  (.add tables plans))))
-            (trace-steps tables n-1 node-ids)))))))
+  ([db sources rules nodes incoming-link-counts required-vars component deferred]
+   (plan-component db sources rules nodes incoming-link-counts required-vars
+                   component deferred {} component nil))
+  ([db sources rules nodes incoming-link-counts required-vars component deferred
+    groups dp-component]
+   (plan-component db sources rules nodes incoming-link-counts required-vars
+                   component deferred groups dp-component nil))
+  ([db sources rules nodes incoming-link-counts required-vars component deferred
+    groups dp-component entity-order]
+   (let [n (count dp-component)]
+     (if (= n 1)
+       [(base-plan db nodes (first component) true)]
+       (let [base-plans (build-base-plans db nodes component deferred)
+             node-ids   (dp-node-ids dp-component)]
+         (if (empty? base-plans)
+           [nil]
+           (let [raw-pairs     (into (vec (connected-pairs nodes component))
+                                     (map (fn [[id {:keys [owner]}]]
+                                            [owner id]))
+                                     groups)
+                 pairs         (if node-ids
+                                 (dp-pairs raw-pairs node-ids)
+                                 raw-pairs)
+                 predecessors  (when (seq entity-order)
+                                 (into {}
+                                       (map-indexed
+                                         (fn [i e]
+                                           [e (set (take i entity-order))]))
+                                       entity-order))
+                 initial-bases (if (seq entity-order)
+                                  (select-keys base-plans
+                                               [[(first entity-order)]])
+                                  base-plans)
+                 initial-plans (if node-ids
+                                 (dp-initial-plans initial-bases node-ids)
+                                 initial-bases)
+                 tables        (FastList. n)
+                 ratios        (ConcurrentHashMap.)
+                 build-cache   (IdentityHashMap.)
+                 n-1           (dec n)
+                 pn            ^long (min (long c/plan-search-max)
+                                          (long (u/n-permutations n 2)))]
+             (.add tables initial-plans)
+             (dotimes [i n-1]
+               (let [plans (plans db sources rules nodes node-ids
+                                  incoming-link-counts required-vars pairs
+                                  base-plans groups predecessors
+                                  (.get tables i) ratios build-cache)]
+                 (if (< pn (count plans))
+                   (.add tables (shrink-space plans node-ids))
+                   (.add tables plans))))
+             (if (empty? (.get tables n-1))
+               [nil]
+               (trace-steps tables n-1 node-ids)))))))))
 
 (def ^:private connected-components qog/connected-components)
 
+(defn- attribute-group-placements
+  [plan-trace]
+  (loop [plans plan-trace
+         step-index (long 0)
+         hash-count (long 0)
+         placements {}]
+    (if-let [{:keys [steps size]} (first plans)]
+      (let [[step-index hash-count placements]
+            (reduce
+              (fn [[step-index hash-count placements] step]
+                [(u/long-inc (long step-index))
+                 (if (= :hash-join (-type step))
+                   (u/long-inc (long hash-count))
+                   (long hash-count))
+                 (if-let [id (:attribute-group step)]
+                   (assoc placements id
+                          {:step-index step-index
+                           :after-hash-join? (pos? (long hash-count))
+                           :estimated-output size})
+                   placements)])
+              [step-index hash-count placements] steps)]
+        (recur (next plans) (long step-index) (long hash-count) placements))
+      placements)))
+
+(defn- hash-join-plan-trace?
+  [plan-trace]
+  (boolean (some #(= :hash-join (-type %))
+                 (mapcat :steps plan-trace))))
+
+(defn- post-hash-merge-attrs
+  [plan-trace]
+  (loop [steps (seq (mapcat :steps plan-trace))
+         after-hash? false
+         attrs #{}]
+    (if-let [step (first steps)]
+      (let [step-type (-type step)]
+        (recur (next steps)
+               (or after-hash? (= :hash-join step-type))
+               (if (and after-hash? (= :merge step-type))
+                 (into attrs (map first) (:attrs-v step))
+                 attrs)))
+      attrs)))
+
+(defn- plan-entity-order
+  [plan-trace component]
+  (let [entities (set component)
+        order
+        (reduce
+          (fn [order {:keys [steps]}]
+            (let [out   (set (:out (peek steps)))
+                  seen  (set order)
+                  added (sort-by str (set/difference
+                                       (set/intersection entities out)
+                                       seen))]
+              (into order added)))
+          [] plan-trace)]
+    (if (= (count order) (count component)) order (vec component))))
+
+(defn- attribute-group-potential-savings
+  "Estimate an optimistic bound on work removable from existing fused merge
+  scans. Late group scans are deliberately priced at zero here; if even this
+  bound is immaterial, expanding the placement state space cannot pay."
+  [plan-trace groups]
+  (let [candidate-attrs (into #{} (mapcat #(map :attr (:clauses %)))
+                              (vals groups))
+        candidate-vars  (into #{} (mapcat #(map :var (:clauses %)))
+                              (vals groups))]
+    (loop [plans plan-trace
+           previous-size (long 0)
+           seen #{}
+           savings (double 0.0)]
+      (if-let [{:keys [steps size]} (first plans)]
+        (let [input-size (max previous-size (long (or size 0)))
+              [seen savings]
+              (reduce
+                (fn [[seen savings] step]
+                  (if (= :merge (-type step))
+                    (let [attrs-v       (:attrs-v step)
+                          movable       (into #{}
+                                              (comp (map first)
+                                                    (filter candidate-attrs))
+                                              attrs-v)
+                          remaining     (filterv
+                                          #(not (contains? movable (first %)))
+                                          attrs-v)
+                          remaining-vars
+                          (filterv #(not (contains? candidate-vars %))
+                                   (:vars step))
+                          full-cost     (double
+                                          (estimate-scan-v-cost step input-size))
+                          remaining-cost
+                          (if (seq remaining)
+                            (double
+                              (estimate-scan-v-cost
+                                (assoc step :attrs-v remaining
+                                            :vars remaining-vars)
+                                input-size))
+                            0.0)]
+                      [(into seen movable)
+                       (+ (double savings)
+                          (max 0.0 (- full-cost remaining-cost)))])
+                    [seen savings]))
+                [seen savings] steps)]
+          (recur (next plans) (long (or size previous-size)) seen
+                 (double savings)))
+        (if (= seen candidate-attrs)
+          savings
+          Double/POSITIVE_INFINITY)))))
+
+(defn- unplanned-attribute-group-summary
+  [groups]
+  (mapv
+    (fn [[id {:keys [owner role clauses selectivity]}]]
+      {:id id
+       :owner owner
+       :role role
+       :attrs (mapv :attr clauses)
+       :vars (mapv :var clauses)
+       :estimated-selectivity selectivity})
+    (sort-by (comp str key) groups)))
+
+(defn- component-plan-alternatives
+  [db sources rules nodes incoming-counts required-vars component deferred]
+  (let [eager (plan-component db sources rules nodes incoming-counts
+                              required-vars component deferred)
+        classified (when (hash-join-plan-trace? eager)
+                     (classify-attribute-groups
+                       db nodes component (post-hash-merge-attrs eager)))]
+    (if-not classified
+      {:plan eager}
+      (let [eager-valid? (not (some nil? eager))
+            eager-cost   (when eager-valid? (final-plan-cost eager))
+            potential    (attribute-group-potential-savings
+                           eager (:groups classified))
+            min-saving   (* (double eager-cost)
+                            (double c/deferred-eav-min-cost-improvement))]
+        (if (< (double potential) min-saving)
+          {:plan eager
+           :attribute-group-planning
+           {:groups (unplanned-attribute-group-summary (:groups classified))
+            :alternatives
+            [{:kind :eager
+              :cost eager-cost
+              :size (final-plan-size eager)}
+             {:kind :deferred
+              :planned? false
+              :optimistic-cost (max 0.0 (- (double eager-cost)
+                                            (double potential)))
+              :potential-savings potential}]
+            :selected :eager
+            :reason :insufficient-potential-savings}}
+          (let [grouped (plan-component
+                          db sources rules (:nodes classified) incoming-counts
+                          required-vars component deferred (:groups classified)
+                          (:component classified)
+                          (plan-entity-order eager component))
+                grouped-placements (attribute-group-placements grouped)
+                grouped-valid? (and (not (some nil? grouped))
+                                    (some :after-hash-join?
+                                          (vals grouped-placements)))
+                grouped-cost   (when grouped-valid?
+                                 (final-plan-cost grouped))
+                selected-kind  (if (and grouped-valid?
+                                        (or (not eager-valid?)
+                                            (< (double grouped-cost)
+                                               (- (double eager-cost)
+                                                  min-saving))))
+                                 :deferred
+                                 :eager)
+                selected       (if (= :deferred selected-kind) grouped eager)
+                placements     (when (= :deferred selected-kind)
+                                 grouped-placements)
+                group-summary
+                (mapv
+                  (fn [[id {:keys [owner role clauses selectivity]}]]
+                    (merge {:id id
+                            :owner owner
+                            :role role
+                            :attrs (mapv :attr clauses)
+                            :vars (mapv :var clauses)
+                            :estimated-selectivity selectivity}
+                           (get placements id)))
+                  (sort-by (comp str key) (:groups classified)))]
+            {:plan selected
+             :attribute-group-planning
+             {:groups group-summary
+              :alternatives
+              (cond-> [{:kind :eager
+                        :cost eager-cost
+                        :size (when eager-valid? (final-plan-size eager))}]
+                grouped-valid?
+                (conj {:kind :deferred
+                       :cost grouped-cost
+                       :size (final-plan-size grouped)}))
+              :selected selected-kind}}))))))
+
 (defn- build-plan*
-  [db sources rules nodes required-vars]
+  [db sources rules nodes required-vars projected-vars]
   (let [cc              (connected-components nodes)
-        incoming-counts (incoming-link-counts nodes)]
-    (if (= 1 (count cc))
-      [(plan-component db sources rules nodes incoming-counts required-vars
-                       (first cc))]
-      (map+ (bound-fn [component]
-              (plan-component db sources rules nodes incoming-counts
-                              required-vars component))
-            cc))))
+        incoming-counts (incoming-link-counts nodes)
+        components      (mapv
+                          (fn [component]
+                            [component
+                             (deferred-base-sample-entities
+                               db nodes component projected-vars)])
+                          cc)
+        deferred        (into #{} (mapcat second) components)
+        alternatives
+        (if (= 1 (count components))
+          (let [[component deferred] (first components)]
+            [(component-plan-alternatives
+               db sources rules nodes incoming-counts required-vars
+               component deferred)])
+          (map+ (bound-fn [[component deferred]]
+                  (component-plan-alternatives
+                    db sources rules nodes incoming-counts required-vars
+                    component deferred))
+                components))]
+    {:plans (mapv :plan alternatives)
+     :deferred deferred
+     :attribute-group-planning
+     (not-empty (mapv :attribute-group-planning
+                      (filter :attribute-group-planning alternatives)))}))
 
 (defn- required-plan-vars
   [{:keys [parsed-q rels late-clauses optimizable-not-joins graph]} src]
@@ -4010,6 +4775,25 @@
                 plan-vec))
         plans))
 
+(defn- assoc-source-plan
+  [context src plans deferred attribute-group-planning]
+  (let [context (assoc-in context [:plan src] plans)
+        context
+        (if (seq deferred)
+          (assoc-in context [:deferred-base-samples src]
+                    (vec (sort-by str deferred)))
+          (let [remaining (not-empty
+                            (dissoc (:deferred-base-samples context) src))]
+            (cond-> (dissoc context :deferred-base-samples)
+              remaining (assoc :deferred-base-samples remaining))))]
+    (if (seq attribute-group-planning)
+      (assoc-in context [:attribute-group-planning src]
+                attribute-group-planning)
+      (let [remaining (not-empty
+                        (dissoc (:attribute-group-planning context) src))]
+        (cond-> (dissoc context :attribute-group-planning)
+          remaining (assoc :attribute-group-planning remaining))))))
+
 (defn build-plan
   "Generate a query plan that looks like this:
 
@@ -4024,24 +4808,36 @@
 
   :op here means step type.
   :result-set will be #{} if there is any clause that matches nothing."
-  [{:keys [graph sources rules] :as context}]
+  [{:keys [graph sources rules parsed-q] :as context}]
   (if graph
     (unreduced
       (reduce-kv
         (fn [c src nodes]
           (let [^DB db        (sources src)
                 required-vars (required-plan-vars context src)
-                k             [(.-store db) nodes required-vars]]
+                projected-vars (set (dp/find-vars (:qfind parsed-q)))
+                k             [(.-store db) nodes required-vars
+                               projected-vars]]
             (if-let [cached (.get ^LRUCache (plan-cache) k)]
-              (assoc-in c [:plan src] cached)
+              (assoc-source-plan c src (:plans cached) (:deferred cached)
+                                 (:attribute-group-planning cached))
               (let [nodes (update-nodes db nodes)
-                    plans (if (< 1 (count nodes))
-                            (build-plan* db sources rules nodes required-vars)
-                            [[(base-plan db nodes (ffirst nodes) true)]])]
+                    {:keys [plans deferred attribute-group-planning]}
+                    (if (< 1 (count nodes))
+                      (build-plan* db sources rules nodes required-vars
+                                   projected-vars)
+                      {:plans [[(base-plan db nodes (ffirst nodes) true)]]
+                       :deferred #{}
+                       :attribute-group-planning nil})]
                 (if (some #(some nil? %) plans)
                   (reduced (assoc c :result-set #{}))
-                  (do (.put ^LRUCache (plan-cache) k (strip-result plans))
-                      (assoc-in c [:plan src] plans)))))))
+                  (do (.put ^LRUCache (plan-cache) k
+                            {:plans (strip-result plans)
+                             :deferred deferred
+                             :attribute-group-planning
+                             attribute-group-planning})
+                      (assoc-source-plan c src plans deferred
+                                         attribute-group-planning)))))))
         context graph))
     context))
 

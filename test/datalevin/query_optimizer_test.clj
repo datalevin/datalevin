@@ -52,6 +52,86 @@
     :order-by [?date :desc ?message-id :asc]
     :limit 20])
 
+(def deferred-eav-group-query
+  '[:find ?forum-id ?forum-title ?post
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?person]
+    [?membership :membership/person ?person]
+    [?membership :membership/forum ?forum]
+    [?membership :membership/date ?date]
+    [(> ?date 0)]
+    [?post :post/person ?person]
+    [?post :post/forum ?forum]
+    [?forum :forum/id ?forum-id]
+    [?forum :forum/title ?forum-title]])
+
+(def dominated-projection-root-query
+  '[:find ?friend-id ?first-name ?last-name
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?friend]
+    [?friend :person/id ?friend-id]
+    [?friend :person/firstName ?first-name]
+    [?friend :person/lastName ?last-name]])
+
+(def filtered-projection-root-query
+  '[:find ?friend-id ?score
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?friend]
+    [?friend :person/id ?friend-id]
+    [?friend :person/score ?score]
+    [(> ?score 1100)]])
+
+(def post-top-k-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc ?id :asc]
+    :limit 5])
+
+(def post-top-k-enrichment-offset-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [2 :desc 0 :asc]
+    :limit 3
+    :offset 2])
+
+(def filtering-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some $ ?item :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc ?id :asc]
+    :limit 5])
+
+(def unkeyed-enrichment-query
+  '[:find ?content ?score
+    :where
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc]
+    :limit 5])
+
+(def ordered-output-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [1 :asc]
+    :limit 5])
+
 (def unique-endpoint-query
   '[:find ?start ?middle ?end
     :where
@@ -874,6 +954,83 @@
         (is (= 350 (estimate-cost 10 20 50 3)))
         (is (= 1050 (estimate-cost 10 20 150 3)))))))
 
+(deftest zero-cardinality-linked-node-test
+  (let [dir  (u/tmp-dir (str "zero-linked-node-" (UUID/randomUUID)))
+        conn (d/get-conn
+               dir {:node/title {:db/unique :db.unique/identity}
+                    :block/refs {:db/valueType   :db.type/ref
+                                 :db/cardinality :db.cardinality/many}})]
+    (try
+      (d/transact! conn [{:db/id 1 :node/title "Present"}
+                         {:db/id 2 :block/refs 1}])
+      (let [query '[:find ?block
+                    :where
+                    [?page :node/title "Missing"]
+                    [?block :block/refs ?page]]
+            db    (d/db conn)]
+        (is (= #{} (d/q query db)))
+        (is (= 0 (:actual-result-size
+                   (d/explain {:run? true} query db))))
+        (is (nil? (:plan (d/explain {:run? false} query db)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest known-entity-bound-clause-test
+  (let [dir (u/tmp-dir (str "known-entity-bound-" (UUID/randomUUID)))
+        db  (-> (d/empty-db
+                  dir {:name {:db/unique :db.unique/identity}
+                       :aka  {:db/cardinality :db.cardinality/many}})
+                (d/db-with [{:db/id 1 :name "Ivan" :age 15
+                             :aka ["robot" "ai"]}]))
+        query '[:find ?a ?v
+                :in $ ?e ?alias
+                :where
+                [?e ?a ?v]
+                [?e :aka ?alias]]]
+    (try
+      (testing "a true literal clause seeds late dynamic-attribute work"
+        (is (= #{[:name "Ivan"] [:age 15]
+                 [:aka "robot"] [:aka "ai"]}
+               (d/q query db 1 "ai")))
+        (is (= 4 (:actual-result-size
+                   (d/explain {:run? true} query db 1 "ai")))))
+      (testing "the known entity is still checked against the literal"
+        (is (= #{} (d/q query db 1 "missing"))))
+      (testing "known-entity value predicates are applied during EAV scan"
+        (is (= #{}
+               (d/q '[:find ?age
+                      :in $ ?e
+                      :where
+                      [?e :age ?age]
+                      [(> ?age 20)]]
+                    db 1))))
+      (finally
+        (d/close-db db)
+        (u/delete-files dir)))))
+
+(deftest multi-key-join-cardinality-test
+  (let [estimate-size @(ns-resolve 'datalevin.query-optimizer
+                                   'multi-key-result-size)
+        prev-plan     {:steps [{:cols ['?left
+                                       #{:left/a '?a}
+                                       #{:left/b '?b}]}]}
+        target-plan   {:steps [{:cols ['?right
+                                       #{:right/a '?a}
+                                       #{:right/b '?b}]}]}
+        single-target {:steps [{:cols ['?right #{:right/a '?a}]}]}
+        link          {:type :val-eq :var '?a}]
+    (with-redefs [db/-cardinality (fn [_ attr]
+                                    (if (= attr :right/b) 10000 1))]
+      (testing "an unrepresented equality key dampens the join fanout"
+        (is (= 10000
+               (estimate-size nil '?left link prev-plan target-plan
+                              1000000))))
+      (testing "the selected graph key is not counted twice"
+        (is (= 1000000
+               (estimate-size nil '?left link prev-plan single-target
+                              1000000)))))))
+
 (deftest merge-range-predicate-cost-test
   (let [merge-pred-options @(ns-resolve 'datalevin.query-optimizer
                                         'merge-pred-options)
@@ -905,6 +1062,82 @@
         (is (= 60.0 (estimate-cost {:attrs-v [[:date residual-options]]
                                     :vars    []}
                                    10)))))))
+
+(deftest deferred-eav-attribute-group-planning-test
+  (let [dir    (u/tmp-dir (str "deferred-eav-group-" (UUID/randomUUID)))
+        schema {:start/id          {:db/valueType :db.type/long
+                                    :db/unique    :db.unique/identity}
+                :edge/from         {:db/valueType :db.type/ref}
+                :edge/to           {:db/valueType :db.type/ref}
+                :membership/person {:db/valueType :db.type/ref}
+                :membership/forum  {:db/valueType :db.type/ref}
+                :membership/date   {:db/valueType :db.type/long}
+                :post/person       {:db/valueType :db.type/ref}
+                :post/forum        {:db/valueType :db.type/ref}
+                :forum/id          {:db/valueType :db.type/long
+                                    :db/unique    :db.unique/identity}
+                :forum/title       {:db/valueType :db.type/string}}
+        conn   (d/get-conn dir schema)
+        person-count (long 20)
+        forum-count  (long 10)]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1 :start/id 1}]
+              (concat
+                (map (fn [^long i]
+                       {:db/id (+ 2000 i)
+                        :forum/id i
+                        :forum/title (str "forum-" i)})
+                     (range forum-count))
+                (map (fn [^long i]
+                       {:db/id (+ 10000 i)
+                        :edge/from 1
+                        :edge/to (+ 1000 i)})
+                     (range person-count))
+                (for [^long i (range person-count)
+                      ^long j (range forum-count)]
+                  {:db/id (+ 100000 (* i forum-count) j)
+                   :membership/person (+ 1000 i)
+                   :membership/forum (+ 2000 j)
+                   :membership/date (inc j)})
+                (map (fn [^long i]
+                       {:db/id (+ 200000 i)
+                        :post/person (+ 1000 i)
+                        :post/forum (+ 2000 (long (mod i forum-count)))})
+                     (range person-count)))))
+      (let [db-value (db/-clear-tx-cache (d/db conn))
+            common-bindings
+            {#'c/init-exec-size-threshold 5
+             #'c/hash-join-min-input-size 1
+             #'c/magic-cost-hash-join 0.1}]
+        (with-bindings (assoc common-bindings
+                              #'c/deferred-eav-min-cost-improvement 1.0)
+          (let [explain  (d/explain {:run? false}
+                                    deferred-eav-group-query db-value)
+                planning (-> explain :attribute-group-planning vals first first)]
+            (testing "a high required improvement retains the eager plan"
+              (is (= :eager (:selected planning)))
+              (is (= [:membership/date]
+                     (get-in planning [:groups 0 :attrs]))))))
+        (.clear ^datalevin.utl.LRUCache qo/*plan-cache*)
+        (with-bindings (assoc common-bindings
+                              #'c/deferred-eav-min-cost-improvement 0.0)
+          (let [explain  (d/explain {:run? true}
+                                    deferred-eav-group-query db-value)
+                planning (-> explain :attribute-group-planning vals first first)
+                result   (d/q deferred-eav-group-query db-value)]
+            (testing "the fixed join DAG can place a legal group after hash"
+              (is (= :deferred (:selected planning)))
+              (is (true? (get-in planning
+                                 [:groups 0 :after-hash-join?])))
+              (is (= 20 (:actual-result-size explain))))
+            (testing "late cardinality-one filtering preserves query results"
+              (is (= 20 (count result)))
+              (is (contains? result [0 "forum-0" 200000]))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest sampled-late-expansion-cost-test
   (let [dir    (u/tmp-dir (str "late-expansion-cost-" (UUID/randomUUID)))
@@ -1010,7 +1243,12 @@
         (testing "a projected fanout cannot outspend the conventional plan"
           (is (true? (:unavailable? preferred)))
           (is (= :sample-work-budget (:unavailable-reason preferred)))
-          (is (= :knows/to (:attr abort)))
+          (is (= :access-propagation-preflight (:phase abort)))
+          (is (zero? (long (get-in preferred [:estimate :sample-rows]))))
+          (is (zero? (double
+                       (get-in preferred
+                               [:estimate :planning-sample-cost]))))
+          (is (= :person/id (:attr abort)))
           (is (< (double (:budget abort))
                  (+ (double (:cost abort))
                     (double (:projected-cost abort)))))
@@ -1020,6 +1258,162 @@
           (is (= 20 (count result)))
           (is (= [119 1019 1019] (first result)))
           (is (= [100 1000 1000] (peek result)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest terminal-access-count-sample-test
+  (let [dir    (u/tmp-dir (str "terminal-access-count-"
+                               (UUID/randomUUID)))
+        schema {:sample/rank {:db/valueType :db.type/long}
+                :sample/keep {:db/valueType :db.type/boolean}
+                :sample/tag  {:db/valueType   :db.type/string
+                              :db/cardinality :db.cardinality/many}}
+        conn   (d/get-conn dir schema)
+        query  '[:find ?e ?rank ?tag
+                 :in $ ?max-rank
+                 :where
+                 [?e :sample/rank ?rank]
+                 [(<= ?rank ?max-rank)]
+                 [?e :sample/keep true]
+                 [?e :sample/tag ?tag]
+                 :order-by [?rank :desc ?e :asc ?tag :asc]
+                 :limit 6]]
+    (try
+      (d/transact!
+        conn
+        (mapv
+          (fn [^long e]
+            (let [tag-count (unchecked-inc (long (mod (quot e 5) 5)))]
+              (cond-> {:db/id e :sample/rank e}
+                (zero? (rem e 5))
+                (assoc :sample/keep true
+                       :sample/tag
+                       (mapv #(str "tag-" %) (range tag-count))))))
+          (range 1 361)))
+      (let [db-value  (db/-clear-tx-cache (d/db conn))
+            explain   (d/explain {:run? false} query db-value 360)
+            preferred (:preferred-access-plan explain)
+            counted   (some #(when (= :counted (:sampling %)) %)
+                            (get-in preferred [:estimate :join-stages]))]
+        (testing "a terminal projection can be sampled without materializing"
+          (is (true? (:access-path-selected? explain)))
+          (is (= :adaptive-top-k
+                 (get-in explain [:selected-plan-alternative :mode])))
+          (is (= :sample/tag (:attr counted)))
+          (is (pos? (long (:output counted))))
+          (is (<= (double
+                    (get-in preferred [:estimate :planning-sample-cost]))
+                  (double (:conventional-plan-cost explain))))
+          (is (= 6 (count (d/q query db-value 360))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest dominated-projection-base-sample-test
+  (let [dir    (u/tmp-dir (str "dominated-projection-root-"
+                               (UUID/randomUUID)))
+        schema {:start/id         {:db/valueType :db.type/long
+                                   :db/unique    :db.unique/identity}
+                :edge/from        {:db/valueType :db.type/ref}
+                :edge/to          {:db/valueType :db.type/ref}
+                :person/id        {:db/valueType :db.type/long
+                                   :db/unique    :db.unique/identity}
+                :person/firstName {:db/valueType :db.type/string}
+                :person/lastName  {:db/valueType :db.type/string}
+                :person/score     {:db/valueType :db.type/long}}
+        conn   (d/get-conn dir schema)
+        people (mapv (fn [^long i]
+                       {:db/id            (+ 1000 i)
+                        :person/id        i
+                        :person/firstName (str "first-" i)
+                        :person/lastName  (str "last-" i)
+                        :person/score     i})
+                     (range 1200))
+        edges  (mapv (fn [^long i]
+                       {:db/id     (+ 10000 i)
+                        :edge/from 1
+                        :edge/to   (+ 1000 i)})
+                     (range 29))]
+    (try
+      (d/transact! conn (into [{:db/id 1 :start/id 1}]
+                              (concat people edges)))
+      (let [db-value (d/db conn)
+            explain  (d/explain {:run? false}
+                                dominated-projection-root-query db-value)
+            result   (d/q dominated-projection-root-query db-value)
+            filtered (d/explain {:run? false}
+                                filtered-projection-root-query db-value)]
+        (testing "pure output properties defer their global root sample"
+          (is (= ['?friend]
+                 (get (:deferred-base-samples explain) '$)))
+          (is (= 29 (count result)))
+          (is (contains? result [0 "first-0" "last-0"]))
+          (is (contains? result [28 "first-28" "last-28"])))
+        (testing "a projected property used by a predicate is still sampled"
+          (is (nil? (:deferred-base-samples filtered)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest post-top-k-property-enrichment-test
+  (let [dir    (u/tmp-dir (str "post-top-k-enrichment-"
+                               (UUID/randomUUID)))
+        schema {:item/id      {:db/valueType :db.type/long
+                               :db/unique    :db.unique/identity}
+                :item/score   {:db/valueType :db.type/long}
+                :item/content {:db/valueType :db.type/string}
+                :item/image   {:db/valueType :db.type/string}}
+        conn   (d/get-conn dir schema)
+        items  (mapv (fn [^long i]
+                       (cond-> {:db/id       (+ 100 i)
+                                :item/id      i
+                                :item/score   i}
+                         (< i 28) (assoc :item/content (str "content-" i))
+                         (= i 28) (assoc :item/image "image-28")))
+                     (range 30))]
+    (try
+      (d/transact! conn items)
+      (let [db-value        (d/db conn)
+            explain         (d/explain {:run? true}
+                                       post-top-k-enrichment-query db-value)
+            result          (d/q post-top-k-enrichment-query db-value)
+            offset          (d/q post-top-k-enrichment-offset-query db-value)
+            filtering       (d/q filtering-enrichment-query db-value)
+            unkeyed         (d/explain {:run? false}
+                                       unkeyed-enrichment-query db-value)
+            unkeyed-result  (d/q unkeyed-enrichment-query db-value)
+            ordered-output  (d/explain
+                              {:run? false}
+                              ordered-output-enrichment-query db-value)
+            enrichment      (:post-top-k-enrichment explain)]
+        (testing "the total fallback preserves missing-property rows"
+          (is (= [[29 nil 29]
+                  [28 "image-28" 28]
+                  [27 "content-27" 27]
+                  [26 "content-26" 26]
+                  [25 "content-25" 25]]
+                 result))
+          (is (= [[27 "content-27" 27]
+                  [26 "content-26" 26]
+                  [25 "content-25" 25]]
+                 offset)))
+        (testing "only the selected top-k rows are enriched"
+          (is (= ['get-some-else] (:functions enrichment)))
+          (is (= 30 (:candidate-count enrichment)))
+          (is (= 5 (:selected-count enrichment)))
+          (is (= {:cardinality-preserving true
+                  :projection-only true
+                  :stable-distinct-key true}
+                 (:proof enrichment))))
+        (testing "the filtering function retains its original semantics"
+          (is (= [28 "image-28" 28] (first filtering)))
+          (is (= 5 (count filtering))))
+        (testing "deferral requires a projected stable row key"
+          (is (nil? (:post-top-k-enrichment unkeyed)))
+          (is (= [nil 29] (first unkeyed-result))))
+        (testing "deferral rejects outputs referenced by indexed ordering"
+          (is (nil? (:post-top-k-enrichment ordered-output)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

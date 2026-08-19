@@ -2,6 +2,9 @@
 
 ## WIP
 
+### Added
+- [Datalog] `get-some-else` built-in function. Similar to `get-some` but always
+  return a tuple.
 ### Improved
 - [Datalog] planner accounts for late clauses cost and better hash join cost
   estimation.

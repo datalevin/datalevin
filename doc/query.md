@@ -388,6 +388,29 @@ different pages are cached separately. Transaction invalidation remains based
 on the attributes used by the query. Unbounded queries continue to cache their
 full result, and the plan cache remains independent of result-window caching.
 
+### Post-top-k property enrichment
+
+An ordered limit can still do unnecessary work when a late function fetches
+properties used only by the final projection. Datalevin can defer a total
+`get-some-else` enrichment until after the result window is selected. It first
+collects and orders the candidate keys, applies `:offset` and `:limit`, and then
+reads the optional properties only for the selected rows. The fallback argument
+to `get-some-else` makes the operation cardinality preserving even when none of
+the requested properties exists.
+
+This rewrite requires a proof that moving the function cannot affect filtering,
+ordering, or distinctness. Every enrichment output must be introduced only by
+that clause and used only by `:find`; it cannot occur in `:in`, `:with`,
+`:having`, `:order-by`, or another where clause. A retained projected entity ID
+or unique attribute value must also provide a stable distinct key. Queries with
+aggregates, pull expressions, result maps, or other non-relational result
+shapes retain their original evaluation order.
+
+`explain` reports an accepted rewrite under `:post-top-k-enrichment`. With
+`{:run? true}`, it includes both the number of candidates and the number of
+rows enriched, together with the cardinality-preserving, projection-only, and
+stable-distinct-key proof obligations.
+
 ### Adaptive unordered limits
 
 A finite unordered relation query can also avoid producing every source match
@@ -425,6 +448,54 @@ The input list of entity IDs may come from a search on `:ave` index that returns
 an entity ID list, a set of linking references from a relation produced
 in the previous step, or the reverse references from the previous step, and so
 on.
+
+The implementation sorts the input entity IDs and requested attributes, then
+uses one EAV cursor to obtain all requested values for each entity. Attribute
+prefix setup, cursor positioning, and predicate dispatch are shared by the
+fused operation. Consequently, the cost model charges the first output value at
+full price and, by default, each additional output value at only 15 percent of
+that price. Residual value predicates and equality checks against columns
+already in the input tuple are evaluated during the scan, before rejected rows
+are materialized.
+
+Presence-only EAV checks and exact AVE membership checks have narrower native
+loops. Their invariant key portion is encoded once per chunk, and repeated
+adjacent entity IDs, values, or value/entity pairs reuse the preceding probe
+result. These paths preserve every matching input tuple, including duplicate
+payload rows, while avoiding retrieval of values that the query does not need.
+
+### Deferred EAV attribute groups
+
+Fusing attributes is usually cheaper than issuing independent EAV scans, but it
+can be wasteful when a large entity relation is about to be reduced by a hash
+join. The optimizer therefore builds a guarded alternative in which eligible
+attributes become dependency nodes in the component plan. It groups them by
+owning entity and by role: projection-only attributes form one group and local
+filters form another. An attribute is movable only when it is not
+cardinality-many, has a non-placeholder binding variable, has no literal
+value, and that variable is not a connection key between entity nodes.
+
+The eager plan is built first. Deferred placement is considered only when that
+plan contains a hash join, and attributes already placed after a hash join are
+removed from consideration. To keep the additional state space bounded, the
+alternative preserves the eager plan's entity join order and searches only the
+legal positions of at most four attribute groups in a component of at most ten
+entity-plus-group nodes. Thus the search answers a global question--whether the
+smaller downstream scan repays the loss of fusion--without reopening the much
+larger join-order search.
+
+Before expanding those states, Datalevin computes an optimistic upper bound on
+savings by pretending that every deferred scan is free. If even that bound is
+less than five percent of the complete eager-plan cost, the eager plan wins
+without further enumeration. Otherwise, the complete eager and deferred costs
+are compared, and a deferred plan is selected only when a group actually lands
+after a hash join and clears the same improvement margin.
+
+`explain` exposes the decision under `:attribute-group-planning`, including
+each group's owner, role, attributes, variables, estimated selectivity, the
+evaluated alternative costs, and the selected strategy. A search rejected by
+the early guard instead reports `:reason :insufficient-potential-savings` and
+its optimistic savings bound.
 
 ### Query graph simplification
 
@@ -599,6 +670,16 @@ estimation should also be directional. No attribute independence assumption is
 made in our size estimation, as it is based entirely on counting and sampling.
 Data correlations are encoded naturally by these methods.
 
+When two join inputs share more equality variables than the graph link chosen
+to connect them, estimating from that primary link alone can greatly
+overestimate the result. Datalevin recognizes the additional common keys from
+the two input schemas and reduces the estimate for each one. It deliberately
+uses the square root of the key attribute's observed domain cardinality rather
+than the full independence formula: graph attributes are often correlated, so
+the damped correction captures the extra equality constraint without assuming
+independent distributions. The corrected output estimate is also used when
+comparing an indexed link with its hash-join alternative.
+
 ### Direct counting for result size estimation (new)
 
 As mentioned, the main advantage of our system is having more accurate
@@ -646,6 +727,15 @@ branch. See the
 [CIDR 2027 estimator study](cidr2027.md#24-managing-sampling-uncertainty) for
 the distinction and experimental results.
 
+Sampling itself is also subject to dominance checks. If a connected component
+already contains an exact one-row anchor, an unbound, cardinality-one node whose
+attributes are used only for projection cannot provide a better root. Datalevin
+therefore defers that node's speculative global value sample while retaining
+its catalog count and its normal place in join enumeration. An attribute used
+by a predicate, join, or late clause is not eligible, because its sample can
+still change selectivity or ordering decisions. Deferred roots are listed by
+source under `:deferred-base-samples` in `explain`.
+
 ### Recency based link choice (new)
 
 During planning, when multiple links are possible to reach the same next node in
@@ -672,12 +762,33 @@ complex queries.
 ### Parallel processing
 
 Our counting and sampling based query planning method does more work than
-traditional statistics based methods at query time. Fortunately, these work are
-amicable for parallel processing, so it is done whenever appropriate.
+traditional statistics based methods at query time. Independent component
+counts, samples, and plans are evaluated concurrently when the database is
+read-only. Plan execution also uses a bounded tuple pipeline, so different
+steps can have tuples in flight at the same time.
 
-Pipelining is used for plan execution, so multiple tuples in different execution
-steps are in flight at the same time. A tuple generated from one step becomes input
-of next step. Each step is processed by a dedicated thread.
+The most expensive list-based storage operations additionally parallelize
+inside an individual scan batch. This currently covers fused EAV merge scans,
+EAV presence filtering, AVE filtering by a bound entity, and AVE filtering by
+a value/entity pair. Inputs are divided into contiguous chunks and outputs are
+concatenated in chunk order, preserving the serial result order. The calling
+thread performs one chunk while the remaining chunks use the common fork-join
+pool.
+
+Participation is adaptive rather than a fixed worker count. It is bounded by
+the number of available processors, currently available executor slots, and
+the amount of useful work at a target of roughly 4,000 probes per participant.
+Nested calls from a fork-join worker discount the occupied pool slot. A
+single-core machine, a small input, an exhausted executor, or a write
+transaction therefore remains serial.
+
+A predicate used by a parallel EAV scan must also be safe to invoke
+concurrently. Generated predicates carry a factory from which each chunk gets
+an independent instance; immutable predicates may explicitly be marked
+shareable. Predicate composition retains these factories when every child is
+forkable. An opaque user predicate has no such proof, so its scan remains
+serial. This makes storage-level parallelism available to normal Datalog plans
+without introducing shared mutable predicate state.
 
 ### Multiple stage clause resolution
 
