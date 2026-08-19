@@ -24,6 +24,7 @@
    [datalevin.pipe :as p]
    [datalevin.query.access :as qaccess]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.predicate :as qpred]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
@@ -2256,7 +2257,9 @@
         (let [[k i]   mpath
               bound1  (mapv (fn [{:keys [val] :as b}]
                               (-> b
-                                  (update :pred add-pred #(= val %))
+                                  (update :pred add-pred
+                                          (qpred/shareable-predicate
+                                            #(= val %)))
                                   (assoc :var (gensym "?bound"))))
                             (if (= k :bound) (u/vec-remove bound i) bound))
               all     (->> (concatv bound1
@@ -3308,7 +3311,9 @@
         a1         (:attr s1)
         ip-options (merge-pred-options v1 s1)
         ip         (cond-> (:pred ip-options)
-                     (some? val1) (add-pred #(= % val1)))
+                     (some? val1)
+                     (add-pred
+                       (qpred/shareable-predicate #(= % val1))))
         ip-options (cond-> (assoc ip-options :pred ip)
                      (some? val1) (dissoc :range-pred?))
         attrs-v2   (:attrs-v s2)

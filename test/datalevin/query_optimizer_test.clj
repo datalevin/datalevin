@@ -9,6 +9,7 @@
    [datalevin.parser :as dp]
    [datalevin.query.execute :as qexec]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.predicate :as qpred]
    [datalevin.query-optimizer :as qo]
    [datalevin.query.plan :as qplan]
    [datalevin.query.resolve :as qresolve]
@@ -496,6 +497,45 @@
     (is (qor/exact-inequality-range? :db.type/bytes)))
   (testing "BigDecimal retains its exact residual predicate"
     (is (not (qor/exact-inequality-range? :db.type/bigdec)))))
+
+(deftest forkable-predicate-test
+  (let [instances (atom 0)
+        pred      (qpred/forkable-predicate
+                    (fn []
+                      (let [instance (swap! instances inc)
+                            args     (object-array [nil 10])]
+                        (fn [v]
+                          (aset args 0 v)
+                          [(aget args 0) (aget args 1) instance]))))
+        fork-1    (qpred/fork-predicate pred)
+        fork-2    (qpred/fork-predicate pred)]
+    (is (qpred/forkable-predicate? pred))
+    (is (= [:a 10 2] (fork-1 :a)))
+    (is (= [:b 10 3] (fork-2 :b)))
+    (is (= 3 @instances))
+    (testing "composition forks both child predicates"
+      (let [upper    (qpred/shareable-predicate #(< ^long % 10))
+            positive (qpred/shareable-predicate #(pos? ^long %))
+            combined (qor/add-pred upper positive)
+            forked   (qpred/fork-predicate combined)]
+        (is (qpred/forkable-predicate? combined))
+        (is (forked 5))
+        (is (not (forked 0)))
+        (is (not (forked 12)))))
+    (testing "composition with an opaque predicate remains opaque"
+      (is (not (qpred/forkable-predicate?
+                 (qor/add-pred pred (fn [_] true))))))))
+
+(deftest activated-variable-predicate-is-forkable-test
+  (let [pred (qor/activate-var-pred
+               {:make-call qresolve/make-call
+                :resolve-pred qresolve/resolve-pred}
+               '?value '(< ?value 10))
+        fork-1 (qpred/fork-predicate pred)
+        fork-2 (qpred/fork-predicate pred)]
+    (is (qpred/forkable-predicate? pred))
+    (is (fork-1 9))
+    (is (not (fork-2 10)))))
 
 (deftest unique-constant-lookups-materialized-test
   (let [dir    (u/tmp-dir (str "unique-constant-lookup-"

@@ -28,6 +28,7 @@
    [datalevin.embedding :as emb]
    [datalevin.vector :as v]
    [datalevin.prepare :as prep]
+   [datalevin.query.predicate :as qpred]
    [datalevin.constants :as c]
    [datalevin.datom :as d]
    [datalevin.async :as a]
@@ -48,9 +49,9 @@
             get-env-flags set-env-flags]]
    [clojure.string :as str])
   (:import
-   [java.util List Comparator Collection HashMap IdentityHashMap UUID]
-   [java.util.concurrent TimeUnit ScheduledExecutorService ConcurrentHashMap
-    ScheduledFuture]
+   [java.util ArrayList List Comparator Collection HashMap IdentityHashMap UUID]
+   [java.util.concurrent Callable ForkJoinPool ForkJoinWorkerThread Future
+    TimeUnit ScheduledExecutorService ConcurrentHashMap ScheduledFuture]
    [java.util.concurrent.locks ReentrantReadWriteLock]
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
@@ -421,6 +422,147 @@
                  (d/compare-with-type (aget ^objects a v-idx)
                                       (aget ^objects b v-idx))))))))
 
+(defn- sorted-distinct-tuple-values
+  ^long [^List tuples ^long value-idx]
+  (let [n (.size tuples)]
+    (if (zero? n)
+      0
+      (loop [i          (long 1)
+             last-value (aget ^objects (.get tuples 0) value-idx)
+             total      (long 1)]
+        (if (== i n)
+          total
+          (let [value (aget ^objects (.get tuples (int i)) value-idx)]
+            (if (== 0 (long (d/compare-with-type value last-value)))
+              (recur (u/long-inc i) last-value total)
+              (recur (u/long-inc i) value (u/long-inc total)))))))))
+
+(def ^:private ^:const parallel-scan-target-chunk-size 4000)
+
+(defn- eav-filter-presence-chunk
+  [lmdb ^List in eid-idx aid]
+  (let [out      (FastList. (.size in))
+        dbi-name c/eav]
+    (scan/scan
+      (cpp/filter-list-id-int-prefix! rtx cur in eid-idx aid out)
+      (u/raise "Fail to filter EAV attribute presence: " e
+               {:eid-idx eid-idx :aid aid}))))
+
+(defn- ave-filter-bound-id-chunk
+  [lmdb ^List in value-idx aid value-type bound-id]
+  (let [out      (FastList. (.size in))
+        dbi-name c/ave]
+    (scan/scan
+      (cpp/filter-list-avg-bound-id!
+        rtx cur in value-idx aid value-type bound-id out)
+      (u/raise "Fail to filter AVE by bound entity: " e
+               {:value-idx value-idx :aid aid :bound-id bound-id}))))
+
+(defn- ave-filter-tuple-id-chunk
+  [lmdb ^List in value-idx entity-idx aid value-type]
+  (let [out      (FastList. (.size in))
+        dbi-name c/ave]
+    (scan/scan
+      (cpp/filter-list-avg-tuple-id!
+        rtx cur in value-idx entity-idx aid value-type out)
+      (u/raise "Fail to filter AVE by tuple entity: " e
+               {:value-idx value-idx :entity-idx entity-idx :aid aid}))))
+
+(defn- parallel-scan-participant-capacity
+  ^long [^long n ^long cpu-count ^long pool-slots]
+  (let [cpu-capacity      (max 1 cpu-count)
+        executor-capacity (inc (max 0 pool-slots))
+        useful-work       (max
+                            1
+                            (quot (+ n
+                                     (dec parallel-scan-target-chunk-size))
+                                  parallel-scan-target-chunk-size))]
+    (long (min cpu-capacity executor-capacity useful-work))))
+
+(defn- parallel-scan-participant-count
+  ^long [^long n]
+  (let [^ForkJoinPool pool (ForkJoinPool/commonPool)
+        ^Thread thread    (Thread/currentThread)
+        parallelism      (long (.getParallelism pool))
+        pool-slots       (if (and (instance? ForkJoinWorkerThread thread)
+                                  (identical?
+                                    pool
+                                    (.getPool ^ForkJoinWorkerThread thread)))
+                           (max 0 (dec parallelism))
+                           parallelism)]
+    (parallel-scan-participant-capacity
+      n (.availableProcessors (Runtime/getRuntime)) pool-slots)))
+
+(defn- ordered-parallel-list-chunks
+  [^List in ^long requested-participants f]
+  (let [n            (.size in)
+        participants (long (max 1 (min requested-participants (max 1 n))))]
+    (if (== 1 participants)
+      (f in)
+      (let [^ForkJoinPool pool (ForkJoinPool/commonPool)
+            bindings          (get-thread-bindings)
+            futures           (ArrayList. (dec participants))]
+        (dotimes [offset (dec participants)]
+          (let [i     (inc offset)
+                start (quot (* i n) participants)
+                end   (quot (* (inc i) n) participants)
+                chunk (.subList in (int start) (int end))]
+            (.add futures
+                  (.submit
+                    pool
+                    ^Callable
+                    (reify Callable
+                      (call [_]
+                        (with-bindings bindings
+                          (f chunk))))))))
+        (try
+          (let [first-end   (quot n participants)
+                first-chunk (.subList in 0 (int first-end))
+                out         (FastList. n)]
+            (.addAll out ^Collection (f first-chunk))
+            (dotimes [i (.size futures)]
+              (.addAll out ^Collection
+                       (.get ^Future (.get futures i))))
+            out)
+          (catch Throwable e
+            (dotimes [i (.size futures)]
+              (.cancel ^Future (.get futures i) true))
+            (throw e)))))))
+
+(defn- scan-list-in-chunks
+  ([lmdb ^List in f]
+   (scan-list-in-chunks lmdb in (.size in) f))
+  ([lmdb ^List in work-count f]
+   (let [participants (if (lmdb/writing? lmdb)
+                        1
+                        (parallel-scan-participant-count work-count))]
+     (if (== 1 participants)
+       (f in)
+       (ordered-parallel-list-chunks in participants f)))))
+
+(defn- eav-filter-presence-list*
+  [lmdb ^List in eid-idx aid]
+  (scan-list-in-chunks
+    lmdb in
+    (fn [chunk]
+      (eav-filter-presence-chunk lmdb chunk eid-idx aid))))
+
+(defn- ave-filter-bound-id-list*
+  [lmdb ^List in value-idx aid value-type bound-id]
+  (scan-list-in-chunks
+    lmdb in (sorted-distinct-tuple-values in value-idx)
+    (fn [chunk]
+      (ave-filter-bound-id-chunk
+        lmdb chunk value-idx aid value-type bound-id))))
+
+(defn- ave-filter-tuple-id-list*
+  [lmdb ^List in value-idx entity-idx aid value-type]
+  (scan-list-in-chunks
+    lmdb in
+    (fn [chunk]
+      (ave-filter-tuple-id-chunk
+        lmdb chunk value-idx entity-idx aid value-type))))
+
 (defn- group-counts
   [aids]
   (sequence (comp (partition-by identity) (map count)) aids))
@@ -531,20 +673,14 @@
             (.addAll out (r/prod-tuples (r/single-tuples tuple) ts)))))))
 
 (defn- val-eq-scan-e-bound*
-  [iter ^Collection out tuple aid v vt bound]
-  (visit-list* iter (fn [^ByteBuffer vb]
-                      (let [e (.getLong vb 0)]
-                        (when (= ^long e ^long bound)
-                          (.add out (r/conj-tuple tuple e)))))
-               (b/indexable nil aid v vt nil) :avg vt true))
+  [rtx cur ^Collection out tuple aid v vt bound]
+  (when (cpp/list-avg-id? rtx cur aid v vt bound)
+    (.add out (r/conj-tuple tuple (long bound)))))
 
 (defn- val-eq-filter-e*
-  [iter ^Collection out tuple aid v vt old-e]
-  (visit-list* iter
-               (fn [^ByteBuffer vb]
-                 (when (== (.getLong vb 0) ^long old-e)
-                   (.add out tuple)))
-               (b/indexable nil aid v vt nil) :avg vt true))
+  [rtx cur ^Collection out tuple aid v vt old-e]
+  (when (cpp/list-avg-id? rtx cur aid v vt old-e)
+    (.add out tuple)))
 
 (defn- single-attrs?
   [schema attrs-v]
@@ -553,6 +689,31 @@
          (not-any? #(identical? (-> % schema :db/cardinality)
                                 :db.cardinality/many)
                    attrs))))
+
+(defn- eav-scan-v-list-chunk
+  [lmdb ^List in eid-idx attrs-v single? na nvs ^ints aids ^objects preds
+   ^objects fidxs ^booleans skips has-fidx? ^ints gstarts ^ints gcounts]
+  (let [nt       (.size in)
+        out      (FastList. nt)
+        seen     (when-not has-fidx? (LongObjectHashMap. nt))
+        preds    (qpred/fork-predicates preds)
+        dbi-name c/eav]
+    (scan/scan
+      (with-open [^AutoCloseable iter
+                  (lmdb/val-iterator
+                    (lmdb/iterate-list-val-full dbi rtx cur))]
+        (if single?
+          (dotimes [i nt]
+            (eav-scan-v-single*
+              lmdb iter na nvs out (.get in i) eid-idx seen aids preds fidxs
+              skips))
+          (dotimes [i nt]
+            (eav-scan-v-multi*
+              lmdb iter na out (.get in i) eid-idx seen aids preds fidxs skips
+              gstarts gcounts))))
+      (u/raise "Fail to eav-scan-v: " e
+               {:eid-idx eid-idx :attrs-v attrs-v}))
+    out))
 
 (defn- ea->avg-buffer
   [schema lmdb e a]
@@ -1219,36 +1380,38 @@
             aids      (mapv get-aid attrs-v)
             na        (count aids)
             in        (sort-tuples-by-eid in eid-idx)
-            nt        (.size ^List in)
-            out       (FastList. nt)
             maps      (mapv peek attrs-v)
             nvs       (count (remove :skip? maps))
             skips     (boolean-array (map :skip? maps))
             preds     (object-array (map :pred maps))
+            parallel? (every? qpred/forkable-predicate? preds)
             has-fidx? (boolean (some :fidx maps))
             fidxs     (object-array (map :fidx maps))
             aids      (int-array aids)
-            seen      (when-not has-fidx? (LongObjectHashMap. nt))
-            dbi-name  c/eav]
-        (scan/scan
-          (with-open [^AutoCloseable iter
-                      (lmdb/val-iterator
-                        (lmdb/iterate-list-val-full dbi rtx cur))]
-            (if (single-attrs? schema attrs-v)
-              (dotimes [i nt]
-                (eav-scan-v-single*
-                  lmdb iter na nvs out (.get ^List in i) eid-idx seen aids
-                  preds fidxs skips))
-              (let [gcounts (group-counts aids)
-                    gstarts ^ints (group-starts gcounts)
-                    gcounts (int-array gcounts)]
-                (dotimes [i nt]
-                  (eav-scan-v-multi*
-                    lmdb iter na out (.get ^List in i) eid-idx seen aids
-                    preds fidxs skips gstarts gcounts)))))
-          (u/raise "Fail to eav-scan-v: " e
-                   {:eid-idx eid-idx :attrs-v attrs-v}))
-        out)))
+            presence-only?
+            (and (== 1 na)
+                 (zero? nvs)
+                 (aget ^booleans skips 0)
+                 (nil? (aget ^objects preds 0))
+                 (nil? (aget ^objects fidxs 0)))
+            single?   (and (not presence-only?)
+                           (single-attrs? schema attrs-v))
+            gcounts   (when (and (not presence-only?) (not single?))
+                        (int-array (group-counts aids)))
+            gstarts   (when gcounts (group-starts gcounts))]
+        (if presence-only?
+          (eav-filter-presence-list*
+            lmdb in eid-idx (long (aget ^ints aids 0)))
+          (let [scan-chunk
+                (fn [chunk]
+                  (eav-scan-v-list-chunk
+                    lmdb chunk eid-idx attrs-v single? na nvs aids preds fidxs
+                    skips has-fidx? gstarts gcounts))]
+            ;; Generated query predicates carry factories for independent
+            ;; chunk-local instances. Opaque predicates stay serial.
+            (if parallel?
+              (scan-list-in-chunks lmdb in scan-chunk)
+              (scan-chunk in)))))))
 
   (val-eq-scan-e [_ in out v-idx attr]
     (if attr
@@ -1299,14 +1462,12 @@
               aid      (props :db/aid)
               dbi-name c/ave]
           (scan/scan
-            (with-open [^AutoCloseable iter
-                        (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
-              (loop [^objects tuple (p/produce in)]
-                (when tuple
-                  (let [v (aget tuple v-idx)]
-                    (val-eq-scan-e-bound* iter out tuple aid v vt bound)
-                    (recur (p/produce in))))))
+            (loop [^objects tuple (p/produce in)]
+              (when tuple
+                (let [v (aget tuple v-idx)]
+                  (val-eq-scan-e-bound*
+                    rtx cur out tuple aid v vt bound)
+                  (recur (p/produce in)))))
             (u/raise "Fail to val-eq-scan-e-bound: " e
                      {:v-idx v-idx :attr attr}))))
       (loop []
@@ -1318,21 +1479,9 @@
       (when-let [props (schema attr)]
         (let [vt       (value-type props)
               in       (sort-tuples-by-val in v-idx vt)
-              nt       (.size ^List in)
-              aid      (props :db/aid)
-              dbi-name c/ave
-              out      (FastList. nt)]
-          (scan/scan
-            (with-open [^AutoCloseable iter
-                        (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
-              (dotimes [i nt]
-                (let [^objects tuple (.get ^List in i)
-                      v              (aget tuple v-idx)]
-                  (val-eq-scan-e-bound* iter out tuple aid v vt bound))))
-            (u/raise "Fail to val-eq-scan-e-list-bound: " e
-                     {:v-idx v-idx :attr attr}))
-          out))))
+              aid      (props :db/aid)]
+          (ave-filter-bound-id-list*
+            lmdb in v-idx aid vt bound)))))
 
   (val-eq-filter-e [_ in out v-idx attr f-idx]
     (if attr
@@ -1341,15 +1490,13 @@
               dbi-name c/ave
               aid      (props :db/aid)]
           (scan/scan
-            (with-open [^AutoCloseable iter
-                        (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
-              (loop [^objects tuple (p/produce in)]
-                (when tuple
-                  (let [old-e (aget tuple f-idx)
-                        v     (aget tuple v-idx)]
-                    (val-eq-filter-e* iter out tuple aid v vt old-e)
-                    (recur (p/produce in))))))
+            (loop [^objects tuple (p/produce in)]
+              (when tuple
+                (let [old-e (aget tuple f-idx)
+                      v     (aget tuple v-idx)]
+                  (val-eq-filter-e*
+                    rtx cur out tuple aid v vt old-e)
+                  (recur (p/produce in)))))
             (u/raise "Fail to val-eq-filter-e: " e
                      {:v-idx v-idx :attr attr}))))
       (loop []
@@ -1361,22 +1508,9 @@
       (when-let [props (schema attr)]
         (let [vt       (value-type props)
               in       (sort-tuples-by-val in v-idx vt)
-              nt       (.size ^List in)
-              out      (FastList. nt)
-              dbi-name c/ave
               aid      (props :db/aid)]
-          (scan/scan
-            (with-open [^AutoCloseable iter
-                        (lmdb/val-iterator
-                          (lmdb/iterate-list-val-full dbi rtx cur))]
-              (dotimes [i nt]
-                (let [^objects tuple (.get ^List in i)
-                      old-e          (aget tuple f-idx)
-                      v              (aget tuple v-idx)]
-                  (val-eq-filter-e* iter out tuple aid v vt old-e))))
-            (u/raise "Fail to val-eq-filter-e-list: " e
-                     {:v-idx v-idx :attr attr}))
-          out)))))
+          (ave-filter-tuple-id-list*
+            lmdb in v-idx f-idx aid vt))))))
 
 (defn- fulltext-op-ref
   [op]

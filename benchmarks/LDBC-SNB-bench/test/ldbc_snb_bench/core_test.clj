@@ -245,6 +245,17 @@
   (testing "IC10: Friend recommendation"
     (let [result (run-query-with-params ic/ic10 {:person-id 100 :month 5})]
       (is (= 10 (row-count result)))
+      (is (= [[4398046512397 0]
+              [32985348837818 0]
+              [35184372089752 0]
+              [30786325577908 -1]
+              [35184372090120 -1]
+              [10995116280785 -2]
+              [19791209304104 -2]
+              [32985348838698 -2]
+              [35184372092244 -2]
+              [37383395352602 -2]]
+             (mapv (fn [row] [(nth row 0) (nth row 3)]) (:rows result))))
       ;; Results: [person-id first-name last-name score gender city-name]
       (let [row (first-row result)]
         (is (= 4398046512397 (nth row 0)))  ; person-id

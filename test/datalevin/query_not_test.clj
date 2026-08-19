@@ -13,6 +13,8 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.pipe :as p]
+   [datalevin.query.predicate :as qpred]
    [datalevin.relation :as r]
    [datalevin.rules]
    [datalevin.util :as u])
@@ -132,6 +134,240 @@
         (is (every? #(= 1 (alength ^objects %)) wildcard))
         (is (= #{[1 :a] [1 :b]} (set (mapv vec values))))
         (is (= [[1]] (mapv vec exact))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest adaptive-parallel-scan-participant-count-test
+  (let [participant-capacity @(ns-resolve
+                                'datalevin.storage
+                                'parallel-scan-participant-capacity)]
+    (testing "one CPU always stays serial"
+      (is (= 1 (participant-capacity 200000 1 11))))
+    (testing "the caller participates alongside available pool threads"
+      (is (= 2 (participant-capacity 200000 2 1)))
+      (is (= 4 (participant-capacity 200000 12 3))))
+    (testing "executor capacity and useful work both limit participation"
+      (is (= 1 (participant-capacity 200000 12 0)))
+      (is (= 1 (participant-capacity 4000 64 63)))
+      (is (= 3 (participant-capacity 8001 64 63)))
+      (is (= 64 (participant-capacity 1000000 64 63))))))
+
+(deftest batched-presence-filter-test
+  (let [dir  (u/tmp-dir (str "batched-presence-" (UUID/randomUUID)))
+        conn (d/get-conn
+               dir {:item/tags {:db/cardinality :db.cardinality/many}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/tags [:a :b]}
+                         {:db/id 2 :item/name "no tags"}
+                         {:db/id 3 :item/tags [:c]}])
+      (let [database (d/db conn)
+            input    (tuples [:first 1]
+                             [:missing-first 2]
+                             [:second 1]
+                             [:missing-second 2]
+                             [:third 3])]
+        (is (= [[:first 1] [:second 1] [:third 3]]
+               (mapv vec (db/-eav-filter-presence-list
+                           database input 1 :item/tags)))
+            "matching duplicates survive and missing duplicates are removed")
+        (testing "parallel chunks preserve duplicates split across boundaries"
+          (let [parallel-chunks
+                (ns-resolve 'datalevin.storage
+                            'ordered-parallel-list-chunks)
+                input  (tuples [:one-a 1]
+                               [:one-b 1]
+                               [:one-c 1]
+                               [:one-d 1]
+                               [:one-e 1]
+                               [:missing-a 2]
+                               [:missing-b 2]
+                               [:missing-c 2]
+                               [:three-a 3]
+                               [:three-b 3])
+                result (parallel-chunks
+                         input 3
+                         #(db/-eav-filter-presence-list
+                            database % 1 :item/tags))]
+            (is (= [[:one-a 1] [:one-b 1] [:one-c 1] [:one-d 1] [:one-e 1]
+                    [:three-a 3] [:three-b 3]]
+                   (mapv vec result))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest batched-eav-merge-scan-test
+  (let [participant-count
+        @(ns-resolve 'datalevin.storage 'parallel-scan-participant-count)
+        parallel-chunks
+        @(ns-resolve 'datalevin.storage 'ordered-parallel-list-chunks)
+        run-scan
+        (fn [database input attrs-v]
+          (db/-eav-scan-v-list database input 1 attrs-v))
+        run-chunked-scan
+        (fn [database participants input attrs-v]
+          (parallel-chunks
+            input participants
+            #(db/-eav-scan-v-list database % 1 attrs-v)))
+        repeated-input
+        (fn [^long n]
+          (let [input (ArrayList. n)]
+            (dotimes [i n]
+              (.add input (object-array [i 1])))
+            input))
+        dir  (u/tmp-dir (str "batched-eav-merge-" (UUID/randomUUID)))
+        conn (d/get-conn
+               dir {:item/tags {:db/cardinality :db.cardinality/many}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/name "one" :item/tags [:a :b]}
+                         {:db/id 2 :item/name "two"}
+                         {:db/id 3 :item/name "three" :item/tags [:c]}])
+      (let [database (d/db conn)
+            rows     [[:one-a 1]
+                      [:one-b 1]
+                      [:one-c 1]
+                      [:one-d 1]
+                      [:one-e 1]
+                      [:one-f 1]
+                      [:missing 2]
+                      [:three-a 3]
+                      [:three-b 3]]]
+        (testing "parallel single-value chunks match serial order exactly"
+          (let [attrs-v  [[:item/name {:skip? false}]]
+                serial   (run-scan database (apply tuples rows) attrs-v)
+                parallel (run-chunked-scan
+                           database 3 (apply tuples rows) attrs-v)]
+            (is (= (mapv vec serial) (mapv vec parallel)))
+            (is (= 9 (.size ^java.util.List parallel)))))
+        (testing "cardinality-many duplicates can cross chunk boundaries"
+          (let [attrs-v  [[:item/tags {:skip? false}]]
+                serial   (run-scan database (apply tuples rows) attrs-v)
+                parallel (run-chunked-scan
+                           database 3 (apply tuples rows) attrs-v)]
+            (is (= (mapv vec serial) (mapv vec parallel)))
+            (is (= 14 (.size ^java.util.List parallel)))))
+        (testing "residual predicates stay on the calling thread"
+          (let [n       4001
+                threads (atom #{})
+                caller  (.getName (Thread/currentThread))
+                pred    (fn [_]
+                          (swap! threads conj
+                                 (.getName (Thread/currentThread)))
+                          true)]
+            (is (= n (.size ^java.util.List
+                            (run-scan
+                              database (repeated-input n)
+                              [[:item/name {:skip? false :pred pred}]]))))
+            (is (= #{caller} @threads))))
+        (testing "forkable predicates create one instance per scan chunk"
+          (let [n             4001
+                ^long participants (participant-count n)
+                factory-count (atom 0)
+                instances    (atom #{})
+                pred
+                (qpred/forkable-predicate
+                  (fn []
+                    (let [instance (Object.)]
+                      (swap! factory-count inc)
+                      (fn [_]
+                        (swap! instances conj instance)
+                        true))))
+                result
+                (run-scan
+                  database (repeated-input n)
+                  [[:item/name {:skip? false :pred pred}]])]
+            (is (= n (.size ^java.util.List result)))
+            (is (= (inc participants) @factory-count)
+                "one initial predicate plus one predicate per scan chunk")
+            (is (= participants (count @instances))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest ave-exact-membership-filter-test
+  (let [dir  (u/tmp-dir (str "ave-exact-membership-" (UUID/randomUUID)))
+        conn (d/get-conn dir {:edge/to {:db/valueType :db.type/ref}})]
+    (try
+      (d/transact! conn [{:db/id 100 :node/name "target"}
+                         {:db/id 101 :node/name "other target"}
+                         {:db/id 1 :edge/to 100}
+                         {:db/id 2 :edge/to 100}
+                         {:db/id 3 :edge/to 101}
+                         {:db/id 4 :node/name "no edge"}])
+      (let [database (d/db conn)]
+        (testing "a fixed entity is appended only for exact AVE membership"
+          (let [input (tuples [100 :first]
+                              [102 :missing-value]
+                              [100 :duplicate]
+                              [101 :wrong-bound])]
+            (is (= [[100 :first 1] [100 :duplicate 1]]
+                   (mapv vec
+                         (db/-val-eq-scan-e-list
+                           database input 0 :edge/to 1))))))
+        (testing "tuple entities filter exact pairs while preserving payloads"
+          (let [input (tuples [100 1 :first]
+                              [100 3 :wrong-entity]
+                              [100 2 :second]
+                              [101 3 :third]
+                              [101 2 :wrong-value]
+                              [102 1 :missing-value])]
+            (is (= [[100 1 :first] [100 2 :second] [101 3 :third]]
+                   (mapv vec
+                         (db/-val-eq-filter-e-list
+                           database input 0 :edge/to 1))))))
+        (testing "streaming variants use the same exact membership semantics"
+          (let [bound-out  (ArrayList.)
+                filter-out (ArrayList.)]
+            (db/-val-eq-scan-e
+              database
+              (p/list-tuple-pipe (tuples [100 :hit] [101 :miss]))
+              bound-out 0 :edge/to 1)
+            (db/-val-eq-filter-e
+              database
+              (p/list-tuple-pipe
+                (tuples [100 2 :hit] [100 3 :miss] [101 3 :hit]))
+              filter-out 0 :edge/to 1)
+            (is (= [[100 :hit 1]] (mapv vec bound-out)))
+            (is (= [[100 2 :hit] [101 3 :hit]]
+                   (mapv vec filter-out))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest bound-presence-semi-join-test
+  (let [filter-presence @(ns-resolve 'datalevin.query.resolve
+                                     'filter-bound-entity-presence)
+        dir             (u/tmp-dir (str "presence-semi-join-"
+                                        (UUID/randomUUID)))
+        conn            (d/get-conn dir {:item/key    {:db/unique
+                                                       :db.unique/identity}
+                                        :item/active {}})]
+    (try
+      (d/transact! conn [{:db/id 1 :item/key "one" :item/active true}
+                         {:db/id 2 :item/key "two" :item/name "inactive"}
+                         {:db/id 3 :item/key "three" :item/active false}])
+      (let [database (d/db conn)
+            rel      (r/relation! {'?item 0 '?payload 1}
+                                  (tuples [1 :a] [1 :b] [2 :c] [3 :d]))
+            context  {:rels             [rel]
+                      :rels-bound-cache (volatile! {})}
+            result   (binding [c/magic-cost-link-probe      0.0
+                               c/magic-cost-link-retrieval  0.0
+                               c/magic-cost-init-scan-e     100.0
+                               c/magic-cost-hash-join       0.0]
+                       (filter-presence
+                         context database '[?item :item/active _]))]
+        (is (= {'?item 0 '?payload 1} (-> result :rels first :attrs)))
+        (is (= [[1 :a] [1 :b] [3 :d]]
+               (rows (first (:rels result)))))
+        (testing "lookup refs retain their original query values"
+          (is (= #{[[:item/key "one"]]}
+                 (d/q '[:find ?item
+                        :in $ [?item ...]
+                        :where
+                        [?item :item/active _]]
+                      database
+                      [[:item/key "one"] [:item/key "two"]])))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

@@ -14,6 +14,7 @@
    [clojure.walk :as w]
    [datalevin.bits :as b]
    [datalevin.constants :as c]
+   [datalevin.query.predicate :as qpred]
    [datalevin.query-util :as qu]
    [datalevin.util :as u])
   (:import
@@ -213,24 +214,22 @@
             idxs       (u/idxs-of #(= var %) args)
             ni         (count idxs)
             idxs-arr   (int-array idxs)
-            args-arr   (object-array args)
-            call       (make-call (resolve-pred f nil))]
-        (fn var-pred [x]
-          (dotimes [i ni]
-            (aset args-arr (aget idxs-arr i) x))
-          (call args-arr))))))
+            args       (object-array args)
+            call       (make-call (resolve-pred f nil))
+            factory
+            (fn []
+              (let [args-arr (aclone ^objects args)]
+                (fn var-pred [x]
+                  (dotimes [i ni]
+                    (aset args-arr (aget idxs-arr i) x))
+                  (call args-arr))))]
+        (qpred/forkable-predicate factory)))))
 
 (defn add-pred
   ([old-pred new-pred]
    (add-pred old-pred new-pred false))
   ([old-pred new-pred or?]
-   (if new-pred
-     (if old-pred
-       (if or?
-         (fn [x] (or (old-pred x) (new-pred x)))
-         (fn [x] (and (old-pred x) (new-pred x))))
-       new-pred)
-     old-pred)))
+   (qpred/combine-predicates old-pred new-pred or?)))
 
 (defn exact-inequality-range?
   "Whether AVE ordering exactly implements Datalog inequality ordering for a
@@ -301,20 +300,27 @@
 (defn- nested-pred
   [helpers f args v]
   (let [len      (count args)
-        fn-arr   (object-array len)
-        args-arr (object-array args)
+        fn-preds (object-array len)
+        args     (object-array args)
         call     ((:make-call helpers) ((:resolve-pred helpers) f nil))]
     (dotimes [i len]
-      (let [arg (aget args-arr i)]
+      (let [arg (aget args i)]
         (when (list? arg)
-          (aset fn-arr i (if (some list? arg)
-                           (nested-pred helpers (first arg) (rest arg) v)
-                           (activate-var-pred helpers v arg))))))
-    (fn [x]
-      (dotimes [i len]
-        (when-some [f (aget fn-arr i)]
-          (aset args-arr i (f x))))
-      (call args-arr))))
+          (aset fn-preds i (if (some list? arg)
+                             (nested-pred helpers (first arg) (rest arg) v)
+                             (activate-var-pred helpers v arg))))))
+    (let [factory
+          (fn []
+            (let [args-arr (aclone ^objects args)
+                  fn-arr   (qpred/fork-predicates fn-preds)]
+              (fn [x]
+                (dotimes [i len]
+                  (when-some [f (aget fn-arr i)]
+                    (aset args-arr i (f x))))
+                (call args-arr))))]
+      (if (every? qpred/forkable-predicate? fn-preds)
+        (qpred/forkable-predicate factory)
+        (factory)))))
 
 (defn- split-and-clauses
   "If pred is an (and ...) form where every arg is a predicate list,

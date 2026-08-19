@@ -393,34 +393,27 @@
      [?person :person/isLocatedIn ?city]
      [?city :place/name ?city-name]
 
-     ;; Score computation:
-     ;; - Post with matching tag: +1 (counts once per post, even with multiple tags)
-     ;; - Post without matching tag: -1
-     ;; - No posts: 0
+     ;; Score computation: start each person at 0, subtract 1 for every post,
+     ;; then add 2 for every post with a matching tag. This is equivalent to
+     ;; 2*commonPosts - totalPosts, while scanning each person's posts once.
      (or-join [?person ?start ?post ?score-contrib]
-                ;; Post with matching tag: +1 (dedupe multiple matching tags per post)
-                (and [?post :message/hasCreator ?person]
-                     [?post :message/isContainedIn _]
-                     [?post :message/hasTag ?tag]
-                     [?start :person/hasInterest ?tag]
-                   (not-join [?post ?start ?tag]
-                             [?post :message/hasTag ?tag2]
-                             [?start :person/hasInterest ?tag2]
-                             [(< ?tag2 ?tag)])
-                   [(ground 1) ?score-contrib])
-                ;; Post without matching tag: -1
-                (and [?post :message/hasCreator ?person]
-                     [?post :message/isContainedIn _]
-                     (not-join [?post ?start]
-                             [?post :message/hasTag ?t]
-                             [?start :person/hasInterest ?t])
-                   [(ground -1) ?score-contrib])
-                ;; Person with no posts: 0
-                (and (not-join [?person]
-                               [?p :message/hasCreator ?person]
-                               [?p :message/isContainedIn _])
-                     [(ground :no-post) ?post]
-                   [(ground 0) ?score-contrib]))
+              ;; The base row preserves people with no posts in the aggregate.
+              (and [(ground :person-base) ?post]
+                   [(ground 0) ?score-contrib])
+              (and [?post :message/hasCreator ?person]
+                   [?post :message/isContainedIn _]
+                   (or-join [?post ?start ?score-contrib]
+                            ;; Every post contributes -1.
+                            (and [(ground -1) ?score-contrib])
+                            ;; A matching post contributes another +2. Choose
+                            ;; one matching tag so the post is counted once.
+                            (and [?post :message/hasTag ?tag]
+                                 [?start :person/hasInterest ?tag]
+                                 (not-join [?post ?start ?tag]
+                                           [?post :message/hasTag ?tag2]
+                                           [?start :person/hasInterest ?tag2]
+                                           [(< ?tag2 ?tag)])
+                                 [(ground 2) ?score-contrib]))))
 
      :order-by [3 :desc ?person-id :asc]
      :limit 10]})

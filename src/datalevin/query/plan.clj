@@ -21,6 +21,7 @@
    [datalevin.pipe :as p]
    [datalevin.query.access :as qaccess]
    [datalevin.query.optimizer.range :as qor]
+   [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
@@ -600,9 +601,7 @@
 (defn- compose-pred
   "Compose a new predicate with an existing one"
   [existing-pred new-pred]
-  (if existing-pred
-    (fn [v] (and (existing-pred v) (new-pred v)))
-    new-pred))
+  (qpred/combine-predicates existing-pred new-pred false))
 
 (defn- find-attr-in-attrs-v
   "Find the index of attr in attrs-v and return [index opts]"
@@ -628,7 +627,8 @@
             max-v     (b/bitmap64-max bm)
             new-range [[[:closed min-v] [:closed max-v]]]
             old-range (:range init-step)
-            bm-pred   (fn [v] (b/bitmap64-contains? bm v))
+            bm-pred   (qpred/shareable-predicate
+                        (fn [v] (b/bitmap64-contains? bm v)))
             old-pred  (:pred init-step)]
         (assoc init-step
                :range (if old-range
@@ -640,7 +640,8 @@
   "Modify MergeScanStep attrs-v to add bitmap predicate for join attr"
   [merge-step bm join-attr]
   (let [attrs-v (:attrs-v merge-step)
-        bm-pred (fn [v] (b/bitmap64-contains? bm v))
+        bm-pred (qpred/shareable-predicate
+                  (fn [v] (b/bitmap64-contains? bm v)))
         new-attrs-v
         (mapv (fn [[a opts :as entry]]
                 (if (= a join-attr)

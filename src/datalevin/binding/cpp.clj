@@ -45,7 +45,8 @@
    [java.util.concurrent.atomic AtomicBoolean]
    [java.lang AutoCloseable]
    [java.io File]
-   [java.util Iterator HashMap ArrayDeque Arrays Comparator List Map$Entry]
+   [java.util Iterator HashMap ArrayDeque Arrays Collection Comparator List
+    Map$Entry]
    [java.util.function Supplier]
    [java.nio BufferOverflowException ByteBuffer]
    [org.bytedeco.javacpp SizeTPointer LongPointer]
@@ -259,6 +260,24 @@
     (.flip bf)
     (.reset vp)))
 
+(defprotocol ^:no-doc IListSeekBuffer
+  (filter-list-id-int-prefix!
+    [this cur in id-idx prefix out]
+    "Filter sorted tuples by list values with an integer prefix. List keys are
+    entity IDs; duplicate IDs are probed once and matching tuples are kept.")
+  (list-avg-id?
+    [this cur aid value value-type id]
+    "Return true when an AVE list contains the exact entity ID.")
+  (filter-list-avg-bound-id!
+    [this cur in value-idx aid value-type bound-id out]
+    "Filter tuples by an AVE key and a fixed entity ID, appending that ID to
+    each matching tuple. Equal adjacent values are probed once.")
+  (filter-list-avg-tuple-id!
+    [this cur in value-idx entity-idx aid value-type out]
+    "Filter tuples by AVE keys and entity IDs stored in tuple columns. Equal
+    adjacent keys reuse their encoding and equal adjacent pairs are probed
+    once."))
+
 (deftype Rtx [^:unsynchronized-mutable lmdb
               ^Txn txn
               depth
@@ -277,6 +296,133 @@
   ICompress
   (key-bf [_] (.clear k-comp-bf))
   (val-bf [_] (.clear v-comp-bf))
+
+  IListSeekBuffer
+  (filter-list-id-int-prefix! [_ cur in id-idx prefix out]
+    (let [^Cursor cur       cur
+          ^List in         in
+          ^Collection out  out
+          id-idx           (int id-idx)
+          prefix           (long prefix)
+          nt               (.size in)
+          key-compressor   (key-compressor lmdb)
+          ^BufVal cur-val  (.val cur)]
+      (put-bufval start-vp prefix :int (val-compressor lmdb) v-comp-bf)
+      (loop [i           (long 0)
+             last-id     (long 0)
+             last-found? false
+             have-last?  false]
+        (when (< i nt)
+          (let [^objects tuple (.get in (int i))
+                id             (long (aget tuple id-idx))
+                found?
+                (if (and have-last? (== id last-id))
+                  last-found?
+                  (do
+                    (put-id-bufval start-kp id key-compressor k-comp-bf)
+                    (boolean
+                      (and (.get cur ^BufVal start-kp ^BufVal start-vp
+                                 DTLV/MDB_GET_BOTH_RANGE)
+                           (== prefix (.getInt (.outBuf cur-val) 0))))))]
+            (when found?
+              (.add out tuple))
+            (recur (u/long-inc i) (long id) found? true))))
+      out))
+
+  (list-avg-id? [_ cur aid value value-type id]
+    (let [^Cursor cur cur]
+      (put-bufval start-kp
+                  (b/indexable nil (long aid) value value-type nil)
+                  :avg (key-compressor lmdb) k-comp-bf)
+      (put-id-bufval start-vp (long id) (val-compressor lmdb) v-comp-bf)
+      (boolean
+        (.get cur ^BufVal start-kp ^BufVal start-vp DTLV/MDB_GET_BOTH))))
+
+  (filter-list-avg-bound-id!
+    [_ cur in value-idx aid value-type bound-id out]
+    (let [^Cursor cur       cur
+          ^List in         in
+          ^Collection out  out
+          value-idx        (int value-idx)
+          aid              (long aid)
+          bound-id         (long bound-id)
+          nt               (.size in)
+          key-compressor   (key-compressor lmdb)
+          value-compressor (val-compressor lmdb)]
+      (put-id-bufval start-vp bound-id value-compressor v-comp-bf)
+      (loop [i           (long 0)
+             last-value  nil
+             last-found? false
+             have-last?  false]
+        (when (< i nt)
+          (let [^objects tuple (.get in (int i))
+                value          (aget tuple value-idx)
+                same-value?    (and have-last?
+                                    (or (identical? value last-value)
+                                        (= value last-value)))
+                found?         (if same-value?
+                                 last-found?
+                                 (do
+                                   (put-bufval
+                                     start-kp
+                                     (b/indexable nil aid value value-type nil)
+                                     :avg key-compressor k-comp-bf)
+                                   (boolean
+                                     (.get cur
+                                           ^BufVal start-kp
+                                           ^BufVal start-vp
+                                           DTLV/MDB_GET_BOTH))))]
+            (when found?
+              (let [tuple-size      (alength tuple)
+                    ^objects joined (Arrays/copyOf
+                                      tuple (int (inc tuple-size)))]
+                (aset joined tuple-size (Long/valueOf bound-id))
+                (.add out joined)))
+            (recur (u/long-inc i) value found? true))))
+      out))
+
+  (filter-list-avg-tuple-id!
+    [_ cur in value-idx entity-idx aid value-type out]
+    (let [^Cursor cur       cur
+          ^List in         in
+          ^Collection out  out
+          value-idx        (int value-idx)
+          entity-idx       (int entity-idx)
+          aid              (long aid)
+          nt               (.size in)
+          key-compressor   (key-compressor lmdb)
+          value-compressor (val-compressor lmdb)]
+      (loop [i           (long 0)
+             last-value  nil
+             last-id     (long 0)
+             last-found? false
+             have-last?  false]
+        (when (< i nt)
+          (let [^objects tuple (.get in (int i))
+                value          (aget tuple value-idx)
+                id             (long (aget tuple entity-idx))
+                same-value?    (and have-last?
+                                    (or (identical? value last-value)
+                                        (= value last-value)))
+                same-id?       (and have-last? (== id last-id))
+                same-probe?    (and same-value? same-id?)]
+            (when-not same-value?
+              (put-bufval start-kp
+                          (b/indexable nil aid value value-type nil)
+                          :avg key-compressor k-comp-bf))
+            (when-not same-id?
+              (put-id-bufval start-vp id value-compressor v-comp-bf))
+            (let [found? (if same-probe?
+                           last-found?
+                           (boolean
+                             (.get cur
+                                   ^BufVal start-kp
+                                   ^BufVal start-vp
+                                   DTLV/MDB_GET_BOTH)))]
+              (when found?
+                (.add out tuple))
+              (recur (u/long-inc i) value id found? true)))))
+      out))
 
   IBuffer
   (put-key [_ x t]

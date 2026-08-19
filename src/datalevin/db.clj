@@ -96,6 +96,7 @@
   (-default-ratio [db a])
   (-eav-scan-v [db in out eid-idx attrs-v])
   (-eav-scan-v-list [db in eid-idx attrs-v])
+  (-eav-filter-presence-list [db in eid-idx attr])
   (-val-eq-scan-e [db in out v-idx attr] [db in out v-idx attr bound])
   (-val-eq-scan-e-list [db in v-idx attr] [db in v-idx attr bound])
   (-val-eq-filter-e [db in out v-idx attr f-idx])
@@ -630,6 +631,10 @@
     (wrap-cache
         store [:eav-scan-v in eid-idx attrs-v]
       (eav-scan-v-list store in eid-idx attrs-v)))
+
+  (-eav-filter-presence-list
+    [db in eid-idx attr]
+    (eav-scan-v-list store in eid-idx [[attr {:skip? true}]]))
 
   (-val-eq-scan-e
     [db in out v-idx attr]

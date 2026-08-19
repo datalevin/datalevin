@@ -321,10 +321,16 @@
         v'               (if (or (qu/free-var? v) (= v '_)) nil v)
         existence-only?  (or (= v '_) (qu/placeholder? v))
         acc              (FastList.)]
-    (doseq [[e eid] entity-pairs]
-      (if existence-only?
-        (when (db/-ea-populated? db eid a')
-          (.add acc (object-array [e])))
+    (if existence-only?
+      (let [input (FastList. (count entity-pairs))]
+        (doseq [[e eid] entity-pairs]
+          (.add input (object-array [e eid])))
+        (when-let [^List matches
+                   (db/-eav-filter-presence-list db input 1 a')]
+          (dotimes [i (.size matches)]
+            (let [^objects tuple (.get matches i)]
+              (.add acc (object-array [(aget tuple 0)]))))))
+      (doseq [[e eid] entity-pairs]
         (let [tuples (db/-search-tuples db [eid a' v'])]
           (when tuples
             (let [^List ts tuples
@@ -564,6 +570,41 @@
                              pattern search-pattern)
                        @idxs)
                      (db/-search-tuples db search-pattern))))))
+
+(defn- integer-tuple-column?
+  [^List tuples ^long idx]
+  (let [n (.size tuples)]
+    (loop [i (long 0)]
+      (or (== i n)
+          (and (integer? (aget ^objects (.get tuples (int i)) idx))
+               (recur (u/long-inc i)))))))
+
+(defn- filter-bound-entity-presence
+  "Apply `[?e :attr _]` directly to the relation that binds `?e`. This is an
+  indexed semi-join: it preserves every matching input tuple without building
+  and joining a separate one-column relation."
+  [context db pattern]
+  (let [[e a v]        pattern
+        presence-only? (and (= 3 (count pattern))
+                            (or (= v '_) (qu/placeholder? v)))
+        rel             (when (qu/binding-var? e) (rel-with-attr context e))
+        ^List tuples    (when (and presence-only?
+                                   rel
+                                   (keyword? a)
+                                   (contains? (db/-schema db) a))
+                          (:tuples rel))
+        eid-idx         (when tuples (long ((:attrs rel) e)))
+        bound-count     (when tuples (.size tuples))]
+    (when (and bound-count
+               (> ^long bound-count 1)
+               (integer-tuple-column? tuples eid-idx)
+               (multi-lookup-cheaper?
+                 (long bound-count)
+                 (long (db/-count db [nil a nil]))))
+      (let [tuples   (db/-eav-filter-presence-list db tuples eid-idx a)
+            filtered (assoc rel :tuples tuples)]
+        (assoc context :rels
+               (mapv #(if (identical? % rel) filtered %) (:rels context)))))))
 
 (defn matches-pattern?
   [pattern tuple]
@@ -1294,12 +1335,16 @@
 
      '[*]
      (let [source   qu/*implicit-source*
-           pattern' (resolve-pattern-lookup-refs source clause)
-           relation (lookup-pattern context source pattern')]
-       (binding [qu/*lookup-attrs* (if (db/-searchable? source)
-                                     (dynamic-lookup-attrs source pattern')
-                                     qu/*lookup-attrs*)]
-         (update context :rels collapse-rels relation))))))
+           pattern' (resolve-pattern-lookup-refs source clause)]
+       (if-let [filtered-context
+                (when (satisfies? db/ITuples source)
+                  (filter-bound-entity-presence context source pattern'))]
+         filtered-context
+         (let [relation (lookup-pattern context source pattern')]
+           (binding [qu/*lookup-attrs* (if (db/-searchable? source)
+                                         (dynamic-lookup-attrs source pattern')
+                                         qu/*lookup-attrs*)]
+             (update context :rels collapse-rels relation))))))))
 
 (defn resolve-clause
   [context clause]
