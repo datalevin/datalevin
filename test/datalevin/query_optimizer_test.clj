@@ -72,6 +72,51 @@
     [?friend :person/score ?score]
     [(> ?score 1100)]])
 
+(def post-top-k-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc ?id :asc]
+    :limit 5])
+
+(def post-top-k-enrichment-offset-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [2 :desc 0 :asc]
+    :limit 3
+    :offset 2])
+
+(def filtering-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some $ ?item :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc ?id :asc]
+    :limit 5])
+
+(def unkeyed-enrichment-query
+  '[:find ?content ?score
+    :where
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [?score :desc]
+    :limit 5])
+
+(def ordered-output-enrichment-query
+  '[:find ?id ?content ?score
+    :where
+    [?item :item/id ?id]
+    [?item :item/score ?score]
+    [(get-some-else $ ?item nil :item/content :item/image) [_ ?content]]
+    :order-by [1 :asc]
+    :limit 5])
+
 (def unique-endpoint-query
   '[:find ?start ?middle ?end
     :where
@@ -1091,6 +1136,68 @@
           (is (contains? result [28 "first-28" "last-28"])))
         (testing "a projected property used by a predicate is still sampled"
           (is (nil? (:deferred-base-samples filtered)))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest post-top-k-property-enrichment-test
+  (let [dir    (u/tmp-dir (str "post-top-k-enrichment-"
+                               (UUID/randomUUID)))
+        schema {:item/id      {:db/valueType :db.type/long
+                               :db/unique    :db.unique/identity}
+                :item/score   {:db/valueType :db.type/long}
+                :item/content {:db/valueType :db.type/string}
+                :item/image   {:db/valueType :db.type/string}}
+        conn   (d/get-conn dir schema)
+        items  (mapv (fn [^long i]
+                       (cond-> {:db/id       (+ 100 i)
+                                :item/id      i
+                                :item/score   i}
+                         (< i 28) (assoc :item/content (str "content-" i))
+                         (= i 28) (assoc :item/image "image-28")))
+                     (range 30))]
+    (try
+      (d/transact! conn items)
+      (let [db-value        (d/db conn)
+            explain         (d/explain {:run? true}
+                                       post-top-k-enrichment-query db-value)
+            result          (d/q post-top-k-enrichment-query db-value)
+            offset          (d/q post-top-k-enrichment-offset-query db-value)
+            filtering       (d/q filtering-enrichment-query db-value)
+            unkeyed         (d/explain {:run? false}
+                                       unkeyed-enrichment-query db-value)
+            unkeyed-result  (d/q unkeyed-enrichment-query db-value)
+            ordered-output  (d/explain
+                              {:run? false}
+                              ordered-output-enrichment-query db-value)
+            enrichment      (:post-top-k-enrichment explain)]
+        (testing "the total fallback preserves missing-property rows"
+          (is (= [[29 nil 29]
+                  [28 "image-28" 28]
+                  [27 "content-27" 27]
+                  [26 "content-26" 26]
+                  [25 "content-25" 25]]
+                 result))
+          (is (= [[27 "content-27" 27]
+                  [26 "content-26" 26]
+                  [25 "content-25" 25]]
+                 offset)))
+        (testing "only the selected top-k rows are enriched"
+          (is (= ['get-some-else] (:functions enrichment)))
+          (is (= 30 (:candidate-count enrichment)))
+          (is (= 5 (:selected-count enrichment)))
+          (is (= {:cardinality-preserving true
+                  :projection-only true
+                  :stable-distinct-key true}
+                 (:proof enrichment))))
+        (testing "the filtering function retains its original semantics"
+          (is (= [28 "image-28" 28] (first filtering)))
+          (is (= 5 (count filtering))))
+        (testing "deferral requires a projected stable row key"
+          (is (nil? (:post-top-k-enrichment unkeyed)))
+          (is (= [nil 29] (first unkeyed-result))))
+        (testing "deferral rejects outputs referenced by indexed ordering"
+          (is (nil? (:post-top-k-enrichment ordered-output)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

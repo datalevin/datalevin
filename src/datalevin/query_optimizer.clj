@@ -2617,6 +2617,8 @@
   [context ^long plan-size access-plans]
   (let [input-size  (estimated-late-input-size context plan-size)
         operations  (mapv late-operation (:late-clauses context))
+        deferred    (set (get-in context
+                                 [:post-top-k-enrichment :clauses]))
         expansion?  (some late-expansion-operation? operations)
         sampled     (when expansion?
                       (sampled-access-cardinality access-plans))
@@ -2640,14 +2642,23 @@
     (reduce
       (fn [{:keys [cost stages] :as estimate} [clause operation]]
         (if (late-row-operation? operation)
-          (let [stage-cost (estimate-row-evaluation-cost output-size)]
+          (let [post-top-k? (contains? deferred clause)
+                stage-input (if post-top-k?
+                              (min output-size
+                                   (long
+                                     (get-in context
+                                             [:post-top-k-enrichment :limit]
+                                             output-size)))
+                              output-size)
+                stage-cost (estimate-row-evaluation-cost stage-input)]
             {:cost   (+ (double cost) (double stage-cost))
              :output-size output-size
              :stages (conj stages
-                           {:operation operation
-                            :input     output-size
-                            :cost      stage-cost
-                            :clause    clause})})
+                           (cond-> {:operation operation
+                                    :input     stage-input
+                                    :cost      stage-cost
+                                    :clause    clause}
+                             post-top-k? (assoc :post-top-k? true)))})
           estimate))
       initial
       (map vector (:late-clauses context) operations))))

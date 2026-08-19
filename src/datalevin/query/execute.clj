@@ -40,8 +40,8 @@
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
    [java.util Comparator List PriorityQueue]
-   [datalevin.parser Constant FindColl FindRel FindScalar FindTuple Pattern
-    Variable]
+   [datalevin.parser BindTuple Constant FindColl FindRel FindScalar FindTuple
+    Pattern Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
 
 (def ^:private plugin-inputs qo/plugin-inputs)
@@ -66,7 +66,8 @@
 
 (def ^:private rewrite-unused-vars qo/rewrite-unused-vars)
 
-(declare sort-planned-late-clauses access-batch-query access-outer-query)
+(declare sort-planned-late-clauses plan-post-top-k-enrichment
+         access-batch-query access-outer-query)
 
 (defn- adaptive-limit-query?
   [parsed-q]
@@ -181,6 +182,7 @@
             qo/build-plan
             qo/plan-not-joins))
       sort-planned-late-clauses
+      plan-post-top-k-enrichment
       ((fn [context]
          (if (seq (:access-plans context))
            (let [plans (prepare-access-plans context
@@ -316,6 +318,129 @@
          :entity (first pattern)
          :attr   (second pattern)
          :value  (nth pattern 2)}))))
+
+(defn- post-top-k-enrichment-entry
+  [clause]
+  (let [clause       (strip-clause-source clause)
+        call         (when (and (vector? clause) (= 2 (count clause)))
+                       (first clause))
+        f            (when (sequential? call) (first call))
+        [_ source entity else-val & attrs] call
+        binding      (when call (dp/parse-binding (second clause)))
+        binding-vars (when call
+                       (filterv qu/binding-var?
+                                (qu/collect-vars (second clause))))]
+    (when (and (contains? built-ins/post-top-k-enrichment-fns f)
+               (qu/source? source)
+               (qu/binding-var? entity)
+               (not (qu/binding-var? else-val))
+               (seq attrs)
+               (every? keyword? attrs)
+               (instance? BindTuple binding)
+               (= (count binding-vars) (count (distinct binding-vars))))
+      (let [{:keys [requires provides]} (late-clause-deps clause)
+            entity-requires (disj (set requires) entity)]
+        (when (and (empty? entity-requires) (seq provides))
+          {:clause   clause
+           :function f
+           :source   source
+           :entity   entity
+           :requires (set requires)
+           :provides (set provides)})))))
+
+(defn- exclusive-enrichment-outputs?
+  [{:keys [qorig-where qin qwith qhaving]} provides ordering-vars]
+  (and
+    ;; Every output is introduced by exactly this one where clause.
+    (every?
+      (fn [v]
+        (= 1 (count (filter #(contains? (clause-vars %) v) qorig-where))))
+      provides)
+    ;; Find projection is the only legal consumer. In particular, ordering or
+    ;; a later predicate would make enrichment part of row selection.
+    (not-any? #(some provides (clause-vars %))
+              [qin qwith qhaving])
+    (not-any? provides ordering-vars)))
+
+(defn- symbolic-ordering
+  [find-vars ordering]
+  (into []
+        (mapcat
+          (fn [[v direction]]
+            [(if (integer? v) (nth find-vars v) v) direction]))
+        (partition 2 ordering)))
+
+(defn- unique-projected-key-for-entity?
+  [{:keys [parsed-q sources]} retained-vars
+   {enrichment-source :source entity :entity}]
+  (or (contains? retained-vars entity)
+      (boolean
+        (some
+          (fn [clause]
+            (when-let [{:keys [source attr value]
+                        pattern-entity :entity}
+                       (data-pattern-parts clause '$)]
+              (when (and (= enrichment-source source)
+                         (= entity pattern-entity)
+                         (contains? retained-vars value))
+                (some-> (get sources source)
+                        db/-schema
+                        (get attr)
+                        :db/unique))))
+          (:qorig-where parsed-q)))))
+
+(defn- plan-post-top-k-enrichment
+  "Defer explicitly total property enrichment until after top-k when its
+   outputs are projection-only and a retained entity key proves that early
+   distinct cannot change the selected result window."
+  [{:keys [parsed-q late-clauses] :as context}]
+  (let [find-vars (vec (dp/find-vars (:qfind parsed-q)))
+        limit     (:qlimit parsed-q)]
+    (if (and (adaptive-limit-query? parsed-q)
+             (seq (:qorder parsed-q))
+             (some? limit)
+             (not= -1 limit)
+             (pos? (long limit))
+             (= (count find-vars) (count (distinct find-vars))))
+      (let [projected     (set find-vars)
+            ordering      (symbolic-ordering find-vars (:qorder parsed-q))
+            ordering-vars (into #{} (take-nth 2) ordering)
+            entries       (into []
+                                (comp
+                                  (keep post-top-k-enrichment-entry)
+                                  (filter
+                                    (fn [{:keys [provides]}]
+                                      (and (every? projected provides)
+                                           (exclusive-enrichment-outputs?
+                                             parsed-q provides
+                                             ordering-vars)))))
+                                late-clauses)
+            provides      (into #{} (mapcat :provides) entries)
+            requires      (into #{} (mapcat :requires) entries)
+            retained      (into #{} (remove provides) find-vars)
+            keyed?        (every?
+                            #(unique-projected-key-for-entity?
+                               context retained %)
+                            entries)]
+        (if (and (seq entries)
+                 keyed?
+                 (not-any? provides requires))
+          (let [candidate-vars
+                (into (vec (remove provides find-vars))
+                      (remove retained)
+                      (sort-by str requires))]
+            (assoc context :post-top-k-enrichment
+                   {:clauses        (mapv :clause entries)
+                    :functions      (mapv :function entries)
+                    :candidate-vars candidate-vars
+                    :ordering       ordering
+                    :offset         (long (or (:qoffset parsed-q) 0))
+                    :limit          (long limit)
+                    :proof          {:cardinality-preserving true
+                                     :projection-only true
+                                     :stable-distinct-key true}}))
+          (dissoc context :post-top-k-enrichment)))
+      (dissoc context :post-top-k-enrichment))))
 
 (defn- constant-ground-binding?
   [clause]
@@ -936,6 +1061,15 @@
                (u/remove-idxs (set selected-idxs) pending)
                (into executed selected-clauses))))))
 
+(defn- resolve-pre-top-k-late-clauses
+  [{:keys [late-clauses post-top-k-enrichment] :as context}]
+  (if-let [deferred (seq (:clauses post-top-k-enrichment))]
+    (let [deferred (set deferred)
+          resolved (resolve-late-clauses
+                     context (into [] (remove deferred) late-clauses))]
+      (assoc resolved :all-late-clauses late-clauses))
+    (resolve-late-clauses context late-clauses)))
+
 (defn- plan-explain
   []
   (when qplan/*explain*
@@ -954,7 +1088,7 @@
           (do (plan-explain) c)
           (if run? (execute-plan c) c)
           (if run?
-            (resolve-late-clauses c (:late-clauses c))
+            (resolve-pre-top-k-late-clauses c)
             c))))))
 
 (defn -collect-tuples
@@ -1178,7 +1312,7 @@
    (when qplan/*explain* (vswap! qplan/*explain* assoc :result result)))
   ([{:keys [graph result-set plan opt-clauses late-clauses run?
             access-plans preferred-access-plan property-memo
-            deferred-base-samples]
+            deferred-base-samples post-top-k-enrichment]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
@@ -1225,6 +1359,7 @@
                                                 :tuples-count]))))
                            e)) plan)
                :deferred-base-samples deferred-base-samples
+               :post-top-k-enrichment post-top-k-enrichment
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
                :preferred-access-plan
@@ -1670,9 +1805,43 @@
           (finally
             (qaccess/close-cursor cursor)))))))
 
+(defn- candidate-relation
+  [candidate-vars rows]
+  (let [tuples (FastList. (count rows))]
+    (doseq [row rows]
+      (.add tuples (object-array row)))
+    (r/relation! (zipmap candidate-vars (range)) tuples)))
+
+(defn- apply-post-top-k-enrichment
+  [parsed-q context]
+  (if-let [{:keys [clauses candidate-vars ordering offset limit] :as plan}
+           (:post-top-k-enrichment context)]
+    (let [candidate-context (collect context candidate-vars)
+          candidates        (:result-set candidate-context)
+          selected          (order-result candidate-vars candidates ordering
+                                          limit offset)
+          seeded            (assoc candidate-context
+                                   :rels [(candidate-relation
+                                           candidate-vars selected)]
+                                   :result-set nil
+                                   :late-clauses [])
+          resolved          (binding [qu/*implicit-source*
+                                      (get (:sources context) '$)]
+                              (resolve-late-clauses seeded clauses))
+          diagnostic        (assoc plan
+                                   :candidate-count (count candidates)
+                                   :selected-count (count selected))]
+      [(assoc parsed-q :qoffset 0)
+       (assoc resolved
+              :late-clauses (or (:all-late-clauses context)
+                                (:late-clauses context))
+              :post-top-k-enrichment diagnostic)])
+    [parsed-q context]))
+
 (defn- finish-query
   [parsed-q context]
-  (let [find          (:qfind parsed-q)
+  (let [[parsed-q context] (apply-post-top-k-enrichment parsed-q context)
+        find          (:qfind parsed-q)
         find-elements (dp/find-elements find)
         result-arity  (count find-elements)
         with          (:qwith parsed-q)
@@ -1704,12 +1873,12 @@
       result)))
 
 (defn- run-planned-context
-  [{:keys [result-set late-clauses sources] :as context}]
+  [{:keys [result-set sources] :as context}]
   (binding [qu/*implicit-source* (get sources '$)]
     (if (= result-set #{})
       context
       (let [context (execute-plan context)]
-        (resolve-late-clauses context late-clauses)))))
+        (resolve-pre-top-k-late-clauses context)))))
 
 (defn- execute-planned-query
   [context inputs]
