@@ -2770,7 +2770,8 @@
   are evaluated under the replay write lock so read-dependent cleanup rows are
   derived from the state immediately preceding this record. Set
   `:replay-skipped?` when an existing local LSN may represent a different
-  local-only record and the incoming payload must still be materialized."
+  local-only record and an incoming payload newer than the materialized floor
+  must still be applied."
   ([lmdb record]
    (mirror-replayed-txlog-record! lmdb record nil))
   ([lmdb record preapply-rows]
@@ -2802,6 +2803,7 @@
          (if-let [state (txlog-runtime-state lmdb)]
            (let [_ (txlog/refresh-shared-state! state)
                  record-lsn (long (:lsn record))
+                 local-payload-lsn (long (persisted-local-payload-lsn lmdb))
                  expected-lsn0 (long @(:next-lsn state))
                  expected-lsn (if (> record-lsn expected-lsn0)
                                 (do
@@ -2826,7 +2828,13 @@
                   state
                   record
                   expected-lsn)
-                 (if replay-skipped?
+                 ;; A lagging advisory follower cursor can ask for a record
+                 ;; whose payload is already materialized. Reapplying that
+                 ;; older physical payload would regress cardinality-one
+                 ;; values even though the payload floor remains monotonic.
+                 ;; Only repair the crash window where WAL is ahead of LMDB.
+                 (if (and replay-skipped?
+                          (> record-lsn local-payload-lsn))
                    (do
                      (replay-txlog-rows! lmdb materialize-rows record-lsn)
                      {:lsn record-lsn

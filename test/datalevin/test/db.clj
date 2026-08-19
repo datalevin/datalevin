@@ -6,10 +6,13 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.interface :as i]
+   [datalevin.kv :as kv]
    [datalevin.lmdb :as l]
    [datalevin.query.plan :as qplan]
    [datalevin.util :as u :refer [defrecord-updatable]])
   (:import
+   [java.util UUID]
    [java.util.concurrent Callable ExecutorService Future TimeUnit]))
 
 ;;
@@ -75,6 +78,74 @@
             :cause     "native reader failure"}
            (ex-data error)))
     (is (identical? cause (ex-cause error)))))
+
+(deftest stale-ha-replay-does-not-regress-materialized-payload
+  (let [dir (u/tmp-dir (str "stale-ha-replay-" (UUID/randomUUID)))]
+    (try
+      (let [kv-store (d/open-kv dir {:wal? true})]
+        (try
+          (d/open-dbi kv-store "values")
+          (is (= :transacted
+                 (d/transact-kv kv-store
+                                [[:put "values" :key :older]])))
+          (let [older-record (last (d/open-tx-log kv-store 1))]
+            (is (= :transacted
+                   (d/transact-kv kv-store
+                                  [[:put "values" :key :newer]])))
+            (let [newer-record (last (d/open-tx-log kv-store 1))
+                  result (kv/mirror-replayed-txlog-record!
+                          kv-store
+                          older-record
+                          nil
+                          {:replay-skipped? true})]
+              (is (< (long (:lsn older-record))
+                     (long (:lsn newer-record))))
+              (is (:skipped? result))
+              (is (not (:replayed? result)))
+              (is (= :newer (d/get-value kv-store "values" :key)))))
+          (finally
+            (d/close-kv kv-store))))
+      (finally
+        (u/delete-files dir)))))
+
+(deftest ha-replay-repairs-wal-ahead-of-materialized-payload
+  (let [dir (u/tmp-dir (str "ha-replay-unapplied-tail-"
+                            (UUID/randomUUID)))]
+    (try
+      (let [kv-store (d/open-kv dir {:wal? true})]
+        (try
+          (d/open-dbi kv-store "values")
+          (is (= :transacted
+                 (d/transact-kv kv-store
+                                [[:put "values" :key :expected]])))
+          (let [record (last (d/open-tx-log kv-store 1))
+                lsn (long (:lsn record))]
+            ;; Model a crash after WAL append but before the corresponding
+            ;; payload and materialization floor were committed to LMDB.
+            (is (= :transacted
+                   (kv/transact-kv-without-txlog!
+                    kv-store
+                    [[:put "values" :key :stale]
+                     [:put c/kv-info c/wal-local-payload-lsn
+                      (dec lsn) :keyword :data]])))
+            (let [result (kv/mirror-replayed-txlog-record!
+                          kv-store
+                          record
+                          nil
+                          {:replay-skipped? true})]
+              (is (:skipped? result))
+              (is (:replayed? result))
+              (is (= :expected (d/get-value kv-store "values" :key)))
+              (is (= lsn
+                     (long (i/get-value kv-store
+                                        c/kv-info
+                                        c/wal-local-payload-lsn
+                                        :keyword
+                                        :data))))))
+          (finally
+            (d/close-kv kv-store))))
+      (finally
+        (u/delete-files dir)))))
 
 (defn- now [] (System/currentTimeMillis))
 
