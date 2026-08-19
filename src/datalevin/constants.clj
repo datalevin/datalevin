@@ -847,6 +847,17 @@ is Integer/MAX_VALUE, i.e. no cap."}
   magic-cost-var 5.5)
 
 (def ^{:dynamic true
+       :doc     "Marginal cost of each additional output variable in one fused
+EAV scan, relative to the first variable. Prefix encoding and scan setup are
+shared by all attributes in the fused operator."}
+  magic-cost-fused-var-marginal 0.15)
+
+(def ^{:dynamic true
+       :doc     "Minimum complete-plan cost fraction that movable EAV groups
+must be capable of saving before the planner expands their placement states."}
+  deferred-eav-min-cost-improvement 0.05)
+
+(def ^{:dynamic true
        :doc     "Cost associated with running a filter during scan"}
   magic-cost-fidx 1.4)
 

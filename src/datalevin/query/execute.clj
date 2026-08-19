@@ -1312,7 +1312,8 @@
    (when qplan/*explain* (vswap! qplan/*explain* assoc :result result)))
   ([{:keys [graph result-set plan opt-clauses late-clauses run?
             access-plans preferred-access-plan property-memo
-            deferred-base-samples post-top-k-enrichment]
+            deferred-base-samples attribute-group-planning
+            post-top-k-enrichment]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
@@ -1359,6 +1360,7 @@
                                                 :tuples-count]))))
                            e)) plan)
                :deferred-base-samples deferred-base-samples
+               :attribute-group-planning attribute-group-planning
                :post-top-k-enrichment post-top-k-enrichment
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)

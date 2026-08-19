@@ -392,6 +392,27 @@
          (if (identical? type :_ref) "reverse reference" "equal values")
          " of " attr ".")))
 
+(defrecord IdentityStep [in out cols strata seen-or-joins]
+
+  IStep
+  (-type [_] :identity)
+
+  (-execute [_ _ source]
+    source)
+
+  (-execute-pipe [_ _ source sink]
+    (when source
+      (loop []
+        (when-let [tuple (p/produce source)]
+          (.add ^Collection sink tuple)
+          (recur)))))
+
+  (-sample [_ _ source]
+    source)
+
+  (-explain [_ _]
+    "Carry a linked entity without scanning properties."))
+
 (defrecord HashJoinStep [link link-e in out in-cols cols strata seen-or-joins
                          tgt-steps in-size tgt-size]
 
@@ -861,7 +882,7 @@
 (defn execute-steps
   "Execute all steps of a component's plan to obtain a relation."
   [context db steps]
-  (let [steps (vec steps)
+  (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
         n     (count steps)
         attrs (cols->attrs (:cols (peek steps)))]
     (case n
@@ -878,7 +899,7 @@
   "Execute a component plan and count its output without retaining the final
   tuples. This is intended for offline exact-cardinality measurements."
   [db steps]
-  (let [steps    (vec steps)
+  (let [steps    (into [] (remove #(identical? :identity (-type %))) steps)
         n        (count steps)
         pipes    (object-array
                    (mapv (fn [i]

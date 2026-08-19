@@ -52,6 +52,21 @@
     :order-by [?date :desc ?message-id :asc]
     :limit 20])
 
+(def deferred-eav-group-query
+  '[:find ?forum-id ?forum-title ?post
+    :where
+    [?start :start/id 1]
+    [?edge :edge/from ?start]
+    [?edge :edge/to ?person]
+    [?membership :membership/person ?person]
+    [?membership :membership/forum ?forum]
+    [?membership :membership/date ?date]
+    [(> ?date 0)]
+    [?post :post/person ?person]
+    [?post :post/forum ?forum]
+    [?forum :forum/id ?forum-id]
+    [?forum :forum/title ?forum-title]])
+
 (def dominated-projection-root-query
   '[:find ?friend-id ?first-name ?last-name
     :where
@@ -939,6 +954,28 @@
         (is (= 350 (estimate-cost 10 20 50 3)))
         (is (= 1050 (estimate-cost 10 20 150 3)))))))
 
+(deftest multi-key-join-cardinality-test
+  (let [estimate-size @(ns-resolve 'datalevin.query-optimizer
+                                   'multi-key-result-size)
+        prev-plan     {:steps [{:cols ['?left
+                                       #{:left/a '?a}
+                                       #{:left/b '?b}]}]}
+        target-plan   {:steps [{:cols ['?right
+                                       #{:right/a '?a}
+                                       #{:right/b '?b}]}]}
+        single-target {:steps [{:cols ['?right #{:right/a '?a}]}]}
+        link          {:type :val-eq :var '?a}]
+    (with-redefs [db/-cardinality (fn [_ attr]
+                                    (if (= attr :right/b) 10000 1))]
+      (testing "an unrepresented equality key dampens the join fanout"
+        (is (= 10000
+               (estimate-size nil '?left link prev-plan target-plan
+                              1000000))))
+      (testing "the selected graph key is not counted twice"
+        (is (= 1000000
+               (estimate-size nil '?left link prev-plan single-target
+                              1000000)))))))
+
 (deftest merge-range-predicate-cost-test
   (let [merge-pred-options @(ns-resolve 'datalevin.query-optimizer
                                         'merge-pred-options)
@@ -970,6 +1007,82 @@
         (is (= 60.0 (estimate-cost {:attrs-v [[:date residual-options]]
                                     :vars    []}
                                    10)))))))
+
+(deftest deferred-eav-attribute-group-planning-test
+  (let [dir    (u/tmp-dir (str "deferred-eav-group-" (UUID/randomUUID)))
+        schema {:start/id          {:db/valueType :db.type/long
+                                    :db/unique    :db.unique/identity}
+                :edge/from         {:db/valueType :db.type/ref}
+                :edge/to           {:db/valueType :db.type/ref}
+                :membership/person {:db/valueType :db.type/ref}
+                :membership/forum  {:db/valueType :db.type/ref}
+                :membership/date   {:db/valueType :db.type/long}
+                :post/person       {:db/valueType :db.type/ref}
+                :post/forum        {:db/valueType :db.type/ref}
+                :forum/id          {:db/valueType :db.type/long
+                                    :db/unique    :db.unique/identity}
+                :forum/title       {:db/valueType :db.type/string}}
+        conn   (d/get-conn dir schema)
+        person-count (long 20)
+        forum-count  (long 10)]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1 :start/id 1}]
+              (concat
+                (map (fn [^long i]
+                       {:db/id (+ 2000 i)
+                        :forum/id i
+                        :forum/title (str "forum-" i)})
+                     (range forum-count))
+                (map (fn [^long i]
+                       {:db/id (+ 10000 i)
+                        :edge/from 1
+                        :edge/to (+ 1000 i)})
+                     (range person-count))
+                (for [^long i (range person-count)
+                      ^long j (range forum-count)]
+                  {:db/id (+ 100000 (* i forum-count) j)
+                   :membership/person (+ 1000 i)
+                   :membership/forum (+ 2000 j)
+                   :membership/date (inc j)})
+                (map (fn [^long i]
+                       {:db/id (+ 200000 i)
+                        :post/person (+ 1000 i)
+                        :post/forum (+ 2000 (long (mod i forum-count)))})
+                     (range person-count)))))
+      (let [db-value (db/-clear-tx-cache (d/db conn))
+            common-bindings
+            {#'c/init-exec-size-threshold 5
+             #'c/hash-join-min-input-size 1
+             #'c/magic-cost-hash-join 0.1}]
+        (with-bindings (assoc common-bindings
+                              #'c/deferred-eav-min-cost-improvement 1.0)
+          (let [explain  (d/explain {:run? false}
+                                    deferred-eav-group-query db-value)
+                planning (-> explain :attribute-group-planning vals first first)]
+            (testing "a high required improvement retains the eager plan"
+              (is (= :eager (:selected planning)))
+              (is (= [:membership/date]
+                     (get-in planning [:groups 0 :attrs]))))))
+        (.clear ^datalevin.utl.LRUCache qo/*plan-cache*)
+        (with-bindings (assoc common-bindings
+                              #'c/deferred-eav-min-cost-improvement 0.0)
+          (let [explain  (d/explain {:run? true}
+                                    deferred-eav-group-query db-value)
+                planning (-> explain :attribute-group-planning vals first first)
+                result   (d/q deferred-eav-group-query db-value)]
+            (testing "the fixed join DAG can place a legal group after hash"
+              (is (= :deferred (:selected planning)))
+              (is (true? (get-in planning
+                                 [:groups 0 :after-hash-join?])))
+              (is (= 20 (:actual-result-size explain))))
+            (testing "late cardinality-one filtering preserves query results"
+              (is (= 20 (count result)))
+              (is (contains? result [0 "forum-0" 200000]))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
 
 (deftest sampled-late-expansion-cost-test
   (let [dir    (u/tmp-dir (str "late-expansion-cost-" (UUID/randomUUID)))
@@ -1080,7 +1193,7 @@
           (is (zero? (double
                        (get-in preferred
                                [:estimate :planning-sample-cost]))))
-          (is (= :knows/to (:attr abort)))
+          (is (= :person/id (:attr abort)))
           (is (< (double (:budget abort))
                  (+ (double (:cost abort))
                     (double (:projected-cost abort)))))
