@@ -13,9 +13,11 @@
    [datalevin.constants :as c]
    [datalevin.core :as d]
    [datalevin.db :as db]
+   [datalevin.join :as j]
    [datalevin.pipe :as p]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
+   [datalevin.query-util :as qu]
    [datalevin.relation :as r]
    [datalevin.rules]
    [datalevin.util :as u])
@@ -138,6 +140,88 @@
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest large-multi-entity-lookup-uses-merged-eav-test
+  (let [lookup        @(ns-resolve 'datalevin.query.resolve
+                                   'lookup-pattern-multi-entity)
+        resolve-pairs @(ns-resolve 'datalevin.query.resolve
+                                   'resolve-entity-pairs)
+        threshold     @(ns-resolve 'datalevin.query.resolve
+                                   'merged-eav-lookup-threshold)
+        n             (inc (long threshold))
+        dir           (u/tmp-dir (str "merged-eav-lookup-"
+                                      (UUID/randomUUID)))
+        conn          (d/get-conn
+                        dir
+                        {:item/key {:db/unique :db.unique/identity}})]
+    (try
+      (d/transact!
+        conn
+        (mapv (fn [^long i]
+                {:db/id      i
+                 :item/key   (str "item-" i)
+                 :item/value (mod i 17)})
+              (range 1 (inc n))))
+      (let [database    (d/db conn)
+            originals   (mapv (fn [^long i]
+                                [:item/key (str "item-" i)])
+                              (range 1 (inc n)))
+            entity-pairs (vec (resolve-pairs database originals))
+            result       (lookup database ['?item :item/value '?value]
+                                 entity-pairs true)]
+        (is (= n (.size ^java.util.List result)))
+        (is (= (set (map (fn [lookup-ref ^long i]
+                           [lookup-ref (mod i 17)])
+                         originals (range 1 (inc n))))
+               (set (mapv vec result))))
+        (is (every? #(= 2 (alength ^objects %)) result)))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest disjunction-branches-project-hidden-cells-test
+  (let [data    [[10 :left/person 4]
+                 [10 :right/person 4]
+                 [20 :path/start 1]
+                 [20 :path/end 4]
+                 [21 :path/start 1]
+                 [21 :path/end 4]]
+        context {:sources {'$ data}
+                 :rules   {}
+                 :rels    [(r/relation! {'?entity 0 '?start 1}
+                                        (tuples [10 1]))]}
+        resolve (fn [clause]
+                  (binding [qu/*implicit-source* data]
+                    (-> (qresolve/resolve-clause context clause)
+                        :rels
+                        (#(reduce j/hash-join %)))))
+        assert-single-visible!
+        (fn [rel expected]
+          (let [attrs (:attrs rel)
+                rows  (:tuples rel)]
+            (is (= (set (keys expected)) (set (keys attrs))))
+            (is (= 1 (.size ^java.util.List rows)))
+            (is (= (count attrs)
+                   (alength ^objects (.get ^java.util.List rows 0))))
+            (is (= expected
+                   (into {}
+                         (map (fn [[var idx]]
+                                [var (aget ^objects
+                                           (.get ^java.util.List rows 0) idx)]))
+                         attrs)))))]
+    (testing "or dedupes by visible variables, not branch-local tuple cells"
+      (assert-single-visible!
+        (resolve
+          '(or [?entity :left/person ?person]
+               [?entity :right/person ?person]))
+        {'?entity 10 '?start 1 '?person 4}))
+    (testing "or-join projects and dedupes repeated paths within a branch"
+      (assert-single-visible!
+        (resolve
+          '(or-join [?start ?person]
+             (and [?path :path/start ?start]
+                  [?path :path/end ?person])))
+        {'?entity 10 '?start 1 '?person 4}))))
 
 (deftest adaptive-parallel-scan-participant-count-test
   (let [participant-capacity @(ns-resolve

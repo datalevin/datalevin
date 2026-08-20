@@ -294,6 +294,11 @@
 ;; comparison below chooses between indexed probes and a full scan.
 (def ^:const ^:private ^long multi-lookup-safety-limit 1000000)
 
+;; Match the storage scan's target chunk size. Below this point individual
+;; probes avoid sorting and projecting an input batch; at and above it one EAV
+;; merge scan can also use the storage layer's CPU-aware parallel chunking.
+(def ^:const ^:private ^long merged-eav-lookup-threshold 4000)
+
 (defn- estimate-multi-lookup-output
   ^long [^long bound-count ^long scan-count]
   (long
@@ -328,14 +333,16 @@
 (defn- lookup-pattern-multi-entity
   "Perform multiple point lookups for bound entity values.
    More efficient than full table scan when entity is bound to multiple values.
-   Wildcard values use existence probes and emit one tuple per entity."
+   Large value-producing batches use one merged EAV scan. Wildcard values use
+   existence probes and emit one tuple per entity."
   [db pattern entity-pairs v-is-var?]
   (let [[_ a v]          pattern
         a'               (if (keyword? a) a nil)
         v'               (if (or (qu/free-var? v) (= v '_)) nil v)
         existence-only?  (or (= v '_) (qu/placeholder? v))
         acc              (FastList.)]
-    (if existence-only?
+    (cond
+      existence-only?
       (let [input (FastList. (count entity-pairs))]
         (doseq [[e eid] entity-pairs]
           (.add input (object-array [e eid])))
@@ -344,6 +351,23 @@
           (dotimes [i (.size matches)]
             (let [^objects tuple (.get matches i)]
               (.add acc (object-array [(aget tuple 0)]))))))
+
+      (and v-is-var?
+           (<= merged-eav-lookup-threshold (count entity-pairs)))
+      (let [input (FastList. (count entity-pairs))]
+        ;; Keep the original value beside its resolved eid. EAV appends the
+        ;; attribute value, after which the resolved eid is projected away.
+        ;; This preserves lookup refs (and aliases resolving to the same eid).
+        (doseq [[e eid] entity-pairs]
+          (.add input (object-array [e eid])))
+        (when-let [^List matches
+                   (db/-eav-scan-v-list
+                     db input 1 [[a' {:skip? false}]])]
+          (dotimes [i (.size matches)]
+            (let [^objects tuple (.get matches i)]
+              (.add acc (object-array [(aget tuple 0) (aget tuple 2)]))))))
+
+      :else
       (doseq [[e eid] entity-pairs]
         (let [tuples (db/-search-tuples db [eid a' v'])]
           (when tuples
@@ -550,7 +574,7 @@
 
       use-entity-multi?
       (let [resolved-pattern (resolve-pattern-lookup-refs db pattern)
-            entity-pairs     (resolve-entity-pairs db entity-values)
+            entity-pairs     (vec (resolve-entity-pairs db entity-values))
             v-resolved       (nth resolved-pattern 2 nil)
             v-is-var?        (and (or (nil? v-resolved)
                                       (qu/free-var? v-resolved)
@@ -1119,6 +1143,16 @@
   [context vars]
   (assoc context :rels (keep #(limit-rel % vars) (:rels context))))
 
+(defn- project-visible-distinct
+  "Physically remove tuple cells hidden from a relation's attrs, then dedupe
+   by those visible attrs. Logical attr limiting alone is insufficient at a
+  set-union boundary because hidden branch-local values distinguish arrays."
+  [rel]
+  (r/project-distinct rel
+                      (->> (:attrs rel)
+                           (sort-by val)
+                           (mapv key))))
+
 (defn bound-vars
   [context]
   (into #{} (mapcat #(keys (:attrs %))) (:rels context)))
@@ -1364,7 +1398,8 @@
            _              (check-free-same (bound-vars context) branches clause)
            contexts       (map #(resolve-clause context %) branches)]
        (assoc (first contexts) :rels [(transduce
-                                        (map #(reduce j/hash-join (:rels %)))
+                                        (map #(-> (reduce j/hash-join (:rels %))
+                                                  project-visible-distinct))
                                         r/sum-rel-dedupe
                                         contexts)]))
 
@@ -1396,7 +1431,8 @@
                                            (limit-context vars))))
                                 (map #(let [rels (:rels %)]
                                         (if (seq rels)
-                                          (reduce j/hash-join rels)
+                                          (-> (reduce j/hash-join rels)
+                                              project-visible-distinct)
                                           []))))
                           r/sum-rel-dedupe branches)))
 
