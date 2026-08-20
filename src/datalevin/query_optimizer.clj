@@ -4821,23 +4821,29 @@
             (if-let [cached (.get ^LRUCache (plan-cache) k)]
               (assoc-source-plan c src (:plans cached) (:deferred cached)
                                  (:attribute-group-planning cached))
-              (let [nodes (update-nodes db nodes)
-                    {:keys [plans deferred attribute-group-planning]}
-                    (if (< 1 (count nodes))
-                      (build-plan* db sources rules nodes required-vars
-                                   projected-vars)
-                      {:plans [[(base-plan db nodes (ffirst nodes) true)]]
-                       :deferred #{}
-                       :attribute-group-planning nil})]
-                (if (some #(some nil? %) plans)
+              (let [nodes (update-nodes db nodes)]
+                ;; A zero count has already been verified against the actual
+                ;; index by zero-count-clause-size. Since every graph node is
+                ;; conjunctive, no base sampling or join enumeration can make
+                ;; this source component satisfiable.
+                (if (some #(zero? (long (:mcount %))) (vals nodes))
                   (reduced (assoc c :result-set #{}))
-                  (do (.put ^LRUCache (plan-cache) k
-                            {:plans (strip-result plans)
-                             :deferred deferred
-                             :attribute-group-planning
-                             attribute-group-planning})
-                      (assoc-source-plan c src plans deferred
-                                         attribute-group-planning)))))))
+                  (let [{:keys [plans deferred attribute-group-planning]}
+                        (if (< 1 (count nodes))
+                          (build-plan* db sources rules nodes required-vars
+                                       projected-vars)
+                          {:plans [[(base-plan db nodes (ffirst nodes) true)]]
+                           :deferred #{}
+                           :attribute-group-planning nil})]
+                    (if (some #(some nil? %) plans)
+                      (reduced (assoc c :result-set #{}))
+                      (do (.put ^LRUCache (plan-cache) k
+                                {:plans (strip-result plans)
+                                 :deferred deferred
+                                 :attribute-group-planning
+                                 attribute-group-planning})
+                          (assoc-source-plan c src plans deferred
+                                             attribute-group-planning)))))))))
         context graph))
     context))
 

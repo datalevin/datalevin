@@ -967,8 +967,17 @@
                     :where
                     [?page :node/title "Missing"]
                     [?block :block/refs ?page]]
-            db    (d/db conn)]
-        (is (= #{} (d/q query db)))
+            db    (d/db conn)
+            build-plan* (ns-resolve 'datalevin.query-optimizer 'build-plan*)
+            entered?    (volatile! false)
+            original    @build-plan*]
+        (with-redefs-fn
+          {build-plan* (fn [& args]
+                         (vreset! entered? true)
+                         (apply original args))}
+          #(is (= #{} (d/q query db))))
+        (is (false? @entered?)
+            "verified empty nodes should bypass component plan enumeration")
         (is (= 0 (:actual-result-size
                    (d/explain {:run? true} query db))))
         (is (nil? (:plan (d/explain {:run? false} query db)))))
