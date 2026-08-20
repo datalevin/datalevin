@@ -15,6 +15,7 @@
    [datalevin.db :as db]
    [datalevin.pipe :as p]
    [datalevin.query.predicate :as qpred]
+   [datalevin.query.resolve :as qresolve]
    [datalevin.relation :as r]
    [datalevin.rules]
    [datalevin.util :as u])
@@ -438,6 +439,93 @@
                          [?block :block/score ?score]
                          [(> ?score 0)])]
                      db))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest not-join-reusable-prefix-test
+  (let [dir       (u/tmp-dir (str "not-join-prefix-" (UUID/randomUUID)))
+        conn      (d/get-conn
+                    dir
+                    {:message/hasCreator {:db/valueType :db.type/ref}
+                     :likes/message      {:db/valueType :db.type/ref}
+                     :likes/person       {:db/valueType :db.type/ref}})
+        start     1
+        message-a 1000
+        message-b 1001
+        likers    (range 2000 2020)
+        query
+        '[:find ?liker-id ?message-id ?like-date
+          :where
+          [?start :person/id 100]
+          [?message :message/hasCreator ?start]
+          [?message :message/id ?message-id]
+          [?like :likes/message ?message]
+          [?like :likes/person ?liker]
+          [?like :likes/creationDate ?like-date]
+          [?liker :person/id ?liker-id]
+          (not-join [?liker ?like-date ?message-id ?start]
+                    [?other-message :message/hasCreator ?start]
+                    [?other-message :message/id ?other-message-id]
+                    [?other-like :likes/message ?other-message]
+                    [?other-like :likes/person ?liker]
+                    [?other-like :likes/creationDate ?other-like-date]
+                    (or-join
+                      [?like-date ?other-like-date
+                       ?message-id ?other-message-id]
+                      [(> ?other-like-date ?like-date)]
+                      (and [(= ?other-like-date ?like-date)]
+                           [(< ?other-message-id ?message-id)])))]
+        not-form  (last query)
+        prefix-plan
+        ((ns-resolve 'datalevin.query.resolve 'not-join-prefix-plan)
+         (second not-form) (drop 2 not-form))]
+    (try
+      (d/transact!
+        conn
+        (into
+          [{:db/id start :person/id 100}
+           {:db/id message-a
+            :message/hasCreator start
+            :message/id 10}
+           {:db/id message-b
+            :message/hasCreator start
+            :message/id 20}]
+          (mapcat
+            (fn [^long liker]
+              (let [liker-id (- liker 1900)
+                    like-a   (+ 3000 (* 2 liker-id))
+                    like-b   (inc like-a)
+                    date-b   (if (even? liker-id) 300 200)]
+                [{:db/id liker :person/id liker-id}
+                 {:db/id like-a
+                  :likes/message message-a
+                  :likes/person liker
+                  :likes/creationDate 200}
+                 {:db/id like-b
+                  :likes/message message-b
+                  :likes/person liker
+                  :likes/creationDate date-b}]))
+            likers)))
+      (testing "the connected prefix is anchored only by the reusable key"
+        (is (= ['?start] (:anchor-vars prefix-plan)))
+        (is (= 5 (count (:prefix prefix-plan))))
+        (is (= 1 (count (:residual prefix-plan)))))
+      (let [database     (d/db conn)
+            conventional (binding [qresolve/*not-join-prefix-specialization?*
+                                   false]
+                           (d/q query database))
+            specialized  (d/q query database)
+            expected
+            (into #{}
+                  (map (fn [^long liker]
+                         (let [liker-id (- liker 1900)]
+                           (if (even? liker-id)
+                             [liker-id 20 300]
+                             [liker-id 10 200]))))
+                  likers)]
+        (testing "decorrelation preserves date and tie-break semantics"
+          (is (= expected conventional specialized))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

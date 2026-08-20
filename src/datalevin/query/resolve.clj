@@ -51,6 +51,13 @@
   indices. Normal resolution retains dependency-ordered source order."
   nil)
 
+(def ^:dynamic *not-join-prefix-specialization?*
+  "Whether a correlated not-join may evaluate a reusable indexed prefix on
+  distinct anchor keys before joining the remaining correlation keys back in."
+  true)
+
+(def ^:private ^:const ^long not-join-prefix-min-reuse 16)
+
 (defn server-safe-resolver?
   []
   (= :server-safe *resolver-mode*))
@@ -1146,6 +1153,91 @@
   (assert (nil? (next coll)) "Expected single element")
   (first coll))
 
+(defn- indexed-data-pattern?
+  [clause]
+  (and (vector? clause)
+       (= 3 (count clause))
+       (keyword? (second clause))))
+
+(defn- not-join-prefix-plan
+  "Find a conservative decorrelation boundary for a not-join. The reusable
+  prefix must consist of connected indexed patterns, start from a strict
+  subset of the correlation variables, produce another correlation variable,
+  and leave a residual clause to evaluate after the outer keys are rejoined."
+  [vars clauses]
+  (when (and *not-join-prefix-specialization?*
+             (< 1 (count vars))
+             (indexed-data-pattern? (first clauses)))
+    (let [var-set     (set vars)
+          first-vars  (qu/collect-vars (first clauses))
+          anchor-vars (into [] (filter first-vars) vars)
+          anchor-set  (set anchor-vars)]
+      (when (and (seq anchor-vars)
+                 (< (count anchor-vars) (count vars)))
+        (let [[prefix residual known]
+              (loop [known   anchor-set
+                     pending clauses
+                     prefix  []]
+                (if-let [clause (first pending)]
+                  (let [pattern-vars (qu/collect-vars clause)]
+                    (if (and (indexed-data-pattern? clause)
+                             (seq (set/intersection known pattern-vars)))
+                      (recur (into known pattern-vars)
+                             (next pending)
+                             (conj prefix clause))
+                      [prefix pending known]))
+                  [prefix nil known]))
+              produced (set/difference (set/intersection var-set known)
+                                       anchor-set)]
+          (when (and (< 1 (count prefix))
+                     (seq residual)
+                     (seq produced))
+            {:anchor-vars anchor-vars
+             :prefix     prefix
+             :residual   residual}))))))
+
+(defn- resolve-not-join-negation
+  [context outer-rel vars clauses]
+  (let [join-context     (assoc context :rels
+                                [(r/project-distinct outer-rel vars)])
+        negation-context (-> (reduce resolve-clause join-context clauses)
+                             (limit-context (set vars)))]
+    (-> (reduce j/hash-join (:rels negation-context))
+        (r/project-distinct vars))))
+
+(defn- resolve-not-join-prefix
+  [context outer-rel vars clauses]
+  (when-let [{:keys [anchor-vars prefix residual]}
+             (when (and qu/*implicit-source*
+                        (nil? (:delta-bound-values context))
+                        (db/-searchable? qu/*implicit-source*))
+               (not-join-prefix-plan vars clauses))]
+    (let [outer-keys  (r/project-distinct outer-rel vars)
+          anchor-keys (r/project-distinct outer-keys anchor-vars)
+          outer-size  (.size ^List (:tuples outer-keys))
+          anchor-size (.size ^List (:tuples anchor-keys))]
+      (when (and (pos? anchor-size)
+                 (<= (* (long anchor-size) not-join-prefix-min-reuse)
+                     (long outer-size)))
+        (let [prefix-context (reduce resolve-clause
+                                     (assoc context :rels [anchor-keys])
+                                     prefix)
+              prefix-rel     (reduce j/hash-join (:rels prefix-context))
+              lookup-attrs   (into (or qu/*lookup-attrs* #{})
+                                   (mapcat #(dynamic-lookup-attrs
+                                              qu/*implicit-source* %))
+                                   prefix)
+              joined-rel     (binding [qu/*lookup-attrs* lookup-attrs]
+                               (j/hash-join outer-keys prefix-rel))
+              residual-ctx   (reduce resolve-clause
+                                     (assoc context :rels [joined-rel])
+                                     residual)]
+          (-> residual-ctx
+              (limit-context (set vars))
+              :rels
+              (#(reduce j/hash-join %))
+              (r/project-distinct vars)))))))
+
 (defn looks-like?
   [pattern form]
   (cond
@@ -1339,13 +1431,10 @@
            context1           (assoc context :rels
                                      [(reduce j/hash-join (:rels context))])
            outer-rel          (single (:rels context1))
-           join-context       (assoc context1 :rels
-                                     [(r/project-distinct outer-rel vars)])
-           negation-context   (-> (reduce resolve-clause join-context clauses)
-                                  (limit-context var-set))
-           neg-rel            (-> (reduce j/hash-join
-                                          (:rels negation-context))
-                                  (r/project-distinct vars))]
+           neg-rel            (or (resolve-not-join-prefix
+                                    context1 outer-rel vars clauses)
+                                  (resolve-not-join-negation
+                                    context1 outer-rel vars clauses))]
        (assoc context1 :rels
               [(j/subtract-rel
                  outer-rel
