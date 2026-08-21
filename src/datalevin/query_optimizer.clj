@@ -2463,8 +2463,16 @@
 
 (defn- aid [db] #(((db/-schema db) %) :db/aid))
 
+(defn- predicate-only-clause?
+  [materialized-vars {:keys [var pred range]}]
+  (and (some? materialized-vars)
+       (qu/binding-var? var)
+       (not (qu/placeholder? var))
+       (not (contains? materialized-vars var))
+       (or pred range)))
+
 (defn- init-steps
-  [db e node single? sample?]
+  [db e node single? sample? materialized-vars]
   (let [{:keys [bound free mpath mcount]}            node
         {:keys [attr var val range pred] :as clause} (get-in node mpath)
 
@@ -2481,6 +2489,8 @@
                               :vars (cond-> [e]
                                       (not no-var?) (conj var))
                               :range range)
+               (predicate-only-clause? materialized-vars clause)
+               (assoc :predicate-only? true)
                (some? val) (assoc :val val)
                know-e? (assoc :know-e? true)
                true    (#(let [vars (:vars %)]
@@ -2518,7 +2528,13 @@
                                         (remove nil?))
                                      attrs vars))
                         no-var? (conj attr))
-              pred-options (mapv merge-pred-options vars all)
+              pred-options
+              (mapv (fn [v clause]
+                      (cond-> (merge-pred-options v clause)
+                        (predicate-only-clause?
+                          materialized-vars clause)
+                        (assoc :predicate-only? true)))
+                    vars all)
               attrs-v      (attrs-vec attrs pred-options skips (repeat nil))
               cols         (into (:cols init)
                                  (sequence
@@ -2587,12 +2603,14 @@
                    (double (dec n))))))))
 
 (defn- estimate-scan-v-cost
-  [{:keys [attrs-v vars]} ^long size]
-  (* size
-     ^double c/magic-cost-merge-scan-v
-     ^long (fused-var-factor (count vars))
-     ^long (factor c/magic-cost-pred (n-costly-preds attrs-v))
-     ^long (factor c/magic-cost-fidx (n-items attrs-v :fidx))))
+  [{:keys [attrs-v vars cost-attrs-v cost-var-count]} ^long size]
+  (let [cost-attrs-v (or cost-attrs-v attrs-v)
+        var-count    (long (or cost-var-count (count vars)))]
+    (* size
+       ^double c/magic-cost-merge-scan-v
+       ^long (fused-var-factor var-count)
+       ^long (factor c/magic-cost-pred (n-costly-preds cost-attrs-v))
+       ^long (factor c/magic-cost-fidx (n-items cost-attrs-v :fidx)))))
 
 (defn- estimate-base-cost
   [{:keys [mcount]} steps]
@@ -3534,10 +3552,13 @@
   ([db nodes e single?]
    (base-plan db nodes e single? true))
   ([db nodes e single? sample?]
+   (base-plan db nodes e single? sample? nil))
+  ([db nodes e single? sample? materialized-vars]
    (let [node   (get nodes e)
          mcount (:mcount node)]
      (when (and (:mpath node) (not (zero? ^long mcount)))
-       (let [isteps (cond->> (init-steps db e node single? sample?)
+       (let [isteps (cond->> (init-steps db e node single? sample?
+                                        materialized-vars)
                       (not sample?)
                       (mapv #(assoc % :deferred-projection? true)))]
          (if single?
@@ -3567,6 +3588,25 @@
           (mapcat #(get-in nodes [% :links]))
           (keep :var))
         component))
+
+(defn- plan-materialized-vars
+  "Variables whose values must survive their originating index scan. Base
+   samples retain every value; this set only marks predicate-local values for
+   removal when a base scan is fused into an expansion."
+  [nodes required-vars]
+  (let [clauses      (mapcat #(concat (:bound %) (:free %)) (vals nodes))
+        occurrences (frequencies
+                      (keep (fn [{:keys [var]}]
+                              (when (qu/binding-var? var) var))
+                            clauses))]
+    (reduce-kv
+      (fn [vars e {:keys [links]}]
+        (cond-> (into vars (qu/collect-vars links))
+          (qu/binding-var? e) (conj e)))
+      (into (set required-vars)
+            (keep (fn [[var n]] (when (< 1 ^long n) var)))
+            occurrences)
+      nodes)))
 
 (defn- movable-attribute-clause?
   [db connection-vars {:keys [attr var val]}]
@@ -3712,10 +3752,11 @@
     #{}))
 
 (defn- build-base-plans
-  [db nodes component deferred]
+  [db nodes component deferred materialized-vars]
   (let [f (bound-fn [e]
             (when-let [plan (base-plan db nodes e false
-                                      (not (contains? deferred e)))]
+                                      (not (contains? deferred e))
+                                      materialized-vars)]
               [[e] plan]))]
     (into {} (if (writing? db)
                (keep f component)
@@ -3723,66 +3764,120 @@
 
 (def find-index qplan/find-index)
 
+(defn- proven-eav-clause?
+  [step entity-idx attr value-idx]
+  (= value-idx (get-in step [:eav-provenance entity-idx attr])))
+
 (defn- merge-scan-step
   [db last-step index new-key new-steps]
-  (let [in         (:out last-step)
-        out        (if (set? in) (set new-key) new-key)
-        lcols      (:cols last-step)
-        lstrata    (:strata last-step)
-        ncols      (:cols (peek new-steps))
-        [s1 s2]    new-steps
-        val1       (:val s1)
-        [_ v1]     (:vars s1)
-        a1         (:attr s1)
-        ip-options (merge-pred-options v1 s1)
-        ip         (cond-> (:pred ip-options)
-                     (some? val1)
-                     (add-pred
-                       (qpred/shareable-predicate #(= % val1))))
-        ip-options (cond-> (assoc ip-options :pred ip)
-                     (some? val1) (dissoc :range-pred?))
-        attrs-v2   (:attrs-v s2)
-        get-a      (fn [coll] (some #(when (keyword? %) %) coll))
-        [attrs-v vars cols]
+  (let [in               (:out last-step)
+        out              (if (set? in) (set new-key) new-key)
+        lcols            (:cols last-step)
+        lstrata          (:strata last-step)
+        ncols            (:cols (peek new-steps))
+        [s1 s2]          new-steps
+        val1             (:val s1)
+        [_ v1]           (:vars s1)
+        logical-emit-v1? (and v1 (some? (find-index v1 ncols)))
+        predicate-v1?    (and logical-emit-v1? (:predicate-only? s1))
+        emit-v1?         (and logical-emit-v1? (not predicate-v1?))
+        a1               (:attr s1)
+        ip-options       (merge-pred-options v1 s1)
+        ip               (cond-> (:pred ip-options)
+                           (some? val1)
+                           (add-pred
+                             (qpred/shareable-predicate #(= % val1))))
+        ip-options       (cond-> (assoc ip-options :pred ip)
+                           (some? val1) (dissoc :range-pred?))
+        attrs-v2         (:attrs-v s2)
+        get-a            (fn [coll] (some #(when (keyword? %) %) coll))
+        [raw-attrs-v vars cols elided predicate-vars]
         (reduce
-          (fn [[attrs-v vars cols] col]
+          (fn [[attrs-v vars cols elided predicate-vars] col]
             (let [v (some #(when (symbol? %) %) col)]
               (if (and ip (= v v1))
-                [attrs-v vars cols]
-                (let [a (get-a col)
-                      options (or (some (fn [[attr options]]
-                                          (when (and (= a attr)
-                                                     (:pred options))
-                                            (select-keys options
-                                                         [:pred
-                                                          :range-pred?])))
-                                        attrs-v2)
-                                  {:pred nil})
-                      skip? (boolean
-                              (some (fn [[attr options]]
-                                      (when (= a attr) (:skip? options)))
-                                    attrs-v2))]
+                [attrs-v vars cols elided predicate-vars]
+                (let [a            (get-a col)
+                      attr-options
+                      (or (some (fn [[attr options]]
+                                  (when (and (= a attr) (:pred options))
+                                    options))
+                                attrs-v2)
+                          (some (fn [[attr options]]
+                                  (when (= a attr) options))
+                                attrs-v2))
+                      options      (if attr-options
+                                     (select-keys
+                                       attr-options
+                                       [:pred :range-pred?
+                                        :predicate-only?])
+                                     {:pred nil})
+                      skip?        (boolean
+                                     (some (fn [[attr options]]
+                                             (when (= a attr)
+                                               (:skip? options)))
+                                           attrs-v2))
+                      predicate?   (boolean (:predicate-only? options))]
                   (if-let [f (find-index v lcols)]
-                    [(conj attrs-v
-                           [a (assoc options :skip? true :fidx f)])
-                     vars cols]
-                    [(conj attrs-v
-                           [a (assoc options
-                                     :skip? skip?
-                                     :fidx nil)])
-                     (conj vars v) (conj cols col)])))))
+                    (if (and (nil? (:pred options))
+                             (proven-eav-clause? last-step index a f))
+                      [attrs-v vars cols
+                       (conj elided
+                             [a (assoc options :skip? true :fidx f)])
+                       predicate-vars]
+                      [(conj attrs-v
+                             [a (assoc options :skip? true :fidx f)])
+                       vars cols elided predicate-vars])
+                    (if predicate?
+                      [(conj attrs-v
+                             [a (assoc options :skip? true :fidx nil)])
+                       vars cols elided (conj predicate-vars v)]
+                      [(conj attrs-v
+                             [a (assoc options
+                                       :skip? skip?
+                                       :fidx nil)])
+                       (conj vars v) (conj cols col) elided
+                       predicate-vars]))))))
           (if (or ip (nil? v1))
             [[[a1 (assoc ip-options
-                         :skip? (not (and v1 (find-index v1 ncols)))
+                         :skip? (not emit-v1?)
                          :fidx nil)]]
-             (if v1 [v1] [])
-             (if v1 [#{a1 v1}] [])]
-            [[] [] []])
+             (if emit-v1? [v1] [])
+             (if emit-v1? [#{a1 v1}] [])
+             []
+             (if predicate-v1? [v1] [])]
+            [[] [] [] [] []])
           (rest ncols))
-        fcols    (into lcols (sort-by (comp (aid db) get-a) cols))
-        strata   (conj lstrata (set vars))
-        lseen    (:seen-or-joins last-step)]
-    (mk-merge-scan-step index attrs-v vars in out fcols strata lseen nil nil)))
+        ;; MergeScanStep requires at least one physical attribute. Retain one
+        ;; otherwise redundant check for degenerate duplicate-clause queries.
+        [scan-attrs-v remaining-elided]
+        (if (and (empty? raw-attrs-v) (seq elided))
+          [[(first elided)] (vec (rest elided))]
+          [raw-attrs-v elided])
+        elided-attrs     (mapv first remaining-elided)
+        cost-attrs-v     (when (seq remaining-elided)
+                           (into scan-attrs-v remaining-elided))
+        ;; The tuple-dependent equality check disabled the entity cache. Keep
+        ;; that allocation-free mode after provenance makes the check itself
+        ;; redundant; linked expansion inputs are normally unique by entity.
+        attrs-v          (if (seq remaining-elided)
+                           (mapv (fn [[attr options]]
+                                   [attr (assoc options :cache-eids? false)])
+                                 scan-attrs-v)
+                           scan-attrs-v)
+        fcols            (into lcols (sort-by (comp (aid db) get-a) cols))
+        strata           (conj lstrata (set vars))
+        lseen            (:seen-or-joins last-step)
+        step             (mk-merge-scan-step index attrs-v vars in out fcols
+                                             strata lseen nil nil)]
+    (cond-> step
+      (seq remaining-elided)
+      (assoc :elided-eav-attrs elided-attrs
+             :cost-attrs-v cost-attrs-v)
+
+      (seq predicate-vars)
+      (assoc :predicate-only-vars predicate-vars
+             :cost-var-count (+ (count vars) (count predicate-vars))))))
 
 (defn- index-by-link
   [cols link-e link]
@@ -3900,8 +3995,14 @@
         lseen   (:seen-or-joins last-step)
         fidx    (find-index tgt lcols)
         cols    (cond-> (enrich-cols lcols index attr)
-                  (nil? fidx) (conj tgt))]
-    [(mk-link-step type index attr tgt fidx in out cols (conj lstrata #{tgt}) lseen)
+                  (nil? fidx) (conj tgt))
+        step    (mk-link-step type index attr tgt fidx in out cols
+                              (conj lstrata #{tgt}) lseen)
+        tgt-idx (find-index tgt cols)
+        step    (cond-> step
+                  (and (#{:_ref :val-eq} type) (some? tgt-idx))
+                  (assoc :eav-provenance {tgt-idx {attr index}}))]
+    [step
      (or fidx (dec (count cols)))]))
 
 (defn- identity-link-step
@@ -3985,7 +4086,12 @@
                                    in out or-cols
                                    (conj lstrata #{tgt})
                                    or-seen)
-        tgt-idx   (dec (count or-cols))]
+        tgt-idx   (dec (count or-cols))
+        free-idx  (find-index (first free-vars) or-cols)
+        or-step   (cond-> or-step
+                    (some? free-idx)
+                    (assoc :eav-provenance
+                           {tgt-idx {tgt-attr free-idx}}))]
     (if new-base
       (let [new-steps (:steps new-base)]
         [or-step (merge-scan-step db or-step tgt-idx new-key new-steps)])
@@ -4469,10 +4575,12 @@
                    component deferred groups dp-component nil))
   ([db sources rules nodes incoming-link-counts required-vars component deferred
     groups dp-component entity-order]
-   (let [n (count dp-component)]
+   (let [n                 (count dp-component)
+         materialized-vars (plan-materialized-vars nodes required-vars)]
      (if (= n 1)
-       [(base-plan db nodes (first component) true)]
-       (let [base-plans (build-base-plans db nodes component deferred)
+       [(base-plan db nodes (first component) true true materialized-vars)]
+       (let [base-plans (build-base-plans db nodes component deferred
+                                          materialized-vars)
              node-ids   (dp-node-ids dp-component)]
          (if (empty? base-plans)
            [nil]
@@ -4713,6 +4821,112 @@
                        :size (final-plan-size grouped)}))
               :selected selected-kind}}))))))
 
+(defn- target-plan-scans-attr?
+  [steps attr]
+  (boolean
+    (some
+      (fn [step]
+        (case (-type step)
+          :init  (= attr (:attr step))
+          :merge (boolean (some #(= attr (first %)) (:attrs-v step)))
+          false))
+      steps)))
+
+(defn- reusable-domain-sip-candidate?
+  [database or-step hash-step domain-var target-attr]
+  (and (identical? (get-in hash-step [:link :type]) :val-eq)
+       (= domain-var (first (:free-vars or-step)))
+       (some? (find-index domain-var (:in-cols hash-step)))
+       target-attr
+       (= :db.type/ref
+          (get-in (db/-schema database) [target-attr :db/valueType]))
+       (<= (long c/hash-join-min-input-size)
+           (long (:in-size hash-step)))
+       (<= (long c/hash-join-min-input-size)
+           (long (:tgt-size hash-step)))
+       (target-plan-scans-attr? (:tgt-steps hash-step) target-attr)))
+
+(defn- reusable-domain-sip-candidate
+  [database sources used hash-step]
+  (when (identical? (get-in hash-step [:link :type]) :val-eq)
+    (some
+      (fn [col]
+        (let [domain-var  (col-var col)
+              target-attr (col-attr col)
+              source      (get sources domain-var)
+              source-id   (when source
+                            [(:plan-index source) (:step-index source)])]
+          (when (and source
+                     (not (contains? used source-id))
+                     (reusable-domain-sip-candidate?
+                       database (:step source) hash-step domain-var
+                       target-attr))
+            {:domain-var domain-var
+             :target-attr target-attr
+             :source source
+             :source-id source-id})))
+      (:cols (peek (:tgt-steps hash-step))))))
+
+(defn- annotate-reusable-sip-domains
+  "Connect a fused or-join's pre-expansion value domain to a later val-eq
+   hash join. Runtime cardinality guards decide whether to use the bitmap."
+  [database plan-trace]
+  (if (some nil? plan-trace)
+    plan-trace
+    (let [trace-vector? (vector? plan-trace)
+          plan-trace   (vec plan-trace)
+          positions
+          (vec
+            (mapcat
+              (fn [plan-index plan]
+                (map-indexed
+                  (fn [step-index step]
+                    {:plan-index plan-index
+                     :step-index step-index
+                     :step       step})
+                  (:steps plan)))
+              (range) plan-trace))
+          annotated
+          (-> (reduce
+                (fn [{:keys [plan sources used] :as state}
+                     {:keys [plan-index step-index step] :as position}]
+                  (case (-type step)
+                    :or-join
+                    (if-let [domain-var (first (:free-vars step))]
+                      (assoc state :sources
+                             (assoc sources domain-var position))
+                      state)
+
+                    :hash-join
+                    (if-let [{:keys [domain-var target-attr source source-id]}
+                             (reusable-domain-sip-candidate
+                               database sources used step)]
+                      (let [domain-id (Object.)
+                            capture-step
+                            (assoc (:step source)
+                                   :sip-domain-id domain-id
+                                   :sip-domain-var domain-var)
+                            hash-step
+                            (assoc step
+                                   :sip-domain-id domain-id
+                                   :sip-domain-var domain-var
+                                   :sip-target-attr target-attr)]
+                        {:plan (-> plan
+                                   (assoc-in [(:plan-index source) :steps
+                                              (:step-index source)]
+                                             capture-step)
+                                   (assoc-in [plan-index :steps step-index]
+                                             hash-step))
+                         :sources sources
+                         :used (conj used source-id)})
+                      state)
+
+                    state))
+                {:plan plan-trace :sources {} :used #{}}
+                positions)
+              :plan)]
+      (if trace-vector? annotated (seq annotated)))))
+
 (defn- build-plan*
   [db sources rules nodes required-vars projected-vars]
   (let [cc              (connected-components nodes)
@@ -4735,7 +4949,7 @@
                     db sources rules nodes incoming-counts required-vars
                     component deferred))
                 components))]
-    {:plans (mapv :plan alternatives)
+    {:plans (mapv #(annotate-reusable-sip-domains db (:plan %)) alternatives)
      :deferred deferred
      :attribute-group-planning
      (not-empty (mapv :attribute-group-planning
@@ -4832,7 +5046,10 @@
                         (if (< 1 (count nodes))
                           (build-plan* db sources rules nodes required-vars
                                        projected-vars)
-                          {:plans [[(base-plan db nodes (ffirst nodes) true)]]
+                          {:plans [[(base-plan
+                                      db nodes (ffirst nodes) true true
+                                      (plan-materialized-vars
+                                        nodes required-vars))]]
                            :deferred #{}
                            :attribute-group-planning nil})]
                     (if (some #(some nil? %) plans)

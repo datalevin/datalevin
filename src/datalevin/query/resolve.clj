@@ -1505,44 +1505,55 @@
         (-resolve-clause context clause)))))
 
 (defn or-join-build
-  [sources rules ^List tuples clause bound-var bound-idx free-vars]
-  (when (pos? (.size tuples))
-    (let [bound-rel      (r/relation!
-                           {bound-var 0}
-                           (let [seen (HashSet.)
-                                 res  (FastList.)]
-                             (dotimes [i (.size tuples)]
-                               (let [v (aget ^objects (.get tuples i)
-                                             bound-idx)]
-                                 (when (.add seen v)
-                                   (.add res (object-array [v])))))
-                             res))
-          or-context     {:sources sources
-                          :rules   rules
-                          :rels    [bound-rel]}
-          result-context (binding [qu/*implicit-source* (get sources '$)]
-                           (resolve-clause or-context clause))
-          result-rels    (:rels result-context)]
-      (when (seq result-rels)
-        (let [or-result-rel       (if (< 1 (count result-rels))
-                                    (reduce j/hash-join result-rels)
-                                    (first result-rels))
-              or-attrs            (:attrs or-result-rel)
-              or-tuples           ^List (:tuples or-result-rel)
-              free-var            (first free-vars)
-              free-var-idx        (or-attrs free-var)
-              bound-var-idx-in-or (or-attrs bound-var)
-              or-by-bound
-              (let [m (HashMap.)]
-                (dotimes [i (.size or-tuples)]
-                  (let [^objects t (.get or-tuples i)
-                        bv         (aget t bound-var-idx-in-or)]
-                    (.putIfAbsent m bv (FastList.))
-                    (.add ^List (.get m bv) t)))
-                m)]
-          {:or-by-bound  or-by-bound
-           :free-var-idx free-var-idx
-           :tuple-len    (alength ^objects (.get tuples 0))})))))
+  ([sources rules ^List tuples clause bound-var bound-idx free-vars]
+   (or-join-build sources rules tuples clause bound-var bound-idx free-vars
+                  nil))
+  ([sources rules ^List tuples clause bound-var bound-idx free-vars
+    capture-domain]
+   (when (pos? (.size tuples))
+     (let [bound-rel      (r/relation!
+                            {bound-var 0}
+                            (let [seen (HashSet.)
+                                  res  (FastList.)]
+                              (dotimes [i (.size tuples)]
+                                (let [v (aget ^objects (.get tuples i)
+                                              bound-idx)]
+                                  (when (.add seen v)
+                                    (.add res (object-array [v])))))
+                              res))
+           or-context     {:sources sources
+                           :rules   rules
+                           :rels    [bound-rel]}
+           result-context (binding [qu/*implicit-source* (get sources '$)]
+                            (resolve-clause or-context clause))
+           result-rels    (:rels result-context)]
+       (when (seq result-rels)
+         (let [or-result-rel       (if (< 1 (count result-rels))
+                                     (reduce j/hash-join result-rels)
+                                     (first result-rels))
+               or-attrs            (:attrs or-result-rel)
+               or-tuples           ^List (:tuples or-result-rel)
+               free-var            (first free-vars)
+               free-var-idx        (or-attrs free-var)
+               bound-var-idx-in-or (or-attrs bound-var)
+               or-by-bound
+               (let [m (HashMap.)]
+                 (try
+                   (dotimes [i (.size or-tuples)]
+                     (let [^objects t (.get or-tuples i)
+                           bv         (aget t bound-var-idx-in-or)
+                           fv         (aget t free-var-idx)]
+                       (when capture-domain
+                         (capture-domain fv))
+                       (.putIfAbsent m bv (FastList.))
+                       (.add ^List (.get m bv) t)))
+                   (finally
+                     (when capture-domain
+                       (capture-domain))))
+                 m)]
+           {:or-by-bound   or-by-bound
+            :free-var-idx free-var-idx
+            :tuple-len    (alength ^objects (.get tuples 0))}))))))
 
 (defn or-join-build-cached
   "Reuse an or-join build for the same input list and immutable link shape."
@@ -1561,27 +1572,32 @@
         built))))
 
 (defn or-join-execute-link
-  [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr]
-  (if-let [{:keys [or-by-bound free-var-idx tuple-len]}
-           (or-join-build sources rules tuples clause bound-var bound-idx
-                          free-vars)]
-    (let [size   (.size tuples)
-          joined (FastList. size)]
-      (dotimes [i size]
-        (let [^objects in-tuple (.get tuples i)
-              bv                (aget in-tuple bound-idx)]
-          (when-let [^List or-matches (.get ^HashMap or-by-bound bv)]
-            (dotimes [j (.size or-matches)]
-              (let [^objects or-tuple (.get or-matches j)
-                    fv                (aget or-tuple free-var-idx)
-                    joined-tuple      (object-array (inc ^long tuple-len))]
-                (System/arraycopy in-tuple 0 joined-tuple 0 tuple-len)
-                (aset joined-tuple tuple-len fv)
-                (.add joined joined-tuple))))))
-      (if (zero? (.size joined))
-        (FastList.)
-        (db/-val-eq-scan-e-list db joined tuple-len tgt-attr)))
-    (FastList.)))
+  ([db sources rules ^List tuples clause bound-var bound-idx free-vars
+    tgt-attr]
+   (or-join-execute-link db sources rules tuples clause bound-var bound-idx
+                         free-vars tgt-attr nil))
+  ([db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr
+    capture-domain]
+   (if-let [{:keys [or-by-bound free-var-idx tuple-len]}
+            (or-join-build sources rules tuples clause bound-var bound-idx
+                           free-vars capture-domain)]
+     (let [size   (.size tuples)
+           joined (FastList. size)]
+       (dotimes [i size]
+         (let [^objects in-tuple (.get tuples i)
+               bv                (aget in-tuple bound-idx)]
+           (when-let [^List or-matches (.get ^HashMap or-by-bound bv)]
+             (dotimes [j (.size or-matches)]
+               (let [^objects or-tuple (.get or-matches j)
+                     fv                (aget or-tuple free-var-idx)
+                     joined-tuple      (object-array (inc ^long tuple-len))]
+                 (System/arraycopy in-tuple 0 joined-tuple 0 tuple-len)
+                 (aset joined-tuple tuple-len fv)
+                 (.add joined joined-tuple))))))
+       (if (zero? (.size joined))
+         (FastList.)
+         (db/-val-eq-scan-e-list db joined tuple-len tgt-attr)))
+     (FastList.))))
 
 (defn or-join-count-built
   "Count target tuples from an existing or-join build."
@@ -1627,13 +1643,17 @@
     (or-join-build sources rules tuples clause bound-var bound-idx free-vars)))
 
 (defn or-join-execute-link-into
-  [db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr
-   sink]
-  (when-let [{:keys [or-by-bound free-var-idx tuple-len]}
-             (or-join-build sources rules tuples clause bound-var bound-idx
-                            free-vars)]
-    (when-not (.isEmpty ^HashMap or-by-bound)
-      (let [pipe (p/or-join-tuple-pipe tuples bound-idx or-by-bound free-var-idx
-                                       tuple-len)]
-        (db/-val-eq-scan-e db pipe sink tuple-len tgt-attr))))
-  sink)
+  ([db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr
+    sink]
+   (or-join-execute-link-into db sources rules tuples clause bound-var
+                              bound-idx free-vars tgt-attr sink nil))
+  ([db sources rules ^List tuples clause bound-var bound-idx free-vars tgt-attr
+    sink capture-domain]
+   (when-let [{:keys [or-by-bound free-var-idx tuple-len]}
+              (or-join-build sources rules tuples clause bound-var bound-idx
+                             free-vars capture-domain)]
+     (when-not (.isEmpty ^HashMap or-by-bound)
+       (let [pipe (p/or-join-tuple-pipe tuples bound-idx or-by-bound
+                                        free-var-idx tuple-len)]
+         (db/-val-eq-scan-e db pipe sink tuple-len tgt-attr))))
+   sink))

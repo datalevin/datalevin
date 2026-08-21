@@ -1,5 +1,6 @@
 (ns datalevin.query-optimizer-test
   (:require
+   [clojure.string :as str]
    [clojure.test :refer [deftest is testing]]
    [clojure.walk :as walk]
    [datalevin.constants :as c]
@@ -66,6 +67,45 @@
     [?post :post/forum ?forum]
     [?forum :forum/id ?forum-id]
     [?forum :forum/title ?forum-title]])
+
+(def reusable-domain-sip-query
+  '[:find ?post
+    :where
+    [?start :start/id 1]
+    (or-join [?start ?person]
+      (and [?edge :edge/from ?start]
+           [?edge :edge/to ?person])
+      (and [?edge1 :edge/from ?start]
+           [?edge1 :edge/to ?mid]
+           [?edge2 :edge/from ?mid]
+           [?edge2 :edge/to ?person]))
+    [?membership :membership/person ?person]
+    [?membership :membership/forum ?forum]
+    [?post :post/person ?person]
+    [?post :post/forum ?forum]])
+
+(def linked-eav-gather-query
+  '[:find ?forum
+    :where
+    [?start :start/id 1]
+    [?membership :membership/person ?start]
+    [?membership :membership/forum ?forum]
+    [?membership :membership/date ?date]
+    [(> ?date 0)]])
+
+(def or-join-eav-gather-query
+  '[:find ?forum
+    :where
+    [?start :start/id 1]
+    (or-join [?start ?person]
+      (and [?edge :edge/from ?start]
+           [?edge :edge/to ?person])
+      (and [?edge1 :edge/from ?start]
+           [?edge1 :edge/to ?mid]
+           [?edge2 :edge/from ?mid]
+           [?edge2 :edge/to ?person]))
+    [?membership :membership/person ?person]
+    [?membership :membership/forum ?forum]])
 
 (def dominated-projection-root-query
   '[:find ?friend-id ?first-name ?last-name
@@ -1144,6 +1184,112 @@
             (testing "late cardinality-one filtering preserves query results"
               (is (= 20 (count result)))
               (is (contains? result [0 "forum-0" 200000]))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest reusable-or-join-domain-sip-test
+  (let [dir    (u/tmp-dir (str "reusable-domain-sip-" (UUID/randomUUID)))
+        schema {:start/id          {:db/valueType :db.type/long
+                                    :db/unique    :db.unique/identity}
+                :edge/from         {:db/valueType :db.type/ref}
+                :edge/to           {:db/valueType :db.type/ref}
+                :membership/person {:db/valueType :db.type/ref}
+                :membership/forum  {:db/valueType :db.type/ref}
+                :membership/date   {:db/valueType :db.type/long}
+                :post/person       {:db/valueType :db.type/ref}
+                :post/forum        {:db/valueType :db.type/ref}}
+        conn   (d/get-conn dir schema)]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1 :start/id 1}
+               {:db/id 9000
+                :membership/person 1
+                :membership/forum  900
+                :membership/date   1}
+               {:db/id 9001
+                :membership/person 1
+                :membership/forum  901}]
+              (concat
+                (map-indexed
+                  (fn [^long i person]
+                    {:db/id (+ 10000 i)
+                     :edge/from 1
+                     :edge/to person})
+                  (range 100 110))
+                (for [^long i (range 10), ^long j (range 20)]
+                  {:db/id (+ 100000 (* i 20) j)
+                   :membership/person (+ 100 i)
+                   :membership/forum (+ 2000 j)
+                   :membership/date 1})
+                (for [^long i (range 10), ^long j (range 20)]
+                  {:db/id (+ 200000 (* i 20) j)
+                   :post/person (+ 100 i)
+                   :post/forum (+ 2000 j)})
+                ;; These rows make the post relation much wider than the
+                ;; domain captured from the fused or-join.
+                (for [^long i (range 100), ^long j (range 20)]
+                  {:db/id (+ 300000 (* i 20) j)
+                   :post/person (+ 1000 i)
+                   :post/forum (+ 2000 j)}))))
+      (.clear ^datalevin.utl.LRUCache qo/*plan-cache*)
+      (binding [c/init-exec-size-threshold 5
+                c/hash-join-min-input-size 1
+                c/magic-cost-hash-join 0.1]
+        (let [db-value (db/-clear-tx-cache (d/db conn))]
+          (let [explain (d/explain {:run? true}
+                                   linked-eav-gather-query db-value)
+                steps   (filter string?
+                                (tree-seq coll? seq (:plan explain)))
+                scan    (some #(when (str/includes?
+                                       % ":membership/date") %)
+                              steps)]
+            (testing "linked EAV gathers reuse access-path proof"
+              (is (= #{[900]} (d/q linked-eav-gather-query db-value)))
+              (is (str/includes? scan ":membership/forum"))
+              (is (not (str/includes? scan ":membership/person"))))
+            (testing "local predicate values are not materialized"
+              (is (str/includes? scan "Merge [?forum]"))
+              (is (not (str/includes? scan "?date")))))
+          (let [explain (d/explain {} or-join-eav-gather-query db-value)
+                steps   (filter string?
+                                (tree-seq coll? seq (:plan explain)))
+                scan    (some #(when (str/includes?
+                                       % ":membership/forum") %)
+                              steps)]
+            (testing "or-join expansion also carries EAV provenance"
+              (is (= 20 (count (d/q or-join-eav-gather-query db-value))))
+              (is (str/includes? scan ":membership/forum"))
+              (is (not (str/includes? scan ":membership/person")))))
+          (let [explain (d/explain {:run? true}
+                                   reusable-domain-sip-query db-value)
+                sip     (first (:reusable-sip-domains explain))
+                result  (d/q reusable-domain-sip-query db-value)]
+            (testing "a fused or-join domain feeds a later multi-key hash join"
+              (is (= '?person (:var sip)))
+              (is (= '?forum (:primary-var sip)))
+              (is (not= (:var sip) (:primary-var sip)))
+              (is (#{:membership/person :post/person}
+                    (:target-attr sip))))
+            (testing "the runtime guard uses the small distinct domain"
+              (is (true? (:used? sip)))
+              (is (= '?person (:var sip)))
+              (is (= 10 (:domain-size sip))))
+            (testing "target filtering preserves the composite join result"
+              (is (= 200 (:actual-result-size explain)))
+              (is (= (into #{}
+                           (map (fn [^long i] (vector (+ 200000 i))))
+                           (range 200))
+                     result))))
+          (binding [c/sip-ratio-threshold 1000]
+            (let [explain (d/explain {:run? true}
+                                     reusable-domain-sip-query db-value)
+                  sip     (first (:reusable-sip-domains explain))]
+              (testing
+                "the runtime guard safely falls back for a costly domain"
+                (is (false? (:used? sip)))
+                (is (= 200 (:actual-result-size explain))))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

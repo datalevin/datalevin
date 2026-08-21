@@ -29,7 +29,8 @@
    [datalevin.util :as u])
   (:import
    [java.util AbstractCollection Collection Collections HashSet List]
-   [java.util.concurrent Callable ExecutorService Executors Future TimeUnit]
+   [java.util.concurrent Callable CompletableFuture ConcurrentHashMap
+    ExecutorService Executors Future TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -39,6 +40,8 @@
 (def ^:dynamic *intermediate-counts?* true)
 
 (def ^:dynamic *start-time* nil)
+
+(def ^:dynamic *sip-domains* nil)
 
 (defrecord Context [parsed-q rels sources rules opt-clauses late-clauses
                     optimizable-or-joins graph plan intermediates run?
@@ -69,6 +72,8 @@
   (-explain [step context] "explain the query step"))
 
 (declare cols->attrs execute-steps hash-join-execute hash-join-execute-into
+         normal-hash-join-execute-pipe reusable-sip-bitmap
+         reusable-sip-hash-join-execute reusable-sip-hash-join-execute-pipe
          sip-execute-pipe sip-hash-join-execute index-semi-join-execute
          index-semi-join-execute-into)
 
@@ -425,25 +430,48 @@
   (-explain [_ _]
     "Carry a linked entity without scanning properties."))
 
+(defn- sip-domain-future
+  ^CompletableFuture [domain-id]
+  (when (and domain-id *sip-domains*)
+    (let [domains ^ConcurrentHashMap *sip-domains*]
+      (or (.get domains domain-id)
+          (let [created (CompletableFuture.)]
+            (or (.putIfAbsent domains domain-id created) created))))))
+
+(defn- reusable-domain-capture
+  [domain-id]
+  (when-let [future (sip-domain-future domain-id)]
+    (let [bitmap (b/bitmap64)]
+      (fn
+        ([] (.complete ^CompletableFuture future bitmap))
+        ([v]
+         (when (integer? v)
+           (b/bitmap64-add bitmap (long v))))))))
+
+(defn- late-sip?
+  [link ^long in-size ^long tgt-size]
+  (and (identical? (:type link) :_ref)
+       (> tgt-size (* in-size (long c/sip-ratio-threshold)))))
+
 (defrecord HashJoinStep [link link-e in out in-cols cols strata seen-or-joins
                          tgt-steps in-size tgt-size]
 
   IStep
   (-type [_] :hash-join)
 
-  (-execute [_ db src]
-    (let [use-sip? (and (identical? (:type link) :_ref)
-                        (> (long tgt-size) (* (long in-size)
-                                              (long c/sip-ratio-threshold))))]
-      (if use-sip?
+  (-execute [this db src]
+    (if-let [bitmap (reusable-sip-bitmap this)]
+      (reusable-sip-hash-join-execute
+        db (:sip-target-attr this) in-cols tgt-steps src bitmap)
+      (if (late-sip? link (long in-size) (long tgt-size))
         (sip-hash-join-execute db link link-e in-cols tgt-steps src)
         (hash-join-execute db in-cols tgt-steps src))))
 
-  (-execute-pipe [_ db src sink]
-    (let [use-sip? (and (identical? (:type link) :_ref)
-                        (> (long tgt-size) (* (long in-size)
-                                              (long c/sip-ratio-threshold))))]
-      (if use-sip?
+  (-execute-pipe [this db src sink]
+    (if-let [bitmap (reusable-sip-bitmap this)]
+      (reusable-sip-hash-join-execute-pipe
+        db (:sip-target-attr this) in-cols tgt-steps src sink bitmap)
+      (if (late-sip? link (long in-size) (long tgt-size))
         (let [input (FastList.)]
           (when src
             (loop []
@@ -452,24 +480,18 @@
                 (recur))))
           (when (pos? (.size input))
             (sip-execute-pipe db link link-e in-cols tgt-steps input sink)))
-        (let [tgt-rel (execute-steps nil db tgt-steps)
-              input   (FastList.)]
-          (when src
-            (loop []
-              (when-let [tuple (p/produce src)]
-                (.add input tuple)
-                (recur))))
-          (hash-join-execute-into in-cols tgt-rel input sink)))))
+        (normal-hash-join-execute-pipe db in-cols tgt-steps src sink))))
 
-  (-explain [_ _]
-    (let [use-sip? (and (identical? (:type link) :_ref)
-                        (> (long tgt-size) (* (long in-size)
-                                              (long c/sip-ratio-threshold))))]
-      (str "Hash join to " (:tgt link) " by " (case (:type link)
-                                                :_ref   "reverse reference"
-                                                :val-eq "equal values"
-                                                "link")
-           (when use-sip? " with SIP") "."))))
+  (-explain [this _]
+    (str "Hash join to " (:tgt link) " by " (case (:type link)
+                                              :_ref   "reverse reference"
+                                              :val-eq "equal values"
+                                              "link")
+         (cond
+           (:sip-domain-id this) " with reusable-domain SIP"
+           (late-sip? link (long in-size) (long tgt-size)) " with SIP"
+           :else nil)
+         ".")))
 
 (defrecord SemiJoinStep [in out in-cols cols strata seen-or-joins join-steps]
 
@@ -497,23 +519,40 @@
   IStep
   (-type [_] :or-join)
 
-  (-execute [_ db tuples]
-    (qresolve/or-join-execute-link db sources rules tuples clause bound-var
-                                   bound-idx free-vars tgt-attr))
+  (-execute [this db tuples]
+    (if-let [capture (reusable-domain-capture (:sip-domain-id this))]
+      (try
+        (qresolve/or-join-execute-link
+          db sources rules tuples clause bound-var bound-idx free-vars
+          tgt-attr capture)
+        (finally
+          (capture)))
+      (qresolve/or-join-execute-link db sources rules tuples clause bound-var
+                                     bound-idx free-vars tgt-attr)))
 
-  (-execute-pipe [_ db src sink]
-    (let [input (FastList.)]
+  (-execute-pipe [this db src sink]
+    (let [input   (FastList.)
+          capture (reusable-domain-capture (:sip-domain-id this))]
       (when src
         (loop []
           (when-let [tuple (p/produce src)]
             (.add input tuple)
             (recur))))
-      (qresolve/or-join-execute-link-into db sources rules input clause
-                                          bound-var bound-idx free-vars
-                                          tgt-attr sink)))
+      (if capture
+        (try
+          (qresolve/or-join-execute-link-into
+            db sources rules input clause bound-var bound-idx free-vars
+            tgt-attr sink capture)
+          (finally
+            (capture)))
+        (qresolve/or-join-execute-link-into
+          db sources rules input clause bound-var bound-idx free-vars tgt-attr
+          sink))))
 
-  (-explain [_ _]
-    (str "Or-join from " bound-var " to " tgt " via " tgt-attr ".")))
+  (-explain [this _]
+    (str "Or-join from " bound-var " to " tgt " via " tgt-attr
+         (when (:sip-domain-id this) " while capturing a reusable domain")
+         ".")))
 
 (defrecord NotJoinStep [clause vars sources rules in out cols strata seen-or-joins]
 
@@ -610,6 +649,54 @@
      (let [in-rel (r/relation! (cols->attrs in-cols) tuples)]
        (j/hash-join-into in-rel tgt-rel sink)))))
 
+(defn normal-hash-join-execute-pipe
+  [db in-cols tgt-steps src sink]
+  (let [tgt-rel (execute-steps nil db tgt-steps)
+        input   (FastList.)]
+    (when src
+      (loop []
+        (when-let [tuple (p/produce src)]
+          (.add input tuple)
+          (recur))))
+    (hash-join-execute-into in-cols tgt-rel input sink)))
+
+(defn- sip-target-attr
+  [link]
+  (case (:type link)
+    :val-eq ((:attrs link) (:tgt link))
+    (:attr link)))
+
+(defn- sip-input-var
+  [link link-e]
+  (if (identical? (:type link) :val-eq)
+    (:var link)
+    link-e))
+
+(defn reusable-sip-bitmap
+  [step]
+  (when-let [future (sip-domain-future (:sip-domain-id step))]
+    (timeout/assert-time-left)
+    (let [bitmap      (.get ^CompletableFuture future)
+          cardinality (b/bitmap64-cardinality bitmap)
+          threshold   (double c/sip-ratio-threshold)
+          in-size     (double (long (:in-size step)))
+          tgt-size    (double (long (:tgt-size step)))
+          useful?     (and (pos? cardinality)
+                           (> in-size (* (double cardinality) threshold))
+                           (> tgt-size (* (double cardinality) threshold)))]
+      (timeout/assert-time-left)
+      (when *explain*
+        (locking *explain*
+          (vswap! *explain* update :reusable-sip-domains (fnil conj [])
+                  {:var (:sip-domain-var step)
+                   :primary-var (get-in step [:link :var])
+                   :target-attr (:sip-target-attr step)
+                   :domain-size cardinality
+                   :input-size (long (:in-size step))
+                   :target-size (long (:tgt-size step))
+                   :used? useful?})))
+      (when useful? bitmap))))
+
 (defn find-index
   [a-or-v cols]
   (when a-or-v
@@ -686,28 +773,33 @@
     (assoc merge-step :attrs-v new-attrs-v)))
 
 (defn- apply-sip-to-tgt-steps
-  "Apply SIP optimization to target steps for :_ref link type"
+  "Apply SIP optimization to the target step that scans the join attribute."
   [tgt-steps bm join-attr]
-  (let [init-step (first tgt-steps)
+  (let [tgt-steps (vec tgt-steps)
+        init-step (first tgt-steps)
         init-attr (:attr init-step)]
     (if (= init-attr join-attr)
-      (assoc (vec tgt-steps) 0
-             (modify-init-step-for-sip init-step bm))
-      (if (< 1 (count tgt-steps))
-        (let [merge-step (second tgt-steps)
-              attrs-v    (:attrs-v merge-step)]
-          (if (find-attr-in-attrs-v attrs-v join-attr)
-            (assoc (vec tgt-steps) 1
-                   (modify-merge-scan-step-for-sip merge-step bm join-attr))
-            tgt-steps))
+      (assoc tgt-steps 0 (modify-init-step-for-sip init-step bm))
+      (if-let [merge-index
+               (first
+                 (keep-indexed
+                   (fn [i step]
+                     (when (and (= :merge (-type step))
+                                (find-attr-in-attrs-v
+                                  (:attrs-v step) join-attr))
+                       i))
+                   tgt-steps))]
+        (assoc tgt-steps merge-index
+               (modify-merge-scan-step-for-sip
+                 (tgt-steps merge-index) bm join-attr))
         tgt-steps))))
 
 (defn sip-execute-pipe
   "Execute hash join with SIP (Sideways Information Passing) optimization.
    Called when SIP is determined to be beneficial."
   [db link link-e in-cols tgt-steps ^FastList input sink]
-  (let [join-attr   (:attr link)
-        col-idx     (find-index link-e in-cols)
+  (let [join-attr   (sip-target-attr link)
+        col-idx     (find-index (sip-input-var link link-e) in-cols)
         bm          (build-sip-bitmap input col-idx)
         cardinality (b/bitmap64-cardinality bm)]
     (when (pos? cardinality)
@@ -719,8 +811,8 @@
   "Execute hash join with SIP optimization (for -execute path)"
   [db link link-e in-cols tgt-steps input]
   (when (and input (pos? (.size ^List input)))
-    (let [join-attr   (:attr link)
-          col-idx     (find-index link-e in-cols)
+    (let [join-attr   (sip-target-attr link)
+          col-idx     (find-index (sip-input-var link link-e) in-cols)
           bm          (build-sip-bitmap input col-idx)
           cardinality (b/bitmap64-cardinality bm)]
       (if (pos? cardinality)
@@ -730,6 +822,34 @@
           (hash-join-execute-into in-cols tgt-rel input out)
           out)
         (FastList.)))))
+
+(defn reusable-sip-hash-join-execute
+  "Execute a hash join using a domain captured before input expansion."
+  [db target-attr in-cols tgt-steps input bitmap]
+  (if (and input (pos? (.size ^List input)))
+    (let [modified-tgt-steps
+          (apply-sip-to-tgt-steps tgt-steps bitmap target-attr)
+          tgt-rel (execute-steps nil db modified-tgt-steps)
+          out     (FastList. (.size ^List input))]
+      (hash-join-execute-into in-cols tgt-rel input out)
+      out)
+    (FastList.)))
+
+(defn reusable-sip-hash-join-execute-pipe
+  "Push a captured domain into the target scan before draining expanded input."
+  [db target-attr in-cols tgt-steps src sink bitmap]
+  (let [modified-tgt-steps
+        (apply-sip-to-tgt-steps tgt-steps bitmap target-attr)
+        ;; The or-join publishes its domain before beginning the expanded AVE
+        ;; scan. Starting the target here lets both storage scans overlap.
+        tgt-rel (execute-steps nil db modified-tgt-steps)
+        input   (FastList.)]
+    (when src
+      (loop []
+        (when-let [tuple (p/produce src)]
+          (.add input tuple)
+          (recur))))
+    (hash-join-execute-into in-cols tgt-rel input sink)))
 
 (defonce ^:private pipe-thread-pool-atom (atom nil))
 
@@ -894,18 +1014,19 @@
 (defn execute-steps
   "Execute all steps of a component's plan to obtain a relation."
   [context db steps]
-  (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
-        n     (count steps)
-        attrs (cols->attrs (:cols (peek steps)))]
-    (case n
-      1 (let [tuples (step-execute (first steps) db nil)]
-          (save-intermediates context steps nil tuples)
-          (r/relation! attrs tuples))
-      2 (let [src    (step-execute (first steps) db nil)
-              tuples (step-execute (peek steps) db src)]
-          (save-intermediates context steps (object-array [src]) tuples)
-          (r/relation! attrs tuples))
-      (pipelining context db attrs steps n))))
+  (binding [*sip-domains* (or *sip-domains* (ConcurrentHashMap.))]
+    (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
+          n     (count steps)
+          attrs (cols->attrs (:cols (peek steps)))]
+      (case n
+        1 (let [tuples (step-execute (first steps) db nil)]
+            (save-intermediates context steps nil tuples)
+            (r/relation! attrs tuples))
+        2 (let [src    (step-execute (first steps) db nil)
+                tuples (step-execute (peek steps) db src)]
+            (save-intermediates context steps (object-array [src]) tuples)
+            (r/relation! attrs tuples))
+        (pipelining context db attrs steps n)))))
 
 (defn count-steps
   "Execute a component plan and count its output without retaining the final

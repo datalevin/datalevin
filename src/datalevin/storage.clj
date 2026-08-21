@@ -692,10 +692,10 @@
 
 (defn- eav-scan-v-list-chunk
   [lmdb ^List in eid-idx attrs-v single? na nvs ^ints aids ^objects preds
-   ^objects fidxs ^booleans skips has-fidx? ^ints gstarts ^ints gcounts]
+   ^objects fidxs ^booleans skips cache-eids? ^ints gstarts ^ints gcounts]
   (let [nt       (.size in)
         out      (FastList. nt)
-        seen     (when-not has-fidx? (LongObjectHashMap. nt))
+        seen     (when cache-eids? (LongObjectHashMap. nt))
         preds    (qpred/fork-predicates preds)
         dbi-name c/eav]
     (scan/scan
@@ -1342,11 +1342,13 @@
             nvs       (count (remove :skip? maps))
             skips     (boolean-array (map :skip? maps))
             preds     (object-array (map :pred maps))
-            has-fidx? (boolean (some :fidx maps))
-            fidxs     (object-array (map :fidx maps))
-            aids      (int-array aids)
-            seen      (when-not has-fidx? (LongObjectHashMap.))
-            dbi-name  c/eav]
+            has-fidx?   (boolean (some :fidx maps))
+            cache-eids? (and (not has-fidx?)
+                             (not-any? #(false? (:cache-eids? %)) maps))
+            fidxs       (object-array (map :fidx maps))
+            aids        (int-array aids)
+            seen        (when cache-eids? (LongObjectHashMap.))
+            dbi-name    c/eav]
         (scan/scan
           (with-open [^AutoCloseable iter
                       (lmdb/val-iterator
@@ -1385,9 +1387,11 @@
             skips     (boolean-array (map :skip? maps))
             preds     (object-array (map :pred maps))
             parallel? (every? qpred/forkable-predicate? preds)
-            has-fidx? (boolean (some :fidx maps))
-            fidxs     (object-array (map :fidx maps))
-            aids      (int-array aids)
+            has-fidx?   (boolean (some :fidx maps))
+            cache-eids? (and (not has-fidx?)
+                             (not-any? #(false? (:cache-eids? %)) maps))
+            fidxs       (object-array (map :fidx maps))
+            aids        (int-array aids)
             presence-only?
             (and (== 1 na)
                  (zero? nvs)
@@ -1406,7 +1410,7 @@
                 (fn [chunk]
                   (eav-scan-v-list-chunk
                     lmdb chunk eid-idx attrs-v single? na nvs aids preds fidxs
-                    skips has-fidx? gstarts gcounts))]
+                    skips cache-eids? gstarts gcounts))]
             ;; Generated query predicates carry factories for independent
             ;; chunk-local instances. Opaque predicates stay serial.
             (if parallel?

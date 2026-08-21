@@ -62,6 +62,26 @@
                             [[:a {:pred pred :skip? false}]])))
           (is (= 2 @predicate-calls))))
 
+      (testing "a provenance-certified scan can bypass the entity cache"
+        (let [predicate-calls (atom 0)
+              pred            (fn [_]
+                                (swap! predicate-calls inc)
+                                true)]
+          (is (= [[:five 5 1]
+                  [:five-again 5 1]
+                  [:eight 8 7]
+                  [:eight-again 8 7]]
+                 (scan-list store
+                            [[:eight 8]
+                             [:five 5]
+                             [:eight-again 8]
+                             [:five-again 5]]
+                            1
+                            [[:a {:pred pred
+                                  :skip? false
+                                  :cache-eids? false}]])))
+          (is (= 4 @predicate-calls))))
+
       (testing "multi-valued scans reuse the product for every tuple in a group"
         (is (= #{[:five 5 "x" "x"]
                  [:five 5 "x" "y"]
