@@ -302,6 +302,26 @@ counts. Tuples whose opposite endpoint is not in the other bound set are
 discarded during the read, before a relation and its hash joins are
 materialized.
 
+### Bound-value expansion with presence filtering
+
+A bound-value pattern that produces a new entity can be fused with contiguous
+presence-only checks on that entity. For example, given bound `?person` rows,
+the sequence `[?post :message/hasCreator ?person]` followed by
+`[?post :message/isContainedIn _]` first performs the normal costed AVE
+expansion in an isolated relation. It applies the presence check to that compact
+producer and joins the surviving posts with the wider outer payload only once.
+This avoids carrying payload columns through rows that the presence check will
+discard.
+
+The specialization accepts one or more immediately following wildcard checks
+with the same entity and database source. Each check still uses the ordinary
+cost choice between indexed EAV presence probes and an attribute scan; the
+rewrite does not create an index or force a particular storage operation.
+Default and explicit sources, singleton and multi-value bindings, and duplicate
+outer rows preserve their normal semantics. An intervening clause, a different
+source or entity, a value-producing EAV pattern, or an already bound entity
+falls back to ordinary clause resolution.
+
 ### Costed late indexed-producer scheduling
 
 Some dependencies expressed by rules or disjunctions are deliberately left
@@ -376,11 +396,19 @@ source clause with a relation of candidate tuples, then executes the rest of the
 original query against that relation. Distinct result tuples are accumulated
 until the scan has passed the primary order value of the last tuple in the
 requested window. All candidates at the boundary value are evaluated before
-stopping, so secondary order terms are handled correctly. If 32 candidate
-batches are insufficient, execution falls back to the normal plan rather than
-allowing an unexpectedly unselective scan to run without a bound. `explain`
-also uses the normal path so its plan and intermediate statistics describe
-complete execution.
+stopping, so secondary order terms are handled correctly.
+
+The adaptive controller derives a maximum candidate budget from
+`:offset + :limit` and the sampled or estimated yield of the residual joins and
+filters, capped by the available access range. A retained planning-sample
+prefix counts toward that budget, and execution resumes from its opaque access
+frontier instead of reading the prefix again. If the budget is exhausted before
+the requested window is proven complete, execution uses the already planned
+conventional root. The older 32-batch limit remains only as a safety guard for
+an access path without an explicit candidate budget. `explain` reports the
+access and conventional alternatives, the candidate budget, and sample reuse;
+with `{:run? true}` it executes the conventional root so intermediate
+statistics describe complete execution.
 
 The query result cache stores the exact ordered `:offset`/`:limit` window. Its
 key includes the complete parsed query, including the ordering and window, so
@@ -435,6 +463,26 @@ The general access-method contract, property propagation rules, correlated
 access scheduling, and bounded alternative search are described in
 [Property-Aware Access Planning](access-planning.md).
 
+### Bounded access-path sampling
+
+Sampling an access alternative must not cost more than the plan choice could
+save. When the conventional root has a complete cost estimate, that cost is a
+shared planning-sample budget across all access alternatives. Before opening an
+access cursor, the optimizer projects the work of the reachable indexed joins
+from catalog counts. It rejects an over-budget alternative without reading its
+speculative tuples. During sampling, the same budget is checked before each
+materialized expansion; rejected work is reported as
+`:unavailable-reason :sample-work-budget` and under
+`:estimate :sampling-abort` in `explain`.
+
+A terminal EAV expansion sometimes needs no sample relation at all. If the
+entity and value are both projected, their pair proves distinct result rows,
+there are no later indexed joins, and the remaining residual predicates are
+safe to sample, Datalevin sums the actual sample's indexed fanouts instead of
+materializing the expanded values. Duplicate input sample rows retain their
+weight, and the count is capped by the remaining work budget. The corresponding
+join stage appears in `explain` with `:sampling :counted`.
+
 ### Merge scan
 
 For star-like attributes, we utilize an idea similar to pivot scan [2], which
@@ -463,6 +511,41 @@ loops. Their invariant key portion is encoded once per chunk, and repeated
 adjacent entity IDs, values, or value/entity pairs reuse the preceding probe
 result. These paths preserve every matching input tuple, including duplicate
 payload rows, while avoiding retrieval of values that the query does not need.
+
+### Provenance-aware EAV gathering
+
+An indexed expansion can already prove one of the facts that a following merge
+scan would otherwise read again. For example, after expanding memberships by a
+bound person through AVE, gathering the membership's other properties does not
+need to verify the person attribute a second time. Reverse-reference and
+value-equality link steps, as well as compatible fused `or-join` expansions,
+therefore attach provenance that identifies the produced entity column, the
+proven attribute, and the input value column.
+
+When the immediately following base scan is fused into that expansion, the
+planner removes the redundant EAV attribute only if all three parts of the
+proof match. An attribute with a residual predicate is never removed. The
+proof is deliberately local to the preceding operator, so it cannot survive an
+intervening operation that might change either column. If every attribute in a
+degenerate duplicate-pattern scan would be removed, one physical check is
+retained because a merge scan must still have an attribute to scan.
+
+The same physical rewrite avoids carrying values needed only by a local range
+or predicate. The planner first determines which variables must survive for
+the result, a downstream join or clause, an entity or link binding, or another
+occurrence of the variable. A value outside that set is still read and tested
+inside the fused EAV scan, but it is not appended to every output tuple. Base
+samples continue to materialize all logical values, and the cost model retains
+the original attributes and variable count. Consequently, this narrower
+runtime tuple does not perturb sampling, join enumeration, or existing plan
+selection.
+
+Removing a tuple-dependent equality check could otherwise enable the
+repeated-entity output cache. The planner explicitly keeps that cache disabled,
+preserving the previous no-cache execution mode. Duplicate entity IDs are
+safely rescanned rather than incorrectly reusing a result produced for a
+different input tuple. This optimization uses the existing AVE expansion and
+EAV cursor; it neither creates nor requires a composite index or schema change.
 
 ### Deferred EAV attribute groups
 
@@ -582,6 +665,33 @@ superset of its physical properties.
 For reverse reference type of hash join, we implement a form of sideway
 information passing (SIP) using a bitmap [15] to pre-filter target relation.
 
+##### Reusable-domain SIP
+
+The ordinary reverse-reference SIP bitmap is built from the hash join's full
+left input. That may be too late when an earlier `or-join` produced a small
+domain and an intervening AVE expansion multiplied it into a much larger
+relation. For a later value-equality hash join, the optimizer can connect that
+earlier domain directly to the target scan instead.
+
+The producer must be a fused `or-join` whose first free variable is a reference
+value used by the later hash-join input. The target must scan a reference
+attribute for the same value, and both hash-join inputs must clear the normal
+minimum-size guard. The `or-join` records the distinct integer domain in a
+bitmap before beginning its AVE expansion. This allows the target scan to start
+with the domain filter while the expanded input is still flowing through the
+pipeline.
+
+At runtime, SIP is used only when the actual domain is non-empty and is
+sufficiently smaller than both estimated hash-join inputs. A small domain
+on the target's initial scan becomes exact single-value index ranges; a larger
+one becomes a bounded range plus a bitmap predicate. If the target attribute is
+already part of a fused merge scan, the bitmap predicate is attached directly
+to that attribute. If the runtime guard fails, execution uses the normal hash
+join. One captured domain is assigned to at most one later consumer. `explain`
+identifies the annotated operators as `reusable-domain SIP` and reports the
+domain variable, primary join variable, target attribute, actual domain size,
+input sizes, and decision under `:reusable-sip-domains`.
+
 #### Indexed semi-join `:semi-join`
 
 When the target of an indexed join is used only to test existence, producing
@@ -656,6 +766,25 @@ negative body. The negative result is projected and deduplicated the same way
 before subtraction. This avoids carrying hidden tuple columns or repeated keys
 through the anti-join while preserving the original outer tuples in the final
 result.
+
+##### Reusable indexed prefix
+
+A correlated `not-join` may declare several join variables even though the
+first part of its body depends on only a much smaller anchor key. Resolving the
+whole negative body for every distinct full key then repeats the same indexed
+walk. Datalevin can decorrelate a contiguous prefix of at least two connected
+EAV patterns, evaluate it once per distinct anchor, and join the prefix result
+back to the complete outer keys before resolving the residual clauses.
+
+Eligibility is conservative. The prefix must start from a non-empty strict
+subset of the declared join variables, produce at least one other declared
+join variable, and leave a residual clause whose semantics still depend on the
+complete key. It requires the searchable implicit source and is disabled for
+incremental delta evaluation. The specialization runs only when there are at
+least 16 distinct full outer keys per distinct anchor key; otherwise ordinary
+`not-join` resolution is cheaper and remains the fallback. Both paths finally
+project and deduplicate the declared keys before subtracting them from the
+original outer relation.
 
 ### Directional join result size estimation (new)
 

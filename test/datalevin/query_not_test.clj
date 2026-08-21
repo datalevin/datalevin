@@ -15,6 +15,7 @@
    [datalevin.db :as db]
    [datalevin.join :as j]
    [datalevin.pipe :as p]
+   [datalevin.query :as dq]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
@@ -453,6 +454,120 @@
                         [?item :item/active _]]
                       database
                       [[:item/key "one"] [:item/key "two"]])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest bound-value-expansion-presence-fusion-test
+  (let [dir      (u/tmp-dir (str "ave-presence-fusion-" (UUID/randomUUID)))
+        conn     (d/get-conn dir {:post/creator {:db/valueType :db.type/ref}})
+        input    [[1 :first] [1 :second] [2 :third]]
+        query    '[:find ?payload ?post
+                   :in $ [[?person ?payload]]
+                   :where
+                   (or-join [?person ?payload ?post]
+                     (and [?post :post/creator ?person]
+                          [?post :post/container _]
+                          [?post :post/visible _]))]
+        explicit '[:find ?payload ?post
+                   :in $db [[?person ?payload]]
+                   :where
+                   (or-join [?person ?payload ?post]
+                     (and [$db ?post :post/creator ?person]
+                          [$db ?post :post/container _]
+                          [$db ?post :post/visible _]))]
+        expected #{[:first 100] [:second 100] [:third 103]}]
+    (try
+      (d/transact! conn [{:db/id 1 :person/id 1}
+                         {:db/id 2 :person/id 2}
+                         {:db/id 3 :person/id 3}
+                         {:db/id 100
+                          :post/creator 1
+                          :post/container 10
+                          :post/visible true}
+                         {:db/id 101
+                          :post/creator 1
+                          :post/container 10}
+                         {:db/id 102
+                          :post/creator 1
+                          :post/visible true}
+                         {:db/id 103
+                          :post/creator 2
+                          :post/container 20
+                          :post/visible false}
+                         {:db/id 104
+                          :post/creator 3
+                          :post/container 30
+                          :post/visible true}])
+      (let [database (d/db conn)
+            rel      (r/relation! {'?person 0 '?payload 1}
+                                  (tuples [1 :first]
+                                          [1 :second]
+                                          [2 :third]))
+            context  {:sources {'$      database
+                                '$db    database
+                                '$other [[100 :post/container 10]]}
+                      :rules   {}
+                      :rels    [rel]}
+            clauses  '[[?post :post/creator ?person]
+                       [?post :post/container _]
+                       [?post :post/visible _]]
+            explicit-clauses
+            '[[$db ?post :post/creator ?person]
+              [$db ?post :post/container _]
+              [$db ?post :post/visible _]]
+            result-set
+            (fn [context]
+              (let [rel   (reduce j/hash-join (:rels context))
+                    attrs (:attrs rel)]
+                (into #{}
+                      (map (fn [^objects tuple]
+                             [(aget tuple (attrs '?payload))
+                              (aget tuple (attrs '?post))]))
+                      (:tuples rel))))
+            fuse
+            (fn [context clauses]
+              (binding [qu/*implicit-source* database
+                        c/magic-cost-link-probe      0.0
+                        c/magic-cost-link-retrieval  0.0
+                        c/magic-cost-init-scan-e     100.0
+                        c/magic-cost-hash-join       0.0]
+                (qresolve/resolve-bound-value-presence-prefix
+                  context clauses 0)))]
+        (testing "the compact producer consumes all contiguous checks"
+          (let [{:keys [context idxs]} (fuse context clauses)]
+            (is (= [0 1 2] idxs))
+            (is (= expected (result-set context)))))
+        (testing "a singleton value binding is also eligible"
+          (let [singleton (assoc context :rels
+                                 [(r/relation! {'?person 0 '?payload 1}
+                                               (tuples [1 :only]))])
+                result    (fuse singleton clauses)]
+            (is (= [0 1 2] (:idxs result)))
+            (is (= #{[:only 100]} (result-set (:context result))))))
+        (testing "a value-producing EAV clause is not a presence check"
+          (is (nil? (fuse context
+                          (assoc clauses 1
+                                 '[?post :post/container ?container])))))
+        (testing "presence checks from another source are not fused"
+          (is (nil? (fuse context
+                          (assoc clauses 1
+                                 '[$other ?post :post/container _])))))
+        (testing "disabled and fused query execution agree"
+          (is (= expected
+                 (binding [dq/*cache?* false
+                           qresolve/*bound-value-presence-fusion?* false]
+                   (d/q query database input))))
+          (is (= expected
+                 (binding [dq/*cache?* false]
+                   (d/q query database input)))))
+        (testing "explicit database sources use the same fused prefix"
+          (let [{:keys [context idxs]} (fuse context explicit-clauses)]
+            (is (= [0 1 2] idxs))
+            (is (= expected (result-set context))))
+          (is (= expected
+                 (binding [dq/*cache?* false]
+                   (d/q explicit database input))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

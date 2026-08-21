@@ -56,6 +56,11 @@
   distinct anchor keys before joining the remaining correlation keys back in."
   true)
 
+(def ^:dynamic *bound-value-presence-fusion?*
+  "Whether a bound-value entity expansion may apply contiguous wildcard EAV
+  filters to its compact lookup relation before joining the outer payload."
+  true)
+
 (def ^:private ^:const ^long not-join-prefix-min-reuse 16)
 
 (defn server-safe-resolver?
@@ -1337,6 +1342,94 @@
          (or (empty? required-any)
              (some bound required-any)))))
 
+(defn- indexed-clause-pattern
+  [context clause]
+  (cond
+    (and (vector? clause) (= 3 (count clause)))
+    {:source  qu/*implicit-source*
+     :pattern clause}
+
+    (and (vector? clause)
+         (= 4 (count clause))
+         (qu/source? (first clause)))
+    {:source  (get (:sources context) (first clause))
+     :pattern (subvec clause 1)}))
+
+(defn- bound-value-expansion
+  [context clause]
+  (when-let [{:keys [source pattern] :as indexed}
+             (indexed-clause-pattern context clause)]
+    (let [[entity attr value] pattern
+          bound               (bound-vars context)
+          delta-bound         (:delta-bound-values context)]
+      (when (and (some? source)
+                 (db/-searchable? source)
+                 (keyword? attr)
+                 (qu/binding-var? entity)
+                 (not (qu/placeholder? entity))
+                 (qu/binding-var? value)
+                 (not (qu/placeholder? value))
+                 (not= entity value)
+                 (not (or (contains? bound entity)
+                          (contains? delta-bound entity)))
+                 (or (contains? bound value)
+                     (contains? delta-bound value)))
+        (assoc indexed :entity entity)))))
+
+(defn- entity-presence-clause
+  [context {:keys [source entity]} clause]
+  (when-let [{presence-source :source
+              [presence-entity attr value] :pattern
+              :as indexed}
+             (indexed-clause-pattern context clause)]
+    (when (and (identical? source presence-source)
+               (= entity presence-entity)
+               (keyword? attr)
+               (or (= value '_) (qu/placeholder? value)))
+      (assoc indexed :clause clause))))
+
+(defn- contiguous-entity-presence-clauses
+  [context expansion pending ^long producer-idx]
+  (loop [idx      (u/long-inc producer-idx)
+         presence []]
+    (if (< idx (count pending))
+      (if-let [clause (entity-presence-clause
+                        context expansion (nth pending idx))]
+        (recur (u/long-inc idx) (conj presence clause))
+        presence)
+      presence)))
+
+(defn resolve-bound-value-presence-prefix
+  "Resolve a bound-value entity lookup and its contiguous wildcard EAV
+  filters as one compact producer. Returns the new context and consumed clause
+  indices, or nil when the selected clause is not an eligible expansion."
+  [context pending ^long producer-idx]
+  (when (and *bound-value-presence-fusion?*
+             (not-any? r/rel-empty (:rels context)))
+    (let [context   (assoc context :rels-bound-cache (volatile! {}))
+          expansion (bound-value-expansion context
+                                           (nth pending producer-idx))
+          presence  (when expansion
+                      (contiguous-entity-presence-clauses
+                        context expansion pending producer-idx))]
+      (when (seq presence)
+        (let [{:keys [source pattern]} expansion
+              pattern      (resolve-pattern-lookup-refs source pattern)
+              producer-rel (lookup-pattern context source pattern)
+              isolated     (binding [qu/*implicit-source* source]
+                             (reduce resolve-clause
+                                     (assoc context :rels [producer-rel])
+                                     (map :clause presence)))
+              filtered-rel (reduce j/hash-join (:rels isolated))
+              context      (binding [qu/*lookup-attrs*
+                                     (dynamic-lookup-attrs source pattern)]
+                             (assoc context :rels
+                                    (collapse-rels (:rels context)
+                                                   filtered-rel)))
+              end-idx      (+ producer-idx (count presence))]
+          {:context context
+           :idxs    (vec (range producer-idx (u/long-inc end-idx)))})))))
+
 (defn- resolve-clauses
   "Resolve conjunction clauses in dependency order, retaining source order
   among clauses whose input bindings are already available."
@@ -1357,8 +1450,11 @@
                         (selector context pending ready))
              idx (if (some #{selected} ready) selected (first ready))]
          (if (some? idx)
-           (recur (resolve-clause context (nth pending idx))
-                  (u/vec-remove pending idx))
+           (if-let [{next-context :context consumed :idxs}
+                    (resolve-bound-value-presence-prefix context pending idx)]
+             (recur next-context (u/remove-idxs (set consumed) pending))
+             (recur (resolve-clause context (nth pending idx))
+                    (u/vec-remove pending idx)))
            ;; Preserve the resolver's detailed insufficient-binding error when
            ;; the conjunction has no clause capable of making progress.
            (reduce resolve-clause context pending)))))))

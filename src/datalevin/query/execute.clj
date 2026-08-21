@@ -1038,27 +1038,39 @@
       (let [clause           (first pending)
             choice           (cheaper-late-producer context pending)
             selected-idxs    (or (:idxs choice) [0])
-            selected-clauses (if (and choice
-                                      (not= :bound-pattern-first
-                                            (get-in choice
-                                                    [:decision :strategy])))
+            strategy         (get-in choice [:decision :strategy])
+            fusion           (when (and (= [0] selected-idxs)
+                                        (or (nil? strategy)
+                                            (= :bound-pattern-first strategy)))
+                               (qresolve/resolve-bound-value-presence-prefix
+                                 context pending 0))
+            consumed-idxs    (or (:idxs fusion) selected-idxs)
+            selected-clauses (cond
+                               fusion
+                               (mapv pending consumed-idxs)
+
+                               (and choice
+                                    (not= :bound-pattern-first strategy))
                                (get-in choice [:producer :selected-clauses])
-                               [clause])
-            strategy         (get-in choice [:decision :strategy])]
+
+                               :else
+                               [clause])]
         (when-let [decision (:decision choice)]
           (when qplan/*explain*
             (vswap! qplan/*explain* update :late-clause-decisions
                     (fnil conj []) decision)))
-        (recur (case strategy
-                 :indexed-union-first
-                 (isolated-union-context
-                   context (get-in choice [:producer :clause]))
+        (recur (if fusion
+                 (:context fusion)
+                 (case strategy
+                   :indexed-union-first
+                   (isolated-union-context
+                     context (get-in choice [:producer :clause]))
 
-                 :indexed-range-first
-                 (isolated-range-context context (:producer choice))
+                   :indexed-range-first
+                   (isolated-range-context context (:producer choice))
 
-                 (resolve-late-clause context clause))
-               (u/remove-idxs (set selected-idxs) pending)
+                   (resolve-late-clause context clause)))
+               (u/remove-idxs (set consumed-idxs) pending)
                (into executed selected-clauses))))))
 
 (defn- resolve-pre-top-k-late-clauses
