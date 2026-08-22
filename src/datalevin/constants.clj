@@ -896,11 +896,14 @@ must be capable of saving before the planner expands their placement states."}
   hash-join-min-input-size 20000)
 
 (def ^{:dynamic true
-       :doc     "Maximum number of single-value ranges for SIP optimization in hash join. When the input cardinality is at or below this threshold, entity IDs are converted to individual ranges instead of using a bitmap predicate."}
+       :doc     "Maximum size of a small runtime SIP domain. In a hash join,
+                 domains at or below this threshold become single-value ranges
+                 instead of a bitmap predicate."}
   sip-range-threshold 1000)
 
 (def ^{:dynamic true
-       :doc     "Ratio threshold for SIP optimization. SIP is applied when target size > input size * this ratio."}
+       :doc     "Ratio threshold for SIP optimization. SIP is applied when the
+                 consumer size is at least the domain size times this ratio."}
   sip-ratio-threshold 5)
 
 (def ^{:dynamic true

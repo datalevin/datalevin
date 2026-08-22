@@ -20,6 +20,7 @@
    [datalevin.join :as j]
    [datalevin.parser :as dp]
    [datalevin.pipe :as p]
+   [datalevin.query.predicate :as qpred]
    [datalevin.query.tuple :as qtuple]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
@@ -61,7 +62,13 @@
   filters to its compact lookup relation before joining the outer payload."
   true)
 
+(def ^:dynamic *singleton-domain-scan?*
+  "Whether two indexed patterns sharing a free value may use the small value
+  domain owned by a singleton entity to constrain the other pattern's scan."
+  true)
+
 (def ^:private ^:const ^long not-join-prefix-min-reuse 16)
+(def ^:private ^:const ^long singleton-domain-min-consumer-size 64)
 
 (defn server-safe-resolver?
   []
@@ -495,6 +502,40 @@
           value  value-originals]
     (.add acc (object-array [entity value])))
   acc)
+
+(defn- lookup-pattern-domain-filtered-entity
+  "Scan a set of bound entities once while applying an immutable value-domain
+  predicate in the EAV read. This avoids the exact per-entity fan-out probes
+  used to choose among the fully generic bounded-both alternatives."
+  [db pattern entity-values value-values]
+  (let [[_ attr _]  pattern
+        entity-pairs (vec (resolve-entity-pairs db entity-values))
+        value-pairs  (vec (resolve-value-pairs db attr value-values))
+        values       (pairs-by-resolved value-pairs)
+        acc          (FastList.)]
+    (if (<= merged-eav-lookup-threshold (count entity-pairs))
+      (let [input (FastList. (count entity-pairs))
+            pred  (qpred/shareable-predicate #(contains? values %))]
+        ;; Preserve each original entity binding beside the eid used by EAV.
+        ;; The scan appends the matched value, so the eid can be discarded.
+        (doseq [[entity eid] entity-pairs]
+          (.add input (object-array [entity eid])))
+        (when-let [^List matches
+                   (db/-eav-scan-v-list
+                     db input 1 [[attr {:skip? false :pred pred}]])]
+          (dotimes [i (.size matches)]
+            (let [^objects tuple (.get matches i)
+                  entity        (aget tuple 0)
+                  value         (aget tuple 2)]
+              (doseq [original (get values value)]
+                (.add acc (object-array [entity original])))))))
+      (doseq [[entity eid] entity-pairs]
+        (when-let [^List tuples (db/-search-tuples db [eid attr nil])]
+          (dotimes [i (.size tuples)]
+            (let [value (aget ^objects (.get tuples i) 0)]
+              (doseq [original (get values value)]
+                (.add acc (object-array [entity original]))))))))
+    acc))
 
 (defn- lookup-pattern-bounded-both
   "Intersect a pattern with bound sets on both entity and value while reading
@@ -1355,6 +1396,245 @@
     {:source  (get (:sources context) (first clause))
      :pattern (subvec clause 1)}))
 
+(defn singleton-domain-candidate-values
+  "Return value variables that occur in two indexed patterns with distinct
+  entity variables and the same source. This structural prepass lets ordinary
+  property-enrichment conjunctions bypass runtime-domain planning entirely."
+  [context clauses]
+  (let [groups
+        (reduce
+          (fn [groups clause]
+            (if-let [{:keys [source pattern]}
+                     (indexed-clause-pattern context clause)]
+              (let [[entity attr value] pattern]
+                (if (and (some? source)
+                         (db/-searchable? source)
+                         (keyword? attr)
+                         (qu/binding-var? entity)
+                         (not (qu/placeholder? entity))
+                         (qu/binding-var? value)
+                         (not (qu/placeholder? value))
+                         (not= entity value))
+                  (update groups [source value] (fnil conj #{}) entity)
+                  groups))
+              groups))
+          {}
+          clauses)]
+    (into #{}
+          (keep (fn [[[ _ value] entities]]
+                  (when (< 1 (count entities)) value)))
+          groups)))
+
+(defn singleton-domain-planning-input?
+  "Whether the current context is large enough for runtime-domain planning to
+  repay even its structural prepass. The exact distinct-size guard is applied
+  later once a compatible pattern pair has been found."
+  [context]
+  (some (fn [rel]
+          (let [^List tuples (:tuples rel)]
+            (and tuples
+                 (<= singleton-domain-min-consumer-size (.size tuples)))))
+        (:rels context)))
+
+(defn- singleton-domain-candidate-clause?
+  [context candidate-values clause]
+  (when (seq candidate-values)
+    (when-let [{[_ _ value] :pattern}
+               (indexed-clause-pattern context clause)]
+      (contains? candidate-values value))))
+
+(defn- relation-distinct-values
+  [rel sym]
+  (let [idx    (long ((:attrs rel) sym))
+        ^List tuples (:tuples rel)
+        values (HashSet.)]
+    (dotimes [i (.size tuples)]
+      (.add values (aget ^objects (.get tuples i) idx)))
+    values))
+
+(defn- bound-value-scan-pattern
+  [context idx clause]
+  (when-let [{:keys [source pattern] :as indexed}
+             (indexed-clause-pattern context clause)]
+    (let [[entity attr value] pattern
+          delta-bound         (:delta-bound-values context)
+          entity-rel          (when (qu/binding-var? entity)
+                                (rel-with-attr context entity))
+          value-rel           (when (qu/binding-var? value)
+                                (rel-with-attr context value))]
+      (when (and (some? source)
+                 (db/-searchable? source)
+                 (keyword? attr)
+                 (qu/binding-var? entity)
+                 (not (qu/placeholder? entity))
+                 (qu/binding-var? value)
+                 (not (qu/placeholder? value))
+                 (not= entity value)
+                 entity-rel
+                 (nil? value-rel)
+                 (not (contains? delta-bound value)))
+        (assoc indexed
+               :idx idx
+               :clause clause
+               :entity entity
+               :attr attr
+               :value value
+               :entity-rel entity-rel)))))
+
+(defn- relation-domain-shape
+  "Classify one relation column as singleton or multiple without building its
+  complete distinct-value set. Multiple columns normally stop after two rows."
+  [rel sym]
+  (let [idx          (long ((:attrs rel) sym))
+        ^List tuples (:tuples rel)
+        n            (.size tuples)]
+    (when (pos? n)
+      (let [value (aget ^objects (.get tuples 0) idx)]
+        (loop [i (long 1)]
+          (cond
+            (== i n) {:kind :singleton, :value value}
+            (= value (aget ^objects (.get tuples (int i)) idx))
+            (recur (u/long-inc i))
+            :else {:kind :multiple}))))))
+
+(defn- singleton-domain-count
+  [{:keys [source attr entity-values]}]
+  (when-let [[_ owner] (first (resolve-entity-pairs source entity-values))]
+    (long (db/-count source [owner attr nil]))))
+
+(defn- singleton-domain-pair
+  [left right]
+  (when (and (identical? (:source left) (:source right))
+             (= (:value left) (:value right))
+             (not= (:entity left) (:entity right)))
+    (let [left-shape  (relation-domain-shape (:entity-rel left)
+                                              (:entity left))
+          right-shape (relation-domain-shape (:entity-rel right)
+                                              (:entity right))
+          [domain consumer]
+          (cond
+            (and (= :singleton (:kind left-shape))
+                 (= :multiple (:kind right-shape)))
+            [left right]
+
+            (and (= :singleton (:kind right-shape))
+                 (= :multiple (:kind left-shape)))
+            [right left])
+          domain-shape   (if (identical? domain left)
+                           left-shape right-shape)
+          consumer-values
+          (when consumer
+            (relation-distinct-values (:entity-rel consumer)
+                                      (:entity consumer)))
+          domain-values
+          (when domain
+            (doto (HashSet.) (.add (:value domain-shape))))
+          domain          (when domain
+                            (assoc domain
+                                   :entity-values domain-values
+                                   :entity-count 1))
+          consumer        (when consumer
+                            (assoc consumer
+                                   :entity-values consumer-values
+                                   :entity-count
+                                   (.size ^HashSet consumer-values)))]
+      (when domain
+        (when-some [domain-count (singleton-domain-count domain)]
+          (let [domain-count   (long domain-count)
+                consumer-count (long (:entity-count consumer))]
+            (when (and (<= domain-count (long c/sip-range-threshold))
+                       (<= singleton-domain-min-consumer-size consumer-count)
+                       (or (zero? domain-count)
+                           (<= (* domain-count
+                                  (long c/sip-ratio-threshold))
+                               consumer-count))
+                       (<= consumer-count multi-lookup-safety-limit))
+              {:domain      domain
+               :consumer    consumer
+               :domain-cost domain-count})))))))
+
+(defn- singleton-domain-plan
+  [context pending ^long selected-idx]
+  (when-let [selected (bound-value-scan-pattern
+                        context selected-idx (nth pending selected-idx))]
+    (->> pending
+         (keep-indexed
+           (fn [idx clause]
+             (when (not= idx selected-idx)
+               (when-let [{candidate-source :source
+                           [candidate-entity _ candidate-value] :pattern}
+                          (indexed-clause-pattern context clause)]
+                 ;; Most bound property-enrichment clauses produce unrelated
+                 ;; values. Reject those before inspecting relation columns or
+                 ;; constructing a full candidate descriptor.
+                 (when (and (identical? (:source selected) candidate-source)
+                            (= (:value selected) candidate-value)
+                            (not= (:entity selected) candidate-entity))
+                   (when-let [candidate (bound-value-scan-pattern
+                                          context idx clause)]
+                     (singleton-domain-pair selected candidate)))))))
+         (sort-by :domain-cost)
+         first)))
+
+(defn- resolve-singleton-domain-plan
+  [context {:keys [domain consumer]}]
+  (let [{domain-source :source
+         domain-pattern :pattern
+         owner          :entity
+         value          :value
+         owner-rel      :entity-rel} domain
+        {consumer-source :source
+         consumer-pattern :pattern
+         entity            :entity
+         entity-values     :entity-values} consumer
+        owner-rel      (r/project-distinct owner-rel [owner])
+        domain-context (binding [qu/*implicit-source* domain-source]
+                         (resolve-clause (assoc context :rels [owner-rel])
+                                         domain-pattern))
+        domain-rel     (-> (reduce j/hash-join (:rels domain-context))
+                           (r/project-distinct [owner value]))
+        domain-values  (relation-distinct-values domain-rel value)
+        matched-rel    (r/relation!
+                         {entity 0, value 1}
+                         (if (zero? (.size ^HashSet domain-values))
+                           (FastList.)
+                           (lookup-pattern-domain-filtered-entity
+                             consumer-source consumer-pattern
+                             entity-values domain-values)))
+        lookup-attrs   (into (or qu/*lookup-attrs* #{})
+                             (concat
+                               (dynamic-lookup-attrs domain-source
+                                                     domain-pattern)
+                               (dynamic-lookup-attrs consumer-source
+                                                     consumer-pattern)))
+        pair-rel       (binding [qu/*lookup-attrs* lookup-attrs]
+                         (j/hash-join domain-rel matched-rel))
+        context        (binding [qu/*lookup-attrs* lookup-attrs]
+                         (assoc context
+                                :rels (collapse-rels (:rels context) pair-rel)
+                                :rels-bound-cache (volatile! {})))]
+    {:context      context
+     :idxs         (vec (sort [(:idx domain) (:idx consumer)]))
+     :domain-size  (.size ^HashSet domain-values)
+     :matched-size (.size ^List (:tuples matched-rel))}))
+
+(defn resolve-singleton-domain-scan
+  "Resolve two indexed patterns sharing a free value as a runtime-domain scan
+  when one pattern is owned by a singleton entity and produces a small domain.
+  The value remains in the result relation, so this is an exact join rewrite,
+  not existential join elimination. Returns the context and consumed indices."
+  ([context pending ^long selected-idx]
+   (resolve-singleton-domain-scan
+     context pending selected-idx
+     (singleton-domain-candidate-values context pending)))
+  ([context pending ^long selected-idx candidate-values]
+   (when (and *singleton-domain-scan?*
+              (not-any? r/rel-empty (:rels context))
+              (singleton-domain-candidate-clause?
+                context candidate-values (nth pending selected-idx)))
+     (when-let [plan (singleton-domain-plan context pending selected-idx)]
+       (resolve-singleton-domain-plan context plan)))))
+
 (defn- bound-value-expansion
   [context clause]
   (when-let [{:keys [source pattern] :as indexed}
@@ -1436,28 +1716,47 @@
   ([context clauses]
    (resolve-clauses context clauses nil))
   ([context clauses selector]
-   (loop [context context
-          pending (vec clauses)]
+   (loop [context          context
+          pending          (vec clauses)
+          candidate-values nil
+          candidates-ready? false]
      (if (empty? pending)
        context
-       (let [bound (bound-vars context)
-             ready (into []
-                         (keep-indexed
-                           (fn [i clause]
-                             (when (clause-bindings-ready? bound clause) i)))
-                         pending)
-             selected (when (and selector (seq ready))
-                        (selector context pending ready))
-             idx (if (some #{selected} ready) selected (first ready))]
-         (if (some? idx)
-           (if-let [{next-context :context consumed :idxs}
-                    (resolve-bound-value-presence-prefix context pending idx)]
-             (recur next-context (u/remove-idxs (set consumed) pending))
-             (recur (resolve-clause context (nth pending idx))
-                    (u/vec-remove pending idx)))
-           ;; Preserve the resolver's detailed insufficient-binding error when
-           ;; the conjunction has no clause capable of making progress.
-           (reduce resolve-clause context pending)))))))
+       (let [plan-candidates?
+             (and *singleton-domain-scan?*
+                  (not candidates-ready?)
+                  (< 1 (count pending))
+                  (singleton-domain-planning-input? context))
+             candidate-values
+             (if plan-candidates?
+               (singleton-domain-candidate-values context clauses)
+               candidate-values)
+             candidates-ready? (or candidates-ready? plan-candidates?)
+             bound (bound-vars context)
+               ready (into []
+                           (keep-indexed
+                             (fn [i clause]
+                               (when (clause-bindings-ready? bound clause) i)))
+                           pending)
+               selected (when (and selector (seq ready))
+                          (selector context pending ready))
+               idx (if (some #{selected} ready) selected (first ready))]
+           (if (some? idx)
+             (if-let [{next-context :context consumed :idxs}
+                      (or (resolve-bound-value-presence-prefix
+                            context pending idx)
+                          (when (seq candidate-values)
+                            (resolve-singleton-domain-scan
+                              context pending idx candidate-values)))]
+               (recur next-context
+                      (u/remove-idxs (set consumed) pending)
+                      candidate-values candidates-ready?)
+               (recur (resolve-clause context (nth pending idx))
+                      (u/vec-remove pending idx)
+                      candidate-values candidates-ready?))
+             ;; Preserve the resolver's detailed insufficient-binding error
+             ;; when the conjunction has no clause capable of making progress.
+             (reduce resolve-clause context pending)))))))
 
 (defn -resolve-clause
   ([context clause]

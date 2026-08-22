@@ -322,6 +322,40 @@ outer rows preserve their normal semantics. An intervening clause, a different
 source or entity, a value-producing EAV pattern, or an already bound entity
 falls back to ordinary clause resolution.
 
+### Singleton-owned runtime domains
+
+Two indexed patterns can share a value that is not yet logically bound while
+both of their entity variables are already bound. If exactly one entity has a
+single distinct value, its pattern can cheaply produce a semi-known runtime
+domain for the shared value. For example, given many bound `?post` values but
+one bound `?start`, these clauses need not materialize every tag on every post
+before discovering the start person's small interest set:
+
+```clojure
+[?post :message/hasTag ?tag]
+[?start :person/hasInterest ?tag]
+```
+
+Datalevin resolves the singleton-owned pattern in isolation and turns its
+distinct values into an immutable membership predicate on the other pattern's
+EAV scan. Large bound-entity inputs retain the storage layer's CPU-aware
+parallel chunk scan because the predicate is safe to share between workers;
+smaller inputs use point probes. Only matching entity/value pairs are
+materialized and joined with the wider outer payload.
+
+This is an exact join rewrite, not existential join elimination: the owner,
+consumer entity, and shared value remain in the compact result, so later uses
+of the shared value and duplicate outer payload rows preserve normal query
+semantics. The rewrite is independent of `or-join` and is available in both
+normal conjunction resolution and late-clause execution. It requires the same
+searchable source, keyword attributes, one singleton owner, and an actually
+small domain relative to a non-trivial consumer entity set. A structural
+prepass lets conjunctions without a compatible shared value bypass domain
+planning, while a minimum consumer-size guard avoids turning short property
+chains into optimization work. Multiple owners, an already bound shared value,
+incompatible sources, oversized domains, or insufficient runtime selectivity
+fall back to ordinary clause resolution.
+
 ### Costed late indexed-producer scheduling
 
 Some dependencies expressed by rules or disjunctions are deliberately left

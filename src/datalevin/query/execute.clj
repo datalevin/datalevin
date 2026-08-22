@@ -1030,48 +1030,65 @@
 
 (defn- resolve-late-clauses
   [context clauses]
-  (loop [context  context
-         pending  (vec clauses)
-         executed []]
+  (loop [context           context
+         pending           (vec clauses)
+         executed          []
+         candidate-values  nil
+         candidates-ready? false]
     (if (empty? pending)
       (assoc context :late-clauses executed)
-      (let [clause           (first pending)
-            choice           (cheaper-late-producer context pending)
-            selected-idxs    (or (:idxs choice) [0])
-            strategy         (get-in choice [:decision :strategy])
-            fusion           (when (and (= [0] selected-idxs)
-                                        (or (nil? strategy)
-                                            (= :bound-pattern-first strategy)))
-                               (qresolve/resolve-bound-value-presence-prefix
-                                 context pending 0))
-            consumed-idxs    (or (:idxs fusion) selected-idxs)
-            selected-clauses (cond
-                               fusion
-                               (mapv pending consumed-idxs)
+      (let [plan-candidates?
+            (and qresolve/*singleton-domain-scan?*
+                 (not candidates-ready?)
+                 (< 1 (count pending))
+                 (qresolve/singleton-domain-planning-input? context))
+            candidate-values
+            (if plan-candidates?
+              (qresolve/singleton-domain-candidate-values context clauses)
+              candidate-values)
+            candidates-ready? (or candidates-ready? plan-candidates?)
+            clause           (first pending)
+              choice           (cheaper-late-producer context pending)
+              selected-idxs    (or (:idxs choice) [0])
+              strategy         (get-in choice [:decision :strategy])
+              specialization   (when (and (= [0] selected-idxs)
+                                          (or (nil? strategy)
+                                              (= :bound-pattern-first strategy)))
+                                 (or
+                                   (qresolve/resolve-bound-value-presence-prefix
+                                     context pending 0)
+                                   (when (seq candidate-values)
+                                     (qresolve/resolve-singleton-domain-scan
+                                       context pending 0 candidate-values))))
+              consumed-idxs    (or (:idxs specialization) selected-idxs)
+              selected-clauses (cond
+                                 specialization
+                                 (mapv pending consumed-idxs)
 
-                               (and choice
-                                    (not= :bound-pattern-first strategy))
-                               (get-in choice [:producer :selected-clauses])
+                                 (and choice
+                                      (not= :bound-pattern-first strategy))
+                                 (get-in choice [:producer :selected-clauses])
 
-                               :else
-                               [clause])]
-        (when-let [decision (:decision choice)]
-          (when qplan/*explain*
-            (vswap! qplan/*explain* update :late-clause-decisions
-                    (fnil conj []) decision)))
-        (recur (if fusion
-                 (:context fusion)
-                 (case strategy
-                   :indexed-union-first
-                   (isolated-union-context
-                     context (get-in choice [:producer :clause]))
+                                 :else
+                                 [clause])]
+          (when-let [decision (:decision choice)]
+            (when qplan/*explain*
+              (vswap! qplan/*explain* update :late-clause-decisions
+                      (fnil conj []) decision)))
+          (recur (if specialization
+                   (:context specialization)
+                   (case strategy
+                     :indexed-union-first
+                     (isolated-union-context
+                       context (get-in choice [:producer :clause]))
 
-                   :indexed-range-first
-                   (isolated-range-context context (:producer choice))
+                     :indexed-range-first
+                     (isolated-range-context context (:producer choice))
 
-                   (resolve-late-clause context clause)))
-               (u/remove-idxs (set consumed-idxs) pending)
-               (into executed selected-clauses))))))
+                     (resolve-late-clause context clause)))
+                 (u/remove-idxs (set consumed-idxs) pending)
+                 (into executed selected-clauses)
+                 candidate-values candidates-ready?)))))
 
 (defn- resolve-pre-top-k-late-clauses
   [{:keys [late-clauses post-top-k-enrichment] :as context}]

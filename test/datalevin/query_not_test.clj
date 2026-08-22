@@ -572,6 +572,147 @@
         (d/close conn)
         (u/delete-files dir)))))
 
+(deftest singleton-domain-scan-test
+  (let [dir      (u/tmp-dir (str "singleton-domain-scan-"
+                                 (UUID/randomUUID)))
+        conn     (d/get-conn
+                   dir
+                   {:person/interest {:db/valueType   :db.type/ref
+                                      :db/cardinality :db.cardinality/many}
+                    :post/tag        {:db/valueType   :db.type/ref
+                                      :db/cardinality :db.cardinality/many}})
+        input    (into [[100 1 :first]
+                       [100 1 :second]
+                       [101 1 :third]
+                       [102 1 :fourth]]
+                      (map (fn [post] [post 1 post]))
+                      (range 103 170))
+        query    '[:find ?payload ?post ?tag
+                   :in $ [[?post ?start ?payload]]
+                   :where
+                   (or-join [?post ?start ?payload ?tag]
+                     (and [?post :post/tag ?tag]
+                          [?start :person/interest ?tag]))]
+        expected #{[:first 100 10]
+                   [:second 100 10]
+                   [:fourth 102 20]}]
+    (try
+      (d/transact!
+        conn
+        [{:db/id 1 :person/interest [10 20]}
+         {:db/id 2 :person/interest [20 30]}
+         {:db/id 10 :tag/name "ten"}
+         {:db/id 20 :tag/name "twenty"}
+         {:db/id 30 :tag/name "thirty"}
+         {:db/id 100 :post/tag 10}
+         {:db/id 101 :post/tag 30}
+         {:db/id 102 :post/tag [20 30]}])
+      (let [database (d/db conn)
+            rel      (r/relation! {'?post 0 '?start 1 '?payload 2}
+                                  (apply tuples input))
+            context  {:sources {'$      database
+                                '$db    database
+                                '$other [[100 :post/tag 10]]}
+                      :rules   {}
+                      :rels    [rel]}
+            clauses  '[[?post :post/tag ?tag]
+                       [?start :person/interest ?tag]]
+            explicit-clauses
+            '[[$db ?post :post/tag ?tag]
+              [$db ?start :person/interest ?tag]]
+            reversed (vec (reverse clauses))
+            result-set
+            (fn [context]
+              (let [rel   (reduce j/hash-join (:rels context))
+                    attrs (:attrs rel)]
+                (into #{}
+                      (map (fn [^objects tuple]
+                             [(aget tuple (attrs '?payload))
+                              (aget tuple (attrs '?post))
+                              (aget tuple (attrs '?tag))]))
+                      (:tuples rel))))
+            specialize
+            (fn [context clauses selected-idx]
+              (binding [qu/*implicit-source* database]
+                (qresolve/resolve-singleton-domain-scan
+                  context clauses selected-idx)))]
+        (testing "the singleton-owned domain constrains the other bound scan"
+          (let [{:keys [context idxs domain-size matched-size]}
+                (specialize context clauses 0)]
+            (is (= [0 1] idxs))
+            (is (= 2 domain-size))
+            (is (= 2 matched-size))
+            (is (= expected (result-set context)))))
+        (testing "the rewrite is independent of which pattern is selected"
+          (let [result (specialize context reversed 0)]
+            (is (= [0 1] (:idxs result)))
+            (is (= expected (result-set (:context result))))))
+        (testing "an explicit source uses the same runtime-domain scan"
+          (let [{:keys [context idxs]}
+                (specialize context explicit-clauses 0)]
+            (is (= [0 1] idxs))
+            (is (= expected (result-set context)))))
+        (testing "large entity inputs use the parallel-safe predicate path"
+          (let [large   (assoc context :rels
+                               [(r/relation!
+                                  {'?post 0 '?start 1 '?payload 2}
+                                  (apply tuples
+                                         (map (fn [post] [post 1 post])
+                                              (range 100 4101))))])
+                result  (specialize large clauses 0)]
+            (is (= 2 (:matched-size result)))
+            (is (= #{[100 100 10] [102 102 20]}
+                   (result-set (:context result))))))
+        (testing "an empty singleton-owned domain annihilates the conjunction"
+          (let [missing (assoc context :rels
+                               [(r/relation!
+                                  {'?post 0 '?start 1 '?payload 2}
+                                  (apply tuples
+                                         (map (fn [[post _ payload]]
+                                                [post 999 payload])
+                                              input)))])
+                result  (specialize missing clauses 0)]
+            (is (= 0 (:domain-size result)))
+            (is (empty? (result-set (:context result))))))
+        (testing "more than one owner is not a semi-known domain"
+          (let [multiple (assoc context :rels
+                                [(r/relation!
+                                   {'?post 0 '?start 1 '?payload 2}
+                                   (tuples [100 1 :first]
+                                           [102 2 :second]))])]
+            (is (nil? (specialize multiple clauses 0)))))
+        (testing "small consumers retain ordinary clause resolution"
+          (let [small (assoc context :rels
+                             [(r/relation!
+                                {'?post 0 '?start 1 '?payload 2}
+                                (apply tuples (take 10 input)))])]
+            (is (nil? (specialize small clauses 0)))))
+        (testing "the runtime size guard retains ordinary resolution"
+          (is (nil?
+                (binding [c/sip-range-threshold 1]
+                  (specialize context clauses 0))))
+          (is (nil?
+                (binding [c/sip-ratio-threshold 36]
+                  (specialize context clauses 0)))))
+        (testing "patterns from different sources are not combined"
+          (is (nil?
+                (specialize
+                  context
+                  '[[$db ?post :post/tag ?tag]
+                    [$other ?start :person/interest ?tag]]
+                  0))))
+        (testing "both execution paths preserve the visible shared value"
+          (is (= expected
+                 (binding [dq/*cache?* false
+                           qresolve/*singleton-domain-scan?* false]
+                   (d/q query database input))))
+          (is (= expected
+                 (binding [dq/*cache?* false]
+                   (d/q query database input))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
 (deftest project-distinct-test
   (let [rel (r/relation! {'?entity 0 '?group 1 '?kind 2}
                          (tuples [1 "g" :x]
