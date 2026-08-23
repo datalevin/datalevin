@@ -487,6 +487,9 @@
    :process-id (.pid (ProcessHandle/current))
    :jvm-instance-id jvm-instance-id
    :clojure (clojure-version)
+   :clojure-direct-linking
+   (Boolean/parseBoolean
+     (System/getProperty "clojure.compiler.direct-linking" "false"))
    :datalevin constants/version
    :java (System/getProperty "java.version")
    :vm (System/getProperty "java.vm.name")

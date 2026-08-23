@@ -161,6 +161,13 @@ else
 fi
 
 echo "Using neo4j-admin: $NEO4J_ADMIN"
+EXPECTED_NEO4J_VERSION="$(tr -d '[:space:]' < "${SCRIPT_DIR}/version.txt")"
+NEO4J_ADMIN_VERSION="$($NEO4J_ADMIN --version)"
+if [[ "$NEO4J_ADMIN_VERSION" != "$EXPECTED_NEO4J_VERSION" ]]; then
+  echo "ERROR: neo4j-admin is $NEO4J_ADMIN_VERSION, but the embedded runner requires $EXPECTED_NEO4J_VERSION." >&2
+  echo "Use a matching import tool, or update deps.edn and neo4j/version.txt together." >&2
+  exit 1
+fi
 
 # Stop this benchmark server if it is running.
 NEO4J_HOME="$NEO4J_HOME" NEO4J_DATA_DIR="$NEO4J_DATA_DIR" \
@@ -272,15 +279,16 @@ if [[ "$START_NEO4J" == "1" ]]; then
       "${NEO4J_HOME}/bin/cypher-shell" -a bolt://localhost:7687 \
         -u neo4j -p "$NEO4J_PASSWORD" -f "${SCRIPT_DIR}/schema.cypher"
       echo ""
-      echo "To run benchmark queries:"
-      echo "  ./run-queries.sh --password $NEO4J_PASSWORD"
+      echo "Stop the server before running the embedded benchmark:"
+      echo "  ./server.sh stop"
+      echo "  ./run-queries.sh"
       exit 0
     fi
     sleep 2
   done
   echo "WARNING: Neo4j may not be fully ready yet. Check with 'neo4j status'."
 else
-  echo "To start Neo4j and run queries:"
-  echo "  ./server.sh start"
-  echo "  ./run-queries.sh --password $NEO4J_PASSWORD"
+  echo "To apply the schema, start Neo4j and use neo4j/schema.cypher."
+  echo "Stop the server before running the embedded benchmark:"
+  echo "  ./run-queries.sh"
 fi

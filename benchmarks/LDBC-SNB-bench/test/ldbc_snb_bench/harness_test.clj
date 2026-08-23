@@ -15,6 +15,11 @@
    :origin {:kind :bundled-sf1-sample}
    :expected-count 1})
 
+(deftest host-info-records-direct-linking-test
+  (is (= (Boolean/parseBoolean
+           (System/getProperty "clojure.compiler.direct-linking" "false"))
+         (:clojure-direct-linking (harness/host-info)))))
+
 (deftest latency-summary-test
   (is (= {:count 4
           :min 1.0

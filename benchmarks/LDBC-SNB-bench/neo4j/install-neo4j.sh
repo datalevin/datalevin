@@ -5,8 +5,8 @@ usage() {
   cat <<'EOF'
 Usage: install-neo4j.sh [options]
 
-Installs or upgrades Neo4j and prepares the isolated benchmark configuration
-(macOS via Homebrew).
+Installs Neo4j when absent, verifies the embedded benchmark version, and
+prepares the isolated import configuration (macOS via Homebrew).
 
 Options:
   --password PASS    Initial Neo4j password (default: neo4jtest)
@@ -18,6 +18,7 @@ EOF
 }
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+EXPECTED_NEO4J_VERSION="$(tr -d '[:space:]' < "${SCRIPT_DIR}/version.txt")"
 NEO4J_PASSWORD="${NEO4J_PASSWORD:-neo4jtest}"
 HEAP_SIZE="8g"
 PAGECACHE_SIZE="4g"
@@ -66,13 +67,18 @@ fi
 
 echo "Installing Neo4j via Homebrew..."
 if brew list neo4j &>/dev/null; then
-  echo "Neo4j is already installed; upgrading to the latest stable formula..."
-  brew upgrade neo4j
+  echo "Neo4j is already installed."
 else
   brew install neo4j
 fi
 
-echo "Installed Neo4j version: $(neo4j --version)"
+INSTALLED_NEO4J_VERSION="$(neo4j --version)"
+echo "Installed Neo4j version: $INSTALLED_NEO4J_VERSION"
+if [[ "$INSTALLED_NEO4J_VERSION" != "$EXPECTED_NEO4J_VERSION" ]]; then
+  echo "ERROR: The embedded benchmark requires Neo4j $EXPECTED_NEO4J_VERSION." >&2
+  echo "Install that version, or update deps.edn and neo4j/version.txt together." >&2
+  exit 1
+fi
 
 NEO4J_HOME="$(brew --prefix neo4j)/libexec"
 

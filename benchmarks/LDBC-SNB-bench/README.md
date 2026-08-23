@@ -6,16 +6,16 @@ Interactive v1 in Datalevin and maintains a matching Cypher suite for Neo4j.
 Both runners use the same correctness-gated query-latency harness so
 optimization work and local cross-system comparisons share one measurement
 contract. The reported comparison follows the JOB benchmark method: execute
-one complete warmup pass, start a new client/JVM process, then execute and
+one complete warmup pass, start a new runner/JVM process, then execute and
 report one complete measurement pass. It does not repeatedly time each query
-and summarize warmed executions.
+and summarize warmed executions, as that would be measuring caching behavior.
 
 This is not an official LDBC result. The official driver defines a scheduled
 workload with update operations, dependent short reads, throughput/power
 metrics, and auditing rules. This harness measures the implemented read
-queries in either one embedded Datalevin process or one local Neo4j Community
-server; every EDN report records `:official-ldbc-result false` to make that
-distinction machine-readable.
+queries in separate embedded Datalevin and Neo4j Community processes; every
+EDN report records `:official-ldbc-result false` to make that distinction
+machine-readable.
 
 ## What is covered
 
@@ -87,9 +87,10 @@ clj -M:bench --db /tmp/ldbc-sf1 IS1
 
 ## Prepare Neo4j
 
-The setup script installs Neo4j when absent or upgrades the Homebrew formula
-to its latest stable version. It creates a benchmark-local configuration and
-does not edit Homebrew's global `neo4j.conf`:
+The setup script installs Neo4j when absent and verifies that the installed
+tools match the embedded artifact version pinned by this benchmark. It creates
+a benchmark-local configuration and does not edit Homebrew's global
+`neo4j.conf`:
 
 ```bash
 ./neo4j/install-neo4j.sh
@@ -97,7 +98,7 @@ does not edit Homebrew's global `neo4j.conf`:
 
 Import the same Spark Datagen CSV tree used by the Datalevin loader. `--wipe`
 removes only this benchmark's Neo4j database and import staging directory. With
-`--start`, the script starts the server, waits for Bolt, and applies
+`--start`, the script temporarily starts the server, waits for Bolt, and applies
 [`neo4j/schema.cypher`](neo4j/schema.cypher):
 
 ```bash
@@ -112,12 +113,14 @@ configuration; retaining that out-of-the-box behavior is part of the
 comparison rather than something the Neo4j setup attempts to reproduce with
 hand-selected indexes.
 
-The local server defaults to Neo4j Community, Cypher 25, an 8 GiB heap, a
-4 GiB page cache, Bolt on `localhost:7687`, and disabled HTTP connectors. Set
-`NEO4J_HEAP`, `NEO4J_PAGECACHE`, or the other variables listed by
-`./neo4j/server.sh --help` when the host requires a different allocation. The
-actual server version and memory settings are queried at run time and embedded
-in every Neo4j EDN report.
+The benchmark itself embeds Neo4j Community in the runner JVM through the
+`org.neo4j/neo4j` dependency. The embedded artifact and the `neo4j-admin`
+version used for import must match; the expected version is recorded in
+[`neo4j/version.txt`](neo4j/version.txt) and checked by the setup, import, and
+test paths. The runner defaults to Cypher 25 and a 4 GiB Neo4j page cache. Set
+`NEO4J_PAGECACHE` or pass `--page-cache` when the host requires a different
+allocation. Every report records the actual embedded artifact version, access
+mode, page-cache size, and live schema inventory.
 
 ## Run the benchmark
 
@@ -130,7 +133,7 @@ clj -M:bench
 ```
 
 For a result comparable to the JOB numbers, invoke the command twice. These
-are two independent client/JVM processes; the first report is the warmup pass
+are two independent runner/JVM processes; the first report is the warmup pass
 and only the second report supplies latency numbers:
 
 ```bash
@@ -147,12 +150,11 @@ clj -M:bench \
   --results /tmp/ldbc-datalevin-results.csv
 ```
 
-The Neo4j runner accepts the same harness options and query names. Keep the
-server alive, but use separate runner invocations for the two client passes:
+The Neo4j runner accepts the same harness options and query names. Each command
+opens the database directly in its runner JVM and closes it afterward, so the
+standalone server must remain stopped:
 
 ```bash
-./neo4j/server.sh start
-
 ./neo4j/run-queries.sh \
   --run-role warmup \
   --output /tmp/ldbc-neo4j-warmup.edn \
@@ -164,12 +166,11 @@ server alive, but use separate runner invocations for the two client passes:
   --output /tmp/ldbc-neo4j.edn \
   --perf /tmp/ldbc-neo4j-perf.csv \
   --results /tmp/ldbc-neo4j-results.csv
-
-./neo4j/server.sh stop
 ```
 
-Neo4j connection options are `--address`, `--user`, `--password`, `--database`,
-and `--cypher`. The defaults target the local setup above.
+Embedded Neo4j options are `--database`, `--home`, `--page-cache`, and
+`--cypher`. `--db` selects the Neo4j data directory, just as it selects the
+Datalevin database for that runner.
 
 `--warmup` and multiple `--iterations` remain available for diagnostics inside
 one process, but those settings measure progressively warmed process state and
@@ -242,8 +243,8 @@ default does not add an extra untimed query execution.
 The published JOB-style procedure is deliberately outside a single harness
 process:
 
-1. a client/JVM process executes one complete pass labeled `warmup`, then exits;
-2. a new client/JVM process executes one complete pass labeled `measurement`;
+1. a runner/JVM process executes one complete pass labeled `warmup`, then exits;
+2. a new runner/JVM process executes one complete pass labeled `measurement`;
 3. only the second pass supplies the reported query times;
 4. the comparator checks distinct JVM-instance IDs, matching configuration and
    parameter schedules, and exact result digests from both processes.
@@ -254,10 +255,10 @@ filesystem pages into the storage cache.
 
 The timer starts immediately before query execution and stops after
 query-specific post-processing and full result realization. For Datalevin this
-is the embedded query call. For Neo4j it spans `Session.run`, Bolt transfer,
-record conversion, and full `.list` realization. Database or driver/session
-open, parameter conversion, cache clearing, console output, and artifact
-writing are excluded.
+is the embedded query call. For Neo4j it spans the embedded transaction, Cypher
+execution, result iteration and conversion, and transaction completion.
+Database open, parameter conversion, cache clearing, console output, and
+artifact writing are excluded for both systems.
 
 Datalevin's query-result cache is disabled. Before each measured query, the
 runner clears Datalevin's parsed-query and plan caches outside the timer; parse,
@@ -267,22 +268,29 @@ call also parses and plans instead of reusing a cached logical plan. This
 benchmark is therefore aimed at query processing, not query-plan or final-result
 cache lookup.
 
-Storage caching is intentionally retained. Datalevin reopens the same LMDB
-database in the second process, allowing operating-system pages to remain warm.
-Neo4j keeps its server and page cache alive while only the Bolt client/JVM is
-restarted. That gives the server system an unavoidable lifecycle advantage,
-but matches the JOB convention and avoids restarting a database server merely
-because the embedded system starts a new client process.
+The Neo4j runner reads its live schema through the embedded schema API rather
+than issuing an untimed metadata query. It therefore does not compile Cypher
+before IC1; any lazy query-compiler initialization in the fresh measurement JVM
+is included in that first timed query.
+
+Both benchmark runner aliases enable Clojure direct linking, matching the main
+Datalevin build. The setting is recorded in the host manifest and the comparator
+rejects reports produced with different compiler modes.
+
+Storage caching is intentionally retained. Both measurement processes reopen
+their database after the independent warmup process exits, allowing operating-
+system pages to remain warm. Neo4j's in-process page cache and both JVMs' JIT
+state do not survive the process boundary. Database initialization remains
+outside the query timer for both systems.
 
 `--query-cache` explicitly measures Datalevin's cached application path and is
 recorded in the report. Neo4j rejects that option because it has no equivalent
 application result-cache mode; do not use it in a cross-system comparison.
 
-The default is a warm-cache, single-client latency workload. It is not a
-cold-page-cache test, a concurrent throughput test, or the official operation
-schedule. A Datalevin-versus-Neo4j comparison also necessarily compares an
-embedded call with local Bolt; Neo4j's loopback transport and result decoding
-are intentionally included in its end-to-end query latency.
+The default is a warm-filesystem-cache, single-client latency workload. It is
+not a cold-page-cache test, a concurrent throughput test, or the official
+operation schedule. Both database engines and query APIs run embedded, without
+network transport.
 
 ## Correctness and failures
 
@@ -323,8 +331,8 @@ Datalevin defaults:
 | `results/results.csv` | result rows used for correctness checks, in report schedule order |
 
 Neo4j writes the same three artifact types below `neo4j/results/` by default.
-Its EDN report also records the schema-file hash and the exact live index
-inventory returned by the server. The independent-pass validator requires that
+Its EDN report also records the embedded artifact version, schema-file hash,
+and exact live index inventory. The independent-pass validator requires that
 inventory to match between warmup and measurement.
 
 Override them with `--output`, `--perf`, and `--results`. The EDN report is the
@@ -370,12 +378,12 @@ See every option with `clj -M:bench --help`.
 
 ## Current local Datalevin/Neo4j comparison
 
-The following same-harness snapshot was captured sequentially on 2026-08-17
+The following same-harness snapshot was captured sequentially on 2026-08-23
 PDT. For each system, the warmup and measurement passes were separate
-client/JVM processes. Neo4j's server stayed alive between its two client passes;
-Datalevin reopened the same LMDB database. Only the single execution of each
-query in the second process is reported. This is not an official LDBC result or
-a portable cross-machine baseline.
+runner/JVM processes, and each process opened the database through its embedded
+API. No server, network transport, or driver round trip was involved. Only the
+single execution of each query in the second process is reported. This is not
+an official LDBC result or a portable cross-machine baseline.
 
 - SF1, using the same raw Spark Datagen dataset and one bundled validated
   parameter for each query
@@ -385,9 +393,10 @@ a portable cross-machine baseline.
   result verification enabled
 - identical parameter schedule SHA-256:
   `4d65cafce1512af2db43b6cd28b50fcf5de67a1e3bce88f4d9bb74f46c509d2d`
-- Datalevin 1.0.2; Neo4j Community 2026.06.0 with Java driver 6.2.0,
-  Cypher 25, an 8 GiB heap, and a 4 GiB page cache
-- Clojure 1.12.4 and OpenJDK 21.0.11 with a 9 GiB client maximum heap
+- Datalevin 1.0.2; Neo4j Community Embedded 2026.06.0 with Cypher 25 and a
+  4 GiB page cache
+- Clojure 1.12.5 and OpenJDK 21.0.11 with a 9 GiB runner maximum heap
+- Clojure direct linking enabled for both benchmark runners
 - Apple M3 Pro (12 cores, 36 GB), macOS 26.5.1, AArch64
 - Neo4j import: 3,650,498 nodes and 20,630,969 relationships
 - Neo4j schema: eight ID uniqueness constraints and its two automatic token
@@ -395,9 +404,9 @@ a portable cross-machine baseline.
   `ed0bb7c9957fd88cf72d0bd18413a424371e122d2f25bc9e6351d020d57db9e5`
 - Datalevin measurement database manifest: 4,247,601,157 bytes, metadata
   SHA-256
-  `5676d5deb3150f7f98fdf147a387509ab30e980dd4615d94bb6abd56433e8698`
-- Neo4j measurement database manifest: 1,911,189,908 bytes, metadata SHA-256
-  `639fda714cbc4a7912d6965d85963910fa55a45e4b20bfb9cade180ce25e73fc`
+  `56d0541dcf7b85cc86b671feaae8053aad3f6ddf202179d6c84885623715f5db`
+- Neo4j measurement database manifest: 1,911,201,183 bytes, metadata SHA-256
+  `c6355f5c3bc56c3cc1ef8f38c60d954893f4e495237a08b34fae3b5e9924cfcc`
 
 All 21 queries passed their SF1 result-count oracle. The independent-process
 validator matched all 21 exact result digests from warmup to measurement for
@@ -413,66 +422,63 @@ Neo4j (`actual = 2 * half-weight`).
 A value below 1 means Neo4j was lower in this pass; a value above 1 means
 Datalevin was lower. These are observations, not latency-distribution estimates.
 
-| Query | Datalevin measured (ms) | Neo4j Community measured (ms) | Neo4j Community / Datalevin | Lower time |
+| Query | Datalevin measured (ms) | Neo4j Community Embedded measured (ms) | Neo4j Community Embedded / Datalevin | Lower time |
 |---|---:|---:|---:|---|
-| IC1 | 587.998 | 92.818 | 0.158x | Neo4j Community 6.335x |
-| IC2 | 661.245 | 57.989 | 0.088x | Neo4j Community 11.403x |
-| IC3 | 690.553 | 837.922 | 1.213x | Datalevin 1.213x |
-| IC4 | 228.961 | 772.807 | 3.375x | Datalevin 3.375x |
-| IC5 | 3,615.858 | 1,486.024 | 0.411x | Neo4j Community 2.433x |
-| IC6 | 15.759 | 436.938 | 27.726x | Datalevin 27.726x |
-| IC7 | 93.481 | 60.536 | 0.648x | Neo4j Community 1.544x |
-| IC8 | 29.980 | 34.768 | 1.160x | Datalevin 1.160x |
-| IC9 | 131.047 | 981.807 | 7.492x | Datalevin 7.492x |
-| IC10 | 1,115.216 | 108.751 | 0.098x | Neo4j Community 10.255x |
-| IC11 | 92.727 | 44.669 | 0.482x | Neo4j Community 2.076x |
-| IC12 | 264.865 | 86.693 | 0.327x | Neo4j Community 3.055x |
-| IC13 | 1,168.985 | 20.358 | 0.017x | Neo4j Community 57.422x |
-| IC14 | 832.416 | 18,308.867 | 21.995x | Datalevin 21.995x |
-| IS1 | 7.962 | 18.641 | 2.341x | Datalevin 2.341x |
-| IS2 | 60.042 | 45.491 | 0.758x | Neo4j Community 1.320x |
-| IS3 | 21.813 | 17.579 | 0.806x | Neo4j Community 1.241x |
-| IS4 | 4.909 | 18.443 | 3.757x | Datalevin 3.757x |
-| IS5 | 20.841 | 21.425 | 1.028x | Datalevin 1.028x |
-| IS6 | 4.281 | 35.627 | 8.323x | Datalevin 8.323x |
-| IS7 | 23.396 | 34.257 | 1.464x | Datalevin 1.464x |
+| IC1 | 230.210 | 1,655.097 | 7.190x | Datalevin 7.190x |
+| IC2 | 134.797 | 283.436 | 2.103x | Datalevin 2.103x |
+| IC3 | 501.752 | 1,413.357 | 2.817x | Datalevin 2.817x |
+| IC4 | 129.552 | 911.362 | 7.035x | Datalevin 7.035x |
+| IC5 | 1,572.195 | 1,783.555 | 1.134x | Datalevin 1.134x |
+| IC6 | 2.567 | 479.204 | 186.682x | Datalevin 186.682x |
+| IC7 | 41.720 | 146.672 | 3.516x | Datalevin 3.516x |
+| IC8 | 25.345 | 74.907 | 2.956x | Datalevin 2.956x |
+| IC9 | 116.791 | 1,113.116 | 9.531x | Datalevin 9.531x |
+| IC10 | 224.493 | 193.530 | 0.862x | Neo4j Community Embedded 1.160x |
+| IC11 | 60.759 | 75.418 | 1.241x | Datalevin 1.241x |
+| IC12 | 112.504 | 171.706 | 1.526x | Datalevin 1.526x |
+| IC13 | 26.513 | 46.701 | 1.761x | Datalevin 1.761x |
+| IC14 | 635.653 | 18,807.205 | 29.587x | Datalevin 29.587x |
+| IS1 | 2.928 | 21.141 | 7.221x | Datalevin 7.221x |
+| IS2 | 49.338 | 65.003 | 1.317x | Datalevin 1.317x |
+| IS3 | 5.727 | 19.710 | 3.442x | Datalevin 3.442x |
+| IS4 | 1.549 | 23.608 | 15.237x | Datalevin 15.237x |
+| IS5 | 1.140 | 27.784 | 24.374x | Datalevin 24.374x |
+| IS6 | 2.600 | 47.595 | 18.304x | Datalevin 18.304x |
+| IS7 | 11.564 | 45.600 | 3.943x | Datalevin 3.943x |
 
-| Query set | Datalevin sum of measured times (ms) | Neo4j Community sum of measured times (ms) | Neo4j Community / Datalevin sum | Geomean per-query ratio |
+| Query set | Datalevin sum of measured times (ms) | Neo4j Community Embedded sum of measured times (ms) | Neo4j Community Embedded / Datalevin sum | Geomean per-query ratio |
 |---|---:|---:|---:|---:|
-| All | 9,672.335 | 23,522.408 | 2.432x | 1.018x |
-| IC1-IC14 | 9,529.090 | 23,330.945 | 2.448x | 0.760x |
-| IS1-IS7 | 143.244 | 191.462 | 1.337x | 1.824x |
+| All | 3,889.698 | 27,405.707 | 7.046x | 4.996x |
+| IC1-IC14 | 3,814.851 | 27,155.265 | 7.118x | 4.202x |
+| IS1-IS7 | 74.847 | 250.442 | 3.346x | 7.064x |
 
-The workload remains mixed: Datalevin was lower on 11 query types and Neo4j on
-10. The summed all-query time was 2.432x higher for Neo4j, largely because of
-IC14; the equal-query geometric mean was nearly even at 1.018x. Within the complex
-reads, the geometric mean favored Neo4j even though IC14 made its sum larger.
-Both short-read aggregates favored Datalevin in this pass. None of these
-aggregates is an official throughput metric.
+Datalevin was lower on 20 query types and Neo4j Community Embedded on one. The
+summed all-query time was 7.046x higher for Neo4j, largely because of IC14; the
+equal-query geometric mean favored Datalevin by 4.996x. Within the complex
+reads, the sum and geometric mean favored Datalevin by 7.118x and 4.202x,
+respectively. All seven short reads were lower for Datalevin; their sum and
+geometric mean favored it by 3.346x and 7.064x. None of these aggregates is an
+official throughput metric.
 
 IC6 illustrates the indexing-policy difference directly: its tag-name input is
 an automatic AVE lookup in Datalevin, while the untuned Neo4j schema must find
-the matching tag without a user-created `Tag.name` index. The tracked January
-Neo4j CSV is also not comparable to this table: its legacy runner launched and
-wall-clocked a separate `cypher-shell` JVM for every query, adding roughly a
-one-second client/tool floor that the query-processing timer intentionally
-excludes here.
+the matching tag without a user-created `Tag.name` index.
 
 The four raw pass reports and generated comparison for this snapshot are:
 
 ```text
-/private/tmp/ldbc-onepass-datalevin-warmup-20260817.edn
-/private/tmp/ldbc-onepass-datalevin-20260817.edn
-/private/tmp/ldbc-onepass-neo4j-warmup-20260817.edn
-/private/tmp/ldbc-onepass-neo4j-20260817.edn
-/private/tmp/ldbc-onepass-comparison-20260817.edn
-/private/tmp/ldbc-onepass-comparison-20260817.csv
+/private/tmp/ldbc-embedded-datalevin-warmup-20260823.edn
+/private/tmp/ldbc-embedded-datalevin-20260823.edn
+/private/tmp/ldbc-embedded-neo4j-warmup-20260823.edn
+/private/tmp/ldbc-embedded-neo4j-20260823.edn
+/private/tmp/ldbc-embedded-comparison-20260823.edn
+/private/tmp/ldbc-embedded-comparison-20260823.csv
 ```
 
 Rerun both independent-process pairs and retain all four EDN reports before
 using a timing change for another optimization decision. With one measured
-observation per query, extreme crossovers such as IC13 and IC14 are profiling
-leads, not general claims about either engine.
+observation per query, large per-query ratios are profiling leads, not general
+claims about either engine.
 
 ## References
 
@@ -482,4 +488,4 @@ leads, not general claims about either engine.
 4. [LDBC SNB Spark Datagen](https://github.com/ldbc/ldbc_snb_datagen_spark)
 5. [Neo4j Deployment Center](https://neo4j.com/deployment-center/)
 6. [Neo4j release notes](https://neo4j.com/release-notes/)
-7. [Neo4j Java Driver manual](https://neo4j.com/docs/java-manual/current/)
+7. [Neo4j embedded Java setup](https://neo4j.com/docs/java-reference/current/java-embedded/setup/)
