@@ -521,7 +521,10 @@ Only usable for debug output.
       - `:steps` are the descriptions of the processing steps planned.
       - `:cost` is the accumulated estimated cost, which determines the plan.
       - `:size` is the estimated number of resulting tuples for the steps.
-      - `:actual-size` is the actual number of resulting tuples after the steps are executed. "}
+      - `:actual-size` is the actual number of resulting tuples after the steps are executed.
+    When `:run?` selects an access path, `:plan` instead describes that access
+    root and reports its batches, candidate work, fragment output, residual
+    subplans, and any conventional fallback. "}
   explain dq/explain)
 
 ;; Index lookups

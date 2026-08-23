@@ -136,6 +136,10 @@
     :order-by [?score :desc ?id :asc]
     :limit 5])
 
+(defn top-five-rank?
+  [rank]
+  (< 4995 (long rank)))
+
 (def post-top-k-enrichment-offset-query
   '[:find ?id ?content ?score
     :where
@@ -1392,6 +1396,9 @@
             explain   (d/explain {:run? false}
                                  bounded-access-sample-query
                                  db-value 1 2000)
+            executed  (d/explain {:run? true}
+                                 bounded-access-sample-query
+                                 db-value 1 2000)
             preferred (:preferred-access-plan explain)
             abort     (get-in preferred [:estimate :sampling-abort])
             result    (d/q bounded-access-sample-query db-value 1 2000)]
@@ -1409,6 +1416,19 @@
                     (double (:projected-cost abort)))))
           (is (= :conventional
                  (get-in explain [:selected-plan-alternative :kind]))))
+        (testing "runtime explain reports a selected conventional root"
+          (is (= :conventional
+                 (get-in executed [:selected-plan-alternative :kind])))
+          (is (= :conventional
+                 (get-in executed [:executed-plan-alternative :kind])))
+          (is (seq (:access-plans executed)))
+          (is (true? (get-in executed
+                             [:preferred-access-plan :unavailable?])))
+          (is (not= :access (get-in executed [:plan :kind])))
+          (is (pos? (:actual-result-size executed)))
+          (is (= result (:result executed)))
+          (is (some #(and (map? %) (number? (:actual-size %)))
+                    (tree-seq coll? seq (:plan executed)))))
         (testing "aborting the planning sample preserves ordered results"
           (is (= 20 (count result)))
           (is (= [119 1019 1019] (first result)))
@@ -1448,9 +1468,11 @@
           (range 1 361)))
       (let [db-value  (db/-clear-tx-cache (d/db conn))
             explain   (d/explain {:run? false} query db-value 360)
+            executed  (d/explain {:run? true} query db-value 360)
             preferred (:preferred-access-plan explain)
             counted   (some #(when (= :counted (:sampling %)) %)
-                            (get-in preferred [:estimate :join-stages]))]
+                            (get-in preferred [:estimate :join-stages]))
+            batches   (get-in executed [:plan :batches])]
         (testing "a terminal projection can be sampled without materializing"
           (is (true? (:access-path-selected? explain)))
           (is (= :adaptive-top-k
@@ -1460,10 +1482,201 @@
           (is (<= (double
                     (get-in preferred [:estimate :planning-sample-cost]))
                   (double (:conventional-plan-cost explain))))
-          (is (= 6 (count (d/q query db-value 360))))))
+          (is (= 6 (count (d/q query db-value 360)))))
+        (testing "runtime explain describes the selected access path"
+          (is (= :access
+                 (get-in executed [:executed-plan-alternative :kind])))
+          (is (= :access (get-in executed [:plan :kind])))
+          (is (= :ave (get-in executed [:plan :access-plan :method])))
+          (is (= :adaptive-top-k (get-in executed [:plan :mode])))
+          (is (= 6 (get-in executed [:plan :actual-size])))
+          (is (= 360 (get-in executed [:plan :candidate-count])))
+          (is (= 360 (get-in executed [:plan :candidate-work])))
+          (is (= 215 (get-in executed [:plan :fragment-result-count])))
+          (is (= 215 (get-in executed [:plan :residual-result-count])))
+          (is (= [{:source                :planning-sample
+                   :candidate-work        360
+                   :exhausted?            true
+                   :candidate-count       360
+                   :fragment-result-count 215
+                   :residual-result-count 215}]
+                 batches))
+          (is (= (get-in executed [:plan :candidate-count])
+                 (reduce + (map :candidate-count batches))))
+          (is (= (get-in executed [:plan :fragment-result-count])
+                 (reduce + (map :fragment-result-count batches))))
+          (is (every? #(and (keyword? (:source %))
+                            (number? (:candidate-work %))
+                            (number? (:residual-result-count %)))
+                      batches))
+          (is (= :residual
+                 (get-in executed [:plan :subqueries 0 :phase])))
+          (is (some #(and (string? %) (str/starts-with? % "Access "))
+                    (tree-seq coll? seq (:plan executed))))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))
+
+(deftest access-explain-fallback-test
+  (let [dir    (u/tmp-dir (str "access-explain-fallback-"
+                               (UUID/randomUUID)))
+        schema {:sample/rank {:db/valueType :db.type/long}}
+        conn   (d/get-conn dir schema)
+        query  '[:find ?e ?rank
+                 :in $ ?max-rank
+                 :where
+                 [?e :sample/rank ?rank]
+                 [(<= ?rank ?max-rank)]
+                 [(datalevin.query-optimizer-test/top-five-rank? ?rank)]
+                 :order-by [?rank :desc]
+                 :limit 10]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long rank]
+                           {:db/id rank :sample/rank rank})
+                         (range 1 5001)))
+      (let [db-value (db/-clear-tx-cache (d/db conn))
+            planned  (d/explain {:run? false} query db-value 5000)
+            executed (d/explain {:run? true} query db-value 5000)
+            uncounted (d/explain {:run? true :intermediate-counts? false}
+                                 query db-value 5000)
+            plan     (:plan executed)
+            phases   (mapv :phase (:subqueries plan))]
+        (testing "an underestimated access path remains the selected root"
+          (is (= :access
+                 (get-in planned [:selected-plan-alternative :kind])))
+          (is (= :access
+                 (get-in executed [:executed-plan-alternative :kind])))
+          (is (= :access
+                 (get-in executed [:recommended-plan-alternative :kind])))
+          (is (= :access (:kind plan)))
+          (is (= :adaptive-top-k (:mode plan))))
+        (testing "runtime explain retains attempted access work and fallback"
+          (is (= {:kind :conventional :reason :candidate-budget}
+                 (:fallback plan)))
+          (is (= (:fallback plan)
+                 (get-in executed
+                         [:executed-plan-alternative :fallback])))
+          (is (= [:residual :residual :fallback] phases))
+          (is (= 2000 (:candidate-count plan)))
+          (is (= 2000 (:candidate-work plan)))
+          (is (= 2 (count (:batches plan))))
+          (is (= 5 (:residual-result-count plan))))
+        (testing "the fallback result and conventional subplan are reported"
+          (is (= 5 (:actual-result-size executed)))
+          (is (= [[5000 5000]
+                  [4999 4999]
+                  [4998 4998]
+                  [4997 4997]
+                  [4996 4996]]
+                 (:result executed)))
+          (is (some? (get-in executed [:plan :subqueries 2 :plan])))
+          (is (some #(and (map? %) (number? (:actual-size %)))
+                    (tree-seq coll? seq
+                              (get-in executed [:plan :subqueries 2 :plan])))))
+        (testing "intermediate counting can be disabled independently"
+          (is (= :access (get-in uncounted [:plan :kind])))
+          (is (= (:candidate-count plan)
+                 (get-in uncounted [:plan :candidate-count])))
+          (is (not-any? #(and (map? %) (contains? % :actual-size))
+                        (tree-seq coll? seq
+                                  (get-in uncounted
+                                          [:plan :subqueries]))))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest adaptive-limit-access-explain-test
+  (let [conn  (d/create-conn
+                nil
+                {:doc/idoc {:db/valueType :db.type/idoc
+                            :db/domain    "profiles"}}
+                {:kv-opts {:inmemory? true}})
+        query '[:find ?e
+                :where
+                [(idoc-match $ :doc/idoc {:status "active"}) [[?e _ _]]]
+                :offset 2
+                :limit 5]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [^long e]
+                           {:db/id e :doc/idoc {:status "active"}})
+                         (range 1 101)))
+      (let [db-value (d/db conn)
+            planned  (d/explain {:run? false} query db-value)
+            executed (d/explain {:run? true} query db-value)
+            plan     (:plan executed)
+            batch    (first (:batches plan))]
+        (testing "adaptive-limit execution reports the idoc access root"
+          (is (= :access
+                 (get-in planned [:selected-plan-alternative :kind])))
+          (is (= :adaptive-limit
+                 (get-in planned [:selected-plan-alternative :mode])))
+          (is (= :access
+                 (get-in executed [:executed-plan-alternative :kind])))
+          (is (= :adaptive-limit (:mode plan)))
+          (is (= :idoc (get-in plan [:access-plan :method])))
+          (is (nil? (:fallback plan))))
+        (testing "the requested window and its source work are exact"
+          (is (= 5 (:actual-size plan)))
+          (is (= 5 (:actual-result-size executed)))
+          (is (= 5 (count (:result executed))))
+          (is (= 7 (:candidate-count plan)))
+          (is (= 7 (:candidate-work plan)))
+          (is (= 7 (:fragment-result-count plan)))
+          (is (= 7 (:residual-result-count plan)))
+          (is (= :access-cursor (:source batch)))
+          (is (false? (:exhausted? batch)))
+          (is (= [:residual] (mapv :phase (:subqueries plan))))))
+      (finally
+        (d/close conn)))))
+
+(deftest complete-access-explain-test
+  (let [conn  (d/create-conn
+                nil
+                {:doc/idoc {:db/valueType :db.type/idoc
+                            :db/domain    "profiles"}}
+                {:kv-opts {:inmemory? true}})
+        query '[:find ?e ?name
+                :where
+                [(idoc-match $ :doc/idoc {:status "active"}) [[?e _ _]]]
+                [?e :name ?name]]]
+    (try
+      (d/transact!
+        conn
+        (into [{:db/id 1001
+                :name "Ada"
+                :doc/idoc {:status "active"}}
+               {:db/id 1002
+                :name "Grace"
+                :doc/idoc {:status "inactive"}}]
+              (map (fn [^long e] {:db/id e :name (str "name-" e)}))
+              (range 1 1001)))
+      (let [db-value (d/db conn)
+            planned  (d/explain {:run? false} query db-value)
+            executed (d/explain {:run? true} query db-value)
+            plan     (:plan executed)
+            batch    (first (:batches plan))]
+        (testing "complete access is executed and identified"
+          (is (= :access
+                 (get-in planned [:selected-plan-alternative :kind])))
+          (is (= :complete
+                 (get-in planned [:selected-plan-alternative :mode])))
+          (is (= :access
+                 (get-in executed [:executed-plan-alternative :kind])))
+          (is (= :complete (:mode plan)))
+          (is (= :idoc (get-in plan [:access-plan :method])))
+          (is (= #{[1001 "Ada"]} (:result executed))))
+        (testing "complete access reports source and fragment cardinalities"
+          (is (= 1 (:candidate-count plan)))
+          (is (= 1 (:candidate-work plan)))
+          (is (= 1 (:fragment-result-count plan)))
+          (is (= 1 (:residual-result-count plan)))
+          (is (= :complete-access (:source batch)))
+          (is (true? (:exhausted? batch)))
+          (is (= [:residual] (mapv :phase (:subqueries plan))))))
+      (finally
+        (d/close conn)))))
 
 (deftest dominated-projection-base-sample-test
   (let [dir    (u/tmp-dir (str "dominated-projection-root-"

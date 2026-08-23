@@ -247,5 +247,8 @@ Explain output reports:
 - recommended alternative; and
 - executed alternative.
 
-When explain deliberately executes the conventional plan for instrumentation,
-it must not label an access recommendation as the executed plan.
+With `:run? true`, explain executes the selected alternative. Access execution
+reports source work, fragment output, and residual subplans per batch. If an
+adaptive access attempt falls back, explain reports both the attempted access
+work and the conventional fallback instead of attributing conventional counts
+to the selected access root.

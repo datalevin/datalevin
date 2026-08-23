@@ -55,6 +55,10 @@
   "Physical access methods considered during query planning."
   [qave/access-method function-access-method])
 
+(def ^:dynamic ^:private *access-execution* nil)
+
+(def ^:dynamic ^:private *deferred-result-explain* nil)
+
 (def ^:private materialize-input-bound-patterns
   qo/materialize-input-bound-patterns)
 
@@ -1814,20 +1818,52 @@
 
 (defn result-explain
   ([context result]
-   (result-explain context)
-   (when qplan/*explain* (vswap! qplan/*explain* assoc :result result)))
+   (if *deferred-result-explain*
+     (vreset! *deferred-result-explain*
+              {:context context :result result})
+     (do
+       (result-explain context)
+       (when qplan/*explain* (vswap! qplan/*explain* assoc :result result)))))
   ([{:keys [graph result-set plan opt-clauses late-clauses run?
             access-plans preferred-access-plan property-memo
             deferred-base-samples attribute-group-planning
-            post-top-k-enrichment keyed-group-reduction]
+            post-top-k-enrichment access-path-execution
+            explain-actual-result-size keyed-group-reduction]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
            @qplan/*explain*
            memo-summary (some-> property-memo qo/property-memo-summary)
+           selected-summary (:selected memo-summary)
+           runtime-post-top-k (:post-top-k-enrichment @qplan/*explain*)
            conventional-cost
            (some #(when (= :conventional (:kind %)) (:cost %))
                  (:alternatives memo-summary))
+           conventional-plan
+           (when-not access-path-execution
+             (w/postwalk
+               (fn [e]
+                 (if (qplan/plan? e)
+                   (let [{:keys [steps] :as plan} e]
+                     (cond->
+                         (assoc plan :steps
+                                (mapv #(qplan/step-explain % context) steps))
+                       (and run? qplan/*intermediate-counts?*)
+                       (assoc :actual-size
+                              (get-in @(:intermediates context)
+                                      [(:out (last steps))
+                                       :tuples-count]))))
+                   e)) plan))
+           explained-plan (or access-path-execution conventional-plan)
+           executed-summary
+           (cond
+             (not run?) {:kind :not-run}
+             access-path-execution
+             (cond-> selected-summary
+               (:fallback access-path-execution)
+               (assoc :fallback (:fallback access-path-execution)))
+             selected-summary selected-summary
+             :else {:kind :conventional})
            et  (double (/ (- ^long (System/nanoTime)
                              (+ ^long qplan/*start-time* planning-time
                                 parsing-time building-time))
@@ -1838,7 +1874,8 @@
            ppt (double (/ (+ parsing-time building-time planning-time)
                           1000000))]
        (vswap! qplan/*explain* assoc
-               :actual-result-size (count result-set)
+               :actual-result-size (or explain-actual-result-size
+                                       (count result-set))
                :parsing-time (format "%.3f" pat)
                :building-time (format "%.3f" bt)
                :planning-time (format "%.3f" plt)
@@ -1852,22 +1889,11 @@
                                          (for [[k v] e
                                                :when (nil? v)] k))
                                   e)) graph)
-               :plan (w/postwalk
-                       (fn [e]
-                         (if (qplan/plan? e)
-                           (let [{:keys [steps] :as plan} e]
-                             (cond->
-                                 (assoc plan :steps
-                                        (mapv #(qplan/step-explain % context) steps))
-                               (and run? qplan/*intermediate-counts?*)
-                               (assoc :actual-size
-                                      (get-in @(:intermediates context)
-                                               [(:out (last steps))
-                                                :tuples-count]))))
-                           e)) plan)
+               :plan explained-plan
                :deferred-base-samples deferred-base-samples
                :attribute-group-planning attribute-group-planning
-               :post-top-k-enrichment post-top-k-enrichment
+               :post-top-k-enrichment (or runtime-post-top-k
+                                          post-top-k-enrichment)
                :keyed-group-reduction keyed-group-reduction
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
@@ -1878,10 +1904,9 @@
                (= :access (get-in memo-summary [:selected :kind]))
                :physical-plan-alternatives (:alternatives memo-summary)
                :physical-plan-subsets (:subsets memo-summary)
-               :selected-plan-alternative (:selected memo-summary)
-               :recommended-plan-alternative (:selected memo-summary)
-               :executed-plan-alternative
-               {:kind (if run? :conventional :not-run)})))))
+               :selected-plan-alternative selected-summary
+               :recommended-plan-alternative selected-summary
+               :executed-plan-alternative executed-summary)))))
 
 (defn- order-comps
   [tg find-vars order]
@@ -2119,10 +2144,88 @@
 
 (declare execute-query execute-planned-query)
 
+(def ^:private access-subquery-explain-keys
+  [:actual-result-size :execution-time :plan :late-clauses
+   :late-clause-decisions :late-or-join-branch-decisions
+   :post-top-k-enrichment :reusable-sip-domains])
+
+(defn- record-access-execution!
+  [key value]
+  (when *access-execution*
+    (vswap! *access-execution* update key (fnil conj []) value)))
+
+(defn- query-result-size
+  [parsed-q result]
+  (let [find (:qfind parsed-q)]
+    (if (or (instance? FindRel find) (instance? FindColl find))
+      (count result)
+      (if (nil? result) 0 1))))
+
+(defn- execute-access-subquery
+  [phase execute]
+  (if *access-execution*
+    (let [explain (volatile! {:parsing-time  0
+                              :building-time 0
+                              :planning-time 0})
+          result
+          (binding [qplan/*explain*    explain
+                    qplan/*start-time* (System/nanoTime)]
+            (execute))]
+      (record-access-execution!
+        :subqueries
+        (assoc (select-keys @explain access-subquery-explain-keys)
+               :phase phase))
+      result)
+    (execute)))
+
+(defn- execute-access-batch
+  [parsed-q batch-query inputs source-db access-plan tuples batch]
+  (let [fragment-tuples (execute-access-fragment
+                          parsed-q source-db access-plan tuples)
+        result          (execute-access-subquery
+                          :residual
+                          #(execute-query
+                             batch-query
+                             (conj (vec inputs) fragment-tuples)))]
+    (record-access-execution!
+      :batches
+      (assoc batch
+             :candidate-count (.size ^java.util.List tuples)
+             :candidate-work (long (or (:candidate-work batch)
+                                       (.size ^java.util.List tuples)))
+             :fragment-result-count
+             (.size ^java.util.List fragment-tuples)
+             :residual-result-count (query-result-size batch-query result)))
+    result))
+
+(defn- execute-access-fallback
+  [fallback inputs reason]
+  (when *access-execution*
+    (vswap! *access-execution* assoc :fallback
+            {:kind :conventional :reason reason}))
+  (execute-access-subquery
+    :fallback
+    #(execute-planned-query
+       (assoc (:context fallback) :run? true) inputs)))
+
 (defn- access-source-db
   [step inputs]
   (or (:access-source step)
       (first (filter db/db? inputs))))
+
+(defn- execute-complete-access-source
+  [source source-db input]
+  (if *access-execution*
+    (let [candidate-work (volatile! 0)
+          tuples
+          (binding [qplan/*access-batch-observer*
+                    #(vswap! candidate-work
+                             (fn [^long total]
+                               (unchecked-add
+                                 total (qaccess/batch-work %))))]
+            (qplan/step-execute source source-db input))]
+      [tuples @candidate-work])
+    [(qplan/step-execute source source-db input) nil]))
 
 (defn- top-k-pushdown-query
   [parsed-q inputs
@@ -2145,12 +2248,12 @@
         sample-rows
         (if (pos? sample-count)
           (into #{}
-                (execute-query batch-query
-                               (conj
-                                 (vec inputs)
-                                 (execute-access-fragment
-                                   parsed-q source-db access-plan
-                                   sample-tuples))))
+                (execute-access-batch
+                  parsed-q batch-query inputs source-db access-plan
+                  sample-tuples
+                  {:source         :planning-sample
+                   :candidate-work (qaccess/batch-work sample-batch)
+                   :exhausted?     (:exhausted? sample-batch)}))
           #{})
         sample-done?
         (or (:exhausted? sample-batch)
@@ -2167,7 +2270,7 @@
           sample-batch
           (assoc :resume (:frontier sample-batch)
                  :emitted sample-count))
-        fallback-query #(execute-planned-query (:context fallback) inputs)]
+        fallback-query #(execute-access-fallback fallback inputs %)]
     (cond
       sample-done?
       (order-result find-vars sample-rows order limit offset)
@@ -2175,7 +2278,7 @@
       (and budgeted?
            (or (not (pos? (long work-budget)))
                (>= sample-count (long work-budget))))
-      (fallback-query)
+      (fallback-query :candidate-budget)
 
       :else
       (let [cursor (qaccess/open-access
@@ -2188,20 +2291,22 @@
                          (>= (long batches) top-k-max-candidate-batches))
                     (and budgeted?
                          (>= (long scanned) (long work-budget))))
-              (fallback-query)
+              (fallback-query (if budgeted?
+                                :candidate-budget
+                                :batch-limit))
               (let [{:keys [tuples frontier exhausted?] :as batch}
                     (qaccess/next-batch cursor)]
                 (if (zero? (.size ^java.util.List tuples))
                   (if exhausted?
                     (order-result find-vars rows order limit offset)
-                    (fallback-query))
+                    (fallback-query :empty-batch))
                   (let [batch-result
-                        (execute-query batch-query
-                                       (conj
-                                         (vec inputs)
-                                         (execute-access-fragment
-                                           parsed-q source-db access-plan
-                                           tuples)))
+                        (execute-access-batch
+                          parsed-q batch-query inputs source-db access-plan
+                          tuples
+                          {:source         :access-cursor
+                           :candidate-work (qaccess/batch-work batch)
+                           :exhausted?     exhausted?})
                         rows (into rows batch-result)]
                     (if (or exhausted?
                             (past-top-k-boundary?
@@ -2237,12 +2342,12 @@
         sample-rows
         (if (pos? sample-count)
           (into #{}
-                (execute-query batch-query
-                               (conj
-                                 (vec inputs)
-                                 (execute-access-fragment
-                                   parsed-q source-db access-plan
-                                   sample-tuples))))
+                (execute-access-batch
+                  parsed-q batch-query inputs source-db access-plan
+                  sample-tuples
+                  {:source         :planning-sample
+                   :candidate-work sample-work
+                   :exhausted?     (:exhausted? sample-batch)}))
           #{})
         sample-done?
         (or (:exhausted? sample-batch)
@@ -2257,7 +2362,7 @@
           sample-batch
           (assoc :resume (:frontier sample-batch)
                  :emitted sample-work))
-        fallback-query #(execute-planned-query (:context fallback) inputs)
+        fallback-query #(execute-access-fallback fallback inputs %)
         finish         #(result-window % limit offset)]
     (cond
       (zero? window-end)
@@ -2269,7 +2374,7 @@
       (and budgeted?
            (or (not (pos? (long work-budget)))
                (>= sample-work (long work-budget))))
-      (fallback-query)
+      (fallback-query :candidate-budget)
 
       :else
       (let [cursor (qaccess/open-access
@@ -2282,7 +2387,9 @@
                          (>= (long batches) top-k-max-candidate-batches))
                     (and budgeted?
                          (>= (long scanned) (long work-budget))))
-              (fallback-query)
+              (fallback-query (if budgeted?
+                                :candidate-budget
+                                :batch-limit))
               (let [{:keys [tuples exhausted?] :as batch}
                     (qaccess/next-batch cursor)
                     batch-work (qaccess/batch-work batch)
@@ -2293,17 +2400,17 @@
                     (finish rows)
 
                     (zero? batch-work)
-                    (fallback-query)
+                    (fallback-query :empty-batch)
 
                     :else
                     (recur rows (unchecked-inc-int batches) scanned))
                   (let [batch-result
-                        (execute-query batch-query
-                                       (conj
-                                         (vec inputs)
-                                         (execute-access-fragment
-                                           parsed-q source-db access-plan
-                                           tuples)))
+                        (execute-access-batch
+                          parsed-q batch-query inputs source-db access-plan
+                          tuples
+                          {:source         :access-cursor
+                           :candidate-work batch-work
+                           :exhausted?     exhausted?})
                         rows (into rows batch-result)]
                     (if (or exhausted?
                             (<= window-end (long (count rows))))
@@ -2458,45 +2565,111 @@
 
       :correlated-complete
       (let [source-db (access-source-db source inputs)
-            outer     (execute-query outer-query inputs)
-            tuples    (->> (qplan/step-execute source source-db outer)
-                           (execute-access-fragment
-                             parsed-q source-db access-plan))]
-        (execute-query residual-query (conj (vec inputs) tuples)))
+            outer     (execute-access-subquery
+                        :outer #(execute-query outer-query inputs))
+            [tuples candidate-work]
+            (execute-complete-access-source source source-db outer)]
+        (execute-access-batch
+          parsed-q residual-query inputs source-db access-plan tuples
+          {:source         :correlated-access
+           :candidate-work candidate-work
+           :exhausted?     true}))
 
       :complete
       (let [source-db (access-source-db source inputs)
-            tuples    (->> (qplan/step-execute source source-db nil)
-                           (execute-access-fragment
-                             parsed-q source-db access-plan))]
-        (execute-query residual-query (conj (vec inputs) tuples)))
+            [tuples candidate-work]
+            (execute-complete-access-source source source-db nil)]
+        (execute-access-batch
+          parsed-q residual-query inputs source-db access-plan tuples
+          {:source         :complete-access
+           :candidate-work candidate-work
+           :exhausted?     true}))
 
-      (execute-query parsed-q inputs))))
+      (do
+        (when *access-execution*
+          (vswap! *access-execution* assoc :fallback
+                  {:kind :conventional :reason :unsupported-access-mode}))
+        (execute-access-subquery
+          :fallback #(execute-query parsed-q inputs))))))
 
 (defmethod execute-alternative :conventional
   [_parsed-q inputs _access-plans alternative]
-  (execute-planned-query (get-in alternative [:plan :context]) inputs))
+  (execute-planned-query
+    (assoc (get-in alternative [:plan :context]) :run? true) inputs))
 
 (defmethod execute-alternative :default
   [parsed-q inputs access-plans _alternative]
   (execute-query parsed-q inputs access-plans))
+
+(defn- access-execution-plan
+  [context alternative execution actual-size]
+  (let [{:keys [mode source access-plan operators fragment-cols]}
+        (:plan alternative)
+        batches (:batches execution)
+        sum-batches
+        (fn [key]
+          (reduce + 0 (map #(long (or (get % key) 0)) batches)))]
+    (cond->
+        {:kind                  :access
+         :mode                  mode
+         :steps                 [(qplan/step-explain source context)]
+         :access-plan           (qaccess/plan-summary access-plan)
+         :operators             operators
+         :fragment-cols         fragment-cols
+         :cost                  (:cost alternative)
+         :size                  (:size alternative)
+         :actual-size           actual-size
+         :candidate-count       (sum-batches :candidate-count)
+         :candidate-work        (sum-batches :candidate-work)
+         :fragment-result-count (sum-batches :fragment-result-count)
+         :residual-result-count (sum-batches :residual-result-count)
+         :batches               (vec batches)
+         :subqueries            (vec (:subqueries execution))}
+      (:fallback execution) (assoc :fallback (:fallback execution)))))
 
 (defn q*
   [parsed-q inputs]
   (binding [timeout/*deadline* (timeout/effective-deadline
                                  (:qtimeout parsed-q))]
     (let [plans (discover-access-plans parsed-q inputs)]
-      (cond
-        qplan/*explain*
-        (execute-query parsed-q inputs plans)
-
-        (seq plans)
+      (if (seq plans)
         (let [planned-context (access-query-plan parsed-q inputs plans)]
-          (execute-alternative
-            parsed-q inputs (:access-plans planned-context)
-            (qo/selected-alternative planned-context)))
-
-        :else
+          (let [alternative (qo/selected-alternative planned-context)]
+            (if qplan/*explain*
+              (if (= :access (:kind alternative))
+                (let [execution (volatile! {:batches [] :subqueries []})
+                      result
+                      (binding [qplan/*explain*  nil
+                                *access-execution* execution]
+                        (execute-alternative
+                          parsed-q inputs (:access-plans planned-context)
+                          alternative))
+                      actual-size (query-result-size parsed-q result)
+                      explained-context
+                      (assoc planned-context
+                             :run? true
+                             :explain-actual-result-size actual-size
+                             :access-path-execution
+                             (access-execution-plan
+                               planned-context alternative @execution
+                               actual-size))]
+                  (result-explain explained-context result)
+                  result)
+                (let [deferred (volatile! nil)
+                      result
+                      (binding [*deferred-result-explain* deferred]
+                        (execute-alternative
+                          parsed-q inputs (:access-plans planned-context)
+                          alternative))
+                      executed-context (:context @deferred)]
+                  (result-explain
+                    (assoc executed-context
+                           :property-memo (:property-memo planned-context))
+                    result)
+                  result))
+              (execute-alternative
+                parsed-q inputs (:access-plans planned-context)
+                alternative))))
         (execute-query parsed-q inputs plans)))))
 
 (defn mark-parsing-finished!
