@@ -301,18 +301,32 @@ performance of Datalevin with other databases.
 
 We compared Datalevin with PostgreSQL and SQLite in handling complex queries, using
 [Join Order Benchmark](benchmarks/JOB-bench). On a
-MacBook Pro, Apple M3 chip with 12 cores, 30 GB memory and 1TB SSD drive, the
+MacBook Pro, Apple M3 Pro chip with 12 cores, 36 GB memory and 1TB SSD drive, the
 chart below plots query latency for all 113 queries in the benchmark.
 
 <p align="center">
 <img src="benchmarks/JOB-bench/job_benchmark_log_bars.svg" alt="JOB benchmark" height="300"></img>
 </p>
 
-Datalevin is about 2.4X faster than PostgreSQL and 4X faster than SQLite
-on average in running these complex queries that involves many joins. The gain
-is mainly due to shorter query execution time as Datalevin's query optimizer
-generates better plans. Details of the analysis can be found in [this
+In the current second-pass snapshot, PostgreSQL's 171.3-second reported total
+is 4.24X Datalevin's 40.4 seconds. SQLite's completed-query subtotal is 295.0
+seconds, or 7.30X Datalevin's, with another nine queries reaching the one-minute
+timeout. The gain is mainly due to shorter query execution time as Datalevin's
+query optimizer generates better plans. Details of the benchmark and its
+methodology are in the [JOB README](benchmarks/JOB-bench); background analysis
+can be found in [this
 article](https://yyhh.org/blog/2024/09/competing-for-the-job-with-a-triplestore/)
+
+We also compare Datalevin with Neo4j Community Embedded using the 21 read
+queries in the [LDBC SNB benchmark](benchmarks/LDBC-SNB-bench). In the current
+SF1 snapshot, captured on 2026-08-23 with both engines embedded and no network
+transport, Datalevin's summed measured query time was 3.890 seconds versus
+27.406 seconds for Neo4j. Neo4j's sum was 7.046X Datalevin's, the equal-query
+Neo4j/Datalevin geometric-mean ratio was 4.996X, and Datalevin had the lower
+time on 20 of 21 queries. This local read-latency harness uses one measured
+execution per query after an independent-process warmup and is not an official
+LDBC result; the [LDBC README](benchmarks/LDBC-SNB-bench) documents the full
+methodology and per-query results.
 
 For durable transaction performance, we compared Datalevin with
 SQLite using [this write benchmark](benchmark/write-bench) on a 2016 Ubuntu
