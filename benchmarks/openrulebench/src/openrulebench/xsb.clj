@@ -42,6 +42,19 @@ bench.
 count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
 ")
 
+(def join1-program
+  "% JOIN1
+:- table c1/2.
+:- table b1/2.
+:- table b2/2.
+:- table a/2.
+
+c1(X, Y) :- d1(X, Z), d2(Z, Y).
+b2(X, Y) :- c3(X, Z), c4(Z, Y).
+b1(X, Y) :- c1(X, Z), c2(Z, Y).
+a(X, Y) :- b1(X, Z), b2(Z, Y).
+")
+
 ;; =============================================================================
 ;; File Generation
 ;; =============================================================================
@@ -74,6 +87,17 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
     (spit prog-file (str ":- consult('" data-file "').\n" sg-program))
     prog-file))
 
+(defn write-join1-files
+  [relations dir]
+  (let [data-file (str dir "/data.P")
+        prog-file (str dir "/join1.P")]
+    (with-open [w (io/writer data-file)]
+      (doseq [relation [:d1 :d2 :c2 :c3 :c4]
+              [a b] (get relations relation)]
+        (.write w (str (name relation) "(" a ", " b ").\n"))))
+    (spit prog-file (str ":- consult('" data-file "').\n" join1-program))
+    prog-file))
+
 ;; =============================================================================
 ;; XSB Execution
 ;; =============================================================================
@@ -96,9 +120,65 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
     (when (zero? (:exit result))
       (parse-long (str/trim (:out result))))))
 
+(defn run-xsb-count-goal
+  "Run a complete XSB goal that binds N to the answer cardinality."
+  [prog-file goal]
+  (let [result (sh/sh "xsb" "--nobanner" "--quietload"
+                      "-e" (str "['" prog-file "'], " goal ", "
+                                "write(N), nl, halt."))]
+    (when (zero? (:exit result))
+      (parse-long (str/trim (:out result))))))
+
+(def ^:private xsb-version
+  (delay
+    (try
+      (let [{:keys [exit out err]} (sh/sh "xsb" "--version")]
+        (when (zero? exit)
+          (str/trim (if (str/blank? out) err out))))
+      (catch Exception _ nil))))
+
+(defn- answer-count-goal
+  [{:keys [family query binding bound-value]}]
+  (let [predicate (name (if (= family :join1) query family))]
+    (case binding
+      :ff (format "findall([X,Y], %s(X,Y), L), length(L,N)" predicate)
+      :bf (format "findall(Y, %s(%d,Y), L), length(L,N)"
+                  predicate bound-value)
+      :fb (format "findall(X, %s(X,%d), L), length(L,N)"
+                  predicate bound-value))))
+
 ;; =============================================================================
 ;; Benchmark Runners
 ;; =============================================================================
+
+(defn run-portable-benchmark
+  [{:keys [family spec] :as task}]
+  (let [task-data (core/generate-task-data task)
+        dir       (str "/tmp/openrulebench-xsb-" (name family) "-"
+                       (UUID/randomUUID))
+        _         (io/make-parents (str dir "/dummy"))
+        prog-file (case family
+                    :tc (write-tc-files task-data dir)
+                    :sg (write-sg-files task-data dir)
+                    :join1 (write-join1-files task-data dir))]
+    (try
+      (let [start        (core/now-ms)
+            result-count (run-xsb-count-goal prog-file
+                                             (answer-count-goal task))
+            time-ms      (- (core/now-ms) start)]
+        {:system "xsb"
+         :benchmark spec
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :base-fact-count (core/task-base-fact-count task task-data)
+         :input-digest (core/task-data-digest task task-data)
+         :engine-version (or @xsb-version "unknown")
+         :timing-scope :external-process-load-evaluate-materialize
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (or (seq (.listFiles (io/file dir))) [])]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 (defn run-tc-benchmark
   "Run TC benchmark on an OpenRuleBench instance. Returns result map."
@@ -151,21 +231,18 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "sg:small"])
+  ["tc:50k-cyclic-ff" "sg:6k-cyclic-ff"])
 
 (defn parse-benchmark [spec]
   (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
-  (let [[bench-type instance] (parse-benchmark spec)]
-    (try
-      (case bench-type
-        "tc" (run-tc-benchmark instance)
-        "sg" (run-sg-benchmark instance)
-        {:system "xsb" :benchmark spec :status :error})
-      (catch Exception e
-        (println "Error:" (.getMessage e))
-        {:system "xsb" :benchmark spec :status :error}))))
+  (try
+    (run-portable-benchmark (core/require-benchmark-task spec))
+    (catch Exception e
+      (println "Error:" (.getMessage e))
+      {:system "xsb" :benchmark spec :status :error
+       :error (.getMessage e)})))
 
 (defn run-benchmarks [benchmark-specs]
   (doall (map run-benchmark benchmark-specs)))

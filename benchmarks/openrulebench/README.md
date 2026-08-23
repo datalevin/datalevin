@@ -1,343 +1,209 @@
-# OpenRuleBench for Datalevin
+# Portable OpenRuleBench tasks
 
-Benchmarks for comparing Datalevin's Datalog engine with rule engines,
-recursive SQL systems, and deductive systems. The suite follows the
-[OpenRuleBench](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf)
-workloads where practical, and also includes a non-standard `tiny` TC/SG scale
-for local development runs when the standard `small` case is too large.
+This directory contains a correctness-gated, cross-system subset derived from
+[OpenRuleBench](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf).
+The comparison suite deliberately includes only tasks for which we can state the
+same logical semantics, input relations, query bindings, result contract, and
+timing boundary for every participating backend.
 
-## Benchmarks
+It is not a reproduction of the 2009 result tables. The original anonymous CVS
+repository is no longer available, so the generated relation files are not
+claimed to be byte-for-byte copies of the historical inputs. The rules, fact
+counts, cyclic/acyclic variants, and query-binding matrix follow the paper; the
+generators in this directory are fixed, deterministic benchmark inputs. Results
+from this harness are comparable with one another, not directly with the paper's
+reported times.
 
-| Benchmark | Type | Description | Sizes |
-|-----------|------|-------------|-------|
-| **TC** | Synthetic | Transitive closure on random graphs | 1K, 50K, 125K, 250K, 500K, 1M edges |
-| **SG** | Synthetic | Same generation over random `par`/`sib` relations | 1K, 6K, 24K, 48K facts |
-| **Join1** | Synthetic | 5-way join with intermediate results | 10K, 50K, 250K tuples |
-| **DBLP** | Real-world | Publication data (4-way self-join) | 2K, 8K, 64K papers |
-| **LUBM** | Semantic | University domain (type inference) | 1, 10, 50 universities |
+## Defensible task set
 
-## Quick Start
+| Family | Published scales | Variants | What it exercises |
+|---|---:|---|---|
+| TC | 50K, 500K facts | cyclic/acyclic; FF/BF/FB | recursive transitive closure and bound-query propagation |
+| SG | 6K, 24K facts | cyclic/acyclic; FF/BF/FB | nonlinear recursive same-generation fixed points |
+| Join1 | 50K, 250K facts per base relation | `a`/`b1`/`b2`; FF/BF/FB | nonrecursive trees of joins and intermediate-result control |
+
+`FF` means both query arguments are free, `BF` fixes the first argument to
+`1`, and `FB` fixes the second argument to `1`. TC and SG use both a cyclic
+random-relation profile and a DAG profile. At each SG scale, half of the facts
+are in `par` and half are in `sib`. Join1 has five set-valued base relations
+over a 1,000-value domain. Every generator emits exactly the requested number
+of unique tuples in a stable order, using fixed seeds.
+
+The rules are:
+
+```prolog
+tc(X,Y) :- edge(X,Y).
+tc(X,Y) :- edge(X,Z), tc(Z,Y).
+
+sg(X,Y) :- sib(X,Y).
+sg(X,Y) :- par(X,Z), sg(Z,Z1), par(Y,Z1).
+
+c1(X,Y) :- d1(X,Z), d2(Z,Y).
+b2(X,Y) :- c3(X,Z), c4(Z,Y).
+b1(X,Y) :- c1(X,Z), c2(Z,Y).
+a(X,Y)  :- b1(X,Z), b2(Z,Y).
+```
+
+The non-published `tiny` profile exists only for fast smoke and differential
+checks. Never present `tiny` results as OpenRuleBench results.
+
+Join1 `a` is intentionally much harder than `b1` and `b2`: it joins two large
+derived relations. A timeout or OOM at the published scales is a benchmark
+result, not a reason for the harness to substitute a smaller relation or omit
+the cell. Join1 is therefore outside the default group but remains in `joins`,
+`stress`, and `all`.
+
+## Excluded workloads
+
+The source tree still contains exploratory DBLP, LUBM, and ORE code, but these
+are not accepted by the comparison runner:
+
+- DBLP requires the benchmark's frozen roughly 2.5-million-fact bibliography
+  snapshot. Downloading today's DBLP XML and truncating it to invented sizes is
+  not a reproducible equivalent.
+- The existing LUBM namespace uses a custom generator and a reduced type rule,
+  not the official 10- and 50-university data plus OpenRuleBench Query1, Query2,
+  and Query9 translations.
+- ORE 2015 is a useful separate ontology experiment, but it is not an
+  OpenRuleBench task and currently has only a Datalevin implementation.
+- Join2, Mondial, WordNet, Wine, and negation tests are omitted until their
+  frozen data and portable semantic contracts can be supplied.
+
+This is preferable to reporting Datalevin-only placeholders as cross-system
+benchmarks.
+
+## Systems and timing classes
+
+| System | TC/SG FF | TC/SG bound | Join1 | Timing class |
+|---|---:|---:|---:|---|
+| Datalevin | yes | yes | yes | query + full result materialization |
+| SQLite | yes | yes | yes | recursive/nonrecursive SQL + JDBC row materialization |
+| PostgreSQL | yes | yes | yes | recursive/nonrecursive SQL + JDBC row materialization |
+| XSB | yes | yes | yes | external process: load + evaluate + materialize |
+| Souffle | yes | yes | yes | external process: compile/evaluate + output writing |
+| Clara Rules | yes | no | no | forward-chain + query materialization |
+| O'Doyle Rules | yes | no | no | forward-chain + query materialization |
+
+Datalevin, SQLite, PostgreSQL, Clara, and O'Doyle exclude data generation,
+database/session construction, fact loading, index construction, and statistics
+collection from the timed region. Each timed region evaluates the rules/query
+and fully materializes its answer.
+
+XSB and Souffle cannot use that same embedded boundary in the current runners.
+Their results are labeled `:external-process-load-evaluate-materialize` (XSB)
+or `:external-process-compile-load-evaluate-materialize` (Souffle) in the EDN
+artifact and must not be placed in the same latency ranking as the
+embedded/JDBC results. They remain useful as correctness and process-level
+scalability references.
+
+Clara and O'Doyle are materialize-all production-rule systems. Bound queries
+would execute the same full closure and filter it afterward, so the runner marks
+those task/system pairs `N/A` instead of implying bound-query optimization.
+
+## Correctness and measurement contract
+
+- Every warmup and measured sample gets newly generated and newly loaded base
+  relations. Generation is deterministic.
+- Base relations and derived answers have set semantics in every backend. SQL
+  plans use duplicate elimination at Datalog relation boundaries.
+- The default is one warmup and five measured iterations. The displayed value
+  is the median; the EDN artifact retains every sample and min/mean/p95/p99.
+- Every measured answer count must be stable across samples and equal an
+  independent reference: BitSet transitive closure for TC, a delta work queue
+  for SG, and BitSet relation composition for Join1.
+- Every sample records a SHA-256 digest of its named base relations. Digests
+  must agree across samples and systems before the combined report is accepted.
+- Incorrect counts, errors, timeouts, out-of-memory results, missing child
+  reports, and failed child processes make the top-level command exit nonzero.
+- `--no-verify` is for diagnosis only and is unsuitable for published results.
+- Child processes isolate JVM state and heap behavior between systems. Artifacts
+  record the parsed task, fact count, timing class, Clojure/JVM/OS/CPU metadata,
+  engine version where discoverable, latency distribution, and raw samples.
+
+The orchestrator requests an 8 GiB maximum heap for every Clojure wrapper.
+Every child records its effective maximum heap. PostgreSQL-server, XSB, and
+Souffle resource limits are external and must be reported separately.
+
+Setup is excluded because the benchmark is about inference/query execution.
+The separately labeled XSB/Souffle boundary is the only exception.
+
+## Running the suite
+
+Requirements are Java 17+ and Clojure 1.12.5. SQLite is brought in through
+JDBC. PostgreSQL, XSB, and Souffle are optional external installations.
 
 ```bash
 cd benchmarks/openrulebench
 
-# Run the common TC/SG core on Datalevin and SQLite
-./bench.clj --output results/core.edn
+# Four published-size FF recursive tasks on the default systems
+./bench.clj --output results/default.edn
 
-# Run a tiny local comparison between Datalevin and Clara
-./bench.clj --systems datalevin,clara tc:tiny sg:tiny
+# Fast non-published smoke check
+./bench.clj --systems datalevin,sqlite --warmup 0 --iterations 1 smoke
 
-# Run selected OpenRuleBench standard cases
-./bench.clj --systems datalevin,sqlite --warmup 1 --iterations 5 \
-  --output results/tc-sg-small.edn tc:small sg:small
+# All 21 tiny variants; useful after changing a backend implementation
+./bench.clj --systems datalevin,sqlite --warmup 0 --iterations 1 \
+  --output results/differential.edn differential
 
-# Run every workload supported by each selected system; unsupported pairs are N/A
-./bench.clj --systems datalevin,sqlite all
+# Complete published recursive or Join1 matrices
+./bench.clj --systems datalevin,sqlite recursive
+./bench.clj --systems datalevin,sqlite joins
 
-# Run Datalevin stress tests
-./bench.clj --systems datalevin stress
+# One explicit task
+./bench.clj --systems datalevin,sqlite tc:50k-acyclic-bf
+
+# All 42 published tasks supported by each selected system
+./bench.clj --systems datalevin,sqlite,postgresql all
+
+# Unit tests for task parsing, generators, references, and failure gates
+clojure -M:test
 ```
 
-The Datalevin runner uses the in-memory KV store for generated benchmark
-databases. Datalevin, Clara, and O'Doyle are run with `-J-Xmx8g`.
+Available groups are `default`, `smoke`, `differential`, `recursive`, `joins`,
+`stress`, and `all`. Run `./bench.clj --help` for the canonical task syntax and
+CLI options. Unsupported pairs are printed as `N/A`; they are distinct from a
+failed implementation.
 
-The default is deliberately limited to the common TC/SG core. Workloads not
-implemented by a selected system are printed as `N/A`; they are not reported
-as errors or silently substituted. `join1`, DBLP, and LUBM can currently be
-selected for Datalevin, while the comparison runners implement TC and SG.
+For PostgreSQL, the runner currently connects to
+`jdbc:postgresql://localhost:5432/postgres`. Set `-Dpg.user=...` and
+`-Dpg.pass=...` as JVM properties when needed. Each sample uses connection-local
+temporary tables, so it does not replace application tables.
 
-### Benchmark Contract
+## Publishing results
 
-- Each warmup and measured sample gets a freshly generated, freshly loaded
-  database or rule-engine session. Generation uses fixed seeds.
-- The default is one warmup and five measured iterations. The reported value
-  is the median; EDN artifacts retain every sample and min/mean/p95/p99.
-- Setup is excluded. The timed region performs rule evaluation and fully
-  materializes results.
-- TC and SG counts are checked before a result is accepted, using independent
-  fixed-point implementations in `openrulebench.core`. A mismatch is `BAD`.
-- Errors, timeouts, out-of-memory results, incorrect results, missing child
-  reports, and child-process failures produce a non-zero harness exit status.
-- `--output` records the commands' configuration, host/JVM metadata, status,
-  correctness result, summary statistics, and raw samples in EDN.
+A defensible result report should include:
 
-Run `clojure -M:test` for the fixed-point oracle, statistics, failure-gate, and
-CLI tests. Tiny end-to-end smoke checks are:
+1. the raw EDN artifact produced without `--no-verify`;
+2. the exact task list and timing class;
+3. engine, JVM, OS, CPU, memory limit, and external-server configuration;
+4. median and raw samples, not a single best run;
+5. explicit `N/A`, timeout, and OOM cells; and
+6. a statement that these deterministic inputs are OpenRuleBench-derived and
+   are not the lost historical relation files.
 
-```bash
-./bench.clj --systems datalevin,sqlite --warmup 0 --iterations 2 \
-  tc:tiny sg:tiny
-```
+Do not combine external-process and embedded/JDBC numbers into a single
+speedup. Do not compare `tiny` results with published scales. Do not silently
+drop failed or unsupported cells.
 
-### Timing Method
+## Layout
 
-The in-process TC and SG runners use the same timing boundary. Data generation,
-engine or session creation, base-fact loading, index creation, and statistics
-collection are setup and are not timed. After setup and a full GC, the timed
-region performs recursive rule evaluation and fully materializes the result:
-`d/q` for Datalevin, `fire-rules` plus `query` for Clara, `fire-session` plus
-`query-all` for O'Doyle, and the recursive query plus row materialization for
-SQLite and PostgreSQL. Timeout bookkeeping is outside O'Doyle's reported time.
-XSB and Souffle use external process runners and retain their documented
-process-level timings. XSB materializes and counts answers in one timed process;
-Soufflé includes its compilation/execution process and output writing. Those
-numbers should only be compared when their runner-specific boundaries are held
-fixed.
-
-### Options
-
-- `--systems LIST` — comma-separated systems; default `datalevin,sqlite`
-- `--warmup N` — fresh-database warmup runs; default 1
-- `--iterations N` — measured fresh-database runs; default 5
-- `--output PATH` — write a combined EDN artifact
-- `--no-verify` — skip the TC/SG oracle; unsuitable for published results
-- `--help` — print usage without compiling or running a benchmark
-
-## Current Results
-
-Environment for these runs: Clojure `1.12.5`, Clara Rules `0.24.0`,
-O'Doyle Rules `1.3.1`, OpenJDK `21.0.11`, macOS arm64, `-J-Xmx8g`.
-
-### Tiny TC/SG
-
-These are non-standard local development instances. `tc:tiny` uses 100 nodes
-and 1,000 edges; `sg:tiny` uses 100 nodes, 500 `par` facts, and 500 `sib` facts.
-These results use the common timing boundary above. Datalevin and Clara
-produced the same result counts.
-
-| Benchmark | Datalevin | Clara | O'Doyle | Result count |
-|-----------|-----------|-------|---------|--------------|
-| `tc:tiny` | 57.46 ms | 352.2 ms | T/O at 60s | 10,000 for Datalevin/Clara |
-| `sg:tiny` | 27.37 ms | 404.5 ms | T/O at 60s | 10,000 for Datalevin/Clara |
-
-These are historical one-shot values retained for context; they predate the
-current artifact-producing harness and are not a current baseline.
-
-### Small Runs
-
-`tc:small` is the OpenRuleBench TC small graph: 1,000 nodes and 50,000 edges.
-`sg:small` is the OpenRuleBench SG small shape: 1,000 nodes, 3,000 `par` facts,
-and 3,000 `sib` facts. These results use the common timing boundary above.
-
-| Benchmark | Datalevin | Clara | O'Doyle | Result count |
-|-----------|-----------|-------|---------|--------------|
-| `tc:small` | 1,048.8 ms | OOM after about 6m45s | setup >5m; stopped | 1,000,000 for Datalevin |
-| `sg:small` | 1,470.0 ms | 43,757.1 ms | T/O at 60s | 869,923 for Datalevin/Clara |
-
-These are historical medians of five runs. The observed ranges were
-897.9-1,145.4 ms for `tc:small` and 1,311.5-1,560.2 ms for `sg:small`.
-
-Correctness was checked for both Datalevin and Clara TC/SG rules against
-independent fixed-point references. The corrected SG reference uses the
-OpenRuleBench rule shape: `sg(X,Y) :- sib(X,Y)` and
-`sg(X,Y) :- par(X,Z), sg(Z,Z1), par(Y,Z1)`. Clara's current benchmark
-implementation uses private process-wide seen sets, so it is intended for the
-sequential benchmark harness.
-
-O'Doyle requires tuple ids such as `[::sg x y]` to represent many-valued binary
-relations; a simpler `[x ::sg y]` encoding overwrites values for the same `x`.
-With the corrected tuple representation, a small custom SG sanity case passes.
-Under the common timing boundary, both O'Doyle tiny cases still time out during
-rule evaluation. O'Doyle `sg:small` also times out during rule evaluation;
-`tc:small` did not finish the excluded session-construction phase within five
-minutes, so no timed result is reported.
-
-## ORE 2015 OWL-RL Benchmark (Realistic Reasoning)
-
-This benchmark uses a stratified 50-ontology subset of the ORE 2015 corpus
-and runs OWL-RL materialization plus a fixed set of generic queries.
-The subset is selected by axiom count and cached in a manifest file for
-reproducibility.
-
-Download ORE 2015:
-```bash
-./scripts/download-ore2015.sh
-```
-
-Run the OWL-RL benchmark:
-```bash
-clojure -M:ore-rl -m openrulebench.ore-rl
-```
-
-Optional flags:
-```bash
-clojure -M:ore-rl -m openrulebench.ore-rl --limit 10 --refresh --out out/ore-rl-small.csv
-```
-
-Notes:
-- The OWL-RL rule set implemented is an OWL-RL core (RDFS + property/class
-  hierarchy, sameAs, inverse, symmetric, transitive, functional).
-- Materialization is performed by enumerating all inferred triples and
-  storing them in a new Datalevin database; queries run on that closure.
-
-## Benchmark Details
-
-### Transitive Closure (TC)
-
-Compute reachability in a directed graph:
-```
-tc(A, B) :- edge(A, B).
-tc(A, B) :- edge(A, X), tc(X, B).
-```
-
-| Instance | Nodes | Edges |
-|----------|-------|-------|
-| tiny | 100 | 1,000 |
-| small | 1,000 | 50,000 |
-| medium | 1,000 | 125,000 |
-| large | 2,000 | 250,000 |
-| xlarge | 2,000 | 500,000 |
-| xxlarge | 2,000 | 1,000,000 |
-
-`tiny` is a non-standard development scale for local comparisons when the
-OpenRuleBench `small` instance is too large for a system or heap size.
-
-### Same Generation (SG)
-
-Find same-generation pairs from base `sib` and `par` relations:
-```
-sg(X, Y) :- sib(X, Y).
-sg(X, Y) :- par(X, Z), sg(Z, Z1), par(Y, Z1).
-```
-
-| Instance | Nodes | `par` facts | `sib` facts | Total facts |
-|----------|-------|-------------|-------------|-------------|
-| tiny | 100 | 500 | 500 | 1,000 |
-| small | 1,000 | 3,000 | 3,000 | 6,000 |
-| medium | 1,000 | 12,000 | 12,000 | 24,000 |
-| large | 1,000 | 24,000 | 24,000 | 48,000 |
-
-`tiny` and `large` are local development extensions; the OpenRuleBench paper
-reports SG sizes of 6,000 and 24,000 base facts.
-
-### Join1 (5-Way Join)
-
-Tests intermediate result elimination with cascading joins:
-```
-c1(X, Y) :- d1(X, Z), d2(Z, Y).
-b2(X, Y) :- c3(X, Z), c4(Z, Y).
-b1(X, Y) :- c1(X, Z), c2(Z, Y).
-a(X, Y)  :- b1(X, Z), b2(Z, Y).
-```
-
-| Instance | Tuples per relation |
-|----------|---------------------|
-| small | 10,000 |
-| medium | 50,000 |
-| large | 250,000 |
-
-### DBLP (Real-World Data)
-
-4-way self-join query on publication metadata in EAV format:
-```clojure
-[:find ?id ?title ?year ?author ?month
- :where
- [?e1 :db/id ?id] [?e1 :att/attribute :title] [?e1 :att/value ?title]
- [?e2 :db/id ?id] [?e2 :att/attribute :year] [?e2 :att/value ?year]
- [?e3 :db/id ?id] [?e3 :att/attribute :author] [?e3 :att/value ?author]
- [?e4 :db/id ?id] [?e4 :att/attribute :month] [?e4 :att/value ?month]]
-```
-
-| Instance | Papers |
-|----------|--------|
-| small | 2,000 |
-| medium | 8,000 |
-| large | 64,000 |
-
-To use real DBLP data (optional):
-```bash
-./scripts/download-dblp.sh
-```
-
-### LUBM (Semantic Web)
-
-Tests type inference with university domain ontology:
-```
-;; Type hierarchy inference
-[(is-a ?x :Student) [?x :type :GraduateStudent]]
-[(is-a ?x :Person) (is-a ?x :Student)]
-```
-
-| Instance | Universities | Triples |
-|----------|--------------|---------|
-| lubm-1 | 1 | ~100K |
-| lubm-10 | 10 | ~1M |
-| lubm-50 | 50 | ~5M |
-
-## Systems Compared
-
-| System | Category | Description |
-|--------|----------|-------------|
-| **Datalevin** | Deductive (Datalog) | Bottom-up with tabling |
-| **Clara Rules** | Production rule engine | Rete-style forward chaining |
-| **O'Doyle Rules** | Production rule engine | EAV-style forward chaining |
-| **SQLite** | SQL | Recursive CTE baseline |
-| **PostgreSQL** | SQL | Recursive CTE (optional) |
-| **XSB** | Deductive (Tabled Prolog) | Reference implementation |
-| **Soufflé** | Compiled Datalog | Reference (compiles to C++) |
-
-## Requirements
-
-### Required
-- Clojure 1.12+; benchmark aliases currently pin Clojure `1.12.4`
-- Java 17+
-
-### Optional External Systems
-
-**SQLite** (usually pre-installed):
-```bash
-sqlite3 --version
-```
-
-**PostgreSQL**:
-```bash
-brew install postgresql  # macOS
-# or
-apt install postgresql   # Linux
-```
-
-**XSB Prolog**:
-```bash
-brew install xsb  # macOS
-# or set XSB_PATH=/path/to/xsb
-```
-
-**Soufflé**:
-```bash
-brew install souffle  # macOS
-```
-
-## File Structure
-
-```
+```text
 openrulebench/
-├── bench.clj                 # Main benchmark runner
-├── README.md                 # This file
+├── bench.clj
+├── deps.edn
 ├── src/openrulebench/
-│   ├── core.clj              # Timing utilities
-│   ├── data.clj              # Data generation
-│   ├── datalevin.clj         # Datalevin benchmarks
-│   ├── dblp.clj              # DBLP data loader
-│   ├── lubm.clj              # LUBM data generator
-│   ├── sqlite.clj            # SQLite benchmarks
-│   └── ...                   # Other systems
-├── scripts/
-│   ├── download-dblp.sh      # Download real DBLP data
-│   └── generate-lubm.sh      # Generate LUBM data
-├── external/
-│   ├── xsb/                  # XSB Prolog programs
-│   ├── sql/                  # SQL scripts
-│   └── souffle/              # Soufflé Datalog
-└── data/
-    ├── dblp/                 # DBLP XML (downloaded)
-    └── lubm/                 # LUBM OWL (generated)
+│   ├── core.clj          # task contract, references, statistics, artifacts
+│   ├── data.clj          # deterministic set-valued generators
+│   ├── runner.clj        # capability-aware process orchestrator
+│   ├── datalevin.clj
+│   ├── sqlite.clj
+│   ├── postgresql.clj
+│   ├── xsb.clj
+│   ├── souffle.clj
+│   ├── clara.clj
+│   └── odoyle.clj
+└── test/openrulebench/
 ```
 
-
-## References
-
-- [OpenRuleBench Paper](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf)
-- [LUBM Benchmark](http://swat.cse.lehigh.edu/projects/lubm/)
-- [DBLP](https://dblp.uni-trier.de/)
-- [XSB Prolog](https://xsb.sourceforge.net/)
-- [Soufflé](https://souffle-lang.github.io/)
+The primary benchmark definition is the
+[OpenRuleBench paper](https://www3.cs.stonybrook.edu/~kifer/TechReports/OpenRuleBench09.pdf).

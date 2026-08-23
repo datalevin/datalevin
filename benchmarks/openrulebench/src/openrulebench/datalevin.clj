@@ -1,16 +1,13 @@
 (ns openrulebench.datalevin
-  "Datalevin benchmarks for OpenRuleBench.
-   Implements standard OpenRuleBench benchmarks:
-   - TC (Transitive Closure): Random graphs
-   - SG (Same Generation): Random par/sib relations
-   - Join1: 5-way join benchmark
-   - DBLP: Real-world publication data (4-way self-join)
-   - LUBM: Semantic university benchmark (type inference)"
+  "Datalevin backend for the portable TC, SG, and Join1 task contract.
+   Legacy exploratory DBLP/LUBM helpers remain in this namespace, but the
+   comparison runner intentionally does not expose them."
   (:require
    [openrulebench.core :as core]
    [openrulebench.data :as data]
    [openrulebench.dblp :as dblp]
    [openrulebench.lubm :as lubm]
+   [datalevin.constants :as c]
    [datalevin.core :as d]))
 
 ;; =============================================================================
@@ -143,28 +140,62 @@
 ;; =============================================================================
 
 (defn run-tc-query
-  "Transitive closure with both arguments free (full materialization)."
-  [db]
-  (d/q '[:find ?a ?b
-         :in $ %
-         :where (tc ?a ?b)]
-       db tc-rules))
+  "Transitive closure under a portable binding mode."
+  ([db]
+   (run-tc-query db :ff 1))
+  ([db binding bound]
+   (case binding
+     :ff (d/q '[:find ?a ?b
+                :in $ %
+                :where (tc ?a ?b)]
+              db tc-rules)
+     :bf (d/q '[:find ?b
+                :in $ % ?bound
+                :where (tc ?bound ?b)]
+              db tc-rules bound)
+     :fb (d/q '[:find ?a
+                :in $ % ?bound
+                :where (tc ?a ?bound)]
+              db tc-rules bound))))
 
 (defn run-sg-query
-  "Same generation with both arguments free."
-  [db]
-  (d/q '[:find ?x ?y
-         :in $ %
-         :where (sg ?x ?y)]
-       db sg-rules))
+  "Same generation under a portable binding mode."
+  ([db]
+   (run-sg-query db :ff 1))
+  ([db binding bound]
+   (case binding
+     :ff (d/q '[:find ?x ?y
+                :in $ %
+                :where (sg ?x ?y)]
+              db sg-rules)
+     :bf (d/q '[:find ?y
+                :in $ % ?bound
+                :where (sg ?bound ?y)]
+              db sg-rules bound)
+     :fb (d/q '[:find ?x
+                :in $ % ?bound
+                :where (sg ?x ?bound)]
+              db sg-rules bound))))
 
 (defn run-join1-query
-  "JOIN1: 5-way join query."
-  [db]
-  (d/q '[:find ?x ?y
-         :in $ %
-         :where (a ?x ?y)]
-       db join1-rules))
+  "Run one of the published JOIN1 predicates and binding modes."
+  ([db]
+   (run-join1-query db :a :ff 1))
+  ([db query binding bound]
+   (let [query-form
+         (case [query binding]
+           [:a :ff]  '[:find ?x ?y :in $ % :where (a ?x ?y)]
+           [:a :bf]  '[:find ?y :in $ % ?bound :where (a ?bound ?y)]
+           [:a :fb]  '[:find ?x :in $ % ?bound :where (a ?x ?bound)]
+           [:b1 :ff] '[:find ?x ?y :in $ % :where (b1 ?x ?y)]
+           [:b1 :bf] '[:find ?y :in $ % ?bound :where (b1 ?bound ?y)]
+           [:b1 :fb] '[:find ?x :in $ % ?bound :where (b1 ?x ?bound)]
+           [:b2 :ff] '[:find ?x ?y :in $ % :where (b2 ?x ?y)]
+           [:b2 :bf] '[:find ?y :in $ % ?bound :where (b2 ?bound ?y)]
+           [:b2 :fb] '[:find ?x :in $ % ?bound :where (b2 ?x ?bound)])]
+     (if (= binding :ff)
+       (d/q query-form db join1-rules)
+       (d/q query-form db join1-rules bound)))))
 
 (defn run-dblp-query
   "DBLP: 4-way self-join query.
@@ -215,6 +246,36 @@
 ;; =============================================================================
 ;; Benchmark Runners
 ;; =============================================================================
+
+(defn run-portable-benchmark
+  "Run a parsed TC, SG, or JOIN1 task with setup outside the timed region."
+  [{:keys [family binding bound-value query spec] :as task}]
+  (let [task-data (core/generate-task-data task)
+        conn      (case family
+                    :tc (create-tc-db task-data)
+                    :sg (create-sg-db task-data)
+                    :join1 (create-join1-db task-data))]
+    (try
+      (let [db (d/db conn)
+            _  (d/analyze db)
+            _  (System/gc)
+            [result time-ms]
+            (core/time-once
+              (case family
+                :tc (run-tc-query db binding bound-value)
+                :sg (run-sg-query db binding bound-value)
+                :join1 (run-join1-query db query binding bound-value)))]
+        {:system "datalevin"
+         :benchmark spec
+         :time-ms time-ms
+         :result-count (count result)
+         :base-fact-count (core/task-base-fact-count task task-data)
+         :input-digest (core/task-data-digest task task-data)
+         :engine-version c/version
+         :timing-scope :query-and-materialization
+         :status :ok})
+      (finally
+        (d/close conn)))))
 
 (defn run-tc-benchmark
   "Run TC benchmark on an instance. Returns result map.
@@ -331,7 +392,7 @@
 (def default-benchmarks
   "Default benchmarks: benchmark-type:instance-size
    Uses OpenRuleBench standard sizes where available."
-  ["tc:small" "sg:small"])
+  ["tc:50k-cyclic-ff" "sg:6k-cyclic-ff"])
 
 (defn parse-benchmark
   "Parse benchmark spec like 'tc:p1000' into [type instance]."
@@ -341,21 +402,18 @@
 (defn run-benchmark
   "Run a single benchmark by spec. Returns result map."
   [spec]
-  (let [[bench-type instance] (parse-benchmark spec)]
-    (try
-      (case bench-type
-        "tc" (run-tc-benchmark instance)
-        "sg" (run-sg-benchmark instance)
-        "join1" (run-join1-benchmark instance)
-        "dblp" (run-dblp-benchmark instance)
-        "lubm" (run-lubm-benchmark instance)
-        {:system "datalevin" :benchmark spec :status :error})
-      (catch OutOfMemoryError _
-        (System/gc)
-        {:system "datalevin" :benchmark spec :status :oom})
-      (catch Exception e
-        (println "Error:" (.getMessage e))
-        {:system "datalevin" :benchmark spec :status :error}))))
+  (try
+    (run-portable-benchmark (core/require-benchmark-task spec))
+    (catch OutOfMemoryError _
+      (System/gc)
+      {:system "datalevin" :benchmark spec :status :oom})
+    (catch Exception e
+      (let [oom? (core/out-of-memory? e)]
+        (println (if oom? "OOM:" "Error:") (.getMessage e))
+        {:system "datalevin"
+         :benchmark spec
+         :status (if oom? :oom :error)
+         :error (.getMessage e)}))))
 
 (defn run-benchmarks
   "Run all specified benchmarks. Returns seq of result maps."

@@ -148,6 +148,39 @@
           {:status :ok :result result}))
       (catch Exception _ {:status :error}))))
 
+(defn run-portable-benchmark
+  [{:keys [family binding spec] :as task}]
+  (when-not (and (#{:tc :sg} family) (= :ff binding))
+    (throw (ex-info "O'Doyle supports only free/free TC and SG tasks"
+                    {:task task})))
+  (let [task-data (core/generate-task-data task)
+        session   (case family
+                    :tc (create-tc-session task-data)
+                    :sg (create-sg-session task-data))
+        _         (System/gc)
+        outcome   (run-with-timeout
+                    #(core/time-once
+                       (let [fired (fire-session session)]
+                         (case family
+                           :tc (query-tc-all fired)
+                           :sg (query-sg-all fired)))))]
+    (if (= :ok (:status outcome))
+      (let [[result time-ms] (:result outcome)]
+        {:system "odoyle"
+         :benchmark spec
+         :time-ms time-ms
+         :result-count (count result)
+         :base-fact-count (core/task-base-fact-count task task-data)
+         :input-digest (core/task-data-digest task task-data)
+         :engine-version "1.3.1"
+         :timing-scope :query-and-materialization
+         :status :ok})
+      {:system "odoyle"
+       :benchmark spec
+       :base-fact-count (core/task-base-fact-count task task-data)
+       :timing-scope :query-and-materialization
+       :status (:status outcome)})))
+
 (defn run-tc-benchmark
   "Run TC benchmark on an OpenRuleBench instance. Returns result map."
   [instance-name]
@@ -195,25 +228,22 @@
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "sg:small"])
+  ["tc:50k-cyclic-ff" "sg:6k-cyclic-ff"])
 
 (defn parse-benchmark [spec]
   (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
-  (let [[bench-type instance] (parse-benchmark spec)]
-    (try
-      (case bench-type
-        "tc" (run-tc-benchmark instance)
-        "sg" (run-sg-benchmark instance)
-        {:system "odoyle" :benchmark spec :status :error})
-      (catch OutOfMemoryError _
-        (System/gc)
-        {:system "odoyle" :benchmark spec :status :oom})
-      (catch StackOverflowError _
-        {:system "odoyle" :benchmark spec :status :error})
-      (catch Exception _
-        {:system "odoyle" :benchmark spec :status :error}))))
+  (try
+    (run-portable-benchmark (core/require-benchmark-task spec))
+    (catch OutOfMemoryError _
+      (System/gc)
+      {:system "odoyle" :benchmark spec :status :oom})
+    (catch StackOverflowError _
+      {:system "odoyle" :benchmark spec :status :error})
+    (catch Exception e
+      {:system "odoyle" :benchmark spec :status :error
+       :error (.getMessage e)})))
 
 (defn run-benchmarks [benchmark-specs]
   (doall (map run-benchmark benchmark-specs)))

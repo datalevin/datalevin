@@ -7,6 +7,9 @@
    [clojure.string :as str]
    [openrulebench.data :as data])
   (:import
+   [java.nio ByteBuffer]
+   [java.nio.charset StandardCharsets]
+   [java.security MessageDigest]
    [java.time Instant]
    [java.util ArrayDeque ArrayList BitSet]))
 
@@ -69,33 +72,51 @@
         (.add ^ArrayList (aget result (int from)) (long to))))
     result))
 
-(defn tc-reference-count
-  "Return the exact transitive-closure cardinality using independent BFS."
-  [edges]
-  (let [n   (node-count edges)
-        adj (adjacency n edges :forward)]
-    (loop [source 0
-           total  0]
-      (if (= source n)
-        total
-        (let [seen  (BitSet. n)
-              queue (ArrayDeque.)]
-          (doseq [target ^ArrayList (aget adj source)]
-            (let [target (long target)]
-              (when-not (.get seen (int target))
-                (.set seen (int target))
-                (.addLast queue target))))
-          (while (not (.isEmpty queue))
-            (let [node (long (.removeFirst queue))]
-              (doseq [target ^ArrayList (aget adj (int node))]
-                (let [target (long target)]
-                  (when-not (.get seen (int target))
-                    (.set seen (int target))
-                    (.addLast queue target))))))
-          (recur (inc source) (+ total (.cardinality seen))))))))
+(defn- relation-row-count
+  [n ^objects rows binding bound]
+  (case binding
+    :ff (reduce (fn [total ^BitSet row]
+                  (+ total (.cardinality row)))
+                0
+                rows)
+    :bf (if (and (<= 0 bound) (< bound n))
+          (.cardinality ^BitSet (aget rows (int bound)))
+          0)
+    :fb (if (and (<= 0 bound) (< bound n))
+          (reduce (fn [total ^BitSet row]
+                    (if (.get row (int bound)) (inc total) total))
+                  0
+                  rows)
+          0)))
 
-(defn sg-reference-count
-  "Return the exact SG fixed-point cardinality using a delta work queue."
+(defn- tc-reference-rows
+  [edges]
+  (let [n    (node-count edges)
+        rows (object-array n)]
+    (dotimes [i n]
+      (aset rows i (BitSet. n)))
+    (doseq [[a b] edges]
+      (.set ^BitSet (aget rows (int a)) (int b)))
+    ;; BitSet Warshall is independent of every backend and avoids repeating a
+    ;; dense adjacency scan once per source on the 500K case.
+    (dotimes [k n]
+      (let [^BitSet via (aget rows k)]
+        (dotimes [i n]
+          (let [^BitSet row (aget rows i)]
+            (when (.get row k)
+              (.or row via))))))
+    {:size n :rows rows}))
+
+(defn tc-reference-count
+  "Return an exact TC cardinality using independent BitSet closure. Binding is
+   one of :ff, :bf (first argument fixed), or :fb (second argument fixed)."
+  ([edges]
+   (tc-reference-count edges :ff 1))
+  ([edges binding bound]
+   (let [{:keys [size rows]} (tc-reference-rows edges)]
+     (relation-row-count size rows binding bound))))
+
+(defn- sg-reference-rows
   [{:keys [par sib]}]
   (let [n     (node-count (concat par sib))
         preds (adjacency n par :reverse)
@@ -118,9 +139,16 @@
         (doseq [x ^ArrayList (aget preds (int z))
                 y ^ArrayList (aget preds (int z1))]
           (add! x y))))
-    (reduce (fn [total ^BitSet row] (+ total (.cardinality row)))
-            0
-            seen)))
+    {:size n :rows seen}))
+
+(defn sg-reference-count
+  "Return an exact SG fixed-point cardinality using an independent delta work
+   queue. Binding has the same :ff/:bf/:fb meaning as TC."
+  ([relations]
+   (sg-reference-count relations :ff 1))
+  ([relations binding bound]
+   (let [{:keys [size rows]} (sg-reference-rows relations)]
+     (relation-row-count size rows binding bound))))
 
 (defn parse-benchmark
   [spec]
@@ -130,22 +158,244 @@
                       {:benchmark spec})))
     [bench-type instance]))
 
+(def ^:private binding-modes #{:ff :bf :fb})
+(def ^:private graph-shapes #{:cyclic :acyclic})
+
+(defn- legacy-graph-task
+  [family instance]
+  (let [instances (case family
+                    :tc data/tc-instances
+                    :sg data/sg-instances)]
+    (when (contains? instances (keyword instance))
+      {:family family
+       :instance (keyword instance)
+       :shape :cyclic
+       :binding :ff
+       :bound-value 1
+       :published? false})))
+
+(defn- task-input-profile
+  [{:keys [family instance]}]
+  (case family
+    :tc (let [{:keys [nodes edges]} (get data/tc-instances instance)]
+          {:generator-version 1
+           :seed 42
+           :nodes nodes
+           :edge-facts edges})
+    :sg (let [{:keys [nodes par-facts sib-facts]}
+              (get data/sg-instances instance)]
+          {:generator-version 1
+           :par-seed 42
+           :sib-seed 43
+           :nodes nodes
+           :par-facts par-facts
+           :sib-facts sib-facts})
+    :join1 (let [{:keys [tuples domain]}
+                 (get data/join1-instances instance)]
+             {:generator-version 1
+              :relation-seeds {:d1 1 :d2 2 :c2 3 :c3 4 :c4 5}
+              :domain domain
+              :facts-per-relation tuples})))
+
+(defn benchmark-task
+  "Parse a portable benchmark specification into an executable task map.
+
+   Published forms are:
+   tc:<50k|500k>-<cyclic|acyclic>-<ff|bf|fb>
+   sg:<6k|24k>-<cyclic|acyclic>-<ff|bf|fb>
+   join1:<50k|250k>-<a|b1|b2>-<ff|bf|fb>
+
+   `tiny` may replace a published size in any of these forms for non-published
+   differential runs. The old two-part instance names remain development
+   aliases. DBLP, LUBM, and ORE are intentionally outside this portable
+   comparison contract."
+  [spec]
+  (let [[workload instance-name] (parse-benchmark spec)
+        parts (str/split instance-name #"-")
+        task
+        (case workload
+          "tc"
+          (if (= 3 (count parts))
+            (let [[size shape binding] (map keyword parts)]
+              (when (and (#{:tiny :50k :500k} size)
+                         (graph-shapes shape)
+                         (binding-modes binding))
+                {:family :tc
+                 :instance size
+                 :shape shape
+                 :binding binding
+                 :bound-value 1
+                 :published? (not= size :tiny)}))
+            (legacy-graph-task :tc instance-name))
+
+          "sg"
+          (if (= 3 (count parts))
+            (let [[size shape binding] (map keyword parts)]
+              (when (and (#{:tiny :6k :24k} size)
+                         (graph-shapes shape)
+                         (binding-modes binding))
+                {:family :sg
+                 :instance size
+                 :shape shape
+                 :binding binding
+                 :bound-value 1
+                 :published? (not= size :tiny)}))
+            (legacy-graph-task :sg instance-name))
+
+          "join1"
+          (if (= 3 (count parts))
+            (let [[size query binding] (map keyword parts)]
+              (when (and (#{:tiny :50k :250k} size)
+                         (#{:a :b1 :b2} query)
+                         (binding-modes binding))
+                {:family :join1
+                 :instance size
+                 :query query
+                 :binding binding
+                 :bound-value 1
+                 :published? (not= size :tiny)}))
+            (when (contains? data/join1-instances (keyword instance-name))
+              {:family :join1
+               :instance (keyword instance-name)
+               :query :a
+               :binding :ff
+               :bound-value 1
+               :published? false}))
+
+          nil)]
+    (when task
+      (assoc task
+             :spec spec
+             :input-profile (task-input-profile task)))))
+
+(defn require-benchmark-task
+  [spec]
+  (or (benchmark-task spec)
+      (throw (ex-info (str "Unknown or non-portable benchmark task: " spec)
+                      {:benchmark spec}))))
+
+(defn generate-task-data
+  "Generate the canonical base relations for a parsed portable task."
+  [{:keys [family instance shape]}]
+  (case family
+    :tc (data/generate-tc-instance instance
+                                   {:acyclic? (= shape :acyclic)})
+    :sg (data/generate-sg-instance instance
+                                   {:acyclic? (= shape :acyclic)})
+    :join1 (data/generate-join1-instance instance)
+    (throw (ex-info "Task has no portable data generator" {:family family}))))
+
+(defn task-base-fact-count
+  [{:keys [family]} task-data]
+  (case family
+    :tc (count task-data)
+    :sg (+ (count (:par task-data)) (count (:sib task-data)))
+    :join1 (reduce + (map #(count (get task-data %))
+                         [:d1 :d2 :c2 :c3 :c4]))))
+
+(defn task-data-digest
+  "Return a canonical SHA-256 digest of all named base-relation tuples."
+  [{:keys [family]} task-data]
+  (let [relations (case family
+                    :tc [[:edge task-data]]
+                    :sg [[:par (:par task-data)] [:sib (:sib task-data)]]
+                    :join1 (mapv (fn [relation]
+                                   [relation (get task-data relation)])
+                                 [:d1 :d2 :c2 :c3 :c4]))
+        digest (MessageDigest/getInstance "SHA-256")
+        buffer (ByteBuffer/allocate 16)
+        bytes  (.array buffer)]
+    (doseq [[relation pairs] relations]
+      (.update digest (.getBytes (name relation) StandardCharsets/UTF_8))
+      (.update digest (byte 0))
+      (doseq [[a b] pairs]
+        (.clear buffer)
+        (.putLong buffer (long a))
+        (.putLong buffer (long b))
+        (.update digest bytes)))
+    (apply str (map #(format "%02x" (bit-and (int %) 0xff))
+                    (.digest digest)))))
+
+(defn- pairs->bit-rows
+  [n pairs]
+  (let [rows (object-array n)]
+    (dotimes [i n]
+      (aset rows i (BitSet. n)))
+    (doseq [[a b] pairs]
+      (.set ^BitSet (aget rows (int a)) (int b)))
+    rows))
+
+(defn- compose-bit-relations
+  [n ^objects left ^objects right]
+  (let [result (object-array n)]
+    (dotimes [x n]
+      (let [out (BitSet. n)
+            ^BitSet intermediates (aget left x)]
+        (loop [z (.nextSetBit intermediates 0)]
+          (when (not= z -1)
+            (.or out ^BitSet (aget right z))
+            (recur (.nextSetBit intermediates (inc z)))))
+        (aset result x out)))
+    result))
+
+(defn- join1-reference-relations
+  [relations]
+  (let [n   (inc (long (reduce max -1 (mapcat identity
+                                                (mapcat #(get relations %)
+                                                        [:d1 :d2 :c2 :c3
+                                                         :c4])))))
+        d1  (pairs->bit-rows n (:d1 relations))
+        d2  (pairs->bit-rows n (:d2 relations))
+        c2  (pairs->bit-rows n (:c2 relations))
+        c3  (pairs->bit-rows n (:c3 relations))
+        c4  (pairs->bit-rows n (:c4 relations))
+        c1  (compose-bit-relations n d1 d2)
+        b2  (compose-bit-relations n c3 c4)
+        b1  (compose-bit-relations n c1 c2)
+        a   (compose-bit-relations n b1 b2)]
+    {:size n :relations {:a a :b1 b1 :b2 b2}}))
+
+(defn join1-reference-count
+  "Return an exact set-semantics JOIN1 answer count using independent BitSet
+   relation composition."
+  [relations query binding bound]
+  (let [{:keys [size relations]} (join1-reference-relations relations)]
+    (relation-row-count size (get relations query) binding bound)))
+
 (def ^:private expected-count-cache (atom {}))
+(def ^:private reference-cache (atom {}))
+
+(defn- reference-for-task
+  [{:keys [family instance shape] :as task}]
+  (let [key (case family
+              :tc [family instance shape]
+              :sg [family instance shape]
+              :join1 [family instance])]
+    (if (contains? @reference-cache key)
+      (get @reference-cache key)
+      (let [task-data (generate-task-data task)
+            reference (case family
+                        :tc (tc-reference-rows task-data)
+                        :sg (sg-reference-rows task-data)
+                        :join1 (join1-reference-relations task-data))]
+        (swap! reference-cache assoc key reference)
+        reference))))
 
 (defn expected-result-count
-  "Return an independent fixed-point count for TC/SG, or nil for workloads
-   that do not yet have a suite oracle."
+  "Return the independent answer cardinality for every portable task."
   [spec]
   (if (contains? @expected-count-cache spec)
     (get @expected-count-cache spec)
-    (let [[bench-type instance] (parse-benchmark spec)
-          expected
-          (case bench-type
-            "tc" (tc-reference-count
-                   (data/generate-tc-instance (keyword instance)))
-            "sg" (sg-reference-count
-                   (data/generate-sg-instance (keyword instance)))
-            nil)]
+    (let [{:keys [family binding bound-value query] :as task}
+          (benchmark-task spec)
+          {:keys [size rows relations]}
+          (when task (reference-for-task task))
+          expected (case family
+                     :tc (relation-row-count size rows binding bound-value)
+                     :sg (relation-row-count size rows binding bound-value)
+                     :join1 (relation-row-count size (get relations query)
+                                                   binding bound-value)
+                     nil)]
       (swap! expected-count-cache assoc spec expected)
       expected)))
 
@@ -268,7 +518,8 @@
 
 (defn run-repeated
   [system spec run-once {:keys [warmup iterations verify?]}]
-  (let [warmup-results (run-until-failure run-once spec warmup)]
+  (let [task           (benchmark-task spec)
+        warmup-results (run-until-failure run-once spec warmup)]
     (if-let [failure (first-failure warmup-results)]
       (assoc failure
              :system system
@@ -285,37 +536,52 @@
                                                         runs)))
           (let [counts       (mapv :result-count runs)
                 consistent?  (apply = counts)
+                input-digests (mapv :input-digest runs)
+                inputs-consistent? (apply = input-digests)
                 expected     (when verify? (expected-result-count spec))
                 oracle-ok?   (or (nil? expected)
                                  (every? #(= expected %) counts))
                 times        (mapv :time-ms runs)
                 summary      (latency-summary times)
-                correctness  (cond
-                               (not verify?)
-                               {:status :skipped}
+                run-metadata (select-keys (first runs)
+                                          [:timing-scope :base-fact-count
+                                           :engine-version :input-digest])
+                correctness  (assoc
+                               (cond
+                                 (not verify?)
+                                 {:status :skipped}
 
-                               (some? expected)
-                               {:status (if (and consistent? oracle-ok?)
-                                          :passed :failed)
-                                :oracle :independent-fixed-point
-                                :expected-count expected}
+                                 (some? expected)
+                                 {:status (if (and consistent?
+                                                   inputs-consistent?
+                                                   oracle-ok?)
+                                            :passed :failed)
+                                  :oracle :independent-reference
+                                  :expected-count expected}
 
-                               :else
-                               {:status (if consistent? :consistent :failed)
-                                :oracle :none})]
-            (if (and consistent? oracle-ok?)
+                                 :else
+                                 {:status (if consistent? :consistent :failed)
+                                  :oracle :none})
+                               :input-status (if inputs-consistent?
+                                               :consistent :failed))]
+            (if (and consistent? inputs-consistent? oracle-ok?)
+              (merge
+                {:system system
+                 :benchmark spec
+                 :task (dissoc task :spec)
+                 :status :ok
+                 :result-count (first counts)
+                 :time-ms (:median summary)
+                 :latency-ms summary
+                 :samples-ms times
+                 :correctness correctness}
+                run-metadata)
               {:system system
                :benchmark spec
-               :status :ok
-               :result-count (first counts)
-               :time-ms (:median summary)
-               :latency-ms summary
-               :samples-ms times
-               :correctness correctness}
-              {:system system
-               :benchmark spec
+               :task (dissoc task :spec)
                :status :incorrect
                :result-counts counts
+               :input-digests input-digests
                :expected-count expected
                :samples-ms times
                :correctness correctness})))))))
@@ -370,7 +636,7 @@
         (if (str/starts-with? arg "--")
           (throw (ex-info (str "Unrecognized option: " arg) {:option arg}))
           (do
-            (parse-benchmark arg)
+            (require-benchmark-task arg)
             (recur (next remaining) opts (conj benchmarks arg)))))
       (assoc opts :benchmarks (if (seq benchmarks)
                                 benchmarks
@@ -385,7 +651,9 @@
    :os         (System/getProperty "os.name")
    :os-version (System/getProperty "os.version")
    :arch       (System/getProperty "os.arch")
-   :processors (.availableProcessors (Runtime/getRuntime))})
+   :processors (.availableProcessors (Runtime/getRuntime))
+   :max-heap-bytes (.maxMemory (Runtime/getRuntime))
+   :direct-linking (System/getProperty "clojure.compiler.direct-linking")})
 
 (defn write-edn!
   [path value]
@@ -399,13 +667,23 @@
        "  --warmup N       Fresh-database warmup runs (default 1)\n"
        "  --iterations N   Measured fresh-database runs (default 5)\n"
        "  --output PATH    Write an EDN report with raw samples\n"
-       "  --no-verify      Skip the independent TC/SG count oracle\n"
+       "  --no-verify      Skip the independent answer-count oracle\n"
        "  --quiet          Suppress the console result row\n"
        "  --help           Show this help\n"))
 
 (defn result-failure?
   [{:keys [status]}]
   (contains? #{:error :timeout :oom :incorrect} status))
+
+(defn out-of-memory?
+  "Return true when an engine wraps an OutOfMemoryError in an exception."
+  [throwable]
+  (loop [cause throwable]
+    (when cause
+      (or (instance? OutOfMemoryError cause)
+          (boolean (some->> (.getMessage ^Throwable cause)
+                            (re-find #"OutOfMemoryError|Java heap space")))
+          (recur (.getCause ^Throwable cause))))))
 
 (defn run-system-cli!
   [system default-benchmarks run-once args]
@@ -416,8 +694,9 @@
         (println (child-usage system))
         {:exit-code 0 :help? true})
       (let [results (mapv #(run-repeated system % run-once opts) benchmarks)
-            report  {:format-version 1
+            report  {:format-version 2
                      :benchmark-suite :openrulebench
+                     :contract :portable-tc-sg-join1-v1
                      :system system
                      :host (host-info)
                      :configuration (select-keys opts

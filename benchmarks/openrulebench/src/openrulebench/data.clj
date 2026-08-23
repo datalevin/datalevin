@@ -1,11 +1,7 @@
 (ns openrulebench.data
-  "Data generation and loading for OpenRuleBench.
-   Implements standard OpenRuleBench benchmark instances:
-   - TC (Transitive Closure): Random graphs with 50K-1M edges
-   - SG (Same Generation): Random par/sib relations
-   - Join1: 5-way join benchmark
-   - DBLP: Real-world publication data
-   - LUBM: Semantic university benchmark"
+  "Deterministic set-valued data generators for the portable OpenRuleBench
+   tasks. Each sample is generated in Clojure and handed unchanged to its
+   backend."
   (:import [java.util Random]))
 
 ;; =============================================================================
@@ -19,7 +15,14 @@
      :seed    - Random seed for reproducibility (default: 42)
      :acyclic? - If true, ensure from < to (creates DAG, default: false)"
   [n m & {:keys [seed acyclic?] :or {seed 42 acyclic? false}}]
-  (let [rng (Random. seed)
+  (let [capacity (if acyclic?
+                   (quot (* (long n) (dec (long n))) 2)
+                   (* (long n) (dec (long n))))
+        _ (when (or (neg? m) (> m capacity))
+            (throw (ex-info "Requested graph does not fit its node domain"
+                            {:nodes n :edges m :capacity capacity
+                             :acyclic? acyclic?})))
+        rng (Random. seed)
         gen-edge (if acyclic?
                    ;; For acyclic: from < to
                    (fn [] (let [a (.nextInt rng n)
@@ -27,10 +30,11 @@
                             (if (< a b) [a b] [b a])))
                    ;; For cyclic: any edge
                    (fn [] [(.nextInt rng n) (.nextInt rng n)]))]
-    ;; Generate m unique edges
+    ;; A sorted vector makes the generated input stable across runtimes, not
+    ;; merely stable within one Clojure hash-set implementation.
     (loop [edges #{}]
       (if (>= (count edges) m)
-        (vec edges)
+        (vec (sort edges))
         (let [e (gen-edge)]
           (if (and (not= (first e) (second e)) ;; no self-loops
                    (not (edges e)))
@@ -39,67 +43,75 @@
 
 ;; =============================================================================
 ;; OpenRuleBench TC Instances
-;; Standard sizes match OpenRuleBench paper: 50K, 125K, 250K, 500K, 1M edges.
-;; :tiny is a non-standard development scale for local comparisons.
+;; The paper reports 50K and 500K facts, each in cyclic and acyclic forms.
+;; Legacy aliases remain available for old local commands, but only :50k and
+;; :500k are part of the publication task matrix.
 ;; =============================================================================
 
 (def tc-instances
   "TC benchmark instances."
-  {:tiny    {:nodes 100   :edges 1000}
-   :small   {:nodes 1000  :edges 50000}
-   :medium  {:nodes 1000  :edges 125000}
-   :large   {:nodes 2000  :edges 250000}
-   :xlarge  {:nodes 2000  :edges 500000}
-   :xxlarge {:nodes 2000  :edges 1000000}})
+  {:tiny    {:nodes 100  :edges 1000}
+   :50k     {:nodes 1000 :edges 50000}
+   :500k    {:nodes 2000 :edges 500000}
+   ;; Legacy development aliases.
+   :small   {:nodes 1000 :edges 50000}
+   :medium  {:nodes 1000 :edges 125000}
+   :large   {:nodes 2000 :edges 250000}
+   :xlarge  {:nodes 2000 :edges 500000}
+   :xxlarge {:nodes 2000 :edges 1000000}})
 
 (defn generate-tc-instance
   "Generate TC instance data. Returns seq of [from to] edges.
-   Instance can be :tiny, :small, :medium, :large, :xlarge, :xxlarge
-   or a map with :nodes and :edges keys."
+   Canonical instances are :tiny, :50k, and :500k. Legacy development aliases
+   and maps with :nodes/:edges are also accepted."
   ([instance-key]
    (generate-tc-instance instance-key {}))
   ([instance-key opts]
    (let [{:keys [nodes edges]} (if (map? instance-key)
                                  instance-key
                                  (get tc-instances instance-key))
-         {:keys [acyclic?] :or {acyclic? false}} opts]
+         {:keys [acyclic? seed] :or {acyclic? false seed 42}} opts]
      (when (nil? nodes)
        (throw (ex-info (str "Unknown instance: " instance-key)
                        {:instance instance-key :available (keys tc-instances)})))
-     (generate-random-graph nodes edges :acyclic? acyclic?))))
+     (generate-random-graph nodes edges :seed seed :acyclic? acyclic?))))
 
 ;; =============================================================================
 ;; OpenRuleBench SG Instances
 ;; OpenRuleBench SG uses two base relations, par and sib. The paper reports
-;; 6K and 24K SG data sizes; :tiny and :large are development extensions.
+;; 6K and 24K SG data sizes, each in cyclic and acyclic forms. Cyclicity is a
+;; property of par, the relation traversed by the recursive rule.
 ;; =============================================================================
 
 (def sg-instances
   "SG benchmark instances. Counts are total par+sib facts."
-  {:tiny  {:nodes 100  :par-facts 500   :sib-facts 500}
-   :small {:nodes 1000 :par-facts 3000  :sib-facts 3000}
+  {:tiny   {:nodes 100  :par-facts 500   :sib-facts 500}
+   :6k     {:nodes 1000 :par-facts 3000  :sib-facts 3000}
+   :24k    {:nodes 1000 :par-facts 12000 :sib-facts 12000}
+   ;; Legacy development aliases.
+   :small  {:nodes 1000 :par-facts 3000  :sib-facts 3000}
    :medium {:nodes 1000 :par-facts 12000 :sib-facts 12000}
-   :large {:nodes 1000 :par-facts 24000 :sib-facts 24000}})
+   :large  {:nodes 1000 :par-facts 24000 :sib-facts 24000}})
 
 (defn generate-sg-instance
   "Generate SG instance data as {:par [...], :sib [...]}.
-   Instance can be :tiny, :small, :medium, :large, or a map with :nodes,
-   :par-facts, and :sib-facts keys."
+   Canonical instances are :tiny, :6k, and :24k. Legacy development aliases
+   and maps with :nodes/:par-facts/:sib-facts are also accepted."
   ([instance-key]
    (generate-sg-instance instance-key {}))
   ([instance-key opts]
    (let [{:keys [nodes par-facts sib-facts]} (if (map? instance-key)
                                                instance-key
                                                (get sg-instances instance-key))
-         {:keys [acyclic?] :or {acyclic? false}} opts]
+         {:keys [acyclic? seed] :or {acyclic? false seed 42}} opts]
      (when (nil? nodes)
        (throw (ex-info (str "Unknown SG instance: " instance-key)
                        {:instance instance-key :available (keys sg-instances)})))
      {:par (generate-random-graph nodes par-facts
-                                  :seed 42
+                                  :seed seed
                                   :acyclic? acyclic?)
       :sib (generate-random-graph nodes sib-facts
-                                  :seed 43)})))
+                                  :seed (inc (long seed)))})))
 
 ;; =============================================================================
 ;; Join1 Data Generation
@@ -108,27 +120,37 @@
 (def join1-instances
   "JOIN1 benchmark instances.
    Each instance has 5 relations: d1, d2, c2, c3, c4"
-  {:small  {:tuples 10000}
-   :medium {:tuples 50000}
-   :large  {:tuples 250000}})
+  {:tiny   {:tuples 100 :domain 100}
+   :50k    {:tuples 50000 :domain 1000}
+   :250k   {:tuples 250000 :domain 1000}
+   ;; Legacy development aliases.
+   :small  {:tuples 10000 :domain 1000}
+   :medium {:tuples 50000 :domain 1000}
+   :large  {:tuples 250000 :domain 1000}})
 
 (defn generate-join1-relation
-  "Generate a join1 relation with n tuples.
-   Each tuple is [a b] where a,b are random integers."
+  "Generate exactly n unique tuples in a deterministic order."
   [n domain seed]
-  (let [rng (Random. seed)]
-    (vec (repeatedly n (fn [] [(.nextInt rng domain) (.nextInt rng domain)])))))
+  (let [capacity (* (long domain) domain)
+        _ (when (> n capacity)
+            (throw (ex-info "JOIN1 relation does not fit its domain"
+                            {:tuples n :domain domain :capacity capacity})))
+        rng (Random. seed)]
+    (loop [tuples #{}]
+      (if (= (count tuples) n)
+        (vec (sort tuples))
+        (recur (conj tuples [(.nextInt rng domain)
+                             (.nextInt rng domain)]))))))
 
 (defn generate-join1-instance
   "Generate all JOIN1 relations for an instance.
-   Returns map {:d1 [...] :d2 [...] :c2 [...] :c3 [...] :c4 [...]}
-   Domain size scales with tuple count to maintain join selectivity."
+   Returns map {:d1 [...] :d2 [...] :c2 [...] :c3 [...] :c4 [...]}. A custom
+   instance map must contain :tuples and :domain."
   [instance-key]
-  (let [{:keys [tuples]} (if (map? instance-key)
-                           instance-key
-                           (get join1-instances instance-key))
-        domain (int (Math/sqrt tuples))]
-    (when (nil? tuples)
+  (let [{:keys [tuples domain]} (if (map? instance-key)
+                                  instance-key
+                                  (get join1-instances instance-key))]
+    (when (or (nil? tuples) (nil? domain))
       (throw (ex-info (str "Unknown instance: " instance-key)
                       {:instance instance-key :available (keys join1-instances)})))
     {:d1 (generate-join1-relation tuples domain 1)
@@ -136,6 +158,18 @@
      :c2 (generate-join1-relation tuples domain 3)
      :c3 (generate-join1-relation tuples domain 4)
      :c4 (generate-join1-relation tuples domain 5)}))
+
+(defn join1-domain
+  "Return the node-domain size used by a JOIN1 instance."
+  [instance-key]
+  (let [{:keys [domain]} (if (map? instance-key)
+                           instance-key
+                           (get join1-instances instance-key))]
+    (when-not domain
+      (throw (ex-info (str "Unknown JOIN1 instance: " instance-key)
+                      {:instance instance-key
+                       :available (keys join1-instances)})))
+    domain))
 
 ;; =============================================================================
 ;; Datalevin Data Conversion
@@ -182,7 +216,7 @@
   (count (:d1 j1)) ;; => 10000
 
   ;; List available instances
-  (keys tc-instances)  ;; => (:tiny :small :medium :large :xlarge :xxlarge)
-  (keys sg-instances)  ;; => (:tiny :small :medium :large)
-  (keys join1-instances) ;; => (:small :medium :large)
+  (keys tc-instances)
+  (keys sg-instances)
+  (keys join1-instances)
   )

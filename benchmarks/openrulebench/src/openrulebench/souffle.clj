@@ -7,7 +7,8 @@
    [openrulebench.core :as core]
    [openrulebench.data :as data]
    [clojure.java.io :as io]
-   [clojure.java.shell :as sh])
+   [clojure.java.shell :as sh]
+   [clojure.string :as str])
   (:import
    [java.util UUID]))
 
@@ -41,6 +42,48 @@ tc(a, b) :- edge(a, x), tc(x, b).
 sg(x, y) :- sib(x, y).
 sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
 ")
+
+(def join1-program
+  ".decl d1(a: number, b: number)
+.input d1
+.decl d2(a: number, b: number)
+.input d2
+.decl c2(a: number, b: number)
+.input c2
+.decl c3(a: number, b: number)
+.input c3
+.decl c4(a: number, b: number)
+.input c4
+
+.decl c1(x: number, y: number)
+.decl b1(x: number, y: number)
+.decl b2(x: number, y: number)
+.decl a(x: number, y: number)
+
+c1(x, y) :- d1(x, z), d2(z, y).
+b2(x, y) :- c3(x, z), c4(z, y).
+b1(x, y) :- c1(x, z), c2(z, y).
+a(x, y) :- b1(x, z), b2(z, y).
+")
+
+(defn- result-program
+  [predicate binding bound]
+  (case binding
+    :ff (format ".decl result(x: number, y: number)\n.output result\n\nresult(x, y) :- %s(x, y).\n"
+                predicate)
+    :bf (format ".decl result(y: number)\n.output result\n\nresult(y) :- %s(%d, y).\n"
+                predicate bound)
+    :fb (format ".decl result(x: number)\n.output result\n\nresult(x) :- %s(x, %d).\n"
+                predicate bound)))
+
+(defn program-for-task
+  [{:keys [family query binding bound-value]}]
+  (let [base (case family
+               :tc (str/replace tc-program ".output tc\n" "")
+               :sg (str/replace sg-program ".output sg\n" "")
+               :join1 join1-program)
+        predicate (name (if (= family :join1) query family))]
+    (str base "\n" (result-program predicate binding bound-value))))
 
 ;; =============================================================================
 ;; File Generation
@@ -76,6 +119,28 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
     (spit prog-file sg-program)
     prog-file))
 
+(defn write-portable-files
+  [{:keys [family] :as task} task-data dir]
+  (case family
+    :tc (with-open [w (io/writer (str dir "/edge.facts"))]
+          (doseq [[a b] task-data]
+            (.write w (str a "\t" b "\n"))))
+    :sg (do
+          (with-open [w (io/writer (str dir "/par.facts"))]
+            (doseq [[a b] (:par task-data)]
+              (.write w (str a "\t" b "\n"))))
+          (with-open [w (io/writer (str dir "/sib.facts"))]
+            (doseq [[a b] (:sib task-data)]
+              (.write w (str a "\t" b "\n")))))
+    :join1 (doseq [relation [:d1 :d2 :c2 :c3 :c4]]
+             (with-open [w (io/writer (str dir "/" (name relation)
+                                           ".facts"))]
+               (doseq [[a b] (get task-data relation)]
+                 (.write w (str a "\t" b "\n"))))))
+  (let [prog-file (str dir "/task.dl")]
+    (spit prog-file (program-for-task task))
+    prog-file))
+
 ;; =============================================================================
 ;; Souffle Execution
 ;; =============================================================================
@@ -86,6 +151,14 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
   (let [result (sh/sh "souffle" "-F" dir "-D" dir prog-file)]
     (when (zero? (:exit result))
       dir)))
+
+(def ^:private souffle-version
+  (delay
+    (try
+      (let [{:keys [exit out err]} (sh/sh "souffle" "--version")]
+        (when (zero? exit)
+          (str/trim (if (str/blank? out) err out))))
+      (catch Exception _ nil))))
 
 (defn count-output
   "Count lines in output file."
@@ -98,6 +171,30 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
 ;; =============================================================================
 ;; Benchmark Runners
 ;; =============================================================================
+
+(defn run-portable-benchmark
+  [{:keys [family spec] :as task}]
+  (let [task-data (core/generate-task-data task)
+        dir       (str "/tmp/openrulebench-souffle-" (name family) "-"
+                       (UUID/randomUUID))
+        _         (io/make-parents (str dir "/dummy"))
+        prog-file (write-portable-files task task-data dir)]
+    (try
+      (let [[output-dir time-ms] (core/time-once (run-souffle prog-file dir))
+            result-count (when output-dir (count-output output-dir "result"))]
+        {:system "souffle"
+         :benchmark spec
+         :time-ms time-ms
+         :result-count (or result-count 0)
+         :base-fact-count (core/task-base-fact-count task task-data)
+         :input-digest (core/task-data-digest task task-data)
+         :engine-version (or @souffle-version "unknown")
+         :timing-scope :external-process-compile-load-evaluate-materialize
+         :status (if result-count :ok :error)})
+      (finally
+        (doseq [f (or (seq (.listFiles (io/file dir))) [])]
+          (io/delete-file f true))
+        (io/delete-file dir true)))))
 
 (defn run-tc-benchmark
   "Run TC benchmark on an OpenRuleBench instance. Returns result map."
@@ -146,21 +243,18 @@ sg(x, y) :- par(x, z), sg(z, z1), par(y, z1).
 ;; =============================================================================
 
 (def default-benchmarks
-  ["tc:small" "sg:small"])
+  ["tc:50k-cyclic-ff" "sg:6k-cyclic-ff"])
 
 (defn parse-benchmark [spec]
   (core/parse-benchmark spec))
 
 (defn run-benchmark [spec]
-  (let [[bench-type instance] (parse-benchmark spec)]
-    (try
-      (case bench-type
-        "tc" (run-tc-benchmark instance)
-        "sg" (run-sg-benchmark instance)
-        {:system "souffle" :benchmark spec :status :error})
-      (catch Exception e
-        (println "Error:" (.getMessage e))
-        {:system "souffle" :benchmark spec :status :error}))))
+  (try
+    (run-portable-benchmark (core/require-benchmark-task spec))
+    (catch Exception e
+      (println "Error:" (.getMessage e))
+      {:system "souffle" :benchmark spec :status :error
+       :error (.getMessage e)})))
 
 (defn run-benchmarks [benchmark-specs]
   (doall (map run-benchmark benchmark-specs)))
