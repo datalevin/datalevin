@@ -43,6 +43,8 @@
 
 (def ^:dynamic *sip-domains* nil)
 
+(def ^:dynamic *access-batch-observer* nil)
+
 (defrecord Context [parsed-q rels sources rules opt-clauses late-clauses
                     optimizable-or-joins graph plan intermediates run?
                     result-set])
@@ -99,7 +101,10 @@
     (try
       (loop []
         (let [{batch-tuples :tuples
-               :keys        [exhausted?]} (qaccess/next-batch cursor)]
+               :keys        [exhausted?]
+               :as          batch} (qaccess/next-batch cursor)]
+          (when *access-batch-observer*
+            (*access-batch-observer* batch))
           (.addAll tuples ^Collection batch-tuples)
           (if exhausted?
             tuples

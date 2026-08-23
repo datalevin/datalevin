@@ -441,8 +441,11 @@ the requested window is proven complete, execution uses the already planned
 conventional root. The older 32-batch limit remains only as a safety guard for
 an access path without an explicit candidate budget. `explain` reports the
 access and conventional alternatives, the candidate budget, and sample reuse;
-with `{:run? true}` it executes the conventional root so intermediate
-statistics describe complete execution.
+with `{:run? true}` it executes the selected root. When an access root is
+selected, `:plan` reports its access method, mode, physical operators, actual
+candidate and fragment counts, and the residual plan for each batch. If the
+adaptive controller falls back, the same plan also reports the attempted
+access work and the conventional fallback reason and plan.
 
 The query result cache stores the exact ordered `:offset`/`:limit` window. Its
 key includes the complete parsed query, including the ordering and window, so
