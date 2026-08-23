@@ -363,11 +363,6 @@ applying 4 rules to a mathematics genealogy data set on a Macbook Pro 2023.
 For recursive rules like Q4, Datalevin can be orders of magnitude faster,
 while Datomic and Datascript struggle.
 
-Datalevin compares favorably with Neo4j on [an industrial standard graph
-database benchmark](benchmarks/LDBC-SNB-bench). For point access in
-graphs, Datalevin is several orders of magnitude faster, while performs
-comparably with Neo4j on complex graph queries.
-
 ## :rocket: Status
 
 Datalevin is extensively tested with property-based testing and is used
