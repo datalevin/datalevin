@@ -404,7 +404,7 @@
                    [?post :message/isContainedIn _]
                    (or-join [?post ?start ?score-contrib]
                             ;; Every post contributes -1.
-                            (and [(ground -1) ?score-contrib])
+                            [(ground -1) ?score-contrib]
                             ;; A matching post contributes another +2. Choose
                             ;; one matching tag so the post is counted once.
                             (and [?post :message/hasTag ?tag]

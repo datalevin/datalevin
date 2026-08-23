@@ -1758,6 +1758,46 @@
              ;; when the conjunction has no clause capable of making progress.
              (reduce resolve-clause context pending)))))))
 
+(defn resolve-branch-clauses
+  "Resolve a conjunction using the active late or-join branch selector."
+  [context clauses]
+  (resolve-clauses context clauses *or-join-branch-selector*))
+
+(defn resolve-or-join-branch-relations
+  "Resolve each branch of a simple or-join to a projected, branch-distinct
+  relation without materializing the union between branches."
+  [context vars branches]
+  (let [vars         (into #{} (filter qu/binding-var?) vars)
+        _            (check-free-subset (bound-vars context) vars branches)
+        join-context (limit-context context vars)]
+    (into []
+          (comp (map (fn [branch]
+                       (-> (if (and *or-join-branch-selector*
+                                    (sequential? branch)
+                                    (= 'and (first branch)))
+                             (resolve-branch-clauses join-context (next branch))
+                             (resolve-clause join-context branch))
+                           (limit-context vars))))
+                (map #(let [rels (:rels %)]
+                        (if (seq rels)
+                          (-> (reduce j/hash-join rels)
+                              project-visible-distinct)
+                          []))))
+          branches)))
+
+(defn union-or-join-branch-relations
+  "Materialize the exact union of already projected or-join branches."
+  [branch-rels]
+  (transduce identity r/sum-rel-dedupe branch-rels))
+
+(defn resolve-or-join-relation
+  "Resolve the branches of a simple or-join to their exact projected union.
+  The returned relation has not yet been joined back into the outer context,
+  which lets terminal consumers reduce it at the correlation boundary."
+  [context vars branches]
+  (union-or-join-branch-relations
+    (resolve-or-join-branch-relations context vars branches)))
+
 (defn -resolve-clause
   ([context clause]
    (-resolve-clause context clause clause))
@@ -1809,27 +1849,9 @@
 
      '[or-join [*] *]
      (let [[_ vars & branches] clause
-           vars                (into #{} (filter qu/binding-var?) vars)
-           _                   (check-free-subset (bound-vars context) vars
-                                                  branches)
-           join-context        (limit-context context vars)]
+           union-rel           (resolve-or-join-relation context vars branches)]
        (update context :rels collapse-rels
-               (transduce (comp (map (fn [branch]
-                                       (-> (if (and *or-join-branch-selector*
-                                                    (sequential? branch)
-                                                    (= 'and (first branch)))
-                                             (resolve-clauses
-                                               join-context (next branch)
-                                               *or-join-branch-selector*)
-                                             (resolve-clause join-context
-                                                             branch))
-                                           (limit-context vars))))
-                                (map #(let [rels (:rels %)]
-                                        (if (seq rels)
-                                          (-> (reduce j/hash-join rels)
-                                              project-visible-distinct)
-                                          []))))
-                          r/sum-rel-dedupe branches)))
+               union-rel))
 
      '[and *]
      (let [[_ & clauses] clause]

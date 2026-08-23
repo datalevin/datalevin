@@ -16,6 +16,7 @@
    [datalevin.join :as j]
    [datalevin.pipe :as p]
    [datalevin.query :as dq]
+   [datalevin.query.aggregate :as qagg]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
@@ -35,6 +36,12 @@
 (defn- rows
   [rel]
   (mapv vec (:tuples rel)))
+
+(defn ground
+  "Test query function whose qualified name must not be treated as the
+  built-in `ground` by planner proofs."
+  [_]
+  1)
 
 (deftest rule-bound-value-cardinality-order-test
   (let [estimate-clause-size @(ns-resolve 'datalevin.rules
@@ -223,6 +230,334 @@
              (and [?path :path/start ?start]
                   [?path :path/end ?person])))
         {'?entity 10 '?start 1 '?person 4}))))
+
+(deftest terminal-keyed-distinct-sum-test
+  (let [dir   (u/tmp-dir (str "keyed-distinct-sum-" (UUID/randomUUID)))
+        conn  (d/get-conn
+                dir
+                {:item/owner {:db/valueType   :db.type/ref
+                              :db/cardinality :db.cardinality/many}
+                 :copy/owner {:db/valueType :db.type/ref}
+                 :copy/item  {:db/valueType :db.type/ref}})
+        query '[:find ?group (sum ?delta)
+                :with ?item
+                :where
+                [?owner :owner/group ?group]
+                (or-join [?owner ?item ?delta]
+                  (and [(ground :base) ?item]
+                       [(ground 0) ?delta])
+                  (and [?item :item/owner ?owner]
+                       [?item :item/delta ?delta])
+                  (and [?copy :copy/owner ?owner]
+                       [?copy :copy/item ?item]
+                       [?copy :copy/delta ?delta]))]
+        injective-query
+        '[:find ?owner (sum ?delta)
+          :with ?item
+          :where
+          [?owner :owner/group _]
+          (or-join [?owner ?item ?delta]
+            (and [(ground :base) ?item]
+                 [(ground 0) ?delta])
+            (and [?item :item/owner ?owner]
+                 [?item :item/delta ?delta])
+            (and [?copy :copy/owner ?owner]
+                 [?copy :copy/item ?item]
+                 [?copy :copy/delta ?delta]))]
+        disjoint-query
+        '[:find ?owner (sum ?score)
+          :with ?item
+          :where
+          [?owner :owner/group _]
+          (or-join [?owner ?item ?score]
+            (and [(ground :base) ?item]
+                 [(ground 0) ?score])
+            (and [?item :item/owner ?owner]
+                 [(ground 1) ?score]))]
+        qualified-ground-query
+        '[:find ?owner (sum ?score)
+          :with ?item
+          :where
+          [?owner :owner/group _]
+          (or-join [?owner ?item ?score]
+            (and [(ground :base) ?item]
+                 [(datalevin.query-not-test/ground 0) ?score])
+            (and [(ground :base) ?item]
+                 [(datalevin.query-not-test/ground 2) ?score]))]
+        expected           #{["A" 4] ["B" 5] ["C" 0]}
+        injective-expected #{[1 1] [2 5] [3 5] [4 0]}
+        disjoint-expected  #{[1 2] [2 2] [3 1] [4 0]}
+        qualified-expected #{[1 1] [2 1] [3 1] [4 1]}]
+    (try
+      (d/transact! conn [{:db/id 1 :owner/group "A"}
+                         {:db/id 2 :owner/group "A"}
+                         {:db/id 3 :owner/group "B"}
+                         {:db/id 4 :owner/group "C"}
+                         {:db/id 10 :item/owner [1 2] :item/delta 2}
+                         {:db/id 11 :item/owner 1 :item/delta -1}
+                         {:db/id 12 :item/owner 2 :item/delta 3}
+                         {:db/id 20 :item/owner 3 :item/delta 5}
+                         ;; These rows duplicate one projected branch result,
+                         ;; which also overlaps the direct item branch.
+                         {:db/id 100
+                          :copy/owner 1 :copy/item 10 :copy/delta 2}
+                         {:db/id 101
+                          :copy/owner 1 :copy/item 10 :copy/delta 2}])
+      (let [database (d/db conn)
+            ordinary
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction?* false]
+              (d/q query database))
+            reduced-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} query database))
+            reduced
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q query database))
+            fallback-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1000]
+              (d/explain {:run? true} query database))
+            injective-ordinary
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction?* false]
+              (d/q injective-query database))
+            injective-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} injective-query database))
+            injective-reduced
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q injective-query database))
+            disjoint-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} disjoint-query database))
+            disjoint-result
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q disjoint-query database))
+            qualified-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} qualified-ground-query database))
+            qualified-result
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q qualified-ground-query database))]
+        (is (= expected (set ordinary) (set reduced)))
+        (testing "logical find/with identities dedupe across physical keys"
+          (is (= 7 (get-in reduced-explain
+                           [:keyed-group-reduction :identity-count])))
+          (is (= 3 (get-in reduced-explain
+                           [:keyed-group-reduction :group-count])))
+          (is (= :seen-set
+                 (get-in reduced-explain
+                         [:keyed-group-reduction :identity-mode]))))
+        (testing "the reducer is runtime-gated with an exact fallback"
+          (is (true? (get-in reduced-explain
+                             [:keyed-group-reduction :executed?])))
+          (is (true? (get-in reduced-explain
+                             [:keyed-group-reduction :direct-feed?])))
+          (is (false? (get-in reduced-explain
+                              [:keyed-group-reduction :union-materialized?])))
+          (is (false? (get-in fallback-explain
+                              [:keyed-group-reduction :executed?])))
+          (is (true? (get-in fallback-explain
+                             [:keyed-group-reduction :union-materialized?])))
+          (is (= :below-runtime-cost-threshold
+                 (get-in fallback-explain
+                         [:keyed-group-reduction :reason]))))
+        (testing "injective correlations dedupe across direct producers"
+          (is (= injective-expected
+                 (set injective-ordinary)
+                 (set injective-reduced)))
+          (is (= :cross-producer-seen-set
+                 (get-in injective-explain
+                         [:keyed-group-reduction :identity-mode])))
+          (is (true? (get-in injective-explain
+                             [:keyed-group-reduction :direct-feed?]))))
+        (testing "constant domains prove direct producers disjoint"
+          (is (= disjoint-expected (set disjoint-result)))
+          (is (= :producer-disjoint
+                 (get-in disjoint-explain
+                         [:keyed-group-reduction :identity-mode])))
+          (is (= {:var '?score :domains [#{0} #{1}]}
+                 (get-in disjoint-explain
+                         [:keyed-group-reduction :proof
+                          :producer-disjoint]))))
+        (testing "qualified functions named ground are not proof constants"
+          (is (= qualified-expected (set qualified-result)))
+          (is (= :cross-producer-seen-set
+                 (get-in qualified-explain
+                         [:keyed-group-reduction :identity-mode])))
+          (is (nil? (get-in qualified-explain
+                            [:keyed-group-reduction :proof
+                             :producer-disjoint])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest terminal-virtual-producer-sum-test
+  (let [dir  (u/tmp-dir (str "virtual-producer-sum-" (UUID/randomUUID)))
+        conn (d/get-conn
+               dir
+               {:item/owner {:db/valueType   :db.type/ref
+                             :db/cardinality :db.cardinality/many}})
+        query
+        '[:find ?owner (sum ?score)
+          :with ?item
+          :where
+          [?owner :owner/group _]
+          (or-join [?owner ?item ?score]
+            (and [(ground :base) ?item]
+                 [(ground 0) ?score])
+            (and [?item :item/owner ?owner]
+                 [?item :item/delta _]
+                 (or-join [?item ?score]
+                   [(ground -1) ?score]
+                   (and [?item :item/delta 2]
+                        [(ground 2) ?score]))))]
+        overlap-query
+        '[:find ?owner (sum ?score)
+          :with ?item
+          :where
+          [?owner :owner/group _]
+          (or-join [?owner ?item ?score]
+            (and [(ground :base) ?item]
+                 [(ground 0) ?score])
+            (and [?item :item/owner ?owner]
+                 [?item :item/delta _]
+                 (or-join [?item ?score]
+                   [(ground -1) ?score]
+                   (and [?item :item/delta 2]
+                        [(ground -1) ?score]))))]
+        expected         #{[1 0] [2 1] [3 0]}
+        overlap-expected #{[1 -2] [2 -1] [3 0]}]
+    (try
+      (d/transact! conn [{:db/id 1 :owner/group "A"}
+                         {:db/id 2 :owner/group "B"}
+                         {:db/id 3 :owner/group "C"}
+                         {:db/id 10 :item/owner [1 2] :item/delta 2}
+                         {:db/id 11 :item/owner 1 :item/delta 3}])
+      (let [database (d/db conn)
+            ordinary
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction?* false]
+              (d/q query database))
+            materialized
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-virtual-producers?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q query database))
+            virtual-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} query database))
+            virtual
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q query database))
+            overlap-ordinary
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction?* false]
+              (d/q overlap-query database))
+            overlap-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/explain {:run? true} overlap-query database))
+            overlap-virtual
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1
+                      qagg/*keyed-group-reduction-min-ratio* 1.0]
+              (d/q overlap-query database))
+            fallback-explain
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1000]
+              (d/explain {:run? true} query database))
+            fallback
+            (binding [dq/*cache?* false
+                      qagg/*keyed-group-reduction-min-input* 1000]
+              (d/q query database))]
+        (testing "constant columns feed the terminal sink without a union"
+          (is (= expected
+                 (set ordinary)
+                 (set materialized)
+                 (set virtual)))
+          (is (true? (get-in virtual-explain
+                             [:keyed-group-reduction
+                              :virtual-producer-feed?])))
+          (is (false? (get-in virtual-explain
+                              [:keyed-group-reduction
+                               :union-materialized?])))
+          (is (= 2 (get-in virtual-explain
+                           [:keyed-group-reduction
+                            :virtual-producer-count])))
+          (is (= [#{0} #{-1} #{2}]
+                 (get-in virtual-explain
+                         [:keyed-group-reduction :proof
+                          :stream-producer-domains])))
+          (is (= {:var '?score :domains [#{0} #{-1} #{2}]}
+                 (get-in virtual-explain
+                         [:keyed-group-reduction :proof
+                          :producer-disjoint]))))
+        (testing "overlapping virtual and materialized identities dedupe"
+          (is (= overlap-expected
+                 (set overlap-ordinary)
+                 (set overlap-virtual)))
+          (is (= :cross-producer-seen-set
+                 (get-in overlap-explain
+                         [:keyed-group-reduction :identity-mode])))
+          (is (false? (get-in overlap-explain
+                              [:keyed-group-reduction
+                               :producer-disjoint?])))
+          (is (nil? (get-in overlap-explain
+                            [:keyed-group-reduction :proof
+                             :producer-disjoint]))))
+        (testing "a rejected virtual reduction materializes without rescanning"
+          (is (= expected (set fallback)))
+          (is (false? (get-in fallback-explain
+                              [:keyed-group-reduction :executed?])))
+          (is (false? (get-in fallback-explain
+                              [:keyed-group-reduction
+                               :virtual-producer-feed?])))
+          (is (true? (get-in fallback-explain
+                             [:keyed-group-reduction
+                              :union-materialized?])))
+          (is (= :below-runtime-cost-threshold
+                 (get-in fallback-explain
+                         [:keyed-group-reduction :reason])))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest distinct-sum-sink-fork-merge-test
+  (let [sink (qagg/distinct-sum-sink ['?group] '?score)
+        fork (qagg/-fork-keyed sink)]
+    (qagg/-accept-keyed! sink ["A"] [:same 2] 2)
+    (qagg/-accept-keyed! fork ["A"] [:same 2] 2)
+    (qagg/-accept-keyed! fork ["A"] [:other 3] 3)
+    (qagg/-accept-keyed! fork ["B"] [:only 7] 7)
+    (qagg/-merge-keyed! sink fork)
+    (is (= {:identity-count 3 :group-count 2}
+           (qagg/-keyed-stats sink)))
+    (is (= #{["A" 5] ["B" 7]}
+           (set (rows (qagg/-keyed-relation sink)))))))
 
 (deftest adaptive-parallel-scan-participant-count-test
   (let [participant-capacity @(ns-resolve

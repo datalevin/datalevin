@@ -473,6 +473,64 @@ shapes retain their original evaluation order.
 rows enriched, together with the cardinality-preserving, projection-only, and
 stable-distinct-key proof obligations.
 
+### Terminal keyed grouped reduction
+
+A high-fanout terminal fragment need not join all of its payload rows back into
+the wide outer relation before a grouped aggregate. Datalevin can instead feed
+the fragment into a keyed reduction sink at the last-use frontier of its
+identity variables. The first physical implementation covers a direct `sum`
+whose final late clause is a simple `or-join`: all result-group variables must
+already be bound, and the clause may produce only its correlation key, the sum
+input, and the variables named by `:with`.
+
+The resolver exposes each projected, branch-distinct `or-join` producer to the
+sink separately. On the selected path, those producers feed the reduction
+directly, so execution never constructs their combined union. The sink still
+preserves Datalevin's set-before-aggregate semantics by deduplicating the
+complete physical identity across producers before adding a contribution.
+When the observed correlation-to-group mapping is not one-to-one, it instead
+deduplicates the complete logical identity—group variables, `:with` variables,
+and the sum input.
+
+A terminal branch may also end in a nested simple `or-join` after a shared
+conjunctive prefix. When an inner branch only binds new payload variables with
+the exact built-in `ground`, the resolver scans the prefix once and represents
+those bindings as virtual constant columns while feeding the prefix tuples to
+the sink. It does not allocate the constant-expanded relation, the nested
+union, or their final outer projection. Residual inner branches still use the
+ordinary resolver and join back to the prefix. A constant binding that overlaps
+an already-bound column is not eligible, because that binding is a unification
+constraint rather than a new column.
+
+This feed starts at the output boundary of the existing bulk storage scan. The
+scan remains CPU-aware, chunked, and relation-producing when another inner
+branch needs its rows; replacing that scan with tuple-at-a-time index probes
+would discard its sorted merge-scan advantage. Virtual and materialized
+producers nevertheless share the same reducer, including exact local and
+cross-producer identity deduplication.
+
+For a one-to-one correlation, one producer is already unique. Multiple
+producers normally use a compact cross-producer seen set. A generic proof can
+remove that set when some identity variable has pairwise-disjoint finite
+constant domains in the branches; for example, branches contributing `0` and
+`#{-1 2}` cannot emit the same aggregate identity. Execution then sums on the
+narrower correlation key and maps it back to the projected group only when
+emitting results. The reduction sink remains forkable and merges by logical
+identity, allowing later scan-level integrations to reduce worker-local state
+without changing results.
+
+Selection remains runtime costed. The fragment must contain at least 4,096
+rows and at least four rows per outer row. A second gate checks the exact
+distinct identity count after reduction. If either gate rejects the rewrite,
+the already-resolved branches are unioned and joined through the ordinary path;
+no branch scan is rerun. `explain` reports the proof, producer/input/group
+cardinalities, `:direct-feed?`, `:union-materialized?`, and whether identity
+handling used `:producer-unique`, `:producer-disjoint`,
+`:cross-producer-seen-set`, or `:seen-set` under
+`:keyed-group-reduction`. A nested constant feed additionally reports
+`:virtual-producer-feed?`, `:virtual-producer-count`, and the expanded
+`:stream-producer-domains` used for its disjointness proof.
+
 ### Adaptive unordered limits
 
 A finite unordered relation query can also avoid producing every source match
