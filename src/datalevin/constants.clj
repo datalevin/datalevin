@@ -927,6 +927,22 @@ must be capable of saving before the planner expands their placement states."}
        :doc     "Batch size for pipelined scans. Tuples are buffered, sorted, then scanned in batch for sequential seeks. Set to 0 to disable batching."}
   query-pipe-batch-size 12384)
 
+(def ^{:dynamic true
+       :doc     "Enable single-layer partition execution for eligible linear query-plan segments."}
+  query-partitioned-execution? true)
+
+(def ^{:dynamic true
+       :doc     "Minimum materialized input size before partition execution is considered."}
+  query-partition-min-input-size 8000)
+
+(def ^{:dynamic true
+       :doc     "Target tuple count for each query execution partition."}
+  query-partition-target-size 2000)
+
+(def ^{:dynamic true
+       :doc     "Minimum number of contiguous safe index steps required for partition execution."}
+  query-partition-min-step-count 3)
+
 
 ;; search engine
 

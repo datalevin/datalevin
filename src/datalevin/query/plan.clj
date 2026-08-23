@@ -25,12 +25,13 @@
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
    [datalevin.relation :as r]
+   [datalevin.storage :as storage]
    [datalevin.timeout :as timeout]
    [datalevin.util :as u])
   (:import
-   [java.util AbstractCollection Collection Collections HashSet List]
+   [java.util AbstractCollection ArrayList Collection Collections HashSet List]
    [java.util.concurrent Callable CompletableFuture ConcurrentHashMap
-    ExecutorService Executors Future TimeUnit]
+    ExecutorService Executors ForkJoinPool ForkJoinWorkerThread Future TimeUnit]
    [datalevin.db DB]
    [datalevin.storage Store]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -1016,6 +1017,279 @@
     (save-intermediates context steps pipes tuples)
     (r/relation! attrs tuples)))
 
+(defn- save-intermediate-counts
+  [context steps counts]
+  (when-let [res (and *explain* *intermediate-counts?*
+                      (:intermediates context))]
+    (vswap! res merge
+            (into {}
+                  (map (fn [step count]
+                         [(:out step) {:tuples-count count}])
+                       steps counts)))))
+
+(defn- pipeline-span
+  [db steps ^List source]
+  (let [n (long (count steps))]
+    (case n
+      0 {:tuples (or source (FastList.)) :counts []}
+      1 (let [tuples (or (step-execute (first steps) db source) (FastList.))]
+          {:tuples tuples
+           :counts (when (and *explain* *intermediate-counts?*)
+                     [(.size ^List tuples)])})
+      (let [n-1        (dec n)
+            input      (when source (p/list-tuple-pipe source))
+            tuples     (FastList.
+                         (int (if source
+                                (.size source)
+                                c/init-exec-size-threshold)))
+            counting?  (and *explain* *intermediate-counts?*)
+            pipes      (object-array
+                         (repeatedly n-1 #(if counting?
+                                            (p/counted-tuple-pipe)
+                                            (p/tuple-pipe))))
+            work       (fn [step ^long i]
+                         (let [src  (if (zero? i)
+                                      input
+                                      (aget pipes (dec i)))
+                               sink (if (= i n-1)
+                                      tuples
+                                      (aget pipes i))]
+                           (step-execute-pipe step db src sink)))
+            finish     #(when (not= % n-1) (p/finish (aget pipes %)))]
+        (if (writing? db)
+          (dotimes [i n]
+            (try
+              (work (nth steps i) i)
+              (finally (finish i))))
+          (let [bindings (get-thread-bindings)
+                tasks    (mapv (fn [step i]
+                                 ^Callable
+                                 #(with-bindings bindings
+                                    (try
+                                      (work step i)
+                                      (finally
+                                        (finish i)))))
+                               steps (range n))]
+            (doseq [^Future f (.invokeAll ^ExecutorService
+                                          (get-pipe-thread-pool) tasks)]
+              (.get f))))
+        (p/remove-end-scan tuples)
+        {:tuples tuples
+         :counts (when counting?
+                   (conj
+                     (mapv (fn [^long i]
+                             (p/total (aget pipes i)))
+                           (range n-1))
+                     (.size tuples)))}))))
+
+(defn- partition-safe-step?
+  [step]
+  (case (-type step)
+    :link true
+    :merge
+    (and (nil? (:result step))
+         (every? (fn [[_ opts]]
+                   (qpred/forkable-predicate? (:pred opts)))
+                 (:attrs-v step)))
+    false))
+
+(defn- next-partition-segment
+  [steps start]
+  (let [n       (long (count steps))
+        minimum (long c/query-partition-min-step-count)]
+    (loop [idx (long start)]
+      (when (< idx n)
+        (if (partition-safe-step? (nth steps idx))
+          (let [end (long
+                      (loop [end (u/long-inc idx)]
+                        (if (and (< end n)
+                                 (partition-safe-step? (nth steps end)))
+                          (recur (u/long-inc end))
+                          end)))]
+            (if (<= minimum (- end idx))
+              [idx end]
+              (recur (long end))))
+          (recur (u/long-inc idx)))))))
+
+(defn- partition-plan?
+  [context db steps]
+  (let [minimum (long c/query-partition-min-step-count)]
+    (and context
+         c/query-partitioned-execution?
+         (not (writing? db))
+         (pos? (long c/query-partition-target-size))
+         (pos? (long c/query-partition-min-input-size))
+         (pos? minimum)
+         (<= (inc minimum) (count steps))
+         (identical? :init (-type (first steps)))
+         (some? (next-partition-segment steps 1)))))
+
+(defn- partition-participant-capacity
+  ^long [^long n ^long cpu-count ^long pool-slots ^long target-size]
+  (let [cpu-capacity      (max 1 cpu-count)
+        executor-capacity (inc (max 0 pool-slots))
+        useful-work       (max 1 (quot (+ n (dec target-size)) target-size))]
+    (long (min cpu-capacity executor-capacity useful-work))))
+
+(defn- partition-participant-count
+  ^long [^long n]
+  (if (< n (long c/query-partition-min-input-size))
+    1
+    (let [^ForkJoinPool pool (ForkJoinPool/commonPool)
+          ^Thread thread    (Thread/currentThread)
+          parallelism      (long (.getParallelism pool))
+          pool-slots       (if (and (instance? ForkJoinWorkerThread thread)
+                                    (identical?
+                                      pool
+                                      (.getPool ^ForkJoinWorkerThread thread)))
+                             (max 0 (dec parallelism))
+                             parallelism)]
+      (partition-participant-capacity
+        n (.availableProcessors (Runtime/getRuntime)) pool-slots
+        (long c/query-partition-target-size)))))
+
+(defn- copy-tuple-partition
+  ^FastList [^List tuples ^long start ^long end]
+  (let [out (FastList. (int (- end start)))]
+    (loop [i start]
+      (when (< i end)
+        (.add out (.get tuples (int i)))
+        (recur (inc i))))
+    out))
+
+(defn- execute-step-partition
+  [db steps ^List tuples]
+  (binding [storage/*parallel-list-scan?* false]
+    (loop [remaining steps
+           tuples    tuples
+           counts    []]
+      (if-let [step (first remaining)]
+        (if (zero? (.size tuples))
+          {:tuples tuples
+           :counts (into counts (repeat (count remaining) 0))}
+          (let [result (or (step-execute step db tuples) (FastList.))]
+            (recur (next remaining) result
+                   (conj counts (.size ^List result)))))
+        {:tuples tuples :counts counts}))))
+
+(defn- execute-partitioned-steps
+  [db steps ^List tuples ^long participants]
+  (let [n          (.size tuples)
+        bindings   (get-thread-bindings)
+        partitions (mapv (fn [^long i]
+                           (let [start (quot (* i n) participants)
+                                 end   (quot (* (inc i) n) participants)]
+                             (copy-tuple-partition tuples start end)))
+                         (range participants))
+        ^ForkJoinPool pool (ForkJoinPool/commonPool)
+        futures     (ArrayList. (int (dec participants)))]
+    (dotimes [offset (dec participants)]
+      (let [i (inc offset)]
+        (.add futures
+              (.submit
+                pool
+                ^Callable
+                (reify Callable
+                  (call [_]
+                    (with-bindings bindings
+                      (execute-step-partition db steps (nth partitions i)))))))))
+    (try
+      (let [results (ArrayList. (int participants))]
+        (.add results (execute-step-partition db steps (first partitions)))
+        (dotimes [i (.size futures)]
+          (.add results (.get ^Future (.get futures i))))
+        (let [total-count (reduce + 0
+                                  (map (fn [result]
+                                         (.size ^List (:tuples result)))
+                                       results))
+              out         (FastList. (int total-count))
+              counts      (long-array (count steps))]
+          (dotimes [i (.size results)]
+            (let [{part-tuples :tuples part-counts :counts} (.get results i)]
+              (.addAll out ^Collection part-tuples)
+              (doseq [[idx count] (map-indexed vector part-counts)]
+                (aset-long counts idx
+                           (+ (aget counts idx) (long count))))))
+          {:tuples out :counts (vec counts)}))
+      (catch Throwable e
+        (dotimes [i (.size futures)]
+          (.cancel ^Future (.get futures i) true))
+        (throw e)))))
+
+(defn- execute-partition-segment
+  [db steps segment-start segment-end ^List source]
+  (let [segment-start (long segment-start)
+        segment-end   (long segment-end)]
+    (loop [idx    segment-start
+           tuples source
+           counts []]
+      (let [remaining (- segment-end idx)]
+        (cond
+          (zero? remaining)
+          {:tuples tuples :counts counts}
+
+          (zero? (.size tuples))
+          {:tuples tuples
+           :counts (into counts (repeat remaining 0))}
+
+          :else
+          (let [tuple-count  (.size tuples)
+                participants
+                (if (>= remaining (long c/query-partition-min-step-count))
+                  (partition-participant-count tuple-count)
+                  1)]
+            (if (< 1 participants)
+              (let [segment (subvec steps idx segment-end)
+                    result  (execute-partitioned-steps
+                              db segment tuples participants)]
+                (when *explain*
+                  (vswap! *explain* update :partitioned-execution (fnil conj [])
+                          {:mode :partitioned-segment
+                           :segment-start-step-index segment-start
+                           :split-step-index idx
+                           :segment-end-step-index segment-end
+                           :input-rows tuple-count
+                           :partitions participants
+                           :segment-step-count
+                           (- segment-end segment-start)
+                           :segment-step-types
+                           (mapv -type
+                                 (subvec steps segment-start segment-end))
+                           :partitioned-step-count remaining
+                           :partitioned-step-types (mapv -type segment)
+                           :previous-step-type
+                           (when (pos? segment-start)
+                             (-type (nth steps (dec segment-start))))
+                           :next-step-type
+                           (when (< segment-end (count steps))
+                             (-type (nth steps segment-end)))}))
+                {:tuples (:tuples result)
+                 :counts (into counts (:counts result))})
+              (let [result (or (step-execute (nth steps idx) db tuples)
+                               (FastList.))]
+                (recur (inc idx) result
+                       (conj counts (.size ^List result)))))))))))
+
+(defn- segmented-execution
+  [context db attrs steps]
+  (let [n (count steps)]
+    (loop [idx    0
+           tuples nil
+           counts []]
+      (if-let [[segment-start segment-end]
+               (next-partition-segment steps idx)]
+        (let [prefix (pipeline-span db (subvec steps idx segment-start) tuples)
+              segment
+              (execute-partition-segment
+                db steps segment-start segment-end (:tuples prefix))]
+          (recur (long segment-end) (:tuples segment)
+                 (into (into counts (:counts prefix)) (:counts segment))))
+        (let [tail   (pipeline-span db (subvec steps idx n) tuples)
+              tuples (:tuples tail)
+              counts (into counts (:counts tail))]
+          (save-intermediate-counts context steps counts)
+          (r/relation! attrs tuples))))))
+
 (defn execute-steps
   "Execute all steps of a component's plan to obtain a relation."
   [context db steps]
@@ -1031,7 +1305,9 @@
                 tuples (step-execute (peek steps) db src)]
             (save-intermediates context steps (object-array [src]) tuples)
             (r/relation! attrs tuples))
-        (pipelining context db attrs steps n)))))
+        (if (partition-plan? context db steps)
+          (segmented-execution context db attrs steps)
+          (pipelining context db attrs steps n))))))
 
 (defn count-steps
   "Execute a component plan and count its output without retaining the final

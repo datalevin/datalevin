@@ -988,8 +988,8 @@ complex queries.
 Our counting and sampling based query planning method does more work than
 traditional statistics based methods at query time. Independent component
 counts, samples, and plans are evaluated concurrently when the database is
-read-only. Plan execution also uses a bounded tuple pipeline, so different
-steps can have tuples in flight at the same time.
+read-only. Plans that cannot be partitioned use a bounded tuple pipeline, so
+different steps can have tuples in flight at the same time.
 
 The most expensive list-based storage operations additionally parallelize
 inside an individual scan batch. This currently covers fused EAV merge scans,
@@ -1013,6 +1013,35 @@ shareable. Predicate composition retains these factories when every child is
 forkable. An opaque user predicate has no such proof, so its scan remains
 serial. This makes storage-level parallelism available to normal Datalog plans
 without introducing shared mutable predicate state.
+
+Long linear scan segments use a single layer of parallelism instead. Within a
+read-only component, the executor finds each maximal run of link and merge
+steps. Every merge predicate in the run must be forkable, and no merge may
+depend on a precomputed relation. A hash, semi-join, branch, access, or other
+coordinating operator ends the run, but does not disqualify safe runs before or
+after it. The intervening nonlinear spans retain bounded pipeline execution and
+provide materialized inputs to the neighboring safe segments.
+
+Once an input within a safe segment reaches 8,000 tuples with at least three
+index steps remaining in that segment, its tuples are copied into independent
+partitions targeting roughly 2,000 tuples each. Each partition traverses the
+rest of the segment on one worker. The list operators still sort that partition
+for the index order needed by each step, retaining batched sequential cursor
+access without placing every stage in a separate pipeline task.
+
+Storage-level chunking is disabled while such a partition is running. This
+prevents a query partition from recursively consuming another set of workers,
+and lets the common fork-join pool bound total CPU use. The caller processes
+one partition, other partitions use available pool slots, and the participant
+count is capped by the processor count and useful work. A single-core machine
+therefore takes the same serial path. Results are concatenated in partition
+order, and per-step row counts are summed for `explain`.
+
+Each selected boundary is reported under `:partitioned-execution` with the
+segment bounds and step types, the runtime split point and partitioned step
+types, input row count, partition count, and adjacent nonlinear step types.
+Non-forkable predicates and writes retain their existing serial or pipelined
+execution path.
 
 ### Multiple stage clause resolution
 

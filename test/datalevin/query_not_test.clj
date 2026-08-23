@@ -17,6 +17,7 @@
    [datalevin.pipe :as p]
    [datalevin.query :as dq]
    [datalevin.query.aggregate :as qagg]
+   [datalevin.query.plan]
    [datalevin.query.predicate :as qpred]
    [datalevin.query.resolve :as qresolve]
    [datalevin.query-util :as qu]
@@ -1201,6 +1202,138 @@
                   likers)]
         (testing "decorrelation preserves date and tie-break semantics"
           (is (= expected conventional specialized))))
+      (finally
+        (d/close conn)
+        (u/delete-files dir)))))
+
+(deftest partitioned-linear-execution-test
+  (let [dir   (u/tmp-dir (str "partitioned-linear-" (UUID/randomUUID)))
+        conn  (d/get-conn
+                dir
+                {:start/id    {:db/valueType :db.type/long
+                               :db/unique    :db.unique/identity}
+                 :edge/from   {:db/valueType :db.type/ref}
+                 :edge/to     {:db/valueType :db.type/ref}
+                 :person/blocked {}
+                 :post/person {:db/valueType :db.type/ref}
+                 :post/forum  {:db/valueType :db.type/ref}
+                 :forum/title {:db/valueType :db.type/string}
+                 :forum/owner {:db/valueType :db.type/ref}
+                 :owner/name  {:db/valueType :db.type/string}})
+        query '[:find ?person ?title (count ?post)
+                :where
+                [?start :start/id 1]
+                [?edge :edge/from ?start]
+                [?edge :edge/to ?person]
+                [?post :post/person ?person]
+                [?post :post/forum ?forum]
+                [?forum :forum/title ?title]]
+        nonlinear-query
+        '[:find ?person ?title (count ?post)
+          :where
+          [?start :start/id 1]
+          [?edge :edge/from ?start]
+          [?edge :edge/to ?person]
+          [?post :post/person ?person]
+          [?post :post/forum ?forum]
+          [?forum :forum/title ?title]
+          (not-join [?person]
+            [?person :person/blocked true])]
+        nonlinear-prefix-query
+        '[:find ?person ?title ?owner-name (count ?post)
+          :where
+          [?start :start/id 1]
+          (or-join [?start ?person]
+            (and [?edge :edge/from ?start]
+                 [?edge :edge/to ?person]))
+          [?post :post/person ?person]
+          [?post :post/forum ?forum]
+          [?forum :forum/title ?title]
+          [?forum :forum/owner ?owner]
+          [?owner :owner/name ?owner-name]]
+        participant-capacity
+        @(ns-resolve 'datalevin.query.plan
+                     'partition-participant-capacity)
+        participant-count
+        (ns-resolve 'datalevin.query.plan 'partition-participant-count)]
+    (try
+      (d/transact!
+        conn
+        (into
+          [{:db/id 1 :start/id 1}
+           {:db/id 100 :person/blocked true}]
+          (concat
+            (map (fn [^long i]
+                   {:db/id (+ 3000 i)
+                    :forum/title (str "forum-" i)
+                    :forum/owner (+ 4000 i)})
+                 (range 4))
+            (map (fn [^long i]
+                   {:db/id (+ 4000 i) :owner/name (str "owner-" i)})
+                 (range 4))
+            (map (fn [^long i]
+                   {:db/id (+ 1000 i)
+                    :edge/from 1
+                    :edge/to (+ 100 i)})
+                 (range 8))
+            (for [^long person (range 8), ^long forum (range 4)]
+              {:db/id (+ 10000 (* person 4) forum)
+               :post/person (+ 100 person)
+               :post/forum (+ 3000 forum)}))))
+      (let [database (d/db conn)
+            pipeline (binding [c/query-partitioned-execution? false]
+                       (d/q query database))
+            run-partitioned
+            (fn [f]
+              (binding [c/query-partitioned-execution? true
+                        c/query-partition-min-input-size 5
+                        c/query-partition-target-size 2
+                        c/query-partition-min-step-count 3]
+                (with-redefs-fn
+                  {participant-count
+                   (fn ^long [^long n]
+                     (if (< n 5) 1 4))}
+                  f)))
+            partitioned (run-partitioned #(d/q query database))
+            explain     (run-partitioned
+                          #(d/explain {:run? true} query database))
+            decision    (first (:partitioned-execution explain))
+            nonlinear-pipeline
+            (binding [c/query-partitioned-execution? false]
+              (d/q nonlinear-query database))
+            nonlinear-explain
+            (run-partitioned
+              #(d/explain {:run? true} nonlinear-query database))
+            nonlinear-decision
+            (first (:partitioned-execution nonlinear-explain))
+            nonlinear-prefix-pipeline
+            (binding [c/query-partitioned-execution? false]
+              (d/q nonlinear-prefix-query database))
+            nonlinear-prefix-explain
+            (run-partitioned
+              #(d/explain {:run? true} nonlinear-prefix-query database))
+            nonlinear-prefix-decision
+            (first (:partitioned-execution nonlinear-prefix-explain))]
+        (testing "a sorted partition traverses the unary suffix exactly once"
+          (is (= pipeline partitioned))
+          (is (= :partitioned-segment (:mode decision)))
+          (is (= 8 (:input-rows decision)))
+          (is (= 4 (:partitions decision)))
+          (is (= [:merge :merge :link :merge :merge]
+                 (:partitioned-step-types decision))))
+        (testing "a nonlinear suffix does not disqualify its safe segment"
+          (is (= nonlinear-pipeline (:result nonlinear-explain)))
+          (is (= :partitioned-segment (:mode nonlinear-decision)))
+          (is (= :not-join (:next-step-type nonlinear-decision))))
+        (testing "a nonlinear prefix does not disqualify its safe segment"
+          (is (= nonlinear-prefix-pipeline (:result nonlinear-prefix-explain)))
+          (is (= :partitioned-segment (:mode nonlinear-prefix-decision)))
+          (is (= :or-join
+                 (:previous-step-type nonlinear-prefix-decision))))
+        (testing "the capacity model works on one core and respects pool slots"
+          (is (= 1 (participant-capacity 10000 1 10 2000)))
+          (is (= 2 (participant-capacity 10000 8 1 2000)))
+          (is (= 3 (participant-capacity 5000 8 8 2000)))))
       (finally
         (d/close conn)
         (u/delete-files dir)))))

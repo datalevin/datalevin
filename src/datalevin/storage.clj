@@ -439,6 +439,10 @@
 
 (def ^:private ^:const parallel-scan-target-chunk-size 4000)
 
+(def ^:dynamic *parallel-list-scan?*
+  "Whether a list storage operation may create its own parallel scan chunks."
+  true)
+
 (defn- eav-filter-presence-chunk
   [lmdb ^List in eid-idx aid]
   (let [out      (FastList. (.size in))
@@ -533,7 +537,8 @@
   ([lmdb ^List in f]
    (scan-list-in-chunks lmdb in (.size in) f))
   ([lmdb ^List in work-count f]
-   (let [participants (if (lmdb/writing? lmdb)
+   (let [participants (if (or (lmdb/writing? lmdb)
+                              (not *parallel-list-scan?*))
                         1
                         (parallel-scan-participant-count work-count))]
      (if (== 1 participants)
