@@ -123,6 +123,25 @@ cached EAV adjacency. Once that domain is exhausted, later deltas for the group
 are skipped. Rule calls that only rename a complete result relation reuse its
 tuple arrays rather than materializing an identical projection.
 
+### Indexed bound transitive closure
+
+A binary transitive-closure rule with one singleton-bound endpoint does not
+need to materialize the complete recursive relation. The rule engine recognizes
+the canonical two-branch form: a base branch containing one ref-valued EAV
+clause, plus a left- or right-linear recursive branch that composes the same EAV
+relation with the predicate. Both physical EAV orientations are supported.
+
+For this shape, evaluation performs a work-queue traversal from the bound
+endpoint. Each expansion is an indexed EA or AV lookup, depending on the
+direction, and a seen set provides Datalog set semantics and cycle termination.
+The start value is returned only when a non-empty cycle reaches it, matching
+ordinary transitive rather than reflexive-transitive closure. Literal bounds
+and query variables whose current domain contains exactly one value are
+eligible. Committed databases use compact tuple probes; a `db-with` value with
+a pending transaction overlay uses transaction-aware datom probes. Other rule
+shapes, multi-valued bounds, non-ref attributes, and calls against an already
+materialized rule relation continue through the general semi-naive evaluator.
+
 ## Benchmarks
 
 ### Math Genealogy Benchmark

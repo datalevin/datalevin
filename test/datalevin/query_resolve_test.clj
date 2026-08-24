@@ -12,7 +12,8 @@
   (:require
    [clojure.test :refer [deftest is testing]]
    [datalevin.core :as d]
-   [datalevin.query.execute]))
+   [datalevin.query.execute]
+   [datalevin.rules :as rules]))
 
 (deftest flat-function-tuple-binding-test
   (testing "ignored elements and new variables bind directly"
@@ -93,3 +94,106 @@
              (sort-late #{} rules clauses))))
     (testing "ties retain source order"
       (is (= clauses (sort-late #{'?x} rules clauses))))))
+
+(deftest bound-transitive-eav-specialization-test
+  (let [schema       {:edge {:db/valueType   :db.type/ref
+                             :db/cardinality :db.cardinality/many}}
+        facts        [{:db/id 1 :db/ident :node/one :edge [2]}
+                      {:db/id 2 :edge [3 4]}
+                      {:db/id 3 :edge [1]}
+                      {:db/id 4}]
+        conn         (d/create-conn nil schema
+                                    {:kv-opts {:inmemory? true}})
+        fallback     (d/create-conn nil schema
+                                    {:kv-opts {:inmemory? true}})
+        left-rules   '[[(tc ?a ?b)
+                        [?a :edge ?b]]
+                       [(tc ?a ?b)
+                        [?a :edge ?mid]
+                        (tc ?mid ?b)]]
+        right-rules  '[[(tc-right ?a ?b)
+                        [?a :edge ?b]]
+                       [(tc-right ?a ?b)
+                        (tc-right ?a ?mid)
+                        [?mid :edge ?b]]]
+        reverse-rules '[[(tc-reverse ?a ?b)
+                         [?b :edge ?a]]
+                        [(tc-reverse ?a ?b)
+                         [?mid :edge ?a]
+                         (tc-reverse ?mid ?b)]]
+        constrained-rules
+        '[[(tc-constrained ?a ?b)
+           [?a :edge ?b]]
+          [(tc-constrained ?a ?b)
+           [?a :edge ?a]
+           (tc-constrained ?a ?b)]]
+        bf-query     '[:find [?b ...]
+                       :in $ % ?start
+                       :where (tc ?start ?b)]
+        fb-query     '[:find [?a ...]
+                       :in $ % ?end
+                       :where (tc ?a ?end)]]
+    (try
+      (d/transact! conn facts)
+      (d/transact! fallback facts)
+      (testing "a singleton input traverses only the indexed reachable graph"
+        (is (= #{1 2 3 4}
+               (set (d/q bf-query (d/db conn) left-rules 1))))
+        (is (= #{1 2 3}
+               (set (d/q fb-query (d/db conn) left-rules 4))))
+        (is (= #{1 2 3 4}
+               (set (d/q '[:find [?b ...]
+                           :in $ %
+                           :where (tc 1 ?b)]
+                         (d/db conn) left-rules))))
+        (is (= #{1 2 3 4}
+               (set (d/q bf-query (d/db conn) left-rules :node/one)))))
+
+      (testing "right-linear and physically reversed forms retain semantics"
+        (is (= #{1 2 3 4}
+               (set (d/q '[:find [?b ...]
+                           :in $ % ?start
+                           :where (tc-right ?start ?b)]
+                         (d/db conn) right-rules 1))))
+        (is (= #{1 2 3}
+               (set (d/q '[:find [?b ...]
+                           :in $ % ?start
+                           :where (tc-reverse ?start ?b)]
+                         (d/db conn) reverse-rules 4))))
+        (is (= #{1 2 3 4}
+               (set (d/q '[:find [?a ...]
+                           :in $ % ?end
+                           :where (tc-reverse ?a ?end)]
+                         (d/db conn) reverse-rules 1)))))
+
+      (testing "variable equality constraints stay on the general evaluator"
+        (is (= #{2}
+               (set (d/q '[:find [?b ...]
+                           :in $ % ?start
+                           :where (tc-constrained ?start ?b)]
+                         (d/db conn) constrained-rules 1)))))
+
+      (testing "the specialized result agrees with the general fixed point"
+        (is (= (set (d/q bf-query (d/db conn) left-rules 1))
+               (binding [rules/*bound-transitive-eav?* false]
+                 (set (d/q bf-query (d/db fallback) left-rules 1)))))
+        (is (= (set (d/q fb-query (d/db conn) left-rules 4))
+               (binding [rules/*bound-transitive-eav?* false]
+                 (set (d/q fb-query (d/db fallback) left-rules 4))))))
+
+      (testing "a pending transaction overlay uses transaction-aware probes"
+        (let [overlay (d/db-with (d/db conn) [[:db/add 4 :edge 5]])]
+          (is (= #{1 2 3 4 5}
+                 (set (d/q '[:find [?b ...]
+                             :in $ % ?start
+                             :where (tc-overlay ?start ?b)]
+                           overlay
+                           '[[(tc-overlay ?a ?b)
+                              [?a :edge ?b]]
+                             [(tc-overlay ?a ?b)
+                              [?a :edge ?mid]
+                              (tc-overlay ?mid ?b)]]
+                           1))))))
+      (finally
+        (d/close conn)
+        (d/close fallback)))))

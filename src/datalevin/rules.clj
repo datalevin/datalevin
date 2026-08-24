@@ -23,10 +23,11 @@
    [datalevin.relation :as r])
   (:import
    [datalevin.utl ArrayUtil]
+   [datalevin.datom Datom]
    [datalevin.db DB]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [java.util List HashMap HashSet]))
+   [java.util List HashMap HashSet ArrayDeque]))
 
 (defn parse-rules
   [rules]
@@ -1203,6 +1204,7 @@
 (def ^:dynamic *auto-optimize-temporal* true)
 (def ^:dynamic *keep-temporal-intermediates* false)
 (def ^:dynamic *magic-rewrite?* true)
+(def ^:dynamic *bound-transitive-eav?* true)
 
 ;; magic set rewrite
 
@@ -1579,6 +1581,173 @@
                         branches)
                   idx)))
             head-vars))))
+
+(defn- transitive-eav-base-plan
+  "Recognize a binary rule base branch backed by one EAV relation. The
+   returned entity position describes which logical rule argument occupies
+   the physical E position."
+  [branch]
+  (let [[head & clauses] branch
+        head-vars        (vec (rest head))]
+    (when (and (= 2 (count head-vars))
+               (every? qu/binding-var? head-vars)
+               (distinct-vars? head-vars)
+               (= 1 (count clauses))
+               (simple-eav-clause? (first clauses)))
+      (let [[e attr v] (first clauses)]
+        (cond
+          (= [e v] head-vars) {:attr attr, :entity-pos 0}
+          (= [v e] head-vars) {:attr attr, :entity-pos 1})))))
+
+(defn- logical-eav-ends
+  [clause entity-pos]
+  (let [[e _ v] clause]
+    (if (zero? ^long entity-pos) [e v] [v e])))
+
+(defn- transitive-eav-recursive-branch?
+  [context rule-name branch attr entity-pos]
+  (let [[head & clauses] branch
+        head-vars        (vec (rest head))
+        eavs             (filterv simple-eav-clause? clauses)
+        calls            (filterv
+                           #(and (sequential? %)
+                                 (rule-call? context %)
+                                 (= rule-name (rule-head %)))
+                           clauses)]
+    (when (and (= 2 (count head-vars))
+               (every? qu/binding-var? head-vars)
+               (distinct-vars? head-vars)
+               (= 2 (count clauses))
+               (= 1 (count eavs))
+               (= 1 (count calls))
+               (nil? (source (first calls))))
+      (let [eav       (first eavs)
+            call-args (vec (rule-args (first calls)))
+            [left right] head-vars
+            [edge-left edge-right] (logical-eav-ends eav entity-pos)]
+        (and (= attr (second eav))
+             (= 2 (count call-args))
+             (let [[call-left call-right] call-args]
+               (or
+                 ;; edge(left, mid), tc(mid, right)
+                 (and (= edge-left left)
+                      (= edge-right call-left)
+                      (= call-right right)
+                      (qu/binding-var? edge-right)
+                      (not= edge-right left)
+                      (not= edge-right right))
+                 ;; tc(left, mid), edge(mid, right)
+                 (and (= call-left left)
+                      (= call-right edge-left)
+                      (= edge-right right)
+                      (qu/binding-var? edge-left)
+                      (not= edge-left left)
+                      (not= edge-left right)))))))))
+
+(defn- transitive-eav-rule-plan
+  [context rule-name]
+  (let [branches (get-in context [:rules rule-name])]
+    (when (= 2 (count branches))
+      (let [base-plans (keep (fn [branch]
+                               (when-not (some #(and (sequential? %)
+                                                     (rule-call? context %))
+                                               (rest branch))
+                                 (when-let [plan
+                                            (transitive-eav-base-plan branch)]
+                                   [branch plan])))
+                             branches)]
+        (when (= 1 (count base-plans))
+          (let [[base-branch {:keys [attr entity-pos]}] (first base-plans)
+                rec-branches (remove #(identical? % base-branch) branches)]
+            (when (and (= 1 (count rec-branches))
+                       (transitive-eav-recursive-branch?
+                         context rule-name (first rec-branches)
+                         attr entity-pos))
+              {:attr       attr
+               :entity-pos entity-pos
+               :head-vars  (vec (rest (ffirst branches)))})))))))
+
+(defn- singleton-bound-argument
+  [context arg]
+  (if (qu/free-var? arg)
+    (let [values (values-for-var context arg)]
+      (when (= 1 (count values))
+        {:value (first values)}))
+    {:value arg}))
+
+(defn- bound-transitive-eav-plan
+  [context rule-name args]
+  (when (and *bound-transitive-eav?*
+             (= 2 (count args))
+             (nil? (get-in context [:rule-rels rule-name])))
+    (let [pattern    (binding-pattern args (context-bound-vars context))
+          bound-idxs (vec (bound-indices pattern))]
+      (when (= 1 (count bound-idxs))
+        (let [bound-idx (long (first bound-idxs))]
+          (when-let [{:keys [attr] :as plan}
+                     (transitive-eav-rule-plan context rule-name)]
+            (let [database (get-in context [:sources '$])]
+              (when (and database
+                         (db/-searchable? database)
+                         (identical? :db.type/ref
+                                     (get-in (db/-schema database)
+                                             [attr :db/valueType])))
+                (when-let [bound (singleton-bound-argument
+                                   context (nth args bound-idx))]
+                  (when-let [traversal-value
+                             (db/entid database (:value bound))]
+                    (assoc plan
+                           :db database
+                           :bound-idx bound-idx
+                           :bound-value (:value bound)
+                           :pending-tx? (db/pending-tx-cache? database)
+                           :traversal-value traversal-value)))))))))))
+
+(defn- eval-bound-transitive-eav
+  [{:keys [^DB db attr ^long entity-pos head-vars
+           ^long bound-idx bound-value traversal-value pending-tx?]}
+   args]
+  (let [bound-side (if (= bound-idx entity-pos) :e :v)
+        queue      (ArrayDeque.)
+        expanded   (HashSet.)
+        answers    (HashSet.)
+        tuples     (FastList.)]
+    (.add expanded traversal-value)
+    (.add queue traversal-value)
+    (while (not (.isEmpty queue))
+      (let [node    (.removeFirst queue)
+            pattern (if (= bound-side :e)
+                      [node attr nil]
+                      [nil attr node])]
+        (if pending-tx?
+          (let [datoms ^List (db/-search db pattern)]
+            (when datoms
+              (dotimes [i (.size datoms)]
+                (let [datom    ^Datom (.get datoms i)
+                      neighbor (if (= bound-side :e)
+                                 (.-v datom)
+                                 (.-e datom))]
+                  (when (.add answers neighbor)
+                    (.add tuples
+                          (if (zero? bound-idx)
+                            (object-array [bound-value neighbor])
+                            (object-array [neighbor bound-value]))))
+                  (when (.add expanded neighbor)
+                    (.addLast queue neighbor))))))
+          (let [neighbors ^List (db/-search-tuples db pattern)]
+            (when neighbors
+              (dotimes [i (.size neighbors)]
+                (let [neighbor (aget ^objects (.get neighbors i) 0)]
+                  (when (.add answers neighbor)
+                    (.add tuples
+                          (if (zero? bound-idx)
+                            (object-array [bound-value neighbor])
+                            (object-array [neighbor bound-value]))))
+                  (when (.add expanded neighbor)
+                    (.addLast queue neighbor)))))))))
+    (map-rule-result
+      (r/relation! (zipmap head-vars (range)) tuples)
+      head-vars args)))
 
 (defn- variable-dependency
   "look for [(inc ?x) ?y], [(+ ?x 1) ?y], ..."
@@ -2091,69 +2260,72 @@
 
 (defn solve-stratified
   [context rule-name args resolve-clause-fn]
-  (let [rules       (:rules context)
-        deps        (or (:rules-deps context) (dependency-graph rules))
-        sccs        (dependency-sccs deps)
-        stratum     (some #(when (% rule-name) %) sccs)
-        recursive?  (when stratum (recursive-stratum? stratum deps rule-name))
-        bound-vars  (context-bound-vars context)
-        base-pattern (binding-pattern args bound-vars)
-        base-bound?  (some #{:b} base-pattern)
-        stratum-set  (when stratum (set stratum))
-        branches     (when stratum (rules rule-name))
-        head-vars    (when branches (rest (ffirst branches)))
-        required-idxs (if (and recursive? branches)
-                        (required-seeds branches head-vars context)
-                        #{})
-        stable-idxs  (if (and recursive? branches)
-                       (stable-head-idxs branches stratum-set)
-                       #{})
-        bound-idxs   (set (bound-indices base-pattern))
-        magic-idxs   (set/intersection bound-idxs stable-idxs)
-        seedable-idxs (set/union required-idxs magic-idxs)
-        ;; Avoid over-adornment for recursive rules when extra bound args
-        ;; would explode magic seeds; only keep seedable bound indices.
-        magic-pattern (if (and recursive? base-bound? (seq stable-idxs))
-                        (mapv (fn [idx p]
-                                (if (and (= p :b)
-                                         (contains? seedable-idxs idx))
-                                  :b
-                                  :f))
-                              (range (count base-pattern))
-                              base-pattern)
-                        base-pattern)
-        has-bound?  (some #{:b} magic-pattern)]
-    (if (and *magic-rewrite?*
-             has-bound?
-             recursive?
-             (positive-recursive? rules stratum)
-             (not (magic-head? rule-name))
-             (magic-effective? rules rule-name
-                               (bound-indices magic-pattern) stratum-set))
-      ;; Try magic evaluation; fall back to non-magic if explosion detected
-      (let [{:keys [rules magic-heads goal]}
-            (magic-rewrite-program rules rule-name magic-pattern stratum-set)
-            magic-goal   (magic-name goal)
-            b-idxs       (vec (bound-indices magic-pattern))
-            bound-args   (mapv #(nth args %) b-idxs)
-            head-vars    (get magic-heads magic-goal)
-            seed-rel     (magic-seed-rel context head-vars bound-args)
-            magic-context (-> context
-                              (assoc :rules rules
-                                     :rules-deps (dependency-graph rules)
-                                     :magic-seeds {magic-goal seed-rel}))]
-        (try
-          (binding [*magic-rewrite?* false]
-            (solve-stratified* magic-context goal args resolve-clause-fn))
-          (catch clojure.lang.ExceptionInfo e
-            (if (= ::magic-explosion (:type (ex-data e)))
-              ;; Magic caused explosion, retry without magic
-              (binding [*magic-rewrite?* false]
-                (solve-stratified* context rule-name args resolve-clause-fn))
-              ;; Re-throw other exceptions
-              (throw e)))))
-      (binding [*magic-rewrite?* false]
-        (solve-stratified* context rule-name args resolve-clause-fn)))))
+  (if-let [plan (bound-transitive-eav-plan context rule-name args)]
+    (eval-bound-transitive-eav plan args)
+    (let [rules       (:rules context)
+          deps        (or (:rules-deps context) (dependency-graph rules))
+          sccs        (dependency-sccs deps)
+          stratum     (some #(when (% rule-name) %) sccs)
+          recursive?  (when stratum
+                        (recursive-stratum? stratum deps rule-name))
+          bound-vars  (context-bound-vars context)
+          base-pattern (binding-pattern args bound-vars)
+          base-bound?  (some #{:b} base-pattern)
+          stratum-set  (when stratum (set stratum))
+          branches     (when stratum (rules rule-name))
+          head-vars    (when branches (rest (ffirst branches)))
+          required-idxs (if (and recursive? branches)
+                          (required-seeds branches head-vars context)
+                          #{})
+          stable-idxs  (if (and recursive? branches)
+                         (stable-head-idxs branches stratum-set)
+                         #{})
+          bound-idxs   (set (bound-indices base-pattern))
+          magic-idxs   (set/intersection bound-idxs stable-idxs)
+          seedable-idxs (set/union required-idxs magic-idxs)
+          ;; Avoid over-adornment for recursive rules when extra bound args
+          ;; would explode magic seeds; only keep seedable bound indices.
+          magic-pattern (if (and recursive? base-bound? (seq stable-idxs))
+                          (mapv (fn [idx p]
+                                  (if (and (= p :b)
+                                           (contains? seedable-idxs idx))
+                                    :b
+                                    :f))
+                                (range (count base-pattern))
+                                base-pattern)
+                          base-pattern)
+          has-bound?  (some #{:b} magic-pattern)]
+      (if (and *magic-rewrite?*
+               has-bound?
+               recursive?
+               (positive-recursive? rules stratum)
+               (not (magic-head? rule-name))
+               (magic-effective? rules rule-name
+                                 (bound-indices magic-pattern) stratum-set))
+        ;; Try magic evaluation; fall back to non-magic if explosion detected
+        (let [{:keys [rules magic-heads goal]}
+              (magic-rewrite-program rules rule-name magic-pattern stratum-set)
+              magic-goal   (magic-name goal)
+              b-idxs       (vec (bound-indices magic-pattern))
+              bound-args   (mapv #(nth args %) b-idxs)
+              head-vars    (get magic-heads magic-goal)
+              seed-rel     (magic-seed-rel context head-vars bound-args)
+              magic-context (-> context
+                                (assoc :rules rules
+                                       :rules-deps (dependency-graph rules)
+                                       :magic-seeds {magic-goal seed-rel}))]
+          (try
+            (binding [*magic-rewrite?* false]
+              (solve-stratified* magic-context goal args resolve-clause-fn))
+            (catch clojure.lang.ExceptionInfo e
+              (if (= ::magic-explosion (:type (ex-data e)))
+                ;; Magic caused explosion, retry without magic
+                (binding [*magic-rewrite?* false]
+                  (solve-stratified* context rule-name args resolve-clause-fn))
+                ;; Re-throw other exceptions
+                (throw e)))))
+        (binding [*magic-rewrite?* false]
+          (solve-stratified* context rule-name args resolve-clause-fn))))))
 
 ;; rewrite
 
