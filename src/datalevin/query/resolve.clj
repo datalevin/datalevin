@@ -730,6 +730,23 @@
           (recur (next rels) new-rel new-rel-attrs (conj! acc rel)))
         (conj! acc new-rel)))))
 
+(defn- add-resolved-relation
+  "Add a normally resolved relation, or stream a terminal rule-body join into
+   its distinct head projection when the rule evaluator requested that sink."
+  [context new-rel]
+  (let [projected-vars (:datalevin.rules/distinct-projection-vars context)
+        rels           (:rels context)
+        available      (when projected-vars
+                         (into (set (keys (:attrs new-rel)))
+                               (mapcat #(keys (:attrs %))) rels))]
+    (if (and projected-vars (every? available projected-vars))
+      (assoc context :rels
+             [(if (seq rels)
+                (j/hash-join-project-distinct
+                  (reduce j/hash-join rels) new-rel projected-vars)
+                (r/project-distinct new-rel projected-vars))])
+      (update context :rels collapse-rels new-rel))))
+
 (defn context-resolve-val
   [context sym]
   (when-some [rel (rel-with-attr context sym)]
@@ -1904,7 +1921,7 @@
            (binding [qu/*lookup-attrs* (if (db/-searchable? source)
                                          (dynamic-lookup-attrs source pattern')
                                          qu/*lookup-attrs*)]
-             (update context :rels collapse-rels relation))))))))
+             (add-resolved-relation context relation))))))))
 
 (defn resolve-clause
   [context clause]

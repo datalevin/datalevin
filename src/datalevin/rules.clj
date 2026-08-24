@@ -198,6 +198,19 @@
               res)))))
     body-rel))
 
+(defn- project-rule-result-distinct
+  "Project a completed rule body to its set-valued predicate relation."
+  [body-rel head-vars]
+  (cond
+    (r/rel-empty body-rel)
+    (r/relation! (zipmap head-vars (range)) (FastList.))
+
+    (seq head-vars)
+    (r/project-distinct body-rel head-vars)
+
+    :else
+    (r/dedupe-rel body-rel)))
+
 (defn- head-indices
   [attrs rule-head-vars]
   (int-array
@@ -319,7 +332,9 @@
       (r/relation!
         result-attrs
         (let [size (.size tuples)
-              acc  (FastList. size)]
+              acc  (FastList. size)
+              seen (HashSet. size)
+              key  (r/array-lookup)]
           (dotimes [i size]
             (let [^objects tuple (.get tuples i)]
               (when (and (const-check const-idxs const-values tuple)
@@ -327,7 +342,9 @@
                 (let [to (object-array n)]
                   (dotimes [j n]
                     (aset to j (aget tuple (aget projection-idxs j))))
-                  (.add acc to)))))
+                  (when-not (.contains seen (r/reset-array-lookup! key to))
+                    (.add seen (r/wrap-array to))
+                    (.add acc to))))))
           acc)))))
 
 (defn- rename-rule
@@ -1010,6 +1027,74 @@
                           v0 (.get values1 k)))))))))))
       (r/relation! (zipmap head-vars (range)) acc))))
 
+(declare solve-stratified)
+
+(defn- solve-rule-call-relation
+  [context clause resolve-fn]
+  (let [src  (source clause)
+        head (rule-head clause)
+        args (rule-args clause)]
+    (if src
+      (binding [qu/*implicit-source* (get (:sources context) src)]
+        (solve-stratified context head args resolve-fn))
+      (solve-stratified context head args resolve-fn))))
+
+(defn- attach-singleton-head-seeds
+  "Reattach head bindings that a bound lookup proved and elided from its body
+   relation. Only a singleton seed is safe to reattach without a correlation
+   key; multi-valued seeds must remain represented in the resolved body."
+  [rel context head-vars]
+  (reduce
+    (fn [rel head-var]
+      (if (contains? (:attrs rel) head-var)
+        rel
+        (if-let [seed
+                 (some
+                   (fn [candidate]
+                     (let [^List tuples (:tuples candidate)]
+                       (when (and (contains? (:attrs candidate) head-var)
+                                  tuples
+                                  (= 1 (.size tuples)))
+                         (r/project-distinct candidate [head-var]))))
+                   (:rels context))]
+          (j/hash-join rel seed)
+          rel)))
+    rel head-vars))
+
+(defn- eval-rule-branch
+  "Evaluate a rule branch as a set-valued head relation. When the last body
+   clause is itself a rule call, stream its join with the already evaluated
+   prefix into the distinct head projection."
+  [context clauses head-vars resolve-fn]
+  (let [clauses  (vec clauses)
+        terminal (peek clauses)]
+    (if (and terminal (rule-call? context terminal))
+      (let [prefix-context (reduce resolve-fn context (pop clauses))
+            prefix-rels    (:rels prefix-context)]
+        (if (some r/rel-empty prefix-rels)
+          (r/relation! (zipmap head-vars (range)) (FastList.))
+          (let [terminal-rel (solve-rule-call-relation prefix-context terminal
+                                                       resolve-fn)]
+            (if (seq prefix-rels)
+              (j/hash-join-project-distinct
+                (attach-singleton-head-seeds
+                  (reduce j/hash-join prefix-rels) context head-vars)
+                terminal-rel head-vars)
+              (project-rule-result-distinct
+                (attach-singleton-head-seeds terminal-rel context head-vars)
+                head-vars)))))
+      (let [prefix-context   (reduce resolve-fn context (pop clauses))
+            body-res-context (resolve-fn
+                               (assoc
+                                 prefix-context
+                                 :datalevin.rules/distinct-projection-vars
+                                 head-vars)
+                               terminal)
+            body-rel         (-> (reduce j/hash-join (:rels body-res-context))
+                                 (attach-singleton-head-seeds
+                                   context head-vars))]
+        (project-rule-result-distinct body-rel head-vars)))))
+
 (defn- eval-rule-body
   [context rule-name rule-branches resolve-fn]
   (let [context (assoc context :current-rule rule-name)]
@@ -1021,11 +1106,10 @@
                                (assoc :delta-bound-values delta-bounds))
               [[_ & args] & clauses] branch
               ordered-clauses        (reorder-clauses clauses context)
-              body-res-context       (reduce resolve-fn branch-context
-                                             ordered-clauses)
-              body-rel               (reduce j/hash-join (:rels body-res-context))
-              projected-rel          (project-rule-result body-rel args)]
-          (r/sum-rel rel projected-rel)))
+              projected-rel          (eval-rule-branch branch-context
+                                                       ordered-clauses args
+                                                       resolve-fn)]
+          (r/sum-rel-dedupe rel projected-rel)))
       (empty-rel-for-rule rule-name (:rules context))
       rule-branches)))
 
@@ -2079,6 +2163,33 @@
         scc-map (into {} (mapcat (fn [scc] (map #(vector % scc) scc))) sccs)]
     (recursive-stratum? (scc-map rule-name) deps rule-name)))
 
+(defn- rule-needs-set-boundary?
+  "A nested rule needs its predicate boundary when evaluating a branch can
+   project away bindings, or when branches can derive the same head tuple.
+   Inlining through that boundary preserves answers but retains every proof,
+   which can multiply dramatically in a downstream join."
+  [rules head]
+  (let [branches (get rules head)]
+    (or (< 1 (count branches))
+        (some
+          (fn [[head-clause & body-clauses]]
+            (let [head-vars (into #{} (filter qu/free-var?)
+                                  (rule-args head-clause))
+                  body-vars (into
+                              #{}
+                              (mapcat #(u/walk-collect % qu/free-var?))
+                              body-clauses)]
+              (not (set/subset? body-vars head-vars))))
+          branches))))
+
+(defn- rule-depends-on-derived-relation?
+  [context rules head]
+  (boolean
+    (some
+      (fn [branch]
+        (some #(rule-call? context %) (rest branch)))
+      (get rules head))))
+
 (declare expand-clauses)
 
 (defn- expand-rule
@@ -2102,7 +2213,7 @@
                   new-body   (mapv #(ensure-src-where src %)
                                    (walk/postwalk-replace
                                      full-map body-clauses))]
-              (expand-clauses context to-rm rules deps new-body)))
+              (expand-clauses context to-rm rules deps new-body true)))
           branches)]
     (if (= 1 (count expanded))
       (first expanded)
@@ -2115,8 +2226,9 @@
                       expanded))]))))
 
 (defn- expand-clauses
-  "expand rules in clauses if they are non-recursive"
-  [context to-rm rules deps clauses]
+  "Expand non-recursive rules, preserving set-valued boundaries below the
+   outermost expansion when a rule can have multiple proofs per head tuple."
+  [context to-rm rules deps clauses nested-rule?]
   (into
     []
     (mapcat
@@ -2127,7 +2239,12 @@
                 args (rule-args clause)]
 
           ;; Non-recursive rule call
-          (and (rule-call? context clause) (not (recursive? deps head)))
+          (and (rule-call? context clause)
+               (not (recursive? deps head))
+               (not (and (rule-needs-set-boundary? rules head)
+                         (or nested-rule?
+                             (rule-depends-on-derived-relation?
+                               context rules head)))))
           (do (vswap! to-rm conj head)
               (expand-rule context to-rm rules deps src head args))
 
@@ -2141,7 +2258,8 @@
                  (mapv
                    (fn [branch]
                      (let [expanded
-                           (expand-clauses context to-rm rules deps [branch])]
+                           (expand-clauses context to-rm rules deps [branch]
+                                           nested-rule?)]
                        (if (and (seq expanded) (nil? (next expanded)))
                          (first expanded)
                          (cons 'and expanded))))
@@ -2153,7 +2271,8 @@
             [(ensure-src
                src
                (cons 'and
-                     (expand-clauses context to-rm rules deps sub-clauses)))])
+                     (expand-clauses context to-rm rules deps sub-clauses
+                                     nested-rule?)))])
 
           ;; (not ...)
           (and (sequential? head) (= 'not (first head)))
@@ -2161,7 +2280,8 @@
             [(ensure-src
                src
                (cons 'not
-                     (expand-clauses context to-rm rules deps sub-clauses)))])
+                     (expand-clauses context to-rm rules deps sub-clauses
+                                     nested-rule?)))])
 
           ;; not-join
           (= 'not-join head)
@@ -2169,7 +2289,8 @@
             [(ensure-src
                src
                (apply list 'not-join (filterv qu/free-var? vars)
-                      (expand-clauses context to-rm rules deps sub-clauses)))])
+                      (expand-clauses context to-rm rules deps sub-clauses
+                                      nested-rule?)))])
 
           ;; (not-join ...)
           (and (sequential? head) (= 'not-join (first head)))
@@ -2177,7 +2298,8 @@
             [(ensure-src
                src
                (apply list 'not-join (filterv qu/free-var? vars)
-                      (expand-clauses context to-rm rules deps sub-clauses)))])
+                      (expand-clauses context to-rm rules deps sub-clauses
+                                      nested-rule?)))])
 
           ;; (or-join ...)
           (and (sequential? head) (= 'or-join (first head)))
@@ -2189,7 +2311,8 @@
                  (mapv
                    (fn [branch]
                      (let [expanded
-                           (expand-clauses context to-rm rules deps [branch])]
+                           (expand-clauses context to-rm rules deps [branch]
+                                           nested-rule?)]
                        (if (and (seq expanded) (nil? (next expanded)))
                          (first expanded)
                          (cons 'and expanded))))
@@ -2206,7 +2329,7 @@
     (let [to-remove (volatile! #{})
           old-where (get-in context [:parsed-q :qorig-where])
           new-where (expand-clauses
-                      context to-remove rules rules-deps old-where)]
+                      context to-remove rules rules-deps old-where false)]
       (-> context
           (assoc :rules-deps (dependency-graph rules))
           (assoc-in [:parsed-q :qorig-where] new-where)

@@ -262,19 +262,57 @@
        (or (empty? requires-any)
            (some bound requires-any))))
 
+(defn- late-rule-call?
+  [rules clause]
+  (let [clause (strip-clause-source clause)
+        head   (when (sequential? clause) (first clause))]
+    (and (symbol? head) (contains? rules head))))
+
+(defn- bound-rule-arg-count
+  [bound clause]
+  (count
+    (filter
+      (fn [arg]
+        (if (qu/binding-var? arg)
+          (contains? bound arg)
+          (not (qu/placeholder? arg))))
+      (qu/clause-args clause))))
+
+(defn- best-ready-late-clause
+  "Retain dependency order generally. If the first ready clause is a rule,
+   prefer another ready rule with more bound arguments so predicate evaluation
+   starts from the more selective side of a rule DAG."
+  [bound rules todo ready]
+  (let [first-ready (first ready)
+        first-entry (nth todo first-ready)]
+    (if (late-rule-call? rules (:clause first-entry))
+      (reduce
+        (fn [best idx]
+          (let [entry (nth todo idx)]
+            (if (and (late-rule-call? rules (:clause entry))
+                     (> (long (bound-rule-arg-count bound (:clause entry)))
+                        (long
+                          (bound-rule-arg-count
+                            bound (:clause (nth todo best))))))
+              idx
+              best)))
+        first-ready (next ready))
+      first-ready)))
+
 (defn- sort-late-clauses
-  [initial-bound clauses]
+  [initial-bound rules clauses]
   (let [entries (mapv #(assoc (late-clause-deps %) :clause %) clauses)]
     (loop [bound initial-bound
            todo  entries
            acc   []]
       (if (empty? todo)
         (mapv :clause acc)
-        (if-let [idx (first (keep-indexed
+        (if-let [ready (seq (keep-indexed
                               (fn [i entry]
                                 (when (late-clause-ready? bound entry) i))
                               todo))]
-          (let [entry (nth todo idx)]
+          (let [idx   (best-ready-late-clause bound rules todo ready)
+                entry (nth todo idx)]
             (recur (into bound (:provides entry))
                    (u/vec-remove todo idx)
                    (conj acc entry)))
@@ -296,11 +334,12 @@
       (planned-step-vars step))))
 
 (defn- sort-planned-late-clauses
-  [{:keys [late-clauses] :as context}]
+  [{:keys [late-clauses rules] :as context}]
   (cond-> context
     (seq late-clauses)
     (assoc :late-clauses
-           (sort-late-clauses (planned-bound-vars context) late-clauses))))
+           (sort-late-clauses (planned-bound-vars context) rules
+                              late-clauses))))
 
 (defn- context-bound-values
   [context sym]

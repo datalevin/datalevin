@@ -51,13 +51,50 @@ seeding tuples are often produced more efficiently than SNE, as they benefit
 from indices and the cost based query optimizer. These seeds effectively act as
 filters to prevent the generation of unnecessary tuples during SNE.
 
-### Inline non-recursive rule clauses (new)
+### Selectively inline non-recursive rule clauses (new)
 
-As an innovation, we identify the clauses that are not involved in recursions,
-pull them out and add them to the regular query clauses to allow the cost-based
-query optimizer to work on them. That is to say, SNE only works on the rules
-that involved in recursions. This increases efficiency as index based joins are
-faster than SNE.
+As an innovation, we identify clauses that are not involved in recursion and,
+when safe, pull them into the regular query clauses so the cost-based query
+optimizer can work on them. SNE therefore only evaluates rules involved in
+recursion, while ordinary index-based joins handle simple non-recursive rules.
+
+Inlining is deliberately selective. A Datalog predicate is a set, so its rule
+boundary removes duplicate proofs of the same head tuple. Inlining through a
+rule that projects away body-local variables, or that has multiple branches,
+can lose that boundary and retain every proof in downstream joins. The number
+of proofs can be orders of magnitude larger than the number of predicate
+tuples. The rewriter consequently keeps these set-valued boundaries in nested
+or derived-rule DAGs, while continuing to inline single-branch rules whose body
+does not project away variables.
+
+### Set-valued rule boundaries and fused distinct joins
+
+Every retained non-recursive rule branch is projected to its head variables and
+deduplicated before it is combined with other branches. Branch unions are also
+deduplicated. This applies Datalog set semantics at the earliest useful
+predicate boundary instead of carrying duplicate derivations through the rest
+of the rule DAG.
+
+When a rule branch ends in another rule call, the engine uses a fused hash join,
+head projection, and distinct sink. It emits only previously unseen head tuples
+without first materializing the complete proof relation. The same sink can be
+pushed into a terminal EAV lookup, so duplicate scan and join results are
+discarded as they are produced. For relation-composition shapes whose projected
+variables are split across the two inputs, the operator tracks the projected
+value domain for each output group and stops probing a group once that domain
+is complete.
+
+Memory use is therefore governed by the distinct predicate relations, join hash
+tables, and final result rather than by the potentially much larger number of
+proof paths. The optimization does not imply constant memory: a genuinely large
+distinct result must still be represented.
+
+Bound rule calls benefit as well. If a lookup proves and elides a bound head
+variable, the evaluator safely reattaches a singleton seed before projecting
+the rule result. When several rule clauses are otherwise ready, the late-clause
+scheduler starts with the rule call having the most bound arguments, preserving
+source order for ties. This lets bound-first and bound-last forms enter the same
+rule DAG from its more selective side.
 
 ### Temporal elimination
 
@@ -99,7 +136,13 @@ can be several orders of magnitude.
 
 This industry standard benchmark for graph databases also contains some queries
 that leverage rules. Datalevin is compared favorably with neo4j
-[here](../benchmarks/LDBC-SNB-bench), particularly those queries that use rules.
+[here](../benchmarks/LDBC-SNB-bench).
+
+### OpenRuleBench
+
+The portable [OpenRuleBench suite](../benchmarks/openrulebench) includes
+recursive rule task TC and SG, as well as Join1, a non-recursive rule DAG
+designed to expose intermediate-result growth.
 
 ## References
 
