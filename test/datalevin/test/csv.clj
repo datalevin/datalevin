@@ -24,6 +24,11 @@
   (is (= [["a" "b"]]
          (vec (csv/read-csv (StringReader. "a,b\n"))))))
 
+(deftest read-csv-backslash-before-closing-quote-test
+  (is (= [["1" "value\\" "tail"]
+          ["2" "next" "row"]]
+         (read-rows "1,\"value\\\\\",tail\n2,next,row\n"))))
+
 (deftest read-csv-is-lazy-test
   (let [reads  (atom 0)
         reader (proxy [java.io.Reader] []

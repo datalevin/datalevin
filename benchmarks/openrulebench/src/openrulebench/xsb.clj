@@ -18,6 +18,7 @@
 
 (def tc-program
   "% Transitive Closure
+:- import length/2 from basics.
 :- table tc/2.
 
 tc(A, B) :- edge(A, B).
@@ -31,6 +32,7 @@ count_tc(N) :- findall(1, tc(_, _), L), length(L, N).
 
 (def sg-program
   "% Same Generation (OpenRuleBench spec)
+:- import length/2 from basics.
 :- table sg/2.
 
 sg(X, Y) :- sib(X, Y).
@@ -44,6 +46,7 @@ count_sg(N) :- findall(1, sg(_, _), L), length(L, N).
 
 (def join1-program
   "% JOIN1
+:- import length/2 from basics.
 :- table c1/2.
 :- table b1/2.
 :- table b2/2.
@@ -105,7 +108,7 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
 (defn run-xsb
   "Run XSB with a program file and goal."
   [prog-file goal]
-  (let [result (sh/sh "xsb" "--nobanner" "--quietload"
+  (let [result (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
                       "-e" (str "['" prog-file "'], " goal ", halt."))]
     (when (zero? (:exit result))
       (str/trim (:out result)))))
@@ -113,7 +116,7 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
 (defn run-xsb-timed
   "Run XSB benchmark and return count."
   [prog-file count-goal]
-  (let [result (sh/sh "xsb" "--nobanner" "--quietload"
+  (let [result (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
                       "-e" (str "['" prog-file "'], "
                                 count-goal "(N), "
                                 "write(N), nl, halt."))]
@@ -123,7 +126,7 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
 (defn run-xsb-count-goal
   "Run a complete XSB goal that binds N to the answer cardinality."
   [prog-file goal]
-  (let [result (sh/sh "xsb" "--nobanner" "--quietload"
+  (let [result (sh/sh "xsb" "--nobanner" "--quietload" "--noprompt"
                       "-e" (str "['" prog-file "'], " goal ", "
                                 "write(N), nl, halt."))]
     (when (zero? (:exit result))
@@ -141,10 +144,10 @@ a(X, Y) :- b1(X, Z), b2(Z, Y).
   [{:keys [family query binding bound-value]}]
   (let [predicate (name (if (= family :join1) query family))]
     (case binding
-      :ff (format "findall([X,Y], %s(X,Y), L), length(L,N)" predicate)
-      :bf (format "findall(Y, %s(%d,Y), L), length(L,N)"
+      :ff (format "findall([X,Y], %s(X,Y), L), basics:length(L,N)" predicate)
+      :bf (format "findall(Y, %s(%d,Y), L), basics:length(L,N)"
                   predicate bound-value)
-      :fb (format "findall(X, %s(X,%d), L), length(L,N)"
+      :fb (format "findall(X, %s(X,%d), L), basics:length(L,N)"
                   predicate bound-value))))
 
 ;; =============================================================================

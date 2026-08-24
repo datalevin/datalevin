@@ -28,7 +28,7 @@
 
 (deftest external-program-bindings-test
   (let [task (core/require-benchmark-task "join1:50k-b1-fb")]
-    (is (= "findall(X, b1(X,1), L), length(L,N)"
+    (is (= "findall(X, b1(X,1), L), basics:length(L,N)"
            (#'xsb/answer-count-goal task)))
     (is (str/includes? (souffle/program-for-task task)
                        "result(x) :- b1(x, 1)."))))

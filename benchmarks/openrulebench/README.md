@@ -119,6 +119,9 @@ those task/system pairs `N/A` instead of implying bound-query optimization.
 - Child processes isolate JVM state and heap behavior between systems. Artifacts
   record the parsed task, fact count, timing class, Clojure/JVM/OS/CPU metadata,
   engine version where discoverable, latency distribution, and raw samples.
+- O'Doyle runs each task in a separate child JVM because its rule-firing loop
+  does not honor thread cancellation. A timed-out worker therefore exits with
+  its task process and cannot overlap the next measurement.
 
 The orchestrator requests an 8 GiB maximum heap for every Clojure wrapper.
 Every child records its effective maximum heap. PostgreSQL-server, XSB, and

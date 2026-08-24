@@ -70,6 +70,7 @@ public final class CSVReader implements Iterator<List<String>> {
             if (value == -1) {
                 finished = true;
                 if (!started && record.isEmpty() && field.length() == 0) return null;
+                if (escaped) field.append('\\');
                 record.add(field.toString());
                 return record;
             }
@@ -83,16 +84,20 @@ public final class CSVReader implements Iterator<List<String>> {
 
             if (c == separator) {
                 if (quoted) {
+                    if (escaped) {
+                        field.append('\\');
+                        escaped = false;
+                    }
                     field.append(c);
                 } else {
                     record.add(field.toString());
                     field.setLength(0);
                 }
-                escaped = false;
             } else if (c == quote) {
                 if (quoted) {
                     if (escaped) {
                         field.append(c);
+                        escaped = false;
                     } else {
                         quoted = false;
                     }
@@ -101,27 +106,38 @@ public final class CSVReader implements Iterator<List<String>> {
                 } else {
                     field.append(c);
                 }
-                escaped = false;
             } else if (c == '\n') {
                 if (quoted) {
+                    if (escaped) {
+                        field.append('\\');
+                        escaped = false;
+                    }
                     field.append(c);
-                    escaped = false;
                 } else {
                     record.add(field.toString());
                     return record;
                 }
             } else if (c == '\r') {
                 if (quoted) {
+                    if (escaped) {
+                        field.append('\\');
+                        escaped = false;
+                    }
                     field.append(c);
-                    escaped = false;
                 } else {
                     record.add(field.toString());
                     skipLineFeed = true;
                     return record;
                 }
             } else if (c == '\\' && quoted) {
-                escaped = true;
+                if (escaped) {
+                    field.append(c);
+                    escaped = false;
+                } else {
+                    escaped = true;
+                }
             } else {
+                if (escaped) field.append('\\');
                 field.append(c);
                 escaped = false;
             }

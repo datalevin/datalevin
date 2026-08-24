@@ -87,7 +87,12 @@
    :odoyle    {:alias "odoyle"
                :namespace "openrulebench.odoyle"
                :families #{:tc :sg}
-               :bindings #{:ff}}})
+               :bindings #{:ff}
+               ;; O'Doyle's rule firing does not respond to future
+               ;; cancellation.  Keep each task in its own JVM so a timeout
+               ;; cannot leave a worker consuming CPU while the next task
+               ;; starts.
+               :isolate-tasks? true}})
 
 (def default-options
   {:systems default-systems
@@ -259,6 +264,12 @@
       (finally
         (io/delete-file file true)))))
 
+(defn- child-task-groups
+  [system supported]
+  (if (get-in system-config [system :isolate-tasks?])
+    (mapv vector supported)
+    [supported]))
+
 (defn- order-results
   [system benchmarks child-results]
   (let [by-benchmark (into {} (map (juxt :benchmark identity)) child-results)]
@@ -275,12 +286,19 @@
 
 (defn- run-system
   [system {:keys [benchmarks] :as opts}]
-  (let [supported (filterv #(supported? system %) benchmarks)
-        child     (when (seq supported) (run-child system opts supported))
-        results   (order-results system benchmarks (:results child))]
+  (let [supported  (filterv #(supported? system %) benchmarks)
+        children   (when (seq supported)
+                     (mapv #(run-child system opts %)
+                           (child-task-groups system supported)))
+        child-exit (some (fn [{:keys [child-exit]}]
+                           (when (and child-exit (not= 0 child-exit))
+                             child-exit))
+                         children)
+        results    (order-results system benchmarks
+                                  (mapcat :results children))]
     {:system system
-     :host (:host child)
-     :child-exit (:child-exit child)
+     :host (:host (first children))
+     :child-exit child-exit
      :results results}))
 
 (defn- input-mismatches

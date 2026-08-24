@@ -32,6 +32,13 @@
   (is (not (#'runner/supported? :clara "sg:6k-cyclic-bf")))
   (is (not (#'runner/supported? :odoyle "join1:50k-a-ff"))))
 
+(deftest non-cancellable-backends-isolate-each-task-test
+  (let [tasks ["tc:tiny-cyclic-ff" "sg:tiny-cyclic-ff"]]
+    (is (= [tasks]
+           (#'runner/child-task-groups :datalevin tasks)))
+    (is (= [["tc:tiny-cyclic-ff"] ["sg:tiny-cyclic-ff"]]
+           (#'runner/child-task-groups :odoyle tasks)))))
+
 (deftest cross-system-input-digest-test
   (is (empty? (#'runner/input-mismatches
                 [{:benchmark "tc:tiny" :status :ok :input-digest "same"}

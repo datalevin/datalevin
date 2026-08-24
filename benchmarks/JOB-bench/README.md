@@ -183,11 +183,14 @@ interested in the behavior of query optimizer.
 The table below reports the second pass of each benchmark command described
 above and is retained with the raw CSV files for reproducibility.
 
-The Datalevin column was regenerated on 2026-08-23 from two separate
-runner/JVM processes: one complete warmup pass followed by one complete
-measurement pass. Both used Clojure 1.12.5 with direct linking enabled. The
-113-query correctness suite passed before measurement. The retained PostgreSQL
-and SQLite columns were not rerun.
+All three columns were regenerated on 2026-08-23. Each system ran one complete
+warmup pass followed by one complete measurement pass in a separate runner/JVM
+process. The Datalevin and JDBC runners used Clojure 1.12.5; Datalevin used
+direct linking. The 113-query Datalevin correctness suite passed after the
+runs. Before measurement, SQLite was rebuilt from the source CSV files and all
+21 table row counts were verified to match PostgreSQL exactly. The complete
+two-pass environment and artifacts are retained in the
+[2026-08-23 run directory](results/baseline-postgres-sqlite-20260823/README.md).
 
 We look at the timing results. The total query time can be divided into two
 parts: query planning time and plan execution time. SQLite does not report
@@ -205,13 +208,14 @@ The table below sums the database-reported planning and execution times for all
 
 |DB|Total Query Time (seconds)|
 |---|---|
-|PostgreSQL|171.3|
-|SQLite|295.0 (9 timeouts)|
+|PostgreSQL|129.4|
+|SQLite|281.8 completed-query subtotal (9 timeouts)|
 |Datalevin|40.4|
 
-PostgreSQL's recorded total is 4.24X Datalevin's. SQLite's non-timeout subtotal
-alone is 7.30X Datalevin's, and understates SQLite's actual total because nine
-queries reached the one-minute limit.
+PostgreSQL's recorded total is 3.20X Datalevin's. SQLite's non-timeout subtotal
+alone is 6.98X Datalevin's. Counting each timed-out query at only its 60-second
+cutoff gives SQLite a lower bound of 821.8 seconds, or 20.35X Datalevin's; its
+actual total is higher.
 
 SQLite took extremely long to run some queries, so we had to put in a
 one-minute timeout for each query. In the end, 9 queries timed out, meaning the
@@ -222,125 +226,125 @@ table:
 
 |Query|PostgreSQL (ms)|SQLite (ms)|Datalevin (ms)|
 |---|---|---|---|
-|1a|34.6|136.9|20.7|
-|1b|29.7|137.0|17.1|
-|1c|44.8|124.1|25.3|
-|1d|29.8|141.2|9.4|
-|2a|281.2|93.9|52.8|
-|2b|267.5|86.6|19.3|
-|2c|248.2|87.9|3.7|
-|2d|377.3|117.3|24.3|
-|3a|114.7|161.1|102.4|
-|3b|65.0|116.5|13.5|
-|3c|201.7|199.3|300.7|
-|4a|69.3|234.3|383.3|
-|4b|62.8|57.0|14.0|
-|4c|69.6|389.3|865.0|
-|5a|56.4|100.6|54.1|
-|5b|52.1|74.5|326.8|
-|5c|77.0|91.2|578.8|
-|6a|13.2|283.8|15.1|
-|6b|162.6|415.7|31.4|
-|6c|4.2|277.1|7.4|
-|6d|4819.4|1514.0|326.4|
-|6e|8.2|284.3|10.6|
-|6f|4808.5|2323.3|793.0|
-|7a|670.8|915.6|102.3|
-|7b|158.5|103.2|48.6|
-|7c|1428.4|4898.8|825.6|
-|8a|864.8|2292.3|47.6|
-|8b|68.8|361.2|48.7|
-|8c|2947.2|timeout|3876.4|
-|8d|1414.7|timeout|322.9|
-|9a|112.2|6623.3|287.1|
-|9b|106.5|2668.2|346.2|
-|9c|259.7|37069.9|339.4|
-|9d|1872.9|37808.4|735.2|
-|10a|239.9|6144.5|300.0|
-|10b|105.2|120.7|77.2|
-|10c|7343.5|timeout|2127.6|
-|11a|36.5|430.3|63.8|
-|11b|11.4|16.8|22.5|
-|11c|575.9|209.5|362.3|
-|11d|72.2|335.7|103.3|
-|12a|123.7|3611.9|170.5|
-|12b|32.4|1904.9|230.9|
-|12c|356.2|4562.1|302.7|
-|13a|553.6|1230.6|924.9|
-|13b|234.9|1233.5|315.7|
-|13c|229.0|1186.3|745.7|
-|13d|865.2|3804.8|1204.7|
-|14a|231.7|372.1|311.3|
-|14b|82.3|122.8|56.9|
-|14c|477.0|473.3|214.5|
-|15a|134.9|2762.0|468.9|
-|15b|18.2|16.2|33.9|
-|15c|269.6|timeout|534.3|
-|15d|318.4|timeout|489.7|
-|16a|130.7|108.8|65.9|
-|16b|9768.6|10652.8|2388.1|
-|16c|833.5|519.9|300.5|
-|16d|678.2|423.1|197.7|
-|17a|7469.3|2392.8|587.0|
-|17b|6326.7|4321.2|384.1|
-|17c|6293.4|4238.8|28.8|
-|17d|6376.2|4367.1|246.0|
-|17e|7469.8|4338.8|1985.2|
-|17f|7533.8|5704.0|433.6|
-|18a|2661.6|16368.2|686.0|
-|18b|129.0|534.3|517.5|
-|18c|3431.9|18014.1|532.5|
-|19a|141.6|4439.3|571.5|
-|19b|61.9|745.4|102.8|
-|19c|963.2|19589.7|270.8|
-|19d|2015.6|20814.6|1556.5|
-|20a|2293.5|3622.3|325.2|
-|20b|1832.4|2577.1|116.0|
-|20c|986.9|2225.5|107.4|
-|21a|38.0|101.5|65.2|
-|21b|25.6|87.0|38.0|
-|21c|26.9|119.8|87.7|
-|22a|308.8|1464.5|255.2|
-|22b|278.5|1171.3|66.1|
-|22c|999.1|2138.9|336.4|
-|22d|650.8|3041.8|109.1|
-|23a|119.4|timeout|195.2|
-|23b|44.1|timeout|47.6|
-|23c|174.8|timeout|542.5|
-|24a|310.9|5528.2|112.7|
-|24b|41.8|23.4|65.3|
-|25a|1732.1|1715.5|580.6|
-|25b|188.2|798.3|46.3|
-|25c|6123.7|5810.5|214.7|
-|26a|11369.5|2271.8|241.5|
-|26b|165.9|1235.1|93.5|
-|26c|36105.7|1337.7|111.6|
-|27a|41.5|313.5|103.8|
-|27b|31.7|204.0|89.6|
-|27c|44.5|247.8|114.0|
-|28a|492.0|1281.8|398.8|
-|28b|349.8|543.1|197.9|
-|28c|550.0|timeout|283.0|
-|29a|56.0|11.4|870.9|
-|29b|48.3|8.1|904.1|
-|29c|177.3|429.3|1104.6|
-|30a|2797.8|2429.6|595.0|
-|30b|194.4|2317.5|109.0|
-|30c|4427.0|2006.6|271.5|
-|31a|704.0|1076.5|105.6|
-|31b|260.4|999.2|65.4|
-|31c|709.2|1392.7|185.8|
-|32a|4.9|59.8|5.7|
-|32b|60.3|57.2|29.3|
-|33a|50.5|27.1|106.5|
-|33b|47.2|22.7|92.5|
-|33c|66.9|38.0|111.2|
+|1a|36.4|138.7|20.7|
+|1b|30.3|134.5|17.1|
+|1c|31.4|125.1|25.3|
+|1d|30.1|141.2|9.4|
+|2a|288.5|91.2|52.8|
+|2b|274.6|89.1|19.3|
+|2c|254.7|86.0|3.7|
+|2d|385.0|113.2|24.3|
+|3a|114.1|143.9|102.4|
+|3b|62.3|116.2|13.5|
+|3c|202.4|196.1|300.7|
+|4a|68.5|232.2|383.3|
+|4b|61.5|57.7|14.0|
+|4c|67.2|392.0|865.0|
+|5a|52.3|77.5|54.1|
+|5b|49.0|76.6|326.8|
+|5c|72.0|89.9|578.8|
+|6a|12.4|277.4|15.1|
+|6b|157.1|387.2|31.4|
+|6c|3.7|274.5|7.4|
+|6d|4712.5|1533.0|326.4|
+|6e|7.9|280.2|10.6|
+|6f|5176.2|2319.5|793.0|
+|7a|667.6|460.9|102.3|
+|7b|160.8|105.8|48.6|
+|7c|2066.0|4482.2|825.6|
+|8a|835.8|2273.5|47.6|
+|8b|65.9|350.1|48.7|
+|8c|1785.0|timeout|3876.4|
+|8d|703.0|timeout|322.9|
+|9a|109.6|6804.3|287.1|
+|9b|105.1|2759.1|346.2|
+|9c|179.7|38617.0|339.4|
+|9d|2058.4|38763.4|735.2|
+|10a|242.9|356.1|300.0|
+|10b|106.2|119.6|77.2|
+|10c|7266.9|timeout|2127.6|
+|11a|39.1|58.3|63.8|
+|11b|12.5|17.1|22.5|
+|11c|604.7|114.7|362.3|
+|11d|88.1|336.9|103.3|
+|12a|126.3|1444.0|170.5|
+|12b|35.1|1863.3|230.9|
+|12c|352.3|1994.0|302.7|
+|13a|567.1|408.0|924.9|
+|13b|237.3|1246.4|315.7|
+|13c|229.5|1216.9|745.7|
+|13d|916.4|2822.2|1204.7|
+|14a|227.8|203.9|311.3|
+|14b|78.9|122.1|56.9|
+|14c|467.0|373.8|214.5|
+|15a|130.5|2616.3|468.9|
+|15b|18.9|16.4|33.9|
+|15c|235.7|timeout|534.3|
+|15d|322.4|timeout|489.7|
+|16a|126.2|47.8|65.9|
+|16b|10618.1|8296.8|2388.1|
+|16c|897.0|525.4|300.5|
+|16d|728.3|409.0|197.7|
+|17a|7463.7|2392.3|587.0|
+|17b|6259.1|4310.4|384.1|
+|17c|6225.4|4287.6|28.8|
+|17d|6383.0|4432.7|246.0|
+|17e|7883.5|4304.8|1985.2|
+|17f|7784.9|5688.9|433.6|
+|18a|2714.7|16852.7|686.0|
+|18b|129.1|540.1|517.5|
+|18c|3431.6|17992.1|532.5|
+|19a|118.7|4472.9|571.5|
+|19b|60.0|745.5|102.8|
+|19c|931.7|19694.4|270.8|
+|19d|2042.5|20813.3|1556.5|
+|20a|2312.6|3596.2|325.2|
+|20b|1782.8|935.9|116.0|
+|20c|975.5|2267.9|107.4|
+|21a|39.1|102.0|65.2|
+|21b|26.1|88.0|38.0|
+|21c|28.5|121.5|87.7|
+|22a|302.1|1286.5|255.2|
+|22b|270.2|1172.3|66.1|
+|22c|1000.8|2175.0|336.4|
+|22d|661.6|3077.4|109.1|
+|23a|122.0|timeout|195.2|
+|23b|45.0|timeout|47.6|
+|23c|178.2|timeout|542.5|
+|24a|314.0|6360.2|112.7|
+|24b|43.9|23.8|65.3|
+|25a|1680.2|1791.8|580.6|
+|25b|185.3|806.8|46.3|
+|25c|5984.3|6082.1|214.7|
+|26a|696.2|2335.1|241.5|
+|26b|162.2|1300.0|93.5|
+|26c|1284.0|1417.1|111.6|
+|27a|39.1|318.4|103.8|
+|27b|33.1|209.1|89.6|
+|27c|44.7|252.8|114.0|
+|28a|480.2|1325.6|398.8|
+|28b|276.9|552.5|197.9|
+|28c|338.0|timeout|283.0|
+|29a|59.3|9.3|870.9|
+|29b|50.6|8.0|904.1|
+|29c|119.8|422.2|1104.6|
+|30a|4103.5|2450.7|595.0|
+|30b|828.1|2396.3|109.0|
+|30c|6052.8|2111.3|271.5|
+|31a|704.7|1082.2|105.6|
+|31b|256.4|1001.8|65.4|
+|31c|709.0|1430.0|185.8|
+|32a|5.1|60.6|5.7|
+|32b|59.7|62.8|29.3|
+|33a|53.3|27.7|106.5|
+|33b|54.7|23.7|92.5|
+|33c|80.8|38.8|111.2|
 
 ### Planning time
 
 |DB|Mean|Min|Median|Max|
 |---|---|---|---|---|
-|PostgreSQL|9.2 |0.2 |2.3 |48.8 |
+|PostgreSQL|9.7 |0.3 |2.4 |52.7 |
 |Datalevin|68.7 |2.3 |30.3 |1079.8 |
 
 Datalevin spent 7.761 seconds in planning, or 19.2% of its 40.392-second
@@ -353,14 +357,14 @@ SQLite doesn't report any internal timing.
 
 |DB|Mean|Min|Median|Max|
 |---|---|---|---|---|
-|PostgreSQL|1507.0 |3.5 |227.1 |36075.3 |
-|SQLite|2836.9 |8.1 |644.2 |37808.4 |
+|PostgreSQL|1135.8 |3.3 |226.0 |10615.9 |
+|SQLite|2710.1 |8.0 |493.1 |38763.4 |
 |Datalevin|288.8 |0.2 |86.7 |3865.7 |
 
-PostgreSQL's mean execution time is 5.2X Datalevin's, and SQLite's recorded
-mean is 9.8X Datalevin's. Their medians are 2.6X and 7.4X Datalevin's,
+PostgreSQL's mean execution time is 3.9X Datalevin's, and SQLite's recorded
+mean is 9.4X Datalevin's. Their medians are 2.6X and 5.7X Datalevin's,
 respectively. The maximum Datalevin execution time is 3.866 seconds, versus
-36.075 seconds for PostgreSQL and 37.808 seconds among SQLite's completed
+10.616 seconds for PostgreSQL and 38.763 seconds among SQLite's completed
 queries.
 
 ## Remarks
