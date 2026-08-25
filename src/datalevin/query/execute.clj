@@ -114,6 +114,19 @@
       (set! projected nil)
       result-set))
 
+  qplan/ITerminalDistinctSink
+  (-add-distinct-batch! [_ tuples]
+    (let [^List tuples tuples
+          n            (.size tuples)]
+      (aset-long input-count 0
+                 (unchecked-add (aget input-count 0) (long n)))
+      (if (zero? (.size projected))
+        (if (instance? FastList tuples)
+          (set! projected tuples)
+          (.addAll projected tuples))
+        (.addAll projected tuples))
+      true))
+
   Collection
   (add [_ tuple]
     (let [^objects tuple tuple
@@ -293,17 +306,27 @@
           (if (every? #(contains? attrs %) symbols)
             (let [{:keys [sink input-count]}
                   (projected-distinct-sink attrs symbols)]
-              (if (qplan/execute-steps-into context db all-steps sink)
+              (if-let [physical-operator
+                       (qplan/execute-steps-into
+                         context db all-steps sink symbols)]
                 (let [result-set
-                      (.finishResult ^IProjectedDistinctSink sink)]
+                      (.finishResult ^IProjectedDistinctSink sink)
+                      candidate-pairs (:candidate-pairs physical-operator)
+                      collection
+                      (cond->
+                        {:mode          :projected-distinct
+                         :symbols       symbols
+                         :input-tuples  (long
+                                          (or candidate-pairs
+                                              (aget ^longs input-count 0)))
+                         :result-tuples (count result-set)}
+                        (= :dense-eav-composition
+                           (:operator physical-operator))
+                        (assoc :physical-operator physical-operator))]
                   (assoc context
                          :result-set result-set
                          :terminal-collected-symbols symbols
-                         :terminal-result-collection
-                         {:mode          :projected-distinct
-                          :symbols       symbols
-                          :input-tuples  (aget ^longs input-count 0)
-                          :result-tuples (count result-set)}))
+                         :terminal-result-collection collection))
                 (execute-rel)))
             (execute-rel)))
         (execute-rel)))

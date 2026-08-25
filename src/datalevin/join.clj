@@ -17,7 +17,8 @@
   (:import
    [java.util BitSet Collection HashMap HashSet List Map$Entry]
    [org.eclipse.collections.impl.list.mutable FastList]
-   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
+   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
+   [org.roaringbitmap PeekableIntIterator RoaringBitmap]))
 
 ;; hash join
 
@@ -282,6 +283,37 @@
 (def ^:private ^:const dense-composition-sample-size 512)
 (def ^:private ^:const dense-composition-min-sample-repeats 16)
 (def ^:private ^:const dense-composition-sample-threshold 4096)
+(def ^:private ^:const dense-composition-roaring-min-domain 4096)
+
+(defn- composition-bitmap
+  [roaring? ^long domain-size]
+  (if roaring?
+    (RoaringBitmap.)
+    (BitSet. (int domain-size))))
+
+(defn- composition-bitmap-add!
+  [roaring? bitmap ^long ordinal]
+  (if roaring?
+    (.add ^RoaringBitmap bitmap (int ordinal))
+    (.set ^BitSet bitmap (int ordinal))))
+
+(defn- composition-bitmap-cardinality
+  ^long [roaring? bitmap]
+  (if roaring?
+    (.getCardinality ^RoaringBitmap bitmap)
+    (.cardinality ^BitSet bitmap)))
+
+(defn- composition-bitmap-or!
+  [roaring? target source]
+  (if roaring?
+    (.or ^RoaringBitmap target ^RoaringBitmap source)
+    (.or ^BitSet target ^BitSet source)))
+
+(defn- clone-composition-bitmap
+  [roaring? bitmap]
+  (if roaring?
+    (.clone ^RoaringBitmap bitmap)
+    (.clone ^BitSet bitmap)))
 
 (defn- sampled-key-reuse?
   [^List tuples key-fn]
@@ -297,7 +329,7 @@
                  repeated
                  (unchecked-inc repeated)))))))
 
-(defn- dense-binary-composition
+(defn ^:no-doc dense-binary-composition
   "Use bitset unions for a dense two-relation composition. Returns nil when
    the shape or measured relation density does not justify the representation."
   [rel1 rel2 vars]
@@ -373,7 +405,9 @@
                 bitset-words (long (quot (+ (long domain-size) 63) 64))
                 bitset-bytes (long (* bitset-words 8
                                       (+ (long anchor-count)
-                                         (.size join-counts))))]
+                                         (.size join-counts))))
+                roaring?     (> domain-size
+                                dense-composition-roaring-min-domain)]
             (when (and (pos? domain-size)
                        (pos? anchor-count)
                        (>= candidate-pairs dense-composition-min-candidates)
@@ -386,56 +420,85 @@
                 (dotimes [i (.size hash-tuples)]
                   (let [^objects tuple (.get hash-tuples i)
                         join-key       (hash-key-fn tuple)
-                        ^BitSet values (or (.get adjacency join-key)
-                                           (let [values (BitSet. domain-size)]
+                        values         (or (.get adjacency join-key)
+                                           (let [values
+                                                 (composition-bitmap
+                                                   roaring? domain-size)]
                                              (.put adjacency join-key values)
                                              values))
                         ^Number ordinal
                         (.get value-ordinals (aget tuple value-idx))]
-                    (.set values (.intValue ordinal))))
+                    (composition-bitmap-add!
+                      roaring? values (.intValue ordinal))))
                 ;; Composition becomes an OR of complete value sets instead of
                 ;; one hash-set insertion for every proof pair.
                 (let [^HashMap groups (HashMap.)
                       ^longs total-output (long-array 1)]
                   (dotimes [i (.size scan-tuples)]
                     (let [^objects tuple (.get scan-tuples i)
-                          ^BitSet values (.get adjacency (scan-key-fn tuple))]
+                          values         (.get adjacency (scan-key-fn tuple))]
                       (when values
                         (let [anchor        (aget tuple anchor-idx)
-                              ^BitSet known (.get groups anchor)]
+                              known         (.get groups anchor)]
                           (if known
-                            (when (< (.cardinality known) domain-size)
-                              (let [before (.cardinality known)]
-                                (.or known values)
+                            (when (< (composition-bitmap-cardinality
+                                      roaring? known)
+                                     domain-size)
+                              (let [before (composition-bitmap-cardinality
+                                             roaring? known)]
+                                (composition-bitmap-or!
+                                  roaring? known values)
                                 (aset total-output 0
                                       (unchecked-add
                                         (aget total-output 0)
-                                        (long (- (.cardinality known)
-                                                 before))))))
-                            (let [^BitSet copy (.clone values)]
+                                        (long
+                                          (- (composition-bitmap-cardinality
+                                               roaring? known)
+                                             before))))))
+                            (let [copy (clone-composition-bitmap
+                                         roaring? values)]
                               (.put groups anchor copy)
                               (aset total-output 0
                                     (unchecked-add
                                       (aget total-output 0)
-                                      (long (.cardinality copy))))))))))
+                                      (composition-bitmap-cardinality
+                                        roaring? copy)))))))))
                   (let [anchor-pos (int (.indexOf ^List vars anchor-var))
                         value-pos  (int (.indexOf ^List vars value-var))
                         capacity   (int (Math/min (aget total-output 0)
                                                   (long 1000000)))
                         output     (FastList. capacity)]
                     (doseq [^Map$Entry entry (.entrySet groups)]
-                      (let [anchor        (.getKey entry)
-                            ^BitSet known (.getValue entry)]
-                        (loop [ordinal (.nextSetBit known 0)]
-                          (when-not (neg? ordinal)
-                            (let [tuple (object-array 2)]
-                              (aset tuple anchor-pos anchor)
-                              (aset tuple value-pos
-                                    (.get ordinal-values ordinal))
-                              (.add output tuple))
-                            (recur (.nextSetBit
-                                     known (unchecked-inc-int ordinal)))))))
-                    (r/relation! (zipmap vars (range)) output)))))))))))
+                      (let [anchor (.getKey entry)
+                            known  (.getValue entry)
+                            emit!  (fn [^long ordinal]
+                                     (let [tuple (object-array 2)]
+                                       (aset tuple anchor-pos anchor)
+                                       (aset tuple value-pos
+                                             (.get ordinal-values ordinal))
+                                       (.add output tuple)))]
+                        (if roaring?
+                          (let [^PeekableIntIterator iter
+                                (.getIntIterator ^RoaringBitmap known)]
+                            (while (.hasNext iter)
+                              (emit! (.next iter))))
+                          (loop [ordinal (.nextSetBit ^BitSet known 0)]
+                            (when-not (neg? ordinal)
+                              (emit! ordinal)
+                              (recur (.nextSetBit
+                                       ^BitSet known
+                                       (unchecked-inc-int ordinal))))))))
+                    (with-meta
+                      (r/relation! (zipmap vars (range)) output)
+                      {::dense-composition
+                       {:candidate-pairs candidate-pairs
+                        :input-tuples   input-size
+                        :output-tuples  (aget total-output 0)
+                        :anchor-count   anchor-count
+                        :domain-size    domain-size
+                        :bitmap         (if roaring? :roaring :dense)
+                        :memory-limit   dense-composition-max-bitset-bytes
+                        :memory-upper-bound bitset-bytes}})))))))))))
 
 (defn hash-join-project-distinct
   "Hash-join two relations while retaining only distinct `vars`, without

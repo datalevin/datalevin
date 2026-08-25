@@ -4971,14 +4971,19 @@
 
 (defn- strip-step-result
   [step]
-  (let [step (cond-> step
+  (let [sample-size (when (instance? List (:sample step))
+                      (.size ^List (:sample step)))
+        step (cond-> step
                (contains? step :tgt-steps)
                (update :tgt-steps (fn [steps]
                                     (mapv strip-step-result steps)))
 
                (contains? step :join-steps)
                (update :join-steps (fn [steps]
-                                     (mapv strip-step-result steps))))]
+                                     (mapv strip-step-result steps)))
+
+               sample-size
+               (assoc :sample-size sample-size))]
     (assoc step :result nil :sample nil)))
 
 (defn- strip-result

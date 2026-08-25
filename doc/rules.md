@@ -89,6 +89,14 @@ join-key adjacency and per-group results are represented as bitsets. The join
 then unions complete value sets instead of performing one hash-set insertion per
 proof pair; sparse or wide-domain cases retain the ordinary fused hash join.
 
+The same physical composition is selected directly at a terminal two-clause
+EAV boundary when the join key is hidden by the final distinct projection. The
+compiler chooses between a full sequential AVE scan and scans of only the
+distinct bound join keys, then feeds the resulting binary relation to the
+composition operator instead of constructing the complete three-column proof
+relation. Small compact projected domains use dense machine-word bitmaps;
+larger domains switch to Roaring bitmaps so sparse value sets remain compact.
+
 Memory use is therefore governed by the distinct predicate relations, join hash
 tables, and final result rather than by the potentially much larger number of
 proof paths. The optimization does not imply constant memory: a genuinely large

@@ -1004,6 +1004,32 @@ When selected, `explain` reports `:terminal-result-collection` with the
 projected symbols, the number of rows emitted by the final operator, and the
 number of distinct result rows.
 
+A high-fanout two-step EAV composition receives a stronger compiler
+specialization. For a shape equivalent to `[?x :left ?z]`, `[?z :right ?y]`
+with terminal distinct projection `?x ?y`, the hidden join variable no longer
+has to be carried through every proof tuple. The compiler materializes the two
+binary relations and invokes the fused projected binary-composition operator.
+It unions complete `?y` domains per `?x` and transfers its already-distinct
+arrays directly to the terminal sink. A row-dependent equality (`:fidx`), more
+than one merge attribute, a projected join key, or a non-terminal query retains
+the normal EAV pipeline.
+
+Admission uses retained planning-sample cardinalities when available and the
+analyzed storage fanout otherwise. Materialization then supplies exact input,
+domain, proof-pair, and memory costs before the dense operator is selected. The
+target side uses one sequential full AVE scan when its complete attribute is
+small relative to the materialized input; otherwise it scans only the distinct
+bound entity IDs. Compact domains use dense machine-word bitmaps. Domains large
+enough to benefit from compression use Roaring bitmaps, under the same bounded
+memory guard.
+
+For this specialization, `:terminal-result-collection` additionally contains
+`:physical-operator`. It reports the target scan mode, bitmap representation,
+source and target cardinalities, estimated and exact candidate-pair counts, and
+the bitmap memory upper bound. `:input-tuples` remains the logical number of
+proof candidates elided by the fused operator rather than the smaller number
+of arrays delivered to the sink.
+
 ### Parallel processing
 
 Our counting and sampling based query planning method does more work than

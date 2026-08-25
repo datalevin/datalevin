@@ -106,3 +106,22 @@
                 (relation {'?x 0 '?z 1} [[1 10] [2 20]])
                 (relation {'?z 0 '?y 1} [[10 :a] [20 :b]])
                 ['?x '?y])))))
+
+(deftest roaring-binary-composition-test
+  (let [domain   5000
+        ;; Keep the projected value side slightly smaller so it becomes the
+        ;; hash side and exercises the large-domain representation. Duplicate
+        ;; proof rows are legal input to the physical operator and should not
+        ;; affect its distinct result.
+        left     (relation {'?x 0 '?z 1}
+                           (repeat (inc domain) [0 1]))
+        right    (relation {'?z 0 '?y 1}
+                           (map (fn [y] [1 y]) (range domain)))
+        composed (j/dense-binary-composition left right ['?x '?y])
+        stats    (::j/dense-composition (meta composed))]
+    (is (= :roaring (:bitmap stats)))
+    (is (= (* (inc domain) domain) (:candidate-pairs stats)))
+    (is (= domain (.size ^java.util.List (:tuples composed))))
+    (is (= #{[0 0] [0 (dec domain)]}
+           (set (filter #(#{0 (dec domain)} (second %))
+                        (row-set composed)))))))

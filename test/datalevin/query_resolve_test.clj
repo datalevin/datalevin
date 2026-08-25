@@ -13,6 +13,7 @@
    [clojure.test :refer [deftest is testing]]
    [datalevin.core :as d]
    [datalevin.query.execute]
+   [datalevin.query.plan :as qplan]
    [datalevin.rules :as rules]))
 
 (deftest flat-function-tuple-binding-test
@@ -106,6 +107,78 @@
                 :input-tuples  3
                 :result-tuples 2}
                (:terminal-result-collection explain))))
+      (finally
+        (d/close conn)))))
+
+(deftest terminal-eav-binary-composition-test
+  (let [n      64
+        domain (vec (range 1 (inc n)))
+        schema {:c3 {:db/valueType   :db.type/ref
+                     :db/cardinality :db.cardinality/many}
+                :c4 {:db/valueType   :db.type/ref
+                     :db/cardinality :db.cardinality/many}}
+        conn   (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        rules  '[[(b2 ?x ?y)
+                  [?x :c3 ?z]
+                  [?z :c4 ?y]]]
+        query  '[:find ?x ?y :in $ % :where (b2 ?x ?y)]]
+    (try
+      (d/transact! conn
+                   (mapv (fn [x]
+                           {:db/id x, :c3 domain, :c4 domain})
+                         domain))
+      (let [database (d/db conn)
+            explain  (d/explain {:run? true} query database rules)
+            terminal (:terminal-result-collection explain)
+            physical (:physical-operator terminal)
+            expected (set (for [x domain, y domain] [x y]))]
+        (is (= expected (:result explain)))
+        (is (= (* n n n) (:input-tuples terminal)))
+        (is (= (* n n) (:result-tuples terminal)))
+        (is (= :dense-eav-composition (:operator physical)))
+        (is (= :full-ave (:target-scan physical)))
+        (is (= :dense (:bitmap physical)))
+        (is (= (* n n n) (:candidate-pairs physical)))
+        (is (= expected
+               (binding [qplan/*terminal-eav-composition?* false]
+                 (d/q query database rules)))))
+      (finally
+        (d/close conn)))))
+
+(deftest terminal-eav-composition-distinct-bound-scan-test
+  (let [join-keys (vec (range 1 17))
+        values    (vec (range 100 164))
+        anchors   (vec (range 1000 1064))
+        unrelated (vec (range 2000 2080))
+        schema    {:c3 {:db/valueType   :db.type/ref
+                        :db/cardinality :db.cardinality/many}
+                   :c4 {:db/valueType   :db.type/ref
+                        :db/cardinality :db.cardinality/many}}
+        conn      (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        rules     '[[(b2 ?x ?y)
+                     [?x :c3 ?z]
+                     [?z :c4 ?y]]]
+        query     '[:find ?x ?y :in $ % :where (b2 ?x ?y)]]
+    (try
+      (d/transact!
+        conn
+        (vec (concat
+               (map (fn [x] {:db/id x, :c3 join-keys}) anchors)
+               (map (fn [z] {:db/id z, :c4 values}) join-keys)
+               (map (fn [z] {:db/id z, :c4 values}) unrelated))))
+      (let [explain  (d/explain {:run? true} query (d/db conn) rules)
+            terminal (:terminal-result-collection explain)
+            physical (:physical-operator terminal)]
+        (is (= (set (for [x anchors, y values] [x y]))
+               (:result explain)))
+        (is (= :dense-eav-composition (:operator physical)))
+        (is (= :distinct-bound-eav (:target-scan physical)))
+        (is (= (count join-keys) (:distinct-join-keys physical)))
+        (is (= (* (+ (count join-keys) (count unrelated))
+                  (count values))
+               (:target-attribute-tuples physical)))
+        (is (= (* (count join-keys) (count values))
+               (:target-tuples physical))))
       (finally
         (d/close conn)))))
 

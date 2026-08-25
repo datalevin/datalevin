@@ -46,6 +46,8 @@
 
 (def ^:dynamic *access-batch-observer* nil)
 
+(def ^:dynamic ^:no-doc *terminal-eav-composition?* true)
+
 (defrecord Context [parsed-q rels sources rules opt-clauses late-clauses
                     optimizable-or-joins graph plan intermediates run?
                     result-set])
@@ -73,6 +75,10 @@
   (-execute-pipe [step db source sink] "execute as part of pipeline")
   (-sample [step db source] "sample the step, not all steps implement")
   (-explain [step context] "explain the query step"))
+
+(defprotocol ITerminalDistinctSink
+  (-add-distinct-batch! [sink tuples]
+    "Add a batch already distinct in the terminal projection."))
 
 (declare cols->attrs execute-steps hash-join-execute hash-join-execute-into
          normal-hash-join-execute-pipe reusable-sip-bitmap
@@ -1314,33 +1320,198 @@
           (segmented-execution context db attrs steps)
           (pipelining context db attrs steps n))))))
 
+(def ^:private ^:const terminal-composition-min-candidates 65536)
+(def ^:private ^:const terminal-composition-min-fanout 4.0)
+(def ^:private ^:const terminal-composition-full-scan-ratio 4.0)
+
+(defn- tuple-list-size
+  ^long [tuples]
+  (if (instance? List tuples)
+    (.size ^List tuples)
+    0))
+
+(defn- terminal-composition-estimated-pairs
+  [db input-step merge-step ^List source attr]
+  (let [sample-input    (or (:sample input-step) (:result input-step))
+        sample-output   (or (:sample merge-step) (:result merge-step))
+        observed-input  (tuple-list-size sample-input)
+        observed-output (tuple-list-size sample-output)
+        input-size      (long (if (pos? observed-input)
+                                observed-input
+                                (or (:sample-size input-step) 0)))
+        output-size     (long (if (pos? observed-output)
+                                observed-output
+                                (or (:sample-size merge-step) 0)))
+        source-size     (.size source)
+        sampled-fanout  (when (and (pos? input-size) (pos? output-size))
+                           (/ (double output-size) (double input-size)))
+        ;; Cached plans retain bounded sample cardinalities. If none are
+        ;; available, the analyzed AVE value-frequency ratio is a cheap
+        ;; admission estimate; the dense operator still performs exact
+        ;; costing after materializing the target side.
+        fanout          (or sampled-fanout
+                            (double (db/-default-ratio db attr)))]
+    (when (pos? source-size)
+      (let [fanout    (double fanout)
+            estimate (* (double source-size) fanout)]
+        (when (and (>= fanout terminal-composition-min-fanout)
+                   (>= estimate
+                       (double terminal-composition-min-candidates)))
+          (long (Math/ceil (min estimate (double Long/MAX_VALUE)))))))))
+
+(defn- terminal-composition-shape
+  [db steps ^List source terminal-symbols]
+  (when (and *terminal-eav-composition?*
+             (= 2 (count steps))
+             (= 2 (count terminal-symbols))
+             (= 2 (count (distinct terminal-symbols))))
+    (let [input-step (first steps)
+          merge-step (peek steps)
+          attrs-v    (:attrs-v merge-step)]
+      (when (and (identical? :merge (-type merge-step))
+                 (nil? (:result merge-step))
+                 (= 1 (count attrs-v))
+                 (= 1 (count (:vars merge-step))))
+        (let [[attr opts] (first attrs-v)
+              input-attrs (cols->attrs (:cols input-step))
+              index       (long (:index merge-step))
+              join-var    (some-> (:cols input-step) (nth index)
+                                  (#(if (set? %)
+                                      (some (fn [x]
+                                              (when (symbol? x) x)) %)
+                                      %)))
+              value-var   (first (:vars merge-step))
+              target-attrs {join-var 0, value-var 1}
+              source-only (filterv #(and (contains? input-attrs %)
+                                         (not (contains? target-attrs %)))
+                                   terminal-symbols)
+              target-only (filterv #(and (contains? target-attrs %)
+                                         (not (contains? input-attrs %)))
+                                   terminal-symbols)]
+          (when (and join-var
+                     (keyword? attr)
+                     (not (:skip? opts))
+                     (nil? (:fidx opts))
+                     (= 1 (count source-only))
+                     (= 1 (count target-only))
+                     ;; A target value already present in the input is a
+                     ;; tuple-dependent equality, even if an unusual plan did
+                     ;; not retain an explicit fidx.
+                     (not (contains? input-attrs value-var)))
+            (when-let [estimated-pairs
+                       (terminal-composition-estimated-pairs
+                         db input-step merge-step source attr)]
+              {:attr            attr
+               :estimated-pairs estimated-pairs
+               :index           index
+               :input-attrs     input-attrs
+               :join-var        join-var
+               :merge-options   opts
+               :target-attrs    target-attrs
+               :value-var       value-var})))))))
+
+(defn- distinct-entity-input
+  [^List source ^long index]
+  (let [seen   (HashSet.)
+        tuples (FastList.)]
+    (dotimes [i (.size source)]
+      (let [entity (aget ^objects (.get source i) index)]
+        (when (.add seen entity)
+          (.add tuples (object-array [entity])))))
+    tuples))
+
+(defn- composition-target
+  [db ^List source {:keys [attr index join-var merge-options target-attrs]}]
+  (let [source-size  (.size source)
+        target-count (long (db/-count db [nil attr nil]))
+        full-scan?   (<= (double target-count)
+                         (* terminal-composition-full-scan-ratio
+                            (double source-size)))
+        [scan-mode distinct-keys tuples]
+        (if full-scan?
+          [:full-ave nil
+           (db/-init-tuples-list
+             db attr [[[:closed c/v0] [:closed c/vmax]]]
+             (:pred merge-options) true)]
+          (let [^List entities (distinct-entity-input source index)]
+            [:distinct-bound-eav (.size entities)
+             (db/-eav-scan-v-list
+               db entities 0 [[attr merge-options]])]))]
+    {:relation      (r/relation! target-attrs (or tuples (FastList.)))
+     :scan-mode     scan-mode
+     :target-count  target-count
+     :target-tuples (tuple-list-size tuples)
+     :distinct-keys distinct-keys
+     :join-var      join-var}))
+
+(defn- terminal-eav-composition
+  [db steps ^List source terminal-symbols]
+  (when-let [{:keys [input-attrs estimated-pairs] :as shape}
+             (terminal-composition-shape db steps source terminal-symbols)]
+    (let [{:keys [relation scan-mode target-count target-tuples distinct-keys]}
+          (composition-target db source shape)
+          composed (j/dense-binary-composition
+                     (r/relation! input-attrs source)
+                     relation terminal-symbols)]
+      (when composed
+        (let [stats (::j/dense-composition (meta composed))]
+          {:relation composed
+           :operator :dense-eav-composition
+           :bitmap (:bitmap stats)
+           :target-scan scan-mode
+           :source-tuples (.size source)
+           :target-attribute-tuples target-count
+           :target-tuples target-tuples
+           :distinct-join-keys distinct-keys
+           :estimated-candidate-pairs estimated-pairs
+           :candidate-pairs (:candidate-pairs stats)
+           :anchor-count (:anchor-count stats)
+           :domain-size (:domain-size stats)
+           :memory-upper-bound (:memory-upper-bound stats)})))))
+
 (defn execute-steps-into
-  "Execute one component directly into `sink`. Return true when direct
-   execution was used, or false when the component requires partitioned
-   materialization and should use `execute-steps` instead."
-  [context db steps ^Collection sink]
-  (binding [*sip-domains* (or *sip-domains* (ConcurrentHashMap.))]
-    (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
-          n     (count steps)]
-      (when (zero? n)
-        (u/raise "Cannot execute an empty query plan" {}))
-      (if (and (< 2 n) (partition-plan? context db steps))
-        false
-        (do
-          (case n
-            1
-            (do
-              (step-execute-pipe (first steps) db nil sink)
-              (save-intermediates context steps (object-array 0) sink))
+  "Execute one component directly into `sink`. Return a physical-operator map
+   when direct execution was used, or nil when partitioned materialization must
+   use `execute-steps` instead. `terminal-symbols` enables safe final-operator
+   specializations for sinks that accept already-distinct projected batches."
+  ([context db steps sink]
+   (execute-steps-into context db steps sink nil))
+  ([context db steps ^Collection sink terminal-symbols]
+   (binding [*sip-domains* (or *sip-domains* (ConcurrentHashMap.))]
+     (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
+           n     (count steps)]
+       (when (zero? n)
+         (u/raise "Cannot execute an empty query plan" {}))
+       (when-not (and (< 2 n) (partition-plan? context db steps))
+         (case n
+           1
+           (do
+             (step-execute-pipe (first steps) db nil sink)
+             (save-intermediates context steps (object-array 0) sink)
+             {:operator :pipeline})
 
-            2
-            (let [src (or (step-execute (first steps) db nil) (FastList.))]
-              (step-execute-pipe (peek steps) db (p/list-tuple-pipe src) sink)
-              (save-intermediates context steps (object-array [src]) sink))
+           2
+           (let [src (or (step-execute (first steps) db nil) (FastList.))]
+             (if-some [{:keys [relation] :as composition}
+                       (when (and terminal-symbols
+                                  (satisfies? ITerminalDistinctSink sink))
+                         (terminal-eav-composition
+                           db steps src terminal-symbols))]
+               (do
+                 (-add-distinct-batch! sink (:tuples relation))
+                 (save-intermediates
+                   context steps (object-array [src]) sink)
+                 (dissoc composition :relation))
+               (do
+                 (step-execute-pipe
+                   (peek steps) db (p/list-tuple-pipe src) sink)
+                 (save-intermediates
+                   context steps (object-array [src]) sink)
+                 {:operator :pipeline})))
 
-            (let [pipes (run-pipeline-into db steps n sink)]
-              (save-intermediates context steps pipes sink)))
-          true)))))
+           (let [pipes (run-pipeline-into db steps n sink)]
+             (save-intermediates context steps pipes sink)
+             {:operator :pipeline})))))))
 
 (defn count-steps
   "Execute a component plan and count its output without retaining the final

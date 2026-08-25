@@ -14,6 +14,8 @@
 - [Datalog] parallel index scans.
 - [Datalog] magic-set seeds participate in rule-call cost estimation.
 - [Datalog] late or-join branch planner.
+- [Datalog] segmented morsel-driven execution.
+- [Datalog] cheaper final result collection.
 
 ## 1.0.2 (2026-08-11)
 
