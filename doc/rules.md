@@ -155,6 +155,14 @@ a pending transaction overlay uses transaction-aware datom probes. Other rule
 shapes, multi-valued bounds, non-ref attributes, and calls against an already
 materialized rule relation continue through the general semi-naive evaluator.
 
+The committed-database traversal is adaptive for dense reachable components.
+It starts with indexed probes and measures their fanout. When the known pending
+frontier predicts work comparable to scanning the attribute, the evaluator
+performs one full attribute scan, builds a primitive long-to-long adjacency
+map, and finishes the existing work queue from that map. A minimum observation
+and frontier size keeps sparse or short traversals on point probes; pending
+transaction overlays always remain on the transaction-aware indexed path.
+
 ### Demand-driven synchronized closure
 
 A singleton-bound binary predicate can also avoid whole-relation evaluation for

@@ -886,6 +886,15 @@
                 (d/datom e a c/v0)
                 (d/datom e a c/vmax))))
 
+(defn ^:no-doc local-ref-attr-adjacency?
+  [^DB db]
+  (instance? Store (.-store db)))
+
+(defn ^:no-doc ref-attr-adjacency
+  [^DB db attr bound-side]
+  (when (local-ref-attr-adjacency? db)
+    (s/ref-attr-adjacency (.-store db) attr bound-side)))
+
 ;; (defmethod print-method DB [^DB db, ^java.io.Writer w]
 ;;   (binding [*out* w]
 ;;     (let [{:keys [store eavt max-eid max-tx]} db]

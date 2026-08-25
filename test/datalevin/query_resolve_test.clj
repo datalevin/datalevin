@@ -295,6 +295,45 @@
         (d/close conn)
         (d/close fallback)))))
 
+(deftest bound-transitive-dense-frontier-test
+  (let [schema   {:edge {:db/valueType   :db.type/ref
+                         :db/cardinality :db.cardinality/many}}
+        facts    (into [{:db/id 0 :edge (vec (range 1 160))}]
+                       (map (fn [node] {:db/id node :edge [0]}))
+                       (range 1 160))
+        adaptive (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        indexed  (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        tc-rules '[[(tc ?a ?b)
+                    [?a :edge ?b]]
+                   [(tc ?a ?b)
+                    [?a :edge ?mid]
+                    (tc ?mid ?b)]]
+        bf-query '[:find [?b ...]
+                   :in $ % ?start
+                   :where (tc ?start ?b)]
+        fb-query '[:find [?a ...]
+                   :in $ % ?end
+                   :where (tc ?a ?end)]
+        expected (set (range 160))]
+    (try
+      (d/transact! adaptive facts)
+      (d/transact! indexed facts)
+      (testing "a dense pending frontier selects a full attribute scan"
+        (is (#'rules/dense-transitive-frontier? 152 8 166 318))
+        (is (= expected
+               (set (d/q bf-query (d/db adaptive) tc-rules 0))))
+        (is (= expected
+               (set (d/q fb-query (d/db adaptive) tc-rules 0)))))
+      (testing "the adaptive scan agrees with an indexed-only traversal"
+        (binding [rules/*bound-transitive-full-scan?* false]
+          (is (= expected
+                 (set (d/q bf-query (d/db indexed) tc-rules 0))))
+          (is (= expected
+                 (set (d/q fb-query (d/db indexed) tc-rules 0))))))
+      (finally
+        (d/close adaptive)
+        (d/close indexed)))))
+
 (deftest bound-synchronized-eav-specialization-test
   (let [schema        {:par     {:db/valueType   :db.type/ref
                                  :db/cardinality :db.cardinality/many}

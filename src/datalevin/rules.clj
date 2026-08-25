@@ -27,6 +27,9 @@
    [datalevin.db DB]
    [datalevin.relation Relation]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [org.eclipse.collections.impl.list.mutable.primitive LongArrayList]
+   [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
+   [org.eclipse.collections.impl.set.mutable.primitive LongHashSet]
    [java.util List HashMap HashSet ArrayDeque]))
 
 (defn parse-rules
@@ -1205,6 +1208,7 @@
 (def ^:dynamic *keep-temporal-intermediates* false)
 (def ^:dynamic *magic-rewrite?* true)
 (def ^:dynamic *bound-transitive-eav?* true)
+(def ^:dynamic *bound-transitive-full-scan?* true)
 (def ^:dynamic *bound-synchronized-eav?* true)
 
 ;; magic set rewrite
@@ -1704,48 +1708,139 @@
                            :pending-tx? (db/pending-tx-cache? database)
                            :traversal-value traversal-value)))))))))))
 
+(def ^:private ^:const ^long bound-transitive-full-scan-min-observations 8)
+(def ^:private ^:const ^long bound-transitive-full-scan-min-pending 128)
+(def ^:private ^:const ^double bound-transitive-full-scan-work-ratio 0.5)
+
+(defn- build-long-eav-adjacency
+  [^DB database attr bound-side]
+  (db/ref-attr-adjacency database attr bound-side))
+
+(defn- add-bound-transitive-tuple!
+  [^FastList tuples ^long bound-idx bound-value ^long neighbor]
+  (.add tuples
+        (if (zero? bound-idx)
+          (object-array [bound-value (Long/valueOf neighbor)])
+          (object-array [(Long/valueOf neighbor) bound-value]))))
+
+(defn- dense-transitive-frontier?
+  [^long pending ^long observations ^long observed-edges ^long scan-count]
+  (and *bound-transitive-full-scan?*
+       (>= observations bound-transitive-full-scan-min-observations)
+       (>= pending bound-transitive-full-scan-min-pending)
+       (pos? observed-edges)
+       (pos? scan-count)
+       (>= (* (double pending)
+              (/ (double observed-edges) (double observations)))
+           (* bound-transitive-full-scan-work-ratio
+              (double scan-count)))))
+
 (defn- eval-bound-transitive-eav
   [{:keys [^DB db attr ^long entity-pos head-vars
            ^long bound-idx bound-value traversal-value pending-tx?]}
    args]
-  (let [bound-side (if (= bound-idx entity-pos) :e :v)
-        queue      (ArrayDeque.)
-        expanded   (HashSet.)
-        answers    (HashSet.)
-        tuples     (FastList.)]
-    (.add expanded traversal-value)
-    (.add queue traversal-value)
-    (while (not (.isEmpty queue))
-      (let [node    (.removeFirst queue)
-            pattern (if (= bound-side :e)
-                      [node attr nil]
-                      [nil attr node])]
-        (if pending-tx?
-          (let [datoms ^List (db/-search db pattern)]
+  (let [bound-side     (if (= bound-idx entity-pos) :e :v)
+        traversal-node (long traversal-value)
+        queue          (LongArrayList.)
+        seen           (LongHashSet.)
+        cycle?         (boolean-array 1)
+        full-scan?     (and *bound-transitive-full-scan?*
+                            (db/local-ref-attr-adjacency? db))
+        tuples         (FastList.)]
+    (.add seen traversal-node)
+    (.add queue traversal-node)
+    (if pending-tx?
+      ;; Transaction overlays are small and must use transaction-aware datom
+      ;; probes, so they deliberately stay on the indexed path.
+      (loop [cursor 0]
+        (when (< cursor (.size queue))
+          (let [node    (.get queue (int cursor))
+                pattern (if (= bound-side :e)
+                          [node attr nil]
+                          [nil attr node])
+                datoms  ^List (db/-search db pattern)]
             (when datoms
               (dotimes [i (.size datoms)]
                 (let [datom    ^Datom (.get datoms i)
-                      neighbor (if (= bound-side :e)
-                                 (.-v datom)
-                                 (.-e datom))]
-                  (when (.add answers neighbor)
-                    (.add tuples
-                          (if (zero? bound-idx)
-                            (object-array [bound-value neighbor])
-                            (object-array [neighbor bound-value]))))
-                  (when (.add expanded neighbor)
-                    (.addLast queue neighbor))))))
-          (let [neighbors ^List (db/-search-tuples db pattern)]
-            (when neighbors
-              (dotimes [i (.size neighbors)]
-                (let [neighbor (aget ^objects (.get neighbors i) 0)]
-                  (when (.add answers neighbor)
-                    (.add tuples
-                          (if (zero? bound-idx)
-                            (object-array [bound-value neighbor])
-                            (object-array [neighbor bound-value]))))
-                  (when (.add expanded neighbor)
-                    (.addLast queue neighbor)))))))))
+                      neighbor (long (if (= bound-side :e)
+                                       (.-v datom)
+                                       (.-e datom)))]
+                  (if (== neighbor traversal-node)
+                    (when-not (aget cycle? 0)
+                      (aset cycle? 0 true)
+                      (add-bound-transitive-tuple!
+                        tuples bound-idx bound-value neighbor))
+                    (when (.add seen neighbor)
+                      (.add queue neighbor)
+                      (add-bound-transitive-tuple!
+                        tuples bound-idx bound-value neighbor))))))
+            (recur (inc cursor)))))
+      (let [switch-cursor
+            ;; Indexed probes are optimal while the reachable subgraph is
+            ;; small. Once the observed fanout and the already-known pending
+            ;; frontier predict work comparable to a full attribute scan,
+            ;; return the first unexpanded queue position.
+            (loop [cursor        0
+                   observed-edges 0
+                   scan-count    -1]
+              (if (>= cursor (.size queue))
+                -1
+                (let [node      (.get queue (int cursor))
+                      pattern   (if (= bound-side :e)
+                                  [node attr nil]
+                                  [nil attr node])
+                      neighbors ^List (db/-search-tuples db pattern)
+                      n         (long (if neighbors (.size neighbors) 0))]
+                  (when neighbors
+                    (dotimes [i n]
+                      (let [neighbor
+                            (long (aget ^objects (.get neighbors i) 0))]
+                        (if (== neighbor traversal-node)
+                          (when-not (aget cycle? 0)
+                            (aset cycle? 0 true)
+                            (add-bound-transitive-tuple!
+                              tuples bound-idx bound-value neighbor))
+                          (when (.add seen neighbor)
+                            (.add queue neighbor)
+                            (add-bound-transitive-tuple!
+                              tuples bound-idx bound-value neighbor))))))
+                  (let [next-cursor   (inc cursor)
+                        observations  next-cursor
+                        observed      (+ observed-edges n)
+                        pending       (- (.size queue) next-cursor)
+                        eligible?     (and full-scan?
+                                           (>= observations
+                                               bound-transitive-full-scan-min-observations)
+                                           (>= pending
+                                               bound-transitive-full-scan-min-pending))
+                        scan-count'   (if (and eligible? (neg? scan-count))
+                                        (long (db/-count db [nil attr nil]))
+                                        scan-count)]
+                    (if (and eligible?
+                             (dense-transitive-frontier?
+                               pending observations observed scan-count'))
+                      next-cursor
+                      (recur next-cursor observed scan-count'))))))]
+        (when-not (neg? (long switch-cursor))
+          (let [adjacency ^LongObjectHashMap
+                (build-long-eav-adjacency db attr bound-side)]
+            (loop [cursor (long switch-cursor)]
+              (when (< cursor (.size queue))
+                (let [node   (.get queue (int cursor))
+                      values ^LongArrayList (.get adjacency node)]
+                  (when values
+                    (dotimes [i (.size values)]
+                      (let [neighbor (.get values i)]
+                        (if (== neighbor traversal-node)
+                          (when-not (aget cycle? 0)
+                            (aset cycle? 0 true)
+                            (add-bound-transitive-tuple!
+                              tuples bound-idx bound-value neighbor))
+                          (when (.add seen neighbor)
+                            (.add queue neighbor)
+                            (add-bound-transitive-tuple!
+                              tuples bound-idx bound-value neighbor))))))
+                  (recur (inc cursor)))))))))
     (map-rule-result
       (r/relation! (zipmap head-vars (range)) tuples)
       head-vars args)))

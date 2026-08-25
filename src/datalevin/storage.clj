@@ -56,6 +56,7 @@
    [java.nio ByteBuffer]
    [java.lang AutoCloseable]
    [org.eclipse.collections.impl.list.mutable FastList]
+   [org.eclipse.collections.impl.list.mutable.primitive LongArrayList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]
    [datalevin.datom Datom]
    [datalevin.interface IStore]
@@ -1520,6 +1521,34 @@
               aid      (props :db/aid)]
           (ave-filter-tuple-id-list*
             lmdb in v-idx f-idx aid vt))))))
+
+(defn ^:no-doc ref-attr-adjacency
+  "Scan a ref-valued AVE attribute directly into a primitive adjacency map.
+   `bound-side` selects whether entity IDs or ref values are map keys."
+  [^Store store attr bound-side]
+  (let [props      ((schema store) attr)
+        capacity   (int (min (long Integer/MAX_VALUE)
+                             (max 16 (long (.cardinality store attr)))))
+        adjacency  (LongObjectHashMap. capacity)
+        entity-key? (= bound-side :e)]
+    (when props
+      (let [lmdb (.-lmdb store)
+            aid  (:db/aid props)
+            vt   (value-type props)]
+        (ave-tuples-scan*
+          lmdb aid vt [[[:closed c/v0] [:closed c/vmax]]] nil
+          (fn [kv]
+            (let [entity (long (.getLong ^ByteBuffer (lmdb/v kv) 0))
+                  value  (long (idx/avg-buffer->v lmdb (lmdb/k kv)))
+                  k      (if entity-key? entity value)
+                  v      (if entity-key? value entity)
+                  values ^LongArrayList (.get adjacency k)]
+              (if values
+                (.add values v)
+                (let [values (LongArrayList.)]
+                  (.add values v)
+                  (.put adjacency k values))))))))
+    adjacency))
 
 (defn- fulltext-op-ref
   [op]
