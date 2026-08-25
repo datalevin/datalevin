@@ -15,7 +15,7 @@
    [datalevin.query-util :as qu]
    [datalevin.util :as u :refer [concatv]])
   (:import
-   [java.util Collection HashMap HashSet List]
+   [java.util BitSet Collection HashMap HashSet List Map$Entry]
    [org.eclipse.collections.impl.list.mutable FastList]
    [org.eclipse.collections.impl.map.mutable.primitive LongObjectHashMap]))
 
@@ -275,6 +275,168 @@
             (aset key i (aget tuple (aget idxs i))))
           (r/wrap-array key))))))
 
+(def ^:private ^:const dense-composition-min-candidates 65536)
+(def ^:private ^:const dense-composition-min-fanout 4)
+(def ^:private ^:const dense-composition-max-bitset-bytes
+  (* 64 1024 1024))
+(def ^:private ^:const dense-composition-sample-size 512)
+(def ^:private ^:const dense-composition-min-sample-repeats 16)
+(def ^:private ^:const dense-composition-sample-threshold 4096)
+
+(defn- sampled-key-reuse?
+  [^List tuples key-fn]
+  (let [n             (min (.size tuples) dense-composition-sample-size)
+        ^HashSet seen (HashSet. n)]
+    (loop [i 0, repeated 0]
+      (cond
+        (>= repeated dense-composition-min-sample-repeats) true
+        (= i n) false
+        :else
+        (recur (unchecked-inc-int i)
+               (if (.add seen (key-fn (.get tuples i)))
+                 repeated
+                 (unchecked-inc repeated)))))))
+
+(defn- dense-binary-composition
+  "Use bitset unions for a dense two-relation composition. Returns nil when
+   the shape or measured relation density does not justify the representation."
+  [rel1 rel2 vars]
+  (let [^List tuples1 (:tuples rel1)
+        ^List tuples2 (:tuples rel2)
+        attrs1        (:attrs rel1)
+        attrs2        (:attrs rel2)
+        vars          (vec vars)
+        common-attrs  (qu/intersect-keys attrs1 attrs2)
+        vars1         (filterv #(and (contains? attrs1 %)
+                                     (not (contains? attrs2 %)))
+                               vars)
+        vars2         (filterv #(and (contains? attrs2 %)
+                                     (not (contains? attrs1 %)))
+                               vars)]
+    (when (and (= 2 (count vars))
+               (seq common-attrs)
+               (= 1 (count vars1))
+               (= 1 (count vars2))
+               (not-any? #(contains? qu/*lookup-attrs* %) vars))
+      (let [hash-first?  (< (.size tuples1) (.size tuples2))
+            ^List hash-tuples (if hash-first? tuples1 tuples2)
+            ^List scan-tuples (if hash-first? tuples2 tuples1)
+            hash-attrs   (if hash-first? attrs1 attrs2)
+            scan-attrs   (if hash-first? attrs2 attrs1)
+            value-var    (if hash-first? (first vars1) (first vars2))
+            anchor-var   (if hash-first? (first vars2) (first vars1))
+            value-idx    (int (hash-attrs value-var))
+            anchor-idx   (int (scan-attrs anchor-var))
+            [hash-key-fn _] (tuple-key-fns hash-attrs common-attrs)
+            [scan-build-key-fn scan-key-fn]
+            (tuple-key-fns scan-attrs common-attrs)
+            input-size     (long (+ (long (.size hash-tuples))
+                                    (.size scan-tuples)))
+            ^HashMap value-ordinals (HashMap.)
+            ^FastList ordinal-values (FastList.)
+            ^HashMap join-counts (HashMap.)]
+        ;; Avoid an exact costing pass when a bounded sample finds no evidence
+        ;; that either side reuses join keys enough for dense composition.
+        (when (or (< input-size dense-composition-sample-threshold)
+                  (sampled-key-reuse? hash-tuples hash-key-fn)
+                  (sampled-key-reuse? scan-tuples scan-build-key-fn))
+          ;; Establish a compact value domain and exact hash-side key counts.
+          (dotimes [i (.size hash-tuples)]
+            (let [^objects tuple (.get hash-tuples i)
+                  value          (aget tuple value-idx)]
+              (when-not (.containsKey value-ordinals value)
+                (.put value-ordinals value (.size ordinal-values))
+                (.add ordinal-values value))
+              (let [join-key (hash-key-fn tuple)
+                    n        (.get join-counts join-key)]
+                (.put join-counts join-key
+                      (unchecked-inc (long (or n 0)))))))
+          ;; Count the other output domain and exact number of proof pairs.
+          (let [^HashSet anchors (HashSet.)
+                candidate-pairs
+                (long
+                  (loop [i 0, total 0]
+                    (if (< i (.size scan-tuples))
+                      (let [^objects tuple (.get scan-tuples i)
+                            _              (.add anchors
+                                                 (aget tuple anchor-idx))
+                            n              (.get join-counts
+                                                 (scan-key-fn tuple))
+                            n              (long (or n 0))
+                            total          (if (> total (- Long/MAX_VALUE n))
+                                             Long/MAX_VALUE
+                                             (unchecked-add total n))]
+                        (recur (unchecked-inc-int i) total))
+                      total)))
+                domain-size  (.size ordinal-values)
+                anchor-count (.size anchors)
+                bitset-words (long (quot (+ (long domain-size) 63) 64))
+                bitset-bytes (long (* bitset-words 8
+                                      (+ (long anchor-count)
+                                         (.size join-counts))))]
+            (when (and (pos? domain-size)
+                       (pos? anchor-count)
+                       (>= candidate-pairs dense-composition-min-candidates)
+                       (>= candidate-pairs
+                           (* dense-composition-min-fanout input-size))
+                       (<= bitset-bytes dense-composition-max-bitset-bytes))
+              (let [^HashMap adjacency (HashMap.)]
+                ;; Each join key maps to the distinct projected values
+                ;; reachable on the hash side.
+                (dotimes [i (.size hash-tuples)]
+                  (let [^objects tuple (.get hash-tuples i)
+                        join-key       (hash-key-fn tuple)
+                        ^BitSet values (or (.get adjacency join-key)
+                                           (let [values (BitSet. domain-size)]
+                                             (.put adjacency join-key values)
+                                             values))
+                        ^Number ordinal
+                        (.get value-ordinals (aget tuple value-idx))]
+                    (.set values (.intValue ordinal))))
+                ;; Composition becomes an OR of complete value sets instead of
+                ;; one hash-set insertion for every proof pair.
+                (let [^HashMap groups (HashMap.)
+                      ^longs total-output (long-array 1)]
+                  (dotimes [i (.size scan-tuples)]
+                    (let [^objects tuple (.get scan-tuples i)
+                          ^BitSet values (.get adjacency (scan-key-fn tuple))]
+                      (when values
+                        (let [anchor        (aget tuple anchor-idx)
+                              ^BitSet known (.get groups anchor)]
+                          (if known
+                            (when (< (.cardinality known) domain-size)
+                              (let [before (.cardinality known)]
+                                (.or known values)
+                                (aset total-output 0
+                                      (unchecked-add
+                                        (aget total-output 0)
+                                        (long (- (.cardinality known)
+                                                 before))))))
+                            (let [^BitSet copy (.clone values)]
+                              (.put groups anchor copy)
+                              (aset total-output 0
+                                    (unchecked-add
+                                      (aget total-output 0)
+                                      (long (.cardinality copy))))))))))
+                  (let [anchor-pos (int (.indexOf ^List vars anchor-var))
+                        value-pos  (int (.indexOf ^List vars value-var))
+                        capacity   (int (Math/min (aget total-output 0)
+                                                  (long 1000000)))
+                        output     (FastList. capacity)]
+                    (doseq [^Map$Entry entry (.entrySet groups)]
+                      (let [anchor        (.getKey entry)
+                            ^BitSet known (.getValue entry)]
+                        (loop [ordinal (.nextSetBit known 0)]
+                          (when-not (neg? ordinal)
+                            (let [tuple (object-array 2)]
+                              (aset tuple anchor-pos anchor)
+                              (aset tuple value-pos
+                                    (.get ordinal-values ordinal))
+                              (.add output tuple))
+                            (recur (.nextSetBit
+                                     known (unchecked-inc-int ordinal)))))))
+                    (r/relation! (zipmap vars (range)) output)))))))))))
+
 (defn hash-join-project-distinct
   "Hash-join two relations while retaining only distinct `vars`, without
    accumulating the complete proof relation. If projected columns split across
@@ -297,32 +459,32 @@
     (if (or (nil? tuples1) (nil? tuples2)
             (zero? (.size tuples1)) (zero? (.size tuples2)))
       (r/relation! output-attrs output)
-      (let [common-attrs (qu/intersect-keys attrs1 attrs2)
-            hash-first?  (< (.size tuples1) (.size tuples2))
-            ^List hash-input-tuples (if hash-first? tuples1 tuples2)
-            ^List scan-tuples (if hash-first? tuples2 tuples1)
-            hash-attrs    (if hash-first? attrs1 attrs2)
-            scan-attrs    (if hash-first? attrs2 attrs1)
-            [hash-key-fn _]
-            (tuple-key-fns hash-attrs common-attrs)
-            [_ scan-key-fn]
-            (tuple-key-fns scan-attrs common-attrs)
-            ^LongObjectHashMap lhash
-            (when (== 1 (count common-attrs))
-              (hash-long-tuples hash-key-fn hash-input-tuples))
-            ^HashMap hash (when-not lhash
-                            (hash-tuples hash-key-fn hash-input-tuples))
-            value-vars    (filterv #(and (contains? hash-attrs %)
-                                         (not (contains? scan-attrs %)))
-                                   vars)
-            anchor-vars   (filterv #(contains? scan-attrs %) vars)
-            composition?  (and (seq value-vars)
-                                (not-any? #(contains? qu/*lookup-attrs* %)
-                                          vars)
-                                (= (count vars)
-                                   (+ (count anchor-vars)
-                                      (count value-vars))))
-            output-plan   (mapv (fn [var]
+      (if-some [composed (dense-binary-composition rel1 rel2 vars)]
+        composed
+        (let [common-attrs   (qu/intersect-keys attrs1 attrs2)
+              hash-first?    (< (.size tuples1) (.size tuples2))
+              ^List hash-input-tuples (if hash-first? tuples1 tuples2)
+              ^List scan-tuples (if hash-first? tuples2 tuples1)
+              hash-attrs     (if hash-first? attrs1 attrs2)
+              scan-attrs     (if hash-first? attrs2 attrs1)
+              [hash-key-fn _] (tuple-key-fns hash-attrs common-attrs)
+              [_ scan-key-fn] (tuple-key-fns scan-attrs common-attrs)
+              ^LongObjectHashMap lhash
+              (when (== 1 (count common-attrs))
+                (hash-long-tuples hash-key-fn hash-input-tuples))
+              ^HashMap hash   (when-not lhash
+                                (hash-tuples hash-key-fn hash-input-tuples))
+              value-vars      (filterv #(and (contains? hash-attrs %)
+                                              (not (contains? scan-attrs %)))
+                                       vars)
+              anchor-vars     (filterv #(contains? scan-attrs %) vars)
+              composition?    (and (seq value-vars)
+                                    (not-any?
+                                      #(contains? qu/*lookup-attrs* %) vars)
+                                    (= (count vars)
+                                       (+ (count anchor-vars)
+                                          (count value-vars))))
+              output-plan     (mapv (fn [var]
                                   (if-let [idx (get attrs1 var)]
                                     [0 (int idx)]
                                     [1 (int (attrs2 var))]))
@@ -404,7 +566,7 @@
                       (let [^List bucket bucket]
                         (dotimes [j (.size bucket)]
                           (accept! (.get bucket j)))))))))))
-        (r/relation! output-attrs output)))))
+          (r/relation! output-attrs output))))))
 
 (defn subtract-rel
   [a b]

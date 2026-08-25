@@ -82,7 +82,12 @@ pushed into a terminal EAV lookup, so duplicate scan and join results are
 discarded as they are produced. For relation-composition shapes whose projected
 variables are split across the two inputs, the operator tracks the projected
 value domain for each output group and stops probing a group once that domain
-is complete.
+is complete. Dense binary compositions receive a bounded reuse sample followed
+by exact domain and proof-pair costing. If the projected domains are compact,
+the proof-pair fanout is high enough, and a bounded memory estimate passes,
+join-key adjacency and per-group results are represented as bitsets. The join
+then unions complete value sets instead of performing one hash-set insertion per
+proof pair; sparse or wide-domain cases retain the ordinary fused hash join.
 
 Memory use is therefore governed by the distinct predicate relations, join hash
 tables, and final result rather than by the potentially much larger number of

@@ -85,6 +85,30 @@
       (is (= 'b1 (ffirst (:late-clauses
                            (d/explain {:run? false} b1-q facts rules))))))))
 
+(deftest terminal-projected-distinct-collection-test
+  (let [schema {:c3 {:db/valueType   :db.type/ref
+                     :db/cardinality :db.cardinality/many}
+                :c4 {:db/valueType   :db.type/ref
+                     :db/cardinality :db.cardinality/many}}
+        conn   (d/create-conn nil schema {:kv-opts {:inmemory? true}})
+        rules  '[[(b2 ?x ?y)
+                  [?x :c3 ?z]
+                  [?z :c4 ?y]]]
+        query  '[:find ?x ?y :in $ % :where (b2 ?x ?y)]]
+    (try
+      (d/transact! conn [{:db/id 1 :c3 [10 11]}
+                         {:db/id 10 :c4 [20 21]}
+                         {:db/id 11 :c4 [20]}])
+      (let [explain (d/explain {:run? true} query (d/db conn) rules)]
+        (is (= #{[1 20] [1 21]} (:result explain)))
+        (is (= {:mode          :projected-distinct
+                :symbols       '[?x ?y]
+                :input-tuples  3
+                :result-tuples 2}
+               (:terminal-result-collection explain))))
+      (finally
+        (d/close conn)))))
+
 (deftest bound-late-rule-order-test
   (let [sort-late @(ns-resolve 'datalevin.query.execute 'sort-late-clauses)
         rules     {'left :defined, 'right :defined}

@@ -86,3 +86,23 @@
           (is (= (expected-projected-join left right projected)
                  (row-set
                    (j/hash-join-project-distinct left right projected)))))))))
+
+(deftest dense-binary-composition-test
+  (let [n     64
+        left  (relation {'?x 0 '?z 1}
+                        (for [x (range n), z (range n)] [x z]))
+        right (relation {'?z 0 '?y 1}
+                        (for [z (range n), y (range n)] [z y]))
+        selected (#'j/dense-binary-composition left right ['?x '?y])
+        actual   (j/hash-join-project-distinct left right ['?x '?y])]
+    (is (some? selected))
+    (is (= (* n n) (.size ^java.util.List (:tuples selected))))
+    (is (= (set (for [x (range n), y (range n)] [x y]))
+           (row-set actual)))
+    (is (= (row-set actual)
+           (row-set
+             (j/hash-join-project-distinct right left ['?x '?y]))))
+    (is (nil? (#'j/dense-binary-composition
+                (relation {'?x 0 '?z 1} [[1 10] [2 20]])
+                (relation {'?z 0 '?y 1} [[10 :a] [20 :b]])
+                ['?x '?y])))))

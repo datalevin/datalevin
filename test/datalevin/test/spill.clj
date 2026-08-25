@@ -22,6 +22,10 @@
   (doseq [klass [SpillableVector SpillableMap SpillableSet]]
     (is (empty? (finalize-methods klass)))))
 
+(deftest spillable-set-supports-initial-capacity
+  (let [s (sp/new-spillable-set (range 20) {:initial-capacity 32})]
+    (is (= (set (range 20)) s))))
+
 (defn- assert-spill-dir-cleaned!
   [root cleanup-fn]
   (let [paths (child-paths root)]

@@ -633,14 +633,19 @@
 (defn new-spillable-set
   ([] (new-spillable-set nil nil))
   ([s] (new-spillable-set s nil))
-  ([s {:keys [spill-threshold spill-root]
+  ([s {:keys [spill-threshold spill-root initial-capacity]
        :or   {spill-threshold c/default-spill-threshold
               spill-root      c/default-spill-root}}]
    (when (empty? @listeners) (memory-updater))
    (let [impl (SpillableMap. spill-threshold
                              spill-root
                              (volatile! nil)
-                             (UnifiedMap.)
+                             (if (some? initial-capacity)
+                               (UnifiedMap.
+                                 (int
+                                   (min (long Integer/MAX_VALUE)
+                                        (max 0 (long initial-capacity)))))
+                               (UnifiedMap.))
                              (volatile! nil)
                              (volatile! nil)
                              nil)]

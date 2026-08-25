@@ -39,7 +39,8 @@
    [datalevin.timeout :as timeout]
    [datalevin.util :as u :refer [cond+ concatv map+]])
   (:import
-   [java.util Comparator HashSet List PriorityQueue]
+   [clojure.lang IPersistentCollection]
+   [java.util Collection Comparator HashSet List PriorityQueue]
    [datalevin.parser BindTuple Constant FindColl FindRel FindScalar FindTuple
     Pattern Variable]
    [org.eclipse.collections.impl.list.mutable FastList]))
@@ -58,6 +59,8 @@
 (def ^:dynamic ^:private *access-execution* nil)
 
 (def ^:dynamic ^:private *deferred-result-explain* nil)
+
+(def ^:dynamic ^:no-doc *terminal-result-collection?* true)
 
 (def ^:private materialize-input-bound-patterns
   qo/materialize-input-bound-patterns)
@@ -85,6 +88,85 @@
          (not-any? #(or (dp/aggregate? %) (dp/find-expr? %)
                         (dp/pull? %))
                    find-elements))))
+
+(definterface IProjectedDistinctSink
+  (^Object finishResult []))
+
+(deftype ProjectedDistinctSink [^ints idxs
+                                ^:unsynchronized-mutable ^HashSet seen
+                                ^:unsynchronized-mutable ^FastList projected
+                                ^:unsynchronized-mutable ^objects scratch
+                                ^:unsynchronized-mutable lookup
+                                ^longs input-count]
+  IProjectedDistinctSink
+  (finishResult [_]
+    (let [^FastList tuples projected
+          size             (.size tuples)
+          result-set       (sp/new-spillable-set
+                             nil {:initial-capacity size})]
+      (set! seen nil)
+      (set! scratch nil)
+      (set! lookup nil)
+      (dotimes [i size]
+        (.cons ^IPersistentCollection result-set
+               (vec ^objects (.get tuples i))))
+      (.clear tuples)
+      (set! projected nil)
+      result-set))
+
+  Collection
+  (add [_ tuple]
+    (let [^objects tuple tuple
+          width          (alength idxs)]
+      (aset-long input-count 0 (unchecked-inc (aget input-count 0)))
+      (if (= 1 width)
+        (let [value (aget tuple (aget idxs 0))]
+          (when (.add seen value)
+            (.add projected (object-array [value]))))
+        (do
+          (dotimes [i width]
+            (aset scratch i (aget tuple (aget idxs i))))
+          (r/reset-array-lookup! lookup scratch)
+          (when-not (.contains seen lookup)
+            (let [key (aclone scratch)]
+              (.add seen (r/wrap-array key))
+              (.add projected key)))))
+      true))
+  (addAll [this tuples]
+    (if (instance? List tuples)
+      (let [^List tuples tuples]
+        (dotimes [i (.size tuples)]
+          (.add ^Collection this (.get tuples i))))
+      (doseq [tuple tuples]
+        (.add ^Collection this tuple)))
+    true)
+  (size [_]
+    (int (min Integer/MAX_VALUE (aget input-count 0)))))
+
+(defn- projected-distinct-sink
+  [attrs symbols]
+  (let [input-count (long-array 1)
+        idxs        (int-array (map attrs symbols))
+        width       (alength idxs)]
+    {:sink        (ProjectedDistinctSink.
+                    idxs (HashSet.) (FastList.)
+                    (when (< 1 width) (object-array width))
+                    (when (< 1 width) (r/array-lookup)) input-count)
+     :input-count input-count}))
+
+(defn- terminal-collection-symbols
+  [{:keys [parsed-q rels late-clauses result-set]
+    :as context}]
+  (let [find-elements (dp/find-elements (:qfind parsed-q))]
+    (when (and *terminal-result-collection?*
+               (nil? result-set)
+               (empty? rels)
+               (empty? late-clauses)
+               (nil? (:post-top-k-enrichment context))
+               (adaptive-limit-query? parsed-q)
+               (seq find-elements)
+               (every? #(instance? Variable %) find-elements))
+      (mapv :symbol find-elements))))
 
 (defn- root-access-demand
   [parsed-q]
@@ -201,10 +283,30 @@
 (defn execute-plan
   [{:keys [plan sources] :as context}]
   (if (= 1 (transduce (map (fn [[_ components]] (count components))) + plan))
-    (update context :rels qresolve/collapse-rels
-            (let [[src components] (first plan)
-                  all-steps        (vec (mapcat :steps (first components)))]
-              (qplan/execute-steps context (sources src) all-steps)))
+    (let [[src components] (first plan)
+          db               (sources src)
+          all-steps        (vec (mapcat :steps (first components)))
+          execute-rel      #(update context :rels qresolve/collapse-rels
+                                    (qplan/execute-steps context db all-steps))]
+      (if-let [symbols (terminal-collection-symbols context)]
+        (let [attrs (qplan/step-attrs all-steps)]
+          (if (every? #(contains? attrs %) symbols)
+            (let [{:keys [sink input-count]}
+                  (projected-distinct-sink attrs symbols)]
+              (if (qplan/execute-steps-into context db all-steps sink)
+                (let [result-set
+                      (.finishResult ^IProjectedDistinctSink sink)]
+                  (assoc context
+                         :result-set result-set
+                         :terminal-collected-symbols symbols
+                         :terminal-result-collection
+                         {:mode          :projected-distinct
+                          :symbols       symbols
+                          :input-tuples  (aget ^longs input-count 0)
+                          :result-tuples (count result-set)}))
+                (execute-rel)))
+            (execute-rel)))
+        (execute-rel)))
     (reduce
       (fn [c r] (update c :rels qresolve/collapse-rels r))
       context (->> plan
@@ -1691,7 +1793,8 @@
 
 (defn collect
   [{:keys [result-set] :as context} symbols]
-  (if (= result-set #{})
+  (if (or (= result-set #{})
+          (= (vec symbols) (:terminal-collected-symbols context)))
     context
     (assoc context :result-set (into (sp/new-spillable-set) (map vec)
                                      (-collect context symbols)))))
@@ -1867,7 +1970,8 @@
             access-plans preferred-access-plan property-memo
             deferred-base-samples attribute-group-planning
             post-top-k-enrichment access-path-execution
-            explain-actual-result-size keyed-group-reduction]
+            explain-actual-result-size keyed-group-reduction
+            terminal-result-collection]
      :as context}]
    (when qplan/*explain*
      (let [{:keys [^long planning-time ^long parsing-time ^long building-time]}
@@ -1934,6 +2038,7 @@
                :post-top-k-enrichment (or runtime-post-top-k
                                           post-top-k-enrichment)
                :keyed-group-reduction keyed-group-reduction
+               :terminal-result-collection terminal-result-collection
                :late-clauses late-clauses
                :access-plans (mapv qaccess/plan-summary access-plans)
                :preferred-access-plan

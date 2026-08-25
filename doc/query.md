@@ -983,6 +983,27 @@ of planning has relatively little impact on quality of the final plan, while
 results in significant savings in memory consumption and planning time for
 complex queries.
 
+### Terminal projected-distinct collection
+
+For a single planned component whose final answer consists only of ordinary
+find variables, execution can feed the last operator directly into a
+projection-aware distinct sink. Hidden proof columns are discarded as rows are
+emitted, and reusable array lookups suppress duplicate projections before an
+answer vector is allocated. The final spillable set is then created with the
+exact distinct cardinality as its initial capacity.
+
+This avoids retaining a complete proof relation and walking it again during
+result collection. It is especially useful when a rule body has many proofs
+for each head tuple. Queries with input relations, late clauses, aggregates,
+pull or find expressions, `:with`, result maps, or multiple plan components
+retain the ordinary materialize-and-collect path. Components that select
+morsel-partitioned execution also retain that path until their worker-local
+result sinks can be merged safely.
+
+When selected, `explain` reports `:terminal-result-collection` with the
+projected symbols, the number of rows emitted by the final operator, and the
+number of distinct result rows.
+
 ### Parallel processing
 
 Our counting and sampling based query planning method does more work than

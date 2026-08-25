@@ -879,7 +879,7 @@
   nil)
 
 (defn- save-intermediates
-  [context steps ^objects sinks ^List tuples]
+  [context steps ^objects sinks ^Collection tuples]
   (when-let [res (and *explain* *intermediate-counts?*
                       (:intermediates context))]
     (vswap! res merge
@@ -979,20 +979,19 @@
     db in-cols join-steps tuples
     (FastList. (int (if tuples (.size ^List tuples) 0)))))
 
-(defn- pipelining
-  [context db attrs steps n]
-  (let [n-1    (dec ^long n)
-        tuples (FastList. (int c/init-exec-size-threshold))
-        pipes  (object-array (repeatedly n-1 #(if (and *explain*
-                                                       *intermediate-counts?*)
-                                                (p/counted-tuple-pipe)
-                                                (p/tuple-pipe))))
+(defn- run-pipeline-into
+  [db steps n sink]
+  (let [n-1   (dec ^long n)
+        pipes (object-array (repeatedly n-1 #(if (and *explain*
+                                                      *intermediate-counts?*)
+                                               (p/counted-tuple-pipe)
+                                               (p/tuple-pipe))))
         work   (fn [step ^long i]
                  (if (zero? i)
                    (step-execute-pipe step db nil (aget pipes 0))
                    (let [src (aget pipes (dec i))]
                      (if (= i n-1)
-                       (step-execute-pipe step db src tuples)
+                       (step-execute-pipe step db src sink)
                        (step-execute-pipe step db src (aget pipes i))))))
         finish #(when (not= % n-1) (p/finish (aget pipes %)))]
     (if (writing? db)
@@ -1013,6 +1012,12 @@
         (doseq [^Future f (.invokeAll ^ExecutorService
                                       (get-pipe-thread-pool) tasks)]
           (.get f))))
+    pipes))
+
+(defn- pipelining
+  [context db attrs steps n]
+  (let [tuples (FastList. (int c/init-exec-size-threshold))
+        pipes  (run-pipeline-into db steps n tuples)]
     (p/remove-end-scan tuples)
     (save-intermediates context steps pipes tuples)
     (r/relation! attrs tuples)))
@@ -1308,6 +1313,34 @@
         (if (partition-plan? context db steps)
           (segmented-execution context db attrs steps)
           (pipelining context db attrs steps n))))))
+
+(defn execute-steps-into
+  "Execute one component directly into `sink`. Return true when direct
+   execution was used, or false when the component requires partitioned
+   materialization and should use `execute-steps` instead."
+  [context db steps ^Collection sink]
+  (binding [*sip-domains* (or *sip-domains* (ConcurrentHashMap.))]
+    (let [steps (into [] (remove #(identical? :identity (-type %))) steps)
+          n     (count steps)]
+      (when (zero? n)
+        (u/raise "Cannot execute an empty query plan" {}))
+      (if (and (< 2 n) (partition-plan? context db steps))
+        false
+        (do
+          (case n
+            1
+            (do
+              (step-execute-pipe (first steps) db nil sink)
+              (save-intermediates context steps (object-array 0) sink))
+
+            2
+            (let [src (or (step-execute (first steps) db nil) (FastList.))]
+              (step-execute-pipe (peek steps) db (p/list-tuple-pipe src) sink)
+              (save-intermediates context steps (object-array [src]) sink))
+
+            (let [pipes (run-pipeline-into db steps n sink)]
+              (save-intermediates context steps pipes sink)))
+          true)))))
 
 (defn count-steps
   "Execute a component plan and count its output without retaining the final
