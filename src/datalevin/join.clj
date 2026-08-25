@@ -329,6 +329,15 @@
                  repeated
                  (unchecked-inc repeated)))))))
 
+(defn- sampled-unresolved-ref?
+  [^List tuples ^long idx]
+  (let [n (min (.size tuples) dense-composition-sample-size)]
+    (loop [i 0]
+      (cond
+        (= i n) false
+        (sequential? (aget ^objects (.get tuples i) idx)) true
+        :else (recur (unchecked-inc-int i))))))
+
 (defn ^:no-doc dense-binary-composition
   "Use bitset unions for a dense two-relation composition. Returns nil when
    the shape or measured relation density does not justify the representation."
@@ -348,8 +357,7 @@
     (when (and (= 2 (count vars))
                (seq common-attrs)
                (= 1 (count vars1))
-               (= 1 (count vars2))
-               (not-any? #(contains? qu/*lookup-attrs* %) vars))
+               (= 1 (count vars2)))
       (let [hash-first?  (< (.size tuples1) (.size tuples2))
             ^List hash-tuples (if hash-first? tuples1 tuples2)
             ^List scan-tuples (if hash-first? tuples2 tuples1)
@@ -359,6 +367,9 @@
             anchor-var   (if hash-first? (first vars2) (first vars1))
             value-idx    (int (hash-attrs value-var))
             anchor-idx   (int (scan-attrs anchor-var))
+            lookup-value? (boolean (contains? qu/*lookup-attrs* value-var))
+            lookup-anchor? (boolean (contains? qu/*lookup-attrs* anchor-var))
+            ^booleans unresolved-projection (boolean-array 1)
             [hash-key-fn _] (tuple-key-fns hash-attrs common-attrs)
             [scan-build-key-fn scan-key-fn]
             (tuple-key-fns scan-attrs common-attrs)
@@ -368,14 +379,30 @@
             ^FastList ordinal-values (FastList.)
             ^HashMap join-counts (HashMap.)]
         ;; Avoid an exact costing pass when a bounded sample finds no evidence
-        ;; that either side reuses join keys enough for dense composition.
-        (when (or (< input-size dense-composition-sample-threshold)
-                  (sampled-key-reuse? hash-tuples hash-key-fn)
-                  (sampled-key-reuse? scan-tuples scan-build-key-fn))
+        ;; that either side reuses join keys enough for dense composition. An
+        ;; actual lookup-ref sample also keeps its zero-cost early fallback;
+        ;; the exact pass below catches mixed inputs whose lookup refs occur
+        ;; later.
+        (when (and (not (and lookup-value?
+                             (sampled-unresolved-ref?
+                               hash-tuples value-idx)))
+                   (not (and lookup-anchor?
+                             (sampled-unresolved-ref?
+                               scan-tuples anchor-idx)))
+                   (or (< input-size dense-composition-sample-threshold)
+                       (sampled-key-reuse? hash-tuples hash-key-fn)
+                       (sampled-key-reuse? scan-tuples scan-build-key-fn)))
           ;; Establish a compact value domain and exact hash-side key counts.
           (dotimes [i (.size hash-tuples)]
             (let [^objects tuple (.get hash-tuples i)
                   value          (aget tuple value-idx)]
+              ;; A lookup-marked var is common for ref-valued rule heads, even
+              ;; when an EAV scan has already produced numeric entity ids. The
+              ;; dense representation is safe for those resolved values. Keep
+              ;; the conservative path for actual lookup-ref tuples because it
+              ;; preserves their original query representation.
+              (when (and lookup-value? (sequential? value))
+                (aset unresolved-projection 0 true))
               (when-not (.containsKey value-ordinals value)
                 (.put value-ordinals value (.size ordinal-values))
                 (.add ordinal-values value))
@@ -390,8 +417,12 @@
                   (loop [i 0, total 0]
                     (if (< i (.size scan-tuples))
                       (let [^objects tuple (.get scan-tuples i)
-                            _              (.add anchors
-                                                 (aget tuple anchor-idx))
+                            anchor         (aget tuple anchor-idx)
+                            _              (when (and lookup-anchor?
+                                                      (sequential? anchor))
+                                             (aset unresolved-projection
+                                                   0 true))
+                            _              (.add anchors anchor)
                             n              (.get join-counts
                                                  (scan-key-fn tuple))
                             n              (long (or n 0))
@@ -408,7 +439,8 @@
                                          (.size join-counts))))
                 roaring?     (> domain-size
                                 dense-composition-roaring-min-domain)]
-            (when (and (pos? domain-size)
+            (when (and (not (aget unresolved-projection 0))
+                       (pos? domain-size)
                        (pos? anchor-count)
                        (>= candidate-pairs dense-composition-min-candidates)
                        (>= candidate-pairs

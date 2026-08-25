@@ -107,6 +107,32 @@
                 (relation {'?z 0 '?y 1} [[10 :a] [20 :b]])
                 ['?x '?y])))))
 
+(deftest dense-binary-composition-resolved-lookup-projection-test
+  (let [n     64
+        left  (relation {'?x 0 '?z 1}
+                        (for [x (range n), z (range n)] [x z]))
+        right (relation {'?z 0 '?y 1}
+                        (for [z (range n), y (range n)] [z y]))]
+    (testing "resolved entity ids can use the dense path"
+      (binding [qu/*lookup-attrs* #{'?x '?z '?y}]
+        (let [composed (j/dense-binary-composition left right ['?x '?y])]
+          (is (some? composed))
+          (is (= (expected-projected-join left right ['?x '?y])
+                 (row-set composed))))))
+
+    (testing "actual lookup refs preserve the conservative result path"
+      (let [lookup-left
+            (relation {'?x 0 '?z 1}
+                      (for [x (range n), z (range n)]
+                        [[:entity/id x] z]))]
+        (binding [qu/*lookup-attrs* #{'?x '?z '?y}]
+          (is (nil? (j/dense-binary-composition
+                      lookup-left right ['?x '?y])))
+          (is (= (expected-projected-join lookup-left right ['?x '?y])
+                 (row-set
+                   (j/hash-join-project-distinct
+                     lookup-left right ['?x '?y])))))))))
+
 (deftest roaring-binary-composition-test
   (let [domain   5000
         ;; Keep the projected value side slightly smaller so it becomes the
