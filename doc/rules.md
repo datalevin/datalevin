@@ -155,6 +155,29 @@ a pending transaction overlay uses transaction-aware datom probes. Other rule
 shapes, multi-valued bounds, non-ref attributes, and calls against an already
 materialized rule relation continue through the general semi-naive evaluator.
 
+### Demand-driven synchronized closure
+
+A singleton-bound binary predicate can also avoid whole-relation evaluation for
+the synchronized recursive form
+
+```clojure
+[(p ?x ?y) [?x :base ?y]]
+[(p ?x ?y) [?x :left ?z] (p ?z ?z1) [?y :right ?z1]]
+```
+
+The physical EAV direction of each clause may be reversed. The evaluator first
+discovers only the recursive bound values reachable from the demand. It then
+seeds those subproblems from the base relation and propagates each new result
+once through a delta work queue to its dependent callers. Per-demand result
+sets provide Datalog set semantics and terminate cyclic inputs without
+materializing the complete binary predicate. Both bound-first and bound-last
+calls use the same mechanism by exchanging the demand and output sides.
+
+This specialization requires exactly one singleton-bound argument, two distinct
+binary head variables, one ref-valued EAV base branch, and one recursive branch
+with two ref-valued EAV links that preserve argument position. Other shapes and
+multi-valued demands retain the general semi-naive rule evaluator.
+
 ## Benchmarks
 
 ### Math Genealogy Benchmark
