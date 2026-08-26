@@ -5,6 +5,7 @@
 ### Added
 - [Datalog] `get-some-else` built-in function. Similar to `get-some` but always
   return a tuple.
+
 ### Improved
 - [Datalog] planner accounts for late clauses cost and better hash join cost
   estimation.
@@ -15,8 +16,28 @@
 - [Datalog] magic-set seeds participate in rule-call cost estimation.
 - [Datalog] late or-join branch planner.
 - [Datalog] segmented morsel-driven execution.
-- [Datalog] cheaper final result collection.
+- [Datalog] faster transitive closure: indexed specialization for
+  singleton-bound cases, demand driven closure specialization, and adaptive
+  closure traversal.
+- [Datalog] more execution specializations: terminal EAV composition, fused
+  bound value/presence AVE scans, EAV scan fast paths (singleton/small domain,
+  group scan without fixed index, cheap deferred attribute scans), existence
+  check path, paired longs hash join, flat tuple functions, and correlated
+  `not-join`.
+- [Datalog] materialize entities with a known unique attribute to avoid
+  expanding on them, and project and dedupe `not-join` input.
+- [Datalog] reduction sink for aggregations.
+- [Datalog] `or` and `or-join` improvements: union optimization and dedupe
+  before union.
 - [Datalog] better error report for missing tuple elements.
+
+### Changed
+- [Datalog] set semantics at rule boundary.
+
+### Fixed
+- [WAL] avoid replaying an older, already-materialized WAL record; lock for
+  complete LMDB teardown.
+- [Datalog] CSV reader fix.
 
 ## 1.0.2 (2026-08-11)
 
